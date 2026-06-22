@@ -137,20 +137,21 @@
   /// unmounted, so their Markdown never parses until they're revealed.
   ///
   /// The window is a top-cursor index, deliberately NOT a fixed-size tail: a tail
-  /// count would unmount the oldest visible block on every append, churning the
-  /// `content-visibility` remembered sizes (see the containment note below) and
-  /// nudging the viewport. The cursor only decreases (upward reveal, a later
-  /// milestone) or holds, so appended turns always render and nothing already
-  /// visible is unmounted. `INITIAL_WINDOW` is a tuning knob, not a contract;
-  /// block count is a loose proxy for the real cost driver (render *items* — one
-  /// agent block can hold dozens, a compact user row one), so it's sized
-  /// generously to cover a viewport plus scroll buffer.
+  /// count would unmount the oldest visible block on every append — re-parsing
+  /// markdown and disturbing scroll for an unrelated new turn. The cursor only
+  /// decreases (upward reveal) or holds, so appended turns always render and
+  /// nothing already visible is unmounted. `INITIAL_WINDOW` is a tuning knob, not
+  /// a contract; block count is a loose proxy for the real cost driver (render
+  /// *items* — one agent block can hold dozens, a compact user row one), so it's
+  /// sized generously to cover a viewport plus scroll buffer.
   ///
   /// Known limitation: select-all (and any future find-in-page) reaches only
-  /// mounted blocks — unmounted history isn't in the DOM until scrolled to. This
-  /// is exactly the tradeoff the containment-only approach was chosen to avoid;
-  /// windowing reintroduces it deliberately, for the load-time win.
+  /// mounted blocks — unmounted history isn't in the DOM until scrolled to. A
+  /// deliberate tradeoff for the load-time win.
   const INITIAL_WINDOW = 50;
+  /// How many older blocks each upward-reveal mounts. Same tunable-knob status as
+  /// `INITIAL_WINDOW` (block count is a loose proxy for the per-item render cost).
+  const REVEAL_BATCH = 50;
   let firstVisibleIndex = $state(0);
   const visibleBlocks = $derived(blocks.slice(firstVisibleIndex));
 
@@ -315,52 +316,18 @@
     return keys;
   });
 
-  /// Containment of the *mounted* blocks, complementary to render-windowing
-  /// above: windowing bounds how many blocks mount (so the initial markdown
-  /// cost is paid only for the tail), while containment keeps the mounted
-  /// window — which can still exceed a viewport — cheap to lay out. It is
-  /// ~CSS-only, keeps the hand-built scroll-anchoring machinery and its browser
-  /// tests intact, and is removable in one line. Off-screen blocks skip layout
-  /// and paint and contribute `contain-intrinsic-size` placeholder geometry —
-  /// which is exactly the work the compose textarea's per-keystroke forced
-  /// reflow pays for on a long transcript. `auto` makes the engine remember
-  /// each block's real height once rendered; the per-kind length is only the
-  /// pre-first-render guess, sized to minimize |estimate − typical rendered
-  /// height| (that error is what shows as scrollbar jitter on the first-ever
-  /// scroll through unseen history). Estimates target the DEFAULT rendering —
-  /// compact mode on, fan-out columns side-by-side (≥ lg) — so compact-off
-  /// and stacked-column first scrolls carry larger error; acceptable, since
-  /// `auto` corrects each block after its first render. Three literal class
-  /// strings (not an interpolated size) because Tailwind only generates CSS
-  /// for classes it can see statically. Requires a Safari-18+ engine; older
-  /// system WebKits ignore the property — a graceful no-op, not a breakage.
-  const CONTAINMENT_COMPACT_ROW = "[content-visibility:auto] [contain-intrinsic-size:auto_4rem]";
-  const CONTAINMENT_AGENT_ROW = "[content-visibility:auto] [contain-intrinsic-size:auto_16rem]";
-  const CONTAINMENT_FANOUT = "[content-visibility:auto] [contain-intrinsic-size:auto_20rem]";
-
-  function blockIsLive(block: RenderBlock): boolean {
-    if (block.kind === "row") {
-      return block.row.kind === "agent" && isLiveStreaming(block.row.turn);
-    }
-    return block.columns.some((col) =>
-      col.rows.some((r) => r.kind === "agent" && isLiveStreaming(r.turn)),
-    );
-  }
-
-  function blockContainment(block: RenderBlock): string {
-    // LIVE blocks are exempt from containment: a streaming block's height must
-    // always be its real geometry (the pinned path follows it; the inner live
-    // pin and cap depend on it), and its per-chunk re-renders inside a skipped
-    // wrapper churn remembered sizes into spurious outer-height changes.
-    // Liveness is a stable property (it flips once at stream start/end), so a
-    // block's containment class never changes from unrelated appends — an
-    // index-based "last N" window flips membership on every new turn, and a
-    // freshly-contained block loses its remembered size and snaps to the
-    // declared placeholder when off-screen (a guaranteed view nudge per turn).
-    if (blockIsLive(block)) return "";
-    if (block.kind === "fanout") return CONTAINMENT_FANOUT;
-    return block.row.kind === "agent" ? CONTAINMENT_AGENT_ROW : CONTAINMENT_COMPACT_ROW;
-  }
+  // No `content-visibility` containment on transcript blocks: render-windowing
+  // (above) bounds the mounted set, so the off-screen-layout cost containment
+  // existed to cut is already small by default. Keeping it actively broke the M2
+  // upward reveal — off-screen blocks sit at size *estimates*, which flip to real
+  // heights mid-correction and shift the reading position ~a block. With real
+  // heights the existing `reanchor` holds a top-prepend exactly, so windowing
+  // owns mounted-set size and scroll-anchoring owns position stability, with no
+  // estimate machinery between them. Residual: a user who reveals deep history
+  // grows the mounted set, so a forced full relayout scales with it (~3 ms at the
+  // default ~50 blocks, ~18 ms once ~300 are revealed — measured in WebKit). Past
+  // there, the answer is a true sliding-window/virtualization follow-up, not CSS
+  // containment estimates.
 
   /// Clip + bottom-fade for a height-clipped preview. Absolute stops (not
   /// percentages) so a short message never fades; the fade starts around the
@@ -636,9 +603,8 @@
   // position still regardless of WHERE a height change happened: gap-from-bottom
   // maintenance shifts the view by exactly the change whenever it happens below
   // the viewport (a streaming response growing, a new turn arriving — the
-  // read-while-streaming bug), and containment makes off-screen heights churn
-  // in both directions as blocks skip/materialize. The gap is kept for two
-  // cases only:
+  // read-while-streaming bug), and an upward reveal prepends a batch ABOVE it.
+  // The gap is kept for two cases only:
   // - the change happened INSIDE the anchor block (its own height moved): the
   //   user expanded/collapsed the thing they're looking at, and the contract
   //   there is "the toggle I clicked stays put" — which gap-hold provides,
@@ -754,6 +720,66 @@
     const ro = new ResizeObserver(reanchor);
     ro.observe(el);
     return () => ro.disconnect();
+  });
+
+  /// Upward reveal: a sentinel above the block list (rendered only while history
+  /// is windowed off the top) is watched by an IntersectionObserver rooted on the
+  /// scroll container; reaching it mounts the next older batch (`revealOlder`).
+  /// The sentinel lives OUTSIDE `content`, so `captureAnchor` (which scans
+  /// `content.children`) never anchors on it.
+  ///
+  /// A cursor decrement changes neither `rows.length` nor the transcript
+  /// revision, so the `scrollSignal` re-anchor effect does NOT fire on a reveal —
+  /// the ResizeObserver on `content` is the sole, correct trigger, and its
+  /// `reanchor` restores the reading position as the prepend grows `content`.
+  ///
+  /// `revealing` latches one batch per scroll-to-top: it gates re-entry until the
+  /// flush settles, and also drives the brief spinner — the reveal is synchronous
+  /// (blocks are in memory) but mounting + parsing a batch's Markdown is real work.
+  let revealSentinel = $state<HTMLElement | null>(null);
+  let revealing = $state(false);
+  let pendingReveal = false;
+
+  function revealOlder(): void {
+    if (firstVisibleIndex === 0) return;
+    // A trigger that arrives mid-reveal is REMEMBERED, not dropped: the observer
+    // only re-fires on an intersection *change*, so if the sentinel is still in
+    // view when the latch releases it would otherwise never reveal again (a stuck
+    // window). Coalesced to at most one pending batch.
+    if (revealing) {
+      pendingReveal = true;
+      return;
+    }
+    revealing = true;
+    firstVisibleIndex = Math.max(0, firstVisibleIndex - REVEAL_BATCH);
+    // The reveal is synchronous (blocks are in memory). Growing `content` fires
+    // the ResizeObserver → `reanchor`, which restores the reading position
+    // (anchor-restore: the read block's own height is unchanged, only blocks
+    // above it mounted). `revealing` gates re-entry to one batch per
+    // scroll-to-top and drives the brief spinner; released after the frame.
+    requestAnimationFrame(() => {
+      revealing = false;
+      if (pendingReveal) {
+        pendingReveal = false;
+        revealOlder();
+      }
+    });
+  }
+
+  $effect(() => {
+    const node = revealSentinel;
+    const root = container;
+    if (node === null || root === null) return;
+    // A top `rootMargin` pre-triggers slightly before the sentinel is fully in
+    // view, so the older batch is ready as the user reaches the top.
+    const io = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) revealOlder();
+      },
+      { root, rootMargin: "200px 0px 0px 0px" },
+    );
+    io.observe(node);
+    return () => io.disconnect();
   });
 
   /// Top-edge fade for a capped live region, keyed by preview key: true once the
@@ -1455,9 +1481,22 @@
     <p class="text-muted text-sm">No messages yet. Type a prompt below.</p>
   {/if}
 
+  <!-- Upward-reveal sentinel: older history exists above the window. Kept OUTSIDE
+       `content` so `captureAnchor`'s `content.children` scan never anchors on it. -->
+  {#if firstVisibleIndex > 0}
+    <div
+      bind:this={revealSentinel}
+      data-testid="reveal-sentinel"
+      class="text-muted flex items-center justify-center gap-2 py-3 text-xs"
+    >
+      {#if revealing}<Spinner class="h-4 w-4" />{/if}
+      <span>Earlier messages</span>
+    </div>
+  {/if}
+
   <div bind:this={content} class="space-y-5">
     {#each visibleBlocks as block (block.kind === "fanout" ? block.key : block.row.key)}
-      <div class={blockContainment(block)} data-testid="transcript-block">
+      <div data-testid="transcript-block">
         {#if block.kind === "row"}
           {#if block.row.kind === "user"}
             {@render userMessage(block.row)}

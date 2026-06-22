@@ -1,8 +1,18 @@
 # Transcript render windowing — fast load for long conversations
 
-**Status:** Proposed
+**Status:** Implemented (M1 + M2). See **As-built** below for what shipped and where it deviated from this plan.
 **Date:** 2026-06-21
 **Area:** Frontend (`src/lib/components/UnifiedTranscript.svelte`)
+
+## As-built (outcome)
+
+The forward-looking milestone text below is preserved as written; this section records what actually shipped, including one material deviation. Where the two disagree, this section is authoritative.
+
+- **M1 — windowed render.** Renders `blocks.slice(firstVisibleIndex)`; a top-cursor index, never a sliding tail. The cursor is **seeded on `loadStatus === "complete"`** (the content-settle signal — the component mounts before history loads), and reseeds whenever the **conversation identity** changes, where identity = `projectId` + the **visible-agent list (in order)** + the **oldest block's key**. The visible-agent term is load-bearing: a pane hides/shows an agent on the *same* persistent component, and without it a stale cursor sliced a shorter `blocks` to empty (blank pane). The oldest-key term catches a late retry-hydration inserting history at the front. The window is also bounded **while loading** (so stale mid-load content can't mount unbounded), but the seed is only recorded on `complete`.
+
+- **M2 — upward reveal.** A sentinel above the block list (kept OUTSIDE the `captureAnchor`-scanned `content`) is watched by an IntersectionObserver; reaching it mounts the next older batch. Reading-position stability is **not** hand-rolled — the prepend grows `content`, the existing `ResizeObserver → reanchor` holds the anchor. A one-batch latch gates re-entry and **coalesces** (does not drop) a trigger that arrives mid-reveal.
+
+- **Deviation — Option A: `content-visibility` containment was REMOVED** (this plan had listed keeping it, and removing it, as out of scope). Reason: containment gives off-screen blocks *estimated* heights, and those estimates flip to real mid-correction, shifting the reading position ~a block — it was the confounder breaking the M2 reveal. With real heights the existing `reanchor` holds a top-prepend exactly, so windowing owns mounted-set size and scroll-anchoring owns position stability, with no estimate machinery between them. Windowing already bounds the mounted set, so containment's perf role is largely subsumed. **Residual:** revealing deep history grows the mounted set, so a forced relayout scales with it (measured in WebKit: ~3 ms at the default ~50 blocks, ~18 ms once ~300 are revealed). Past that the answer is true sliding-window virtualization — a deferred ceiling alongside backend cursoring, not CSS containment estimates.
 
 ## Problem
 
@@ -203,11 +213,10 @@ Cursor lifecycle / edge cases the agent must handle:
   front, express the cursor against a stable key instead. State the assumption in
   a comment so a future change that violates it is caught.
 
-Keep the `content-visibility` containment as-is — it still helps within the
-bounded window (which can exceed a viewport) and during compose reflows. The two
-mechanisms are complementary; windowing supersedes containment's role as the
-"very long transcript" mitigation but does not replace it. Do not remove it in
-this milestone.
+> **Superseded by As-built (Option A).** This plan originally kept the
+> `content-visibility` containment in M1. It was **removed** during M2: its
+> off-screen height estimates broke the reveal's reading-position stability, and
+> windowing already bounds the mounted set. See the As-built section.
 
 Interaction with `pinned`/`reanchor`: because the window already *is* the bottom
 and the component opens pinned, M1 should require no change to the pin-to-bottom
@@ -359,8 +368,9 @@ network fetch or build a fake delay.
   If, after windowing, the ~8.76 MB IPC payload or JS-side memory becomes the
   next ceiling on very large projects, add backend cursoring as a *separate*
   follow-up — windowing is the prerequisite that makes it useful.
-- **Removing `content-visibility` containment.** Kept; complementary to
-  windowing.
+- ~~**Removing `content-visibility` containment.** Kept; complementary to
+  windowing.~~ **Reversed in M2 (Option A) — containment was removed.** See
+  As-built.
 - **Deferred/idle Markdown rendering** (render plain text first, upgrade on
   view). A different optimization; windowing addresses the same cost more
   directly. Not built here.
@@ -369,8 +379,12 @@ network fetch or build a fake delay.
 
 - **Select-all and find-in-page cover only mounted blocks.** Unmounted history
   (above the window, before the user has scrolled to it) is not in the DOM, so
-  ⌘A / any future ⌘F won't include it until scrolled into the window. This is the
-  explicit tradeoff the original containment approach was chosen to avoid; it is
-  inherent to the windowing the request asks for. **Flag for sign-off:** confirm
-  this is acceptable before/while implementing — there is no current find-in-page
-  feature, so the practical loss today is select-all over full history.
+  ⌘A / any future ⌘F won't include it until scrolled into the window. Inherent to
+  windowing. **Accepted** (signed off before implementation): there is no current
+  find-in-page feature, so the practical loss today is select-all over full
+  history.
+- **Deep-reveal layout cost.** Revealing a lot of history grows the mounted set,
+  so a forced relayout (e.g. the compose bar's per-keystroke reflow) scales with
+  it (~3 ms @ ~50 blocks, ~18 ms @ ~300, in WebKit). Acceptable now; the eventual
+  answer is sliding-window virtualization, not the removed containment. See
+  As-built.

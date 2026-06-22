@@ -47,6 +47,43 @@ function fireTo(channel: string, event: NormalizedEvent): void {
   cb({ payload: event });
 }
 
+// jsdom has no IntersectionObserver; the upward-reveal sentinel uses one. This
+// controllable stub captures the component's callback so a test can simulate the
+// sentinel scrolling into view (`fireIntersect`). Geometry/scroll preservation
+// is layout-coupled and lives in the browser suite; jsdom drives the cursor.
+let intersectionCallback: IntersectionObserverCallback | null = null;
+class MockIntersectionObserver implements IntersectionObserver {
+  readonly root = null;
+  readonly rootMargin = "";
+  readonly scrollMargin = "";
+  readonly thresholds: ReadonlyArray<number> = [];
+  constructor(cb: IntersectionObserverCallback) {
+    intersectionCallback = cb;
+  }
+  observe(): void {}
+  unobserve(): void {}
+  disconnect(): void {}
+  takeRecords(): IntersectionObserverEntry[] {
+    return [];
+  }
+}
+globalThis.IntersectionObserver =
+  MockIntersectionObserver as unknown as typeof IntersectionObserver;
+
+function fireIntersect(): void {
+  intersectionCallback?.([{ isIntersecting: true } as IntersectionObserverEntry], {
+    root: null,
+    rootMargin: "",
+    thresholds: [],
+  } as unknown as IntersectionObserver);
+}
+
+// `revealOlder` releases its one-batch latch on the next animation frame, so a
+// second reveal must wait for it.
+function raf(): Promise<void> {
+  return new Promise((resolve) => requestAnimationFrame(() => resolve()));
+}
+
 const PROJECT_ID = "00000000-0000-7000-8000-0000000000ff";
 
 const CLAUDE_AGENT: AgentRecord = {
@@ -69,6 +106,7 @@ const CODEX_AGENT: AgentRecord = {
 beforeEach(() => {
   listeners.clear();
   invokeMock.mockReset();
+  intersectionCallback = null;
   agentCopy.set("last_answer_block");
   // Default the suite to expanded rendering so behavioral tests state the mode
   // they exercise. Compact mode is on by default in the app, so the
@@ -3531,11 +3569,13 @@ describe("UnifiedTranscript render windowing", () => {
     expect(blockCount()).toBe(10);
     expect(screen.queryByText("msg 0-0")).not.toBeNull();
     expect(screen.queryByText("msg 0-9")).not.toBeNull();
+    // Nothing windowed off the top → no upward-reveal sentinel.
+    expect(screen.queryByTestId("reveal-sentinel")).toBeNull();
   });
 
   // A new turn appends at the end. The cursor must not advance (advancing would
-  // unmount the oldest visible block, churning content-visibility); the window
-  // grows by one at the bottom.
+  // unmount the oldest visible block, re-parsing markdown and disturbing scroll);
+  // the window grows by one at the bottom.
   it("holds the cursor on live append", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
@@ -3699,5 +3739,78 @@ describe("UnifiedTranscript render windowing", () => {
     expect(screen.queryByText("fan reply bob")).not.toBeNull();
     expect(screen.queryByText("msg 0-9")).toBeNull(); // block before the boundary
     expect(screen.queryByText("msg 2-48")).not.toBeNull(); // newest, in window
+  });
+
+  // M2 upward reveal. The sentinel signals (and triggers) older history; it's
+  // present while the window has a top to reveal (the windowed-off case; the
+  // short-transcript test above covers its absence).
+  it("shows the reveal sentinel while history is windowed off the top", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+
+    state.transcripts[CLAUDE_AGENT.id] = agentTurns(CLAUDE_AGENT, 60);
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT], loadStatus: "complete" },
+    });
+    await tick();
+    expect(screen.queryByTestId("reveal-sentinel")).not.toBeNull();
+  });
+
+  // Reaching the sentinel mounts the next older batch; repeating walks back to
+  // the start, after which the sentinel is gone and further triggers are no-ops.
+  it("reveals older blocks in batches and clamps at the top", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = agentTurns(CLAUDE_AGENT, 160);
+
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT], loadStatus: "complete" },
+    });
+    await tick();
+    expect(blockCount()).toBe(WINDOW); // cursor at 110
+
+    fireIntersect();
+    await tick();
+    expect(blockCount()).toBe(100); // +50
+    await raf();
+
+    fireIntersect();
+    await tick();
+    expect(blockCount()).toBe(150); // +50
+    await raf();
+
+    fireIntersect();
+    await tick();
+    expect(blockCount()).toBe(160); // clamped: 10 → 0
+    expect(screen.queryByTestId("reveal-sentinel")).toBeNull();
+    await raf();
+
+    // Nothing left to reveal — a further trigger is a no-op.
+    fireIntersect();
+    await tick();
+    expect(blockCount()).toBe(160);
+  });
+
+  // A trigger arriving mid-reveal (while the latch is held) must be REMEMBERED,
+  // not dropped: the observer only re-fires on an intersection change, so a
+  // dropped trigger would leave the window stuck. Fire twice synchronously — the
+  // second lands while the first is in flight — and assert both batches reveal.
+  // Without coalescing only one would (blockCount 100, not 150).
+  it("coalesces a trigger that arrives mid-reveal instead of dropping it", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = agentTurns(CLAUDE_AGENT, 160);
+
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT], loadStatus: "complete" },
+    });
+    await tick();
+    expect(blockCount()).toBe(WINDOW); // cursor at 110
+
+    fireIntersect();
+    fireIntersect(); // second arrives while the first is still latched
+    await raf(); // latch releases and replays the coalesced batch
+    await tick();
+    expect(blockCount()).toBe(150); // two batches: 110 → 60 → 10
   });
 });

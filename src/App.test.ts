@@ -1187,6 +1187,7 @@ describe("App", () => {
       type: "turn_start",
       turn_id: turnId,
       message_id: backend.sendMessageId,
+      send_id: backend.sendMessageId,
       started_at: "2026-05-20T01:00:00Z",
     });
     fireTo(`agent:ag-1`, { type: "content_chunk", turn_id: turnId, kind: "text", text: "bg work" });
@@ -1391,6 +1392,7 @@ describe("App", () => {
       type: "turn_start",
       turn_id: turnId,
       message_id: backend.sendMessageId,
+      send_id: backend.sendMessageId,
       started_at: "2026-05-20T00:00:00Z",
     });
     fireTo(channel, { type: "content_chunk", turn_id: turnId, kind: "text", text: "hello back" });
@@ -1439,6 +1441,7 @@ describe("App", () => {
       type: "turn_start",
       turn_id: turnId,
       message_id: backend.sendMessageId,
+      send_id: backend.sendMessageId,
       started_at: "2026-05-20T00:00:00Z",
     });
     fireTo(channel, {

@@ -628,7 +628,12 @@ function handleEvent(agentId: AgentId, event: NormalizedEvent): void {
     event.type === "message_failed"
       ? pendingEntryFor(priorRuntime, event.message_id)?.send_id
       : undefined;
-  const sendId = startEntry?.send_id ?? cancelledSendId ?? failedSendId;
+  // Prefer the locally-tracked pending-send (frontend-originated sends correlate
+  // by `message_id`); fall back to the `turn_start` event's own `send_id` for a
+  // send the frontend didn't originate (e.g. a workflow dispatch), so its fan-out
+  // turns still group side-by-side live without waiting for a reload's journal merge.
+  const eventSendId = event.type === "turn_start" ? event.send_id : undefined;
+  const sendId = startEntry?.send_id ?? eventSendId ?? cancelledSendId ?? failedSendId;
   setTranscript(
     agentId,
     transcriptReducer(

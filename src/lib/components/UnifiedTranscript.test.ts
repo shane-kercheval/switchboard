@@ -508,6 +508,7 @@ describe("UnifiedTranscript", () => {
         type: "turn_start",
         turn_id: "agent-1",
         message_id: "00000000-0000-7000-8000-0000000000e1",
+        send_id: "00000000-0000-7000-8000-0000000000e1",
         started_at: "2026-05-16T00:00:00Z",
       });
       await tick();
@@ -547,6 +548,7 @@ describe("UnifiedTranscript", () => {
       type: "turn_start",
       turn_id: "turn-1",
       message_id: "msg-1",
+      send_id: "msg-1",
       started_at: "2026-05-16T00:00:00Z",
     });
     fireTo(`agent:${CLAUDE_AGENT.id}`, {
@@ -1318,6 +1320,7 @@ describe("UnifiedTranscript — markdown rendering", () => {
       type: "turn_start",
       turn_id: "turn-1",
       message_id: "msg-1",
+      send_id: "msg-1",
       started_at: "2026-05-16T00:00:00Z",
     });
     // Unclosed fence — marked renders a partial code block; must not throw.
@@ -1361,6 +1364,7 @@ describe("UnifiedTranscript — markdown rendering", () => {
       type: "turn_start",
       turn_id: "turn-1",
       message_id: "msg-1",
+      send_id: "msg-1",
       started_at: "2026-05-16T00:00:00Z",
     });
     fireTo(`agent:${CLAUDE_AGENT.id}`, {
@@ -1400,6 +1404,7 @@ describe("UnifiedTranscript — markdown rendering", () => {
       type: "turn_start",
       turn_id: "turn-1",
       message_id: "msg-1",
+      send_id: "msg-1",
       started_at: "2026-05-16T00:00:00Z",
     });
     fireTo(`agent:${CLAUDE_AGENT.id}`, {
@@ -1450,6 +1455,7 @@ describe("UnifiedTranscript — markdown rendering", () => {
       type: "turn_start",
       turn_id: "turn-1",
       message_id: "msg-1",
+      send_id: "msg-1",
       started_at: "2026-05-16T00:00:00Z",
     });
     fireTo(`agent:${CLAUDE_AGENT.id}`, {

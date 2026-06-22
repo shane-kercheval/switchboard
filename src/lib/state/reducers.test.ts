@@ -21,7 +21,13 @@ function turnStart(
   messageId = MESSAGE_1,
   startedAt = "2026-05-16T00:00:00Z",
 ): NormalizedEvent {
-  return { type: "turn_start", turn_id: turnId, message_id: messageId, started_at: startedAt };
+  return {
+    type: "turn_start",
+    turn_id: turnId,
+    message_id: messageId,
+    send_id: messageId,
+    started_at: startedAt,
+  };
 }
 
 function contentChunk(turnId: string, text: string): NormalizedEvent {

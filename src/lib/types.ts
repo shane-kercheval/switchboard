@@ -120,7 +120,17 @@ export type StagedAttachment = {
 };
 
 export type NormalizedEvent =
-  | { type: "turn_start"; turn_id: TurnId; message_id: MessageId; started_at: string }
+  | {
+      type: "turn_start";
+      turn_id: TurnId;
+      message_id: MessageId;
+      // The originating send's id, shared across a fan-out's recipients. Lets the
+      // live UI group concurrent turns of one send side-by-side even when the
+      // frontend didn't originate the send (e.g. a workflow dispatch), which has
+      // no local `pending_sends` entry to derive the grouping from.
+      send_id: SendId;
+      started_at: string;
+    }
   | { type: "content_chunk"; turn_id: TurnId; kind: ContentKind; text: string }
   // Content-free liveness signal: the harness is still alive mid-turn but
   // produced no renderable content (e.g. Claude Opus 4.8's redacted thinking

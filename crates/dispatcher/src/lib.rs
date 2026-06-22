@@ -1328,6 +1328,7 @@ async fn run_turn(
         &NormalizedEvent::TurnStart {
             turn_id,
             message_id: item.message_id,
+            send_id: item.send_id,
             started_at,
         },
         agent_id,

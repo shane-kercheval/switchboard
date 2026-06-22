@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use switchboard_core::{AgentId, SessionLocator};
+use switchboard_core::{AgentId, SendId, SessionLocator};
 use uuid::Uuid;
 
 /// UUID v7 turn identifier — consistent with `AgentId` and `ProjectId`.
@@ -323,6 +323,12 @@ pub enum NormalizedEvent {
         /// produced it — see [`MessageId`]. The frontend flips its optimistic
         /// message bubble (keyed by `message_id`) from queued/sending to running.
         message_id: MessageId,
+        /// The `send_id` of the originating send — shared across a fan-out's
+        /// recipients. Lets the live UI group concurrent turns of one send into a
+        /// side-by-side row even when the frontend didn't originate the send (a
+        /// workflow dispatches backend-side, so it has no local `pending_sends`
+        /// entry to derive the grouping from).
+        send_id: SendId,
         started_at: DateTime<Utc>,
     },
     ContentChunk {
@@ -640,16 +646,19 @@ mod tests {
     fn turn_start_wire_shape() {
         let turn_id = fresh_turn_id();
         let message_id = Uuid::now_v7();
+        let send_id = Uuid::now_v7();
         let started_at = fresh_time();
         let event = NormalizedEvent::TurnStart {
             turn_id,
             message_id,
+            send_id,
             started_at,
         };
         let value = serde_json::to_value(&event).unwrap();
         assert_eq!(value["type"], "turn_start");
         assert_eq!(value["turn_id"], turn_id.to_string());
         assert_eq!(value["message_id"], message_id.to_string());
+        assert_eq!(value["send_id"], send_id.to_string());
         let parsed: NormalizedEvent = serde_json::from_value(value).unwrap();
         assert_eq!(parsed, event);
     }

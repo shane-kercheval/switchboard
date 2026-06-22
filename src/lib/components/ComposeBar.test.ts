@@ -984,6 +984,7 @@ describe("ComposeBar", () => {
       type: "turn_start",
       turn_id: "turn-1",
       message_id: "msg-1",
+      send_id: "msg-1",
       started_at: "2026-05-16T00:00:00Z",
     });
     await waitFor(() => expect(state.runtimes[AGENT_A.id]?.run_status).toBe("processing"));
@@ -2206,6 +2207,7 @@ describe("ComposeBar — cross-agent forward", () => {
       type: "turn_start",
       turn_id: "t-a",
       message_id: "msg-fwd",
+      send_id: "msg-fwd",
       started_at: "2026-05-16T00:00:00Z",
     });
     await waitFor(() => {

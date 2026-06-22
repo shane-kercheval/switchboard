@@ -46,6 +46,7 @@ serde_norway.workspace = true
 tokio-util.workspace = true
 switchboard-workflow = { version = "0.0.1", path = "../workflow" }
 tauri-plugin-notification = "2.3.3"
+keepawake = "0.6.0"
 
 [dev-dependencies]
 tokio = { workspace = true }

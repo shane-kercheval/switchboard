@@ -14,6 +14,7 @@ mod metadata;
 mod preferences;
 mod secret_store;
 mod state;
+mod wake_lock;
 pub mod workflow;
 mod workflow_commands;
 mod workspace;
@@ -27,6 +28,8 @@ use switchboard_harness::{
     MockHarnessAdapter,
 };
 use tauri::{Emitter, Manager, State};
+
+use crate::wake_lock::WakeLockEmitter;
 
 use crate::commands::ProjectConversation;
 use crate::commands::{
@@ -1295,9 +1298,16 @@ pub fn run() {
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_notification::init())
         .setup(move |app| {
-            let emitter: Arc<dyn EventEmitter> = Arc::new(AppHandleEmitter {
+            // Wrap the base emitter so any in-flight agent turn holds an OS
+            // wake lock; the decorator counts `turn_start`/`turn_end` across
+            // all agents and releases once the last turn ends.
+            let base_emitter: Arc<dyn EventEmitter> = Arc::new(AppHandleEmitter {
                 app: app.handle().clone(),
             });
+            let emitter: Arc<dyn EventEmitter> = Arc::new(WakeLockEmitter::new(
+                base_emitter,
+                wake_lock::KeepAwakeInhibitor::new(),
+            ));
             let state = AppState::new(
                 Arc::clone(&claude_adapter),
                 Arc::clone(&codex_adapter),

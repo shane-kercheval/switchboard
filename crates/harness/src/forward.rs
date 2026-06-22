@@ -152,6 +152,7 @@ mod tests {
             agent_id: Uuid::now_v7(),
             started_at: Utc::now(),
             text: text.to_owned(),
+            source: crate::transcript::UserPromptSource::Unknown,
         }
     }
 

@@ -17,6 +17,30 @@ use switchboard_core::AgentId;
 
 use crate::events::{ContentKind, McpServerStatus, ToolKind, TurnId, TurnSpend, TurnUsage};
 
+/// Origin of a reconstructed user prompt. The conversation merge uses it to
+/// decide whether the journal already owns this prompt (suppress the harness
+/// copy) or it must render from the harness file (imported). Populated by the
+/// Claude parser from the session file's `promptSource`; other harnesses leave
+/// it `Unknown`, which routes their turns through the merge's count-based
+/// fallback. **Backend-private** — never serialized to the IPC wire (the merge
+/// consumes it in-process), mirroring `Turn::Agent.stable_message_id`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum UserPromptSource {
+    /// Dispatched by an SDK/headless client (Switchboard) — Claude
+    /// `promptSource: "sdk"`. The journal owns this prompt when a send pairs
+    /// with it.
+    Sdk,
+    /// Typed into the harness's own TUI (`typed`/`queued`) — a genuine prompt
+    /// the journal never saw; always renders imported.
+    External,
+    /// No provenance signal (older CLI, or a non-Claude harness). Routes the
+    /// agent through the merge's count-based correlation fallback.
+    #[default]
+    Unknown,
+}
+
 /// One reconstructed turn. Discriminated by `role` matching the event-vocabulary
 /// convention. User turns carry just the prompt text; agent turns carry the
 /// ordered `items` stream plus per-turn usage and lifecycle status.
@@ -35,6 +59,11 @@ pub enum Turn {
         agent_id: AgentId,
         started_at: DateTime<Utc>,
         text: String,
+        /// Origin of this prompt (see [`UserPromptSource`]). Backend-private —
+        /// `skip_serializing` keeps it off the IPC wire; `default` fills it as
+        /// `Unknown` on any deserialize. Consumed only by the conversation merge.
+        #[serde(default, skip_serializing)]
+        source: UserPromptSource,
     },
     Agent {
         turn_id: TurnId,
@@ -270,12 +299,24 @@ mod tests {
             agent_id: fresh_agent_id(),
             started_at: Utc::now(),
             text: "hello".to_owned(),
+            // A non-default source to prove it is dropped on serialize.
+            source: UserPromptSource::Sdk,
         };
         let value = serde_json::to_value(&turn).unwrap();
         assert_eq!(value["role"], "user");
         assert_eq!(value["text"], "hello");
-        let parsed: Turn = serde_json::from_value(value).unwrap();
-        assert_eq!(parsed, turn);
+        // `source` is backend-private — never serialized onto the IPC wire.
+        assert!(
+            value.get("source").is_none(),
+            "source must not cross the wire"
+        );
+        // The wire never carries it, so it deserializes as the `Unknown` default;
+        // the public fields still round-trip.
+        let Turn::User { source, text, .. } = serde_json::from_value(value).unwrap() else {
+            panic!("expected a user turn");
+        };
+        assert_eq!(source, UserPromptSource::Unknown);
+        assert_eq!(text, "hello");
     }
 
     #[test]

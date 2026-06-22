@@ -12,7 +12,7 @@ use switchboard_core::{AgentRecord, HarnessKind, SessionLocator};
 use switchboard_harness::{
     AdapterEvent, AntigravityAdapter, ClaudeCodeAdapter, CodexAdapter, ContentKind,
     DispatchOptions, GeminiAdapter, HarnessAdapter, RateLimitSource, Turn, TurnOutcome,
-    load_antigravity_transcript, load_claude_transcript, load_codex_transcript,
+    UserPromptSource, load_antigravity_transcript, load_claude_transcript, load_codex_transcript,
     load_gemini_transcript,
 };
 use uuid::Uuid;
@@ -254,6 +254,50 @@ async fn live_claude_hydration_key_matches_live_turn_end() {
     assert_eq!(
         live_key, disk_key,
         "the live TurnEnd's first-message id must equal the parser's reconstructed hydration_key"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires claude installed — run with: make test-live"]
+async fn live_claude_dispatched_prompt_classified_sdk() {
+    // The transcript-merge dedup keys on Claude writing `promptSource:"sdk"` for
+    // a Switchboard (SDK) dispatch, which the parser classifies as
+    // `UserPromptSource::Sdk`. If a CLI version renames/drops the field the
+    // parser falls back to `Unknown` and the merge silently reverts to the
+    // fragile count-based path — this catches that drift before it ships.
+    let adapter = ClaudeCodeAdapter::new();
+    let agent = live_agent();
+    let Some(SessionLocator::Uuid(session_id)) = agent.session_locator else {
+        unreachable!("live claude agent has a uuid locator")
+    };
+    let turn_id = Uuid::now_v7();
+
+    let stream = adapter
+        .dispatch(
+            &agent,
+            Path::new("/tmp"),
+            "Reply with only the word ack and nothing else.",
+            turn_id,
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("dispatch should succeed with real claude");
+    let _events: Vec<AdapterEvent> = stream.collect().await;
+
+    let loaded = load_claude_transcript(&home_dir(), Path::new("/tmp"), session_id, agent.id)
+        .expect("loading the just-written session file should succeed");
+    let source = loaded
+        .turns
+        .iter()
+        .find_map(|t| match t {
+            Turn::User { source, .. } => Some(*source),
+            _ => None,
+        })
+        .expect("the dispatched prompt must appear as a user turn");
+    assert_eq!(
+        source,
+        UserPromptSource::Sdk,
+        "an SDK dispatch must write promptSource:\"sdk\" (parsed as Sdk); a fallback to Unknown means the field drifted"
     );
 }
 

@@ -169,7 +169,7 @@ pub struct CompletionResult {
 /// together (the centralization that keeps a new terminal path from
 /// emit-or-journal-but-forget-to-fire). Two kinds ride the same terminal:
 ///
-/// - `completion` — the M1 per-send handle (outcome + captured text). At most
+/// - `completion` — the per-send handle (outcome + captured text). At most
 ///   one, set at send time only for `send_message_awaiting_completion`.
 /// - `current_turn` — per-agent [`Command::WaitForCurrentTurn`] waiters
 ///   registered *mid-turn* (the manual forward's source wait). Carry the same
@@ -227,7 +227,7 @@ pub enum AwaitableSendOutcome {
 /// "await this agent's current in-flight turn's terminal" capability used by the
 /// manual cross-agent forward.
 ///
-/// Like the per-send [`CompletionResult`] (M1), this carries the turn's captured
+/// Like the per-send [`CompletionResult`], this carries the turn's captured
 /// text — but for a turn the waiter never dispatched (the manual forward
 /// references an agent whose turn the user kicked off from an *earlier* compose
 /// send, so there is no per-send handle to it). Because the waiter registers
@@ -321,7 +321,7 @@ enum Command {
     /// forward-source wait). Replies [`CurrentTurnWait::Idle`] at once if no turn
     /// is running; otherwise the reply is held and fired with
     /// [`CurrentTurnWait::Terminal`] when the running turn reaches its terminal —
-    /// the same instant the M1 completion signal fires, since both ride the
+    /// the same instant the completion signal fires, since both ride the
     /// turn's terminal-synthesis points.
     WaitForCurrentTurn {
         reply: oneshot::Sender<CurrentTurnWait>,
@@ -1333,7 +1333,7 @@ async fn drain_turn(
     commands: &mut mpsc::UnboundedReceiver<Command>,
     backlog: &mut VecDeque<WorkItem>,
 ) -> TurnAfter {
-    // Everything that must be fired at this turn's terminal: the M1 per-send
+    // Everything that must be fired at this turn's terminal: the per-send
     // completion handle (if any) plus any per-agent current-turn waiters that
     // register mid-turn. Both fire together at every terminal-synthesis point.
     let mut awaiters = TurnAwaiters {
@@ -1351,7 +1351,7 @@ async fn drain_turn(
     let mut shutdown_reply: Option<oneshot::Sender<()>> = None;
     let mut channel_closed = false;
     // Accumulated `Text`-kind output for the turn — the text a forward/aggregate
-    // consumer reads, delivered to both the M1 completion handle and the
+    // consumer reads, delivered to both the completion handle and the
     // current-turn waiters. Captured for **every** turn from its start, not only
     // awaited ones: a current-turn waiter (manual forward) registers *mid-turn*,
     // so the prefix it would otherwise miss must already be buffered. The cost is

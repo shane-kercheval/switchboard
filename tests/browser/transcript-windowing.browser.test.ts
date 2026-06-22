@@ -14,10 +14,10 @@ import { ALICE, PROJECT_ID } from "./fixtures";
 import { buildLargeTranscript } from "$lib/dev/largeTranscript";
 import { INITIAL_WINDOW } from "$lib/state/unified";
 
-// Render-windowing in real WebKit (plan: 2026-06-21-transcript-render-windowing
-// M1). The jsdom suite proves the cursor logic; this proves the window is a real
-// DOM bound — only a tail of blocks mounts — and that the mount still lands at
-// the true bottom despite the off-window history being absent.
+// Render-windowing in real WebKit. The jsdom suite proves the cursor logic; this
+// proves the window is a real DOM bound — only a tail of blocks mounts — and that
+// the mount still lands at the true bottom despite the off-window history being
+// absent.
 
 const blockCount = (): number => page.getByTestId("transcript-block").elements().length;
 

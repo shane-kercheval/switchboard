@@ -33,15 +33,14 @@ import type { Turn } from "$lib/state/types";
 // production case), not all 300 exchanges. To measure the old unwindowed upper
 // bound a run would have to defeat the window.
 //
-// What it measures and which decisions it feeds (see the perf plan's M3/M5
-// sections, docs/implementation_plans/2026-06-09-performance-improvements.md):
+// What it measures and which decisions it feeds:
 // - The compose autosize's exact per-keystroke layout operation (height-reset
 //   write + scrollHeight read) against {small, windowed-tail} × {compact on/off}.
 //   (The former containment on/off A/B is gone — content-visibility containment
 //   was removed once render-windowing took over bounding the mounted set.)
 // - Per-chunk cost of each streaming pipeline stage on the large fixture
 //   (reducer, rows rebuild, scrollSignal walk, markdown re-parse by segment
-//   size) — M5's step-0 baseline that gates its Fixes 3/4.
+//   size) — the streaming-pipeline baseline that gates the streaming fixes.
 
 const PERF = import.meta.env.VITE_PERF === "1";
 
@@ -124,7 +123,7 @@ test.runIf(PERF)("forced-layout cost per keystroke-equivalent", async () => {
   expect(results.join(" | ")).toBe("__REPORT__");
 });
 
-test.runIf(PERF)("streaming pipeline per-chunk stage costs (M5 step 0)", () => {
+test.runIf(PERF)("streaming pipeline per-chunk stage costs (baseline)", () => {
   const results: string[] = [];
   const agentId = ALICE.id;
   const history = buildLargeTranscript({ agentIds: [agentId], exchanges: 300 })[agentId]!;
@@ -161,7 +160,7 @@ test.runIf(PERF)("streaming pipeline per-chunk stage costs (M5 step 0)", () => {
   });
 
   const rows = buildUnifiedRows(turns, [], knownIds);
-  bench("scrollSignal content walk [HISTORICAL — removed by M5 Fix 2]", () => {
+  bench("scrollSignal content walk [HISTORICAL — since removed]", () => {
     // The pre-Fix-2 digest derived. Production now reads an O(1) revision
     // counter instead (`getTranscriptRevision`); this benchmark is kept only
     // as the step-0 baseline that justified the change — it does NOT reflect

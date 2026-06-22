@@ -3753,7 +3753,7 @@ describe("UnifiedTranscript render windowing", () => {
     expect(screen.queryByText(`msg 2-${WINDOW - 2}`)).not.toBeNull(); // newest, in window
   });
 
-  // M2 upward reveal. The sentinel signals (and triggers) older history; it's
+  // Upward reveal. The sentinel signals (and triggers) older history; it's
   // present while the window has a top to reveal (the windowed-off case; the
   // short-transcript test above covers its absence).
   it("shows the reveal sentinel while history is windowed off the top", async () => {

@@ -211,7 +211,7 @@ export async function hydrateAgent(agentId: AgentId): Promise<void> {
 /// Re-attempt an agent's hydration after a failure. Clears the sticky
 /// `hydrationAttempted` guard (so `hydrateAgent` actually re-runs) and drops the
 /// prior `hydration_error` (so the UI shows the loading state, not a stale
-/// failure, during the re-attempt). Safe even before M2's idempotent merge: a
+/// failure, during the re-attempt). Safe even without the idempotent merge: a
 /// failed hydration applies *nothing* (the load is all-or-nothing at the IPC
 /// boundary — `loadTranscript` either returns a complete value that is then
 /// applied, or throws and applies nothing), so a retry-after-failure cannot
@@ -229,7 +229,7 @@ export async function retryAgentHydration(agentId: AgentId): Promise<void> {
   // retry would `hydrationAttempted.delete` the guard the first call just
   // re-added and start a *second* concurrent `load_transcript`; both would
   // resolve and both apply, and since each parse mints fresh `turn_id`s the
-  // pre-M2 merge can't dedup them — duplicating the agent's history.
+  // un-keyed merge can't dedup them — duplicating the agent's history.
   // `hydrateAgent` sets `"loading"` synchronously before its await, so a
   // racing retry observes it here.
   if (current.hydration_status === "loading") return;

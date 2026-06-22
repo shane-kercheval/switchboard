@@ -611,7 +611,7 @@ async fn live_antigravity_full_stack_two_turns_resume_through_dispatcher() {
 }
 
 // ---------------------------------------------------------------------------
-// Live cancellation tests (M4.3). Each dispatches a turn through the real CLI,
+// Live cancellation tests. Each dispatches a turn through the real CLI,
 // fires the cancellation token while it is in flight, and asserts the
 // dispatcher synthesizes a `Cancelled` terminal and the agent returns to idle
 // (reaches agent_idle) and is re-promptable.

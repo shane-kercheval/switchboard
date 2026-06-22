@@ -453,7 +453,7 @@ pub struct LinkedProject {
     pub directory: String,
 }
 
-/// One tracked repo for the Git view: the M1 read-model plus the project links.
+/// One tracked repo for the Git view: the read-model plus the project links.
 ///
 /// `repo` is `switchboard_git::RepoView` verbatim — the single source of the git
 /// contract, never re-mirrored here. Project linking is returned *alongside* as
@@ -516,7 +516,7 @@ pub fn remove_tracked_repo_impl(state: &AppState, path: &str) {
     }
 }
 
-/// The aggregate Git-view read: for every tracked repo, the M1 `RepoView`
+/// The aggregate Git-view read: for every tracked repo, the `RepoView`
 /// enriched with the Switchboard projects living in each worktree. The **sole**
 /// read command (no separate cheap "list" — the per-repo availability is already
 /// in each `RepoView`).
@@ -586,7 +586,7 @@ fn is_tracked_worktree(roots: &[PathBuf], path: &str) -> bool {
 }
 
 /// The changed files in a worktree (working-tree changes vs. HEAD — staged,
-/// unstaged, untracked), for the M5 diff panel's file list. A clean or
+/// unstaged, untracked), for the diff panel's file list. A clean or
 /// unreadable path yields an empty list (the non-error state); a genuine mid-read
 /// failure surfaces as [`AppError::GitRead`] so the panel can say why it's empty.
 ///
@@ -773,7 +773,7 @@ fn worktree_paths(repo: &switchboard_git::RepoView) -> Vec<PathBuf> {
 /// of spelling.
 ///
 /// Reads the **in-memory** workspace cached snapshots, **not** `list_projects_impl`.
-/// The Git-view read is polled by M3, so it must be side-effect-free: going
+/// The Git-view read is polled, so it must be side-effect-free: going
 /// through `list_projects_impl` would re-scan every directory from disk and could
 /// rewrite `workspace.yaml` as a cache-refresh side effect. The cached snapshot
 /// is the workspace registry's purpose and is kept current by project
@@ -1399,7 +1399,7 @@ pub fn open_project_impl(
     // no-op returning the existing handle, with no second lock acquisition
     // (`flock` is the inter-process guard only; a process re-locking its own
     // held file via a second fd would spuriously conflict). Keeping this
-    // check lock-free means M4.6 project switches don't serialize against
+    // check lock-free means project switches don't serialize against
     // creates/registers.
     if let Some(loaded) = lock(&state.projects).get(&project_id) {
         return Ok(ProjectSummary {
@@ -1611,7 +1611,7 @@ pub fn rename_agent_impl(
 /// freezes the agent record at construction today, so the refreshed cache is
 /// not yet read mid-session; the factory's live-read of `agents_by_id` lands
 /// alongside the capture sink, at which point the next turn sees the update.)
-// Exercised by tests but not yet on a production call path — the M2 runtime-
+// Exercised by tests but not yet on a production call path — the runtime-
 // capture sink is its first caller.
 #[allow(dead_code)]
 pub fn set_agent_session_locator_impl(
@@ -1857,7 +1857,7 @@ pub fn attach_agent_impl(
         _ => return Err(AppError::UnsupportedHarness),
     };
 
-    // Register-cache (M4.1): the new attached agent's project is `active`,
+    // Register-cache: the new attached agent's project is `active`,
     // which is loaded (resolved above), so a subsequent `lookup_agent` hits
     // the cache without a disk scan.
     lock(&state.agents_by_id).insert(record.id, record.clone());
@@ -2186,7 +2186,7 @@ pub fn list_agents_impl(
         .cloned()
         .ok_or(AppError::ProjectNotLoaded(pid))?;
     let agents = project.list_agents()?;
-    // Keep the register-cache (M4.1) in sync with what's on disk for this
+    // Keep the register-cache in sync with what's on disk for this
     // project (insert-only — v1 has no agent deletion).
     {
         let mut cache = lock(&state.agents_by_id);
@@ -2264,7 +2264,7 @@ pub fn search_project_files_in_root(
 /// before the dispatcher is touched.
 /// The result of staging one dropped file: where it now lives and the original
 /// basename for display. The frontend assigns the `label`/`kind` (it owns the
-/// extension→kind mapping per the M1 contract) and builds the full
+/// extension→kind mapping) and builds the full
 /// [`Attachment`] from these two values.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StagedAttachment {
@@ -2333,7 +2333,7 @@ fn stage_attachment_io(
 /// command thread and stall unrelated IPC / event handling. Resolving the
 /// project is a cheap lock lookup, kept on the async side; only the file copy is
 /// offloaded — matching how `load_project_conversation_impl` offloads transcript
-/// parsing. Classification/labeling is the frontend's job (M1 contract).
+/// parsing. Classification/labeling is the frontend's job.
 pub async fn stage_attachment_impl(
     state: &AppState,
     project_id: ProjectId,
@@ -2827,9 +2827,10 @@ pub struct ForwardArg {
 }
 
 /// Manual forward into a prompt's arguments (the prompt-composer analogue of
-/// [`forward_message_impl`], and the manual precursor of M4's workflow `send`
-/// with `prompt` + `template_vars` — M4 reuses this resolve → fill-args → render
-/// tail, so keep them in step). Resolve-only, like `forward_message_impl`: holds
+/// [`forward_message_impl`], and the manual precursor of the workflow `send`
+/// with `prompt` + `template_vars` — the workflow `send` reuses this resolve →
+/// fill-args → render tail, so keep them in step). Resolve-only, like
+/// `forward_message_impl`: holds
 /// for the sources, composes each forwarded argument (its typed text first, then
 /// its forwarded blocks — the same `compose_forwarded_message` as the compose
 /// bar), fills the args map, renders the prompt via `PromptService`, and returns
@@ -2936,7 +2937,7 @@ async fn forward_prompt_resolve(
         result = resolve_all_sources(state, &flat, home_dir) => result?,
     };
 
-    // Invalidate on the first source whose turn failed/cancelled (same as M2).
+    // Invalidate on the first source whose turn failed/cancelled.
     for resolution in &resolved {
         if let SourceResolution::Invalidated {
             name: source_name,
@@ -3025,9 +3026,9 @@ pub fn cancel_forward_impl(state: &AppState, forward_id: Uuid) {
 /// `project_ids`' instance locks — strictly in that order, so a project lock
 /// is never released while one of its agents' turns is still live (which would
 /// reopen the double-drive race the lock guards). The reusable
-/// cancel-and-drain lifecycle primitive: standalone and unit-tested in M4.2;
-/// M4.6 wires it to remove-directory (passing one directory's agents +
-/// project), and the app-quit handler is deferred to M8.
+/// cancel-and-drain lifecycle primitive: standalone and unit-tested;
+/// remove-directory wires it up (passing one directory's agents +
+/// project), and the app-quit handler is deferred.
 // Exercised by tests but not yet on a production call path — the
 // remove-working-directory lifecycle consumes it once that command exists.
 #[allow(dead_code)]
@@ -3039,7 +3040,7 @@ pub async fn drain_agents_then_release_locks(
 ) {
     // `shutdown_agent` is atomic per agent: it abandons the backlog, cancels any
     // running turn, drains it, and only then returns — so no *fresh* turn starts
-    // mid-teardown (the orphan-subprocess problem M4.3 fixed) and the lock is
+    // mid-teardown (the orphan-subprocess problem) and the lock is
     // never released while a turn is still driving the harness session.
     for &agent_id in agents {
         state.dispatcher.shutdown_agent(agent_id, source).await;
@@ -3858,7 +3859,7 @@ fn merge_project_conversation(
                     // Prompt and attachments are shared across a fan-out's
                     // recipients (the compose bar snapshots one attachment list
                     // and sends it to every recipient), so taking the first
-                    // record's is correct; M6 templated per-recipient prompts
+                    // record's is correct; templated per-recipient prompts
                     // will need this revisited.
                     index_of.insert(send_id, user_messages.len());
                     user_messages.push((send_id, vec![agent_id], prompt, attachments, at));
@@ -3928,7 +3929,7 @@ fn merge_project_conversation(
         // owns the prompt). User-visible symptom: a completed answer can render
         // under a `cancelled` badge (wrong *status* on a real answer), not a
         // duplicated or missing prompt. Pinned by characterization tests below;
-        // the deferred durable key-join (plan doc) dissolves it.
+        // the deferred durable key-join dissolves it.
         //
         // `turn_offset` is the count of the agent's leading **imported** turns
         // (pre-journaling history). Counting it as `agent_turns - min(turns, sends)`
@@ -4618,7 +4619,7 @@ fn resolve_owning_directory(
 }
 
 fn lookup_agent(state: &AppState, agent_id: AgentId) -> Result<(Project, AgentRecord), AppError> {
-    // Register-cache hit (M4.1): the cached `AgentRecord` carries its
+    // Register-cache hit: the cached `AgentRecord` carries its
     // `project_id`, so we resolve the owning project without scanning every
     // loaded project's `registry.jsonl` from disk. The project is always
     // loaded when its agents are cached (the cache is populated on open and
@@ -4638,7 +4639,7 @@ fn lookup_agent(state: &AppState, agent_id: AgentId) -> Result<(Project, AgentRe
 /// Filename of the per-project inter-process lock inside its metadata dir.
 const INSTANCE_LOCK_FILE: &str = "instance.lock";
 
-/// Acquire the per-project advisory file lock (M4.1) using the standard
+/// Acquire the per-project advisory file lock using the standard
 /// library's `File::try_lock` (stable since Rust 1.89 — no external crate
 /// needed). Returns the live `File` handle that *is* the lock — the caller
 /// stores it in `AppState.project_locks` for the project's loaded lifetime;
@@ -8732,7 +8733,7 @@ mod tests {
         );
     }
 
-    // ---- M4.1: project instance lock + register-cache ----
+    // ---- project instance lock + register-cache ----
 
     fn mock_app_state() -> AppState {
         let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
@@ -8968,7 +8969,7 @@ mod tests {
         assert!(cancelled, "cancel synthesizes a cancelled terminal");
     }
 
-    // --- remove_agent / rename_agent (M5) ---
+    // --- remove_agent / rename_agent ---
     // Fixture-level only — no live test: these commands don't change how we talk
     // to a real CLI, just registry/sidecar/in-memory state.
 
@@ -9798,7 +9799,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_session_locator_persists_to_registry_and_cache() {
-        // The runtime-capture mechanism (M1 plumbing, wired to the M2 sink): a
+        // The runtime-capture mechanism (plumbing wired to the capture sink): a
         // Codex agent starts with no locator; setting one must land both on
         // disk (registry.jsonl) and in the `agents_by_id` cache, so the next
         // dispatch's DispatchContext reads the captured locator.
@@ -10380,7 +10381,7 @@ mod tests {
         assert!(matches!(err, AppError::QueuedMessageNotFound(id) if id == unknown));
     }
 
-    // ---- M4.6: multi-directory workspace ----
+    // ---- multi-directory workspace ----
 
     #[tokio::test]
     async fn two_spellings_of_same_directory_collapse_to_one() {
@@ -10654,7 +10655,7 @@ mod tests {
         .expect("same Claude id under a different directory is a distinct session");
     }
 
-    // ---- M4.6 hardening: directory-identity helper, list resilience ----
+    // ---- directory-identity helper, list resilience ----
 
     #[tokio::test]
     async fn create_project_canonicalization_matches_init_directory_key() {
@@ -10861,7 +10862,7 @@ mod tests {
         assert_eq!(reopened.id, beta.id);
     }
 
-    // ---- M4.6 hardening: remove_directory teardown-race tests ----
+    // ---- remove_directory teardown-race tests ----
 
     #[tokio::test]
     async fn remove_directory_races_send_no_second_turn_and_no_orphan_actor() {
@@ -12753,7 +12754,7 @@ mod tests {
         );
     }
 
-    /// A *completed* send whose last disk turn reads `Streaming` (the M2
+    /// A *completed* send whose last disk turn reads `Streaming` (the
     /// `eof_tail_status` running-vs-finished limitation: no `end_turn` written)
     /// with **no** Outcome marker. Order-pairing keys off the all-sends list, not
     /// the harness status, so the turn still pairs to its completed send — a
@@ -14054,7 +14055,7 @@ mod tests {
         assert!(matches!(err, AppError::Prompt(_)));
     }
 
-    // `topic` typed, `feedback` forwarded — the M2.5 prompt-forward fixture.
+    // `topic` typed, `feedback` forwarded — the prompt-forward fixture.
     const AGGREGATE_PROMPT: &str = "---\nname: aggregate\ndescription: Aggregate.\narguments:\n  - name: topic\n    required: true\n  - name: feedback\n    required: true\n---\nTopic: {{ topic }}\n\n{{ feedback }}\n";
     // A single optional forwarded arg.
     const NOTES_PROMPT: &str = "---\nname: notes\ndescription: Notes.\narguments:\n  - name: extra\n    required: false\n---\nNotes: {{ extra }}\n";
@@ -14147,7 +14148,7 @@ mod tests {
         let (body, skipped) = resolved(&outcome);
         assert!(skipped.is_empty());
         // The typed arg rendered, and the forwarded arg filled with the canonical
-        // M2 block shape (shared `compose_forwarded_message`).
+        // block shape (shared `compose_forwarded_message`).
         assert!(
             body.contains("Topic: poems"),
             "typed arg rendered: {body:?}"
@@ -14263,7 +14264,7 @@ mod tests {
 
     #[tokio::test]
     async fn forward_prompt_composes_typed_lead_then_blocks_in_one_arg() {
-        // The distinctive M2.5 shape: ONE argument that is both typed *and*
+        // The distinctive shape: ONE argument that is both typed *and*
         // forwarded — the typed lead text leads, then the forwarded block, in that
         // argument's single rendered value.
         let (_tmp, home, state, project_id) = prompt_forward_state().await;

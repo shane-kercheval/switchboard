@@ -2,7 +2,7 @@ import type { AttachmentKind } from "$lib/types";
 
 // Extension → attachment kind. The frontend owns this mapping: it has the
 // dropped filename and assigns the numbered label, so the backend only persists
-// what it's told (see the M1 contract). Extend the lists here.
+// what it's told (the backend persists the label as given). Extend the lists here.
 //
 // `classifyKind` never returns `"unknown"` — that variant is the wire fallback
 // for a kind a *newer* build wrote into the journal (see `AttachmentKind` in

@@ -20,7 +20,7 @@ import { ALICE, PROJECT_ID } from "./fixtures";
 import { buildLargeTranscript } from "$lib/dev/largeTranscript";
 import { INITIAL_WINDOW } from "$lib/state/unified";
 
-// M2 upward reveal in real WebKit — the authoritative coverage, since
+// Upward reveal in real WebKit — the authoritative coverage, since
 // scroll-position preservation is layout-coupled and jsdom can't measure it. The
 // real IntersectionObserver fires the reveal when the sentinel scrolls into view;
 // the assertion is that prepending older blocks does NOT move the reading

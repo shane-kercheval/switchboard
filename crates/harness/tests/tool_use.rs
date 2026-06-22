@@ -413,7 +413,7 @@ async fn live_codex_emits_tool_started_and_tool_completed_for_shell_command() {
 ///   the rest of the test would pass spuriously.
 /// - **Cross-check**: none of these ids may appear in any parent-stream
 ///   `ToolStarted` / `ToolCompleted`. If one did, that's a leaked
-///   subagent-internal call — the exact M1 bug.
+///   subagent-internal call — the exact subagent-leak bug.
 ///
 /// We glob `~/.claude/projects/*/<session-id>/subagents/*.jsonl` rather
 /// than reconstructing the encoded-cwd path because session ids are
@@ -554,7 +554,7 @@ async fn live_claude_subagent_collapses_to_parent_tool_call() {
     );
 
     // (2) No parent-stream ToolStarted/ToolCompleted may carry a tool_use_id
-    // that was emitted inside a subagent. A match here is the M1 bug —
+    // that was emitted inside a subagent. A match here is the subagent-leak bug —
     // a subagent-internal call leaking into the parent turn.
     let leaked: Vec<(&str, &str)> = events
         .iter()
@@ -572,7 +572,7 @@ async fn live_claude_subagent_collapses_to_parent_tool_call() {
         .collect();
     assert!(
         leaked.is_empty(),
-        "subagent-internal tool_use_id(s) leaked into the parent stream — the M1 bug. \
+        "subagent-internal tool_use_id(s) leaked into the parent stream — the subagent-leak bug. \
          Leaked: {leaked:?}. Subagent ids: {subagent_tool_use_ids:?}. Events: {events:?}",
     );
 

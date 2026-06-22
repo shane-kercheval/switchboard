@@ -26,7 +26,7 @@ use crate::error::{CoreError, Result};
 /// promises. A **sync failure is returned as an error** (it is the kernel
 /// reporting that durability could not be confirmed — `flush` only reaches the
 /// OS page cache, not stable storage), so the durability guarantee stays
-/// enforceable for high-frequency callers that depend on it (the M4.2 journal).
+/// enforceable for high-frequency callers that depend on it (the journal).
 ///
 /// **Critical caller contract:** because the sync happens *after* `writeln!`,
 /// an `Err` from `append_jsonl` does **not** mean "the record was not written"
@@ -44,7 +44,7 @@ pub(crate) fn append_jsonl<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     // Whether *this* call creates the file decides if the parent directory
     // entry needs syncing — appends to an existing file leave the entry
     // unchanged, so a dir fsync there is pure overhead (load-bearing for the
-    // high-frequency logs that reuse this path: the M4.2 journal, M6 runs).
+    // high-frequency logs that reuse this path: the journal, runs).
     let created = !path.exists();
     let mut file = OpenOptions::new()
         .create(true)

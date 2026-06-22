@@ -87,10 +87,10 @@ export function copyTextOf(turn: AgentTurn, mode: AgentCopyMode): string {
 /// One rendered row in the unified transcript.
 ///
 /// `agent_ids` on the user row is the recipient set — length 1 today
-/// (single-recipient sends), N once M4.7 fan-out lands. The array shape is
-/// uniform now (live single-recipient turns normalize to a length-1 array) so
-/// M4.7 adds only a grouping pass over live sends sharing a `send_id`, never a
-/// row-shape change.
+/// (single-recipient sends), N once multi-recipient fan-out lands. The array
+/// shape is uniform now (live single-recipient turns normalize to a length-1
+/// array) so fan-out adds only a grouping pass over live sends sharing a
+/// `send_id`, never a row-shape change.
 export type UnifiedRow =
   | {
       kind: "user";

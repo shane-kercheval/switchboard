@@ -1360,7 +1360,7 @@
                    of overage; the overage escalation (amber `warning` token) is
                    layered on top only when billing to credits. One always-present
                    tooltip carries full dates (a window can be days out) and the
-                   snapshot age when rehydrated. Survives restart via the M3
+                   snapshot age when rehydrated. Survives restart via the
                    metadata sidecar. -->
               <Tooltip side="right">
                 {#snippet trigger(props)}

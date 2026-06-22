@@ -89,7 +89,7 @@ pub enum Turn {
         /// Per-turn real-spend attribution restored on reopen. The session-file
         /// parser leaves this `None`; the app's metadata overlay fills it from
         /// the durable `turnmeta` sidecar by joining on `stable_message_id`, so
-        /// the inline cost/overage surface survives restart (M4). `None` for
+        /// the inline cost/overage surface survives restart. `None` for
         /// non-real-spend turns and pre-feature turns (no backfill).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         spend: Option<TurnSpend>,

@@ -20,7 +20,7 @@ use crate::model::{
 
 /// Resolve any path inside (or at) a git repo to the canonical **main-worktree /
 /// common-dir root**. Returns `None` if the path is not inside a git repo. This
-/// is the identity used for tracking and dedup (the M2 registry stores this).
+/// is the identity used for tracking and dedup (the registry stores this).
 ///
 /// Linked worktrees share one git database, so discovery from any of them — or
 /// from a subdirectory — resolves to the same root.
@@ -547,8 +547,8 @@ fn collect_worktrees(repo: &Repository) -> std::result::Result<Worktrees, git2::
         // Prunable: git holds the record but its directory is gone. `validate`
         // fails when the worktree dir/gitdir is missing. Git still considers the
         // recorded branch checked out here until the user prunes, so attach the
-        // warning to *that branch* — otherwise M3 shows the branch as free and
-        // M4 offers "create worktree" for it, which `git worktree add` refuses.
+        // warning to *that branch* — otherwise the branch would show as free and
+        // offer "create worktree" for it, which `git worktree add` refuses.
         if worktree.validate().is_err() {
             let prunable = WorktreeView {
                 path: wt_path,

@@ -260,7 +260,7 @@
   const compactEnabled = $derived(stateFor(projectId).enabled);
 
   /// A still-live response: genuinely streaming, not yet closed. These use the
-  /// M3 live cap, never the completed-preview compaction. A streaming-on-disk
+  /// live-streaming cap, never the completed-preview compaction. A streaming-on-disk
   /// turn an outcome marker has closed (a dangling/cancelled-mid turn) is *not*
   /// live — it's terminal and collapses like any other response.
   function isLiveStreaming(turn: AgentTurn): boolean {
@@ -321,7 +321,7 @@
 
   // No `content-visibility` containment on transcript blocks: render-windowing
   // (above) bounds the mounted set, so the off-screen-layout cost containment
-  // existed to cut is already small by default. Keeping it actively broke the M2
+  // existed to cut is already small by default. Keeping it actively broke the
   // upward reveal — off-screen blocks sit at size *estimates*, which flip to real
   // heights mid-correction and shift the reading position ~a block. With real
   // heights the existing `reanchor` holds a top-prepend exactly, so windowing
@@ -1379,7 +1379,7 @@
   {@const ownedByOutcome = hasOutcomeFor(turn)}
   <!-- Compact preview applies to any terminal response with content (complete,
        failed, cancelled, or dangling streaming-on-disk closed by a marker). Only
-       a genuinely-live streaming turn is excluded — it uses M3's live cap. -->
+       a genuinely-live streaming turn is excluded — it uses the live-streaming cap. -->
   {@const previewEligible = isCollapsibleResponse(turn)}
   {@const key = `agent:${turn.turn_id}`}
   {@const latestResponse = latestResponseKeys.has(key)}

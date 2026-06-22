@@ -58,7 +58,7 @@ use crate::events::{ContentKind, TurnId, TurnUsage};
 use crate::parser::classify_claude_tool_kind;
 use crate::transcript::{
     LoadTranscriptError, LoadedTranscript, ParseWarning, SessionMetaInfo, Turn, TurnItem,
-    TurnStatus, merge_meta_with_loaders,
+    TurnStatus, UserPromptSource, merge_meta_with_loaders,
 };
 
 use super::claude_session_file_path;
@@ -143,6 +143,64 @@ fn fallback_scan(home_dir: &Path, session_id: Uuid) -> Option<PathBuf> {
     None
 }
 
+/// Leading tags Claude writes into the `user` channel for local-command and
+/// task-tool housekeeping — echoes, not prompts. Maintained denylist; a new
+/// shape would surface as a stray `External` message (the symptom that prompts a
+/// denylist update). Matched anchored at the (trimmed) content start, so a real
+/// prompt that merely *contains* one of these is unaffected.
+const HOUSEKEEPING_PREFIXES: [&str; 6] = [
+    "<command-message>",
+    "<command-name>",
+    "<local-command-caveat>",
+    "<local-command-stdout>",
+    "<local-command-stderr>",
+    "<task-notification>",
+];
+
+/// True when a `user` *string* record is Claude housekeeping (a slash-command
+/// wrapper, a compaction summary, a task notification, or a meta marker) rather
+/// than a real prompt. **Checked before [`classify_prompt_source`]** because some
+/// housekeeping records carry `promptSource: "sdk"`; mapping first would let them
+/// masquerade as a dispatched send and consume a journal slot.
+fn is_user_housekeeping(record: &Value, text: &str) -> bool {
+    if record.get("isCompactSummary").and_then(Value::as_bool) == Some(true)
+        || record.get("isMeta").and_then(Value::as_bool) == Some(true)
+    {
+        return true;
+    }
+    let prompt_source = record.get("promptSource").and_then(Value::as_str);
+    // System-injected records are never user prompts.
+    if prompt_source == Some("system") {
+        return true;
+    }
+    let trimmed = text.trim_start();
+    if HOUSEKEEPING_PREFIXES
+        .iter()
+        .any(|tag| trimmed.starts_with(tag))
+    {
+        // A denylist-prefixed record is housekeeping UNLESS it's a genuine
+        // user-typed prompt: `typed`/`queued` have no journal copy to recover, so
+        // dropping one would be silent data loss. `sdk`-tagged rows (including a
+        // `<task-notification>` carrying `promptSource:"sdk"`) stay dropped — the
+        // journal owns the real prompt text when it's truly a dispatch — and
+        // unmarked bookkeeping (the bulk) stays dropped.
+        return !matches!(prompt_source, Some("typed" | "queued"));
+    }
+    false
+}
+
+/// Classify a real (non-housekeeping) `user` prompt by Claude's `promptSource`.
+/// `sdk` is a Switchboard/SDK dispatch (journal-owned when a send pairs with it);
+/// `typed`/`queued` are bare-TUI prompts; anything else or absent has no signal,
+/// so the merge falls back to count-based correlation for that agent.
+fn classify_prompt_source(record: &Value) -> UserPromptSource {
+    match record.get("promptSource").and_then(Value::as_str) {
+        Some("sdk") => UserPromptSource::Sdk,
+        Some("typed" | "queued") => UserPromptSource::External,
+        _ => UserPromptSource::Unknown,
+    }
+}
+
 /// In-progress reconstruction state. Walks records in order, opening a
 /// fresh `Turn::User` on each prompt and accumulating `assistant` records
 /// into the corresponding `Turn::Agent`.
@@ -166,6 +224,10 @@ struct ReconstructionState {
     /// `tool_use_id` appears in a later turn, the stale entry has been
     /// flushed by then and won't silently bind to the new turn's tool.
     pending_tool_results: Vec<DeferredToolResult>,
+    /// Count of `user` string records dropped as Claude housekeeping (see
+    /// [`is_user_housekeeping`]). Logged once at `finalize` so a denylist that
+    /// stops matching (an unexpected zero on a compaction-heavy file) is visible.
+    housekeeping_skipped: usize,
 }
 
 struct AgentTurnBuilder {
@@ -218,6 +280,7 @@ impl ReconstructionState {
             first_model: None,
             warnings: Vec::new(),
             pending_tool_results: Vec::new(),
+            housekeeping_skipped: 0,
         }
     }
 
@@ -267,18 +330,29 @@ impl ReconstructionState {
         let content = message.and_then(|m| m.get("content"));
         match content {
             Some(Value::String(text)) => {
-                // Fresh user prompt — close any open agent turn, flush any
-                // unmatched deferred tool_results (they belonged to the
-                // turn that just ended; they must not carry into the new
-                // turn), then open a new User turn.
+                // A fresh user string record is a turn boundary whether it's a
+                // real prompt or Claude housekeeping — close any open agent turn
+                // and flush unmatched deferred tool_results (they belonged to the
+                // turn that just ended) either way.
                 self.close_current_agent(TurnStatus::Complete);
                 self.flush_deferred_as_warnings();
+                // Housekeeping (slash-command wrappers, compaction summaries,
+                // task notifications, meta markers) echoes into the user channel
+                // but is not a prompt — emit no turn. Checked BEFORE
+                // `promptSource` because some housekeeping carries
+                // `promptSource:"sdk"` and would otherwise look dispatched.
+                if is_user_housekeeping(record, text) {
+                    self.housekeeping_skipped += 1;
+                    return;
+                }
+                let source = classify_prompt_source(record);
                 let started_at = parse_timestamp(record).unwrap_or_else(Utc::now);
                 self.turns.push(Turn::User {
                     turn_id: Uuid::now_v7(),
                     agent_id: self.agent_id,
                     started_at,
                     text: text.clone(),
+                    source,
                 });
             }
             Some(Value::Array(blocks)) => {
@@ -553,6 +627,12 @@ impl ReconstructionState {
             .map_or(TurnStatus::Complete, eof_tail_status);
         self.close_current_agent(status);
         self.flush_deferred_as_warnings();
+        if self.housekeeping_skipped > 0 {
+            tracing::debug!(
+                skipped = self.housekeeping_skipped,
+                "dropped Claude housekeeping user records (slash-command / compaction / task-notification)"
+            );
+        }
         let meta = self.first_model.map(|model| SessionMetaInfo {
             model,
             harness_version: String::new(),
@@ -2076,5 +2156,115 @@ mod tests {
         let result = load_claude_transcript(home.path(), cwd.path(), session_id, agent_id).unwrap();
         let meta = result.meta.unwrap();
         assert_eq!(meta.model, "claude-opus-4-7", "first model wins");
+    }
+
+    fn hydrate_records(records: &[Value]) -> LoadedTranscript {
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        let session_id = Uuid::now_v7();
+        let agent_id = Uuid::now_v7();
+        stage_session_file(home.path(), cwd.path(), session_id, &jsonl(records));
+        load_claude_transcript(home.path(), cwd.path(), session_id, agent_id).unwrap()
+    }
+
+    fn user_sources(turns: &[Turn]) -> Vec<UserPromptSource> {
+        turns
+            .iter()
+            .filter_map(|t| match t {
+                Turn::User { source, .. } => Some(*source),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn user_record_with_source(text: &str, prompt_source: &str, timestamp: &str) -> Value {
+        json!({
+            "type": "user",
+            "message": { "role": "user", "content": text },
+            "promptSource": prompt_source,
+            "timestamp": timestamp,
+        })
+    }
+
+    #[test]
+    fn user_prompts_classified_by_prompt_source() {
+        let result = hydrate_records(&[
+            user_record_with_source("dispatched", "sdk", "2026-05-14T04:43:15Z"),
+            user_record_with_source("typed in tui", "typed", "2026-05-14T04:43:16Z"),
+            user_record_with_source("queued in tui", "queued", "2026-05-14T04:43:17Z"),
+            user_record("no marker", "2026-05-14T04:43:18Z"),
+        ]);
+        assert_eq!(
+            user_sources(&result.turns),
+            vec![
+                UserPromptSource::Sdk,
+                UserPromptSource::External,
+                UserPromptSource::External,
+                UserPromptSource::Unknown,
+            ],
+        );
+    }
+
+    #[test]
+    fn housekeeping_user_records_emit_no_turn() {
+        let result = hydrate_records(&[
+            json!({"type":"user","message":{"role":"user","content":"<command-message>compact</command-message>"},"timestamp":"2026-05-14T04:43:15Z"}),
+            json!({"type":"user","message":{"role":"user","content":"<local-command-stdout>Compacted</local-command-stdout>"},"timestamp":"2026-05-14T04:43:16Z"}),
+            json!({"type":"user","message":{"role":"user","content":"This session is being continued…"},"isCompactSummary":true,"timestamp":"2026-05-14T04:43:17Z"}),
+            json!({"type":"user","message":{"role":"user","content":"[image]"},"isMeta":true,"timestamp":"2026-05-14T04:43:18Z"}),
+            // The sharp case: a `<task-notification>` carrying promptSource:"sdk"
+            // must be dropped as housekeeping, NOT mapped to a dispatched send —
+            // otherwise it consumes a journal slot and re-introduces drift.
+            json!({"type":"user","message":{"role":"user","content":"<task-notification><task-id>x</task-id></task-notification>"},"promptSource":"sdk","timestamp":"2026-05-14T04:43:19Z"}),
+            user_record_with_source("real prompt", "sdk", "2026-05-14T04:43:20Z"),
+        ]);
+        assert_eq!(
+            user_sources(&result.turns),
+            vec![UserPromptSource::Sdk],
+            "only the real prompt survives; all housekeeping (incl. the sdk-tagged task-notification) is dropped",
+        );
+    }
+
+    #[test]
+    fn prompt_merely_containing_a_wrapper_tag_is_preserved() {
+        // A genuine prompt that mentions a wrapper tag mid-text (not at the
+        // start) must not be mistaken for housekeeping and dropped.
+        let result = hydrate_records(&[user_record_with_source(
+            "please explain the <command-name> wrapper",
+            "sdk",
+            "2026-05-14T04:43:15Z",
+        )]);
+        assert_eq!(user_sources(&result.turns), vec![UserPromptSource::Sdk]);
+    }
+
+    #[test]
+    fn system_prompt_source_emits_no_turn() {
+        // A system-injected record (even without a denylist prefix) is never a
+        // user prompt — it must not render as a fake message in provenance mode.
+        let result = hydrate_records(&[
+            user_record_with_source(
+                "ignore: system bookkeeping",
+                "system",
+                "2026-05-14T04:43:15Z",
+            ),
+            user_record_with_source("real prompt", "sdk", "2026-05-14T04:43:16Z"),
+        ]);
+        assert_eq!(user_sources(&result.turns), vec![UserPromptSource::Sdk]);
+    }
+
+    #[test]
+    fn typed_prompt_starting_with_a_tag_is_preserved() {
+        // A genuine bare-CLI prompt that *starts with* a denylist tag has no
+        // journal copy to recover, so it must not be dropped as housekeeping —
+        // only auto-generated bookkeeping (unmarked / sdk / system) is.
+        let result = hydrate_records(&[user_record_with_source(
+            "<task-notification> explain this XML shape to me",
+            "typed",
+            "2026-05-14T04:43:15Z",
+        )]);
+        assert_eq!(
+            user_sources(&result.turns),
+            vec![UserPromptSource::External]
+        );
     }
 }

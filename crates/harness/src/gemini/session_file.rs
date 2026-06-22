@@ -464,6 +464,7 @@ impl GeminiReconstruction {
             agent_id: self.agent_id,
             started_at,
             text,
+            source: crate::transcript::UserPromptSource::Unknown,
         });
     }
 

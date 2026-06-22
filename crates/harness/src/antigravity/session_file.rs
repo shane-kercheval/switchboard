@@ -238,6 +238,7 @@ impl Reconstruction {
                 agent_id: self.agent_id,
                 started_at: ts,
                 text,
+                source: crate::transcript::UserPromptSource::Unknown,
             });
             // `close_current()` above already stamped the prior turn with the
             // old `current_model`; now fold in this turn's announcement (if any)

@@ -3479,7 +3479,14 @@ describe("UnifiedTranscript — cross-agent forward", () => {
 });
 
 describe("UnifiedTranscript render windowing", () => {
-  const WINDOW = 50;
+  // Keep in sync with INITIAL_WINDOW / REVEAL_BATCH in UnifiedTranscript.svelte.
+  // Seed sizes and expectations below are expressed relative to these, so a tuning
+  // change there is a two-line change here, not a per-assertion rewrite.
+  const WINDOW = 20;
+  const BATCH = 20;
+  // Comfortably more blocks than the window, so the tail is bounded with history
+  // above it.
+  const OVER = WINDOW * 3;
 
   // One standalone agent turn renders as one render block (no fan-out), so a
   // block count maps directly to a turn count. `hour` orders distinct groups on
@@ -3522,12 +3529,12 @@ describe("UnifiedTranscript render windowing", () => {
     expect(blockCount()).toBe(0);
 
     // Mirrors hydrateProject: turns land and status flips to complete together.
-    state.transcripts[CLAUDE_AGENT.id] = agentTurns(CLAUDE_AGENT, 60);
+    state.transcripts[CLAUDE_AGENT.id] = agentTurns(CLAUDE_AGENT, OVER);
     await view.rerender({ projectId: PROJECT_ID, agents: [CLAUDE_AGENT], loadStatus: "complete" });
     await tick();
 
     expect(blockCount()).toBe(WINDOW);
-    expect(screen.queryByText("msg 0-59")).not.toBeNull(); // newest mounted
+    expect(screen.queryByText(`msg 0-${OVER - 1}`)).not.toBeNull(); // newest mounted
     expect(screen.queryByText("msg 0-0")).toBeNull(); // oldest windowed out
   });
 
@@ -3540,20 +3547,20 @@ describe("UnifiedTranscript render windowing", () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
 
-    state.transcripts[CLAUDE_AGENT.id] = agentTurns(CLAUDE_AGENT, 60);
+    state.transcripts[CLAUDE_AGENT.id] = agentTurns(CLAUDE_AGENT, OVER);
     const view = render(UnifiedTranscript, {
       props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT], loadStatus: "loading" },
     });
     await tick();
 
-    // Bounded already, mid-load — the full 60 stale blocks never mount.
+    // Bounded already, mid-load — the full stale transcript never mounts.
     expect(blockCount()).toBe(WINDOW);
 
     await view.rerender({ projectId: PROJECT_ID, agents: [CLAUDE_AGENT], loadStatus: "complete" });
     await tick();
 
     expect(blockCount()).toBe(WINDOW);
-    expect(screen.queryByText("msg 0-59")).not.toBeNull();
+    expect(screen.queryByText(`msg 0-${OVER - 1}`)).not.toBeNull();
   });
 
   it("renders a short transcript in full (no window edge)", async () => {
@@ -3579,7 +3586,7 @@ describe("UnifiedTranscript render windowing", () => {
   it("holds the cursor on live append", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
-    state.transcripts[CLAUDE_AGENT.id] = agentTurns(CLAUDE_AGENT, 60);
+    state.transcripts[CLAUDE_AGENT.id] = agentTurns(CLAUDE_AGENT, OVER);
 
     render(UnifiedTranscript, {
       props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT], loadStatus: "complete" },
@@ -3588,7 +3595,7 @@ describe("UnifiedTranscript render windowing", () => {
     expect(blockCount()).toBe(WINDOW);
 
     state.transcripts[CLAUDE_AGENT.id] = [
-      ...agentTurns(CLAUDE_AGENT, 60),
+      ...agentTurns(CLAUDE_AGENT, OVER),
       {
         role: "agent",
         turn_id: "aturn-new",
@@ -3602,7 +3609,8 @@ describe("UnifiedTranscript render windowing", () => {
 
     expect(blockCount()).toBe(WINDOW + 1);
     expect(screen.queryByText("fresh reply")).not.toBeNull(); // appended, mounted
-    expect(screen.queryByText("msg 0-10")).not.toBeNull(); // prior window edge still mounted
+    // The prior window edge (first visible block) is still mounted.
+    expect(screen.queryByText(`msg 0-${OVER - WINDOW}`)).not.toBeNull();
   });
 
   // A failed-then-retried agent: blocks is empty at the first `complete`, so a
@@ -3619,11 +3627,11 @@ describe("UnifiedTranscript render windowing", () => {
     expect(blockCount()).toBe(0);
 
     // Retry lands the full history after the initial (empty) completion.
-    state.transcripts[CLAUDE_AGENT.id] = agentTurns(CLAUDE_AGENT, 60);
+    state.transcripts[CLAUDE_AGENT.id] = agentTurns(CLAUDE_AGENT, OVER);
     await tick();
 
     expect(blockCount()).toBe(WINDOW);
-    expect(screen.queryByText("msg 0-59")).not.toBeNull();
+    expect(screen.queryByText(`msg 0-${OVER - 1}`)).not.toBeNull();
     expect(screen.queryByText("msg 0-0")).toBeNull();
   });
 
@@ -3638,7 +3646,7 @@ describe("UnifiedTranscript render windowing", () => {
     };
     await state.registerAgent(CLAUDE_AGENT);
     await state.registerAgent(AGENT_B);
-    state.transcripts[CLAUDE_AGENT.id] = agentTurns(CLAUDE_AGENT, 60);
+    state.transcripts[CLAUDE_AGENT.id] = agentTurns(CLAUDE_AGENT, OVER);
     state.transcripts[AGENT_B.id] = agentTurns(AGENT_B, 60);
 
     const view = render(UnifiedTranscript, {
@@ -3653,7 +3661,7 @@ describe("UnifiedTranscript render windowing", () => {
     await tick();
 
     expect(blockCount()).toBe(WINDOW);
-    expect(screen.queryByText("msg 0-59")).not.toBeNull();
+    expect(screen.queryByText(`msg 0-${OVER - 1}`)).not.toBeNull();
     expect(screen.queryByText("msg 0-0")).toBeNull();
   });
 
@@ -3668,21 +3676,23 @@ describe("UnifiedTranscript render windowing", () => {
     // CLAUDE owns the oldest block (hour 0); CODEX's turns are newer and more
     // numerous, so hiding CODEX shrinks blocks far below the old cursor WITHOUT
     // changing blocks[0]'s key — the case a projectId+oldest-key guard misses.
-    state.transcripts[CLAUDE_AGENT.id] = agentTurns(CLAUDE_AGENT, 30, 0);
-    state.transcripts[CODEX_AGENT.id] = agentTurns(CODEX_AGENT, 80, 2);
+    const claudeBlocks = WINDOW + 10; // > WINDOW, so its own tail is still windowed
+    state.transcripts[CLAUDE_AGENT.id] = agentTurns(CLAUDE_AGENT, claudeBlocks, 0);
+    state.transcripts[CODEX_AGENT.id] = agentTurns(CODEX_AGENT, WINDOW * 4, 2);
 
     const view = render(UnifiedTranscript, {
       props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT, CODEX_AGENT], loadStatus: "complete" },
     });
     await tick();
-    expect(blockCount()).toBe(WINDOW); // 110 blocks → 50 mounted, cursor at 60
+    expect(blockCount()).toBe(WINDOW); // cursor is high, against the full roster
 
     await view.rerender({ projectId: PROJECT_ID, agents: [CLAUDE_AGENT], loadStatus: "complete" });
     await tick();
 
-    // Reseeded against the 30-block array — not blank, not a stale slice.
-    expect(blockCount()).toBe(30);
-    expect(screen.queryByText("msg 0-29")).not.toBeNull();
+    // Reseeded against CLAUDE's shorter block list — bounded and non-blank, not
+    // the empty slice a stale high cursor would produce.
+    expect(blockCount()).toBe(WINDOW);
+    expect(screen.queryByText(`msg 0-${claudeBlocks - 1}`)).not.toBeNull();
   });
 
   // Windowing slices whole RenderBlocks (not turns), so a fan-out — one prompt,
@@ -3716,12 +3726,13 @@ describe("UnifiedTranscript render windowing", () => {
       },
     ];
 
-    // 10 standalone (hour 0) + 1 fan-out (hour 1) + 49 standalone (hour 2) = 60
-    // blocks → cursor at 10, so the fan-out is exactly the first visible block.
+    // WINDOW standalone (hour 0) + 1 fan-out (hour 1) + WINDOW-1 standalone
+    // (hour 2): the fan-out lands at index WINDOW, i.e. exactly the first visible
+    // block, with WINDOW-1 blocks after it filling out the window.
     state.transcripts[CLAUDE_AGENT.id] = [
-      ...agentTurns(CLAUDE_AGENT, 10, 0),
+      ...agentTurns(CLAUDE_AGENT, WINDOW, 0),
       ...fanoutTurns(CLAUDE_AGENT),
-      ...agentTurns(CLAUDE_AGENT, 49, 2),
+      ...agentTurns(CLAUDE_AGENT, WINDOW - 1, 2),
     ];
     state.transcripts[CODEX_AGENT.id] = fanoutTurns(CODEX_AGENT);
 
@@ -3737,8 +3748,8 @@ describe("UnifiedTranscript render windowing", () => {
     expect(screen.queryAllByTestId("fanout-column").length).toBe(2);
     expect(screen.queryByText("fan reply alice")).not.toBeNull();
     expect(screen.queryByText("fan reply bob")).not.toBeNull();
-    expect(screen.queryByText("msg 0-9")).toBeNull(); // block before the boundary
-    expect(screen.queryByText("msg 2-48")).not.toBeNull(); // newest, in window
+    expect(screen.queryByText(`msg 0-${WINDOW - 1}`)).toBeNull(); // block before the boundary
+    expect(screen.queryByText(`msg 2-${WINDOW - 2}`)).not.toBeNull(); // newest, in window
   });
 
   // M2 upward reveal. The sentinel signals (and triggers) older history; it's
@@ -3748,7 +3759,7 @@ describe("UnifiedTranscript render windowing", () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
 
-    state.transcripts[CLAUDE_AGENT.id] = agentTurns(CLAUDE_AGENT, 60);
+    state.transcripts[CLAUDE_AGENT.id] = agentTurns(CLAUDE_AGENT, OVER);
     render(UnifiedTranscript, {
       props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT], loadStatus: "complete" },
     });
@@ -3761,56 +3772,54 @@ describe("UnifiedTranscript render windowing", () => {
   it("reveals older blocks in batches and clamps at the top", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
-    state.transcripts[CLAUDE_AGENT.id] = agentTurns(CLAUDE_AGENT, 160);
+    // Not a multiple of BATCH above WINDOW, so the final batch overshoots and
+    // must clamp to 0 rather than going negative.
+    const TOTAL = WINDOW * 2 + 10;
+    state.transcripts[CLAUDE_AGENT.id] = agentTurns(CLAUDE_AGENT, TOTAL);
 
     render(UnifiedTranscript, {
       props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT], loadStatus: "complete" },
     });
     await tick();
-    expect(blockCount()).toBe(WINDOW); // cursor at 110
+    expect(blockCount()).toBe(WINDOW);
 
-    fireIntersect();
-    await tick();
-    expect(blockCount()).toBe(100); // +50
-    await raf();
+    let expected = WINDOW;
+    while (expected < TOTAL) {
+      fireIntersect();
+      await tick();
+      expected = Math.min(expected + BATCH, TOTAL); // clamps on the last batch
+      expect(blockCount()).toBe(expected);
+      await raf();
+    }
 
-    fireIntersect();
-    await tick();
-    expect(blockCount()).toBe(150); // +50
-    await raf();
-
-    fireIntersect();
-    await tick();
-    expect(blockCount()).toBe(160); // clamped: 10 → 0
+    // Everything mounted → sentinel gone, further triggers are no-ops.
     expect(screen.queryByTestId("reveal-sentinel")).toBeNull();
-    await raf();
-
-    // Nothing left to reveal — a further trigger is a no-op.
     fireIntersect();
     await tick();
-    expect(blockCount()).toBe(160);
+    expect(blockCount()).toBe(TOTAL);
   });
 
   // A trigger arriving mid-reveal (while the latch is held) must be REMEMBERED,
   // not dropped: the observer only re-fires on an intersection change, so a
   // dropped trigger would leave the window stuck. Fire twice synchronously — the
-  // second lands while the first is in flight — and assert both batches reveal.
-  // Without coalescing only one would (blockCount 100, not 150).
+  // second lands while the first is in flight — and assert BOTH batches reveal.
+  // Without coalescing only the first would (WINDOW + BATCH, not WINDOW + 2*BATCH).
   it("coalesces a trigger that arrives mid-reveal instead of dropping it", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
-    state.transcripts[CLAUDE_AGENT.id] = agentTurns(CLAUDE_AGENT, 160);
+    // Enough history for two full batches plus a margin, so neither batch clamps.
+    state.transcripts[CLAUDE_AGENT.id] = agentTurns(CLAUDE_AGENT, WINDOW + 2 * BATCH + 5);
 
     render(UnifiedTranscript, {
       props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT], loadStatus: "complete" },
     });
     await tick();
-    expect(blockCount()).toBe(WINDOW); // cursor at 110
+    expect(blockCount()).toBe(WINDOW);
 
     fireIntersect();
     fireIntersect(); // second arrives while the first is still latched
     await raf(); // latch releases and replays the coalesced batch
     await tick();
-    expect(blockCount()).toBe(150); // two batches: 110 → 60 → 10
+    expect(blockCount()).toBe(WINDOW + 2 * BATCH);
   });
 });

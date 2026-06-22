@@ -148,10 +148,10 @@
   /// Known limitation: select-all (and any future find-in-page) reaches only
   /// mounted blocks — unmounted history isn't in the DOM until scrolled to. A
   /// deliberate tradeoff for the load-time win.
-  const INITIAL_WINDOW = 50;
+  const INITIAL_WINDOW = 20;
   /// How many older blocks each upward-reveal mounts. Same tunable-knob status as
   /// `INITIAL_WINDOW` (block count is a loose proxy for the per-item render cost).
-  const REVEAL_BATCH = 50;
+  const REVEAL_BATCH = 20;
   let firstVisibleIndex = $state(0);
   const visibleBlocks = $derived(blocks.slice(firstVisibleIndex));
 

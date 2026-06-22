@@ -32,10 +32,10 @@ beforeEach(() => {
 
 test("a clipped unit scrolled into view shows its collapse toggle", async () => {
   await registerAgent(ALICE);
-  // Under the render window (INITIAL_WINDOW = 50 blocks; 2 blocks/exchange) so
-  // the whole history is mounted and the top block is reachable by scrolling,
-  // not by the upward-reveal path.
-  const seeded = buildLargeTranscript({ agentIds: [ALICE.id], exchanges: 24 });
+  // Small enough to fit within the render window (≈2 blocks/exchange), so the
+  // whole history is mounted and the top block is reachable by scrolling, not by
+  // the upward-reveal path — this isolates the clip-on-scroll behavior.
+  const seeded = buildLargeTranscript({ agentIds: [ALICE.id], exchanges: 10 });
   seedTurns(ALICE.id, seeded[ALICE.id]!);
 
   mountTranscript({ projectId: PROJECT_ID, agents: [ALICE] });
@@ -113,7 +113,9 @@ test("an unfollowed streaming unit keeps its inner pin and content through scrol
 test("the generator's fan-outs render as fan-out groups", async () => {
   await registerAgent(ALICE);
   await registerAgent(BOB);
-  const seeded = buildLargeTranscript({ agentIds: [ALICE.id, BOB.id], exchanges: 60 });
+  // The generator emits a fan-out at step 50; keep it near the end so it lands
+  // inside the render window (only the tail mounts).
+  const seeded = buildLargeTranscript({ agentIds: [ALICE.id, BOB.id], exchanges: 52 });
   seedTurns(ALICE.id, seeded[ALICE.id]!);
   seedTurns(BOB.id, seeded[BOB.id]!);
 

@@ -49,6 +49,7 @@ test("reaching the top reveals older blocks and holds the reading position", asy
   mountTranscript({ projectId: PROJECT_ID, agents: [ALICE] });
   await expect.poll(() => blockCount()).toBeLessThanOrEqual(50);
   await expect.poll(() => distanceFromBottom()).toBeLessThan(32);
+  const initialCount = blockCount();
 
   // Scroll to the top of the window; the first block is now the reading anchor.
   // Capture it BEFORE the async reveal fires.
@@ -57,7 +58,7 @@ test("reaching the top reveals older blocks and holds the reading position", asy
   const before = refEl.getBoundingClientRect().top;
 
   // The sentinel intersects → the reveal mounts an older batch.
-  await expect.poll(() => blockCount()).toBeGreaterThan(50);
+  await expect.poll(() => blockCount()).toBeGreaterThan(initialCount);
 
   // Reading position held: the reference block did not jump as older blocks
   // prepended above it (reanchor alone, no manual scrollTop math).
@@ -80,7 +81,8 @@ test("repeated reveals walk back to the start and retire the sentinel", async ()
   const c = transcriptContainer();
   const settle = (): Promise<void> =>
     new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => r())));
-  for (let guard = 0; guard < 12 && blockCount() < 240; guard++) {
+  // Generous iteration cap — enough rounds even for a small batch size.
+  for (let guard = 0; guard < 40 && blockCount() < 240; guard++) {
     const before = blockCount();
     c.scrollTop = c.scrollHeight;
     c.dispatchEvent(new Event("scroll"));

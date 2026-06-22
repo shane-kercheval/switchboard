@@ -770,6 +770,7 @@ impl CodexReconstruction {
                     agent_id: self.agent_id,
                     started_at,
                     text: message.to_owned(),
+                    source: crate::transcript::UserPromptSource::Unknown,
                 };
                 self.turns.push(user_turn);
             }

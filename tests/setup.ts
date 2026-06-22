@@ -1,4 +1,20 @@
+import { afterAll } from "vitest";
 import "@testing-library/jest-dom/vitest";
+
+// bits-ui's body-scroll-lock schedules a 24ms `window.setTimeout` on unmount to
+// reset body styles (see bits-ui#1639). Under jsdom that timer can fire *after*
+// Vitest has torn down the file's environment, so `document` is gone and the
+// deferred callback throws `ReferenceError: document is not defined` as an
+// uncaught exception that fails the entire run — intermittently, depending on
+// teardown timing. Waiting out the delay once per file lets any pending cleanup
+// run while `document` still exists. The flush must be a real wait: the timer is
+// already scheduled on the real clock by the time this hook runs, so fake-timer
+// flushing can't reach it. Cost is one short wait per test file (~61), not per
+// test.
+const BODY_SCROLL_LOCK_CLEANUP_MS = 24;
+afterAll(async () => {
+  await new Promise((resolve) => setTimeout(resolve, BODY_SCROLL_LOCK_CLEANUP_MS + 25));
+});
 
 // jsdom ships no `matchMedia`; the theme store needs it. Default to light
 // (no dark preference); individual tests override `window.matchMedia` to

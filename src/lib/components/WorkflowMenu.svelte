@@ -130,7 +130,7 @@
         {#if builtin && oncopy}
           <button
             type="button"
-            class="text-accent hover:bg-panel/80 absolute top-1.5 right-2 cursor-pointer rounded px-1.5 py-0.5 text-[11px] outline-none"
+            class="text-accent hover:bg-accent-soft focus-visible:ring-accent absolute top-1.5 right-2 cursor-pointer rounded border border-transparent px-1.5 py-0.5 text-[11px] outline-none focus-visible:ring-2 focus-visible:outline-none"
             data-testid={`workflow-copy-${workflowKey(workflow)}`}
             onclick={() => oncopy(workflow)}
           >

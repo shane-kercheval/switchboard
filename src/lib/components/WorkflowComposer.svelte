@@ -114,6 +114,9 @@
   // (≥2 non-empty panes): with a single pane "this pane" == "every agent", which
   // the agent chips already cover. Mirrors the forward picker's `multiPane` rule.
   const multiPane = $derived(panes.filter((p) => p.members.length > 0).length > 1);
+  // A single `agent` slot only offers single-member panes, so its pane row (and
+  // the divider that sets it off from the agent chips) appears only when one exists.
+  const hasSingleMemberPane = $derived(panes.some((p) => p.members.length === 1));
 
   function paneMemberNames(pane: TranscriptPane): string[] {
     return pane.members
@@ -142,9 +145,13 @@
     const v = asString(name);
     return v !== "" && paneMemberNames(pane).includes(v);
   }
+  // Clicking the chip for the already-bound member clears the slot, mirroring the
+  // multi-member pane's toggle-off (an `agent` slot holds one agent, so "clear"
+  // means the empty string — the unset value isMissingInput checks for).
   function selectPaneMember(name: string, pane: TranscriptPane): void {
     const [member] = paneMemberNames(pane);
-    if (member !== undefined) inputs[name] = member;
+    if (member === undefined) return;
+    inputs[name] = asString(name) === member ? "" : member;
   }
   // Recipient-chip styling reused from the compose bar's To field (icon + low
   // height), minus the position number, which has no meaning here.
@@ -154,6 +161,20 @@
       selected
         ? "bg-accent-soft text-fg border-transparent"
         : "border-panel bg-panel text-muted hover:bg-raised hover:text-fg",
+    );
+  }
+
+  // Pane chips invert the agent chips: where an agent reads as a filled gray
+  // pill, a pane is borderless and unfilled at rest (the composer card shows
+  // through) and fills gray on hover — a second, type-level signal alongside the
+  // green pane icon. The transparent border preserves the chip's box size so it
+  // aligns with the bordered agent chips beside it.
+  function paneChipClass(selected: boolean): string {
+    return cn(
+      "focus-visible:ring-accent inline-flex items-center gap-1 rounded-full border py-px pr-2 pl-1.5 text-sm transition-colors focus-visible:ring-2 focus-visible:outline-none",
+      selected
+        ? "bg-accent-soft text-fg border-transparent"
+        : "border-transparent bg-transparent text-muted hover:bg-panel hover:text-fg",
     );
   }
 
@@ -280,7 +301,7 @@
     <button
       type="button"
       aria-pressed={selected}
-      class={chipClass(selected)}
+      class={paneChipClass(selected)}
       data-testid={`workflow-pane-${name}-${pane.id}`}
       title={paneMemberNames(pane).join(", ")}
       onclick={onpick}
@@ -292,7 +313,7 @@
         stroke-width="1.8"
         stroke-linecap="round"
         stroke-linejoin="round"
-        class="h-3.5 w-3.5 shrink-0"
+        class="text-accent h-3.5 w-3.5 shrink-0"
         aria-hidden="true"
       >
         <rect x="3" y="4" width="18" height="16" rx="2" />
@@ -300,6 +321,12 @@
       </svg>
       {pane.name}
     </button>
+  {/snippet}
+
+  <!-- Sets the pane chips (group selectors) apart from the agent chips (leaves)
+       they govern, so the parent→child relationship reads at a glance. -->
+  {#snippet groupDivider()}
+    <span class="bg-border/70 mx-0.5 w-px self-stretch" aria-hidden="true"></span>
   {/snippet}
 
   {#snippet forwardPicker(name: string)}
@@ -365,6 +392,7 @@
                     )}
                   {/if}
                 {/each}
+                {#if hasSingleMemberPane}{@render groupDivider()}{/if}
               {/if}
               <span class="contents" role="radiogroup" aria-label={input.name}>
                 {#each agents as agent (agent.id)}
@@ -392,6 +420,7 @@
                     )}
                   {/if}
                 {/each}
+                {@render groupDivider()}
               {/if}
               {#each agents as agent (agent.id)}
                 <button

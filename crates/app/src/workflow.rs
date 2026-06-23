@@ -254,12 +254,24 @@ impl WorkflowRun {
             })?;
             match self
                 .dispatcher
-                .send_message_awaiting_completion(agent_id, &body, Vec::new(), send_id, factory)
+                .send_workflow_message_awaiting_completion(
+                    agent_id,
+                    &body,
+                    Vec::new(),
+                    send_id,
+                    factory,
+                )
                 .await
             {
                 AwaitableSendOutcome::Accepted { completion, .. } => {
                     pending.entry(agent_id).or_default().push_back(completion);
                     *in_flight.entry(agent_id).or_insert(0) += 1;
+                    // The dispatcher emits this send's live user message once it is
+                    // durable (after `record_send`, before `TurnStart`) — see
+                    // `send_workflow_message_awaiting_completion`. A fan-out's
+                    // recipients share `send_id`, so the frontend groups them into
+                    // one user row + per-recipient columns, matching a manual send
+                    // and the reloaded journal view.
                 }
                 // Contention = step failure (FailFast). Per the partial-dispatch
                 // rule, remaining recipients are not dispatched and already-issued
@@ -1006,6 +1018,54 @@ mod tests {
             "got: {body}"
         );
         assert!(body.contains("Execute the plan above."));
+    }
+
+    #[tokio::test]
+    async fn workflow_send_emits_a_user_message_per_recipient_sharing_send_id() {
+        // Each `send` surfaces its dispatched body as a live user message on every
+        // recipient's channel; a fan-out's recipients share one send_id so the UI
+        // groups them into one user row + per-recipient columns (matching a manual
+        // send and the reloaded journal view). Emitted only on acceptance.
+        let rig = rig(vec![
+            ("rev-1", vec![MockScenario::Streaming]),
+            ("rev-2", vec![MockScenario::Streaming]),
+        ]);
+        let yaml = "name: fan\ndescription: d\ninputs:\n  revs: [agent]\nsteps:\n  - send:\n      to: \"{{ revs }}\"\n      text: \"please review\"\n";
+        let (run, _dir, _path) = build_run(
+            &rig,
+            PromptService::disabled(),
+            yaml,
+            "fan",
+            supplied(vec![("revs", list(&["rev-1", "rev-2"]))]),
+            CancellationToken::new(),
+        );
+        assert_eq!(run.execute().await, RunStatus::Complete);
+
+        let user_messages: Vec<(String, serde_json::Value)> = rig
+            .emitter
+            .snapshot()
+            .into_iter()
+            .filter(|(_, payload)| payload["type"] == "user_message")
+            .collect();
+        assert_eq!(user_messages.len(), 2, "one per recipient");
+        assert!(
+            user_messages
+                .iter()
+                .all(|(_, p)| p["text"] == "please review")
+        );
+        let send_ids: std::collections::HashSet<String> = user_messages
+            .iter()
+            .map(|(_, p)| p["send_id"].to_string())
+            .collect();
+        assert_eq!(
+            send_ids.len(),
+            1,
+            "a fan-out's recipients share one send_id"
+        );
+        let channels: std::collections::HashSet<String> =
+            user_messages.iter().map(|(c, _)| c.clone()).collect();
+        assert!(channels.contains(&format!("agent:{}", rig.ids["rev-1"])));
+        assert!(channels.contains(&format!("agent:{}", rig.ids["rev-2"])));
     }
 
     #[tokio::test]

@@ -719,13 +719,14 @@ async fn dispatch_failure_emits_message_failed_no_turn_start_and_stays_usable() 
         noop_journal(),
     );
 
+    let send_id = Uuid::now_v7();
     let message_id = accepted(
         dispatcher
             .send_message(
                 agent.id,
                 "won't dispatch",
                 vec![],
-                Uuid::now_v7(),
+                send_id,
                 Arc::clone(&factory) as Arc<dyn DispatchContextFactory>,
                 OnBusy::Enqueue,
             )
@@ -760,6 +761,11 @@ async fn dispatch_failure_emits_message_failed_no_turn_start_and_stays_usable() 
         extract_message_id(&failed.1),
         message_id,
         "message_failed is keyed by the accepted send's message_id"
+    );
+    assert_eq!(
+        failed.1["send_id"].as_str(),
+        Some(send_id.to_string().as_str()),
+        "message_failed carries the send_id (so a backend-originated send can attach its failure)"
     );
 
     // The next send must run to completion — the agent isn't stuck.
@@ -1733,6 +1739,10 @@ async fn send_record_failure_aborts_the_turn_without_starting_it() {
         .find(|(_, v)| event_type(v) == "message_failed")
         .expect("a message_failed event");
     assert_eq!(extract_message_id(&failed.1), message_id);
+    assert!(
+        failed.1["send_id"].is_null(),
+        "a journal-write failure is pre-durable: no send_id, so the live UI invents no row (matches the empty reload)"
+    );
 }
 
 #[tokio::test]

@@ -626,7 +626,13 @@ function handleEvent(agentId: AgentId, event: NormalizedEvent): void {
   // live turn still owns the outcome and there is no double-render.
   const failedSendId =
     event.type === "message_failed"
-      ? pendingEntryFor(priorRuntime, event.message_id)?.send_id
+      ? // Prefer the pending entry (manual sends); fall back to the event's own
+        // `send_id` for a backend-originated send (a workflow step that fails before
+        // `turn_start`), which has no pending entry — so its failed marker renders
+        // under the workflow's live user row. A `null` event `send_id` means the
+        // send was never durably recorded → coerce to `undefined` so the reducer
+        // renders no row (matching the empty reload).
+        (pendingEntryFor(priorRuntime, event.message_id)?.send_id ?? event.send_id ?? undefined)
       : undefined;
   // Prefer the locally-tracked pending-send (frontend-originated sends correlate
   // by `message_id`); fall back to the `turn_start` event's own `send_id` for a

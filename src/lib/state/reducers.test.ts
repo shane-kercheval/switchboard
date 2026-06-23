@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
-import type { NormalizedEvent, ReducerInput } from "$lib/types";
+import type { ConversationItem, NormalizedEvent, ReducerInput } from "$lib/types";
 import { _internal, freshRuntime, runtimeReducer, transcriptReducer } from "./reducers";
-import { buildUnifiedRows } from "./unified";
+import { buildUnifiedRows, groupRenderBlocks } from "./unified";
 import type { AgentRuntime, TextChunk, ToolCall, Turn } from "./types";
 
 const AGENT_A = "00000000-0000-7000-8000-000000000aaa";
@@ -332,6 +332,7 @@ describe("transcriptReducer", () => {
         {
           type: "message_failed",
           message_id: MESSAGE_1,
+          send_id: MESSAGE_1,
           agent_id: AGENT_A,
           error: "adapter failed to launch",
           at: RECEIVED_AT,
@@ -355,6 +356,7 @@ describe("transcriptReducer", () => {
         {
           type: "message_failed",
           message_id: MESSAGE_1,
+          send_id: MESSAGE_1,
           agent_id: AGENT_A,
           error: "boom",
           at: RECEIVED_AT,
@@ -1299,6 +1301,7 @@ describe("runtimeReducer", () => {
     const r = runtimeReducer(starting, {
       type: "message_failed",
       message_id: MESSAGE_1,
+      send_id: MESSAGE_1,
       agent_id: AGENT_A,
       error: "journal write failed",
       at: "2026-05-16T00:00:00Z",
@@ -1320,6 +1323,7 @@ describe("runtimeReducer", () => {
     const r = runtimeReducer(starting, {
       type: "message_failed",
       message_id: MESSAGE_2,
+      send_id: MESSAGE_2,
       agent_id: AGENT_A,
       error: "stale",
       at: "2026-05-16T00:00:00Z",
@@ -1383,6 +1387,7 @@ describe("runtimeReducer", () => {
     r = runtimeReducer(r, {
       type: "message_failed",
       message_id: MESSAGE_1,
+      send_id: MESSAGE_1,
       agent_id: AGENT_A,
       error: "ignored",
       at: "2026-05-16T00:00:00Z",
@@ -1710,5 +1715,74 @@ describe("cross-agent isolation", () => {
     expect(turnsB).toHaveLength(1);
     expect((turnsA[0] as Extract<Turn, { role: "agent" }>).agent_id).toBe(AGENT_A);
     expect((turnsB[0] as Extract<Turn, { role: "agent" }>).agent_id).toBe(AGENT_B);
+  });
+});
+
+describe("workflow user_message events", () => {
+  const SEND = "00000000-0000-7000-8000-0000000000d1";
+  const AT = "2026-05-16T00:00:00Z";
+  const userMessage = (text: string): NormalizedEvent => ({
+    type: "user_message",
+    send_id: SEND,
+    text,
+    at: AT,
+  });
+  const turnStart = (turnId: string, messageId: string): NormalizedEvent => ({
+    type: "turn_start",
+    turn_id: turnId,
+    message_id: messageId,
+    send_id: SEND,
+    started_at: AT,
+  });
+
+  it("appends a user turn carrying the event's send_id, idempotent on re-delivery", () => {
+    const turns = transcriptReducer([], userMessage("do the thing"), AGENT_A, RECEIVED_AT);
+    expect(turns).toHaveLength(1);
+    const t = turns[0];
+    expect(t?.role).toBe("user");
+    if (t?.role !== "user") throw new Error("unreachable");
+    expect(t.send_id).toBe(SEND);
+    expect(t.text).toBe("do the thing");
+    // Re-delivery (same send_id + agent) does not append a duplicate.
+    const again = transcriptReducer(turns, userMessage("do the thing"), AGENT_A, RECEIVED_AT);
+    expect(again).toHaveLength(1);
+  });
+
+  it("does not double a single-recipient send present both live and in the journal overlay", () => {
+    // A workflow single-recipient send exists as a live user turn (in transcripts)
+    // and, after a background refresh rebuilds the journal overlay, as an overlay
+    // `user_message` with the same send_id. The unified view must render it ONCE.
+    const liveTurns: Turn[] = [
+      { role: "user", turn_id: `user:${SEND}:${AGENT_A}`, agent_id: AGENT_A, send_id: SEND, started_at: AT, text: "review" },
+      { role: "agent", turn_id: TURN_1, agent_id: AGENT_A, send_id: SEND, started_at: AT, status: "complete", items: [] },
+    ];
+    // A dispatched send's overlay item keys `id` off the send_id (types.ts).
+    const overlay: ConversationItem[] = [
+      { kind: "user_message", id: SEND, send_id: SEND, agent_ids: [AGENT_A], text: "review", at: AT },
+    ];
+    const rows = buildUnifiedRows(liveTurns, overlay, new Set([AGENT_A]));
+    const blocks = groupRenderBlocks(rows, [AGENT_A]);
+    const userRows = blocks.filter((b) => b.kind === "row" && b.row.kind === "user");
+    expect(userRows).toHaveLength(1);
+  });
+
+  it("a backend-originated fan-out groups into one user row + per-recipient columns", () => {
+    // No `pending_sends` (the frontend didn't originate the send) — the grouping
+    // comes entirely from the per-recipient `user_message` + `turn_start` events
+    // sharing one `send_id`. This is the end-to-end guard for the workflow fan-out
+    // rendering side-by-side, not stacked.
+    let a = transcriptReducer([], userMessage("review"), AGENT_A, RECEIVED_AT);
+    a = transcriptReducer(a, turnStart(TURN_1, MESSAGE_1), AGENT_A, RECEIVED_AT, SEND);
+    let b = transcriptReducer([], userMessage("review"), AGENT_B, RECEIVED_AT);
+    b = transcriptReducer(b, turnStart(TURN_2, MESSAGE_2), AGENT_B, RECEIVED_AT, SEND);
+
+    const rows = buildUnifiedRows([...a, ...b], [], new Set([AGENT_A, AGENT_B]));
+    const blocks = groupRenderBlocks(rows, [AGENT_A, AGENT_B]);
+    const fanout = blocks.find((x) => x.kind === "fanout");
+    expect(fanout?.kind).toBe("fanout");
+    if (fanout?.kind !== "fanout") throw new Error("expected a fanout block, got stacked rows");
+    expect(fanout.columns).toHaveLength(2);
+    expect(fanout.user.agent_ids).toEqual([AGENT_A, AGENT_B]);
+    expect(fanout.user.text).toBe("review");
   });
 });

@@ -152,6 +152,13 @@ struct WorkItem {
     /// discarding the item (see [`resolve_dropped_completion`]) — never a silent
     /// drop that would leave the awaiter on a `RecvError`.
     completion: Option<oneshot::Sender<CompletionResult>>,
+    /// Emit a live [`NormalizedEvent::UserMessage`] for this send once it is
+    /// durable (after `record_send` succeeds, before `TurnStart`). Set for
+    /// backend-originated sends (a workflow `send`) that have no frontend
+    /// optimistic user turn; `false` for the compose-bar path, which renders its
+    /// user turn optimistically. Emitting at the journal boundary keeps the live
+    /// user message identical to the reloaded journal view by construction.
+    emit_user_message: bool,
 }
 
 /// Delivered once, when an awaited send's turn reaches a terminal state, over
@@ -721,6 +728,9 @@ impl Dispatcher {
             prompt: prompt.to_owned(),
             attachments,
             completion: None,
+            // Compose-bar sends render their user turn optimistically on the
+            // frontend; no backend-emitted user message.
+            emit_user_message: false,
         };
         self.accept(agent_id, item, factory, on_busy).await
     }
@@ -752,6 +762,39 @@ impl Dispatcher {
         send_id: SendId,
         factory: Arc<dyn DispatchContextFactory>,
     ) -> AwaitableSendOutcome {
+        self.send_awaitable(agent_id, prompt, attachments, send_id, factory, false)
+            .await
+    }
+
+    /// Like [`send_message_awaiting_completion`](Self::send_message_awaiting_completion),
+    /// but also emits a live [`NormalizedEvent::UserMessage`] for this send once it
+    /// is durable. Used by **backend-originated workflow sends**, which have no
+    /// frontend optimistic user turn: the workflow's dispatched message must still
+    /// appear as a user message live (and group a fan-out into columns), exactly
+    /// as it does after a reload from the journal. Emitting at the journal boundary
+    /// (in the actor, after `record_send` succeeds) keeps live == reload by
+    /// construction — a send whose journal write fails shows no live user message.
+    pub async fn send_workflow_message_awaiting_completion(
+        &self,
+        agent_id: AgentId,
+        prompt: &str,
+        attachments: Vec<Attachment>,
+        send_id: SendId,
+        factory: Arc<dyn DispatchContextFactory>,
+    ) -> AwaitableSendOutcome {
+        self.send_awaitable(agent_id, prompt, attachments, send_id, factory, true)
+            .await
+    }
+
+    async fn send_awaitable(
+        &self,
+        agent_id: AgentId,
+        prompt: &str,
+        attachments: Vec<Attachment>,
+        send_id: SendId,
+        factory: Arc<dyn DispatchContextFactory>,
+        emit_user_message: bool,
+    ) -> AwaitableSendOutcome {
         let (completion_tx, completion_rx) = oneshot::channel();
         let item = WorkItem {
             message_id: Uuid::now_v7(),
@@ -759,6 +802,7 @@ impl Dispatcher {
             prompt: prompt.to_owned(),
             attachments,
             completion: Some(completion_tx),
+            emit_user_message,
         };
         match self.accept(agent_id, item, factory, OnBusy::FailFast).await {
             SendOutcome::Accepted(message_id) => AwaitableSendOutcome::Accepted {
@@ -813,6 +857,8 @@ impl Dispatcher {
                         factory.idle_emitter().as_ref(),
                         &channel_name(agent_id),
                         message_id,
+                        // Pre-`record_send`: the actor never received the item.
+                        None,
                         agent_id,
                         "agent worker is unavailable",
                     );
@@ -1146,6 +1192,8 @@ fn abandon_backlog(
             emitter,
             channel,
             item.message_id,
+            // A never-run (dropped) item — no durable record.
+            None,
             agent_id,
             "agent is shutting down",
         );
@@ -1233,6 +1281,10 @@ enum TurnAfter {
 /// live), journals the send fail-closed, dispatches, emits `TurnStart`, then
 /// drains — handling `Cancel`/`Enqueue`/`Remove`/`Shutdown` promptly via
 /// `select!`.
+// A single linear turn lifecycle (build → journal → user-message → dispatch →
+// emit → drain); splitting it would scatter the fail-closed ordering it must
+// keep in one place.
+#[allow(clippy::too_many_lines)]
 async fn run_turn(
     agent_id: AgentId,
     channel: &str,
@@ -1273,6 +1325,9 @@ async fn run_turn(
             emitter.as_ref(),
             channel,
             item.message_id,
+            // The journal write itself failed — there is no durable send for reload
+            // to reconstruct, so the frontend must not invent a row.
+            None,
             agent_id,
             &e.to_string(),
         );
@@ -1286,6 +1341,22 @@ async fn run_turn(
             String::new(),
         );
         return TurnAfter::Continue;
+    }
+
+    // The send is now durable (journaled above). For a backend-originated send (a
+    // workflow `send`, which has no frontend optimistic user turn), surface its
+    // message as a live user message before the turn starts — so the live view
+    // matches the reloaded journal view. Emitting *past* `record_send` means a
+    // journal-write failure (handled above) shows no live user message either.
+    if item.emit_user_message {
+        emit_user_message(
+            emitter.as_ref(),
+            channel,
+            item.send_id,
+            &item.prompt,
+            started_at,
+            agent_id,
+        );
     }
 
     let token = CancellationToken::new();
@@ -1314,6 +1385,10 @@ async fn run_turn(
                 emitter.as_ref(),
                 channel,
                 item.message_id,
+                // Post-`record_send`: the send is durable (and a `Failed` outcome
+                // was just recorded), so reload reconstructs user message + marker
+                // — carry the send_id so live attaches the marker identically.
+                Some(item.send_id),
                 agent_id,
                 &message,
             );
@@ -1856,6 +1931,8 @@ fn reject_send(
                 factory.idle_emitter().as_ref(),
                 &channel_name(agent_id),
                 message_id,
+                // Rejected before the actor ran it — no durable record.
+                None,
                 agent_id,
                 reason,
             );
@@ -1866,10 +1943,37 @@ fn reject_send(
 }
 
 /// Emit a `MessageFailed` for a send that could not start a turn.
+/// Emit a live [`NormalizedEvent::UserMessage`] for a backend-originated send,
+/// once it is durable. The frontend renders it as a user turn (grouping a fan-out
+/// by `send_id`), matching a manual send and the reloaded journal view.
+fn emit_user_message(
+    emitter: &dyn EventEmitter,
+    channel: &str,
+    send_id: SendId,
+    text: &str,
+    at: DateTime<Utc>,
+    agent_id: AgentId,
+) {
+    emit_event(
+        emitter,
+        channel,
+        &NormalizedEvent::UserMessage {
+            send_id,
+            text: text.to_owned(),
+            at,
+        },
+        agent_id,
+    );
+}
+
 fn emit_message_failed(
     emitter: &dyn EventEmitter,
     channel: &str,
     message_id: MessageId,
+    // `Some` only when the send was durably recorded (the post-`record_send`
+    // adapter-launch-failure path); `None` for every pre-durable failure, so the
+    // frontend invents no transcript row for a send reload can't reconstruct.
+    send_id: Option<SendId>,
     agent_id: AgentId,
     error: &str,
 ) {
@@ -1878,6 +1982,7 @@ fn emit_message_failed(
         channel,
         &NormalizedEvent::MessageFailed {
             message_id,
+            send_id,
             agent_id,
             error: error.to_owned(),
             at: Utc::now(),

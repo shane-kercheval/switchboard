@@ -619,6 +619,7 @@ describe("message_failed event → transcript", () => {
     fireTo(`agent:${AGENT_A}`, {
       type: "message_failed",
       message_id: MESSAGE_1,
+      send_id: MESSAGE_1,
       agent_id: AGENT_A,
       error: "adapter failed to launch",
       at: "2026-05-16T00:00:01Z",
@@ -644,6 +645,7 @@ describe("message_failed event → transcript", () => {
     fireTo(`agent:${AGENT_A}`, {
       type: "message_failed",
       message_id: MESSAGE_1,
+      send_id: MESSAGE_1,
       agent_id: AGENT_A,
       error: "adapter failed to launch",
       at: "2026-05-16T00:00:01Z",
@@ -678,6 +680,9 @@ describe("message_failed event → transcript", () => {
     fireTo(`agent:${AGENT_A}`, {
       type: "message_failed",
       message_id: MESSAGE_1,
+      // Matches the send's id (the backend stamps `item.send_id`); the post-start
+      // guard finds the already-streaming turn for this send and skips.
+      send_id: "send-1",
       agent_id: AGENT_A,
       error: "boom",
       at: "2026-05-16T00:00:02Z",
@@ -685,6 +690,60 @@ describe("message_failed event → transcript", () => {
 
     const agentTurns = (state.transcripts[AGENT_A] ?? []).filter((t) => t.role === "agent");
     expect(agentTurns).toHaveLength(1);
+  });
+
+  it("renders a failed marker for a backend-originated pre-start failure via the event's send_id", async () => {
+    // A workflow step's send fails before `turn_start` (e.g. the agent's harness
+    // fails to launch). There's no `pending_sends` entry, so the failed marker is
+    // attributed from the event's own `send_id` — and it carries that `send_id`,
+    // so it renders under the workflow's live user row instead of orphaning.
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A));
+    fireTo(`agent:${AGENT_A}`, {
+      type: "message_failed",
+      message_id: MESSAGE_1,
+      send_id: "wf-send-1",
+      agent_id: AGENT_A,
+      error: "agent failed to launch",
+      at: "2026-05-16T00:00:00Z",
+    });
+    const turns = state.transcripts[AGENT_A] ?? [];
+    expect(turns).toHaveLength(1);
+    const t = turns[0];
+    expect(t?.role).toBe("agent");
+    if (t?.role !== "agent") throw new Error("unreachable");
+    expect(t.status).toBe("failed");
+    expect(t.send_id).toBe("wf-send-1");
+
+    // Re-delivery of the same failure is a no-op (the failed turn already carries
+    // this send_id, so the post-start guard skips it) — no double-render.
+    fireTo(`agent:${AGENT_A}`, {
+      type: "message_failed",
+      message_id: MESSAGE_1,
+      send_id: "wf-send-1",
+      agent_id: AGENT_A,
+      error: "agent failed to launch",
+      at: "2026-05-16T00:00:01Z",
+    });
+    expect((state.transcripts[AGENT_A] ?? []).filter((x) => x.role === "agent")).toHaveLength(1);
+  });
+
+  it("renders no row for a pre-durable backend failure (send_id null) — matches the empty reload", async () => {
+    // A workflow send whose journal write fails: not durably recorded, so the
+    // event carries no send_id and there's no pending entry. The live transcript
+    // must add nothing (reload reconstructs nothing); the run indicator owns the
+    // failure.
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A));
+    fireTo(`agent:${AGENT_A}`, {
+      type: "message_failed",
+      message_id: MESSAGE_1,
+      send_id: null,
+      agent_id: AGENT_A,
+      error: "journal write failed",
+      at: "2026-05-16T00:00:00Z",
+    });
+    expect(state.transcripts[AGENT_A] ?? []).toHaveLength(0);
   });
 });
 

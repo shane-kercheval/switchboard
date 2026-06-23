@@ -231,6 +231,14 @@ export function buildUnifiedRows(
 
   for (const item of overlay) {
     if (item.kind === "user_message") {
+      // Skip an overlay user message whose send already has a **live** user row
+      // (same `send_id`): the live turn(s) and the journal overlay both describe
+      // the same send, and a background refresh can surface both at once. Without
+      // this, a single-recipient send renders twice (the fan-out path is collapsed
+      // later by `groupRenderBlocks`, but a single-recipient row would double). The
+      // live row wins — it carries the in-session realtime state. An imported
+      // prompt (`send_id` null) has no live group, so it always renders.
+      if (item.send_id != null && groups.has(item.send_id)) continue;
       rows.push({
         kind: "user",
         at: item.at,

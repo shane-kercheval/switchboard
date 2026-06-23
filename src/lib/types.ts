@@ -131,6 +131,11 @@ export type NormalizedEvent =
       send_id: SendId;
       started_at: string;
     }
+  // A user-side message a workflow `send` dispatched to this agent (the frontend
+  // has no optimistic user turn for a backend-originated send). The reducer turns
+  // it into a user turn; a fan-out's recipients share `send_id` so they group into
+  // one user row + per-recipient columns. Manual sends don't use this.
+  | { type: "user_message"; send_id: SendId; text: string; at: string }
   | { type: "content_chunk"; turn_id: TurnId; kind: ContentKind; text: string }
   // Content-free liveness signal: the harness is still alive mid-turn but
   // produced no renderable content (e.g. Claude Opus 4.8's redacted thinking
@@ -204,7 +209,19 @@ export type NormalizedEvent =
   // adapter failed to launch pre-`turn_start`). Keyed by `message_id` — there
   // is no live turn. Carries no prompt; the frontend still holds the
   // optimistically-rendered text and marks that bubble failed.
-  | { type: "message_failed"; message_id: MessageId; agent_id: AgentId; error: string; at: string }
+  | {
+      type: "message_failed";
+      message_id: MessageId;
+      // The **durably recorded** send this failure belongs to, or `null` if the
+      // send never reached the journal. When set, a backend-originated send
+      // (workflow) attaches its failed marker via this; when `null` it renders no
+      // row (reload can't reconstruct an unrecorded send). Manual sends ignore it
+      // and resolve via `pending_sends`.
+      send_id: SendId | null;
+      agent_id: AgentId;
+      error: string;
+      at: string;
+    }
   // A queued send was cancelled before it started (its backlog item was dropped
   // by cancel_send / cancel_agent). Keyed by `message_id`, no `turn_id`. The
   // authoritative signal that a not-yet-started send is gone — the frontend

@@ -260,7 +260,14 @@ const invokeMock = vi.fn(async (cmd: string, args?: Record<string, unknown>): Pr
       return { found: true, files: [] };
     case "file_diff":
     case "commit_file_diff":
-      return { path: "", binary: false, truncated: false, hunks: [] };
+      return {
+        path: "",
+        binary: false,
+        truncated: false,
+        too_large: false,
+        too_large_bytes: null,
+        hunks: [],
+      };
     case "open_in_editor":
       if (backend.openEditorQueue.length > 0) return await backend.openEditorQueue.shift();
       if (backend.openEditorFailure !== null) throw new Error(backend.openEditorFailure);

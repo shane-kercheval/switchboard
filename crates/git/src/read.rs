@@ -96,7 +96,8 @@ pub fn changed_files(path: &Path) -> Result<Vec<ChangedFile>> {
 /// worktree at `path` — changes vs. HEAD, including untracked content. Returns an
 /// empty [`FileDiff`] when the file has no diff (clean) or the path isn't a
 /// readable worktree; `binary: true` (no hunks) for binary content libgit2
-/// declines to render inline.
+/// declines to render inline; `too_large: true` (no hunks) for a file past the
+/// inline-diff size limit, which is never rendered at all.
 pub fn file_diff(path: &Path, file: &str) -> Result<FileDiff> {
     let repo = match Repository::open(path) {
         Ok(repo) => repo,
@@ -121,6 +122,14 @@ pub fn file_diff(path: &Path, file: &str) -> Result<FileDiff> {
     }
     .map_err(|e| GitError::read(path, e))?;
 
+    // Reject a file past the inline limit before rendering. Working off the diff's
+    // deltas (not a filesystem stat) means a *clean* file has no delta and so is
+    // never mis-flagged — only an actual change is gated. Building the diff is cheap
+    // (deltas are metadata; content loads lazily at `print`), so this runs before any
+    // blob is read.
+    if let Some(size) = diff_target_too_large(&repo, &diff, Path::new(file), false) {
+        return Ok(FileDiff::too_large(file, size));
+    }
     collect_file_diff(&diff, file, false).map_err(|e| GitError::read(path, e))
 }
 
@@ -243,8 +252,17 @@ pub fn commit_file_diff(path: &Path, oid: &str, file: &str) -> Result<FileDiff> 
     else {
         return Ok(FileDiff::empty(file));
     };
+    // Rename detection must run before the size gate: it pairs an add+delete into one
+    // delta, which is how the gate recognizes a pure rename (identical old/new blob)
+    // as "no content to render" rather than "too large". For an inexactly-renamed
+    // large file this can read content for similarity scoring before the gate — a
+    // bounded, commit-history-only cost (libgit2 caps inexact scoring by size), so we
+    // accept it rather than sacrifice rename pairing.
     diff.find_similar(None)
         .map_err(|e| GitError::read(path, e))?;
+    if let Some(size) = diff_target_too_large(&repo, &diff, Path::new(file), true) {
+        return Ok(FileDiff::too_large(file, size));
+    }
     collect_file_diff(&diff, file, true).map_err(|e| GitError::read(path, e))
 }
 
@@ -801,6 +819,91 @@ fn renamed_target(entry: &git2::StatusEntry<'_>) -> Option<String> {
 /// the file was cut off rather than imply it's fully shown.
 const MAX_DIFF_LINES: usize = 5_000;
 
+/// Companion byte cap to [`MAX_DIFF_LINES`]. The line cap alone misses a file with
+/// few but enormous lines — a minified bundle, a one-line JSON/CSV blob — where the
+/// whole file is one or a handful of lines. Such a file (e.g. a brand-new untracked
+/// file rendered entirely as additions) would otherwise ship its full content
+/// across IPC and freeze the renderer. We stop collecting once the kept content
+/// crosses this budget, generous enough that no human-readable diff reaches it.
+const MAX_DIFF_BYTES: usize = 2 * 1024 * 1024;
+
+/// Per-line clamp. A single line longer than this is cut (on a UTF-8 boundary) and
+/// the diff flagged `truncated`. Needed because one giant line lands in front of
+/// the [`MAX_DIFF_BYTES`] check before it can trip, so without this the full line
+/// would still be collected. The value is bounded by *render* cost, not byte cost:
+/// the webview lays out each line with `break-all` wrapping, and very long lines are
+/// disproportionately expensive (measured ~10× slower for 90 KB lines than for the
+/// same total bytes split into short lines). 10 KB is far past any readable source
+/// line yet keeps the worst case (a 2 MB diff of clamped lines) rendering in well
+/// under 200 ms.
+const MAX_DIFF_LINE_BYTES: usize = 10_000;
+
+/// Size above which a file is not rendered inline at all — we return `too_large`
+/// instead of asking libgit2 to load and split the blob. This is a different job
+/// from [`MAX_DIFF_BYTES`]: that bounds *how much of a diffable file we keep*, this
+/// is *the size past which we don't even try* (loading a 100MB+ blob just to throw
+/// it away is the native-side cost the render caps can't reach). Hence the deliberate
+/// `TOO_LARGE_TO_DIFF_BYTES` > `MAX_DIFF_BYTES`: files between the two still get a
+/// real truncated preview; only files past this get the placeholder.
+const TOO_LARGE_TO_DIFF_BYTES: u64 = 10 * 1024 * 1024;
+
+/// The size (bytes) of one side of a delta, without loading its content. For a
+/// real blob (committed/index side) the size comes from the object-DB header — a
+/// header read, not a full object load. The workdir side of an untracked or
+/// modified file has no blob yet (`id` is zero), so its size comes from the delta's
+/// stat-derived `size()`.
+fn side_size(odb: Option<&git2::Odb<'_>>, file: &git2::DiffFile<'_>) -> u64 {
+    if !file.id().is_zero()
+        && let Some(odb) = odb
+        && let Ok((size, _)) = odb.read_header(file.id())
+    {
+        return size as u64;
+    }
+    file.size()
+}
+
+/// If the file `target` in `diff` is larger than [`TOO_LARGE_TO_DIFF_BYTES`], the
+/// size to report — checked *before* rendering so libgit2 never loads the blob.
+///
+/// Both sides are considered: a huge *deletion* has a zero-size new side but an
+/// enormous old side, and diffing it still loads the old blob. Sizes come from
+/// metadata only (delta stat or object-DB header), never a content read.
+fn diff_target_too_large(
+    repo: &Repository,
+    diff: &Diff<'_>,
+    target: &Path,
+    filter_to_file: bool,
+) -> Option<u64> {
+    let odb = repo.odb().ok();
+    let mut max = 0u64;
+    for delta in diff.deltas() {
+        if filter_to_file
+            && delta.new_file().path() != Some(target)
+            && delta.old_file().path() != Some(target)
+        {
+            continue;
+        }
+        // Identical content on both sides means nothing is rendered regardless of
+        // size, so skip it (returns "no changes", not "too large"). This catches a
+        // pure rename/copy on the commit path, where both sides carry the same real
+        // blob id. The `!is_zero()` guard is load-bearing: an untracked file has a
+        // zero id on *both* sides and must stay gated (size comes from the workdir
+        // stat). A *worktree* mode-only change isn't caught — libgit2 leaves the
+        // worktree side's id unset, and proving content-identity would mean hashing
+        // the file — so it's reported `too_large` (a wrong label, but still gated by
+        // header size with no content load).
+        let old_id = delta.old_file().id();
+        let new_id = delta.new_file().id();
+        if !old_id.is_zero() && old_id == new_id {
+            continue;
+        }
+        max = max
+            .max(side_size(odb.as_ref(), &delta.new_file()))
+            .max(side_size(odb.as_ref(), &delta.old_file()));
+    }
+    (max > TOO_LARGE_TO_DIFF_BYTES).then_some(max)
+}
+
 /// Walk libgit2's structured diff for one file into [`FileDiff`] hunks. Uses the
 /// same `print` traversal as the rest of this module, but collects structured
 /// lines instead of flattening to unified text — the frontend renders from this
@@ -819,17 +922,18 @@ fn collect_file_diff(
     let mut binary = false;
     let mut truncated = false;
     let mut lines = 0usize;
+    let mut bytes = 0usize;
     let target = std::path::Path::new(file);
 
-    diff.print(DiffFormat::Patch, |delta, hunk, line| {
-        // Past the cap, append nothing more — not content *and not hunk headers*
-        // (otherwise a huge file leaves a tail of empty hunks). We keep returning
-        // `true`: returning `false` aborts `print` as a `GIT_EUSER` error that the
-        // `?` below would turn a successful-but-truncated diff into a `GitRead`
-        // failure. libgit2 has already computed the diff before this walk, so
-        // finishing the (now no-op) iteration is cheap.
+    let result = diff.print(DiffFormat::Patch, |delta, hunk, line| {
+        // Once truncated, stop the walk by returning `false`. libgit2 surfaces that
+        // as a `GIT_EUSER` error, which the caller below treats as a
+        // successful-but-truncated diff rather than a failure. Aborting matters for
+        // a huge file: continuing the walk would have libgit2 generate the entire
+        // remaining patch (seconds of work for hundreds of MB) only for us to
+        // discard every line.
         if truncated {
-            return true;
+            return false;
         }
         // Skip lines belonging to other files' deltas when collecting one file
         // out of a whole-commit diff (a rename delta's path is its new name).
@@ -857,9 +961,12 @@ fn collect_file_diff(
             // newline; treat it like ordinary context. The `>`/`<` EOFNL markers
             // and the `F` file header carry no renderable content — skip them.
             origin @ (' ' | '=' | '+' | '-') => {
-                if lines >= MAX_DIFF_LINES {
+                // Stop at the line *or* byte budget — whichever trips first. The byte
+                // budget guards a file with few but enormous lines that slips under
+                // the line cap yet would otherwise ship its whole content.
+                if lines >= MAX_DIFF_LINES || bytes >= MAX_DIFF_BYTES {
                     truncated = true;
-                    return true;
+                    return false;
                 }
                 lines += 1;
                 let kind = match origin {
@@ -867,14 +974,27 @@ fn collect_file_diff(
                     '-' => DiffLineKind::Removed,
                     _ => DiffLineKind::Context,
                 };
+                // Clamp the raw bytes *before* widening to a String. One giant line (a
+                // whole file on one line) is under the line cap and reaches here before
+                // the byte check can trip; converting it whole would allocate the full
+                // line first (and non-UTF-8 text would expand under `from_utf8_lossy`).
+                // Cutting raw bytes can land mid-codepoint — `from_utf8_lossy` then
+                // turns the trailing partial bytes into a single `U+FFFD`, so the cut
+                // is within one replacement char of the boundary, which is fine.
+                let raw_bytes = line.content();
+                if raw_bytes.len() > MAX_DIFF_LINE_BYTES {
+                    truncated = true;
+                }
+                let clamped = &raw_bytes[..raw_bytes.len().min(MAX_DIFF_LINE_BYTES)];
+                let raw = String::from_utf8_lossy(clamped);
                 // Strip the trailing newline (and a preceding CR for CRLF); a
                 // last line with no newline is left as-is.
-                let raw = String::from_utf8_lossy(line.content());
                 let content = match raw.strip_suffix('\n') {
                     Some(without_lf) => without_lf.strip_suffix('\r').unwrap_or(without_lf),
                     None => &raw,
                 }
                 .to_owned();
+                bytes += content.len();
                 // Defensive: libgit2 always emits a hunk header before content,
                 // but never index past an empty stack.
                 if let Some(current) = hunks.last_mut() {
@@ -889,12 +1009,29 @@ fn collect_file_diff(
             _ => {}
         }
         true
-    })?;
+    });
+    // `false` from the callback aborts the walk as `GIT_EUSER`, but only ever after
+    // we set `truncated` — so accept that exact pairing as a successful-but-truncated
+    // diff. A `GIT_EUSER` without `truncated` would be some future callback abort we
+    // didn't intend; surface it as a read failure rather than a silent partial diff.
+    match result {
+        Ok(()) => {}
+        Err(e) if e.code() == ErrorCode::User && truncated => {}
+        Err(e) => return Err(e),
+    }
+
+    // If truncation tripped on a hunk's first content line, its header was pushed but
+    // no lines followed — drop that trailing empty hunk so "no empty hunks" holds.
+    if hunks.last().is_some_and(|h| h.lines.is_empty()) {
+        hunks.pop();
+    }
 
     Ok(FileDiff {
         path: file.to_owned(),
         binary,
         truncated,
+        too_large: false,
+        too_large_bytes: None,
         hunks,
     })
 }

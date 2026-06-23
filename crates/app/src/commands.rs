@@ -609,7 +609,8 @@ pub fn changed_files_impl(
 
 /// The structured working-tree diff for one `file` (repo-relative) in the
 /// worktree at `path`. Untracked path → empty [`FileDiff`]; clean/unreadable →
-/// empty; binary content → `binary: true` with no hunks; a genuine mid-read
+/// empty; binary content → `binary: true` with no hunks; a file past the
+/// inline-diff size limit → `too_large: true` with no hunks; a genuine mid-read
 /// failure → [`AppError::GitRead`]. Synchronous `git2`; runs on a blocking worker.
 pub fn file_diff_impl(
     roots: &[PathBuf],

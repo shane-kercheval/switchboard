@@ -407,6 +407,69 @@ describe("buildUnifiedRows", () => {
   });
 });
 
+describe("buildUnifiedRows: system markers (compaction)", () => {
+  function compactionItem(agentId: string, at: string, summary = "recap"): ConversationItem {
+    return {
+      kind: "system_marker",
+      id: `marker:${agentId}:${at}`,
+      agent_id: agentId,
+      marker: { marker_kind: "compaction", summary },
+      at,
+    };
+  }
+
+  it("renders a compaction marker as an agent-attributed row, between turns", () => {
+    const rows = buildUnifiedRows(
+      [
+        userTurn(TURN_1, AGENT_A, "2026-05-16T00:00:00Z", "go", SEND_1),
+        agentTurn("a1", AGENT_A, "2026-05-16T00:00:01Z", SEND_1),
+      ],
+      [compactionItem(AGENT_A, "2026-05-16T00:00:02Z", "the recap text")],
+    );
+    expect(rows.map((r) => r.kind)).toEqual(["user", "agent", "system_marker"]);
+    const marker = rows.find((r) => r.kind === "system_marker")!;
+    expect(marker).toMatchObject({
+      agent_id: AGENT_A,
+      marker: { marker_kind: "compaction", summary: "the recap text" },
+    });
+    // It carries no send_id, so it never groups into a fan-out.
+    expect((marker as Extract<UnifiedRow, { kind: "system_marker" }>).send_id).toBeUndefined();
+  });
+
+  it("attributes a marker to its own agent and prunes it when that agent leaves the roster", () => {
+    // Agent B's marker must not leak into a roster that no longer includes B —
+    // the marker is per-agent, not project-wide.
+    const overlay: ConversationItem[] = [
+      compactionItem(AGENT_A, "2026-05-16T00:00:00Z"),
+      compactionItem(AGENT_B, "2026-05-16T00:00:01Z"),
+    ];
+    const rows = buildUnifiedRows([], overlay, new Set([AGENT_A]));
+    const markers = rows.filter((r) => r.kind === "system_marker");
+    expect(markers).toHaveLength(1);
+    expect((markers[0] as Extract<UnifiedRow, { kind: "system_marker" }>).agent_id).toBe(AGENT_A);
+  });
+
+  it("keys the marker row parse-stably so a re-parse doesn't churn its expanded state", () => {
+    // The marker's `turn_id` (the overlay item `id`) is regenerated on every
+    // parse; the rendered row must NOT key off it, or a project refresh would
+    // destroy/recreate the row and collapse a recap the user expanded. Same
+    // (agent, at) → same key, even with a different `id`.
+    const at = "2026-05-16T00:00:02Z";
+    const keyOf = (id: string): string => {
+      const item: ConversationItem = {
+        kind: "system_marker",
+        id,
+        agent_id: AGENT_A,
+        marker: { marker_kind: "compaction", summary: "recap" },
+        at,
+      };
+      const rows = buildUnifiedRows([], [item]);
+      return rows.find((r) => r.kind === "system_marker")!.key;
+    };
+    expect(keyOf("parse-1-uuid")).toBe(keyOf("parse-2-uuid"));
+  });
+});
+
 describe("groupRenderBlocks", () => {
   function fanoutOf(blocks: RenderBlock[]): Extract<RenderBlock, { kind: "fanout" }> {
     const f = blocks.find((b) => b.kind === "fanout");

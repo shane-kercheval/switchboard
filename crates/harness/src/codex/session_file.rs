@@ -1692,7 +1692,7 @@ not valid json
             .into_iter()
             .filter_map(|t| match t {
                 Turn::Agent { hydration_key, .. } => Some(hydration_key),
-                Turn::User { .. } => None,
+                Turn::User { .. } | Turn::System { .. } => None,
             })
             .collect()
     }
@@ -1720,7 +1720,7 @@ not valid json
                         hydration_key,
                         ..
                     } => Some((turn_id, hydration_key)),
-                    Turn::User { .. } => None,
+                    Turn::User { .. } | Turn::System { .. } => None,
                 })
                 .expect("one agent turn")
         };
@@ -1832,7 +1832,7 @@ not valid json
             .iter()
             .filter_map(|t| match t {
                 Turn::Agent { effort, .. } => Some(effort.clone()),
-                Turn::User { .. } => None,
+                Turn::User { .. } | Turn::System { .. } => None,
             })
             .collect();
         assert_eq!(
@@ -1875,7 +1875,7 @@ not valid json
             .iter()
             .filter_map(|t| match t {
                 Turn::Agent { model, effort, .. } => Some((model.clone(), effort.clone())),
-                Turn::User { .. } => None,
+                Turn::User { .. } | Turn::System { .. } => None,
             })
             .collect();
         assert_eq!(

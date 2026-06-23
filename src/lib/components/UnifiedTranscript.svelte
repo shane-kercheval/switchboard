@@ -33,6 +33,7 @@
   import { agentCopy } from "$lib/agentCopy.svelte";
   import { HARNESS_COLOR } from "$lib/harnessDisplay";
   import Badge from "$lib/components/ui/Badge.svelte";
+  import Disclosure from "$lib/components/ui/Disclosure.svelte";
   import HarnessIcon from "$lib/components/ui/HarnessIcon.svelte";
   import Markdown from "$lib/components/ui/Markdown.svelte";
   import CopyButton from "$lib/components/ui/CopyButton.svelte";
@@ -972,12 +973,16 @@
   {#each colRows as r (r.key)}
     {#if r.kind === "agent"}
       {#if !colHasOutcome}{@render turnStatusLabel(r.turn.status)}{/if}
-    {:else if r.status === "cancelled"}
-      <StatusChip status="cancelled" testid="outcome-cancelled" />
-    {:else}
-      <StatusChip status="failed" testid="outcome-failed" />
-      {#if r.reason}<span class="text-muted text-xs"> — {r.reason}</span>{/if}
+    {:else if r.kind === "outcome"}
+      {#if r.status === "cancelled"}
+        <StatusChip status="cancelled" testid="outcome-cancelled" />
+      {:else}
+        <StatusChip status="failed" testid="outcome-failed" />
+        {#if r.reason}<span class="text-muted text-xs"> — {r.reason}</span>{/if}
+      {/if}
     {/if}
+    <!-- system_marker rows never enter a fan-out column (no send_id), so they
+         have no status chip here. -->
   {/each}
 {/snippet}
 
@@ -1432,6 +1437,55 @@
   </div>
 {/snippet}
 
+<!-- An agent-scoped inter-turn marker (compaction). Attributed to its agent (name
+     + harness icon + the agent's lane border), then rendered as a tool-style
+     `Disclosure` (gray box, chevron, collapsed by default) — the recap is a large
+     verbatim harness block the user rarely needs expanded. No status icon: a
+     compaction has no success/error state, so the header carries only the label.
+     NOT a project-wide centered divider — in a multi-agent project that would
+     misread as "the project compacted" and sever the per-agent lanes. -->
+{#snippet systemMarkerRow(row: Extract<UnifiedRow, { kind: "system_marker" }>)}
+  {@const harness = agentById[row.agent_id]?.harness}
+  <div
+    class="group space-y-1.5"
+    data-testid="system-marker"
+    data-role="agent"
+    data-agent-id={row.agent_id}
+  >
+    <div class="flex items-center gap-2 text-xs font-semibold tracking-wide uppercase">
+      <span class="text-fg" data-testid="turn-agent-name">{agentName(row.agent_id)}</span>
+      {#if harness}<HarnessIcon {harness} testid="turn-harness-icon" />{/if}
+    </div>
+    <div class="border-l-[0.5px] pl-3" style:border-left-color={agentBorderColor(row.agent_id)}>
+      {#if row.marker.marker_kind === "compaction"}
+        <Disclosure testid="compaction-marker">
+          {#snippet header()}
+            <span class="text-muted shrink-0 text-[10px] font-semibold tracking-wide uppercase">
+              Conversation compacted
+            </span>
+          {/snippet}
+          <div class="border-border/70 border-t px-2.5 py-2">
+            <pre
+              class="text-muted max-h-44 overflow-y-auto font-mono text-xs whitespace-pre-wrap">{row
+                .marker.summary}</pre>
+          </div>
+        </Disclosure>
+      {/if}
+      <!-- Unknown marker_kind: render nothing (degrade gracefully on a future
+           variant this build doesn't model). -->
+    </div>
+    <!-- Same hover-revealed timestamp + copy as every other row (copies the
+         verbatim recap). Also restores the inter-row spacing the bare disclosure
+         lost. -->
+    {@render messageMeta({
+      at: row.at,
+      copyable: row.marker.marker_kind === "compaction" ? row.marker.summary : "",
+      label: "Copy summary",
+      mt: "mt-2.5",
+    })}
+  </div>
+{/snippet}
+
 <div
   bind:this={container}
   onscroll={onScroll}
@@ -1513,6 +1567,8 @@
             {/if}
           {:else if block.row.kind === "outcome"}
             {@render outcomeRow(block.row)}
+          {:else if block.row.kind === "system_marker"}
+            {@render systemMarkerRow(block.row)}
           {:else}
             {@render agentRow(block.row.turn)}
           {/if}

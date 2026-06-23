@@ -1,10 +1,18 @@
 //! Shared types for transcript hydration from harness session files.
 //!
-//! `Turn` and `TurnItem` mirror the TS shape in `src/lib/state/types.ts`
-//! verbatim. `items: Vec<TurnItem>` is a single ordered stream of text +
-//! tool entries — interleaved by arrival, not split into parallel arrays —
-//! so chronology observable from the session file survives serde without
-//! any boundary translation.
+//! `Turn::User`/`Turn::Agent` and `TurnItem` mirror the TS shape in
+//! `src/lib/state/types.ts` verbatim — they round-trip through the per-agent
+//! hydration path (`load_transcript`) onto the frontend's `LoadedTurn`.
+//! `Turn::System` is the exception: it has **no** frontend `Turn`/`LoadedTurn`
+//! analog. It reaches the UI only as a `ConversationItem` via the project
+//! conversation merge, and `load_transcript_impl` (`crates/app/src/commands.rs`)
+//! filters it out before the per-agent IPC. A new caller that serializes
+//! `LoadedTranscript` straight to the frontend must filter `Turn::System` too,
+//! or it re-introduces a `role:"system"` turn the frontend can't model.
+//! `items: Vec<TurnItem>` is a single ordered stream of text + tool entries —
+//! interleaved by arrival, not split into parallel arrays — so chronology
+//! observable from the session file survives serde without any boundary
+//! translation.
 //!
 //! `LoadedTranscript` is the output shape both per-harness parsers return.
 //! Errors are limited to lookup-mechanism failures
@@ -41,9 +49,26 @@ pub enum UserPromptSource {
     Unknown,
 }
 
+/// A non-conversational event the harness recorded between turns, surfaced in
+/// the transcript so the user can see it but deliberately invisible to the
+/// prompt↔send correlation (it is neither a user prompt nor an agent turn).
+/// Currently only context compaction; the enum is `#[non_exhaustive]` so a new
+/// kind (e.g. a state-changing slash command) is an additive variant, not a
+/// breaking change.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "marker_kind", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum SystemMarker {
+    /// The harness compacted the conversation's context. `summary` is the
+    /// continuation recap the harness wrote (Claude's `isCompactSummary`
+    /// record); rendered collapsed since it is a large structured block.
+    Compaction { summary: String },
+}
+
 /// One reconstructed turn. Discriminated by `role` matching the event-vocabulary
 /// convention. User turns carry just the prompt text; agent turns carry the
-/// ordered `items` stream plus per-turn usage and lifecycle status.
+/// ordered `items` stream plus per-turn usage and lifecycle status; system turns
+/// carry a [`SystemMarker`] for an inter-turn event.
 // A `User` turn is tiny; an `Agent` turn carries the full per-turn payload
 // (items, usage, model/effort, spend). The asymmetry is intrinsic — boxing the
 // hot, pattern-matched-everywhere `Agent` variant would add indirection for no
@@ -123,6 +148,16 @@ pub enum Turn {
         /// the frontend never sees a field the backend treats as private.
         #[serde(default, skip_serializing)]
         stable_message_id: Option<String>,
+    },
+    /// A harness-recorded inter-turn event (see [`SystemMarker`]). Carries no
+    /// content stream and no usage — it renders as a marker and is skipped by
+    /// the conversation merge's prompt↔send correlation. Serialized as
+    /// `role: "system"`.
+    System {
+        turn_id: TurnId,
+        agent_id: AgentId,
+        started_at: DateTime<Utc>,
+        marker: SystemMarker,
     },
 }
 

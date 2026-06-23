@@ -895,7 +895,7 @@ mod tests {
                         hydration_key,
                         ..
                     } => Some((turn_id, hydration_key)),
-                    Turn::User { .. } => None,
+                    Turn::User { .. } | Turn::System { .. } => None,
                 })
                 .expect("one agent turn")
         };
@@ -1148,7 +1148,7 @@ mod tests {
             .iter()
             .filter_map(|turn| match turn {
                 Turn::Agent { model, effort, .. } => Some((model.clone(), effort.clone())),
-                Turn::User { .. } => None,
+                Turn::User { .. } | Turn::System { .. } => None,
             })
             .collect();
         assert_eq!(

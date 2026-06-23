@@ -22,9 +22,16 @@
 // outcome marker carry an identical timestamp in real data (both equal the
 // turn's `started_at`), so a timestamp-only sort would render a
 // failed/cancelled marker *above* the prompt that caused it. Ranks: user (0) <
-// agent (1) < outcome (2).
+// agent (1) < system_marker (2) < outcome (3).
 
-import type { AgentId, Attachment, ConversationItem, OutcomeStatus, TurnId } from "$lib/types";
+import type {
+  AgentId,
+  Attachment,
+  ConversationItem,
+  OutcomeStatus,
+  SystemMarker,
+  TurnId,
+} from "$lib/types";
 import type { AgentCopyMode } from "$lib/agentCopyMode";
 import type { Turn } from "./types";
 
@@ -110,9 +117,21 @@ export type UnifiedRow =
     }
   | { kind: "agent"; at: string; rank: 1; key: string; send_id?: string; turn: AgentTurn }
   | {
-      kind: "outcome";
+      // An agent-scoped inter-turn marker (compaction). Never correlated to a
+      // send — `send_id` is always absent, which keeps it out of fan-out
+      // grouping and anchors it to its own timestamp.
+      kind: "system_marker";
       at: string;
       rank: 2;
+      key: string;
+      send_id?: undefined;
+      agent_id: AgentId;
+      marker: SystemMarker;
+    }
+  | {
+      kind: "outcome";
+      at: string;
+      rank: 3;
       key: string;
       send_id?: string;
       turn_id: TurnId;
@@ -142,7 +161,7 @@ export type RenderBlock =
 export const INITIAL_WINDOW = 20;
 export const REVEAL_BATCH = 20;
 
-const KIND_RANK = { user: 0, agent: 1, outcome: 2 } as const;
+const KIND_RANK = { user: 0, agent: 1, system_marker: 2, outcome: 3 } as const;
 
 /// Merge the active project's per-agent turns (live + hydrated agent content
 /// and this-session user turns) with its journal overlay (historical user
@@ -270,6 +289,20 @@ export function buildUnifiedRows(
         status: item.status,
         reason: item.reason,
       });
+    } else if (item.kind === "system_marker") {
+      rows.push({
+        kind: "system_marker",
+        at: item.at,
+        rank: KIND_RANK.system_marker,
+        // Key on the parse-stable (agent, timestamp), NOT `item.id`: the marker's
+        // `turn_id` is regenerated on every parse, so an `id`-keyed row is
+        // destroyed and recreated on each project refresh — resetting the
+        // `<details>` recap a user expanded back to collapsed. `at` derives from
+        // the summary record's own timestamp and is invariant across re-parses.
+        key: `s:${item.agent_id}:${item.at}`,
+        agent_id: item.agent_id,
+        marker: item.marker,
+      });
     }
     // `agent_turn` overlay items are not expected in the decompose model
     // (routed to per-agent state); ignore to avoid double-rendering.
@@ -287,7 +320,7 @@ export function buildUnifiedRows(
     } else if (row.kind === "user") {
       const agent_ids = row.agent_ids.filter((id) => knownAgentIds.has(id));
       if (agent_ids.length > 0) visibleRows.push({ ...row, agent_ids });
-    } else if (row.kind === "outcome") {
+    } else if (row.kind === "outcome" || row.kind === "system_marker") {
       if (knownAgentIds.has(row.agent_id)) visibleRows.push(row);
     } else if (knownAgentIds.has(row.turn.agent_id)) {
       visibleRows.push(row);
@@ -304,8 +337,8 @@ export function buildUnifiedRows(
   // prompt (detached from its own); anchoring keeps it adjacent. Rows whose
   // send has no user message (pre-journal history with no recoverable send_id)
   // fall back to their own `at`. Within one anchor: kind rank (user < agent <
-  // outcome), then own `at`; `Array.prototype.sort` is stable so ties hold
-  // insertion order.
+  // system_marker < outcome), then own `at`; `Array.prototype.sort` is stable so
+  // ties hold insertion order.
   const sendAnchor = new Map<string, string>();
   for (const row of visibleRows) {
     if (row.kind === "user" && row.send_id !== undefined) {

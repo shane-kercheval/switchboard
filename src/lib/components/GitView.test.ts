@@ -95,7 +95,14 @@ function wire(list: RepoListing[]) {
     if (cmd === "changed_files") return Promise.resolve([]);
     if (cmd === "commit_changed_files") return Promise.resolve({ found: true, files: [] });
     if (cmd === "file_diff" || cmd === "commit_file_diff")
-      return Promise.resolve({ path: "", binary: false, truncated: false, hunks: [] });
+      return Promise.resolve({
+        path: "",
+        binary: false,
+        truncated: false,
+        too_large: false,
+        too_large_bytes: null,
+        hunks: [],
+      });
     if (cmd === "branch_commits")
       return Promise.resolve([
         {

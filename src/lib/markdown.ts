@@ -29,7 +29,10 @@ import "prismjs/components/prism-sql";
 import "prismjs/components/prism-diff";
 import "prismjs/components/prism-markdown";
 
-function escapeHtml(text: string): string {
+/// Escape the five HTML-significant characters so raw text renders literally.
+/// Shared so the diff renderer's over-long-line path escapes identically — one
+/// sanitizer-adjacent helper, hardened in one place.
+export function escapeHtml(text: string): string {
   return text
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")

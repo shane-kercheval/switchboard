@@ -57,8 +57,8 @@ use uuid::Uuid;
 use crate::events::{ContentKind, TurnId, TurnUsage};
 use crate::parser::classify_claude_tool_kind;
 use crate::transcript::{
-    LoadTranscriptError, LoadedTranscript, ParseWarning, SessionMetaInfo, Turn, TurnItem,
-    TurnStatus, UserPromptSource, merge_meta_with_loaders,
+    LoadTranscriptError, LoadedTranscript, ParseWarning, SessionMetaInfo, SystemMarker, Turn,
+    TurnItem, TurnStatus, UserPromptSource, merge_meta_with_loaders,
 };
 
 use super::claude_session_file_path;
@@ -158,10 +158,15 @@ const HOUSEKEEPING_PREFIXES: [&str; 6] = [
 ];
 
 /// True when a `user` *string* record is Claude housekeeping (a slash-command
-/// wrapper, a compaction summary, a task notification, or a meta marker) rather
-/// than a real prompt. **Checked before [`classify_prompt_source`]** because some
-/// housekeeping records carry `promptSource: "sdk"`; mapping first would let them
-/// masquerade as a dispatched send and consume a journal slot.
+/// wrapper, a task notification, or a meta marker) rather than a real prompt.
+/// **Checked before [`classify_prompt_source`]** because some housekeeping
+/// records carry `promptSource: "sdk"`; mapping first would let them masquerade
+/// as a dispatched send and consume a journal slot.
+///
+/// Compaction summaries (`isCompactSummary`) are diverted to a `Turn::System`
+/// marker by `handle_user` *before* this predicate is consulted, so the
+/// `isCompactSummary` arm below is defensive — it keeps the "not a prompt"
+/// guarantee if that diversion is ever bypassed.
 fn is_user_housekeeping(record: &Value, text: &str) -> bool {
     if record.get("isCompactSummary").and_then(Value::as_bool) == Some(true)
         || record.get("isMeta").and_then(Value::as_bool) == Some(true)
@@ -336,11 +341,31 @@ impl ReconstructionState {
                 // turn that just ended) either way.
                 self.close_current_agent(TurnStatus::Complete);
                 self.flush_deferred_as_warnings();
-                // Housekeeping (slash-command wrappers, compaction summaries,
-                // task notifications, meta markers) echoes into the user channel
-                // but is not a prompt — emit no turn. Checked BEFORE
-                // `promptSource` because some housekeeping carries
-                // `promptSource:"sdk"` and would otherwise look dispatched.
+                // A compaction summary is not a user prompt, but unlike the other
+                // housekeeping records it is surfaced as a system marker rather
+                // than dropped, so the user can see where the conversation's
+                // context was compacted. Emitted from the summary record itself —
+                // it carries both the recap text and a timestamp — so no
+                // cross-record state with the preceding `compact_boundary` event
+                // is needed. Checked before the housekeeping drop, which would
+                // otherwise swallow it (`isCompactSummary` → housekeeping).
+                if record.get("isCompactSummary").and_then(Value::as_bool) == Some(true) {
+                    let started_at = parse_timestamp(record).unwrap_or_else(Utc::now);
+                    self.turns.push(Turn::System {
+                        turn_id: Uuid::now_v7(),
+                        agent_id: self.agent_id,
+                        started_at,
+                        marker: SystemMarker::Compaction {
+                            summary: text.clone(),
+                        },
+                    });
+                    return;
+                }
+                // Housekeeping (slash-command wrappers, task notifications, meta
+                // markers) echoes into the user channel but is not a prompt —
+                // emit no turn. Checked BEFORE `promptSource` because some
+                // housekeeping carries `promptSource:"sdk"` and would otherwise
+                // look dispatched.
                 if is_user_housekeeping(record, text) {
                     self.housekeeping_skipped += 1;
                     return;
@@ -860,7 +885,7 @@ mod tests {
             .into_iter()
             .filter_map(|t| match t {
                 Turn::Agent { status, .. } => Some(status),
-                Turn::User { .. } => None,
+                Turn::User { .. } | Turn::System { .. } => None,
             })
             .collect()
     }
@@ -1154,7 +1179,7 @@ mod tests {
             .iter()
             .filter_map(|t| match t {
                 Turn::Agent { model, effort, .. } => Some((model.clone(), effort.clone())),
-                Turn::User { .. } => None,
+                Turn::User { .. } | Turn::System { .. } => None,
             })
             .collect();
         assert_eq!(
@@ -2208,7 +2233,6 @@ mod tests {
         let result = hydrate_records(&[
             json!({"type":"user","message":{"role":"user","content":"<command-message>compact</command-message>"},"timestamp":"2026-05-14T04:43:15Z"}),
             json!({"type":"user","message":{"role":"user","content":"<local-command-stdout>Compacted</local-command-stdout>"},"timestamp":"2026-05-14T04:43:16Z"}),
-            json!({"type":"user","message":{"role":"user","content":"This session is being continued…"},"isCompactSummary":true,"timestamp":"2026-05-14T04:43:17Z"}),
             json!({"type":"user","message":{"role":"user","content":"[image]"},"isMeta":true,"timestamp":"2026-05-14T04:43:18Z"}),
             // The sharp case: a `<task-notification>` carrying promptSource:"sdk"
             // must be dropped as housekeeping, NOT mapped to a dispatched send —
@@ -2220,6 +2244,101 @@ mod tests {
             user_sources(&result.turns),
             vec![UserPromptSource::Sdk],
             "only the real prompt survives; all housekeeping (incl. the sdk-tagged task-notification) is dropped",
+        );
+        // No housekeeping record (the compaction summary is now a System marker,
+        // not housekeeping) leaked a turn of any other role.
+        assert!(
+            !result
+                .turns
+                .iter()
+                .any(|t| matches!(t, Turn::System { .. })),
+            "no compaction summary present → no System marker",
+        );
+    }
+
+    fn compaction_markers(turns: &[Turn]) -> Vec<&SystemMarker> {
+        turns
+            .iter()
+            .filter_map(|t| match t {
+                Turn::System { marker, .. } => Some(marker),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn compaction_summary_emits_system_marker_with_recap_text() {
+        // A compaction summary is surfaced as a System marker carrying the recap
+        // text — emitted from the summary record itself, with NO preceding
+        // `compact_boundary`, proving the parser does not depend on the boundary.
+        let result = hydrate_records(&[
+            json!({"type":"user","message":{"role":"user","content":"This session is being continued from a previous conversation…"},"isCompactSummary":true,"timestamp":"2026-05-14T04:43:17Z"}),
+        ]);
+        let markers = compaction_markers(&result.turns);
+        assert_eq!(markers.len(), 1, "exactly one compaction marker");
+        let SystemMarker::Compaction { summary } = markers[0];
+        assert_eq!(
+            summary,
+            "This session is being continued from a previous conversation…"
+        );
+        // It is not a user prompt — it must never reach prompt↔send correlation.
+        assert!(user_sources(&result.turns).is_empty());
+    }
+
+    #[test]
+    fn compaction_marker_closes_prior_turn_and_separates_the_next() {
+        // assistant → compact_boundary → isCompactSummary → assistant must yield
+        // TWO distinct agent turns (the summary closes the first, as every user
+        // string record does) with the marker between them — post-compaction
+        // assistant records must not append to the pre-compaction turn.
+        let result = hydrate_records(&[
+            user_record("first prompt", "2026-05-14T04:43:14Z"),
+            assistant_text_record(
+                "before compaction",
+                "claude-sonnet-4-6",
+                "2026-05-14T04:43:15Z",
+            ),
+            json!({"type":"system","subtype":"compact_boundary","timestamp":"2026-05-14T04:43:16Z"}),
+            json!({"type":"user","message":{"role":"user","content":"This session is being continued…"},"isCompactSummary":true,"timestamp":"2026-05-14T04:43:17Z"}),
+            assistant_text_record(
+                "after compaction",
+                "claude-sonnet-4-6",
+                "2026-05-14T04:43:18Z",
+            ),
+        ]);
+        let roles: Vec<&str> = result
+            .turns
+            .iter()
+            .map(|t| match t {
+                Turn::User { .. } => "user",
+                Turn::Agent { .. } => "agent",
+                Turn::System { .. } => "system",
+            })
+            .collect();
+        assert_eq!(roles, vec!["user", "agent", "system", "agent"]);
+        let agent_texts: Vec<String> = result
+            .turns
+            .iter()
+            .filter_map(|t| match t {
+                Turn::Agent { items, .. } => Some(
+                    items
+                        .iter()
+                        .filter_map(|i| match i {
+                            TurnItem::Text { text, .. } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<String>(),
+                ),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            agent_texts,
+            vec![
+                "before compaction".to_owned(),
+                "after compaction".to_owned()
+            ],
+            "the post-compaction text is its own turn, not appended to the first",
         );
     }
 

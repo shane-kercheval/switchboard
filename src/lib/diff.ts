@@ -4,7 +4,7 @@
 // one non-trivial bit — is unit-testable on its own.
 
 import DOMPurify from "dompurify";
-import { highlightCode } from "$lib/markdown";
+import { escapeHtml, highlightCode } from "$lib/markdown";
 import type { DiffLine } from "$lib/types";
 
 // File extension → Prism language id. Only the grammars `markdown.ts` actually
@@ -43,6 +43,33 @@ export function languageForPath(path: string): string {
   return EXT_TO_LANG[base.slice(dot + 1).toLowerCase()] ?? "";
 }
 
+/// A byte count as a short human-readable size (decimal units, matching Finder),
+/// e.g. `122 MB`. Used for the "file too large to diff" message.
+export function formatFileSize(bytes: number): string {
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let value = bytes;
+  let unit = 0;
+  while (value >= 1000 && unit < units.length - 1) {
+    value /= 1000;
+    unit += 1;
+  }
+  // Whole bytes; one decimal under 100; whole numbers above (122 MB, not 122.2 MB).
+  let rounded = unit === 0 ? value : value >= 100 ? Math.round(value) : Math.round(value * 10) / 10;
+  // Rounding can carry into the next unit (999.96 MB → 1000 → "1 GB", not "1000 MB").
+  if (rounded >= 1000 && unit < units.length - 1) {
+    rounded /= 1000;
+    unit += 1;
+  }
+  return `${rounded} ${units[unit]}`;
+}
+
+/// Above this many characters, a single line skips Prism tokenizing and renders as
+/// escaped plain text. The backend already clamps absurd lines, but Prism's cost
+/// grows with line length, so this is a main-thread-safety net: highlighting a
+/// multi-kilobyte line buys nothing a reader can use and risks janking the frame.
+/// Set well above any real source line, so normal diffs are untouched.
+const MAX_HIGHLIGHT_LINE_LENGTH = 5_000;
+
 /// Render one diff line's content as highlighted, **sanitized** HTML for `{@html}`.
 ///
 /// The content is whatever the user's agents wrote, rendered in a privileged
@@ -51,7 +78,14 @@ export function languageForPath(path: string): string {
 /// `<img onerror=…>` becomes inert text, never an execution (the same contract as
 /// the Markdown renderer). Highlighting is per line: a line is a self-contained
 /// unit here, which keeps the cost bounded and avoids cross-line grammar state.
+///
+/// An over-long line skips highlighting and renders as escaped text — still safe
+/// (escaping plus DOMPurify), just uncolored — so one pathological line can't block
+/// the main thread.
 export function highlightDiffLine(content: string, lang: string): string {
+  if (content.length > MAX_HIGHLIGHT_LINE_LENGTH) {
+    return DOMPurify.sanitize(escapeHtml(content));
+  }
   return DOMPurify.sanitize(highlightCode(content, lang));
 }
 

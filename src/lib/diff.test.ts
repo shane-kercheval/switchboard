@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { languageForPath, highlightDiffLine, toSideBySide } from "./diff";
+import { languageForPath, highlightDiffLine, toSideBySide, formatFileSize } from "./diff";
 import type { DiffLine } from "./types";
 
 const line = (
@@ -42,6 +42,36 @@ describe("highlightDiffLine", () => {
     const out = highlightDiffLine("<script>alert(1)</script>", "typescript");
     expect(out.toLowerCase()).not.toContain("<script>");
     expect(out.toLowerCase()).not.toContain("</script>");
+  });
+
+  it("renders an over-long line as escaped text without Prism markup", () => {
+    // A pathological line (a minified bundle on one line) must not be tokenized:
+    // it renders as escaped text, so highlighting can't block the main thread.
+    const longLine = "const x = 1; ".repeat(1000); // > the 5000-char clamp
+    const out = highlightDiffLine(longLine, "typescript");
+    expect(out).not.toContain('class="token'); // no Prism tokens emitted
+    expect(out.length).toBeGreaterThan(0);
+  });
+
+  it("still neutralizes HTML on the over-long-line path", () => {
+    const longHostile = "<img src=x onerror=alert(1)> ".repeat(500); // > the clamp
+    const out = highlightDiffLine(longHostile, "");
+    expect(out).not.toMatch(/<img/i); // no live element
+    expect(out).toContain("&lt;img"); // escaped text only
+  });
+});
+
+describe("formatFileSize", () => {
+  it("formats byte counts as short decimal sizes", () => {
+    expect(formatFileSize(122_180_589)).toBe("122 MB"); // the reported recording file
+    expect(formatFileSize(512)).toBe("512 B");
+    expect(formatFileSize(9_800_000)).toBe("9.8 MB");
+    expect(formatFileSize(1_500_000_000)).toBe("1.5 GB");
+  });
+
+  it("carries into the next unit when rounding hits 1000", () => {
+    // 999.96 MB rounds to 1000 in MB → should read "1 GB", not "1000 MB".
+    expect(formatFileSize(999_960_000)).toBe("1 GB");
   });
 });
 

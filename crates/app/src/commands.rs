@@ -627,7 +627,8 @@ pub fn changed_files_impl(
 
 /// The structured working-tree diff for one `file` (repo-relative) in the
 /// worktree at `path`. Untracked path → empty [`FileDiff`]; clean/unreadable →
-/// empty; binary content → `binary: true` with no hunks; a genuine mid-read
+/// empty; binary content → `binary: true` with no hunks; a file past the
+/// inline-diff size limit → `too_large: true` with no hunks; a genuine mid-read
 /// failure → [`AppError::GitRead`]. Synchronous `git2`; runs on a blocking worker.
 pub fn file_diff_impl(
     roots: &[PathBuf],
@@ -3231,7 +3232,18 @@ pub fn load_transcript_impl(
     home_dir: &Path,
 ) -> Result<switchboard_harness::LoadedTranscript, AppError> {
     let (project, agent) = lookup_agent(state, agent_id)?;
-    load_agent_transcript(&project, &agent, home_dir)
+    let mut transcript = load_agent_transcript(&project, &agent, home_dir)?;
+    // System markers (e.g. compaction) are surfaced only in the project-level
+    // unified conversation, where the merge turns them into `ConversationItem`s.
+    // This per-agent hydrate path serializes `Turn` straight to the wire, and the
+    // frontend's `LoadedTurn` only models `user`/`agent` — a `role:"system"` turn
+    // would be mis-normalized as an agent turn (no items/status). Drop them here,
+    // NOT in the shared `load_agent_transcript` (the project path calls that too
+    // and DOES need the markers).
+    transcript
+        .turns
+        .retain(|t| !matches!(t, switchboard_harness::Turn::System { .. }));
+    Ok(transcript)
 }
 
 /// Load one agent's prior conversation from its harness session file. The
@@ -3798,6 +3810,16 @@ pub enum ConversationItem {
         reason: Option<String>,
         at: chrono::DateTime<chrono::Utc>,
     },
+    /// A harness-recorded inter-turn event (e.g. compaction), sourced from the
+    /// agent's session file. Agent-scoped (carries `agent_id`) and never
+    /// correlated to a send — it renders as a per-agent marker, not project-wide.
+    /// `id` is the harness `turn_id` (stable render identity; not a send key).
+    SystemMarker {
+        id: switchboard_harness::TurnId,
+        agent_id: AgentId,
+        marker: switchboard_harness::SystemMarker,
+        at: chrono::DateTime<chrono::Utc>,
+    },
 }
 
 /// The non-completed terminal kinds the journal records. This is where
@@ -3845,11 +3867,16 @@ type UserMessageGroup = (
 
 /// How a single harness turn renders in the merged conversation: an agent turn
 /// carrying its optional journal `send_id`, an imported user prompt (rendered
-/// from the harness file because the journal doesn't own it), or nothing (a
-/// journaled prompt the journal already renders, or a non-user/agent turn).
+/// from the harness file because the journal doesn't own it), a system marker
+/// (rendered but deliberately not correlated to any send), or nothing (a
+/// journaled prompt the journal already renders).
 enum TurnRender {
     Agent(Option<SendId>),
     UserImported,
+    /// A `Turn::System` (e.g. compaction): rendered as a marker, but invisible to
+    /// prompt↔send correlation — it consumes no send slot and advances no counter
+    /// in either classifier, so it cannot shift the alignment.
+    SystemMarker,
     Skip,
 }
 
@@ -3876,6 +3903,7 @@ fn classify_turns_by_provenance(
         .iter()
         .map(|turn| match turn {
             switchboard_harness::Turn::Agent { .. } => TurnRender::Agent(pending_send.take()),
+            switchboard_harness::Turn::System { .. } => TurnRender::SystemMarker,
             switchboard_harness::Turn::User {
                 started_at, source, ..
             } => {
@@ -3940,6 +3968,7 @@ fn classify_turns_by_count(
                     TurnRender::Skip
                 }
             }
+            switchboard_harness::Turn::System { .. } => TurnRender::SystemMarker,
             _ => TurnRender::Skip,
         })
         .collect()
@@ -4250,6 +4279,22 @@ fn merge_project_conversation(
                         at: started_at,
                     });
                 }
+                (
+                    switchboard_harness::Turn::System {
+                        turn_id,
+                        agent_id: a_id,
+                        started_at,
+                        marker,
+                    },
+                    TurnRender::SystemMarker,
+                ) => {
+                    items.push(ConversationItem::SystemMarker {
+                        id: turn_id,
+                        agent_id: a_id,
+                        marker,
+                        at: started_at,
+                    });
+                }
                 _ => {}
             }
         }
@@ -4265,9 +4310,10 @@ fn merge_project_conversation(
 
     // Sort ascending by an explicit `(timestamp, kind_rank)` key so that at an
     // equal instant a user message always precedes the content/markers it
-    // annotates: `UserMessage` (0) < `AgentTurn` (1) < `Outcome` (2). The common
-    // failed-to-start/cancelled case has `Send.at == Outcome.started_at`, so a
-    // timestamp-only sort would render the marker before its own message.
+    // annotates: `UserMessage` (0) < `AgentTurn` (1) < `SystemMarker` (2) <
+    // `Outcome` (3). The common failed-to-start/cancelled case has
+    // `Send.at == Outcome.started_at`, so a timestamp-only sort would render the
+    // marker before its own message.
     items.sort_by_key(conversation_item_sort_key);
 
     ProjectConversation { items, agents }
@@ -4277,19 +4323,22 @@ fn merge_project_conversation(
 /// `AgentTurn`→`started_at`, `Outcome`→`at`).
 fn conversation_item_timestamp(item: &ConversationItem) -> chrono::DateTime<chrono::Utc> {
     match item {
-        ConversationItem::UserMessage { at, .. } | ConversationItem::Outcome { at, .. } => *at,
+        ConversationItem::UserMessage { at, .. }
+        | ConversationItem::Outcome { at, .. }
+        | ConversationItem::SystemMarker { at, .. } => *at,
         ConversationItem::AgentTurn { started_at, .. } => *started_at,
     }
 }
 
 /// The ordering key for an item: its timestamp, tie-broken by kind rank so a
-/// user message (0) sorts before agent content (1) and an outcome marker (2) at
-/// the same instant.
+/// user message (0) sorts before agent content (1), a system marker (2), and an
+/// outcome marker (3) at the same instant.
 fn conversation_item_sort_key(item: &ConversationItem) -> (chrono::DateTime<chrono::Utc>, u8) {
     let rank = match item {
         ConversationItem::UserMessage { .. } => 0,
         ConversationItem::AgentTurn { .. } => 1,
-        ConversationItem::Outcome { .. } => 2,
+        ConversationItem::SystemMarker { .. } => 2,
+        ConversationItem::Outcome { .. } => 3,
     };
     (conversation_item_timestamp(item), rank)
 }
@@ -8195,6 +8244,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn load_transcript_filters_system_markers_from_per_agent_wire() {
+        // A compaction marker is surfaced only in the project-level conversation.
+        // The per-agent hydrate path serializes `Turn` straight to the wire, where
+        // the frontend models only user/agent — so `load_transcript` must drop the
+        // `role:"system"` turn rather than leak one the frontend would
+        // mis-normalize as a content-less agent turn.
+        let (tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
+        let session_id = Uuid::now_v7();
+        let canonical_cwd = tmp_workdir.path().canonicalize().unwrap();
+        let session_path = switchboard_harness::claude_session_file_path(
+            tmp_home.path(),
+            &canonical_cwd,
+            &session_id,
+        );
+        std::fs::create_dir_all(session_path.parent().unwrap()).unwrap();
+        let session_jsonl = [
+            serde_json::json!({
+                "type": "user",
+                "message": { "role": "user", "content": "hello" },
+                "timestamp": "2026-05-31T18:00:00Z",
+            }),
+            serde_json::json!({
+                "type": "assistant",
+                "message": {
+                    "id": "m1",
+                    "model": "claude-opus-4-8",
+                    "role": "assistant",
+                    "content": [{ "type": "text", "text": "hi" }],
+                    "stop_reason": "end_turn",
+                    "usage": { "input_tokens": 1, "output_tokens": 1 }
+                },
+                "timestamp": "2026-05-31T18:00:01Z",
+            }),
+            serde_json::json!({
+                "type": "system",
+                "subtype": "compact_boundary",
+                "timestamp": "2026-05-31T18:00:02Z",
+            }),
+            serde_json::json!({
+                "type": "user",
+                "message": { "role": "user", "content": "This session is being continued…" },
+                "isCompactSummary": true,
+                "timestamp": "2026-05-31T18:00:03Z",
+            }),
+        ]
+        .iter()
+        .map(|r| serde_json::to_string(r).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+        std::fs::write(&session_path, session_jsonl).unwrap();
+
+        let record = attach_agent_impl(
+            &state,
+            "x",
+            HarnessKind::ClaudeCode,
+            &session_id.to_string(),
+            tmp_home.path(),
+            None,
+            None,
+        )
+        .unwrap();
+
+        let result = load_transcript_impl(&state, record.id, tmp_home.path()).unwrap();
+        assert!(
+            !result
+                .turns
+                .iter()
+                .any(|t| matches!(t, switchboard_harness::Turn::System { .. })),
+            "no system marker reaches the per-agent hydrate wire"
+        );
+        assert!(
+            result
+                .turns
+                .iter()
+                .any(|t| matches!(t, switchboard_harness::Turn::Agent { .. })),
+            "the real agent turn still hydrates"
+        );
+    }
+
+    #[tokio::test]
     async fn load_transcript_overlays_metadata_sidecar_for_claude_agent() {
         // End-to-end wiring: a Claude agent with a staged metadata sidecar
         // surfaces the persisted rate-limit + its capture time through the
@@ -11240,7 +11369,7 @@ mod tests {
     use chrono::{DateTime, TimeZone, Utc};
     use switchboard_core::JournalRecord;
     use switchboard_harness::{
-        ContentKind, LoadedTranscript, Turn, TurnItem, TurnStatus, UserPromptSource,
+        ContentKind, LoadedTranscript, SystemMarker, Turn, TurnItem, TurnStatus, UserPromptSource,
     };
 
     /// A fixed instant offset by `secs` seconds — deterministic timestamps so
@@ -11449,6 +11578,32 @@ mod tests {
             .collect()
     }
 
+    fn system_marker_turn(turn_id: Uuid, agent_id: AgentId, summary: &str, t: i64) -> Turn {
+        Turn::System {
+            turn_id,
+            agent_id,
+            started_at: at(t),
+            marker: SystemMarker::Compaction {
+                summary: summary.to_owned(),
+            },
+        }
+    }
+
+    /// Compaction-marker summaries in the merged output, in render order.
+    fn compaction_summaries(merged: &ProjectConversation) -> Vec<&str> {
+        merged
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                ConversationItem::SystemMarker {
+                    marker: SystemMarker::Compaction { summary },
+                    ..
+                } => Some(summary.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
     #[test]
     fn merge_provenance_orphan_continuation_does_not_duplicate_later_prompt() {
         // The reported bug, at the merge layer. A `/compact` mid-conversation
@@ -11485,6 +11640,93 @@ mod tests {
         );
         // The continuation is un-grouped; reply1/reply2 pair to their sends.
         assert_eq!(agent_send_ids(&merged), vec![Some(s1), None, Some(s2)]);
+    }
+
+    #[test]
+    fn merge_compaction_marker_renders_without_shifting_provenance_correlation() {
+        // A compaction marker interleaved between two journaled sends must render
+        // once AND be inert to prompt↔send correlation: each journaled prompt
+        // still renders exactly once, both replies pair to their own send, and no
+        // imported duplicate appears. This is the regression guard — a marker that
+        // consumed a slot or advanced a counter would re-create the original bug.
+        let agent = Uuid::now_v7();
+        let (s1, s2) = (Uuid::now_v7(), Uuid::now_v7());
+        let journal = vec![
+            send_record(s1, Uuid::now_v7(), agent, "prompt1", 1),
+            send_record(s2, Uuid::now_v7(), agent, "prompt2", 5),
+        ];
+        let turns = vec![
+            user_turn_src(Uuid::now_v7(), agent, "prompt1", 2, UserPromptSource::Sdk),
+            agent_turn(Uuid::now_v7(), agent, "reply1", 3),
+            system_marker_turn(Uuid::now_v7(), agent, "compacted recap", 4),
+            user_turn_src(Uuid::now_v7(), agent, "prompt2", 6, UserPromptSource::Sdk),
+            agent_turn(Uuid::now_v7(), agent, "reply2", 7),
+        ];
+        let merged = merge_project_conversation(journal, vec![(agent, transcript_of(turns), None)]);
+
+        assert_eq!(user_texts(&merged), vec!["prompt1", "prompt2"]);
+        assert!(
+            !merged
+                .items
+                .iter()
+                .any(|i| matches!(i, ConversationItem::UserMessage { send_id: None, .. })),
+            "no imported duplicate of a journaled prompt"
+        );
+        assert_eq!(compaction_summaries(&merged), vec!["compacted recap"]);
+        assert_eq!(
+            agent_send_ids(&merged),
+            vec![Some(s1), Some(s2)],
+            "both replies pair to their own send — the marker shifted nothing"
+        );
+        // The marker sorts between reply1 and prompt2 (its own timestamp).
+        let kinds: Vec<&str> = merged
+            .items
+            .iter()
+            .map(|i| match i {
+                ConversationItem::UserMessage { .. } => "user",
+                ConversationItem::AgentTurn { .. } => "agent",
+                ConversationItem::SystemMarker { .. } => "marker",
+                ConversationItem::Outcome { .. } => "outcome",
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec!["user", "agent", "marker", "user", "agent"],
+            "marker renders in place between the two turns"
+        );
+    }
+
+    #[test]
+    fn merge_compaction_marker_inert_in_count_fallback() {
+        // The same interleaving with NO provenance signal (all `Unknown`) routes
+        // through the count-based fallback. The marker must be equally inert there:
+        // the count path's agent/user counters never see a `Turn::System`, so
+        // correlation is unchanged and the marker still renders once.
+        let agent = Uuid::now_v7();
+        let (s1, s2) = (Uuid::now_v7(), Uuid::now_v7());
+        let journal = vec![
+            send_record(s1, Uuid::now_v7(), agent, "prompt1", 1),
+            send_record(s2, Uuid::now_v7(), agent, "prompt2", 5),
+        ];
+        let turns = vec![
+            user_turn(Uuid::now_v7(), agent, "prompt1", 2),
+            agent_turn(Uuid::now_v7(), agent, "reply1", 3),
+            system_marker_turn(Uuid::now_v7(), agent, "compacted recap", 4),
+            user_turn(Uuid::now_v7(), agent, "prompt2", 6),
+            agent_turn(Uuid::now_v7(), agent, "reply2", 7),
+        ];
+        let merged = merge_project_conversation(journal, vec![(agent, transcript_of(turns), None)]);
+
+        assert_eq!(user_texts(&merged), vec!["prompt1", "prompt2"]);
+        assert!(
+            !merged
+                .items
+                .iter()
+                .any(|i| matches!(i, ConversationItem::UserMessage { send_id: None, .. })),
+            "count path: no imported duplicate either"
+        );
+        assert_eq!(compaction_summaries(&merged), vec!["compacted recap"]);
+        assert_eq!(agent_send_ids(&merged), vec![Some(s1), Some(s2)]);
     }
 
     #[test]

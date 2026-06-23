@@ -217,6 +217,14 @@ pub struct FileDiff {
     /// The diff exceeded the render cap and `hunks` was truncated, so the UI can
     /// say so rather than imply the whole file is shown.
     pub truncated: bool,
+    /// The file is larger than the inline-diff size limit, so its content was never
+    /// rendered at all (distinct from `truncated`, which shows a prefix). `hunks` is
+    /// empty; the UI shows an "open externally" placeholder. `too_large_bytes`
+    /// carries the file size for that message.
+    pub too_large: bool,
+    /// The size (bytes) of the file that tripped `too_large`, for the UI message.
+    /// `None` whenever `too_large` is false.
+    pub too_large_bytes: Option<u64>,
     pub hunks: Vec<DiffHunk>,
 }
 
@@ -229,6 +237,22 @@ impl FileDiff {
             path: file.into(),
             binary: false,
             truncated: false,
+            too_large: false,
+            too_large_bytes: None,
+            hunks: Vec::new(),
+        }
+    }
+
+    /// A diff for a file too large to render inline: no content, flagged
+    /// `too_large` with its `size` so the UI can show "too large — open externally".
+    #[must_use]
+    pub fn too_large(file: impl Into<String>, size: u64) -> Self {
+        Self {
+            path: file.into(),
+            binary: false,
+            truncated: false,
+            too_large: true,
+            too_large_bytes: Some(size),
             hunks: Vec::new(),
         }
     }

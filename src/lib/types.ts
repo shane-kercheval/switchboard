@@ -550,8 +550,13 @@ export type FileDiff = {
   path: string;
   // Binary change: `hunks` is empty; the UI shows a placeholder instead of a body.
   binary: boolean;
-  // The diff exceeded the render cap and was cut off.
+  // The diff exceeded the render cap and was cut off (a prefix is still shown).
   truncated: boolean;
+  // The file is past the inline-diff size limit and was never rendered (distinct
+  // from `truncated`: nothing is shown, not a prefix). `too_large_bytes` is the
+  // file size for the "open externally" message; null whenever `too_large` is false.
+  too_large: boolean;
+  too_large_bytes: number | null;
   hunks: DiffHunk[];
 };
 
@@ -662,7 +667,23 @@ export type ConversationItem =
       status: OutcomeStatus;
       reason?: string | null;
       at: string;
+    }
+  | {
+      // A harness-recorded inter-turn event (currently only compaction), sourced
+      // from one agent's session file. Agent-scoped (`agent_id`) — rendered as a
+      // per-agent marker, never correlated to a send. `id` is the harness
+      // `turn_id` (stable render identity, not a send key).
+      kind: "system_marker";
+      id: string;
+      agent_id: AgentId;
+      marker: SystemMarker;
+      at: string;
     };
+
+// Mirror of Rust `SystemMarker` (`crates/harness/src/transcript.rs`,
+// `#[serde(tag = "marker_kind")]`). Discriminated union so a future marker kind
+// lands additively; reducers default-branch on an unknown `marker_kind`.
+export type SystemMarker = { marker_kind: "compaction"; summary: string };
 
 // Per-agent metadata carried alongside the merged items. `warnings` and
 // `load_error` are agent-scoped: one agent's transcript failing to load leaves

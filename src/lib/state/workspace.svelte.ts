@@ -763,6 +763,11 @@ export async function hydrateProject(
           hydration_key: item.hydration_key ?? null,
         });
         turnsByAgent.set(item.agent_id, arr);
+      } else if (item.kind === "system_marker") {
+        // An agent-scoped inter-turn marker (compaction). It has no send and no
+        // live counterpart (compaction is reopen-only), so it never needs the
+        // live-slice dedup below — pass it straight through to the overlay.
+        overlay.push(item);
       } else {
         // user_message | outcome — the project-level overlay. Skip a journaled
         // row (has a `send_id`) whose send is already live in a slice; imported

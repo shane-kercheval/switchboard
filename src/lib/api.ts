@@ -394,7 +394,7 @@ export interface ForwardArg {
   required: boolean;
 }
 
-// Manual forward into a prompt's arguments (M2.5): hold until each forwarded
+// Manual forward into a prompt's arguments: hold until each forwarded
 // argument's sources finish, compose each (typed text + forwarded blocks), fill
 // the args map, render the prompt, and return the rendered body for the caller to
 // dispatch. `typedArgs` carries every argument's typed value (forwarded args

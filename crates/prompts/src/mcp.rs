@@ -384,7 +384,7 @@ mod tests {
         assert_eq!(obj.get("k").and_then(|v| v.as_str()), Some("v"));
     }
 
-    // The per-provider timeout is M2's headline resilience guarantee; these tests
+    // The per-provider timeout is a headline resilience guarantee; these tests
     // drive a real in-process server that stalls past a short timeout, so the
     // `tokio::time::timeout` actually fires (the dead-port integration test fails
     // fast and never exercises it).

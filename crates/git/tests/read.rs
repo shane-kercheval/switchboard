@@ -581,8 +581,8 @@ fn bare_repo_lists_branches_and_is_marked_bare() {
 fn bare_repo_root_resolves_correctly_via_a_linked_worktree() {
     // The `--bare` + `worktree add` layout, read from one of the worktrees.
     // Bareness reflects how a handle was opened (a linked worktree opens
-    // non-bare), so the root must be derived authoritatively — both the M2 dedup
-    // key (`resolve_repo_root`) and the M1 rendered model (`read_repo`) must
+    // non-bare), so the root must be derived authoritatively — both the dedup
+    // key (`resolve_repo_root`) and the rendered model (`read_repo`) must
     // point at the bare repo itself, not its parent directory.
     let origin_src = repo_with_main();
     git(origin_src.path(), &["branch", "feature"]);
@@ -623,7 +623,7 @@ fn bare_repo_root_resolves_correctly_via_a_linked_worktree() {
     );
 }
 
-// --- changed files + diff text (consumed by M5) ---------------------------
+// --- changed files + diff text -------------------------------------------
 
 #[test]
 fn changed_files_covers_staged_unstaged_untracked() {

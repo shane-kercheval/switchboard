@@ -1,7 +1,7 @@
 import type { AgentRecord } from "$lib/types";
 import type { Turn } from "$lib/state/index.svelte";
 
-// Shared seed data for the M2 browser specs. Mirrors the agent/turn shapes the
+// Shared seed data for the transcript browser specs. Mirrors the agent/turn shapes the
 // jsdom suite (`UnifiedTranscript.test.ts`) uses, so the two suites stay legible
 // against each other. Builders keep specs focused on the layout fact under test.
 // Shape twin of `$lib/dev/largeTranscript.ts` (which builds `Turn`s directly so

@@ -27,16 +27,20 @@ import type { Turn } from "$lib/state/types";
 // console output doesn't reach the terminal reliably). Without VITE_PERF the
 // tests skip, so `make check` is unaffected.
 //
-// What it measures and which decisions it feeds (see the perf plan's M3/M5
-// sections, docs/implementation_plans/2026-06-09-performance-improvements.md):
+// NOTE: render-windowing caps the mounted transcript at INITIAL_WINDOW blocks,
+// so the "windowed-tail" scenarios below seed a deep history but mount only the
+// tail window — the relayout numbers reflect the windowed DOM (now the realistic
+// production case), not all 300 exchanges. To measure the old unwindowed upper
+// bound a run would have to defeat the window.
+//
+// What it measures and which decisions it feeds:
 // - The compose autosize's exact per-keystroke layout operation (height-reset
-//   write + scrollHeight read) against {small, large} × {containment on/off}
-//   × {compact on/off} — the M4 gate and the M1 rAF contingency. Containment
-//   "off" is a same-build A/B via an injected style override, isolating M3's
-//   contribution.
+//   write + scrollHeight read) against {small, windowed-tail} × {compact on/off}.
+//   (The former containment on/off A/B is gone — content-visibility containment
+//   was removed once render-windowing took over bounding the mounted set.)
 // - Per-chunk cost of each streaming pipeline stage on the large fixture
 //   (reducer, rows rebuild, scrollSignal walk, markdown re-parse by segment
-//   size) — M5's step-0 baseline that gates its Fixes 3/4.
+//   size) — the streaming-pipeline baseline that gates the streaming fixes.
 
 const PERF = import.meta.env.VITE_PERF === "1";
 
@@ -50,7 +54,6 @@ function timeBatched(reps: number, run: () => void): number {
 
 beforeEach(() => {
   resetState();
-  document.getElementById("perf-no-containment")?.remove();
 });
 
 test.runIf(PERF)("forced-layout cost per keystroke-equivalent", async () => {
@@ -59,18 +62,10 @@ test.runIf(PERF)("forced-layout cost per keystroke-equivalent", async () => {
   const measureScenario = async (
     label: string,
     exchanges: number,
-    opts: { containment: boolean; compact: boolean },
+    opts: { compact: boolean },
   ): Promise<void> => {
     resetState();
-    document.getElementById("perf-no-containment")?.remove();
     setProjectCompact(PROJECT_ID, opts.compact);
-    if (!opts.containment) {
-      const style = document.createElement("style");
-      style.id = "perf-no-containment";
-      style.textContent =
-        '[data-testid="transcript-block"] { content-visibility: visible !important; }';
-      document.head.append(style);
-    }
     await registerAgent(ALICE);
     seedTurns(ALICE.id, buildLargeTranscript({ agentIds: [ALICE.id], exchanges })[ALICE.id]!);
     const r = mountTranscript({ projectId: PROJECT_ID, agents: [ALICE] });
@@ -101,8 +96,9 @@ test.runIf(PERF)("forced-layout cost per keystroke-equivalent", async () => {
     const perKeystroke = timeBatched(200, keystroke);
 
     // (ii) Full-relayout bound: alternate the transcript container's width so
-    // the whole transcript participates in the flush — the upper bound that
-    // containment exists to cut.
+    // the whole mounted window participates in the flush — the upper bound the
+    // compose textarea pays, now bounded by render-windowing rather than cut by
+    // containment.
     const container = document.querySelector('[data-testid="unified-transcript"]') as HTMLElement;
     let flip = false;
     const fullRelayout = (): void => {
@@ -120,31 +116,14 @@ test.runIf(PERF)("forced-layout cost per keystroke-equivalent", async () => {
     );
   };
 
-  await measureScenario("small (10x) containment+compact", 10, {
-    containment: true,
-    compact: true,
-  });
-  await measureScenario("large (300x) containment+compact", 300, {
-    containment: true,
-    compact: true,
-  });
-  await measureScenario("large (300x) NO-containment compact", 300, {
-    containment: false,
-    compact: true,
-  });
-  await measureScenario("large (300x) containment compact-OFF", 300, {
-    containment: true,
-    compact: false,
-  });
-  await measureScenario("large (300x) NO-containment compact-OFF", 300, {
-    containment: false,
-    compact: false,
-  });
+  await measureScenario("small (10x) compact", 10, { compact: true });
+  await measureScenario("windowed-tail (300x seed) compact", 300, { compact: true });
+  await measureScenario("windowed-tail (300x seed) compact-OFF", 300, { compact: false });
 
   expect(results.join(" | ")).toBe("__REPORT__");
 });
 
-test.runIf(PERF)("streaming pipeline per-chunk stage costs (M5 step 0)", () => {
+test.runIf(PERF)("streaming pipeline per-chunk stage costs (baseline)", () => {
   const results: string[] = [];
   const agentId = ALICE.id;
   const history = buildLargeTranscript({ agentIds: [agentId], exchanges: 300 })[agentId]!;
@@ -181,7 +160,7 @@ test.runIf(PERF)("streaming pipeline per-chunk stage costs (M5 step 0)", () => {
   });
 
   const rows = buildUnifiedRows(turns, [], knownIds);
-  bench("scrollSignal content walk [HISTORICAL — removed by M5 Fix 2]", () => {
+  bench("scrollSignal content walk [HISTORICAL — since removed]", () => {
     // The pre-Fix-2 digest derived. Production now reads an O(1) revision
     // counter instead (`getTranscriptRevision`); this benchmark is kept only
     // as the step-0 baseline that justified the change — it does NOT reflect

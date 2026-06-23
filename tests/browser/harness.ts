@@ -46,8 +46,8 @@ import { _testing as previewState } from "$lib/state/transcriptPreview.svelte";
 //   matches every clip on the page and `page.getByTestId("preview-clip")` would
 //   silently resolve the first. Scope to the owning turn —
 //   `page.getByTestId("turn").nth(i).getByTestId("preview-clip")` — or add a
-//   type-specific testid when M2 needs to disambiguate user vs agent vs column
-//   clips. The M1 example seeds a single turn, so it can use the bare locator.
+//   type-specific testid when a spec needs to disambiguate user vs agent vs column
+//   clips. A spec that seeds a single turn can use the bare locator.
 // ---------------------------------------------------------------------------
 
 /** The unified transcript's outer scroll container. */

@@ -79,8 +79,7 @@ pub struct DispatchOptions {
     /// only the dispatcher knows why it fired). The dispatcher always
     /// overwrites this with the turn's token before calling `dispatch`; the
     /// `Default` (a fresh, never-fired token) is just a harmless placeholder
-    /// for direct callers. The real subprocess kill lands in M4.3; until then
-    /// the four real adapters ignore the token and the mock honors it.
+    /// for direct callers.
     pub cancel_token: CancellationToken,
 }
 

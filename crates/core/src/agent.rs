@@ -250,7 +250,7 @@ mod tests {
 
     #[test]
     fn session_locator_wire_shapes_are_externally_tagged() {
-        // Pin the on-disk shape: the M4 migration writes these exact forms.
+        // Pin the on-disk shape: the migration writes these exact forms.
         let uuid = Uuid::parse_str("019e2c5f-aaaa-7000-8000-000000000001").unwrap();
         let uuid_json = serde_json::to_value(SessionLocator::Uuid(uuid)).unwrap();
         assert_eq!(uuid_json["uuid"], uuid.to_string());

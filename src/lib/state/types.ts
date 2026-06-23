@@ -80,13 +80,13 @@ export type Turn =
       usage?: TurnUsage;
       /// Per-turn real-spend attribution (cost/overage gate), stamped at turn
       /// end. The transcript shows the inline cost + "using credits" marker only
-      /// when `spend.real_spend`. Absent on non-Claude turns and (until M4) on
+      /// when `spend.real_spend`. Absent on non-Claude turns and on
       /// hydrated turns — both render nothing.
       spend?: TurnSpend;
       /// The model this turn ran on and (Codex-only) the reasoning effort —
       /// per-turn *history*, distinct from the agent's *selected* model/effort
       /// on its sidebar card. Stamped at turn end (live) or from the harness
-      /// session file (hydrate). Rendered in the transcript footer (M6); absent
+      /// session file (hydrate). Rendered in the transcript footer; absent
       /// → render nothing.
       model?: string;
       effort?: string;

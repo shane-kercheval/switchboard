@@ -57,7 +57,7 @@ describe("harnessAvailability store", () => {
     await refreshHarnessAvailability();
     expect(harnessAvailability.availability("gemini").binary).toBe("missing");
     // Order is deterministic by `HARNESSES` construction, not coincidence —
-    // M4 auto-create relies on a stable iteration order.
+    // auto-create relies on a stable iteration order.
     expect(harnessAvailability.installed()).toEqual(["claude_code", "codex", "antigravity"]);
   });
 

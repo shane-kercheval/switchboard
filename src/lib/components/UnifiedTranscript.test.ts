@@ -15,6 +15,7 @@ import {
   _testing as previewState,
 } from "$lib/state/transcriptPreview.svelte";
 import type { Turn } from "$lib/state/index.svelte";
+import { INITIAL_WINDOW, REVEAL_BATCH } from "$lib/state/unified";
 
 const listeners = new Map<string, (e: { payload: NormalizedEvent }) => void>();
 vi.mock("@tauri-apps/api/event", () => ({
@@ -47,6 +48,43 @@ function fireTo(channel: string, event: NormalizedEvent): void {
   cb({ payload: event });
 }
 
+// jsdom has no IntersectionObserver; the upward-reveal sentinel uses one. This
+// controllable stub captures the component's callback so a test can simulate the
+// sentinel scrolling into view (`fireIntersect`). Geometry/scroll preservation
+// is layout-coupled and lives in the browser suite; jsdom drives the cursor.
+let intersectionCallback: IntersectionObserverCallback | null = null;
+class MockIntersectionObserver implements IntersectionObserver {
+  readonly root = null;
+  readonly rootMargin = "";
+  readonly scrollMargin = "";
+  readonly thresholds: ReadonlyArray<number> = [];
+  constructor(cb: IntersectionObserverCallback) {
+    intersectionCallback = cb;
+  }
+  observe(): void {}
+  unobserve(): void {}
+  disconnect(): void {}
+  takeRecords(): IntersectionObserverEntry[] {
+    return [];
+  }
+}
+globalThis.IntersectionObserver =
+  MockIntersectionObserver as unknown as typeof IntersectionObserver;
+
+function fireIntersect(): void {
+  intersectionCallback?.([{ isIntersecting: true } as IntersectionObserverEntry], {
+    root: null,
+    rootMargin: "",
+    thresholds: [],
+  } as unknown as IntersectionObserver);
+}
+
+// `revealOlder` releases its one-batch latch on the next animation frame, so a
+// second reveal must wait for it.
+function raf(): Promise<void> {
+  return new Promise((resolve) => requestAnimationFrame(() => resolve()));
+}
+
 const PROJECT_ID = "00000000-0000-7000-8000-0000000000ff";
 
 const CLAUDE_AGENT: AgentRecord = {
@@ -69,6 +107,7 @@ const CODEX_AGENT: AgentRecord = {
 beforeEach(() => {
   listeners.clear();
   invokeMock.mockReset();
+  intersectionCallback = null;
   agentCopy.set("last_answer_block");
   // Default the suite to expanded rendering so behavioral tests state the mode
   // they exercise. Compact mode is on by default in the app, so the
@@ -3437,5 +3476,351 @@ describe("UnifiedTranscript — cross-agent forward", () => {
     });
     expect(turn).toHaveAttribute("data-forwarded", "false");
     expect(screen.queryByTestId("forward-caption")).toBeNull();
+  });
+});
+
+describe("UnifiedTranscript render windowing", () => {
+  // Sourced from the same module the component uses, so a tuning change there
+  // flows here automatically — seed sizes and expectations below are expressed
+  // relative to these.
+  const WINDOW = INITIAL_WINDOW;
+  const BATCH = REVEAL_BATCH;
+  // Comfortably more blocks than the window, so the tail is bounded with history
+  // above it.
+  const OVER = WINDOW * 3;
+
+  // One standalone agent turn renders as one render block (no fan-out), so a
+  // block count maps directly to a turn count. `hour` orders distinct groups on
+  // the global timeline (the merge sorts by `started_at`); turn ids embed it so
+  // groups never collide.
+  function agentTurns(agent: AgentRecord, n: number, hour = 0): Turn[] {
+    const hh = String(hour).padStart(2, "0");
+    const turns: Turn[] = [];
+    for (let k = 0; k < n; k++) {
+      const mm = String(Math.floor(k / 60)).padStart(2, "0");
+      const ss = String(k % 60).padStart(2, "0");
+      turns.push({
+        role: "agent",
+        turn_id: `aturn-${agent.id}-${hour}-${k}`,
+        agent_id: agent.id,
+        started_at: `2026-05-16T${hh}:${mm}:${ss}Z`,
+        status: "complete",
+        items: [{ item_kind: "text", kind: "text", text: `msg ${hour}-${k}` }],
+      });
+    }
+    return turns;
+  }
+
+  function blockCount(): number {
+    return screen.queryAllByTestId("transcript-block").length;
+  }
+
+  // The headline guard: the component mounts before history loads, so the window
+  // must seed when content *settles* (loadStatus → complete), not at mount. A
+  // naive "seed at mount from blocks.length" passes a pre-seeded test but renders
+  // everything here.
+  it("windows to the tail once content settles (mount-loading → complete)", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+
+    const view = render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT], loadStatus: "loading" },
+    });
+    await tick();
+    expect(blockCount()).toBe(0);
+
+    // Mirrors hydrateProject: turns land and status flips to complete together.
+    state.transcripts[CLAUDE_AGENT.id] = agentTurns(CLAUDE_AGENT, OVER);
+    await view.rerender({ projectId: PROJECT_ID, agents: [CLAUDE_AGENT], loadStatus: "complete" });
+    await tick();
+
+    expect(blockCount()).toBe(WINDOW);
+    expect(screen.queryByText(`msg 0-${OVER - 1}`)).not.toBeNull(); // newest mounted
+    expect(screen.queryByText("msg 0-0")).toBeNull(); // oldest windowed out
+  });
+
+  // Load-start resets the journal overlay but not the per-agent transcripts
+  // store, so a re-open can show stale content while loadStatus is back to
+  // loading. The window must stay bounded even in that transitional frame
+  // (never mount the full stale transcript), yet must not LOCK to that stale
+  // snapshot — the authoritative seed lands on complete.
+  it("bounds the window while loading on stale content, then reseeds on complete", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+
+    state.transcripts[CLAUDE_AGENT.id] = agentTurns(CLAUDE_AGENT, OVER);
+    const view = render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT], loadStatus: "loading" },
+    });
+    await tick();
+
+    // Bounded already, mid-load — the full stale transcript never mounts.
+    expect(blockCount()).toBe(WINDOW);
+
+    await view.rerender({ projectId: PROJECT_ID, agents: [CLAUDE_AGENT], loadStatus: "complete" });
+    await tick();
+
+    expect(blockCount()).toBe(WINDOW);
+    expect(screen.queryByText(`msg 0-${OVER - 1}`)).not.toBeNull();
+  });
+
+  it("renders a short transcript in full (no window edge)", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = agentTurns(CLAUDE_AGENT, 10);
+
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT], loadStatus: "complete" },
+    });
+    await tick();
+
+    expect(blockCount()).toBe(10);
+    expect(screen.queryByText("msg 0-0")).not.toBeNull();
+    expect(screen.queryByText("msg 0-9")).not.toBeNull();
+    // Nothing windowed off the top → no upward-reveal sentinel.
+    expect(screen.queryByTestId("reveal-sentinel")).toBeNull();
+  });
+
+  // A new turn appends at the end. The cursor must not advance (advancing would
+  // unmount the oldest visible block, re-parsing markdown and disturbing scroll);
+  // the window grows by one at the bottom.
+  it("holds the cursor on live append", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = agentTurns(CLAUDE_AGENT, OVER);
+
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT], loadStatus: "complete" },
+    });
+    await tick();
+    expect(blockCount()).toBe(WINDOW);
+
+    state.transcripts[CLAUDE_AGENT.id] = [
+      ...agentTurns(CLAUDE_AGENT, OVER),
+      {
+        role: "agent",
+        turn_id: "aturn-new",
+        agent_id: CLAUDE_AGENT.id,
+        started_at: "2026-05-16T01:00:00Z",
+        status: "complete",
+        items: [{ item_kind: "text", kind: "text", text: "fresh reply" }],
+      },
+    ];
+    await tick();
+
+    expect(blockCount()).toBe(WINDOW + 1);
+    expect(screen.queryByText("fresh reply")).not.toBeNull(); // appended, mounted
+    // The prior window edge (first visible block) is still mounted.
+    expect(screen.queryByText(`msg 0-${OVER - WINDOW}`)).not.toBeNull();
+  });
+
+  // A failed-then-retried agent: blocks is empty at the first `complete`, so a
+  // project-identity-only guard would seed at 0 and then render everything when
+  // the retry lands. Reseeding on an oldest-block change keeps it bounded.
+  it("reseeds when a late hydration fills history at the front", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT], loadStatus: "complete" },
+    });
+    await tick();
+    expect(blockCount()).toBe(0);
+
+    // Retry lands the full history after the initial (empty) completion.
+    state.transcripts[CLAUDE_AGENT.id] = agentTurns(CLAUDE_AGENT, OVER);
+    await tick();
+
+    expect(blockCount()).toBe(WINDOW);
+    expect(screen.queryByText(`msg 0-${OVER - 1}`)).not.toBeNull();
+    expect(screen.queryByText("msg 0-0")).toBeNull();
+  });
+
+  it("reseeds to the new tail on project-identity change", async () => {
+    const state = await loadState();
+    const PROJECT_B = "00000000-0000-7000-8000-0000000000ee";
+    const AGENT_B: AgentRecord = {
+      ...CLAUDE_AGENT,
+      id: "00000000-0000-7000-8000-000000000ccc",
+      project_id: PROJECT_B,
+      name: "carol",
+    };
+    await state.registerAgent(CLAUDE_AGENT);
+    await state.registerAgent(AGENT_B);
+    state.transcripts[CLAUDE_AGENT.id] = agentTurns(CLAUDE_AGENT, OVER);
+    state.transcripts[AGENT_B.id] = agentTurns(AGENT_B, 60);
+
+    const view = render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT], loadStatus: "complete" },
+    });
+    await tick();
+    expect(blockCount()).toBe(WINDOW);
+
+    // Switch projects without remount: the cursor must reseed against the new
+    // blocks array rather than carrying the prior index.
+    await view.rerender({ projectId: PROJECT_B, agents: [AGENT_B], loadStatus: "complete" });
+    await tick();
+
+    expect(blockCount()).toBe(WINDOW);
+    expect(screen.queryByText(`msg 0-${OVER - 1}`)).not.toBeNull();
+    expect(screen.queryByText("msg 0-0")).toBeNull();
+  });
+
+  // A pane hides an agent on the SAME persistent component (it's keyed by pane
+  // id, not roster), so the visible-agent set is a distinct identity axis. If it
+  // weren't in the seed guard, the stale high cursor would slice the now-shorter
+  // block list to empty — a blank pane.
+  it("reseeds when a pane hides an agent, even if the oldest block is unchanged", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    await state.registerAgent(CODEX_AGENT);
+    // CLAUDE owns the oldest block (hour 0); CODEX's turns are newer and more
+    // numerous, so hiding CODEX shrinks blocks far below the old cursor WITHOUT
+    // changing blocks[0]'s key — the case a projectId+oldest-key guard misses.
+    const claudeBlocks = WINDOW + 10; // > WINDOW, so its own tail is still windowed
+    state.transcripts[CLAUDE_AGENT.id] = agentTurns(CLAUDE_AGENT, claudeBlocks, 0);
+    state.transcripts[CODEX_AGENT.id] = agentTurns(CODEX_AGENT, WINDOW * 4, 2);
+
+    const view = render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT, CODEX_AGENT], loadStatus: "complete" },
+    });
+    await tick();
+    expect(blockCount()).toBe(WINDOW); // cursor is high, against the full roster
+
+    await view.rerender({ projectId: PROJECT_ID, agents: [CLAUDE_AGENT], loadStatus: "complete" });
+    await tick();
+
+    // Reseeded against CLAUDE's shorter block list — bounded and non-blank, not
+    // the empty slice a stale high cursor would produce.
+    expect(blockCount()).toBe(WINDOW);
+    expect(screen.queryByText(`msg 0-${claudeBlocks - 1}`)).not.toBeNull();
+  });
+
+  // Windowing slices whole RenderBlocks (not turns), so a fan-out — one prompt,
+  // several agents answering in columns — is atomic and can't be split at the
+  // window edge. This is the invariant the block-vs-turn design exists to
+  // protect; assert it directly with a fan-out sitting on the boundary.
+  it("keeps a fan-out block whole at the window boundary and counts it as one", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    await state.registerAgent(CODEX_AGENT);
+
+    const SEND_F = "00000000-0000-7000-8000-0000000000f1";
+    const fanoutTurns = (agent: AgentRecord): Turn[] => [
+      {
+        role: "user",
+        turn_id: `fan-user-${agent.id}`,
+        agent_id: agent.id,
+        started_at: "2026-05-16T01:00:00Z",
+        text: "compare your approaches",
+        send_id: SEND_F,
+      },
+      {
+        role: "agent",
+        turn_id: `fan-agent-${agent.id}`,
+        agent_id: agent.id,
+        started_at: "2026-05-16T01:00:01Z",
+        ended_at: "2026-05-16T01:00:30Z",
+        status: "complete",
+        send_id: SEND_F,
+        items: [{ item_kind: "text", kind: "text", text: `fan reply ${agent.name}` }],
+      },
+    ];
+
+    // WINDOW standalone (hour 0) + 1 fan-out (hour 1) + WINDOW-1 standalone
+    // (hour 2): the fan-out lands at index WINDOW, i.e. exactly the first visible
+    // block, with WINDOW-1 blocks after it filling out the window.
+    state.transcripts[CLAUDE_AGENT.id] = [
+      ...agentTurns(CLAUDE_AGENT, WINDOW, 0),
+      ...fanoutTurns(CLAUDE_AGENT),
+      ...agentTurns(CLAUDE_AGENT, WINDOW - 1, 2),
+    ];
+    state.transcripts[CODEX_AGENT.id] = fanoutTurns(CODEX_AGENT);
+
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT, CODEX_AGENT], loadStatus: "complete" },
+    });
+    await tick();
+
+    // The fan-out counts as one block toward the window, rendered whole (both
+    // columns), and sits at the boundary: the block just before it is out.
+    expect(blockCount()).toBe(WINDOW);
+    expect(screen.queryAllByTestId("fanout-group").length).toBe(1);
+    expect(screen.queryAllByTestId("fanout-column").length).toBe(2);
+    expect(screen.queryByText("fan reply alice")).not.toBeNull();
+    expect(screen.queryByText("fan reply bob")).not.toBeNull();
+    expect(screen.queryByText(`msg 0-${WINDOW - 1}`)).toBeNull(); // block before the boundary
+    expect(screen.queryByText(`msg 2-${WINDOW - 2}`)).not.toBeNull(); // newest, in window
+  });
+
+  // Upward reveal. The sentinel signals (and triggers) older history; it's
+  // present while the window has a top to reveal (the windowed-off case; the
+  // short-transcript test above covers its absence).
+  it("shows the reveal sentinel while history is windowed off the top", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+
+    state.transcripts[CLAUDE_AGENT.id] = agentTurns(CLAUDE_AGENT, OVER);
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT], loadStatus: "complete" },
+    });
+    await tick();
+    expect(screen.queryByTestId("reveal-sentinel")).not.toBeNull();
+  });
+
+  // Reaching the sentinel mounts the next older batch; repeating walks back to
+  // the start, after which the sentinel is gone and further triggers are no-ops.
+  it("reveals older blocks in batches and clamps at the top", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    // Not a multiple of BATCH above WINDOW, so the final batch overshoots and
+    // must clamp to 0 rather than going negative.
+    const TOTAL = WINDOW * 2 + 10;
+    state.transcripts[CLAUDE_AGENT.id] = agentTurns(CLAUDE_AGENT, TOTAL);
+
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT], loadStatus: "complete" },
+    });
+    await tick();
+    expect(blockCount()).toBe(WINDOW);
+
+    let expected = WINDOW;
+    while (expected < TOTAL) {
+      fireIntersect();
+      await tick();
+      expected = Math.min(expected + BATCH, TOTAL); // clamps on the last batch
+      expect(blockCount()).toBe(expected);
+      await raf();
+    }
+
+    // Everything mounted → sentinel gone, further triggers are no-ops.
+    expect(screen.queryByTestId("reveal-sentinel")).toBeNull();
+    fireIntersect();
+    await tick();
+    expect(blockCount()).toBe(TOTAL);
+  });
+
+  // A trigger arriving mid-reveal (while the latch is held) must be REMEMBERED,
+  // not dropped: the observer only re-fires on an intersection change, so a
+  // dropped trigger would leave the window stuck. Fire twice synchronously — the
+  // second lands while the first is in flight — and assert BOTH batches reveal.
+  // Without coalescing only the first would (WINDOW + BATCH, not WINDOW + 2*BATCH).
+  it("coalesces a trigger that arrives mid-reveal instead of dropping it", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    // Enough history for two full batches plus a margin, so neither batch clamps.
+    state.transcripts[CLAUDE_AGENT.id] = agentTurns(CLAUDE_AGENT, WINDOW + 2 * BATCH + 5);
+
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT], loadStatus: "complete" },
+    });
+    await tick();
+    expect(blockCount()).toBe(WINDOW);
+
+    fireIntersect();
+    fireIntersect(); // second arrives while the first is still latched
+    await raf(); // latch releases and replays the coalesced batch
+    await tick();
+    expect(blockCount()).toBe(WINDOW + 2 * BATCH);
   });
 });

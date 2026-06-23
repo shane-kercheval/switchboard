@@ -91,7 +91,7 @@ impl McpSection {
 /// the prefix in `<name>:<prompt>`, so it must be non-empty, must not be the
 /// reserved `local` (which always routes to the file store), and must not contain
 /// `:` (which would break address parsing). Duplicate detection is the caller's
-/// job — it needs the full set. M3's "Add MCP server" form reuses this rule.
+/// job — it needs the full set. The "Add MCP server" form reuses this rule.
 pub(crate) fn is_valid_provider_name(name: &str) -> bool {
     !name.trim().is_empty() && name != LOCAL_PROVIDER && !name.contains(':')
 }

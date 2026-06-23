@@ -225,9 +225,9 @@ async fn live_claude_transcript_load_hydrates_tool_items() {
 /// session file *before* their matching `tool_use` (within the same
 /// turn, ~1s gap; the canonical case was session
 /// `22300f1b-3efe-4dbc-a4a0-7c1c954d1da2.jsonl` lines 1406/1408 and
-/// 1607/1609). Pre-M2 the parser dropped the result's output silently
-/// and emitted a "did not match any open tool" warning; on rehydration
-/// the affected tool calls rendered with empty content.
+/// 1607/1609). Without deferred binding the parser would drop the result's
+/// output silently and emit a "did not match any open tool" warning, and on
+/// rehydration the affected tool calls would render with empty content.
 ///
 /// Multi-tool prompt makes the out-of-order pattern more likely to
 /// manifest in any given run (the originally-observed sessions all had

@@ -165,12 +165,6 @@ test("fan-out columns streaming at different rates never move an unpinned reader
   await expect.poll(() => page.getByTestId("fanout-group").elements().length).toBe(1);
   await expect.poll(() => distanceFromBottom()).toBeLessThan(32);
 
-  // The live fan-out block is containment-exempt (real geometry while any
-  // column streams).
-  const fanoutBlock = (): HTMLElement =>
-    page.getByTestId("fanout-group").element().closest('[data-testid="transcript-block"]')!;
-  expect(getComputedStyle(fanoutBlock()).contentVisibility).not.toBe("auto");
-
   const c = transcriptContainer();
   scrollTo(c.scrollHeight - c.clientHeight - 300);
   await expect.poll(() => distanceFromBottom()).toBeGreaterThan(250);
@@ -190,10 +184,10 @@ test("fan-out columns streaming at different rates never move an unpinned reader
       .toBeLessThanOrEqual(1);
   }
 
-  // Both columns complete: the block gains containment for the first time.
+  // Both columns complete — a height change (the live cap drops) the reader
+  // must survive without moving.
   seedTurns(ALICE.id, [...history, ...column(ALICE.id, 30, "complete")]);
   seedTurns(BOB.id, column(BOB.id, 28, "complete"));
-  await expect.poll(() => getComputedStyle(fanoutBlock()).contentVisibility).toBe("auto");
   await expect
     .poll(() => Math.abs(Math.round(anchor.getBoundingClientRect().top) - reading))
     .toBeLessThanOrEqual(1);

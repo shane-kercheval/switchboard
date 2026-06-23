@@ -1,4 +1,4 @@
-// Pure helpers for the M5 diff view: map a file path to a Prism language, render
+// Pure helpers for the diff view: map a file path to a Prism language, render
 // one diff line's content as sanitized highlighted HTML, and fold a hunk's lines
 // into aligned side-by-side rows. Kept out of the component so the alignment — the
 // one non-trivial bit — is unit-testable on its own.

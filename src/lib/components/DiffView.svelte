@@ -5,7 +5,7 @@
   /// content through the shared Prism path. Content is sanitized in
   /// `highlightDiffLine` before `{@html}` (agent-authored file content in a
   /// privileged webview — see `diff.ts`).
-  import { highlightDiffLine, toSideBySide } from "$lib/diff";
+  import { formatFileSize, highlightDiffLine, toSideBySide } from "$lib/diff";
   import type { DiffLine, FileDiff, DiffStyle } from "$lib/types";
 
   let { diff, style, language }: { diff: FileDiff; style: DiffStyle; language: string } = $props();
@@ -43,7 +43,12 @@
   data-testid="diff-view"
   data-style={style}
 >
-  {#if diff.binary}
+  {#if diff.too_large}
+    <p class="text-muted px-3 py-6 text-center text-sm" data-testid="diff-too-large">
+      File too large to diff inline{#if diff.too_large_bytes !== null}
+        — {formatFileSize(diff.too_large_bytes)}{/if}. Open it in your editor or difftool.
+    </p>
+  {:else if diff.binary}
     <p class="text-muted px-3 py-6 text-center text-sm" data-testid="diff-binary">
       Binary file — no preview.
     </p>

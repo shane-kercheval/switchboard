@@ -29,6 +29,8 @@ const diffFixture = (over: Partial<FileDiff> = {}): FileDiff => ({
   path: "code.ts",
   binary: false,
   truncated: false,
+  too_large: false,
+  too_large_bytes: null,
   hunks: [
     {
       header: "@@ -1,2 +1,2 @@",
@@ -240,6 +242,22 @@ describe("DiffPanel (uncommitted target)", () => {
     });
     render(DiffPanel, { props: { target: wtTarget(), onClose: noop } });
     await waitFor(() => expect(screen.getByTestId("diff-binary")).toBeInTheDocument());
+    expect(screen.queryByTestId("diff-line")).not.toBeInTheDocument();
+  });
+
+  it("shows a too-large placeholder with the file size, not a rendered body", async () => {
+    wire({
+      files: [{ path: "recording.json", change: "added" }],
+      diff: diffFixture({
+        path: "recording.json",
+        too_large: true,
+        too_large_bytes: 122_180_589,
+        hunks: [],
+      }),
+    });
+    render(DiffPanel, { props: { target: wtTarget(), onClose: noop } });
+    const placeholder = await waitFor(() => screen.getByTestId("diff-too-large"));
+    expect(placeholder).toHaveTextContent("122 MB");
     expect(screen.queryByTestId("diff-line")).not.toBeInTheDocument();
   });
 

@@ -523,8 +523,13 @@ export type FileDiff = {
   path: string;
   // Binary change: `hunks` is empty; the UI shows a placeholder instead of a body.
   binary: boolean;
-  // The diff exceeded the render cap and was cut off.
+  // The diff exceeded the render cap and was cut off (a prefix is still shown).
   truncated: boolean;
+  // The file is past the inline-diff size limit and was never rendered (distinct
+  // from `truncated`: nothing is shown, not a prefix). `too_large_bytes` is the
+  // file size for the "open externally" message; null whenever `too_large` is false.
+  too_large: boolean;
+  too_large_bytes: number | null;
   hunks: DiffHunk[];
 };
 

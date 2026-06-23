@@ -4,6 +4,7 @@
 //! on-disk shapes real repos have — including the `origin/HEAD` symbolic ref,
 //! worktree records, and upstream config that the read layer keys on.
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 
@@ -741,6 +742,214 @@ fn file_diff_caps_a_huge_diff_and_flags_truncation() {
     );
 }
 
+// Backend size limits, mirrored from `read.rs` (private consts aren't visible to an
+// integration test). The existing huge-diff test already hardcodes the 5000-line
+// cap the same way.
+const MAX_DIFF_BYTES: usize = 2 * 1024 * 1024;
+const MAX_DIFF_LINE_BYTES: usize = 10_000;
+const TOO_LARGE_TO_DIFF_BYTES: usize = 10 * 1024 * 1024;
+
+fn collected_lines(diff: &switchboard_git::FileDiff) -> Vec<&switchboard_git::DiffLine> {
+    diff.hunks.iter().flat_map(|h| &h.lines).collect()
+}
+
+#[test]
+fn file_diff_byte_cap_stops_a_file_of_many_mid_size_lines() {
+    // Isolates the *byte* cap from the per-line clamp: every line is 9 KB — under the
+    // per-line clamp (10 KB) — so no line is individually cut, and the file is ~2.3 MB,
+    // under the too-large limit (10 MB). The only thing that can stop collection is
+    // the 2 MB byte budget. This also proves the tier boundary: a file between the
+    // byte cap and the too-large limit yields a real truncated preview, not the
+    // too-large placeholder.
+    let repo = repo_with_main();
+    let line_len = 9 * 1024;
+    let line = "x".repeat(line_len);
+    let mut content = String::new();
+    for _ in 0..250 {
+        content.push_str(&line); // 9 KB/line × 250 ≈ 2.3 MB total
+        content.push('\n');
+    }
+    write(repo.path(), "data.csv", &content);
+
+    let diff = file_diff(repo.path(), "data.csv").unwrap();
+    assert!(
+        !diff.too_large,
+        "a ~2.3 MB file is under the too-large limit"
+    );
+    assert!(diff.truncated, "but over the byte budget, so truncated");
+    let lines = collected_lines(&diff);
+    assert!(
+        !lines.is_empty(),
+        "a real preview must be shown, not nothing"
+    );
+    let longest = lines.iter().map(|l| l.content.len()).max().unwrap_or(0);
+    assert_eq!(
+        longest, line_len,
+        "no line should be per-line-clamped; the byte cap is what stopped collection"
+    );
+    let total: usize = lines.iter().map(|l| l.content.len()).sum();
+    assert!(
+        total > MAX_DIFF_BYTES && total <= MAX_DIFF_BYTES + line_len,
+        "retained {total} bytes, expected just past the {MAX_DIFF_BYTES}-byte budget"
+    );
+}
+
+#[test]
+fn file_diff_clamps_a_single_giant_line() {
+    // One line (no newline) a little over the per-line clamp: under the too-large
+    // limit and under the line cap, so only the per-line clamp can bound it. Sized
+    // just past the clamp — no need for megabytes to exercise the cut.
+    let repo = repo_with_main();
+    let giant = "a".repeat(MAX_DIFF_LINE_BYTES * 2);
+    write(repo.path(), "oneline.txt", &giant);
+
+    let diff = file_diff(repo.path(), "oneline.txt").unwrap();
+    assert!(!diff.too_large, "5 MB is under the too-large limit");
+    assert!(diff.truncated, "the giant line must flag truncation");
+    let longest = collected_lines(&diff)
+        .iter()
+        .map(|l| l.content.len())
+        .max()
+        .unwrap_or(0);
+    assert!(
+        longest <= MAX_DIFF_LINE_BYTES,
+        "the line must be clamped to the {MAX_DIFF_LINE_BYTES}-byte cap, got {longest}"
+    );
+}
+
+#[test]
+fn file_diff_clamps_a_giant_invalid_utf8_line_without_widening_it_whole() {
+    // Invalid-UTF-8 "text" (high bytes, no NUL → libgit2 treats it as text, not
+    // binary). The clamp must cut the raw bytes *before* `from_utf8_lossy`, so the
+    // retained content stays bounded instead of widening the whole line into
+    // replacement chars. `U+FFFD` is 3 bytes, so the clamped line can widen to at
+    // most 3× the clamp — still bounded. Sized just past the clamp.
+    let repo = repo_with_main();
+    let giant = vec![0xFFu8; MAX_DIFF_LINE_BYTES * 2];
+    std::fs::write(repo.path().join("blob.dat"), &giant).unwrap();
+
+    let diff = file_diff(repo.path(), "blob.dat").unwrap();
+    assert!(!diff.binary, "no NUL bytes, so libgit2 renders it as text");
+    assert!(diff.truncated, "the giant line must flag truncation");
+    let longest = collected_lines(&diff)
+        .iter()
+        .map(|l| l.content.len())
+        .max()
+        .unwrap_or(0);
+    assert!(
+        longest <= MAX_DIFF_LINE_BYTES * 3,
+        "retained {longest} bytes; the raw line must be cut before widening, not after"
+    );
+}
+
+#[test]
+fn file_diff_marks_a_file_over_the_inline_limit_too_large() {
+    // A new file past the too-large limit is never rendered: it short-circuits to
+    // `too_large` with its size and no hunks, so libgit2 never loads the blob.
+    let repo = repo_with_main();
+    let size = TOO_LARGE_TO_DIFF_BYTES + 1024 * 1024; // ~11 MB
+    write(repo.path(), "recording.json", &"a".repeat(size));
+
+    let diff = file_diff(repo.path(), "recording.json").unwrap();
+    assert!(
+        diff.too_large,
+        "a file past the limit must be flagged too_large"
+    );
+    assert!(!diff.truncated, "too_large is distinct from truncated");
+    assert!(
+        diff.hunks.is_empty(),
+        "no content is rendered for a too-large file"
+    );
+    assert_eq!(
+        diff.too_large_bytes,
+        Some(size as u64),
+        "the file size must be carried for the UI message"
+    );
+}
+
+#[test]
+fn file_diff_clean_large_tracked_file_is_empty_not_too_large() {
+    // A clean (committed, unmodified) large file has no delta, so it must come back
+    // empty — never flagged too_large. Guards the contract the removed filesystem
+    // fast path used to violate.
+    let repo = repo_with_main();
+    let size = TOO_LARGE_TO_DIFF_BYTES + 1024 * 1024; // ~11 MB
+    write(repo.path(), "big.bin", &"a".repeat(size));
+    commit_all(repo.path(), "add big file");
+
+    let diff = file_diff(repo.path(), "big.bin").unwrap();
+    assert!(
+        !diff.too_large,
+        "a clean file has no change to be too large"
+    );
+    assert!(diff.hunks.is_empty(), "a clean file has no hunks");
+}
+
+#[test]
+fn file_diff_modified_large_tracked_file_is_too_large() {
+    // A *modified* large tracked file routes through the tracked-delta path, not the
+    // untracked-content path the other too_large test covers — pin it separately.
+    let repo = repo_with_main();
+    let size = TOO_LARGE_TO_DIFF_BYTES + 1024 * 1024; // ~11 MB
+    write(repo.path(), "big.bin", &"a".repeat(size));
+    commit_all(repo.path(), "add big file");
+    write(repo.path(), "big.bin", &"b".repeat(size)); // changed content, still huge
+
+    let diff = file_diff(repo.path(), "big.bin").unwrap();
+    assert!(diff.too_large, "a modified huge file must be too_large");
+    assert!(diff.hunks.is_empty());
+}
+
+#[test]
+fn file_diff_worktree_mode_only_change_of_large_file_is_reported_too_large() {
+    // Documents a known limitation: a worktree mode-only change (chmod, no content
+    // change) on a huge file is reported `too_large` even though there's nothing to
+    // render. libgit2 leaves the worktree side's blob id unset, so we can't confirm
+    // the content is unchanged without hashing the file — and a content change with a
+    // coincidentally-equal size would be indistinguishable. The label is imperfect,
+    // but the file is still gated by header size with no content load, and chmod-ing
+    // a 10 MB+ tracked file is vanishingly rare. (A *committed* pure rename, where
+    // both blob ids are real, is correctly not too_large — see the commit-path test.)
+    let repo = repo_with_main();
+    git(repo.path(), &["config", "core.fileMode", "true"]);
+    let size = TOO_LARGE_TO_DIFF_BYTES + 1024 * 1024; // ~11 MB
+    write(repo.path(), "big.sh", &"a".repeat(size));
+    commit_all(repo.path(), "add big file");
+    std::fs::set_permissions(
+        repo.path().join("big.sh"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+
+    let diff = file_diff(repo.path(), "big.sh").unwrap();
+    assert!(
+        diff.too_large,
+        "documents the worktree mode-only limitation"
+    );
+    assert!(diff.hunks.is_empty());
+}
+
+#[test]
+fn file_diff_worktree_rename_of_large_file_stays_too_large() {
+    // A worktree rename isn't paired (no find_similar on the workdir path): it's a
+    // large deletion plus a large untracked add, each real content. Both sides must
+    // stay too_large — the identical-blob skip must not absorb them.
+    let repo = repo_with_main();
+    let size = TOO_LARGE_TO_DIFF_BYTES + 1024 * 1024; // ~11 MB
+    write(repo.path(), "old.bin", &"a".repeat(size));
+    commit_all(repo.path(), "add big file");
+    std::fs::rename(repo.path().join("old.bin"), repo.path().join("new.bin")).unwrap();
+
+    assert!(
+        file_diff(repo.path(), "new.bin").unwrap().too_large,
+        "the untracked add side stays too_large"
+    );
+    assert!(
+        file_diff(repo.path(), "old.bin").unwrap().too_large,
+        "the deletion side stays too_large"
+    );
+}
+
 #[test]
 fn file_diff_flags_binary_content_with_no_body() {
     // The binary flag rests on libgit2 emitting a binary marker under our diff
@@ -1189,6 +1398,67 @@ fn commit_file_diff_returns_hunks_for_a_committed_change() {
         .map(|l| l.content.as_str())
         .collect();
     assert!(added.contains(&"TWO"));
+}
+
+#[test]
+fn commit_file_diff_marks_a_committed_file_over_the_limit_too_large() {
+    // The commit path reaches the too-large gate through the diff's delta metadata —
+    // the blob size comes from an object-DB header read, not a content load.
+    let dir = repo_with_main();
+    let size = TOO_LARGE_TO_DIFF_BYTES + 1024 * 1024; // ~11 MB
+    write(dir.path(), "big.bin", &"a".repeat(size));
+    commit_all(dir.path(), "add big file");
+    let head = git(dir.path(), &["rev-parse", "HEAD"]);
+
+    let diff = commit_file_diff(dir.path(), &head, "big.bin").unwrap();
+    assert!(
+        diff.too_large,
+        "a committed file past the limit must be too_large"
+    );
+    assert!(diff.hunks.is_empty());
+    assert_eq!(diff.too_large_bytes, Some(size as u64));
+}
+
+#[test]
+fn commit_file_diff_pure_rename_of_large_file_is_not_too_large() {
+    // On the commit path find_similar pairs the rename into one delta whose old/new
+    // blob ids are identical — no content to render, so "no changes", not "too large".
+    let dir = repo_with_main();
+    let size = TOO_LARGE_TO_DIFF_BYTES + 1024 * 1024; // ~11 MB
+    write(dir.path(), "old.bin", &"a".repeat(size));
+    commit_all(dir.path(), "add big file");
+    git(dir.path(), &["mv", "old.bin", "new.bin"]);
+    commit_all(dir.path(), "rename big file");
+    let head = git(dir.path(), &["rev-parse", "HEAD"]);
+
+    let diff = commit_file_diff(dir.path(), &head, "new.bin").unwrap();
+    assert!(
+        !diff.too_large,
+        "a pure rename has no content to be too large"
+    );
+    assert!(
+        diff.hunks.is_empty(),
+        "a pure rename shows no content hunks"
+    );
+}
+
+#[test]
+fn file_diff_marks_a_worktree_deletion_of_a_huge_file_too_large() {
+    // A huge tracked file deleted in the worktree: the file is gone so the
+    // filesystem fast path can't see it, and the diff content is the *old* blob.
+    // The both-sides delta preflight must catch it via `old_file().size()`.
+    let dir = repo_with_main();
+    let size = TOO_LARGE_TO_DIFF_BYTES + 1024 * 1024; // ~11 MB
+    write(dir.path(), "big.bin", &"a".repeat(size));
+    commit_all(dir.path(), "add big file");
+    std::fs::remove_file(dir.path().join("big.bin")).unwrap();
+
+    let diff = file_diff(dir.path(), "big.bin").unwrap();
+    assert!(
+        diff.too_large,
+        "a worktree deletion of a huge file must be caught via the old-blob size"
+    );
+    assert!(diff.hunks.is_empty());
 }
 
 #[test]

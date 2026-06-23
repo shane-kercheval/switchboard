@@ -1753,12 +1753,34 @@ describe("workflow user_message events", () => {
     // and, after a background refresh rebuilds the journal overlay, as an overlay
     // `user_message` with the same send_id. The unified view must render it ONCE.
     const liveTurns: Turn[] = [
-      { role: "user", turn_id: `user:${SEND}:${AGENT_A}`, agent_id: AGENT_A, send_id: SEND, started_at: AT, text: "review" },
-      { role: "agent", turn_id: TURN_1, agent_id: AGENT_A, send_id: SEND, started_at: AT, status: "complete", items: [] },
+      {
+        role: "user",
+        turn_id: `user:${SEND}:${AGENT_A}`,
+        agent_id: AGENT_A,
+        send_id: SEND,
+        started_at: AT,
+        text: "review",
+      },
+      {
+        role: "agent",
+        turn_id: TURN_1,
+        agent_id: AGENT_A,
+        send_id: SEND,
+        started_at: AT,
+        status: "complete",
+        items: [],
+      },
     ];
     // A dispatched send's overlay item keys `id` off the send_id (types.ts).
     const overlay: ConversationItem[] = [
-      { kind: "user_message", id: SEND, send_id: SEND, agent_ids: [AGENT_A], text: "review", at: AT },
+      {
+        kind: "user_message",
+        id: SEND,
+        send_id: SEND,
+        agent_ids: [AGENT_A],
+        text: "review",
+        at: AT,
+      },
     ];
     const rows = buildUnifiedRows(liveTurns, overlay, new Set([AGENT_A]));
     const blocks = groupRenderBlocks(rows, [AGENT_A]);

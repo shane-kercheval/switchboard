@@ -21,6 +21,8 @@ import {
   _testing as selectionState,
 } from "$lib/state/recipientSelection.svelte";
 import { setProjectCompact, _testing as previewState } from "$lib/state/transcriptPreview.svelte";
+import { workflowRuns, _testing as workflowState } from "$lib/state/workflows.svelte";
+import { tick } from "svelte";
 import { shortcut } from "$lib/platform";
 
 const listeners = new Map<string, (e: { payload: NormalizedEvent }) => void>();
@@ -137,6 +139,7 @@ beforeEach(() => {
   // lets its effects observe (and react to) the wipe.
   panesState.reset();
   selectionState.reset();
+  workflowState.reset();
   listeners.clear();
   invokeMock.mockReset();
   setProjectCompact(PROJECT_ID, false);
@@ -668,6 +671,39 @@ describe("targeting", () => {
     renderPanes();
     expect(paneEls()[0]).toHaveAttribute("data-coverage", "full");
     expect(paneEls()[1]).toHaveAttribute("data-coverage", "full");
+  });
+
+  it("suppresses the coverage border while a workflow run owns the project, restores after", async () => {
+    await seedTwoAgentTranscripts();
+    moveAgentToNewPane(PROJECT_ID, ROSTER_IDS, BOB.id);
+    setRecipients(PROJECT_ID, [ALICE.id, BOB.id]);
+    renderPanes();
+    // Baseline: full coverage shows the border.
+    expect(paneEls()[0]).toHaveAttribute("data-coverage", "full");
+    expect(within(paneEls()[0]!).getByTestId("pane-coverage")).toBeInTheDocument();
+
+    // A live run takes over (compose bar is replaced, sends locked out) → the
+    // recipient-coverage border is meaningless and must disappear.
+    workflowRuns[PROJECT_ID] = [
+      {
+        run_id: "r1",
+        workflow: "wf",
+        step: 1,
+        total: 3,
+        status: "running",
+        reason: null,
+        steps: [],
+      },
+    ];
+    await tick();
+    expect(paneEls()[0]).toHaveAttribute("data-coverage", "none");
+    expect(screen.queryByTestId("pane-coverage")).not.toBeInTheDocument();
+
+    // Run clears (complete/cancel/abandon) → the border returns unchanged.
+    workflowRuns[PROJECT_ID] = [];
+    await tick();
+    expect(paneEls()[0]).toHaveAttribute("data-coverage", "full");
+    expect(within(paneEls()[0]!).getByTestId("pane-coverage")).toBeInTheDocument();
   });
 });
 

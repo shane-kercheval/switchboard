@@ -30,7 +30,9 @@ describe("WorkflowMenu", () => {
     const { onpick, oncopy } = setup([listing()]);
     const key = "builtin:review-and-aggregate";
     expect(screen.getByTestId(`workflow-builtin-tag-${key}`)).toBeInTheDocument();
-    expect(screen.getByTestId(`workflow-copy-${key}`)).toBeInTheDocument();
+    // The copy action is icon-only — its accessible name is the only text
+    // affordance, so it carries the discoverability/a11y contract.
+    expect(screen.getByTestId(`workflow-copy-${key}`)).toHaveAccessibleName("Copy to my workflows");
 
     await fireEvent.click(screen.getByTestId(`workflow-copy-${key}`));
     expect(oncopy).toHaveBeenCalledTimes(1);

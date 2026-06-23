@@ -13,7 +13,9 @@
     type ForwardSource,
   } from "$lib/state/heldForwards.svelte";
   import { cn } from "$lib/utils";
+  import { ICON_BUTTON_ON_RAISED_CLASS } from "$lib/components/ui/iconButton";
   import Textarea from "$lib/components/ui/Textarea.svelte";
+  import ClearIcon from "$lib/components/ui/ClearIcon.svelte";
   import HarnessIcon from "$lib/components/ui/HarnessIcon.svelte";
   import WorkflowSteps from "$lib/components/WorkflowSteps.svelte";
   import ForwardSourceChip from "$lib/components/ui/ForwardSourceChip.svelte";
@@ -401,7 +403,7 @@
         triggerTestid={`workflow-forward-picker-${name}`}
         triggerLabel={`Forward an agent's output into ${name}`}
         tooltipLabel="Forward an agent's output"
-        triggerClass="text-muted hover:text-fg hover:bg-panel border-border focus-visible:ring-accent flex h-9 w-9 shrink-0 items-center justify-center self-start rounded-md border transition-colors focus-visible:ring-2 focus-visible:outline-none"
+        triggerClass={cn(ICON_BUTTON_ON_RAISED_CLASS, "shrink-0 self-center")}
       />
     {/if}
   {/snippet}
@@ -425,24 +427,13 @@
                drop at once. -->
           <button
             type="button"
-            class="text-muted hover:text-fg hover:bg-panel ml-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-full transition-colors"
+            class={cn(ICON_BUTTON_ON_RAISED_CLASS, "ml-0.5 shrink-0")}
             data-testid={`workflow-forward-sources-${name}-clear`}
             aria-label="Clear forward sources"
             title="Clear forward sources"
             onclick={() => clearArgSources(name)}
           >
-            <svg
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              stroke-width="1.75"
-              stroke-linecap="round"
-              class="h-4 w-4"
-              aria-hidden="true"
-            >
-              <circle cx="12" cy="12" r="9" />
-              <path d="m5.6 5.6 12.8 12.8" />
-            </svg>
+            <ClearIcon />
           </button>
         {/if}
       </div>

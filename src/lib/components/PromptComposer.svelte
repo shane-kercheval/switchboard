@@ -23,7 +23,9 @@
   import Spinner from "$lib/components/ui/Spinner.svelte";
   import ForwardSourceChip from "$lib/components/ui/ForwardSourceChip.svelte";
   import ForwardSourcePicker from "$lib/components/ui/ForwardSourcePicker.svelte";
+  import ClearIcon from "$lib/components/ui/ClearIcon.svelte";
   import { cn } from "$lib/utils";
+  import { ICON_BUTTON_ON_RAISED_CLASS } from "$lib/components/ui/iconButton";
 
   /// Prompt mode: the chosen prompt, its argument inputs, an appended-text field,
   /// and a Preview overlay of the combined message. The parent (`ComposeBar`)
@@ -292,7 +294,7 @@
           triggerTestid={testid}
           triggerLabel={label}
           tooltipLabel="Forward an agent's output"
-          triggerClass="text-muted hover:text-fg hover:bg-panel border-border focus-visible:ring-accent flex h-9 w-9 shrink-0 items-center justify-center self-start rounded-md border transition-colors focus-visible:ring-2 focus-visible:outline-none"
+          triggerClass={cn(ICON_BUTTON_ON_RAISED_CLASS, "shrink-0 self-center")}
         />
       {/snippet}
 
@@ -318,7 +320,7 @@
                    to drop at once. -->
               <button
                 type="button"
-                class="text-muted hover:text-fg hover:bg-panel ml-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-full transition-colors disabled:opacity-50"
+                class={cn(ICON_BUTTON_ON_RAISED_CLASS, "ml-0.5 shrink-0 disabled:opacity-50")}
                 data-testid={`${testid}-clear`}
                 aria-label="Clear forward sources"
                 title="Clear forward sources"
@@ -327,18 +329,7 @@
                   if (!busy) onClear();
                 }}
               >
-                <svg
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  stroke-width="1.75"
-                  stroke-linecap="round"
-                  class="h-4 w-4"
-                  aria-hidden="true"
-                >
-                  <circle cx="12" cy="12" r="9" />
-                  <path d="m5.6 5.6 12.8 12.8" />
-                </svg>
+                <ClearIcon />
               </button>
             {/if}
           </div>

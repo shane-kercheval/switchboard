@@ -1,8 +1,11 @@
 <script lang="ts">
   import { tick } from "svelte";
+  import { BookmarkPlus } from "@lucide/svelte";
   import type { Prompt } from "$lib/types";
   import { isBuiltinPrompt, promptDisplayName } from "$lib/prompt";
   import { cn } from "$lib/utils";
+  import Tooltip from "$lib/components/ui/Tooltip.svelte";
+  import { ICON_BUTTON_CLASS } from "$lib/components/ui/iconButton";
 
   /// A typeahead popover over the cached prompt list. Opened by the compose
   /// bar's prompt button (or `/` on an empty textarea); picking a prompt enters
@@ -92,7 +95,7 @@
           class={cn(
             "flex w-full cursor-pointer flex-col gap-0.5 rounded-md px-2.5 py-1.5 text-left outline-none select-none",
             i === highlighted ? "bg-panel/80" : "",
-            builtin ? "pr-24" : "",
+            builtin ? "pr-10" : "",
           )}
           data-testid={`prompt-option-${promptKey(prompt)}`}
           role="option"
@@ -116,14 +119,26 @@
           {/if}
         </button>
         {#if builtin && oncopy}
-          <button
-            type="button"
-            class="text-accent hover:bg-accent-soft focus-visible:ring-accent absolute top-1.5 right-2 cursor-pointer rounded border border-transparent px-1.5 py-0.5 text-[11px] outline-none focus-visible:ring-2 focus-visible:outline-none"
-            data-testid={`prompt-copy-${promptKey(prompt)}`}
-            onclick={() => oncopy(prompt)}
-          >
-            Copy to my prompts
-          </button>
+          <!-- Save-to-my-library glyph (bookmark-plus), not a clipboard-copy icon:
+               this writes the built-in into the user's own editable prompts.
+               "Copy" stays in the tooltip as the plainer description. -->
+          <Tooltip label="Copy to my prompts">
+            {#snippet trigger(props)}
+              <button
+                {...props}
+                type="button"
+                class={cn(
+                  ICON_BUTTON_CLASS,
+                  "hover:bg-accent-soft hover:text-accent absolute top-1/2 right-1.5 -translate-y-1/2",
+                )}
+                data-testid={`prompt-copy-${promptKey(prompt)}`}
+                aria-label="Copy to my prompts"
+                onclick={() => oncopy(prompt)}
+              >
+                <BookmarkPlus size={16} strokeWidth={2} aria-hidden="true" />
+              </button>
+            {/snippet}
+          </Tooltip>
         {/if}
       </div>
     {/each}

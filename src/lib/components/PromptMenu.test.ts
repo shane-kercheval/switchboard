@@ -149,7 +149,11 @@ describe("PromptMenu", () => {
     setup([BUILTIN, PROMPTS[0]!]);
     // The built-in carries the read-only tag and a copy button.
     expect(screen.getByTestId("prompt-builtin-tag-builtin:code-review")).toBeInTheDocument();
-    expect(screen.getByTestId("prompt-copy-builtin:code-review")).toBeInTheDocument();
+    // The copy action is icon-only — its accessible name is the only text
+    // affordance, so it carries the discoverability/a11y contract.
+    expect(screen.getByTestId("prompt-copy-builtin:code-review")).toHaveAccessibleName(
+      "Copy to my prompts",
+    );
     // The user's own local prompt does not.
     expect(screen.queryByTestId("prompt-builtin-tag-local:code-review")).toBeNull();
     expect(screen.queryByTestId("prompt-copy-local:code-review")).toBeNull();

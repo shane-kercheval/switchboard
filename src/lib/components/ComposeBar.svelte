@@ -59,6 +59,8 @@
   import StopIcon from "$lib/components/ui/StopIcon.svelte";
   import HarnessIcon from "$lib/components/ui/HarnessIcon.svelte";
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
+  import ClearIcon from "$lib/components/ui/ClearIcon.svelte";
+  import { ICON_BUTTON_ON_RAISED_CLASS } from "$lib/components/ui/iconButton";
   import PromptMenu from "$lib/components/PromptMenu.svelte";
   import PromptComposer from "$lib/components/PromptComposer.svelte";
   import WorkflowMenu from "$lib/components/WorkflowMenu.svelte";
@@ -2012,18 +2014,7 @@
                   {shortcut("mod", "shift", "A")}
                 </span>
               {:else if item.kind === "clear"}
-                <svg
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  stroke-width="2"
-                  stroke-linecap="round"
-                  class="text-muted h-4 w-4"
-                  aria-hidden="true"
-                >
-                  <circle cx="12" cy="12" r="9" />
-                  <path d="m5.6 5.6 12.8 12.8" />
-                </svg>
+                <ClearIcon class="text-muted" />
                 <span class="text-fg">Clear</span>
                 <span class="text-muted ml-auto font-mono text-[13px]">{shortcut("esc")}</span>
               {:else if item.kind === "pane"}
@@ -2152,7 +2143,7 @@
                  drop at once. -->
             <button
               type="button"
-              class="text-muted hover:text-fg hover:bg-panel ml-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-full transition-colors disabled:opacity-50"
+              class={cn(ICON_BUTTON_ON_RAISED_CLASS, "ml-0.5 shrink-0 disabled:opacity-50")}
               data-testid="forward-sources-clear"
               aria-label="Clear forward sources"
               title="Clear forward sources"
@@ -2161,18 +2152,7 @@
                 if (!sending) forwardSources = [];
               }}
             >
-              <svg
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                stroke-width="1.75"
-                stroke-linecap="round"
-                class="h-4 w-4"
-                aria-hidden="true"
-              >
-                <circle cx="12" cy="12" r="9" />
-                <path d="m5.6 5.6 12.8 12.8" />
-              </svg>
+              <ClearIcon />
             </button>
           {/if}
         </div>
@@ -2258,7 +2238,7 @@
                   <button
                     {...props}
                     type="button"
-                    class="text-muted hover:text-fg hover:bg-panel ml-0.5 flex h-[26px] w-[26px] items-center justify-center rounded-full transition-colors"
+                    class={cn(ICON_BUTTON_ON_RAISED_CLASS, "ml-0.5")}
                     data-testid="recipient-clear"
                     aria-label="Clear recipients"
                     disabled={sending}
@@ -2266,18 +2246,7 @@
                       if (!sending) setSelectedIds([]);
                     }}
                   >
-                    <svg
-                      viewBox="0 0 24 24"
-                      fill="none"
-                      stroke="currentColor"
-                      stroke-width="1.75"
-                      stroke-linecap="round"
-                      class="h-4 w-4"
-                      aria-hidden="true"
-                    >
-                      <circle cx="12" cy="12" r="9" />
-                      <path d="m5.6 5.6 12.8 12.8" />
-                    </svg>
+                    <ClearIcon />
                   </button>
                 {/snippet}
               </Tooltip>

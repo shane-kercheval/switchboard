@@ -2394,7 +2394,9 @@ describe("ComposeBar — cross-agent forward", () => {
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
     // Expand the default pane to its members, then submit.
     await fireEvent.keyDown(window, { key: "1", metaKey: true, ctrlKey: true });
-    await waitFor(() => expect(screen.getByTestId("forward-source-chip-alice")).toBeInTheDocument());
+    await waitFor(() =>
+      expect(screen.getByTestId("forward-source-chip-alice")).toBeInTheDocument(),
+    );
     await fireEvent.input(screen.getByTestId("compose-textarea"), { target: { value: "go" } });
     await fireEvent.click(screen.getByTestId("compose-send"));
 
@@ -2423,8 +2425,12 @@ describe("ComposeBar — cross-agent forward", () => {
 
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
     await fireEvent.keyDown(window, { key: "1", metaKey: true, ctrlKey: true });
-    await waitFor(() => expect(screen.getByTestId("forward-source-chip-alice")).toBeInTheDocument());
-    await fireEvent.input(screen.getByTestId("compose-textarea"), { target: { value: "aggregate" } });
+    await waitFor(() =>
+      expect(screen.getByTestId("forward-source-chip-alice")).toBeInTheDocument(),
+    );
+    await fireEvent.input(screen.getByTestId("compose-textarea"), {
+      target: { value: "aggregate" },
+    });
     await fireEvent.click(screen.getByTestId("compose-send"));
 
     // The composer comes back with the member agent chips (not a pane chip) and

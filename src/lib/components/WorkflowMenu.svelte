@@ -1,7 +1,10 @@
 <script lang="ts">
   import { tick } from "svelte";
+  import { BookmarkPlus } from "@lucide/svelte";
   import type { WorkflowListing } from "$lib/types";
   import { cn } from "$lib/utils";
+  import Tooltip from "$lib/components/ui/Tooltip.svelte";
+  import { ICON_BUTTON_CLASS } from "$lib/components/ui/iconButton";
 
   /// A typeahead popover over the project's workflows (built-in + directory),
   /// modeled on `PromptMenu`. Opened by the compose bar's `+ Workflow` button.
@@ -90,7 +93,7 @@
             "flex w-full flex-col gap-0.5 rounded-md px-2.5 py-1.5 text-left outline-none select-none",
             canPick ? "cursor-pointer" : "cursor-not-allowed opacity-70",
             i === highlighted && canPick ? "bg-panel/80" : "",
-            builtin ? "pr-28" : "",
+            builtin ? "pr-10" : "",
           )}
           data-testid={`workflow-option-${workflowKey(workflow)}`}
           role="option"
@@ -128,14 +131,26 @@
           {/if}
         </button>
         {#if builtin && oncopy}
-          <button
-            type="button"
-            class="text-accent hover:bg-accent-soft focus-visible:ring-accent absolute top-1.5 right-2 cursor-pointer rounded border border-transparent px-1.5 py-0.5 text-[11px] outline-none focus-visible:ring-2 focus-visible:outline-none"
-            data-testid={`workflow-copy-${workflowKey(workflow)}`}
-            onclick={() => oncopy(workflow)}
-          >
-            Copy to my workflows
-          </button>
+          <!-- Save-to-my-library glyph (bookmark-plus), not a clipboard-copy icon:
+               this writes the built-in into the user's own editable workflows.
+               "Copy" stays in the tooltip as the plainer description. -->
+          <Tooltip label="Copy to my workflows">
+            {#snippet trigger(props)}
+              <button
+                {...props}
+                type="button"
+                class={cn(
+                  ICON_BUTTON_CLASS,
+                  "hover:bg-accent-soft hover:text-accent absolute top-1/2 right-1.5 -translate-y-1/2",
+                )}
+                data-testid={`workflow-copy-${workflowKey(workflow)}`}
+                aria-label="Copy to my workflows"
+                onclick={() => oncopy(workflow)}
+              >
+                <BookmarkPlus size={16} strokeWidth={2} aria-hidden="true" />
+              </button>
+            {/snippet}
+          </Tooltip>
         {/if}
       </div>
     {/each}

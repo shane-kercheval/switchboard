@@ -244,10 +244,7 @@ describe("PromptComposer per-argument forwarding", () => {
   });
 
   it("removes a source chip via its remove control", async () => {
-    setupForward(
-      { focus: "", tone: "" },
-      { argSources: { focus: [{ id: BOB.id, name: "bob" }] } },
-    );
+    setupForward({ focus: "", tone: "" }, { argSources: { focus: [{ id: BOB.id, name: "bob" }] } });
     expect(screen.getByTestId("forward-source-chip-bob")).toBeInTheDocument();
 
     await fireEvent.click(screen.getByTestId("forward-source-remove-bob"));
@@ -270,10 +267,7 @@ describe("PromptComposer per-argument forwarding", () => {
   it("treats a required argument as satisfied once it has a forward source", () => {
     // `focus` is required and typed-empty, but a source fills it → Preview enabled
     // and no missing-required highlight.
-    setupForward(
-      { focus: "", tone: "" },
-      { argSources: { focus: [{ id: BOB.id, name: "bob" }] } },
-    );
+    setupForward({ focus: "", tone: "" }, { argSources: { focus: [{ id: BOB.id, name: "bob" }] } });
     expect((screen.getByTestId("prompt-preview-button") as HTMLButtonElement).disabled).toBe(false);
     expect(screen.getByTestId("prompt-arg-focus")).not.toHaveClass("border-status-failed");
   });

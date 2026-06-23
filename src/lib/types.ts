@@ -638,7 +638,23 @@ export type ConversationItem =
       status: OutcomeStatus;
       reason?: string | null;
       at: string;
+    }
+  | {
+      // A harness-recorded inter-turn event (currently only compaction), sourced
+      // from one agent's session file. Agent-scoped (`agent_id`) — rendered as a
+      // per-agent marker, never correlated to a send. `id` is the harness
+      // `turn_id` (stable render identity, not a send key).
+      kind: "system_marker";
+      id: string;
+      agent_id: AgentId;
+      marker: SystemMarker;
+      at: string;
     };
+
+// Mirror of Rust `SystemMarker` (`crates/harness/src/transcript.rs`,
+// `#[serde(tag = "marker_kind")]`). Discriminated union so a future marker kind
+// lands additively; reducers default-branch on an unknown `marker_kind`.
+export type SystemMarker = { marker_kind: "compaction"; summary: string };
 
 // Per-agent metadata carried alongside the merged items. `warnings` and
 // `load_error` are agent-scoped: one agent's transcript failing to load leaves

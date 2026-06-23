@@ -2574,6 +2574,42 @@ describe("UnifiedTranscript compact mode", () => {
     expect(toggleLabel(outcome)).toBeNull();
   });
 
+  it("renders a compaction marker attributed to its own agent, not project-wide", async () => {
+    // Multi-agent project: a compaction marker for one agent must render in that
+    // agent's lane (carrying its agent id + name), not as a project-wide divider
+    // that would misread as "the whole project compacted".
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    await state.registerAgent(CODEX_AGENT);
+
+    const overlay: ConversationItem[] = [
+      {
+        kind: "system_marker",
+        id: "marker-1",
+        agent_id: CLAUDE_AGENT.id,
+        marker: { marker_kind: "compaction", summary: "the recap text" },
+        at: "2026-05-16T00:00:05Z",
+      },
+    ];
+
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT, CODEX_AGENT], overlay },
+    });
+
+    const markers = screen.getAllByTestId("system-marker");
+    expect(markers).toHaveLength(1);
+    expect(markers[0]).toHaveAttribute("data-agent-id", CLAUDE_AGENT.id);
+    expect(markers[0]!.querySelector('[data-testid="turn-agent-name"]')).not.toBeNull();
+    // The disclosure carries the recap behind a label, COLLAPSED by default — a
+    // regression that adds `open` (flooding long transcripts with full recaps)
+    // must fail here. `toHaveTextContent` alone wouldn't catch it: a closed
+    // `<details>` still keeps its body text in the DOM.
+    const details = screen.getByTestId("compaction-marker");
+    expect(details).not.toHaveAttribute("open");
+    expect(details).toHaveTextContent("Conversation compacted");
+    expect(details).toHaveTextContent("the recap text");
+  });
+
   it("hides tool calls and thinking widgets in a compact completed response", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);

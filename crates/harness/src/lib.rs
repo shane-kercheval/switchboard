@@ -52,6 +52,6 @@ pub use gemini::session_file::{
 pub use mock::{MockHarnessAdapter, MockScenario};
 pub use resume::interactive_resume_command;
 pub use transcript::{
-    LoadTranscriptError, LoadedTranscript, ParseWarning, SessionMetaInfo, Turn, TurnItem,
-    TurnStatus, UserPromptSource,
+    LoadTranscriptError, LoadedTranscript, ParseWarning, SessionMetaInfo, SystemMarker, Turn,
+    TurnItem, TurnStatus, UserPromptSource,
 };

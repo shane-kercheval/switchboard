@@ -37,6 +37,8 @@
   import PlusIcon from "$lib/components/ui/PlusIcon.svelte";
   import StopIcon from "$lib/components/ui/StopIcon.svelte";
   import Spinner from "$lib/components/ui/Spinner.svelte";
+  import StatusDot from "$lib/components/ui/StatusDot.svelte";
+  import { workflowRuns, cancelRun } from "$lib/state/workflows.svelte";
   import DropdownMenu from "$lib/components/ui/DropdownMenu.svelte";
   import DropdownMenuItem from "$lib/components/ui/DropdownMenuItem.svelte";
   import { ICON_BUTTON_CLASS } from "$lib/components/ui/iconButton";
@@ -67,6 +69,15 @@
     for (const [sendId, agentIds] of liveProjectSends(projectId)) {
       cancelSend(sendId, agentIds);
     }
+  }
+
+  // The row's stop is a convenience control; a failed cancel is logged rather than
+  // surfaced (the run's own live view, opened from the row, owns visible feedback).
+  // Catching also avoids an unhandled rejection from the fire-and-forget click.
+  function stopWorkflowRun(runId: string): void {
+    cancelRun(runId).catch((e: unknown) =>
+      console.warn("[switchboard] failed to cancel workflow run", e),
+    );
   }
 
   let deleteConfirmProjectId = $state<ProjectId | null>(null);
@@ -457,6 +468,14 @@
         {@const liveSends = liveProjectSends(project.id)}
         {@const busy = liveSends.size > 0}
         {@const completed = !busy && project.id in backgroundCompletedProjectIds}
+        <!-- Workflow state is derived from `workflowRuns`, NOT `busy`: a workflow
+             between steps, before its first dispatch, or in the failed-held state
+             has no live send and would otherwise look idle. -->
+        {@const workflowRun = workflowRuns[project.id]?.[0] ?? null}
+        {@const workflowRunning = workflowRun?.status === "running"}
+        {@const workflowFailedOrInterrupted =
+          workflowRun !== null &&
+          (workflowRun.status === "failed" || workflowRun.status === "interrupted")}
         {@const editing = editingProjectId === project.id}
         {@const highlighted =
           project.id === (selection.loadingProjectId ?? selection.activeProjectId)}
@@ -717,13 +736,31 @@
                     </DropdownMenu>
                   </div>
                 {/if}
-                {#if busy}
+                {#if workflowFailedOrInterrupted}
+                  <!-- The only surviving signal for a *background* workflow
+                       failure (the global header indicator was removed): persists
+                       until the user opens the project and dismisses the held
+                       failed view (= abandon, which drops it from `workflowRuns`). -->
+                  <div
+                    class="flex h-[26px] w-[26px] items-center justify-center"
+                    data-testid="project-workflow-failed"
+                  >
+                    <StatusDot
+                      status="failed"
+                      label="Workflow failed — open to dismiss"
+                      class="h-2 w-2"
+                    />
+                  </div>
+                {:else if busy || workflowRunning}
                   <button
                     type="button"
                     class="group/cancel text-muted hover:bg-status-failed-soft/70 hover:text-status-failed focus-visible:ring-accent focus-visible:bg-status-failed-soft/70 focus-visible:text-status-failed inline-flex h-[26px] w-[26px] items-center justify-center rounded-full transition-colors focus-visible:ring-2 focus-visible:outline-none"
-                    aria-label="Cancel all running agents"
+                    aria-label={workflowRunning ? "Stop workflow" : "Cancel all running agents"}
                     data-testid="project-cancel"
-                    onclick={() => cancelAllForProject(project.id)}
+                    onclick={() =>
+                      workflowRunning && workflowRun !== null
+                        ? stopWorkflowRun(workflowRun.run_id)
+                        : cancelAllForProject(project.id)}
                   >
                     <Spinner
                       class="h-5 w-5 group-hover/cancel:hidden group-focus-visible/cancel:hidden"

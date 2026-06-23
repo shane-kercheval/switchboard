@@ -7,6 +7,8 @@ import type { AgentRecord, ProjectListing } from "$lib/types";
 // not inside the first test's timeout (cold CI transforms have no vite cache).
 // `vi.mock` is hoisted above imports, so the mocks below still apply.
 import ProjectsSidebar from "./ProjectsSidebar.svelte";
+import { workflowRuns, _testing as workflowsTesting } from "$lib/state/workflows.svelte";
+import type { WorkflowRunInfo } from "$lib/types";
 
 const invokeMock = vi.fn<(cmd: string, args?: Record<string, unknown>) => Promise<unknown>>(
   async () => undefined,
@@ -119,6 +121,7 @@ afterEach(async () => {
   state._testing.reset();
   const ws = await loadWorkspace();
   ws._testing.reset();
+  workflowsTesting.reset();
 });
 
 /// Seed a project with one agent that has a live (pending) send.
@@ -950,5 +953,107 @@ describe("ProjectsSidebar — search", () => {
     await fireEvent.click(screen.getByTestId("project-view-archived"));
     expect(rowIds()).toEqual([]);
     expect(screen.getByText("No archived projects.")).toBeInTheDocument();
+  });
+});
+
+describe("ProjectsSidebar — workflow run state (M5)", () => {
+  async function seedProject(projectId: string): Promise<void> {
+    const ws = await loadWorkspace();
+    ws.projects.list = [project(projectId)];
+  }
+
+  function wfRun(over: Partial<WorkflowRunInfo> = {}): WorkflowRunInfo {
+    return {
+      run_id: "run-1",
+      workflow: "review-and-aggregate",
+      step: 0,
+      total: 3,
+      status: "running",
+      reason: null,
+      steps: [],
+      ...over,
+    };
+  }
+
+  it("shows the running indicator from workflow state even with no live sends", async () => {
+    // A workflow between steps has no live send — the row must still read busy.
+    await seedProject(PROJECT_1);
+    workflowRuns[PROJECT_1] = [wfRun()];
+    render(ProjectsSidebar, { props: noopProps });
+    await tick();
+
+    expect(screen.getByTestId("project-cancel")).toBeInTheDocument();
+    expect(screen.queryByTestId("project-workflow-failed")).toBeNull();
+  });
+
+  it("the row stop cancels the workflow run when one is running", async () => {
+    await seedProject(PROJECT_1);
+    workflowRuns[PROJECT_1] = [wfRun()];
+    render(ProjectsSidebar, { props: noopProps });
+    await tick();
+
+    await fireEvent.click(screen.getByTestId("project-cancel"));
+    expect(invokeMock).toHaveBeenCalledWith("cancel_workflow_run", { runId: "run-1" });
+  });
+
+  it("shows a failure badge (and no cancel) for a failed run", async () => {
+    await seedProject(PROJECT_1);
+    workflowRuns[PROJECT_1] = [wfRun({ status: "failed", step: 1, reason: "boom" })];
+    render(ProjectsSidebar, { props: noopProps });
+    await tick();
+
+    expect(screen.getByTestId("project-workflow-failed")).toBeInTheDocument();
+    expect(screen.queryByTestId("project-cancel")).toBeNull();
+  });
+
+  it("shows a failure badge for an interrupted run", async () => {
+    await seedProject(PROJECT_1);
+    workflowRuns[PROJECT_1] = [wfRun({ status: "interrupted", step: 1 })];
+    render(ProjectsSidebar, { props: noopProps });
+    await tick();
+
+    expect(screen.getByTestId("project-workflow-failed")).toBeInTheDocument();
+  });
+
+  it("clears the failure badge once the run is dismissed (dropped from state)", async () => {
+    await seedProject(PROJECT_1);
+    workflowRuns[PROJECT_1] = [wfRun({ status: "failed" })];
+    render(ProjectsSidebar, { props: noopProps });
+    await tick();
+    expect(screen.getByTestId("project-workflow-failed")).toBeInTheDocument();
+
+    workflowRuns[PROJECT_1] = [];
+    await tick();
+    expect(screen.queryByTestId("project-workflow-failed")).toBeNull();
+  });
+
+  it("a normal live send (no workflow) still spins and cancels sends, with no failure badge", async () => {
+    await seedBusyProject(PROJECT_1);
+    const state = await loadState();
+    state.recordSendAccepted(AGENT_1, "user-1", "msg-1");
+    render(ProjectsSidebar, { props: noopProps });
+
+    await fireEvent.click(screen.getByTestId("project-cancel"));
+    expect(invokeMock).toHaveBeenCalledWith("cancel_send", {
+      sendId: "send-1",
+      recipients: [AGENT_1],
+    });
+    expect(screen.queryByTestId("project-workflow-failed")).toBeNull();
+  });
+
+  it("catches a failed workflow-run cancel (no unhandled rejection)", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "cancel_workflow_run") throw new Error("backend gone");
+      return undefined;
+    });
+    await seedProject(PROJECT_1);
+    workflowRuns[PROJECT_1] = [wfRun()];
+    render(ProjectsSidebar, { props: noopProps });
+    await tick();
+
+    await fireEvent.click(screen.getByTestId("project-cancel"));
+    await vi.waitFor(() => expect(warn).toHaveBeenCalled());
+    warn.mockRestore();
   });
 });

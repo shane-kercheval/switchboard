@@ -7,6 +7,8 @@ import type { AgentRecord, NormalizedEvent, Prompt } from "$lib/types";
 // not inside the first test's timeout (cold CI transforms have no vite cache).
 // `vi.mock` is hoisted above imports, so the mocks below still apply.
 import ComposeBar from "./ComposeBar.svelte";
+import { workflowRuns, _testing as workflowsTesting } from "$lib/state/workflows.svelte";
+import type { WorkflowRunInfo } from "$lib/types";
 
 const invokeMock = vi.fn(
   async (_cmd: string, _args?: Record<string, unknown>): Promise<unknown> => null,
@@ -2777,8 +2779,14 @@ describe("ComposeBar — cross-agent forward", () => {
       is_builtin: true,
       invocable: true,
       inputs: WORKFLOW.inputs,
+      steps: [],
       derived_args: [
-        { name: "context", required: false, description: "Optional background", prompts: ["builtin:code-review"] },
+        {
+          name: "context",
+          required: false,
+          description: "Optional background",
+          prompts: ["builtin:code-review"],
+        },
       ],
       compatibility: { state: "ok" },
     };
@@ -2850,8 +2858,14 @@ describe("ComposeBar — cross-agent forward", () => {
       is_builtin: true,
       invocable: true,
       inputs: WORKFLOW.inputs,
+      steps: [],
       derived_args: [
-        { name: "context", required: false, description: "Optional background", prompts: ["builtin:code-review"] },
+        {
+          name: "context",
+          required: false,
+          description: "Optional background",
+          prompts: ["builtin:code-review"],
+        },
       ],
       compatibility: { state: "ok" },
     };
@@ -2906,6 +2920,7 @@ describe("ComposeBar — cross-agent forward", () => {
       is_builtin: false,
       invocable: true,
       inputs: WORKFLOW.inputs,
+      steps: [],
       derived_args: [] as unknown[],
     };
     // The first describe lands while the MCP prompt is still cold (unresolved);
@@ -2961,6 +2976,7 @@ describe("ComposeBar — cross-agent forward", () => {
           is_builtin: false,
           invocable: true,
           inputs: WORKFLOW.inputs,
+          steps: [],
           derived_args: [],
           compatibility: { state: "unresolved", prompts: ["tiddly:gone"] },
         };
@@ -3003,6 +3019,7 @@ describe("ComposeBar — cross-agent forward", () => {
       is_builtin: false,
       invocable: true,
       inputs: WORKFLOW.inputs,
+      steps: [],
       derived_args: [] as unknown[],
     };
     const pending: Array<(d: unknown) => void> = [];
@@ -3033,5 +3050,172 @@ describe("ComposeBar — cross-agent forward", () => {
     // The stale unresolved reply is ignored — the form stays resolved.
     expect(screen.getByTestId("workflow-agent-worker-alice")).toBeInTheDocument();
     expect(screen.queryByTestId("workflow-resolving")).toBeNull();
+  });
+});
+
+describe("ComposeBar — workflow run live view (M4 swap / hold / stop)", () => {
+  function run(over: Partial<WorkflowRunInfo> = {}): WorkflowRunInfo {
+    return {
+      run_id: "run-1",
+      workflow: "review-and-aggregate",
+      step: 0,
+      total: 3,
+      status: "running",
+      reason: null,
+      steps: [
+        {
+          label: "Send the review",
+          recipients: [{ kind: "literal", name: "alice" }],
+          feeds_from: [],
+        },
+        {
+          label: "Wait for reviews",
+          recipients: [{ kind: "literal", name: "alice" }],
+          feeds_from: [],
+        },
+        { label: "Hand off", recipients: [{ kind: "literal", name: "bob" }], feeds_from: [] },
+      ],
+      ...over,
+    };
+  }
+
+  beforeEach(() => workflowsTesting.reset());
+  afterEach(() => workflowsTesting.reset());
+
+  it("replaces compose with the live progress view while a workflow runs", async () => {
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    expect(screen.getByTestId("compose-box")).toBeInTheDocument();
+
+    workflowRuns[PROJECT_ID] = [run()];
+    await tick();
+
+    expect(screen.getByTestId("workflow-run-live")).toBeInTheDocument();
+    // The compose box (and any send path) is GONE, not merely disabled.
+    expect(screen.queryByTestId("compose-box")).toBeNull();
+    expect(screen.queryByTestId("compose-textarea")).toBeNull();
+    expect(screen.queryByTestId("compose-send")).toBeNull();
+    // Labeled steps render, with the active step on step 0.
+    expect(screen.getByTestId("workflow-step-0")).toHaveTextContent("Send the review");
+    expect(screen.getByTestId("workflow-step-0")).toHaveAttribute("data-step-state", "active");
+  });
+
+  it("restores compose when the run completes and drops from state", async () => {
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    workflowRuns[PROJECT_ID] = [run()];
+    await tick();
+    expect(screen.getByTestId("workflow-run-live")).toBeInTheDocument();
+
+    // complete/cancelled remove the run from state.
+    workflowRuns[PROJECT_ID] = [];
+    await tick();
+    expect(screen.getByTestId("compose-box")).toBeInTheDocument();
+    expect(screen.queryByTestId("workflow-run-live")).toBeNull();
+  });
+
+  it("holds on a failed run and Dismiss abandons it", async () => {
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    workflowRuns[PROJECT_ID] = [run({ status: "failed", step: 1, reason: "agent is busy" })];
+    await tick();
+
+    // Held (no Stop), showing the failed step + reason.
+    expect(screen.getByTestId("workflow-run-live")).toHaveAttribute("data-run-status", "failed");
+    expect(screen.queryByTestId("workflow-run-stop")).toBeNull();
+    expect(screen.getByTestId("workflow-step-1")).toHaveAttribute("data-step-state", "failed");
+    expect(screen.getByTestId("workflow-step-reason-1")).toHaveTextContent("agent is busy");
+
+    await fireEvent.click(screen.getByTestId("workflow-run-dismiss"));
+    const call = invokeMock.mock.calls.find(([c]) => c === "abandon_workflow_run");
+    expect(call?.[1]).toMatchObject({ projectId: PROJECT_ID, runId: "run-1" });
+  });
+
+  it("Stop cancels the workflow run", async () => {
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    workflowRuns[PROJECT_ID] = [run()];
+    await tick();
+
+    await fireEvent.click(screen.getByTestId("workflow-run-stop"));
+    const call = invokeMock.mock.calls.find(([c]) => c === "cancel_workflow_run");
+    expect(call?.[1]).toMatchObject({ runId: "run-1" });
+  });
+
+  it("renders a fallback count line when steps are absent (legacy/pre-refresh)", async () => {
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    workflowRuns[PROJECT_ID] = [run({ steps: [] })];
+    await tick();
+    expect(screen.getByTestId("workflow-run-fallback")).toHaveTextContent("Step 1 of 3");
+  });
+
+  it("holds the lockout via an optimistic row when the post-invoke refresh fails", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    const WORKFLOW = {
+      name: "review-and-aggregate",
+      is_builtin: true,
+      description: "d",
+      inputs: [
+        { name: "reviewers", ty: "agent_list", optional: false, description: null },
+        { name: "worker", ty: "agent", optional: false, description: null },
+      ],
+      invocable: true,
+      parse_error: null,
+    };
+    const DESCRIPTOR = {
+      name: "review-and-aggregate",
+      description: "d",
+      is_builtin: true,
+      invocable: true,
+      inputs: WORKFLOW.inputs,
+      steps: [
+        {
+          label: "Send the review",
+          recipients: [{ kind: "slot", input: "reviewers" }],
+          feeds_from: [],
+        },
+      ],
+      derived_args: [],
+      compatibility: { state: "ok" },
+    };
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "list_workflows") return [WORKFLOW];
+      if (cmd === "describe_workflow_form") return DESCRIPTOR;
+      if (cmd === "list_prompts") return [];
+      if (cmd === "invoke_workflow") return "run-opt";
+      // The follow-up seed fails — the lockout must NOT depend on it.
+      if (cmd === "list_workflow_runs") throw new Error("transient backend error");
+      return null;
+    });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    await fireEvent.click(screen.getByTestId("compose-workflow-button"));
+    await waitFor(() => screen.getByTestId("workflow-option-builtin:review-and-aggregate"));
+    await fireEvent.click(screen.getByTestId("workflow-option-builtin:review-and-aggregate"));
+    await waitFor(() => screen.getByTestId("workflow-composer"));
+    await fireEvent.click(screen.getByTestId("workflow-agent-reviewers-bob"));
+    await fireEvent.click(screen.getByTestId("workflow-agent-worker-alice"));
+    await fireEvent.click(screen.getByTestId("workflow-invoke-button"));
+
+    // Refresh rejected, but the optimistic row keeps the compose box gone.
+    await waitFor(() => expect(screen.getByTestId("workflow-run-live")).toBeInTheDocument());
+    expect(screen.queryByTestId("compose-box")).toBeNull();
+    expect(screen.queryByTestId("compose-textarea")).toBeNull();
+    expect(screen.getByTestId("workflow-step-0")).toHaveTextContent("Send the review");
+  });
+
+  it("surfaces a Dismiss failure inline and keeps the run held", async () => {
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "abandon_workflow_run") throw new Error("file is gone");
+      return null;
+    });
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    workflowRuns[PROJECT_ID] = [run({ status: "failed", step: 1, reason: "boom" })];
+    await tick();
+
+    await fireEvent.click(screen.getByTestId("workflow-run-dismiss"));
+    await waitFor(() =>
+      expect(screen.getByTestId("workflow-run-error")).toHaveTextContent("Couldn't dismiss"),
+    );
+    // Still held — the run wasn't cleared.
+    expect(screen.getByTestId("workflow-run-live")).toBeInTheDocument();
   });
 });

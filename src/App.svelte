@@ -13,7 +13,6 @@
   import Sidebar from "$lib/components/Sidebar.svelte";
   import TranscriptPanes from "$lib/components/TranscriptPanes.svelte";
   import WelcomeScreen from "$lib/components/WelcomeScreen.svelte";
-  import WorkflowRunIndicator from "$lib/components/WorkflowRunIndicator.svelte";
   import Dialog from "$lib/components/ui/Dialog.svelte";
   import Button from "$lib/components/ui/Button.svelte";
   import AppShell from "$lib/components/ui/AppShell.svelte";
@@ -914,8 +913,6 @@
         {:else}
           <div class="flex-1"></div>
         {/if}
-
-        <WorkflowRunIndicator />
 
         {#if showPaneHeaderControls}
           <div class="flex min-w-0 shrink items-center gap-1" data-tauri-no-drag>

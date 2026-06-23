@@ -64,9 +64,67 @@ describe("workflows store", () => {
     expect(workflowRuns["p1"]?.find((r) => r.run_id === "r1")?.step).toBe(2);
   });
 
+  it("preserves a run's steps when a lean progress event updates it in place", async () => {
+    const seeded: WorkflowRunInfo[] = [
+      {
+        run_id: "r1",
+        workflow: "review-and-aggregate",
+        step: 0,
+        total: 3,
+        status: "running",
+        reason: null,
+        steps: [{ label: "Send the review", recipients: [], feeds_from: [] }],
+      },
+    ];
+    invokeMock.mockResolvedValueOnce(seeded); // list_workflow_runs
+    await subscribeProjectWorkflows("p1");
+
+    // The progress payload carries no steps; the update must keep the seeded ones.
+    emit("p1", running({ step: 2 }));
+    const row = workflowRuns["p1"]?.find((r) => r.run_id === "r1");
+    expect(row?.step).toBe(2);
+    expect(row?.steps).toHaveLength(1);
+    expect(row?.steps[0]?.label).toBe("Send the review");
+  });
+
+  it("refreshes to fetch steps when a run is first seen via an event", async () => {
+    invokeMock.mockResolvedValueOnce([]); // initial seed: empty
+    await subscribeProjectWorkflows("p1");
+
+    // The authoritative snapshot the triggered refresh will return.
+    invokeMock.mockResolvedValueOnce([
+      {
+        run_id: "r2",
+        workflow: "w",
+        step: 0,
+        total: 2,
+        status: "running",
+        reason: null,
+        steps: [{ label: "Go", recipients: [], feeds_from: [] }],
+      },
+    ]); // list_workflow_runs (refresh)
+
+    // An event for an unknown run appends a step-less row immediately...
+    emit("p1", running({ run_id: "r2", total: 2 }));
+    expect(workflowRuns["p1"]?.find((r) => r.run_id === "r2")?.steps).toHaveLength(0);
+
+    // ...and the triggered refresh fills the steps.
+    await vi.waitFor(() =>
+      expect(workflowRuns["p1"]?.find((r) => r.run_id === "r2")?.steps).toHaveLength(1),
+    );
+  });
+
   it("drives terminals from the payload without a re-query", async () => {
     invokeMock.mockResolvedValueOnce([
-      { run_id: "r1", workflow: "w", step: 0, total: 3, status: "running", reason: null, steps: [] },
+      {
+        run_id: "r1",
+        workflow: "w",
+        step: 0,
+        total: 3,
+        status: "running",
+        reason: null,
+        steps: [],
+      },
     ]); // seed
     await subscribeProjectWorkflows("p1");
     const seedQueries = () =>
@@ -111,7 +169,15 @@ describe("workflows store", () => {
 
     unsubscribeProjectWorkflows(["p1"]);
     resolveSeed([
-      { run_id: "r1", workflow: "w", step: 0, total: 3, status: "running", reason: null, steps: [] },
+      {
+        run_id: "r1",
+        workflow: "w",
+        step: 0,
+        total: 3,
+        status: "running",
+        reason: null,
+        steps: [],
+      },
     ]);
     await sub;
 

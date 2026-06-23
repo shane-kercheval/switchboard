@@ -15,6 +15,7 @@
   import { cn } from "$lib/utils";
   import Textarea from "$lib/components/ui/Textarea.svelte";
   import HarnessIcon from "$lib/components/ui/HarnessIcon.svelte";
+  import WorkflowSteps from "$lib/components/WorkflowSteps.svelte";
   import ForwardSourceChip from "$lib/components/ui/ForwardSourceChip.svelte";
   import ForwardSourcePicker from "$lib/components/ui/ForwardSourcePicker.svelte";
 
@@ -82,9 +83,7 @@
   }
 
   function removeArgSource(name: string, key: string): void {
-    forwardSources[name] = (forwardSources[name] ?? []).filter(
-      (s) => forwardSourceKey(s) !== key,
-    );
+    forwardSources[name] = (forwardSources[name] ?? []).filter((s) => forwardSourceKey(s) !== key);
   }
 
   function hasSources(name: string): boolean {
@@ -206,9 +205,7 @@
   const unresolvedMissing = $derived(
     compat.state === "unresolved" && syncSettled ? compat.prompts : null,
   );
-  const pending = $derived(
-    loading || (compat.state === "unresolved" && !syncSettled),
-  );
+  const pending = $derived(loading || (compat.state === "unresolved" && !syncSettled));
 
   const missing = $derived([
     ...descriptor.inputs.filter((i) => isMissingInput(i.name, i.ty, i.optional)).map((i) => i.name),
@@ -259,6 +256,18 @@
     {/if}
   </div>
 
+  {#if descriptor.invocable && descriptor.steps.length > 0}
+    <!-- Preview of the workflow's steps: what it does and which agents it will
+         invoke. Slot recipients resolve live against `inputs` as the user binds
+         agents below (the same shared step component the live run view uses). -->
+    <div
+      class="border-border/70 bg-surface/40 rounded-md border px-2.5 py-2"
+      data-testid="workflow-steps-preview"
+    >
+      <WorkflowSteps steps={descriptor.steps} mode="preview" {inputs} />
+    </div>
+  {/if}
+
   {#if !descriptor.invocable}
     <p class="text-status-failed text-xs" data-testid="workflow-not-supported">
       This workflow uses a step type not supported in this version.
@@ -282,14 +291,20 @@
       Resolving prompts…
     </p>
   {:else if incompatible}
-    <div class="text-status-failed flex flex-col gap-0.5 text-xs" data-testid="workflow-incompatible">
+    <div
+      class="text-status-failed flex flex-col gap-0.5 text-xs"
+      data-testid="workflow-incompatible"
+    >
       <span class="font-medium">This workflow can't run — its prompt has changed:</span>
       {#each incompatible.issues as issue (issue.prompt + issue.argument + issue.reason)}
         <span>• {issue.reason}</span>
       {/each}
     </div>
   {:else if unresolvedMissing}
-    <div class="text-status-failed flex flex-col gap-0.5 text-xs" data-testid="workflow-prompt-missing">
+    <div
+      class="text-status-failed flex flex-col gap-0.5 text-xs"
+      data-testid="workflow-prompt-missing"
+    >
       <span class="font-medium">This workflow can't run — a prompt it uses wasn't found:</span>
       {#each unresolvedMissing as id (id)}
         <span>• prompt <code>{id}</code> is not available</span>

@@ -128,6 +128,12 @@ function handleProgress(projectId: ProjectId, payload: WorkflowProgressPayload):
   workflowRuns[projectId] = existing
     ? current.map((r) => (r.run_id === payload.run_id ? row : r))
     : [...current, row];
+  // A run first seen via an event — started outside the launching view (a
+  // background project, direct IPC), or before that view's post-invoke seed
+  // resolved — has no `steps`. Fetch the authoritative snapshot once so the live
+  // view renders labeled steps. Only the first event for the run hits this; later
+  // events find `existing` and update in place (preserving the fetched steps).
+  if (existing === undefined) void refreshRuns(projectId);
 }
 
 /// Cancel a live run (fire-and-forget on the backend; the channel event clears it).
@@ -135,19 +141,11 @@ export async function cancelRun(runId: string): Promise<void> {
   await api.cancelWorkflowRun(runId);
 }
 
-/// Abandon a failed/interrupted run, then refresh so it drops from the indicator.
+/// Abandon a failed/interrupted run, then refresh so it drops from the per-project
+/// state (which clears the held failed view and the sidebar failure badge).
 export async function abandonRun(projectId: ProjectId, runId: string): Promise<void> {
   await api.abandonWorkflowRun(projectId, runId);
   await refreshRuns(projectId);
-}
-
-/// All runs across loaded projects, flattened for the global indicator.
-export function allRuns(): { projectId: ProjectId; run: WorkflowRunInfo }[] {
-  const out: { projectId: ProjectId; run: WorkflowRunInfo }[] = [];
-  for (const [projectId, runs] of Object.entries(workflowRuns)) {
-    for (const run of runs) out.push({ projectId, run });
-  }
-  return out;
 }
 
 /// Test-only reset: drop all subscriptions and run state.

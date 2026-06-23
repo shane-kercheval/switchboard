@@ -11,12 +11,15 @@ inputs:
     type: agent
     description: The agent that receives every reviewer's combined feedback and produces the recommendations.
 steps:
-  - send:
+  - label: Send code review to reviewers
+    send:
       to: "{{ reviewers }}"
       prompt: "builtin:code-review"
-  - wait_for_all:
+  - label: Wait for all reviews
+    wait_for_all:
       agents: "{{ reviewers }}"
-  - send:
+  - label: Send combined feedback to worker
+    send:
       to: "{{ worker }}"
       text: |
         Here's feedback from several reviewers:

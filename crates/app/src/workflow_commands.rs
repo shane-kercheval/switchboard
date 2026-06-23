@@ -19,9 +19,9 @@ use switchboard_core::{AgentId, AgentRecord, Project, ProjectId};
 use switchboard_dispatcher::{DispatchContextFactory, EventEmitter};
 use switchboard_prompts::{PromptArgument, PromptId, PromptService};
 use switchboard_workflow::{
-    InputType, InputValue, RunRecord, RunStatus, ScopeValue, Step, TerminalStatus, Workflow,
-    WorkflowError, bind_invocation, builtin_workflow, builtin_workflow_content, builtin_workflows,
-    parse_workflow,
+    InputType, InputValue, RecipientRef, RunRecord, RunStatus, ScopeValue, Step, TerminalStatus,
+    Workflow, WorkflowError, WorkflowStepInfo, bind_invocation, builtin_workflow,
+    builtin_workflow_content, builtin_workflows, parse_workflow, step_display,
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -252,6 +252,47 @@ pub struct WorkflowRunInfo {
     pub total: usize,
     pub status: &'static str,
     pub reason: Option<String>,
+    /// Per-step display info for the live progress view. **Resolved** recipients
+    /// (concrete agent names) for a live run, sourced from the registry; *declared*
+    /// recipients for a disk-sourced failed/interrupted run, reconstructed from the
+    /// run file's snapshot (no binding snapshot is journaled). May be empty for a
+    /// legacy run file written before the snapshot existed.
+    pub steps: Vec<WorkflowStepInfo>,
+}
+
+/// Resolve a declared step snapshot's recipients against the invocation's bindings,
+/// for the live progress view. A `Slot { input }` expands to one `Literal` per
+/// bound agent name (a single `agent` → one, an `[agent]` → the list); an unbound
+/// slot is left as-is. `Literal` references pass through unchanged.
+fn resolve_step_display(
+    declared: &[WorkflowStepInfo],
+    bound: &BTreeMap<String, ScopeValue>,
+) -> Vec<WorkflowStepInfo> {
+    let resolve = |refs: &[RecipientRef]| -> Vec<RecipientRef> {
+        refs.iter()
+            .flat_map(|r| match r {
+                RecipientRef::Slot { input } => match bound.get(input) {
+                    Some(ScopeValue::Text(name)) => {
+                        vec![RecipientRef::Literal { name: name.clone() }]
+                    }
+                    Some(ScopeValue::List(names)) => names
+                        .iter()
+                        .map(|name| RecipientRef::Literal { name: name.clone() })
+                        .collect(),
+                    None => vec![r.clone()],
+                },
+                RecipientRef::Literal { .. } => vec![r.clone()],
+            })
+            .collect()
+    };
+    declared
+        .iter()
+        .map(|s| WorkflowStepInfo {
+            label: s.label.clone(),
+            recipients: resolve(&s.recipients),
+            feeds_from: resolve(&s.feeds_from),
+        })
+        .collect()
 }
 
 fn input_type_str(ty: InputType) -> &'static str {
@@ -472,7 +513,7 @@ fn hardcoded_prompt_sends(workflow: &Workflow) -> Vec<(&str, Vec<&str>)> {
     workflow
         .steps
         .iter()
-        .filter_map(|step| match step {
+        .filter_map(|labeled| match &labeled.step {
             Step::Send(send) => send.prompt.as_deref().map(|id| {
                 let keys = send.template_vars.iter().map(|(k, _)| k.as_str()).collect();
                 (id, keys)
@@ -532,6 +573,10 @@ pub struct WorkflowFormDescriptor {
     pub inputs: Vec<WorkflowInputInfo>,
     pub derived_args: Vec<DerivedArgInfo>,
     pub compatibility: FormCompatibility,
+    /// The workflow's steps with **declared** recipients (slots unresolved), for
+    /// the composer preview — the frontend resolves slots live against the form's
+    /// bindings as the user assigns agents.
+    pub steps: Vec<WorkflowStepInfo>,
 }
 
 /// The resolved form: the user-fillable derived fields, the compatibility
@@ -826,6 +871,7 @@ pub fn describe_workflow_form_impl(
         inputs,
         derived_args: form.derived_args,
         compatibility: form.compatibility,
+        steps: step_display(&workflow),
     })
 }
 
@@ -919,6 +965,9 @@ pub fn invoke_workflow_impl(
     let cancel = CancellationToken::new();
     let done = Arc::new(tokio::sync::Notify::new());
 
+    // Live-view step snapshot with recipients resolved to the bound agent names.
+    let resolved_steps = resolve_step_display(&step_display(&workflow), &bound);
+
     let sink = Arc::new(ChannelProgressSink::new(
         run_id,
         project_id,
@@ -928,20 +977,36 @@ pub fn invoke_workflow_impl(
         Arc::clone(&state.workflow_runs),
     ));
 
+    // A held failed/interrupted run occupies the project too: it replaces the
+    // compose box until dismissed, so launching requires dismissing it first.
+    if project_has_held_run(state, &project, project_id) {
+        return Err(AppError::WorkflowRunRequiresDismissal { project_id });
+    }
+
     // Register the live run before spawning so cancel/list see it immediately.
-    lock(&state.workflow_runs).insert(
-        run_id,
-        ActiveRun {
-            cancel: cancel.clone(),
-            project_id,
-            workflow: workflow_name.clone(),
-            snapshot: RunSnapshot {
-                total_steps,
-                current_step: 0,
+    // Enforce one run per project **atomically** under the registry lock: check for
+    // an existing active run for this project and insert under the same acquisition,
+    // so two concurrent invokes can't both pass. The task is spawned only after.
+    {
+        let mut runs = lock(&state.workflow_runs);
+        if runs.values().any(|r| r.project_id == project_id) {
+            return Err(AppError::WorkflowAlreadyRunning { project_id });
+        }
+        runs.insert(
+            run_id,
+            ActiveRun {
+                cancel: cancel.clone(),
+                project_id,
+                workflow: workflow_name.clone(),
+                snapshot: RunSnapshot {
+                    total_steps,
+                    current_step: 0,
+                },
+                steps: resolved_steps,
+                done: Arc::clone(&done),
             },
-            done: Arc::clone(&done),
-        },
-    );
+        );
+    }
 
     let run = WorkflowRun {
         workflow,
@@ -1017,6 +1082,29 @@ pub fn cancel_workflow_run_impl(state: &AppState, run_id: Uuid) {
 /// registry), retained **failed** runs, and **interrupted** runs (a run file with
 /// no terminal record, not in the live registry). Complete/cancelled files were
 /// pruned on terminal and do not appear.
+/// Whether the project has a retained **failed/interrupted** run awaiting
+/// dismissal — which occupies the project the same way a live run does. Scanned
+/// **outside** the registry lock by the caller (the lock is only taken briefly to
+/// read live ids): `read_run_files` does blocking I/O and `workflow_runs` is a
+/// sync mutex. Live runs are excluded because their not-yet-terminal file would
+/// otherwise classify as `interrupted`.
+fn project_has_held_run(state: &AppState, project: &Project, project_id: ProjectId) -> bool {
+    let live_ids: Vec<Uuid> = {
+        let runs = lock(&state.workflow_runs);
+        runs.iter()
+            .filter(|(_, r)| r.project_id == project_id)
+            .map(|(id, _)| *id)
+            .collect()
+    };
+    read_run_files(&project.runs_dir())
+        .into_iter()
+        .any(|(id, records)| {
+            !live_ids.contains(&id)
+                && classify_run_file(id, &records)
+                    .is_some_and(|info| matches!(info.status, "failed" | "interrupted"))
+        })
+}
+
 pub fn list_workflow_runs_impl(state: &AppState, project_id: ProjectId) -> Vec<WorkflowRunInfo> {
     let mut out = Vec::new();
     let mut live_ids: Vec<Uuid> = Vec::new();
@@ -1034,6 +1122,7 @@ pub fn list_workflow_runs_impl(state: &AppState, project_id: ProjectId) -> Vec<W
                 total: run.snapshot.total_steps,
                 status: "running",
                 reason: None,
+                steps: run.steps.clone(),
             });
         }
     }
@@ -1078,16 +1167,19 @@ fn classify_run_file(run_id: Uuid, records: &[RunRecord]) -> Option<WorkflowRunI
     let mut workflow = String::new();
     let mut total = 0usize;
     let mut completed = 0usize;
+    let mut steps: Vec<WorkflowStepInfo> = Vec::new();
     let mut terminal: Option<(TerminalStatus, Option<usize>, Option<String>)> = None;
     for record in records {
         match record {
             RunRecord::Started {
                 workflow: name,
                 total_steps,
+                steps: snapshot,
                 ..
             } => {
                 workflow.clone_from(name);
                 total = *total_steps;
+                steps.clone_from(snapshot);
             }
             RunRecord::StepCompleted { .. } => completed += 1,
             RunRecord::Terminal {
@@ -1108,6 +1200,7 @@ fn classify_run_file(run_id: Uuid, records: &[RunRecord]) -> Option<WorkflowRunI
             total,
             status: "failed",
             reason,
+            steps,
         }),
         // Complete/cancelled should already be pruned; never surface it.
         Some(_) => None,
@@ -1119,6 +1212,7 @@ fn classify_run_file(run_id: Uuid, records: &[RunRecord]) -> Option<WorkflowRunI
             total,
             status: "interrupted",
             reason: None,
+            steps,
         }),
     }
 }
@@ -1276,6 +1370,7 @@ mod tests {
                     total_steps,
                     current_step,
                 },
+                steps: Vec::new(),
                 done: Arc::new(tokio::sync::Notify::new()),
             },
         );
@@ -1344,5 +1439,83 @@ mod tests {
         let (_, payload) = emitter.last.lock().unwrap().clone().unwrap();
         assert_eq!(payload["step"], 2);
         assert_eq!(payload["status"], "cancelled");
+    }
+
+    fn slot(input: &str) -> RecipientRef {
+        RecipientRef::Slot {
+            input: input.to_owned(),
+        }
+    }
+    fn lit(name: &str) -> RecipientRef {
+        RecipientRef::Literal {
+            name: name.to_owned(),
+        }
+    }
+    fn step(label: &str, recipients: Vec<RecipientRef>) -> WorkflowStepInfo {
+        WorkflowStepInfo {
+            label: label.to_owned(),
+            recipients,
+            feeds_from: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn resolve_step_display_expands_slots_to_bound_agent_names() {
+        let declared = vec![
+            step("Fan out", vec![slot("reviewers"), lit("ops")]),
+            step("Hand off", vec![slot("worker")]),
+            step("Unbound", vec![slot("missing")]),
+        ];
+        let mut bound = BTreeMap::new();
+        bound.insert(
+            "reviewers".to_owned(),
+            ScopeValue::List(vec!["alice".to_owned(), "bob".to_owned()]),
+        );
+        bound.insert("worker".to_owned(), ScopeValue::Text("carol".to_owned()));
+
+        let resolved = resolve_step_display(&declared, &bound);
+        // `[agent]` slot → one literal per bound name; the literal passes through.
+        assert_eq!(
+            resolved[0].recipients,
+            vec![lit("alice"), lit("bob"), lit("ops")]
+        );
+        // Single `agent` slot → one literal.
+        assert_eq!(resolved[1].recipients, vec![lit("carol")]);
+        // An unbound slot is left as-is (declared fallback).
+        assert_eq!(resolved[2].recipients, vec![slot("missing")]);
+    }
+
+    #[test]
+    fn classify_run_file_reconstructs_steps_for_failed_and_interrupted() {
+        let snapshot = vec![step("Send the review", vec![slot("reviewers")])];
+        let started = RunRecord::Started {
+            workflow: "w".to_owned(),
+            total_steps: 1,
+            steps: snapshot.clone(),
+            at: chrono::Utc::now(),
+        };
+
+        // Failed: terminal present.
+        let failed = classify_run_file(
+            Uuid::now_v7(),
+            &[
+                started.clone(),
+                RunRecord::Terminal {
+                    status: TerminalStatus::Failed,
+                    failed_step: Some(0),
+                    reason: Some("boom".to_owned()),
+                    at: chrono::Utc::now(),
+                },
+            ],
+        )
+        .expect("failed run surfaces");
+        assert_eq!(failed.status, "failed");
+        assert_eq!(failed.steps, snapshot);
+
+        // Interrupted: no terminal record. Same declared snapshot is reconstructed.
+        let interrupted =
+            classify_run_file(Uuid::now_v7(), &[started]).expect("interrupted run surfaces");
+        assert_eq!(interrupted.status, "interrupted");
+        assert_eq!(interrupted.steps, snapshot);
     }
 }

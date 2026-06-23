@@ -40,6 +40,7 @@
 //! execution.
 
 mod builtin;
+mod display;
 mod error;
 mod invocation;
 mod model;
@@ -50,10 +51,11 @@ mod template;
 pub use builtin::{
     builtin_workflow, builtin_workflow_content, builtin_workflows, parse_builtin_workflows,
 };
+pub use display::{RecipientRef, WorkflowStepInfo, step_display};
 pub use error::{Result, WorkflowError};
 pub use invocation::{InputValue, bind_invocation, validate_agent_list, validate_invocation};
 pub use model::{
-    ForEachStep, InputDecl, InputType, PauseForUserStep, SendStep, Step, Templated,
+    ForEachStep, InputDecl, InputType, LabeledStep, PauseForUserStep, SendStep, Step, Templated,
     UNSUPPORTED_STEP_MESSAGE, WaitForAllStep, WaitForStep, Workflow,
 };
 pub use parse::parse_workflow;

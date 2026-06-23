@@ -211,7 +211,7 @@ mod tests {
 
     fn workflow(inputs_yaml: &str) -> Workflow {
         let yaml = format!(
-            "name: wf\ndescription: d\ninputs:\n{inputs_yaml}steps:\n  - send: {{to: a, text: t}}\n"
+            "name: wf\ndescription: d\ninputs:\n{inputs_yaml}steps:\n  - {{label: s, send: {{to: a, text: t}}}}\n"
         );
         parse_workflow("wf", &yaml).expect("fixture workflow parses")
     }
@@ -345,7 +345,7 @@ mod tests {
 
     #[test]
     fn bind_uses_explicit_long_form_default() {
-        let yaml = "name: wf\ndescription: d\ninputs:\n  ctx:\n    type: text\n    default: fallback\nsteps:\n  - send: {to: a, text: t}\n";
+        let yaml = "name: wf\ndescription: d\ninputs:\n  ctx:\n    type: text\n    default: fallback\nsteps:\n  - {label: s, send: {to: a, text: t}}\n";
         let wf = parse_workflow("wf", yaml).unwrap();
         let bound = bind_invocation(&wf, &BTreeMap::new(), &agents()).unwrap();
         assert_eq!(

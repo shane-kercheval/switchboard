@@ -50,7 +50,7 @@ use switchboard_prompts::{PromptId, PromptService};
 use switchboard_workflow::{
     OutputScope, RunRecord, RunStatus, Scope, ScopeValue, SendStep, Step, Templated,
     TerminalStatus, UNSUPPORTED_STEP_MESSAGE, WaitForAllStep, WaitForStep, Workflow, render,
-    resolve_agent_refs, validate_agent_list,
+    resolve_agent_refs, step_display, validate_agent_list,
 };
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
@@ -178,6 +178,10 @@ impl WorkflowRun {
         self.record(&RunRecord::Started {
             workflow: self.workflow.name.clone(),
             total_steps: self.workflow.steps.len(),
+            // Declared step snapshot, so a failed/interrupted run reconstructs its
+            // progress view from the run file after a restart (the live registry's
+            // resolved copy is gone once the process exits).
+            steps: step_display(&self.workflow),
             at: Utc::now(),
         });
         self.progress.emit(WorkflowProgress::Started {
@@ -188,13 +192,13 @@ impl WorkflowRun {
         // The steps are the immutable snapshot; clone so the walk doesn't borrow
         // `self` while the step executors take `&mut` of it.
         let steps = self.workflow.steps.clone();
-        for (index, step) in steps.iter().enumerate() {
+        for (index, labeled) in steps.iter().enumerate() {
             if self.cancel.is_cancelled() {
                 return self.finish_cancelled(&in_flight);
             }
             self.progress
                 .emit(WorkflowProgress::StepStarted { step_index: index });
-            let result = match step {
+            let result = match &labeled.step {
                 Step::Send(s) => {
                     self.execute_send(s, &outputs, &mut pending, &mut in_flight)
                         .await
@@ -969,7 +973,7 @@ mod tests {
         (dir, service)
     }
 
-    const SEQUENTIAL: &str = "name: seq\ndescription: d\ninputs:\n  planner: agent\n  implementer: agent\n  goal: text\nsteps:\n  - send:\n      to: \"{{ planner }}\"\n      text: \"Plan: {{ goal }}\"\n  - wait_for:\n      agent: \"{{ planner }}\"\n  - send:\n      to: \"{{ implementer }}\"\n      forward_from: \"{{ planner }}\"\n      text: \"Execute the plan above.\"\n  - wait_for:\n      agent: \"{{ implementer }}\"\n";
+    const SEQUENTIAL: &str = "name: seq\ndescription: d\ninputs:\n  planner: agent\n  implementer: agent\n  goal: text\nsteps:\n  - label: s\n    send:\n      to: \"{{ planner }}\"\n      text: \"Plan: {{ goal }}\"\n  - label: s\n    wait_for:\n      agent: \"{{ planner }}\"\n  - label: s\n    send:\n      to: \"{{ implementer }}\"\n      forward_from: \"{{ planner }}\"\n      text: \"Execute the plan above.\"\n  - label: s\n    wait_for:\n      agent: \"{{ implementer }}\"\n";
 
     #[tokio::test]
     async fn sequential_handoff_runs_to_complete() {
@@ -1030,7 +1034,7 @@ mod tests {
             ("rev-1", vec![MockScenario::Streaming]),
             ("rev-2", vec![MockScenario::Streaming]),
         ]);
-        let yaml = "name: fan\ndescription: d\ninputs:\n  revs: [agent]\nsteps:\n  - send:\n      to: \"{{ revs }}\"\n      text: \"please review\"\n";
+        let yaml = "name: fan\ndescription: d\ninputs:\n  revs: [agent]\nsteps:\n  - label: s\n    send:\n      to: \"{{ revs }}\"\n      text: \"please review\"\n";
         let (run, _dir, _path) = build_run(
             &rig,
             PromptService::disabled(),
@@ -1085,7 +1089,7 @@ mod tests {
             ("reviewer-1", vec![MockScenario::Streaming]),
             ("reviewer-2", vec![MockScenario::Streaming]),
         ]);
-        let yaml = "name: fan\ndescription: d\ninputs:\n  primary_agent: agent\n  reviewer_agents: [agent]\n  user_context: text?\nsteps:\n  - send:\n      to: \"{{ reviewer_agents }}\"\n      prompt: \"local:review\"\n      template_vars:\n        context: \"{{ user_context }}\"\n  - wait_for_all:\n      agents: \"{{ reviewer_agents }}\"\n  - send:\n      to: \"{{ primary_agent }}\"\n      prompt: \"local:aggregate\"\n      template_vars:\n        feedback: \"{{ aggregated_responses(reviewer_agents) }}\"\n";
+        let yaml = "name: fan\ndescription: d\ninputs:\n  primary_agent: agent\n  reviewer_agents: [agent]\n  user_context: text?\nsteps:\n  - label: s\n    send:\n      to: \"{{ reviewer_agents }}\"\n      prompt: \"local:review\"\n      template_vars:\n        context: \"{{ user_context }}\"\n  - label: s\n    wait_for_all:\n      agents: \"{{ reviewer_agents }}\"\n  - label: s\n    send:\n      to: \"{{ primary_agent }}\"\n      prompt: \"local:aggregate\"\n      template_vars:\n        feedback: \"{{ aggregated_responses(reviewer_agents) }}\"\n";
         let (run, _dir, path) = build_run(
             &rig,
             prompts,
@@ -1134,7 +1138,7 @@ mod tests {
                 "---\nname: rev\ndescription: d\narguments:\n  - name: context\n    required: false\n---\nReview.{% if context %} Context: {{ context }}{% endif %}\n",
             )]);
             let rig = rig(vec![("worker", vec![MockScenario::Streaming])]);
-            let yaml = "name: w\ndescription: d\ninputs:\n  w: agent\nsteps:\n  - send:\n      to: \"{{ w }}\"\n      prompt: \"local:rev\"\n";
+            let yaml = "name: w\ndescription: d\ninputs:\n  w: agent\nsteps:\n  - label: s\n    send:\n      to: \"{{ w }}\"\n      prompt: \"local:rev\"\n";
             let (run, _dir, _path) = build_run_with_user_args(
                 &rig,
                 prompts,
@@ -1187,7 +1191,7 @@ mod tests {
             ("a", vec![MockScenario::Streaming]),
             ("b", vec![MockScenario::Streaming]),
         ]);
-        let yaml = "name: iso\ndescription: d\ninputs:\n  a: agent\n  b: agent\nsteps:\n  - send:\n      to: \"{{ a }}\"\n      prompt: \"local:pa\"\n  - send:\n      to: \"{{ b }}\"\n      prompt: \"local:pb\"\n";
+        let yaml = "name: iso\ndescription: d\ninputs:\n  a: agent\n  b: agent\nsteps:\n  - label: s\n    send:\n      to: \"{{ a }}\"\n      prompt: \"local:pa\"\n  - label: s\n    send:\n      to: \"{{ b }}\"\n      prompt: \"local:pb\"\n";
         let (run, _dir, _path) = build_run_with_user_args(
             &rig,
             prompts,
@@ -1249,7 +1253,7 @@ mod tests {
             .await;
         rig.emitter.wait_for_type("turn_start", 1).await;
 
-        let yaml = "name: c\ndescription: d\ninputs:\n  w: agent\nsteps:\n  - send:\n      to: \"{{ w }}\"\n      text: hi\n";
+        let yaml = "name: c\ndescription: d\ninputs:\n  w: agent\nsteps:\n  - label: s\n    send:\n      to: \"{{ w }}\"\n      text: hi\n";
         let (run, _dir, path) = build_run(
             &rig,
             PromptService::disabled(),
@@ -1277,7 +1281,7 @@ mod tests {
             ("good", vec![MockScenario::Streaming]),
             ("bad", vec![MockScenario::DispatchFails]),
         ]);
-        let yaml = "name: s\ndescription: d\ninputs:\n  rs: [agent]\nsteps:\n  - send:\n      to: \"{{ rs }}\"\n      text: review\n  - wait_for_all:\n      agents: \"{{ rs }}\"\n";
+        let yaml = "name: s\ndescription: d\ninputs:\n  rs: [agent]\nsteps:\n  - label: s\n    send:\n      to: \"{{ rs }}\"\n      text: review\n  - label: s\n    wait_for_all:\n      agents: \"{{ rs }}\"\n";
         let (run, _dir, path) = build_run(
             &rig,
             PromptService::disabled(),
@@ -1315,7 +1319,7 @@ mod tests {
     async fn workflow_cancel_marks_run_cancelled() {
         let rig = rig(vec![("w", vec![MockScenario::AwaitCancellation])]);
         let cancel = CancellationToken::new();
-        let yaml = "name: x\ndescription: d\ninputs:\n  w: agent\nsteps:\n  - send:\n      to: \"{{ w }}\"\n      text: go\n  - wait_for:\n      agent: \"{{ w }}\"\n";
+        let yaml = "name: x\ndescription: d\ninputs:\n  w: agent\nsteps:\n  - label: s\n    send:\n      to: \"{{ w }}\"\n      text: go\n  - label: s\n    wait_for:\n      agent: \"{{ w }}\"\n";
         let (run, _dir, path) = build_run(
             &rig,
             PromptService::disabled(),
@@ -1346,7 +1350,7 @@ mod tests {
         // agent's turn (the awaited completion resolves `Cancelled`), which marks
         // the whole run cancelled — uniformly, per the spec.
         let rig = rig(vec![("w", vec![MockScenario::AwaitCancellation])]);
-        let yaml = "name: x\ndescription: d\ninputs:\n  w: agent\nsteps:\n  - send:\n      to: \"{{ w }}\"\n      text: go\n  - wait_for:\n      agent: \"{{ w }}\"\n";
+        let yaml = "name: x\ndescription: d\ninputs:\n  w: agent\nsteps:\n  - label: s\n    send:\n      to: \"{{ w }}\"\n      text: go\n  - label: s\n    wait_for:\n      agent: \"{{ w }}\"\n";
         let (run, _dir, path) = build_run(
             &rig,
             PromptService::disabled(),
@@ -1377,7 +1381,7 @@ mod tests {
     async fn trailing_settle_holds_for_fire_and_forget_then_completes() {
         // A send with no trailing wait_for: the run must hold open until it settles.
         let rig = rig(vec![("w", vec![MockScenario::Streaming])]);
-        let yaml = "name: t\ndescription: d\ninputs:\n  w: agent\nsteps:\n  - send:\n      to: \"{{ w }}\"\n      text: go\n";
+        let yaml = "name: t\ndescription: d\ninputs:\n  w: agent\nsteps:\n  - label: s\n    send:\n      to: \"{{ w }}\"\n      text: go\n";
         let (run, _dir, path) = build_run(
             &rig,
             PromptService::disabled(),
@@ -1399,7 +1403,7 @@ mod tests {
     #[tokio::test]
     async fn trailing_failure_marks_run_failed() {
         let rig = rig(vec![("w", vec![MockScenario::DispatchFails])]);
-        let yaml = "name: t\ndescription: d\ninputs:\n  w: agent\nsteps:\n  - send:\n      to: \"{{ w }}\"\n      text: go\n";
+        let yaml = "name: t\ndescription: d\ninputs:\n  w: agent\nsteps:\n  - label: s\n    send:\n      to: \"{{ w }}\"\n      text: go\n";
         let (run, _dir, path) = build_run(
             &rig,
             PromptService::disabled(),
@@ -1426,7 +1430,7 @@ mod tests {
             ("a", vec![MockScenario::Streaming]),
             ("b", vec![MockScenario::Streaming]),
         ]);
-        let yaml = "name: f\ndescription: d\ninputs:\n  a: agent\n  b: agent\nsteps:\n  - send:\n      to: \"{{ b }}\"\n      forward_from: \"{{ a }}\"\n      text: use it\n";
+        let yaml = "name: f\ndescription: d\ninputs:\n  a: agent\n  b: agent\nsteps:\n  - label: s\n    send:\n      to: \"{{ b }}\"\n      forward_from: \"{{ a }}\"\n      text: use it\n";
         let (run, _dir, path) = build_run(
             &rig,
             PromptService::disabled(),
@@ -1448,7 +1452,7 @@ mod tests {
         // `for_each` parses but is not executable in this version — the
         // interpreter fails clearly (defense-in-depth behind the invoke gate).
         let rig = rig(vec![("w", vec![MockScenario::Streaming])]);
-        let yaml = "name: g\ndescription: d\ninputs:\n  ms: [text]\n  w: agent\nsteps:\n  - for_each:\n      item: m\n      in: \"{{ ms }}\"\n      steps:\n        - send:\n            to: \"{{ w }}\"\n            text: \"{{ m }}\"\n";
+        let yaml = "name: g\ndescription: d\ninputs:\n  ms: [text]\n  w: agent\nsteps:\n  - label: s\n    for_each:\n      item: m\n      in: \"{{ ms }}\"\n      steps:\n        - label: s\n          send:\n            to: \"{{ w }}\"\n            text: \"{{ m }}\"\n";
         let (run, _dir, path) = build_run(
             &rig,
             PromptService::disabled(),
@@ -1524,7 +1528,7 @@ mod tests {
             ("b", vec![MockScenario::Streaming]),
         ]);
         let sink = Arc::new(RecordingProgressSink::default());
-        let yaml = "name: f\ndescription: d\ninputs:\n  a: agent\n  b: agent\nsteps:\n  - send:\n      to: \"{{ b }}\"\n      forward_from: \"{{ a }}\"\n      text: use it\n";
+        let yaml = "name: f\ndescription: d\ninputs:\n  a: agent\n  b: agent\nsteps:\n  - label: s\n    send:\n      to: \"{{ b }}\"\n      forward_from: \"{{ a }}\"\n      text: use it\n";
         let (run, _dir, _path) = build_run_with_sink(
             &rig,
             PromptService::disabled(),
@@ -1555,7 +1559,7 @@ mod tests {
             "w",
             vec![MockScenario::Streaming, MockScenario::Streaming],
         )]);
-        let yaml = "name: b\ndescription: d\ninputs:\n  w: agent\nsteps:\n  - send:\n      to: \"{{ w }}\"\n      text: one\n  - wait_for:\n      agent: \"{{ w }}\"\n  - send:\n      to: \"{{ w }}\"\n      text: two\n  - wait_for:\n      agent: \"{{ w }}\"\n";
+        let yaml = "name: b\ndescription: d\ninputs:\n  w: agent\nsteps:\n  - label: s\n    send:\n      to: \"{{ w }}\"\n      text: one\n  - label: s\n    wait_for:\n      agent: \"{{ w }}\"\n  - label: s\n    send:\n      to: \"{{ w }}\"\n      text: two\n  - label: s\n    wait_for:\n      agent: \"{{ w }}\"\n";
         let (run, _dir, _path) = build_run(
             &rig,
             PromptService::disabled(),
@@ -1592,7 +1596,7 @@ mod tests {
             .await;
 
         let cancel = CancellationToken::new();
-        let yaml = "name: x\ndescription: d\ninputs:\n  a: agent\n  b: agent\nsteps:\n  - send:\n      to: \"{{ a }}\"\n      text: go\n  - wait_for:\n      agent: \"{{ a }}\"\n";
+        let yaml = "name: x\ndescription: d\ninputs:\n  a: agent\n  b: agent\nsteps:\n  - label: s\n    send:\n      to: \"{{ a }}\"\n      text: go\n  - label: s\n    wait_for:\n      agent: \"{{ a }}\"\n";
         let (run, _dir, _path) = build_run(
             &rig,
             PromptService::disabled(),
@@ -1637,7 +1641,7 @@ mod tests {
         ]);
         // send w (fails), then send/wait o (gives w's first turn time to settle),
         // then send w again (accepted) — no wait on either w send.
-        let yaml = "name: f\ndescription: d\ninputs:\n  w: agent\n  o: agent\nsteps:\n  - send:\n      to: \"{{ w }}\"\n      text: x\n  - send:\n      to: \"{{ o }}\"\n      text: y\n  - wait_for:\n      agent: \"{{ o }}\"\n  - send:\n      to: \"{{ w }}\"\n      text: z\n";
+        let yaml = "name: f\ndescription: d\ninputs:\n  w: agent\n  o: agent\nsteps:\n  - label: s\n    send:\n      to: \"{{ w }}\"\n      text: x\n  - label: s\n    send:\n      to: \"{{ o }}\"\n      text: y\n  - label: s\n    wait_for:\n      agent: \"{{ o }}\"\n  - label: s\n    send:\n      to: \"{{ w }}\"\n      text: z\n";
         let (run, _dir, path) = build_run(
             &rig,
             PromptService::disabled(),
@@ -1685,7 +1689,7 @@ mod tests {
         rig.emitter.wait_for_type("turn_start", 1).await;
 
         // Fan-out to [a, busy] in order: `a` is accepted, `busy` fails fast.
-        let yaml = "name: p\ndescription: d\ninputs:\n  rs: [agent]\nsteps:\n  - send:\n      to: \"{{ rs }}\"\n      text: hi\n";
+        let yaml = "name: p\ndescription: d\ninputs:\n  rs: [agent]\nsteps:\n  - label: s\n    send:\n      to: \"{{ rs }}\"\n      text: hi\n";
         let (run, _dir, _path) = build_run(
             &rig,
             PromptService::disabled(),

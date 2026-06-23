@@ -7,30 +7,39 @@ inputs:
   milestones: [text]
 
 steps:
-  - for_each:
+  - label: Iterate over milestones
+    for_each:
       item: milestone
       in: "{{ milestones }}"
       steps:
-        - send:
+        - label: Ask the coder to plan the milestone
+          send:
             to: "{{ coder }}"
             text: "Plan milestone: {{ milestone }}. Output the plan only; don't implement yet."
-        - wait_for:
+        - label: Wait for the plan
+          wait_for:
             agent: "{{ coder }}"
-        - pause_for_user:
+        - label: Pause for plan approval
+          pause_for_user:
             context: "Plan for {{ milestone }} ready. Approve, redirect, or add context."
             recipient: "{{ coder }}"
-        - send:
+        - label: Send the implementation to the reviewer
+          send:
             to: "{{ reviewer }}"
             forward_from: "{{ coder }}"
             text: "Review the implementation above for the milestone: {{ milestone }}"
-        - wait_for:
+        - label: Wait for the review
+          wait_for:
             agent: "{{ reviewer }}"
-        - send:
+        - label: Send review feedback to the coder
+          send:
             to: "{{ coder }}"
             forward_from: "{{ reviewer }}"
             text: "Address the review feedback above for: {{ milestone }}"
-        - wait_for:
+        - label: Wait for the revision
+          wait_for:
             agent: "{{ coder }}"
-        - pause_for_user:
+        - label: Pause to commit or revise
+          pause_for_user:
             context: "Milestone {{ milestone }} done. Commit and continue, or revise?"
             recipient: "{{ coder }}"

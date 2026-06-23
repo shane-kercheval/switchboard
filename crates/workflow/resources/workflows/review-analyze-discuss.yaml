@@ -13,19 +13,24 @@ inputs:
     type: agent
     description: The agent that distills the reviewers' feedback into a verdict, weighs their pushback, and gives the final recommendation.
 steps:
-  - send:
+  - label: Send code review to reviewers
+    send:
       to: "{{ reviewers }}"
       prompt: "builtin:code-review"
-  - wait_for_all:
+  - label: Wait for all reviews
+    wait_for_all:
       agents: "{{ reviewers }}"
-  - send:
+  - label: Distill feedback into a verdict
+    send:
       to: "{{ worker }}"
       prompt: "builtin:ai-review-feedback"
       template_vars:
         review: "{{ aggregated_responses(reviewers) }}"
-  - wait_for:
+  - label: Wait for the verdict
+    wait_for:
       agent: "{{ worker }}"
-  - send:
+  - label: Ask reviewers to weigh in on the verdict
+    send:
       to: "{{ reviewers }}"
       text: |
         An analyst reviewed all of the feedback and responded:
@@ -33,9 +38,11 @@ steps:
         {{ last_output(worker) }}
 
         Do you agree with this analysis? Push back where you think it's wrong, and confirm where it's right.
-  - wait_for_all:
+  - label: Wait for reviewer responses
+    wait_for_all:
       agents: "{{ reviewers }}"
-  - send:
+  - label: Send responses to worker for final call
+    send:
       to: "{{ worker }}"
       text: |
         Here's how the reviewers responded to your analysis:
@@ -43,5 +50,6 @@ steps:
         {{ aggregated_responses(reviewers) }}
 
         Weigh their responses and give your final recommendation.
-  - wait_for:
+  - label: Wait for final recommendation
+    wait_for:
       agent: "{{ worker }}"

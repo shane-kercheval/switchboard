@@ -109,6 +109,13 @@ function handleProgress(projectId: ProjectId, payload: WorkflowProgressPayload):
     workflowRuns[projectId] = current.filter((r) => r.run_id !== payload.run_id);
     return;
   }
+  // The lean progress payload carries no `steps`; preserve the snapshot the run
+  // was seeded with (from `list_workflow_runs`) when updating in place. Empty
+  // `steps` is therefore a normal *transient* state for a run first seen via an
+  // event before a seed/refresh populates it (not only a legacy disk file) — the
+  // M4 live-view work refreshes on invoke / on an unknown running event to close
+  // that window before the progress view renders.
+  const existing = current.find((r) => r.run_id === payload.run_id);
   const row: WorkflowRunInfo = {
     run_id: payload.run_id,
     workflow: payload.workflow,
@@ -116,8 +123,9 @@ function handleProgress(projectId: ProjectId, payload: WorkflowProgressPayload):
     total: payload.total,
     status: payload.status === "failed" ? "failed" : "running",
     reason: payload.status === "failed" ? payload.reason : null,
+    steps: existing?.steps ?? [],
   };
-  workflowRuns[projectId] = current.some((r) => r.run_id === payload.run_id)
+  workflowRuns[projectId] = existing
     ? current.map((r) => (r.run_id === payload.run_id ? row : r))
     : [...current, row];
 }

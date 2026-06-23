@@ -27,6 +27,7 @@ function run(over: Partial<WorkflowRunInfo> = {}): WorkflowRunInfo {
     total: 3,
     status: "running",
     reason: null,
+    steps: [],
     ...over,
   };
 }

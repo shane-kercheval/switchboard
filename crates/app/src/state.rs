@@ -10,6 +10,7 @@ use switchboard_core::{AgentId, AgentRecord, Directory, Project, ProjectId};
 use switchboard_dispatcher::{Dispatcher, EventEmitter};
 use switchboard_harness::HarnessAdapter;
 use switchboard_prompts::PromptService;
+use switchboard_workflow::WorkflowStepInfo;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -36,6 +37,11 @@ pub struct ActiveRun {
     /// Latest step progress, updated by the progress sink as the run advances, so
     /// `list_workflow_runs` reports a live run's step without reading disk.
     pub snapshot: RunSnapshot,
+    /// Per-step display info with recipients **resolved** to concrete agent names
+    /// (from the invocation's bindings), so the live progress view names the actual
+    /// agents. Disk-sourced runs instead reconstruct *declared* steps from the run
+    /// file; this resolved copy exists only for the in-flight run.
+    pub steps: Vec<WorkflowStepInfo>,
     /// Notified once when the run reaches a terminal status. Teardown collects a
     /// clone **before** firing cancel, then awaits it — so the wait can't be
     /// stranded by the owning task removing its own registry entry. `notify_one`

@@ -99,16 +99,21 @@ Long-form `type` is required when long form is used; mixing shorthand and long f
 
 ## Steps
 
-`steps` is a YAML sequence. Each entry is a mapping with exactly one top-level key naming the step type. The value of that key is the step's parameters.
+`steps` is a YAML sequence. Each entry is a mapping with a required **`label`** plus exactly one key naming the step type. The value of the step-type key is the step's parameters.
+
+`label` is a short, human-readable name for the step (e.g. `Send the review to reviewers`), shown in the workflow's progress and preview views. It is a reserved sibling key of the step-type key, required on **every** step including those inside a `for_each` body; a missing, blank, or non-string `label` is a validation error.
 
 ```yaml
 steps:
-  - send:
+  - label: Send the review to reviewers
+    send:
       to: "{{ reviewer_agents }}"
       prompt: "builtin:code-review"
-  - wait_for_all:
+  - label: Wait for all reviews
+    wait_for_all:
       agents: "{{ reviewer_agents }}"
-  - send:
+  - label: Aggregate feedback for the primary
+    send:
       to: "{{ primary_agent }}"
       prompt: "builtin:ai-review-feedback"
       template_vars:
@@ -429,7 +434,7 @@ A workflow file is validated at two times:
 - `name` matches the slug regex and equals the filename
 - `inputs` declarations use valid types
 - No `default` (and thus no optionality) on a non-`text` input (per §Inputs — `text`-only in v1)
-- Each `steps` entry has exactly one step-type key with a known type
+- Each `steps` entry has a required, non-blank `label` (string) plus exactly one step-type key with a known type
 - Each step's required fields are present
 - All template strings parse as valid templates and stay within the **tag/filter** subset (per §Templating "Enforcement boundary"); expression-level operators are accepted. Referenced variable names need not be declared yet — that's an invocation-time check.
 - No nested `for_each`

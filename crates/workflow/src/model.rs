@@ -20,7 +20,20 @@ pub struct Workflow {
     pub name: String,
     pub description: String,
     pub inputs: Vec<InputDecl>,
-    pub steps: Vec<Step>,
+    pub steps: Vec<LabeledStep>,
+}
+
+/// A workflow step paired with its required, human-readable `label`. In the file
+/// grammar the label is a reserved sibling key of the step-type key
+/// (`{ label: "Gather reviews", send: {...} }`), parsed in
+/// [`crate::parse::parse_workflow`]. It is required on *every* step — including
+/// the capability-gated ones — because the progress and preview views key off it;
+/// a step without a label has no name to show. Wrapping (rather than a per-variant
+/// field) lets every consumer read `.label` uniformly without matching the kind.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LabeledStep {
+    pub label: String,
+    pub step: Step,
 }
 
 impl Workflow {
@@ -32,7 +45,7 @@ impl Workflow {
     /// [`UNSUPPORTED_STEP_MESSAGE`]) and the list `invocable` flag.
     #[must_use]
     pub fn gated_step_kind(&self) -> Option<&'static str> {
-        self.steps.iter().find_map(|step| match step {
+        self.steps.iter().find_map(|labeled| match labeled.step {
             Step::PauseForUser(_) => Some("pause_for_user"),
             Step::ForEach(_) => Some("for_each"),
             _ => None,
@@ -145,7 +158,7 @@ pub struct PauseForUserStep {
 pub struct ForEachStep {
     pub item: String,
     pub r#in: Templated,
-    pub steps: Vec<Step>,
+    pub steps: Vec<LabeledStep>,
 }
 
 #[cfg(test)]
@@ -157,7 +170,14 @@ mod tests {
             name: "w".to_owned(),
             description: "d".to_owned(),
             inputs: Vec::new(),
-            steps,
+            steps: steps.into_iter().map(labeled).collect(),
+        }
+    }
+
+    fn labeled(step: Step) -> LabeledStep {
+        LabeledStep {
+            label: "step".to_owned(),
+            step,
         }
     }
 
@@ -194,7 +214,7 @@ mod tests {
         let steps = vec![Step::ForEach(ForEachStep {
             item: "x".to_owned(),
             r#in: Templated::List(vec!["a".to_owned()]),
-            steps: vec![send()],
+            steps: vec![labeled(send())],
         })];
         assert_eq!(workflow(steps).gated_step_kind(), Some("for_each"));
     }

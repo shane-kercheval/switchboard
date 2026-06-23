@@ -19,8 +19,8 @@ use switchboard_core::name::canonicalize_for_uniqueness;
 
 use crate::error::{Result, WorkflowError};
 use crate::model::{
-    ForEachStep, InputDecl, InputType, PauseForUserStep, SendStep, Step, Templated, WaitForAllStep,
-    WaitForStep, Workflow,
+    ForEachStep, InputDecl, InputType, LabeledStep, PauseForUserStep, SendStep, Step, Templated,
+    WaitForAllStep, WaitForStep, Workflow,
 };
 use crate::template::validate_template;
 
@@ -266,7 +266,7 @@ fn parse_steps(
     input_names: &HashSet<String>,
     inside_for_each: bool,
     ctx: &str,
-) -> Result<Vec<Step>> {
+) -> Result<Vec<LabeledStep>> {
     let seq = value.and_then(Value::as_sequence).ok_or_else(|| {
         WorkflowError::validation(format!("`{ctx}` must be a non-empty sequence"))
     })?;
@@ -281,21 +281,37 @@ fn parse_steps(
         .collect()
 }
 
+/// `label` is a **reserved sibling key** of the step-type key, required and
+/// non-blank — it names the step in the progress/preview views. It is pulled out
+/// of the step mapping here so the remaining single key is the step type, keeping
+/// the "exactly one step-type key" rule intact for that remainder.
 fn parse_step(
     value: &Value,
     input_names: &HashSet<String>,
     inside_for_each: bool,
     ctx: &str,
-) -> Result<Step> {
+) -> Result<LabeledStep> {
     let map = value
         .as_mapping()
         .ok_or_else(|| WorkflowError::validation(format!("{ctx}: each step must be a mapping")))?;
-    if map.len() != 1 {
-        return Err(WorkflowError::validation(format!(
-            "{ctx}: each step must have exactly one step-type key"
-        )));
-    }
-    let (key, params) = map.into_iter().next().expect("len checked == 1");
+
+    let label = parse_step_label(map, ctx)?;
+
+    // The step-type key is the single key other than `label`.
+    let mut type_entries = map.iter().filter(|(k, _)| k.as_str() != Some("label"));
+    let (key, params) = match (type_entries.next(), type_entries.next()) {
+        (Some(entry), None) => entry,
+        (None, _) => {
+            return Err(WorkflowError::validation(format!(
+                "{ctx}: each step requires a step-type key (e.g. `send`) alongside its `label`"
+            )));
+        }
+        (Some(_), Some(_)) => {
+            return Err(WorkflowError::validation(format!(
+                "{ctx}: each step must have exactly one step-type key"
+            )));
+        }
+    };
     let step_type = key
         .as_str()
         .ok_or_else(|| WorkflowError::validation(format!("{ctx}: step type must be a string")))?;
@@ -315,13 +331,30 @@ fn parse_step(
         WorkflowError::validation(format!("{ctx}: `{step_type}` parameters must be a mapping"))
     })?;
 
-    match step_type {
+    let step = match step_type {
         "send" => parse_send(body, ctx),
         "wait_for" => parse_wait_for(body, ctx),
         "wait_for_all" => parse_wait_for_all(body, ctx),
         "pause_for_user" => parse_pause(body, ctx),
         "for_each" => parse_for_each(body, input_names, inside_for_each, ctx),
         _ => unreachable!("step type validated above"),
+    }?;
+
+    Ok(LabeledStep { label, step })
+}
+
+fn parse_step_label(map: &serde_norway::Mapping, ctx: &str) -> Result<String> {
+    match map.get("label") {
+        Some(Value::String(s)) if !s.trim().is_empty() => Ok(s.clone()),
+        Some(Value::String(_)) => Err(WorkflowError::validation(format!(
+            "{ctx}: `label` must not be blank"
+        ))),
+        Some(_) => Err(WorkflowError::validation(format!(
+            "{ctx}: `label` must be a string"
+        ))),
+        None => Err(WorkflowError::validation(format!(
+            "{ctx}: each step requires a `label`"
+        ))),
     }
 }
 
@@ -646,7 +679,7 @@ mod tests {
 
     /// A minimal valid workflow named `wf`, used as the base for negative-case
     /// tweaks. One text input, one `send`.
-    const BASE: &str = "name: wf\ndescription: d\ninputs:\n  goal: text\nsteps:\n  - send:\n      to: \"{{ goal }}\"\n      text: hi\n";
+    const BASE: &str = "name: wf\ndescription: d\ninputs:\n  goal: text\nsteps:\n  - label: s\n    send:\n      to: \"{{ goal }}\"\n      text: hi\n";
 
     fn parse(yaml: &str) -> Result<Workflow> {
         parse_workflow("wf", yaml)
@@ -675,12 +708,12 @@ mod tests {
         assert!(
             parse_workflow(
                 "Wf",
-                "name: Wf\ndescription: d\nsteps:\n  - send: {to: a, text: b}\n"
+                "name: Wf\ndescription: d\nsteps:\n  - {label: s, send: {to: a, text: b}}\n"
             )
             .is_err()
         );
         assert!(
-            err_msg("name: wf_x\ndescription: d\nsteps:\n  - send: {to: a, text: b}\n")
+            err_msg("name: wf_x\ndescription: d\nsteps:\n  - {label: s, send: {to: a, text: b}}\n")
                 .contains("name")
         );
     }
@@ -710,23 +743,31 @@ mod tests {
 
     #[test]
     fn missing_required_top_level_keys() {
-        assert!(err_msg("description: d\nsteps:\n  - send: {to: a, text: b}\n").contains("name"));
-        assert!(err_msg("name: wf\nsteps:\n  - send: {to: a, text: b}\n").contains("description"));
+        assert!(
+            err_msg("description: d\nsteps:\n  - {label: s, send: {to: a, text: b}}\n")
+                .contains("name")
+        );
+        assert!(
+            err_msg("name: wf\nsteps:\n  - {label: s, send: {to: a, text: b}}\n")
+                .contains("description")
+        );
         assert!(err_msg("name: wf\ndescription: d\n").contains("steps"));
     }
 
     #[test]
     fn empty_description_and_empty_steps_are_rejected() {
         assert!(
-            err_msg("name: wf\ndescription: \"\"\nsteps:\n  - send: {to: a, text: b}\n")
-                .contains("description")
+            err_msg(
+                "name: wf\ndescription: \"\"\nsteps:\n  - {label: s, send: {to: a, text: b}}\n"
+            )
+            .contains("description")
         );
         assert!(err_msg("name: wf\ndescription: d\nsteps: []\n").contains("empty"));
     }
 
     #[test]
     fn input_type_grammar() {
-        let yaml = "name: wf\ndescription: d\ninputs:\n  a: agent\n  b: [agent]\n  t: text\n  o: text?\n  l: [text]\nsteps:\n  - send: {to: \"{{ a }}\", text: x}\n";
+        let yaml = "name: wf\ndescription: d\ninputs:\n  a: agent\n  b: [agent]\n  t: text\n  o: text?\n  l: [text]\nsteps:\n  - {label: s, send: {to: \"{{ a }}\", text: x}}\n";
         let wf = parse(yaml).unwrap();
         let types: Vec<_> = wf
             .inputs
@@ -742,14 +783,14 @@ mod tests {
 
     #[test]
     fn unknown_input_type_is_rejected() {
-        assert!(err_msg("name: wf\ndescription: d\ninputs:\n  x: widget\nsteps:\n  - send: {to: a, text: b}\n").contains("unknown type"));
+        assert!(err_msg("name: wf\ndescription: d\ninputs:\n  x: widget\nsteps:\n  - {label: s, send: {to: a, text: b}}\n").contains("unknown type"));
     }
 
     #[test]
     fn prompt_id_input_type_is_rejected() {
         // `prompt_id` is no longer a type — a step hardcodes its prompt instead.
         let err = err_msg(
-            "name: wf\ndescription: d\ninputs:\n  p: prompt_id\nsteps:\n  - send: {to: a, text: b}\n",
+            "name: wf\ndescription: d\ninputs:\n  p: prompt_id\nsteps:\n  - {label: s, send: {to: a, text: b}}\n",
         );
         assert!(err.contains("unknown type"), "got: {err}");
         assert!(
@@ -761,7 +802,7 @@ mod tests {
     #[test]
     fn send_prompt_must_be_a_literal_not_a_template() {
         let err = err_msg(
-            "name: wf\ndescription: d\ninputs:\n  p: text\nsteps:\n  - send: {to: a, prompt: \"{{ p }}\"}\n",
+            "name: wf\ndescription: d\ninputs:\n  p: text\nsteps:\n  - {label: s, send: {to: a, prompt: \"{{ p }}\"}}\n",
         );
         assert!(err.contains("literal prompt id"), "got: {err}");
     }
@@ -769,10 +810,10 @@ mod tests {
     #[test]
     fn send_prompt_literal_id_parses_and_round_trips() {
         let wf = parse(
-            "name: wf\ndescription: d\nsteps:\n  - send: {to: a, prompt: \"builtin:code-review\"}\n",
+            "name: wf\ndescription: d\nsteps:\n  - {label: s, send: {to: a, prompt: \"builtin:code-review\"}}\n",
         )
         .unwrap();
-        let Step::Send(send) = &wf.steps[0] else {
+        let Step::Send(send) = &wf.steps[0].step else {
             panic!()
         };
         assert_eq!(send.prompt.as_deref(), Some("builtin:code-review"));
@@ -781,14 +822,14 @@ mod tests {
     #[test]
     fn optional_suffix_only_valid_on_text() {
         let err = err_msg(
-            "name: wf\ndescription: d\ninputs:\n  x: agent?\nsteps:\n  - send: {to: a, text: b}\n",
+            "name: wf\ndescription: d\ninputs:\n  x: agent?\nsteps:\n  - {label: s, send: {to: a, text: b}}\n",
         );
         assert!(err.contains("only valid on `text`"), "got: {err}");
     }
 
     #[test]
     fn long_form_default_implies_optional() {
-        let yaml = "name: wf\ndescription: d\ninputs:\n  ctx:\n    type: text\n    description: opt\n    default: \"\"\nsteps:\n  - send: {to: a, text: b}\n";
+        let yaml = "name: wf\ndescription: d\ninputs:\n  ctx:\n    type: text\n    description: opt\n    default: \"\"\nsteps:\n  - {label: s, send: {to: a, text: b}}\n";
         let wf = parse(yaml).unwrap();
         assert!(wf.inputs[0].optional);
         assert_eq!(wf.inputs[0].default.as_deref(), Some(""));
@@ -812,37 +853,73 @@ mod tests {
 
     #[test]
     fn reserved_input_name_user_input_is_rejected() {
-        assert!(err_msg("name: wf\ndescription: d\ninputs:\n  user_input: text\nsteps:\n  - send: {to: a, text: b}\n").contains("reserved"));
+        assert!(err_msg("name: wf\ndescription: d\ninputs:\n  user_input: text\nsteps:\n  - {label: s, send: {to: a, text: b}}\n").contains("reserved"));
     }
 
     #[test]
     fn input_name_grammar_is_enforced() {
-        assert!(err_msg("name: wf\ndescription: d\ninputs:\n  Bad-Name: text\nsteps:\n  - send: {to: a, text: b}\n").contains("must match"));
+        assert!(err_msg("name: wf\ndescription: d\ninputs:\n  Bad-Name: text\nsteps:\n  - {label: s, send: {to: a, text: b}}\n").contains("must match"));
     }
 
     #[test]
     fn step_must_have_exactly_one_key() {
         let err = err_msg(
-            "name: wf\ndescription: d\nsteps:\n  - send: {to: a, text: b}\n    wait_for: {agent: a}\n",
+            "name: wf\ndescription: d\nsteps:\n  - label: s\n    send: {to: a, text: b}\n    wait_for: {agent: a}\n",
         );
         assert!(err.contains("exactly one"), "got: {err}");
     }
 
     #[test]
+    fn step_requires_a_label() {
+        let err = err_msg("name: wf\ndescription: d\nsteps:\n  - send: {to: a, text: b}\n");
+        assert!(err.contains("requires a `label`"), "got: {err}");
+    }
+
+    #[test]
+    fn step_label_must_not_be_blank() {
+        let err = err_msg(
+            "name: wf\ndescription: d\nsteps:\n  - {label: \"   \", send: {to: a, text: b}}\n",
+        );
+        assert!(err.contains("must not be blank"), "got: {err}");
+    }
+
+    #[test]
+    fn step_label_must_be_a_string() {
+        let err =
+            err_msg("name: wf\ndescription: d\nsteps:\n  - {label: 5, send: {to: a, text: b}}\n");
+        assert!(err.contains("`label` must be a string"), "got: {err}");
+    }
+
+    #[test]
+    fn label_is_required_and_captured_on_every_step_type() {
+        // Every step type — including the capability-gated `pause_for_user` /
+        // `for_each` — carries a label, read uniformly off the wrapper.
+        let yaml = "name: wf\ndescription: d\ninputs:\n  ms: [text]\nsteps:\n  - {label: one, send: {to: a, text: t}}\n  - {label: two, wait_for: {agent: a}}\n  - {label: three, wait_for_all: {agents: [a]}}\n  - {label: four, pause_for_user: {context: c}}\n  - label: five\n    for_each:\n      item: m\n      in: \"{{ ms }}\"\n      steps:\n        - {label: inner, send: {to: a, text: \"{{ m }}\"}}\n";
+        let wf = parse(yaml).unwrap();
+        let labels: Vec<&str> = wf.steps.iter().map(|s| s.label.as_str()).collect();
+        assert_eq!(labels, ["one", "two", "three", "four", "five"]);
+        let Step::ForEach(fe) = &wf.steps[4].step else {
+            panic!("expected for_each");
+        };
+        assert_eq!(fe.steps[0].label, "inner");
+    }
+
+    #[test]
     fn unknown_and_reserved_step_types() {
         assert!(
-            err_msg("name: wf\ndescription: d\nsteps:\n  - frobnicate: {}\n")
+            err_msg("name: wf\ndescription: d\nsteps:\n  - {label: s, frobnicate: {}}\n")
                 .contains("unknown step type")
         );
         for key in ["if", "branch", "wait_for_first"] {
-            let yaml = format!("name: wf\ndescription: d\nsteps:\n  - {key}: {{}}\n");
+            let yaml = format!("name: wf\ndescription: d\nsteps:\n  - {{label: s, {key}: {{}}}}\n");
             assert!(err_msg(&yaml).contains("reserved step type"), "{key}");
         }
     }
 
     #[test]
     fn send_requires_a_body_source() {
-        let err = err_msg("name: wf\ndescription: d\nsteps:\n  - send:\n      to: a\n");
+        let err =
+            err_msg("name: wf\ndescription: d\nsteps:\n  - label: s\n    send:\n      to: a\n");
         assert!(
             err.contains("at least one of `prompt`, `text`, or `forward_from`"),
             "got: {err}"
@@ -852,7 +929,7 @@ mod tests {
     #[test]
     fn send_prompt_and_text_are_mutually_exclusive() {
         let err = err_msg(
-            "name: wf\ndescription: d\nsteps:\n  - send:\n      to: a\n      prompt: p\n      text: t\n",
+            "name: wf\ndescription: d\nsteps:\n  - label: s\n    send:\n      to: a\n      prompt: p\n      text: t\n",
         );
         assert!(err.contains("not both"), "got: {err}");
     }
@@ -860,18 +937,19 @@ mod tests {
     #[test]
     fn send_unknown_field_is_rejected() {
         let err = err_msg(
-            "name: wf\ndescription: d\nsteps:\n  - send:\n      to: a\n      text: t\n      bogus: x\n",
+            "name: wf\ndescription: d\nsteps:\n  - label: s\n    send:\n      to: a\n      text: t\n      bogus: x\n",
         );
         assert!(err.contains("unknown field `bogus`"), "got: {err}");
     }
 
     #[test]
     fn agent_list_literal_empty_and_duplicate_are_rejected() {
-        let empty =
-            err_msg("name: wf\ndescription: d\nsteps:\n  - send:\n      to: []\n      text: t\n");
+        let empty = err_msg(
+            "name: wf\ndescription: d\nsteps:\n  - label: s\n    send:\n      to: []\n      text: t\n",
+        );
         assert!(empty.contains("must not be empty"), "got: {empty}");
         let dup = err_msg(
-            "name: wf\ndescription: d\nsteps:\n  - send:\n      to: [rev-1, rev_1]\n      text: t\n",
+            "name: wf\ndescription: d\nsteps:\n  - label: s\n    send:\n      to: [rev-1, rev_1]\n      text: t\n",
         );
         assert!(dup.contains("duplicate"), "got: {dup}"); // rev-1 and rev_1 normalize equal
     }
@@ -879,9 +957,9 @@ mod tests {
     #[test]
     fn agent_list_literal_valid_passes() {
         let wf =
-            parse("name: wf\ndescription: d\nsteps:\n  - send:\n      to: [a, b]\n      text: t\n")
+            parse("name: wf\ndescription: d\nsteps:\n  - label: s\n    send:\n      to: [a, b]\n      text: t\n")
                 .unwrap();
-        let Step::Send(send) = &wf.steps[0] else {
+        let Step::Send(send) = &wf.steps[0].step else {
             panic!()
         };
         assert_eq!(
@@ -892,26 +970,29 @@ mod tests {
 
     #[test]
     fn wait_for_requires_agent() {
-        assert!(err_msg("name: wf\ndescription: d\nsteps:\n  - wait_for: {}\n").contains("agent"));
+        assert!(
+            err_msg("name: wf\ndescription: d\nsteps:\n  - {label: s, wait_for: {}}\n")
+                .contains("agent")
+        );
     }
 
     #[test]
     fn pause_output_var_is_reserved_and_required_must_be_bool() {
         assert!(
-            err_msg("name: wf\ndescription: d\nsteps:\n  - pause_for_user:\n      output_var: x\n")
+            err_msg("name: wf\ndescription: d\nsteps:\n  - label: s\n    pause_for_user:\n      output_var: x\n")
                 .contains("reserved")
         );
         let err = err_msg(
-            "name: wf\ndescription: d\nsteps:\n  - pause_for_user:\n      required: maybe\n",
+            "name: wf\ndescription: d\nsteps:\n  - label: s\n    pause_for_user:\n      required: maybe\n",
         );
         assert!(err.contains("boolean"), "got: {err}");
     }
 
     #[test]
     fn pause_required_defaults_true() {
-        let wf = parse("name: wf\ndescription: d\nsteps:\n  - pause_for_user:\n      context: c\n")
+        let wf = parse("name: wf\ndescription: d\nsteps:\n  - label: s\n    pause_for_user:\n      context: c\n")
             .unwrap();
-        let Step::PauseForUser(p) = &wf.steps[0] else {
+        let Step::PauseForUser(p) = &wf.steps[0].step else {
             panic!()
         };
         assert!(p.required);
@@ -919,19 +1000,19 @@ mod tests {
 
     #[test]
     fn nested_for_each_is_rejected() {
-        let yaml = "name: wf\ndescription: d\ninputs:\n  ms: [text]\nsteps:\n  - for_each:\n      item: m\n      in: \"{{ ms }}\"\n      steps:\n        - for_each:\n            item: n\n            in: \"{{ ms }}\"\n            steps:\n              - send: {to: a, text: t}\n";
+        let yaml = "name: wf\ndescription: d\ninputs:\n  ms: [text]\nsteps:\n  - label: outer\n    for_each:\n      item: m\n      in: \"{{ ms }}\"\n      steps:\n        - label: inner\n          for_each:\n            item: n\n            in: \"{{ ms }}\"\n            steps:\n              - {label: s, send: {to: a, text: t}}\n";
         assert!(err_msg(yaml).contains("nested"));
     }
 
     #[test]
     fn for_each_item_collides_with_input_name() {
-        let yaml = "name: wf\ndescription: d\ninputs:\n  m: [text]\nsteps:\n  - for_each:\n      item: m\n      in: \"{{ m }}\"\n      steps:\n        - send: {to: a, text: t}\n";
+        let yaml = "name: wf\ndescription: d\ninputs:\n  m: [text]\nsteps:\n  - label: outer\n    for_each:\n      item: m\n      in: \"{{ m }}\"\n      steps:\n        - {label: s, send: {to: a, text: t}}\n";
         assert!(err_msg(yaml).contains("collides"));
     }
 
     #[test]
     fn for_each_item_cannot_be_reserved_name() {
-        let yaml = "name: wf\ndescription: d\ninputs:\n  ms: [text]\nsteps:\n  - for_each:\n      item: user_input\n      in: \"{{ ms }}\"\n      steps:\n        - send: {to: a, text: t}\n";
+        let yaml = "name: wf\ndescription: d\ninputs:\n  ms: [text]\nsteps:\n  - label: outer\n    for_each:\n      item: user_input\n      in: \"{{ ms }}\"\n      steps:\n        - {label: s, send: {to: a, text: t}}\n";
         assert!(err_msg(yaml).contains("reserved"));
     }
 
@@ -939,20 +1020,20 @@ mod tests {
     fn for_each_in_text_list_literal_may_be_empty_and_duplicated() {
         // `in` is not an agent target, so the empty/dup agent-literal rule does
         // not apply (empty [text] is valid; duplicate text items are meaningful).
-        let yaml = "name: wf\ndescription: d\nsteps:\n  - for_each:\n      item: m\n      in: [x, x]\n      steps:\n        - send: {to: a, text: \"{{ m }}\"}\n";
+        let yaml = "name: wf\ndescription: d\nsteps:\n  - label: outer\n    for_each:\n      item: m\n      in: [x, x]\n      steps:\n        - {label: s, send: {to: a, text: \"{{ m }}\"}}\n";
         assert!(parse(yaml).is_ok());
     }
 
     #[test]
     fn template_syntax_error_is_a_template_error() {
-        let err = parse("name: wf\ndescription: d\nsteps:\n  - send:\n      to: a\n      text: \"{{ unclosed\"\n").unwrap_err();
+        let err = parse("name: wf\ndescription: d\nsteps:\n  - label: s\n    send:\n      to: a\n      text: \"{{ unclosed\"\n").unwrap_err();
         assert!(matches!(err, WorkflowError::Template { .. }), "got: {err}");
     }
 
     #[test]
     fn unsupported_tag_in_step_field_is_a_template_error() {
         // Parse routes templated step fields through the subset scan.
-        let err = parse("name: wf\ndescription: d\nsteps:\n  - send:\n      to: a\n      text: \"{% set x = 1 %}\"\n").unwrap_err();
+        let err = parse("name: wf\ndescription: d\nsteps:\n  - label: s\n    send:\n      to: a\n      text: \"{% set x = 1 %}\"\n").unwrap_err();
         assert!(matches!(err, WorkflowError::Template { .. }), "got: {err}");
     }
 
@@ -960,7 +1041,7 @@ mod tests {
     fn duplicate_input_name_is_rejected() {
         // Two inputs with the same key — a duplicate mapping key. (serde_norway
         // keeps the last; the explicit guard is belt-and-suspenders.)
-        let yaml = "name: wf\ndescription: d\ninputs:\n  a: text\n  a: agent\nsteps:\n  - send: {to: a, text: t}\n";
+        let yaml = "name: wf\ndescription: d\ninputs:\n  a: text\n  a: agent\nsteps:\n  - {label: s, send: {to: a, text: t}}\n";
         // Either serde collapses the dup (one input) or our guard fires; both are
         // acceptable — assert it does not panic and yields a single `a`.
         if let Ok(wf) = parse(yaml) {

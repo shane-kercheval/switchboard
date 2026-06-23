@@ -52,6 +52,7 @@ describe("workflows store", () => {
         total: 3,
         status: "running",
         reason: null,
+        steps: [],
       },
     ];
     invokeMock.mockResolvedValueOnce(seeded); // list_workflow_runs
@@ -65,7 +66,7 @@ describe("workflows store", () => {
 
   it("drives terminals from the payload without a re-query", async () => {
     invokeMock.mockResolvedValueOnce([
-      { run_id: "r1", workflow: "w", step: 0, total: 3, status: "running", reason: null },
+      { run_id: "r1", workflow: "w", step: 0, total: 3, status: "running", reason: null, steps: [] },
     ]); // seed
     await subscribeProjectWorkflows("p1");
     const seedQueries = () =>
@@ -110,7 +111,7 @@ describe("workflows store", () => {
 
     unsubscribeProjectWorkflows(["p1"]);
     resolveSeed([
-      { run_id: "r1", workflow: "w", step: 0, total: 3, status: "running", reason: null },
+      { run_id: "r1", workflow: "w", step: 0, total: 3, status: "running", reason: null, steps: [] },
     ]);
     await sub;
 

@@ -22,15 +22,15 @@ fn sequential_handoff_parses() {
     assert_eq!(wf.name, "plan-then-implement");
     assert_eq!(wf.inputs.len(), 3);
     assert_eq!(wf.steps.len(), 4);
-    assert!(matches!(wf.steps[0], Step::Send(_)));
-    assert!(matches!(wf.steps[1], Step::WaitFor(_)));
+    assert!(matches!(wf.steps[0].step, Step::Send(_)));
+    assert!(matches!(wf.steps[1].step, Step::WaitFor(_)));
 }
 
 #[test]
 fn fan_in_review_parses_and_invocation_validates() {
     let wf = load("review-and-aggregate");
     assert_eq!(wf.steps.len(), 3);
-    assert!(matches!(wf.steps[1], Step::WaitForAll(_)));
+    assert!(matches!(wf.steps[1].step, Step::WaitForAll(_)));
 
     let agents = vec![
         "primary".to_owned(),
@@ -58,12 +58,12 @@ fn milestone_iteration_parses_with_for_each_and_pause() {
     // capability check, never at parse time — else this example couldn't exist).
     let wf = load("implement-milestones");
     assert_eq!(wf.steps.len(), 1);
-    let Step::ForEach(fe) = &wf.steps[0] else {
+    let Step::ForEach(fe) = &wf.steps[0].step else {
         panic!("expected a for_each step");
     };
     assert_eq!(fe.item, "milestone");
     assert_eq!(fe.steps.len(), 8);
-    assert!(matches!(fe.steps[2], Step::PauseForUser(_)));
+    assert!(matches!(fe.steps[2].step, Step::PauseForUser(_)));
 }
 
 /// End-to-end over a real fixture: parse → bind (with an omitted optional) →
@@ -72,7 +72,7 @@ fn milestone_iteration_parses_with_for_each_and_pause() {
 /// `aggregated_responses` `template_var` composes the reviewers' outputs in
 /// declared order.
 fn send_step(wf: &Workflow, index: usize) -> &switchboard_workflow::SendStep {
-    match &wf.steps[index] {
+    match &wf.steps[index].step {
         Step::Send(s) => s,
         other => panic!("step {index} should be a send, got {other:?}"),
     }

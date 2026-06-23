@@ -9,14 +9,17 @@ inputs:
   user_context: text?
 
 steps:
-  - send:
+  - label: Send the review to reviewers
+    send:
       to: "{{ reviewer_agents }}"
       prompt: "local:review"
       template_vars:
         context: "{{ user_context }}"
-  - wait_for_all:
+  - label: Wait for all reviews
+    wait_for_all:
       agents: "{{ reviewer_agents }}"
-  - send:
+  - label: Aggregate feedback for the primary
+    send:
       to: "{{ primary_agent }}"
       prompt: "local:aggregate"
       template_vars:

@@ -20,6 +20,8 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::display::WorkflowStepInfo;
+
 /// The terminal status of a run as the reader / UI sees it. `Interrupted` is
 /// never written — it is inferred from a run file with no [`RunRecord::Terminal`]
 /// (the process died mid-run). The writable subset is [`TerminalStatus`].
@@ -66,13 +68,23 @@ impl From<TerminalStatus> for RunStatus {
 #[serde(tag = "type", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum RunRecord {
-    /// First line of the file: the run's workflow name and step count, so the app
-    /// can label it ("interrupted at step N of M, workflow X") without re-reading the
-    /// workflow file. Carries the *name* only — not the program or inputs (that
-    /// snapshot is the deferred-resume concern, not written here).
+    /// First line of the file: the run's workflow name, step count, and a
+    /// **declared** per-step display snapshot (labels + declared recipients), so a
+    /// failed or interrupted run surfaced after a restart can render its progress
+    /// view without re-reading the workflow file — which is unreliable, since
+    /// user-global workflow files are mutable/deletable and a built-in and a user
+    /// copy can share a name. The snapshot is *display metadata* (step labels and
+    /// declared agent/slot references authored in the YAML), **not** agent output
+    /// and **not** replay state — so it does not weaken the system-design §3 "no
+    /// agent content on disk" invariant; it is the same category as the workflow
+    /// name and step count already persisted here. Recipients stay *declared*
+    /// (slots unresolved) because the binding snapshot is not journaled; the live
+    /// registry holds resolved recipients for an in-flight run.
     Started {
         workflow: String,
         total_steps: usize,
+        #[serde(default)]
+        steps: Vec<WorkflowStepInfo>,
         at: DateTime<Utc>,
     },
     /// Written when a top-level step finishes. The highest `step_index` seen,
@@ -120,6 +132,13 @@ mod tests {
             RunRecord::Started {
                 workflow: "review-and-aggregate".to_owned(),
                 total_steps: 3,
+                steps: vec![WorkflowStepInfo {
+                    label: "Send the review".to_owned(),
+                    recipients: vec![crate::display::RecipientRef::Slot {
+                        input: "reviewers".to_owned(),
+                    }],
+                    feeds_from: Vec::new(),
+                }],
                 at: fixed_time(),
             },
             RunRecord::StepCompleted {
@@ -221,13 +240,17 @@ mod tests {
     }
 
     #[test]
-    fn started_record_holds_only_name_count_and_time() {
-        // Guards the §3 invariant at the record level: the run-start record
-        // carries no field that could hold agent output — just a name, a count,
-        // and a timestamp.
+    fn started_record_holds_name_count_time_and_declared_step_snapshot() {
+        // Guards the §3 invariant at the record level: the run-start record carries
+        // no field that could hold *agent output*. It now also persists a declared
+        // step snapshot (`steps`) — labels + declared agent/slot references authored
+        // in the YAML — which is display metadata, not agent content, so it stays
+        // within §3. This test pins the exact key set so a future field that *could*
+        // hold agent output can't be added unnoticed.
         let value = serde_json::to_value(RunRecord::Started {
             workflow: "w".to_owned(),
             total_steps: 2,
+            steps: Vec::new(),
             at: fixed_time(),
         })
         .unwrap();
@@ -238,6 +261,19 @@ mod tests {
             .map(String::as_str)
             .collect();
         keys.sort_unstable();
-        assert_eq!(keys, ["at", "total_steps", "type", "workflow"]);
+        assert_eq!(keys, ["at", "steps", "total_steps", "type", "workflow"]);
+    }
+
+    #[test]
+    fn started_snapshot_defaults_empty_for_legacy_files_without_it() {
+        // Pre-release migration: a run file written before the snapshot existed has
+        // no `steps` key; it must deserialize to an empty snapshot, not error.
+        let legacy =
+            r#"{"type":"started","workflow":"w","total_steps":2,"at":"2026-06-18T12:00:00Z"}"#;
+        let record: RunRecord = serde_json::from_str(legacy).unwrap();
+        assert!(matches!(
+            record,
+            RunRecord::Started { steps, .. } if steps.is_empty()
+        ));
     }
 }

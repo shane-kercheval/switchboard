@@ -265,6 +265,21 @@ pub enum AppError {
     #[error("workflow run {run_id} not found")]
     WorkflowRunNotFound { run_id: uuid::Uuid },
 
+    /// A workflow is already running in this project. Only one workflow may run
+    /// per project at a time — the live progress view and compose lockout assume a
+    /// single run. Enforced atomically at registry insertion so concurrent invokes
+    /// can't both start.
+    #[error("a workflow is already running in this project")]
+    WorkflowAlreadyRunning { project_id: ProjectId },
+
+    /// A failed or interrupted workflow run is held in this project, waiting to be
+    /// dismissed. A held run occupies the project the same way a live one does (it
+    /// replaces the compose box until dismissed), so a new run can't start until it
+    /// is abandoned. Distinct from `WorkflowAlreadyRunning` so the UI can prompt
+    /// "dismiss the failed workflow first" rather than "wait for the running one".
+    #[error("a failed or interrupted workflow run must be dismissed before starting another")]
+    WorkflowRunRequiresDismissal { project_id: ProjectId },
+
     /// Abandon was asked to clear a run that is still live. The interpreter would
     /// just recreate the file on its next record; cancel it first.
     #[error("workflow run {run_id} is still active; cancel it before abandoning")]

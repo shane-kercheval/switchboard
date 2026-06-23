@@ -46,6 +46,7 @@ function descriptor(
     inputs,
     derived_args,
     compatibility: { state: "ok" } as FormCompatibility,
+    steps: [],
     ...over,
   };
 }

@@ -832,6 +832,22 @@ export type FormCompatibility =
 // The complete invocation form for a picked workflow: declared inputs plus the
 // auto-derived user-fillable prompt-argument fields, plus a compatibility verdict.
 // Resolved per-pick via `describe_workflow_form` (not in `list_workflows`).
+// A declared recipient reference for a step. `literal` is a hardcoded agent name;
+// `slot` is an `agent`/`[agent]` input the user binds — the composer preview
+// resolves a slot against the form's bindings live, and a live run carries
+// recipients already resolved to `literal`s.
+export type RecipientRef = { kind: "literal"; name: string } | { kind: "slot"; input: string };
+
+// One step as the progress/preview views render it. `recipients` are declared
+// (slots unresolved) on a `WorkflowFormDescriptor`, and resolved to concrete
+// agent names on a live `WorkflowRunInfo`. May be empty for a disk-sourced run
+// from a legacy run file (written before the snapshot existed).
+export type WorkflowStepInfo = {
+  label: string;
+  recipients: RecipientRef[];
+  feeds_from: RecipientRef[];
+};
+
 export type WorkflowFormDescriptor = {
   name: string;
   description: string | null;
@@ -840,6 +856,8 @@ export type WorkflowFormDescriptor = {
   inputs: WorkflowInputInfo[];
   derived_args: DerivedArgInfo[];
   compatibility: FormCompatibility;
+  // Declared steps for the composer preview (slots unresolved).
+  steps: WorkflowStepInfo[];
 };
 
 // A run as the indicator shows it (from `list_workflow_runs`). `status` is
@@ -854,6 +872,9 @@ export type WorkflowRunInfo = {
   total: number;
   status: WorkflowRunStatus;
   reason: string | null;
+  // Per-step display info: resolved recipients for a live run, declared for a
+  // disk-sourced failed/interrupted run. May be empty for a legacy run file.
+  steps: WorkflowStepInfo[];
 };
 
 // The `workflow:<project-id>` channel payload. `status` is `running` while live,

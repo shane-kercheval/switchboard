@@ -14859,7 +14859,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("iterate.yaml"),
-            "name: iterate\ndescription: d\ninputs:\n  ms: [text]\n  w: agent\nsteps:\n  - for_each:\n      item: m\n      in: \"{{ ms }}\"\n      steps:\n        - send:\n            to: \"{{ w }}\"\n            text: \"{{ m }}\"\n",
+            "name: iterate\ndescription: d\ninputs:\n  ms: [text]\n  w: agent\nsteps:\n  - label: s\n    for_each:\n      item: m\n      in: \"{{ ms }}\"\n      steps:\n        - label: s\n          send:\n            to: \"{{ w }}\"\n            text: \"{{ m }}\"\n",
         )
         .unwrap();
         let listed = list_workflows_impl(&state);
@@ -14966,6 +14966,112 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn describe_form_exposes_declared_step_recipients_for_the_preview() {
+        let (_tmp, state, _pid) = workflow_state(&[]).await;
+        seed_workflow(
+            &state,
+            "stepped",
+            "name: stepped\ndescription: d\ninputs:\n  reviewers: [agent]\n  worker: agent\nsteps:\n  - {label: Review, send: {to: \"{{ reviewers }}\", text: hi}}\n  - {label: Wait, wait_for_all: {agents: \"{{ reviewers }}\"}}\n  - {label: Hand off, send: {to: \"{{ worker }}\", forward_from: \"{{ reviewers }}\", text: go}}\n",
+        );
+        let form = describe_workflow_form_impl(&state, "stepped", false).unwrap();
+        let labels: Vec<&str> = form.steps.iter().map(|s| s.label.as_str()).collect();
+        assert_eq!(labels, vec!["Review", "Wait", "Hand off"]);
+        // Declared (slot) recipients — the frontend resolves them against the form.
+        assert_eq!(
+            form.steps[0].recipients,
+            vec![switchboard_workflow::RecipientRef::Slot {
+                input: "reviewers".to_owned()
+            }]
+        );
+        assert_eq!(
+            form.steps[2].feeds_from,
+            vec![switchboard_workflow::RecipientRef::Slot {
+                input: "reviewers".to_owned()
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn invoke_rejects_a_second_workflow_in_the_same_project() {
+        let (_tmp, state, pid) = workflow_state(&["alice"]).await;
+        seed_workflow(
+            &state,
+            "solo",
+            "name: solo\ndescription: d\ninputs:\n  who: agent\nsteps:\n  - {label: Go, send: {to: \"{{ who }}\", text: hi}}\n",
+        );
+        // Simulate an already-active run for this project so the guard fires
+        // deterministically (no dependence on the spawned run's timing).
+        state.workflow_runs.lock().unwrap().insert(
+            Uuid::now_v7(),
+            crate::state::ActiveRun {
+                cancel: tokio_util::sync::CancellationToken::new(),
+                project_id: pid,
+                workflow: "other".to_owned(),
+                snapshot: crate::state::RunSnapshot {
+                    total_steps: 1,
+                    current_step: 0,
+                },
+                steps: Vec::new(),
+                done: std::sync::Arc::new(tokio::sync::Notify::new()),
+            },
+        );
+        let err = invoke_workflow_impl(
+            &state,
+            pid,
+            "solo",
+            false,
+            &inputs(vec![("who", text("alice"))]),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, AppError::WorkflowAlreadyRunning { .. }),
+            "got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn invoke_rejects_while_a_held_failed_or_interrupted_run_awaits_dismissal() {
+        let (_tmp, state, pid) = workflow_state(&["alice"]).await;
+        seed_workflow(
+            &state,
+            "solo",
+            "name: solo\ndescription: d\ninputs:\n  who: agent\nsteps:\n  - {label: Go, send: {to: \"{{ who }}\", text: hi}}\n",
+        );
+        let project = lock(&state.projects).get(&pid).cloned().unwrap();
+        let args = inputs(vec![("who", text("alice"))]);
+
+        // A held *failed* run occupies the project until dismissed.
+        let held = Uuid::now_v7();
+        seed_run_file(
+            &project,
+            held,
+            &[
+                RunRecord::Started {
+                    workflow: "solo".to_owned(),
+                    total_steps: 1,
+                    steps: Vec::new(),
+                    at: chrono::Utc::now(),
+                },
+                RunRecord::Terminal {
+                    status: TerminalStatus::Failed,
+                    failed_step: Some(0),
+                    reason: Some("boom".to_owned()),
+                    at: chrono::Utc::now(),
+                },
+            ],
+        );
+        let err = invoke_workflow_impl(&state, pid, "solo", false, &args).unwrap_err();
+        assert!(
+            matches!(err, AppError::WorkflowRunRequiresDismissal { .. }),
+            "got: {err:?}"
+        );
+
+        // Dismissing it (abandon) frees the project; the same invoke now succeeds.
+        abandon_workflow_run_impl(&state, pid, held).unwrap();
+        invoke_workflow_impl(&state, pid, "solo", false, &args).expect("invoke after dismiss");
+    }
+
+    #[tokio::test]
     async fn describe_form_blocks_a_template_var_targeting_a_missing_argument() {
         let (tmp, state, pid) = workflow_state(&["a"]).await;
         // A prompt that has NO `context` argument.
@@ -14974,7 +15080,7 @@ mod tests {
         seed_workflow(
             &state,
             "drifted",
-            "name: drifted\ndescription: d\ninputs:\n  a: agent\nsteps:\n  - send:\n      to: \"{{ a }}\"\n      prompt: \"local:bare\"\n      template_vars:\n        context: \"hello\"\n",
+            "name: drifted\ndescription: d\ninputs:\n  a: agent\nsteps:\n  - label: s\n    send:\n      to: \"{{ a }}\"\n      prompt: \"local:bare\"\n      template_vars:\n        context: \"hello\"\n",
         );
 
         let form = describe_workflow_form_impl(&state, "drifted", false).unwrap();
@@ -15004,7 +15110,7 @@ mod tests {
         seed_workflow(
             &state,
             "shadow",
-            "name: shadow\ndescription: d\ninputs:\n  reviewers: [agent]\n  context:\n    type: text?\n    description: My own label\nsteps:\n  - send:\n      to: \"{{ reviewers }}\"\n      prompt: \"builtin:code-review\"\n",
+            "name: shadow\ndescription: d\ninputs:\n  reviewers: [agent]\n  context:\n    type: text?\n    description: My own label\nsteps:\n  - label: s\n    send:\n      to: \"{{ reviewers }}\"\n      prompt: \"builtin:code-review\"\n",
         );
         let form = describe_workflow_form_impl(&state, "shadow", false).unwrap();
         assert_eq!(form.compatibility, FormCompatibility::Ok);
@@ -15027,7 +15133,7 @@ mod tests {
         seed_workflow(
             &state,
             "shadowreq",
-            "name: shadowreq\ndescription: d\ninputs:\n  a: agent\n  x: text?\nsteps:\n  - send:\n      to: \"{{ a }}\"\n      prompt: \"local:reqx\"\n",
+            "name: shadowreq\ndescription: d\ninputs:\n  a: agent\n  x: text?\nsteps:\n  - label: s\n    send:\n      to: \"{{ a }}\"\n      prompt: \"local:reqx\"\n",
         );
 
         // The descriptor reports `x` as required even though it's declared `text?`
@@ -15077,7 +15183,7 @@ mod tests {
         seed_workflow(
             &state,
             "defshadow",
-            "name: defshadow\ndescription: d\ninputs:\n  a: agent\n  y:\n    type: text\n    default: fallback\nsteps:\n  - send:\n      to: \"{{ a }}\"\n      prompt: \"local:reqy\"\n",
+            "name: defshadow\ndescription: d\ninputs:\n  a: agent\n  y:\n    type: text\n    default: fallback\nsteps:\n  - label: s\n    send:\n      to: \"{{ a }}\"\n      prompt: \"local:reqy\"\n",
         );
         validate_workflow_invocation_impl(
             &state,
@@ -15096,7 +15202,7 @@ mod tests {
         seed_workflow(
             &state,
             "clash",
-            "name: clash\ndescription: d\ninputs:\n  context: [agent]\nsteps:\n  - send:\n      to: \"{{ context }}\"\n      prompt: \"builtin:code-review\"\n",
+            "name: clash\ndescription: d\ninputs:\n  context: [agent]\nsteps:\n  - label: s\n    send:\n      to: \"{{ context }}\"\n      prompt: \"builtin:code-review\"\n",
         );
         let form = describe_workflow_form_impl(&state, "clash", false).unwrap();
         assert!(matches!(
@@ -15123,7 +15229,7 @@ mod tests {
         seed_workflow(
             &state,
             "twoprompt",
-            "name: twoprompt\ndescription: d\ninputs:\n  a: agent\n  b: agent\nsteps:\n  - send:\n      to: \"{{ a }}\"\n      prompt: \"local:p-opt\"\n  - send:\n      to: \"{{ b }}\"\n      prompt: \"local:p-req\"\n",
+            "name: twoprompt\ndescription: d\ninputs:\n  a: agent\n  b: agent\nsteps:\n  - label: s\n    send:\n      to: \"{{ a }}\"\n      prompt: \"local:p-opt\"\n  - label: s\n    send:\n      to: \"{{ b }}\"\n      prompt: \"local:p-req\"\n",
         );
         let form = describe_workflow_form_impl(&state, "twoprompt", false).unwrap();
         assert_eq!(form.compatibility, FormCompatibility::Ok);
@@ -15152,7 +15258,7 @@ mod tests {
         seed_workflow(
             &state,
             "needs",
-            "name: needs\ndescription: d\ninputs:\n  a: agent\nsteps:\n  - send:\n      to: \"{{ a }}\"\n      prompt: \"local:needsx\"\n",
+            "name: needs\ndescription: d\ninputs:\n  a: agent\nsteps:\n  - label: s\n    send:\n      to: \"{{ a }}\"\n      prompt: \"local:needsx\"\n",
         );
         // Required derived arg unfilled → blocked.
         let err = validate_workflow_invocation_impl(
@@ -15187,7 +15293,7 @@ mod tests {
         seed_workflow(
             &state,
             "usesmut",
-            "name: usesmut\ndescription: d\ninputs:\n  a: agent\nsteps:\n  - send:\n      to: \"{{ a }}\"\n      prompt: \"local:mut\"\n",
+            "name: usesmut\ndescription: d\ninputs:\n  a: agent\nsteps:\n  - label: s\n    send:\n      to: \"{{ a }}\"\n      prompt: \"local:mut\"\n",
         );
         // The form validates cleanly now (only an optional arg).
         let form = describe_workflow_form_impl(&state, "usesmut", false).unwrap();
@@ -15231,7 +15337,7 @@ mod tests {
         seed_workflow(
             &state,
             "ghostly",
-            "name: ghostly\ndescription: d\ninputs:\n  a: agent\nsteps:\n  - send:\n      to: \"{{ a }}\"\n      prompt: \"local:ghost\"\n",
+            "name: ghostly\ndescription: d\ninputs:\n  a: agent\nsteps:\n  - label: s\n    send:\n      to: \"{{ a }}\"\n      prompt: \"local:ghost\"\n",
         );
         let form = describe_workflow_form_impl(&state, "ghostly", false).unwrap();
         match &form.compatibility {
@@ -15248,7 +15354,7 @@ mod tests {
         seed_workflow(
             &state,
             "mcpish",
-            "name: mcpish\ndescription: d\ninputs:\n  a: agent\nsteps:\n  - send:\n      to: \"{{ a }}\"\n      prompt: \"tiddly:ghost\"\n",
+            "name: mcpish\ndescription: d\ninputs:\n  a: agent\nsteps:\n  - label: s\n    send:\n      to: \"{{ a }}\"\n      prompt: \"tiddly:ghost\"\n",
         );
         let form = describe_workflow_form_impl(&state, "mcpish", false).unwrap();
         assert!(matches!(
@@ -15264,7 +15370,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("iterate.yaml"),
-            "name: iterate\ndescription: d\ninputs:\n  ms: [text]\n  w: agent\nsteps:\n  - for_each:\n      item: m\n      in: \"{{ ms }}\"\n      steps:\n        - send:\n            to: \"{{ w }}\"\n            text: \"{{ m }}\"\n",
+            "name: iterate\ndescription: d\ninputs:\n  ms: [text]\n  w: agent\nsteps:\n  - label: s\n    for_each:\n      item: m\n      in: \"{{ ms }}\"\n      steps:\n        - label: s\n          send:\n            to: \"{{ w }}\"\n            text: \"{{ m }}\"\n",
         )
         .unwrap();
         let err = invoke_workflow_impl(
@@ -15467,6 +15573,7 @@ mod tests {
                 RunRecord::Started {
                     workflow: "w".to_owned(),
                     total_steps: 3,
+                    steps: Vec::new(),
                     at: chrono::Utc::now(),
                 },
                 RunRecord::StepCompleted {
@@ -15490,6 +15597,7 @@ mod tests {
                 RunRecord::Started {
                     workflow: "w2".to_owned(),
                     total_steps: 5,
+                    steps: Vec::new(),
                     at: chrono::Utc::now(),
                 },
                 RunRecord::StepCompleted {
@@ -15507,6 +15615,7 @@ mod tests {
                 RunRecord::Started {
                     workflow: "w3".to_owned(),
                     total_steps: 1,
+                    steps: Vec::new(),
                     at: chrono::Utc::now(),
                 },
                 RunRecord::Terminal {

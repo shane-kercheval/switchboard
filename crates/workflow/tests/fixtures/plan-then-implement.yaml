@@ -7,16 +7,20 @@ inputs:
   goal: text
 
 steps:
-  - send:
+  - label: Ask the planner for a plan
+    send:
       to: "{{ planner }}"
       text: "Produce a step-by-step plan to: {{ goal }}"
-  - wait_for:
+  - label: Wait for the plan
+    wait_for:
       agent: "{{ planner }}"
-  - send:
+  - label: Hand the plan to the implementer
+    send:
       to: "{{ implementer }}"
       forward_from: "{{ planner }}"
       text: |
         Execute the plan above. Ask me if you encounter ambiguity
         rather than guessing.
-  - wait_for:
+  - label: Wait for the implementation
+    wait_for:
       agent: "{{ implementer }}"

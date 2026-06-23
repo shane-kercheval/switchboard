@@ -246,7 +246,7 @@ describe("PromptComposer per-argument forwarding", () => {
   it("removes a source chip via its remove control", async () => {
     setupForward(
       { focus: "", tone: "" },
-      { argSources: { focus: [{ kind: "agent", id: BOB.id, name: "bob" }] } },
+      { argSources: { focus: [{ id: BOB.id, name: "bob" }] } },
     );
     expect(screen.getByTestId("forward-source-chip-bob")).toBeInTheDocument();
 
@@ -258,7 +258,7 @@ describe("PromptComposer per-argument forwarding", () => {
     setupForward(
       { focus: "", tone: "" },
       {
-        argSources: { focus: [{ kind: "agent", id: BOB.id, name: "bob" }] },
+        argSources: { focus: [{ id: BOB.id, name: "bob" }] },
         agentHasOutput: () => false,
       },
     );
@@ -272,7 +272,7 @@ describe("PromptComposer per-argument forwarding", () => {
     // and no missing-required highlight.
     setupForward(
       { focus: "", tone: "" },
-      { argSources: { focus: [{ kind: "agent", id: BOB.id, name: "bob" }] } },
+      { argSources: { focus: [{ id: BOB.id, name: "bob" }] } },
     );
     expect((screen.getByTestId("prompt-preview-button") as HTMLButtonElement).disabled).toBe(false);
     expect(screen.getByTestId("prompt-arg-focus")).not.toHaveClass("border-status-failed");
@@ -282,7 +282,7 @@ describe("PromptComposer per-argument forwarding", () => {
     invokeMock.mockResolvedValue({ text: "RENDERED" });
     setupForward(
       { focus: "lead text", tone: "" },
-      { argSources: { focus: [{ kind: "agent", id: BOB.id, name: "bob" }] } },
+      { argSources: { focus: [{ id: BOB.id, name: "bob" }] } },
     );
 
     await fireEvent.click(screen.getByTestId("prompt-preview-button"));
@@ -296,7 +296,7 @@ describe("PromptComposer per-argument forwarding", () => {
     expect(sentArgs.focus).toContain("«forwarding from bob…»");
   });
 
-  it("adds a pane pick as a single named chip (not expanded per member)", async () => {
+  it("expands a pane pick to one chip per member agent (no pane chip)", async () => {
     const pane: TranscriptPane = {
       id: "pane-1",
       name: "Reviewers",
@@ -311,10 +311,52 @@ describe("PromptComposer per-argument forwarding", () => {
     await fireEvent.click(await screen.findByTestId("forward-picker-pane-pane-1"));
 
     const sources = await screen.findByTestId("prompt-arg-sources-focus");
-    // One chip for the pane, labelled by the pane name — not one chip per member.
-    const chip = within(sources).getByTestId("forward-source-chip-Reviewers");
-    expect(chip).toHaveAttribute("data-kind", "pane");
-    expect(within(sources).queryByTestId("forward-source-chip-bob")).toBeNull();
-    expect(within(sources).queryByTestId("forward-source-chip-carol")).toBeNull();
+    // Agents are the first-class unit: the pane resolves to one chip per member,
+    // never a pane chip.
+    expect(within(sources).getByTestId("forward-source-chip-bob")).toBeInTheDocument();
+    expect(within(sources).getByTestId("forward-source-chip-carol")).toBeInTheDocument();
+    expect(within(sources).queryByTestId("forward-source-chip-Reviewers")).toBeNull();
+  });
+
+  it("dedups a pane pick against a member already attached to the field", async () => {
+    const pane: TranscriptPane = {
+      id: "pane-1",
+      name: "Reviewers",
+      members: [BOB.id, CAROL.id],
+      hidden: [],
+    };
+    const other: TranscriptPane = { id: "pane-2", name: "Pane 2", members: [CAROL.id], hidden: [] };
+    // `focus` already carries bob; picking the pane must add only carol.
+    setupForward(
+      { focus: "", tone: "" },
+      { argSources: { focus: [{ id: BOB.id, name: "bob" }] }, panes: [pane, other] },
+    );
+
+    await fireEvent.click(screen.getByTestId("prompt-arg-forward-focus"));
+    await fireEvent.click(await screen.findByTestId("forward-picker-pane-pane-1"));
+
+    const sources = await screen.findByTestId("prompt-arg-sources-focus");
+    await waitFor(() =>
+      expect(within(sources).getByTestId("forward-source-chip-carol")).toBeInTheDocument(),
+    );
+    expect(within(sources).getAllByTestId("forward-source-chip-bob")).toHaveLength(1);
+  });
+
+  it("clears all of a field's sources with one click", async () => {
+    const pane: TranscriptPane = {
+      id: "pane-1",
+      name: "Reviewers",
+      members: [BOB.id, CAROL.id],
+      hidden: [],
+    };
+    const other: TranscriptPane = { id: "pane-2", name: "Pane 2", members: [CAROL.id], hidden: [] };
+    setupForward({ focus: "", tone: "" }, { panes: [pane, other] });
+
+    await fireEvent.click(screen.getByTestId("prompt-arg-forward-focus"));
+    await fireEvent.click(await screen.findByTestId("forward-picker-pane-pane-1"));
+    await screen.findByTestId("forward-source-chip-bob");
+
+    await fireEvent.click(screen.getByTestId("prompt-arg-sources-focus-clear"));
+    await waitFor(() => expect(screen.queryByTestId("prompt-arg-sources-focus")).toBeNull());
   });
 });

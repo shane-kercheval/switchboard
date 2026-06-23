@@ -14,7 +14,7 @@
     forwardSourceKey,
     expandForwardSources,
     forwardSourceForAgent,
-    forwardSourceForPane,
+    forwardSourceAgentsForPane,
     type ForwardSource,
   } from "$lib/state/heldForwards.svelte";
   import { buildLiveSendsMap } from "$lib/state/liveSends";
@@ -151,6 +151,12 @@
     forwardSources = [...forwardSources, source];
   }
 
+  /// Add every (live) member of a pane as its own agent source — a pane is a
+  /// selection shortcut, not a stored entity, so it expands to agent chips here.
+  function addPaneForwardSources(pane: TranscriptPane): void {
+    for (const source of forwardSourceAgentsForPane(pane, agents)) addForwardSource(source);
+  }
+
   function removeForwardSource(key: string): void {
     forwardSources = forwardSources.filter((s) => forwardSourceKey(s) !== key);
   }
@@ -163,16 +169,13 @@
     );
   }
 
-  /// Whether a source has nothing to forward yet — an agent with no completed
-  /// turn, or a pane whose every member is empty (or has no members).
+  /// Whether a source has nothing to forward yet — an agent with no completed turn.
   function sourceIsEmpty(source: ForwardSource): boolean {
-    const ids = source.kind === "agent" ? [source.id] : source.members;
-    return ids.length === 0 || ids.every((id) => !agentHasCompletedOutput(id));
+    return !agentHasCompletedOutput(source.id);
   }
 
   /// Agent names that actually carried output, for the partial-empty caption —
-  /// derived from the expanded agent ids (panes included) minus the backend's
-  /// skipped names.
+  /// derived from the expanded agent ids minus the backend's skipped names.
   function includedNames(sources: ForwardSource[], skipped: string[]): string[] {
     return expandForwardSources(sources)
       .map((id) => agents.find((a) => a.id === id)?.name)
@@ -537,7 +540,7 @@
         const pane = paneLayout.panes[Number(e.key) - 1];
         if (pane !== undefined && pane.members.length > 0) {
           e.preventDefault();
-          if (!sending) addForwardSource(forwardSourceForPane(pane, agents));
+          if (!sending) addPaneForwardSources(pane);
         }
         return;
       }
@@ -698,14 +701,18 @@
     if (!menuOpen || agents.length <= 1 || mode !== "plain") return [];
     const q = menuQuery.toLowerCase();
     const items: ForwardMenuItem[] = [];
+    const alreadyForwarded = expandForwardSources(forwardSources);
     if (paneLayout.panes.length > 1) {
       for (const pane of paneLayout.panes) {
-        if (pane.members.length === 0) continue;
         if (!pane.name.toLowerCase().includes(q)) continue;
+        // A pane resolves to its live member agents; offer it only while at least
+        // one of those isn't already forwarded — otherwise picking it is a no-op
+        // (the agent-only model has no pane chip of its own to add).
+        const addable = forwardSourceAgentsForPane(pane, agents);
+        if (addable.length === 0 || addable.every((s) => alreadyForwarded.includes(s.id))) continue;
         items.push({ kind: "forward-pane", key: `forward-pane:${pane.id}`, pane });
       }
     }
-    const alreadyForwarded = expandForwardSources(forwardSources);
     for (const agent of agentCandidates) {
       if (alreadyForwarded.includes(agent.id)) continue;
       items.push({ kind: "forward-agent", key: `forward-agent:${agent.id}`, agent });
@@ -882,9 +889,9 @@
       addForwardSource(forwardSourceForAgent(item.agent));
       stripAtToken();
     } else if (item.kind === "forward-pane") {
-      // One pane chip (membership snapshotted at pick time, moments before send);
-      // it expands to per-agent blocks only at dispatch.
-      addForwardSource(forwardSourceForPane(item.pane, agents));
+      // A pane is a shortcut for its members — add one agent source per live
+      // member (deduped), never a pane chip.
+      addPaneForwardSources(item.pane);
       stripAtToken();
     } else {
       setSelectedIds([item.agent.id]);
@@ -2139,6 +2146,35 @@
               onRemove={() => removeForwardSource(forwardSourceKey(source))}
             />
           {/each}
+          {#if forwardSources.length > 1}
+            <!-- Each chip carries its own ✕; the bulk clear (same ⊘ glyph as
+                 "Clear recipients") only earns its place once there are several to
+                 drop at once. -->
+            <button
+              type="button"
+              class="text-muted hover:text-fg hover:bg-panel ml-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-full transition-colors disabled:opacity-50"
+              data-testid="forward-sources-clear"
+              aria-label="Clear forward sources"
+              title="Clear forward sources"
+              disabled={sending}
+              onclick={() => {
+                if (!sending) forwardSources = [];
+              }}
+            >
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.75"
+                stroke-linecap="round"
+                class="h-4 w-4"
+                aria-hidden="true"
+              >
+                <circle cx="12" cy="12" r="9" />
+                <path d="m5.6 5.6 12.8 12.8" />
+              </svg>
+            </button>
+          {/if}
         </div>
       {/if}
       {#snippet recipientChips()}
@@ -2262,7 +2298,7 @@
               {agents}
               panes={paneLayout.panes}
               onPickAgent={(agent) => addForwardSource(forwardSourceForAgent(agent))}
-              onPickPane={(pane) => addForwardSource(forwardSourceForPane(pane, agents))}
+              onPickPane={(pane) => addPaneForwardSources(pane)}
               agentHasOutput={agentHasCompletedOutput}
               disabled={sending}
               showPaneShortcuts

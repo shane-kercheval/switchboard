@@ -9,7 +9,7 @@
   import {
     forwardSourceKey,
     forwardSourceForAgent,
-    forwardSourceForPane,
+    forwardSourceAgentsForPane,
     type ForwardSource,
   } from "$lib/state/heldForwards.svelte";
   import { cn } from "$lib/utils";
@@ -86,6 +86,10 @@
     forwardSources[name] = (forwardSources[name] ?? []).filter((s) => forwardSourceKey(s) !== key);
   }
 
+  function clearArgSources(name: string): void {
+    forwardSources[name] = [];
+  }
+
   function hasSources(name: string): boolean {
     return (forwardSources[name]?.length ?? 0) > 0;
   }
@@ -121,7 +125,7 @@
       const add = focusedFieldAdd();
       if (add === null) return;
       e.preventDefault();
-      add(forwardSourceForPane(pane, agents));
+      for (const source of forwardSourceAgentsForPane(pane, agents)) add(source);
     }
     window.addEventListener("keydown", onKeydown);
     return () => window.removeEventListener("keydown", onKeydown);
@@ -390,7 +394,9 @@
         {panes}
         {agentHasOutput}
         onPickAgent={(agent) => addArgSource(name, forwardSourceForAgent(agent))}
-        onPickPane={(pane) => addArgSource(name, forwardSourceForPane(pane, agents))}
+        onPickPane={(pane) => {
+          for (const source of forwardSourceAgentsForPane(pane, agents)) addArgSource(name, source);
+        }}
         showPaneShortcuts
         triggerTestid={`workflow-forward-picker-${name}`}
         triggerLabel={`Forward an agent's output into ${name}`}
@@ -413,6 +419,32 @@
             onRemove={() => removeArgSource(name, forwardSourceKey(source))}
           />
         {/each}
+        {#if sources.length > 1}
+          <!-- Each chip carries its own ✕; the bulk clear (same ⊘ glyph as
+               "Clear recipients") only earns its place once there are several to
+               drop at once. -->
+          <button
+            type="button"
+            class="text-muted hover:text-fg hover:bg-panel ml-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-full transition-colors"
+            data-testid={`workflow-forward-sources-${name}-clear`}
+            aria-label="Clear forward sources"
+            title="Clear forward sources"
+            onclick={() => clearArgSources(name)}
+          >
+            <svg
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.75"
+              stroke-linecap="round"
+              class="h-4 w-4"
+              aria-hidden="true"
+            >
+              <circle cx="12" cy="12" r="9" />
+              <path d="m5.6 5.6 12.8 12.8" />
+            </svg>
+          </button>
+        {/if}
       </div>
     {/if}
   {/snippet}

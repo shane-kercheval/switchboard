@@ -265,14 +265,14 @@ describe("WorkflowComposer", () => {
 
     const sourcesEl = await screen.findByTestId("workflow-forward-sources-context");
     expect(within(sourcesEl).getByTestId("forward-source-chip-primary")).toBeInTheDocument();
-    expect(sources().context).toEqual([{ kind: "agent", id: "a1", name: "primary" }]);
+    expect(sources().context).toEqual([{ id: "a1", name: "primary" }]);
 
     await fireEvent.click(screen.getByTestId("forward-source-remove-primary"));
     await waitFor(() => expect(screen.queryByTestId("forward-source-chip-primary")).toBeNull());
     expect(sources().context).toEqual([]);
   });
 
-  it("forwards a pane into the focused field via the ⌘⌃N chord", async () => {
+  it("forwards a pane into the focused field via the ⌘⌃N chord (as member agents)", async () => {
     const { sources } = setupForward(
       descriptor([], [arg({ name: "context" })]),
       { context: "" },
@@ -284,8 +284,62 @@ describe("WorkflowComposer", () => {
     field.focus();
     await fireEvent.keyDown(window, { key: "1", metaKey: true, ctrlKey: true });
 
-    await waitFor(() => expect((sources().context ?? []).length).toBe(1));
-    expect(screen.getByTestId("workflow-forward-sources-context")).toBeInTheDocument();
+    // Pane "Left" expands to its single member agent — a chip per member, no pane chip.
+    await waitFor(() => expect(sources().context).toEqual([{ id: "a1", name: "primary" }]));
+    const sourcesEl = screen.getByTestId("workflow-forward-sources-context");
+    expect(within(sourcesEl).getByTestId("forward-source-chip-primary")).toBeInTheDocument();
+  });
+
+  it("expands a multi-member pane to one chip per member, deduped, with a Clear", async () => {
+    const both: TranscriptPane[] = [
+      { id: "pane-all", name: "All", members: ["a1", "a2"], hidden: [] },
+      { id: "pane-empty", name: "Empty", members: [], hidden: [] },
+    ] as TranscriptPane[];
+    const { sources } = setupForward(
+      descriptor([], [arg({ name: "context" })]),
+      { context: "" },
+      // Seed with `primary` already attached so the pane pick must dedup it.
+      { context: [{ id: "a1", name: "primary" }] },
+      both,
+    );
+
+    // The chord works regardless of pane count (the picker hides its pane rows
+    // until ≥2 non-empty panes); pane "All" sits at index 0 → ⌘⌃1.
+    const field = screen.getByTestId("workflow-arg-input-context") as HTMLTextAreaElement;
+    field.focus();
+    await fireEvent.keyDown(window, { key: "1", metaKey: true, ctrlKey: true });
+
+    // Both members present, `primary` not duplicated.
+    await waitFor(() =>
+      expect(sources().context).toEqual([
+        { id: "a1", name: "primary" },
+        { id: "a2", name: "reviewer-1" },
+      ]),
+    );
+
+    // Bulk Clear empties the field (each chip also still has its own remove ✕).
+    await fireEvent.click(screen.getByTestId("workflow-forward-sources-context-clear"));
+    await waitFor(() => expect(sources().context).toEqual([]));
+  });
+
+  it("a zero-member pane is a clean no-op (no ghost chip)", async () => {
+    const empties: TranscriptPane[] = [
+      { id: "pane-empty", name: "Empty", members: [], hidden: [] },
+      { id: "pane-one", name: "One", members: ["a1"], hidden: [] },
+    ] as TranscriptPane[];
+    const { sources } = setupForward(
+      descriptor([], [arg({ name: "context" })]),
+      { context: "" },
+      {},
+      empties,
+    );
+    // The empty pane sits at index 0, so ⌘⌃1 targets it — and adds nothing.
+    const field = screen.getByTestId("workflow-arg-input-context") as HTMLTextAreaElement;
+    field.focus();
+    await fireEvent.keyDown(window, { key: "1", metaKey: true, ctrlKey: true });
+
+    await waitFor(() => expect(sources().context ?? []).toEqual([]));
+    expect(screen.queryByTestId("workflow-forward-sources-context")).toBeNull();
   });
 
   it("the per-field forward picker shows the ⌘⌃N pane shortcut", async () => {
@@ -303,7 +357,7 @@ describe("WorkflowComposer", () => {
     await fireEvent.click(screen.getByTestId("workflow-forward-picker-note"));
     await fireEvent.click(await screen.findByTestId("forward-picker-agent-a1"));
     await screen.findByTestId("forward-source-chip-primary");
-    expect(sources().note).toEqual([{ kind: "agent", id: "a1", name: "primary" }]);
+    expect(sources().note).toEqual([{ id: "a1", name: "primary" }]);
   });
 
   it("does not offer a forward picker on agent or list fields", () => {
@@ -322,7 +376,7 @@ describe("WorkflowComposer", () => {
 
   it("treats a required text field with a forward source as filled", () => {
     setup(descriptor([input({ name: "note", ty: "text" })]), { note: "" }, [], false, {
-      note: [{ kind: "agent", id: "a1", name: "primary" }],
+      note: [{ id: "a1", name: "primary" }],
     });
     expect(screen.queryByTestId("workflow-missing")).toBeNull();
   });

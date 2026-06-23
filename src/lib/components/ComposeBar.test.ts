@@ -2097,6 +2097,44 @@ describe("ComposeBar — cross-agent forward", () => {
     await resetHeldForwards();
   });
 
+  it("@ menu pane row adds missing members, dedups, and disappears once all are attached", async () => {
+    const panes = await import("$lib/state/transcriptPanes.svelte");
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    await state.registerAgent(AGENT_C);
+    const roster = [AGENT_A.id, AGENT_B.id, AGENT_C.id];
+    // Split into two non-empty panes (the @ menu only offers panes once split):
+    // "reviewers" = bob + carol; the default pane keeps alice.
+    const reviewers = panes.moveAgentToNewPane(PROJECT_ID, roster, AGENT_B.id);
+    panes.moveAgentToPane(PROJECT_ID, roster, AGENT_C.id, reviewers);
+    panes.renamePane(PROJECT_ID, roster, reviewers, "reviewers");
+
+    render(ComposeBar, {
+      props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B, AGENT_C] },
+    });
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+
+    // Attach one member (bob) on its own, then forward the whole pane from the @
+    // menu: only the missing member (carol) is added, bob isn't duplicated, and a
+    // pane chip never appears.
+    await pickForwardSource(AGENT_B.id);
+    await fireEvent.input(textarea, { target: { value: "@review" } });
+    await fireEvent.click(await screen.findByTestId(`forward-option-forward-pane:${reviewers}`));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("forward-source-chip-carol")).toBeInTheDocument(),
+    );
+    expect(screen.getAllByTestId("forward-source-chip-bob")).toHaveLength(1);
+    expect(screen.queryByTestId("forward-source-chip-reviewers")).toBeNull();
+
+    // Both members now attached → the pane row is suppressed (picking it would be a
+    // no-op), while the still-forwardable alice keeps the menu open.
+    await fireEvent.input(textarea, { target: { value: "@" } });
+    await screen.findByTestId(`forward-option-forward-agent:${AGENT_A.id}`);
+    expect(screen.queryByTestId(`forward-option-forward-pane:${reviewers}`)).toBeNull();
+  });
+
   it("picks a forward source from the @ menu and dispatches a forward", async () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);
@@ -2342,6 +2380,64 @@ describe("ComposeBar — cross-agent forward", () => {
     expect(invokeMock.mock.calls.filter(([c]) => c === "send_message")).toHaveLength(0);
   });
 
+  it("a pane-selected manual forward holds individual agent sources (not a pane)", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    await seedCompletedTurn(AGENT_A.id);
+    await seedCompletedTurn(AGENT_B.id);
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "forward_message") return new Promise(() => {}); // holds forever
+      return null;
+    });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    // Expand the default pane to its members, then submit.
+    await fireEvent.keyDown(window, { key: "1", metaKey: true, ctrlKey: true });
+    await waitFor(() => expect(screen.getByTestId("forward-source-chip-alice")).toBeInTheDocument());
+    await fireEvent.input(screen.getByTestId("compose-textarea"), { target: { value: "go" } });
+    await fireEvent.click(screen.getByTestId("compose-send"));
+
+    // The held entry carries one agent source per member — no pane grouping.
+    const held = await import("$lib/state/heldForwards.svelte");
+    await waitFor(() => {
+      const forwards = held.heldForwardsFor(PROJECT_ID);
+      expect(forwards).toHaveLength(1);
+      expect(forwards[0]?.sources).toEqual([
+        { id: AGENT_A.id, name: "alice" },
+        { id: AGENT_B.id, name: "bob" },
+      ]);
+    });
+  });
+
+  it("restores individual agent chips when a pane-selected forward is cancelled", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    await seedCompletedTurn(AGENT_A.id);
+    await seedCompletedTurn(AGENT_B.id);
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "forward_message") return { status: "cancelled" };
+      return null;
+    });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    await fireEvent.keyDown(window, { key: "1", metaKey: true, ctrlKey: true });
+    await waitFor(() => expect(screen.getByTestId("forward-source-chip-alice")).toBeInTheDocument());
+    await fireEvent.input(screen.getByTestId("compose-textarea"), { target: { value: "aggregate" } });
+    await fireEvent.click(screen.getByTestId("compose-send"));
+
+    // The composer comes back with the member agent chips (not a pane chip) and
+    // the typed draft intact.
+    await waitFor(() => {
+      expect(screen.getByTestId("forward-source-chip-alice")).toBeInTheDocument();
+      expect(screen.getByTestId("forward-source-chip-bob")).toBeInTheDocument();
+      expect((screen.getByTestId("compose-textarea") as HTMLTextAreaElement).value).toBe(
+        "aggregate",
+      );
+    });
+  });
+
   it("removes the held forward when it resolves after the user switches projects", async () => {
     // Regression: the held "waiting for…" row used to stick forever if the user
     // navigated to another project while a forward was holding (and stack across
@@ -2427,25 +2523,39 @@ describe("ComposeBar — cross-agent forward", () => {
     await fireEvent.click(await screen.findByTestId(`forward-picker-agent-${agentId}`));
   }
 
-  it("⌘⌃1 forwards from pane 1 as a single named chip (mirrors ⌘⌥1 targeting)", async () => {
+  it("⌘⌃1 forwards pane 1 as one chip per member agent (mirrors ⌘⌥1 targeting)", async () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);
     await state.registerAgent(AGENT_B);
 
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
-    // The default pane "Pane 1" holds every agent; ⌘⌃1 adds it as one pane chip
-    // (expanded to its members only at dispatch), not one chip per agent.
+    // The default pane "Pane 1" holds every agent; ⌘⌃1 expands it to one chip per
+    // member agent — a pane is a selection shortcut, never a stored pane chip.
     await fireEvent.keyDown(window, { key: "1", metaKey: true, ctrlKey: true });
 
     await waitFor(() => {
-      const chip = screen.getByTestId("forward-source-chip-Pane 1");
-      expect(chip).toHaveAttribute("data-kind", "pane");
+      expect(screen.getByTestId("forward-source-chip-alice")).toBeInTheDocument();
+      expect(screen.getByTestId("forward-source-chip-bob")).toBeInTheDocument();
     });
-    expect(screen.queryByTestId("forward-source-chip-alice")).toBeNull();
-    expect(screen.queryByTestId("forward-source-chip-bob")).toBeNull();
+    expect(screen.queryByTestId("forward-source-chip-Pane 1")).toBeNull();
   });
 
-  it("a pane forward chip dispatches expanded to its member agent ids", async () => {
+  it("re-picking a pane and an already-attached agent does not duplicate chips", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    // Attach one agent via the picker, then expand the whole pane via the chord:
+    // alice must not appear twice.
+    await pickForwardSource(AGENT_A.id);
+    await fireEvent.keyDown(window, { key: "1", metaKey: true, ctrlKey: true });
+
+    await waitFor(() => expect(screen.getByTestId("forward-source-chip-bob")).toBeInTheDocument());
+    expect(screen.getAllByTestId("forward-source-chip-alice")).toHaveLength(1);
+  });
+
+  it("a pane-expanded forward dispatches its member agent ids", async () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);
     await state.registerAgent(AGENT_B);
@@ -2460,12 +2570,12 @@ describe("ComposeBar — cross-agent forward", () => {
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
     await fireEvent.keyDown(window, { key: "1", metaKey: true, ctrlKey: true });
     await waitFor(() =>
-      expect(screen.getByTestId("forward-source-chip-Pane 1")).toBeInTheDocument(),
+      expect(screen.getByTestId("forward-source-chip-alice")).toBeInTheDocument(),
     );
     await fireEvent.input(screen.getByTestId("compose-textarea"), { target: { value: "go" } });
     await fireEvent.click(screen.getByTestId("compose-send"));
 
-    // The single pane chip expands to its member agent ids on the wire.
+    // The member agent chips ride the wire as their agent ids.
     await waitFor(() => {
       const calls = invokeMock.mock.calls.filter(([c]) => c === "forward_message");
       expect(calls).toHaveLength(1);
@@ -2493,7 +2603,7 @@ describe("ComposeBar — cross-agent forward", () => {
     expect(screen.queryByTestId("forward-source-chips")).toBeNull();
   });
 
-  it("⌘⌃N forwards a pane into the focused prompt field (not the hidden message set)", async () => {
+  it("⌘⌃N forwards a pane into the focused prompt field as member agents (not the hidden message set)", async () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);
     await state.registerAgent(AGENT_B);
@@ -2507,15 +2617,13 @@ describe("ComposeBar — cross-agent forward", () => {
     (screen.getByTestId("prompt-arg-focus") as HTMLTextAreaElement).focus();
     await fireEvent.keyDown(window, { key: "1", metaKey: true, ctrlKey: true });
 
-    // The pane lands as a forward source on that field — not on the whole-message
-    // forward set, which stays hidden in prompt mode.
-    await waitFor(() =>
-      expect(
-        screen
-          .getByTestId("prompt-arg-sources-focus")
-          .querySelector('[data-testid="forward-source-chip-Pane 1"]'),
-      ).not.toBeNull(),
-    );
+    // The pane lands as one chip per member agent on that field — not on the
+    // whole-message forward set, which stays hidden in prompt mode.
+    await waitFor(() => {
+      const field = screen.getByTestId("prompt-arg-sources-focus");
+      expect(field.querySelector('[data-testid="forward-source-chip-alice"]')).not.toBeNull();
+      expect(field.querySelector('[data-testid="forward-source-chip-bob"]')).not.toBeNull();
+    });
     expect(screen.queryByTestId("forward-source-chips")).toBeNull();
   });
 

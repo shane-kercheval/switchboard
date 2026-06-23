@@ -3307,7 +3307,7 @@ describe("UnifiedTranscript — cross-agent forward", () => {
       forwardId: "fwd-1",
       sendId: "s-1",
       body: "please aggregate",
-      sources: [{ kind: "agent", id: CODEX_AGENT.id, name: "bob" }],
+      sources: [{ id: CODEX_AGENT.id, name: "bob" }],
       recipients: [CLAUDE_AGENT.id],
     });
 
@@ -3341,7 +3341,7 @@ describe("UnifiedTranscript — cross-agent forward", () => {
       forwardId: "fwd-1",
       sendId: "s-1",
       body: "please aggregate",
-      sources: [{ kind: "agent", id: CODEX_AGENT.id, name: "bob" }],
+      sources: [{ id: CODEX_AGENT.id, name: "bob" }],
       recipients: [CLAUDE_AGENT.id],
     });
 
@@ -3372,7 +3372,7 @@ describe("UnifiedTranscript — cross-agent forward", () => {
       forwardId: "fwd-1",
       sendId: "s-1",
       body: "aggregate",
-      sources: [{ kind: "agent", id: CODEX_AGENT.id, name: "bob" }],
+      sources: [{ id: CODEX_AGENT.id, name: "bob" }],
       recipients: [CLAUDE_AGENT.id],
     });
 
@@ -3393,7 +3393,7 @@ describe("UnifiedTranscript — cross-agent forward", () => {
       forwardId: "fwd-1",
       sendId: "s-1",
       body: "x",
-      sources: [{ kind: "agent", id: CODEX_AGENT.id, name: "bob" }],
+      sources: [{ id: CODEX_AGENT.id, name: "bob" }],
       recipients: [CLAUDE_AGENT.id, CODEX_AGENT.id],
     });
 

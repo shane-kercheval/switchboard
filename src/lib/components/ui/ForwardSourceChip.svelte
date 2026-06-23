@@ -2,12 +2,12 @@
   import { cn } from "$lib/utils";
   import type { ForwardSource } from "$lib/state/heldForwards.svelte";
 
-  // A forward-source chip — the agent (or pane) whose latest output will be
-  // forwarded. Shared by the compose bar and the prompt composer's per-argument
-  // forwarding so the two surfaces look identical. A pane forwards each member's
-  // output but shows as one named chip (a leading pane glyph distinguishes it);
-  // `empty` flags a source with no completed output yet (for a pane, every member
-  // empty); `onRemove` drops it.
+  // A forward-source chip — the agent whose latest output will be forwarded.
+  // Shared by the compose bar and the prompt/workflow composers' per-field
+  // forwarding so every surface looks identical. Agents are the first-class unit:
+  // a pane is expanded to one chip per member agent at pick time, so a chip always
+  // stands for a single agent. `empty` flags a source with no completed output
+  // yet; `onRemove` drops it.
   let {
     source,
     empty = false,
@@ -29,47 +29,25 @@
       : "border-border bg-panel text-fg",
   )}
   data-testid={`forward-source-chip-${source.name}`}
-  data-kind={source.kind}
   data-empty={empty}
 >
-  {#if source.kind === "pane"}
-    <!-- Pane glyph (matches the picker's pane rows): one chip stands for all its
-         members. -->
-    <svg
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      stroke-width="1.8"
-      stroke-linecap="round"
-      stroke-linejoin="round"
-      class="h-3 w-3 shrink-0"
-      aria-hidden="true"
-    >
-      <rect x="3" y="4" width="18" height="16" rx="2" />
-      <path d="M12 4v16" />
-    </svg>
-  {:else}
-    <svg
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      stroke-width="2"
-      stroke-linecap="round"
-      stroke-linejoin="round"
-      class="h-3 w-3 shrink-0"
-      aria-hidden="true"
-    >
-      <polyline points="15 17 20 12 15 7" />
-      <path d="M4 18v-2a4 4 0 0 1 4-4h12" />
-    </svg>
-  {/if}
+  <svg
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    stroke-width="2"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+    class="h-3 w-3 shrink-0"
+    aria-hidden="true"
+  >
+    <polyline points="15 17 20 12 15 7" />
+    <path d="M4 18v-2a4 4 0 0 1 4-4h12" />
+  </svg>
   <span class="truncate" title={source.name}>{source.name}</span>
   {#if empty}
-    <span
-      class="shrink-0 italic"
-      title={source.kind === "pane"
-        ? "No agent in this pane has completed output to forward"
-        : "This agent has no completed output to forward"}>no output</span
+    <span class="shrink-0 italic" title="This agent has no completed output to forward"
+      >no output</span
     >
   {/if}
   <button

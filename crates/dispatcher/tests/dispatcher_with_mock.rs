@@ -1814,7 +1814,7 @@ async fn dispatch_failure_after_send_journals_a_failed_outcome() {
 }
 
 // ---------------------------------------------------------------------------
-// M4.4: queueing, removal, teardown, and wire-correlation behaviors.
+// Queueing, removal, teardown, and wire-correlation behaviors.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]

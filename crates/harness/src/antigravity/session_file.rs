@@ -366,8 +366,8 @@ impl Reconstruction {
             effort: None,
             // Antigravity has no cost/overage, no `stable_message_id`, and no
             // native per-turn id at all — so no hydration key. The merge falls
-            // back to `turn_id` for keyless turns; it's the one never-M3-eligible
-            // harness.
+            // back to `turn_id` for keyless turns; it's the one harness never
+            // eligible for hydration-key-based re-parse.
             spend: None,
             hydration_key: None,
             stable_message_id: None,

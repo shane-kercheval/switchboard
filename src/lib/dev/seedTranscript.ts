@@ -1,5 +1,4 @@
-// Dev-only transcript seeding for the performance measurement protocol
-// (docs/implementation_plans/2026-06-09-performance-improvements.md, M3):
+// Dev-only transcript seeding for the performance measurement protocol:
 // ⌃⌥⇧S prepends a large synthetic history to every agent in the active
 // project, so typing cost can be profiled against a reproducible large
 // transcript instead of whatever real project happens to be long.

@@ -1469,8 +1469,7 @@ describe("App", () => {
   });
 
   // --- directory removal lifecycle (store-level: the `removeDirectory` +
-  // teardown primitive that M8's project-delete will reuse; there is no
-  // directory-removal UI in this milestone) ---
+  // teardown primitive; there is no directory-removal UI yet) ---
 
   it("removeDirectory drops the directory's projects and tears down its agents' listeners", async () => {
     seedProject({
@@ -2901,7 +2900,7 @@ describe("App", () => {
     input.remove();
   });
 
-  // --- Git view toggle (M3 commit B) ---
+  // --- Git view toggle ---
 
   it("toggles to the Git view (center takeover, sidebar hidden) and back", async () => {
     seedProject({

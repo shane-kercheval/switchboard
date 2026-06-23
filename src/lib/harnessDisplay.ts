@@ -29,7 +29,7 @@ export const HARNESS_LABEL: Record<HarnessKind, string> = {
 /// `["claude_code", …]` array — a bare array is type-legal while incomplete and
 /// silently drops a harness from probes/banners/pickers. Insertion order
 /// (claude → codex → gemini → antigravity) is **load-bearing**: it governs
-/// auto-create sequencing (M4) and display order across banners, the picker, and
+/// auto-create sequencing and display order across banners, the picker, and
 /// the status list. Reorder only if the backend's `HARNESSES` constant changes.
 export const ALL_HARNESSES = Object.keys(HARNESS_LABEL) as HarnessKind[];
 

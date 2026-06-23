@@ -149,7 +149,7 @@ const sessionFingerprintBaseline = new Map<ProjectId, AgentSessionFingerprint[]>
 /// hydration guard before re-reading, so it can't rely on that guard for
 /// re-entry protection; this self-guard keeps a second refresh from kicking off
 /// a redundant concurrent re-read. Defense-in-depth — the sole caller is
-/// `seq`-guarded and the M2 keyed merge already makes a concurrent re-read
+/// `seq`-guarded and the keyed merge already makes a concurrent re-read
 /// dup-safe — but it keeps the function safe for any future caller.
 // eslint-disable-next-line svelte/prefer-svelte-reactivity
 const refreshInFlight = new Set<ProjectId>();
@@ -410,7 +410,7 @@ export async function createProjectAndActivate(name: string, directory: string):
 /// changes. The new-project dialog also stays non-dismissible while this runs
 /// (belt). The durable fix is `create_agent`/`attach_agent` taking an explicit
 /// `project_id` instead of reading active state — out of scope here, but the
-/// same coupling affects M5's remove/rename.
+/// same coupling affects project remove/rename.
 async function seedAgentsForInstalledHarnesses(projectId: ProjectId): Promise<void> {
   if (selection.activeProjectId !== projectId) return;
   await refreshHarnessAvailability();
@@ -830,7 +830,7 @@ export async function hydrateProject(
 /// user continued it in the harness's own TUI). The cheap `stat`-only fingerprint
 /// check gates the expensive parse: when nothing changed, `loadProjectConversation`
 /// is never called. The re-read merges agent turns only for refresh-capable
-/// agents and is dup-safe via the M2 stable key (see `hydrateProject`). A failed
+/// agents and is dup-safe via the stable key (see `hydrateProject`). A failed
 /// fingerprint check degrades to "no refresh" (the displayed history just isn't
 /// updated until the next switch).
 async function maybeRefreshProject(projectId: ProjectId): Promise<void> {

@@ -17,7 +17,9 @@
     buildUnifiedRows,
     copyTextOf,
     groupRenderBlocks,
+    INITIAL_WINDOW,
     lastAnswerTextOf,
+    REVEAL_BATCH,
     type RenderBlock,
     type UnifiedRow,
   } from "$lib/state/unified";
@@ -122,12 +124,88 @@
 
   /// Group the flat rows into render blocks: standalone rows, plus one block per
   /// fan-out whose responses lay out as per-recipient columns.
-  const blocks = $derived(
+  const blocks = $derived.by(() =>
     groupRenderBlocks(
       rows,
       agents.map((a) => a.id),
     ),
   );
+
+  /// Render-windowing: mount only a tail window of `blocks`, so opening a long
+  /// transcript doesn't pay the full markdown-render cost up front. That cost is
+  /// the bottleneck — building the rows/blocks is single-digit ms, but mounting
+  /// every block and running its `renderMarkdown` (marked + Prism + DOMPurify per
+  /// segment) is ~1s on a long history. Off-window blocks stay in memory but
+  /// unmounted, so their Markdown never parses until they're revealed.
+  ///
+  /// The window is a top-cursor index, deliberately NOT a fixed-size tail: a tail
+  /// count would unmount the oldest visible block on every append — re-parsing
+  /// markdown and disturbing scroll for an unrelated new turn. The cursor only
+  /// decreases (upward reveal) or holds, so appended turns always render and
+  /// nothing already visible is unmounted. `INITIAL_WINDOW` is a tuning knob, not
+  /// a contract; block count is a loose proxy for the real cost driver (render
+  /// *items* — one agent block can hold dozens, a compact user row one), so it's
+  /// sized generously to cover a viewport plus scroll buffer.
+  ///
+  /// Known limitation: select-all (and any future find-in-page) reaches only
+  /// mounted blocks — unmounted history isn't in the DOM until scrolled to. A
+  /// deliberate tradeoff for the load-time win. `INITIAL_WINDOW` / `REVEAL_BATCH`
+  /// live in `$lib/state/unified` so the component and the browser-test bound
+  /// share one definition.
+  function blockKey(block: RenderBlock): string {
+    return block.kind === "fanout" ? block.key : block.row.key;
+  }
+
+  /// Conversation identity: a change means the block list was restructured *under*
+  /// the cursor and the window must re-pin to the tail. Three axes, each a
+  /// distinct restructuring (a pure tail append changes none of them, so it must
+  /// NOT reseed):
+  /// - **project switch** — a wholly different conversation;
+  /// - **visible-agent change** — a pane hides/shows an agent on the *same*
+  ///   persistent component (keyed by pane id, not roster); without it a stale
+  ///   high cursor slices the shorter array to empty. Order matters (it drives
+  ///   row grouping / fan-out column order);
+  /// - **oldest-block change** — a front insertion such as a late retry-hydration
+  ///   (incl. the single-failed-agent case: empty at first `complete`, fills on
+  ///   retry). The oldest key is stable across appends/streaming (both touch the
+  ///   tail), so an ordinary new turn holds the cursor.
+  /// NUL (`\u0000`) joins the identity axes: it can't occur in a UUID or a
+  /// block key, so distinct axis values can't collide into one string. Spelled
+  /// as an escape, not a raw byte, so the delimiter stays visible in source.
+  const windowIdentity = $derived(
+    [
+      projectId,
+      agents.map((a) => a.id).join(","),
+      blocks.length > 0 ? blockKey(blocks[0]!) : "",
+    ].join("\u0000"),
+  );
+
+  /// The window must be applied **in the derived**, not set from an `$effect`:
+  /// an effect runs *after* the render it would correct, so the first paint with
+  /// a freshly-loaded transcript would transiently mount — and markdown-parse —
+  /// every block before the effect bounded it. So `firstVisibleIndex` derives a
+  /// tail-bounded fallback for any not-yet-frozen identity, and the effect below
+  /// only *freezes* that fallback into an absolute `cursor` (so later appends grow
+  /// the window instead of sliding it, which would churn the oldest visible
+  /// block). Until frozen — or while a stale cursor belongs to a since-changed
+  /// identity — the fallback bounds the window, so the first render is never the
+  /// whole transcript. The fallback also covers the loading phase (stale content
+  /// from a re-open can't mount unbounded).
+  let cursor = $state<number | null>(null);
+  let frozenIdentity = $state<string | null>(null);
+  const firstVisibleIndex = $derived(
+    cursor !== null && windowIdentity === frozenIdentity
+      ? cursor
+      : Math.max(0, blocks.length - INITIAL_WINDOW),
+  );
+  const visibleBlocks = $derived(blocks.slice(firstVisibleIndex));
+
+  $effect(() => {
+    if (loadStatus === "complete" && windowIdentity !== frozenIdentity) {
+      cursor = Math.max(0, blocks.length - INITIAL_WINDOW);
+      frozenIdentity = windowIdentity;
+    }
+  });
 
   /// Held forwards whose recipients fall in *this* transcript's agents, paired
   /// with that pane-local recipient subset. A held "waiting…" row belongs to the
@@ -182,7 +260,7 @@
   const compactEnabled = $derived(stateFor(projectId).enabled);
 
   /// A still-live response: genuinely streaming, not yet closed. These use the
-  /// M3 live cap, never the completed-preview compaction. A streaming-on-disk
+  /// live-streaming cap, never the completed-preview compaction. A streaming-on-disk
   /// turn an outcome marker has closed (a dangling/cancelled-mid turn) is *not*
   /// live — it's terminal and collapses like any other response.
   function isLiveStreaming(turn: AgentTurn): boolean {
@@ -241,51 +319,19 @@
     return keys;
   });
 
-  /// Containment chosen over virtualization, deliberately: it is ~CSS-only,
-  /// preserves the full DOM (copy, selection, accessibility, any future
-  /// find-in-page), keeps the hand-built scroll-anchoring machinery and its
-  /// browser tests intact, and is removable in one line if windowed
-  /// virtualization ever supersedes it. Off-screen blocks skip layout and
-  /// paint and contribute `contain-intrinsic-size` placeholder geometry —
-  /// which is exactly the work the compose textarea's per-keystroke forced
-  /// reflow pays for on a long transcript. `auto` makes the engine remember
-  /// each block's real height once rendered; the per-kind length is only the
-  /// pre-first-render guess, sized to minimize |estimate − typical rendered
-  /// height| (that error is what shows as scrollbar jitter on the first-ever
-  /// scroll through unseen history). Estimates target the DEFAULT rendering —
-  /// compact mode on, fan-out columns side-by-side (≥ lg) — so compact-off
-  /// and stacked-column first scrolls carry larger error; acceptable, since
-  /// `auto` corrects each block after its first render. Three literal class
-  /// strings (not an interpolated size) because Tailwind only generates CSS
-  /// for classes it can see statically. Requires a Safari-18+ engine; older
-  /// system WebKits ignore the property — a graceful no-op, not a breakage.
-  const CONTAINMENT_COMPACT_ROW = "[content-visibility:auto] [contain-intrinsic-size:auto_4rem]";
-  const CONTAINMENT_AGENT_ROW = "[content-visibility:auto] [contain-intrinsic-size:auto_16rem]";
-  const CONTAINMENT_FANOUT = "[content-visibility:auto] [contain-intrinsic-size:auto_20rem]";
-
-  function blockIsLive(block: RenderBlock): boolean {
-    if (block.kind === "row") {
-      return block.row.kind === "agent" && isLiveStreaming(block.row.turn);
-    }
-    return block.columns.some((col) =>
-      col.rows.some((r) => r.kind === "agent" && isLiveStreaming(r.turn)),
-    );
-  }
-
-  function blockContainment(block: RenderBlock): string {
-    // LIVE blocks are exempt from containment: a streaming block's height must
-    // always be its real geometry (the pinned path follows it; the inner live
-    // pin and cap depend on it), and its per-chunk re-renders inside a skipped
-    // wrapper churn remembered sizes into spurious outer-height changes.
-    // Liveness is a stable property (it flips once at stream start/end), so a
-    // block's containment class never changes from unrelated appends — an
-    // index-based "last N" window flips membership on every new turn, and a
-    // freshly-contained block loses its remembered size and snaps to the
-    // declared placeholder when off-screen (a guaranteed view nudge per turn).
-    if (blockIsLive(block)) return "";
-    if (block.kind === "fanout") return CONTAINMENT_FANOUT;
-    return block.row.kind === "agent" ? CONTAINMENT_AGENT_ROW : CONTAINMENT_COMPACT_ROW;
-  }
+  // No `content-visibility` containment on transcript blocks: render-windowing
+  // (above) bounds the mounted set, so the off-screen-layout cost containment
+  // existed to cut is already small by default. Keeping it actively broke the
+  // upward reveal — off-screen blocks sit at size *estimates*, which flip to real
+  // heights mid-correction and shift the reading position ~a block. With real
+  // heights the existing `reanchor` holds a top-prepend exactly, so windowing
+  // owns mounted-set size and scroll-anchoring owns position stability, with no
+  // estimate machinery between them. Residual: a user who reveals deep history
+  // grows the mounted set, so a forced full relayout scales with it (~3 ms at ~50
+  // mounted blocks, ~18 ms once ~300 are revealed — measured in WebKit when 50
+  // was the default window; the initial window is now 20, so cold open sits well
+  // below the ~50 point). Past there, the answer is a true
+  // sliding-window/virtualization follow-up, not CSS containment estimates.
 
   /// Clip + bottom-fade for a height-clipped preview. Absolute stops (not
   /// percentages) so a short message never fades; the fade starts around the
@@ -561,9 +607,8 @@
   // position still regardless of WHERE a height change happened: gap-from-bottom
   // maintenance shifts the view by exactly the change whenever it happens below
   // the viewport (a streaming response growing, a new turn arriving — the
-  // read-while-streaming bug), and containment makes off-screen heights churn
-  // in both directions as blocks skip/materialize. The gap is kept for two
-  // cases only:
+  // read-while-streaming bug), and an upward reveal prepends a batch ABOVE it.
+  // The gap is kept for two cases only:
   // - the change happened INSIDE the anchor block (its own height moved): the
   //   user expanded/collapsed the thing they're looking at, and the contract
   //   there is "the toggle I clicked stays put" — which gap-hold provides,
@@ -679,6 +724,70 @@
     const ro = new ResizeObserver(reanchor);
     ro.observe(el);
     return () => ro.disconnect();
+  });
+
+  /// Upward reveal: a sentinel above the block list (rendered only while history
+  /// is windowed off the top) is watched by an IntersectionObserver rooted on the
+  /// scroll container; reaching it mounts the next older batch (`revealOlder`).
+  /// The sentinel lives OUTSIDE `content`, so `captureAnchor` (which scans
+  /// `content.children`) never anchors on it.
+  ///
+  /// A cursor decrement changes neither `rows.length` nor the transcript
+  /// revision, so the `scrollSignal` re-anchor effect does NOT fire on a reveal —
+  /// the ResizeObserver on `content` is the sole, correct trigger, and its
+  /// `reanchor` restores the reading position as the prepend grows `content`.
+  ///
+  /// `revealing` latches one batch per scroll-to-top: it gates re-entry until the
+  /// flush settles, and also drives the brief spinner — the reveal is synchronous
+  /// (blocks are in memory) but mounting + parsing a batch's Markdown is real work.
+  let revealSentinel = $state<HTMLElement | null>(null);
+  let revealing = $state(false);
+  let pendingReveal = false;
+
+  function revealOlder(): void {
+    if (firstVisibleIndex === 0) return;
+    // A trigger that arrives mid-reveal is REMEMBERED, not dropped: the observer
+    // only re-fires on an intersection *change*, so if the sentinel is still in
+    // view when the latch releases it would otherwise never reveal again (a stuck
+    // window). Coalesced to at most one pending batch.
+    if (revealing) {
+      pendingReveal = true;
+      return;
+    }
+    revealing = true;
+    // Decrement the absolute cursor (and pin the current identity, so the derived
+    // uses the cursor rather than the tail fallback). `firstVisibleIndex` reflects
+    // it on the next read.
+    cursor = Math.max(0, firstVisibleIndex - REVEAL_BATCH);
+    frozenIdentity = windowIdentity;
+    // The reveal is synchronous (blocks are in memory). Growing `content` fires
+    // the ResizeObserver → `reanchor`, which restores the reading position
+    // (anchor-restore: the read block's own height is unchanged, only blocks
+    // above it mounted). `revealing` gates re-entry to one batch per
+    // scroll-to-top and drives the brief spinner; released after the frame.
+    requestAnimationFrame(() => {
+      revealing = false;
+      if (pendingReveal) {
+        pendingReveal = false;
+        revealOlder();
+      }
+    });
+  }
+
+  $effect(() => {
+    const node = revealSentinel;
+    const root = container;
+    if (node === null || root === null) return;
+    // A top `rootMargin` pre-triggers slightly before the sentinel is fully in
+    // view, so the older batch is ready as the user reaches the top.
+    const io = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) revealOlder();
+      },
+      { root, rootMargin: "200px 0px 0px 0px" },
+    );
+    io.observe(node);
+    return () => io.disconnect();
   });
 
   /// Top-edge fade for a capped live region, keyed by preview key: true once the
@@ -1271,7 +1380,7 @@
   {@const ownedByOutcome = hasOutcomeFor(turn)}
   <!-- Compact preview applies to any terminal response with content (complete,
        failed, cancelled, or dangling streaming-on-disk closed by a marker). Only
-       a genuinely-live streaming turn is excluded — it uses M3's live cap. -->
+       a genuinely-live streaming turn is excluded — it uses the live-streaming cap. -->
   {@const previewEligible = isCollapsibleResponse(turn)}
   {@const key = `agent:${turn.turn_id}`}
   {@const latestResponse = latestResponseKeys.has(key)}
@@ -1380,9 +1489,22 @@
     <p class="text-muted text-sm">No messages yet. Type a prompt below.</p>
   {/if}
 
+  <!-- Upward-reveal sentinel: older history exists above the window. Kept OUTSIDE
+       `content` so `captureAnchor`'s `content.children` scan never anchors on it. -->
+  {#if firstVisibleIndex > 0}
+    <div
+      bind:this={revealSentinel}
+      data-testid="reveal-sentinel"
+      class="text-muted flex items-center justify-center gap-2 py-3 text-xs"
+    >
+      {#if revealing}<Spinner class="h-4 w-4" />{/if}
+      <span>Earlier messages</span>
+    </div>
+  {/if}
+
   <div bind:this={content} class="space-y-5">
-    {#each blocks as block (block.kind === "fanout" ? block.key : block.row.key)}
-      <div class={blockContainment(block)} data-testid="transcript-block">
+    {#each visibleBlocks as block (block.kind === "fanout" ? block.key : block.row.key)}
+      <div data-testid="transcript-block">
         {#if block.kind === "row"}
           {#if block.row.kind === "user"}
             {@render userMessage(block.row)}

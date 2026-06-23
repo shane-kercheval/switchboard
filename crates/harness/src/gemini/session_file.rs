@@ -564,8 +564,8 @@ impl GeminiReconstruction {
             // Gemini has no cost/overage and no Claude-style `stable_message_id`,
             // but its records carry a stable `id` (`g1`/`g2`…). The turn's first
             // record id is a re-parse-stable hydration key (Q1). Live-stream
-            // parity (Q2 → M3 refresh) is unprobed, so the live `TurnEnd` leaves
-            // `hydration_key: None` for now.
+            // parity (Q2 — the live-refresh path) is unprobed, so the live
+            // `TurnEnd` leaves `hydration_key: None` for now.
             spend: None,
             hydration_key: builder.records.first().map(|r| r.id.clone()),
             stable_message_id: None,

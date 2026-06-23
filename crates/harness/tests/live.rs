@@ -157,7 +157,7 @@ async fn live_claude_basic_turn_completes() {
         _ => panic!("expected TurnEnd with Some(usage), got: {terminal:?}"),
     }
 
-    // Rate-limit drift detection (M3/M4 contract). Claude emits a
+    // Rate-limit drift detection. Claude emits a
     // `rate_limit_event` on every normal turn; our parser lifts it to a
     // `StreamOnly` `RateLimitEvent` (persisted to the metadata sidecar for
     // restart continuity) whose `info` carries the fields the Sidebar's
@@ -304,7 +304,7 @@ async fn live_claude_dispatched_prompt_classified_sdk() {
 #[tokio::test]
 #[ignore = "requires claude installed — run with: make test-live"]
 async fn live_claude_rate_limit_precedes_result() {
-    // Per-turn cost/overage stamping (M3) depends on the Claude parser seeing
+    // Per-turn cost/overage stamping depends on the Claude parser seeing
     // the turn's `rate_limit_event` (which carries `isUsingOverage`) BEFORE the
     // terminal event: the `ParserState` overage stash is set when the
     // rate-limit is parsed and read when the `TurnEnd` is built. If a CLI bump
@@ -430,7 +430,7 @@ fn session_meta_model(events: &[AdapterEvent]) -> Option<String> {
 async fn live_claude_model_and_effort_dispatch() {
     // The selected model surfaces in `SessionMeta` (proving `--model` took
     // effect end-to-end), and dispatching with an effort set completes without
-    // error. Per-turn *effort* exposure is asserted in M4 — at M2 the effort
+    // error. Per-turn *effort* exposure is asserted elsewhere — here the effort
     // contract is the build_args unit test plus "dispatch succeeds."
     let adapter = ClaudeCodeAdapter::new();
     let mut agent = live_agent();
@@ -930,7 +930,7 @@ async fn live_codex_basic_turn_completes() {
         "enrichment events must arrive after TurnEnd in order: TurnEnd → RateLimitEvent → SessionMeta"
     );
 
-    // Rate-limit payload-shape drift detection (M4 contract). The ordering
+    // Rate-limit payload-shape drift detection. The ordering
     // check above proves the event fires; this proves its `info` still carries
     // the fields the Sidebar's Codex windows read: `primary.used_percent` (the
     // gauge — relied on since the original single cell), plus `window_minutes`
@@ -1022,7 +1022,7 @@ async fn live_codex_basic_turn_completes() {
 async fn live_codex_model_and_effort_dispatch() {
     // `-m <model>` is plan-gated (only the account's entitled model is
     // accepted), so we pin the entitled `gpt-5.5` rather than switching models;
-    // the across-turns *effort* assertion lands in M4. Here we prove the flags
+    // the across-turns *effort* assertion lives elsewhere. Here we prove the flags
     // are accepted end-to-end (dispatch completes, model surfaces in
     // SessionMeta) — a rejected `-m`/`-c` would 400 and fail the turn.
     let tmp = tempfile::TempDir::new().unwrap();
@@ -1819,7 +1819,7 @@ async fn live_antigravity_dash_leading_prompt_completes() {
     );
 }
 
-// --- M4: per-turn model/effort across a mid-conversation switch ---
+// --- Per-turn model/effort across a mid-conversation switch ---
 //
 // Each asserts on BOTH the emitted `TurnEnd` (the live carrier) AND a real-file
 // hydration via `load_*_transcript` — because the live carrier and the hydrator

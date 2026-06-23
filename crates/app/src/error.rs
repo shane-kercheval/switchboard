@@ -62,7 +62,7 @@ pub enum AppError {
     ProjectNotLoaded(ProjectId),
 
     /// The project's `instance.lock` is held by another Switchboard process.
-    /// Inter-process guard (M4.1): one Switchboard process per project. The
+    /// Inter-process guard: one Switchboard process per project. The
     /// frontend surfaces this as "This project is already open in another
     /// Switchboard window."
     #[error("project {0} is already open in another Switchboard process")]

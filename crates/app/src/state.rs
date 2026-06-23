@@ -183,7 +183,7 @@ pub struct AppState {
     /// attach must not leak forward.
     pub needs_session_meta: Arc<Mutex<HashSet<AgentId>>>,
 
-    /// Per-project inter-process lock handles (M4.1). One entry per loaded
+    /// Per-project inter-process lock handles. One entry per loaded
     /// project, holding an advisory exclusive lock (std `File::try_lock`,
     /// stable since Rust 1.89 — `flock` on unix) on
     /// `<directory>/.switchboard/projects/<id>/instance.lock`. Acquired in
@@ -196,7 +196,7 @@ pub struct AppState {
     /// re-open returns the already-loaded handle without re-locking.
     pub project_locks: Mutex<HashMap<ProjectId, File>>,
 
-    /// Canonical agent-lookup index (M4.1): `AgentId → AgentRecord`. The
+    /// Canonical agent-lookup index: `AgentId → AgentRecord`. The
     /// record carries `project_id`, so this single map answers "which
     /// project owns this agent, and what is its record" without scanning
     /// every loaded project's `registry.jsonl` from disk (the prior

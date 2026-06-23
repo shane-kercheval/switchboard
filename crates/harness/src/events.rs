@@ -383,10 +383,10 @@ pub enum NormalizedEvent {
         /// marker on the message. `None` = show neither. See [`TurnSpend`].
         spend: Option<TurnSpend>,
         /// The model this turn ran on, rendered per-turn in the transcript
-        /// footer (M6). `None` = render nothing. See [`AdapterEvent::TurnEnd`].
+        /// footer. `None` = render nothing. See [`AdapterEvent::TurnEnd`].
         model: Option<String>,
         /// The reasoning effort this turn ran at (Codex only), rendered per-turn
-        /// in the footer (M6). `None` = render nothing.
+        /// in the footer. `None` = render nothing.
         effort: Option<String>,
         /// **Live-matched** hydration key — the same per-turn id this turn will
         /// carry on disk, so a turn that streamed live *and* is later re-read
@@ -599,7 +599,7 @@ impl AdapterEvent {
 /// not adapter-emitted**: a binary cancellation token can't carry intent, and
 /// the dispatcher is the only layer that knows *why* it fired the token, so it
 /// synthesizes this variant with the `source` it recorded. `source` also lets
-/// M6 (workflow cancel) and M8 (shutdown) reuse the same mechanism.
+/// workflow cancel and shutdown reuse the same mechanism.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "status", rename_all = "snake_case")]
 #[non_exhaustive]
@@ -618,7 +618,7 @@ pub enum TurnOutcome {
 pub enum CancelSource {
     /// The user cancelled an in-flight turn (compose-bar / context-menu stop).
     User,
-    /// A workflow aborted the turn (M6).
+    /// A workflow aborted the turn.
     Workflow,
     /// App shutdown or working-directory removal drained the turn.
     Shutdown,

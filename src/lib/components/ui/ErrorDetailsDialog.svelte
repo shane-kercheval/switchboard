@@ -3,8 +3,8 @@
   /// action, so a user can paste it into a bug report. Driven from failure
   /// state (hydration failures today); deliberately a reusable *component*, not
   /// a global error store/pipeline — a future shared error surface would adopt
-  /// this, but the broader bus is out of scope (see the hydration-robustness
-  /// plan, M1). Owns no failure state itself: the caller controls `open` and
+  /// this, but the broader bus is out of scope. Owns no failure state itself:
+  /// the caller controls `open` and
   /// passes the title / human message / verbatim details.
   import Dialog from "$lib/components/ui/Dialog.svelte";
   import CopyButton from "$lib/components/ui/CopyButton.svelte";

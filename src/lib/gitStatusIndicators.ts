@@ -1,7 +1,7 @@
-// Pure mapping from the M1 read-model (branch/worktree status) to the
+// Pure mapping from the branch/worktree read-model to the
 // at-a-glance status indicators the Git view renders. Kept separate from the
 // Svelte components so the mapping is unit-testable and reused wherever git
-// state is shown (the Git view now; the project-scoped panel in M6).
+// state is shown (the Git view now; the project-scoped panel later).
 
 import type { BranchView, RemoteBranchView, SyncState, WorktreeView } from "$lib/types";
 
@@ -108,7 +108,7 @@ function branchStateIndicators(branch: BranchView): GitStatusIndicator[] {
 
 /// Worktree-level signal: any uncommitted change (dirty OR untracked) collapses
 /// to one "changes" indicator; the staged/unstaged/untracked split is only
-/// surfaced in the M5 diff panel, not the tree.
+/// surfaced in the diff panel, not the tree.
 function worktreeIndicators(wt: WorktreeView): GitStatusIndicator[] {
   const indicators: GitStatusIndicator[] = [];
   if (wt.dirty || wt.untracked) {

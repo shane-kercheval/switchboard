@@ -708,7 +708,7 @@ fn parse_timestamp(record: &Value) -> Option<DateTime<Utc>> {
 /// `context_input_tokens` reconstructs the same disjoint sum the live parser
 /// computes (`input + cache_read + cache_creation`), so a hydrated turn's
 /// context-utilization matches what it showed live. The window denominator is
-/// still absent on disk until the Milestone 2 sidecar fills it, but the
+/// still absent on disk until the context-window sidecar fills it, but the
 /// numerator is recoverable here.
 fn parse_usage(usage: &serde_json::Map<String, Value>) -> TurnUsage {
     let input_tokens = usage
@@ -1640,11 +1640,11 @@ mod tests {
         }
     }
 
-    // --- Out-of-order tool_use / tool_result binding (M2 of the parser
-    // fidelity plan: Claude 2.1.150 was observed to write tool_result
-    // records to disk before their matching tool_use, ~1s gap, in session
+    // --- Out-of-order tool_use / tool_result binding: Claude 2.1.150 was
+    // observed to write tool_result records to disk before their matching
+    // tool_use, ~1s gap, in session
     // `22300f1b-3efe-4dbc-a4a0-7c1c954d1da2.jsonl` lines 1406/1408 and
-    // 1607/1609). Tests assert on the returned LoadedTranscript — the path
+    // 1607/1609. Tests assert on the returned LoadedTranscript — the path
     // production goes through — not on intermediate state. ---
 
     fn user_tool_result(tool_use_id: &str, output: &str, timestamp: &str) -> Value {
@@ -1682,9 +1682,7 @@ mod tests {
     }
 
     /// The bug: Claude 2.1.150 can write a `tool_result` before its matching
-    /// `tool_use` in the session file. Pre-M2, the parser dropped the
-    /// `tool_result`'s output silently and emitted a "did not match any
-    /// open tool" warning. After M2, the deferred queue binds at
+    /// `tool_use` in the session file. The deferred queue binds at
     /// `tool_use` time and no warning surfaces.
     #[test]
     fn out_of_order_tool_result_before_tool_use_binds_via_deferred_queue() {
@@ -1821,7 +1819,7 @@ mod tests {
             result.warnings[0]
                 .reason
                 .contains("never matched a tool_use"),
-            "warning must use the unified post-M2 wording; got {:?}",
+            "warning must use the unified deferred-binding wording; got {:?}",
             result.warnings[0].reason,
         );
         // No phantom TurnItem::Tool is created — the orphan result

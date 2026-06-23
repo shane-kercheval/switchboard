@@ -816,7 +816,7 @@ describe("transcriptReducer", () => {
     it("re-applying the same batch re-parsed (fresh turn_ids, same hydration_key) does not duplicate", () => {
       // Re-reading a session file mints fresh `turn_id`s but the stable
       // `hydration_key` is parse-invariant — the merge must recognize the turn
-      // and not append a second copy. This is the core M2 idempotency guard.
+      // and not append a second copy. This is the core idempotency guard.
       const diskTurn = (turnId: string) => ({
         type: "hydrate" as const,
         agent_id: AGENT_A,

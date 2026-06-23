@@ -193,7 +193,7 @@ describe("copyTextOf", () => {
 });
 
 describe("buildUnifiedRows", () => {
-  it("renders a live user turn as a length-1 agent_ids row (M4.7-ready shape)", () => {
+  it("renders a live user turn as a length-1 agent_ids row (multi-recipient-ready shape)", () => {
     const rows = buildUnifiedRows([userTurn(TURN_1, AGENT_A, "2026-05-16T00:00:00Z")], []);
     expect(rows).toHaveLength(1);
     const row = rows[0] as Extract<UnifiedRow, { kind: "user" }>;

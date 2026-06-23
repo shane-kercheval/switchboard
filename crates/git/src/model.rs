@@ -182,7 +182,7 @@ impl CommitChanges {
     }
 }
 
-/// One changed file in a worktree (consumed by the M5 diff panel).
+/// One changed file in a worktree (consumed by the diff panel).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ChangedFile {
     /// Repo-relative path. For a rename this is the new path.
@@ -201,7 +201,7 @@ pub enum ChangeKind {
     Untracked,
 }
 
-/// One file's working-tree diff as structured hunks, for the M5 diff panel.
+/// One file's working-tree diff as structured hunks, for the diff panel.
 ///
 /// Built straight from libgit2's structured diff rather than parsed back from
 /// unified-diff text — the frontend renders rows directly from this, so there's

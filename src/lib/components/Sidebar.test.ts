@@ -915,7 +915,7 @@ describe("Sidebar Claude rate-limit tooltip", () => {
     await vi.advanceTimersByTimeAsync(500);
     const detail = await waitFor(() => screen.getByTestId("agent-rate-detail"));
     expect(detail).toHaveTextContent("5-hour limit resets");
-    // The overage window — dropped before M4, now surfaced here.
+    // The overage window is surfaced here.
     expect(detail).toHaveTextContent("overage window resets");
     // Live snapshot (as_of null) → no snapshot-age line.
     expect(screen.queryByTestId("agent-rate-snapshot")).toBeNull();
@@ -1048,8 +1048,8 @@ describe("Sidebar clean-hide for absent metadata", () => {
 /// Transcript-warnings indicator. The indicator persists for the
 /// lifetime of a project session — it's the project's drift detector
 /// for upstream CLI parser changes (see `harness-update-review.md`).
-/// What changed in M3: native `title=` → themed `Tooltip` with rows;
-/// 10-row cap with "+N more" footer for long tails.
+/// Renders as a themed `Tooltip` with rows; 10-row cap with "+N more"
+/// footer for long tails.
 describe("Sidebar agent-parse-warnings tooltip", () => {
   beforeEach(() => {
     // bits-ui Tooltip has a 500ms delayDuration; fake timers let

@@ -41,6 +41,13 @@
   /// verbatim; a `slot` resolves against `inputs` in preview (and falls back to the
   /// input name when unbound), and in live mode is already a literal — an
   /// unresolved slot there just shows the input name.
+  ///
+  /// Agents are the first-class unit: a slot bound by selecting a *pane* resolves
+  /// to its member agent names here — we deliberately do NOT collapse a pane's
+  /// members back to a pane name. A pane is a selection convenience (and a
+  /// keyboard shortcut), not a displayed entity, which keeps every recipient
+  /// surface consistent and sidesteps stale/ambiguous pane references (pane
+  /// membership is mutable; the run resolved to concrete agents at invoke).
   function names(refs: RecipientRef[]): string[] {
     return refs.flatMap((r) => {
       if (r.kind === "literal") return [r.name];

@@ -30,7 +30,13 @@ function input(over: Partial<WorkflowInputInfo>): WorkflowInputInfo {
 }
 
 function arg(over: Partial<DerivedArgInfo>): DerivedArgInfo {
-  return { name: "context", required: false, description: null, prompts: ["builtin:code-review"], ...over };
+  return {
+    name: "context",
+    required: false,
+    description: null,
+    prompts: ["builtin:code-review"],
+    ...over,
+  };
 }
 
 function descriptor(
@@ -83,13 +89,14 @@ function setupForward(
   desc: WorkflowFormDescriptor,
   inputs: Record<string, string | string[]> = {},
   initialForwardSources: Record<string, ForwardSource[]> = {},
+  panes: TranscriptPane[] = [],
 ) {
   let latest: Record<string, ForwardSource[]> = initialForwardSources;
   render(ForwardHarness, {
     props: {
       descriptor: desc,
       agents: AGENTS,
-      panes: [],
+      panes,
       initialInputs: inputs,
       initialForwardSources,
       onForwardSources: (s: Record<string, ForwardSource[]>) => (latest = s),
@@ -102,10 +109,7 @@ describe("WorkflowComposer", () => {
   it("renders the right control per declared input plus auto-derived arg fields", () => {
     setup(
       descriptor(
-        [
-          input({ name: "reviewers", ty: "agent_list" }),
-          input({ name: "worker", ty: "agent" }),
-        ],
+        [input({ name: "reviewers", ty: "agent_list" }), input({ name: "worker", ty: "agent" })],
         [arg({ name: "context", required: false, description: "Optional background" })],
       ),
       { reviewers: [], worker: "", context: "" },
@@ -117,7 +121,9 @@ describe("WorkflowComposer", () => {
     expect(screen.getByTestId("workflow-arg-input-context")).toBeInTheDocument();
     expect(screen.queryByTestId("workflow-prompt-review_prompt")).toBeNull();
     // The derived field labels which prompt it feeds.
-    expect(screen.getByTestId("workflow-arg-feeds-context")).toHaveTextContent("builtin:code-review");
+    expect(screen.getByTestId("workflow-arg-feeds-context")).toHaveTextContent(
+      "builtin:code-review",
+    );
   });
 
   it("editing a derived arg field binds its value", async () => {
@@ -185,7 +191,9 @@ describe("WorkflowComposer", () => {
   });
 
   it("removes the workflow via the x button", async () => {
-    const { onremove } = setup(descriptor([input({ name: "worker", ty: "agent" })]), { worker: "" });
+    const { onremove } = setup(descriptor([input({ name: "worker", ty: "agent" })]), {
+      worker: "",
+    });
     await fireEvent.click(screen.getByTestId("workflow-composer-remove"));
     expect(onremove).toHaveBeenCalledOnce();
   });
@@ -205,7 +213,13 @@ describe("WorkflowComposer", () => {
       descriptor([], [], {
         compatibility: {
           state: "incompatible",
-          issues: [{ prompt: "local:bare", argument: "context", reason: "prompt `local:bare` has no argument `context`" }],
+          issues: [
+            {
+              prompt: "local:bare",
+              argument: "context",
+              reason: "prompt `local:bare` has no argument `context`",
+            },
+          ],
         },
       }),
     );
@@ -258,6 +272,30 @@ describe("WorkflowComposer", () => {
     expect(sources().context).toEqual([]);
   });
 
+  it("forwards a pane into the focused field via the ⌘⌃N chord", async () => {
+    const { sources } = setupForward(
+      descriptor([], [arg({ name: "context" })]),
+      { context: "" },
+      {},
+      PANES,
+    );
+    // Focus the field, then press ⌘⌃1 → forward the first pane into *that* field.
+    const field = screen.getByTestId("workflow-arg-input-context") as HTMLTextAreaElement;
+    field.focus();
+    await fireEvent.keyDown(window, { key: "1", metaKey: true, ctrlKey: true });
+
+    await waitFor(() => expect((sources().context ?? []).length).toBe(1));
+    expect(screen.getByTestId("workflow-forward-sources-context")).toBeInTheDocument();
+  });
+
+  it("the per-field forward picker shows the ⌘⌃N pane shortcut", async () => {
+    setupForward(descriptor([], [arg({ name: "context" })]), { context: "" }, {}, PANES);
+    await fireEvent.click(screen.getByTestId("workflow-forward-picker-context"));
+    // The picker's pane row carries the chord hint (mod+ctrl+1).
+    const row = await screen.findByTestId("forward-picker-pane-pane-1");
+    expect(row.textContent).toMatch(/1/);
+  });
+
   it("attaches a forward source on a declared text input", async () => {
     const { sources } = setupForward(descriptor([input({ name: "note", ty: "text" })]), {
       note: "",
@@ -283,13 +321,9 @@ describe("WorkflowComposer", () => {
   });
 
   it("treats a required text field with a forward source as filled", () => {
-    setup(
-      descriptor([input({ name: "note", ty: "text" })]),
-      { note: "" },
-      [],
-      false,
-      { note: [{ kind: "agent", id: "a1", name: "primary" }] },
-    );
+    setup(descriptor([input({ name: "note", ty: "text" })]), { note: "" }, [], false, {
+      note: [{ kind: "agent", id: "a1", name: "primary" }],
+    });
     expect(screen.queryByTestId("workflow-missing")).toBeNull();
   });
 

@@ -2840,6 +2840,65 @@ describe("ComposeBar — cross-agent forward", () => {
     });
   });
 
+  it("runs the workflow on ⌘Enter from inside a workflow form field", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    const WORKFLOW = {
+      name: "review-and-aggregate",
+      is_builtin: true,
+      description: "d",
+      inputs: [
+        { name: "reviewers", ty: "agent_list", optional: false, description: null },
+        { name: "worker", ty: "agent", optional: false, description: null },
+      ],
+      invocable: true,
+      parse_error: null,
+    };
+    const DESCRIPTOR = {
+      name: "review-and-aggregate",
+      description: "d",
+      is_builtin: true,
+      invocable: true,
+      inputs: WORKFLOW.inputs,
+      steps: [],
+      derived_args: [
+        {
+          name: "context",
+          required: false,
+          description: "Optional",
+          prompts: ["builtin:code-review"],
+        },
+      ],
+      compatibility: { state: "ok" },
+    };
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "list_workflows") return [WORKFLOW];
+      if (cmd === "describe_workflow_form") return DESCRIPTOR;
+      if (cmd === "list_prompts") return [];
+      if (cmd === "invoke_workflow") return "run-1";
+      return null;
+    });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    await fireEvent.click(screen.getByTestId("compose-workflow-button"));
+    await waitFor(() => screen.getByTestId("workflow-option-builtin:review-and-aggregate"));
+    await fireEvent.click(screen.getByTestId("workflow-option-builtin:review-and-aggregate"));
+    await waitFor(() => screen.getByTestId("workflow-arg-input-context"));
+    await fireEvent.click(screen.getByTestId("workflow-agent-reviewers-bob"));
+    await fireEvent.click(screen.getByTestId("workflow-agent-worker-alice"));
+
+    // ⌘Enter from inside a form field runs it — no click on the invoke button.
+    const field = screen.getByTestId("workflow-arg-input-context") as HTMLTextAreaElement;
+    field.focus();
+    await fireEvent.keyDown(window, { key: "Enter", metaKey: true });
+
+    await waitFor(() =>
+      expect(invokeMock.mock.calls.some(([c]) => c === "invoke_workflow")).toBe(true),
+    );
+    workflowsTesting.reset();
+  });
+
   it("invokes a workflow with a forward source attached to a derived field", async () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);
@@ -3216,6 +3275,23 @@ describe("ComposeBar — workflow run live view (M4 swap / hold / stop)", () => 
       expect(screen.getByTestId("workflow-run-error")).toHaveTextContent("Couldn't dismiss"),
     );
     // Still held — the run wasn't cleared.
+    expect(screen.getByTestId("workflow-run-live")).toBeInTheDocument();
+  });
+
+  it("surfaces a Stop failure inline and keeps the run live", async () => {
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "cancel_workflow_run") throw new Error("backend gone");
+      return null;
+    });
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    workflowRuns[PROJECT_ID] = [run()]; // running → Stop control
+    await tick();
+
+    await fireEvent.click(screen.getByTestId("workflow-run-stop"));
+    await waitFor(() =>
+      expect(screen.getByTestId("workflow-run-error")).toHaveTextContent("Couldn't stop"),
+    );
+    // Still live — the run wasn't cleared.
     expect(screen.getByTestId("workflow-run-live")).toBeInTheDocument();
   });
 });

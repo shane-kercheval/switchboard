@@ -542,9 +542,16 @@
         return;
       }
       if (e.key === "Enter") {
-        if (mode === "prompt" && composeEl?.contains(document.activeElement)) {
-          e.preventDefault();
-          handlePrimaryAction();
+        if (composeEl?.contains(document.activeElement)) {
+          if (mode === "prompt") {
+            e.preventDefault();
+            handlePrimaryAction();
+          } else if (mode === "workflow") {
+            // ⌘Enter from inside the workflow form runs it (the invoke action
+            // no-ops if the form isn't runnable / is already starting).
+            e.preventDefault();
+            void invokeWorkflowAction();
+          }
         }
         return;
       }
@@ -2158,7 +2165,7 @@
                     {...props}
                     type="button"
                     class={cn(
-                      "focus-visible:ring-accent inline-flex items-center gap-1 rounded-full border py-px pr-2 pl-1.5 text-sm transition-colors focus-visible:ring-2 focus-visible:outline-none",
+                      "focus-visible:ring-accent inline-flex h-6 items-center gap-1 rounded-full border px-2 text-xs transition-colors focus-visible:ring-2 focus-visible:outline-none",
                       selected
                         ? "bg-accent-soft text-fg border-transparent"
                         : "border-panel bg-panel text-muted hover:bg-raised hover:text-fg",

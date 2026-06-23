@@ -90,6 +90,43 @@
     return (forwardSources[name]?.length ?? 0) > 0;
   }
 
+  // Element refs for the fillable single-text fields (declared `text` inputs +
+  // derived args), keyed by field name, so the ⌘⌃N pane chord can target the
+  // field currently being typed in — mirrors the prompt composer's per-field
+  // forwarding. (Names are disjoint across inputs and derived args: a `text`
+  // input that shadows a same-named prompt arg removes it from `derived_args`.)
+  let fieldRefs = $state<Record<string, HTMLTextAreaElement | undefined>>({});
+
+  /// The add-source closure for whichever fillable field currently holds focus,
+  /// or `null` when focus is elsewhere.
+  function focusedFieldAdd(): ((source: ForwardSource) => void) | null {
+    const active = document.activeElement;
+    if (active === null) return null;
+    for (const [name, ref] of Object.entries(fieldRefs)) {
+      if (ref === active) return (source) => addArgSource(name, source);
+    }
+    return null;
+  }
+
+  // ⌘⌃1..9 → forward pane N into the focused field. The compose bar's own ⌘⌃
+  // chord no-ops while a workflow is being composed (its handler returns when
+  // `mode !== "plain"`), so there's no double-fire; the index matches the pane's
+  // position in `panes` — the order the picker shows the chord for.
+  $effect(() => {
+    function onKeydown(e: KeyboardEvent): void {
+      if (!e.metaKey || !e.ctrlKey || e.altKey || e.shiftKey) return;
+      if (e.key < "1" || e.key > "9") return;
+      const pane = panes[Number(e.key) - 1];
+      if (pane === undefined || pane.members.length === 0) return;
+      const add = focusedFieldAdd();
+      if (add === null) return;
+      e.preventDefault();
+      add(forwardSourceForPane(pane, agents));
+    }
+    window.addEventListener("keydown", onKeydown);
+    return () => window.removeEventListener("keydown", onKeydown);
+  });
+
   function asString(name: string): string {
     const v = inputs[name];
     return typeof v === "string" ? v : "";
@@ -156,7 +193,7 @@
   // height), minus the position number, which has no meaning here.
   function chipClass(selected: boolean): string {
     return cn(
-      "focus-visible:ring-accent inline-flex items-center gap-1 rounded-full border py-px pr-2 pl-1.5 text-sm transition-colors focus-visible:ring-2 focus-visible:outline-none",
+      "focus-visible:ring-accent inline-flex h-6 items-center gap-1 rounded-full border px-2 text-xs transition-colors focus-visible:ring-2 focus-visible:outline-none",
       selected
         ? "bg-accent-soft text-fg border-transparent"
         : "border-panel bg-panel text-muted hover:bg-raised hover:text-fg",
@@ -170,7 +207,7 @@
   // aligns with the bordered agent chips beside it.
   function paneChipClass(selected: boolean): string {
     return cn(
-      "focus-visible:ring-accent inline-flex items-center gap-1 rounded-full border py-px pr-2 pl-1.5 text-sm transition-colors focus-visible:ring-2 focus-visible:outline-none",
+      "focus-visible:ring-accent inline-flex h-6 items-center gap-1 rounded-full border px-2 text-xs transition-colors focus-visible:ring-2 focus-visible:outline-none",
       selected
         ? "bg-accent-soft text-fg border-transparent"
         : "border-transparent bg-transparent text-muted hover:bg-panel hover:text-fg",
@@ -354,6 +391,7 @@
         {agentHasOutput}
         onPickAgent={(agent) => addArgSource(name, forwardSourceForAgent(agent))}
         onPickPane={(pane) => addArgSource(name, forwardSourceForPane(pane, agents))}
+        showPaneShortcuts
         triggerTestid={`workflow-forward-picker-${name}`}
         triggerLabel={`Forward an agent's output into ${name}`}
         tooltipLabel="Forward an agent's output"
@@ -467,6 +505,7 @@
                 id={`wf-${input.name}`}
                 data-testid={`workflow-text-${input.name}`}
                 class="flex-1"
+                bind:ref={fieldRefs[input.name]}
                 value={asString(input.name)}
                 oninput={(e: Event) => {
                   inputs[input.name] = (e.currentTarget as HTMLTextAreaElement).value;
@@ -498,6 +537,7 @@
               id={`wf-arg-${arg.name}`}
               data-testid={`workflow-arg-input-${arg.name}`}
               class="flex-1"
+              bind:ref={fieldRefs[arg.name]}
               value={asString(arg.name)}
               oninput={(e: Event) => {
                 inputs[arg.name] = (e.currentTarget as HTMLTextAreaElement).value;

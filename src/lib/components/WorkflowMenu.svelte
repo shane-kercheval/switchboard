@@ -82,7 +82,14 @@
   data-testid="workflow-menu"
   role="listbox"
 >
-  <div class="max-h-64 overflow-y-auto" data-testid="workflow-menu-scroll">
+  <!-- Inset the rows from the right edge (`pr-2`) so the scrollbar doesn't sit on
+       top of the per-row copy button; `scrollbar-gutter: stable` reserves a proper
+       lane on WebKit versions that support it (older ones ignore it, hence the
+       padding). -->
+  <div
+    class="max-h-64 [scrollbar-gutter:stable] overflow-y-auto pr-3"
+    data-testid="workflow-menu-scroll"
+  >
     {#each filtered as workflow, i (workflowKey(workflow))}
       {@const builtin = workflow.is_builtin}
       {@const canPick = selectable(workflow)}
@@ -185,7 +192,7 @@
       data-testid="workflow-menu-open-folder"
       onclick={() => onopenfolder()}
     >
-      Open workflows folder…
+      Open local workflows folder…
     </button>
   {/if}
 </div>

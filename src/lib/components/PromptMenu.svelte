@@ -17,6 +17,7 @@
     loading = false,
     onpick,
     oncopy,
+    onopenfolder,
     onclose,
   }: {
     prompts: Prompt[];
@@ -27,6 +28,9 @@
     /// Copy a read-only built-in into the user's own prompts. Only built-in rows
     /// surface the affordance; omitting the handler hides it everywhere.
     oncopy?: (prompt: Prompt) => void;
+    /// Open the local prompts folder (where the user adds their own). Omitting the
+    /// handler hides the row.
+    onopenfolder?: () => void;
     onclose: () => void;
   } = $props();
 
@@ -83,7 +87,14 @@
   data-testid="prompt-menu"
   role="listbox"
 >
-  <div class="max-h-64 overflow-y-auto" data-testid="prompt-menu-scroll">
+  <!-- Inset the rows from the right edge (`pr-2`) so the scrollbar doesn't sit on
+       top of the per-row copy button; `scrollbar-gutter: stable` reserves a proper
+       lane on WebKit versions that support it (older ones ignore it, hence the
+       padding). -->
+  <div
+    class="max-h-64 [scrollbar-gutter:stable] overflow-y-auto pr-3"
+    data-testid="prompt-menu-scroll"
+  >
     {#each filtered as prompt, i (promptKey(prompt))}
       {@const builtin = isBuiltinPrompt(prompt)}
       <!-- The row wraps a full-width pick button plus, for built-ins, a separate
@@ -166,4 +177,14 @@
     data-testid="prompt-menu-search"
     class="border-border bg-panel text-fg placeholder:text-muted focus-visible:ring-accent mt-1 w-full rounded-md border px-2.5 py-1.5 text-sm focus-visible:ring-2 focus-visible:outline-none"
   />
+  {#if onopenfolder}
+    <button
+      type="button"
+      class="text-muted hover:text-fg mt-1 w-full rounded-md px-2.5 py-1 text-left text-xs"
+      data-testid="prompt-menu-open-folder"
+      onclick={() => onopenfolder()}
+    >
+      Open local prompts folder…
+    </button>
+  {/if}
 </div>

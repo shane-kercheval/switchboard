@@ -1240,6 +1240,12 @@
     });
   }
 
+  function openPromptsFolder(): void {
+    void api.openLocalPromptsDir().catch((err: unknown) => {
+      console.error("[switchboard] open prompts folder failed", err);
+    });
+  }
+
   /// Whether the picked workflow is runnable: the form is resolved, invocable,
   /// compatible (prompts resolved, no drift), and every required field (declared
   /// input or derived prompt arg) is filled. Drives the invoke button's disabled
@@ -1854,6 +1860,7 @@
           loading={!promptsLoaded}
           onpick={pickPrompt}
           oncopy={copyPrompt}
+          onopenfolder={openPromptsFolder}
           onclose={() => (promptMenuOpen = false)}
         />
       {/if}

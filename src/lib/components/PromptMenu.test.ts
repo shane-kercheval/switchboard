@@ -44,9 +44,10 @@ const BUILTIN: Prompt = {
 function setup(prompts: Prompt[] = PROMPTS, loading = false) {
   const onpick = vi.fn();
   const oncopy = vi.fn();
+  const onopenfolder = vi.fn();
   const onclose = vi.fn();
-  render(PromptMenu, { props: { prompts, loading, onpick, oncopy, onclose } });
-  return { onpick, oncopy, onclose };
+  render(PromptMenu, { props: { prompts, loading, onpick, oncopy, onopenfolder, onclose } });
+  return { onpick, oncopy, onopenfolder, onclose };
 }
 
 describe("PromptMenu", () => {
@@ -165,6 +166,12 @@ describe("PromptMenu", () => {
     expect(oncopy).toHaveBeenCalledTimes(1);
     expect(oncopy.mock.calls[0]?.[0]).toMatchObject({ provider: "builtin", name: "code-review" });
     expect(onpick).not.toHaveBeenCalled();
+  });
+
+  it("offers an open-folder action", async () => {
+    const { onopenfolder } = setup();
+    await fireEvent.click(screen.getByTestId("prompt-menu-open-folder"));
+    expect(onopenfolder).toHaveBeenCalledTimes(1);
   });
 
   it("still picks the built-in row itself", async () => {

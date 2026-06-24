@@ -16,6 +16,7 @@ inputs:
     description: The agent that receives every reviewer's combined feedback and produces the recommendations.
 steps:
   - label: Code review
+    description: Each reviewer independently reviews the current changes in parallel.
     send:
       to: "{{ reviewers }}"
       prompt: "builtin:code-review"
@@ -23,6 +24,7 @@ steps:
     wait_for_all:
       agents: "{{ reviewers }}"
   - label: Recommendations
+    description: The worker reads the combined reviews and produces prioritized recommendations.
     send:
       to: "{{ worker }}"
       text: |

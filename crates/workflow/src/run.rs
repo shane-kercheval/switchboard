@@ -135,6 +135,7 @@ mod tests {
                 steps: vec![WorkflowStepInfo {
                     kind: crate::display::WorkflowStepKind::Send,
                     label: "Send the review".to_owned(),
+                    description: None,
                     recipients: vec![crate::display::RecipientRef::Slot {
                         input: "reviewers".to_owned(),
                     }],

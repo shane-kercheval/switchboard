@@ -874,6 +874,8 @@ export type WorkflowStepKind = "send" | "wait" | "pause" | "for_each" | "unknown
 export type WorkflowStepInfo = {
   kind?: WorkflowStepKind;
   label: string;
+  // Optional one-line explanation, rendered as a sub-line under the label.
+  description?: string | null;
   recipients: RecipientRef[];
   feeds_from: RecipientRef[];
 };

@@ -290,6 +290,7 @@ fn resolve_step_display(
         .map(|s| WorkflowStepInfo {
             kind: s.kind,
             label: s.label.clone(),
+            description: s.description.clone(),
             recipients: resolve(&s.recipients),
             feeds_from: resolve(&s.feeds_from),
         })
@@ -1456,6 +1457,7 @@ mod tests {
         WorkflowStepInfo {
             kind: WorkflowStepKind::Send,
             label: label.to_owned(),
+            description: None,
             recipients,
             feeds_from: Vec::new(),
         }

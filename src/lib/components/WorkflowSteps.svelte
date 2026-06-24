@@ -38,6 +38,7 @@
   /// nodes (overlapping ranges) both read active = two spinners.
   type DisplayNode = {
     label: string;
+    description?: string | null;
     recipients: RecipientRef[];
     feeds_from: RecipientRef[];
     startStep: number;
@@ -88,6 +89,7 @@
     const ownRow = (s: WorkflowStepInfo, i: number): DisplayNode => {
       const node: DisplayNode = {
         label: s.label,
+        description: s.description,
         recipients: s.recipients,
         feeds_from: s.feeds_from,
         startStep: i,
@@ -212,6 +214,11 @@
             </span>
           {/if}
         </span>
+        {#if node.description}
+          <span class="text-muted text-xs" data-testid={`workflow-step-description-${i}`}>
+            {node.description}
+          </span>
+        {/if}
         {#if feeds.length > 0}
           <span class="text-muted text-[11px] leading-4" data-testid={`workflow-step-feeds-${i}`}>
             ↪ feeds from {feeds.join(", ")}

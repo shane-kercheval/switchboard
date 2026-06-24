@@ -112,6 +112,8 @@ Long-form keys: `type` (required), `description` (optional), `default` (optional
 
 **Label convention — name the deliverable, not the dispatch.** A label should be a short **noun phrase naming what the step produces** — `Code review`, `Verdict`, `Final recommendation` — *not* a verb phrase describing the mechanic (`Send code review to reviewers`, `Wait for all reviews`). The progress view shows the producing agents alongside the label, so the label shouldn't repeat them. It also **collapses a `send` and the `wait` that synchronizes it into one row** (the wait's label is absorbed), so the view reads as a pipeline of deliverables: `Code review (alice, bob)` → `Verdict (carol)`. Give `wait` steps a brief required label anyway (e.g. `Reviews received`) — it's only shown in a degraded fallback when a step can't be collapsed.
 
+**Optional step `description`.** Each step may carry a `description` — another reserved sibling key — a one-line explanation rendered as a muted sub-line under the label in both the preview and live views. Use it to say what the step does beyond its noun label (e.g. label `Code review`, description `Each reviewer independently reviews the current changes in parallel.`). It's optional but recommended on the `send` steps (the deliverables); on a collapsed `send`+`wait` node the send's description is the one shown. Present-but-blank or non-string is a parse error.
+
 ### `send` — dispatch a message
 
 ```yaml
@@ -477,6 +479,7 @@ inputs:
     description: The agent that receives every reviewer's combined feedback and produces the recommendations.
 steps:
   - label: Code review
+    description: Each reviewer independently reviews the current changes in parallel.
     send:
       to: "{{ reviewers }}"
       prompt: "builtin:code-review"
@@ -484,6 +487,7 @@ steps:
     wait_for_all:
       agents: "{{ reviewers }}"
   - label: Recommendations
+    description: The worker reads the combined reviews and produces prioritized recommendations.
     send:
       to: "{{ worker }}"
       text: |
@@ -512,6 +516,7 @@ inputs:
     description: The agent that distills the reviewers' feedback into a verdict, weighs their pushback, and gives the final recommendation.
 steps:
   - label: Code review
+    description: Each reviewer independently reviews the current changes in parallel.
     send:
       to: "{{ reviewers }}"
       prompt: "builtin:code-review"
@@ -519,6 +524,7 @@ steps:
     wait_for_all:
       agents: "{{ reviewers }}"
   - label: Verdict
+    description: The worker distills the reviewers' feedback into a decision-ready verdict.
     send:
       to: "{{ worker }}"
       prompt: "builtin:ai-review-feedback"
@@ -528,6 +534,7 @@ steps:
     wait_for:
       agent: "{{ worker }}"
   - label: Reviewer responses
+    description: The reviewers push back on or confirm the worker's verdict.
     send:
       to: "{{ reviewers }}"
       text: |
@@ -540,6 +547,7 @@ steps:
     wait_for_all:
       agents: "{{ reviewers }}"
   - label: Final recommendation
+    description: The worker weighs the reviewers' responses and gives a final recommendation.
     send:
       to: "{{ worker }}"
       text: |

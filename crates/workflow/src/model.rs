@@ -23,16 +23,18 @@ pub struct Workflow {
     pub steps: Vec<LabeledStep>,
 }
 
-/// A workflow step paired with its required, human-readable `label`. In the file
-/// grammar the label is a reserved sibling key of the step-type key
-/// (`{ label: "Gather reviews", send: {...} }`), parsed in
-/// [`crate::parse::parse_workflow`]. It is required on *every* step — including
-/// the capability-gated ones — because the progress and preview views key off it;
-/// a step without a label has no name to show. Wrapping (rather than a per-variant
-/// field) lets every consumer read `.label` uniformly without matching the kind.
+/// A workflow step paired with its required, human-readable `label` and an
+/// optional one-line `description`. In the file grammar both are reserved sibling
+/// keys of the step-type key (`{ label: "Code review", description: "...", send:
+/// {...} }`), parsed in [`crate::parse::parse_workflow`]. `label` is required on
+/// *every* step because the progress and preview views key off it; `description`
+/// is optional and surfaced as a sub-line. Wrapping (rather than per-variant
+/// fields) lets every consumer read `.label`/`.description` uniformly without
+/// matching the kind.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LabeledStep {
     pub label: String,
+    pub description: Option<String>,
     pub step: Step,
 }
 
@@ -177,6 +179,7 @@ mod tests {
     fn labeled(step: Step) -> LabeledStep {
         LabeledStep {
             label: "step".to_owned(),
+            description: None,
             step,
         }
     }

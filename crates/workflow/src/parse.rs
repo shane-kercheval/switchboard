@@ -296,9 +296,13 @@ fn parse_step(
         .ok_or_else(|| WorkflowError::validation(format!("{ctx}: each step must be a mapping")))?;
 
     let label = parse_step_label(map, ctx)?;
+    let description = parse_step_description(map, ctx)?;
 
-    // The step-type key is the single key other than `label`.
-    let mut type_entries = map.iter().filter(|(k, _)| k.as_str() != Some("label"));
+    // The step-type key is the single key other than the reserved sibling keys
+    // (`label`, `description`).
+    let mut type_entries = map
+        .iter()
+        .filter(|(k, _)| !matches!(k.as_str(), Some("label" | "description")));
     let (key, params) = match (type_entries.next(), type_entries.next()) {
         (Some(entry), None) => entry,
         (None, _) => {
@@ -340,7 +344,27 @@ fn parse_step(
         _ => unreachable!("step type validated above"),
     }?;
 
-    Ok(LabeledStep { label, step })
+    Ok(LabeledStep {
+        label,
+        description,
+        step,
+    })
+}
+
+/// `description` is an **optional** reserved sibling key — a one-line explanation
+/// shown beneath the label. Absent → `None`; present must be a non-blank string
+/// (a blank one is an authoring slip, treated like a blank label).
+fn parse_step_description(map: &serde_norway::Mapping, ctx: &str) -> Result<Option<String>> {
+    match map.get("description") {
+        None => Ok(None),
+        Some(Value::String(s)) if !s.trim().is_empty() => Ok(Some(s.clone())),
+        Some(Value::String(_)) => Err(WorkflowError::validation(format!(
+            "{ctx}: step `description` must not be blank"
+        ))),
+        Some(_) => Err(WorkflowError::validation(format!(
+            "{ctx}: step `description` must be a string"
+        ))),
+    }
 }
 
 fn parse_step_label(map: &serde_norway::Mapping, ctx: &str) -> Result<String> {

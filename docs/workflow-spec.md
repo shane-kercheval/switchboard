@@ -103,9 +103,12 @@ Long-form `type` is required when long form is used; mixing shorthand and long f
 
 `label` is a short, human-readable name for the step, shown in the workflow's progress and preview views. It is a reserved sibling key of the step-type key, required on **every** step including those inside a `for_each` body; a missing, blank, or non-string `label` is a validation error. By convention a label names the **deliverable** the step produces (a noun phrase — `Code review`, `Recommendations`), not the dispatch mechanic; the progress view shows the producing agents alongside it and collapses a `send` with the `wait` that synchronizes it into one row.
 
+`description` is an **optional** reserved sibling key — a one-line explanation rendered as a sub-line under the label. Absent → none; present must be a non-blank string (a blank one is a validation error).
+
 ```yaml
 steps:
   - label: Code review
+    description: Each reviewer independently reviews the current changes in parallel.
     send:
       to: "{{ reviewer_agents }}"
       prompt: "builtin:code-review"

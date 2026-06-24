@@ -22,8 +22,9 @@ function kstep(
   label: string,
   recipients: RecipientRef[] = [],
   feeds_from: RecipientRef[] = [],
+  description?: string,
 ): WorkflowStepInfo {
-  return { kind, label, recipients, feeds_from };
+  return { kind, label, description, recipients, feeds_from };
 }
 function rowCount(): number {
   return screen.getAllByTestId(/^workflow-step-\d+$/).length;
@@ -272,6 +273,32 @@ describe("WorkflowSteps — collapse (send + its wait into one deliverable node)
     // The reason renders only on the failed (owning) node.
     expect(screen.getByTestId("workflow-step-reason-0")).toHaveTextContent("agent sec is busy");
     expect(screen.queryByTestId("workflow-step-reason-1")).toBeNull();
+  });
+
+  it("renders a step's description as a sub-line", () => {
+    const steps = [kstep("send", "Code review", [lit("a")], [], "Each reviewer reviews the diff.")];
+    render(WorkflowSteps, { steps, mode: "preview", inputs: {} });
+    expect(screen.getByTestId("workflow-step-description-0")).toHaveTextContent(
+      "Each reviewer reviews the diff.",
+    );
+  });
+
+  it("a collapsed node shows the send's description (the wait's is absorbed)", () => {
+    const steps = [
+      kstep("send", "Code review", [lit("a")], [], "Reviewers review the diff."),
+      kstep("wait", "x", [lit("a")]),
+    ];
+    render(WorkflowSteps, { steps, mode: "preview", inputs: {} });
+    expect(rowCount()).toBe(1);
+    expect(screen.getByTestId("workflow-step-description-0")).toHaveTextContent(
+      "Reviewers review the diff.",
+    );
+  });
+
+  it("omits the description sub-line when a step has none", () => {
+    const steps = [kstep("send", "Code review", [lit("a")])];
+    render(WorkflowSteps, { steps, mode: "preview", inputs: {} });
+    expect(screen.queryByTestId("workflow-step-description-0")).toBeNull();
   });
 
   it("a shared wait_for_all failing marks every branch it barriered (set-cover)", () => {

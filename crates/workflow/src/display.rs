@@ -47,6 +47,10 @@ pub struct WorkflowStepInfo {
     #[serde(default)]
     pub kind: WorkflowStepKind,
     pub label: String,
+    /// Optional one-line explanation, shown as a sub-line under the label.
+    /// `#[serde(default)]` for the same legacy-snapshot reason as `kind`.
+    #[serde(default)]
+    pub description: Option<String>,
     /// The step's targets — who it sends to / waits for. Empty for steps with no
     /// agent target (e.g. a `for_each` wrapper).
     pub recipients: Vec<RecipientRef>,
@@ -110,6 +114,7 @@ fn step_info(labeled: &LabeledStep, inputs: &[InputDecl]) -> WorkflowStepInfo {
     WorkflowStepInfo {
         kind,
         label: labeled.label.clone(),
+        description: labeled.description.clone(),
         recipients,
         feeds_from,
     }
@@ -230,6 +235,7 @@ mod tests {
         let info = WorkflowStepInfo {
             kind: WorkflowStepKind::Send,
             label: "Send the review".to_owned(),
+            description: Some("Each reviewer reviews the diff.".to_owned()),
             recipients: vec![
                 RecipientRef::Slot {
                     input: "reviewers".to_owned(),
@@ -243,6 +249,7 @@ mod tests {
         let v = serde_json::to_value(&info).unwrap();
         assert_eq!(v["label"], "Send the review");
         assert_eq!(v["kind"], "send");
+        assert_eq!(v["description"], "Each reviewer reviews the diff.");
         assert_eq!(v["recipients"][0]["kind"], "slot");
         assert_eq!(v["recipients"][0]["input"], "reviewers");
         assert_eq!(v["recipients"][1]["kind"], "literal");
@@ -282,6 +289,17 @@ mod tests {
         let back: WorkflowStepInfo = serde_json::from_value(legacy).unwrap();
         assert_eq!(back.kind, WorkflowStepKind::Unknown);
         assert_eq!(back.label, "Send the review");
+        assert_eq!(back.description, None);
+    }
+
+    #[test]
+    fn step_description_is_optional_and_carried_through() {
+        let steps = display(
+            "name: wf\ndescription: d\ninputs:\n  a: agent\nsteps:\n  - {label: S, description: Reviews the diff, send: {to: \"{{ a }}\", text: hi}}\n  - {label: W, wait_for: {agent: \"{{ a }}\"}}\n",
+        );
+        assert_eq!(steps[0].description.as_deref(), Some("Reviews the diff"));
+        // A step without a `description:` key carries `None`.
+        assert_eq!(steps[1].description, None);
     }
 
     #[test]

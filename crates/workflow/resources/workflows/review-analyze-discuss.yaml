@@ -18,6 +18,7 @@ inputs:
     description: The agent that distills the reviewers' feedback into a verdict, weighs their pushback, and gives the final recommendation.
 steps:
   - label: Code review
+    description: Each reviewer independently reviews the current changes in parallel.
     send:
       to: "{{ reviewers }}"
       prompt: "builtin:code-review"
@@ -25,6 +26,7 @@ steps:
     wait_for_all:
       agents: "{{ reviewers }}"
   - label: Verdict
+    description: The worker distills the reviewers' feedback into a decision-ready verdict.
     send:
       to: "{{ worker }}"
       prompt: "builtin:ai-review-feedback"
@@ -34,6 +36,7 @@ steps:
     wait_for:
       agent: "{{ worker }}"
   - label: Reviewer responses
+    description: The reviewers push back on or confirm the worker's verdict.
     send:
       to: "{{ reviewers }}"
       text: |
@@ -46,6 +49,7 @@ steps:
     wait_for_all:
       agents: "{{ reviewers }}"
   - label: Final recommendation
+    description: The worker weighs the reviewers' responses and gives a final recommendation.
     send:
       to: "{{ worker }}"
       text: |

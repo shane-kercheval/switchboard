@@ -703,6 +703,153 @@ async fn truncated_stream_without_turn_end_synthesizes_failed_terminal() {
 }
 
 #[tokio::test]
+async fn workflow_send_emits_user_message_after_journal_before_turn_start() {
+    // A backend-originated workflow send has no frontend optimistic user turn, so
+    // the dispatcher surfaces a live UserMessage for it — emitted past the
+    // fail-closed `record_send` and before TurnStart, so live == the reloaded
+    // journal view by construction.
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+    let factory = TestFactory::new(
+        MockScenario::Streaming,
+        agent.clone(),
+        Arc::clone(&emitter),
+        Arc::new(RecordingJournal::default()) as Arc<dyn ConversationJournal>,
+    );
+
+    let send_id = Uuid::now_v7();
+    let _ = dispatcher
+        .send_workflow_message_awaiting_completion(
+            agent.id,
+            "review this diff",
+            vec![],
+            send_id,
+            factory,
+        )
+        .await;
+
+    within(
+        &emitter,
+        "agent_idle",
+        emitter.wait_for_type("agent_idle", 1),
+    )
+    .await;
+
+    let events = emitter.snapshot();
+    let user_msgs: Vec<_> = events
+        .iter()
+        .filter(|(_, v)| event_type(v) == "user_message")
+        .collect();
+    assert_eq!(
+        user_msgs.len(),
+        1,
+        "exactly one UserMessage for the workflow send"
+    );
+    assert_eq!(
+        user_msgs[0].1["send_id"].as_str(),
+        Some(send_id.to_string().as_str()),
+        "UserMessage carries the originating send_id (for fan-out grouping)"
+    );
+    assert_eq!(user_msgs[0].1["text"].as_str(), Some("review this diff"));
+
+    // Ordering: the UserMessage is emitted after the journal write but before the
+    // turn's TurnStart.
+    let um = events
+        .iter()
+        .position(|(_, v)| event_type(v) == "user_message")
+        .unwrap();
+    let ts = events
+        .iter()
+        .position(|(_, v)| event_type(v) == "turn_start")
+        .unwrap();
+    assert!(um < ts, "UserMessage precedes TurnStart");
+}
+
+#[tokio::test]
+async fn manual_send_emits_no_user_message() {
+    // A manual send's user turn is created optimistically by the frontend, so the
+    // dispatcher must not also emit a UserMessage (it would double-render).
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+    let factory = TestFactory::new(
+        MockScenario::Streaming,
+        agent.clone(),
+        Arc::clone(&emitter),
+        noop_journal(),
+    );
+
+    let _ = dispatcher
+        .send_message_awaiting_completion(agent.id, "hi", vec![], Uuid::now_v7(), factory)
+        .await;
+
+    within(
+        &emitter,
+        "agent_idle",
+        emitter.wait_for_type("agent_idle", 1),
+    )
+    .await;
+
+    assert_eq!(
+        count_type(&emitter.snapshot(), "user_message"),
+        0,
+        "a manual send emits no UserMessage"
+    );
+}
+
+#[tokio::test]
+async fn workflow_send_journal_failure_suppresses_user_message() {
+    // `record_send` is fail-closed: a journal write failure surfaces MessageFailed
+    // and starts no turn — and must emit no live UserMessage, since a send that
+    // isn't durable has no row for a reload to reconstruct (live == reload).
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+    let factory = TestFactory::new(
+        MockScenario::Streaming,
+        agent.clone(),
+        Arc::clone(&emitter),
+        Arc::new(FailingJournal) as Arc<dyn ConversationJournal>,
+    );
+
+    let _ = dispatcher
+        .send_workflow_message_awaiting_completion(
+            agent.id,
+            "never durable",
+            vec![],
+            Uuid::now_v7(),
+            factory,
+        )
+        .await;
+
+    within(
+        &emitter,
+        "message_failed",
+        emitter.wait_for_type("message_failed", 1),
+    )
+    .await;
+    within(
+        &emitter,
+        "agent_idle",
+        emitter.wait_for_type("agent_idle", 1),
+    )
+    .await;
+
+    let events = emitter.snapshot();
+    assert_eq!(
+        count_type(&events, "user_message"),
+        0,
+        "a journal-write failure suppresses the live UserMessage"
+    );
+    assert_eq!(
+        count_type(&events, "turn_start"),
+        0,
+        "no turn starts when the journal write fails"
+    );
+}
+
+#[tokio::test]
 async fn dispatch_failure_emits_message_failed_no_turn_start_and_stays_usable() {
     // MockScenario::DispatchFails → `adapter.dispatch()` returns Err before any
     // stream. The actor emits NO TurnStart; instead it emits MessageFailed

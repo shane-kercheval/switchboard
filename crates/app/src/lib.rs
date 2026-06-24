@@ -1319,7 +1319,8 @@ pub fn run() {
             // git-view.yaml, config.yaml) — see `with_persistence_paths`.
             let state = with_persistence_paths(state);
             // Resolve and inject the user-global prompt config + default prompts
-            // store (seeding the example prompts on first run).
+            // store. Built-in example prompts are baked into the service as a
+            // read-only library — nothing is written into the user's folder.
             let prompts = build_prompt_service();
             // Warm the prompt cache in the background so a slow/cold MCP server
             // never blocks startup. `PromptService` is cheaply cloneable and

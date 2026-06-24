@@ -2725,7 +2725,7 @@ async fn forward_resolve(
 /// chosen sources contribute their *latest completed* output, composed with the
 /// field's typed lead. If any source has a turn **actively running**, the whole
 /// invocation is rejected (the workflow launch is never held open waiting on a
-/// streaming agent — see the M5 "completed-only" decision). Returns field name →
+/// streaming agent — a forward field captures only completed output). Returns field name →
 /// composed text for the caller to merge into the invocation inputs.
 ///
 /// `inputs` supplies each field's typed lead (its current string value); the
@@ -5345,7 +5345,7 @@ mod tests {
     #[tokio::test]
     async fn workflow_forward_resolves_a_completed_source_into_the_field() {
         // A workflow forward-field captures its source's latest *completed* output,
-        // composed after the field's typed lead (completed-only M5 semantics).
+        // composed after the field's typed lead (a forward captures completed output only).
         let (tmp, state, _emitter) = fresh_state_with_mock();
         let home = TempDir::new().unwrap();
         let (_recipient, project_id) = project_with_agent(&state, &tmp).await;
@@ -15716,6 +15716,50 @@ mod tests {
         assert!(
             !project.run_path(run_id).exists(),
             "a complete run file is pruned"
+        );
+    }
+
+    #[tokio::test]
+    async fn invoke_creates_the_run_directory_so_records_can_persist() {
+        // Regression: `runs/` is never pre-created, and `append_jsonl` won't create
+        // a parent dir, so without `invoke` creating it every run-record write fails
+        // (silently, to a warning) and a failed/interrupted run can't survive a
+        // restart. Invoking on a fresh project (no `runs/` yet) must create the dir.
+        let (_tmp, state, pid) = workflow_state(&["primary", "reviewer-1"]).await;
+        let project = lock(&state.projects).get(&pid).cloned().unwrap();
+        assert!(
+            !project.runs_dir().exists(),
+            "runs dir absent before any run"
+        );
+
+        let run_id = invoke_workflow_impl(
+            &state,
+            pid,
+            "review-and-recommend",
+            true,
+            &inputs(vec![
+                ("worker", text("primary")),
+                ("reviewers", list(&["reviewer-1"])),
+            ]),
+        )
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if !lock(&state.workflow_runs).contains_key(&run_id) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("run did not terminalize");
+
+        // The directory exists even though a completed run's file is pruned —
+        // proving invoke created it (records could be written), not that a file
+        // happened to linger.
+        assert!(
+            project.runs_dir().exists(),
+            "invoke must create the run-record directory"
         );
     }
 

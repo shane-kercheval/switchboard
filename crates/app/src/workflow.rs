@@ -898,7 +898,7 @@ mod tests {
     }
 
     /// Build a run with **explicit** user-fillable prompt-arg values, to exercise
-    /// M3's per-prompt argument assembly (a derived arg the user filled is not a
+    /// per-prompt argument assembly (a derived arg the user filled is not a
     /// declared input, so `build_run` can't inject it from the bound scope).
     #[allow(clippy::needless_pass_by_value)]
     fn build_run_with_user_args(

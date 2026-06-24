@@ -298,6 +298,17 @@ pub enum AppError {
         source: std::io::Error,
     },
 
+    /// The run-record directory (`projects/<id>/runs/`) could not be created
+    /// before launching a workflow. Run files are how a failed/interrupted run
+    /// survives a restart, so we fail loudly here rather than start a run whose
+    /// records would silently fail to persist.
+    #[error("could not prepare workflow run directory at {path}: {source}")]
+    WorkflowRunSetupIo {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
     /// "Copy to my prompts" would overwrite an existing file. The app never
     /// clobbers a user's prompt — they rename or remove the existing file first.
     #[error("a prompt file already exists at {path}")]

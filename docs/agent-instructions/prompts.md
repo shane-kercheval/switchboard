@@ -10,7 +10,7 @@ Local prompts are file-based. There is no in-app editor. You are generating a fi
 
 ## Where local prompts live
 
-Local prompts are **user-global** — configured once at the user level and available in every project, regardless of working directory. Switchboard resolves them from the directories listed in `local_prompt_dirs` in the user-global `config.yaml`, in declared order (an earlier directory shadows a later one on name collision). If `local_prompt_dirs` is unset, Switchboard uses a single default store: the OS-conventional `prompts/` directory under the user-global config dir (e.g. `~/.config/switchboard/prompts/` on Linux, `~/Library/Application Support/switchboard/prompts/` on macOS), which is seeded with example prompts on first run.
+Local prompts are **user-global** — configured once at the user level and available in every project, regardless of working directory. Switchboard resolves them from the directories listed in `local_prompt_dirs` in the user-global `config.yaml`, in declared order (an earlier directory shadows a later one on name collision). If `local_prompt_dirs` is unset, Switchboard uses a single default store: the OS-conventional `prompts/` directory under the user-global config dir (e.g. `~/.config/switchboard/prompts/` on Linux, `~/Library/Application Support/switchboard/prompts/` on macOS), which starts empty — example prompts ship as a read-only built-in library baked into the app, not written into this folder.
 
 Default to writing the prompt into the default store (or, if the user keeps a personal prompt library listed in `local_prompt_dirs`, into that directory). If the user has indicated they keep prompts elsewhere, follow their instruction.
 

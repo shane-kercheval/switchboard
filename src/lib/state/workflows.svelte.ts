@@ -113,7 +113,7 @@ function handleProgress(projectId: ProjectId, payload: WorkflowProgressPayload):
   // was seeded with (from `list_workflow_runs`) when updating in place. Empty
   // `steps` is therefore a normal *transient* state for a run first seen via an
   // event before a seed/refresh populates it (not only a legacy disk file) — the
-  // M4 live-view work refreshes on invoke / on an unknown running event to close
+  // live view refreshes on invoke / on an unknown running event to close
   // that window before the progress view renders.
   const existing = current.find((r) => r.run_id === payload.run_id);
   const row: WorkflowRunInfo = {

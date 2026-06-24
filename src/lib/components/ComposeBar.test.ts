@@ -3226,7 +3226,7 @@ describe("ComposeBar — cross-agent forward", () => {
   });
 });
 
-describe("ComposeBar — workflow run live view (M4 swap / hold / stop)", () => {
+describe("ComposeBar — workflow run live view (swap / hold / stop)", () => {
   function run(over: Partial<WorkflowRunInfo> = {}): WorkflowRunInfo {
     return {
       run_id: "run-1",

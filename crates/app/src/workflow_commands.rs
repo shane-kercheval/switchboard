@@ -963,6 +963,7 @@ pub fn invoke_workflow_impl(
 
     let run_id = Uuid::now_v7();
     let run_path = project.run_path(run_id);
+    prepare_run_dir(&project)?;
     let total_steps = workflow.steps.len();
     let workflow_name = workflow.name.clone();
     let cancel = CancellationToken::new();
@@ -1091,6 +1092,18 @@ pub fn cancel_workflow_run_impl(state: &AppState, run_id: Uuid) {
 /// read live ids): `read_run_files` does blocking I/O and `workflow_runs` is a
 /// sync mutex. Live runs are excluded because their not-yet-terminal file would
 /// otherwise classify as `interrupted`.
+/// Create a project's run-record directory before launching a run. `append_jsonl`
+/// creates the file but not its parent, so without this every record write fails
+/// (silently, to a warning) and a failed/interrupted run never survives a restart.
+/// Fail loudly here rather than start a run whose records can't persist.
+fn prepare_run_dir(project: &Project) -> Result<(), AppError> {
+    let runs_dir = project.runs_dir();
+    std::fs::create_dir_all(&runs_dir).map_err(|source| AppError::WorkflowRunSetupIo {
+        path: runs_dir,
+        source,
+    })
+}
+
 fn project_has_held_run(state: &AppState, project: &Project, project_id: ProjectId) -> bool {
     let live_ids: Vec<Uuid> = {
         let runs = lock(&state.workflow_runs);

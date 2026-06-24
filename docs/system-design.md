@@ -92,7 +92,7 @@ Switchboard-managed state lives in a `.switchboard/` directory at the working di
 ~/.config/switchboard/          # user-global config (illustrative Linux/XDG path; resolved via the `directories` crate —
 │                               #   on macOS this is ~/Library/Application Support/switchboard/)
 ├── config.yaml                 # personal preferences + prompt providers (local_prompt_dirs, mcp_providers — see §6)
-├── prompts/                    # default local prompt store (seeded with example prompts on first run — see §6)
+├── prompts/                    # default local prompt store (user's own prompts; built-ins are baked-in read-only, not written here — see §6)
 └── workspace.yaml              # app-managed: the working directories the user works across,
                                 #   each with a cached snapshot of its projects, plus the
                                 #   user-global set of archived project ids (view-state)

@@ -26,7 +26,7 @@ function emit(projectId: string, payload: WorkflowProgressPayload): void {
 function running(over: Partial<WorkflowProgressPayload> = {}): WorkflowProgressPayload {
   return {
     run_id: "r1",
-    workflow: "review-and-aggregate",
+    workflow: "review-and-recommend",
     step: 0,
     total: 3,
     status: "running",
@@ -47,7 +47,7 @@ describe("workflows store", () => {
     const seeded: WorkflowRunInfo[] = [
       {
         run_id: "r1",
-        workflow: "review-and-aggregate",
+        workflow: "review-and-recommend",
         step: 0,
         total: 3,
         status: "running",
@@ -68,12 +68,21 @@ describe("workflows store", () => {
     const seeded: WorkflowRunInfo[] = [
       {
         run_id: "r1",
-        workflow: "review-and-aggregate",
+        workflow: "review-and-recommend",
         step: 0,
         total: 3,
         status: "running",
         reason: null,
-        steps: [{ label: "Send the review", recipients: [], feeds_from: [] }],
+        steps: [
+          {
+            kind: "send",
+            label: "Send the review",
+            description: null,
+            prompt: { kind: "named", id: "builtin:code-review" },
+            recipients: [],
+            feeds_from: [],
+          },
+        ],
       },
     ];
     invokeMock.mockResolvedValueOnce(seeded); // list_workflow_runs
@@ -100,7 +109,16 @@ describe("workflows store", () => {
         total: 2,
         status: "running",
         reason: null,
-        steps: [{ label: "Go", recipients: [], feeds_from: [] }],
+        steps: [
+          {
+            kind: "send",
+            label: "Go",
+            description: null,
+            prompt: null,
+            recipients: [],
+            feeds_from: [],
+          },
+        ],
       },
     ]); // list_workflow_runs (refresh)
 

@@ -32,7 +32,7 @@ fn label() -> &'static Path {
 /// owns it end to end.
 const BUILTIN_PROMPTS: &[&str] = &[
     include_str!("../resources/prompts/code-review.md"),
-    include_str!("../resources/prompts/ai-review-feedback.md"),
+    include_str!("../resources/prompts/analyze-ai-reviews.md"),
     include_str!("../resources/prompts/security-review.md"),
 ];
 
@@ -132,7 +132,7 @@ mod tests {
         let prompts = BuiltinProvider::new().list().await;
         let names: Vec<&str> = prompts.iter().map(|p| p.name.as_str()).collect();
         assert!(names.contains(&"code-review"), "got {names:?}");
-        assert!(names.contains(&"ai-review-feedback"), "got {names:?}");
+        assert!(names.contains(&"analyze-ai-reviews"), "got {names:?}");
         assert!(names.contains(&"security-review"), "got {names:?}");
         assert!(prompts.iter().all(|p| p.provider == BUILTIN_PROVIDER));
     }
@@ -149,15 +149,17 @@ mod tests {
             .await
             .unwrap();
         assert!(with.contains("the new file-upload endpoint"));
-        assert!(with.contains("security vulnerabilities"));
-        assert!(!with.contains("No extra context was provided"));
+        // The base review target is ALWAYS present — context supplements it.
+        assert!(with.contains("Uncommitted changes in the current directory"));
+        assert!(with.contains("Additional context and focus"));
 
         let without = provider
             .render("security-review", &args(&[]))
             .await
             .unwrap();
-        assert!(without.contains("No extra context was provided"));
-        assert!(!without.contains("Context for this review"));
+        assert!(without.contains("Uncommitted changes in the current directory"));
+        assert!(!without.contains("Additional context and focus"));
+        assert!(!without.contains("the new file-upload endpoint"));
     }
 
     #[tokio::test]
@@ -172,19 +174,23 @@ mod tests {
             .await
             .unwrap();
         assert!(with.contains("focus on the auth path"));
-        assert!(!with.contains("No extra context was provided"));
+        // The base review target is ALWAYS present — context supplements, never
+        // replaces it (a focus note must not become the entire review subject).
+        assert!(with.contains("Uncommitted changes in the current directory"));
+        assert!(with.contains("Additional context and focus"));
 
         let without = provider.render("code-review", &args(&[])).await.unwrap();
-        assert!(without.contains("No extra context was provided"));
-        assert!(!without.contains("Context for this review"));
+        assert!(without.contains("Uncommitted changes in the current directory"));
+        assert!(!without.contains("Additional context and focus"));
+        assert!(!without.contains("focus on the auth path"));
     }
 
     #[tokio::test]
-    async fn ai_review_feedback_requires_review_and_substitutes_it() {
+    async fn analyze_ai_reviews_requires_review_and_substitutes_it() {
         let provider = BuiltinProvider::new();
 
         let err = provider
-            .render("ai-review-feedback", &args(&[]))
+            .render("analyze-ai-reviews", &args(&[]))
             .await
             .unwrap_err();
         assert!(matches!(
@@ -194,7 +200,7 @@ mod tests {
 
         let out = provider
             .render(
-                "ai-review-feedback",
+                "analyze-ai-reviews",
                 &args(&[("review", "REVIEWER SAYS X")]),
             )
             .await

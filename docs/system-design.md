@@ -237,7 +237,7 @@ Workflow definition format (illustrative; the authoritative schema is `docs/work
 A workflow **hardcodes the prompts its steps run** as literal ids (`prompt: "builtin:code-review"`); a prompt is never a user-selected input. A prompt's user-fillable arguments are **auto-derived** from the resolved prompt and offered as form fields at invocation, while author-wired `template_vars` hold only **computed bindings** (workflow expressions the user can't type, e.g. `aggregated_responses(...)`). The example below fans `builtin:code-review` out to the reviewers, then hands the aggregated feedback to a primary agent via an inline `text` step.
 
 ```yaml
-name: review-and-aggregate
+name: review-and-recommend
 description: Send a message to multiple reviewers, aggregate, send to primary.
 inputs:
   primary_agent: agent
@@ -272,11 +272,11 @@ Workflows are authored as YAML files in the user-global `workflows/` folder unde
 
 Authoring is intentionally file-based. The user edits workflows in whichever editor they prefer (Vim, VS Code, etc.); Switchboard's UI reads the files but does not include an editor of its own. The supported authoring path for new users is to point an existing Claude Code, Codex, or Gemini agent at `docs/agent-instructions/workflows.md` and have it generate a starter workflow from a description (per §2 "Agent-friendly authoring"). Hand-authoring against the DSL spec works too for power users.
 
-v1 ships with a small library of built-in workflows (review-and-aggregate — review in parallel, aggregate, hand to a primary; review-analyze-discuss — fan-in review, analyze, then a round-trip discussion back to the analyst) as starting points; users can copy or fork these to author their own.
+v1 ships with a small library of built-in workflows (review-and-recommend — review in parallel, aggregate, hand to a primary; review-and-reconcile — fan-in review, analyze, then a round-trip discussion back to the analyst) as starting points; users can copy or fork these to author their own.
 
 Users without an existing harness installation outside Switchboard can use a Switchboard-spawned agent itself to author a workflow from the instruction docs — agents Switchboard manages are full Claude Code / Codex / Gemini sessions and can read project files normally. Hand-authoring against the DSL spec also works for power users.
 
-Workflow files are **user-global** — one workflows folder under the OS config dir, parallel to user-global prompts, shared across every project in every working directory. A workflow you author once (say a review fan-out) is invocable everywhere without redefinition. This is symmetric with prompts on purpose: both are personal, portable, parameterized templates. A workflow's `agent`/`[agent]` inputs are named slots bound to a project's real agents at invocation, so the definition is not tied to any one repo's agent names — the same `review-and-aggregate` runs against any project's roster.
+Workflow files are **user-global** — one workflows folder under the OS config dir, parallel to user-global prompts, shared across every project in every working directory. A workflow you author once (say a review fan-out) is invocable everywhere without redefinition. This is symmetric with prompts on purpose: both are personal, portable, parameterized templates. A workflow's `agent`/`[agent]` inputs are named slots bound to a project's real agents at invocation, so the definition is not tied to any one repo's agent names — the same `review-and-recommend` runs against any project's roster.
 
 ## 6. Prompts and prompt providers
 
@@ -601,7 +601,7 @@ These pin how the §3 split renders concretely after an app restart, when live U
 
 In a fan-out where outcomes differ per recipient (e.g. B completes, C is cancelled — whether individually or via cancel-send), these compose: the user message renders once (`User → B|C`), then B's completed content, then C's `cancelled` marker (with C's partial above it only if C's harness persisted any), interleaved by timestamp. Cancellation/error is always per-turn; there is no aggregate send-level outcome record.
 
-## 8. Worked example: review-and-aggregate
+## 8. Worked example: review-and-recommend
 
 To anchor the abstractions above, here is what a code-review workflow looks like end to end.
 
@@ -619,7 +619,7 @@ The user has authored a workflow in their user-global workflows folder (the OS c
 
 **Invocation:**
 
-1. The user invokes the workflow: "Run review-and-aggregate."
+1. The user invokes the workflow: "Run review-and-recommend."
 2. Switchboard pops up an invocation form with one field per declared input plus the auto-derived user-fillable arguments of the workflow's hardcoded prompts (`primary_agent`, `reviewer_agents`, and `code-review`'s optional `context` — see §4 for the schema). The user fills in:
    - **`primary_agent`** → `implementer`
    - **`reviewer_agents`** → `reviewer-claude` and `reviewer-codex` (multi-select)
@@ -640,7 +640,7 @@ The user has authored a workflow in their user-global workflows folder (the OS c
 
 **During execution:**
 
-Each reviewer's turn appears in the unified project transcript as it streams — attributed to `reviewer-claude` and `reviewer-codex` respectively — so the user reads both reviews interleaved chronologically as they land. The overview sidebar shows real-time status (running → completed) and per-agent cost / quota for each reviewer. When the implementer kicks in, its aggregated turn appears next in the same transcript, attributed to `implementer`. The workflow-progress surface (per §7) shows where the workflow is overall — e.g., "review-and-aggregate: step 2 of 3 (waiting on reviewers)" — alongside the transcript and sidebar.
+Each reviewer's turn appears in the unified project transcript as it streams — attributed to `reviewer-claude` and `reviewer-codex` respectively — so the user reads both reviews interleaved chronologically as they land. The overview sidebar shows real-time status (running → completed) and per-agent cost / quota for each reviewer. When the implementer kicks in, its aggregated turn appears next in the same transcript, attributed to `implementer`. The workflow-progress surface (per §7) shows where the workflow is overall — e.g., "review-and-recommend: step 2 of 3 (waiting on reviewers)" — alongside the transcript and sidebar.
 
 **Afterwards:**
 

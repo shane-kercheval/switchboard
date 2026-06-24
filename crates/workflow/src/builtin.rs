@@ -12,8 +12,8 @@ use crate::parse::parse_workflow;
 /// The bundled workflows as raw YAML. Each is parsed with its own `name:` as the
 /// file stem, so the YAML is the sole source of its id.
 const BUILTIN_WORKFLOWS: &[&str] = &[
-    include_str!("../resources/workflows/review-and-aggregate.yaml"),
-    include_str!("../resources/workflows/review-analyze-discuss.yaml"),
+    include_str!("../resources/workflows/review-and-recommend.yaml"),
+    include_str!("../resources/workflows/review-and-reconcile.yaml"),
 ];
 
 /// Extract the top-level `name:` from a workflow YAML without a full parse, so a
@@ -80,11 +80,11 @@ mod tests {
     fn the_two_shipped_built_ins_are_present_and_runnable() {
         let names: Vec<String> = builtin_workflows().into_iter().map(|w| w.name).collect();
         assert!(
-            names.contains(&"review-and-aggregate".to_owned()),
+            names.contains(&"review-and-recommend".to_owned()),
             "{names:?}"
         );
         assert!(
-            names.contains(&"review-analyze-discuss".to_owned()),
+            names.contains(&"review-and-reconcile".to_owned()),
             "{names:?}"
         );
         // Both use only runnable steps (no pause_for_user / for_each).
@@ -95,8 +95,8 @@ mod tests {
 
     #[test]
     fn content_matches_by_name() {
-        let yaml = builtin_workflow_content("review-and-aggregate").unwrap();
-        assert!(yaml.contains("name: review-and-aggregate"));
+        let yaml = builtin_workflow_content("review-and-recommend").unwrap();
+        assert!(yaml.contains("name: review-and-recommend"));
         assert!(builtin_workflow_content("nope").is_none());
     }
 }

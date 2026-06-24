@@ -23,7 +23,7 @@ A workflow authored once is invocable from every project without redefinition �
 Every workflow file is a YAML mapping with these top-level keys:
 
 ```yaml
-name: review-and-aggregate
+name: review-and-recommend
 description: Send to multiple reviewers, aggregate, send to primary.
 
 inputs:
@@ -373,7 +373,7 @@ steps:
 ### 2. Fan-in review
 
 ```yaml
-name: review-and-aggregate
+name: review-and-recommend
 description: Send to multiple reviewers in parallel, aggregate, send to primary.
 
 inputs:
@@ -393,12 +393,12 @@ steps:
   - label: Recommendations
     send:
       to: "{{ primary_agent }}"
-      prompt: "builtin:ai-review-feedback"
+      prompt: "builtin:analyze-ai-reviews"
       template_vars:
         review: "{{ aggregated_responses(reviewer_agents) }}"   # computed binding, hidden from user
 ```
 
-The invocation form here shows three fields: `primary_agent`, `reviewer_agents`, and the auto-derived `context` (from `builtin:code-review`). `ai-review-feedback`'s `review` argument is a computed binding, so it never appears.
+The invocation form here shows three fields: `primary_agent`, `reviewer_agents`, and the auto-derived `context` (from `builtin:code-review`). `analyze-ai-reviews`'s `review` argument is a computed binding, so it never appears.
 
 ### 3. Per-milestone iteration with user approval
 
@@ -457,18 +457,18 @@ Three prompts ship as read-only built-ins under the `builtin:` provider. Referen
 
 - **`builtin:code-review`** — review the current uncommitted changes for correctness, design, tests, and risk. Optional `context` argument.
 - **`builtin:security-review`** — review the current uncommitted changes for real, exploitable security vulnerabilities (high confidence bar, low noise). Optional `context` argument.
-- **`builtin:ai-review-feedback`** — analyze one or more reviews into a decision-ready, de-duplicated verdict. Required `review` argument (usually wired via `template_vars` with `aggregated_responses(...)`).
+- **`builtin:analyze-ai-reviews`** — analyze one or more reviews into a decision-ready, de-duplicated verdict. Required `review` argument (usually wired via `template_vars` with `aggregated_responses(...)`).
 
 ## Shipped built-in workflows
 
 Two workflows ship with the app as a read-only built-in library (alongside the built-in prompts above). They appear in the `+ Workflow` menu tagged **built-in / read-only**; "Copy to my workflows" writes an editable copy into your user-global workflows folder if you want to customize one. They are the canonical examples to model your own on. Both standardize on `reviewers` (the fan-out list) and `worker` (the single agent that synthesizes).
 
-### `review-and-aggregate` (generic fan-in)
+### `review-and-recommend` (generic fan-in)
 
 Review in parallel with several agents, then hand the combined feedback to a worker agent. The reviewers run the hardcoded `builtin:code-review` prompt; the aggregation is an **inline `text`** step (no second prompt), so the workflow is self-contained. `code-review`'s optional `context` argument is auto-derived as a user-fillable field — it is not declared as an input.
 
 ```yaml
-name: review-and-aggregate
+name: review-and-recommend
 description: Fan a code review out to several reviewers in parallel, then hand the combined feedback to a worker agent for recommendations.
 inputs:
   reviewers:
@@ -500,12 +500,12 @@ steps:
 
 The invocation form shows `reviewers`, `worker`, and the auto-derived optional `context` (from `builtin:code-review`). `context` is the background handed to each reviewer; the worker never sees it directly — only the reviewers' responses.
 
-### `review-analyze-discuss` (flagship)
+### `review-and-reconcile` (flagship)
 
-Reviewers review in parallel with `builtin:code-review`; a worker distills their feedback into a decision-ready verdict using `builtin:ai-review-feedback` (its required `review` argument filled with the reviewers' aggregated responses via `template_vars`); the reviewers respond to the analysis; the worker gives a final recommendation. It demonstrates a computed binding into a hardcoded prompt's argument, plus round-trip discussion via the `last_output` / `aggregated_responses` helpers in inline `text`.
+Reviewers review in parallel with `builtin:code-review`; a worker distills their feedback into a decision-ready verdict using `builtin:analyze-ai-reviews` (its required `review` argument filled with the reviewers' aggregated responses via `template_vars`); the reviewers respond to the analysis; the worker gives a final recommendation. It demonstrates a computed binding into a hardcoded prompt's argument, plus round-trip discussion via the `last_output` / `aggregated_responses` helpers in inline `text`.
 
 ```yaml
-name: review-analyze-discuss
+name: review-and-reconcile
 description: Reviewers review in parallel, a worker distills their feedback into a decision-ready verdict, the reviewers respond to it, and the worker gives a final recommendation.
 inputs:
   reviewers:
@@ -527,7 +527,7 @@ steps:
     description: The worker distills the reviewers' feedback into a decision-ready verdict.
     send:
       to: "{{ worker }}"
-      prompt: "builtin:ai-review-feedback"
+      prompt: "builtin:analyze-ai-reviews"
       template_vars:
         review: "{{ aggregated_responses(reviewers) }}"
   - label: Verdict ready
@@ -561,12 +561,12 @@ steps:
       agent: "{{ worker }}"
 ```
 
-Both prompts are hardcoded. The invocation form shows `reviewers`, `worker`, and `code-review`'s auto-derived optional `context`. `ai-review-feedback`'s `review` argument is a computed binding, so it is hidden; if that prompt ever renamed `review`, invocation would be blocked with an error naming the prompt and argument rather than failing mid-run.
+Both prompts are hardcoded. The invocation form shows `reviewers`, `worker`, and `code-review`'s auto-derived optional `context`. `analyze-ai-reviews`'s `review` argument is a computed binding, so it is hidden; if that prompt ever renamed `review`, invocation would be blocked with an error naming the prompt and argument rather than failing mid-run.
 
 ## Conventions
 
-- **Filename = name field**. `review-and-aggregate.yaml` has `name: review-and-aggregate`.
-- **Slug-style names**. Lowercase, hyphens, descriptive. Verb-first if the workflow is action-shaped (`plan-then-implement`, `review-and-aggregate`).
+- **Filename = name field**. `review-and-recommend.yaml` has `name: review-and-recommend`.
+- **Slug-style names**. Lowercase, hyphens, descriptive. Verb-first if the workflow is action-shaped (`plan-then-implement`, `review-and-recommend`).
 - **Prefer agent-typed inputs over hardcoded names**. Workflows are reusable; hardcoding `reviewer-claude` makes the workflow unusable for someone whose agents are named differently.
 - **Explicit waits**. Even though `pause_for_user` with `recipient` waits implicitly, every other `send` is fire-and-forget. Pair `send` steps with `wait_for` / `wait_for_all` deliberately.
 - **One workflow per task**. If a workflow is starting to feel like it's doing two things, split it.

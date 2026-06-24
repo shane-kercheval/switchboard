@@ -1,11 +1,13 @@
 <script lang="ts">
   import type {
     RecipientRef,
+    StepPrompt,
     WorkflowStepInfo,
     WorkflowInputValue,
     WorkflowRunStatus,
   } from "$lib/types";
   import Spinner from "$lib/components/ui/Spinner.svelte";
+  import Tooltip from "$lib/components/ui/Tooltip.svelte";
   import { cn } from "$lib/utils";
 
   /// The ordered step list for a workflow, in two modes:
@@ -39,6 +41,10 @@
   type DisplayNode = {
     label: string;
     description?: string | null;
+    // The prompt the node's `send` runs, shown as a chip. A node is built from its
+    // `send` (the `wait` it absorbs carries none), so the send's prompt is the
+    // node's prompt; `null` for a non-send row or a pure-forward send.
+    prompt: StepPrompt | null;
     recipients: RecipientRef[];
     feeds_from: RecipientRef[];
     startStep: number;
@@ -81,8 +87,8 @@
 
   /// Fold the physical steps into display nodes. `send` opens a node; a matching
   /// `wait` closes it (absorbing the wait's index into the node's range);
-  /// everything else (unmatched wait, `pause`, `for_each`, or an `unknown`/legacy
-  /// kind) renders as its own row. A send never closed = fire-and-forget.
+  /// everything else (unmatched wait, `pause`, `for_each`, or a kind the reducer
+  /// doesn't recognize) renders as its own row. A send never closed = fire-and-forget.
   const nodes = $derived.by<DisplayNode[]>(() => {
     const out: DisplayNode[] = [];
     let open: OpenSend[] = [];
@@ -90,6 +96,7 @@
       const node: DisplayNode = {
         label: s.label,
         description: s.description,
+        prompt: s.prompt,
         recipients: s.recipients,
         feeds_from: s.feeds_from,
         startStep: i,
@@ -99,7 +106,7 @@
       return node;
     };
     steps.forEach((s, i) => {
-      const kind = s.kind ?? "unknown";
+      const kind = s.kind;
       if (kind === "send") {
         open.push({ node: ownRow(s, i), agents: refSet(s.recipients) });
       } else if (kind === "wait") {
@@ -154,6 +161,20 @@
       return bound.length === 0 ? [r.input] : bound;
     });
   }
+
+  /// The prompt chip's visible text: the full `provider:name` id (so the provider
+  /// — `builtin`/`local`/`mcp` — is always visible), or `inline prompt` for a send
+  /// that carries inline text rather than a named prompt.
+  function promptLabel(p: StepPrompt): string {
+    return p.kind === "inline" ? "inline prompt" : p.id;
+  }
+  /// The hover tooltip: a plain sentence explaining what the chip means, since the
+  /// id itself is already on the chip.
+  function promptTooltip(label: string, p: StepPrompt): string {
+    return p.kind === "inline"
+      ? `The "${label}" step uses an inline prompt (no named prompt).`
+      : `The "${label}" step runs the ${p.id} prompt.`;
+  }
 </script>
 
 <ol class="flex flex-col gap-1.5" data-testid="workflow-steps">
@@ -203,15 +224,40 @@
           ></span>
         {/if}
       </span>
-      <span class="flex min-w-0 flex-col gap-0.5">
-        <span class="flex flex-wrap items-baseline gap-x-1.5">
+      <span class="flex min-w-0 flex-1 flex-col gap-0.5">
+        <span class="flex flex-wrap items-center gap-x-1.5 gap-y-1">
           <span class={cn("font-medium", state === "pending" ? "text-muted" : "text-fg")}
             >{node.label}</span
           >
           {#if recipients.length > 0}
-            <span class="text-muted text-xs" data-testid={`workflow-step-recipients-${i}`}>
-              ({recipients.join(", ")})
+            <span
+              class="flex flex-wrap items-center gap-1"
+              data-testid={`workflow-step-recipients-${i}`}
+            >
+              {#each recipients as name, j (j)}
+                <span
+                  class="bg-panel text-muted rounded-full px-1.5 py-px text-[11px] leading-4"
+                  data-testid={`workflow-step-agent-${i}-${j}`}>{name}</span
+                >
+              {/each}
             </span>
+          {/if}
+          {#if node.prompt}
+            {@const prompt = node.prompt}
+            <Tooltip label={promptTooltip(node.label, prompt)}>
+              {#snippet trigger(props)}
+                <span
+                  {...props}
+                  class={cn(
+                    "border-border/70 text-muted ml-auto rounded border px-1.5 py-px text-[11px] leading-4",
+                    prompt.kind === "named" ? "font-mono" : "italic",
+                  )}
+                  data-testid={`workflow-step-prompt-${i}`}
+                >
+                  {promptLabel(prompt)}
+                </span>
+              {/snippet}
+            </Tooltip>
           {/if}
         </span>
         {#if node.description}

@@ -291,6 +291,7 @@ fn resolve_step_display(
             kind: s.kind,
             label: s.label.clone(),
             description: s.description.clone(),
+            prompt: s.prompt.clone(),
             recipients: resolve(&s.recipients),
             feeds_from: resolve(&s.feeds_from),
         })
@@ -1458,6 +1459,7 @@ mod tests {
             kind: WorkflowStepKind::Send,
             label: label.to_owned(),
             description: None,
+            prompt: None,
             recipients,
             feeds_from: Vec::new(),
         }

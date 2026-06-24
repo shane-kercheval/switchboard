@@ -860,22 +860,26 @@ export type FormCompatibility =
 export type RecipientRef = { kind: "literal"; name: string } | { kind: "slot"; input: string };
 
 // What a step is, so the progress view can group a `send` with the `wait` that
-// synchronizes it. Both wait variants are `"wait"`. `"unknown"` is the
-// forward-compatible default for a legacy run-file step written before the field
-// existed (Rust `#[serde(default)]`); the progress view treats `unknown` (and
-// anything it doesn't recognize) as non-collapsible — its own honest row.
-export type WorkflowStepKind = "send" | "wait" | "pause" | "for_each" | "unknown";
+// synchronizes it. Both wait variants are `"wait"`. The reducer's default branch
+// degrades gracefully on a kind a newer build added but this one doesn't know
+// (Rust `#[non_exhaustive]`) — such a step renders as its own honest row.
+export type WorkflowStepKind = "send" | "wait" | "pause" | "for_each";
+
+// The prompt a `send` step runs, surfaced as a "which prompt" chip: a named
+// prompt (`builtin:code-review`) or inline text. `null` on a step that runs no
+// prompt (a wait/pause, or a pure-forward send).
+export type StepPrompt = { kind: "named"; id: string } | { kind: "inline" };
 
 // One step as the progress/preview views render it. `recipients` are declared
 // (slots unresolved) on a `WorkflowFormDescriptor`, and resolved to concrete
-// agent names on a live `WorkflowRunInfo`. May be empty for a disk-sourced run
-// from a legacy run file (written before the snapshot existed). `kind` may be
-// absent on such legacy snapshots — treat a missing/unknown kind as `"unknown"`.
+// agent names on a live `WorkflowRunInfo`.
 export type WorkflowStepInfo = {
-  kind?: WorkflowStepKind;
+  kind: WorkflowStepKind;
   label: string;
-  // Optional one-line explanation, rendered as a sub-line under the label.
-  description?: string | null;
+  // One-line explanation, rendered as a sub-line under the label.
+  description: string | null;
+  // The prompt this step runs, shown as a chip; `null` when the step runs none.
+  prompt: StepPrompt | null;
   recipients: RecipientRef[];
   feeds_from: RecipientRef[];
 };

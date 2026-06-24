@@ -14514,7 +14514,7 @@ mod tests {
             .map(|p| p.name.as_str())
             .collect();
         assert!(builtins.contains(&"code-review"), "got {builtins:?}");
-        assert!(builtins.contains(&"ai-review-feedback"), "got {builtins:?}");
+        assert!(builtins.contains(&"analyze-ai-reviews"), "got {builtins:?}");
     }
 
     #[tokio::test]
@@ -14557,11 +14557,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(
-            rendered
-                .text
-                .contains("Review the current uncommitted changes")
-        );
+        assert!(rendered.text.contains("Code Review Guidelines"));
     }
 
     #[test]
@@ -15051,15 +15047,15 @@ mod tests {
             .filter(|w| w.is_builtin)
             .map(|w| w.name.as_str())
             .collect();
-        assert!(builtins.contains(&"review-and-aggregate"), "{builtins:?}");
-        assert!(builtins.contains(&"review-analyze-discuss"), "{builtins:?}");
+        assert!(builtins.contains(&"review-and-recommend"), "{builtins:?}");
+        assert!(builtins.contains(&"review-and-reconcile"), "{builtins:?}");
         // Both shipped built-ins use only runnable steps.
         assert!(listed.iter().filter(|w| w.is_builtin).all(|w| w.invocable));
-        // review-and-aggregate declares only its agent inputs; its prompt is
+        // review-and-recommend declares only its agent inputs; its prompt is
         // hardcoded and its `context` arg is auto-derived (not a declared input).
         let raa = listed
             .iter()
-            .find(|w| w.name == "review-and-aggregate")
+            .find(|w| w.name == "review-and-recommend")
             .unwrap();
         let input_names: Vec<&str> = raa.inputs.iter().map(|i| i.name.as_str()).collect();
         assert_eq!(input_names, vec!["reviewers", "worker"]);
@@ -15118,7 +15114,7 @@ mod tests {
         let err = validate_workflow_invocation_impl(
             &state,
             pid,
-            "review-and-aggregate",
+            "review-and-recommend",
             true,
             &inputs(vec![("worker", text("primary"))]),
         )
@@ -15129,7 +15125,7 @@ mod tests {
         let err = validate_workflow_invocation_impl(
             &state,
             pid,
-            "review-and-aggregate",
+            "review-and-recommend",
             true,
             &inputs(vec![
                 ("worker", text("ghost")),
@@ -15143,7 +15139,7 @@ mod tests {
         let err = validate_workflow_invocation_impl(
             &state,
             pid,
-            "review-and-aggregate",
+            "review-and-recommend",
             true,
             &inputs(vec![
                 ("worker", text("primary")),
@@ -15159,7 +15155,7 @@ mod tests {
         validate_workflow_invocation_impl(
             &state,
             pid,
-            "review-and-aggregate",
+            "review-and-recommend",
             true,
             &inputs(vec![
                 ("worker", text("primary")),
@@ -15172,7 +15168,7 @@ mod tests {
         validate_workflow_invocation_impl(
             &state,
             pid,
-            "review-and-aggregate",
+            "review-and-recommend",
             true,
             &inputs(vec![
                 ("worker", text("primary")),
@@ -15187,7 +15183,7 @@ mod tests {
     async fn describe_form_surfaces_declared_inputs_and_auto_derived_args() {
         let (_tmp, state, _pid) = workflow_state(&["primary", "reviewer-1"]).await;
 
-        let raa = describe_workflow_form_impl(&state, "review-and-aggregate", true).unwrap();
+        let raa = describe_workflow_form_impl(&state, "review-and-recommend", true).unwrap();
         assert_eq!(raa.compatibility, FormCompatibility::Ok);
         let inputs: Vec<&str> = raa.inputs.iter().map(|i| i.name.as_str()).collect();
         assert_eq!(inputs, vec!["reviewers", "worker"]);
@@ -15199,9 +15195,9 @@ mod tests {
             .collect();
         assert_eq!(derived, vec![("context", false)]);
 
-        // review-analyze-discuss surfaces `context` but NOT `review` — `review` is
-        // a computed binding (ai-review-feedback's required arg), hidden from the user.
-        let rad = describe_workflow_form_impl(&state, "review-analyze-discuss", true).unwrap();
+        // review-and-reconcile surfaces `context` but NOT `review` — `review` is
+        // a computed binding (analyze-ai-reviews's required arg), hidden from the user.
+        let rad = describe_workflow_form_impl(&state, "review-and-reconcile", true).unwrap();
         assert_eq!(rad.compatibility, FormCompatibility::Ok);
         let names: Vec<&str> = rad.derived_args.iter().map(|d| d.name.as_str()).collect();
         assert_eq!(names, vec!["context"]);
@@ -15567,7 +15563,7 @@ mod tests {
         let (tmp, state) = state_with_prompts();
         let state = state.with_workflows_dir(tmp.path().join("workflows"));
 
-        let form = describe_workflow_form_impl(&state, "review-and-aggregate", true).unwrap();
+        let form = describe_workflow_form_impl(&state, "review-and-recommend", true).unwrap();
         assert_eq!(
             form.compatibility,
             FormCompatibility::Ok,
@@ -15659,7 +15655,7 @@ mod tests {
         let run_id = invoke_workflow_impl(
             &state,
             project.id,
-            "review-and-aggregate",
+            "review-and-recommend",
             true,
             &inputs(vec![
                 ("worker", text("primary")),
@@ -15691,7 +15687,7 @@ mod tests {
         let run_id = invoke_workflow_impl(
             &state,
             pid,
-            "review-and-aggregate",
+            "review-and-recommend",
             true,
             &inputs(vec![
                 ("worker", text("primary")),
@@ -15753,7 +15749,7 @@ mod tests {
         let run_id = invoke_workflow_impl(
             &state,
             project.id,
-            "review-and-aggregate",
+            "review-and-recommend",
             true,
             &inputs(vec![
                 ("worker", text("primary")),
@@ -15890,28 +15886,28 @@ mod tests {
         let (_tmp, state, _pid) = workflow_state(&[]).await;
         let dir = user_workflows_dir(&state).unwrap();
 
-        let written = copy_builtin_workflow_impl("review-and-aggregate", &dir).unwrap();
-        assert_eq!(written, dir.join("review-and-aggregate.yaml"));
+        let written = copy_builtin_workflow_impl("review-and-recommend", &dir).unwrap();
+        assert_eq!(written, dir.join("review-and-recommend.yaml"));
         let content = std::fs::read_to_string(&written).unwrap();
-        assert!(content.contains("name: review-and-aggregate"));
+        assert!(content.contains("name: review-and-recommend"));
 
         // It now lists as a normal (non-built-in) directory workflow.
         let listed = list_workflows_impl(&state);
         assert!(
             listed
                 .iter()
-                .any(|w| w.name == "review-and-aggregate" && !w.is_builtin),
+                .any(|w| w.name == "review-and-recommend" && !w.is_builtin),
             "the copy lists as a user workflow"
         );
 
         // A second copy refuses rather than clobber.
-        let err = copy_builtin_workflow_impl("review-and-aggregate", &dir).unwrap_err();
+        let err = copy_builtin_workflow_impl("review-and-recommend", &dir).unwrap_err();
         assert!(matches!(err, AppError::WorkflowCopyExists { .. }));
 
         // A pre-existing `.yml` of the same name also blocks the `.yaml` copy
         // (the scan treats both extensions as the same workflow).
-        std::fs::write(dir.join("review-analyze-discuss.yml"), "name: x\n").unwrap();
-        let err = copy_builtin_workflow_impl("review-analyze-discuss", &dir).unwrap_err();
+        std::fs::write(dir.join("review-and-reconcile.yml"), "name: x\n").unwrap();
+        let err = copy_builtin_workflow_impl("review-and-reconcile", &dir).unwrap_err();
         assert!(matches!(err, AppError::WorkflowCopyExists { .. }));
     }
 }

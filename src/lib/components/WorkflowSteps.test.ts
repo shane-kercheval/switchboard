@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import "@testing-library/jest-dom/vitest";
 import { render, screen } from "@testing-library/svelte";
 import WorkflowSteps from "./WorkflowSteps.svelte";
-import type { RecipientRef, WorkflowStepInfo, WorkflowInputValue } from "$lib/types";
+import type { RecipientRef, StepPrompt, WorkflowStepInfo, WorkflowInputValue } from "$lib/types";
 
 function slot(input: string): RecipientRef {
   return { kind: "slot", input };
@@ -15,16 +15,17 @@ function step(
   recipients: RecipientRef[] = [],
   feeds_from: RecipientRef[] = [],
 ): WorkflowStepInfo {
-  return { label, recipients, feeds_from };
+  return { kind: "send", label, description: null, prompt: null, recipients, feeds_from };
 }
 function kstep(
-  kind: NonNullable<WorkflowStepInfo["kind"]>,
+  kind: WorkflowStepInfo["kind"],
   label: string,
   recipients: RecipientRef[] = [],
   feeds_from: RecipientRef[] = [],
   description?: string,
+  prompt: StepPrompt | null = null,
 ): WorkflowStepInfo {
-  return { kind, label, description, recipients, feeds_from };
+  return { kind, label, description: description ?? null, prompt, recipients, feeds_from };
 }
 function rowCount(): number {
   return screen.getAllByTestId(/^workflow-step-\d+$/).length;
@@ -58,9 +59,10 @@ describe("WorkflowSteps — preview mode", () => {
     // Unbound → slot name.
     expect(recipientsText(0)).toContain("reviewers");
 
-    // Bind the list slot → resolves to the agent names, in order.
+    // Bind the list slot → resolves to the agent names, in order (one chip each).
     await rerender({ steps: STEPS, mode: "preview", inputs: { reviewers: ["alice", "bob"] } });
-    expect(recipientsText(0)).toContain("alice, bob");
+    expect(recipientsText(0)).toContain("alice");
+    expect(recipientsText(0)).toContain("bob");
     expect(recipientsText(0)).not.toContain("reviewers");
 
     // Clear it → back to the slot name.
@@ -141,12 +143,13 @@ describe("WorkflowSteps — collapse (send + its wait into one deliverable node)
     expect(rows[1]).toHaveTextContent("Recommendations");
   });
 
-  it("shows recipients in parens (produced-by), not an arrow", () => {
+  it("shows recipients as chips (produced-by), not an arrow", () => {
     const steps = [kstep("send", "Code review", [lit("alice"), lit("bob")])];
     render(WorkflowSteps, { steps, mode: "preview", inputs: {} });
-    const text = recipientsText(0) ?? "";
-    expect(text).toBe("(alice, bob)");
-    expect(text).not.toContain("→");
+    // One chip per agent, in order.
+    expect(screen.getByTestId("workflow-step-agent-0-0")).toHaveTextContent("alice");
+    expect(screen.getByTestId("workflow-step-agent-0-1")).toHaveTextContent("bob");
+    expect(recipientsText(0) ?? "").not.toContain("→");
   });
 
   it("keeps a collapsed node active across both dispatch and the absorbed wait", () => {
@@ -231,11 +234,41 @@ describe("WorkflowSteps — collapse (send + its wait into one deliverable node)
     expect(rows[1]).toHaveTextContent("Your input");
   });
 
-  it("does not collapse steps with no/unknown kind (legacy snapshot degrades to raw rows)", () => {
-    // No `kind` → "unknown" → each step is its own honest row, never collapsed.
-    const steps = [step("Send the review", [slot("r")]), step("Wait for reviews", [slot("r")])];
+  it("shows a named prompt as a chip with its full provider:name id", () => {
+    const steps = [
+      kstep("send", "Code review", [lit("a")], [], undefined, {
+        kind: "named",
+        id: "builtin:code-review",
+      }),
+    ];
     render(WorkflowSteps, { steps, mode: "preview", inputs: {} });
-    expect(rowCount()).toBe(2);
+    // The full id (provider prefix included) is on the chip itself.
+    expect(screen.getByTestId("workflow-step-prompt-0")).toHaveTextContent("builtin:code-review");
+  });
+
+  it("shows an inline-text send as an 'inline prompt' chip", () => {
+    const steps = [kstep("send", "Hand off", [lit("a")], [], undefined, { kind: "inline" })];
+    render(WorkflowSteps, { steps, mode: "preview", inputs: {} });
+    expect(screen.getByTestId("workflow-step-prompt-0")).toHaveTextContent("inline prompt");
+  });
+
+  it("omits the prompt chip when a step runs no prompt", () => {
+    const steps = [kstep("wait", "Reviews received", [lit("a")])];
+    render(WorkflowSteps, { steps, mode: "preview", inputs: {} });
+    expect(screen.queryByTestId("workflow-step-prompt-0")).toBeNull();
+  });
+
+  it("a collapsed node shows the send's prompt (the wait carries none)", () => {
+    const steps = [
+      kstep("send", "Code review", [lit("a")], [], undefined, {
+        kind: "named",
+        id: "builtin:code-review",
+      }),
+      kstep("wait", "x", [lit("a")]),
+    ];
+    render(WorkflowSteps, { steps, mode: "preview", inputs: {} });
+    expect(rowCount()).toBe(1);
+    expect(screen.getByTestId("workflow-step-prompt-0")).toHaveTextContent("builtin:code-review");
   });
 
   // Diamond: nodes A [0,2] and B [1,3] have *overlapping* ranges. On failure the

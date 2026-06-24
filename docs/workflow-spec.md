@@ -27,7 +27,7 @@ What is **out of scope** for this doc:
 ## File location and naming
 
 - Workflow files are **user-global**: they live in one folder under the OS config dir (e.g. `~/Library/Application Support/switchboard/workflows/` on macOS), shared across every project in every working directory; see system-design §3. A workflow's `agent`/`[agent]` inputs bind to whichever project's agents it's run against, so the definition isn't tied to any one directory.
-- One workflow per file; filename matches the workflow's declared `name` (e.g., `review-and-aggregate.yaml`)
+- One workflow per file; filename matches the workflow's declared `name` (e.g., `review-and-recommend.yaml`)
 - File extension: `.yaml` (preferred) or `.yml`
 
 ## Top-level structure
@@ -118,7 +118,7 @@ steps:
   - label: Recommendations
     send:
       to: "{{ primary_agent }}"
-      prompt: "builtin:ai-review-feedback"
+      prompt: "builtin:analyze-ai-reviews"
       template_vars:
         review: "{{ aggregated_responses(reviewer_agents) }}"
 ```
@@ -346,7 +346,7 @@ Rationale: deterministic, predictable behavior. The author writes the workflow a
 === END response from <agent_b_name> ===
 ```
 
-A receiving prompt that simply wraps the aggregation in a single text argument (e.g., `builtin:ai-review-feedback`'s `{{ review }}`) gets this canonical shape with no Switchboard-specific authoring required.
+A receiving prompt that simply wraps the aggregation in a single text argument (e.g., `builtin:analyze-ai-reviews`'s `{{ review }}`) gets this canonical shape with no Switchboard-specific authoring required.
 
 **Sentinel collision policy:** there is no escaping of `=== START` / `=== END` in agent output. If an agent's output literally contains a sentinel-shaped line, the receiving agent sees it as part of the forwarded content. This is judged acceptable: collisions are rare in practice (the sentinel pattern is distinctive), agents are good at recovering from minor delimitation noise, and escaping would obscure the structure for the common case. Authors who need strict delimitation can use `responses_from` and a custom template that wraps content explicitly (e.g., XML-style tags).
 
@@ -490,10 +490,10 @@ steps:
       agent: "{{ implementer }}"
 ```
 
-### 2. Fan-in review (review-and-aggregate, the canonical)
+### 2. Fan-in review (review-and-recommend, the canonical)
 
 ```yaml
-name: review-and-aggregate
+name: review-and-recommend
 description: Send to multiple reviewers in parallel, aggregate, send to primary.
 
 inputs:
@@ -510,12 +510,12 @@ steps:
       agents: "{{ reviewer_agents }}"
   - send:
       to: "{{ primary_agent }}"
-      prompt: "builtin:ai-review-feedback"
+      prompt: "builtin:analyze-ai-reviews"
       template_vars:
         review: "{{ aggregated_responses(reviewer_agents) }}"
 ```
 
-Both prompts are hardcoded literals, not inputs. The invocation form shows `primary_agent`, `reviewer_agents`, and one auto-derived field — `code-review`'s optional `context` — and nothing else. `ai-review-feedback`'s required `review` argument is a **computed binding** (filled by `aggregated_responses`), so it is hidden from the user; if `ai-review-feedback` ever renamed `review`, the `template_vars: { review: … }` binding would become a `T \ A` invalid binding and invocation would be blocked with an error naming the prompt and argument.
+Both prompts are hardcoded literals, not inputs. The invocation form shows `primary_agent`, `reviewer_agents`, and one auto-derived field — `code-review`'s optional `context` — and nothing else. `analyze-ai-reviews`'s required `review` argument is a **computed binding** (filled by `aggregated_responses`), so it is hidden from the user; if `analyze-ai-reviews` ever renamed `review`, the `template_vars: { review: … }` binding would become a `T \ A` invalid binding and invocation would be blocked with an error naming the prompt and argument.
 
 This passes the aggregated reviews as a single text blob to whatever argument the analysis prompt declares — here `review`. A cross-platform prompt that takes a single text argument wraps the blob directly:
 
@@ -609,4 +609,4 @@ The following are *implementation* details, not language-spec details, and live 
 - Concurrency model for parallel `send` dispatches within a `wait_for_all`
 - Tauri command shapes for invoking workflows from the Svelte frontend
 - Workflow-progress event payload format for the frontend ring buffer
-- Built-in workflow files shipped with v1 (`review-and-aggregate.yaml`, etc.) — content TBD
+- Built-in workflow files shipped with v1 (`review-and-recommend.yaml`, etc.) — content TBD

@@ -45,7 +45,7 @@ function descriptor(
   over: Partial<WorkflowFormDescriptor> = {},
 ): WorkflowFormDescriptor {
   return {
-    name: "review-and-aggregate",
+    name: "review-and-recommend",
     description: "d",
     is_builtin: true,
     invocable: true,

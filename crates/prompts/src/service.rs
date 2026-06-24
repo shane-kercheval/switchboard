@@ -781,7 +781,7 @@ mod tests {
         };
         assert!(by_provider(LOCAL_PROVIDER).contains(&"code-review".to_owned()));
         assert!(by_provider(BUILTIN_PROVIDER).contains(&"code-review".to_owned()));
-        assert!(by_provider(BUILTIN_PROVIDER).contains(&"ai-review-feedback".to_owned()));
+        assert!(by_provider(BUILTIN_PROVIDER).contains(&"analyze-ai-reviews".to_owned()));
 
         // Each resolves to its own content.
         let mine = service
@@ -793,11 +793,7 @@ mod tests {
             .render(BUILTIN_PROVIDER, "code-review", &BTreeMap::new())
             .await
             .unwrap();
-        assert!(
-            builtin
-                .text
-                .contains("Review the current uncommitted changes")
-        );
+        assert!(builtin.text.contains("Code Review Guidelines"));
     }
 
     #[tokio::test]

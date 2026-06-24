@@ -130,12 +130,15 @@ mod tests {
     fn records_round_trip() {
         for record in [
             RunRecord::Started {
-                workflow: "review-and-aggregate".to_owned(),
+                workflow: "review-and-recommend".to_owned(),
                 total_steps: 3,
                 steps: vec![WorkflowStepInfo {
                     kind: crate::display::WorkflowStepKind::Send,
                     label: "Send the review".to_owned(),
                     description: None,
+                    prompt: Some(crate::display::StepPrompt::Named {
+                        id: "builtin:code-review".to_owned(),
+                    }),
                     recipients: vec![crate::display::RecipientRef::Slot {
                         input: "reviewers".to_owned(),
                     }],

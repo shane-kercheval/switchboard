@@ -965,7 +965,7 @@ describe("ProjectsSidebar — workflow run state (M5)", () => {
   function wfRun(over: Partial<WorkflowRunInfo> = {}): WorkflowRunInfo {
     return {
       run_id: "run-1",
-      workflow: "review-and-aggregate",
+      workflow: "review-and-recommend",
       step: 0,
       total: 3,
       status: "running",

@@ -6,7 +6,7 @@ import type { WorkflowListing } from "$lib/types";
 
 function listing(over: Partial<WorkflowListing> = {}): WorkflowListing {
   return {
-    name: "review-and-aggregate",
+    name: "review-and-recommend",
     is_builtin: true,
     description: "Fan out reviews then aggregate",
     inputs: [],
@@ -28,7 +28,7 @@ function setup(workflows: WorkflowListing[]) {
 describe("WorkflowMenu", () => {
   it("tags a built-in read-only and offers copy; picking enters it", async () => {
     const { onpick, oncopy } = setup([listing()]);
-    const key = "builtin:review-and-aggregate";
+    const key = "builtin:review-and-recommend";
     expect(screen.getByTestId(`workflow-builtin-tag-${key}`)).toBeInTheDocument();
     // The copy action is icon-only — its accessible name is the only text
     // affordance, so it carries the discoverability/a11y contract.
@@ -39,7 +39,7 @@ describe("WorkflowMenu", () => {
     expect(onpick).not.toHaveBeenCalled();
 
     await fireEvent.click(screen.getByTestId(`workflow-option-${key}`));
-    expect(onpick.mock.calls[0]?.[0]).toMatchObject({ name: "review-and-aggregate" });
+    expect(onpick.mock.calls[0]?.[0]).toMatchObject({ name: "review-and-recommend" });
   });
 
   it("shows a parse error and does not pick that row", async () => {
@@ -70,7 +70,7 @@ describe("WorkflowMenu", () => {
     await fireEvent.input(screen.getByTestId("workflow-menu-search"), {
       target: { value: "aggregate" },
     });
-    expect(screen.getByTestId("workflow-option-builtin:review-and-aggregate")).toBeInTheDocument();
+    expect(screen.getByTestId("workflow-option-builtin:review-and-recommend")).toBeInTheDocument();
     expect(screen.queryByTestId("workflow-option-dir:other")).toBeNull();
 
     await fireEvent.input(screen.getByTestId("workflow-menu-search"), {

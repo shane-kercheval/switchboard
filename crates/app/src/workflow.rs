@@ -1289,7 +1289,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn review_and_aggregate_builtin_runs_end_to_end() {
+    async fn review_and_recommend_builtin_runs_end_to_end() {
         // Runs the *actual shipped* built-in workflow YAML through the executor
         // with mock agents — guarding the file users invoke, not a copy. Parse-only
         // coverage can't catch a broken helper, a renamed prompt argument, or a bad
@@ -1299,7 +1299,7 @@ mod tests {
             ("rev-2", vec![MockScenario::Streaming]),
             ("boss", vec![MockScenario::Streaming]),
         ]);
-        let yaml = switchboard_workflow::builtin_workflow_content("review-and-aggregate")
+        let yaml = switchboard_workflow::builtin_workflow_content("review-and-recommend")
             .expect("shipped built-in");
         // A builtins-enabled `PromptService` (the default) so `builtin:code-review`
         // resolves; no local prompts needed.
@@ -1308,7 +1308,7 @@ mod tests {
             &rig,
             prompts,
             yaml,
-            "review-and-aggregate",
+            "review-and-recommend",
             supplied(vec![
                 ("reviewers", list(&["rev-1", "rev-2"])),
                 ("worker", text("boss")),
@@ -1333,7 +1333,7 @@ mod tests {
                 .expect("dispatched")
         };
         // Reviewers received the rendered `builtin:code-review` prompt.
-        assert!(body_for(rig.ids["rev-1"]).contains("Review the current uncommitted changes"));
+        assert!(body_for(rig.ids["rev-1"]).contains("Code Review Guidelines"));
         // The worker received both reviewers' outputs aggregated into the handoff.
         let worker_body = body_for(rig.ids["boss"]);
         assert!(worker_body.contains("Here's feedback from several reviewers:"));
@@ -1345,7 +1345,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn review_analyze_discuss_builtin_runs_end_to_end() {
+    async fn review_and_reconcile_builtin_runs_end_to_end() {
         // The flagship 8-step built-in, end to end. Today it is only parse-checked,
         // so reaching `Complete` is itself high-value; we also thread-check the
         // multi-round handoffs (reviewers and worker are each dispatched twice).
@@ -1363,14 +1363,14 @@ mod tests {
                 vec![MockScenario::Streaming, MockScenario::Streaming],
             ),
         ]);
-        let yaml = switchboard_workflow::builtin_workflow_content("review-analyze-discuss")
+        let yaml = switchboard_workflow::builtin_workflow_content("review-and-reconcile")
             .expect("shipped built-in");
         let (_pd, prompts) = prompt_service_with(&[]);
         let (run, _dir, path) = build_run(
             &rig,
             prompts,
             yaml,
-            "review-analyze-discuss",
+            "review-and-reconcile",
             supplied(vec![
                 ("reviewers", list(&["rev-1", "rev-2"])),
                 ("worker", text("boss")),
@@ -1394,7 +1394,7 @@ mod tests {
                 .map(|(_, b)| b.clone())
                 .collect()
         };
-        // Worker dispatched twice: first the analysis (`builtin:ai-review-feedback`
+        // Worker dispatched twice: first the analysis (`builtin:analyze-ai-reviews`
         // fed the aggregated reviews), then the final-call handoff.
         let worker_bodies = bodies_for(rig.ids["boss"]);
         assert_eq!(worker_bodies.len(), 2, "worker dispatched twice");
@@ -1408,7 +1408,7 @@ mod tests {
         // worker's verdict (which forwards `last_output(worker)`).
         let rev1_bodies = bodies_for(rig.ids["rev-1"]);
         assert_eq!(rev1_bodies.len(), 2, "reviewer dispatched twice");
-        assert!(rev1_bodies[0].contains("Review the current uncommitted changes"));
+        assert!(rev1_bodies[0].contains("Code Review Guidelines"));
         assert!(rev1_bodies[1].contains("An analyst reviewed all of the feedback"));
     }
 

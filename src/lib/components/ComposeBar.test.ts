@@ -2875,7 +2875,7 @@ describe("ComposeBar — cross-agent forward", () => {
     await state.registerAgent(AGENT_A);
     await state.registerAgent(AGENT_B);
     const WORKFLOW = {
-      name: "review-and-aggregate",
+      name: "review-and-recommend",
       is_builtin: true,
       description: "d",
       inputs: [
@@ -2888,7 +2888,7 @@ describe("ComposeBar — cross-agent forward", () => {
     // The descriptor adds the auto-derived `context` arg (optional) from the
     // hardcoded code-review prompt.
     const DESCRIPTOR = {
-      name: "review-and-aggregate",
+      name: "review-and-recommend",
       description: "d",
       is_builtin: true,
       invocable: true,
@@ -2915,8 +2915,8 @@ describe("ComposeBar — cross-agent forward", () => {
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
 
     await fireEvent.click(screen.getByTestId("compose-workflow-button"));
-    await waitFor(() => screen.getByTestId("workflow-option-builtin:review-and-aggregate"));
-    await fireEvent.click(screen.getByTestId("workflow-option-builtin:review-and-aggregate"));
+    await waitFor(() => screen.getByTestId("workflow-option-builtin:review-and-recommend"));
+    await fireEvent.click(screen.getByTestId("workflow-option-builtin:review-and-recommend"));
 
     // Workflow mode: the composer renders, and the To field + message forward
     // affordance are hidden (the workflow owns routing via its agent inputs).
@@ -2942,7 +2942,7 @@ describe("ComposeBar — cross-agent forward", () => {
     const call = invokeMock.mock.calls.find(([c]) => c === "invoke_workflow");
     expect(call?.[1]).toMatchObject({
       projectId: PROJECT_ID,
-      name: "review-and-aggregate",
+      name: "review-and-recommend",
       isBuiltin: true,
       inputs: {
         reviewers: ["bob"],
@@ -2959,7 +2959,7 @@ describe("ComposeBar — cross-agent forward", () => {
     await state.registerAgent(AGENT_A);
     await state.registerAgent(AGENT_B);
     const WORKFLOW = {
-      name: "review-and-aggregate",
+      name: "review-and-recommend",
       is_builtin: true,
       description: "d",
       inputs: [
@@ -2970,7 +2970,7 @@ describe("ComposeBar — cross-agent forward", () => {
       parse_error: null,
     };
     const DESCRIPTOR = {
-      name: "review-and-aggregate",
+      name: "review-and-recommend",
       description: "d",
       is_builtin: true,
       invocable: true,
@@ -2996,8 +2996,8 @@ describe("ComposeBar — cross-agent forward", () => {
 
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
     await fireEvent.click(screen.getByTestId("compose-workflow-button"));
-    await waitFor(() => screen.getByTestId("workflow-option-builtin:review-and-aggregate"));
-    await fireEvent.click(screen.getByTestId("workflow-option-builtin:review-and-aggregate"));
+    await waitFor(() => screen.getByTestId("workflow-option-builtin:review-and-recommend"));
+    await fireEvent.click(screen.getByTestId("workflow-option-builtin:review-and-recommend"));
     await waitFor(() => screen.getByTestId("workflow-arg-input-context"));
     await fireEvent.click(screen.getByTestId("workflow-agent-reviewers-bob"));
     await fireEvent.click(screen.getByTestId("workflow-agent-worker-alice"));
@@ -3018,7 +3018,7 @@ describe("ComposeBar — cross-agent forward", () => {
     await state.registerAgent(AGENT_A);
     await state.registerAgent(AGENT_B);
     const WORKFLOW = {
-      name: "review-and-aggregate",
+      name: "review-and-recommend",
       is_builtin: true,
       description: "d",
       inputs: [{ name: "worker", ty: "agent", optional: false, description: null }],
@@ -3026,7 +3026,7 @@ describe("ComposeBar — cross-agent forward", () => {
       parse_error: null,
     };
     const DESCRIPTOR = {
-      name: "review-and-aggregate",
+      name: "review-and-recommend",
       description: "d",
       is_builtin: true,
       invocable: true,
@@ -3053,8 +3053,8 @@ describe("ComposeBar — cross-agent forward", () => {
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
 
     await fireEvent.click(screen.getByTestId("compose-workflow-button"));
-    await waitFor(() => screen.getByTestId("workflow-option-builtin:review-and-aggregate"));
-    await fireEvent.click(screen.getByTestId("workflow-option-builtin:review-and-aggregate"));
+    await waitFor(() => screen.getByTestId("workflow-option-builtin:review-and-recommend"));
+    await fireEvent.click(screen.getByTestId("workflow-option-builtin:review-and-recommend"));
 
     await waitFor(() => screen.getByTestId("workflow-arg-input-context"));
     await fireEvent.click(screen.getByTestId("workflow-agent-worker-alice"));
@@ -3071,7 +3071,7 @@ describe("ComposeBar — cross-agent forward", () => {
     const call = invokeMock.mock.calls.find(([c]) => c === "invoke_workflow");
     // The pane-expanded agent ids land under the field name.
     expect(call?.[1]).toMatchObject({
-      name: "review-and-aggregate",
+      name: "review-and-recommend",
       forwardSources: { context: [AGENT_A.id] },
     });
   });
@@ -3230,23 +3230,36 @@ describe("ComposeBar — workflow run live view (M4 swap / hold / stop)", () => 
   function run(over: Partial<WorkflowRunInfo> = {}): WorkflowRunInfo {
     return {
       run_id: "run-1",
-      workflow: "review-and-aggregate",
+      workflow: "review-and-recommend",
       step: 0,
       total: 3,
       status: "running",
       reason: null,
       steps: [
         {
+          kind: "send",
           label: "Send the review",
+          description: null,
+          prompt: { kind: "named", id: "builtin:code-review" },
           recipients: [{ kind: "literal", name: "alice" }],
           feeds_from: [],
         },
         {
+          kind: "wait",
           label: "Wait for reviews",
+          description: null,
+          prompt: null,
           recipients: [{ kind: "literal", name: "alice" }],
           feeds_from: [],
         },
-        { label: "Hand off", recipients: [{ kind: "literal", name: "bob" }], feeds_from: [] },
+        {
+          kind: "send",
+          label: "Hand off",
+          description: null,
+          prompt: { kind: "inline" },
+          recipients: [{ kind: "literal", name: "bob" }],
+          feeds_from: [],
+        },
       ],
       ...over,
     };
@@ -3290,11 +3303,12 @@ describe("ComposeBar — workflow run live view (M4 swap / hold / stop)", () => 
     workflowRuns[PROJECT_ID] = [run({ status: "failed", step: 1, reason: "agent is busy" })];
     await tick();
 
-    // Held (no Stop), showing the failed step + reason.
+    // Held (no Stop), showing the failed step + reason. The send + its wait
+    // collapse into one node [0,1]; a failure at step 1 fails that node (index 0).
     expect(screen.getByTestId("workflow-run-live")).toHaveAttribute("data-run-status", "failed");
     expect(screen.queryByTestId("workflow-run-stop")).toBeNull();
-    expect(screen.getByTestId("workflow-step-1")).toHaveAttribute("data-step-state", "failed");
-    expect(screen.getByTestId("workflow-step-reason-1")).toHaveTextContent("agent is busy");
+    expect(screen.getByTestId("workflow-step-0")).toHaveAttribute("data-step-state", "failed");
+    expect(screen.getByTestId("workflow-step-reason-0")).toHaveTextContent("agent is busy");
 
     await fireEvent.click(screen.getByTestId("workflow-run-dismiss"));
     const call = invokeMock.mock.calls.find(([c]) => c === "abandon_workflow_run");
@@ -3323,7 +3337,7 @@ describe("ComposeBar — workflow run live view (M4 swap / hold / stop)", () => 
     await state.registerAgent(AGENT_A);
     await state.registerAgent(AGENT_B);
     const WORKFLOW = {
-      name: "review-and-aggregate",
+      name: "review-and-recommend",
       is_builtin: true,
       description: "d",
       inputs: [
@@ -3334,14 +3348,17 @@ describe("ComposeBar — workflow run live view (M4 swap / hold / stop)", () => 
       parse_error: null,
     };
     const DESCRIPTOR = {
-      name: "review-and-aggregate",
+      name: "review-and-recommend",
       description: "d",
       is_builtin: true,
       invocable: true,
       inputs: WORKFLOW.inputs,
       steps: [
         {
+          kind: "send",
           label: "Send the review",
+          description: null,
+          prompt: { kind: "named", id: "builtin:code-review" },
           recipients: [{ kind: "slot", input: "reviewers" }],
           feeds_from: [],
         },
@@ -3361,8 +3378,8 @@ describe("ComposeBar — workflow run live view (M4 swap / hold / stop)", () => 
 
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
     await fireEvent.click(screen.getByTestId("compose-workflow-button"));
-    await waitFor(() => screen.getByTestId("workflow-option-builtin:review-and-aggregate"));
-    await fireEvent.click(screen.getByTestId("workflow-option-builtin:review-and-aggregate"));
+    await waitFor(() => screen.getByTestId("workflow-option-builtin:review-and-recommend"));
+    await fireEvent.click(screen.getByTestId("workflow-option-builtin:review-and-recommend"));
     await waitFor(() => screen.getByTestId("workflow-composer"));
     await fireEvent.click(screen.getByTestId("workflow-agent-reviewers-bob"));
     await fireEvent.click(screen.getByTestId("workflow-agent-worker-alice"));

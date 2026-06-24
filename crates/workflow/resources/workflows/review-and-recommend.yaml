@@ -1,4 +1,4 @@
-name: review-and-aggregate
+name: review-and-recommend
 description: Fan a code review out to several reviewers in parallel, then hand the combined feedback to a worker agent for recommendations.
 # The review prompt is hardcoded (`builtin:code-review`). Its `context` argument
 # is not declared as an input — it is auto-derived from the prompt and offered as

@@ -288,6 +288,7 @@ fn resolve_step_display(
     declared
         .iter()
         .map(|s| WorkflowStepInfo {
+            kind: s.kind,
             label: s.label.clone(),
             recipients: resolve(&s.recipients),
             feeds_from: resolve(&s.feeds_from),
@@ -1341,7 +1342,7 @@ pub async fn cancel_runs_for_projects(state: &AppState, project_ids: &[ProjectId
 #[cfg(test)]
 mod tests {
     use super::*;
-    use switchboard_workflow::TerminalStatus;
+    use switchboard_workflow::{TerminalStatus, WorkflowStepKind};
 
     /// Captures the most recent emitted (channel, payload) for assertions.
     struct CapturingEmitter {
@@ -1453,6 +1454,7 @@ mod tests {
     }
     fn step(label: &str, recipients: Vec<RecipientRef>) -> WorkflowStepInfo {
         WorkflowStepInfo {
+            kind: WorkflowStepKind::Send,
             label: label.to_owned(),
             recipients,
             feeds_from: Vec::new(),
@@ -1483,6 +1485,8 @@ mod tests {
         assert_eq!(resolved[1].recipients, vec![lit("carol")]);
         // An unbound slot is left as-is (declared fallback).
         assert_eq!(resolved[2].recipients, vec![slot("missing")]);
+        // Resolution preserves each step's kind (only recipients are rewritten).
+        assert!(resolved.iter().all(|s| s.kind == WorkflowStepKind::Send));
     }
 
     #[test]

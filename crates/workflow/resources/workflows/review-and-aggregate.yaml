@@ -3,6 +3,10 @@ description: Fan a code review out to several reviewers in parallel, then hand t
 # The review prompt is hardcoded (`builtin:code-review`). Its `context` argument
 # is not declared as an input — it is auto-derived from the prompt and offered as
 # a user-fillable field at invocation.
+#
+# Labels name the *deliverable* each step produces (a noun phrase), not the
+# dispatch ("Send … to …"); the progress view shows agents alongside. The `wait`
+# labels are absorbed into the preceding send in the collapsed progress view.
 inputs:
   reviewers:
     type: [agent]
@@ -11,14 +15,14 @@ inputs:
     type: agent
     description: The agent that receives every reviewer's combined feedback and produces the recommendations.
 steps:
-  - label: Send code review to reviewers
+  - label: Code review
     send:
       to: "{{ reviewers }}"
       prompt: "builtin:code-review"
-  - label: Wait for all reviews
+  - label: Reviews received
     wait_for_all:
       agents: "{{ reviewers }}"
-  - label: Send combined feedback to worker
+  - label: Recommendations
     send:
       to: "{{ worker }}"
       text: |

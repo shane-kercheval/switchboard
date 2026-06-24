@@ -133,6 +133,7 @@ mod tests {
                 workflow: "review-and-aggregate".to_owned(),
                 total_steps: 3,
                 steps: vec![WorkflowStepInfo {
+                    kind: crate::display::WorkflowStepKind::Send,
                     label: "Send the review".to_owned(),
                     recipients: vec![crate::display::RecipientRef::Slot {
                         input: "reviewers".to_owned(),

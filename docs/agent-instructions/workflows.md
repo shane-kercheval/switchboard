@@ -31,11 +31,11 @@ inputs:
   reviewer_agents: [agent]
 
 steps:
-  - label: Send the review to reviewers
+  - label: Code review
     send: { ... }
-  - label: Wait for all reviews
+  - label: Reviews received
     wait_for_all: { ... }
-  - label: Aggregate feedback for the primary
+  - label: Recommendations
     send: { ... }
 ```
 
@@ -108,12 +108,14 @@ Long-form keys: `type` (required), `description` (optional), `default` (optional
 - `pause_for_user` — suspend the workflow and wait for the user to type a response
 - `for_each` — repeat a sub-sequence of steps once per item in a list
 
-**Every step requires a `label`** — a short, human-readable name (e.g. `Send the review to reviewers`) shown in the workflow's progress and preview views. It is a reserved sibling key of the step-type key and applies to *every* step type, including those inside a `for_each` body. A missing, blank, or non-string `label` is a parse error.
+**Every step requires a `label`** — shown in the workflow's progress and preview views. It is a reserved sibling key of the step-type key and applies to *every* step type, including those inside a `for_each` body. A missing, blank, or non-string `label` is a parse error.
+
+**Label convention — name the deliverable, not the dispatch.** A label should be a short **noun phrase naming what the step produces** — `Code review`, `Verdict`, `Final recommendation` — *not* a verb phrase describing the mechanic (`Send code review to reviewers`, `Wait for all reviews`). The progress view shows the producing agents alongside the label, so the label shouldn't repeat them. It also **collapses a `send` and the `wait` that synchronizes it into one row** (the wait's label is absorbed), so the view reads as a pipeline of deliverables: `Code review (alice, bob)` → `Verdict (carol)`. Give `wait` steps a brief required label anyway (e.g. `Reviews received`) — it's only shown in a degraded fallback when a step can't be collapsed.
 
 ### `send` — dispatch a message
 
 ```yaml
-- label: Ask the primary to plan
+- label: Plan
   send:
     to: "{{ primary_agent }}"
     text: "Plan the next milestone."
@@ -147,7 +149,7 @@ inputs:
   implementer: agent
   focus: text?          # declaring it here is what makes it a fillable form field
 steps:
-  - label: Send the milestone to the implementer
+  - label: Implementation
     send:
       to: "{{ implementer }}"
       text: |
@@ -162,11 +164,11 @@ The contrast: in the **named-prompt** path the user-fillable fields come from th
 ### `wait_for` and `wait_for_all` — synchronization
 
 ```yaml
-- label: Wait for the planner
+- label: Plan received
   wait_for:
     agent: "{{ planner }}"
 
-- label: Wait for all reviewers
+- label: Reviews received
   wait_for_all:
     agents: "{{ reviewer_agents }}"
 ```
@@ -176,7 +178,7 @@ The contrast: in the **named-prompt** path the user-fillable fields come from th
 ### `pause_for_user` — wait for the human
 
 ```yaml
-- label: Ask the user for direction
+- label: Direction
   pause_for_user:
     context: "Reviews are in. What direction do you want to take?"
     recipient: "{{ primary_agent }}"
@@ -200,14 +202,14 @@ If you want fire-and-forget after a pause, drop `recipient` (use Mode 1) and wri
 ### `for_each` — iterate over a list
 
 ```yaml
-- label: Iterate over milestones
+- label: Milestones
   for_each:
     item: milestone
     in: "{{ milestones }}"
     steps:
-      - label: Plan the milestone
+      - label: Plan
         send: { ... }
-      - label: Wait for the plan
+      - label: Plan received
         wait_for: { ... }
 ```
 
@@ -303,11 +305,11 @@ security-review (agent X) | code-review (agent Y)     # two different sends, no 
   send: { to: "{{ security_reviewer }}", prompt: "builtin:security-review" }
 - label: Code review                # no wait above, so this runs concurrently with the security review
   send: { to: "{{ code_reviewer }}", prompt: "builtin:code-review" }
-- label: Wait for security review
+- label: Security review received
   wait_for: { agent: "{{ security_reviewer }}" }
-- label: Wait for code review
+- label: Code review received
   wait_for: { agent: "{{ code_reviewer }}" }
-- label: Analyze both reviews
+- label: Reconciliation
   send:
     to: "{{ worker }}"
     text: "Reconcile these reviews: {{ aggregated_responses([security_reviewer, code_reviewer]) }}"
@@ -347,21 +349,21 @@ inputs:
   goal: text
 
 steps:
-  - label: Ask the planner for a plan
+  - label: Plan
     send:
       to: "{{ planner }}"
       text: "Produce a step-by-step plan to: {{ goal }}"
-  - label: Wait for the plan
+  - label: Plan received
     wait_for:
       agent: "{{ planner }}"
-  - label: Hand the plan to the implementer
+  - label: Implementation
     send:
       to: "{{ implementer }}"
       forward_from: "{{ planner }}"
       text: |
         Execute the plan above. Ask me if you encounter ambiguity
         rather than guessing.
-  - label: Wait for the implementation
+  - label: Implementation received
     wait_for:
       agent: "{{ implementer }}"
 ```
@@ -377,16 +379,16 @@ inputs:
   reviewer_agents: [agent]
 
 steps:
-  - label: Send the review to reviewers
+  - label: Code review
     send:
       to: "{{ reviewer_agents }}"
       prompt: "builtin:code-review"
       # code-review's optional `context` argument is auto-derived as a form field —
       # not declared here, not wired in template_vars.
-  - label: Wait for all reviews
+  - label: Reviews received
     wait_for_all:
       agents: "{{ reviewer_agents }}"
-  - label: Aggregate feedback for the primary
+  - label: Recommendations
     send:
       to: "{{ primary_agent }}"
       prompt: "builtin:ai-review-feedback"
@@ -408,40 +410,40 @@ inputs:
   milestones: [text]
 
 steps:
-  - label: Iterate over milestones
+  - label: Milestones
     for_each:
       item: milestone
       in: "{{ milestones }}"
       steps:
-        - label: Ask the coder to plan the milestone
+        - label: Plan
           send:
             to: "{{ coder }}"
             text: "Plan milestone: {{ milestone }}. Output the plan only."
-        - label: Wait for the plan
+        - label: Plan received
           wait_for:
             agent: "{{ coder }}"
-        - label: Pause for plan approval
+        - label: Plan approval
           pause_for_user:
             context: "Plan for {{ milestone }} ready. Approve, redirect, or add context."
             recipient: "{{ coder }}"
         # No wait_for here — pause_for_user with `recipient` (Mode 2) implicitly waits.
-        - label: Send the implementation to the reviewer
+        - label: Implementation review
           send:
             to: "{{ reviewer }}"
             forward_from: "{{ coder }}"
             text: "Review the implementation above for the milestone: {{ milestone }}"
-        - label: Wait for the review
+        - label: Review received
           wait_for:
             agent: "{{ reviewer }}"
-        - label: Send review feedback to the coder
+        - label: Revision
           send:
             to: "{{ coder }}"
             forward_from: "{{ reviewer }}"
             text: "Address the review feedback above for: {{ milestone }}"
-        - label: Wait for the revision
+        - label: Revision received
           wait_for:
             agent: "{{ coder }}"
-        - label: Pause to commit or revise
+        - label: Commit decision
           pause_for_user:
             context: "Milestone {{ milestone }} done. Commit and continue, or revise?"
             recipient: "{{ coder }}"
@@ -474,14 +476,14 @@ inputs:
     type: agent
     description: The agent that receives every reviewer's combined feedback and produces the recommendations.
 steps:
-  - label: Send code review to reviewers
+  - label: Code review
     send:
       to: "{{ reviewers }}"
       prompt: "builtin:code-review"
-  - label: Wait for all reviews
+  - label: Reviews received
     wait_for_all:
       agents: "{{ reviewers }}"
-  - label: Send combined feedback to worker
+  - label: Recommendations
     send:
       to: "{{ worker }}"
       text: |
@@ -509,23 +511,23 @@ inputs:
     type: agent
     description: The agent that distills the reviewers' feedback into a verdict, weighs their pushback, and gives the final recommendation.
 steps:
-  - label: Send code review to reviewers
+  - label: Code review
     send:
       to: "{{ reviewers }}"
       prompt: "builtin:code-review"
-  - label: Wait for all reviews
+  - label: Reviews received
     wait_for_all:
       agents: "{{ reviewers }}"
-  - label: Distill feedback into a verdict
+  - label: Verdict
     send:
       to: "{{ worker }}"
       prompt: "builtin:ai-review-feedback"
       template_vars:
         review: "{{ aggregated_responses(reviewers) }}"
-  - label: Wait for the verdict
+  - label: Verdict ready
     wait_for:
       agent: "{{ worker }}"
-  - label: Ask reviewers to weigh in on the verdict
+  - label: Reviewer responses
     send:
       to: "{{ reviewers }}"
       text: |
@@ -534,10 +536,10 @@ steps:
         {{ last_output(worker) }}
 
         Do you agree with this analysis? Push back where you think it's wrong, and confirm where it's right.
-  - label: Wait for reviewer responses
+  - label: Responses received
     wait_for_all:
       agents: "{{ reviewers }}"
-  - label: Send responses to worker for final call
+  - label: Final recommendation
     send:
       to: "{{ worker }}"
       text: |
@@ -546,7 +548,7 @@ steps:
         {{ aggregated_responses(reviewers) }}
 
         Weigh their responses and give your final recommendation.
-  - label: Wait for final recommendation
+  - label: Recommendation ready
     wait_for:
       agent: "{{ worker }}"
 ```

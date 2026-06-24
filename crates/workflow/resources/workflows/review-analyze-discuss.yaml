@@ -5,6 +5,10 @@ description: Reviewers review in parallel, a worker distills their feedback into
 # argument is auto-derived from the prompt and offered as a user-fillable field;
 # ai-review-feedback's required `review` argument is a computed binding (filled
 # from the reviewers' aggregated responses) and never shown to the user.
+#
+# Labels name the *deliverable* each step produces (a noun phrase), not the
+# dispatch; the `wait` labels are absorbed into the preceding send in the
+# collapsed progress view.
 inputs:
   reviewers:
     type: [agent]
@@ -13,23 +17,23 @@ inputs:
     type: agent
     description: The agent that distills the reviewers' feedback into a verdict, weighs their pushback, and gives the final recommendation.
 steps:
-  - label: Send code review to reviewers
+  - label: Code review
     send:
       to: "{{ reviewers }}"
       prompt: "builtin:code-review"
-  - label: Wait for all reviews
+  - label: Reviews received
     wait_for_all:
       agents: "{{ reviewers }}"
-  - label: Distill feedback into a verdict
+  - label: Verdict
     send:
       to: "{{ worker }}"
       prompt: "builtin:ai-review-feedback"
       template_vars:
         review: "{{ aggregated_responses(reviewers) }}"
-  - label: Wait for the verdict
+  - label: Verdict ready
     wait_for:
       agent: "{{ worker }}"
-  - label: Ask reviewers to weigh in on the verdict
+  - label: Reviewer responses
     send:
       to: "{{ reviewers }}"
       text: |
@@ -38,10 +42,10 @@ steps:
         {{ last_output(worker) }}
 
         Do you agree with this analysis? Push back where you think it's wrong, and confirm where it's right.
-  - label: Wait for reviewer responses
+  - label: Responses received
     wait_for_all:
       agents: "{{ reviewers }}"
-  - label: Send responses to worker for final call
+  - label: Final recommendation
     send:
       to: "{{ worker }}"
       text: |
@@ -50,6 +54,6 @@ steps:
         {{ aggregated_responses(reviewers) }}
 
         Weigh their responses and give your final recommendation.
-  - label: Wait for final recommendation
+  - label: Recommendation ready
     wait_for:
       agent: "{{ worker }}"

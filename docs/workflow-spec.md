@@ -101,18 +101,18 @@ Long-form `type` is required when long form is used; mixing shorthand and long f
 
 `steps` is a YAML sequence. Each entry is a mapping with a required **`label`** plus exactly one key naming the step type. The value of the step-type key is the step's parameters.
 
-`label` is a short, human-readable name for the step (e.g. `Send the review to reviewers`), shown in the workflow's progress and preview views. It is a reserved sibling key of the step-type key, required on **every** step including those inside a `for_each` body; a missing, blank, or non-string `label` is a validation error.
+`label` is a short, human-readable name for the step, shown in the workflow's progress and preview views. It is a reserved sibling key of the step-type key, required on **every** step including those inside a `for_each` body; a missing, blank, or non-string `label` is a validation error. By convention a label names the **deliverable** the step produces (a noun phrase — `Code review`, `Recommendations`), not the dispatch mechanic; the progress view shows the producing agents alongside it and collapses a `send` with the `wait` that synchronizes it into one row.
 
 ```yaml
 steps:
-  - label: Send the review to reviewers
+  - label: Code review
     send:
       to: "{{ reviewer_agents }}"
       prompt: "builtin:code-review"
-  - label: Wait for all reviews
+  - label: Reviews received
     wait_for_all:
       agents: "{{ reviewer_agents }}"
-  - label: Aggregate feedback for the primary
+  - label: Recommendations
     send:
       to: "{{ primary_agent }}"
       prompt: "builtin:ai-review-feedback"

@@ -30,11 +30,106 @@
 
   type StepState = "done" | "active" | "pending" | "failed" | "preview";
 
-  function stepState(index: number): StepState {
+  /// A displayed node: one unit of work. A `send` and the `wait` that
+  /// synchronizes it collapse into a single node so the view reads as a pipeline
+  /// of deliverables, not "Send…/Wait for…" mechanics. A node owns the *range* of
+  /// physical step indices it absorbed (`[startStep, endStep]`) — the live state
+  /// maps the run's single `current` index into that range, so two concurrent
+  /// nodes (overlapping ranges) both read active = two spinners.
+  type DisplayNode = {
+    label: string;
+    recipients: RecipientRef[];
+    feeds_from: RecipientRef[];
+    startStep: number;
+    endStep: number;
+  };
+
+  /// Identity of a recipient ref for collapse matching — independent of preview
+  /// slot-resolution, so a send and its wait match whether recipients are still
+  /// slots (preview) or resolved literals (live).
+  function refKey(r: RecipientRef): string {
+    return r.kind === "literal" ? `l:${r.name}` : `s:${r.input}`;
+  }
+  function refSet(refs: RecipientRef[]): Set<string> {
+    return new Set(refs.map(refKey));
+  }
+  function setEq(a: Set<string>, b: Set<string>): boolean {
+    return a.size === b.size && [...a].every((x) => b.has(x));
+  }
+  function isSubset(a: Set<string>, b: Set<string>): boolean {
+    return [...a].every((x) => b.has(x));
+  }
+
+  type OpenSend = { node: DisplayNode; agents: Set<string> };
+
+  /// Match a wait to the open send(s) it synchronizes. Equality (one send whose
+  /// recipients exactly equal the wait — FIFO when an agent set was sent to more
+  /// than once) covers linear flows and list-send→`wait_for_all`. Set-cover (a
+  /// `wait_for_all` whose recipients are the union of several open single sends)
+  /// covers the heterogeneous diamond. Anything else returns `[]` → the wait is
+  /// **not** collapsed and renders as its own honest row (a wrong-but-honest
+  /// display beats confidently mis-rendering sends as fire-and-forget).
+  function matchOpens(open: OpenSend[], want: Set<string>): OpenSend[] {
+    const eq = open.find((o) => setEq(o.agents, want));
+    if (eq) return [eq];
+    const subset = open.filter((o) => isSubset(o.agents, want));
+    if (subset.length === 0) return [];
+    const union = new Set(subset.flatMap((o) => [...o.agents]));
+    return setEq(union, want) ? subset : [];
+  }
+
+  /// Fold the physical steps into display nodes. `send` opens a node; a matching
+  /// `wait` closes it (absorbing the wait's index into the node's range);
+  /// everything else (unmatched wait, `pause`, `for_each`, or an `unknown`/legacy
+  /// kind) renders as its own row. A send never closed = fire-and-forget.
+  const nodes = $derived.by<DisplayNode[]>(() => {
+    const out: DisplayNode[] = [];
+    let open: OpenSend[] = [];
+    const ownRow = (s: WorkflowStepInfo, i: number): DisplayNode => {
+      const node: DisplayNode = {
+        label: s.label,
+        recipients: s.recipients,
+        feeds_from: s.feeds_from,
+        startStep: i,
+        endStep: i,
+      };
+      out.push(node);
+      return node;
+    };
+    steps.forEach((s, i) => {
+      const kind = s.kind ?? "unknown";
+      if (kind === "send") {
+        open.push({ node: ownRow(s, i), agents: refSet(s.recipients) });
+      } else if (kind === "wait") {
+        const matched = matchOpens(open, refSet(s.recipients));
+        if (matched.length > 0) {
+          for (const m of matched) m.node.endStep = i;
+          open = open.filter((o) => !matched.includes(o));
+        } else {
+          ownRow(s, i); // unmatched wait → honest row, not a silent mis-collapse
+        }
+      } else {
+        ownRow(s, i);
+      }
+    });
+    return out;
+  });
+
+  function nodeState(node: DisplayNode): StepState {
     if (mode === "preview") return "preview";
-    if (index < current) return "done";
-    if (index === current) return status === "running" ? "active" : "failed";
-    return "pending";
+    if (current > node.endStep) return "done";
+    if (current < node.startStep) return "pending";
+    // `current` is inside the node's absorbed range. While running, that's two
+    // concurrent spinners for overlapping (diamond) nodes — correct.
+    if (status === "running") return "active";
+    // Terminal run: attribute the failure by *ownership*, not range membership. A
+    // node owns only its send (`startStep`) and its closing wait (`endStep`); the
+    // indices between belong to interleaved sibling branches. So only the node
+    // whose own step actually failed turns red — a concurrent sibling cut short by
+    // a different branch's failure shows neutral `pending` (it never completed),
+    // not a false `failed`. (A shared `wait_for_all` failing at `endStep`
+    // correctly marks every node that absorbed it — they all own that index.)
+    return current === node.startStep || current === node.endStep ? "failed" : "pending";
   }
 
   /// Resolve a row's recipient refs to display names. A `literal` is shown
@@ -60,10 +155,10 @@
 </script>
 
 <ol class="flex flex-col gap-1.5" data-testid="workflow-steps">
-  {#each steps as step, i (i)}
-    {@const state = stepState(i)}
-    {@const recipients = names(step.recipients)}
-    {@const feeds = names(step.feeds_from)}
+  {#each nodes as node, i (i)}
+    {@const state = nodeState(node)}
+    {@const recipients = names(node.recipients)}
+    {@const feeds = names(node.feeds_from)}
     <li
       class="flex items-start gap-2 text-sm"
       data-testid={`workflow-step-${i}`}
@@ -109,11 +204,11 @@
       <span class="flex min-w-0 flex-col gap-0.5">
         <span class="flex flex-wrap items-baseline gap-x-1.5">
           <span class={cn("font-medium", state === "pending" ? "text-muted" : "text-fg")}
-            >{step.label}</span
+            >{node.label}</span
           >
           {#if recipients.length > 0}
             <span class="text-muted text-xs" data-testid={`workflow-step-recipients-${i}`}>
-              → {recipients.join(", ")}
+              ({recipients.join(", ")})
             </span>
           {/if}
         </span>

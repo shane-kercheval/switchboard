@@ -12,10 +12,40 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::{InputDecl, LabeledStep, Step, Templated, Workflow};
 
-/// One step, as the progress/preview views show it: its label, the agent(s) it
-/// targets, and any "feeds from" forwarding hint.
+/// What a step *is*, surfaced so the progress view can group a `send` with the
+/// `wait` that synchronizes it (and tell both apart from a `pause`). Both wait
+/// variants collapse to `Wait` — the display never distinguishes single from all.
+///
+/// `Unknown` is the legacy / forward-compatible default: a step persisted in a
+/// run file before this field existed (or a future kind this build doesn't know)
+/// deserializes to it. The progress view treats `Unknown` as non-collapsible — it
+/// renders as its own honest row — so an old snapshot degrades gracefully rather
+/// than failing to load.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum WorkflowStepKind {
+    Send,
+    Wait,
+    Pause,
+    ForEach,
+    /// `#[serde(other)]` so a run file written by a *newer* build that introduced a
+    /// step kind this build doesn't know (e.g. a future `retry`) deserializes here
+    /// instead of failing the whole run record — the forward-compat companion to
+    /// the field's `#[serde(default)]` (which only covers a wholly absent `kind`).
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+/// One step, as the progress/preview views show it: its kind, label, the agent(s)
+/// it targets, and any "feeds from" forwarding hint.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowStepInfo {
+    /// The step type. `#[serde(default)]` so a run-file snapshot written before
+    /// this field existed still deserializes (to `Unknown`) instead of failing.
+    #[serde(default)]
+    pub kind: WorkflowStepKind,
     pub label: String,
     /// The step's targets — who it sends to / waits for. Empty for steps with no
     /// agent target (e.g. a `for_each` wrapper).
@@ -48,17 +78,23 @@ pub fn step_display(workflow: &Workflow) -> Vec<WorkflowStepInfo> {
 }
 
 fn step_info(labeled: &LabeledStep, inputs: &[InputDecl]) -> WorkflowStepInfo {
-    let (recipients, feeds_from) = match &labeled.step {
+    let (kind, recipients, feeds_from) = match &labeled.step {
         Step::Send(s) => (
+            WorkflowStepKind::Send,
             refs(&s.to, inputs),
             s.forward_from
                 .as_ref()
                 .map(|f| refs(f, inputs))
                 .unwrap_or_default(),
         ),
-        Step::WaitFor(w) => (vec![classify(&w.agent, inputs)], Vec::new()),
-        Step::WaitForAll(w) => (refs(&w.agents, inputs), Vec::new()),
+        Step::WaitFor(w) => (
+            WorkflowStepKind::Wait,
+            vec![classify(&w.agent, inputs)],
+            Vec::new(),
+        ),
+        Step::WaitForAll(w) => (WorkflowStepKind::Wait, refs(&w.agents, inputs), Vec::new()),
         Step::PauseForUser(p) => (
+            WorkflowStepKind::Pause,
             p.recipient
                 .as_ref()
                 .map(|r| vec![classify(r, inputs)])
@@ -69,9 +105,10 @@ fn step_info(labeled: &LabeledStep, inputs: &[InputDecl]) -> WorkflowStepInfo {
         // theirs. Bodies are not descended yet — revisit when `for_each` becomes
         // runnable (end of v1): an iterating run's progress view will need the body
         // steps flattened/recursed, not just the bare wrapper row.
-        Step::ForEach(_) => (Vec::new(), Vec::new()),
+        Step::ForEach(_) => (WorkflowStepKind::ForEach, Vec::new(), Vec::new()),
     };
     WorkflowStepInfo {
+        kind,
         label: labeled.label.clone(),
         recipients,
         feeds_from,
@@ -191,6 +228,7 @@ mod tests {
     #[test]
     fn wire_shape_is_snake_case_with_kind_tagged_recipients() {
         let info = WorkflowStepInfo {
+            kind: WorkflowStepKind::Send,
             label: "Send the review".to_owned(),
             recipients: vec![
                 RecipientRef::Slot {
@@ -204,6 +242,7 @@ mod tests {
         };
         let v = serde_json::to_value(&info).unwrap();
         assert_eq!(v["label"], "Send the review");
+        assert_eq!(v["kind"], "send");
         assert_eq!(v["recipients"][0]["kind"], "slot");
         assert_eq!(v["recipients"][0]["input"], "reviewers");
         assert_eq!(v["recipients"][1]["kind"], "literal");
@@ -212,6 +251,52 @@ mod tests {
         // Round-trips.
         let back: WorkflowStepInfo = serde_json::from_value(v).unwrap();
         assert_eq!(back, info);
+    }
+
+    #[test]
+    fn step_kind_is_populated_per_step_type() {
+        let steps = display(
+            "name: wf\ndescription: d\ninputs:\n  a: agent\n  b: agent\nsteps:\n  - {label: S, send: {to: \"{{ a }}\", text: hi}}\n  - {label: W, wait_for: {agent: \"{{ a }}\"}}\n  - {label: WA, wait_for_all: {agents: [\"{{ a }}\", \"{{ b }}\"]}}\n  - {label: P, pause_for_user: {context: c}}\n",
+        );
+        let kinds: Vec<WorkflowStepKind> = steps.iter().map(|s| s.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                WorkflowStepKind::Send,
+                WorkflowStepKind::Wait,
+                WorkflowStepKind::Wait, // both wait variants collapse to Wait
+                WorkflowStepKind::Pause,
+            ]
+        );
+    }
+
+    #[test]
+    fn legacy_step_snapshot_without_kind_deserializes_to_unknown() {
+        // A run-file snapshot written before `kind` existed has no `kind` key; it
+        // must still load (degrading to `Unknown`), not fail the whole run record.
+        let legacy = serde_json::json!({
+            "label": "Send the review",
+            "recipients": [{ "kind": "slot", "input": "reviewers" }],
+            "feeds_from": [],
+        });
+        let back: WorkflowStepInfo = serde_json::from_value(legacy).unwrap();
+        assert_eq!(back.kind, WorkflowStepKind::Unknown);
+        assert_eq!(back.label, "Send the review");
+    }
+
+    #[test]
+    fn unknown_future_kind_string_deserializes_to_unknown() {
+        // A run file from a *newer* build with a step kind this build doesn't know
+        // must load (degrading that step to `Unknown`), not fail to deserialize.
+        let future = serde_json::json!({
+            "kind": "retry",
+            "label": "Retry the step",
+            "recipients": [],
+            "feeds_from": [],
+        });
+        let back: WorkflowStepInfo = serde_json::from_value(future).unwrap();
+        assert_eq!(back.kind, WorkflowStepKind::Unknown);
+        assert_eq!(back.label, "Retry the step");
     }
 
     #[test]

@@ -270,6 +270,69 @@ A workflow's user-fillable **text fields** — both genuine `text` inputs and th
 
 **This is completed-only.** The source's latest **completed** turn is captured at invoke. If a chosen source still has an **in-flight (streaming) turn**, invocation is **rejected** with a clear message ("agent X is still responding — wait for it to finish, then run the workflow") — the workflow launch is never held open waiting on a streaming agent. So a forward-from source must already be done responding when you invoke. This differs from manual compose-bar forwarding, which *holds* the send until a streaming source finishes; workflow invocation does not hold.
 
+## Workflow shapes you can build
+
+The execution model is small but composes into several distinct *topologies*. The only two facts you need:
+
+- **`send` is fire-and-forget** — it dispatches and returns immediately, without waiting for the agent(s).
+- **`wait_for` / `wait_for_all` are barriers** — they block until the named agent(s) reach a terminal state, and they're what makes a completed agent's output available to later steps (via `forward_from` and the `responses_from` / `aggregated_responses` / `last_output` helpers).
+
+So **the structure of a workflow is determined entirely by where you place the waits**, not by the sends. Want two things to happen one-after-another? Put a wait between them. Want them to overlap? Issue both sends back-to-back and put the wait(s) after. That single lever yields all of the shapes below.
+
+### Sequential handoff (A → B → C)
+Each step waits before the next runs; outputs chain forward. `send A` → `wait_for A` → `send B` (forwarding A) → `wait_for B` → …
+Use when each step depends on the previous one's output. (Worked example 1.)
+
+### Parallel fan-out, one prompt (A,B,C in parallel)
+A single `send` with a **list** `to:` dispatches the *same* prompt to N agents concurrently, then one `wait_for_all` synchronizes them. `send P → [a, b, c]` → `wait_for_all [a, b, c]`.
+Use when several agents do the *same* job (e.g. N reviewers running the same review prompt).
+
+### Heterogeneous concurrent fan-out — the "diamond"
+Two or more sends with **different** prompts that run **at the same time**, then fan in. Because a single `send` carries one prompt, *different* concurrent jobs require *separate* sends — and because `send` is fire-and-forget, placing them back-to-back (no wait between) makes them overlap:
+
+```
+security-review (agent X) | code-review (agent Y)     # two different sends, no wait between → run concurrently
+                \                /
+                 wait for both                          # barrier(s)
+                       |
+               analyze-feedback (worker)                # fan-in reads both
+```
+
+```yaml
+- label: Security review
+  send: { to: "{{ security_reviewer }}", prompt: "builtin:security-review" }
+- label: Code review                # no wait above, so this runs concurrently with the security review
+  send: { to: "{{ code_reviewer }}", prompt: "builtin:code-review" }
+- label: Wait for security review
+  wait_for: { agent: "{{ security_reviewer }}" }
+- label: Wait for code review
+  wait_for: { agent: "{{ code_reviewer }}" }
+- label: Analyze both reviews
+  send:
+    to: "{{ worker }}"
+    text: "Reconcile these reviews: {{ aggregated_responses([security_reviewer, code_reviewer]) }}"
+```
+
+This is the shape a single fan-out `send` **cannot** express (that's one prompt to many agents; this is *different* prompts overlapping). It is the reason `wait_for` is a separate, explicitly-placed step rather than something implied by the previous send. (`builtin:security-review` and `builtin:code-review` are both shipped built-ins — see "Shipped built-in prompts" — but any `prompt:` id must name a prompt that actually exists, or invocation is rejected.)
+
+### Fan-out → fan-in (one → many → one)
+A first agent's output fans out to several workers (same-prompt list *or* the heterogeneous diamond above), which then collapse back into one. `send → planner` → `wait` → `send → impl_a` + `send → impl_b` (concurrent, each forwarding the planner) → `wait both` → `send → reviewer` forwarding both.
+
+### Fan-in / aggregation
+The collapse half on its own: after a `wait_for_all`, a `send` consumes every prior agent's output, either with `forward_from: [a, b, …]` or `aggregated_responses([...])` / `responses_from([...])` inside `text`/`template_vars`. (Worked example 2; both built-ins.)
+
+### Fire-and-forget tail
+A final `send` with **no** trailing wait — the run holds open until the dispatched turn settles, then completes. Use for a closing "notify"/"summary" send whose result nothing else consumes.
+
+### Human-in-the-loop and iteration (gated)
+`pause_for_user` (suspend for the user's typed input — Mode 1 captures, Mode 2 also dispatches and waits) and `for_each` (run a sub-sequence once per list item) add interactive and looping shapes. These parse and validate today but are **not runnable until a later milestone** — a workflow using either lists as syntactically valid but cannot be invoked yet.
+
+### Rule of thumb
+- **Sequential?** Put a `wait_for` between the two sends.
+- **Concurrent, same job?** One `send` to a list `to:`, then `wait_for_all`.
+- **Concurrent, different jobs (diamond)?** Separate sends back-to-back with **no** wait between them, then the wait(s), then the fan-in send.
+- The waits' **placement** is the whole design; everything else is which message goes to whom.
+
 ## Worked examples
 
 ### 1. Sequential handoff (planner → implementer)
@@ -384,9 +447,17 @@ steps:
             recipient: "{{ coder }}"
 ```
 
+## Shipped built-in prompts
+
+Three prompts ship as read-only built-ins under the `builtin:` provider. Reference one from a `send` step's `prompt:` field as `prompt: "builtin:<name>"`, or copy it into your own prompts to edit. These are the **only** `builtin:` prompt ids — any other `prompt:` id must resolve to a `local:` or MCP prompt that exists, or invocation is rejected.
+
+- **`builtin:code-review`** — review the current uncommitted changes for correctness, design, tests, and risk. Optional `context` argument.
+- **`builtin:security-review`** — review the current uncommitted changes for real, exploitable security vulnerabilities (high confidence bar, low noise). Optional `context` argument.
+- **`builtin:ai-review-feedback`** — analyze one or more reviews into a decision-ready, de-duplicated verdict. Required `review` argument (usually wired via `template_vars` with `aggregated_responses(...)`).
+
 ## Shipped built-in workflows
 
-Two workflows ship with the app as a read-only built-in library (alongside the built-in prompts they consume, `code-review` and `ai-review-feedback`). They appear in the `+ Workflow` menu tagged **built-in / read-only**; "Copy to my workflows" writes an editable copy into your user-global workflows folder if you want to customize one. They are the canonical examples to model your own on. Both standardize on `reviewers` (the fan-out list) and `worker` (the single agent that synthesizes).
+Two workflows ship with the app as a read-only built-in library (alongside the built-in prompts above). They appear in the `+ Workflow` menu tagged **built-in / read-only**; "Copy to my workflows" writes an editable copy into your user-global workflows folder if you want to customize one. They are the canonical examples to model your own on. Both standardize on `reviewers` (the fan-out list) and `worker` (the single agent that synthesizes).
 
 ### `review-and-aggregate` (generic fan-in)
 

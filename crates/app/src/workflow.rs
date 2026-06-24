@@ -1131,6 +1131,288 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn diamond_two_heterogeneous_sends_fan_in_to_one() {
+        // The "diamond" shape: two *different* sends — distinct messages/jobs (a
+        // security review and a code review) — issued back-to-back with no wait
+        // between, then a barrier fans both into one worker. A single fan-out
+        // `send` (one message to a list) cannot express this; the decoupled
+        // `wait_for` is what makes it possible. This test asserts the *shape* and
+        // composed fan-in body; genuine overlap is proven separately by
+        // `heterogeneous_fan_out_runs_concurrently_not_serially`.
+        let rig = rig(vec![
+            ("sec", vec![MockScenario::Streaming]),
+            ("code", vec![MockScenario::Streaming]),
+            ("worker", vec![MockScenario::Streaming]),
+        ]);
+        let yaml = "name: diamond\ndescription: d\ninputs:\n  sec: agent\n  code: agent\n  worker: agent\nsteps:\n  - label: Security review\n    send:\n      to: \"{{ sec }}\"\n      text: \"Security review the changes.\"\n  - label: Code review\n    send:\n      to: \"{{ code }}\"\n      text: \"Code review the changes.\"\n  - label: Wait for security review\n    wait_for:\n      agent: \"{{ sec }}\"\n  - label: Wait for code review\n    wait_for:\n      agent: \"{{ code }}\"\n  - label: Combine reviews\n    send:\n      to: \"{{ worker }}\"\n      text: \"Combine these reviews: {{ aggregated_responses([sec, code]) }}\"\n";
+        let (run, _dir, path) = build_run(
+            &rig,
+            PromptService::disabled(),
+            yaml,
+            "diamond",
+            supplied(vec![
+                ("sec", text("sec")),
+                ("code", text("code")),
+                ("worker", text("worker")),
+            ]),
+            CancellationToken::new(),
+        );
+        assert_eq!(run.execute().await, RunStatus::Complete);
+        assert!(matches!(
+            records(&path).last(),
+            Some(RunRecord::Terminal {
+                status: TerminalStatus::Complete,
+                ..
+            })
+        ));
+
+        let sends = rig.sends.lock().unwrap();
+        let body_for = |id: AgentId| -> String {
+            sends
+                .iter()
+                .find(|(i, _)| *i == id)
+                .map(|(_, b)| b.clone())
+                .expect("dispatched")
+        };
+        // Each branch got its own distinct message (true heterogeneity, not a
+        // single shared fan-out message).
+        assert!(body_for(rig.ids["sec"]).contains("Security review"));
+        assert!(body_for(rig.ids["code"]).contains("Code review"));
+        // The worker's body fans both branches in, in declared order.
+        let worker_body = body_for(rig.ids["worker"]);
+        assert!(
+            worker_body.contains("=== START response from sec ==="),
+            "got: {worker_body}"
+        );
+        assert!(
+            worker_body.contains("=== START response from code ==="),
+            "got: {worker_body}"
+        );
+        assert!(worker_body.find("from sec").unwrap() < worker_body.find("from code").unwrap());
+    }
+
+    #[tokio::test]
+    async fn fan_out_one_to_two_then_collapse_to_one() {
+        // One → two → one: a planner's output fans out to two *different* workers
+        // (distinct messages) issued back-to-back with no wait between their sends,
+        // then both collapse into a reviewer via multi-source `forward_from`.
+        // Asserts the shape and composed bodies; overlap itself is proven by
+        // `heterogeneous_fan_out_runs_concurrently_not_serially`.
+        let rig = rig(vec![
+            ("planner", vec![MockScenario::Streaming]),
+            ("impl_a", vec![MockScenario::Streaming]),
+            ("impl_b", vec![MockScenario::Streaming]),
+            ("reviewer", vec![MockScenario::Streaming]),
+        ]);
+        let yaml = "name: fanout\ndescription: d\ninputs:\n  planner: agent\n  impl_a: agent\n  impl_b: agent\n  reviewer: agent\n  goal: text\nsteps:\n  - label: Plan\n    send:\n      to: \"{{ planner }}\"\n      text: \"Plan: {{ goal }}\"\n  - label: Wait for plan\n    wait_for:\n      agent: \"{{ planner }}\"\n  - label: Implement part A\n    send:\n      to: \"{{ impl_a }}\"\n      forward_from: \"{{ planner }}\"\n      text: \"Implement part A of the plan above.\"\n  - label: Implement part B\n    send:\n      to: \"{{ impl_b }}\"\n      forward_from: \"{{ planner }}\"\n      text: \"Implement part B of the plan above.\"\n  - label: Wait for A\n    wait_for:\n      agent: \"{{ impl_a }}\"\n  - label: Wait for B\n    wait_for:\n      agent: \"{{ impl_b }}\"\n  - label: Review both\n    send:\n      to: \"{{ reviewer }}\"\n      forward_from: [\"{{ impl_a }}\", \"{{ impl_b }}\"]\n      text: \"Review both implementations.\"\n";
+        let (run, _dir, path) = build_run(
+            &rig,
+            PromptService::disabled(),
+            yaml,
+            "fanout",
+            supplied(vec![
+                ("planner", text("planner")),
+                ("impl_a", text("impl_a")),
+                ("impl_b", text("impl_b")),
+                ("reviewer", text("reviewer")),
+                ("goal", text("ship it")),
+            ]),
+            CancellationToken::new(),
+        );
+        assert_eq!(run.execute().await, RunStatus::Complete);
+        assert!(matches!(
+            records(&path).last(),
+            Some(RunRecord::Terminal {
+                status: TerminalStatus::Complete,
+                ..
+            })
+        ));
+
+        let sends = rig.sends.lock().unwrap();
+        let body_for = |id: AgentId| -> String {
+            sends
+                .iter()
+                .find(|(i, _)| *i == id)
+                .map(|(_, b)| b.clone())
+                .expect("dispatched")
+        };
+        // Both implementers received the planner's output (the fan-out).
+        assert!(body_for(rig.ids["impl_a"]).contains("=== START forwarded from planner ==="));
+        assert!(body_for(rig.ids["impl_b"]).contains("=== START forwarded from planner ==="));
+        // The reviewer received both implementers' outputs (the collapse).
+        let reviewer_body = body_for(rig.ids["reviewer"]);
+        assert!(
+            reviewer_body.contains("=== START forwarded from impl_a ==="),
+            "got: {reviewer_body}"
+        );
+        assert!(
+            reviewer_body.contains("=== START forwarded from impl_b ==="),
+            "got: {reviewer_body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn heterogeneous_fan_out_runs_concurrently_not_serially() {
+        // Proves the overlap is real, not just expressible: two different sends with
+        // no wait between them put *both* agents in flight at once. If `send`
+        // blocked on its recipient, the second turn could not start until the first
+        // finished — and `wait_for_type("turn_start", 2)` would hang.
+        let sig_a = Arc::new(tokio::sync::Notify::new());
+        let sig_b = Arc::new(tokio::sync::Notify::new());
+        let rig = rig(vec![
+            (
+                "a",
+                vec![MockScenario::CompletesOnSignal(Arc::clone(&sig_a))],
+            ),
+            (
+                "b",
+                vec![MockScenario::CompletesOnSignal(Arc::clone(&sig_b))],
+            ),
+        ]);
+        let yaml = "name: conc\ndescription: d\ninputs:\n  a: agent\n  b: agent\nsteps:\n  - label: Send a\n    send:\n      to: \"{{ a }}\"\n      text: a\n  - label: Send b\n    send:\n      to: \"{{ b }}\"\n      text: b\n  - label: Wait a\n    wait_for:\n      agent: \"{{ a }}\"\n  - label: Wait b\n    wait_for:\n      agent: \"{{ b }}\"\n";
+        let (run, _dir, _path) = build_run(
+            &rig,
+            PromptService::disabled(),
+            yaml,
+            "conc",
+            supplied(vec![("a", text("a")), ("b", text("b"))]),
+            CancellationToken::new(),
+        );
+        let handle = tokio::spawn(run.execute());
+        // Both turns are in flight before either completes — the overlap a
+        // block-after-send model could never produce.
+        rig.emitter.wait_for_type("turn_start", 2).await;
+        // Release both; the barriers resolve and the run completes.
+        sig_a.notify_one();
+        sig_b.notify_one();
+        assert_eq!(handle.await.unwrap(), RunStatus::Complete);
+    }
+
+    #[tokio::test]
+    async fn review_and_aggregate_builtin_runs_end_to_end() {
+        // Runs the *actual shipped* built-in workflow YAML through the executor
+        // with mock agents — guarding the file users invoke, not a copy. Parse-only
+        // coverage can't catch a broken helper, a renamed prompt argument, or a bad
+        // agent reference; this can.
+        let rig = rig(vec![
+            ("rev-1", vec![MockScenario::Streaming]),
+            ("rev-2", vec![MockScenario::Streaming]),
+            ("boss", vec![MockScenario::Streaming]),
+        ]);
+        let yaml = switchboard_workflow::builtin_workflow_content("review-and-aggregate")
+            .expect("shipped built-in");
+        // A builtins-enabled `PromptService` (the default) so `builtin:code-review`
+        // resolves; no local prompts needed.
+        let (_pd, prompts) = prompt_service_with(&[]);
+        let (run, _dir, path) = build_run(
+            &rig,
+            prompts,
+            yaml,
+            "review-and-aggregate",
+            supplied(vec![
+                ("reviewers", list(&["rev-1", "rev-2"])),
+                ("worker", text("boss")),
+            ]),
+            CancellationToken::new(),
+        );
+        assert_eq!(run.execute().await, RunStatus::Complete);
+        assert!(matches!(
+            records(&path).last(),
+            Some(RunRecord::Terminal {
+                status: TerminalStatus::Complete,
+                ..
+            })
+        ));
+
+        let sends = rig.sends.lock().unwrap();
+        let body_for = |id: AgentId| -> String {
+            sends
+                .iter()
+                .find(|(i, _)| *i == id)
+                .map(|(_, b)| b.clone())
+                .expect("dispatched")
+        };
+        // Reviewers received the rendered `builtin:code-review` prompt.
+        assert!(body_for(rig.ids["rev-1"]).contains("Review the current uncommitted changes"));
+        // The worker received both reviewers' outputs aggregated into the handoff.
+        let worker_body = body_for(rig.ids["boss"]);
+        assert!(worker_body.contains("Here's feedback from several reviewers:"));
+        assert!(
+            worker_body.contains("=== START response from rev-1 ==="),
+            "got: {worker_body}"
+        );
+        assert!(worker_body.contains("=== START response from rev-2 ==="));
+    }
+
+    #[tokio::test]
+    async fn review_analyze_discuss_builtin_runs_end_to_end() {
+        // The flagship 8-step built-in, end to end. Today it is only parse-checked,
+        // so reaching `Complete` is itself high-value; we also thread-check the
+        // multi-round handoffs (reviewers and worker are each dispatched twice).
+        let rig = rig(vec![
+            (
+                "rev-1",
+                vec![MockScenario::Streaming, MockScenario::Streaming],
+            ),
+            (
+                "rev-2",
+                vec![MockScenario::Streaming, MockScenario::Streaming],
+            ),
+            (
+                "boss",
+                vec![MockScenario::Streaming, MockScenario::Streaming],
+            ),
+        ]);
+        let yaml = switchboard_workflow::builtin_workflow_content("review-analyze-discuss")
+            .expect("shipped built-in");
+        let (_pd, prompts) = prompt_service_with(&[]);
+        let (run, _dir, path) = build_run(
+            &rig,
+            prompts,
+            yaml,
+            "review-analyze-discuss",
+            supplied(vec![
+                ("reviewers", list(&["rev-1", "rev-2"])),
+                ("worker", text("boss")),
+            ]),
+            CancellationToken::new(),
+        );
+        assert_eq!(run.execute().await, RunStatus::Complete);
+        assert!(matches!(
+            records(&path).last(),
+            Some(RunRecord::Terminal {
+                status: TerminalStatus::Complete,
+                ..
+            })
+        ));
+
+        let sends = rig.sends.lock().unwrap();
+        let bodies_for = |id: AgentId| -> Vec<String> {
+            sends
+                .iter()
+                .filter(|(i, _)| *i == id)
+                .map(|(_, b)| b.clone())
+                .collect()
+        };
+        // Worker dispatched twice: first the analysis (`builtin:ai-review-feedback`
+        // fed the aggregated reviews), then the final-call handoff.
+        let worker_bodies = bodies_for(rig.ids["boss"]);
+        assert_eq!(worker_bodies.len(), 2, "worker dispatched twice");
+        assert!(
+            worker_bodies[0].contains("=== START response from rev-1 ==="),
+            "got: {}",
+            worker_bodies[0]
+        );
+        assert!(worker_bodies[1].contains("give your final recommendation"));
+        // Reviewers dispatched twice: the code review, then weighing in on the
+        // worker's verdict (which forwards `last_output(worker)`).
+        let rev1_bodies = bodies_for(rig.ids["rev-1"]);
+        assert_eq!(rev1_bodies.len(), 2, "reviewer dispatched twice");
+        assert!(rev1_bodies[0].contains("Review the current uncommitted changes"));
+        assert!(rev1_bodies[1].contains("An analyst reviewed all of the feedback"));
+    }
+
+    #[tokio::test]
     async fn user_fillable_arg_renders_into_the_prompt_or_omits_when_blank() {
         let body_for = |user: BTreeMap<String, String>| async move {
             let (_pd, prompts) = prompt_service_with(&[(

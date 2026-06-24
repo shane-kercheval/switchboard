@@ -33,6 +33,7 @@ fn label() -> &'static Path {
 const BUILTIN_PROMPTS: &[&str] = &[
     include_str!("../resources/prompts/code-review.md"),
     include_str!("../resources/prompts/ai-review-feedback.md"),
+    include_str!("../resources/prompts/security-review.md"),
 ];
 
 /// Serves the binary-baked built-in prompts. Stateless — the content is a
@@ -132,7 +133,31 @@ mod tests {
         let names: Vec<&str> = prompts.iter().map(|p| p.name.as_str()).collect();
         assert!(names.contains(&"code-review"), "got {names:?}");
         assert!(names.contains(&"ai-review-feedback"), "got {names:?}");
+        assert!(names.contains(&"security-review"), "got {names:?}");
         assert!(prompts.iter().all(|p| p.provider == BUILTIN_PROVIDER));
+    }
+
+    #[tokio::test]
+    async fn security_review_renders_with_and_without_context() {
+        let provider = BuiltinProvider::new();
+
+        let with = provider
+            .render(
+                "security-review",
+                &args(&[("context", "the new file-upload endpoint")]),
+            )
+            .await
+            .unwrap();
+        assert!(with.contains("the new file-upload endpoint"));
+        assert!(with.contains("security vulnerabilities"));
+        assert!(!with.contains("No extra context was provided"));
+
+        let without = provider
+            .render("security-review", &args(&[]))
+            .await
+            .unwrap();
+        assert!(without.contains("No extra context was provided"));
+        assert!(!without.contains("Context for this review"));
     }
 
     #[tokio::test]

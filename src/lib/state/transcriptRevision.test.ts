@@ -57,6 +57,7 @@ describe("transcript revision (the re-anchor change signal)", () => {
       type: "turn_start",
       turn_id: TURN_1,
       message_id: MESSAGE_1,
+      send_id: MESSAGE_1,
       started_at: "2026-05-16T00:00:00Z",
     });
 
@@ -119,6 +120,7 @@ describe("transcript revision (the re-anchor change signal)", () => {
       type: "turn_start",
       turn_id: TURN_1,
       message_id: MESSAGE_1,
+      send_id: MESSAGE_1,
       started_at: "2026-05-16T00:00:00Z",
     });
     // A liveness signal mid-stream re-arms the heartbeat but changes no content,

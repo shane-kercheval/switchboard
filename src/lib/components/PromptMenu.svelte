@@ -1,8 +1,11 @@
 <script lang="ts">
   import { tick } from "svelte";
+  import { BookmarkPlus } from "@lucide/svelte";
   import type { Prompt } from "$lib/types";
-  import { promptDisplayName } from "$lib/prompt";
+  import { isBuiltinPrompt, promptDisplayName } from "$lib/prompt";
   import { cn } from "$lib/utils";
+  import Tooltip from "$lib/components/ui/Tooltip.svelte";
+  import { ICON_BUTTON_CLASS } from "$lib/components/ui/iconButton";
 
   /// A typeahead popover over the cached prompt list. Opened by the compose
   /// bar's prompt button (or `/` on an empty textarea); picking a prompt enters
@@ -13,6 +16,8 @@
     prompts,
     loading = false,
     onpick,
+    oncopy,
+    onopenfolder,
     onclose,
   }: {
     prompts: Prompt[];
@@ -20,6 +25,12 @@
     /// "no prompts" empty state, which would otherwise flash on first open.
     loading?: boolean;
     onpick: (prompt: Prompt) => void;
+    /// Copy a read-only built-in into the user's own prompts. Only built-in rows
+    /// surface the affordance; omitting the handler hides it everywhere.
+    oncopy?: (prompt: Prompt) => void;
+    /// Open the local prompts folder (where the user adds their own). Omitting the
+    /// handler hides the row.
+    onopenfolder?: () => void;
     onclose: () => void;
   } = $props();
 
@@ -76,28 +87,71 @@
   data-testid="prompt-menu"
   role="listbox"
 >
-  <div class="max-h-64 overflow-y-auto" data-testid="prompt-menu-scroll">
+  <!-- Inset the rows from the right edge (`pr-2`) so the scrollbar doesn't sit on
+       top of the per-row copy button; `scrollbar-gutter: stable` reserves a proper
+       lane on WebKit versions that support it (older ones ignore it, hence the
+       padding). -->
+  <div
+    class="max-h-64 [scrollbar-gutter:stable] overflow-y-auto pr-3"
+    data-testid="prompt-menu-scroll"
+  >
     {#each filtered as prompt, i (promptKey(prompt))}
-      <button
-        type="button"
-        class={cn(
-          "flex w-full cursor-pointer flex-col gap-0.5 rounded-md px-2.5 py-1.5 text-left outline-none select-none",
-          i === highlighted ? "bg-panel/80" : "",
-        )}
-        data-testid={`prompt-option-${promptKey(prompt)}`}
-        role="option"
-        aria-selected={i === highlighted}
-        onmousemove={() => (highlighted = i)}
-        onclick={() => onpick(prompt)}
-      >
-        <span class="flex items-baseline gap-1.5">
-          <span class="text-fg text-sm font-medium">{promptDisplayName(prompt)}</span>
-          <span class="text-muted font-mono text-[11px]">{prompt.provider}</span>
-        </span>
-        {#if prompt.description}
-          <span class="text-muted truncate text-xs">{prompt.description}</span>
+      {@const builtin = isBuiltinPrompt(prompt)}
+      <!-- The row wraps a full-width pick button plus, for built-ins, a separate
+           "Copy to my prompts" button. They are siblings (not nested) so both
+           stay real, accessible buttons. -->
+      <div class="relative" role="presentation" onmousemove={() => (highlighted = i)}>
+        <button
+          type="button"
+          class={cn(
+            "flex w-full cursor-pointer flex-col gap-0.5 rounded-md px-2.5 py-1.5 text-left outline-none select-none",
+            i === highlighted ? "bg-panel/80" : "",
+            builtin ? "pr-10" : "",
+          )}
+          data-testid={`prompt-option-${promptKey(prompt)}`}
+          role="option"
+          aria-selected={i === highlighted}
+          onclick={() => onpick(prompt)}
+        >
+          <span class="flex items-baseline gap-1.5">
+            <span class="text-fg text-sm font-medium">{promptDisplayName(prompt)}</span>
+            <span class="text-muted font-mono text-[11px]">{prompt.provider}</span>
+            {#if builtin}
+              <span
+                class="border-border/80 text-muted rounded border px-1 text-[10px] tracking-wide uppercase"
+                data-testid={`prompt-builtin-tag-${promptKey(prompt)}`}
+              >
+                Built-in · read-only
+              </span>
+            {/if}
+          </span>
+          {#if prompt.description}
+            <span class="text-muted truncate text-xs">{prompt.description}</span>
+          {/if}
+        </button>
+        {#if builtin && oncopy}
+          <!-- Save-to-my-library glyph (bookmark-plus), not a clipboard-copy icon:
+               this writes the built-in into the user's own editable prompts.
+               "Copy" stays in the tooltip as the plainer description. -->
+          <Tooltip label="Copy to my prompts">
+            {#snippet trigger(props)}
+              <button
+                {...props}
+                type="button"
+                class={cn(
+                  ICON_BUTTON_CLASS,
+                  "hover:bg-accent-soft hover:text-accent absolute top-1/2 right-1.5 -translate-y-1/2",
+                )}
+                data-testid={`prompt-copy-${promptKey(prompt)}`}
+                aria-label="Copy to my prompts"
+                onclick={() => oncopy(prompt)}
+              >
+                <BookmarkPlus size={16} strokeWidth={2} aria-hidden="true" />
+              </button>
+            {/snippet}
+          </Tooltip>
         {/if}
-      </button>
+      </div>
     {/each}
     {#if filtered.length === 0}
       {#if loading && prompts.length === 0}
@@ -123,4 +177,14 @@
     data-testid="prompt-menu-search"
     class="border-border bg-panel text-fg placeholder:text-muted focus-visible:ring-accent mt-1 w-full rounded-md border px-2.5 py-1.5 text-sm focus-visible:ring-2 focus-visible:outline-none"
   />
+  {#if onopenfolder}
+    <button
+      type="button"
+      class="text-muted hover:text-fg mt-1 w-full rounded-md px-2.5 py-1 text-left text-xs"
+      data-testid="prompt-menu-open-folder"
+      onclick={() => onopenfolder()}
+    >
+      Open local prompts folder…
+    </button>
+  {/if}
 </div>

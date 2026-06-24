@@ -23,6 +23,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 
+use crate::builtin::BuiltinProvider;
 use crate::config::{
     McpProviderConfig, McpSection, McpTransport, PromptConfig, is_valid_provider_name,
     resolve_local_dirs,
@@ -30,7 +31,7 @@ use crate::config::{
 use crate::error::PromptError;
 use crate::local::LocalProvider;
 use crate::mcp::McpProvider;
-use crate::model::{LOCAL_PROVIDER, Prompt};
+use crate::model::{BUILTIN_PROVIDER, LOCAL_PROVIDER, Prompt};
 use crate::provider::PromptProvider;
 use crate::secret::{InMemorySecretStore, SecretStore};
 
@@ -99,6 +100,12 @@ pub struct PromptService {
     /// concurrent edits can't both read the old file and clobber each other's
     /// change. Synchronous (the mutators are sync fns), distinct from `sync_lock`.
     config_write_lock: Arc<std::sync::Mutex<()>>,
+    /// Whether the app-owned read-only built-in library participates. True for a
+    /// real service, false for [`disabled`](Self::disabled) (which must stay
+    /// inert). This is *not* the user's "show built-ins" toggle — that is an
+    /// app-layer visibility filter; the built-ins are always listed and
+    /// resolvable here so a workflow wired to one never breaks.
+    include_builtins: bool,
 }
 
 impl PromptService {
@@ -118,11 +125,13 @@ impl PromptService {
             provider_status: Arc::new(RwLock::new(HashMap::new())),
             sync_lock: Arc::new(tokio::sync::Mutex::new(())),
             config_write_lock: Arc::new(std::sync::Mutex::new(())),
+            include_builtins: true,
         }
     }
 
     /// An inert service for contexts with no resolved prompt store. Listing is
-    /// empty; rendering fails as provider-not-found.
+    /// empty (no local, MCP, or built-in prompts); rendering fails as
+    /// provider-not-found.
     #[must_use]
     pub fn disabled() -> Self {
         Self {
@@ -134,6 +143,7 @@ impl PromptService {
             provider_status: Arc::new(RwLock::new(HashMap::new())),
             sync_lock: Arc::new(tokio::sync::Mutex::new(())),
             config_write_lock: Arc::new(std::sync::Mutex::new(())),
+            include_builtins: false,
         }
     }
 
@@ -145,6 +155,34 @@ impl PromptService {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+
+    /// One prompt by `provider:name`, or `None` if absent. Synchronous and
+    /// offline. The **freshness contract**: `builtin` and `local` prompts are
+    /// always resolvable without a sync (compiled-in / a filesystem scan), so they
+    /// are resolved **directly** here — a cold cache never reports them missing.
+    /// MCP prompts live only in the cache, so a not-yet-synced one returns `None`;
+    /// callers treat that as "unresolved" (distinct from a hard error) and
+    /// re-check after a sync.
+    #[must_use]
+    pub fn get(&self, provider: &str, name: &str) -> Option<Prompt> {
+        let direct = match provider {
+            BUILTIN_PROVIDER if self.include_builtins => BuiltinProvider::list_sync(),
+            LOCAL_PROVIDER => self
+                .local_provider()
+                .map(|local| local.list_sync())
+                .unwrap_or_default(),
+            _ => {
+                return self
+                    .cache
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .iter()
+                    .find(|p| p.provider == provider && p.name == name)
+                    .cloned();
+            }
+        };
+        direct.into_iter().find(|p| p.name == name)
     }
 
     /// Rebuild the cache from all configured providers.
@@ -172,6 +210,11 @@ impl PromptService {
             Some(local) => local.list().await,
             None => Vec::new(),
         };
+        // Built-ins are baked-in and instant, so they publish in the same fast
+        // first pass as local prompts — never held behind a slow MCP server.
+        if self.include_builtins {
+            prompts.extend(BuiltinProvider::new().list().await);
+        }
         self.publish(prompts.clone());
 
         let pendings: Vec<Pending> = self
@@ -244,6 +287,16 @@ impl PromptService {
                     provider: provider.to_owned(),
                 })?;
             local.render(name, args).await?
+        } else if provider == BUILTIN_PROVIDER {
+            // Always resolvable when built-ins are enabled, regardless of the
+            // app's "show built-ins" toggle — that toggle hides them from the
+            // pickers, it does not unwire a workflow that already points at one.
+            if !self.include_builtins {
+                return Err(PromptError::ProviderNotFound {
+                    provider: provider.to_owned(),
+                });
+            }
+            BuiltinProvider::new().render(name, args).await?
         } else {
             let config = self
                 .mcp_provider_configs()
@@ -545,6 +598,17 @@ mod tests {
         (dir, service)
     }
 
+    /// The cache contents with the always-present built-in library filtered out,
+    /// so local/MCP-focused assertions aren't perturbed by the bundled prompts
+    /// (which a real service always lists — covered separately below).
+    fn non_builtin(service: &PromptService) -> Vec<Prompt> {
+        service
+            .list()
+            .into_iter()
+            .filter(|p| p.provider != BUILTIN_PROVIDER)
+            .collect()
+    }
+
     #[tokio::test]
     async fn disabled_service_lists_nothing_and_render_fails() {
         let service = PromptService::disabled();
@@ -569,7 +633,7 @@ mod tests {
         // Before sync the cache is empty; after sync the local prompt appears.
         assert!(service.list().is_empty());
         service.sync().await;
-        let prompts = service.list();
+        let prompts = non_builtin(&service);
         assert_eq!(prompts.len(), 1);
         assert_eq!(prompts[0].name, "p");
 
@@ -612,7 +676,7 @@ mod tests {
             Arc::new(InMemorySecretStore::new()),
         );
         service.sync().await;
-        let names: Vec<String> = service.list().into_iter().map(|p| p.name).collect();
+        let names: Vec<String> = non_builtin(&service).into_iter().map(|p| p.name).collect();
         assert_eq!(names, vec!["from-custom".to_owned()]);
     }
 
@@ -652,7 +716,7 @@ mod tests {
             Arc::new(InMemorySecretStore::new()),
         );
         service.sync().await;
-        let names: Vec<String> = service.list().into_iter().map(|p| p.name).collect();
+        let names: Vec<String> = non_builtin(&service).into_iter().map(|p| p.name).collect();
         assert_eq!(names, vec!["note".to_owned()]);
     }
 
@@ -668,7 +732,7 @@ mod tests {
         );
         let other = service.clone();
         tokio::join!(service.sync(), other.sync());
-        assert_eq!(service.list().len(), 1);
+        assert_eq!(non_builtin(&service).len(), 1);
     }
 
     #[tokio::test]
@@ -691,7 +755,58 @@ mod tests {
             Arc::new(InMemorySecretStore::new()),
         );
         service.sync().await;
-        assert_eq!(service.list().len(), 1);
+        assert_eq!(non_builtin(&service).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn built_ins_list_and_resolve_alongside_local_without_collision() {
+        // A real service surfaces the built-in library after sync, and a user's
+        // same-named local prompt coexists with the built-in under its own
+        // provider identity (no collision). Resolution is per-provider.
+        let (dir, service) = service_with_prompts_dir();
+        write(
+            &dir.path().join("prompts"),
+            "code-review.md",
+            "---\nname: code-review\ndescription: mine\n---\nMY OWN REVIEW PROMPT\n",
+        );
+        service.sync().await;
+
+        let by_provider = |p: &str| -> Vec<String> {
+            service
+                .list()
+                .into_iter()
+                .filter(|x| x.provider == p)
+                .map(|x| x.name)
+                .collect()
+        };
+        assert!(by_provider(LOCAL_PROVIDER).contains(&"code-review".to_owned()));
+        assert!(by_provider(BUILTIN_PROVIDER).contains(&"code-review".to_owned()));
+        assert!(by_provider(BUILTIN_PROVIDER).contains(&"analyze-ai-reviews".to_owned()));
+
+        // Each resolves to its own content.
+        let mine = service
+            .render(LOCAL_PROVIDER, "code-review", &BTreeMap::new())
+            .await
+            .unwrap();
+        assert!(mine.text.contains("MY OWN REVIEW PROMPT"));
+        let builtin = service
+            .render(BUILTIN_PROVIDER, "code-review", &BTreeMap::new())
+            .await
+            .unwrap();
+        assert!(builtin.text.contains("Code Review Guidelines"));
+    }
+
+    #[tokio::test]
+    async fn disabled_service_lists_no_built_ins_and_render_fails() {
+        // The inert service stays inert — built-ins are a real-service feature.
+        let service = PromptService::disabled();
+        service.sync().await;
+        assert!(service.list().is_empty());
+        let err = service
+            .render(BUILTIN_PROVIDER, "code-review", &BTreeMap::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PromptError::ProviderNotFound { .. }));
     }
 
     #[tokio::test]
@@ -752,6 +867,13 @@ mod tests {
         ));
         assert!(matches!(
             service.add_mcp_provider("local", "https://b", None),
+            Err(PromptError::InvalidProviderName { .. })
+        ));
+        // The built-in library's namespace is reserved at the boundary a user
+        // hits — an MCP provider named `builtin` can't shadow the read-only
+        // built-ins. This is the milestone's no-collision keystone.
+        assert!(matches!(
+            service.add_mcp_provider("builtin", "https://b", None),
             Err(PromptError::InvalidProviderName { .. })
         ));
         assert!(matches!(

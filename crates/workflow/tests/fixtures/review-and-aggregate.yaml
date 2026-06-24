@@ -1,0 +1,26 @@
+name: review-and-aggregate
+description: Send to multiple reviewers in parallel, aggregate, send to primary.
+
+# Prompts are hardcoded (`local:review` / `local:aggregate`); the reviewers'
+# `context` arg is wired from a workflow input via a `template_vars` binding.
+inputs:
+  primary_agent: agent
+  reviewer_agents: [agent]
+  user_context: text?
+
+steps:
+  - label: Send the review to reviewers
+    send:
+      to: "{{ reviewer_agents }}"
+      prompt: "local:review"
+      template_vars:
+        context: "{{ user_context }}"
+  - label: Wait for all reviews
+    wait_for_all:
+      agents: "{{ reviewer_agents }}"
+  - label: Aggregate feedback for the primary
+    send:
+      to: "{{ primary_agent }}"
+      prompt: "local:aggregate"
+      template_vars:
+        feedback: "{{ aggregated_responses(reviewer_agents) }}"

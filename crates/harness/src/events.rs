@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use switchboard_core::{AgentId, SessionLocator};
+use switchboard_core::{AgentId, SendId, SessionLocator};
 use uuid::Uuid;
 
 /// UUID v7 turn identifier — consistent with `AgentId` and `ProjectId`.
@@ -323,7 +323,26 @@ pub enum NormalizedEvent {
         /// produced it — see [`MessageId`]. The frontend flips its optimistic
         /// message bubble (keyed by `message_id`) from queued/sending to running.
         message_id: MessageId,
+        /// The `send_id` of the originating send — shared across a fan-out's
+        /// recipients. Lets the live UI group concurrent turns of one send into a
+        /// side-by-side row even when the frontend didn't originate the send (a
+        /// workflow dispatches backend-side, so it has no local `pending_sends`
+        /// entry to derive the grouping from).
+        send_id: SendId,
         started_at: DateTime<Utc>,
+    },
+    /// A **user-side** message dispatched to this agent, surfaced on the agent
+    /// channel so the live transcript renders it like any other send's user
+    /// message. Emitted by a workflow `send` step (which dispatches backend-side,
+    /// so the frontend has no optimistic user turn for it); a fan-out's recipients
+    /// share one `send_id`, letting the live UI group them into one user row +
+    /// per-recipient columns, identical to a manual send and to the journal-backed
+    /// view after reload. Manual sends do **not** use this (the frontend creates
+    /// their user turn optimistically).
+    UserMessage {
+        send_id: SendId,
+        text: String,
+        at: DateTime<Utc>,
     },
     ContentChunk {
         turn_id: TurnId,
@@ -406,6 +425,17 @@ pub enum NormalizedEvent {
     /// pre-actor synchronous fail-closed `Err`.
     MessageFailed {
         message_id: MessageId,
+        /// The **durably recorded** send this failure belongs to, or `None` if the
+        /// send never reached the journal (it failed before `record_send`). When
+        /// present it lets a backend-originated send (a workflow `send`, which has
+        /// no frontend `pending_sends` entry) attach the failed marker under its
+        /// live user row; when `None` the frontend renders no row for a
+        /// backend-originated send, so live matches the (empty) reload — a send
+        /// with no durable record can't be reconstructed. Manual sends ignore this
+        /// and resolve via `pending_sends`. (Set `Some` only on the post-`record_send`
+        /// adapter-launch-failure path; the invariant is exact up to the
+        /// best-effort `record_outcome` write that path performs.)
+        send_id: Option<SendId>,
         agent_id: AgentId,
         error: String,
         at: DateTime<Utc>,
@@ -640,16 +670,19 @@ mod tests {
     fn turn_start_wire_shape() {
         let turn_id = fresh_turn_id();
         let message_id = Uuid::now_v7();
+        let send_id = Uuid::now_v7();
         let started_at = fresh_time();
         let event = NormalizedEvent::TurnStart {
             turn_id,
             message_id,
+            send_id,
             started_at,
         };
         let value = serde_json::to_value(&event).unwrap();
         assert_eq!(value["type"], "turn_start");
         assert_eq!(value["turn_id"], turn_id.to_string());
         assert_eq!(value["message_id"], message_id.to_string());
+        assert_eq!(value["send_id"], send_id.to_string());
         let parsed: NormalizedEvent = serde_json::from_value(value).unwrap();
         assert_eq!(parsed, event);
     }
@@ -657,10 +690,12 @@ mod tests {
     #[test]
     fn message_failed_wire_shape() {
         let message_id = Uuid::now_v7();
+        let send_id = Uuid::now_v7();
         let agent_id = Uuid::now_v7();
         let at = fresh_time();
         let event = NormalizedEvent::MessageFailed {
             message_id,
+            send_id: Some(send_id),
             agent_id,
             error: "journal write failed".to_owned(),
             at,
@@ -668,6 +703,16 @@ mod tests {
         let value = serde_json::to_value(&event).unwrap();
         assert_eq!(value["type"], "message_failed");
         assert_eq!(value["message_id"], message_id.to_string());
+        assert_eq!(value["send_id"], send_id.to_string());
+        // A pre-durable failure carries no send_id (serializes as null).
+        let no_send = NormalizedEvent::MessageFailed {
+            message_id,
+            send_id: None,
+            agent_id,
+            error: "rejected".to_owned(),
+            at,
+        };
+        assert!(serde_json::to_value(&no_send).unwrap()["send_id"].is_null());
         assert_eq!(value["agent_id"], agent_id.to_string());
         assert_eq!(value["error"], "journal write failed");
         let parsed: NormalizedEvent = serde_json::from_value(value).unwrap();

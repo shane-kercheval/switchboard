@@ -20,6 +20,7 @@ const PREFS = (editor: string | null, terminal: string): Preferences => ({
   editor_command: editor,
   terminal_app: terminal,
   diff_style: "side_by_side",
+  show_builtins: true,
 });
 
 describe("preferences store", () => {
@@ -67,5 +68,19 @@ describe("preferences store", () => {
     invokeMock.mockResolvedValueOnce(null);
     await updatePreferences({ terminal_app: "iTerm" });
     expect(saveStatus.error).toBeNull();
+  });
+
+  it("loads and persists the show_builtins toggle", async () => {
+    invokeMock.mockResolvedValueOnce({ ...PREFS("code", "Terminal"), show_builtins: false });
+    await loadPreferences();
+    expect(preferences.show_builtins).toBe(false);
+
+    invokeMock.mockResolvedValueOnce(null);
+    await updatePreferences({ show_builtins: true });
+    expect(preferences.show_builtins).toBe(true);
+    // The whole merged value is sent to the backend.
+    expect(invokeMock).toHaveBeenLastCalledWith("set_preferences", {
+      preferences: expect.objectContaining({ show_builtins: true }),
+    });
   });
 });

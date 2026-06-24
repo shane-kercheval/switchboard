@@ -83,6 +83,28 @@ export function transcriptReducer(
       ];
     }
 
+    case "user_message": {
+      // A user-side message a workflow `send` dispatched to this agent. The
+      // frontend has no optimistic user turn for a backend-originated send, so we
+      // create one here — keyed by `send_id`+agent (idempotent on re-delivery).
+      // A fan-out's recipients share `send_id`, so the unified view collapses
+      // these per-recipient user turns into one user row (and groups the responses
+      // into columns), matching a manual send and the reloaded journal view.
+      const turn_id = `user:${input.send_id}:${agentId}`;
+      if (findTurn(turns, turn_id) !== undefined) return turns;
+      return [
+        ...turns,
+        {
+          role: "user",
+          turn_id,
+          agent_id: agentId,
+          send_id: input.send_id,
+          started_at: input.at,
+          text: input.text,
+        },
+      ];
+    }
+
     case "turn_identity": {
       // The live turn's dedup identity, stamped **early** (first assistant
       // message) so a concurrent disk re-read collapses against it instead of
@@ -140,15 +162,21 @@ export function transcriptReducer(
 
     case "message_failed": {
       // A send failed before any turn started (adapter failed to launch, or the
-      // journal write failed). Render a failed agent turn under its prompt so
-      // the failure surfaces in the transcript — the same place post-start
-      // failures and the post-reload journal marker appear. `sendId` is resolved
-      // by the caller from the pending entry (the same lookup `turn_start` uses,
-      // including the pre-receipt front-fallback). A failure whose entry was
-      // already consumed by a `turn_start` is post-start (the live turn renders
-      // it) and arrives here with `sendId` undefined — a no-op, so there is no
-      // double-render. Idempotent on the derived `turn_id`.
+      // journal write failed). Render a failed agent turn under its prompt so the
+      // failure surfaces in the transcript — the same place post-start failures
+      // and the post-reload journal marker appear. `sendId` is resolved by the
+      // caller from the pending entry, falling back to the event's own `send_id`
+      // for a backend-originated send (a workflow step with no pending entry).
+      //
+      // Skip when a turn for this send already exists: that means the failure is
+      // *post-start* (a `turn_start` already created the live turn, which owns the
+      // outcome), so rendering here would double. This — not "`sendId` is
+      // undefined" — is the post-start signal, because a workflow pre-start
+      // failure also has no pending entry yet must still render its marker.
+      // Idempotent on the derived `turn_id` (the failed turn itself carries
+      // `sendId`, so a re-delivery is skipped by this same guard).
       if (sendId === undefined) return turns;
+      if (turns.some((t) => t.role === "agent" && t.send_id === sendId)) return turns;
       return appendFailedTurnImpl(
         turns,
         agentId,

@@ -45,10 +45,10 @@ This orchestration model has a useful side effect for prompt management. Because
 | Concept | Definition |
 |---|---|
 | **Working directory** | An on-disk directory (typically a git repo) where Switchboard does its work. Identified by canonicalized path. One Switchboard-managed `.switchboard/` lives at the directory root and contains zero or more **projects**. |
-| **Project** | A named, task-scoped grouping of agents + workflow runs + runtime state, hosted within a working directory. (Workflow *definitions* are directory-scoped — shared across projects; projects own workflow *runs* — the in-flight invocations against their agents.) Each project has a UUID (`ProjectId`) and a user-supplied name (unique within its directory; can collide across directories). Multiple projects can coexist in the same working directory, allowing the user to run separate workstreams (backend / frontend / planning / etc.) on the same repo simultaneously. Project-specific state lives at `<directory>/.switchboard/projects/<project-id>/` (see directory layout below). |
+| **Project** | A named, task-scoped grouping of agents + workflow runs + runtime state, hosted within a working directory. (Workflow *definitions* are **user-global** — one set shared across every project; projects own workflow *runs* — the in-flight invocations against their agents.) Each project has a UUID (`ProjectId`) and a user-supplied name (unique within its directory; can collide across directories). Multiple projects can coexist in the same working directory, allowing the user to run separate workstreams (backend / frontend / planning / etc.) on the same repo simultaneously. Project-specific state lives at `<directory>/.switchboard/projects/<project-id>/` (see directory layout below). |
 | **Agent** | A Claude Code, Codex, Gemini, or Antigravity session within a project, with a user-assigned name. Each agent has a persistent harness session under the hood, identified by a `session_locator` on its registry record (a UUID for Claude/Gemini/Antigravity; a thread-id + partition-date for Codex). All four harnesses keep their locator wholly on the record — pre-generated at creation (Claude/Gemini) or captured at runtime (Codex/Antigravity). Agents are bound to their project, not directly to the directory. |
 | **Primitive** | An atomic operation Switchboard provides for a workflow to compose: spawn agent, send message, auto-forward output, fan-in with template, pause for user input, iterate over a list. Six exist in v1; see §4. (Saving and invoking a reusable workflow is the composition layer over these primitives, not itself a primitive — see §5.) |
-| **Workflow** | A named, parameterized composition of primitives — for example "fan-out review and aggregate." Defined as a YAML file under `<directory>/.switchboard/workflows/` (workflows are directory-scoped, shared across projects in that directory; rationale below). Invoked by name with arguments against a specific project. |
+| **Workflow** | A named, parameterized composition of primitives — for example "fan-out review and aggregate." Defined as a YAML file in the **user-global** workflows folder (`<config-dir>/workflows/`); workflows are reusable templates shared across every project, like prompts (rationale below). Invoked by name with arguments against a specific project (its `agent` inputs bind to that project's agents). |
 | **Prompt template** | A named prompt definition resolved by ID at routing time. Used as message content (sent to an agent) or as a wrapper applied around aggregated outputs before forwarding (used in fan-in; see §4 Primitive 4). |
 | **Prompt provider** | A source of prompts Switchboard resolves IDs against. Two implementations ship in v1: `local` (file store) and any registered MCP-server provider. Addressed by prefix (e.g. `local:code-review`, `tiddly:code-review`). See §6. |
 | **Routing** | Message passing between agents. Includes fan-out (one source, many recipients), fan-in (many sources, one recipient, with template wrapping), and sequential handoff. |
@@ -92,7 +92,7 @@ Switchboard-managed state lives in a `.switchboard/` directory at the working di
 ~/.config/switchboard/          # user-global config (illustrative Linux/XDG path; resolved via the `directories` crate —
 │                               #   on macOS this is ~/Library/Application Support/switchboard/)
 ├── config.yaml                 # personal preferences + prompt providers (local_prompt_dirs, mcp_providers — see §6)
-├── prompts/                    # default local prompt store (seeded with example prompts on first run — see §6)
+├── prompts/                    # default local prompt store (user's own prompts; built-ins are baked-in read-only, not written here — see §6)
 └── workspace.yaml              # app-managed: the working directories the user works across,
                                 #   each with a cached snapshot of its projects, plus the
                                 #   user-global set of archived project ids (view-state)
@@ -100,9 +100,9 @@ Switchboard-managed state lives in a `.switchboard/` directory at the working di
 
 Switchboard is **single-instance**: launching it again focuses the running window rather than starting a second process, so there is exactly one writer of `workspace.yaml`. The per-project `instance.lock` (below) remains as defense-in-depth for the pathological case of two processes (e.g. a dev build alongside the bundled app); multi-window is out of scope for v1.
 
-**What's directory-scoped vs project-scoped vs user-global:** workflows are directory-scoped — defined once per repo, reusable across projects in that directory. Agents, runtime state, workflow runs, and harness session links are project-scoped — each project has its own. Prompt providers (local directories + MCP servers) are **user-global** — configured once at the user level and available in every project regardless of directory (see §6). Rationale: workflow definitions are about *how to do the work in this repo*; they belong to the directory. Agents and runtime state are about *the work in progress*; they belong to the project. Prompt libraries are personal, portable templates; they belong to the user.
+**What's project-scoped vs user-global:** agents, runtime state, workflow runs, and harness session links are project-scoped — each project has its own. Workflow *definitions* and prompt providers (local directories + MCP servers) are **user-global** — defined once at the user level and available in every project regardless of directory (see §6). Rationale: agents and runtime state are about *the work in progress*; they belong to the project. Workflow and prompt libraries are personal, portable, parameterized templates — a workflow's `agent` slots bind to whatever project it runs against — so one definition serves every project; they belong to the user.
 
-The directory-level `config.yaml` and `workflows/` are intended to be checked into git and shared. (Local prompts are user-global, not directory-scoped — there is no per-directory `prompts/` store; see §6.) Everything else — `projects.jsonl`, the entire `projects/` tree (including per-project `config.yaml`, `registry.jsonl`, `journal.jsonl`, `sessions/`, `attachments/`, `runs/`), and lock files — is local-machine runtime data and should be `.gitignore`d.
+Everything under `<directory>/.switchboard/` — `projects.jsonl`, the entire `projects/` tree (including per-project `config.yaml`, `registry.jsonl`, `journal.jsonl`, `sessions/`, `attachments/`, `runs/`), and lock files — is local-machine runtime data and should be `.gitignore`d. (Workflow definitions and local prompts are user-global, not per-directory — they live in the OS config dir, not the repo; see §6.)
 
 ### Working directories and the workspace
 
@@ -230,35 +230,35 @@ A general-purpose DAG scheduler (topological sort over arbitrary node dependenci
 
 ## 5. Workflows
 
-A **workflow** is a named, parameterized composition of the primitives in §4, defined as a directory-scoped YAML file under `<directory>/.switchboard/workflows/` (shared across the projects in that working directory). Invoking a workflow fills in its parameters and runs it. Workflows resolve relative to the owning directory of the project the workflow runs against — there is no single "current" directory in the flat workspace model. (Prompts, by contrast, are user-global — see §6.)
+A **workflow** is a named, parameterized composition of the primitives in §4, defined as a **user-global** YAML file in the OS config dir's `workflows/` folder (shared across every project, like prompts — see §6). Invoking a workflow fills in its parameters and runs it against a specific project (its `agent` inputs bind to that project's agents).
 
 Workflow definition format (illustrative; the authoritative schema is `docs/workflow-spec.md`):
 
+A workflow **hardcodes the prompts its steps run** as literal ids (`prompt: "builtin:code-review"`); a prompt is never a user-selected input. A prompt's user-fillable arguments are **auto-derived** from the resolved prompt and offered as form fields at invocation, while author-wired `template_vars` hold only **computed bindings** (workflow expressions the user can't type, e.g. `aggregated_responses(...)`). The example below fans `builtin:code-review` out to the reviewers, then hands the aggregated feedback to a primary agent via an inline `text` step.
+
 ```yaml
-name: review-and-aggregate
+name: review-and-recommend
 description: Send a message to multiple reviewers, aggregate, send to primary.
 inputs:
   primary_agent: agent
   reviewer_agents: [agent]
-  review_prompt: prompt_id           # invocation supplies e.g. local:code-review
-  aggregation_prompt: prompt_id      # invocation supplies e.g. tiddly:ai-review-feedback
-  user_context: text?
 steps:
   - send:
       to: "{{ reviewer_agents }}"
-      prompt: "{{ review_prompt }}"
-      template_vars:
-        context: "{{ user_context }}"
+      prompt: "builtin:code-review"   # code-review's optional `context` arg is auto-derived
   - wait_for_all:
       agents: "{{ reviewer_agents }}"
   - send:
       to: "{{ primary_agent }}"
-      prompt: "{{ aggregation_prompt }}"
-      template_vars:
-        feedback: "{{ aggregated_responses(reviewer_agents) }}"
+      text: |
+        Here's feedback from several reviewers:
+
+        {{ aggregated_responses(reviewer_agents) }}
+
+        Let me know what your recommendations are.
 ```
 
-When invoked, Switchboard prompts the user for each input and then executes the steps.
+When invoked, Switchboard prompts the user for each declared input plus any auto-derived prompt arguments (here, `code-review`'s optional `context`), then executes the steps.
 
 The example above uses `aggregated_responses(...)` — the helper that returns the reviewers' outputs pre-formatted in a canonical text shape — because typical aggregation prompts (especially cross-platform ones like `tiddly:ai-review-feedback`) take a single text-blob argument. A sibling helper `responses_from(...)` returns the same data as a name → text mapping for Switchboard-aware prompts that want to iterate with custom formatting. See `docs/workflow-spec.md` for both.
 
@@ -268,15 +268,15 @@ The DSL exposes fan-in as `wait_for_all` + a `send` step (using either helper ab
 
 ### Authoring
 
-Workflows are authored as YAML files at `<directory>/.switchboard/workflows/` (directory-scoped — shared across all projects in that working directory; see §3 for the rationale). Because they live inside the working directory, they are naturally version-controlled along with the repo — diffed, reviewed, and shared via the user's normal git workflow. There is no directory-picker step in Switchboard's UI; the location is conventional.
+Workflows are authored as YAML files in the user-global `workflows/` folder under the OS config dir (shared across every project, like local prompts; see §3 / §6 for the rationale). Settings surfaces the folder path with an "Open" action; the user drops files there (or uses "Copy to my workflows" on a built-in). There is no directory-picker step in Switchboard's UI; the location is conventional.
 
 Authoring is intentionally file-based. The user edits workflows in whichever editor they prefer (Vim, VS Code, etc.); Switchboard's UI reads the files but does not include an editor of its own. The supported authoring path for new users is to point an existing Claude Code, Codex, or Gemini agent at `docs/agent-instructions/workflows.md` and have it generate a starter workflow from a description (per §2 "Agent-friendly authoring"). Hand-authoring against the DSL spec works too for power users.
 
-v1 ships with a small library of built-in workflows (review-and-aggregate, sequential handoff with template) as starting points; users can copy or fork these to author their own.
+v1 ships with a small library of built-in workflows (review-and-recommend — review in parallel, aggregate, hand to a primary; review-and-reconcile — fan-in review, analyze, then a round-trip discussion back to the analyst) as starting points; users can copy or fork these to author their own.
 
 Users without an existing harness installation outside Switchboard can use a Switchboard-spawned agent itself to author a workflow from the instruction docs — agents Switchboard manages are full Claude Code / Codex / Gemini sessions and can read project files normally. Hand-authoring against the DSL spec also works for power users.
 
-Workflow files are **directory-scoped** — there is no user-global workflow directory parallel to user-global prompts. Workflows live under `<directory>/.switchboard/workflows/` and are shared across all projects in that working directory (per §3 directory layout). Reuse across *different* working directories (different repos) happens via copy or symlink. (Asymmetric with prompts on purpose: prompts are user-portable templates while workflows are repo-shaped — they reference the conventions of a specific codebase. But within a single repo, workflows are shared infrastructure, not per-task — multiple projects in the same directory invoke the same workflow definitions against their own agents.)
+Workflow files are **user-global** — one workflows folder under the OS config dir, parallel to user-global prompts, shared across every project in every working directory. A workflow you author once (say a review fan-out) is invocable everywhere without redefinition. This is symmetric with prompts on purpose: both are personal, portable, parameterized templates. A workflow's `agent`/`[agent]` inputs are named slots bound to a project's real agents at invocation, so the definition is not tied to any one repo's agent names — the same `review-and-recommend` runs against any project's roster.
 
 ## 6. Prompts and prompt providers
 
@@ -521,9 +521,9 @@ A workflow is invoked by name. Switchboard prompts for the workflow's inputs (wh
 
 ### Watching a workflow run
 
-Workflow turns appear in the unified project transcript as they happen — each turn attributed to its producing agent — so the user reads the workflow's progress as a single timeline. The overview sidebar shows real-time per-agent status (which agents are still running, waiting, or have completed their step) alongside cost / quota state. Workflow execution proceeds independently of the user's scroll position or interaction — agents keep running in the background regardless of where the user is reading. When a workflow completes (all turns it initiated have reached a terminal state) or pauses on Primitive 5 (waiting for user input), the user is notified via OS-native notification (per §10 Form factor).
+Workflow turns appear in the unified project transcript as they happen — each turn attributed to its producing agent — so the user reads the workflow's progress as a single timeline. The overview sidebar shows real-time per-agent status (which agents are still running, waiting, or have completed their step) alongside cost / quota state. Workflow execution proceeds independently of the user's scroll position or interaction — agents keep running in the background regardless of where the user is reading. When a workflow **completes** or **fails** (its two terminal states), or pauses on Primitive 5 (waiting for user input), the user is notified via OS-native notification (per §10 Form factor) — **suppressed while the app window is focused** (the notification is for when the user has walked away; when they're watching, the run indicator carries it). User-initiated **cancellation** does not notify (it is intentional), and a crash-**interrupted** run does not notify (it has no live process; it is surfaced in the run indicator on the next app start instead). Notification permission is requested contextually at first invoke, not at cold startup.
 
-A **workflow-progress surface** (shape TBD — status row in the project header, side panel, or modal) shows each active workflow's name, current step, total steps, and per-step status. Multiple workflows can be in flight simultaneously (when they target disjoint agents — see "Agent contention" below); the surface lists each. When a workflow is paused on Primitive 5 (waiting for user input), the surface shows "step N of M — waiting for your input." For workflows using Primitive 6 (iterate over a list), the surface shows the iteration dimension as well, in the user's own vocabulary — e.g., "iteration 2 of 3 (milestone = "implement-handlers"), step 3 of 8" — using the loop variable name and value the workflow declared. On return after walk-away, this is the first thing the user sees: any workflow that was interrupted is surfaced with the same step (and iteration) detail and options to retry or abandon (see "Walking away" below).
+A **workflow-progress surface** — in v1, an **app-global run indicator in the top bar** that expands to a run list — shows each active workflow's name, current step, total steps, and per-step status. The indicator is app-global (it lists runs across every loaded project, not only the active one) because runs proceed in the background regardless of which project is in view; it disappears when no run is active, interrupted, or retained-failed. The run's *substance* is in the unified transcript, so this surface is a lightweight orchestration tracker, not a content view. Multiple workflows can be in flight simultaneously (when they target disjoint agents — see "Agent contention" below); the surface lists each. When a workflow is paused on Primitive 5 (waiting for user input), the surface shows "step N of M — waiting for your input." For workflows using Primitive 6 (iterate over a list), the surface shows the iteration dimension as well, in the user's own vocabulary — e.g., "iteration 2 of 3 (milestone = "implement-handlers"), step 3 of 8" — using the loop variable name and value the workflow declared. On return after walk-away, this is the first thing the user sees: any workflow that was interrupted is surfaced with the same step (and iteration) detail and options to retry or abandon (see "Walking away" below).
 
 ### Agent contention
 
@@ -601,7 +601,7 @@ These pin how the §3 split renders concretely after an app restart, when live U
 
 In a fan-out where outcomes differ per recipient (e.g. B completes, C is cancelled — whether individually or via cancel-send), these compose: the user message renders once (`User → B|C`), then B's completed content, then C's `cancelled` marker (with C's partial above it only if C's harness persisted any), interleaved by timestamp. Cancellation/error is always per-turn; there is no aggregate send-level outcome record.
 
-## 8. Worked example: review-and-aggregate
+## 8. Worked example: review-and-recommend
 
 To anchor the abstractions above, here is what a code-review workflow looks like end to end.
 
@@ -615,17 +615,17 @@ The user has a project `feature-event-logs` open in Switchboard. They have three
 
 All three are listed in the overview sidebar. The unified project transcript shows their conversation history so far in chronological order.
 
-The user has previously authored a workflow in `.switchboard/workflows/review-and-aggregate.yaml`. The review prompt ships as a built-in local prompt (`local:code-review`); the aggregation wrapper is one the user keeps in Tiddly (`tiddly:ai-review-feedback`). Both work because Switchboard resolves each ID against the named provider.
+The user has authored a workflow in their user-global workflows folder (the OS config dir's `workflows/`, e.g. `~/Library/Application Support/switchboard/workflows/review-analyze.yaml`) — a variant of the built-in that hands the aggregated reviews to a saved cross-platform analysis prompt instead of an inline `text` step. Both prompts are **hardcoded** in the workflow file: the reviewers run `builtin:code-review`, and the analysis step runs the prompt the user keeps in Tiddly (`tiddly:ai-review-feedback`), with the aggregated reviews wired into its `review` argument via a computed `template_vars` binding. Both resolve because Switchboard routes each ID to its named provider — which is the point of the example.
 
 **Invocation:**
 
-1. The user invokes the workflow: "Run review-and-aggregate."
-2. Switchboard pops up an invocation form with one field per input the workflow declared in its YAML (`primary_agent`, `reviewer_agents`, `review_prompt`, etc. — see §4 for the schema). The user fills in:
+1. The user invokes the workflow: "Run review-and-recommend."
+2. Switchboard pops up an invocation form with one field per declared input plus the auto-derived user-fillable arguments of the workflow's hardcoded prompts (`primary_agent`, `reviewer_agents`, and `code-review`'s optional `context` — see §4 for the schema). The user fills in:
    - **`primary_agent`** → `implementer`
    - **`reviewer_agents`** → `reviewer-claude` and `reviewer-codex` (multi-select)
-   - **`review_prompt`** → `local:code-review` (bundled with Switchboard)
-   - **`aggregation_prompt`** → `tiddly:ai-review-feedback` (the user's own, stored in Tiddly)
-   - **`user_context`** → "Review milestone 1, focus on the event-emission API."
+   - **`context`** (auto-derived from `builtin:code-review`) → "Review milestone 1, focus on the event-emission API."
+
+   The prompts themselves (`builtin:code-review` for the reviewers, `tiddly:ai-review-feedback` for the analysis) are hardcoded in the workflow, so there is no prompt-picker field; and `ai-review-feedback`'s `review` argument is a computed binding (the aggregated reviews), so it is not shown to the user.
 3. The user confirms. The workflow launches.
 
 **Execution:**
@@ -633,14 +633,14 @@ The user has previously authored a workflow in `.switchboard/workflows/review-an
 1. Switchboard sends the review-prompt message (with user context appended) to both reviewers in parallel. Each reviewer runs.
 2. Switchboard waits for both reviewers to complete their turns.
 3. Switchboard collects both reviewers' final responses.
-4. Switchboard composes the two reviews into a single aggregated text blob (canonical shape per `docs/workflow-spec.md`), then renders the aggregation-prompt template with that blob bound to the prompt's text argument. Because the aggregation prompt is a generic Tiddly prompt that takes a single `{{ feedback }}` argument, no Switchboard-specific authoring is needed — the helper does the formatting.
+4. Switchboard composes the two reviews into a single aggregated text blob (canonical shape per `docs/workflow-spec.md`), then renders the hardcoded analysis prompt (`tiddly:ai-review-feedback`) with that blob bound to the prompt's `review` argument via the workflow's computed `template_vars`. Because the analysis prompt is a generic Tiddly prompt that takes a single text argument, no Switchboard-specific authoring is needed — the helper does the formatting.
 5. Switchboard sends the rendered message to `implementer` (the agent supplied as the workflow's `primary_agent` input).
 6. The implementer runs and produces its response.
 7. Workflow complete. The user is notified.
 
 **During execution:**
 
-Each reviewer's turn appears in the unified project transcript as it streams — attributed to `reviewer-claude` and `reviewer-codex` respectively — so the user reads both reviews interleaved chronologically as they land. The overview sidebar shows real-time status (running → completed) and per-agent cost / quota for each reviewer. When the implementer kicks in, its aggregated turn appears next in the same transcript, attributed to `implementer`. The workflow-progress surface (per §7) shows where the workflow is overall — e.g., "review-and-aggregate: step 2 of 3 (waiting on reviewers)" — alongside the transcript and sidebar.
+Each reviewer's turn appears in the unified project transcript as it streams — attributed to `reviewer-claude` and `reviewer-codex` respectively — so the user reads both reviews interleaved chronologically as they land. The overview sidebar shows real-time status (running → completed) and per-agent cost / quota for each reviewer. When the implementer kicks in, its aggregated turn appears next in the same transcript, attributed to `implementer`. The workflow-progress surface (per §7) shows where the workflow is overall — e.g., "review-and-recommend: step 2 of 3 (waiting on reviewers)" — alongside the transcript and sidebar.
 
 **Afterwards:**
 

@@ -26,8 +26,8 @@ What is **out of scope** for this doc:
 
 ## File location and naming
 
-- Workflow files live under `<directory>/.switchboard/workflows/` (directory-scoped — shared across all projects in that working directory; see system-design §3)
-- One workflow per file; filename matches the workflow's declared `name` (e.g., `review-and-aggregate.yaml`)
+- Workflow files are **user-global**: they live in one folder under the OS config dir (e.g. `~/Library/Application Support/switchboard/workflows/` on macOS), shared across every project in every working directory; see system-design §3. A workflow's `agent`/`[agent]` inputs bind to whichever project's agents it's run against, so the definition isn't tied to any one directory.
+- One workflow per file; filename matches the workflow's declared `name` (e.g., `review-and-recommend.yaml`)
 - File extension: `.yaml` (preferred) or `.yml`
 
 ## Top-level structure
@@ -53,12 +53,13 @@ Top-level keys not in this table are an error in v1. (Reserved keys for v2 liste
 |---|---|---|
 | Agent | `agent` | A single agent name (must exist in the project at invocation time) |
 | Agent list | `[agent]` | A list of agent names |
-| Prompt ID | `prompt_id` | A fully-qualified prompt reference (e.g., `local:code-review`, `tiddly:foo`) |
 | Text | `text` | Free-form string |
 | Text (optional) | `text?` | Free-form string; user may leave blank |
 | List of text | `[text]` | List of strings (used by Primitive 6 iteration) |
 
-In v1 the only optional type variant is `text?`. `agent?` and `prompt_id?` are deferred to v2+.
+There is no `prompt_id` input type. A step names its prompt as a **hardcoded literal** (see §`send` and §"Hardcoded prompts and auto-derived arguments"); declaring a `prompt_id` input is a parse error (unknown type). A prompt's user-fillable arguments are auto-derived from the resolved prompt and surfaced as form fields at invocation — they are **not** declared in `inputs`.
+
+In v1 the only optional type variant is `text?`. `agent?` is deferred to v2+.
 
 ### Shorthand form
 
@@ -66,7 +67,6 @@ In v1 the only optional type variant is `text?`. `agent?` and `prompt_id?` are d
 inputs:
   primary_agent: agent
   reviewer_agents: [agent]
-  review_prompt: prompt_id
   user_context: text?
 ```
 
@@ -86,7 +86,7 @@ Long-form keys:
 |---|---|---|
 | `type` | yes | One of the type shorthands above. |
 | `description` | optional | Human description shown in the invocation form. |
-| `default` | optional | Default value if the user leaves the field blank. Providing `default` implicitly makes the input optional; the `?` suffix on a type is shorthand for an optional input with a default of `""`. |
+| `default` | optional | Default value if the user leaves the field blank. Providing `default` implicitly makes the input optional; the `?` suffix on a type is shorthand for an optional input with a default of `""`. **`default` is only valid on a `text` input in v1** — it is the optional-input mechanism, and optional non-`text` inputs (`agent?`, and optional `[agent]`, which would contradict the non-empty-fan-in rule) are deferred to v2. A `default` on any non-`text` type is a parse error. |
 
 Long-form `type` is required when long form is used; mixing shorthand and long form across different inputs is allowed.
 
@@ -96,24 +96,31 @@ Long-form `type` is required when long form is used; mixing shorthand and long f
 - An input named with a reserved built-in name (`user_input`) is an error
 - Required inputs (no `?` suffix, no `default`) must be supplied at invocation; missing values fail invocation pre-flight
 - Agent-typed inputs are validated at invocation time — referenced agents must exist in the project
-- `prompt_id`-typed inputs are validated at invocation time — the prompt must resolve through configured providers
 
 ## Steps
 
-`steps` is a YAML sequence. Each entry is a mapping with exactly one top-level key naming the step type. The value of that key is the step's parameters.
+`steps` is a YAML sequence. Each entry is a mapping with a required **`label`** plus exactly one key naming the step type. The value of the step-type key is the step's parameters.
+
+`label` is a short, human-readable name for the step, shown in the workflow's progress and preview views. It is a reserved sibling key of the step-type key, required on **every** step including those inside a `for_each` body; a missing, blank, or non-string `label` is a validation error. By convention a label names the **deliverable** the step produces (a noun phrase — `Code review`, `Recommendations`), not the dispatch mechanic; the progress view shows the producing agents alongside it and collapses a `send` with the `wait` that synchronizes it into one row.
+
+`description` is an **optional** reserved sibling key — a one-line explanation rendered as a sub-line under the label. Absent → none; present must be a non-blank string (a blank one is a validation error).
 
 ```yaml
 steps:
-  - send:
+  - label: Code review
+    description: Each reviewer independently reviews the current changes in parallel.
+    send:
       to: "{{ reviewer_agents }}"
-      prompt: "{{ review_prompt }}"
-  - wait_for_all:
+      prompt: "builtin:code-review"
+  - label: Reviews received
+    wait_for_all:
       agents: "{{ reviewer_agents }}"
-  - send:
+  - label: Recommendations
+    send:
       to: "{{ primary_agent }}"
-      prompt: "{{ aggregation_prompt }}"
+      prompt: "builtin:analyze-ai-reviews"
       template_vars:
-        responses: "{{ responses_from(reviewer_agents) }}"
+        review: "{{ aggregated_responses(reviewer_agents) }}"
 ```
 
 Each step type is documented below. Unknown step types are a validation error.
@@ -125,12 +132,43 @@ Dispatch a message to one or more agents. Returns immediately; does not wait for
 | Field | Required | Type | Notes |
 |---|---|---|---|
 | `to` | yes | agent or [agent] | Recipient(s). Single agent or a list. Templated. |
-| `prompt` | yes (or `text` or `forward_from`) | prompt_id | Prompt to resolve and render. Templated. |
+| `prompt` | yes (or `text` or `forward_from`) | literal string | A hardcoded prompt id (e.g., `"builtin:code-review"`). **Not templated** — a `{{ }}`/`{% %}` delimiter in `prompt` is a parse error (see §"Hardcoded prompts and auto-derived arguments"). |
 | `text` | yes (or `prompt` or `forward_from`) | text | Literal text to send (no prompt resolution). Templated. Mutually exclusive with `prompt`. |
-| `template_vars` | optional | mapping | Variables passed to the prompt template at render time. Mapping of name → templated value. |
+| `template_vars` | optional | mapping | **Computed bindings only** — workflow expressions wired to a prompt argument (e.g., `review: "{{ aggregated_responses(reviewers) }}"`). Mapping of name → templated value. Each key must be a real argument of the hardcoded prompt (see §"Binding classification"). User-fillable arguments are **not** put here — they are auto-derived. |
 | `forward_from` | optional | agent or [agent] | Auto-forward source(s). When set, the latest output(s) of the named agent(s) are composed into the message body per the canonical shape below. Equivalent to Primitive 3 (auto-forward). If any referenced agent has no completed output from the current workflow run (per §"Output scope"), the step fails with a clear error ("no in-workflow completed output for agent X"). |
 
-If `prompt` is set, the prompt's template is rendered with workflow-scope variables plus any `template_vars` and dispatched. If `text` is set, the literal text is dispatched (after templating). At least one of `prompt`, `text`, or `forward_from` is required.
+If `prompt` is set, the hardcoded prompt is resolved and its template rendered with the step's `template_vars` (computed bindings) plus the user's values for the prompt's auto-derived user-fillable arguments, then dispatched. If `text` is set, the literal text is dispatched (after templating). At least one of `prompt`, `text`, or `forward_from` is required.
+
+#### Hardcoded prompts and auto-derived arguments
+
+A `send` step names its prompt as a **hardcoded literal id**, never a user-supplied input. The id cannot be templated: the app must statically resolve the prompt's argument schema to build the invocation form, so allowing the id to depend on an input value would make form-derivation circular. A `prompt` field containing `{{` or `{%` is a parse error.
+
+Because the prompt is fixed, the app resolves it at invocation and fills its declared arguments from **two sources**:
+
+- **Computed bindings** — the step's `template_vars`, whose values are workflow expressions the user can't type (`{{ aggregated_responses(reviewers) }}`, etc.). These stay in `template_vars` and are hidden from the user.
+- **User-fillable arguments** — every *other* argument of the prompt. These are **auto-derived** from the resolved prompt and surfaced as invocation-form fields (required iff the prompt marks the argument required). They are **not** declared in `inputs`.
+
+At render, each hardcoded-prompt `send` receives exactly its prompt's declared arguments: its `template_vars` plus the user's value for each user-fillable argument the prompt declares — and nothing else (the prompt renderer rejects unknown arguments). An unfilled optional argument is omitted, so the prompt's lenient-undefined `{% if arg %}` branch renders empty.
+
+#### Binding classification
+
+For one hardcoded-prompt `send`, let `A` = the resolved prompt's declared argument names and `T` = the step's `template_vars` keys:
+
+| Set | Meaning | Surfaced to user? |
+|---|---|---|
+| `A ∩ T` | **Computed args** — filled by the workflow expression in `template_vars`. | No (hidden). |
+| `T \ A` | **Invalid bindings** — a `template_vars` key the prompt has no argument for. | Blocks invocation (see below). |
+| `A \ T` | **User-fillable args** — auto-derived form fields, required iff the prompt requires them. | Yes (fillable field). |
+
+**Invocation-time incompatibility check.** Any non-empty `T \ A` — or a `prompt` id that doesn't resolve — is an **invocation-blocking incompatibility**: the form reports it (naming the offending prompt and argument) and disables Run. This catches the drift case where a workflow's computed binding targets an argument the prompt has since renamed or removed. The check runs both when the form is built and again at invoke (invoke is authoritative — a prompt definition can change between form-open and invoke).
+
+#### Flat, merge-by-name argument namespace
+
+Auto-derived user-fillable arguments share **one flat namespace** with the declared `inputs`, keyed by name. A given name appears in the form **once**; at render it is passed to *every* hardcoded prompt that declares it as a user-fillable arg. Because prompt arguments are strings, name collisions resolve by type:
+
+1. A scalar **`text`/`text?` declared input** may shadow-and-satisfy a same-named prompt argument: one field, the declared input's label/description wins, and its value also feeds the prompt (if the prompt marks the argument required, the input is enforced required). This is the escape hatch for custom-labeling a field that feeds a prompt.
+2. **Two hardcoded prompts** that declare a same-named (string) user-fillable argument **share** one field: its value feeds both, required if *either* prompt marks it required.
+3. A **non-text declared input** (`agent`/`[agent]`/`[text]`) colliding with a (string) prompt-argument name is a **validation error** at form-build time — it would feed a non-string into a string slot. This is the only collision that errors rather than shares.
 
 When `to` is a list of agents, dispatches are issued in declared order; agents run in parallel. The step returns once all dispatches have been issued (not when any has completed) — to synchronize, use `wait_for_all` in the next step.
 
@@ -234,12 +272,19 @@ All string values in a workflow file are passed through the templating engine be
 - Variable substitution: `{{ var }}`
 - Member access: `{{ obj.field }}`, `{{ list[0] }}`
 - For loops: `{% for x in list %}...{% endfor %}` (including `loop.index`, `loop.first`, `loop.last`)
-- If conditions: `{% if expr %}...{% elif %}...{% else %}...{% endif %}` (limited to truthiness checks and equality; arithmetic deferred to v2)
+- If conditions: `{% if expr %}...{% elif %}...{% else %}...{% endif %}`
+- Expression operators: comparison (`==`, `!=`, `<`, `>`, `<=`, `>=`), boolean (`and`, `or`, `not`), and basic arithmetic (`+`, `-`, `*`)
 - Whitespace control: `{%-`, `-%}`, `{{-`, `-}}`
 - Comments: `{# ... #}`
 - Built-in filters: `length`, `lower`, `upper`, `default`, `join`, `trim`
 
-### Unsupported in v1 (use produces a render error)
+### Enforcement boundary (what parse-time validation rejects)
+
+Parse-time validation enforces the **tag** subset and the **filter** allowlist above: an unsupported tag (`{% set %}`, `{% raw %}`, macros, inheritance, includes, the `do` tag) or a filter outside the six listed is a parse error. These are the constructs whose availability or behavior **differs across Jinja engines**, so blocking them is what preserves cross-engine portability (MiniJinja ↔ Tiddly's Jinja2, per system-design §6).
+
+Expression-level syntax — the comparison / boolean / arithmetic operators, member access, and indexing above — is **accepted and not parse-rejected**. These operators are core Jinja syntax that renders identically across engines, so enforcing them would buy no portability while requiring a full expression parser. *Author guidance (not enforced):* keep expressions simple for cross-engine fidelity; obscure numeric semantics (e.g. division / floor-division, type coercion) are not guaranteed identical across engines and are not part of the committed v1 contract.
+
+### Unsupported in v1 (tags/filters → parse error; see "Enforcement boundary")
 
 - Custom filters (Tiddly's project-specific filters)
 - The `do` extension
@@ -283,7 +328,7 @@ Functions accepting `agents` arguments accept either a single agent reference or
 - Turns from prior workflow runs against the same agent.
 - Turns from concurrent workflow runs targeting the same agent.
 
-Rationale: deterministic, predictable behavior. The author writes the workflow as a sequence of dispatches with declared dependencies; the helpers should reflect what the workflow itself orchestrated, not silently couple to whatever the user (or another workflow) did out-of-band. Implementation: the workflow runtime maintains a per-run map of agent → most-recent-completed-turn-this-workflow-saw, updated on `wait_for` / `wait_for_all` success **and on `pause_for_user` Mode-2 implicit-wait completion**; the helpers read from this map. The map stores the agent's **resolved output text**, captured from the turn's live event stream at completion — *not* a turn-id to be re-joined against the harness session file later. (An earlier design stored turn-id references and read bodies from disk on resolve; that join is unreliable — the dispatcher turn id and the harness file's turn ids are different id spaces, and one harness has no per-turn id at all — so the runtime captures the text when the turn completes instead. This is also what the run checkpoint persists, so a crash-recovered run can re-feed an earlier step's output; see the M6 plan and the scoped agent-content exception in system-design §3.)
+Rationale: deterministic, predictable behavior. The author writes the workflow as a sequence of dispatches with declared dependencies; the helpers should reflect what the workflow itself orchestrated, not silently couple to whatever the user (or another workflow) did out-of-band. Implementation: the workflow runtime maintains a per-run map of agent → most-recent-completed-turn-this-workflow-saw, updated on `wait_for` / `wait_for_all` success **and on `pause_for_user` Mode-2 implicit-wait completion**; the helpers read from this map. The map stores the agent's **resolved output text**, captured from the turn's live event stream at completion — *not* a turn-id to be re-joined against the harness session file later. (An earlier design stored turn-id references and read bodies from disk on resolve; that join is unreliable — the dispatcher turn id and the harness file's turn ids are different id spaces, and one harness has no per-turn id at all — so the runtime captures the text when the turn completes instead.) This map is **in-memory only** and lives for the duration of a single run; it is **not persisted**. (An earlier design persisted it so a crash-recovered run could re-feed an earlier step's output — but resume/retry is deferred beyond v1, so no agent content is written to disk and the system-design §3 "no agent content" invariant stands unmodified. See "Failure handling" above.)
 
 **Cross-iteration visibility within `for_each`:** Turns from earlier iterations of the same `for_each` body are workflow-run turns and remain visible to helpers in later iterations — only `user_input` is scoped per-iteration. Authors who don't want stale cross-iteration values should explicitly `wait_for` after a fresh `send` at the start of each iteration so the helper sees the new turn rather than the prior iteration's.
 
@@ -301,7 +346,7 @@ Rationale: deterministic, predictable behavior. The author writes the workflow a
 === END response from <agent_b_name> ===
 ```
 
-A receiving prompt that simply wraps the aggregation as `{{ feedback }}` (e.g., `tiddly:ai-review-feedback`) gets this canonical shape with no Switchboard-specific authoring required.
+A receiving prompt that simply wraps the aggregation in a single text argument (e.g., `builtin:analyze-ai-reviews`'s `{{ review }}`) gets this canonical shape with no Switchboard-specific authoring required.
 
 **Sentinel collision policy:** there is no escaping of `=== START` / `=== END` in agent output. If an agent's output literally contains a sentinel-shaped line, the receiving agent sees it as part of the forwarded content. This is judged acceptable: collisions are rare in practice (the sentinel pattern is distinctive), agents are good at recovering from minor delimitation noise, and escaping would obscure the structure for the common case. Authors who need strict delimitation can use `responses_from` and a custom template that wraps content explicitly (e.g., XML-style tags).
 
@@ -358,9 +403,9 @@ Per system-design §7:
 - A user manually cancelling an agent's turn that is part of a workflow step → `cancelled`. Applies uniformly — cancelling any one participating agent in a fan-in step also marks the whole workflow `cancelled`.
 - A user clicking cancel-workflow → `cancelled`
 - Any agent failure within a `wait_for_all` → step `failed`
-- Switchboard process death mid-step → `interrupted` (recovery: surface "interrupted at step N" with retry/abandon options)
+- Switchboard process death mid-step → `interrupted` (v1: surfaced as an interrupted run the user can **abandon**; no resume — see below)
 
-A `failed` or `interrupted` workflow can be retried from the failed step or abandoned. A `cancelled` workflow cannot be auto-resumed (user must re-invoke from the start).
+**v1 does not support resuming or retrying a run.** A `failed`, `interrupted`, or `cancelled` run is terminal: the user **abandons** it (which clears its run record) and, if they still want the work done, re-invokes the workflow from the start. The status values above are *display* states — they describe how a run ended, not resumable states. Resume / retry-from-step, and the snapshot + checkpoint-replay machinery it would require, are **deferred beyond v1** (rationale: a crash leaves participating agents' in-flight turns dead and a half-run transcript, so a correct resume needs both runtime replay and a non-trivial UI to convey what ran; the value is low because crashes are rare, and the cost spans the interpreter and the progress UI). See the v1 plan (M5) for the deferred scope.
 
 ### Sibling-failure policy (parallel `send` / fan-in)
 
@@ -375,20 +420,11 @@ Boundary cases:
 
 Manual cancel remains the user's escape hatch if they want to stop still-running siblings of a doomed step (e.g. coding agents mid-edit); Switchboard does not do this automatically.
 
-**Workflow file snapshot at invocation:** Workflow runs execute against an immutable snapshot of the workflow file and its bound inputs, captured at invocation time. Prompt resolution still happens at each step's dispatch (per system-design §6 prompt resolution rules) — edits to a referenced prompt take effect on the next workflow invocation, not the in-flight run. Edits to the workflow file on disk after invocation do not affect the in-flight run or retries; the snapshot is what executes. Rationale: deterministic execution and deterministic retry; reload-on-retry would create incoherent "same run, different program" behavior given step-index checkpointing.
+**Workflow file snapshot during a live run:** A workflow run executes against an immutable snapshot of the workflow file and its bound inputs, captured at invocation time and held **in memory** for the life of the run, so editing the file on disk mid-run does not change the program the running workflow executes. (Prompt resolution still happens at each step's dispatch per system-design §6 — editing a referenced *prompt* takes effect on the next invocation, not the in-flight run.) Because v1 has no resume, the snapshot does **not** need to be persisted: it exists only to keep a single live run coherent, and a crashed run is abandoned rather than re-executed.
 
-### Retry from inside a `for_each` iteration
+### Retry from inside a `for_each` iteration — deferred beyond v1
 
-When a step inside a `for_each` body fails or is interrupted, the workflow checkpoint captures the iteration index, the iteration variable's value, the per-run **output-scope map** (agent → most-recent-completed-turn-id; see §"Output scope"), and the most recently captured `user_input` in the current scope. On retry, the runtime rebinds the iteration variable from the checkpoint, restores the output-scope map and `user_input`, and resumes execution at the failed step's index *within that iteration*. Earlier steps in the same iteration are not re-executed.
-
-The output-scope-map restoration is what lets `forward_from` / `last_output` / `aggregated_responses` / `responses_from` correctly resolve in steps that come *after* the failed step but *before* a re-completed dispatch — without it, retries would fail with "no in-workflow completed output for agent X" even though earlier iteration steps already completed those dispatches.
-
-The `user_input` restoration rule has two cases:
-
-- **Retry of a non-pause step that comes after a completed `pause_for_user`**: the prior scoped `user_input` is restored from the checkpoint so subsequent steps that template-reference it render correctly.
-- **Retry of the same Mode-2 `pause_for_user` step that failed at dispatch**: the runtime re-enters the pause UI per the Mode-2 dispatch-failure rule. The compose bar is pre-filled with the captured `user_input` and the user must re-submit explicitly. The captured `user_input` is *not* automatically replayed — re-submission is a conscious act.
-
-Authors should keep this in mind when writing iteration bodies that have side-effecting steps (e.g., a `send` that creates a file or commits): on retry of step N within iteration K, steps 1..N-1 of iteration K do not run again. Where retry-correctness matters, design the workflow so the failing step is the side-effecting one (so its effects are not double-applied) or so earlier-step effects are idempotent.
+Resume/retry is not in v1 (see "Failure handling" above), so the iteration-level retry mechanics — checkpointing the iteration index + variable, restoring the per-run output-scope map and `user_input`, and resuming at the failed step within the iteration — are **deferred**. The design intent is recorded here for the future milestone that adds resume: a checkpoint would capture the iteration index, the iteration variable's value, the per-run output-scope map (agent → resolved text), and the current-scope `user_input`, so that `forward_from` / `last_output` / `aggregated_responses` / `responses_from` resolve correctly in steps after the failed step but before a re-completed dispatch, and so a side-effecting iteration body is not re-run from its start. None of this executes in v1.
 
 ## Validation
 
@@ -400,21 +436,24 @@ A workflow file is validated at two times:
 - Top-level keys are exactly `name`, `description`, optionally `inputs`, `steps`
 - `name` matches the slug regex and equals the filename
 - `inputs` declarations use valid types
-- Each `steps` entry has exactly one step-type key with a known type
+- No `default` (and thus no optionality) on a non-`text` input (per §Inputs — `text`-only in v1)
+- Each `steps` entry has a required, non-blank `label` (string) plus exactly one step-type key with a known type
 - Each step's required fields are present
-- All template strings parse as valid templates (referenced variable names need not be declared yet — that's an invocation-time check)
+- All template strings parse as valid templates and stay within the **tag/filter** subset (per §Templating "Enforcement boundary"); expression-level operators are accepted. Referenced variable names need not be declared yet — that's an invocation-time check.
 - No nested `for_each`
 - No reserved built-in names used as input names
 - No `for_each` `item:` name that collides with a workflow input name *or* with the reserved built-in name `user_input` (per §`for_each` — silent shadowing is rejected at the boundary)
 - Hardcoded `[agent]` literals in step bodies (YAML literals, not template substitution) are checked at parse time: empty literals (e.g., `to: []`) and literals containing duplicate references (after hyphen→underscore normalization) are rejected.
+- A `send.prompt` value containing a template delimiter (`{{` or `{%`) is a parse error: the prompt id must be a literal so its argument schema can be statically resolved (see §"Hardcoded prompts and auto-derived arguments").
 
-Hardcoded `prompt_id` literals (e.g., `prompt: "local:code-review"` with no template substitution) are **not** resolved against providers at parse time; provider resolution happens at invocation time. This is intentional — configured prompt providers may change between save and run.
+The literal `prompt` id (e.g., `prompt: "builtin:code-review"`) is **not** resolved against providers at parse time; provider resolution — and the binding/compatibility checks that depend on it — happen at invocation time. This is intentional: configured prompt providers (and a referenced prompt's argument schema) may change between save and run.
 
 ### Invocation-time (when the user invokes the workflow)
 
 - All required inputs are supplied
 - All `agent`-typed input values reference agents that exist in the project
-- All `prompt_id`-typed input values resolve through configured providers
+- Each hardcoded `send.prompt` id resolves through configured providers, and each of its computed `template_vars` keys is a real argument of the resolved prompt — a non-empty `template_vars \ prompt-args` set (or an unresolvable id) is an invocation-blocking incompatibility naming the offending prompt and argument (see §"Binding classification")
+- Every required user-fillable prompt argument (auto-derived, `prompt-args \ template_vars`) is supplied
 - All template variable references resolve in the available scope (per "Available template variables") at the time the template is about to render
 - Built-in functions (`responses_from`, etc.) get arguments of the right shape
 - Any `[agent]` list resolved for use as a step target (`to`), synchronization argument (`agents`), forwarding source (`forward_from`), or helper-function argument (`responses_from`, `aggregated_responses`, `agent_names`) contains unique agents — after hyphen→underscore normalization (per system-design §3 Primitive 1). Duplicate references fail invocation pre-flight; rationale: double-dispatch to a busy agent, ambiguous waits, and mapping-key collisions in fan-in helpers all silently produce wrong results.
@@ -451,41 +490,40 @@ steps:
       agent: "{{ implementer }}"
 ```
 
-### 2. Fan-in review (review-and-aggregate, the canonical)
+### 2. Fan-in review (review-and-recommend, the canonical)
 
 ```yaml
-name: review-and-aggregate
+name: review-and-recommend
 description: Send to multiple reviewers in parallel, aggregate, send to primary.
 
 inputs:
   primary_agent: agent
   reviewer_agents: [agent]
-  review_prompt: prompt_id
-  aggregation_prompt: prompt_id
-  user_context: text?
 
 steps:
   - send:
       to: "{{ reviewer_agents }}"
-      prompt: "{{ review_prompt }}"
-      template_vars:
-        context: "{{ user_context }}"
+      prompt: "builtin:code-review"
+      # No template_vars: code-review's only argument, `context`, is optional and
+      # user-fillable — it is auto-derived and shown as a form field at invocation.
   - wait_for_all:
       agents: "{{ reviewer_agents }}"
   - send:
       to: "{{ primary_agent }}"
-      prompt: "{{ aggregation_prompt }}"
+      prompt: "builtin:analyze-ai-reviews"
       template_vars:
-        feedback: "{{ aggregated_responses(reviewer_agents) }}"
+        review: "{{ aggregated_responses(reviewer_agents) }}"
 ```
 
-This passes the aggregated reviews as a single text blob to whatever variable the aggregation prompt declares (commonly `feedback`). A typical cross-platform aggregation prompt — including ones authored outside Switchboard, such as `tiddly:ai-review-feedback` — wraps the blob directly:
+Both prompts are hardcoded literals, not inputs. The invocation form shows `primary_agent`, `reviewer_agents`, and one auto-derived field — `code-review`'s optional `context` — and nothing else. `analyze-ai-reviews`'s required `review` argument is a **computed binding** (filled by `aggregated_responses`), so it is hidden from the user; if `analyze-ai-reviews` ever renamed `review`, the `template_vars: { review: … }` binding would become a `T \ A` invalid binding and invocation would be blocked with an error naming the prompt and argument.
+
+This passes the aggregated reviews as a single text blob to whatever argument the analysis prompt declares — here `review`. A cross-platform prompt that takes a single text argument wraps the blob directly:
 
 ```jinja
 Here is feedback from AI coding agents:
 
 """
-{{ feedback }}
+{{ review }}
 """
 
 Summarize agreement and disagreement.
@@ -571,4 +609,4 @@ The following are *implementation* details, not language-spec details, and live 
 - Concurrency model for parallel `send` dispatches within a `wait_for_all`
 - Tauri command shapes for invoking workflows from the Svelte frontend
 - Workflow-progress event payload format for the frontend ring buffer
-- Built-in workflow files shipped with v1 (`review-and-aggregate.yaml`, etc.) — content TBD
+- Built-in workflow files shipped with v1 (`review-and-recommend.yaml`, etc.) — content TBD

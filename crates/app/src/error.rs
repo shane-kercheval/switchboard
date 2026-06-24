@@ -241,6 +241,86 @@ pub enum AppError {
         #[source]
         source: std::io::Error,
     },
+
+    /// A workflow-language error (parse, invocation-validation, or binding) from
+    /// the pure crate, surfaced at the command boundary.
+    #[error(transparent)]
+    Workflow(#[from] switchboard_workflow::WorkflowError),
+
+    /// No workflow with this name was found (built-in or in the user folder).
+    #[error("workflow {name:?} not found")]
+    WorkflowNotFound { name: String },
+
+    /// No user-global workflows directory is resolvable (no config dir — an
+    /// exotic host with no home).
+    #[error("workflows are not available (no config directory)")]
+    WorkflowsDirUnavailable,
+
+    /// The workflow uses a step type that is not runnable in this version
+    /// (`pause_for_user` / `for_each`) — gated at invoke, not a parse failure.
+    #[error("step type not supported in this version")]
+    WorkflowStepUnsupported,
+
+    /// No workflow run with this id is active or on disk for the project.
+    #[error("workflow run {run_id} not found")]
+    WorkflowRunNotFound { run_id: uuid::Uuid },
+
+    /// A workflow is already running in this project. Only one workflow may run
+    /// per project at a time — the live progress view and compose lockout assume a
+    /// single run. Enforced atomically at registry insertion so concurrent invokes
+    /// can't both start.
+    #[error("a workflow is already running in this project")]
+    WorkflowAlreadyRunning { project_id: ProjectId },
+
+    /// A failed or interrupted workflow run is held in this project, waiting to be
+    /// dismissed. A held run occupies the project the same way a live one does (it
+    /// replaces the compose box until dismissed), so a new run can't start until it
+    /// is abandoned. Distinct from `WorkflowAlreadyRunning` so the UI can prompt
+    /// "dismiss the failed workflow first" rather than "wait for the running one".
+    #[error("a failed or interrupted workflow run must be dismissed before starting another")]
+    WorkflowRunRequiresDismissal { project_id: ProjectId },
+
+    /// Abandon was asked to clear a run that is still live. The interpreter would
+    /// just recreate the file on its next record; cancel it first.
+    #[error("workflow run {run_id} is still active; cancel it before abandoning")]
+    WorkflowRunActive { run_id: uuid::Uuid },
+
+    /// "Copy to my workflows" would overwrite an existing file; the app never
+    /// clobbers a user's workflow.
+    #[error("a workflow file already exists at {path}")]
+    WorkflowCopyExists { path: PathBuf },
+
+    /// A filesystem error reading, writing, or deleting a workflow / run file.
+    #[error("workflow file I/O error at {path}: {source}")]
+    WorkflowCopyIo {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// The run-record directory (`projects/<id>/runs/`) could not be created
+    /// before launching a workflow. Run files are how a failed/interrupted run
+    /// survives a restart, so we fail loudly here rather than start a run whose
+    /// records would silently fail to persist.
+    #[error("could not prepare workflow run directory at {path}: {source}")]
+    WorkflowRunSetupIo {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// "Copy to my prompts" would overwrite an existing file. The app never
+    /// clobbers a user's prompt — they rename or remove the existing file first.
+    #[error("a prompt file already exists at {path}")]
+    PromptCopyExists { path: PathBuf },
+
+    /// Writing the copied built-in prompt into the user's folder failed.
+    #[error("failed to copy prompt to {path}: {source}")]
+    PromptCopyIo {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 impl AppError {

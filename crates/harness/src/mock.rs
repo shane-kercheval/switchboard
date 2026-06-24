@@ -134,6 +134,17 @@ pub enum MockScenario {
     /// registers mid-turn), and completes only when the test releases it — unlike
     /// the cancellation scenarios, whose synthesized terminal is `Cancelled`.
     CompletesOnSignal(std::sync::Arc<tokio::sync::Notify>),
+
+    /// Emits `ContentChunk → TurnEnd(Completed)` immediately, then **holds the
+    /// stream open** (awaiting an external [`tokio::sync::Notify`]) before ending.
+    /// The terminal has fired, so the actor is parked *inside* `drain_turn`'s
+    /// post-terminal enrichment-drain window until the test releases it — the
+    /// deterministic vehicle for exercising the `FailFast` post-terminal-drain
+    /// accept (a back-to-back same-agent re-send accepted while the agent's own
+    /// turn is terminal but still draining) and the backlog-drop-fires-completion
+    /// paths during that window. Distinct from [`Self::CompletesOnSignal`], which
+    /// parks *before* the terminal (mid-turn).
+    CompletesThenHolds(std::sync::Arc<tokio::sync::Notify>),
 }
 
 /// A `HarnessAdapter` that produces canned events without spawning any subprocess.
@@ -554,6 +565,32 @@ impl HarnessAdapter for MockHarnessAdapter {
                         model: None,
                         effort: None,
                     });
+                });
+            }
+            MockScenario::CompletesThenHolds(ref signal) => {
+                let signal = std::sync::Arc::clone(signal);
+                tokio::spawn(async move {
+                    let _ = tx.send(AdapterEvent::ContentChunk {
+                        turn_id,
+                        kind: ContentKind::Text,
+                        text: "held-output".to_owned(),
+                    });
+                    let _ = tx.send(AdapterEvent::TurnEnd {
+                        turn_id,
+                        outcome: TurnOutcome::Completed,
+                        ended_at: Utc::now(),
+                        usage: None,
+                        context_window_source: None,
+                        stable_message_id: None,
+                        first_message_id: None,
+                        spend: None,
+                        model: None,
+                        effort: None,
+                    });
+                    // Hold the stream open *after* the terminal so the actor stays
+                    // inside drain_turn's post-terminal window; ending happens when
+                    // the test releases us (dropping `tx` closes the stream).
+                    signal.notified().await;
                 });
             }
             MockScenario::DispatchFails => {

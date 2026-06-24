@@ -7,7 +7,7 @@
   import {
     forwardSourceKey,
     forwardSourceForAgent,
-    forwardSourceForPane,
+    forwardSourceAgentsForPane,
     type ForwardSource,
   } from "$lib/state/heldForwards.svelte";
   import {
@@ -23,7 +23,9 @@
   import Spinner from "$lib/components/ui/Spinner.svelte";
   import ForwardSourceChip from "$lib/components/ui/ForwardSourceChip.svelte";
   import ForwardSourcePicker from "$lib/components/ui/ForwardSourcePicker.svelte";
+  import ClearIcon from "$lib/components/ui/ClearIcon.svelte";
   import { cn } from "$lib/utils";
+  import { ICON_BUTTON_ON_RAISED_CLASS } from "$lib/components/ui/iconButton";
 
   /// Prompt mode: the chosen prompt, its argument inputs, an appended-text field,
   /// and a Preview overlay of the combined message. The parent (`ComposeBar`)
@@ -42,6 +44,7 @@
     agentHasOutput,
     onremove,
     send,
+    recipients,
     focusFirstField = false,
     busy = false,
   }: {
@@ -65,18 +68,20 @@
     /// The compose bar's send button, rendered in the footer row beside Preview
     /// so the two actions align. Optional so the component stands alone in tests.
     send?: Snippet;
+    /// The recipient ("To") chips, handed down by the compose bar so they render
+    /// directly under the prompt name (the prompt titles the whole send, above
+    /// the recipients). Optional so the component stands alone in tests.
+    recipients?: Snippet;
     /// Focuses the first editable prompt field when a user explicitly selects a
     /// prompt from the picker. Saved/restored prompt drafts leave focus alone.
     focusFirstField?: boolean;
     busy?: boolean;
   } = $props();
 
-  /// Whether a source has nothing to forward yet — an agent with no completed
-  /// turn, or a pane whose every member is empty (or has no members).
+  /// Whether a source has nothing to forward yet — an agent with no completed turn.
   function sourceIsEmpty(source: ForwardSource): boolean {
     if (!agentHasOutput) return false;
-    const ids = source.kind === "agent" ? [source.id] : source.members;
-    return ids.length === 0 || ids.every((id) => !agentHasOutput(id));
+    return !agentHasOutput(source.id);
   }
 
   // Each forwardable field (every argument, plus the appended text) owns its own
@@ -164,6 +169,39 @@
     });
   });
 
+  /// The add-source closure for whichever of this composer's fields currently
+  /// holds focus (an argument textarea or the appended-text box), or `null` when
+  /// focus is elsewhere. Lets the ⌘⌃N pane chord target the field being typed in.
+  function focusedFieldAdd(): ((source: ForwardSource) => void) | null {
+    const active = document.activeElement;
+    if (active === null) return null;
+    for (const arg of prompt.arguments) {
+      if (argRefs[arg.name] === active) return (source) => addArgSource(arg.name, source);
+    }
+    if (appendedRef === active) return addAppendedSource;
+    return null;
+  }
+
+  // ⌘⌃1..9 → forward pane N into the focused field, mirroring the compose bar's
+  // whole-message chord but routed per-field (the compose bar's own handler
+  // no-ops in prompt mode, so there's no double-fire). Index matches the pane's
+  // position in `panes`, the same order the picker shows the chord for.
+  $effect(() => {
+    function onKeydown(e: KeyboardEvent): void {
+      if (busy) return;
+      if (!e.metaKey || !e.ctrlKey || e.altKey || e.shiftKey) return;
+      if (e.key < "1" || e.key > "9") return;
+      const pane = panes[Number(e.key) - 1];
+      if (pane === undefined || pane.members.length === 0) return;
+      const add = focusedFieldAdd();
+      if (add === null) return;
+      e.preventDefault();
+      for (const source of forwardSourceAgentsForPane(pane, agents)) add(source);
+    }
+    window.addEventListener("keydown", onKeydown);
+    return () => window.removeEventListener("keydown", onKeydown);
+  });
+
   function openPreview(): void {
     if (busy) return;
     previewOpen = true;
@@ -194,45 +232,46 @@
     )}
     data-testid="prompt-composer-content"
   >
-    <div class="flex items-center gap-1.5">
-      <div
-        class="border-border bg-panel inline-flex h-7 min-w-0 items-center gap-1.5 rounded-full border px-3"
-        data-testid="prompt-selector"
-      >
-        <span class="text-fg truncate text-sm font-medium">{promptDisplayName(prompt)}</span>
-        <span class="text-muted shrink-0 font-mono text-[11px]">{prompt.provider}</span>
-      </div>
-      <button
-        type="button"
-        class="text-muted hover:bg-panel hover:text-status-failed inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-full transition-colors"
-        data-testid="prompt-remove"
-        aria-label="Remove prompt"
-        disabled={busy}
-        onclick={() => {
-          if (!busy) onremove();
-        }}
-        class:cursor-not-allowed={busy}
-        class:opacity-50={busy}
-      >
-        <svg
-          width="16"
-          height="16"
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          stroke-width="2"
-          stroke-linecap="round"
-          stroke-linejoin="round"
-          aria-hidden="true"
+    <div class="flex flex-col gap-1">
+      <div class="flex items-center justify-between gap-2">
+        <div class="flex min-w-0 items-baseline gap-1.5" data-testid="prompt-selector">
+          <span class="text-fg truncate text-sm font-semibold">{promptDisplayName(prompt)}</span>
+          <span class="text-muted shrink-0 font-mono text-[11px]">{prompt.provider}</span>
+        </div>
+        <button
+          type="button"
+          class="text-muted hover:bg-panel hover:text-status-failed inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-full transition-colors"
+          data-testid="prompt-remove"
+          aria-label="Remove prompt"
+          disabled={busy}
+          onclick={() => {
+            if (!busy) onremove();
+          }}
+          class:cursor-not-allowed={busy}
+          class:opacity-50={busy}
         >
-          <path d="M18 6 6 18M6 6l12 12" />
-        </svg>
-      </button>
+          <svg
+            width="16"
+            height="16"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            aria-hidden="true"
+          >
+            <path d="M18 6 6 18M6 6l12 12" />
+          </svg>
+        </button>
+      </div>
+
+      {#if prompt.description}
+        <p class="text-muted text-xs">{prompt.description}</p>
+      {/if}
     </div>
 
-    {#if prompt.description}
-      <p class="text-muted text-xs">{prompt.description}</p>
-    {/if}
+    {@render recipients?.()}
 
     <div
       class="min-h-0 [scrollbar-gutter:stable] space-y-3 overflow-y-auto py-1 pr-3 pl-1"
@@ -246,19 +285,23 @@
           {agents}
           {panes}
           onPickAgent={(agent) => onAdd(forwardSourceForAgent(agent))}
-          onPickPane={(pane) => onAdd(forwardSourceForPane(pane, agents))}
+          onPickPane={(pane) => {
+            for (const source of forwardSourceAgentsForPane(pane, agents)) onAdd(source);
+          }}
           {agentHasOutput}
           disabled={busy}
+          showPaneShortcuts
           triggerTestid={testid}
           triggerLabel={label}
           tooltipLabel="Forward an agent's output"
-          triggerClass="text-muted hover:text-fg hover:bg-panel border-border focus-visible:ring-accent flex h-9 w-9 shrink-0 items-center justify-center self-start rounded-md border transition-colors focus-visible:ring-2 focus-visible:outline-none"
+          triggerClass={cn(ICON_BUTTON_ON_RAISED_CLASS, "shrink-0 self-center")}
         />
       {/snippet}
 
       {#snippet fieldChips(
         sources: ForwardSource[],
         onRemove: (key: string) => void,
+        onClear: () => void,
         testid: string,
       )}
         {#if sources.length > 0}
@@ -271,6 +314,24 @@
                 onRemove={() => onRemove(forwardSourceKey(source))}
               />
             {/each}
+            {#if sources.length > 1}
+              <!-- Each chip carries its own ✕; the bulk clear (same ⊘ glyph as
+                   "Clear recipients") only earns its place once there are several
+                   to drop at once. -->
+              <button
+                type="button"
+                class={cn(ICON_BUTTON_ON_RAISED_CLASS, "ml-0.5 shrink-0 disabled:opacity-50")}
+                data-testid={`${testid}-clear`}
+                aria-label="Clear forward sources"
+                title="Clear forward sources"
+                disabled={busy}
+                onclick={() => {
+                  if (!busy) onClear();
+                }}
+              >
+                <ClearIcon />
+              </button>
+            {/if}
           </div>
         {/if}
       {/snippet}
@@ -316,6 +377,7 @@
           {@render fieldChips(
             argSources[arg.name] ?? [],
             (key) => removeArgSource(arg.name, key),
+            () => (argSources[arg.name] = []),
             `prompt-arg-sources-${arg.name}`,
           )}
         </div>
@@ -343,7 +405,12 @@
             )}
           {/if}
         </div>
-        {@render fieldChips(appendedSources, removeAppendedSource, "prompt-appended-sources")}
+        {@render fieldChips(
+          appendedSources,
+          removeAppendedSource,
+          () => (appendedSources = []),
+          "prompt-appended-sources",
+        )}
       </div>
     </div>
 

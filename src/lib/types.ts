@@ -120,7 +120,22 @@ export type StagedAttachment = {
 };
 
 export type NormalizedEvent =
-  | { type: "turn_start"; turn_id: TurnId; message_id: MessageId; started_at: string }
+  | {
+      type: "turn_start";
+      turn_id: TurnId;
+      message_id: MessageId;
+      // The originating send's id, shared across a fan-out's recipients. Lets the
+      // live UI group concurrent turns of one send side-by-side even when the
+      // frontend didn't originate the send (e.g. a workflow dispatch), which has
+      // no local `pending_sends` entry to derive the grouping from.
+      send_id: SendId;
+      started_at: string;
+    }
+  // A user-side message a workflow `send` dispatched to this agent (the frontend
+  // has no optimistic user turn for a backend-originated send). The reducer turns
+  // it into a user turn; a fan-out's recipients share `send_id` so they group into
+  // one user row + per-recipient columns. Manual sends don't use this.
+  | { type: "user_message"; send_id: SendId; text: string; at: string }
   | { type: "content_chunk"; turn_id: TurnId; kind: ContentKind; text: string }
   // Content-free liveness signal: the harness is still alive mid-turn but
   // produced no renderable content (e.g. Claude Opus 4.8's redacted thinking
@@ -194,7 +209,19 @@ export type NormalizedEvent =
   // adapter failed to launch pre-`turn_start`). Keyed by `message_id` — there
   // is no live turn. Carries no prompt; the frontend still holds the
   // optimistically-rendered text and marks that bubble failed.
-  | { type: "message_failed"; message_id: MessageId; agent_id: AgentId; error: string; at: string }
+  | {
+      type: "message_failed";
+      message_id: MessageId;
+      // The **durably recorded** send this failure belongs to, or `null` if the
+      // send never reached the journal. When set, a backend-originated send
+      // (workflow) attaches its failed marker via this; when `null` it renders no
+      // row (reload can't reconstruct an unrecorded send). Manual sends ignore it
+      // and resolve via `pending_sends`.
+      send_id: SendId | null;
+      agent_id: AgentId;
+      error: string;
+      at: string;
+    }
   // A queued send was cancelled before it started (its backlog item was dropped
   // by cancel_send / cancel_agent). Keyed by `message_id`, no `turn_id`. The
   // authoritative signal that a not-yet-started send is gone — the frontend
@@ -571,12 +598,14 @@ export type DiffStyle = "side_by_side" | "unified";
 // Mirror of Rust `Preferences` (`crates/app/src/preferences.rs`) — backend-owned
 // `config.yaml`. `editor_command` defaults to "code"; null → OS default
 // folder-open. `terminal_app` defaults to "Terminal"; `diff_style` defaults to
-// "unified".
+// "unified". `show_builtins` defaults to true (the read-only built-in prompts &
+// workflows appear in the pickers; off → only the user's own content).
 // Theme is NOT here — it stays in frontend localStorage (a device-local concern).
 export type Preferences = {
   editor_command: string | null;
   terminal_app: string;
   diff_style: DiffStyle;
+  show_builtins: boolean;
 };
 
 // Mirror of Rust `ProjectConversation` / `ConversationItem` / `OutcomeStatus` /
@@ -761,3 +790,143 @@ export type Prompt = {
 export type RenderedPrompt = {
   text: string;
 };
+
+// ── Workflows (system-design §7) ──────────────────────────────────────────────
+// Mirror the Rust types in `crates/app/src/workflow_commands.rs`.
+
+// One declared workflow input as the invocation form renders it. `ty` is the
+// base type; `text?` is `ty: "text"` with `optional: true`. List inputs
+// (`[agent]`/`[text]`) are `agent_list`/`text_list`. There is no prompt type — a
+// step's prompt is hardcoded; its arguments are auto-derived (see DerivedArgInfo).
+export type WorkflowInputType = "agent" | "agent_list" | "text" | "text_list";
+
+export type WorkflowInputInfo = {
+  name: string;
+  ty: WorkflowInputType;
+  optional: boolean;
+  description: string | null;
+};
+
+// A workflow as the menu/list shows it: parsed metadata OR a parse error, plus
+// the read-only/built-in flag and the up-front `invocable` flag (false when it
+// uses a not-yet-runnable step — `pause_for_user`/`for_each`).
+export type WorkflowListing = {
+  name: string;
+  is_builtin: boolean;
+  description: string | null;
+  inputs: WorkflowInputInfo[];
+  invocable: boolean;
+  parse_error: string | null;
+};
+
+// A user-fillable prompt argument auto-derived from a workflow's hardcoded
+// prompt(s) — surfaced as a form field alongside the declared inputs. `prompts`
+// lists the hardcoded prompt id(s) it feeds (more than one when two prompts share
+// a same-named argument).
+export type DerivedArgInfo = {
+  name: string;
+  required: boolean;
+  description: string | null;
+  prompts: string[];
+};
+
+// A binding/collision problem that blocks invocation (drift between a workflow
+// and its hardcoded prompt). `argument` is empty when the whole prompt id is the
+// problem (malformed).
+export type BindingIssue = {
+  prompt: string;
+  argument: string;
+  reason: string;
+};
+
+// Whether a picked workflow's hardcoded prompts are runnable as-is.
+//  - `ok`: every prompt resolved, every binding valid.
+//  - `incompatible`: a prompt drifted (invalid binding / malformed id / disallowed
+//    collision) — blocks Run with the listed issues.
+//  - `unresolved`: a prompt isn't resolvable yet (cold MCP cache) — pending, not an
+//    error; the form shows a "resolving" affordance and re-fetches on `prompts:synced`.
+export type FormCompatibility =
+  | { state: "ok" }
+  | { state: "incompatible"; issues: BindingIssue[] }
+  | { state: "unresolved"; prompts: string[] };
+
+// The complete invocation form for a picked workflow: declared inputs plus the
+// auto-derived user-fillable prompt-argument fields, plus a compatibility verdict.
+// Resolved per-pick via `describe_workflow_form` (not in `list_workflows`).
+// A declared recipient reference for a step. `literal` is a hardcoded agent name;
+// `slot` is an `agent`/`[agent]` input the user binds — the composer preview
+// resolves a slot against the form's bindings live, and a live run carries
+// recipients already resolved to `literal`s.
+export type RecipientRef = { kind: "literal"; name: string } | { kind: "slot"; input: string };
+
+// What a step is, so the progress view can group a `send` with the `wait` that
+// synchronizes it. Both wait variants are `"wait"`. The reducer's default branch
+// degrades gracefully on a kind a newer build added but this one doesn't know
+// (Rust `#[non_exhaustive]`) — such a step renders as its own honest row.
+export type WorkflowStepKind = "send" | "wait" | "pause" | "for_each";
+
+// The prompt a `send` step runs, surfaced as a "which prompt" chip: a named
+// prompt (`builtin:code-review`) or inline text. `null` on a step that runs no
+// prompt (a wait/pause, or a pure-forward send).
+export type StepPrompt = { kind: "named"; id: string } | { kind: "inline" };
+
+// One step as the progress/preview views render it. `recipients` are declared
+// (slots unresolved) on a `WorkflowFormDescriptor`, and resolved to concrete
+// agent names on a live `WorkflowRunInfo`.
+export type WorkflowStepInfo = {
+  kind: WorkflowStepKind;
+  label: string;
+  // One-line explanation, rendered as a sub-line under the label.
+  description: string | null;
+  // The prompt this step runs, shown as a chip; `null` when the step runs none.
+  prompt: StepPrompt | null;
+  recipients: RecipientRef[];
+  feeds_from: RecipientRef[];
+};
+
+export type WorkflowFormDescriptor = {
+  name: string;
+  description: string | null;
+  is_builtin: boolean;
+  invocable: boolean;
+  inputs: WorkflowInputInfo[];
+  derived_args: DerivedArgInfo[];
+  compatibility: FormCompatibility;
+  // Declared steps for the composer preview (slots unresolved).
+  steps: WorkflowStepInfo[];
+};
+
+// A run as the indicator shows it (from `list_workflow_runs`). `status` is
+// `running` (live), `failed` (retained terminal), or `interrupted` (no terminal,
+// not live). `step` is the zero-based current/failing step.
+export type WorkflowRunStatus = "running" | "failed" | "interrupted";
+
+export type WorkflowRunInfo = {
+  run_id: string;
+  workflow: string;
+  step: number;
+  total: number;
+  status: WorkflowRunStatus;
+  reason: string | null;
+  // Per-step display info: resolved recipients for a live run, declared for a
+  // disk-sourced failed/interrupted run. May be empty for a legacy run file.
+  steps: WorkflowStepInfo[];
+};
+
+// The `workflow:<project-id>` channel payload. `status` is `running` while live,
+// or a terminal (`complete`/`cancelled`/`failed`). Carries no agent output text.
+export type WorkflowProgressStatus = "running" | "complete" | "cancelled" | "failed";
+
+export type WorkflowProgressPayload = {
+  run_id: string;
+  workflow: string;
+  step: number;
+  total: number;
+  status: WorkflowProgressStatus;
+  reason: string | null;
+};
+
+// An input value supplied at invocation. A scalar (agent/prompt_id/text) is a
+// bare string; a list (`[agent]`/`[text]`) is a string array — matching the
+// untagged Rust `InputValue`.
+export type WorkflowInputValue = string | string[];

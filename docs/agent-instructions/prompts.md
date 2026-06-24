@@ -10,7 +10,7 @@ Local prompts are file-based. There is no in-app editor. You are generating a fi
 
 ## Where local prompts live
 
-Local prompts are **user-global** — configured once at the user level and available in every project, regardless of working directory. Switchboard resolves them from the directories listed in `local_prompt_dirs` in the user-global `config.yaml`, in declared order (an earlier directory shadows a later one on name collision). If `local_prompt_dirs` is unset, Switchboard uses a single default store: the OS-conventional `prompts/` directory under the user-global config dir (e.g. `~/.config/switchboard/prompts/` on Linux, `~/Library/Application Support/switchboard/prompts/` on macOS), which is seeded with example prompts on first run.
+Local prompts are **user-global** — configured once at the user level and available in every project, regardless of working directory. Switchboard resolves them from the directories listed in `local_prompt_dirs` in the user-global `config.yaml`, in declared order (an earlier directory shadows a later one on name collision). If `local_prompt_dirs` is unset, Switchboard uses a single default store: the OS-conventional `prompts/` directory under the user-global config dir (e.g. `~/.config/switchboard/prompts/` on Linux, `~/Library/Application Support/switchboard/prompts/` on macOS), which starts empty — example prompts ship as a read-only built-in library baked into the app, not written into this folder.
 
 Default to writing the prompt into the default store (or, if the user keeps a personal prompt library listed in `local_prompt_dirs`, into that directory). If the user has indicated they keep prompts elsewhere, follow their instruction.
 
@@ -78,15 +78,12 @@ The template is a **MiniJinja subset** (Jinja2-compatible). Switchboard renders 
 - If conditions: `{% if expr %}...{% elif %}...{% else %}...{% endif %}` (truthiness checks and equality)
 - Whitespace control: `{%-`, `-%}`, `{{-`, `-}}`
 - Comments: `{# ... #}`
-- Built-in filters: `length`, `lower`, `upper`, `default`, `join`, `trim`
+- Built-in filters: `length`, `lower`, `upper`, `default`, `join`, `trim` (the portable core — the local renderer supports more MiniJinja filters, but only these are guaranteed to behave identically if the prompt is later used by a workflow or moved to Tiddly)
 
-**Not supported in v1** (using these is a render error):
+**Stay within that core subset.** It is the same subset Switchboard's workflow DSL enforces on its *own* template strings, and it's what renders consistently across Switchboard and Tiddly's Jinja2. Local-prompt rendering does **not** restrict you to it (it's plain MiniJinja with default features), so the constructs below split two ways:
 
-- Custom filters
-- `{% set %}`, `{% raw %}`, `{% macro %}`
-- Template inheritance (`{% extends %}`, `{% block %}`)
-- Includes (`{% include %}`)
-- The `do` extension
+- **These error even in a local prompt** — don't use them: unregistered/custom filters, and the template-loading tags `{% include %}`, `{% extends %}`, `{% block %}` (no template loader is configured, so they fail at render).
+- **These render locally but aren't portable** — avoid them: `{% set %}`, `{% raw %}`, `{% macro %}`, and the `do` tag. They work in a standalone local prompt today, but the workflow DSL rejects them in its own templates and other Jinja2 servers may differ — staying in the core keeps a prompt consistent wherever it's rendered.
 
 If you want richer templating, the user can keep the prompt in Tiddly (an MCP prompt server) instead of a local file.
 

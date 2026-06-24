@@ -12,10 +12,11 @@ mod journal;
 mod locator_sink;
 mod metadata;
 mod preferences;
-mod prompts_setup;
 mod secret_store;
 mod state;
 mod wake_lock;
+pub mod workflow;
+mod workflow_commands;
 mod workspace;
 
 use std::path::Path;
@@ -39,30 +40,39 @@ use crate::commands::{
     check_antigravity_auth_impl, check_antigravity_binary_impl, check_claude_auth_impl,
     check_claude_binary_impl, check_codex_auth_impl, check_codex_binary_impl,
     check_gemini_auth_impl, check_gemini_binary_impl, commit_changed_files_impl,
-    commit_file_diff_impl, commit_ranges_impl, create_agent_impl, create_project_impl,
-    delete_project_impl, editor_open_argv, fetch_repo_impl, file_diff_impl, forward_message_impl,
-    forward_prompt_impl, get_harness_install_status_impl, get_preferences_impl,
-    init_directory_impl, list_agents_impl, list_mcp_providers_impl, list_projects_impl,
-    list_prompts_impl, list_tracked_repos_from_inputs, list_workspace_directories_impl,
-    load_project_conversation_impl, load_transcript_impl, open_commit_file_difftool_impl,
-    open_project_impl, open_worktree_file_difftool_impl, parse_uuid, pick_directory_impl,
-    project_session_fingerprints_impl, read_tracked_repo_from_inputs, remove_agent_impl,
-    remove_directory_impl, remove_mcp_provider_impl, remove_queued_message_impl,
-    remove_tracked_repo_impl, rename_agent_impl, rename_project_impl, render_prompt_impl,
-    reorder_agents_impl, reveal_in_finder_argv, search_project_files_in_root,
-    search_project_files_root_impl, send_message_impl, set_active_project_impl,
-    set_agent_effort_impl, set_agent_model_impl, set_preferences_impl, set_project_archived_impl,
-    stage_attachment_impl, sync_prompts_and_notify, terminal_open_argv, test_mcp_connection_impl,
-    tracked_repos_inputs, tracked_roots, validate_external_url,
+    commit_file_diff_impl, commit_ranges_impl, copy_builtin_prompt_impl, create_agent_impl,
+    create_project_impl, delete_project_impl, editor_open_argv, fetch_repo_impl, file_diff_impl,
+    forward_message_impl, forward_prompt_impl, get_harness_install_status_impl,
+    get_preferences_impl, init_directory_impl, list_agents_impl, list_mcp_providers_impl,
+    list_projects_impl, list_prompts_impl, list_tracked_repos_from_inputs,
+    list_workspace_directories_impl, load_project_conversation_impl, load_transcript_impl,
+    open_commit_file_difftool_impl, open_project_impl, open_worktree_file_difftool_impl,
+    parse_uuid, pick_directory_impl, project_session_fingerprints_impl,
+    read_tracked_repo_from_inputs, remove_agent_impl, remove_directory_impl,
+    remove_mcp_provider_impl, remove_queued_message_impl, remove_tracked_repo_impl,
+    rename_agent_impl, rename_project_impl, render_prompt_impl, reorder_agents_impl,
+    reveal_in_finder_argv, search_project_files_in_root, search_project_files_root_impl,
+    send_message_impl, set_active_project_impl, set_agent_effort_impl, set_agent_model_impl,
+    set_preferences_impl, set_project_archived_impl, stage_attachment_impl,
+    sync_prompts_and_notify, terminal_open_argv, test_mcp_connection_impl, tracked_repos_inputs,
+    tracked_roots, validate_external_url,
 };
 use crate::preferences::Preferences;
 use crate::state::AppState;
+use crate::workflow_commands::{
+    WorkflowFormDescriptor, WorkflowListing, WorkflowRunInfo, abandon_workflow_run_impl,
+    cancel_workflow_run_impl, copy_builtin_workflow_impl, describe_workflow_form_impl,
+    invoke_workflow_impl, list_workflow_runs_impl, list_workflows_impl, user_workflows_dir,
+    validate_workflow_invocation_impl,
+};
 
-use switchboard_core::{AgentRecord, Attachment, HarnessKind, ProjectSummary};
+use switchboard_core::{AgentRecord, Attachment, HarnessKind, ProjectId, ProjectSummary};
 use switchboard_git::{
     BranchKind, ChangeKind, ChangedFile, CommitChanges, FileDiff, GitCommitRange,
 };
 use switchboard_prompts::{McpProviderInfo, Prompt, RenderedPrompt};
+use switchboard_workflow::InputValue;
+use uuid::Uuid;
 
 #[tauri::command]
 async fn check_claude_binary(state: State<'_, AppState>) -> Result<(), String> {
@@ -816,6 +826,148 @@ async fn open_local_prompts_dir() -> Result<(), String> {
     run_open_argv(vec!["open".to_owned(), path.to_string_lossy().into_owned()]).await
 }
 
+/// Copy a built-in prompt into the user's prompts folder as an owned, editable
+/// file, then refresh the prompt cache so the copy appears. Returns the written
+/// path. Errors (already-exists, write failure) surface to the caller.
+#[tauri::command]
+async fn copy_builtin_prompt(state: State<'_, AppState>, name: String) -> Result<String, String> {
+    let prompts_dir = local_prompts_dir_path()?;
+    let written = copy_builtin_prompt_impl(&name, &prompts_dir).map_err(|e| e.to_string())?;
+    let state = state.inner();
+    sync_prompts_and_notify(state.prompts.clone(), Arc::clone(&state.emitter)).await;
+    Ok(written.to_string_lossy().into_owned())
+}
+
+/// All workflows: the read-only built-in library (when `show_builtins` is on)
+/// merged with the user-global workflows folder. User-global — the same set is
+/// available from every project.
+#[tauri::command]
+async fn list_workflows(state: State<'_, AppState>) -> Result<Vec<WorkflowListing>, String> {
+    Ok(list_workflows_impl(state.inner()))
+}
+
+/// Resolve a picked workflow's invocation form: declared inputs + auto-derived
+/// user-fillable prompt-argument fields + a compatibility verdict. No `project_id`
+/// — prompts are user-global. Resolved per-pick (not in `list_workflows`).
+#[tauri::command]
+async fn describe_workflow_form(
+    state: State<'_, AppState>,
+    name: String,
+    is_builtin: bool,
+) -> Result<WorkflowFormDescriptor, String> {
+    describe_workflow_form_impl(state.inner(), &name, is_builtin).map_err(|e| e.to_string())
+}
+
+/// Resolve any forward-fields (completed-only) and merge the composed text into
+/// the invocation inputs, so validation/launch see a forwarded field as a filled
+/// value. A still-streaming source rejects the whole invocation. The HOME read
+/// mirrors the manual-forward shims.
+async fn merge_workflow_forwards(
+    state: &AppState,
+    inputs: &std::collections::BTreeMap<String, InputValue>,
+    forward_sources: &std::collections::BTreeMap<String, Vec<switchboard_core::AgentId>>,
+) -> Result<std::collections::BTreeMap<String, InputValue>, String> {
+    if forward_sources.values().all(Vec::is_empty) {
+        return Ok(inputs.clone());
+    }
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default();
+    let resolved =
+        crate::commands::resolve_workflow_forwards(state, forward_sources, inputs, &home)
+            .await
+            .map_err(|e| e.to_string())?;
+    let mut effective = inputs.clone();
+    for (field, text) in resolved {
+        effective.insert(field, InputValue::Text(text));
+    }
+    Ok(effective)
+}
+
+/// Validate a workflow invocation (capability gate + input/roster/prompt rules)
+/// without launching it — drives the form's enable/disable + error display.
+#[tauri::command]
+async fn validate_workflow_invocation(
+    state: State<'_, AppState>,
+    project_id: ProjectId,
+    name: String,
+    is_builtin: bool,
+    inputs: std::collections::BTreeMap<String, InputValue>,
+    forward_sources: std::collections::BTreeMap<String, Vec<switchboard_core::AgentId>>,
+) -> Result<(), String> {
+    let effective = merge_workflow_forwards(state.inner(), &inputs, &forward_sources).await?;
+    validate_workflow_invocation_impl(state.inner(), project_id, &name, is_builtin, &effective)
+        .map_err(|e| e.to_string())
+}
+
+/// Validate + launch a workflow run on a background task, returning its run id.
+#[tauri::command]
+async fn invoke_workflow(
+    state: State<'_, AppState>,
+    project_id: ProjectId,
+    name: String,
+    is_builtin: bool,
+    inputs: std::collections::BTreeMap<String, InputValue>,
+    forward_sources: std::collections::BTreeMap<String, Vec<switchboard_core::AgentId>>,
+) -> Result<String, String> {
+    let effective = merge_workflow_forwards(state.inner(), &inputs, &forward_sources).await?;
+    invoke_workflow_impl(state.inner(), project_id, &name, is_builtin, &effective)
+        .map(|id| id.to_string())
+        .map_err(|e| e.to_string())
+}
+
+/// Fire a running workflow's cancel token (no-op if it already finished).
+#[tauri::command]
+async fn cancel_workflow_run(state: State<'_, AppState>, run_id: Uuid) -> Result<(), String> {
+    cancel_workflow_run_impl(state.inner(), run_id);
+    Ok(())
+}
+
+/// Active + retained-failed + interrupted runs for a project (the run indicator).
+#[tauri::command]
+async fn list_workflow_runs(
+    state: State<'_, AppState>,
+    project_id: ProjectId,
+) -> Result<Vec<WorkflowRunInfo>, String> {
+    Ok(list_workflow_runs_impl(state.inner(), project_id))
+}
+
+/// Clear a failed or interrupted run's file (the Abandon action).
+#[tauri::command]
+async fn abandon_workflow_run(
+    state: State<'_, AppState>,
+    project_id: ProjectId,
+    run_id: Uuid,
+) -> Result<(), String> {
+    abandon_workflow_run_impl(state.inner(), project_id, run_id).map_err(|e| e.to_string())
+}
+
+/// Copy a built-in workflow into the user-global `workflows/` folder as an owned,
+/// editable file. Returns the written path; refuses to overwrite.
+#[tauri::command]
+async fn copy_builtin_workflow(state: State<'_, AppState>, name: String) -> Result<String, String> {
+    let dir = user_workflows_dir(state.inner()).map_err(|e| e.to_string())?;
+    let written = copy_builtin_workflow_impl(&name, &dir).map_err(|e| e.to_string())?;
+    Ok(written.to_string_lossy().into_owned())
+}
+
+/// Open the user-global `workflows/` folder in Finder (mirrors the prompts-folder
+/// action), creating it if needed.
+#[tauri::command]
+async fn open_workflows_dir(state: State<'_, AppState>) -> Result<(), String> {
+    let dir = user_workflows_dir(state.inner()).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    run_open_argv(vec!["open".to_owned(), dir.to_string_lossy().into_owned()]).await
+}
+
+/// The user-global workflows folder path, for the Settings display.
+#[tauri::command]
+fn workflows_dir() -> Result<String, String> {
+    workflows_dir_path()
+        .map(|p| p.to_string_lossy().into_owned())
+        .ok_or_else(|| "workflows are not available (no config directory)".to_owned())
+}
+
 #[tauri::command]
 async fn open_worktree_file_difftool(
     state: State<'_, AppState>,
@@ -989,10 +1141,18 @@ fn local_prompts_dir_path() -> Result<std::path::PathBuf, String> {
         .ok_or_else(|| "prompt providers are not configured (no config path)".to_owned())
 }
 
-/// Build the prompt service from the user-global config dir, seeding the example
-/// prompts on first run. The pure `crates/prompts` never touches `directories`;
-/// the app resolves and injects the config path, default prompts dir, home, and
-/// the secret store.
+/// The user-global workflows directory (`<config-dir>/workflows`). Workflows are
+/// user-global — shared across every project — like local prompts, not scoped to
+/// a working directory. `None` on an exotic host with no resolvable config dir.
+fn workflows_dir_path() -> Option<std::path::PathBuf> {
+    config_dir().map(|dir| dir.join("workflows"))
+}
+
+/// Build the prompt service from the user-global config dir. The pure
+/// `crates/prompts` never touches `directories`; the app resolves and injects the
+/// config path, default prompts dir, home, and the secret store. Built-in example
+/// prompts come from the read-only library baked into the service — nothing is
+/// written into the user's folder.
 ///
 /// The injected secret store is the OS keychain (`KeyringSecretStore`), namespaced
 /// by build so debug tokens stay separate from a release install's.
@@ -1000,7 +1160,6 @@ fn build_prompt_service() -> switchboard_prompts::PromptService {
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
     if let Some(dir) = config_dir() {
         let prompts_dir = dir.join("prompts");
-        crate::prompts_setup::seed_example_prompts(&prompts_dir);
         let secrets = build_secret_store(&dir);
         switchboard_prompts::PromptService::new(dir.join("config.yaml"), prompts_dir, home, secrets)
     } else {
@@ -1055,10 +1214,50 @@ fn with_persistence_paths(state: AppState) -> AppState {
         state
     };
     // `config.yaml` — personal preferences.
-    if let Some(path) = preferences_config_path() {
+    let state = if let Some(path) = preferences_config_path() {
         state.with_preferences(path)
     } else {
         state
+    };
+    // User-global workflows directory (`<config-dir>/workflows`).
+    if let Some(dir) = workflows_dir_path() {
+        state.with_workflows_dir(dir)
+    } else {
+        tracing::warn!("no config directory resolved — workflows disabled");
+        state
+    }
+}
+
+/// Production [`Notifier`](crate::workflow_commands::Notifier): fires an OS
+/// notification via the notification plugin, **suppressed when the main window is
+/// focused** (the OS notification is for when the user has walked away — when
+/// they're watching, the run indicator carries it). A focus-query failure is
+/// treated as "not focused" so a terminal still surfaces.
+struct TauriNotifier {
+    app: tauri::AppHandle,
+}
+
+impl crate::workflow_commands::Notifier for TauriNotifier {
+    fn notify(&self, title: &str, body: &str) {
+        use tauri_plugin_notification::NotificationExt;
+        let focused = self
+            .app
+            .get_webview_window("main")
+            .and_then(|w| w.is_focused().ok())
+            .unwrap_or(false);
+        if focused {
+            return;
+        }
+        if let Err(e) = self
+            .app
+            .notification()
+            .builder()
+            .title(title)
+            .body(body)
+            .show()
+        {
+            tracing::warn!(error = %e, "failed to show workflow notification");
+        }
     }
 }
 
@@ -1097,6 +1296,7 @@ pub fn run() {
     builder
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(tauri_plugin_notification::init())
         .setup(move |app| {
             // Wrap the base emitter so any in-flight agent turn holds an OS
             // wake lock; the decorator counts `turn_start`/`turn_end` across
@@ -1119,7 +1319,8 @@ pub fn run() {
             // git-view.yaml, config.yaml) — see `with_persistence_paths`.
             let state = with_persistence_paths(state);
             // Resolve and inject the user-global prompt config + default prompts
-            // store (seeding the example prompts on first run).
+            // store. Built-in example prompts are baked into the service as a
+            // read-only library — nothing is written into the user's folder.
             let prompts = build_prompt_service();
             // Warm the prompt cache in the background so a slow/cold MCP server
             // never blocks startup. `PromptService` is cheaply cloneable and
@@ -1130,6 +1331,11 @@ pub fn run() {
                 Arc::clone(&state.emitter),
             ));
             let state = state.with_prompts(prompts);
+            // Fire OS notifications for workflow run terminals (suppressed when the
+            // window is focused).
+            let state = state.with_notifier(Arc::new(TauriNotifier {
+                app: app.handle().clone(),
+            }));
             // Cold start: open a `Directory` handle for every workspace entry so
             // restored directories report `available: true` and participate in
             // the cross-harness session-id collision scan. Unopenable
@@ -1176,6 +1382,17 @@ pub fn run() {
             test_mcp_connection,
             local_prompts_dir,
             open_local_prompts_dir,
+            copy_builtin_prompt,
+            list_workflows,
+            describe_workflow_form,
+            validate_workflow_invocation,
+            invoke_workflow,
+            cancel_workflow_run,
+            list_workflow_runs,
+            abandon_workflow_run,
+            copy_builtin_workflow,
+            open_workflows_dir,
+            workflows_dir,
             create_project,
             rename_project,
             delete_project,

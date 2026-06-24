@@ -4,6 +4,18 @@
 
 import type { Prompt } from "$lib/types";
 
+/// The reserved provider prefix for the app-owned, read-only built-in library.
+/// Mirrors Rust `BUILTIN_PROVIDER`; `provider === BUILTIN_PROVIDER` is the wire
+/// contract for "this is a read-only built-in".
+export const BUILTIN_PROVIDER = "builtin";
+
+/// Whether a prompt is an app-owned read-only built-in (vs. the user's own local
+/// or an MCP prompt). Built-ins are tagged read-only in the picker and offer a
+/// "Copy to my prompts" action instead of in-place editing.
+export function isBuiltinPrompt(prompt: Pick<Prompt, "provider">): boolean {
+  return prompt.provider === BUILTIN_PROVIDER;
+}
+
 /// The label to show a user for a prompt: its friendly `title` when the server
 /// provides one, falling back to the `name` slug (local prompts, or MCP servers
 /// that omit a title).

@@ -30,6 +30,10 @@ import type {
   RepoListing,
   SendId,
   StagedAttachment,
+  WorkflowFormDescriptor,
+  WorkflowInputValue,
+  WorkflowListing,
+  WorkflowRunInfo,
   WorkspaceDirectories,
 } from "./types";
 
@@ -500,6 +504,13 @@ export async function openLocalPromptsDir(): Promise<void> {
   await invoke("open_local_prompts_dir");
 }
 
+/// Copy a built-in prompt into the user's prompts folder as an owned, editable
+/// file (`<name>.md`), refreshing the prompt cache so it appears. Rejects with an
+/// actionable error if a file of that name already exists. Returns the path.
+export async function copyBuiltinPrompt(name: string): Promise<string> {
+  return await invoke<string>("copy_builtin_prompt", { name });
+}
+
 /// Rebuild the cached prompt list from all providers (the Settings "Sync" action).
 export async function syncPrompts(): Promise<void> {
   await invoke("sync_prompts");
@@ -521,4 +532,94 @@ export async function renderPrompt(
   args: Record<string, string>,
 ): Promise<RenderedPrompt> {
   return await invoke<RenderedPrompt>("render_prompt", { provider, name, args });
+}
+
+// ── Workflows ─────────────────────────────────────────────────────────────────
+
+/// All workflows: the read-only built-in library (when `show_builtins` is on)
+/// merged with the user-global workflows folder. User-global — the same set is
+/// available from every project.
+export async function listWorkflows(): Promise<WorkflowListing[]> {
+  return await invoke<WorkflowListing[]>("list_workflows");
+}
+
+/// Resolve a picked workflow's invocation form: declared inputs + auto-derived
+/// user-fillable prompt-argument fields + a compatibility verdict. No `projectId`
+/// — prompts are user-global. Resolved per-pick (not in `listWorkflows`); re-fetch
+/// on `prompts:synced` so a cold MCP cache resolves once sync lands.
+export async function describeWorkflowForm(
+  name: string,
+  isBuiltin: boolean,
+): Promise<WorkflowFormDescriptor> {
+  return await invoke<WorkflowFormDescriptor>("describe_workflow_form", { name, isBuiltin });
+}
+
+/// Validate a workflow invocation (capability gate + input/roster/prompt rules)
+/// without launching it. Rejects with an actionable error string. `forwardSources`
+/// maps a fillable field name → the (pane-expanded) agent ids whose completed
+/// output the backend composes into that field's typed text. Empty map = none.
+export async function validateWorkflowInvocation(
+  projectId: ProjectId,
+  name: string,
+  isBuiltin: boolean,
+  inputs: Record<string, WorkflowInputValue>,
+  forwardSources: Record<string, AgentId[]>,
+): Promise<void> {
+  await invoke("validate_workflow_invocation", {
+    projectId,
+    name,
+    isBuiltin,
+    inputs,
+    forwardSources,
+  });
+}
+
+/// Validate + launch a workflow run on a background task; returns its run id.
+/// `forwardSources` maps a fillable field name → the (pane-expanded) agent ids
+/// whose completed output the backend composes into that field. Empty map = none.
+export async function invokeWorkflow(
+  projectId: ProjectId,
+  name: string,
+  isBuiltin: boolean,
+  inputs: Record<string, WorkflowInputValue>,
+  forwardSources: Record<string, AgentId[]>,
+): Promise<string> {
+  return await invoke<string>("invoke_workflow", {
+    projectId,
+    name,
+    isBuiltin,
+    inputs,
+    forwardSources,
+  });
+}
+
+/// Fire a running workflow's cancel token (no-op if it already finished).
+export async function cancelWorkflowRun(runId: string): Promise<void> {
+  await invoke("cancel_workflow_run", { runId });
+}
+
+/// Active + retained-failed + interrupted runs for a project (the run indicator).
+export async function listWorkflowRuns(projectId: ProjectId): Promise<WorkflowRunInfo[]> {
+  return await invoke<WorkflowRunInfo[]>("list_workflow_runs", { projectId });
+}
+
+/// Clear a failed or interrupted run's file (the Abandon action).
+export async function abandonWorkflowRun(projectId: ProjectId, runId: string): Promise<void> {
+  await invoke("abandon_workflow_run", { projectId, runId });
+}
+
+/// Copy a built-in workflow into the user-global `workflows/` folder as an owned,
+/// editable file. Returns the written path; rejects if it would clobber.
+export async function copyBuiltinWorkflow(name: string): Promise<string> {
+  return await invoke<string>("copy_builtin_workflow", { name });
+}
+
+/// Open the user-global `workflows/` folder in Finder.
+export async function openWorkflowsDir(): Promise<void> {
+  await invoke("open_workflows_dir");
+}
+
+/// The user-global workflows folder path, for the Settings display.
+export async function workflowsDir(): Promise<string> {
+  return await invoke<string>("workflows_dir");
 }

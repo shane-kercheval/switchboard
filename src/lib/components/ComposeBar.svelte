@@ -14,7 +14,7 @@
     forwardSourceKey,
     expandForwardSources,
     forwardSourceForAgent,
-    forwardSourceForPane,
+    forwardSourceAgentsForPane,
     type ForwardSource,
   } from "$lib/state/heldForwards.svelte";
   import { buildLiveSendsMap } from "$lib/state/liveSends";
@@ -47,16 +47,27 @@
     AttachmentKind,
     ProjectId,
     Prompt,
+    WorkflowFormDescriptor,
+    WorkflowInputValue,
+    WorkflowListing,
   } from "$lib/types";
   import { classifyKind } from "$lib/attachments";
   import { getCurrentWebview } from "@tauri-apps/api/webview";
+  import { isPermissionGranted, requestPermission } from "@tauri-apps/plugin-notification";
   import { buildRenderArgs, combinePromptMessage, missingRequiredArgs } from "$lib/prompt";
   import Textarea from "$lib/components/ui/Textarea.svelte";
   import StopIcon from "$lib/components/ui/StopIcon.svelte";
   import HarnessIcon from "$lib/components/ui/HarnessIcon.svelte";
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
+  import ClearIcon from "$lib/components/ui/ClearIcon.svelte";
+  import { ICON_BUTTON_ON_RAISED_CLASS } from "$lib/components/ui/iconButton";
   import PromptMenu from "$lib/components/PromptMenu.svelte";
   import PromptComposer from "$lib/components/PromptComposer.svelte";
+  import WorkflowMenu from "$lib/components/WorkflowMenu.svelte";
+  import WorkflowComposer from "$lib/components/WorkflowComposer.svelte";
+  import WorkflowSteps from "$lib/components/WorkflowSteps.svelte";
+  import { workflowRuns, cancelRun, abandonRun, refreshRuns } from "$lib/state/workflows.svelte";
+  import Button from "$lib/components/ui/Button.svelte";
   import ForwardSourceChip from "$lib/components/ui/ForwardSourceChip.svelte";
   import ForwardSourcePicker from "$lib/components/ui/ForwardSourcePicker.svelte";
   import Spinner from "$lib/components/ui/Spinner.svelte";
@@ -142,6 +153,12 @@
     forwardSources = [...forwardSources, source];
   }
 
+  /// Add every (live) member of a pane as its own agent source — a pane is a
+  /// selection shortcut, not a stored entity, so it expands to agent chips here.
+  function addPaneForwardSources(pane: TranscriptPane): void {
+    for (const source of forwardSourceAgentsForPane(pane, agents)) addForwardSource(source);
+  }
+
   function removeForwardSource(key: string): void {
     forwardSources = forwardSources.filter((s) => forwardSourceKey(s) !== key);
   }
@@ -154,16 +171,13 @@
     );
   }
 
-  /// Whether a source has nothing to forward yet — an agent with no completed
-  /// turn, or a pane whose every member is empty (or has no members).
+  /// Whether a source has nothing to forward yet — an agent with no completed turn.
   function sourceIsEmpty(source: ForwardSource): boolean {
-    const ids = source.kind === "agent" ? [source.id] : source.members;
-    return ids.length === 0 || ids.every((id) => !agentHasCompletedOutput(id));
+    return !agentHasCompletedOutput(source.id);
   }
 
   /// Agent names that actually carried output, for the partial-empty caption —
-  /// derived from the expanded agent ids (panes included) minus the backend's
-  /// skipped names.
+  /// derived from the expanded agent ids minus the backend's skipped names.
   function includedNames(sources: ForwardSource[], skipped: string[]): string[] {
     return expandForwardSources(sources)
       .map((id) => agents.find((a) => a.id === id)?.name)
@@ -237,9 +251,12 @@
   });
 
   // ── Prompt mode ────────────────────────────────────────────────────────────
-  // `mode` swaps the compose area between the plain textarea and the structured
-  // prompt composer; the recipients header and send button are shared.
-  let mode = $state<"plain" | "prompt">("plain");
+  // `mode` swaps the compose area between the plain textarea, the structured
+  // prompt composer, and the workflow invocation form. In workflow mode the
+  // compose bar's own To field + message-level forward affordances are hidden:
+  // a workflow parameterizes its recipients via its declared agent inputs, so
+  // the workflow owns routing (the prompt-vs-workflow routing distinction).
+  let mode = $state<"plain" | "prompt" | "workflow">("plain");
   let selectedPrompt = $state<Prompt | null>(null);
   let promptArgs = $state<Record<string, string>>({});
   // Per-argument forward sources (live-UI-only, like `forwardSources`). A
@@ -251,13 +268,39 @@
   let promptAppendedSources = $state<ForwardSource[]>([]);
   let appendedText = $state<string>("");
   let promptMenuOpen = $state(false);
-  let promptMenuWrapEl = $state<HTMLDivElement | undefined>(undefined);
   let prompts = $state<Prompt[]>([]);
   let focusPromptFieldOnMount = $state(false);
   // Whether the cache has been read at least once, so the picker can show a
   // "loading" row instead of momentarily claiming there are no prompts.
   let promptsLoaded = $state(false);
   let sending = $state(false);
+
+  // Workflow invocation state (live-UI-only). The menu lists the project's
+  // workflows; picking an invocable one enters workflow mode with a per-input
+  // form. Not persisted across reloads (a half-filled invocation is transient).
+  let workflowMenuOpen = $state(false);
+  let workflows = $state<WorkflowListing[]>([]);
+  let workflowsLoaded = $state(false);
+  let selectedWorkflow = $state<WorkflowListing | null>(null);
+  // The resolved invocation form for the picked workflow (declared inputs +
+  // auto-derived prompt-argument fields + compatibility). Fetched per-pick via
+  // `describe_workflow_form`; re-fetched on `prompts:synced` so a cold MCP cache
+  // resolves. Null until the first fetch settles.
+  let workflowForm = $state<WorkflowFormDescriptor | null>(null);
+  let workflowFormLoading = $state(false);
+  // Monotonic token: each pick/re-fetch bumps it; a fetch ignores its reply if a
+  // newer one superseded it (name alone isn't a workflow's identity — a built-in
+  // and a same-named copied user workflow share a name).
+  let workflowFormGen = 0;
+  // Whether a prompt sync has settled since this workflow was picked. Before that,
+  // an `unresolved` prompt is genuinely pending (cold MCP cache); after a settled
+  // sync, a still-`unresolved` prompt is a real "not found" error, not a spinner.
+  let workflowSyncSettled = $state(false);
+  let workflowInputs = $state<Record<string, WorkflowInputValue>>({});
+  // Per-field forward sources for the workflow's fillable single-text fields,
+  // keyed by field name. Live-UI-only, reset whenever the workflow changes.
+  let workflowForwardSources = $state<Record<string, ForwardSource[]>>({});
+  let invokingWorkflow = $state(false);
   // A saved prompt-mode draft to restore once the cache loads; consumed when
   // restoration settles. Null when the saved draft was plain.
   let pendingRestore = $state<PromptContent | null>(
@@ -285,11 +328,25 @@
   // be cold (MCP prompts land only after the launch-time sync), so also re-try
   // when the backend signals a completed sync — and only then is "still absent"
   // proof the prompt is gone.
+  // A single `prompts:synced` subscription drives two cache-warm re-tries: (1)
+  // restoring a saved prompt-mode draft whose prompt was cold at mount, and (2)
+  // re-resolving the workflow form so a workflow hardcoding an MCP prompt leaves
+  // its "Resolving…" pending state once the cache warms — without a re-pick.
   onMount(() => {
-    if (pendingRestore === null) return;
-    void loadPrompts().then(() => tryRestorePrompt(false));
+    const hadDraft = pendingRestore !== null;
+    if (hadDraft) {
+      void loadPrompts().then(() => tryRestorePrompt(false));
+    }
     const unlisten = listen("prompts:synced", () => {
-      void loadPrompts().then(() => tryRestorePrompt(true));
+      if (hadDraft) {
+        void loadPrompts().then(() => tryRestorePrompt(true));
+      }
+      if (mode === "workflow" && selectedWorkflow !== null) {
+        // A sync has now settled for this pick: a still-unresolved prompt after the
+        // re-fetch is a real "not found" error, not a perpetual pending state.
+        workflowSyncSettled = true;
+        void loadWorkflowForm(selectedWorkflow);
+      }
     });
     return () => void unlisten.then((u) => u());
   });
@@ -468,24 +525,38 @@
       // a chord typed into it also toggle recipients or send. Mirrors the ⌘K
       // guard above.
       if (hasOpenDialog()) return;
+      // While a workflow run replaces the compose box, the targeting chords below
+      // (⌘⌃N forward, ⌘N toggle, ⌘⇧A select-all) would silently mutate the hidden
+      // compose state behind the live view — so it would reappear with stray
+      // recipients/forwards when the run ends. Inert them (send is already gated
+      // off; ⌘K/Escape above stay live). Only the compose-targeting region.
+      if (activeWorkflowRun !== null) return;
       // ⌘⌃1..9 → add pane N as a forward source, mirroring ⌘⌥1..9 ("target pane
       // N"). Both modifiers required, so it never collides with ⌘1..9 (target
-      // agent N) — intercepted before that branch below. Plain-mode only: in
-      // prompt mode the whole-message forward set is hidden (forwarding is
-      // per-field), so this must not mutate it from behind a hidden UI.
+      // agent N) — intercepted before that branch below. **Plain-mode only**: in
+      // prompt mode forwarding is per-field, and in workflow mode the workflow
+      // owns routing — the whole-message forward set is hidden in both, so this
+      // must not mutate it from behind a hidden UI.
       if (e.metaKey && e.ctrlKey && !e.shiftKey && e.key >= "1" && e.key <= "9") {
-        if (mode === "prompt") return;
+        if (mode !== "plain") return;
         const pane = paneLayout.panes[Number(e.key) - 1];
         if (pane !== undefined && pane.members.length > 0) {
           e.preventDefault();
-          if (!sending) addForwardSource(forwardSourceForPane(pane, agents));
+          if (!sending) addPaneForwardSources(pane);
         }
         return;
       }
       if (e.key === "Enter") {
-        if (mode === "prompt" && composeEl?.contains(document.activeElement)) {
-          e.preventDefault();
-          handlePrimaryAction();
+        if (composeEl?.contains(document.activeElement)) {
+          if (mode === "prompt") {
+            e.preventDefault();
+            handlePrimaryAction();
+          } else if (mode === "workflow") {
+            // ⌘Enter from inside the workflow form runs it (the invoke action
+            // no-ops if the form isn't runnable / is already starting).
+            e.preventDefault();
+            void invokeWorkflowAction();
+          }
         }
         return;
       }
@@ -627,17 +698,23 @@
   /// recipient. Suppressed in single-agent projects (nothing to forward between)
   /// and for sources already added.
   const forwardItems = $derived.by<ForwardMenuItem[]>(() => {
-    if (!menuOpen || agents.length <= 1) return [];
+    // Message-level forwarding is plain-mode only (prompt mode forwards per-field;
+    // workflow mode routes via its agent inputs).
+    if (!menuOpen || agents.length <= 1 || mode !== "plain") return [];
     const q = menuQuery.toLowerCase();
     const items: ForwardMenuItem[] = [];
+    const alreadyForwarded = expandForwardSources(forwardSources);
     if (paneLayout.panes.length > 1) {
       for (const pane of paneLayout.panes) {
-        if (pane.members.length === 0) continue;
         if (!pane.name.toLowerCase().includes(q)) continue;
+        // A pane resolves to its live member agents; offer it only while at least
+        // one of those isn't already forwarded — otherwise picking it is a no-op
+        // (the agent-only model has no pane chip of its own to add).
+        const addable = forwardSourceAgentsForPane(pane, agents);
+        if (addable.length === 0 || addable.every((s) => alreadyForwarded.includes(s.id))) continue;
         items.push({ kind: "forward-pane", key: `forward-pane:${pane.id}`, pane });
       }
     }
-    const alreadyForwarded = expandForwardSources(forwardSources);
     for (const agent of agentCandidates) {
       if (alreadyForwarded.includes(agent.id)) continue;
       items.push({ kind: "forward-agent", key: `forward-agent:${agent.id}`, agent });
@@ -814,9 +891,9 @@
       addForwardSource(forwardSourceForAgent(item.agent));
       stripAtToken();
     } else if (item.kind === "forward-pane") {
-      // One pane chip (membership snapshotted at pick time, moments before send);
-      // it expands to per-agent blocks only at dispatch.
-      addForwardSource(forwardSourceForPane(item.pane, agents));
+      // A pane is a shortcut for its members — add one agent source per live
+      // member (deduped), never a pane chip.
+      addPaneForwardSources(item.pane);
       stripAtToken();
     } else {
       setSelectedIds([item.agent.id]);
@@ -908,12 +985,39 @@
     return () => document.removeEventListener("pointerdown", onPointerDown);
   });
 
-  // Click-outside closes the prompt picker (its own Escape/pick also close it).
+  // Click-outside closes the prompt / workflow pickers (their own Escape/pick
+  // also close them). "Outside" is anything that isn't the menu itself or its
+  // trigger button: scoping to the menu — rather than the whole compose box —
+  // is what lets a click on the textarea dismiss it, and excluding the trigger
+  // keeps a click there from closing-then-reopening (the trigger owns its own
+  // toggle).
+  function closeMenuOnOutsidePointer(
+    e: PointerEvent,
+    menuTestid: string,
+    triggerTestid: string,
+    close: () => void,
+  ): void {
+    const el = e.target instanceof Element ? e.target : null;
+    if (el?.closest(`[data-testid="${menuTestid}"]`)) return;
+    if (el?.closest(`[data-testid="${triggerTestid}"]`)) return;
+    close();
+  }
   $effect(() => {
     if (!promptMenuOpen) return;
     function onPointerDown(e: PointerEvent): void {
-      if (promptMenuWrapEl?.contains(e.target as Node)) return;
-      promptMenuOpen = false;
+      closeMenuOnOutsidePointer(e, "prompt-menu", "compose-prompt-button", () => {
+        promptMenuOpen = false;
+      });
+    }
+    document.addEventListener("pointerdown", onPointerDown);
+    return () => document.removeEventListener("pointerdown", onPointerDown);
+  });
+  $effect(() => {
+    if (!workflowMenuOpen) return;
+    function onPointerDown(e: PointerEvent): void {
+      closeMenuOnOutsidePointer(e, "workflow-menu", "compose-workflow-button", () => {
+        workflowMenuOpen = false;
+      });
     }
     document.addEventListener("pointerdown", onPointerDown);
     return () => document.removeEventListener("pointerdown", onPointerDown);
@@ -995,6 +1099,7 @@
 
   function openPromptMenu(): void {
     closeMentionMenu();
+    workflowMenuOpen = false;
     void loadPrompts();
     promptMenuOpen = true;
   }
@@ -1015,6 +1120,20 @@
     promptMenuOpen = false;
   }
 
+  /// Copy a read-only built-in into the user's own prompts, then refresh the
+  /// cache so the owned copy appears (the backend syncs before this resolves).
+  /// Keeps the menu open so the user sees their new prompt land; a name clash or
+  /// write failure surfaces on the send-error line.
+  async function copyPrompt(prompt: Prompt): Promise<void> {
+    try {
+      await api.copyBuiltinPrompt(prompt.name);
+      await loadPrompts();
+      sendError = null;
+    } catch (err) {
+      sendError = `Couldn't copy prompt: ${err instanceof Error ? err.message : String(err)}`;
+    }
+  }
+
   /// Leave prompt mode, carrying Appended text back into the plain textarea.
   function removePrompt(): void {
     draft = appendedText;
@@ -1025,6 +1144,229 @@
     promptAppendedSources = [];
     focusPromptFieldOnMount = false;
     appendedText = "";
+  }
+
+  // --- Workflows ------------------------------------------------------------
+
+  async function loadWorkflows(): Promise<void> {
+    try {
+      const list = await api.listWorkflows();
+      workflows = Array.isArray(list) ? list : [];
+    } catch {
+      workflows = [];
+    } finally {
+      workflowsLoaded = true;
+    }
+  }
+
+  function openWorkflowMenu(): void {
+    closeMentionMenu();
+    promptMenuOpen = false;
+    void loadWorkflows();
+    void loadPrompts();
+    workflowMenuOpen = true;
+  }
+
+  /// Enter workflow mode with the picked workflow and resolve its form (declared
+  /// inputs + auto-derived prompt-argument fields) via `describe_workflow_form`.
+  /// The prompt is hardcoded — nothing to pre-seed/pick — so fields seed empty.
+  function pickWorkflow(workflow: WorkflowListing): void {
+    selectedWorkflow = workflow;
+    workflowForm = null;
+    workflowInputs = {};
+    workflowForwardSources = {};
+    workflowSyncSettled = false;
+    mode = "workflow";
+    workflowMenuOpen = false;
+    void loadWorkflowForm(workflow);
+  }
+
+  /// Fetch (or re-fetch) the descriptor for the picked workflow and seed any
+  /// not-yet-present fields. Seeding is additive so a re-fetch (e.g. after
+  /// `prompts:synced` resolves a previously-unresolved prompt) preserves what the
+  /// user already typed. A monotonic generation token guards stale replies — name
+  /// alone is not a workflow's identity (a built-in and a same-named copied user
+  /// workflow share a name), and the token is also future-proof against further
+  /// identity fields.
+  async function loadWorkflowForm(workflow: WorkflowListing): Promise<void> {
+    const gen = ++workflowFormGen;
+    workflowFormLoading = true;
+    try {
+      const form = await api.describeWorkflowForm(workflow.name, workflow.is_builtin);
+      if (gen !== workflowFormGen) return; // superseded by a newer pick/re-fetch
+      workflowForm = form;
+      const seeded: Record<string, WorkflowInputValue> = { ...workflowInputs };
+      for (const input of form.inputs) {
+        if (input.name in seeded) continue;
+        seeded[input.name] = input.ty === "agent_list" || input.ty === "text_list" ? [] : "";
+      }
+      for (const arg of form.derived_args) {
+        if (!(arg.name in seeded)) seeded[arg.name] = "";
+      }
+      workflowInputs = seeded;
+    } catch (err) {
+      if (gen === workflowFormGen) {
+        sendError = `Couldn't load workflow: ${err instanceof Error ? err.message : String(err)}`;
+      }
+    } finally {
+      if (gen === workflowFormGen) workflowFormLoading = false;
+    }
+  }
+
+  function removeWorkflow(): void {
+    mode = "plain";
+    selectedWorkflow = null;
+    workflowForm = null;
+    workflowFormLoading = false;
+    workflowInputs = {};
+    workflowForwardSources = {};
+    workflowSyncSettled = false;
+    workflowFormGen++; // invalidate any in-flight fetch for the removed workflow
+  }
+
+  async function copyWorkflow(workflow: WorkflowListing): Promise<void> {
+    try {
+      await api.copyBuiltinWorkflow(workflow.name);
+      await loadWorkflows();
+      sendError = null;
+    } catch (err) {
+      sendError = `Couldn't copy workflow: ${err instanceof Error ? err.message : String(err)}`;
+    }
+  }
+
+  function openWorkflowsFolder(): void {
+    void api.openWorkflowsDir().catch((err: unknown) => {
+      console.error("[switchboard] open workflows folder failed", err);
+    });
+  }
+
+  function openPromptsFolder(): void {
+    void api.openLocalPromptsDir().catch((err: unknown) => {
+      console.error("[switchboard] open prompts folder failed", err);
+    });
+  }
+
+  /// Whether the picked workflow is runnable: the form is resolved, invocable,
+  /// compatible (prompts resolved, no drift), and every required field (declared
+  /// input or derived prompt arg) is filled. Drives the invoke button's disabled
+  /// state. A pending (`unresolved`) or `incompatible` form blocks Run.
+  const workflowRunnable = $derived.by(() => {
+    const form = workflowForm;
+    if (form === null || workflowFormLoading) return false;
+    if (!form.invocable || form.compatibility.state !== "ok") return false;
+    // A single `text` input / derived arg also counts as filled when it carries
+    // ≥1 forward source (only text/derived fields can — agent/list fields keep
+    // their existing emptiness check).
+    const hasForward = (name: string): boolean => (workflowForwardSources[name]?.length ?? 0) > 0;
+    const inputMissing = form.inputs.some((i) => {
+      if (i.optional) return false;
+      const v = workflowInputs[i.name];
+      if (i.ty === "agent_list" || i.ty === "text_list") return !Array.isArray(v) || v.length === 0;
+      return (typeof v !== "string" || v.trim() === "") && !hasForward(i.name);
+    });
+    const argMissing = form.derived_args.some((a) => {
+      if (!a.required) return false;
+      const v = workflowInputs[a.name];
+      return (typeof v !== "string" || v.trim() === "") && !hasForward(a.name);
+    });
+    return !inputMissing && !argMissing;
+  });
+
+  /// Request OS-notification permission once, contextually at first invoke.
+  async function ensureNotificationPermission(): Promise<void> {
+    try {
+      if (!(await isPermissionGranted())) {
+        await requestPermission();
+      }
+    } catch (err) {
+      console.warn("[switchboard] notification permission request failed", err);
+    }
+  }
+
+  // The viewed project's single workflow run. The `[0]` relies on the
+  // one-run-per-project invariant, enforced at the backend invoke guard (which
+  // rejects both a second *active* run and a launch while a *held*
+  // failed/interrupted run awaits dismissal) — so the array never holds more than
+  // one and `[0]` is the run, not an arbitrary pick. When present it replaces the
+  // compose box with the live progress view: a `running` run shows progress; a
+  // `failed`/`interrupted` run is held (failed step + reason) until dismissed.
+  const activeWorkflowRun = $derived(workflowRuns[projectId]?.[0] ?? null);
+  // A Stop/Dismiss failure, surfaced inline in the held panel — without this a
+  // failed Dismiss is a silent dead button (the run stays held with no feedback).
+  let workflowRunError = $state<string | null>(null);
+
+  async function stopWorkflowRun(): Promise<void> {
+    if (activeWorkflowRun === null) return;
+    workflowRunError = null;
+    try {
+      await cancelRun(activeWorkflowRun.run_id);
+    } catch (err) {
+      workflowRunError = `Couldn't stop the workflow: ${err instanceof Error ? err.message : String(err)}`;
+    }
+  }
+  async function dismissWorkflowRun(): Promise<void> {
+    if (activeWorkflowRun === null) return;
+    workflowRunError = null;
+    try {
+      await abandonRun(projectId, activeWorkflowRun.run_id);
+    } catch (err) {
+      workflowRunError = `Couldn't dismiss the workflow: ${err instanceof Error ? err.message : String(err)}`;
+    }
+  }
+
+  async function invokeWorkflowAction(): Promise<void> {
+    if (selectedWorkflow === null || invokingWorkflow || !workflowRunnable) return;
+    const workflow = selectedWorkflow;
+    invokingWorkflow = true;
+    sendError = null;
+    try {
+      // Contextual permission request at first invoke (not at cold startup).
+      void ensureNotificationPermission();
+      // Pane-expand each field's sources to agent ids; omit empty fields so the
+      // map carries only fields the user actually attached a forward to.
+      const forwardSources: Record<string, AgentId[]> = {};
+      for (const [name, sources] of Object.entries(workflowForwardSources)) {
+        if (sources.length > 0) forwardSources[name] = expandForwardSources(sources);
+      }
+      const runId = await api.invokeWorkflow(
+        projectId,
+        workflow.name,
+        workflow.is_builtin,
+        workflowInputs,
+        forwardSources,
+      );
+      // Lock the UI immediately from the confirmed launch (only reached when
+      // invoke *succeeded* — a validation/guard failure throws to the catch below
+      // and leaves compose up so the user can retry). The optimistic row makes the
+      // lockout independent of the follow-up `list_workflow_runs`, whose transient
+      // failure must not let compose return while the backend run is live. It
+      // carries the *declared* step snapshot; `refreshRuns` upgrades it to the
+      // resolved one, and progress events preserve `steps` while advancing
+      // step/status (so the row survives even if every refresh fails).
+      const steps = workflowForm?.steps ?? [];
+      const existing = workflowRuns[projectId] ?? [];
+      if (!existing.some((r) => r.run_id === runId)) {
+        workflowRuns[projectId] = [
+          ...existing,
+          {
+            run_id: runId,
+            workflow: workflow.name,
+            step: 0,
+            total: steps.length,
+            status: "running",
+            reason: null,
+            steps,
+          },
+        ];
+      }
+      // Best-effort upgrade to the authoritative resolved snapshot.
+      await refreshRuns(projectId);
+      removeWorkflow();
+    } catch (err) {
+      sendError = `Couldn't run workflow: ${err instanceof Error ? err.message : String(err)}`;
+    } finally {
+      invokingWorkflow = false;
+    }
   }
 
   function handlePrimaryAction(): void {
@@ -1440,531 +1782,667 @@
 </script>
 
 <div class="bg-raised px-4 pt-2 pb-4" bind:this={composeEl}>
-  <div
-    class={cn(
-      "border-border bg-raised relative rounded-xl border p-2.5 shadow-[0_10px_32px_rgba(0,0,0,0.08)] transition-colors",
-      dragOver ? "ring-accent border-accent ring-2" : "",
-    )}
-    data-testid="compose-box"
-    data-drag-over={dragOver}
-    bind:this={promptMenuWrapEl}
-  >
-    {#if promptMenuOpen}
-      <!-- Full compose-box width, floating just above the box (anchored to its
+  {#if activeWorkflowRun}
+    <!-- A workflow occupies this project: the live progress view *replaces* the
+         compose box (not merely disables it), so queueing a message mid-run is
+         structurally impossible. A `running` run shows progress with a Stop; a
+         `failed`/`interrupted` run is held with a Dismiss until abandoned. -->
+    <div
+      class="border-border bg-raised rounded-xl border p-3 shadow-[0_10px_32px_rgba(0,0,0,0.08)]"
+      data-testid="workflow-run-live"
+      data-run-status={activeWorkflowRun.status}
+    >
+      <div class="mb-2 flex items-center justify-between gap-2">
+        <span class="text-fg min-w-0 truncate text-sm font-semibold"
+          >{activeWorkflowRun.workflow}</span
+        >
+        {#if activeWorkflowRun.status === "running"}
+          <button
+            type="button"
+            data-testid="workflow-run-stop"
+            onclick={() => void stopWorkflowRun()}
+            aria-label="Stop workflow"
+            class="text-muted hover:bg-status-failed-soft/70 hover:text-status-failed focus-visible:ring-accent inline-flex h-7 shrink-0 items-center gap-1 rounded-full px-2 text-xs transition-colors focus-visible:ring-2 focus-visible:outline-none"
+          >
+            <StopIcon class="size-4" />
+            Stop
+          </button>
+        {:else}
+          <button
+            type="button"
+            data-testid="workflow-run-dismiss"
+            onclick={() => void dismissWorkflowRun()}
+            class="text-muted hover:bg-panel hover:text-fg focus-visible:ring-accent inline-flex h-7 shrink-0 items-center rounded-full px-2.5 text-xs transition-colors focus-visible:ring-2 focus-visible:outline-none"
+          >
+            Dismiss
+          </button>
+        {/if}
+      </div>
+      {#if activeWorkflowRun.steps.length > 0}
+        <WorkflowSteps
+          steps={activeWorkflowRun.steps}
+          mode="live"
+          current={activeWorkflowRun.step}
+          status={activeWorkflowRun.status}
+          reason={activeWorkflowRun.reason}
+        />
+      {:else}
+        <!-- Steps absent (legacy run file, or a brief pre-refresh window): fall back
+             to a count line so the view is never empty. -->
+        <p class="text-muted text-sm" data-testid="workflow-run-fallback">
+          Step {activeWorkflowRun.step + 1} of {activeWorkflowRun.total}{#if activeWorkflowRun.status !== "running"}
+            · {activeWorkflowRun.status}{/if}
+        </p>
+        {#if activeWorkflowRun.reason}
+          <p class="text-status-failed mt-1 text-xs">{activeWorkflowRun.reason}</p>
+        {/if}
+      {/if}
+      {#if workflowRunError}
+        <p class="text-status-failed mt-2 text-xs" data-testid="workflow-run-error">
+          {workflowRunError}
+        </p>
+      {/if}
+    </div>
+  {:else}
+    <div
+      class={cn(
+        "border-border bg-raised relative rounded-xl border p-2.5 shadow-[0_10px_32px_rgba(0,0,0,0.08)] transition-colors",
+        dragOver ? "ring-accent border-accent ring-2" : "",
+      )}
+      data-testid="compose-box"
+      data-drag-over={dragOver}
+    >
+      {#if promptMenuOpen}
+        <!-- Full compose-box width, floating just above the box (anchored to its
            top edge, opening upward so a long list is never cut off). -->
-      <PromptMenu
-        {prompts}
-        loading={!promptsLoaded}
-        onpick={pickPrompt}
-        onclose={() => (promptMenuOpen = false)}
-      />
-    {/if}
-    {#if menuOpen && hasMenuContent}
-      <!-- Full compose-box width, matching the prompt menu's placement. The
+        <PromptMenu
+          {prompts}
+          loading={!promptsLoaded}
+          onpick={pickPrompt}
+          oncopy={copyPrompt}
+          onopenfolder={openPromptsFolder}
+          onclose={() => (promptMenuOpen = false)}
+        />
+      {/if}
+      {#if workflowMenuOpen}
+        <WorkflowMenu
+          {workflows}
+          loading={!workflowsLoaded}
+          onpick={pickWorkflow}
+          oncopy={copyWorkflow}
+          onopenfolder={openWorkflowsFolder}
+          onclose={() => (workflowMenuOpen = false)}
+        />
+      {/if}
+      {#if menuOpen && hasMenuContent}
+        <!-- Full compose-box width, matching the prompt menu's placement. The
            menu opens upward from the compose box instead of following the @
            caret, which keeps file paths readable without side tooltips. -->
-      <div
-        class="border-border/90 bg-raised absolute inset-x-0 bottom-full z-20 mb-1 overflow-hidden rounded-lg border p-1 text-[13px] shadow-[0_10px_28px_rgba(0,0,0,0.10)]"
-        data-testid="recipient-menu"
-        role="listbox"
-        bind:this={menuEl}
-      >
-        {#if showFileSection}
-          <div
-            class="text-muted px-2.5 py-0.5 text-[11px] font-medium tracking-wide uppercase select-none"
-          >
-            Files
-          </div>
-        {/if}
-        <div class="max-h-48 overflow-y-auto" data-testid="file-options-scroll">
-          {#each fileItems as item (item.key)}
-            {@const i = menuItems.findIndex((candidate) => candidate.key === item.key)}
-            <button
-              type="button"
-              class={"hover:bg-panel/80 flex w-full cursor-pointer items-start gap-2 rounded-md px-2.5 py-1.5 text-left leading-5 outline-none select-none " +
-                (i === highlighted ? "bg-panel/80" : "")}
-              data-testid={`file-option-${item.path}`}
-              role="option"
-              aria-selected={i === highlighted}
-              onclick={() => pickItem(item)}
-            >
-              <svg
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                stroke-width="1.8"
-                stroke-linecap="round"
-                stroke-linejoin="round"
-                class="text-muted h-4 w-4 shrink-0"
-                aria-hidden="true"
-              >
-                <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z" />
-                <path d="M14 3v5h5" />
-              </svg>
-              <span class="flex min-w-0 flex-col">
-                <span
-                  class="text-fg min-w-0 truncate text-left text-xs font-medium"
-                  data-testid="file-option-label">{item.label}</span
-                >
-                {#if item.parent !== null}
-                  <span
-                    class="text-muted truncate text-left text-[11px]"
-                    data-testid="file-option-path"
-                  >
-                    {item.parent}
-                  </span>
-                {/if}
-              </span>
-            </button>
-          {/each}
-          {#if fileStatusText !== null}
+        <div
+          class="border-border/90 bg-raised absolute inset-x-0 bottom-full z-20 mb-1 overflow-hidden rounded-lg border p-1 text-[13px] shadow-[0_10px_28px_rgba(0,0,0,0.10)]"
+          data-testid="recipient-menu"
+          role="listbox"
+          bind:this={menuEl}
+        >
+          {#if showFileSection}
             <div
-              class="text-muted flex min-h-7 items-center px-2.5 py-1 text-left leading-5 select-none"
-              data-testid="file-options-status"
+              class="text-muted px-2.5 py-0.5 text-[11px] font-medium tracking-wide uppercase select-none"
             >
-              {fileStatusText}
+              Files
             </div>
           {/if}
-        </div>
-
-        {#if attachmentItems.length > 0}
-          <div
-            class={cn(
-              "text-muted px-2.5 py-0.5 text-[11px] font-medium tracking-wide uppercase select-none",
-              fileItems.length > 0 ? "mt-1" : "",
-            )}
-          >
-            Attachments
+          <div class="max-h-48 overflow-y-auto" data-testid="file-options-scroll">
+            {#each fileItems as item (item.key)}
+              {@const i = menuItems.findIndex((candidate) => candidate.key === item.key)}
+              <button
+                type="button"
+                class={"hover:bg-panel/80 flex w-full cursor-pointer items-start gap-2 rounded-md px-2.5 py-1.5 text-left leading-5 outline-none select-none " +
+                  (i === highlighted ? "bg-panel/80" : "")}
+                data-testid={`file-option-${item.path}`}
+                role="option"
+                aria-selected={i === highlighted}
+                onclick={() => pickItem(item)}
+              >
+                <svg
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="1.8"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  class="text-muted h-4 w-4 shrink-0"
+                  aria-hidden="true"
+                >
+                  <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z" />
+                  <path d="M14 3v5h5" />
+                </svg>
+                <span class="flex min-w-0 flex-col">
+                  <span
+                    class="text-fg min-w-0 truncate text-left text-xs font-medium"
+                    data-testid="file-option-label">{item.label}</span
+                  >
+                  {#if item.parent !== null}
+                    <span
+                      class="text-muted truncate text-left text-[11px]"
+                      data-testid="file-option-path"
+                    >
+                      {item.parent}
+                    </span>
+                  {/if}
+                </span>
+              </button>
+            {/each}
+            {#if fileStatusText !== null}
+              <div
+                class="text-muted flex min-h-7 items-center px-2.5 py-1 text-left leading-5 select-none"
+                data-testid="file-options-status"
+              >
+                {fileStatusText}
+              </div>
+            {/if}
           </div>
-          {#each attachmentItems as item (item.key)}
+
+          {#if attachmentItems.length > 0}
+            <div
+              class={cn(
+                "text-muted px-2.5 py-0.5 text-[11px] font-medium tracking-wide uppercase select-none",
+                fileItems.length > 0 ? "mt-1" : "",
+              )}
+            >
+              Attachments
+            </div>
+            {#each attachmentItems as item (item.key)}
+              {@const i = menuItems.findIndex((candidate) => candidate.key === item.key)}
+              <button
+                type="button"
+                class={"hover:bg-panel/80 flex w-full cursor-pointer items-center gap-2 rounded-md px-2.5 py-1 text-left leading-5 outline-none select-none " +
+                  (i === highlighted ? "bg-panel/80" : "")}
+                data-testid={`attachment-option-${item.label}`}
+                role="option"
+                aria-selected={i === highlighted}
+                onclick={() => pickItem(item)}
+              >
+                <svg
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="1.8"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  class="text-muted h-4 w-4 shrink-0"
+                  aria-hidden="true"
+                >
+                  <path
+                    d="M21.44 11.05 12 20.5a5.5 5.5 0 0 1-7.78-7.78l8.49-8.49a3.5 3.5 0 1 1 4.95 4.95l-8.49 8.49a1.5 1.5 0 0 1-2.12-2.12l7.78-7.78"
+                  />
+                </svg>
+                <span class="text-fg font-mono text-xs">{item.label}</span>
+              </button>
+            {/each}
+          {/if}
+
+          {#if recipientItems.length > 0}
+            <div
+              class={cn(
+                "text-muted px-2.5 py-0.5 text-[11px] font-medium tracking-wide uppercase select-none",
+                fileItems.length > 0 || attachmentItems.length > 0 ? "mt-1" : "",
+              )}
+            >
+              Send to
+            </div>
+          {/if}
+          {#each recipientItems as item (item.key)}
             {@const i = menuItems.findIndex((candidate) => candidate.key === item.key)}
             <button
               type="button"
               class={"hover:bg-panel/80 flex w-full cursor-pointer items-center gap-2 rounded-md px-2.5 py-1 text-left leading-5 outline-none select-none " +
                 (i === highlighted ? "bg-panel/80" : "")}
-              data-testid={`attachment-option-${item.label}`}
+              data-testid={`recipient-option-${item.key}`}
               role="option"
               aria-selected={i === highlighted}
               onclick={() => pickItem(item)}
             >
-              <svg
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                stroke-width="1.8"
-                stroke-linecap="round"
-                stroke-linejoin="round"
-                class="text-muted h-4 w-4 shrink-0"
-                aria-hidden="true"
-              >
-                <path
-                  d="M21.44 11.05 12 20.5a5.5 5.5 0 0 1-7.78-7.78l8.49-8.49a3.5 3.5 0 1 1 4.95 4.95l-8.49 8.49a1.5 1.5 0 0 1-2.12-2.12l7.78-7.78"
-                />
-              </svg>
-              <span class="text-fg font-mono text-xs">{item.label}</span>
-            </button>
-          {/each}
-        {/if}
-
-        {#if recipientItems.length > 0}
-          <div
-            class={cn(
-              "text-muted px-2.5 py-0.5 text-[11px] font-medium tracking-wide uppercase select-none",
-              fileItems.length > 0 || attachmentItems.length > 0 ? "mt-1" : "",
-            )}
-          >
-            Send to
-          </div>
-        {/if}
-        {#each recipientItems as item (item.key)}
-          {@const i = menuItems.findIndex((candidate) => candidate.key === item.key)}
-          <button
-            type="button"
-            class={"hover:bg-panel/80 flex w-full cursor-pointer items-center gap-2 rounded-md px-2.5 py-1 text-left leading-5 outline-none select-none " +
-              (i === highlighted ? "bg-panel/80" : "")}
-            data-testid={`recipient-option-${item.key}`}
-            role="option"
-            aria-selected={i === highlighted}
-            onclick={() => pickItem(item)}
-          >
-            {#if item.kind === "all"}
-              <svg
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                stroke-width="2"
-                stroke-linecap="round"
-                stroke-linejoin="round"
-                class="text-accent h-4 w-4"
-                aria-hidden="true"
-              >
-                <circle cx="12" cy="12" r="9" />
-                <path d="m8.5 12 2.5 2.5 4.5-5" />
-              </svg>
-              <span class="text-fg">All agents</span>
-              <span class="text-muted ml-auto font-mono text-[13px]">
-                {shortcut("mod", "shift", "A")}
-              </span>
-            {:else if item.kind === "clear"}
-              <svg
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                stroke-width="2"
-                stroke-linecap="round"
-                class="text-muted h-4 w-4"
-                aria-hidden="true"
-              >
-                <circle cx="12" cy="12" r="9" />
-                <path d="m5.6 5.6 12.8 12.8" />
-              </svg>
-              <span class="text-fg">Clear</span>
-              <span class="text-muted ml-auto font-mono text-[13px]">{shortcut("esc")}</span>
-            {:else if item.kind === "pane"}
-              <svg
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                stroke-width="1.8"
-                stroke-linecap="round"
-                stroke-linejoin="round"
-                class="text-accent h-4 w-4"
-                aria-hidden="true"
-              >
-                <rect x="3" y="4" width="18" height="16" rx="2" />
-                <path d="M12 4v16" />
-              </svg>
-              <span class="text-fg shrink-0">{item.pane.name}</span>
-              <!-- Member names in roster order (matching chip/pane-column
+              {#if item.kind === "all"}
+                <svg
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  class="text-accent h-4 w-4"
+                  aria-hidden="true"
+                >
+                  <circle cx="12" cy="12" r="9" />
+                  <path d="m8.5 12 2.5 2.5 4.5-5" />
+                </svg>
+                <span class="text-fg">All agents</span>
+                <span class="text-muted ml-auto font-mono text-[13px]">
+                  {shortcut("mod", "shift", "A")}
+                </span>
+              {:else if item.kind === "clear"}
+                <ClearIcon class="text-muted" />
+                <span class="text-fg">Clear</span>
+                <span class="text-muted ml-auto font-mono text-[13px]">{shortcut("esc")}</span>
+              {:else if item.kind === "pane"}
+                <svg
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="1.8"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  class="text-accent h-4 w-4"
+                  aria-hidden="true"
+                >
+                  <rect x="3" y="4" width="18" height="16" rx="2" />
+                  <path d="M12 4v16" />
+                </svg>
+                <span class="text-fg shrink-0">{item.pane.name}</span>
+                <!-- Member names in roster order (matching chip/pane-column
                    order); the menu spans the compose box, so names fit —
                    truncate is just the degenerate-case guard. -->
-              <span
-                class="text-muted min-w-0 truncate text-[11px]"
-                data-testid="pane-option-members"
-              >
-                {agents
-                  .filter((a) => item.pane.members.includes(a.id))
-                  .map((a) => a.name)
-                  .join(", ")}
-              </span>
-              {#if item.index < 9}
-                <span class="text-muted ml-auto font-mono text-[13px]">
-                  {shortcut("mod", "alt", String(item.index + 1))}
-                </span>
-              {/if}
-            {:else if item.kind === "agent"}
-              {@const agentIndex = agents.findIndex((a) => a.id === item.agent.id)}
-              <HarnessIcon harness={item.agent.harness} size="sm" class="h-4 w-4" />
-              <span class="text-fg">{item.agent.name}</span>
-              {#if agentIndex >= 0 && agentIndex < 9}
-                <span class="text-muted ml-auto font-mono text-[13px]">
-                  {shortcut("mod", String(agentIndex + 1))}
-                </span>
-              {/if}
-            {/if}
-          </button>
-        {/each}
-
-        {#if forwardItems.length > 0}
-          <div
-            class={cn(
-              "text-muted px-2.5 py-0.5 text-[11px] font-medium tracking-wide uppercase select-none",
-              "mt-1",
-            )}
-          >
-            Forward from
-          </div>
-        {/if}
-        {#each forwardItems as item (item.key)}
-          {@const i = menuItems.findIndex((candidate) => candidate.key === item.key)}
-          <button
-            type="button"
-            class={"hover:bg-panel/80 flex w-full cursor-pointer items-center gap-2 rounded-md px-2.5 py-1 text-left leading-5 outline-none select-none " +
-              (i === highlighted ? "bg-panel/80" : "")}
-            data-testid={`forward-option-${item.key}`}
-            role="option"
-            aria-selected={i === highlighted}
-            onclick={() => pickItem(item)}
-          >
-            <!-- ↪ forward glyph, shared by both forward entry kinds. -->
-            <svg
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              stroke-width="2"
-              stroke-linecap="round"
-              stroke-linejoin="round"
-              class="text-accent h-4 w-4"
-              aria-hidden="true"
-            >
-              <polyline points="15 17 20 12 15 7" />
-              <path d="M4 18v-2a4 4 0 0 1 4-4h12" />
-            </svg>
-            {#if item.kind === "forward-pane"}
-              {@const paneIndex = paneLayout.panes.findIndex((p) => p.id === item.pane.id)}
-              <span class="text-fg shrink-0">{item.pane.name}</span>
-              <span class="text-muted min-w-0 truncate text-[11px]">
-                {agents
-                  .filter((a) => item.pane.members.includes(a.id))
-                  .map((a) => a.name)
-                  .join(", ")}
-              </span>
-              {#if paneIndex >= 0 && paneIndex < 9}
-                <span class="text-muted ml-auto shrink-0 pl-2 font-mono text-[11px]"
-                  >{shortcut("mod", "ctrl", String(paneIndex + 1))}</span
+                <span
+                  class="text-muted min-w-0 truncate text-[11px]"
+                  data-testid="pane-option-members"
                 >
+                  {agents
+                    .filter((a) => item.pane.members.includes(a.id))
+                    .map((a) => a.name)
+                    .join(", ")}
+                </span>
+                {#if item.index < 9}
+                  <span class="text-muted ml-auto font-mono text-[13px]">
+                    {shortcut("mod", "alt", String(item.index + 1))}
+                  </span>
+                {/if}
+              {:else if item.kind === "agent"}
+                {@const agentIndex = agents.findIndex((a) => a.id === item.agent.id)}
+                <HarnessIcon harness={item.agent.harness} size="sm" class="h-4 w-4" />
+                <span class="text-fg">{item.agent.name}</span>
+                {#if agentIndex >= 0 && agentIndex < 9}
+                  <span class="text-muted ml-auto font-mono text-[13px]">
+                    {shortcut("mod", String(agentIndex + 1))}
+                  </span>
+                {/if}
               {/if}
-            {:else}
-              <HarnessIcon harness={item.agent.harness} size="sm" class="h-4 w-4" />
-              <span class="text-fg">{item.agent.name}</span>
-              {#if !agentHasCompletedOutput(item.agent.id)}
-                <span class="text-muted ml-auto text-[11px] italic">no output yet</span>
+            </button>
+          {/each}
+
+          {#if forwardItems.length > 0}
+            <div
+              class={cn(
+                "text-muted px-2.5 py-0.5 text-[11px] font-medium tracking-wide uppercase select-none",
+                "mt-1",
+              )}
+            >
+              Forward from
+            </div>
+          {/if}
+          {#each forwardItems as item (item.key)}
+            {@const i = menuItems.findIndex((candidate) => candidate.key === item.key)}
+            <button
+              type="button"
+              class={"hover:bg-panel/80 flex w-full cursor-pointer items-center gap-2 rounded-md px-2.5 py-1 text-left leading-5 outline-none select-none " +
+                (i === highlighted ? "bg-panel/80" : "")}
+              data-testid={`forward-option-${item.key}`}
+              role="option"
+              aria-selected={i === highlighted}
+              onclick={() => pickItem(item)}
+            >
+              <!-- ↪ forward glyph, shared by both forward entry kinds. -->
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                class="text-accent h-4 w-4"
+                aria-hidden="true"
+              >
+                <polyline points="15 17 20 12 15 7" />
+                <path d="M4 18v-2a4 4 0 0 1 4-4h12" />
+              </svg>
+              {#if item.kind === "forward-pane"}
+                {@const paneIndex = paneLayout.panes.findIndex((p) => p.id === item.pane.id)}
+                <span class="text-fg shrink-0">{item.pane.name}</span>
+                <span class="text-muted min-w-0 truncate text-[11px]">
+                  {agents
+                    .filter((a) => item.pane.members.includes(a.id))
+                    .map((a) => a.name)
+                    .join(", ")}
+                </span>
+                {#if paneIndex >= 0 && paneIndex < 9}
+                  <span class="text-muted ml-auto shrink-0 pl-2 font-mono text-[11px]"
+                    >{shortcut("mod", "ctrl", String(paneIndex + 1))}</span
+                  >
+                {/if}
+              {:else}
+                <HarnessIcon harness={item.agent.harness} size="sm" class="h-4 w-4" />
+                <span class="text-fg">{item.agent.name}</span>
+                {#if !agentHasCompletedOutput(item.agent.id)}
+                  <span class="text-muted ml-auto text-[11px] italic">no output yet</span>
+                {/if}
               {/if}
-            {/if}
-          </button>
-        {/each}
-      </div>
-    {/if}
-    {#if mode !== "prompt" && forwardSources.length > 0}
-      <!-- Plain-mode only: in prompt mode, forwarding is per-field (per argument
-           or the appended text), so the message-level forward set doesn't apply
-           and is hidden (its state is preserved for when the prompt is removed). -->
-      <div class="mb-1.5 flex flex-wrap items-center gap-1.5" data-testid="forward-source-chips">
-        <span class="text-muted text-xs">Forwarding from</span>
-        {#each forwardSources as source (forwardSourceKey(source))}
-          <ForwardSourceChip
-            {source}
-            empty={sourceIsEmpty(source)}
-            disabled={sending}
-            onRemove={() => removeForwardSource(forwardSourceKey(source))}
-          />
-        {/each}
-      </div>
-    {/if}
-    <div class="mb-1.5 flex items-start justify-between gap-2">
-      {#if agents.length > 1}
-        <div class="flex flex-wrap items-center gap-1.5 text-xs" data-testid="recipient-field">
-          <span class="text-muted">To</span>
-          {#each agents as agent, i (agent.id)}
-            {@const selected = selectedIds.includes(agent.id)}
-            <!-- Targeted ∧ hidden — the cue exists for one hazard: sending to
+            </button>
+          {/each}
+        </div>
+      {/if}
+      {#if mode === "plain" && forwardSources.length > 0}
+        <!-- Plain-mode only: prompt mode forwards per-field, and workflow mode
+           routes via its agent inputs, so the message-level forward set doesn't
+           apply and is hidden in both (its state is preserved for restore when
+           the prompt/workflow is removed). -->
+        <div class="mb-1.5 flex flex-wrap items-center gap-1.5" data-testid="forward-source-chips">
+          <span class="text-muted text-xs">Forwarding from</span>
+          {#each forwardSources as source (forwardSourceKey(source))}
+            <ForwardSourceChip
+              {source}
+              empty={sourceIsEmpty(source)}
+              disabled={sending}
+              onRemove={() => removeForwardSource(forwardSourceKey(source))}
+            />
+          {/each}
+          {#if forwardSources.length > 1}
+            <!-- Each chip carries its own ✕; the bulk clear (same ⊘ glyph as
+                 "Clear recipients") only earns its place once there are several to
+                 drop at once. -->
+            <button
+              type="button"
+              class={cn(ICON_BUTTON_ON_RAISED_CLASS, "ml-0.5 shrink-0 disabled:opacity-50")}
+              data-testid="forward-sources-clear"
+              aria-label="Clear forward sources"
+              title="Clear forward sources"
+              disabled={sending}
+              onclick={() => {
+                if (!sending) forwardSources = [];
+              }}
+            >
+              <ClearIcon />
+            </button>
+          {/if}
+        </div>
+      {/if}
+      {#snippet recipientChips()}
+        {#if agents.length > 1}
+          <div class="flex flex-wrap items-center gap-1.5 text-xs" data-testid="recipient-field">
+            <span class="text-muted">To</span>
+            {#each agents as agent, i (agent.id)}
+              {@const selected = selectedIds.includes(agent.id)}
+              <!-- Targeted ∧ hidden — the cue exists for one hazard: sending to
                  an agent whose replies you've hidden. A hidden-but-unselected
                  chip carries no hazard, so it gets no warning. -->
-            {@const chipHidden = selected && isAgentHidden(projectId, rosterIds, agent.id)}
-            <Tooltip
-              label={chipHidden
-                ? `${agent.name} is hidden in its pane — replies won't be visible`
-                : selected
-                  ? `Drop ${agent.name}`
-                  : `Add ${agent.name}`}
-              shortcut={i < 9 ? shortcut("mod", String(i + 1)) : undefined}
-              delayDuration={chipHidden ? 300 : 1000}
-            >
+              {@const chipHidden = selected && isAgentHidden(projectId, rosterIds, agent.id)}
+              <Tooltip
+                label={chipHidden
+                  ? `${agent.name} is hidden in its pane — replies won't be visible`
+                  : selected
+                    ? `Drop ${agent.name}`
+                    : `Add ${agent.name}`}
+                shortcut={i < 9 ? shortcut("mod", String(i + 1)) : undefined}
+                delayDuration={chipHidden ? 300 : 1000}
+              >
+                {#snippet trigger(props)}
+                  <button
+                    {...props}
+                    type="button"
+                    class={cn(
+                      "focus-visible:ring-accent inline-flex h-6 items-center gap-1 rounded-full border px-2 text-xs transition-colors focus-visible:ring-2 focus-visible:outline-none",
+                      selected
+                        ? "bg-accent-soft text-fg border-transparent"
+                        : "border-panel bg-panel text-muted hover:bg-raised hover:text-fg",
+                      sending ? "cursor-not-allowed opacity-60" : "",
+                    )}
+                    data-testid={`recipient-chip-${agent.id}`}
+                    data-selected={selected}
+                    data-hidden-recipient={chipHidden || undefined}
+                    aria-pressed={selected}
+                    disabled={sending}
+                    onclick={() => toggleRecipient(agent.id)}
+                  >
+                    {#if i < 9}
+                      <!-- Leading position number makes the ⌘1–9 toggle shortcut
+                         discoverable at a glance (it maps to chip position, not a
+                         fixed agent). -->
+                      <span
+                        class="text-muted/80 font-mono text-[10px] tabular-nums"
+                        aria-hidden="true"
+                      >
+                        {i + 1}
+                      </span>
+                    {/if}
+                    <HarnessIcon harness={agent.harness} size="sm" class="h-3.5 w-3.5" />
+                    {agent.name}
+                    {#if chipHidden}
+                      <!-- Targeted-but-hidden cue: without it a user sends to a
+                         hidden agent and never sees the reply appear. -->
+                      <svg
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="2"
+                        stroke-linecap="round"
+                        stroke-linejoin="round"
+                        class="text-warning h-3 w-3 shrink-0"
+                        data-testid={`recipient-hidden-cue-${agent.id}`}
+                        aria-hidden="true"
+                      >
+                        <path
+                          d="M10.7 5.1a9.6 9.6 0 0 1 1.3-.1c7 0 10 7 10 7a13.2 13.2 0 0 1-1.7 2.5"
+                        />
+                        <path d="M6.6 6.6A13.5 13.5 0 0 0 2 12s3 7 10 7a9.7 9.7 0 0 0 5.4-1.6" />
+                        <path d="m2 2 20 20" />
+                      </svg>
+                    {/if}
+                  </button>
+                {/snippet}
+              </Tooltip>
+            {/each}
+            {#if selectedIds.length > 0}
+              <Tooltip label="Clear recipients" shortcut={shortcut("esc")}>
+                {#snippet trigger(props)}
+                  <button
+                    {...props}
+                    type="button"
+                    class={cn(ICON_BUTTON_ON_RAISED_CLASS, "ml-0.5")}
+                    data-testid="recipient-clear"
+                    aria-label="Clear recipients"
+                    disabled={sending}
+                    onclick={() => {
+                      if (!sending) setSelectedIds([]);
+                    }}
+                  >
+                    <ClearIcon />
+                  </button>
+                {/snippet}
+              </Tooltip>
+            {/if}
+          </div>
+        {/if}
+      {/snippet}
+
+      {#if mode === "plain"}
+        <!-- Plain mode owns the To row + the message-level entry points. In prompt
+           mode the To row is handed to the composer (so the prompt name titles
+           the whole thing, above the recipients); workflow mode routes via its
+           own agent inputs, so neither shows. -->
+        <div class="mb-1.5 flex items-start justify-between gap-2">
+          <div class="min-w-0">{@render recipientChips()}</div>
+          <div class="flex shrink-0 items-center gap-1">
+            <ForwardSourcePicker
+              {agents}
+              panes={paneLayout.panes}
+              onPickAgent={(agent) => addForwardSource(forwardSourceForAgent(agent))}
+              onPickPane={(pane) => addPaneForwardSources(pane)}
+              agentHasOutput={agentHasCompletedOutput}
+              disabled={sending}
+              showPaneShortcuts
+              triggerTestid="compose-forward-button"
+              triggerText="Forward"
+              triggerLabel="Forward an agent's output"
+              tooltipLabel="Forward an agent's output"
+              triggerClass={cn(
+                "text-muted hover:text-fg hover:bg-panel focus-visible:ring-accent flex h-6 items-center gap-1 rounded-full border border-transparent px-2 text-xs transition-colors focus-visible:ring-2 focus-visible:outline-none",
+                sending ? "cursor-not-allowed opacity-60" : "",
+              )}
+            />
+            <Tooltip label="Insert a prompt" shortcut={shortcut("/")}>
               {#snippet trigger(props)}
                 <button
                   {...props}
                   type="button"
                   class={cn(
-                    "focus-visible:ring-accent inline-flex items-center gap-1 rounded-full border py-px pr-2 pl-1.5 text-sm transition-colors focus-visible:ring-2 focus-visible:outline-none",
-                    selected
-                      ? "bg-accent-soft text-fg border-transparent"
-                      : "border-panel bg-panel text-muted hover:bg-raised hover:text-fg",
+                    "text-muted hover:text-fg hover:bg-panel focus-visible:ring-accent flex h-6 items-center gap-1 rounded-full border border-transparent px-2 text-xs transition-colors focus-visible:ring-2 focus-visible:outline-none",
                     sending ? "cursor-not-allowed opacity-60" : "",
                   )}
-                  data-testid={`recipient-chip-${agent.id}`}
-                  data-selected={selected}
-                  data-hidden-recipient={chipHidden || undefined}
-                  aria-pressed={selected}
-                  disabled={sending}
-                  onclick={() => toggleRecipient(agent.id)}
-                >
-                  {#if i < 9}
-                    <!-- Leading position number makes the ⌘1–9 toggle shortcut
-                         discoverable at a glance (it maps to chip position, not a
-                         fixed agent). -->
-                    <span
-                      class="text-muted/80 font-mono text-[10px] tabular-nums"
-                      aria-hidden="true"
-                    >
-                      {i + 1}
-                    </span>
-                  {/if}
-                  <HarnessIcon harness={agent.harness} size="sm" class="h-3.5 w-3.5" />
-                  {agent.name}
-                  {#if chipHidden}
-                    <!-- Targeted-but-hidden cue: without it a user sends to a
-                         hidden agent and never sees the reply appear. -->
-                    <svg
-                      viewBox="0 0 24 24"
-                      fill="none"
-                      stroke="currentColor"
-                      stroke-width="2"
-                      stroke-linecap="round"
-                      stroke-linejoin="round"
-                      class="text-warning h-3 w-3 shrink-0"
-                      data-testid={`recipient-hidden-cue-${agent.id}`}
-                      aria-hidden="true"
-                    >
-                      <path
-                        d="M10.7 5.1a9.6 9.6 0 0 1 1.3-.1c7 0 10 7 10 7a13.2 13.2 0 0 1-1.7 2.5"
-                      />
-                      <path d="M6.6 6.6A13.5 13.5 0 0 0 2 12s3 7 10 7a9.7 9.7 0 0 0 5.4-1.6" />
-                      <path d="m2 2 20 20" />
-                    </svg>
-                  {/if}
-                </button>
-              {/snippet}
-            </Tooltip>
-          {/each}
-          {#if selectedIds.length > 0}
-            <Tooltip label="Clear recipients" shortcut={shortcut("esc")}>
-              {#snippet trigger(props)}
-                <button
-                  {...props}
-                  type="button"
-                  class="text-muted hover:text-fg hover:bg-panel ml-0.5 flex h-[26px] w-[26px] items-center justify-center rounded-full transition-colors"
-                  data-testid="recipient-clear"
-                  aria-label="Clear recipients"
+                  data-testid="compose-prompt-button"
+                  aria-label="Insert a prompt"
                   disabled={sending}
                   onclick={() => {
-                    if (!sending) setSelectedIds([]);
+                    if (sending) return;
+                    if (promptMenuOpen) {
+                      promptMenuOpen = false;
+                    } else {
+                      openPromptMenu();
+                    }
                   }}
                 >
                   <svg
                     viewBox="0 0 24 24"
                     fill="none"
                     stroke="currentColor"
-                    stroke-width="1.75"
+                    stroke-width="2"
                     stroke-linecap="round"
                     class="h-4 w-4"
                     aria-hidden="true"
                   >
-                    <circle cx="12" cy="12" r="9" />
-                    <path d="m5.6 5.6 12.8 12.8" />
+                    <path d="M12 5v14M5 12h14" />
                   </svg>
+                  Prompt
                 </button>
               {/snippet}
             </Tooltip>
-          {/if}
+            <Tooltip label="Run a workflow">
+              {#snippet trigger(props)}
+                <button
+                  {...props}
+                  type="button"
+                  class={cn(
+                    "text-muted hover:text-fg hover:bg-panel focus-visible:ring-accent flex h-6 items-center gap-1 rounded-full border border-transparent px-2 text-xs transition-colors focus-visible:ring-2 focus-visible:outline-none",
+                    sending ? "cursor-not-allowed opacity-60" : "",
+                  )}
+                  data-testid="compose-workflow-button"
+                  aria-label="Run a workflow"
+                  disabled={sending}
+                  onclick={() => {
+                    if (sending) return;
+                    if (workflowMenuOpen) {
+                      workflowMenuOpen = false;
+                    } else {
+                      openWorkflowMenu();
+                    }
+                  }}
+                >
+                  <svg
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2"
+                    stroke-linecap="round"
+                    class="h-4 w-4"
+                    aria-hidden="true"
+                  >
+                    <path d="M12 5v14M5 12h14" />
+                  </svg>
+                  Workflow
+                </button>
+              {/snippet}
+            </Tooltip>
+          </div>
         </div>
-      {:else}
-        <div></div>
       {/if}
-      <div class="flex shrink-0 items-center gap-1">
-        {#if mode !== "prompt"}
-          <!-- Plain-mode only: prompt mode forwards per-field, so the
-               message-level ↪ Forward button is hidden while a prompt is active. -->
-          <ForwardSourcePicker
-            {agents}
-            panes={paneLayout.panes}
-            onPickAgent={(agent) => addForwardSource(forwardSourceForAgent(agent))}
-            onPickPane={(pane) => addForwardSource(forwardSourceForPane(pane, agents))}
-            agentHasOutput={agentHasCompletedOutput}
-            disabled={sending}
-            showPaneShortcuts
-            triggerTestid="compose-forward-button"
-            triggerText="Forward"
-            triggerLabel="Forward an agent's output"
-            tooltipLabel="Forward an agent's output"
-            triggerClass={cn(
-              "text-muted hover:text-fg hover:bg-panel focus-visible:ring-accent flex h-6 items-center gap-1 rounded-full border border-transparent px-2 text-xs transition-colors focus-visible:ring-2 focus-visible:outline-none",
-              sending ? "cursor-not-allowed opacity-60" : "",
-            )}
-          />
-        {/if}
-        <Tooltip label="Insert a prompt" shortcut={shortcut("/")}>
-          {#snippet trigger(props)}
-            <button
-              {...props}
-              type="button"
-              class={cn(
-                "text-muted hover:text-fg hover:bg-panel focus-visible:ring-accent flex h-6 items-center gap-1 rounded-full border border-transparent px-2 text-xs transition-colors focus-visible:ring-2 focus-visible:outline-none",
-                sending ? "cursor-not-allowed opacity-60" : "",
-              )}
-              data-testid="compose-prompt-button"
-              aria-label="Insert a prompt"
-              disabled={sending}
-              onclick={() => {
-                if (sending) return;
-                if (promptMenuOpen) {
-                  promptMenuOpen = false;
-                } else {
-                  openPromptMenu();
-                }
-              }}
-            >
-              <svg
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                stroke-width="2"
-                stroke-linecap="round"
-                class="h-4 w-4"
-                aria-hidden="true"
-              >
-                <path d="M12 5v14M5 12h14" />
-              </svg>
-              Prompt
-            </button>
-          {/snippet}
-        </Tooltip>
-      </div>
-    </div>
 
-    {#if attachmentChips.length > 0}
-      <div class="mb-1.5 flex flex-wrap gap-1.5" data-testid="attachment-chips">
-        {#each attachmentChips as chip (chip.id)}
-          <span
-            class="border-border bg-panel text-fg inline-flex max-w-[14rem] items-center gap-1.5 rounded-full border py-px pr-1 pl-2 text-xs"
-            data-testid={`attachment-chip-${chip.label}`}
-            data-kind={chip.kind}
-          >
+      {#if attachmentChips.length > 0}
+        <div class="mb-1.5 flex flex-wrap gap-1.5" data-testid="attachment-chips">
+          {#each attachmentChips as chip (chip.id)}
             <span
-              class="text-muted shrink-0 font-mono text-[10px] whitespace-nowrap"
-              aria-hidden="true">{chip.label}</span
+              class="border-border bg-panel text-fg inline-flex max-w-[14rem] items-center gap-1.5 rounded-full border py-px pr-1 pl-2 text-xs"
+              data-testid={`attachment-chip-${chip.label}`}
+              data-kind={chip.kind}
             >
-            <span class="truncate" title={chip.original_name}>{chip.original_name}</span>
-            <button
-              type="button"
-              class="text-muted hover:text-fg hover:bg-raised flex h-4 w-4 shrink-0 items-center justify-center rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-50"
-              data-testid={`attachment-chip-remove-${chip.label}`}
-              aria-label={`Remove ${chip.original_name}`}
-              disabled={sending}
-              onclick={() => removeAttachmentChip(chip.id)}
-            >
-              <svg
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                stroke-width="2"
-                stroke-linecap="round"
-                class="h-3 w-3"
-                aria-hidden="true"
+              <span
+                class="text-muted shrink-0 font-mono text-[10px] whitespace-nowrap"
+                aria-hidden="true">{chip.label}</span
               >
-                <path d="m6 6 12 12M18 6 6 18" />
-              </svg>
-            </button>
-          </span>
-        {/each}
-      </div>
-    {/if}
+              <span class="truncate" title={chip.original_name}>{chip.original_name}</span>
+              <button
+                type="button"
+                class="text-muted hover:text-fg hover:bg-raised flex h-4 w-4 shrink-0 items-center justify-center rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-50"
+                data-testid={`attachment-chip-remove-${chip.label}`}
+                aria-label={`Remove ${chip.original_name}`}
+                disabled={sending}
+                onclick={() => removeAttachmentChip(chip.id)}
+              >
+                <svg
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  stroke-linecap="round"
+                  class="h-3 w-3"
+                  aria-hidden="true"
+                >
+                  <path d="m6 6 12 12M18 6 6 18" />
+                </svg>
+              </button>
+            </span>
+          {/each}
+        </div>
+      {/if}
 
-    {#if restoring}
-      <!-- A saved prompt-mode draft is still resolving against the (possibly
+      {#if restoring}
+        <!-- A saved prompt-mode draft is still resolving against the (possibly
            cold) cache. Show a neutral placeholder rather than the plain textarea
            so the box doesn't flash empty and look like the draft was lost. -->
-      <div
-        class="text-muted flex h-16 items-center gap-2 px-1 text-sm"
-        data-testid="compose-restoring"
-      >
-        <Spinner class="h-4 w-4" />
-        Restoring prompt…
-      </div>
-    {:else if mode === "prompt" && selectedPrompt !== null}
-      <!-- Prompt mode stacks full-width: the argument/appended boxes span the
-           whole compose area; the send button sits in the composer's footer row
-           beside Preview (passed down as a snippet). -->
-      <div class="mt-2">
+        <div
+          class="text-muted flex h-16 items-center gap-2 px-1 text-sm"
+          data-testid="compose-restoring"
+        >
+          <Spinner class="h-4 w-4" />
+          Restoring prompt…
+        </div>
+      {:else if mode === "workflow" && workflowForm !== null}
+        <!-- Workflow mode: the invocation form spans the compose area. The compose
+           bar's To field + message forwards are hidden (the workflow routes via
+           its agent inputs); the run launches in the background. -->
+        <WorkflowComposer
+          descriptor={workflowForm}
+          {agents}
+          loading={workflowFormLoading}
+          syncSettled={workflowSyncSettled}
+          agentHasOutput={agentHasCompletedOutput}
+          panes={paneLayout.panes}
+          bind:inputs={workflowInputs}
+          bind:forwardSources={workflowForwardSources}
+          onremove={removeWorkflow}
+        >
+          {#snippet invoke()}
+            <Button
+              variant="primary"
+              size="sm"
+              data-testid="workflow-invoke-button"
+              disabled={!workflowRunnable || invokingWorkflow}
+              onclick={() => void invokeWorkflowAction()}
+            >
+              {invokingWorkflow ? "Starting…" : "Run workflow"}
+            </Button>
+          {/snippet}
+        </WorkflowComposer>
+      {:else if mode === "prompt" && selectedPrompt !== null}
+        <!-- Prompt mode stacks full-width: the prompt name titles the area, the To
+           row sits just under it (handed in as a snippet), then the argument /
+           appended boxes; the send button rides the composer's footer row. -->
         <PromptComposer
           prompt={selectedPrompt}
           bind:args={promptArgs}
@@ -1976,32 +2454,33 @@
           agentHasOutput={agentHasCompletedOutput}
           focusFirstField={focusPromptFieldOnMount}
           onremove={removePrompt}
+          recipients={recipientChips}
           busy={sending}
           send={sendButton}
         />
-      </div>
-    {:else}
-      <div class="relative flex items-end gap-2">
-        <Textarea
-          autosize
-          data-testid="compose-textarea"
-          data-shortcut-scope="composer"
-          placeholder="Type a message…  (⌘+Enter to send, @ to add a recipient or forward source, / for a prompt)"
-          rows={3}
-          bind:ref={textareaEl}
-          bind:value={draft}
-          oninput={onInput}
-          onkeydown={handleKey}
-          class="max-h-48 min-h-16 border-0 bg-transparent p-1 shadow-none focus-visible:ring-0"
-        />
-        {@render sendButton()}
-      </div>
+      {:else}
+        <div class="relative flex items-end gap-2">
+          <Textarea
+            autosize
+            data-testid="compose-textarea"
+            data-shortcut-scope="composer"
+            placeholder="Type a message…  (⌘+Enter to send, @ to add a recipient or forward source, / for a prompt)"
+            rows={3}
+            bind:ref={textareaEl}
+            bind:value={draft}
+            oninput={onInput}
+            onkeydown={handleKey}
+            class="max-h-48 min-h-16 border-0 bg-transparent p-1 shadow-none focus-visible:ring-0"
+          />
+          {@render sendButton()}
+        </div>
+      {/if}
+    </div>
+    {#if sendError}
+      <p class="text-status-failed mt-2 text-xs" data-testid="compose-send-error">
+        {sendError}
+      </p>
     {/if}
-  </div>
-  {#if sendError}
-    <p class="text-status-failed mt-2 text-xs" data-testid="compose-send-error">
-      {sendError}
-    </p>
   {/if}
 </div>
 

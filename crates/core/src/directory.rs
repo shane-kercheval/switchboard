@@ -11,9 +11,7 @@ use crate::project::{
     self, PROJECT_CONFIG_VERSION, Project, ProjectConfig, ProjectId, ProjectSummary,
 };
 
-use crate::paths::{
-    CONFIG_FILE, JOURNAL_FILE, PROJECTS_DIR, PROJECTS_INDEX, SWITCHBOARD_DIR, WORKFLOWS_DIR,
-};
+use crate::paths::{CONFIG_FILE, JOURNAL_FILE, PROJECTS_DIR, PROJECTS_INDEX, SWITCHBOARD_DIR};
 
 const DIRECTORY_CONFIG_VERSION: u32 = 1;
 
@@ -50,15 +48,14 @@ impl Directory {
         self.path.join(SWITCHBOARD_DIR).is_dir()
     }
 
-    /// Creates `<path>/.switchboard/{config.yaml, workflows/, projects.jsonl,
-    /// projects/}` if missing. Idempotent — calling twice on the same directory
-    /// leaves existing structure intact. (Prompts are user-global, not
-    /// directory-scoped, so there is no per-directory `prompts/` dir — see §6.)
+    /// Creates `<path>/.switchboard/{config.yaml, projects.jsonl, projects/}` if
+    /// missing. Idempotent — calling twice on the same directory leaves existing
+    /// structure intact. (Both prompts and workflows are user-global, not
+    /// directory-scoped, so there is no per-directory `prompts/` or `workflows/`
+    /// dir — see §3/§6.)
     pub fn init(&self) -> Result<()> {
         let sb = self.switchboard_dir();
         create_dir_all(&sb).map_err(|e| CoreError::io(&sb, e))?;
-        create_dir_all(sb.join(WORKFLOWS_DIR))
-            .map_err(|e| CoreError::io(sb.join(WORKFLOWS_DIR), e))?;
         create_dir_all(sb.join(PROJECTS_DIR))
             .map_err(|e| CoreError::io(sb.join(PROJECTS_DIR), e))?;
 
@@ -329,6 +326,7 @@ impl Directory {
     fn switchboard_dir(&self) -> PathBuf {
         self.path.join(SWITCHBOARD_DIR)
     }
+
     fn projects_dir(&self) -> PathBuf {
         self.switchboard_dir().join(PROJECTS_DIR)
     }

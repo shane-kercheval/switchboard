@@ -13,6 +13,7 @@
 //! this crate takes already-resolved paths and an injected [`SecretStore`] so
 //! dev-instance isolation and test hermeticity stay intact.
 
+mod builtin;
 mod config;
 mod local;
 mod mcp;
@@ -21,8 +22,9 @@ mod provider;
 mod secret;
 mod service;
 
+pub use builtin::builtin_prompt_content;
 pub use config::{McpProviderConfig, McpTransport, PromptConfig, resolve_local_dirs};
-pub use model::{LOCAL_PROVIDER, Prompt, PromptArgument, PromptId};
+pub use model::{BUILTIN_PROVIDER, LOCAL_PROVIDER, Prompt, PromptArgument, PromptId};
 pub use secret::{InMemorySecretStore, SecretStore, SecretStoreError};
 pub use service::{McpProviderInfo, PromptService, ProviderStatus, RenderedPrompt};
 
@@ -110,9 +112,9 @@ mod error {
         McpEmptyContent { provider: String, name: String },
 
         /// A provider name supplied to add/update is not a usable addressing
-        /// prefix (empty, reserved `local`, or contains `:`).
+        /// prefix (empty, a reserved prefix `local`/`builtin`, or contains `:`).
         #[error(
-            "invalid provider name {name:?}: must be non-empty, not `local`, and contain no `:`"
+            "invalid provider name {name:?}: must be non-empty, not a reserved prefix (`local`, `builtin`), and contain no `:`"
         )]
         InvalidProviderName { name: String },
 

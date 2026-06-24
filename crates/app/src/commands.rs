@@ -234,10 +234,28 @@ pub async fn remove_directory_impl(state: &AppState, path: &str) -> Result<(), A
         // `write` drops here — the guard is released BEFORE the drain `.await`.
     }
 
+    // Cancel any workflow runs for the removed projects and let them settle to
+    // `cancelled` BEFORE draining agents. Cancel-runs-first is load-bearing: if
+    // agents drained first, a run would observe an out-of-band terminal and
+    // resolve `failed`/ambiguous instead of `cancelled`, and could write into a
+    // directory about to be deleted.
+    crate::workflow_commands::cancel_runs_for_projects(state, &project_ids).await;
+
     // Shut down each agent's dispatcher actor (cancels + drains any live turn)
     // and release the named project locks. Holds no other state lock across the
     // await.
     drain_agents_then_release_locks(state, &agent_ids, &project_ids, CancelSource::Shutdown).await;
+
+    // Final prune: a turn settling between the earlier map-clear and this drain
+    // (a workflow run cancelling, or a manual turn) can re-insert an agent into
+    // `agents_by_id` via the session-locator sink, which `insert`s unconditionally.
+    // Re-prune the removed projects' agents now that no actor remains to write.
+    {
+        let project_set: HashSet<ProjectId> = project_ids.iter().copied().collect();
+        lock(&state.agents_by_id).retain(|_, r| !project_set.contains(&r.project_id));
+        let removed: HashSet<AgentId> = agent_ids.iter().copied().collect();
+        lock(&state.needs_session_meta).retain(|id| !removed.contains(id));
+    }
 
     // Always drop the workspace entry + persist (idempotent for absent dirs).
     lock(&state.workspace).remove(&canonical);
@@ -1086,8 +1104,48 @@ pub fn set_preferences_impl(state: &AppState, prefs: &Preferences) -> Result<(),
 /// All prompts across configured providers (user-global; no project argument).
 /// Never hard-fails: an unreachable/misconfigured provider contributes nothing
 /// rather than breaking the listing.
+///
+/// The read-only built-in library is dropped from the listing when the user's
+/// `show_builtins` preference is off. This is the **only** place built-ins are
+/// hidden — `PromptService` always lists and renders them — so the toggle
+/// governs picker visibility without unwiring a workflow already pointed at a
+/// built-in (resolution by id still succeeds).
 pub fn list_prompts_impl(state: &AppState) -> Vec<switchboard_prompts::Prompt> {
-    state.prompts.list()
+    let prompts = state.prompts.list();
+    if lock(&state.preferences).show_builtins {
+        return prompts;
+    }
+    prompts
+        .into_iter()
+        .filter(|p| p.provider != switchboard_prompts::BUILTIN_PROVIDER)
+        .collect()
+}
+
+/// Copy a built-in prompt into the user's prompts directory as `<name>.md`, so
+/// they can customize it as an owned file. Refuses to overwrite an existing file
+/// (the app never clobbers a user's prompt). After this, the copy is an ordinary
+/// local prompt the app never touches again — built-in updates don't affect it.
+/// Returns the path written.
+pub fn copy_builtin_prompt_impl(name: &str, prompts_dir: &Path) -> Result<PathBuf, AppError> {
+    let content = switchboard_prompts::builtin_prompt_content(name).ok_or_else(|| {
+        AppError::Prompt(switchboard_prompts::PromptError::PromptNotFound {
+            provider: switchboard_prompts::BUILTIN_PROVIDER.to_owned(),
+            name: name.to_owned(),
+        })
+    })?;
+    let dest = prompts_dir.join(format!("{name}.md"));
+    if dest.exists() {
+        return Err(AppError::PromptCopyExists { path: dest });
+    }
+    std::fs::create_dir_all(prompts_dir).map_err(|source| AppError::PromptCopyIo {
+        path: prompts_dir.to_path_buf(),
+        source,
+    })?;
+    std::fs::write(&dest, content).map_err(|source| AppError::PromptCopyIo {
+        path: dest.clone(),
+        source,
+    })?;
+    Ok(dest)
 }
 
 /// Render a prompt to its finished text. Provider-dispatched (local → `MiniJinja`,
@@ -1313,6 +1371,10 @@ pub async fn delete_project_impl(state: &AppState, project_id: ProjectId) -> Res
         Err(AppError::ProjectNotLoaded(_)) => None,
         Err(e) => return Err(e),
     };
+
+    // Cancel this project's workflow runs and let them settle to `cancelled`
+    // BEFORE draining agents (cancel-runs-first — see `remove_directory_impl`).
+    crate::workflow_commands::cancel_runs_for_projects(state, &[project_id]).await;
 
     // Phase (a): drain this project's loaded agents (only loaded projects have
     // cached agents, so an unopened/unavailable project drains nothing). No lock
@@ -2360,7 +2422,10 @@ pub async fn stage_attachment_impl(
 /// Claude adapter would silently spawn the wrong binary), pinned by the app
 /// routing test. Shared by `send_message_impl` and the forward's recipient
 /// pre-validation so both reject an unsupported harness identically.
-fn adapter_for(state: &AppState, agent: &AgentRecord) -> Result<Arc<dyn HarnessAdapter>, AppError> {
+pub(crate) fn adapter_for(
+    state: &AppState,
+    agent: &AgentRecord,
+) -> Result<Arc<dyn HarnessAdapter>, AppError> {
     match agent.harness {
         HarnessKind::ClaudeCode => Ok(Arc::clone(&state.claude_adapter)),
         HarnessKind::Codex => Ok(Arc::clone(&state.codex_adapter)),
@@ -2653,6 +2718,100 @@ async fn forward_resolve(
     Ok(ForwardOutcome::Resolved {
         body: forwarded,
         skipped,
+    })
+}
+
+/// Resolve a workflow's forward-fields in **completed-only** mode: each field's
+/// chosen sources contribute their *latest completed* output, composed with the
+/// field's typed lead. If any source has a turn **actively running**, the whole
+/// invocation is rejected (the workflow launch is never held open waiting on a
+/// streaming agent — a forward field captures only completed output). Returns field name →
+/// composed text for the caller to merge into the invocation inputs.
+///
+/// `inputs` supplies each field's typed lead (its current string value); the
+/// composed result replaces it. Reuses the manual-forward composition helpers so
+/// a forwarded workflow field reads identically to a forwarded prompt argument.
+pub(crate) async fn resolve_workflow_forwards(
+    state: &AppState,
+    forward_sources: &std::collections::BTreeMap<String, Vec<AgentId>>,
+    inputs: &std::collections::BTreeMap<String, switchboard_workflow::InputValue>,
+    home_dir: &Path,
+) -> Result<std::collections::BTreeMap<String, String>, AppError> {
+    // Read the project journal once (the same file for every source of this
+    // invocation), mirroring `resolve_all_sources`. It supplies a failed/cancelled
+    // latest-turn note when the harness file didn't record it.
+    let journal = match forward_sources.values().flatten().next() {
+        Some(&first) => {
+            let (project, _) = lookup_agent(state, first)?;
+            switchboard_core::journal::read_records(&project.journal_path())?
+        }
+        None => Vec::new(),
+    };
+    let journal = journal.as_slice();
+
+    let mut resolved = std::collections::BTreeMap::new();
+    for (field, sources) in forward_sources {
+        if sources.is_empty() {
+            continue;
+        }
+        let mut resolutions = Vec::with_capacity(sources.len());
+        for &source in sources {
+            resolutions
+                .push(resolve_source_completed_only(state, source, home_dir, journal).await?);
+        }
+        let typed_lead = match inputs.get(field) {
+            Some(switchboard_workflow::InputValue::Text(s)) => s.as_str(),
+            _ => "",
+        };
+        let mut skipped = Vec::new();
+        resolved.insert(
+            field.clone(),
+            compose_resolutions(&resolutions, typed_lead, &mut skipped),
+        );
+    }
+    Ok(resolved)
+}
+
+/// Completed-only resolution of one forward source: reject it if a turn is
+/// **actively running** (the workflow launch never blocks on a streaming agent),
+/// else read its latest *completed* output from settled state.
+///
+/// This is still technically check-then-act (peek, then read), but **benign**: the
+/// "act" is a *non-blocking* read of the latest completed turn — a turn that starts
+/// in the gap between the peek and the read is simply read past, never awaited.
+/// That non-blocking read is the property that upholds the completed-only contract
+/// ("never block on a live turn"). Do **not** "tighten" this into
+/// `wait_for_current_turn`: that awaits a live turn and would reintroduce exactly
+/// the hang this design forbids.
+async fn resolve_source_completed_only(
+    state: &AppState,
+    agent_id: AgentId,
+    home_dir: &Path,
+    journal: &[switchboard_core::JournalRecord],
+) -> Result<SourceResolution, AppError> {
+    let (project, agent) = lookup_agent(state, agent_id)?;
+    if state.dispatcher.is_turn_running(agent_id).await {
+        return Err(AppError::Workflow(
+            switchboard_workflow::WorkflowError::Invocation {
+                message: format!(
+                    "agent {:?} is still responding — wait for it to finish, then run the workflow",
+                    agent.name
+                ),
+            },
+        ));
+    }
+    // Settled: forward a failed/cancelled latest turn over a stale older one;
+    // otherwise the latest completed output from disk.
+    if let Some(note) = latest_turn_failure_note(journal, agent_id, &agent.name) {
+        return Ok(SourceResolution::Resolved {
+            name: agent.name,
+            text: note,
+        });
+    }
+    let transcript = load_agent_transcript(&project, &agent, home_dir)?;
+    Ok(SourceResolution::Resolved {
+        name: agent.name,
+        text: latest_completed_agent_text(&transcript.turns).unwrap_or_default(),
     })
 }
 
@@ -4652,7 +4811,7 @@ fn find_directory_for_project(
 /// not found" and ghost-delete a project whose files are actually present. Falls
 /// back to the on-disk index scan for an available-but-never-opened project.
 /// Returns `ProjectNotLoaded` only when no loaded directory claims the id.
-fn resolve_owning_directory(
+pub(crate) fn resolve_owning_directory(
     state: &AppState,
     project_id: ProjectId,
 ) -> Result<Directory, AppError> {
@@ -5181,6 +5340,70 @@ mod tests {
             !body.contains("old boom"),
             "an earlier failure does not poison a later success: {body:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn workflow_forward_resolves_a_completed_source_into_the_field() {
+        // A workflow forward-field captures its source's latest *completed* output,
+        // composed after the field's typed lead (a forward captures completed output only).
+        let (tmp, state, _emitter) = fresh_state_with_mock();
+        let home = TempDir::new().unwrap();
+        let (_recipient, project_id) = project_with_agent(&state, &tmp).await;
+        let source = seed_source(&state, home.path(), project_id, "gemini", "FRESH ANSWER");
+
+        let mut forward_sources = std::collections::BTreeMap::new();
+        forward_sources.insert("context".to_owned(), vec![source]);
+        let mut inputs = std::collections::BTreeMap::new();
+        inputs.insert(
+            "context".to_owned(),
+            switchboard_workflow::InputValue::Text("my lead".to_owned()),
+        );
+
+        let resolved = resolve_workflow_forwards(&state, &forward_sources, &inputs, home.path())
+            .await
+            .unwrap();
+        let body = resolved.get("context").expect("context resolved");
+        assert!(body.contains("my lead"), "typed lead leads: {body}");
+        assert!(
+            body.contains("FRESH ANSWER"),
+            "forwarded completed output: {body}"
+        );
+        assert!(
+            body.contains("gemini"),
+            "block attributes the source: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_forward_rejects_a_still_streaming_source() {
+        use switchboard_harness::MockScenario;
+        // A source mid-turn is rejected (the workflow launch never holds on a
+        // streaming agent), with an actionable message — not awaited.
+        let (tmp, state, emitter) = fresh_state_with_scenario(MockScenario::AwaitCancellation);
+        let home = TempDir::new().unwrap();
+        let _ = project_with_agent(&state, &tmp).await;
+        let source =
+            create_agent_impl(&state, "reviewer-1", HarnessKind::ClaudeCode, None, None).unwrap();
+        send_msg(&state, source.id, "work").await.unwrap();
+        within(
+            &emitter,
+            "source in flight",
+            emitter.wait_for_type("turn_start", 1),
+        )
+        .await;
+
+        let mut forward_sources = std::collections::BTreeMap::new();
+        forward_sources.insert("context".to_owned(), vec![source.id]);
+        let err = resolve_workflow_forwards(
+            &state,
+            &forward_sources,
+            &std::collections::BTreeMap::new(),
+            home.path(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, AppError::Workflow(_)));
+        assert!(err.to_string().contains("still responding"), "got: {err}");
     }
 
     #[tokio::test]
@@ -14190,6 +14413,7 @@ mod tests {
             editor_command: Some("zed".to_owned()),
             terminal_app: "iTerm".to_owned(),
             diff_style: preferences::DiffStyle::Unified,
+            show_builtins: false,
         };
         set_preferences_impl(&state, &prefs).unwrap();
 
@@ -14213,6 +14437,7 @@ mod tests {
                 editor_command: Some("  ".to_owned()),
                 terminal_app: String::new(),
                 diff_style: preferences::DiffStyle::SideBySide,
+                show_builtins: true,
             },
         )
         .unwrap();
@@ -14233,6 +14458,7 @@ mod tests {
             editor_command: Some("code".to_owned()),
             terminal_app: "Terminal".to_owned(),
             diff_style: preferences::DiffStyle::SideBySide,
+            show_builtins: true,
         };
         set_preferences_impl(&state, &prefs).unwrap();
         assert_eq!(get_preferences_impl(&state), prefs);
@@ -14266,11 +14492,101 @@ mod tests {
         state.prompts.sync().await;
 
         let prompts = list_prompts_impl(&state);
-        assert_eq!(prompts.len(), 1);
-        assert_eq!(prompts[0].provider, "local");
-        assert_eq!(prompts[0].name, "greet");
-        assert_eq!(prompts[0].arguments.len(), 1);
-        assert!(prompts[0].arguments[0].required);
+        let greet = prompts
+            .iter()
+            .find(|p| p.provider == "local" && p.name == "greet")
+            .expect("the local prompt should be listed");
+        assert_eq!(greet.arguments.len(), 1);
+        assert!(greet.arguments[0].required);
+    }
+
+    #[tokio::test]
+    async fn list_prompts_includes_built_ins_by_default() {
+        // Default preferences show built-ins, so a fresh state lists the bundled
+        // library after sync — no local files needed.
+        let (_tmp, state) = state_with_prompts();
+        state.prompts.sync().await;
+
+        let prompts = list_prompts_impl(&state);
+        let builtins: Vec<&str> = prompts
+            .iter()
+            .filter(|p| p.provider == switchboard_prompts::BUILTIN_PROVIDER)
+            .map(|p| p.name.as_str())
+            .collect();
+        assert!(builtins.contains(&"code-review"), "got {builtins:?}");
+        assert!(builtins.contains(&"analyze-ai-reviews"), "got {builtins:?}");
+    }
+
+    #[tokio::test]
+    async fn show_builtins_off_hides_built_ins_but_keeps_resolution() {
+        // The toggle is visibility-only: built-ins drop out of the listing, yet a
+        // render-by-id still resolves (so a workflow wired to one never breaks).
+        let (tmp, state) = state_with_prompts();
+        std::fs::write(tmp.path().join("prompts").join("greet.md"), GREET_PROMPT).unwrap();
+        state.prompts.sync().await;
+
+        set_preferences_impl(
+            &state,
+            &Preferences {
+                show_builtins: false,
+                ..Preferences::default()
+            },
+        )
+        .unwrap();
+
+        let prompts = list_prompts_impl(&state);
+        assert!(
+            prompts
+                .iter()
+                .all(|p| p.provider != switchboard_prompts::BUILTIN_PROVIDER),
+            "built-ins must be hidden when the toggle is off"
+        );
+        assert!(
+            prompts
+                .iter()
+                .any(|p| p.provider == "local" && p.name == "greet"),
+            "the user's own prompt is unaffected by the toggle"
+        );
+
+        // Resolution by id is unaffected — the built-in still renders.
+        let rendered = render_prompt_impl(
+            &state,
+            switchboard_prompts::BUILTIN_PROVIDER,
+            "code-review",
+            &std::collections::BTreeMap::new(),
+        )
+        .await
+        .unwrap();
+        assert!(rendered.text.contains("Code Review Guidelines"));
+    }
+
+    #[test]
+    fn copy_builtin_prompt_writes_owned_file_and_refuses_to_clobber() {
+        let dir = TempDir::new().unwrap();
+        let prompts_dir = dir.path().join("prompts");
+
+        // First copy lands an owned file with the built-in's content.
+        let written = copy_builtin_prompt_impl("code-review", &prompts_dir).unwrap();
+        assert_eq!(written, prompts_dir.join("code-review.md"));
+        let content = std::fs::read_to_string(&written).unwrap();
+        assert!(content.contains("name: code-review"));
+
+        // A second copy refuses rather than overwrite the user's file.
+        std::fs::write(&written, "MY EDITS").unwrap();
+        let err = copy_builtin_prompt_impl("code-review", &prompts_dir).unwrap_err();
+        assert!(matches!(err, AppError::PromptCopyExists { .. }));
+        // The user's edits are intact.
+        assert_eq!(std::fs::read_to_string(&written).unwrap(), "MY EDITS");
+    }
+
+    #[test]
+    fn copy_unknown_builtin_is_not_found() {
+        let dir = TempDir::new().unwrap();
+        let err = copy_builtin_prompt_impl("nope", &dir.path().join("prompts")).unwrap_err();
+        assert!(matches!(
+            err,
+            AppError::Prompt(switchboard_prompts::PromptError::PromptNotFound { .. })
+        ));
     }
 
     #[tokio::test]
@@ -14664,5 +14980,978 @@ mod tests {
             .map(|(name, _)| name)
             .collect();
         assert_eq!(names, vec![PROMPTS_SYNCED_EVENT.to_owned()]);
+    }
+
+    // --- Workflow commands ----------------------------------------------------
+
+    use crate::workflow_commands::{
+        FormCompatibility, abandon_workflow_run_impl, cancel_workflow_run_impl,
+        copy_builtin_workflow_impl, describe_workflow_form_impl, invoke_workflow_impl,
+        list_workflow_runs_impl, list_workflows_impl, user_workflows_dir,
+        validate_workflow_invocation_impl,
+    };
+    use switchboard_workflow::{InputValue, RunRecord, TerminalStatus};
+
+    /// Write a user workflow file into the workspace's user-global workflows dir.
+    fn seed_workflow(state: &AppState, stem: &str, yaml: &str) {
+        let dir = user_workflows_dir(state).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{stem}.yaml")), yaml).unwrap();
+    }
+
+    /// Write a local prompt `.md` into the state's prompt dir (`<tmp>/prompts`).
+    fn seed_prompt(tmp: &TempDir, name: &str, frontmatter_args: &str, body: &str) {
+        let header = format!("---\nname: {name}\ndescription: d\n{frontmatter_args}---\n");
+        std::fs::write(
+            tmp.path().join("prompts").join(format!("{name}.md")),
+            format!("{header}{body}\n"),
+        )
+        .unwrap();
+    }
+
+    /// A prompts-enabled state (real `PromptService`, so built-ins resolve) with a
+    /// project + the named agents, the prompt cache warmed, and a temp user-global
+    /// workflows dir.
+    async fn workflow_state(agent_names: &[&str]) -> (TempDir, AppState, ProjectId) {
+        let (tmp, state) = state_with_prompts();
+        let state = state.with_workflows_dir(tmp.path().join("workflows"));
+        init_directory_impl(&state, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let project = create_project_in_only_dir(&state, "proj");
+        set_active_project_impl(&state, project.id).unwrap();
+        for name in agent_names {
+            create_agent_impl(&state, name, HarnessKind::ClaudeCode, None, None).unwrap();
+        }
+        state.prompts.sync().await;
+        (tmp, state, project.id)
+    }
+
+    fn text(s: &str) -> InputValue {
+        InputValue::Text(s.to_owned())
+    }
+    fn list(items: &[&str]) -> InputValue {
+        InputValue::List(items.iter().map(|s| (*s).to_owned()).collect())
+    }
+    fn inputs(pairs: Vec<(&str, InputValue)>) -> std::collections::BTreeMap<String, InputValue> {
+        pairs.into_iter().map(|(k, v)| (k.to_owned(), v)).collect()
+    }
+
+    #[tokio::test]
+    async fn list_workflows_includes_builtins_and_toggle_hides_them() {
+        let (_tmp, state, _pid) = workflow_state(&[]).await;
+
+        let listed = list_workflows_impl(&state);
+        let builtins: Vec<&str> = listed
+            .iter()
+            .filter(|w| w.is_builtin)
+            .map(|w| w.name.as_str())
+            .collect();
+        assert!(builtins.contains(&"review-and-recommend"), "{builtins:?}");
+        assert!(builtins.contains(&"review-and-reconcile"), "{builtins:?}");
+        // Both shipped built-ins use only runnable steps.
+        assert!(listed.iter().filter(|w| w.is_builtin).all(|w| w.invocable));
+        // review-and-recommend declares only its agent inputs; its prompt is
+        // hardcoded and its `context` arg is auto-derived (not a declared input).
+        let raa = listed
+            .iter()
+            .find(|w| w.name == "review-and-recommend")
+            .unwrap();
+        let input_names: Vec<&str> = raa.inputs.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(input_names, vec!["reviewers", "worker"]);
+
+        set_preferences_impl(
+            &state,
+            &Preferences {
+                show_builtins: false,
+                ..Preferences::default()
+            },
+        )
+        .unwrap();
+        let listed = list_workflows_impl(&state);
+        assert!(
+            listed.iter().all(|w| !w.is_builtin),
+            "built-ins hidden when the toggle is off"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_workflows_surfaces_a_directory_parse_error_in_place() {
+        let (_tmp, state, _pid) = workflow_state(&[]).await;
+        let dir = user_workflows_dir(&state).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("broken.yaml"), "this: is: not a workflow\n").unwrap();
+
+        let listed = list_workflows_impl(&state);
+        let broken = listed.iter().find(|w| w.name == "broken").unwrap();
+        assert!(broken.parse_error.is_some(), "parse error surfaced");
+        assert!(!broken.invocable);
+        // The built-ins are unaffected by one malformed directory file.
+        assert!(listed.iter().any(|w| w.is_builtin));
+    }
+
+    #[tokio::test]
+    async fn list_flags_a_gated_workflow_non_invocable() {
+        let (_tmp, state, _pid) = workflow_state(&["w"]).await;
+        let dir = user_workflows_dir(&state).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("iterate.yaml"),
+            "name: iterate\ndescription: d\ninputs:\n  ms: [text]\n  w: agent\nsteps:\n  - label: s\n    for_each:\n      item: m\n      in: \"{{ ms }}\"\n      steps:\n        - label: s\n          send:\n            to: \"{{ w }}\"\n            text: \"{{ m }}\"\n",
+        )
+        .unwrap();
+        let listed = list_workflows_impl(&state);
+        let iterate = listed.iter().find(|w| w.name == "iterate").unwrap();
+        assert!(!iterate.invocable, "a for_each workflow is non-invocable");
+        assert!(iterate.parse_error.is_none(), "it still parses");
+    }
+
+    #[tokio::test]
+    async fn validate_workflow_invocation_enforces_inputs_roster_and_derived_args() {
+        let (_tmp, state, pid) = workflow_state(&["primary", "reviewer-1"]).await;
+
+        // Missing required declared input (no reviewers).
+        let err = validate_workflow_invocation_impl(
+            &state,
+            pid,
+            "review-and-recommend",
+            true,
+            &inputs(vec![("worker", text("primary"))]),
+        )
+        .unwrap_err();
+        assert!(matches!(err, AppError::Workflow(_)));
+
+        // Non-existent agent (roster check on the declared path).
+        let err = validate_workflow_invocation_impl(
+            &state,
+            pid,
+            "review-and-recommend",
+            true,
+            &inputs(vec![
+                ("worker", text("ghost")),
+                ("reviewers", list(&["reviewer-1"])),
+            ]),
+        )
+        .unwrap_err();
+        assert!(matches!(err, AppError::Workflow(_)));
+
+        // A key that is neither a declared input nor a fillable prompt arg.
+        let err = validate_workflow_invocation_impl(
+            &state,
+            pid,
+            "review-and-recommend",
+            true,
+            &inputs(vec![
+                ("worker", text("primary")),
+                ("reviewers", list(&["reviewer-1"])),
+                ("nonsense", text("x")),
+            ]),
+        )
+        .unwrap_err();
+        assert!(matches!(err, AppError::Workflow(_)));
+
+        // Well-formed: the agent inputs alone validate (code-review's `context` is
+        // an optional derived arg, so omitting it is fine).
+        validate_workflow_invocation_impl(
+            &state,
+            pid,
+            "review-and-recommend",
+            true,
+            &inputs(vec![
+                ("worker", text("primary")),
+                ("reviewers", list(&["reviewer-1"])),
+            ]),
+        )
+        .unwrap();
+
+        // The auto-derived `context` arg is accepted when supplied.
+        validate_workflow_invocation_impl(
+            &state,
+            pid,
+            "review-and-recommend",
+            true,
+            &inputs(vec![
+                ("worker", text("primary")),
+                ("reviewers", list(&["reviewer-1"])),
+                ("context", text("focus on error handling")),
+            ]),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn describe_form_surfaces_declared_inputs_and_auto_derived_args() {
+        let (_tmp, state, _pid) = workflow_state(&["primary", "reviewer-1"]).await;
+
+        let raa = describe_workflow_form_impl(&state, "review-and-recommend", true).unwrap();
+        assert_eq!(raa.compatibility, FormCompatibility::Ok);
+        let inputs: Vec<&str> = raa.inputs.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(inputs, vec!["reviewers", "worker"]);
+        // code-review's optional `context` is auto-derived (not declared).
+        let derived: Vec<(&str, bool)> = raa
+            .derived_args
+            .iter()
+            .map(|d| (d.name.as_str(), d.required))
+            .collect();
+        assert_eq!(derived, vec![("context", false)]);
+
+        // review-and-reconcile surfaces `context` but NOT `review` — `review` is
+        // a computed binding (analyze-ai-reviews's required arg), hidden from the user.
+        let rad = describe_workflow_form_impl(&state, "review-and-reconcile", true).unwrap();
+        assert_eq!(rad.compatibility, FormCompatibility::Ok);
+        let names: Vec<&str> = rad.derived_args.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, vec!["context"]);
+    }
+
+    #[tokio::test]
+    async fn describe_form_exposes_declared_step_recipients_for_the_preview() {
+        let (_tmp, state, _pid) = workflow_state(&[]).await;
+        seed_workflow(
+            &state,
+            "stepped",
+            "name: stepped\ndescription: d\ninputs:\n  reviewers: [agent]\n  worker: agent\nsteps:\n  - {label: Review, send: {to: \"{{ reviewers }}\", text: hi}}\n  - {label: Wait, wait_for_all: {agents: \"{{ reviewers }}\"}}\n  - {label: Hand off, send: {to: \"{{ worker }}\", forward_from: \"{{ reviewers }}\", text: go}}\n",
+        );
+        let form = describe_workflow_form_impl(&state, "stepped", false).unwrap();
+        let labels: Vec<&str> = form.steps.iter().map(|s| s.label.as_str()).collect();
+        assert_eq!(labels, vec!["Review", "Wait", "Hand off"]);
+        // Declared (slot) recipients — the frontend resolves them against the form.
+        assert_eq!(
+            form.steps[0].recipients,
+            vec![switchboard_workflow::RecipientRef::Slot {
+                input: "reviewers".to_owned()
+            }]
+        );
+        assert_eq!(
+            form.steps[2].feeds_from,
+            vec![switchboard_workflow::RecipientRef::Slot {
+                input: "reviewers".to_owned()
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn invoke_rejects_a_second_workflow_in_the_same_project() {
+        let (_tmp, state, pid) = workflow_state(&["alice"]).await;
+        seed_workflow(
+            &state,
+            "solo",
+            "name: solo\ndescription: d\ninputs:\n  who: agent\nsteps:\n  - {label: Go, send: {to: \"{{ who }}\", text: hi}}\n",
+        );
+        // Simulate an already-active run for this project so the guard fires
+        // deterministically (no dependence on the spawned run's timing).
+        state.workflow_runs.lock().unwrap().insert(
+            Uuid::now_v7(),
+            crate::state::ActiveRun {
+                cancel: tokio_util::sync::CancellationToken::new(),
+                project_id: pid,
+                workflow: "other".to_owned(),
+                snapshot: crate::state::RunSnapshot {
+                    total_steps: 1,
+                    current_step: 0,
+                },
+                steps: Vec::new(),
+                done: std::sync::Arc::new(tokio::sync::Notify::new()),
+            },
+        );
+        let err = invoke_workflow_impl(
+            &state,
+            pid,
+            "solo",
+            false,
+            &inputs(vec![("who", text("alice"))]),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, AppError::WorkflowAlreadyRunning { .. }),
+            "got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn invoke_rejects_while_a_held_failed_or_interrupted_run_awaits_dismissal() {
+        let (_tmp, state, pid) = workflow_state(&["alice"]).await;
+        seed_workflow(
+            &state,
+            "solo",
+            "name: solo\ndescription: d\ninputs:\n  who: agent\nsteps:\n  - {label: Go, send: {to: \"{{ who }}\", text: hi}}\n",
+        );
+        let project = lock(&state.projects).get(&pid).cloned().unwrap();
+        let args = inputs(vec![("who", text("alice"))]);
+
+        // A held *failed* run occupies the project until dismissed.
+        let held = Uuid::now_v7();
+        seed_run_file(
+            &project,
+            held,
+            &[
+                RunRecord::Started {
+                    workflow: "solo".to_owned(),
+                    total_steps: 1,
+                    steps: Vec::new(),
+                    at: chrono::Utc::now(),
+                },
+                RunRecord::Terminal {
+                    status: TerminalStatus::Failed,
+                    failed_step: Some(0),
+                    reason: Some("boom".to_owned()),
+                    at: chrono::Utc::now(),
+                },
+            ],
+        );
+        let err = invoke_workflow_impl(&state, pid, "solo", false, &args).unwrap_err();
+        assert!(
+            matches!(err, AppError::WorkflowRunRequiresDismissal { .. }),
+            "got: {err:?}"
+        );
+
+        // Dismissing it (abandon) frees the project; the same invoke now succeeds.
+        abandon_workflow_run_impl(&state, pid, held).unwrap();
+        invoke_workflow_impl(&state, pid, "solo", false, &args).expect("invoke after dismiss");
+    }
+
+    #[tokio::test]
+    async fn describe_form_blocks_a_template_var_targeting_a_missing_argument() {
+        let (tmp, state, pid) = workflow_state(&["a"]).await;
+        // A prompt that has NO `context` argument.
+        seed_prompt(&tmp, "bare", "", "Just a body.");
+        // A workflow that binds `context` anyway → invalid binding (drift).
+        seed_workflow(
+            &state,
+            "drifted",
+            "name: drifted\ndescription: d\ninputs:\n  a: agent\nsteps:\n  - label: s\n    send:\n      to: \"{{ a }}\"\n      prompt: \"local:bare\"\n      template_vars:\n        context: \"hello\"\n",
+        );
+
+        let form = describe_workflow_form_impl(&state, "drifted", false).unwrap();
+        match &form.compatibility {
+            FormCompatibility::Incompatible { issues } => {
+                assert_eq!(issues.len(), 1);
+                assert_eq!(issues[0].prompt, "local:bare");
+                assert_eq!(issues[0].argument, "context");
+            }
+            other => panic!("expected incompatible, got {other:?}"),
+        }
+        // Invoke is blocked too (invoke is authoritative).
+        let err = invoke_workflow_impl(
+            &state,
+            pid,
+            "drifted",
+            false,
+            &inputs(vec![("a", text("a"))]),
+        )
+        .unwrap_err();
+        assert!(matches!(err, AppError::Workflow(_)));
+    }
+
+    #[tokio::test]
+    async fn text_input_shadows_and_satisfies_a_same_named_prompt_arg() {
+        let (_tmp, state, _pid) = workflow_state(&["rev"]).await;
+        seed_workflow(
+            &state,
+            "shadow",
+            "name: shadow\ndescription: d\ninputs:\n  reviewers: [agent]\n  context:\n    type: text?\n    description: My own label\nsteps:\n  - label: s\n    send:\n      to: \"{{ reviewers }}\"\n      prompt: \"builtin:code-review\"\n",
+        );
+        let form = describe_workflow_form_impl(&state, "shadow", false).unwrap();
+        assert_eq!(form.compatibility, FormCompatibility::Ok);
+        // `context` appears once — as the declared input, not a duplicate derived arg.
+        assert!(form.inputs.iter().any(|i| i.name == "context"));
+        assert!(form.derived_args.iter().all(|d| d.name != "context"));
+    }
+
+    #[tokio::test]
+    async fn optional_text_input_shadowing_a_required_prompt_arg_is_enforced() {
+        let (tmp, state, pid) = workflow_state(&["a"]).await;
+        // A prompt with a REQUIRED `x` argument.
+        seed_prompt(
+            &tmp,
+            "reqx",
+            "arguments:\n  - name: x\n    required: true\n",
+            "{{ x }}",
+        );
+        // A workflow shadowing it with an OPTIONAL text input.
+        seed_workflow(
+            &state,
+            "shadowreq",
+            "name: shadowreq\ndescription: d\ninputs:\n  a: agent\n  x: text?\nsteps:\n  - label: s\n    send:\n      to: \"{{ a }}\"\n      prompt: \"local:reqx\"\n",
+        );
+
+        // The descriptor reports `x` as required even though it's declared `text?`
+        // (it feeds a required prompt arg), and does not duplicate it as a derived field.
+        let form = describe_workflow_form_impl(&state, "shadowreq", false).unwrap();
+        assert_eq!(form.compatibility, FormCompatibility::Ok);
+        let x = form.inputs.iter().find(|i| i.name == "x").unwrap();
+        assert!(
+            !x.optional,
+            "shadowing a required prompt arg makes the input required"
+        );
+        assert!(form.derived_args.iter().all(|d| d.name != "x"));
+
+        // Invoking without `x` is blocked BEFORE the run starts (pre-flight soundness:
+        // otherwise the run would start and fail at prompt render).
+        let err = invoke_workflow_impl(
+            &state,
+            pid,
+            "shadowreq",
+            false,
+            &inputs(vec![("a", text("a"))]),
+        )
+        .unwrap_err();
+        assert!(matches!(err, AppError::Workflow(_)));
+        // Supplying `x` validates.
+        validate_workflow_invocation_impl(
+            &state,
+            pid,
+            "shadowreq",
+            false,
+            &inputs(vec![("a", text("a")), ("x", text("here"))]),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn non_blank_default_satisfies_a_shadowed_required_prompt_arg() {
+        let (tmp, state, pid) = workflow_state(&["a"]).await;
+        seed_prompt(
+            &tmp,
+            "reqy",
+            "arguments:\n  - name: y\n    required: true\n",
+            "{{ y }}",
+        );
+        // Declared optional via a non-blank default → the default fills the required arg,
+        // so omitting it is fine (the check runs against the bound value, defaults applied).
+        seed_workflow(
+            &state,
+            "defshadow",
+            "name: defshadow\ndescription: d\ninputs:\n  a: agent\n  y:\n    type: text\n    default: fallback\nsteps:\n  - label: s\n    send:\n      to: \"{{ a }}\"\n      prompt: \"local:reqy\"\n",
+        );
+        validate_workflow_invocation_impl(
+            &state,
+            pid,
+            "defshadow",
+            false,
+            &inputs(vec![("a", text("a"))]),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn non_text_input_colliding_with_a_prompt_arg_is_an_error() {
+        let (_tmp, state, _pid) = workflow_state(&["a"]).await;
+        // An `[agent]` input named `context` collides with code-review's string arg.
+        seed_workflow(
+            &state,
+            "clash",
+            "name: clash\ndescription: d\ninputs:\n  context: [agent]\nsteps:\n  - label: s\n    send:\n      to: \"{{ context }}\"\n      prompt: \"builtin:code-review\"\n",
+        );
+        let form = describe_workflow_form_impl(&state, "clash", false).unwrap();
+        assert!(matches!(
+            form.compatibility,
+            FormCompatibility::Incompatible { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn two_prompts_sharing_a_string_arg_merge_into_one_required_field() {
+        let (tmp, state, _pid) = workflow_state(&["a", "b"]).await;
+        seed_prompt(
+            &tmp,
+            "p-opt",
+            "arguments:\n  - name: shared\n    required: false\n",
+            "{{ shared }}",
+        );
+        seed_prompt(
+            &tmp,
+            "p-req",
+            "arguments:\n  - name: shared\n    required: true\n",
+            "{{ shared }}",
+        );
+        seed_workflow(
+            &state,
+            "twoprompt",
+            "name: twoprompt\ndescription: d\ninputs:\n  a: agent\n  b: agent\nsteps:\n  - label: s\n    send:\n      to: \"{{ a }}\"\n      prompt: \"local:p-opt\"\n  - label: s\n    send:\n      to: \"{{ b }}\"\n      prompt: \"local:p-req\"\n",
+        );
+        let form = describe_workflow_form_impl(&state, "twoprompt", false).unwrap();
+        assert_eq!(form.compatibility, FormCompatibility::Ok);
+        let shared: Vec<_> = form
+            .derived_args
+            .iter()
+            .filter(|d| d.name == "shared")
+            .collect();
+        assert_eq!(shared.len(), 1, "shared arg merged into a single field");
+        assert!(
+            shared[0].required,
+            "required because one prompt requires it"
+        );
+        assert_eq!(shared[0].prompts.len(), 2, "the field feeds both prompts");
+    }
+
+    #[tokio::test]
+    async fn required_derived_arg_blocks_invocation_until_filled() {
+        let (tmp, state, pid) = workflow_state(&["a"]).await;
+        seed_prompt(
+            &tmp,
+            "needsx",
+            "arguments:\n  - name: x\n    required: true\n",
+            "{{ x }}",
+        );
+        seed_workflow(
+            &state,
+            "needs",
+            "name: needs\ndescription: d\ninputs:\n  a: agent\nsteps:\n  - label: s\n    send:\n      to: \"{{ a }}\"\n      prompt: \"local:needsx\"\n",
+        );
+        // Required derived arg unfilled → blocked.
+        let err = validate_workflow_invocation_impl(
+            &state,
+            pid,
+            "needs",
+            false,
+            &inputs(vec![("a", text("a"))]),
+        )
+        .unwrap_err();
+        assert!(matches!(err, AppError::Workflow(_)));
+        // Supplied → validates.
+        validate_workflow_invocation_impl(
+            &state,
+            pid,
+            "needs",
+            false,
+            &inputs(vec![("a", text("a")), ("x", text("here"))]),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn invoke_re_resolves_and_blocks_when_a_prompt_changed_after_describe() {
+        let (tmp, state, pid) = workflow_state(&["a"]).await;
+        seed_prompt(
+            &tmp,
+            "mut",
+            "arguments:\n  - name: ctx\n    required: false\n",
+            "{{ ctx }}",
+        );
+        seed_workflow(
+            &state,
+            "usesmut",
+            "name: usesmut\ndescription: d\ninputs:\n  a: agent\nsteps:\n  - label: s\n    send:\n      to: \"{{ a }}\"\n      prompt: \"local:mut\"\n",
+        );
+        // The form validates cleanly now (only an optional arg).
+        let form = describe_workflow_form_impl(&state, "usesmut", false).unwrap();
+        assert_eq!(form.compatibility, FormCompatibility::Ok);
+
+        // The prompt then gains a REQUIRED arg the workflow can't fill.
+        seed_prompt(
+            &tmp,
+            "mut",
+            "arguments:\n  - name: ctx\n    required: false\n  - name: must\n    required: true\n",
+            "{{ ctx }}{{ must }}",
+        );
+        // Invoke re-resolves the schema (local resolves directly) and blocks.
+        let err = invoke_workflow_impl(
+            &state,
+            pid,
+            "usesmut",
+            false,
+            &inputs(vec![("a", text("a"))]),
+        )
+        .unwrap_err();
+        assert!(matches!(err, AppError::Workflow(_)));
+    }
+
+    #[tokio::test]
+    async fn builtin_resolves_cold_while_missing_local_errors_and_missing_mcp_is_unresolved() {
+        // No sync: the prompt cache is cold. A built-in must still resolve (the
+        // freshness contract).
+        let (tmp, state) = state_with_prompts();
+        let state = state.with_workflows_dir(tmp.path().join("workflows"));
+
+        let form = describe_workflow_form_impl(&state, "review-and-recommend", true).unwrap();
+        assert_eq!(
+            form.compatibility,
+            FormCompatibility::Ok,
+            "a built-in resolves without a sync"
+        );
+
+        // A missing *local* prompt resolves directly (no sync can ever produce it),
+        // so it's a definitive blocking incompatibility — not a perpetual "pending".
+        seed_workflow(
+            &state,
+            "ghostly",
+            "name: ghostly\ndescription: d\ninputs:\n  a: agent\nsteps:\n  - label: s\n    send:\n      to: \"{{ a }}\"\n      prompt: \"local:ghost\"\n",
+        );
+        let form = describe_workflow_form_impl(&state, "ghostly", false).unwrap();
+        match &form.compatibility {
+            FormCompatibility::Incompatible { issues } => {
+                assert!(
+                    issues.iter().any(|i| i.reason.contains("not found")),
+                    "{issues:?}"
+                );
+            }
+            other => panic!("expected a missing-prompt error, got {other:?}"),
+        }
+
+        // A missing *MCP*-provider prompt stays Unresolved (a sync might produce it).
+        seed_workflow(
+            &state,
+            "mcpish",
+            "name: mcpish\ndescription: d\ninputs:\n  a: agent\nsteps:\n  - label: s\n    send:\n      to: \"{{ a }}\"\n      prompt: \"tiddly:ghost\"\n",
+        );
+        let form = describe_workflow_form_impl(&state, "mcpish", false).unwrap();
+        assert!(matches!(
+            form.compatibility,
+            FormCompatibility::Unresolved { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn capability_gate_refuses_invoke_with_the_fixed_message() {
+        let (_tmp, state, pid) = workflow_state(&["w"]).await;
+        let dir = user_workflows_dir(&state).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("iterate.yaml"),
+            "name: iterate\ndescription: d\ninputs:\n  ms: [text]\n  w: agent\nsteps:\n  - label: s\n    for_each:\n      item: m\n      in: \"{{ ms }}\"\n      steps:\n        - label: s\n          send:\n            to: \"{{ w }}\"\n            text: \"{{ m }}\"\n",
+        )
+        .unwrap();
+        let err = invoke_workflow_impl(
+            &state,
+            pid,
+            "iterate",
+            false,
+            &inputs(vec![("ms", list(&["x"])), ("w", text("w"))]),
+        )
+        .unwrap_err();
+        assert!(matches!(err, AppError::WorkflowStepUnsupported));
+        assert_eq!(err.to_string(), "step type not supported in this version");
+    }
+
+    #[derive(Default)]
+    struct RecordingNotifier {
+        calls: std::sync::Mutex<Vec<(String, String)>>,
+    }
+    impl crate::workflow_commands::Notifier for RecordingNotifier {
+        fn notify(&self, title: &str, body: &str) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((title.to_owned(), body.to_owned()));
+        }
+    }
+
+    #[tokio::test]
+    async fn notification_fires_on_completion() {
+        let (tmp, state) = state_with_prompts();
+        let rec = Arc::new(RecordingNotifier::default());
+        let state =
+            state.with_notifier(Arc::clone(&rec) as Arc<dyn crate::workflow_commands::Notifier>);
+        init_directory_impl(&state, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let project = create_project_in_only_dir(&state, "proj");
+        set_active_project_impl(&state, project.id).unwrap();
+        for name in ["primary", "reviewer-1"] {
+            create_agent_impl(&state, name, HarnessKind::ClaudeCode, None, None).unwrap();
+        }
+        state.prompts.sync().await;
+
+        let run_id = invoke_workflow_impl(
+            &state,
+            project.id,
+            "review-and-recommend",
+            true,
+            &inputs(vec![
+                ("worker", text("primary")),
+                ("reviewers", list(&["reviewer-1"])),
+            ]),
+        )
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if !lock(&state.workflow_runs).contains_key(&run_id) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("run did not terminalize");
+        // Give the spawned task a beat to fire the notification after terminal.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let calls = rec.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "exactly one completion notification");
+        assert_eq!(calls[0].0, "Workflow complete");
+    }
+
+    #[tokio::test]
+    async fn invoke_runs_to_terminal_and_clears_the_registry() {
+        let (_tmp, state, pid) = workflow_state(&["primary", "reviewer-1", "reviewer-2"]).await;
+        let run_id = invoke_workflow_impl(
+            &state,
+            pid,
+            "review-and-recommend",
+            true,
+            &inputs(vec![
+                ("worker", text("primary")),
+                ("reviewers", list(&["reviewer-1", "reviewer-2"])),
+            ]),
+        )
+        .unwrap();
+
+        // The live registry has the run on spawn.
+        assert!(lock(&state.workflow_runs).contains_key(&run_id));
+
+        // It reaches a terminal and the background task clears the registry entry.
+        let cleared = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if !lock(&state.workflow_runs).contains_key(&run_id) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(cleared.is_ok(), "run did not terminalize in time");
+
+        // A completed run's file is pruned (retention).
+        let project = lock(&state.projects).get(&pid).cloned().unwrap();
+        assert!(
+            !project.run_path(run_id).exists(),
+            "a complete run file is pruned"
+        );
+    }
+
+    #[tokio::test]
+    async fn invoke_creates_the_run_directory_so_records_can_persist() {
+        // Regression: `runs/` is never pre-created, and `append_jsonl` won't create
+        // a parent dir, so without `invoke` creating it every run-record write fails
+        // (silently, to a warning) and a failed/interrupted run can't survive a
+        // restart. Invoking on a fresh project (no `runs/` yet) must create the dir.
+        let (_tmp, state, pid) = workflow_state(&["primary", "reviewer-1"]).await;
+        let project = lock(&state.projects).get(&pid).cloned().unwrap();
+        assert!(
+            !project.runs_dir().exists(),
+            "runs dir absent before any run"
+        );
+
+        let run_id = invoke_workflow_impl(
+            &state,
+            pid,
+            "review-and-recommend",
+            true,
+            &inputs(vec![
+                ("worker", text("primary")),
+                ("reviewers", list(&["reviewer-1"])),
+            ]),
+        )
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if !lock(&state.workflow_runs).contains_key(&run_id) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("run did not terminalize");
+
+        // The directory exists even though a completed run's file is pruned —
+        // proving invoke created it (records could be written), not that a file
+        // happened to linger.
+        assert!(
+            project.runs_dir().exists(),
+            "invoke must create the run-record directory"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_marks_a_run_cancelled_and_prunes_it() {
+        use switchboard_harness::MockScenario;
+        // A harness that hangs (awaits cancellation) keeps the run live so we can
+        // cancel it deterministically.
+        let (tmp, state, _emitter) = fresh_state_with_scenario(MockScenario::AwaitCancellation);
+        let prompts_dir = tmp.path().join("prompts");
+        std::fs::create_dir_all(&prompts_dir).unwrap();
+        let service = switchboard_prompts::PromptService::new(
+            tmp.path().join("config.yaml"),
+            prompts_dir,
+            None,
+            Arc::new(switchboard_prompts::InMemorySecretStore::new()),
+        );
+        let state = state.with_prompts(service);
+        let rec = Arc::new(RecordingNotifier::default());
+        let state =
+            state.with_notifier(Arc::clone(&rec) as Arc<dyn crate::workflow_commands::Notifier>);
+        init_directory_impl(&state, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let project = create_project_in_only_dir(&state, "proj");
+        set_active_project_impl(&state, project.id).unwrap();
+        create_agent_impl(&state, "primary", HarnessKind::ClaudeCode, None, None).unwrap();
+        create_agent_impl(&state, "reviewer-1", HarnessKind::ClaudeCode, None, None).unwrap();
+        state.prompts.sync().await;
+
+        let run_id = invoke_workflow_impl(
+            &state,
+            project.id,
+            "review-and-recommend",
+            true,
+            &inputs(vec![
+                ("worker", text("primary")),
+                ("reviewers", list(&["reviewer-1"])),
+            ]),
+        )
+        .unwrap();
+
+        // Give the run a moment to dispatch.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Abandon refuses a still-live run (it would just be recreated).
+        assert!(matches!(
+            abandon_workflow_run_impl(&state, project.id, run_id),
+            Err(AppError::WorkflowRunActive { .. })
+        ));
+        cancel_workflow_run_impl(&state, run_id);
+
+        let cleared = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if !lock(&state.workflow_runs).contains_key(&run_id) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(cleared.is_ok(), "cancelled run did not terminalize");
+        // A cancelled run's file is pruned, like a complete one.
+        let loaded = lock(&state.projects).get(&project.id).cloned().unwrap();
+        assert!(!loaded.run_path(run_id).exists());
+        // No notification fires on a user-initiated cancel.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            rec.calls.lock().unwrap().is_empty(),
+            "cancel must not notify"
+        );
+    }
+
+    /// Seed a run file on disk with the given records (simulating a prior process).
+    fn seed_run_file(project: &switchboard_core::Project, run_id: Uuid, records: &[RunRecord]) {
+        let path = project.run_path(run_id);
+        std::fs::create_dir_all(project.runs_dir()).unwrap();
+        for record in records {
+            switchboard_core::append_jsonl(&path, record).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn list_runs_reports_failed_and_interrupted_and_abandon_clears_them() {
+        let (_tmp, state, pid) = workflow_state(&[]).await;
+        let project = lock(&state.projects).get(&pid).cloned().unwrap();
+
+        // A retained failed run (last record is a Failed terminal).
+        let failed = Uuid::now_v7();
+        seed_run_file(
+            &project,
+            failed,
+            &[
+                RunRecord::Started {
+                    workflow: "w".to_owned(),
+                    total_steps: 3,
+                    steps: Vec::new(),
+                    at: chrono::Utc::now(),
+                },
+                RunRecord::StepCompleted {
+                    step_index: 0,
+                    at: chrono::Utc::now(),
+                },
+                RunRecord::Terminal {
+                    status: TerminalStatus::Failed,
+                    failed_step: Some(1),
+                    reason: Some("boom".to_owned()),
+                    at: chrono::Utc::now(),
+                },
+            ],
+        );
+        // An interrupted run (no terminal record).
+        let interrupted = Uuid::now_v7();
+        seed_run_file(
+            &project,
+            interrupted,
+            &[
+                RunRecord::Started {
+                    workflow: "w2".to_owned(),
+                    total_steps: 5,
+                    steps: Vec::new(),
+                    at: chrono::Utc::now(),
+                },
+                RunRecord::StepCompleted {
+                    step_index: 0,
+                    at: chrono::Utc::now(),
+                },
+            ],
+        );
+        // A complete run (should NOT surface — pruned class).
+        let complete = Uuid::now_v7();
+        seed_run_file(
+            &project,
+            complete,
+            &[
+                RunRecord::Started {
+                    workflow: "w3".to_owned(),
+                    total_steps: 1,
+                    steps: Vec::new(),
+                    at: chrono::Utc::now(),
+                },
+                RunRecord::Terminal {
+                    status: TerminalStatus::Complete,
+                    failed_step: None,
+                    reason: None,
+                    at: chrono::Utc::now(),
+                },
+            ],
+        );
+
+        let runs = list_workflow_runs_impl(&state, pid);
+        let by_id = |id: Uuid| runs.iter().find(|r| r.run_id == id.to_string());
+        let f = by_id(failed).expect("failed run surfaces");
+        assert_eq!(f.status, "failed");
+        assert_eq!(f.reason.as_deref(), Some("boom"));
+        let i = by_id(interrupted).expect("interrupted run surfaces");
+        assert_eq!(i.status, "interrupted");
+        assert!(by_id(complete).is_none(), "a complete run is not surfaced");
+
+        // Abandon deletes both the failed and interrupted files.
+        abandon_workflow_run_impl(&state, pid, failed).unwrap();
+        abandon_workflow_run_impl(&state, pid, interrupted).unwrap();
+        assert!(!project.run_path(failed).exists());
+        assert!(!project.run_path(interrupted).exists());
+    }
+
+    #[tokio::test]
+    async fn copy_builtin_workflow_writes_yaml_and_refuses_to_clobber() {
+        let (_tmp, state, _pid) = workflow_state(&[]).await;
+        let dir = user_workflows_dir(&state).unwrap();
+
+        let written = copy_builtin_workflow_impl("review-and-recommend", &dir).unwrap();
+        assert_eq!(written, dir.join("review-and-recommend.yaml"));
+        let content = std::fs::read_to_string(&written).unwrap();
+        assert!(content.contains("name: review-and-recommend"));
+
+        // It now lists as a normal (non-built-in) directory workflow.
+        let listed = list_workflows_impl(&state);
+        assert!(
+            listed
+                .iter()
+                .any(|w| w.name == "review-and-recommend" && !w.is_builtin),
+            "the copy lists as a user workflow"
+        );
+
+        // A second copy refuses rather than clobber.
+        let err = copy_builtin_workflow_impl("review-and-recommend", &dir).unwrap_err();
+        assert!(matches!(err, AppError::WorkflowCopyExists { .. }));
+
+        // A pre-existing `.yml` of the same name also blocks the `.yaml` copy
+        // (the scan treats both extensions as the same workflow).
+        std::fs::write(dir.join("review-and-reconcile.yml"), "name: x\n").unwrap();
+        let err = copy_builtin_workflow_impl("review-and-reconcile", &dir).unwrap_err();
+        assert!(matches!(err, AppError::WorkflowCopyExists { .. }));
     }
 }

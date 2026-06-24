@@ -70,15 +70,17 @@
 //! resolves all its awaiters together via [`TurnAwaiters`].
 //!
 //! **The signal resolves at the turn's terminal, not when the agent is next
-//! re-dispatchable.** It fires the instant the terminal is observed — so the
-//! forwarded text is available with minimal latency — but the actor then keeps
-//! draining post-terminal adapter events (for some harnesses a session-file
-//! read, not microseconds) before it parks and accepts new work. A caller that
-//! awaits a completion and *immediately* `FailFast`-sends to the **same agent**
-//! can therefore still get `Busy`. Resolving completion later (at idle) would
-//! add latency the forward doesn't need, so consumers that re-dispatch to a
-//! just-awaited agent must await that agent's `AgentIdle` first (or tolerate a
-//! single `Busy`), rather than treating completion as "agent is free."
+//! re-dispatchable** — it fires the instant the terminal is observed, so the
+//! forwarded text is available with minimal latency, while the actor then keeps
+//! draining post-terminal adapter events (for some harnesses a session-file read,
+//! not microseconds) before it parks. To keep a back-to-back same-agent
+//! `send`→await→`send` from spuriously failing in that window, the `FailFast`
+//! enqueue path **accepts** a send that arrives once the current turn is terminal
+//! and nothing else is queued (it runs when drain finishes); it returns `Busy`
+//! only for genuine contention — a turn still mid-flight, or other work already
+//! queued. So a caller may re-dispatch to a just-awaited agent immediately after
+//! its completion without awaiting `AgentIdle`, and `Busy` still means a real
+//! conflict (the workflow "contention = step failure" rule holds).
 //!
 //! **Why the payload carries captured text, not a turn id (decision #7).** The
 //! awaited turn's text is accumulated by the actor from the live stream (the
@@ -141,14 +143,22 @@ struct WorkItem {
     attachments: Vec<Attachment>,
     /// Set only for sends made via [`Dispatcher::send_message_awaiting_completion`].
     /// The actor fires it once when this send's turn reaches a terminal state.
-    /// `None` for the compose-bar path — that path allocates no completion
-    /// channel and accumulates no text. The awaitable path is `FailFast`, so such
-    /// an item is dispatched immediately and never lingers in the backlog to be
-    /// queue-dropped; firing at a terminal is therefore the only way it resolves.
-    /// Defensive belt-and-suspenders: were an item with a sender ever dropped
-    /// pre-terminal anyway, the sender drops and the awaiter's `recv` resolves
-    /// `Err`, surfacing as a failed send rather than a hang.
+    /// `None` for the compose-bar path — that path allocates no completion channel
+    /// and accumulates no text. The awaitable path is `FailFast`, normally
+    /// dispatched immediately; but the post-terminal-drain accept (see the
+    /// `FailFast` enqueue arm) can briefly queue such an item, so the contract
+    /// "an accepted awaitable always resolves" is upheld by **every** backlog-drop
+    /// path firing this completion with a synthesized `Cancelled` terminal before
+    /// discarding the item (see [`resolve_dropped_completion`]) — never a silent
+    /// drop that would leave the awaiter on a `RecvError`.
     completion: Option<oneshot::Sender<CompletionResult>>,
+    /// Emit a live [`NormalizedEvent::UserMessage`] for this send once it is
+    /// durable (after `record_send` succeeds, before `TurnStart`). Set for
+    /// backend-originated sends (a workflow `send`) that have no frontend
+    /// optimistic user turn; `false` for the compose-bar path, which renders its
+    /// user turn optimistically. Emitting at the journal boundary keeps the live
+    /// user message identical to the reloaded journal view by construction.
+    emit_user_message: bool,
 }
 
 /// Delivered once, when an awaited send's turn reaches a terminal state, over
@@ -326,6 +336,11 @@ enum Command {
     WaitForCurrentTurn {
         reply: oneshot::Sender<CurrentTurnWait>,
     },
+    /// **Non-blocking** peek: reply `true` iff a turn is *actively running* right
+    /// now (not idle, not already past its terminal). Unlike `WaitForCurrentTurn`
+    /// it never holds the reply — used by completed-only forwarding to reject a
+    /// still-streaming source without waiting on it.
+    PeekCurrentTurn { reply: oneshot::Sender<bool> },
     /// Cancel the running turn (out-of-band; no-op if none is live).
     Cancel(CancelSource),
     /// Cancel a whole *send* on this agent: fire the running turn's cancel
@@ -713,6 +728,9 @@ impl Dispatcher {
             prompt: prompt.to_owned(),
             attachments,
             completion: None,
+            // Compose-bar sends render their user turn optimistically on the
+            // frontend; no backend-emitted user message.
+            emit_user_message: false,
         };
         self.accept(agent_id, item, factory, on_busy).await
     }
@@ -744,6 +762,39 @@ impl Dispatcher {
         send_id: SendId,
         factory: Arc<dyn DispatchContextFactory>,
     ) -> AwaitableSendOutcome {
+        self.send_awaitable(agent_id, prompt, attachments, send_id, factory, false)
+            .await
+    }
+
+    /// Like [`send_message_awaiting_completion`](Self::send_message_awaiting_completion),
+    /// but also emits a live [`NormalizedEvent::UserMessage`] for this send once it
+    /// is durable. Used by **backend-originated workflow sends**, which have no
+    /// frontend optimistic user turn: the workflow's dispatched message must still
+    /// appear as a user message live (and group a fan-out into columns), exactly
+    /// as it does after a reload from the journal. Emitting at the journal boundary
+    /// (in the actor, after `record_send` succeeds) keeps live == reload by
+    /// construction — a send whose journal write fails shows no live user message.
+    pub async fn send_workflow_message_awaiting_completion(
+        &self,
+        agent_id: AgentId,
+        prompt: &str,
+        attachments: Vec<Attachment>,
+        send_id: SendId,
+        factory: Arc<dyn DispatchContextFactory>,
+    ) -> AwaitableSendOutcome {
+        self.send_awaitable(agent_id, prompt, attachments, send_id, factory, true)
+            .await
+    }
+
+    async fn send_awaitable(
+        &self,
+        agent_id: AgentId,
+        prompt: &str,
+        attachments: Vec<Attachment>,
+        send_id: SendId,
+        factory: Arc<dyn DispatchContextFactory>,
+        emit_user_message: bool,
+    ) -> AwaitableSendOutcome {
         let (completion_tx, completion_rx) = oneshot::channel();
         let item = WorkItem {
             message_id: Uuid::now_v7(),
@@ -751,6 +802,7 @@ impl Dispatcher {
             prompt: prompt.to_owned(),
             attachments,
             completion: Some(completion_tx),
+            emit_user_message,
         };
         match self.accept(agent_id, item, factory, OnBusy::FailFast).await {
             SendOutcome::Accepted(message_id) => AwaitableSendOutcome::Accepted {
@@ -805,6 +857,8 @@ impl Dispatcher {
                         factory.idle_emitter().as_ref(),
                         &channel_name(agent_id),
                         message_id,
+                        // Pre-`record_send`: the actor never received the item.
+                        None,
                         agent_id,
                         "agent worker is unavailable",
                     );
@@ -943,6 +997,28 @@ impl Dispatcher {
             return CurrentTurnWait::Idle;
         }
         rx.await.unwrap_or(CurrentTurnWait::Idle)
+    }
+
+    /// Whether `agent_id` has a turn **actively running** right now. Non-blocking:
+    /// the actor answers immediately (never holds the reply for a running turn),
+    /// so completed-only forwarding can reject a still-streaming source without
+    /// waiting on it. `false` for an idle/never-dispatched/shutting-down agent.
+    pub async fn is_turn_running(&self, agent_id: AgentId) -> bool {
+        let commands = {
+            let agents = lock(&self.agents);
+            match agents.get(&agent_id) {
+                Some(AgentSlot::Active(tx)) => tx.clone(),
+                _ => return false,
+            }
+        };
+        let (tx, rx) = oneshot::channel();
+        if commands
+            .send(Command::PeekCurrentTurn { reply: tx })
+            .is_err()
+        {
+            return false;
+        }
+        rx.await.unwrap_or(false)
     }
 
     /// Close `agent_id`'s actor atomically: mark the slot `Closing` (so a racing
@@ -1105,11 +1181,19 @@ fn abandon_backlog(
     channel: &str,
     agent_id: AgentId,
 ) {
-    for item in backlog.drain(..) {
+    for mut item in backlog.drain(..) {
+        resolve_dropped_completion(
+            &mut item,
+            TurnOutcome::Cancelled {
+                source: CancelSource::Shutdown,
+            },
+        );
         emit_message_failed(
             emitter,
             channel,
             item.message_id,
+            // A never-run (dropped) item — no durable record.
+            None,
             agent_id,
             "agent is shutting down",
         );
@@ -1155,18 +1239,23 @@ fn apply_idle_command(
             let _ = reply.send(CurrentTurnWait::Idle);
             IdleAfter::Continue
         }
+        // No turn live ⇒ not running.
+        Command::PeekCurrentTurn { reply } => {
+            let _ = reply.send(false);
+            IdleAfter::Continue
+        }
         // No turn live ⇒ cancel is a no-op.
         Command::Cancel(_) => IdleAfter::Continue,
         // No turn live ⇒ only this send's *queued* items can exist; drop them
         // and emit MessageCancelled for each.
-        Command::CancelSend { send_id, source: _ } => {
-            drop_queued_send(backlog, send_id, emitter, channel, agent_id);
+        Command::CancelSend { send_id, source } => {
+            drop_queued_send(backlog, send_id, source, emitter, channel, agent_id);
             IdleAfter::Continue
         }
         // No turn live ⇒ drop the whole backlog (the actor stays alive),
         // emitting MessageCancelled for each dropped send.
-        Command::CancelAgent { source: _ } => {
-            drop_all_queued(backlog, emitter, channel, agent_id);
+        Command::CancelAgent { source } => {
+            drop_all_queued(backlog, source, emitter, channel, agent_id);
             IdleAfter::Continue
         }
         // The caller (`agent_actor`) abandons the backlog (emitting
@@ -1192,6 +1281,10 @@ enum TurnAfter {
 /// live), journals the send fail-closed, dispatches, emits `TurnStart`, then
 /// drains — handling `Cancel`/`Enqueue`/`Remove`/`Shutdown` promptly via
 /// `select!`.
+// A single linear turn lifecycle (build → journal → user-message → dispatch →
+// emit → drain); splitting it would scatter the fail-closed ordering it must
+// keep in one place.
+#[allow(clippy::too_many_lines)]
 async fn run_turn(
     agent_id: AgentId,
     channel: &str,
@@ -1232,6 +1325,9 @@ async fn run_turn(
             emitter.as_ref(),
             channel,
             item.message_id,
+            // The journal write itself failed — there is no durable send for reload
+            // to reconstruct, so the frontend must not invent a row.
+            None,
             agent_id,
             &e.to_string(),
         );
@@ -1245,6 +1341,22 @@ async fn run_turn(
             String::new(),
         );
         return TurnAfter::Continue;
+    }
+
+    // The send is now durable (journaled above). For a backend-originated send (a
+    // workflow `send`, which has no frontend optimistic user turn), surface its
+    // message as a live user message before the turn starts — so the live view
+    // matches the reloaded journal view. Emitting *past* `record_send` means a
+    // journal-write failure (handled above) shows no live user message either.
+    if item.emit_user_message {
+        emit_user_message(
+            emitter.as_ref(),
+            channel,
+            item.send_id,
+            &item.prompt,
+            started_at,
+            agent_id,
+        );
     }
 
     let token = CancellationToken::new();
@@ -1273,6 +1385,10 @@ async fn run_turn(
                 emitter.as_ref(),
                 channel,
                 item.message_id,
+                // Post-`record_send`: the send is durable (and a `Failed` outcome
+                // was just recorded), so reload reconstructs user message + marker
+                // — carry the send_id so live attaches the marker identically.
+                Some(item.send_id),
                 agent_id,
                 &message,
             );
@@ -1287,6 +1403,7 @@ async fn run_turn(
         &NormalizedEvent::TurnStart {
             turn_id,
             message_id: item.message_id,
+            send_id: item.send_id,
             started_at,
         },
         agent_id,
@@ -1536,8 +1653,26 @@ async fn drain_turn(
                     Some(Command::Enqueue { item, on_busy, reply }) => {
                         match on_busy {
                             OnBusy::FailFast => {
-                                // A turn is running ⇒ busy.
-                                if let Some(reply) = reply { let _ = reply.send(SendOutcome::Busy); }
+                                // FailFast normally refuses while a turn runs. But once
+                                // our own turn has reached terminal and we're only
+                                // draining post-terminal enrichment events with nothing
+                                // else queued, the agent is effectively free — accept and
+                                // let the new turn start when drain finishes, rather than
+                                // spuriously failing a back-to-back same-agent send
+                                // (the completion signal fires at terminal, before the
+                                // actor parks idle). Genuine contention — a turn still
+                                // mid-flight (terminal not seen) or other work already
+                                // queued — still returns Busy, preserving the
+                                // workflow "contention = step failure" rule.
+                                if terminal_seen && backlog.is_empty() {
+                                    let message_id = item.message_id;
+                                    backlog.push_back(item);
+                                    if let Some(reply) = reply {
+                                        let _ = reply.send(SendOutcome::Accepted(message_id));
+                                    }
+                                } else if let Some(reply) = reply {
+                                    let _ = reply.send(SendOutcome::Busy);
+                                }
                             }
                             OnBusy::Enqueue => {
                                 let message_id = item.message_id;
@@ -1566,6 +1701,10 @@ async fn drain_turn(
                             None => awaiters.current_turn.push(reply),
                         }
                     }
+                    // Mid-turn peek: running iff the terminal hasn't passed yet.
+                    Some(Command::PeekCurrentTurn { reply }) => {
+                        let _ = reply.send(terminal.is_none());
+                    }
                     Some(Command::CancelSend { send_id, source }) => {
                         // Fire the running turn's cancel token only if this turn
                         // belongs to the send (post-terminal cancel is a no-op
@@ -1577,7 +1716,7 @@ async fn drain_turn(
                             cancel_source.get_or_insert(source);
                             token.cancel();
                         }
-                        drop_queued_send(backlog, send_id, emitter.as_ref(), channel, agent_id);
+                        drop_queued_send(backlog, send_id, source, emitter.as_ref(), channel, agent_id);
                     }
                     Some(Command::CancelAgent { source }) => {
                         // Stop the agent: cancel the running turn (post-terminal
@@ -1588,7 +1727,7 @@ async fn drain_turn(
                             cancel_source.get_or_insert(source);
                             token.cancel();
                         }
-                        drop_all_queued(backlog, emitter.as_ref(), channel, agent_id);
+                        drop_all_queued(backlog, source, emitter.as_ref(), channel, agent_id);
                     }
                     Some(Command::Shutdown { source, reply }) => {
                         // Cancel the running turn and keep draining to its
@@ -1732,9 +1871,18 @@ fn remove_from_backlog(
         .iter()
         .position(|m| m.message_id == message_id)
         .ok_or(NotQueued)?;
-    let item = backlog
+    let mut item = backlog
         .remove(pos)
         .expect("position from iter is in bounds");
+    // A removed queued message is a user action; resolve any awaitable completion
+    // so an accepted awaitable that was removed before running doesn't strand its
+    // awaiter (compose-bar items carry no completion, so this is usually a no-op).
+    resolve_dropped_completion(
+        &mut item,
+        TurnOutcome::Cancelled {
+            source: CancelSource::User,
+        },
+    );
     Ok(RemovedQueuedMessage {
         agent_id,
         send_id: item.send_id,
@@ -1783,6 +1931,8 @@ fn reject_send(
                 factory.idle_emitter().as_ref(),
                 &channel_name(agent_id),
                 message_id,
+                // Rejected before the actor ran it — no durable record.
+                None,
                 agent_id,
                 reason,
             );
@@ -1793,10 +1943,37 @@ fn reject_send(
 }
 
 /// Emit a `MessageFailed` for a send that could not start a turn.
+/// Emit a live [`NormalizedEvent::UserMessage`] for a backend-originated send,
+/// once it is durable. The frontend renders it as a user turn (grouping a fan-out
+/// by `send_id`), matching a manual send and the reloaded journal view.
+fn emit_user_message(
+    emitter: &dyn EventEmitter,
+    channel: &str,
+    send_id: SendId,
+    text: &str,
+    at: DateTime<Utc>,
+    agent_id: AgentId,
+) {
+    emit_event(
+        emitter,
+        channel,
+        &NormalizedEvent::UserMessage {
+            send_id,
+            text: text.to_owned(),
+            at,
+        },
+        agent_id,
+    );
+}
+
 fn emit_message_failed(
     emitter: &dyn EventEmitter,
     channel: &str,
     message_id: MessageId,
+    // `Some` only when the send was durably recorded (the post-`record_send`
+    // adapter-launch-failure path); `None` for every pre-durable failure, so the
+    // frontend invents no transcript row for a send reload can't reconstruct.
+    send_id: Option<SendId>,
     agent_id: AgentId,
     error: &str,
 ) {
@@ -1805,6 +1982,7 @@ fn emit_message_failed(
         channel,
         &NormalizedEvent::MessageFailed {
             message_id,
+            send_id,
             agent_id,
             error: error.to_owned(),
             at: Utc::now(),
@@ -1837,12 +2015,14 @@ fn emit_message_cancelled(
 fn drop_queued_send(
     backlog: &mut VecDeque<WorkItem>,
     send_id: SendId,
+    source: CancelSource,
     emitter: &dyn EventEmitter,
     channel: &str,
     agent_id: AgentId,
 ) {
-    backlog.retain(|m| {
+    backlog.retain_mut(|m| {
         if m.send_id == send_id {
+            resolve_dropped_completion(m, TurnOutcome::Cancelled { source });
             emit_message_cancelled(emitter, channel, m.message_id, agent_id);
             false
         } else {
@@ -1855,12 +2035,30 @@ fn drop_queued_send(
 /// emitting `MessageCancelled` for each.
 fn drop_all_queued(
     backlog: &mut VecDeque<WorkItem>,
+    source: CancelSource,
     emitter: &dyn EventEmitter,
     channel: &str,
     agent_id: AgentId,
 ) {
-    for item in backlog.drain(..) {
+    for mut item in backlog.drain(..) {
+        resolve_dropped_completion(&mut item, TurnOutcome::Cancelled { source });
         emit_message_cancelled(emitter, channel, item.message_id, agent_id);
+    }
+}
+
+/// Resolve a queued item's awaitable completion (if any) with `outcome` before
+/// the item is dropped, so a `send_message_awaiting_completion` caller whose item
+/// was accepted into the backlog and then cancelled / abandoned receives a real
+/// [`CompletionResult`] rather than a `RecvError`. The post-terminal-drain accept
+/// in the `FailFast` enqueue path can briefly queue an awaitable item, so every
+/// drop path must honor this — it keeps "an accepted awaitable always resolves"
+/// universally true. A no-op for the compose-bar path (no completion sender).
+fn resolve_dropped_completion(item: &mut WorkItem, outcome: TurnOutcome) {
+    if let Some(tx) = item.completion.take() {
+        let _ = tx.send(CompletionResult {
+            outcome,
+            text: String::new(),
+        });
     }
 }
 

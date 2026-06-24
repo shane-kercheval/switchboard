@@ -1,0 +1,24 @@
+[package]
+name = "switchboard-workflow"
+description = "Switchboard workflow language: parser, validation, MiniJinja-subset templating, helper functions, and run/checkpoint record types (pure Rust, no Tauri/dispatcher)"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+chrono.workspace = true
+minijinja = { version = "2.20", features = ["preserve_order"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+serde_norway.workspace = true
+switchboard-core = { version = "0.0.1", path = "../core" }
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -20,6 +20,6 @@ pub use attachment::{Attachment, AttachmentKind, render_prompt_with_attachments}
 pub use directory::{Directory, DirectoryConfig};
 pub use error::{CoreError, Result};
 pub use harness::{HarnessKind, SelectionAxis};
-pub use io::{edit_yaml_mapping, read_yaml, write_yaml};
+pub use io::{append_jsonl, edit_yaml_mapping, read_jsonl, read_yaml, write_yaml};
 pub use journal::{JournalRecord, SendId};
 pub use project::{Project, ProjectConfig, ProjectId, ProjectSummary};

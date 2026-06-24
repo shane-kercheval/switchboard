@@ -16,6 +16,7 @@ const DEFAULTS: Preferences = {
   editor_command: "code",
   terminal_app: "Terminal",
   diff_style: "unified",
+  show_builtins: true,
 };
 
 export const preferences = $state<Preferences>({ ...DEFAULTS });
@@ -45,6 +46,7 @@ export async function loadPreferences(): Promise<void> {
     preferences.editor_command = fetched.editor_command;
     preferences.terminal_app = fetched.terminal_app;
     preferences.diff_style = fetched.diff_style;
+    preferences.show_builtins = fetched.show_builtins;
   } catch (err) {
     // Backend unreachable / no config location — keep defaults. Allow a retry.
     loaded = false;
@@ -63,6 +65,7 @@ export async function updatePreferences(patch: Partial<Preferences>): Promise<vo
   preferences.editor_command = next.editor_command;
   preferences.terminal_app = next.terminal_app;
   preferences.diff_style = next.diff_style;
+  preferences.show_builtins = next.show_builtins;
   try {
     await api.setPreferences(next);
     saveStatus.error = null;
@@ -77,6 +80,7 @@ export const _testing = {
     preferences.editor_command = DEFAULTS.editor_command;
     preferences.terminal_app = DEFAULTS.terminal_app;
     preferences.diff_style = DEFAULTS.diff_style;
+    preferences.show_builtins = DEFAULTS.show_builtins;
     saveStatus.error = null;
     loaded = false;
     dirtied = false;

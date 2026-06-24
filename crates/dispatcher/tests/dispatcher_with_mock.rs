@@ -703,6 +703,153 @@ async fn truncated_stream_without_turn_end_synthesizes_failed_terminal() {
 }
 
 #[tokio::test]
+async fn workflow_send_emits_user_message_after_journal_before_turn_start() {
+    // A backend-originated workflow send has no frontend optimistic user turn, so
+    // the dispatcher surfaces a live UserMessage for it — emitted past the
+    // fail-closed `record_send` and before TurnStart, so live == the reloaded
+    // journal view by construction.
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+    let factory = TestFactory::new(
+        MockScenario::Streaming,
+        agent.clone(),
+        Arc::clone(&emitter),
+        Arc::new(RecordingJournal::default()) as Arc<dyn ConversationJournal>,
+    );
+
+    let send_id = Uuid::now_v7();
+    let _ = dispatcher
+        .send_workflow_message_awaiting_completion(
+            agent.id,
+            "review this diff",
+            vec![],
+            send_id,
+            factory,
+        )
+        .await;
+
+    within(
+        &emitter,
+        "agent_idle",
+        emitter.wait_for_type("agent_idle", 1),
+    )
+    .await;
+
+    let events = emitter.snapshot();
+    let user_msgs: Vec<_> = events
+        .iter()
+        .filter(|(_, v)| event_type(v) == "user_message")
+        .collect();
+    assert_eq!(
+        user_msgs.len(),
+        1,
+        "exactly one UserMessage for the workflow send"
+    );
+    assert_eq!(
+        user_msgs[0].1["send_id"].as_str(),
+        Some(send_id.to_string().as_str()),
+        "UserMessage carries the originating send_id (for fan-out grouping)"
+    );
+    assert_eq!(user_msgs[0].1["text"].as_str(), Some("review this diff"));
+
+    // Ordering: the UserMessage is emitted after the journal write but before the
+    // turn's TurnStart.
+    let um = events
+        .iter()
+        .position(|(_, v)| event_type(v) == "user_message")
+        .unwrap();
+    let ts = events
+        .iter()
+        .position(|(_, v)| event_type(v) == "turn_start")
+        .unwrap();
+    assert!(um < ts, "UserMessage precedes TurnStart");
+}
+
+#[tokio::test]
+async fn manual_send_emits_no_user_message() {
+    // A manual send's user turn is created optimistically by the frontend, so the
+    // dispatcher must not also emit a UserMessage (it would double-render).
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+    let factory = TestFactory::new(
+        MockScenario::Streaming,
+        agent.clone(),
+        Arc::clone(&emitter),
+        noop_journal(),
+    );
+
+    let _ = dispatcher
+        .send_message_awaiting_completion(agent.id, "hi", vec![], Uuid::now_v7(), factory)
+        .await;
+
+    within(
+        &emitter,
+        "agent_idle",
+        emitter.wait_for_type("agent_idle", 1),
+    )
+    .await;
+
+    assert_eq!(
+        count_type(&emitter.snapshot(), "user_message"),
+        0,
+        "a manual send emits no UserMessage"
+    );
+}
+
+#[tokio::test]
+async fn workflow_send_journal_failure_suppresses_user_message() {
+    // `record_send` is fail-closed: a journal write failure surfaces MessageFailed
+    // and starts no turn — and must emit no live UserMessage, since a send that
+    // isn't durable has no row for a reload to reconstruct (live == reload).
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+    let factory = TestFactory::new(
+        MockScenario::Streaming,
+        agent.clone(),
+        Arc::clone(&emitter),
+        Arc::new(FailingJournal) as Arc<dyn ConversationJournal>,
+    );
+
+    let _ = dispatcher
+        .send_workflow_message_awaiting_completion(
+            agent.id,
+            "never durable",
+            vec![],
+            Uuid::now_v7(),
+            factory,
+        )
+        .await;
+
+    within(
+        &emitter,
+        "message_failed",
+        emitter.wait_for_type("message_failed", 1),
+    )
+    .await;
+    within(
+        &emitter,
+        "agent_idle",
+        emitter.wait_for_type("agent_idle", 1),
+    )
+    .await;
+
+    let events = emitter.snapshot();
+    assert_eq!(
+        count_type(&events, "user_message"),
+        0,
+        "a journal-write failure suppresses the live UserMessage"
+    );
+    assert_eq!(
+        count_type(&events, "turn_start"),
+        0,
+        "no turn starts when the journal write fails"
+    );
+}
+
+#[tokio::test]
 async fn dispatch_failure_emits_message_failed_no_turn_start_and_stays_usable() {
     // MockScenario::DispatchFails → `adapter.dispatch()` returns Err before any
     // stream. The actor emits NO TurnStart; instead it emits MessageFailed
@@ -719,13 +866,14 @@ async fn dispatch_failure_emits_message_failed_no_turn_start_and_stays_usable() 
         noop_journal(),
     );
 
+    let send_id = Uuid::now_v7();
     let message_id = accepted(
         dispatcher
             .send_message(
                 agent.id,
                 "won't dispatch",
                 vec![],
-                Uuid::now_v7(),
+                send_id,
                 Arc::clone(&factory) as Arc<dyn DispatchContextFactory>,
                 OnBusy::Enqueue,
             )
@@ -760,6 +908,11 @@ async fn dispatch_failure_emits_message_failed_no_turn_start_and_stays_usable() 
         extract_message_id(&failed.1),
         message_id,
         "message_failed is keyed by the accepted send's message_id"
+    );
+    assert_eq!(
+        failed.1["send_id"].as_str(),
+        Some(send_id.to_string().as_str()),
+        "message_failed carries the send_id (so a backend-originated send can attach its failure)"
     );
 
     // The next send must run to completion — the agent isn't stuck.
@@ -1733,6 +1886,10 @@ async fn send_record_failure_aborts_the_turn_without_starting_it() {
         .find(|(_, v)| event_type(v) == "message_failed")
         .expect("a message_failed event");
     assert_eq!(extract_message_id(&failed.1), message_id);
+    assert!(
+        failed.1["send_id"].is_null(),
+        "a journal-write failure is pre-durable: no send_id, so the live UI invents no row (matches the empty reload)"
+    );
 }
 
 #[tokio::test]
@@ -3631,6 +3788,234 @@ async fn awaited_send_completion_resolves_failed_when_locator_persist_fails() {
         result.text.is_empty(),
         "a force-failed turn carries no text"
     );
+}
+
+#[tokio::test]
+async fn failfast_send_to_mid_flight_agent_is_busy() {
+    // Genuine contention: while a turn is actually running (terminal not yet
+    // seen), a FailFast send must be refused. `CompletesOnSignal` parks the turn
+    // mid-flight until released, so the contention is deterministic.
+    let signal = Arc::new(tokio::sync::Notify::new());
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+    let factory = TestFactory::new(
+        MockScenario::CompletesOnSignal(Arc::clone(&signal)),
+        agent.clone(),
+        Arc::clone(&emitter),
+        noop_journal(),
+    );
+
+    let _running = accepted_completion(
+        dispatcher
+            .send_message_awaiting_completion(
+                agent.id,
+                "first",
+                vec![],
+                Uuid::now_v7(),
+                Arc::clone(&factory) as Arc<dyn DispatchContextFactory>,
+            )
+            .await,
+    );
+    within(
+        &emitter,
+        "turn_start (mid-flight)",
+        emitter.wait_for_type("turn_start", 1),
+    )
+    .await;
+
+    let outcome = dispatcher
+        .send_message_awaiting_completion(agent.id, "second", vec![], Uuid::now_v7(), factory)
+        .await;
+    assert!(
+        matches!(outcome, AwaitableSendOutcome::Busy),
+        "a FailFast send to a genuinely mid-flight agent must be Busy",
+    );
+    // Release the parked turn so the actor can shut down cleanly.
+    signal.notify_one();
+}
+
+/// Count `agent_idle` emissions recorded so far (matched on the wire `type`).
+fn idle_count(emitter: &RecordingEmitter) -> usize {
+    emitter
+        .snapshot()
+        .iter()
+        .filter(|(_, p)| p.get("type").and_then(|t| t.as_str()) == Some("agent_idle"))
+        .count()
+}
+
+#[tokio::test]
+async fn failfast_resend_during_own_drain_is_accepted_not_busy() {
+    // The post-terminal-drain accept, exercised deterministically: turn 1 emits
+    // its terminal then *holds the stream open* (CompletesThenHolds), so the actor
+    // is parked inside drain_turn after the terminal when the re-send arrives. The
+    // re-send must be accepted via the in-drain arm (not the idle path) and run
+    // once the hold releases — guarding the back-to-back `send`→`wait`→`send`
+    // workflow shape against a spurious Busy.
+    let signal = Arc::new(tokio::sync::Notify::new());
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+    let factory = TestFactory::sequence(
+        [
+            MockScenario::CompletesThenHolds(Arc::clone(&signal)),
+            MockScenario::Streaming,
+        ],
+        agent.clone(),
+        Arc::clone(&emitter),
+        noop_journal(),
+    );
+
+    let rx1 = accepted_completion(
+        dispatcher
+            .send_message_awaiting_completion(
+                agent.id,
+                "first",
+                vec![],
+                Uuid::now_v7(),
+                Arc::clone(&factory) as Arc<dyn DispatchContextFactory>,
+            )
+            .await,
+    );
+    assert_eq!(completion_within(rx1).await.outcome, TurnOutcome::Completed);
+    // Turn 1 is terminal but still held in drain — no idle yet, so the next accept
+    // is provably via the in-drain arm rather than the parked-idle path.
+    assert_eq!(
+        idle_count(&emitter),
+        0,
+        "actor must still be draining turn 1"
+    );
+
+    let rx2 = accepted_completion(
+        dispatcher
+            .send_message_awaiting_completion(agent.id, "second", vec![], Uuid::now_v7(), factory)
+            .await,
+    );
+    assert_eq!(
+        idle_count(&emitter),
+        0,
+        "still no idle between the two turns"
+    );
+
+    // Release the hold so turn 1's drain finishes and the accepted turn 2 runs.
+    signal.notify_one();
+    assert_eq!(completion_within(rx2).await.outcome, TurnOutcome::Completed);
+}
+
+#[tokio::test]
+async fn failfast_during_drain_with_queued_work_is_busy() {
+    // The third arm of the FailFast condition: terminal_seen is true, but other
+    // work is already queued — that is genuine contention and must stay Busy
+    // (workflow "contention = step failure"), not be bridged like the empty-backlog
+    // self-drain case.
+    let signal = Arc::new(tokio::sync::Notify::new());
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+    let factory = TestFactory::sequence(
+        [
+            MockScenario::CompletesThenHolds(Arc::clone(&signal)),
+            MockScenario::Streaming,
+        ],
+        agent.clone(),
+        Arc::clone(&emitter),
+        noop_journal(),
+    );
+
+    let rx1 = accepted_completion(
+        dispatcher
+            .send_message_awaiting_completion(
+                agent.id,
+                "first",
+                vec![],
+                Uuid::now_v7(),
+                Arc::clone(&factory) as Arc<dyn DispatchContextFactory>,
+            )
+            .await,
+    );
+    assert_eq!(completion_within(rx1).await.outcome, TurnOutcome::Completed);
+
+    // Queue a second send while turn 1 is held in drain (Enqueue → backlog).
+    let queued = accepted(
+        dispatcher
+            .send_message(
+                agent.id,
+                "queued",
+                vec![],
+                Uuid::now_v7(),
+                Arc::clone(&factory) as Arc<dyn DispatchContextFactory>,
+                OnBusy::Enqueue,
+            )
+            .await,
+    );
+    let _ = queued;
+
+    // Now a FailFast send sees terminal_seen && non-empty backlog → Busy.
+    let outcome = dispatcher
+        .send_message_awaiting_completion(agent.id, "third", vec![], Uuid::now_v7(), factory)
+        .await;
+    assert!(
+        matches!(outcome, AwaitableSendOutcome::Busy),
+        "a FailFast send with other work already queued must be Busy",
+    );
+    signal.notify_one();
+}
+
+#[tokio::test]
+async fn cancel_send_during_drain_resolves_accepted_awaitable_as_cancelled() {
+    // Finding-1 guard: an awaitable send accepted into the backlog during the
+    // post-terminal drain must, if cancelled before it runs, resolve its
+    // completion as `Cancelled` — never strand the awaiter on a RecvError. The
+    // dispatcher's "an accepted awaitable always resolves" contract must hold even
+    // for this brief queued window.
+    let signal = Arc::new(tokio::sync::Notify::new());
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+    let factory = TestFactory::sequence(
+        [
+            MockScenario::CompletesThenHolds(Arc::clone(&signal)),
+            MockScenario::Streaming,
+        ],
+        agent.clone(),
+        Arc::clone(&emitter),
+        noop_journal(),
+    );
+
+    let rx1 = accepted_completion(
+        dispatcher
+            .send_message_awaiting_completion(
+                agent.id,
+                "first",
+                vec![],
+                Uuid::now_v7(),
+                Arc::clone(&factory) as Arc<dyn DispatchContextFactory>,
+            )
+            .await,
+    );
+    assert_eq!(completion_within(rx1).await.outcome, TurnOutcome::Completed);
+
+    // Accept a second send into the backlog during turn 1's drain, then cancel it.
+    let send_id = Uuid::now_v7();
+    let rx2 = accepted_completion(
+        dispatcher
+            .send_message_awaiting_completion(agent.id, "second", vec![], send_id, factory)
+            .await,
+    );
+    dispatcher.cancel_send(send_id, &[agent.id], CancelSource::Workflow);
+
+    let result = completion_within(rx2).await;
+    assert!(
+        matches!(
+            result.outcome,
+            TurnOutcome::Cancelled {
+                source: CancelSource::Workflow
+            }
+        ),
+        "a cancelled queued awaitable must resolve Cancelled, not a receiver error, got {:?}",
+        result.outcome,
+    );
+    signal.notify_one();
 }
 
 // ---------------------------------------------------------------------------

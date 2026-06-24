@@ -47,6 +47,7 @@
     selectionFor,
     targetRecipients,
   } from "$lib/state/recipientSelection.svelte";
+  import { workflowRuns } from "$lib/state/workflows.svelte";
 
   let {
     projectId,
@@ -73,6 +74,13 @@
   const layout = $derived(layoutFor(projectId, rosterIds));
   const multiPane = $derived(layout.panes.length > 1);
   const selection = $derived(selectionFor(projectId));
+  // While a workflow run owns the project, the compose bar is replaced by the
+  // live run view and sends are locked out — so the recipient-coverage border
+  // (which means "this pane's members receive the draft") is meaningless and
+  // misleading. Suppress it for the run's lifetime; it returns on
+  // complete/cancel/abandon, exactly when the compose bar comes back. Mirrors
+  // `ComposeBar`'s `activeWorkflowRun` lockout condition.
+  const workflowActive = $derived((workflowRuns[projectId]?.length ?? 0) > 0);
   const unassignedIds = $derived(unassignedAgentIds(projectId, rosterIds));
   const paneChrome = $derived(multiPane || unassignedIds.length > 0);
   const minimizedIds = $derived(new Set(layout.minimized));
@@ -382,7 +390,7 @@
     {#each renderPanes as item, i (item.pane.id)}
       {@const pane = item.pane}
       {@const visible = paneAgents(pane)}
-      {@const cov = multiPane ? coverage(pane) : "none"}
+      {@const cov = multiPane && !workflowActive ? coverage(pane) : "none"}
       {@const active = paneIsActive(pane)}
       {#if i > 0 && maximizedPane === null}
         <div

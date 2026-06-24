@@ -245,6 +245,7 @@ test("real streamed events keep an unpinned reader still", async () => {
     type: "turn_start",
     turn_id: "live-rt",
     message_id: "00000000-0000-7000-8000-0000000000f1",
+    send_id: "00000000-0000-7000-8000-0000000000f1",
     started_at: "2026-05-16T00:00:00Z",
   });
   fire(channel, { type: "content_chunk", turn_id: "live-rt", kind: "text", text: longText(4) });

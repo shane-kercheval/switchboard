@@ -100,6 +100,7 @@ describe("event routing", () => {
       type: "turn_start",
       turn_id: TURN_1,
       message_id: MESSAGE_1,
+      send_id: MESSAGE_1,
       started_at: "2026-05-15T00:00:00Z",
     });
     expect(state.transcripts[AGENT_A]).toHaveLength(1);
@@ -109,6 +110,31 @@ describe("event routing", () => {
     expect(turn.status).toBe("streaming");
   });
 
+  it("stamps a turn's send_id from the turn_start event when the frontend didn't originate the send", async () => {
+    // A workflow (or any backend-originated) fan-out dispatches without a local
+    // `pending_sends` entry, so the live grouping must come from the event's
+    // own `send_id` — otherwise the fan-out's turns render stacked, not side-by-side.
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A));
+    await state.registerAgent(agentRecord(AGENT_B));
+    const SHARED = "11111111-1111-7111-8111-111111111111";
+    for (const agent of [AGENT_A, AGENT_B]) {
+      fireTo(`agent:${agent}`, {
+        type: "turn_start",
+        turn_id: crypto.randomUUID(),
+        message_id: crypto.randomUUID(),
+        send_id: SHARED,
+        started_at: "2026-05-15T00:00:00Z",
+      });
+    }
+    // Both turns carry the shared send_id (the grouping key), so the UI lays them
+    // out as one fan-out row rather than two stacked sends.
+    const a = state.transcripts[AGENT_A]?.[0];
+    const b = state.transcripts[AGENT_B]?.[0];
+    expect(a?.role === "agent" && a.send_id).toBe(SHARED);
+    expect(b?.role === "agent" && b.send_id).toBe(SHARED);
+  });
+
   it("AgentIdle event flips run_status to idle", async () => {
     const state = await loadState();
     await state.registerAgent(agentRecord(AGENT_A));
@@ -116,6 +142,7 @@ describe("event routing", () => {
       type: "turn_start",
       turn_id: TURN_1,
       message_id: MESSAGE_1,
+      send_id: MESSAGE_1,
       started_at: "2026-05-15T00:00:00Z",
     });
     expect(state.runtimes[AGENT_A]?.run_status).toBe("processing");
@@ -164,12 +191,14 @@ describe("per-agent isolation", () => {
       type: "turn_start",
       turn_id: TURN_1,
       message_id: MESSAGE_1,
+      send_id: MESSAGE_1,
       started_at: "2026-05-15T00:00:00Z",
     });
     fireTo(`agent:${AGENT_B}`, {
       type: "turn_start",
       turn_id: TURN_2,
       message_id: MESSAGE_1,
+      send_id: MESSAGE_1,
       started_at: "2026-05-15T00:00:01Z",
     });
     expect(state.transcripts[AGENT_A]).toHaveLength(1);
@@ -186,6 +215,7 @@ describe("per-agent isolation", () => {
       type: "turn_start",
       turn_id: TURN_1,
       message_id: MESSAGE_1,
+      send_id: MESSAGE_1,
       started_at: "2026-05-15T00:00:00Z",
     });
     // Only A is processing — B stays idle.
@@ -203,6 +233,7 @@ describe("heartbeat orchestration", () => {
       type: "turn_start",
       turn_id: TURN_1,
       message_id: MESSAGE_1,
+      send_id: MESSAGE_1,
       started_at: "2026-05-15T00:00:00Z",
     });
     expect(state._testing.hasHeartbeat(AGENT_A)).toBe(true);
@@ -233,6 +264,7 @@ describe("heartbeat orchestration", () => {
       type: "turn_start",
       turn_id: TURN_1,
       message_id: MESSAGE_1,
+      send_id: MESSAGE_1,
       started_at: "2026-05-15T00:00:00Z",
     });
     vi.advanceTimersByTime(HEARTBEAT_TIMEOUT_MS - 100);
@@ -254,6 +286,7 @@ describe("heartbeat orchestration", () => {
       type: "turn_start",
       turn_id: TURN_1,
       message_id: MESSAGE_1,
+      send_id: MESSAGE_1,
       started_at: "2026-05-15T00:00:00Z",
     });
     vi.advanceTimersByTime(HEARTBEAT_TIMEOUT_MS + 100);
@@ -286,6 +319,7 @@ describe("heartbeat orchestration", () => {
       type: "turn_start",
       turn_id: TURN_1,
       message_id: MESSAGE_1,
+      send_id: MESSAGE_1,
       started_at: "2026-05-15T00:00:00Z",
     });
     // Just before the original deadline.
@@ -313,6 +347,7 @@ describe("heartbeat orchestration", () => {
       type: "turn_start",
       turn_id: TURN_1,
       message_id: MESSAGE_1,
+      send_id: MESSAGE_1,
       started_at: "2026-05-15T00:00:00Z",
     });
     vi.advanceTimersByTime(HEARTBEAT_TIMEOUT_MS - 100);
@@ -348,6 +383,7 @@ describe("heartbeat orchestration", () => {
       type: "turn_start",
       turn_id: TURN_1,
       message_id: MESSAGE_1,
+      send_id: MESSAGE_1,
       started_at: "2026-05-15T00:00:00Z",
     });
     fireTo(`agent:${AGENT_A}`, {
@@ -374,6 +410,7 @@ describe("heartbeat orchestration", () => {
       type: "turn_start",
       turn_id: TURN_1,
       message_id: MESSAGE_1,
+      send_id: MESSAGE_1,
       started_at: "2026-05-15T00:00:00Z",
     });
     // Stale event for TURN_2 (which doesn't exist on this agent). Must
@@ -515,6 +552,7 @@ describe("failSendStart", () => {
       type: "turn_start",
       turn_id: TURN_1,
       message_id: MESSAGE_1,
+      send_id: MESSAGE_1,
       started_at: "2026-05-16T00:00:00Z",
     });
 
@@ -539,6 +577,7 @@ describe("failSendStart", () => {
       type: "turn_start",
       turn_id: TURN_1,
       message_id: MESSAGE_1,
+      send_id: MESSAGE_1,
       started_at: "2026-05-16T00:00:00Z",
     });
     expect(state.runtimes[AGENT_A]?.run_status).toBe("processing");
@@ -580,6 +619,7 @@ describe("message_failed event → transcript", () => {
     fireTo(`agent:${AGENT_A}`, {
       type: "message_failed",
       message_id: MESSAGE_1,
+      send_id: MESSAGE_1,
       agent_id: AGENT_A,
       error: "adapter failed to launch",
       at: "2026-05-16T00:00:01Z",
@@ -605,6 +645,7 @@ describe("message_failed event → transcript", () => {
     fireTo(`agent:${AGENT_A}`, {
       type: "message_failed",
       message_id: MESSAGE_1,
+      send_id: MESSAGE_1,
       agent_id: AGENT_A,
       error: "adapter failed to launch",
       at: "2026-05-16T00:00:01Z",
@@ -629,6 +670,7 @@ describe("message_failed event → transcript", () => {
       type: "turn_start",
       turn_id: TURN_1,
       message_id: MESSAGE_1,
+      send_id: MESSAGE_1,
       started_at: "2026-05-16T00:00:01Z",
     });
 
@@ -638,6 +680,9 @@ describe("message_failed event → transcript", () => {
     fireTo(`agent:${AGENT_A}`, {
       type: "message_failed",
       message_id: MESSAGE_1,
+      // Matches the send's id (the backend stamps `item.send_id`); the post-start
+      // guard finds the already-streaming turn for this send and skips.
+      send_id: "send-1",
       agent_id: AGENT_A,
       error: "boom",
       at: "2026-05-16T00:00:02Z",
@@ -645,6 +690,60 @@ describe("message_failed event → transcript", () => {
 
     const agentTurns = (state.transcripts[AGENT_A] ?? []).filter((t) => t.role === "agent");
     expect(agentTurns).toHaveLength(1);
+  });
+
+  it("renders a failed marker for a backend-originated pre-start failure via the event's send_id", async () => {
+    // A workflow step's send fails before `turn_start` (e.g. the agent's harness
+    // fails to launch). There's no `pending_sends` entry, so the failed marker is
+    // attributed from the event's own `send_id` — and it carries that `send_id`,
+    // so it renders under the workflow's live user row instead of orphaning.
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A));
+    fireTo(`agent:${AGENT_A}`, {
+      type: "message_failed",
+      message_id: MESSAGE_1,
+      send_id: "wf-send-1",
+      agent_id: AGENT_A,
+      error: "agent failed to launch",
+      at: "2026-05-16T00:00:00Z",
+    });
+    const turns = state.transcripts[AGENT_A] ?? [];
+    expect(turns).toHaveLength(1);
+    const t = turns[0];
+    expect(t?.role).toBe("agent");
+    if (t?.role !== "agent") throw new Error("unreachable");
+    expect(t.status).toBe("failed");
+    expect(t.send_id).toBe("wf-send-1");
+
+    // Re-delivery of the same failure is a no-op (the failed turn already carries
+    // this send_id, so the post-start guard skips it) — no double-render.
+    fireTo(`agent:${AGENT_A}`, {
+      type: "message_failed",
+      message_id: MESSAGE_1,
+      send_id: "wf-send-1",
+      agent_id: AGENT_A,
+      error: "agent failed to launch",
+      at: "2026-05-16T00:00:01Z",
+    });
+    expect((state.transcripts[AGENT_A] ?? []).filter((x) => x.role === "agent")).toHaveLength(1);
+  });
+
+  it("renders no row for a pre-durable backend failure (send_id null) — matches the empty reload", async () => {
+    // A workflow send whose journal write fails: not durably recorded, so the
+    // event carries no send_id and there's no pending entry. The live transcript
+    // must add nothing (reload reconstructs nothing); the run indicator owns the
+    // failure.
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A));
+    fireTo(`agent:${AGENT_A}`, {
+      type: "message_failed",
+      message_id: MESSAGE_1,
+      send_id: null,
+      agent_id: AGENT_A,
+      error: "journal write failed",
+      at: "2026-05-16T00:00:00Z",
+    });
+    expect(state.transcripts[AGENT_A] ?? []).toHaveLength(0);
   });
 });
 
@@ -699,6 +798,7 @@ describe("stopAgent", () => {
       type: "turn_start",
       turn_id: TURN_1,
       message_id: MESSAGE_1,
+      send_id: MESSAGE_1,
       started_at: "2026-05-16T00:00:00Z",
     });
     // send-2 queued behind it, accepted.
@@ -792,6 +892,7 @@ describe("cancelSend pre-accept race", () => {
       type: "turn_start",
       turn_id: TURN_1,
       message_id: MESSAGE_1,
+      send_id: MESSAGE_1,
       started_at: "2026-05-16T00:00:00Z",
     });
     expect(invokeMock).toHaveBeenCalledWith(
@@ -844,6 +945,7 @@ describe("pending-send pruning (fan-out / queue correctness)", () => {
       type: "turn_start",
       turn_id: TURN_1,
       message_id: MESSAGE_1,
+      send_id: MESSAGE_1,
       started_at: "2026-05-16T00:00:02Z",
     });
     // The live (streaming) turn is the retry; a failed turn for send-A also sits
@@ -866,6 +968,7 @@ describe("pending-send pruning (fan-out / queue correctness)", () => {
       type: "turn_start",
       turn_id: TURN_1,
       message_id: MESSAGE_1,
+      send_id: MESSAGE_1,
       started_at: "2026-05-16T00:00:01Z",
     });
     expect(state.runtimes[AGENT_A]?.run_status).toBe("processing");
@@ -894,6 +997,7 @@ describe("state machine — starting → processing transition", () => {
       type: "turn_start",
       turn_id: TURN_1,
       message_id: MESSAGE_1,
+      send_id: MESSAGE_1,
       started_at: "2026-05-16T00:00:00Z",
     });
 
@@ -911,6 +1015,7 @@ describe("_testing.reset", () => {
       type: "turn_start",
       turn_id: TURN_1,
       message_id: MESSAGE_1,
+      send_id: MESSAGE_1,
       started_at: "2026-05-16T00:00:00Z",
     });
 
@@ -978,6 +1083,7 @@ describe("invariant violation surfacing", () => {
       type: "turn_start",
       turn_id: TURN_1,
       message_id: MESSAGE_1,
+      send_id: MESSAGE_1,
       started_at: "2026-05-16T00:00:00Z",
     });
 
@@ -1012,6 +1118,7 @@ describe("listener boundary stamps tool started_at / completed_at", () => {
       type: "turn_start",
       turn_id: TURN_1,
       message_id: MESSAGE_1,
+      send_id: MESSAGE_1,
       started_at: "2026-05-16T00:00:00Z",
     });
     fireTo(`agent:${AGENT_A}`, {

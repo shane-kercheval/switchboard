@@ -57,6 +57,12 @@ pub struct Preferences {
 
     /// Diff panel layout. Defaults to unified.
     pub diff_style: DiffStyle,
+
+    /// Whether the app-owned read-only built-in prompts and workflows appear in
+    /// the pickers. Default `true` (show examples); a user who wants only their
+    /// own content turns it off. Visibility only — a workflow wired to a built-in
+    /// still resolves when this is off.
+    pub show_builtins: bool,
 }
 
 impl Default for Preferences {
@@ -65,6 +71,7 @@ impl Default for Preferences {
             editor_command: Some("code".to_owned()),
             terminal_app: default_terminal_app(),
             diff_style: DiffStyle::default(),
+            show_builtins: true,
         }
     }
 }
@@ -94,6 +101,7 @@ impl Preferences {
             editor_command,
             terminal_app,
             diff_style: self.diff_style,
+            show_builtins: self.show_builtins,
         }
     }
 }
@@ -172,6 +180,17 @@ mod tests {
         assert_eq!(p.editor_command.as_deref(), Some("code"));
         assert_eq!(p.terminal_app, "Terminal");
         assert_eq!(p.diff_style, DiffStyle::Unified);
+        assert!(p.show_builtins, "built-ins are shown by default");
+    }
+
+    #[test]
+    fn missing_show_builtins_key_defaults_on() {
+        // The forward/backward-compat contract: a config.yaml written before this
+        // key existed loads with built-ins shown, not hidden.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(&path, "terminal_app: iTerm\n").unwrap();
+        assert!(load(&path).show_builtins);
     }
 
     #[test]
@@ -183,6 +202,8 @@ mod tests {
             editor_command: Some("cursor".to_owned()),
             terminal_app: "iTerm".to_owned(),
             diff_style: DiffStyle::Unified,
+            // Non-default so the round-trip exercises an explicitly-off toggle.
+            show_builtins: false,
         };
         save(&path, &prefs).unwrap();
         assert_eq!(load(&path), prefs);
@@ -206,6 +227,7 @@ mod tests {
                 editor_command: Some("zed".to_owned()),
                 terminal_app: "iTerm".to_owned(),
                 diff_style: DiffStyle::Unified,
+                show_builtins: true,
             },
         )
         .unwrap();
@@ -251,6 +273,7 @@ mod tests {
                     editor_command: Some("zed".to_owned()),
                     terminal_app: "iTerm".to_owned(),
                     diff_style: DiffStyle::Unified,
+                    show_builtins: true,
                 },
             )
             .unwrap();
@@ -323,6 +346,7 @@ mod tests {
             editor_command: Some("  cursor  ".to_owned()),
             terminal_app: "  iTerm  ".to_owned(),
             diff_style: DiffStyle::Unified,
+            show_builtins: true,
         }
         .normalized();
         assert_eq!(p.editor_command.as_deref(), Some("cursor"));
@@ -337,6 +361,7 @@ mod tests {
             editor_command: Some("   ".to_owned()),
             terminal_app: "   ".to_owned(),
             diff_style: DiffStyle::default(),
+            show_builtins: true,
         }
         .normalized();
         assert_eq!(blank.editor_command, None);

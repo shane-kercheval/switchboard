@@ -1,0 +1,63 @@
+name: review-and-reconcile
+description: Reviewers review in parallel, a worker distills their feedback into a decision-ready verdict, the reviewers respond to it, and the worker gives a final recommendation.
+# Both prompts are hardcoded: `builtin:code-review` for the reviewers and
+# `builtin:analyze-ai-reviews` for the worker's analysis. code-review's `context`
+# argument is auto-derived from the prompt and offered as a user-fillable field;
+# analyze-ai-reviews's required `review` argument is a computed binding (filled
+# from the reviewers' aggregated responses) and never shown to the user.
+#
+# Labels name the *deliverable* each step produces (a noun phrase), not the
+# dispatch; the `wait` labels are absorbed into the preceding send in the
+# collapsed progress view.
+inputs:
+  reviewers:
+    type: [agent]
+    description: The agents that review in parallel, then respond to the worker's analysis.
+  worker:
+    type: agent
+    description: The agent that distills the reviewers' feedback into a verdict, weighs their pushback, and gives the final recommendation.
+steps:
+  - label: Code review
+    description: Each reviewer independently reviews the current changes in parallel.
+    send:
+      to: "{{ reviewers }}"
+      prompt: "builtin:code-review"
+  - label: Reviews received
+    wait_for_all:
+      agents: "{{ reviewers }}"
+  - label: Verdict
+    description: The worker distills the reviewers' feedback into a decision-ready verdict.
+    send:
+      to: "{{ worker }}"
+      prompt: "builtin:analyze-ai-reviews"
+      template_vars:
+        review: "{{ aggregated_responses(reviewers) }}"
+  - label: Verdict ready
+    wait_for:
+      agent: "{{ worker }}"
+  - label: Reviewer responses
+    description: The reviewers push back on or confirm the worker's verdict.
+    send:
+      to: "{{ reviewers }}"
+      text: |
+        An analyst reviewed all of the feedback and responded:
+
+        {{ last_output(worker) }}
+
+        Do you agree with this analysis? Push back where you think it's wrong, and confirm where it's right.
+  - label: Responses received
+    wait_for_all:
+      agents: "{{ reviewers }}"
+  - label: Final recommendation
+    description: The worker weighs the reviewers' responses and gives a final recommendation.
+    send:
+      to: "{{ worker }}"
+      text: |
+        Here's how the reviewers responded to your analysis:
+
+        {{ aggregated_responses(reviewers) }}
+
+        Weigh their responses and give your final recommendation.
+  - label: Recommendation ready
+    wait_for:
+      agent: "{{ worker }}"

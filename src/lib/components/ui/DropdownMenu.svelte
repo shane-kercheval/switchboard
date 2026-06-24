@@ -78,10 +78,18 @@
     </Bits.Trigger>
   {/if}
   <Bits.Portal>
+    <!-- When the trigger has a tooltip, suppress the close-time focus return:
+         bits-ui restores focus to the trigger after a pick, which re-opens the
+         (focus-triggered) tooltip and leaves it stuck until the next click.
+         Accepted cost: keyboard users don't get focus back on the trigger after
+         a pick (it falls to the body) — low impact here (mouse-opened pickers),
+         but if a future tooltip-wrapped menu needs focus-return, gate the
+         tooltip's focus-open instead of preventing the focus return. -->
     <Bits.Content
       {align}
       sideOffset={4}
       data-testid={contentTestid}
+      onCloseAutoFocus={tooltipLabel ? (e) => e.preventDefault() : undefined}
       class={cn(
         "border-border/90 bg-raised z-50 min-w-44 rounded-lg border p-1 text-[13px] shadow-[0_10px_28px_rgba(0,0,0,0.10)] outline-none focus:outline-none",
         contentClass,

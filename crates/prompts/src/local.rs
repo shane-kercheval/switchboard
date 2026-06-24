@@ -72,7 +72,7 @@ impl PromptProvider for LocalProvider {
 impl LocalProvider {
     /// Synchronous listing — the filesystem scan. The trait's `async list`
     /// delegates here; the work is blocking I/O, fast enough to run inline.
-    fn list_sync(&self) -> Vec<Prompt> {
+    pub(crate) fn list_sync(&self) -> Vec<Prompt> {
         let mut out = Vec::new();
         let mut seen: BTreeSet<String> = BTreeSet::new();
         for dir in &self.dirs {
@@ -89,7 +89,7 @@ impl LocalProvider {
                         // First occurrence of a name wins; later dirs/files are
                         // shadowed (declared-order resolution).
                         if seen.insert(parsed.name.clone()) {
-                            out.push(parsed.into_prompt());
+                            out.push(parsed.into_prompt(LOCAL_PROVIDER));
                         }
                     }
                     Err(e) => {
@@ -114,21 +114,27 @@ impl LocalProvider {
 }
 
 /// A parsed prompt file: frontmatter-derived metadata plus the template body.
+/// Shared by the local and built-in providers — both parse the same
+/// frontmatter + `MiniJinja`-body format, differing only in their source (a file
+/// on disk vs. binary-baked content) and the provider identity they carry.
 #[derive(Debug)]
-struct ParsedPrompt {
-    name: String,
+pub(crate) struct ParsedPrompt {
+    pub(crate) name: String,
     description: String,
-    arguments: Vec<PromptArgument>,
+    pub(crate) arguments: Vec<PromptArgument>,
     tags: Vec<String>,
-    body: String,
+    pub(crate) body: String,
 }
 
 impl ParsedPrompt {
-    fn into_prompt(self) -> Prompt {
+    /// Build the UI-facing [`Prompt`] under `provider` — `local` for filesystem
+    /// prompts, `builtin` for the baked library. The body is intentionally
+    /// dropped (never sent to the frontend; only rendered text is).
+    pub(crate) fn into_prompt(self, provider: &str) -> Prompt {
         Prompt {
-            provider: LOCAL_PROVIDER.to_owned(),
+            provider: provider.to_owned(),
             name: self.name,
-            // Local prompts have no separate title; `name` is their display label.
+            // These prompts have no separate title; `name` is their display label.
             title: None,
             description: Some(self.description),
             arguments: self.arguments,
@@ -162,8 +168,9 @@ struct FrontmatterArgument {
 }
 
 /// Parse a prompt file into metadata + body. Errors if the file has no `---`
-/// fenced frontmatter or the frontmatter is missing required fields.
-fn parse_prompt_file(path: &Path, content: &str) -> Result<ParsedPrompt, PromptError> {
+/// fenced frontmatter or the frontmatter is missing required fields. `path` is
+/// used only for diagnostics; the built-in provider passes a synthetic label.
+pub(crate) fn parse_prompt_file(path: &Path, content: &str) -> Result<ParsedPrompt, PromptError> {
     let (yaml, body) = split_frontmatter(content).ok_or_else(|| PromptError::Frontmatter {
         path: path.to_owned(),
         message: "missing YAML frontmatter (a prompt file must begin with a `---` fenced block)"
@@ -219,7 +226,7 @@ fn split_frontmatter(content: &str) -> Option<(String, String)> {
 /// Render `body` with `args`. Rejects unknown args (matching the MCP server's
 /// strict behavior, so a prompt behaves identically across stores), enforces
 /// required args, and renders missing optionals as empty via lenient undefined.
-fn render_template(
+pub(crate) fn render_template(
     name: &str,
     body: &str,
     declared: &[PromptArgument],

@@ -17,11 +17,18 @@
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
   import { preferences, saveStatus, updatePreferences } from "$lib/preferences.svelte";
   import McpServersSettings from "$lib/components/McpServersSettings.svelte";
-  import { localPromptsDir, openLocalPromptsDir } from "$lib/api";
+  import {
+    localPromptsDir,
+    openLocalPromptsDir,
+    workflowsDir as workflowsDirApi,
+    openWorkflowsDir,
+  } from "$lib/api";
 
   let { onClose }: { onClose: () => void } = $props();
   let promptsDir = $state<string | null>(null);
   let promptsDirError = $state<string | null>(null);
+  let workflowsDir = $state<string | null>(null);
+  let workflowsDirError = $state<string | null>(null);
 
   const themeOptions: { mode: ThemeMode; label: string }[] = [
     { mode: "system", label: "System" },
@@ -94,11 +101,26 @@
         promptsDir = null;
         promptsDirError = e instanceof Error ? e.message : String(e);
       });
+    void workflowsDirApi()
+      .then((path) => {
+        workflowsDir = path;
+        workflowsDirError = null;
+      })
+      .catch((e: unknown) => {
+        workflowsDir = null;
+        workflowsDirError = e instanceof Error ? e.message : String(e);
+      });
   });
 
   function openPromptsDir(): void {
     void openLocalPromptsDir().catch((e: unknown) => {
       console.error("[switchboard] open local prompts folder failed", e);
+    });
+  }
+
+  function openWorkflowsFolder(): void {
+    void openWorkflowsDir().catch((e: unknown) => {
+      console.error("[switchboard] open workflows folder failed", e);
     });
   }
 </script>
@@ -282,12 +304,100 @@
 
     <section class={cn(sectionClass, "mt-7")}>
       <div>
+        <h2 class={sectionHeadingClass}>Built-in content</h2>
+        <p class="text-muted mt-1 text-sm leading-relaxed">
+          Switchboard ships read-only example prompts and workflows that live in the app, not your
+          folders. To customize one, use “Copy to my prompts” / “Copy to my workflows” in its
+          picker, then edit your copy.
+        </p>
+      </div>
+
+      <div class="flex items-start justify-between gap-4">
+        <div class="min-w-0">
+          <div class="text-fg text-sm">Show built-in prompts &amp; workflows</div>
+          <p class="text-muted mt-0.5 text-xs leading-relaxed">
+            Turn this off to see only your own content in the prompt and workflow pickers.
+          </p>
+        </div>
+        <button
+          type="button"
+          role="switch"
+          aria-checked={preferences.show_builtins}
+          aria-label="Show built-in prompts and workflows"
+          data-testid="show-builtins-toggle"
+          class={cn(
+            "relative mt-0.5 inline-flex h-5 w-9 shrink-0 cursor-pointer items-center rounded-full transition-colors outline-none",
+            preferences.show_builtins ? "bg-accent" : "bg-border",
+          )}
+          onclick={() => void updatePreferences({ show_builtins: !preferences.show_builtins })}
+        >
+          <span
+            class={cn(
+              "bg-raised inline-block h-4 w-4 transform rounded-full transition-transform",
+              preferences.show_builtins ? "translate-x-4" : "translate-x-0.5",
+            )}
+          ></span>
+        </button>
+      </div>
+    </section>
+
+    <section class={cn(sectionClass, "mt-7")}>
+      <div>
+        <h2 class={sectionHeadingClass}>Workflows</h2>
+        <p class="text-muted mt-1 text-sm leading-relaxed">
+          Your workflows are user-global — the same set is available in every project. Drop YAML
+          files in this folder (or use “Copy to my workflows” on a built-in), then invoke them from
+          the compose bar's <span class="font-medium">Workflow</span> button.
+        </p>
+      </div>
+      <div
+        class="border-border bg-panel flex min-h-12 items-center gap-2 rounded-md border px-2.5 py-2"
+      >
+        <div class="min-w-0 flex-1">
+          <div class="text-muted text-xs leading-4">Workflows folder</div>
+          {#if workflowsDir}
+            <div
+              class="text-fg truncate font-mono text-[11px] leading-4"
+              title={workflowsDir}
+              data-testid="workflows-dir"
+            >
+              {workflowsDir}
+            </div>
+          {:else if workflowsDirError}
+            <div class="text-status-failed truncate text-xs leading-4" title={workflowsDirError}>
+              {workflowsDirError}
+            </div>
+          {:else}
+            <div class="text-muted truncate text-xs leading-4">Loading…</div>
+          {/if}
+        </div>
+        <Tooltip label="Open workflows folder in Finder" side="top">
+          {#snippet trigger(props)}
+            <button
+              {...props}
+              type="button"
+              class={cn(ICON_BUTTON_CLASS, "hover:bg-border/60 shrink-0")}
+              aria-label="Open workflows folder in Finder"
+              data-testid="workflows-open"
+              disabled={workflowsDir === null}
+              onclick={openWorkflowsFolder}
+            >
+              <FolderOpen size={14} strokeWidth={1.8} aria-hidden="true" />
+            </button>
+          {/snippet}
+        </Tooltip>
+      </div>
+    </section>
+
+    <section class={cn(sectionClass, "mt-7")}>
+      <div>
         <h2 class={sectionHeadingClass}>Prompt servers (MCP)</h2>
         <p class="text-muted mt-1 text-sm leading-relaxed">
           Add MCP servers that expose prompts (e.g. Tiddly). Their prompts become available to every
           agent via the compose bar. Bearer tokens are stored in your OS keychain, never in config.
         </p>
       </div>
+
       <div
         class="border-border bg-panel flex min-h-12 items-center gap-2 rounded-md border px-2.5 py-2"
       >

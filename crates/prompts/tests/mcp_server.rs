@@ -217,7 +217,14 @@ async fn unreachable_provider_contributes_nothing_without_breaking_local() {
     let (_tmp, service) = service_with("http://127.0.0.1:1/mcp", "any-bearer");
 
     service.sync().await;
-    let names: Vec<String> = service.list().into_iter().map(|p| p.name).collect();
+    // Scope to non-built-in prompts: a real service always lists the built-in
+    // library, which is irrelevant to this MCP-resilience assertion.
+    let names: Vec<String> = service
+        .list()
+        .into_iter()
+        .filter(|p| p.provider != switchboard_prompts::BUILTIN_PROVIDER)
+        .map(|p| p.name)
+        .collect();
 
     // The down provider drops out silently; the local prompt is unaffected.
     assert_eq!(names, vec!["note".to_owned()]);

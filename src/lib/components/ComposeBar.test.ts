@@ -7,6 +7,8 @@ import type { AgentRecord, NormalizedEvent, Prompt } from "$lib/types";
 // not inside the first test's timeout (cold CI transforms have no vite cache).
 // `vi.mock` is hoisted above imports, so the mocks below still apply.
 import ComposeBar from "./ComposeBar.svelte";
+import { workflowRuns, _testing as workflowsTesting } from "$lib/state/workflows.svelte";
+import type { WorkflowRunInfo } from "$lib/types";
 
 const invokeMock = vi.fn(
   async (_cmd: string, _args?: Record<string, unknown>): Promise<unknown> => null,
@@ -414,6 +416,45 @@ describe("ComposeBar", () => {
     await fireEvent.input(textarea, { target: { value: "ping @bo" } });
 
     expect(await screen.findByTestId("recipient-menu")).toBeInTheDocument();
+    expect(screen.queryByTestId("prompt-menu")).toBeNull();
+  });
+
+  it("opening the prompt menu (via /) closes an open workflow menu", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+
+    await fireEvent.click(screen.getByTestId("compose-workflow-button"));
+    expect(await screen.findByTestId("workflow-menu")).toBeInTheDocument();
+
+    // The `/` keyboard path opens the prompt menu; it must close the workflow
+    // menu (mirroring the workflow button, which closes the prompt menu) so the
+    // two popovers can't render stacked.
+    await fireEvent.keyDown(screen.getByTestId("compose-textarea"), { key: "/" });
+    expect(await screen.findByTestId("prompt-menu")).toBeInTheDocument();
+    expect(screen.queryByTestId("workflow-menu")).toBeNull();
+  });
+
+  it("dismisses the prompt menu on a click outside it, but not inside", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+
+    await fireEvent.click(screen.getByTestId("compose-prompt-button"));
+    expect(await screen.findByTestId("prompt-menu")).toBeInTheDocument();
+
+    // A pointer down inside the menu leaves it open (picking happens there).
+    await fireEvent.pointerDown(screen.getByTestId("prompt-menu-search"));
+    expect(screen.queryByTestId("prompt-menu")).toBeInTheDocument();
+
+    // A pointer down on the textarea — inside the compose box but outside the
+    // menu — dismisses it. The old hit region was the whole box, so an in-box
+    // click like this left the menu stuck open.
+    await fireEvent.pointerDown(screen.getByTestId("compose-textarea"));
     expect(screen.queryByTestId("prompt-menu")).toBeNull();
   });
 
@@ -945,6 +986,7 @@ describe("ComposeBar", () => {
       type: "turn_start",
       turn_id: "turn-1",
       message_id: "msg-1",
+      send_id: "msg-1",
       started_at: "2026-05-16T00:00:00Z",
     });
     await waitFor(() => expect(state.runtimes[AGENT_A.id]?.run_status).toBe("processing"));
@@ -1435,7 +1477,6 @@ describe("ComposeBar prompt mode", () => {
     expect((screen.getByTestId("prompt-appended") as HTMLTextAreaElement).disabled).toBe(true);
     expect((screen.getByTestId("prompt-preview-button") as HTMLButtonElement).disabled).toBe(true);
     expect((screen.getByTestId("prompt-remove") as HTMLButtonElement).disabled).toBe(true);
-    expect((screen.getByTestId("compose-prompt-button") as HTMLButtonElement).disabled).toBe(true);
     expect((chip(AGENT_A.id) as HTMLButtonElement).disabled).toBe(true);
     expect((chip(AGENT_B.id) as HTMLButtonElement).disabled).toBe(true);
     expect((screen.getByTestId("recipient-clear") as HTMLButtonElement).disabled).toBe(true);
@@ -2056,6 +2097,44 @@ describe("ComposeBar — cross-agent forward", () => {
     await resetHeldForwards();
   });
 
+  it("@ menu pane row adds missing members, dedups, and disappears once all are attached", async () => {
+    const panes = await import("$lib/state/transcriptPanes.svelte");
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    await state.registerAgent(AGENT_C);
+    const roster = [AGENT_A.id, AGENT_B.id, AGENT_C.id];
+    // Split into two non-empty panes (the @ menu only offers panes once split):
+    // "reviewers" = bob + carol; the default pane keeps alice.
+    const reviewers = panes.moveAgentToNewPane(PROJECT_ID, roster, AGENT_B.id);
+    panes.moveAgentToPane(PROJECT_ID, roster, AGENT_C.id, reviewers);
+    panes.renamePane(PROJECT_ID, roster, reviewers, "reviewers");
+
+    render(ComposeBar, {
+      props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B, AGENT_C] },
+    });
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+
+    // Attach one member (bob) on its own, then forward the whole pane from the @
+    // menu: only the missing member (carol) is added, bob isn't duplicated, and a
+    // pane chip never appears.
+    await pickForwardSource(AGENT_B.id);
+    await fireEvent.input(textarea, { target: { value: "@review" } });
+    await fireEvent.click(await screen.findByTestId(`forward-option-forward-pane:${reviewers}`));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("forward-source-chip-carol")).toBeInTheDocument(),
+    );
+    expect(screen.getAllByTestId("forward-source-chip-bob")).toHaveLength(1);
+    expect(screen.queryByTestId("forward-source-chip-reviewers")).toBeNull();
+
+    // Both members now attached → the pane row is suppressed (picking it would be a
+    // no-op), while the still-forwardable alice keeps the menu open.
+    await fireEvent.input(textarea, { target: { value: "@" } });
+    await screen.findByTestId(`forward-option-forward-agent:${AGENT_A.id}`);
+    expect(screen.queryByTestId(`forward-option-forward-pane:${reviewers}`)).toBeNull();
+  });
+
   it("picks a forward source from the @ menu and dispatches a forward", async () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);
@@ -2168,6 +2247,7 @@ describe("ComposeBar — cross-agent forward", () => {
       type: "turn_start",
       turn_id: "t-a",
       message_id: "msg-fwd",
+      send_id: "msg-fwd",
       started_at: "2026-05-16T00:00:00Z",
     });
     await waitFor(() => {
@@ -2300,6 +2380,70 @@ describe("ComposeBar — cross-agent forward", () => {
     expect(invokeMock.mock.calls.filter(([c]) => c === "send_message")).toHaveLength(0);
   });
 
+  it("a pane-selected manual forward holds individual agent sources (not a pane)", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    await seedCompletedTurn(AGENT_A.id);
+    await seedCompletedTurn(AGENT_B.id);
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "forward_message") return new Promise(() => {}); // holds forever
+      return null;
+    });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    // Expand the default pane to its members, then submit.
+    await fireEvent.keyDown(window, { key: "1", metaKey: true, ctrlKey: true });
+    await waitFor(() =>
+      expect(screen.getByTestId("forward-source-chip-alice")).toBeInTheDocument(),
+    );
+    await fireEvent.input(screen.getByTestId("compose-textarea"), { target: { value: "go" } });
+    await fireEvent.click(screen.getByTestId("compose-send"));
+
+    // The held entry carries one agent source per member — no pane grouping.
+    const held = await import("$lib/state/heldForwards.svelte");
+    await waitFor(() => {
+      const forwards = held.heldForwardsFor(PROJECT_ID);
+      expect(forwards).toHaveLength(1);
+      expect(forwards[0]?.sources).toEqual([
+        { id: AGENT_A.id, name: "alice" },
+        { id: AGENT_B.id, name: "bob" },
+      ]);
+    });
+  });
+
+  it("restores individual agent chips when a pane-selected forward is cancelled", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    await seedCompletedTurn(AGENT_A.id);
+    await seedCompletedTurn(AGENT_B.id);
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "forward_message") return { status: "cancelled" };
+      return null;
+    });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    await fireEvent.keyDown(window, { key: "1", metaKey: true, ctrlKey: true });
+    await waitFor(() =>
+      expect(screen.getByTestId("forward-source-chip-alice")).toBeInTheDocument(),
+    );
+    await fireEvent.input(screen.getByTestId("compose-textarea"), {
+      target: { value: "aggregate" },
+    });
+    await fireEvent.click(screen.getByTestId("compose-send"));
+
+    // The composer comes back with the member agent chips (not a pane chip) and
+    // the typed draft intact.
+    await waitFor(() => {
+      expect(screen.getByTestId("forward-source-chip-alice")).toBeInTheDocument();
+      expect(screen.getByTestId("forward-source-chip-bob")).toBeInTheDocument();
+      expect((screen.getByTestId("compose-textarea") as HTMLTextAreaElement).value).toBe(
+        "aggregate",
+      );
+    });
+  });
+
   it("removes the held forward when it resolves after the user switches projects", async () => {
     // Regression: the held "waiting for…" row used to stick forever if the user
     // navigated to another project while a forward was holding (and stack across
@@ -2385,25 +2529,39 @@ describe("ComposeBar — cross-agent forward", () => {
     await fireEvent.click(await screen.findByTestId(`forward-picker-agent-${agentId}`));
   }
 
-  it("⌘⌃1 forwards from pane 1 as a single named chip (mirrors ⌘⌥1 targeting)", async () => {
+  it("⌘⌃1 forwards pane 1 as one chip per member agent (mirrors ⌘⌥1 targeting)", async () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);
     await state.registerAgent(AGENT_B);
 
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
-    // The default pane "Pane 1" holds every agent; ⌘⌃1 adds it as one pane chip
-    // (expanded to its members only at dispatch), not one chip per agent.
+    // The default pane "Pane 1" holds every agent; ⌘⌃1 expands it to one chip per
+    // member agent — a pane is a selection shortcut, never a stored pane chip.
     await fireEvent.keyDown(window, { key: "1", metaKey: true, ctrlKey: true });
 
     await waitFor(() => {
-      const chip = screen.getByTestId("forward-source-chip-Pane 1");
-      expect(chip).toHaveAttribute("data-kind", "pane");
+      expect(screen.getByTestId("forward-source-chip-alice")).toBeInTheDocument();
+      expect(screen.getByTestId("forward-source-chip-bob")).toBeInTheDocument();
     });
-    expect(screen.queryByTestId("forward-source-chip-alice")).toBeNull();
-    expect(screen.queryByTestId("forward-source-chip-bob")).toBeNull();
+    expect(screen.queryByTestId("forward-source-chip-Pane 1")).toBeNull();
   });
 
-  it("a pane forward chip dispatches expanded to its member agent ids", async () => {
+  it("re-picking a pane and an already-attached agent does not duplicate chips", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    // Attach one agent via the picker, then expand the whole pane via the chord:
+    // alice must not appear twice.
+    await pickForwardSource(AGENT_A.id);
+    await fireEvent.keyDown(window, { key: "1", metaKey: true, ctrlKey: true });
+
+    await waitFor(() => expect(screen.getByTestId("forward-source-chip-bob")).toBeInTheDocument());
+    expect(screen.getAllByTestId("forward-source-chip-alice")).toHaveLength(1);
+  });
+
+  it("a pane-expanded forward dispatches its member agent ids", async () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);
     await state.registerAgent(AGENT_B);
@@ -2418,12 +2576,12 @@ describe("ComposeBar — cross-agent forward", () => {
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
     await fireEvent.keyDown(window, { key: "1", metaKey: true, ctrlKey: true });
     await waitFor(() =>
-      expect(screen.getByTestId("forward-source-chip-Pane 1")).toBeInTheDocument(),
+      expect(screen.getByTestId("forward-source-chip-alice")).toBeInTheDocument(),
     );
     await fireEvent.input(screen.getByTestId("compose-textarea"), { target: { value: "go" } });
     await fireEvent.click(screen.getByTestId("compose-send"));
 
-    // The single pane chip expands to its member agent ids on the wire.
+    // The member agent chips ride the wire as their agent ids.
     await waitFor(() => {
       const calls = invokeMock.mock.calls.filter(([c]) => c === "forward_message");
       expect(calls).toHaveLength(1);
@@ -2451,7 +2609,7 @@ describe("ComposeBar — cross-agent forward", () => {
     expect(screen.queryByTestId("forward-source-chips")).toBeNull();
   });
 
-  it("⌘⌃N does nothing in prompt mode (no hidden forward source added)", async () => {
+  it("⌘⌃N forwards a pane into the focused prompt field as member agents (not the hidden message set)", async () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);
     await state.registerAgent(AGENT_B);
@@ -2459,13 +2617,19 @@ describe("ComposeBar — cross-agent forward", () => {
 
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
     await enterPromptMode("prompt-option-local:review");
+
+    // The chord targets whichever field is focused (it's inert otherwise), so
+    // focus an argument field, then fire it.
+    (screen.getByTestId("prompt-arg-focus") as HTMLTextAreaElement).focus();
     await fireEvent.keyDown(window, { key: "1", metaKey: true, ctrlKey: true });
 
-    // No chip while in prompt mode (the forward set is hidden there), and nothing
-    // resurfaces after the prompt is removed — the shortcut never mutated it.
-    expect(screen.queryByTestId("forward-source-chip-Pane 1")).toBeNull();
-    await fireEvent.click(screen.getByTestId("prompt-remove"));
-    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
+    // The pane lands as one chip per member agent on that field — not on the
+    // whole-message forward set, which stays hidden in prompt mode.
+    await waitFor(() => {
+      const field = screen.getByTestId("prompt-arg-sources-focus");
+      expect(field.querySelector('[data-testid="forward-source-chip-alice"]')).not.toBeNull();
+      expect(field.querySelector('[data-testid="forward-source-chip-bob"]')).not.toBeNull();
+    });
     expect(screen.queryByTestId("forward-source-chips")).toBeNull();
   });
 
@@ -2704,5 +2868,561 @@ describe("ComposeBar — cross-agent forward", () => {
     });
     // Chips clear once the forward has dispatched.
     await waitFor(() => expect(screen.queryByTestId("attachment-chip-image-1")).toBeNull());
+  });
+
+  it("enters workflow mode, resolves the form, and invokes with declared + derived values", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    const WORKFLOW = {
+      name: "review-and-recommend",
+      is_builtin: true,
+      description: "d",
+      inputs: [
+        { name: "reviewers", ty: "agent_list", optional: false, description: null },
+        { name: "worker", ty: "agent", optional: false, description: null },
+      ],
+      invocable: true,
+      parse_error: null,
+    };
+    // The descriptor adds the auto-derived `context` arg (optional) from the
+    // hardcoded code-review prompt.
+    const DESCRIPTOR = {
+      name: "review-and-recommend",
+      description: "d",
+      is_builtin: true,
+      invocable: true,
+      inputs: WORKFLOW.inputs,
+      steps: [],
+      derived_args: [
+        {
+          name: "context",
+          required: false,
+          description: "Optional background",
+          prompts: ["builtin:code-review"],
+        },
+      ],
+      compatibility: { state: "ok" },
+    };
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "list_workflows") return [WORKFLOW];
+      if (cmd === "describe_workflow_form") return DESCRIPTOR;
+      if (cmd === "list_prompts") return [];
+      if (cmd === "invoke_workflow") return "run-1";
+      return null;
+    });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+
+    await fireEvent.click(screen.getByTestId("compose-workflow-button"));
+    await waitFor(() => screen.getByTestId("workflow-option-builtin:review-and-recommend"));
+    await fireEvent.click(screen.getByTestId("workflow-option-builtin:review-and-recommend"));
+
+    // Workflow mode: the composer renders, and the To field + message forward
+    // affordance are hidden (the workflow owns routing via its agent inputs).
+    expect(screen.getByTestId("workflow-composer")).toBeInTheDocument();
+    expect(screen.queryByTestId("recipient-field")).toBeNull();
+    expect(screen.queryByTestId("compose-forward-button")).toBeNull();
+
+    // The auto-derived `context` field renders; no prompt-picker control exists.
+    await waitFor(() => screen.getByTestId("workflow-arg-input-context"));
+    expect(screen.queryByTestId("workflow-prompt-review_prompt")).toBeNull();
+
+    // Fill the required agent inputs and the optional derived arg.
+    await fireEvent.click(screen.getByTestId("workflow-agent-reviewers-bob"));
+    await fireEvent.click(screen.getByTestId("workflow-agent-worker-alice"));
+    await fireEvent.input(screen.getByTestId("workflow-arg-input-context"), {
+      target: { value: "focus on error handling" },
+    });
+
+    await fireEvent.click(screen.getByTestId("workflow-invoke-button"));
+    await waitFor(() => {
+      expect(invokeMock.mock.calls.some(([c]) => c === "invoke_workflow")).toBe(true);
+    });
+    const call = invokeMock.mock.calls.find(([c]) => c === "invoke_workflow");
+    expect(call?.[1]).toMatchObject({
+      projectId: PROJECT_ID,
+      name: "review-and-recommend",
+      isBuiltin: true,
+      inputs: {
+        reviewers: ["bob"],
+        worker: "alice",
+        context: "focus on error handling",
+      },
+      // No field had a forward attached, so the map is present but empty.
+      forwardSources: {},
+    });
+  });
+
+  it("runs the workflow on ⌘Enter from inside a workflow form field", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    const WORKFLOW = {
+      name: "review-and-recommend",
+      is_builtin: true,
+      description: "d",
+      inputs: [
+        { name: "reviewers", ty: "agent_list", optional: false, description: null },
+        { name: "worker", ty: "agent", optional: false, description: null },
+      ],
+      invocable: true,
+      parse_error: null,
+    };
+    const DESCRIPTOR = {
+      name: "review-and-recommend",
+      description: "d",
+      is_builtin: true,
+      invocable: true,
+      inputs: WORKFLOW.inputs,
+      steps: [],
+      derived_args: [
+        {
+          name: "context",
+          required: false,
+          description: "Optional",
+          prompts: ["builtin:code-review"],
+        },
+      ],
+      compatibility: { state: "ok" },
+    };
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "list_workflows") return [WORKFLOW];
+      if (cmd === "describe_workflow_form") return DESCRIPTOR;
+      if (cmd === "list_prompts") return [];
+      if (cmd === "invoke_workflow") return "run-1";
+      return null;
+    });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    await fireEvent.click(screen.getByTestId("compose-workflow-button"));
+    await waitFor(() => screen.getByTestId("workflow-option-builtin:review-and-recommend"));
+    await fireEvent.click(screen.getByTestId("workflow-option-builtin:review-and-recommend"));
+    await waitFor(() => screen.getByTestId("workflow-arg-input-context"));
+    await fireEvent.click(screen.getByTestId("workflow-agent-reviewers-bob"));
+    await fireEvent.click(screen.getByTestId("workflow-agent-worker-alice"));
+
+    // ⌘Enter from inside a form field runs it — no click on the invoke button.
+    const field = screen.getByTestId("workflow-arg-input-context") as HTMLTextAreaElement;
+    field.focus();
+    await fireEvent.keyDown(window, { key: "Enter", metaKey: true });
+
+    await waitFor(() =>
+      expect(invokeMock.mock.calls.some(([c]) => c === "invoke_workflow")).toBe(true),
+    );
+    workflowsTesting.reset();
+  });
+
+  it("invokes a workflow with a forward source attached to a derived field", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    const WORKFLOW = {
+      name: "review-and-recommend",
+      is_builtin: true,
+      description: "d",
+      inputs: [{ name: "worker", ty: "agent", optional: false, description: null }],
+      invocable: true,
+      parse_error: null,
+    };
+    const DESCRIPTOR = {
+      name: "review-and-recommend",
+      description: "d",
+      is_builtin: true,
+      invocable: true,
+      inputs: WORKFLOW.inputs,
+      steps: [],
+      derived_args: [
+        {
+          name: "context",
+          required: false,
+          description: "Optional background",
+          prompts: ["builtin:code-review"],
+        },
+      ],
+      compatibility: { state: "ok" },
+    };
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "list_workflows") return [WORKFLOW];
+      if (cmd === "describe_workflow_form") return DESCRIPTOR;
+      if (cmd === "list_prompts") return [];
+      if (cmd === "invoke_workflow") return "run-1";
+      return null;
+    });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+
+    await fireEvent.click(screen.getByTestId("compose-workflow-button"));
+    await waitFor(() => screen.getByTestId("workflow-option-builtin:review-and-recommend"));
+    await fireEvent.click(screen.getByTestId("workflow-option-builtin:review-and-recommend"));
+
+    await waitFor(() => screen.getByTestId("workflow-arg-input-context"));
+    await fireEvent.click(screen.getByTestId("workflow-agent-worker-alice"));
+
+    // Forward alice's output into the derived `context` field (in place of typing).
+    await fireEvent.click(screen.getByTestId("workflow-forward-picker-context"));
+    await fireEvent.click(await screen.findByTestId(`forward-picker-agent-${AGENT_A.id}`));
+    await waitFor(() => screen.getByTestId("forward-source-chip-alice"));
+
+    await fireEvent.click(screen.getByTestId("workflow-invoke-button"));
+    await waitFor(() => {
+      expect(invokeMock.mock.calls.some(([c]) => c === "invoke_workflow")).toBe(true);
+    });
+    const call = invokeMock.mock.calls.find(([c]) => c === "invoke_workflow");
+    // The pane-expanded agent ids land under the field name.
+    expect(call?.[1]).toMatchObject({
+      name: "review-and-recommend",
+      forwardSources: { context: [AGENT_A.id] },
+    });
+  });
+
+  it("resolves an unresolved workflow form on prompts:synced without a re-pick", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    const WORKFLOW = {
+      name: "mcp-flow",
+      is_builtin: false,
+      description: "d",
+      inputs: [{ name: "worker", ty: "agent", optional: false, description: null }],
+      invocable: true,
+      parse_error: null,
+    };
+    const BASE = {
+      name: "mcp-flow",
+      description: "d",
+      is_builtin: false,
+      invocable: true,
+      inputs: WORKFLOW.inputs,
+      steps: [],
+      derived_args: [] as unknown[],
+    };
+    // The first describe lands while the MCP prompt is still cold (unresolved);
+    // after a sync the same call resolves to ok.
+    let synced = false;
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "list_workflows") return [WORKFLOW];
+      if (cmd === "list_prompts") return [];
+      if (cmd === "describe_workflow_form") {
+        return synced
+          ? { ...BASE, compatibility: { state: "ok" } }
+          : { ...BASE, compatibility: { state: "unresolved", prompts: ["tiddly:x"] } };
+      }
+      return null;
+    });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await fireEvent.click(screen.getByTestId("compose-workflow-button"));
+    await waitFor(() => screen.getByTestId("workflow-option-dir:mcp-flow"));
+    await fireEvent.click(screen.getByTestId("workflow-option-dir:mcp-flow"));
+
+    // Pending affordance shown; the agent field is withheld until resolution.
+    await waitFor(() => screen.getByTestId("workflow-resolving"));
+    expect(screen.queryByTestId("workflow-agent-worker-alice")).toBeNull();
+
+    // A completed sync re-fetches the descriptor, which now resolves → fields render.
+    synced = true;
+    listeners.get("prompts:synced")?.({ payload: null as unknown as NormalizedEvent });
+    await waitFor(() => screen.getByTestId("workflow-agent-worker-alice"));
+    expect(screen.queryByTestId("workflow-resolving")).toBeNull();
+  });
+
+  it("escalates a still-unresolved workflow to a not-found error after a sync settles", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    const WORKFLOW = {
+      name: "mcp-gone",
+      is_builtin: false,
+      description: "d",
+      inputs: [{ name: "worker", ty: "agent", optional: false, description: null }],
+      invocable: true,
+      parse_error: null,
+    };
+    // The MCP prompt is missing and a sync does not produce it — the descriptor is
+    // unresolved before and after the sync.
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "list_workflows") return [WORKFLOW];
+      if (cmd === "list_prompts") return [];
+      if (cmd === "describe_workflow_form") {
+        return {
+          name: "mcp-gone",
+          description: "d",
+          is_builtin: false,
+          invocable: true,
+          inputs: WORKFLOW.inputs,
+          steps: [],
+          derived_args: [],
+          compatibility: { state: "unresolved", prompts: ["tiddly:gone"] },
+        };
+      }
+      return null;
+    });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await fireEvent.click(screen.getByTestId("compose-workflow-button"));
+    await waitFor(() => screen.getByTestId("workflow-option-dir:mcp-gone"));
+    await fireEvent.click(screen.getByTestId("workflow-option-dir:mcp-gone"));
+
+    // Before a sync settles → pending spinner, not an error.
+    await waitFor(() => screen.getByTestId("workflow-resolving"));
+    expect(screen.queryByTestId("workflow-prompt-missing")).toBeNull();
+
+    // After a sync settles and it's still unresolved → blocking not-found error.
+    listeners.get("prompts:synced")?.({ payload: null as unknown as NormalizedEvent });
+    await waitFor(() => screen.getByTestId("workflow-prompt-missing"));
+    expect(screen.queryByTestId("workflow-resolving")).toBeNull();
+  });
+
+  it("drops a stale workflow-form reply that resolves out of order", async () => {
+    // The generation-token guard: an older describe reply that lands after a newer
+    // one must not overwrite the form. Drive two re-fetches whose replies resolve
+    // in reverse order and assert the newer (ok) wins, not the older (unresolved).
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    const WORKFLOW = {
+      name: "race",
+      is_builtin: false,
+      description: "d",
+      inputs: [{ name: "worker", ty: "agent", optional: false, description: null }],
+      invocable: true,
+      parse_error: null,
+    };
+    const base = {
+      name: "race",
+      description: "d",
+      is_builtin: false,
+      invocable: true,
+      inputs: WORKFLOW.inputs,
+      steps: [],
+      derived_args: [] as unknown[],
+    };
+    const pending: Array<(d: unknown) => void> = [];
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "list_workflows") return [WORKFLOW];
+      if (cmd === "list_prompts") return [];
+      if (cmd === "describe_workflow_form") {
+        return new Promise((resolve) => pending.push(resolve));
+      }
+      return null;
+    });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await fireEvent.click(screen.getByTestId("compose-workflow-button"));
+    await waitFor(() => screen.getByTestId("workflow-option-dir:race"));
+    await fireEvent.click(screen.getByTestId("workflow-option-dir:race")); // fetch #1 (gen 1)
+    // Two prompt syncs trigger two more re-fetches (gen 2, then gen 3).
+    listeners.get("prompts:synced")?.({ payload: null as unknown as NormalizedEvent });
+    listeners.get("prompts:synced")?.({ payload: null as unknown as NormalizedEvent });
+    await waitFor(() => expect(pending.length).toBe(3));
+
+    // Resolve the NEWEST (gen 3) as ok, then an older (gen 1) as unresolved.
+    pending[2]?.({ ...base, compatibility: { state: "ok" } });
+    await waitFor(() => screen.getByTestId("workflow-agent-worker-alice"));
+    pending[0]?.({ ...base, compatibility: { state: "unresolved", prompts: ["tiddly:x"] } });
+    await tick();
+
+    // The stale unresolved reply is ignored — the form stays resolved.
+    expect(screen.getByTestId("workflow-agent-worker-alice")).toBeInTheDocument();
+    expect(screen.queryByTestId("workflow-resolving")).toBeNull();
+  });
+});
+
+describe("ComposeBar — workflow run live view (swap / hold / stop)", () => {
+  function run(over: Partial<WorkflowRunInfo> = {}): WorkflowRunInfo {
+    return {
+      run_id: "run-1",
+      workflow: "review-and-recommend",
+      step: 0,
+      total: 3,
+      status: "running",
+      reason: null,
+      steps: [
+        {
+          kind: "send",
+          label: "Send the review",
+          description: null,
+          prompt: { kind: "named", id: "builtin:code-review" },
+          recipients: [{ kind: "literal", name: "alice" }],
+          feeds_from: [],
+        },
+        {
+          kind: "wait",
+          label: "Wait for reviews",
+          description: null,
+          prompt: null,
+          recipients: [{ kind: "literal", name: "alice" }],
+          feeds_from: [],
+        },
+        {
+          kind: "send",
+          label: "Hand off",
+          description: null,
+          prompt: { kind: "inline" },
+          recipients: [{ kind: "literal", name: "bob" }],
+          feeds_from: [],
+        },
+      ],
+      ...over,
+    };
+  }
+
+  beforeEach(() => workflowsTesting.reset());
+  afterEach(() => workflowsTesting.reset());
+
+  it("replaces compose with the live progress view while a workflow runs", async () => {
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    expect(screen.getByTestId("compose-box")).toBeInTheDocument();
+
+    workflowRuns[PROJECT_ID] = [run()];
+    await tick();
+
+    expect(screen.getByTestId("workflow-run-live")).toBeInTheDocument();
+    // The compose box (and any send path) is GONE, not merely disabled.
+    expect(screen.queryByTestId("compose-box")).toBeNull();
+    expect(screen.queryByTestId("compose-textarea")).toBeNull();
+    expect(screen.queryByTestId("compose-send")).toBeNull();
+    // Labeled steps render, with the active step on step 0.
+    expect(screen.getByTestId("workflow-step-0")).toHaveTextContent("Send the review");
+    expect(screen.getByTestId("workflow-step-0")).toHaveAttribute("data-step-state", "active");
+  });
+
+  it("restores compose when the run completes and drops from state", async () => {
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    workflowRuns[PROJECT_ID] = [run()];
+    await tick();
+    expect(screen.getByTestId("workflow-run-live")).toBeInTheDocument();
+
+    // complete/cancelled remove the run from state.
+    workflowRuns[PROJECT_ID] = [];
+    await tick();
+    expect(screen.getByTestId("compose-box")).toBeInTheDocument();
+    expect(screen.queryByTestId("workflow-run-live")).toBeNull();
+  });
+
+  it("holds on a failed run and Dismiss abandons it", async () => {
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    workflowRuns[PROJECT_ID] = [run({ status: "failed", step: 1, reason: "agent is busy" })];
+    await tick();
+
+    // Held (no Stop), showing the failed step + reason. The send + its wait
+    // collapse into one node [0,1]; a failure at step 1 fails that node (index 0).
+    expect(screen.getByTestId("workflow-run-live")).toHaveAttribute("data-run-status", "failed");
+    expect(screen.queryByTestId("workflow-run-stop")).toBeNull();
+    expect(screen.getByTestId("workflow-step-0")).toHaveAttribute("data-step-state", "failed");
+    expect(screen.getByTestId("workflow-step-reason-0")).toHaveTextContent("agent is busy");
+
+    await fireEvent.click(screen.getByTestId("workflow-run-dismiss"));
+    const call = invokeMock.mock.calls.find(([c]) => c === "abandon_workflow_run");
+    expect(call?.[1]).toMatchObject({ projectId: PROJECT_ID, runId: "run-1" });
+  });
+
+  it("Stop cancels the workflow run", async () => {
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    workflowRuns[PROJECT_ID] = [run()];
+    await tick();
+
+    await fireEvent.click(screen.getByTestId("workflow-run-stop"));
+    const call = invokeMock.mock.calls.find(([c]) => c === "cancel_workflow_run");
+    expect(call?.[1]).toMatchObject({ runId: "run-1" });
+  });
+
+  it("renders a fallback count line when steps are absent (legacy/pre-refresh)", async () => {
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    workflowRuns[PROJECT_ID] = [run({ steps: [] })];
+    await tick();
+    expect(screen.getByTestId("workflow-run-fallback")).toHaveTextContent("Step 1 of 3");
+  });
+
+  it("holds the lockout via an optimistic row when the post-invoke refresh fails", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    const WORKFLOW = {
+      name: "review-and-recommend",
+      is_builtin: true,
+      description: "d",
+      inputs: [
+        { name: "reviewers", ty: "agent_list", optional: false, description: null },
+        { name: "worker", ty: "agent", optional: false, description: null },
+      ],
+      invocable: true,
+      parse_error: null,
+    };
+    const DESCRIPTOR = {
+      name: "review-and-recommend",
+      description: "d",
+      is_builtin: true,
+      invocable: true,
+      inputs: WORKFLOW.inputs,
+      steps: [
+        {
+          kind: "send",
+          label: "Send the review",
+          description: null,
+          prompt: { kind: "named", id: "builtin:code-review" },
+          recipients: [{ kind: "slot", input: "reviewers" }],
+          feeds_from: [],
+        },
+      ],
+      derived_args: [],
+      compatibility: { state: "ok" },
+    };
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "list_workflows") return [WORKFLOW];
+      if (cmd === "describe_workflow_form") return DESCRIPTOR;
+      if (cmd === "list_prompts") return [];
+      if (cmd === "invoke_workflow") return "run-opt";
+      // The follow-up seed fails — the lockout must NOT depend on it.
+      if (cmd === "list_workflow_runs") throw new Error("transient backend error");
+      return null;
+    });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    await fireEvent.click(screen.getByTestId("compose-workflow-button"));
+    await waitFor(() => screen.getByTestId("workflow-option-builtin:review-and-recommend"));
+    await fireEvent.click(screen.getByTestId("workflow-option-builtin:review-and-recommend"));
+    await waitFor(() => screen.getByTestId("workflow-composer"));
+    await fireEvent.click(screen.getByTestId("workflow-agent-reviewers-bob"));
+    await fireEvent.click(screen.getByTestId("workflow-agent-worker-alice"));
+    await fireEvent.click(screen.getByTestId("workflow-invoke-button"));
+
+    // Refresh rejected, but the optimistic row keeps the compose box gone.
+    await waitFor(() => expect(screen.getByTestId("workflow-run-live")).toBeInTheDocument());
+    expect(screen.queryByTestId("compose-box")).toBeNull();
+    expect(screen.queryByTestId("compose-textarea")).toBeNull();
+    expect(screen.getByTestId("workflow-step-0")).toHaveTextContent("Send the review");
+  });
+
+  it("surfaces a Dismiss failure inline and keeps the run held", async () => {
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "abandon_workflow_run") throw new Error("file is gone");
+      return null;
+    });
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    workflowRuns[PROJECT_ID] = [run({ status: "failed", step: 1, reason: "boom" })];
+    await tick();
+
+    await fireEvent.click(screen.getByTestId("workflow-run-dismiss"));
+    await waitFor(() =>
+      expect(screen.getByTestId("workflow-run-error")).toHaveTextContent("Couldn't dismiss"),
+    );
+    // Still held — the run wasn't cleared.
+    expect(screen.getByTestId("workflow-run-live")).toBeInTheDocument();
+  });
+
+  it("surfaces a Stop failure inline and keeps the run live", async () => {
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "cancel_workflow_run") throw new Error("backend gone");
+      return null;
+    });
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    workflowRuns[PROJECT_ID] = [run()]; // running → Stop control
+    await tick();
+
+    await fireEvent.click(screen.getByTestId("workflow-run-stop"));
+    await waitFor(() =>
+      expect(screen.getByTestId("workflow-run-error")).toHaveTextContent("Couldn't stop"),
+    );
+    // Still live — the run wasn't cleared.
+    expect(screen.getByTestId("workflow-run-live")).toBeInTheDocument();
   });
 });

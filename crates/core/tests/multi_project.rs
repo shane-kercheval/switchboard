@@ -85,18 +85,21 @@ fn assert_layout(directory: &Path, project_ids: &[uuid::Uuid]) {
     let sb = directory.join(".switchboard");
     assert!(sb.is_dir(), ".switchboard/ should exist");
 
-    for relative in ["config.yaml", "workflows", "projects.jsonl", "projects"] {
+    for relative in ["config.yaml", "projects.jsonl", "projects"] {
         let path = sb.join(relative);
         assert!(path.exists(), "missing {relative} under .switchboard/");
     }
-    assert!(sb.join("workflows").is_dir());
     assert!(sb.join("projects").is_dir());
 
-    // Prompts are user-global, not directory-scoped (system-design §6), so init
-    // must NOT create a per-directory prompts/ store.
+    // Prompts and workflows are user-global, not directory-scoped (system-design
+    // §3/§6), so init must NOT create per-directory prompts/ or workflows/ stores.
     assert!(
         !sb.join("prompts").exists(),
         "init must not create a directory-scoped prompts/ dir"
+    );
+    assert!(
+        !sb.join("workflows").exists(),
+        "init must not create a directory-scoped workflows/ dir"
     );
 
     // Initial layout must NOT eagerly create artifacts that only get

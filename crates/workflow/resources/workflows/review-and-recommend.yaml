@@ -1,0 +1,35 @@
+name: review-and-recommend
+description: Fan a code review out to several reviewers in parallel, then hand the combined feedback to a worker agent for recommendations.
+# The review prompt is hardcoded (`builtin:code-review`). Its `context` argument
+# is not declared as an input — it is auto-derived from the prompt and offered as
+# a user-fillable field at invocation.
+#
+# Labels name the *deliverable* each step produces (a noun phrase), not the
+# dispatch ("Send … to …"); the progress view shows agents alongside. The `wait`
+# labels are absorbed into the preceding send in the collapsed progress view.
+inputs:
+  reviewers:
+    type: [agent]
+    description: The agents that review in parallel. Each receives the review prompt and works independently.
+  worker:
+    type: agent
+    description: The agent that receives every reviewer's combined feedback and produces the recommendations.
+steps:
+  - label: Code review
+    description: Each reviewer independently reviews the current changes in parallel.
+    send:
+      to: "{{ reviewers }}"
+      prompt: "builtin:code-review"
+  - label: Reviews received
+    wait_for_all:
+      agents: "{{ reviewers }}"
+  - label: Recommendations
+    description: The worker reads the combined reviews and produces prioritized recommendations.
+    send:
+      to: "{{ worker }}"
+      text: |
+        Here's feedback from several reviewers:
+
+        {{ aggregated_responses(reviewers) }}
+
+        Let me know what your recommendations are.

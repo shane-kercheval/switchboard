@@ -113,6 +113,15 @@ export const navFocus = $state<{ pane: "commits" | "files" | null }>({ pane: nul
 /// next pointer move, so hover returns the instant the mouse is used again.
 export const hoverSuppressed = $state<{ value: boolean }>({ value: false });
 
+/// A hover-only class (background or `group-hover:` reveal) gated on
+/// [`hoverSuppressed`]: empty while keyboard navigation is active, so the rule
+/// doesn't fire under a stationary mouse, and back to `cls` on the next pointer
+/// move. Used wherever a Git-view row's mouse-hover affordance must yield to the
+/// keyboard selection.
+export function hoverableClass(cls: string): string {
+  return hoverSuppressed.value ? "" : cls;
+}
+
 /// Repo roots whose worktree-actions menu is currently open. The commit keyboard
 /// navigator bails while any is open so the arrows drive the menu, not the commit
 /// list — global (not node-local) so a menu open in one repo also yields the keys

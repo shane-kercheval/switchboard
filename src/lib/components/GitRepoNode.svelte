@@ -52,6 +52,7 @@
     navFocus,
     nextCommitSelection,
     hoverSuppressed,
+    hoverableClass,
     setWorktreeMenuOpen,
     anyWorktreeMenuOpen,
     setViewMode,
@@ -86,12 +87,12 @@
 
   // Row hover is suppressed right after a keyboard move so the mouse-hovered row
   // doesn't stay lit alongside the keyboard selection; it returns on pointer move.
-  const hoverBg = $derived(hoverSuppressed.value ? "" : "hover:bg-raised");
+  const hoverBg = $derived(hoverableClass("hover:bg-raised"));
 
   // The on-hover actions trigger (`…`) is keyed on the real mouse `:hover`, so it
   // must be suppressed alongside the row background — otherwise it lingers under
   // the cursor during commit keyboard nav. Focus/open reveals stay.
-  const triggerHoverReveal = $derived(hoverSuppressed.value ? "" : "group-hover:opacity-100");
+  const triggerHoverReveal = $derived(hoverableClass("group-hover:opacity-100"));
 
   // The default branch anchors the branch list even when it has no local folder.
   // Other folderless branches stay hidden until the user asks for inactive ones.

@@ -36,7 +36,7 @@
   import { shortcut } from "$lib/platform";
   import { preferences, updatePreferences } from "$lib/preferences.svelte";
   import type { ChangedFile, ChangeKind, DiffStyle, FileDiff } from "$lib/types";
-  import { navFocus, hoverSuppressed, nextIndex } from "$lib/state/gitView.svelte";
+  import { navFocus, hoverSuppressed, hoverableClass, nextIndex } from "$lib/state/gitView.svelte";
   import { palette } from "$lib/state/commandPalette.svelte";
   import type { DiffTarget } from "$lib/state/gitView.svelte";
 
@@ -172,7 +172,7 @@
   // Drop the file-row hover highlight right after a keyboard move so the mouse-
   // hovered row doesn't stay lit next to the keyboard selection; pointer movement
   // (handled below) clears the suppression and hover returns.
-  const hoverBg = $derived(hoverSuppressed.value ? "" : "hover:bg-raised");
+  const hoverBg = $derived(hoverableClass("hover:bg-raised"));
 
   // The action-icons reveal (and the room the row text makes for it) is keyed on
   // the real mouse `:hover` via `group-hover`, so it must be suppressed alongside
@@ -180,17 +180,15 @@
   // cursor on the row the keyboard just left. `group-focus-within` stays so
   // keyboard focus still reveals them.
   const iconsHoverReveal = $derived(
-    hoverSuppressed.value ? "" : "group-hover:pointer-events-auto group-hover:opacity-100",
+    hoverableClass("group-hover:pointer-events-auto group-hover:opacity-100"),
   );
   const padFocus = $derived(
     target.kind === "uncommitted" ? "group-focus-within:pr-[5.75rem]" : "group-focus-within:pr-10",
   );
   const padHoverReveal = $derived(
-    hoverSuppressed.value
-      ? ""
-      : target.kind === "uncommitted"
-        ? "group-hover:pr-[5.75rem]"
-        : "group-hover:pr-10",
+    hoverableClass(
+      target.kind === "uncommitted" ? "group-hover:pr-[5.75rem]" : "group-hover:pr-10",
+    ),
   );
 
   const styleOptions: { value: DiffStyle; label: string }[] = [

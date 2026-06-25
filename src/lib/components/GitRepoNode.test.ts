@@ -187,4 +187,17 @@ describe("GitRepoNode actions-trigger hover", () => {
     expect(trigger.className).toContain("hover:bg-border/60");
     expect(trigger.className).toContain("group-data-[selected=true]:hover:bg-raised");
   });
+
+  it("suppresses the actions-trigger hover reveal during commit keyboard nav", async () => {
+    selectRepoA();
+    render(GitRepoNode, { props: props("/a") });
+    await tick();
+    const trigger = screen.getByTestId("worktree-actions-trigger");
+    expect(trigger.className).toContain("group-hover:opacity-100");
+
+    // A keyboard move suppresses hover so the `…` doesn't linger under the cursor.
+    await fireEvent.keyDown(window, { key: "ArrowDown" });
+    await tick();
+    expect(trigger.className).not.toContain("group-hover:opacity-100");
+  });
 });

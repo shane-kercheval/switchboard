@@ -439,7 +439,7 @@ describe("DiffPanel (uncommitted target)", () => {
     expect(fileEls()[1]).toHaveAttribute("data-selected", "true");
   });
 
-  it("drops the file-row hover highlight on keyboard nav and restores it on pointer move", async () => {
+  it("drops the file-row hover highlight and action icons on keyboard nav, restoring on pointer move", async () => {
     wire({
       files: [
         { path: "a.ts", change: "modified" },
@@ -458,15 +458,23 @@ describe("DiffPanel (uncommitted target)", () => {
     expect(rowOf(0).className).not.toContain("hover:bg-raised");
     expect(rowOf(1).className).toContain("hover:bg-raised");
 
+    // The action-icons reveal is also keyed on hover, so it must suppress too.
+    const actionsOf = (i: number): HTMLElement =>
+      within(rowOf(i)).getByTestId("changed-file-difftool").parentElement!;
+    expect(actionsOf(0).className).toContain("group-hover:opacity-100");
+
     await fireEvent.click(screen.getAllByTestId("changed-file")[0]!);
     await fireEvent.keyDown(window, { key: "ArrowDown" });
     await tick();
-    // Row 1 is now the keyboard selection; the non-selected row 0 drops its hover.
+    // Row 1 is now the keyboard selection; the non-selected row 0 drops its hover
+    // background AND its action-icons reveal so nothing lingers under the cursor.
     expect(rowOf(0).className).not.toContain("hover:bg-raised");
+    expect(actionsOf(0).className).not.toContain("group-hover:opacity-100");
 
     await fireEvent.pointerMove(window);
     await tick();
     expect(rowOf(0).className).toContain("hover:bg-raised");
+    expect(actionsOf(0).className).toContain("group-hover:opacity-100");
   });
 
   it("marks the selected row so its action icons hover white via a group-data variant", async () => {

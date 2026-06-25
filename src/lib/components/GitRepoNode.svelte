@@ -88,6 +88,11 @@
   // doesn't stay lit alongside the keyboard selection; it returns on pointer move.
   const hoverBg = $derived(hoverSuppressed.value ? "" : "hover:bg-raised");
 
+  // The on-hover actions trigger (`…`) is keyed on the real mouse `:hover`, so it
+  // must be suppressed alongside the row background — otherwise it lingers under
+  // the cursor during commit keyboard nav. Focus/open reveals stay.
+  const triggerHoverReveal = $derived(hoverSuppressed.value ? "" : "group-hover:opacity-100");
+
   // The default branch anchors the branch list even when it has no local folder.
   // Other folderless branches stay hidden until the user asks for inactive ones.
   const localBranches = $derived(
@@ -538,7 +543,8 @@
                 triggerTestid="worktree-actions-trigger"
                 triggerClass={cn(
                   ICON_BUTTON_CLASS,
-                  "shrink-0 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 data-[state=open]:opacity-100",
+                  "shrink-0 opacity-0 group-focus-within:opacity-100 data-[state=open]:opacity-100",
+                  triggerHoverReveal,
                   // Default gray hover, overridden to the white `bg-raised` fill
                   // on a selected (blue) row so it reads against the blue. Driven
                   // off the row's `data-selected` (a `group-data-` CSS variant),

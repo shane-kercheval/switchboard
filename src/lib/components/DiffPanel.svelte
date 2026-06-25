@@ -174,6 +174,25 @@
   // (handled below) clears the suppression and hover returns.
   const hoverBg = $derived(hoverSuppressed.value ? "" : "hover:bg-raised");
 
+  // The action-icons reveal (and the room the row text makes for it) is keyed on
+  // the real mouse `:hover` via `group-hover`, so it must be suppressed alongside
+  // the background during keyboard nav — otherwise the icons linger under the
+  // cursor on the row the keyboard just left. `group-focus-within` stays so
+  // keyboard focus still reveals them.
+  const iconsHoverReveal = $derived(
+    hoverSuppressed.value ? "" : "group-hover:pointer-events-auto group-hover:opacity-100",
+  );
+  const padFocus = $derived(
+    target.kind === "uncommitted" ? "group-focus-within:pr-[5.75rem]" : "group-focus-within:pr-10",
+  );
+  const padHoverReveal = $derived(
+    hoverSuppressed.value
+      ? ""
+      : target.kind === "uncommitted"
+        ? "group-hover:pr-[5.75rem]"
+        : "group-hover:pr-10",
+  );
+
   const styleOptions: { value: DiffStyle; label: string }[] = [
     { value: "side_by_side", label: "Split" },
     { value: "unified", label: "Unified" },
@@ -474,9 +493,8 @@
                   type="button"
                   class={cn(
                     "flex min-w-0 flex-1 items-start gap-2 px-2 py-1.5 pr-2 text-left transition-[padding]",
-                    target.kind === "uncommitted"
-                      ? "group-focus-within:pr-[5.75rem] group-hover:pr-[5.75rem]"
-                      : "group-focus-within:pr-10 group-hover:pr-10",
+                    padFocus,
+                    padHoverReveal,
                   )}
                   data-testid="changed-file"
                   data-selected={file.path === selectedFile}
@@ -499,7 +517,10 @@
                   </span>
                 </button>
                 <div
-                  class="pointer-events-none absolute top-1/2 right-2 flex -translate-y-1/2 items-center gap-0.5 opacity-0 transition-opacity group-focus-within:pointer-events-auto group-focus-within:opacity-100 group-hover:pointer-events-auto group-hover:opacity-100"
+                  class={cn(
+                    "pointer-events-none absolute top-1/2 right-2 flex -translate-y-1/2 items-center gap-0.5 opacity-0 transition-opacity group-focus-within:pointer-events-auto group-focus-within:opacity-100",
+                    iconsHoverReveal,
+                  )}
                 >
                   {#if target.kind === "uncommitted"}
                     <Tooltip label="Copy path" side="top">

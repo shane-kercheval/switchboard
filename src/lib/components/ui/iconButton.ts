@@ -14,3 +14,11 @@ export const ICON_BUTTON_CLASS = `${ICON_BUTTON_BASE} hover:bg-raised`;
 export const ICON_BUTTON_ON_RAISED_CLASS = `${ICON_BUTTON_BASE} hover:bg-panel`;
 
 export const ICON_SIZE = 18;
+
+/// Hover treatment for an action icon sitting on a *selected* (blue) git-view
+/// row: overrides the default gray hover to the white `bg-raised` fill so it
+/// reads against the blue. Drive it off `data-selected` on the row's `group`
+/// element (a `group-data-` variant) and apply the gray default explicitly
+/// alongside it (`hover:bg-border/60`) — this constant only handles the selected
+/// case, deliberately, so both call sites name their default the same way.
+export const SELECTED_ROW_ICON_HOVER = "group-data-[selected=true]:hover:bg-raised";

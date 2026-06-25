@@ -103,6 +103,72 @@ export const branchCommits = $state<{
 /// The diff shown in the right panel, or `null` when nothing is selected.
 export const diffTarget = $state<{ current: DiffTarget | null }>({ current: null });
 
+/// Which pane the arrow keys navigate, set by the last selection the user made:
+/// picking a commit / uncommitted row focuses the commit pane, picking a changed
+/// file focuses the file pane. `null` when nothing is selected.
+export const navFocus = $state<{ pane: "commits" | "files" | null }>({ pane: null });
+
+/// Set true on keyboard navigation so the row under the (stationary) mouse drops
+/// its hover highlight — otherwise two rows look active at once. Cleared on the
+/// next pointer move, so hover returns the instant the mouse is used again.
+export const hoverSuppressed = $state<{ value: boolean }>({ value: false });
+
+/// Repo roots whose worktree-actions menu is currently open. The commit keyboard
+/// navigator bails while any is open so the arrows drive the menu, not the commit
+/// list — global (not node-local) so a menu open in one repo also yields the keys
+/// when the selected commit lives in a different repo node. A keyed set (not a
+/// counter) so it's idempotent: a stray double-close or a reset can't drive it
+/// negative. Read at event time, so plain (non-reactive) state is enough.
+// eslint-disable-next-line svelte/prefer-svelte-reactivity
+const openWorktreeMenuRoots = new Set<string>();
+
+/// Mark (or clear) a repo node's worktree-actions menu as open. Idempotent.
+export function setWorktreeMenuOpen(repoRoot: string, open: boolean): void {
+  if (open) openWorktreeMenuRoots.add(repoRoot);
+  else openWorktreeMenuRoots.delete(repoRoot);
+}
+
+/// Whether any repo node has a worktree-actions menu open.
+export function anyWorktreeMenuOpen(): boolean {
+  return openWorktreeMenuRoots.size > 0;
+}
+
+/// A navigable entry in the commit pane: the worktree's uncommitted row (shown
+/// above the commits when the worktree is dirty) or one commit. Built by the
+/// component from the live data; consumed by [`nextCommitSelection`].
+export type CommitNavItem =
+  | { kind: "uncommitted"; worktreePath: string }
+  | { kind: "commit"; commit: GitCommitSummary };
+
+/// The index to move to when stepping `delta` (+1 down, -1 up) from `current`
+/// within a list of `len` entries, clamped at both ends (no wrap). When nothing
+/// is current (`-1`), a downward step starts at the top and an upward step at the
+/// bottom. Returns `null` when the list is empty. Shared by the commit and file
+/// pane navigators so the two keep identical step/clamp semantics.
+export function nextIndex(len: number, current: number, delta: number): number | null {
+  if (len === 0) return null;
+  if (current === -1) return delta > 0 ? 0 : len - 1;
+  return Math.min(len - 1, Math.max(0, current + delta));
+}
+
+/// The entry to select when moving `delta` (+1 down, -1 up) from the `current`
+/// diff target within `items`. Returns `null` when there's nothing to move to.
+export function nextCommitSelection(
+  items: CommitNavItem[],
+  current: DiffTarget | null,
+  delta: number,
+): CommitNavItem | null {
+  const idx = items.findIndex((item) =>
+    current === null
+      ? false
+      : item.kind === "uncommitted"
+        ? current.kind === "uncommitted" && current.worktreePath === item.worktreePath
+        : current.kind === "commit" && current.oid === item.commit.oid,
+  );
+  const next = nextIndex(items.length, idx, delta);
+  return next === null ? null : items[next]!;
+}
+
 /// Monotonic signal for the diff panel: a repo refresh can change a worktree's
 /// uncommitted diff without changing the selected target, so the panel depends on
 /// this in addition to the target identity.
@@ -170,6 +236,9 @@ export async function selectBranch(
           subtitle: opts.worktreeSubtitle,
         }
       : null;
+  // Selecting a branch makes its commit list the arrow-key target, whether the
+  // default lands on the uncommitted row or (once loaded) the latest commit.
+  navFocus.pane = "commits";
 
   try {
     const ranges = await api.branchCommits(ref.repoRoot, ref.kind, ref.name);
@@ -197,6 +266,7 @@ export function selectCommit(repoRoot: string, commit: GitCommitSummary): void {
     title: commit.subject.length > 0 ? commit.subject : commit.short_oid,
     subtitle: commitSubtitle(commit),
   };
+  navFocus.pane = "commits";
 }
 
 /// Show a worktree's uncommitted changes in the right panel.
@@ -208,6 +278,7 @@ export function selectUncommitted(repoRoot: string, worktreePath: string, subtit
     title: "Uncommitted changes",
     subtitle,
   };
+  navFocus.pane = "commits";
 }
 
 export function selectedWorktreePathForEditor(): string | null {
@@ -228,6 +299,7 @@ export function clearBranchSelection(): void {
   branchCommits.ranges = [];
   branchCommits.status = "loaded";
   diffTarget.current = null;
+  navFocus.pane = null;
 }
 
 /// Re-read the selected branch's commit ranges in place (after a refresh that may
@@ -693,6 +765,9 @@ export const _testing = {
     branchCommits.ranges = [];
     branchCommits.status = "loaded";
     diffTarget.current = null;
+    navFocus.pane = null;
+    hoverSuppressed.value = false;
+    openWorktreeMenuRoots.clear();
     gitRefresh.revision = 0;
   },
   runtimeSize(): number {

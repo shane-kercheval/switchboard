@@ -1,9 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/svelte";
+import { tick } from "svelte";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/svelte";
 import DiffPanel from "./DiffPanel.svelte";
 import type { ChangedFile, FileDiff } from "$lib/types";
+import { navFocus, hoverSuppressed } from "$lib/state/gitView.svelte";
 import type { DiffTarget } from "$lib/state/gitView.svelte";
+import { palette, _testing as paletteTesting } from "$lib/state/commandPalette.svelte";
 
 const invokeMock = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({
@@ -23,6 +26,9 @@ afterEach(() => {
   invokeMock.mockReset();
   copyTextMock.mockReset();
   copyTextMock.mockResolvedValue(undefined);
+  navFocus.pane = null;
+  hoverSuppressed.value = false;
+  paletteTesting.reset();
 });
 
 const diffFixture = (over: Partial<FileDiff> = {}): FileDiff => ({
@@ -393,6 +399,116 @@ describe("DiffPanel (uncommitted target)", () => {
       expect(screen.getByTestId("diff-view")).toHaveTextContent("b.ts:refreshed"),
     );
     expect(screen.getAllByTestId("changed-file")[1]).toHaveAttribute("data-selected", "true");
+  });
+
+  it("navigates the file list with arrow keys once a file has focus", async () => {
+    wire({
+      files: [
+        { path: "a.ts", change: "modified" },
+        { path: "b.ts", change: "modified" },
+        { path: "c.ts", change: "modified" },
+      ],
+    });
+    render(DiffPanel, { props: { target: wtTarget(), onClose: noop } });
+    await waitFor(() => expect(screen.getByTestId("diff-view")).toBeInTheDocument());
+    const fileEls = (): HTMLElement[] => screen.getAllByTestId("changed-file");
+
+    // The first file is auto-selected, but arrows stay inert until the file pane
+    // is the focused selection (a file was clicked) — auto-select doesn't focus.
+    expect(fileEls()[0]).toHaveAttribute("data-selected", "true");
+    await fireEvent.keyDown(window, { key: "ArrowDown" });
+    await tick();
+    expect(fileEls()[0]).toHaveAttribute("data-selected", "true");
+
+    // Clicking a file focuses the pane; now arrows move and clamp at the ends.
+    await fireEvent.click(fileEls()[0]!);
+    await fireEvent.keyDown(window, { key: "ArrowDown" });
+    await tick();
+    expect(fileEls()[1]).toHaveAttribute("data-selected", "true");
+
+    await fireEvent.keyDown(window, { key: "ArrowDown" });
+    await tick();
+    expect(fileEls()[2]).toHaveAttribute("data-selected", "true");
+
+    await fireEvent.keyDown(window, { key: "ArrowDown" }); // clamp at the bottom
+    await tick();
+    expect(fileEls()[2]).toHaveAttribute("data-selected", "true");
+
+    await fireEvent.keyDown(window, { key: "ArrowUp" });
+    await tick();
+    expect(fileEls()[1]).toHaveAttribute("data-selected", "true");
+  });
+
+  it("drops the file-row hover highlight on keyboard nav and restores it on pointer move", async () => {
+    wire({
+      files: [
+        { path: "a.ts", change: "modified" },
+        { path: "b.ts", change: "modified" },
+      ],
+    });
+    render(DiffPanel, { props: { target: wtTarget(), onClose: noop } });
+    await waitFor(() => expect(screen.getByTestId("diff-view")).toBeInTheDocument());
+    // The hover class lives on the row wrapper around the `changed-file` button.
+    const rowOf = (i: number): HTMLElement =>
+      screen.getAllByTestId("changed-file")[i]!.parentElement!;
+
+    // Row 0 is auto-selected (stays blue, no row hover); row 1 is non-selected
+    // and carries the white hover class.
+    expect(rowOf(0).className).toContain("bg-selected");
+    expect(rowOf(0).className).not.toContain("hover:bg-raised");
+    expect(rowOf(1).className).toContain("hover:bg-raised");
+
+    await fireEvent.click(screen.getAllByTestId("changed-file")[0]!);
+    await fireEvent.keyDown(window, { key: "ArrowDown" });
+    await tick();
+    // Row 1 is now the keyboard selection; the non-selected row 0 drops its hover.
+    expect(rowOf(0).className).not.toContain("hover:bg-raised");
+
+    await fireEvent.pointerMove(window);
+    await tick();
+    expect(rowOf(0).className).toContain("hover:bg-raised");
+  });
+
+  it("marks the selected row so its action icons hover white via a group-data variant", async () => {
+    wire({
+      files: [
+        { path: "a.ts", change: "modified" },
+        { path: "b.ts", change: "modified" },
+      ],
+    });
+    render(DiffPanel, { props: { target: wtTarget(), onClose: noop } });
+    await waitFor(() => expect(screen.getByTestId("diff-view")).toBeInTheDocument());
+    const rowOf = (i: number): HTMLElement =>
+      screen.getAllByTestId("changed-file")[i]!.parentElement!;
+
+    // Row 0 is auto-selected. The row's `data-selected` is what the CSS keys on
+    // (the buttons live in Tooltip snippets that don't re-render on selection).
+    expect(rowOf(0)).toHaveAttribute("data-selected", "true");
+    expect(rowOf(1)).toHaveAttribute("data-selected", "false");
+
+    // The action icons carry the gray default plus the selected-row white
+    // override; CSS picks between them off the row's `data-selected`.
+    const difftool = within(rowOf(0)).getByTestId("changed-file-difftool");
+    expect(difftool.className).toContain("hover:bg-border/60");
+    expect(difftool.className).toContain("group-data-[selected=true]:hover:bg-raised");
+  });
+
+  it("does not navigate files while the command palette is open", async () => {
+    wire({
+      files: [
+        { path: "a.ts", change: "modified" },
+        { path: "b.ts", change: "modified" },
+      ],
+    });
+    render(DiffPanel, { props: { target: wtTarget(), onClose: noop } });
+    await waitFor(() => expect(screen.getByTestId("diff-view")).toBeInTheDocument());
+    const fileEls = (): HTMLElement[] => screen.getAllByTestId("changed-file");
+
+    await fireEvent.click(fileEls()[0]!); // focus the file pane
+    palette.open = true;
+    await fireEvent.keyDown(window, { key: "ArrowDown" });
+    await tick();
+    expect(fileEls()[0]).toHaveAttribute("data-selected", "true"); // unchanged
   });
 });
 

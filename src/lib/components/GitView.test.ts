@@ -290,7 +290,7 @@ describe("GitView", () => {
     await fireEvent.click(trigger);
 
     expect(mainRow).toHaveAttribute("data-actions-open", "true");
-    expect(mainRow.className).toContain("bg-raised");
+    expect(mainRow.className).toContain("bg-selected");
     expect(trigger.className).toContain("opacity-100");
 
     await fireEvent.keyDown(screen.getByTestId("worktree-action-editor"), { key: "Escape" });

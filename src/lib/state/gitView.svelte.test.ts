@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { RepoListing } from "$lib/types";
+import type { GitCommitSummary, RepoListing } from "$lib/types";
+import type { CommitNavItem } from "./gitView.svelte";
 
 const invokeMock = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({
@@ -19,11 +20,16 @@ const {
   addRepo,
   removeRepo,
   selectBranch,
+  selectCommit,
   selectUncommitted,
+  clearBranchSelection,
   selectedWorktreePathForEditor,
   branchSelection,
   branchCommits,
   diffTarget,
+  navFocus,
+  nextIndex,
+  nextCommitSelection,
   gitRefresh,
   loadProjectRepo,
   revealProjectBranch,
@@ -743,5 +749,96 @@ describe("gitView store", () => {
       .map((c) => (c[1] as { path: string }).path)
       .sort();
     expect(fetched).toEqual(["/a", "/b", "/c"]);
+  });
+});
+
+const commitFixture = (oid: string, subject: string): GitCommitSummary => ({
+  oid,
+  short_oid: oid.slice(0, 7),
+  subject,
+  author_name: "T",
+  author_email: null,
+  authored_at: null,
+  branch_work: false,
+  unpushed: false,
+});
+
+describe("nextIndex", () => {
+  it("clamps at both ends and starts from the relevant edge when nothing is current", () => {
+    expect(nextIndex(0, -1, 1)).toBeNull(); // empty list
+    expect(nextIndex(3, -1, 1)).toBe(0); // no current, down → top
+    expect(nextIndex(3, -1, -1)).toBe(2); // no current, up → bottom
+    expect(nextIndex(3, 1, 1)).toBe(2);
+    expect(nextIndex(3, 2, 1)).toBe(2); // clamp bottom
+    expect(nextIndex(3, 0, -1)).toBe(0); // clamp top
+  });
+});
+
+describe("nextCommitSelection", () => {
+  it("returns null when there are no navigable items", () => {
+    expect(nextCommitSelection([], null, 1)).toBeNull();
+  });
+
+  it("starts at the top going down and the bottom going up when nothing is current", () => {
+    const items: CommitNavItem[] = [
+      { kind: "commit", commit: commitFixture("aaaaaaa0", "a") },
+      { kind: "commit", commit: commitFixture("bbbbbbb0", "b") },
+    ];
+    expect(nextCommitSelection(items, null, 1)).toEqual(items[0]);
+    expect(nextCommitSelection(items, null, -1)).toEqual(items[1]);
+  });
+
+  it("moves through commits and clamps at both ends", () => {
+    const items: CommitNavItem[] = [
+      { kind: "commit", commit: commitFixture("aaaaaaa0", "a") },
+      { kind: "commit", commit: commitFixture("bbbbbbb0", "b") },
+    ];
+    selectCommit("/a", commitFixture("aaaaaaa0", "a"));
+    expect(nextCommitSelection(items, diffTarget.current, 1)).toEqual(items[1]);
+
+    selectCommit("/a", commitFixture("bbbbbbb0", "b"));
+    expect(nextCommitSelection(items, diffTarget.current, 1)).toEqual(items[1]); // clamp bottom
+    expect(nextCommitSelection(items, diffTarget.current, -1)).toEqual(items[0]);
+  });
+
+  it("treats the uncommitted row as the entry above the commits", () => {
+    const items: CommitNavItem[] = [
+      { kind: "uncommitted", worktreePath: "/wt" },
+      { kind: "commit", commit: commitFixture("aaaaaaa0", "a") },
+    ];
+    selectUncommitted("/a", "/wt", "~/wt");
+    expect(nextCommitSelection(items, diffTarget.current, 1)).toEqual(items[1]);
+
+    selectCommit("/a", commitFixture("aaaaaaa0", "a"));
+    expect(nextCommitSelection(items, diffTarget.current, -1)).toEqual(items[0]);
+
+    selectUncommitted("/a", "/wt", "~/wt");
+    expect(nextCommitSelection(items, diffTarget.current, -1)).toEqual(items[0]); // clamp top
+  });
+});
+
+describe("navFocus", () => {
+  it("focuses the commit pane when a commit or the uncommitted row is selected", () => {
+    expect(navFocus.pane).toBeNull();
+    selectCommit("/a", commitFixture("aaaaaaa0", "a"));
+    expect(navFocus.pane).toBe("commits");
+
+    navFocus.pane = "files";
+    selectUncommitted("/a", "/wt", "~/wt");
+    expect(navFocus.pane).toBe("commits");
+  });
+
+  it("focuses the commit pane when selecting a branch that defaults to uncommitted changes", async () => {
+    wire({ list: [listingWithWorktree("/a", "/a/wt")] });
+    await refreshAll();
+    await selectBranch(mainRef(), dirtyOpts);
+    expect(diffTarget.current?.kind).toBe("uncommitted");
+    expect(navFocus.pane).toBe("commits");
+  });
+
+  it("clears the focus when the selection is cleared", () => {
+    selectCommit("/a", commitFixture("aaaaaaa0", "a"));
+    clearBranchSelection();
+    expect(navFocus.pane).toBeNull();
   });
 });

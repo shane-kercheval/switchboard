@@ -38,6 +38,11 @@
   --accent-fg: #ffffff;
   --accent-soft: #dcfce7;
 
+  /* selected-row fill — a muted blue, deliberately distinct from the neutral
+     `--raised` used for hover, so a held selection (Git view commits, files,
+     branches) reads differently from a transient hover. */
+  --selected: #dbe7f6;
+
   /* destructive action surface — a solid fill (distinct from the soft
      status-failed chip) so a destructive button carries primary-level weight.
      fg must clear contrast on the fill in both themes. */
@@ -117,6 +122,8 @@
   --accent-fg: #052e16;
   --accent-soft: #14532d;
 
+  --selected: #324863;
+
   /* deeper, less-glary red on a dark surface; white text clears contrast */
   --destructive: #b91c1c;
   --destructive-fg: #fafafa;
@@ -177,6 +184,8 @@
   --color-accent: var(--accent);
   --color-accent-fg: var(--accent-fg);
   --color-accent-soft: var(--accent-soft);
+
+  --color-selected: var(--selected);
 
   --color-destructive: var(--destructive);
   --color-destructive-fg: var(--destructive-fg);

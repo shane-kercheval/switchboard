@@ -3,7 +3,7 @@
   /// availability, per-repo refresh + fetch-failure indicator) over its branches.
   /// Branch filtering is applied by the parent and passed in, so this node is
   /// pure presentation over the data.
-  import { onMount } from "svelte";
+  import { onMount, tick } from "svelte";
   import { homeDir } from "@tauri-apps/api/path";
   import {
     Code2,
@@ -24,7 +24,7 @@
   import AsyncIconButton from "$lib/components/ui/AsyncIconButton.svelte";
   import DropdownMenu from "$lib/components/ui/DropdownMenu.svelte";
   import DropdownMenuItem from "$lib/components/ui/DropdownMenuItem.svelte";
-  import { ICON_BUTTON_CLASS } from "$lib/components/ui/iconButton";
+  import { ICON_BUTTON_CLASS, SELECTED_ROW_ICON_HOVER } from "$lib/components/ui/iconButton";
   import {
     localBranchIndicators,
     remoteBranchIndicators,
@@ -37,7 +37,7 @@
     RepoListing,
     WorktreeView,
   } from "$lib/types";
-  import type { FetchState } from "$lib/state/gitView.svelte";
+  import type { CommitNavItem, FetchState } from "$lib/state/gitView.svelte";
   import {
     refreshRepo,
     fetchRepo,
@@ -49,9 +49,17 @@
     branchSelection,
     branchCommits,
     diffTarget,
+    navFocus,
+    nextCommitSelection,
+    hoverSuppressed,
+    hoverableClass,
+    setWorktreeMenuOpen,
+    anyWorktreeMenuOpen,
     setViewMode,
   } from "$lib/state/gitView.svelte";
   import { activateProject } from "$lib/state/workspace.svelte";
+  import { palette } from "$lib/state/commandPalette.svelte";
+  import { isEditableShortcutTarget } from "$lib/keyboard";
   import { openInEditor, openInTerminal, revealInFinder } from "$lib/api";
   import { copyText } from "$lib/native";
 
@@ -72,9 +80,19 @@
   let homePath = $state<string | null>(null);
   let actionError = $state<string | null>(null);
   let openWorktreeActionsPath = $state<string | null>(null);
+  let commitListEl = $state<HTMLDivElement | null>(null);
 
   const repo = $derived(listing.repo);
   const localBranchCount = $derived(repo.local_branches.length);
+
+  // Row hover is suppressed right after a keyboard move so the mouse-hovered row
+  // doesn't stay lit alongside the keyboard selection; it returns on pointer move.
+  const hoverBg = $derived(hoverableClass("hover:bg-raised"));
+
+  // The on-hover actions trigger (`…`) is keyed on the real mouse `:hover`, so it
+  // must be suppressed alongside the row background — otherwise it lingers under
+  // the cursor during commit keyboard nav. Focus/open reveals stay.
+  const triggerHoverReveal = $derived(hoverableClass("group-hover:opacity-100"));
 
   // The default branch anchors the branch list even when it has no local folder.
   // Other folderless branches stay hidden until the user asks for inactive ones.
@@ -118,6 +136,15 @@
     ) {
       openWorktreeActionsPath = null;
     }
+  });
+
+  // Publish this node's open-menu state to the shared set so the commit
+  // navigator yields to a worktree-actions menu open in ANY repo node, not only
+  // this one. Self-healing: the cleanup clears this node's entry on close and on
+  // unmount (idempotent, so order vs. a reset doesn't matter).
+  $effect(() => {
+    setWorktreeMenuOpen(repo.root, openWorktreeActionsPath !== null);
+    return () => setWorktreeMenuOpen(repo.root, false);
   });
 
   function displayPath(path: string): string {
@@ -201,6 +228,67 @@
     clearBranchSelection();
     selectUncommitted(repo.root, wt.path, displayPath(wt.path));
   }
+
+  // The local branch this node currently owns the selection for, or null (the
+  // selection is elsewhere, or it's a remote branch with no worktree).
+  function selectedLocalBranch(): BranchView | null {
+    const s = branchSelection.current;
+    if (s === null || s.repoRoot !== repo.root || s.kind !== "local") return null;
+    return repo.local_branches.find((b) => b.name === s.name) ?? null;
+  }
+
+  // The commit pane's navigable entries in display order: the uncommitted row
+  // (when the selected branch's worktree is dirty) above the commits, matching
+  // what `commitList` renders.
+  function commitNavItems(): CommitNavItem[] {
+    const items: CommitNavItem[] = [];
+    const branch = selectedLocalBranch();
+    if (branch?.worktree != null && branchHasChanges(branch)) {
+      items.push({ kind: "uncommitted", worktreePath: branch.worktree.path });
+    }
+    for (const range of branchCommits.ranges) {
+      for (const commit of range.commits) items.push({ kind: "commit", commit });
+    }
+    return items;
+  }
+
+  function moveCommitSelection(delta: number): void {
+    const next = nextCommitSelection(commitNavItems(), diffTarget.current, delta);
+    if (next === null) return;
+    if (next.kind === "uncommitted") {
+      selectUncommitted(repo.root, next.worktreePath, displayPath(next.worktreePath));
+    } else {
+      selectCommit(repo.root, next.commit);
+    }
+    // Within the commit list, only the active commit or the uncommitted row
+    // carries `data-selected="true"` (the selected branch row, which also does,
+    // sits outside this container) — so this needs no test-hook selector.
+    void tick().then(() => {
+      commitListEl?.querySelector('[data-selected="true"]')?.scrollIntoView({ block: "nearest" });
+    });
+  }
+
+  // Arrow up/down navigate the commit pane when it's the focused selection (the
+  // user last picked a commit or the uncommitted row). Only the node that owns
+  // the selection acts, so the several mounted nodes don't all respond; an open
+  // overlay (command palette, or a worktree-actions menu open in any repo node)
+  // or an event a closer handler already consumed yields the keys to that owner.
+  function onCommitNavKeydown(event: KeyboardEvent): void {
+    if (navFocus.pane !== "commits") return;
+    if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
+    if (event.metaKey || event.ctrlKey || event.altKey) return;
+    if (event.defaultPrevented || palette.open || anyWorktreeMenuOpen()) return;
+    if (branchSelection.current?.repoRoot !== repo.root) return;
+    if (isEditableShortcutTarget(event.target)) return;
+    event.preventDefault();
+    hoverSuppressed.value = true;
+    moveCommitSelection(event.key === "ArrowDown" ? 1 : -1);
+  }
+
+  $effect(() => {
+    window.addEventListener("keydown", onCommitNavKeydown);
+    return () => window.removeEventListener("keydown", onCommitNavKeydown);
+  });
 
   // Compact fixed-width-ish format keeps dense commit rows scannable.
   function compactCommitTimestamp(commit: {
@@ -423,10 +511,10 @@
             class={cn(
               "group flex min-h-8 items-center gap-2 rounded-md px-2 py-1.5 transition-colors",
               branch.worktree === null && "opacity-60",
-              "hover:bg-raised",
-              (selected || actionsOpen) && "bg-raised hover:bg-raised",
+              selected || actionsOpen ? "bg-selected" : hoverBg,
             )}
             data-testid="git-branch"
+            data-selected={selected || actionsOpen}
             data-branch={branch.name}
             data-actions-open={actionsOpen}
           >
@@ -456,7 +544,15 @@
                 triggerTestid="worktree-actions-trigger"
                 triggerClass={cn(
                   ICON_BUTTON_CLASS,
-                  "hover:bg-border/60 shrink-0 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 data-[state=open]:opacity-100",
+                  "shrink-0 opacity-0 group-focus-within:opacity-100 data-[state=open]:opacity-100",
+                  triggerHoverReveal,
+                  // Default gray hover, overridden to the white `bg-raised` fill
+                  // on a selected (blue) row so it reads against the blue. Driven
+                  // off the row's `data-selected` (a `group-data-` CSS variant),
+                  // not a JS class — the trigger lives in a `{#snippet}` that
+                  // doesn't re-render when the row's selected state changes.
+                  "hover:bg-border/60",
+                  SELECTED_ROW_ICON_HOVER,
                   actionsOpen && "opacity-100",
                 )}
                 contentTestid="worktree-actions-menu"
@@ -557,8 +653,8 @@
           {@const selected = isRemoteSelected(branch.name)}
           <div
             class={cn(
-              "hover:bg-raised flex min-h-8 items-center gap-2 rounded-md px-2 py-1.5 opacity-80 transition-colors",
-              selected && "bg-raised hover:bg-raised",
+              "flex min-h-8 items-center gap-2 rounded-md px-2 py-1.5 opacity-80 transition-colors",
+              selected ? "bg-selected" : hoverBg,
             )}
             data-testid="git-remote-branch"
             data-branch={branch.name}
@@ -596,8 +692,7 @@
             <div
               class={cn(
                 "flex min-h-8 items-center gap-2 rounded-md px-2 py-1.5 transition-colors",
-                wt.warning !== "prunable" && "hover:bg-raised",
-                dselected && "bg-raised hover:bg-raised",
+                dselected ? "bg-selected" : wt.warning !== "prunable" && hoverBg,
               )}
               data-testid="git-detached-worktree"
             >
@@ -626,14 +721,18 @@
 </div>
 
 {#snippet commitList(worktreePath: string | null, hasChanges: boolean)}
-  <div class="border-border mt-1 mb-1 ml-4 border-l pl-2" data-testid="commit-list">
+  <div
+    bind:this={commitListEl}
+    class="border-border mt-1 mb-1 ml-4 border-l pl-2"
+    data-testid="commit-list"
+  >
     {#if worktreePath !== null && hasChanges}
       {@const uSel = isUncommittedSelected(worktreePath)}
       <button
         type="button"
         class={cn(
           "flex w-full items-center gap-2 rounded-md px-2 py-1 text-left text-xs transition-colors",
-          uSel ? "bg-raised text-fg" : "text-muted hover:bg-raised",
+          uSel ? "bg-selected text-fg" : cn("text-muted", hoverBg),
         )}
         data-testid="uncommitted-row"
         data-selected={uSel}
@@ -672,7 +771,7 @@
               type="button"
               class={cn(
                 "flex w-full items-center gap-1.5 rounded-md px-2 py-1 text-left text-xs transition-colors",
-                cSel ? "bg-raised text-fg" : "text-muted hover:bg-raised",
+                cSel ? "bg-selected text-fg" : cn("text-muted", hoverBg),
               )}
               data-testid="commit-row"
               data-oid={commit.oid}

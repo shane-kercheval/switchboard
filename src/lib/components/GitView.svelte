@@ -30,6 +30,7 @@
     selectedWorktreePathForEditor,
     removeRepo,
     gitRefresh,
+    hoverSuppressed,
   } from "$lib/state/gitView.svelte";
   import {
     setCommandSource,
@@ -62,6 +63,11 @@
   function startDetailResize(event: PointerEvent): void {
     resizingDetail = true;
     event.preventDefault();
+  }
+
+  function onWindowPointerMove(event: PointerEvent): void {
+    if (hoverSuppressed.value) hoverSuppressed.value = false;
+    resizeDetail(event);
   }
 
   function resizeDetail(event: PointerEvent): void {
@@ -465,4 +471,4 @@
   </div>
 </div>
 
-<svelte:window onpointermove={resizeDetail} onpointerup={endDetailResize} />
+<svelte:window onpointermove={onWindowPointerMove} onpointerup={endDetailResize} />

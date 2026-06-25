@@ -129,10 +129,18 @@ export function setForwardCaption(
   captions[projectId] = { ...(captions[projectId] ?? {}), [sendId]: caption };
 }
 
-/// The canonical forwarded-block sentinel (`docs/workflow-spec.md` §`send`). The
+/// The canonical manual-forward sentinel (`docs/workflow-spec.md` §`send`). The
 /// transcript uses this to mark a message as a forward **durably** — derived from
 /// the body that the journal persists, so the styling survives reload without a
-/// live marker store.
+/// live marker store. Forward-only on purpose: it drives the manual-forward
+/// `data-forwarded` marker, which a workflow aggregation should not trip.
+///
+/// SYNCHRONIZED WITH THE BACKEND WIRE SHAPE: this must match the string emitted by
+/// `crates/harness/src/forward.rs` (`compose_forwarded_message`). The broader
+/// *banding* matcher — `QUOTED_BLOCK_SENTINEL` / `QUOTED_BLOCK` in
+/// `UnifiedTranscript.svelte`, which also covers the `response from` aggregation
+/// shape from `crates/workflow/src/template.rs` — is the presentation concern and
+/// lives in the component. Change a sentinel on either language → change both.
 export const FORWARD_SENTINEL = /^=== START forwarded from .+ ===$/m;
 
 /// Test-only reset.

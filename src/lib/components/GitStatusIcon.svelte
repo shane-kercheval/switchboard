@@ -15,7 +15,6 @@
     TriangleAlert,
   } from "@lucide/svelte";
   import { cn } from "$lib/utils";
-  import { ICON_BUTTON_CLASS } from "$lib/components/ui/iconButton";
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
   import { indicatorToneClass, type GitStatusIndicator } from "$lib/gitStatusIndicators";
 
@@ -28,11 +27,13 @@
 
 <Tooltip side="top" delayDuration={0} skipDelayDuration={0} disableHoverableContent>
   {#snippet trigger(props)}
+    <!-- A read-only status indicator: footprint + tone color only, no hover
+         affordance (background or icon-color change) — a hover effect would
+         imply it's clickable when it isn't. The tooltip carries the meaning. -->
     <span
       {...props}
       class={cn(
-        ICON_BUTTON_CLASS,
-        "hover:bg-border/60 shrink-0 transition-colors",
+        "inline-flex h-[26px] w-[26px] shrink-0 items-center justify-center",
         indicatorToneClass(indicator.tone),
       )}
       aria-label={indicator.label}

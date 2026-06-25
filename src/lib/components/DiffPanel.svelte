@@ -5,7 +5,7 @@
   /// diff needs no worktree, so a branch with no local folder (or a remote-only
   /// ref) still shows real content. Loads are guarded against target/file races
   /// (a newer selection's result always wins).
-  import { untrack } from "svelte";
+  import { tick, untrack } from "svelte";
   import { Code2, Copy, ExternalLink, Maximize2, Minimize2 } from "@lucide/svelte";
   import { cn, basename } from "$lib/utils";
   import EmptyState from "$lib/components/ui/EmptyState.svelte";
@@ -13,7 +13,7 @@
   import DiffView from "$lib/components/DiffView.svelte";
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
   import AsyncIconButton from "$lib/components/ui/AsyncIconButton.svelte";
-  import { ICON_BUTTON_CLASS } from "$lib/components/ui/iconButton";
+  import { ICON_BUTTON_CLASS, SELECTED_ROW_ICON_HOVER } from "$lib/components/ui/iconButton";
   import {
     SEGMENTED_MAIN_CONTAINER_CLASS,
     SEGMENTED_MAIN_ITEM_CLASS,
@@ -32,9 +32,12 @@
   } from "$lib/api";
   import { languageForPath } from "$lib/diff";
   import { copyText } from "$lib/native";
+  import { isEditableShortcutTarget } from "$lib/keyboard";
   import { shortcut } from "$lib/platform";
   import { preferences, updatePreferences } from "$lib/preferences.svelte";
   import type { ChangedFile, ChangeKind, DiffStyle, FileDiff } from "$lib/types";
+  import { navFocus, hoverSuppressed, hoverableClass, nextIndex } from "$lib/state/gitView.svelte";
+  import { palette } from "$lib/state/commandPalette.svelte";
   import type { DiffTarget } from "$lib/state/gitView.svelte";
 
   let {
@@ -166,6 +169,28 @@
 
   const language = $derived(selectedFile ? languageForPath(selectedFile) : "");
 
+  // Drop the file-row hover highlight right after a keyboard move so the mouse-
+  // hovered row doesn't stay lit next to the keyboard selection; pointer movement
+  // (handled below) clears the suppression and hover returns.
+  const hoverBg = $derived(hoverableClass("hover:bg-raised"));
+
+  // The action-icons reveal (and the room the row text makes for it) is keyed on
+  // the real mouse `:hover` via `group-hover`, so it must be suppressed alongside
+  // the background during keyboard nav — otherwise the icons linger under the
+  // cursor on the row the keyboard just left. `group-focus-within` stays so
+  // keyboard focus still reveals them.
+  const iconsHoverReveal = $derived(
+    hoverableClass("group-hover:pointer-events-auto group-hover:opacity-100"),
+  );
+  const padFocus = $derived(
+    target.kind === "uncommitted" ? "group-focus-within:pr-[5.75rem]" : "group-focus-within:pr-10",
+  );
+  const padHoverReveal = $derived(
+    hoverableClass(
+      target.kind === "uncommitted" ? "group-hover:pr-[5.75rem]" : "group-hover:pr-10",
+    ),
+  );
+
   const styleOptions: { value: DiffStyle; label: string }[] = [
     { value: "side_by_side", label: "Split" },
     { value: "unified", label: "Unified" },
@@ -236,6 +261,11 @@
     event.preventDefault();
   }
 
+  function onWindowPointerMove(event: PointerEvent): void {
+    if (hoverSuppressed.value) hoverSuppressed.value = false;
+    resizeFiles(event);
+  }
+
   function resizeFiles(event: PointerEvent): void {
     if (!resizingFiles || bodyEl === null) return;
     const rect = bodyEl.getBoundingClientRect();
@@ -246,6 +276,41 @@
   function endFileResize(): void {
     resizingFiles = false;
   }
+
+  let filesListEl = $state<HTMLUListElement | null>(null);
+
+  function moveFileSelection(delta: number): void {
+    if (files === null) return;
+    const idx = files.findIndex((f) => f.path === selectedFile);
+    const next = nextIndex(files.length, idx, delta);
+    if (next === null) return;
+    selectedFile = files[next]!.path;
+    // `data-selected="true"` is unique within the file list, so the scroll target
+    // needs no test-hook selector.
+    void tick().then(() => {
+      filesListEl?.querySelector('[data-selected="true"]')?.scrollIntoView({ block: "nearest" });
+    });
+  }
+
+  // Arrow up/down navigate the changed-files list when it's the focused
+  // selection (the user last clicked a file); the commit pane handles them
+  // otherwise. The two panes key off the shared `navFocus`, so only one acts.
+  function onFileNavKeydown(event: KeyboardEvent): void {
+    if (navFocus.pane !== "files") return;
+    if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
+    if (event.metaKey || event.ctrlKey || event.altKey) return;
+    // Yield to an open overlay or an event a closer handler already consumed.
+    if (event.defaultPrevented || palette.open) return;
+    if (isEditableShortcutTarget(event.target)) return;
+    event.preventDefault();
+    hoverSuppressed.value = true;
+    moveFileSelection(event.key === "ArrowDown" ? 1 : -1);
+  }
+
+  $effect(() => {
+    window.addEventListener("keydown", onFileNavKeydown);
+    return () => window.removeEventListener("keydown", onFileNavKeydown);
+  });
 </script>
 
 <div class="flex min-h-0 flex-1 flex-col overflow-hidden" data-testid="diff-panel">
@@ -396,15 +461,27 @@
           </span>
           <span class="text-muted font-mono text-[11px]">{files.length}</span>
         </div>
-        <ul class="h-[calc(100%-2rem)] overflow-y-auto py-1" data-testid="changed-files">
+        <ul
+          bind:this={filesListEl}
+          class="h-[calc(100%-2rem)] overflow-y-auto py-1"
+          data-testid="changed-files"
+        >
           {#each files as file (file.path)}
             {@const badge = changeBadge(file.change)}
             {@const directory = directoryLabel(file.path)}
+            {@const isSelected = file.path === selectedFile}
             <li>
+              <!-- `data-selected` drives the action-icons' hover color via the
+                   shared `SELECTED_ROW_ICON_HOVER` `group-data-` variant: the
+                   icons hover gray by default and white (`bg-raised`) on a
+                   selected (blue) row so they read against the blue. CSS (not a
+                   JS class) because the buttons live inside Tooltip `{#snippet}`s,
+                   which don't re-render when `selectedFile` changes. -->
               <div
+                data-selected={isSelected}
                 class={cn(
                   "group relative flex w-full items-stretch rounded-none text-xs transition-colors",
-                  file.path === selectedFile ? "bg-raised text-fg" : "text-muted hover:bg-raised",
+                  isSelected ? "bg-selected text-fg" : cn("text-muted", hoverBg),
                 )}
               >
                 <!-- The padding lives on the button (not the row) so the click
@@ -414,13 +491,15 @@
                   type="button"
                   class={cn(
                     "flex min-w-0 flex-1 items-start gap-2 px-2 py-1.5 pr-2 text-left transition-[padding]",
-                    target.kind === "uncommitted"
-                      ? "group-focus-within:pr-[5.75rem] group-hover:pr-[5.75rem]"
-                      : "group-focus-within:pr-10 group-hover:pr-10",
+                    padFocus,
+                    padHoverReveal,
                   )}
                   data-testid="changed-file"
                   data-selected={file.path === selectedFile}
-                  onclick={() => (selectedFile = file.path)}
+                  onclick={() => {
+                    selectedFile = file.path;
+                    navFocus.pane = "files";
+                  }}
                 >
                   <span
                     class={cn("mt-0.5 w-4 shrink-0 text-center font-mono text-[11px]", badge.class)}
@@ -436,14 +515,22 @@
                   </span>
                 </button>
                 <div
-                  class="pointer-events-none absolute top-1/2 right-2 flex -translate-y-1/2 items-center gap-0.5 opacity-0 transition-opacity group-focus-within:pointer-events-auto group-focus-within:opacity-100 group-hover:pointer-events-auto group-hover:opacity-100"
+                  class={cn(
+                    "pointer-events-none absolute top-1/2 right-2 flex -translate-y-1/2 items-center gap-0.5 opacity-0 transition-opacity group-focus-within:pointer-events-auto group-focus-within:opacity-100",
+                    iconsHoverReveal,
+                  )}
                 >
                   {#if target.kind === "uncommitted"}
                     <Tooltip label="Copy path" side="top">
                       {#snippet trigger(props)}
                         <AsyncIconButton
                           {...props}
-                          class={cn(ICON_BUTTON_CLASS, "hover:bg-border/60 h-6 w-6 shrink-0")}
+                          class={cn(
+                            ICON_BUTTON_CLASS,
+                            "h-6 w-6 shrink-0",
+                            "hover:bg-border/60",
+                            SELECTED_ROW_ICON_HOVER,
+                          )}
                           label={`Copy path for ${file.path}`}
                           testid="changed-file-copy-path"
                           action={() => copyFilePath(file)}
@@ -459,7 +546,12 @@
                         {#snippet trigger(props)}
                           <AsyncIconButton
                             {...props}
-                            class={cn(ICON_BUTTON_CLASS, "hover:bg-border/60 h-6 w-6 shrink-0")}
+                            class={cn(
+                              ICON_BUTTON_CLASS,
+                              "h-6 w-6 shrink-0",
+                              "hover:bg-border/60",
+                              SELECTED_ROW_ICON_HOVER,
+                            )}
                             label={`Open ${file.path} in editor`}
                             testid="changed-file-editor"
                             completeAfterMs={700}
@@ -480,7 +572,12 @@
                     {#snippet trigger(props)}
                       <AsyncIconButton
                         {...props}
-                        class={cn(ICON_BUTTON_CLASS, "hover:bg-border/60 h-6 w-6 shrink-0")}
+                        class={cn(
+                          ICON_BUTTON_CLASS,
+                          "h-6 w-6 shrink-0",
+                          "hover:bg-border/60",
+                          SELECTED_ROW_ICON_HOVER,
+                        )}
                         label={`Open ${file.path} in difftool`}
                         testid="changed-file-difftool"
                         completeAfterMs={700}
@@ -529,4 +626,4 @@
   {/if}
 </div>
 
-<svelte:window onpointermove={resizeFiles} onpointerup={endFileResize} />
+<svelte:window onpointermove={onWindowPointerMove} onpointerup={endFileResize} />

@@ -221,35 +221,53 @@
       .filter((entry) => entry.recipients.length > 0);
   });
 
-  /// One forwarded `=== START forwarded from <agent> === … === END … ===` block.
-  /// Captures the START sentinel, the inner content, and the END sentinel
+  /// The transcript recognizes a quoted block by matching the **canonical backend
+  /// wire shape** — a synchronized cross-language contract with the Rust emitters
+  /// (`crates/harness/src/forward.rs` `compose_forwarded_message` → `forwarded
+  /// from`; `crates/workflow/src/template.rs` `aggregated_responses` → `response
+  /// from`). Change a sentinel's wording on either side and both must change; these
+  /// comments are a signpost, **not enforcement**. (Follow-up for durable
+  /// enforcement: a shared fixture asserted by a Rust *and* a TS test, or structured
+  /// provenance replacing string-sniffing — deferred; string-matching is the
+  /// root-cause class of the B1 bug this fix addresses.)
+
+  /// Fast single-line gate: does the body contain any quoted block? Anchored (`/m`),
+  /// so no `/g` `lastIndex` state — used only to decide whether to take the banding
+  /// path. Broader than `FORWARD_SENTINEL` (the manual-forward marker, in
+  /// `heldForwards`): it also matches the `response from` aggregation shape.
+  const QUOTED_BLOCK_SENTINEL = /^=== START (?:forwarded|response) from .+ ===$/m;
+
+  /// One quoted block — `=== START (forwarded|response) from <agent> === … === END
+  /// … ===` — covering both a forwarded block (manual or workflow `forward_from`)
+  /// and a fan-in aggregation block (`aggregated_responses`). Captures the START
+  /// sentinel, the keyword, the agent, the inner content, and the END sentinel
   /// separately so the sentinels can be styled while the content renders as
   /// Markdown. Matched non-greedily so adjacent blocks don't merge; blocks don't
-  /// nest, so this is unambiguous. The END agent is a backreference to the START
-  /// agent (`\2`), so a block only bands when its sentinels pair — the canonical
-  /// backend shape always does; stray/pasted sentinel-looking text won't mis-band
-  /// (the backreference matches the captured name literally, so no regex
-  /// injection from agent names).
-  const FORWARD_BLOCK =
-    /(=== START forwarded from (.+?) ===)\n([\s\S]*?)\n(=== END forwarded from \2 ===)/g;
+  /// nest, so this is unambiguous. The END keyword and agent are backreferences to
+  /// the START (`\2`, `\3`), so a block only bands when its sentinels pair on both
+  /// — the canonical backend shapes always do; stray/pasted sentinel-looking text
+  /// won't mis-band (the backreferences match the captured text literally, so no
+  /// regex injection from agent names).
+  const QUOTED_BLOCK =
+    /(=== START (forwarded|response) from (.+?) ===)\n([\s\S]*?)\n(=== END \2 from \3 ===)/g;
 
-  type ForwardSegment =
+  type QuotedSegment =
     | { kind: "text"; text: string }
-    | { kind: "forward"; start: string; inner: string; end: string };
+    | { kind: "quote"; start: string; inner: string; end: string };
 
-  /// Split a forwarded message body into ordered segments — the user's typed text
-  /// (or a rendered prompt) as `text`, each forwarded block as `forward` — so the
-  /// transcript can give *only the forwarded portions* a style-only band, leaving
-  /// the user's own text plain. Text is kept verbatim (sentinels included); only
-  /// the blank-line separators between segments are trimmed for layout.
-  function splitForwardSegments(text: string): ForwardSegment[] {
-    const segments: ForwardSegment[] = [];
+  /// Split a message body into ordered segments — the user's typed text (or a
+  /// rendered prompt) as `text`, each quoted block (forwarded or aggregated) as
+  /// `quote` — so the transcript can give *only the quoted portions* a style-only
+  /// band, leaving the user's own text plain. Text is kept verbatim (sentinels
+  /// included); only the blank-line separators between segments are trimmed.
+  function splitQuotedSegments(text: string): QuotedSegment[] {
+    const segments: QuotedSegment[] = [];
     let last = 0;
-    for (const m of text.matchAll(FORWARD_BLOCK)) {
+    for (const m of text.matchAll(QUOTED_BLOCK)) {
       const idx = m.index ?? 0;
       const between = text.slice(last, idx).replace(/^\n+|\n+$/g, "");
       if (between !== "") segments.push({ kind: "text", text: between });
-      segments.push({ kind: "forward", start: m[1]!, inner: m[3]!, end: m[4]! });
+      segments.push({ kind: "quote", start: m[1]!, inner: m[4]!, end: m[5]! });
       last = idx + m[0].length;
     }
     const tail = text.slice(last).replace(/^\n+|\n+$/g, "");
@@ -1231,12 +1249,15 @@
 {/snippet}
 
 {#snippet userBody(row: Extract<UnifiedRow, { kind: "user" }>)}
-  {#if FORWARD_SENTINEL.test(row.text)}
-    <!-- Forward: give each forwarded block (and only it) a style-only band so the
-         aggregated portion stands apart from the user's own typed text, which
-         stays plain. Text is verbatim — the `=== … ===` sentinels are kept. -->
-    {#each splitForwardSegments(row.text) as seg, i (i)}
-      {#if seg.kind === "forward"}
+  {#if QUOTED_BLOCK_SENTINEL.test(row.text)}
+    <!-- Quoted blocks: give each forwarded (`forwarded from`) or aggregated
+         (`response from`) block — and only it — a style-only band so the quoted
+         agent output stands apart from the user's own typed text, which stays
+         plain. Text is verbatim — the `=== … ===` sentinels are kept. The turn's
+         `data-forwarded` marker stays forward-only (below); the band is purely
+         presentational and covers both shapes. -->
+    {#each splitQuotedSegments(row.text) as seg, i (i)}
+      {#if seg.kind === "quote"}
         <!-- Border-only band: a neutral dark-gray left rule (the `muted` token —
              not the harness-colored agent rules, not the accent green). Extra
              `py` makes the rule extend past the text top/bottom, and `my` adds
@@ -1244,7 +1265,7 @@
              sentinels render bold + monospace (verbatim, as plain text so the
              `===` isn't parsed as Markdown); the content between renders as
              Markdown. -->
-        <div class="border-muted my-3 border-l-2 pl-3" data-testid="forward-block">
+        <div class="border-muted my-3 border-l-2 pl-3" data-testid="quoted-block">
           <div class="font-mono text-xs font-bold">{seg.start}</div>
           <Markdown text={seg.inner} />
           <div class="font-mono text-xs font-bold">{seg.end}</div>

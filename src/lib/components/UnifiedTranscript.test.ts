@@ -3480,7 +3480,7 @@ describe("UnifiedTranscript — cross-agent forward", () => {
 
     render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
-    const block = await screen.findByTestId("forward-block");
+    const block = await screen.findByTestId("quoted-block");
     // The band wraps the forwarded block (sentinel + content) verbatim…
     expect(block).toHaveTextContent("START forwarded from bob");
     expect(block).toHaveTextContent("the review");
@@ -3491,7 +3491,7 @@ describe("UnifiedTranscript — cross-agent forward", () => {
   it("does not band a block whose START and END agents don't pair", async () => {
     // Defensive: the canonical backend shape always pairs START X / END X. Stray
     // or pasted sentinel-looking text with mismatched agents must not mis-band —
-    // it falls through to plain rendering (no forward-block).
+    // it falls through to plain rendering (no quoted-block).
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
     const body = "=== START forwarded from alice ===\nx\n=== END forwarded from bob ===";
@@ -3499,7 +3499,64 @@ describe("UnifiedTranscript — cross-agent forward", () => {
 
     render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
     await waitFor(() => expect(screen.getAllByTestId("turn").length).toBeGreaterThan(0));
-    expect(screen.queryByTestId("forward-block")).toBeNull();
+    expect(screen.queryByTestId("quoted-block")).toBeNull();
+  });
+
+  it("bands a workflow aggregation (`response from`) block without marking it a manual forward", async () => {
+    // `aggregated_responses(...)` emits `=== START response from <agent> ===`
+    // blocks — a different sentinel than a manual forward's `forwarded from`. The
+    // band is purely presentational and must cover this shape too; but the turn is
+    // NOT a manual forward, so `data-forwarded` stays false (no caption).
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    const body =
+      "Here's feedback from several reviewers:\n\n=== START response from rev-1 ===\nLGTM\n=== END response from rev-1 ===";
+    state.dispatchUserTurn(CLAUDE_AGENT.id, "u-1", body, [], "s-9", "2026-05-16T00:00:00Z");
+
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    const block = await screen.findByTestId("quoted-block");
+    // The aggregation block is banded verbatim (sentinel + content)…
+    expect(block).toHaveTextContent("START response from rev-1");
+    expect(block).toHaveTextContent("LGTM");
+    // …the user's own lead-in text stays plain, outside the band…
+    expect(block).not.toHaveTextContent("Here's feedback from several reviewers");
+    // …and the turn is not marked a manual forward.
+    const turn = screen.getAllByTestId("turn").find((t) => t.getAttribute("data-role") === "user")!;
+    expect(turn).toHaveAttribute("data-forwarded", "false");
+  });
+
+  it("bands multiple adjacent `response from` blocks separately (the real fan-in shape)", async () => {
+    // `aggregated_responses(reviewers)` joins one block per reviewer; the band must
+    // split them, not merge two reviews into one block.
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    const body =
+      "=== START response from rev-1 ===\nfirst\n=== END response from rev-1 ===\n\n=== START response from rev-2 ===\nsecond\n=== END response from rev-2 ===";
+    state.dispatchUserTurn(CLAUDE_AGENT.id, "u-1", body, [], "s-10", "2026-05-16T00:00:00Z");
+
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    await waitFor(() => expect(screen.getAllByTestId("turn").length).toBeGreaterThan(0));
+    const blocks = screen.getAllByTestId("quoted-block");
+    expect(blocks).toHaveLength(2);
+    expect(blocks[0]).toHaveTextContent("START response from rev-1");
+    expect(blocks[0]).toHaveTextContent("first");
+    expect(blocks[1]).toHaveTextContent("START response from rev-2");
+    expect(blocks[1]).toHaveTextContent("second");
+  });
+
+  it("does not band a block whose START and END keywords don't pair", async () => {
+    // The keyword backreference (`\2`) requires START/END to share the keyword, so a
+    // `forwarded` START can't close on a `response` END — it falls through plain.
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    const body = "=== START forwarded from alice ===\nx\n=== END response from alice ===";
+    state.dispatchUserTurn(CLAUDE_AGENT.id, "u-1", body, [], "s-11", "2026-05-16T00:00:00Z");
+
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+    await waitFor(() => expect(screen.getAllByTestId("turn").length).toBeGreaterThan(0));
+    expect(screen.queryByTestId("quoted-block")).toBeNull();
   });
 
   it("does not mark an ordinary (non-forward) user message", async () => {

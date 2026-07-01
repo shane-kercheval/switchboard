@@ -8,7 +8,7 @@ Per-harness snapshot of the last version vetted and the one-line verdict. A harn
 
 | Harness | Version | Date | Verdict |
 |---|---|---|---|
-| Codex | `0.141.0` | 2026-06-18 | No impact — `exec` flags, stream vocabulary, `turn_context` fields, session-file path, and auth/exit-code semantics all unchanged. |
+| Codex | `0.142.5` | 2026-07-01 | No impact — `exec` flags, stream vocabulary, session-file records, and auth/exit-code semantics all unchanged. Rollout compression stays disabled-by-default (latent risk only). |
 | Claude Code | `2.1.197` | 2026-07-01 | No adapter-contract impact. Sonnet 5 is the new default (native 1M context) and the `sonnet` alias now **redacts thinking**; version-agnostic, no code change. Behavior note + evidence in `harness-behavior.md` §6. |
 | Gemini | `0.42.0` | 2026-05-27 | Baseline probes from M3; logged-out auth shape captured. |
 | Antigravity (`agy`) | `1.0.10` | 2026-06-20 | No contract impact. **Open follow-up:** the adapter never passes `--print-timeout`, so it inherits `agy`'s 5-minute whole-turn cap (Antigravity-only fix). |
@@ -79,6 +79,7 @@ Some shapes can't be read from a changelog (auth-failure output, quota messages,
 Append-only, newest first — **one or two sentences per review.** Point to `harness-behavior.md` for durable behavior and to the review's PR for the full reasoning; don't re-summarize the changelog here. (Reviews before 2026-07-01 carried their detail in the "Last reviewed" table cells; that prose lives in git history.)
 
 - **Claude Code `2.1.172`→`2.1.197` (2026-07-01)** — no adapter-contract impact. Sonnet 5 became the default and `sonnet`→`claude-sonnet-5`, which **redacts extended thinking** (reversing Sonnet 4.6 — now no default-selectable Claude model exposes reasoning prose; `harness-behavior.md` §3.2/§6). Model-deprecation stderr warning, MCP `claude mcp` CLI changes, nested-skills loading, `--resume` fix, and stream-watchdog default were all benign or outside our surface. Live **12/12** after inverting the now-stale un-redacted-thinking test to `live_claude_sonnet_thinking_is_redacted`.
+- **Codex `0.141.0`→`0.142.5` (2026-07-01)** — no impact. The `0.142` line is app-server / plugins / multi-agent-v2 / Bedrock / proxy work that doesn't touch the `codex exec` slice we use: invocation flags, stream vocabulary, and session-file records (`turn_context`, `event_msg` subtypes, `response_item`) are unchanged; `turn_id`-on-`ResponseItem`-metadata and env-context→world-state are additive/orthogonal. Cold-rollout compression is behind a disabled-by-default feature — a latent risk (we read `rollout-*.jsonl` as plaintext), not a current one. Live 7/7.
 - **Antigravity `1.0.2`→`1.0.10` (2026-06-20)** — no contract impact (re-probe). Flagged a pre-existing gap: the adapter never passes `--print-timeout`, inheriting `agy`'s 5-minute whole-turn cap (still open).
 - **Codex `0.139.0`→`0.141.0` (2026-06-18)** — no impact. `exec` flags, stream vocabulary, `turn_context`, session-file path, and auth/exit-code semantics unchanged; encrypted-secret CLI auth is opt-in and didn't displace `~/.codex/auth.json`.
 - **Claude Code `2.1.170`→`2.1.172` (2026-06-11)** — no impact. Nested sub-agents (depth-agnostic `parent_tool_use_id` filter) and model-id `[1m]`/doubled-suffix fixes both benign.

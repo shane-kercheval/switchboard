@@ -40,7 +40,7 @@ export type ForwardOutcome =
 // reopen). Gemini's reasoning is disk-only and deliberately dropped
 // (stale-on-reopen UX). Claude's redaction is per-model: Opus 4.8 redacts the
 // text to empty, so its reasoning surfaces only as a non-rendering `liveness`
-// event. See docs/research/harness-behavior.md §3.2 for per-harness reality.
+// event. See docs/harness-behavior.md §3.2 for per-harness reality.
 export type ContentKind = "text" | "thinking";
 
 // ToolStarted.kind discriminates tool origin so the UI can label calls

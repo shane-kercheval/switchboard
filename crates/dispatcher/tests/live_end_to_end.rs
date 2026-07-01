@@ -739,7 +739,7 @@ async fn live_antigravity_cancel_terminates_and_synthesizes_cancelled() {
 /// attachment path, asserting the real CLI reads it. This proves the load-bearing
 /// assumption of the whole feature: the staging location resolves under each
 /// harness's sandbox. If a harness fails here, record the gap in
-/// `docs/research/harness-behavior.md` and the README's harness-limitations.
+/// `docs/harness-behavior.md` and the README's harness-limitations.
 async fn live_attachment_case(harness: HarnessKind, adapter: Arc<dyn HarnessAdapter>) {
     let tmp = TempDir::new().expect("tempdir");
     let directory = Directory::at(tmp.path()).expect("Directory::at");

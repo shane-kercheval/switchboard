@@ -20,7 +20,7 @@ Verified by live probe @ **2.1.159** (2026-06-01), mirroring Switchboard's exact
 ## Required reading before implementing
 
 - This file's Background + State-of-play (the per-model finding and the do-not-surface-empty decision are discussion-derived and not recoverable from the code).
-- `docs/research/harness-behavior.md` §3.2 (reasoning availability, updated for the per-model finding alongside this plan) and §7.1 (the redaction issue tracker).
+- `docs/harness-behavior.md` §3.2 (reasoning availability, updated for the per-model finding alongside this plan) and §7.1 (the redaction issue tracker).
 - `crates/harness/src/parser.rs` (the live thinking/empty → `Liveness` contract that M1 must mirror on the hydrate side: empty → no item, non-empty → `Thinking`).
 - `crates/harness/src/claude_code/session_file.rs` — `handle_assistant`'s block match (the `"text"` / `"tool_use"` arms and the catch-all to extend), and the deferred-tool-result reconstruction it sits inside.
 - `src/lib/components/ThinkingWidget.svelte` + `UnifiedTranscript.svelte` (PR #11) — to confirm the render branch already consumes a `{item_kind:"text", kind:"thinking"}` item, so M1 needs no frontend change.

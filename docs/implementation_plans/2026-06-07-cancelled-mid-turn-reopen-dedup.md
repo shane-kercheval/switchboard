@@ -247,7 +247,7 @@ key), so the forward-walk heuristic is needed for old journals regardless —
 making the key-join *additive*, not a replacement. It is cheaper than the first
 draft implied (M1 already persists the key on disk). **Revisit it when the
 documented residual proves to bite** — that mis-grouping shape is its trigger.
-Note this in `docs/research/harness-behavior.md`.
+Note this in `docs/harness-behavior.md`.
 
 ## Additional bug found during real-data verification: Gemini tool-result fragmentation
 

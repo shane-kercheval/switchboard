@@ -4,7 +4,7 @@ The single lookup surface for **how each harness behaves in the scenarios Switch
 
 **How this relates to the other docs:**
 - **system-design §9** is the *design-level* capability matrix (native / derived / unavailable per capability) and the process model. It stays the canonical design statement; this doc is the *operational* companion (observed shapes → our handling → gaps).
-- **`docs/research/archive/<harness>-cli-observed.md`** are the *captured-in-time provenance* — the raw probes (actual strings, exit codes, fixtures) behind the cells here. They are frozen (no longer updated) and live under `archive/`; treat **this** doc as the lookup surface and the archived `-observed` files as the evidence it cites: [claude](archive/claude-code-cli-observed.md), [codex](archive/codex-cli-observed.md), [gemini](archive/gemini-cli-observed.md), [antigravity](archive/antigravity-cli-observed.md).
+- **`docs/research/archive/<harness>-cli-observed.md`** are the *captured-in-time provenance* — the raw probes (actual strings, exit codes, fixtures) behind the cells here. They are frozen (no longer updated) and live under `research/archive/`; treat **this** doc as the lookup surface and the archived `-observed` files as the evidence it cites: [claude](research/archive/claude-code-cli-observed.md), [codex](research/archive/codex-cli-observed.md), [gemini](research/archive/gemini-cli-observed.md), [antigravity](research/archive/antigravity-cli-observed.md).
 
 **Legend:** ✅ handled correctly · ⚠️ partial / stale · ❌ gap. "Displayed where" distinguishes the **transcript** (per-turn) from the **sidebar** (per-agent) from a **project banner** (startup auth probe).
 
@@ -138,7 +138,7 @@ So **refresh eligibility is Claude-only today** (3-of-4 reopen-stable for disk-o
 
 ### 3.2 Reasoning / thinking content (exposed vs surfaced)
 
-Distinct from the `thoughts`/`reasoning` **token buckets** in the §3 table (those are counts) — this is the model's chain-of-thought **prose**, normalized to `ContentKind::Thinking` turn items (`crates/harness/src/events.rs`) so the frontend can render reasoning subordinate to the answer. Evidence cited from the frozen `archive/<harness>-cli-observed.md` probes.
+Distinct from the `thoughts`/`reasoning` **token buckets** in the §3 table (those are counts) — this is the model's chain-of-thought **prose**, normalized to `ContentKind::Thinking` turn items (`crates/harness/src/events.rs`) so the frontend can render reasoning subordinate to the answer. Evidence cited from the frozen `research/archive/<harness>-cli-observed.md` probes.
 
 | Harness | On-disk / wire source | Availability | We emit `Thinking`? | Notes |
 |---|---|---|---|---|

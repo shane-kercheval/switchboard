@@ -85,7 +85,7 @@ from a test name):
   tailed from `transcript.jsonl`, and a turn is `Completed` only when a terminal
   answer is read from it. Its tool-use live test therefore doubles as the guard
   that an agentic (tool-using) turn still yields a readable terminal answer. See
-  `docs/research/harness-behavior.md` (raw probe: `docs/research/archive/antigravity-cli-observed.md`).
+  `docs/harness-behavior.md` (raw probe: `docs/research/archive/antigravity-cli-observed.md`).
 
 ## What's intentionally NOT covered live
 

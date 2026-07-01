@@ -121,7 +121,7 @@ deliberate scope boundary, per "match complexity to the problem."
 - `docs/system-design.md` §3 (split conversation source-of-truth: harness files
   own completed-turn content; the journal owns non-completed outcomes) and §7
   (sends vs. turns).
-- `docs/research/harness-behavior.md` — current Claude adapter behavior and the
+- `docs/harness-behavior.md` — current Claude adapter behavior and the
   gap register; add an entry there (see DoD).
 - Anthropic stop-reason reference — the authoritative, current list of
   `stop_reason` values and their meanings. **Read this before writing the M2
@@ -540,7 +540,7 @@ consumes the now-shared key).
 ## Known limitations (recorded, intentionally out of scope)
 
 These are deliberate scope boundaries from the investigation; record them in
-`docs/research/harness-behavior.md` so they are not mistaken for oversights:
+`docs/harness-behavior.md` so they are not mistaken for oversights:
 
 1. **No live self-heal of a reload-stranded partial.** After a frontend reload
    mid-turn, the backend keeps running the turn but the reloaded frontend lost

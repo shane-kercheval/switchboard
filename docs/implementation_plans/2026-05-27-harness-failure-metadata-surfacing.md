@@ -4,7 +4,7 @@ Supersedes the unreviewed **M4.9 draft** ("Harness quota / usage-limit surfacing
 
 ## Why this exists (the reframe)
 
-The original draft framed the work as "detect quota exhaustion and give it a distinct `FailureKind` + bespoke UI." The audit ([`docs/research/harness-behavior.md`](../research/harness-behavior.md)) and the discussion changed that framing in three ways:
+The original draft framed the work as "detect quota exhaustion and give it a distinct `FailureKind` + bespoke UI." The audit ([`docs/harness-behavior.md`](../harness-behavior.md)) and the discussion changed that framing in three ways:
 
 1. **Quota/auth failures are just failures.** The point is not to *handle* them differently — it's to **display them accurately**, rendered exactly like any other failure in the transcript. So there is **no new `FailureKind`**, no distinct quota/auth render, no banner component. A quota failure is a `HarnessError` with a *correct message* instead of a misleading one.
 2. **The goal is symmetric, per-harness:** for each harness, (A) surface every failure it gives us with an accurate message, and (B) surface the metadata it exposes. Each harness differs; the adapter is the central translation point; some harnesses expose nothing for a given field, and that's fine.
@@ -14,7 +14,7 @@ The concrete gaps this closes (from the audit's gap register): G1 (Antigravity q
 
 ## Required reading (before implementing)
 
-- [`docs/research/harness-behavior.md`](../research/harness-behavior.md) — the canonical matrix; the gap register (G1–G14) is the scope source, and **§3.1 (event ⟂ on-disk parity)** is the substrate for Milestone 3. **Read first.**
+- [`docs/harness-behavior.md`](../harness-behavior.md) — the canonical matrix; the gap register (G1–G14) is the scope source, and **§3.1 (event ⟂ on-disk parity)** is the substrate for Milestone 3. **Read first.**
 
 > **Out of scope here, tracked separately:** Claude session-file / stream parser fidelity (subagent attribution, out-of-order `tool_use`/`tool_result` writes, warning-surface UX) is covered by [`2026-05-27-claude-session-file-parser-fidelity.md`](2026-05-27-claude-session-file-parser-fidelity.md). The "N transcript warnings" surface that fires on those bugs is *unrelated* to this plan's failure/metadata work — don't try to address it here.
 - [`docs/system-design.md`](../system-design.md) §7 "Failure handling" (failures = harness/template/orchestration errors; the transcript is the surface) and §9 (harness adapter pattern; keep the dispatcher harness-agnostic).

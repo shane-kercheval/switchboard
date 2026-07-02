@@ -155,7 +155,7 @@ and frontend. Later milestones must not invent parallel shapes.
 
 - `docs/system-design.md` §3 (filesystem layout + split source-of-truth) and §7
   (sends/turns) — the attachments dir and `Send` shape change touch both.
-- `docs/research/harness-behavior.md` — record the per-harness file-read behavior
+- `docs/harness-behavior.md` — record the per-harness file-read behavior
   and the new live tests here.
 - `docs/ui-conventions.md` — chips/drag-over states must use existing `ui/`
   primitives and semantic tokens.
@@ -299,7 +299,7 @@ Outcomes:
   echo one word from the file, assert the response contains it. This proves the
   cwd-staging location is actually readable under each harness's sandbox — the
   central risk of this feature. If a harness cannot read it, record the gap in
-  `docs/research/harness-behavior.md` and add a user-facing line to the README's
+  `docs/harness-behavior.md` and add a user-facing line to the README's
   "Harness support and limitations".
 - Docs: update `system-design.md` §3 filesystem layout (new `attachments/` dir
   under the per-project metadata dir; `Send` record gains `attachments`) and the

@@ -519,7 +519,7 @@ The resume-command tokens come from the **same adapter-owned session-artifact re
 
 ## M4.9 — Harness quota / usage-limit surfacing
 
-> **🛑 SUPERSEDED — extracted and rewritten.** This draft was reviewed (2026-05-27) and replaced by its own plan: [`2026-05-27-harness-failure-metadata-surfacing.md`](2026-05-27-harness-failure-metadata-surfacing.md). The review rejected this draft's framing (distinct `FailureKind` + bespoke quota UI) in favor of "render failures accurately, like any other failure" and a per-harness failure/metadata audit ([`docs/research/harness-behavior.md`](../research/harness-behavior.md)). **Everything below this line is the obsolete draft — do not implement it; follow the extracted plan.**
+> **🛑 SUPERSEDED — extracted and rewritten.** This draft was reviewed (2026-05-27) and replaced by its own plan: [`2026-05-27-harness-failure-metadata-surfacing.md`](2026-05-27-harness-failure-metadata-surfacing.md). The review rejected this draft's framing (distinct `FailureKind` + bespoke quota UI) in favor of "render failures accurately, like any other failure" and a per-harness failure/metadata audit ([`docs/harness-behavior.md`](../harness-behavior.md)). **Everything below this line is the obsolete draft — do not implement it; follow the extracted plan.**
 
 ### Goal & Outcome
 
@@ -605,7 +605,7 @@ Outcomes:
 - **Gemini's hydrate-only `Thinking` emission is removed** (`gemini/session_file.rs` + its test): it never streams (re-confirmed @ 0.44.0), so reopened-only reasoning is stale UX. Small backend change. The `[Thought: true]` live literal stays an open capture (§5/§7.2) — not reproduced under the default config; parse it only if a later probe proves it's a live reasoning marker.
 - **Claude / Codex** surface nothing — recorded as unavailable (redacted) / impossible (encrypted) in §3.2/§7; no code.
 - The stale `events.rs` doc comment on `ContentKind::Thinking` ("Reserved; not currently emitted") is corrected.
-- The per-harness reasoning reality is recorded in `docs/research/harness-behavior.md` §3.2/§7 (the canonical operational surface, created after this milestone was drafted). The frozen `archive/*-cli-observed.md` probes are cited as evidence, not edited.
+- The per-harness reasoning reality is recorded in `docs/harness-behavior.md` §3.2/§7 (the canonical operational surface, created after this milestone was drafted). The frozen `archive/*-cli-observed.md` probes are cited as evidence, not edited.
 
 ### Background: what the research found (2026-05-26)
 

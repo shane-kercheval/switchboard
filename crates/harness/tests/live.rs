@@ -352,19 +352,18 @@ async fn live_claude_rate_limit_precedes_result() {
 #[ignore = "requires claude installed — run with: make test-live"]
 async fn live_claude_thinking_emits_liveness() {
     // While the model reasons, the CLI streams `thinking_delta` /
-    // `signature_delta`. On a redacting model (Opus 4.8 — the dev's default,
-    // so what this test exercises) the thinking text is empty and the adapter
-    // surfaces `Liveness`; on a non-redacting model (Sonnet 4.6) it surfaces a
+    // `signature_delta`. On a redacting model the thinking text is empty and
+    // the adapter surfaces `Liveness`; on a non-redacting model it surfaces a
     // `Thinking` `ContentChunk`. Either keeps the frontend heartbeat from
     // falsely failing a long thinking turn. If a CLI bump stops streaming
     // during thinking, this test catches it (the fixture test proves the
     // parser maps the delta; this proves the delta still arrives live).
     //
-    // This test runs on the dev default (Opus → redacted), so it only ever
-    // exercises the `Liveness` branch. The non-empty `Thinking` branch — the
-    // "real Sonnet still returns un-redacted reasoning" contract — is covered
-    // live by `live_claude_sonnet_emits_unredacted_thinking`, which pins
-    // `--model sonnet` (possible now that per-agent model selection exists).
+    // As of Sonnet 5, every first-party Claude model redacts thinking in `-p`
+    // (Opus 4.8 / Fable 5 / Sonnet 5 — signature only, empty text; see
+    // harness-behavior.md §3.2), so today this only exercises the `Liveness`
+    // branch. The assertion stays branch-agnostic so it survives a future
+    // server-flag flip back to un-redacted reasoning.
     let adapter = ClaudeCodeAdapter::new();
     let agent = live_agent();
     let turn_id = Uuid::now_v7();
@@ -373,8 +372,13 @@ async fn live_claude_thinking_emits_liveness() {
         .dispatch(
             &agent,
             Path::new("/tmp"),
-            "Think step by step and reason carefully before answering. ultrathink. \
-             Then reply with only the number 4 and nothing else.",
+            // A genuine multi-step word problem with a one-token answer. Trivial
+            // prompts (e.g. "reply with 4") no longer engage thinking on current
+            // Opus/Sonnet even with `ultrathink`, so the prompt must require real
+            // reasoning to reliably produce a thinking block.
+            "ultrathink. A farmer has 17 sheep; all but 9 run away. He then buys \
+             twice as many as he has left, then sells 5. Reason step by step, then \
+             reply with only the final number.",
             turn_id,
             DispatchOptions::default(),
         )
@@ -384,8 +388,8 @@ async fn live_claude_thinking_emits_liveness() {
     let events: Vec<AdapterEvent> = stream.collect().await;
 
     // A thinking block must produce a sign of life that re-arms the heartbeat:
-    // either `Liveness` (a redacting model like Opus 4.8) or
-    // `ContentChunk { Thinking }` (a non-redacting model like Sonnet 4.6).
+    // either `Liveness` (a redacting model, the current case for every
+    // first-party model) or `ContentChunk { Thinking }` (a non-redacting model).
     // Both are product-correct — assert the behavior, not which variant
     // arrives, so the per-model redaction split doesn't read as a regression.
     let sign_of_life = events.iter().any(|e| {
@@ -473,17 +477,18 @@ async fn live_claude_model_and_effort_dispatch() {
 
 #[tokio::test]
 #[ignore = "requires claude installed — run with: make test-live"]
-async fn live_claude_sonnet_emits_unredacted_thinking() {
-    // The only automated guard that the real Sonnet CLI still returns
-    // *un-redacted* reasoning. Claude's redaction is per-model
-    // (`harness-behavior.md` §3.2): the dev default Opus redacts, Sonnet does
-    // not. Pinning `--model sonnet` (now possible) and asserting a non-empty
-    // `Thinking` `ContentChunk` is what catches a silent re-redaction upstream.
-    // Assert content *presence*, not exact text.
-    // A genuinely multi-step problem with a one-token answer: trivial prompts
-    // (e.g. "reply with 4") don't engage thinking at all on Sonnet, so the
-    // prompt must require reasoning. `--effort high` biases the model toward
-    // emitting a thinking block; the answer stays tiny per cost discipline.
+async fn live_claude_sonnet_thinking_is_redacted() {
+    // Pins the current reality: Sonnet (5) redacts extended thinking in `-p`
+    // mode — the block streams (signature only, empty text) so the adapter
+    // surfaces `Liveness`, but no un-redacted `Thinking` prose. As of Sonnet 5,
+    // every first-party Claude model redacts (Opus 4.8 / Fable 5 / Sonnet 5);
+    // Sonnet 4.6 was the lone exception and its alias now points to Sonnet 5
+    // (`harness-behavior.md` §3.2/§7.1). This is the drift guard: the redaction
+    // is server-flag-gated and has moved before (it un-redacted Sonnet 4.6 at
+    // 2.1.159, re-redacted at Sonnet 5), so a future flip back to un-redacted
+    // reasoning trips the `no Thinking text` assertion and tells us to re-enable
+    // rendering. A genuinely multi-step prompt (with `--effort high`) is needed
+    // to reliably *engage* thinking; the answer stays tiny per cost discipline.
     let adapter = ClaudeCodeAdapter::new();
     let mut agent = live_agent();
     agent.model = Some("sonnet".to_owned());
@@ -494,8 +499,8 @@ async fn live_claude_sonnet_emits_unredacted_thinking() {
         .dispatch(
             &agent,
             Path::new("/tmp"),
-            "A shelf holds 3 rows of 14 books and 2 rows of 9 books. Reason step \
-             by step, then reply with only the total number of books.",
+            "ultrathink. Reason step by step whether 1000003 is prime, then reply \
+             with only yes or no.",
             turn_id,
             DispatchOptions::default(),
         )
@@ -503,6 +508,19 @@ async fn live_claude_sonnet_emits_unredacted_thinking() {
         .expect("dispatch should succeed with real claude");
     let events: Vec<AdapterEvent> = stream.collect().await;
 
+    // Thinking was engaged and streamed: a redacted block surfaces as `Liveness`
+    // (the heartbeat that keeps a long thinking turn from falsely failing).
+    let engaged_thinking = events
+        .iter()
+        .any(|e| matches!(e, AdapterEvent::Liveness { turn_id: t } if *t == turn_id));
+    assert!(
+        engaged_thinking,
+        "expected the thinking block to stream as `Liveness` (redacted); got none. \
+         If thinking stopped streaming entirely, re-probe (harness-behavior.md §3.2). \
+         events: {events:?}"
+    );
+
+    // …but the prose is redacted: no un-redacted `Thinking` content chunk.
     let thinking_text: String = events
         .iter()
         .filter_map(|e| match e {
@@ -515,9 +533,10 @@ async fn live_claude_sonnet_emits_unredacted_thinking() {
         })
         .collect();
     assert!(
-        !thinking_text.trim().is_empty(),
-        "Sonnet must stream un-redacted `Thinking` content; got none. If this \
-         fails, re-probe per-model redaction (harness-behavior.md §3.2). events: {events:?}"
+        thinking_text.trim().is_empty(),
+        "Sonnet now redacts thinking — expected no un-redacted `Thinking` prose, but \
+         got some. The server redaction flag may have flipped back; re-probe per-model \
+         (harness-behavior.md §3.2) and re-enable reasoning rendering. text: {thinking_text:?}"
     );
 }
 

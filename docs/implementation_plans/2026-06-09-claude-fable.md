@@ -5,7 +5,7 @@
 This is **not** a milestone implementation plan — it's a record of what was checked and why
 adding Claude Fable 5 to Switchboard is a **one-line** change. It exists so a future agent can
 see the probe evidence behind that one line without re-deriving it. Canonical behavior lives in
-`docs/research/harness-behavior.md` (§3.2 thinking, §3.3 model, §3.4 effort, §6 version notes,
+`docs/harness-behavior.md` (§3.2 thinking, §3.3 model, §3.4 effort, §6 version notes,
 §7.1 redaction); this doc just narrates the reasoning.
 
 ## Context

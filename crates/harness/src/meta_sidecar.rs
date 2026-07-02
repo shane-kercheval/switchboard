@@ -3,7 +3,7 @@
 //!
 //! Some harness metadata lives *only* on the live event stream and has no
 //! on-disk equivalent in the harness's own session file — "class C" in
-//! `docs/research/harness-behavior.md` §3.1. Today that's Claude's
+//! `docs/harness-behavior.md` §3.1. Today that's Claude's
 //! `rate_limit_event` payload (used %, `isUsingOverage`, reset times). The
 //! TUI never loses it because it doesn't restart mid-session; Switchboard
 //! does, so without this cache the agent bar shows nothing quota-related

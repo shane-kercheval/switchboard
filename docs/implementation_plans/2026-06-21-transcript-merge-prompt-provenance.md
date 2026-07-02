@@ -152,7 +152,7 @@ structural. `#41`'s logic is retained as the `Unknown` fallback, not deleted.
 ## Docs to read before implementing
 
 - `docs/system-design.md` §3 (split source-of-truth) and §7 (sends vs. turns).
-- `docs/research/harness-behavior.md` §3.1 — Claude session-file behavior; this
+- `docs/harness-behavior.md` §3.1 — Claude session-file behavior; this
   adds the provenance/housekeeping shape (see Docs DoD below).
 - The `#41` correlation comment (`crates/app/src/commands.rs:3806–3873`) and its
   `merge_*` tests — the contract being refined.
@@ -231,7 +231,7 @@ prompts are never dropped. The real-data diagnostic drops from **9 → 0**.
 ## Milestone 3 — Docs
 
 ### Definition of Done
-- `docs/research/harness-behavior.md` §3.1 — add a subsection documenting: the
+- `docs/harness-behavior.md` §3.1 — add a subsection documenting: the
   4-value `promptSource` enum (with the corpus counts above), the housekeeping
   `type:"user"` record family the parser skips, the large `None`/`Unknown`
   fallback population, and the new drift live-test. Note that the live

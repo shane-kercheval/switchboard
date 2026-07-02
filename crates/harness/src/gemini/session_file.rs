@@ -520,7 +520,7 @@ impl GeminiReconstruction {
             // Gemini's reasoning (`thoughts`) is intentionally NOT surfaced: it
             // is written only to the session file, never to the live stream, so
             // rendering it would show after-the-fact reasoning that only appears
-            // on reopen — stale UX. See docs/research/harness-behavior.md §3.2.
+            // on reopen — stale UX. See docs/harness-behavior.md §3.2.
             for tc in &record.tool_calls {
                 if GEMINI_INTERNAL_TOOL_NAMES.contains(&tc.name.as_str()) {
                     continue;

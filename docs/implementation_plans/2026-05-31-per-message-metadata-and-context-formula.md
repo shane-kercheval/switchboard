@@ -45,7 +45,7 @@ The mechanism is harness-agnostic; the *data availability* is not. A field rende
 
 ## Required reading (before implementing)
 
-- [`docs/research/harness-behavior.md`](../research/harness-behavior.md) §3.1 (event ⟂ on-disk parity — the class-A/B/C model this plan's persistence decisions rest on). **Read first.**
+- [`docs/harness-behavior.md`](../harness-behavior.md) §3.1 (event ⟂ on-disk parity — the class-A/B/C model this plan's persistence decisions rest on). **Read first.**
 - The two superseded notes above — they contain the root-cause analysis (Anthropic prompt-cache token accounting; why cost/context aren't in the session file) that this plan compresses.
 - [`docs/system-design.md`](../system-design.md) §2 (cost surface — no pricing tables, no cross-harness aggregation, no per-token display) and §3 (split source of truth: harness files own completed-turn content, the journal owns the user's side; the `meta.json` sidecar from the failure-metadata plan owns stream-only metadata).
 - [`docs/ui-conventions.md`](../ui-conventions.md) — semantic tokens + `ui/` primitives for the Sidebar and transcript changes.

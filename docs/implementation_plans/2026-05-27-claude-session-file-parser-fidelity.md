@@ -17,7 +17,7 @@ The warning surface is **kept and made better**, not removed: it's the project's
 
 - [`2026-05-24-subagent-rendering-fidelity.md`](2026-05-24-subagent-rendering-fidelity.md) — the original M1 investigation: ground-truth probes, cross-harness verification, exact stream shapes. **M1 below lifts its recommendation; read the source for the evidence.**
 - [`../research/archive/claude-code-cli-observed.md`](../research/archive/claude-code-cli-observed.md) §"Subagent (`Agent` tool) representation" — frozen probe provenance.
-- [`../research/harness-behavior.md`](../research/harness-behavior.md) §1 (failures) and §3.1 (parity matrix) — Claude session-file is class-A for assistant content, which makes these correctness bugs (parity exists; we're dropping it).
+- [`../research/harness-behavior.md`](../harness-behavior.md) §1 (failures) and §3.1 (parity matrix) — Claude session-file is class-A for assistant content, which makes these correctness bugs (parity exists; we're dropping it).
 - `crates/harness/src/parser.rs` — the **stream** parser (`parse_line`, `parse_assistant_envelope`, `parse_user_envelope`) M1 touches.
 - `crates/harness/src/claude_code/session_file.rs` — the **session-file** parser (`handle_tool_result` at `:307-353`, the turn builder) M2 touches.
 - `crates/harness/src/transcript.rs` — `ParseWarning` shape and contract.
@@ -74,7 +74,7 @@ user       parent_tool_use_id=null         tool_result          (Agent aggregate
 - **Live test** (`#[ignore]`-gated, named `live_claude_subagent_collapses_to_parent_tool_call`, run via `make test-live-claude`):
   - Run the probe prompt ("Use the Agent tool to launch exactly one general-purpose subagent…"); assert the parent turn emits one `ToolStarted{Agent}` + one `ToolCompleted`, and **no** subagent-internal tool events at the parent turn.
 - **Cross-check:** `grep parent_tool_use_id` returns hits in `parser.rs` (read site) but **not** in `dispatcher/` / `commands.rs`.
-- **Docs:** [`harness-behavior.md`](../research/harness-behavior.md) updated — note Claude subagent collapsing as the target shape (matches Gemini/Antigravity); `system-design.md` §9 updated: `Task` → `Agent`, "spawn as expected" qualified with the representation note.
+- **Docs:** [`harness-behavior.md`](../harness-behavior.md) updated — note Claude subagent collapsing as the target shape (matches Gemini/Antigravity); `system-design.md` §9 updated: `Task` → `Agent`, "spawn as expected" qualified with the representation note.
 - **Out of scope (record):** v2 nested/labeled "expand this delegation" UI is deferred. v1 deliberately collapses a delegation to one tool call. The data supports v2 later (stream has `parent_tool_use_id`; disk has `subagents/*.jsonl`).
 
 ---
@@ -127,7 +127,7 @@ This preserves the warning surface for real drift while eliminating the false po
   - Run a prompt that triggers several Read/Bash tool calls in sequence; quit Switchboard; rehydrate; assert every `TurnItem::Tool` has non-empty `output` and **no** parse warnings on the loaded transcript. This is the end-to-end TUI-parity check.
 - **Negative-case check:** corrupting the captured fixture by removing the `tool_use` record entirely → exactly one warning produced (genuine miss); the corresponding `TurnItem` is absent (no orphan with empty output).
 - **Docs:**
-  - [`harness-behavior.md`](../research/harness-behavior.md) — add a row under §1 or §3 noting Claude 2.1.150 out-of-order disk writes as a tolerated pattern; reference this milestone as the fix.
+  - [`harness-behavior.md`](../harness-behavior.md) — add a row under §1 or §3 noting Claude 2.1.150 out-of-order disk writes as a tolerated pattern; reference this milestone as the fix.
   - [`harness-update-review.md`](../research/harness-update-review.md) §3 — add "session-file ordering invariant" to the dependency surface, so future version bumps are checked against this assumption.
   - Code comment at the queue site recording the v2.1.150 evidence + the "if a future version crosses turn boundaries" caveat.
 

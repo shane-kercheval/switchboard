@@ -25,7 +25,7 @@ pub type MessageId = Uuid;
 /// and on disk, reconstructed on hydrate), while Opus 4.8 redacts the text to
 /// empty so it surfaces only as a non-rendering [`AdapterEvent::Liveness`]
 /// signal; Codex encrypts it (unavailable). Per-harness reality lives in
-/// `docs/research/harness-behavior.md` §3.2.
+/// `docs/harness-behavior.md` §3.2.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
@@ -74,7 +74,7 @@ pub struct McpServerStatus {
 #[non_exhaustive]
 pub enum RateLimitSource {
     /// Lives only on the live stream; no session-file equivalent (class C, per
-    /// `docs/research/harness-behavior.md` §3.1). Claude's `rate_limit_event`.
+    /// `docs/harness-behavior.md` §3.1). Claude's `rate_limit_event`.
     /// The dispatcher persists these to the metadata sidecar so they survive
     /// restart.
     StreamOnly,

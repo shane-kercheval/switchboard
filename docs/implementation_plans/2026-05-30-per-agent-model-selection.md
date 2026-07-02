@@ -6,7 +6,7 @@ Let each agent run on a user-chosen **model** and **reasoning-effort level**. Bo
 
 ## Background — read before implementing
 
-This plan is the product of empirical probes of all four harness CLIs. **Read `docs/research/harness-behavior.md` §3.3–§3.4 (model selection; reasoning effort) first** — they are the ground truth for the per-harness behavior this plan encodes. The essentials:
+This plan is the product of empirical probes of all four harness CLIs. **Read `docs/harness-behavior.md` §3.3–§3.4 (model selection; reasoning effort) first** — they are the ground truth for the per-harness behavior this plan encodes. The essentials:
 
 **Model** — `--model <alias|id>` (Claude), `-m/--model <id>` (Codex), `-m/--model <id>` (Gemini), and **nothing** for Antigravity (its model is a global, harness-owned config we never touch; its agents run on whatever was last selected inside Antigravity). Model is per-invocation, not configured once — Claude is session-sticky, Gemini reverts to its default without the flag, Codex re-derives per turn — so the rule is **send the flag every turn when set**. Model **values are not enumerable**: no harness has a usable "list models" command (`claude models` only makes the LLM recite a training-frozen table; the others have none), and Codex values are **plan-gated** (only `gpt-5.5` accepted on the probe account; out-of-plan ids 400 from the API, not from us). So model input is **free-text with hardcoded suggestions**, never a validated list.
 
@@ -225,7 +225,7 @@ This **keeps `SessionMeta.model`** (no retirement): it is the observed-model fal
 - Transcript test: an agent turn renders its `model`/`effort` independently from the sidebar value; `None` renders nothing.
 - **`SessionMeta.model` audit — KEPT (decided 2026-06-06).** The audit confirmed `SessionMeta.model` is *not* a per-turn-population intermediate (every harness sources per-turn `TurnEnd.model` from its own parser/enrichment state — Claude `last_assistant_model`, Gemini `current_model`, Codex `turn_context`, Antigravity carry-forward), so it *could* have been retired. It is **kept** because the chosen sidebar design (intent-first, observed-fallback) gives it a real continuing purpose: the observed-model source for the no-explicit-intent cases (Antigravity, attached-at-"No override"). Update the "until M6" comments to say so. No Rust-side removal in M6.
 - **Docs (required):**
-  - `docs/research/harness-behavior.md` §3.3/§3.4 status notes (model & effort selection ship; Antigravity per-turn model is carry-forward; Claude effort per-turn may be intent-only).
+  - `docs/harness-behavior.md` §3.3/§3.4 status notes (model & effort selection ship; Antigravity per-turn model is carry-forward; Claude effort per-turn may be intent-only).
   - **`README.md` "Harness support and limitations"** — update/extend the user-facing bullets to name the gaps this feature exposes, in product terms: **Gemini** — model is selectable, but **reasoning effort can't be set from Switchboard** (Gemini exposes it only through Gemini's own config). **Antigravity** — **model can't be selected from Switchboard** (set it inside Antigravity), and effort is part of the Antigravity model you pick there. (This is the canonical example of bubbling a user-facing harness limitation up to the README — keep it short and in product terms, mechanism stays in the research doc.)
   - `docs/system-design.md` §9 capability matrix if model/effort belong there.
 - `make check` green.

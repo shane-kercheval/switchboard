@@ -29,7 +29,7 @@ This plan fixes both, and then builds the staleness-refresh feature on top (M3):
 ## Authoritative reading — read before implementing
 
 Internal (ground truth — read first):
-- `docs/research/harness-behavior.md` **§3.1-cost** — the existing `stable_message_id` join key: Claude's final non-subagent assistant `message.id`, **verified to round-trip identically between the live stream and the on-disk session file**. M2 generalizes this; do not reinvent it.
+- `docs/harness-behavior.md` **§3.1-cost** — the existing `stable_message_id` join key: Claude's final non-subagent assistant `message.id`, **verified to round-trip identically between the live stream and the on-disk session file**. M2 generalizes this; do not reinvent it.
 - `crates/harness/src/claude_code/session_file.rs` — Claude session-file parser; `last_message_id` → `stable_message_id` (already populated; round-trip test in-file). `crates/harness/src/parser.rs` — the live Claude parser (`last_assistant_message_id`).
 - `crates/harness/src/codex/session_file.rs` and `crates/harness/src/gemini/session_file.rs` — Codex and Gemini session-file parsers; both currently emit `stable_message_id: None`, **but the on-disk id exists and is ignored, not absent**: Codex writes a harness-local `turn_id` on `task_started` records, Gemini a record `id` (`g1`/`g2`). M2 Step 1 captures these and probes whether the *live* stream exposes the same id. `crates/harness/src/antigravity/session_file.rs` mints `Uuid::now_v7()` per parse with no native per-turn id — the one harness with none.
 - `docs/research/archive/*-cli-observed.md` — raw session-file shapes (the probes `harness-behavior.md` distills from). Cite these for the exact on-disk fields when capturing Codex/Gemini stable ids.

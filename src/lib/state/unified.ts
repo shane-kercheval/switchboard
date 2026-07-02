@@ -59,7 +59,7 @@ function trimBlankOuterLines(text: string): string {
 /// reasoning into the response. Route every such consumer through here so that
 /// rule lives in exactly one place. Empty outer lines are removed from each
 /// answer block, while indentation and trailing spaces on meaningful lines are
-/// preserved for Markdown fidelity. See docs/research/harness-behavior.md §3.2.
+/// preserved for Markdown fidelity. See docs/harness-behavior.md §3.2.
 export function answerTextOf(turn: AgentTurn): string {
   return turn.items
     .filter((i) => i.item_kind === "text")

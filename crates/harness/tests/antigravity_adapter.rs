@@ -774,7 +774,7 @@ async fn cancel_terminates_and_emits_no_terminal() {
 /// End-to-end quota path: with the per-dispatch `--log-file` carrying a
 /// `RESOURCE_EXHAUSTED` line, the no-answer branch surfaces an authored
 /// `HarnessError` quota message instead of the generic "agy exited without
-/// producing an answer" fallback. Closes G1 (`docs/research/harness-behavior.md`).
+/// producing an answer" fallback. Closes G1 (`docs/harness-behavior.md`).
 #[tokio::test]
 async fn quota_log_line_surfaces_as_harness_error_quota_message() {
     let home = tempfile::TempDir::new().unwrap();

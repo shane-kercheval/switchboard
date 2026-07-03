@@ -475,6 +475,34 @@ pub enum NormalizedEvent {
 }
 
 impl AdapterEvent {
+    /// Whether this event belongs to the **turn** lifecycle (content, tools,
+    /// liveness, identity, the terminal) as opposed to the **agent** scope
+    /// (rate limits, session metadata, the internal locator capture).
+    ///
+    /// The dispatcher uses this to enforce the adapter contract at its
+    /// boundary: after a turn's terminal, further turn-scoped events are a
+    /// contract violation and are dropped, while agent-scoped enrichment
+    /// legitimately flows post-terminal (Codex and Antigravity both emit
+    /// `RateLimitEvent`/`SessionMeta` after `TurnEnd` by design).
+    ///
+    /// Exhaustive match on purpose — no `_` arm — so adding a variant forces
+    /// an explicit lifecycle classification at compile time instead of
+    /// silently inheriting a default.
+    #[must_use]
+    pub fn is_turn_scoped(&self) -> bool {
+        match self {
+            AdapterEvent::ContentChunk { .. }
+            | AdapterEvent::Liveness { .. }
+            | AdapterEvent::TurnIdentity { .. }
+            | AdapterEvent::ToolStarted { .. }
+            | AdapterEvent::ToolCompleted { .. }
+            | AdapterEvent::TurnEnd { .. } => true,
+            AdapterEvent::RateLimitEvent { .. }
+            | AdapterEvent::SessionMeta { .. }
+            | AdapterEvent::SessionLocatorCaptured { .. } => false,
+        }
+    }
+
     /// Lift an adapter event into its frontend-facing [`NormalizedEvent`], or
     /// `None` for an **internal** event that the dispatcher consumes without
     /// forwarding. Not every adapter event has a wire representation:

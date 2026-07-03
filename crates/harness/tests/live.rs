@@ -66,6 +66,77 @@ fn live_agent() -> AgentRecord {
 
 #[tokio::test]
 #[ignore = "requires claude installed — run with: make test-live"]
+async fn live_claude_background_agent_completes_as_one_turn() {
+    // Drift guard for the background-agent dispatch grammar (probed at
+    // 2.1.198): one `claude -p` process runs N+1 internal init→result cycles,
+    // and the adapter must present them as ONE turn — a single Completed
+    // terminal after ALL cycles' text. If Anthropic changes the cycle
+    // grammar (result timing, task-event vocabulary, exit behavior), this
+    // catches it before it ships. Cost note: deliberately above the
+    // one-word-reply discipline (~$0.10–0.20/run — it must genuinely run a
+    // background sub-agent); the fixture-driven `background-agent*` tests
+    // are the free, hermetic coverage the default suite runs instead.
+    let adapter = ClaudeCodeAdapter::new();
+    let agent = live_agent();
+    let turn_id = Uuid::now_v7();
+
+    let stream = adapter
+        .dispatch(
+            &agent,
+            Path::new("/tmp"),
+            "Use your Agent tool to launch exactly ONE subagent with run_in_background set to \
+             true, whose prompt is: Reply with the single word ack. Immediately after launching \
+             it, output the single word: waiting. Do not poll it. When the background task \
+             completion notification arrives, output the single word: done. Keep every response \
+             minimal.",
+            turn_id,
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("dispatch should succeed with real claude");
+
+    let events: Vec<AdapterEvent> = stream.collect().await;
+
+    let terminals: Vec<&AdapterEvent> = events
+        .iter()
+        .filter(|e| matches!(e, AdapterEvent::TurnEnd { .. }))
+        .collect();
+    assert_eq!(
+        terminals.len(),
+        1,
+        "one dispatch = one terminal, regardless of internal cycles"
+    );
+    assert!(
+        matches!(
+            terminals[0],
+            AdapterEvent::TurnEnd {
+                outcome: TurnOutcome::Completed,
+                ..
+            }
+        ),
+        "expected TurnEnd(Completed), got: {:?}",
+        terminals[0]
+    );
+
+    let text: String = events
+        .iter()
+        .filter_map(|e| match e {
+            AdapterEvent::ContentChunk { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        text.contains("waiting") && text.contains("done"),
+        "both cycles' text must stream (pre- and post-notification), got: {text:?}"
+    );
+    assert!(
+        matches!(events.last(), Some(AdapterEvent::TurnEnd { .. })),
+        "the terminal arrives after all content"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires claude installed — run with: make test-live"]
 async fn live_claude_basic_turn_completes() {
     let adapter = ClaudeCodeAdapter::new();
     let agent = live_agent();

@@ -244,10 +244,57 @@ async fn malformed_json_synthesizes_adapter_failure() {
 }
 
 #[tokio::test]
-async fn exit1_after_completed_does_not_re_emit() {
-    // After observing TurnEnd(Completed), a non-zero subprocess exit must be
-    // logged but NOT cause a second TurnEnd to be emitted. Consumers see exactly
-    // one terminal event: the Completed one.
+async fn malformed_json_after_success_result_keeps_folded_telemetry() {
+    // A stream glitch AFTER a successful cycle (a shape only possible now
+    // that the read loop stays open across background-agent cycles): the
+    // turn fails, but the already-folded whole-dispatch telemetry — usage,
+    // cost, and the cost-join key — must survive onto the failure terminal
+    // instead of being discarded. Partial work is still billed.
+    let agent = fake_agent();
+    let events = collect_events(&adapter(), &agent, &fixture("malformed-after-result")).await;
+
+    let terminals: Vec<&AdapterEvent> = events
+        .iter()
+        .filter(|e| matches!(e, AdapterEvent::TurnEnd { .. }))
+        .collect();
+    assert_eq!(terminals.len(), 1, "exactly one terminal event");
+    match terminals[0] {
+        AdapterEvent::TurnEnd {
+            outcome:
+                TurnOutcome::Failed {
+                    kind: FailureKind::AdapterFailure,
+                    message,
+                },
+            usage: Some(usage),
+            stable_message_id,
+            ..
+        } => {
+            assert!(
+                message.contains("malformed JSON"),
+                "failure cause preserved, got: {message:?}"
+            );
+            assert!(
+                (usage.total_cost_usd.unwrap() - 0.03).abs() < f64::EPSILON,
+                "folded cost survives the glitch"
+            );
+            assert_eq!(
+                stable_message_id.as_deref(),
+                Some("msg_glitch01"),
+                "cost-join key survives the glitch"
+            );
+        }
+        other => panic!("expected Failed(AdapterFailure) with folded telemetry, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn exit1_after_success_result_fails_the_turn() {
+    // The exit-status gate: a successful `result` followed by a non-zero
+    // process exit is a dispatch that did NOT finish — a kill between
+    // background-agent cycles leaves exactly this shape behind. Completing it
+    // would silently feed forwards/workflows a partial answer as
+    // authoritative, so the single terminal must be Failed (carrying the
+    // folded telemetry — partial work is still billed).
     let agent = fake_agent();
     let events = collect_events(&adapter(), &agent, &fixture("exit1-after-completed")).await;
 
@@ -255,11 +302,48 @@ async fn exit1_after_completed_does_not_re_emit() {
         .iter()
         .filter(|e| matches!(e, AdapterEvent::TurnEnd { .. }))
         .collect();
-    assert_eq!(
-        terminals.len(),
-        1,
-        "must not re-emit a second TurnEnd after reconciliation"
-    );
+    assert_eq!(terminals.len(), 1, "exactly one terminal event");
+    match terminals[0] {
+        AdapterEvent::TurnEnd {
+            outcome:
+                TurnOutcome::Failed {
+                    kind: FailureKind::HarnessError,
+                    message,
+                },
+            usage,
+            ..
+        } => {
+            assert!(
+                message.contains("exited with code 1"),
+                "message names the exit status, got: {message:?}"
+            );
+            assert!(
+                message.contains("dispatch incomplete"),
+                "message says the dispatch did not finish, got: {message:?}"
+            );
+            assert!(
+                usage.is_some(),
+                "folded telemetry survives onto the failure terminal"
+            );
+        }
+        other => panic!("expected TurnEnd(Failed(HarnessError)), got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn background_agent_dispatch_completes_as_one_turn() {
+    // A real (sanitized) background-agent capture: two init→result cycles,
+    // task-lifecycle system events, a parent_tool_use_id-tagged relayed
+    // record, and BOTH results exit-batched at the very end. One dispatch =
+    // one turn: exactly one TurnEnd, Completed, after all content.
+    let agent = fake_agent();
+    let events = collect_events(&adapter(), &agent, &fixture("background-agent")).await;
+
+    let terminals: Vec<&AdapterEvent> = events
+        .iter()
+        .filter(|e| matches!(e, AdapterEvent::TurnEnd { .. }))
+        .collect();
+    assert_eq!(terminals.len(), 1, "one dispatch = one terminal");
     assert!(matches!(
         terminals[0],
         AdapterEvent::TurnEnd {
@@ -267,6 +351,138 @@ async fn exit1_after_completed_does_not_re_emit() {
             ..
         }
     ));
+
+    // Every cycle's text reaches the consumer — the capture's cycles end
+    // "waiting" and "done" respectively.
+    let joined: String = events
+        .iter()
+        .filter_map(|e| match e {
+            AdapterEvent::ContentChunk {
+                kind: ContentKind::Text,
+                text,
+                ..
+            } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        joined.contains("waiting"),
+        "cycle-1 text present: {joined:?}"
+    );
+    assert!(joined.contains("done"), "cycle-2 text present: {joined:?}");
+    assert!(
+        joined.contains("waiting\n\ndone"),
+        "block separator between cycles: {joined:?}"
+    );
+
+    // The terminal is the LAST event — no content or liveness after it.
+    assert!(
+        matches!(events.last(), Some(AdapterEvent::TurnEnd { .. })),
+        "terminal arrives after all content"
+    );
+
+    // Task-lifecycle system events surface as Liveness (heartbeat stays armed
+    // through the background wait).
+    let liveness_count = events
+        .iter()
+        .filter(|e| matches!(e, AdapterEvent::Liveness { .. }))
+        .count();
+    assert!(
+        liveness_count >= 3,
+        "task_started/task_updated/task_notification (+ intermediate result) re-arm the heartbeat; got {liveness_count}"
+    );
+
+    // N init cycles → N SessionMeta events; consumers overwrite idempotently.
+    let session_metas = events
+        .iter()
+        .filter(|e| matches!(e, AdapterEvent::SessionMeta { .. }))
+        .count();
+    assert_eq!(session_metas, 2, "one SessionMeta per init cycle");
+}
+
+#[tokio::test]
+async fn background_agent_interleaved_results_still_one_turn_with_final_telemetry() {
+    // The sharp ordering from the two-agent capture: results flush
+    // MID-stream (back-to-back, divergent telemetry), then another full
+    // cycle follows. The old break-on-first-terminal behavior never even
+    // read the third cycle; now it streams and the single terminal carries
+    // the FINAL result's whole-dispatch telemetry.
+    let agent = fake_agent();
+    let events = collect_events(&adapter(), &agent, &fixture("background-agent-interleaved")).await;
+
+    let terminals: Vec<&AdapterEvent> = events
+        .iter()
+        .filter(|e| matches!(e, AdapterEvent::TurnEnd { .. }))
+        .collect();
+    assert_eq!(terminals.len(), 1, "one dispatch = one terminal");
+
+    let joined: String = events
+        .iter()
+        .filter_map(|e| match e {
+            AdapterEvent::ContentChunk {
+                kind: ContentKind::Text,
+                text,
+                ..
+            } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        joined.contains("Both research passes are done."),
+        "content AFTER the intermediate results still streams: {joined:?}"
+    );
+
+    match terminals[0] {
+        AdapterEvent::TurnEnd {
+            outcome: TurnOutcome::Completed,
+            usage: Some(usage),
+            stable_message_id,
+            first_message_id,
+            ..
+        } => {
+            // Kept-last fold: the final result's aggregate wins.
+            assert!(
+                (usage.total_cost_usd.unwrap() - 0.14).abs() < f64::EPSILON,
+                "dispatch total from the final result, not the first"
+            );
+            assert_eq!(usage.output_tokens, 45, "final modelUsage aggregate");
+            // Whole-dispatch identity: first cycle's first message id (dedup
+            // key), last cycle's message id (cost-join key).
+            assert_eq!(first_message_id.as_deref(), Some("msg_bg_cycle1"));
+            assert_eq!(stable_message_id.as_deref(), Some("msg_bg_cycle3"));
+        }
+        other => panic!("expected Completed terminal with folded usage, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn exit1_after_notification_fails_the_turn() {
+    // The kill-between-cycles shape end-to-end: a success result, then a
+    // task notification (a new cycle is coming), then the process dies. The
+    // stashed Completed terminal must NOT be emitted — the exit-status gate
+    // fails the turn.
+    let agent = fake_agent();
+    let events = collect_events(&adapter(), &agent, &fixture("exit1-after-notification")).await;
+
+    let terminals: Vec<&AdapterEvent> = events
+        .iter()
+        .filter(|e| matches!(e, AdapterEvent::TurnEnd { .. }))
+        .collect();
+    assert_eq!(terminals.len(), 1, "exactly one terminal event");
+    assert!(
+        matches!(
+            terminals[0],
+            AdapterEvent::TurnEnd {
+                outcome: TurnOutcome::Failed {
+                    kind: FailureKind::HarnessError,
+                    ..
+                },
+                ..
+            }
+        ),
+        "dirty exit after an intermediate result fails the turn, got {:?}",
+        terminals[0]
+    );
 }
 
 #[tokio::test]

@@ -271,7 +271,6 @@ async fn run_producer(
     ));
 
     let mut terminal_seen = false;
-    let mut terminal_was_completed = false;
     // Set when the cancellation token fires. On cancel the adapter kills the
     // subprocess group and ends the stream WITHOUT a terminal event — the
     // dispatcher synthesizes `TurnEnd { Cancelled { source } }` (it owns the
@@ -301,40 +300,46 @@ async fn run_producer(
                     ParseOutcome::Events(events) => events,
                     ParseOutcome::Skip => continue,
                     ParseOutcome::Error(msg) => {
-                        let _ = tx.send(AdapterEvent::TurnEnd {
-                            turn_id,
-                            outcome: TurnOutcome::Failed {
-                                kind: FailureKind::AdapterFailure,
-                                message: format!("malformed JSON from harness: {msg}"),
-                            },
-                            ended_at: Utc::now(),
-                            usage: None,
-                            context_window_source: None,
-                            stable_message_id: None,
-                            first_message_id: parser_state
-                                .first_assistant_message_id()
-                                .map(str::to_owned),
-                            spend: None,
-                            model: None,
-                            effort: None,
-                        });
+                        let outcome = TurnOutcome::Failed {
+                            kind: FailureKind::AdapterFailure,
+                            message: format!("malformed JSON from harness: {msg}"),
+                        };
+                        // Preserve already-folded whole-dispatch telemetry
+                        // (usage/spend/ids) when cycles completed before the
+                        // glitch — same rule as the dirty-exit gate below;
+                        // bare terminal only when nothing was folded.
+                        let event = parser_state
+                            .take_final_turn_end(turn_id, outcome.clone())
+                            .unwrap_or_else(|| AdapterEvent::TurnEnd {
+                                turn_id,
+                                outcome,
+                                ended_at: Utc::now(),
+                                usage: None,
+                                context_window_source: None,
+                                stable_message_id: None,
+                                first_message_id: parser_state
+                                    .first_assistant_message_id()
+                                    .map(str::to_owned),
+                                spend: None,
+                                model: None,
+                                effort: None,
+                            });
+                        let _ = tx.send(event);
                         terminal_seen = true;
                         break;
                     }
                 };
                 for event in events {
-                    match &event {
-                        AdapterEvent::TurnEnd {
-                            outcome: TurnOutcome::Completed,
-                            ..
-                        } => {
-                            terminal_was_completed = true;
-                            terminal_seen = true;
-                        }
-                        AdapterEvent::TurnEnd { .. } => {
-                            terminal_seen = true;
-                        }
-                        _ => {}
+                    // Only failure terminals arrive mid-stream (error result,
+                    // auth failure, malformed JSON): a successful `result`
+                    // folds into parser state instead, because a
+                    // background-agent dispatch emits one `result` per
+                    // internal cycle with irregular timing and only the
+                    // stream ending reliably bounds the turn. The Completed
+                    // terminal is emitted at stdout EOF below, gated on the
+                    // child's exit status.
+                    if matches!(&event, AdapterEvent::TurnEnd { .. }) {
+                        terminal_seen = true;
                     }
                     let _ = tx.send(event);
                 }
@@ -344,21 +349,28 @@ async fn run_producer(
             }
             Ok(None) => break, // stdout EOF
             Err(e) => {
-                let _ = tx.send(AdapterEvent::TurnEnd {
-                    turn_id,
-                    outcome: TurnOutcome::Failed {
-                        kind: FailureKind::AdapterFailure,
-                        message: format!("stdout read error: {e}"),
-                    },
-                    ended_at: Utc::now(),
-                    usage: None,
-                    context_window_source: None,
-                    stable_message_id: None,
-                    first_message_id: parser_state.first_assistant_message_id().map(str::to_owned),
-                    spend: None,
-                    model: None,
-                    effort: None,
-                });
+                let outcome = TurnOutcome::Failed {
+                    kind: FailureKind::AdapterFailure,
+                    message: format!("stdout read error: {e}"),
+                };
+                // Same folded-telemetry preservation as the malformed-JSON arm.
+                let event = parser_state
+                    .take_final_turn_end(turn_id, outcome.clone())
+                    .unwrap_or_else(|| AdapterEvent::TurnEnd {
+                        turn_id,
+                        outcome,
+                        ended_at: Utc::now(),
+                        usage: None,
+                        context_window_source: None,
+                        stable_message_id: None,
+                        first_message_id: parser_state
+                            .first_assistant_message_id()
+                            .map(str::to_owned),
+                        spend: None,
+                        model: None,
+                        effort: None,
+                    });
+                let _ = tx.send(event);
                 terminal_seen = true;
                 break;
             }
@@ -381,28 +393,47 @@ async fn run_producer(
     // drain task a chance to capture any final lines after stdout EOF.
     let _ = stderr_task.await;
 
-    // Stream contract: ensure exactly one terminal event was emitted. The
-    // failure message includes the tail of stderr so the consumer can see
-    // why the subprocess exited silently (auth error, flag rejection, etc.).
-    if !terminal_seen {
-        let _ = tx.send(synthesize_truncation_turn_end(
-            turn_id,
-            &stderr_tail,
-            parser_state.first_assistant_message_id().map(str::to_owned),
-        ));
-    }
-
-    // Reap subprocess. If the parser observed Completed but the exit code is
-    // non-zero, log the discrepancy — we do not re-emit. Whether to hold
-    // terminal emission until after reconciliation is future work.
-    match child.wait().await {
-        Ok(status) if !status.success() && terminal_was_completed => {
+    if terminal_seen {
+        // A failure terminal was already emitted mid-stream; just reap.
+        if let Err(e) = child.wait().await {
             tracing::warn!(
                 %turn_id,
                 agent_id = %agent_id,
-                exit_code = ?status.code(),
-                "harness emitted result:completed but subprocess exited non-zero — log-only"
+                error = %e,
+                "failed to wait on harness subprocess"
             );
+        }
+        return;
+    }
+
+    // Stdout EOF with no terminal emitted: this is the happy-path terminal
+    // point. Reap FIRST — the terminal outcome is gated on the exit status,
+    // because a folded intermediate `result` is not proof the dispatch
+    // finished: a kill between background-agent cycles leaves a Completed
+    // stash behind, and emitting it would silently feed forwards/workflows a
+    // partial answer as authoritative. Stdout has already closed, so exit is
+    // imminent and this wait adds no meaningful latency (~0.5s measured,
+    // including Stop-hook teardown — see harness-behavior.md §6 @ 2.1.198).
+    let wait_result = child.wait().await;
+    let outcome = match &wait_result {
+        Ok(status) if status.success() => TurnOutcome::Completed,
+        Ok(status) => {
+            let exit_desc = status.code().map_or_else(
+                || "was killed by a signal".to_owned(),
+                |code| format!("exited with code {code}"),
+            );
+            let stderr_msg = crate::subprocess::format_stderr_tail(&stderr_tail);
+            let message = if stderr_msg.is_empty() {
+                format!("harness {exit_desc} after an intermediate result — dispatch incomplete")
+            } else {
+                format!(
+                    "harness {exit_desc} after an intermediate result — dispatch incomplete; stderr: {stderr_msg}"
+                )
+            };
+            TurnOutcome::Failed {
+                kind: FailureKind::HarnessError,
+                message,
+            }
         }
         Err(e) => {
             tracing::warn!(
@@ -411,9 +442,25 @@ async fn run_producer(
                 error = %e,
                 "failed to wait on harness subprocess"
             );
+            TurnOutcome::Failed {
+                kind: FailureKind::AdapterFailure,
+                message: format!("failed to reap harness subprocess: {e}"),
+            }
         }
-        _ => {}
-    }
+    };
+    // The folded final `result` (whole-dispatch telemetry) with the gated
+    // outcome; when no successful result was ever folded, the stream contract
+    // still guarantees exactly one terminal via truncation synthesis.
+    let event = parser_state
+        .take_final_turn_end(turn_id, outcome)
+        .unwrap_or_else(|| {
+            synthesize_truncation_turn_end(
+                turn_id,
+                &stderr_tail,
+                parser_state.first_assistant_message_id().map(str::to_owned),
+            )
+        });
+    let _ = tx.send(event);
 }
 
 /// Build the synthesized `TurnEnd(Failed)` event emitted when stdout EOFs

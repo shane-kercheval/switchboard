@@ -4081,6 +4081,63 @@ async fn wait_for_current_turn_is_idle_when_the_agent_already_finished() {
 }
 
 #[tokio::test]
+async fn duplicate_terminal_from_adapter_is_dropped() {
+    // Sole-terminal contract guard: a contract-violating adapter that emits
+    // two TurnEnds (the Claude multi-`result` background-agent regression was
+    // exactly this bug class) must surface exactly ONE turn_end downstream.
+    // Without the guard, the second terminal re-takes `captured_text` as
+    // empty, re-fires waiters, overwrites the post-terminal stash, and
+    // forwards a second turn_end to the frontend.
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+    let factory = TestFactory::new(
+        MockScenario::DuplicateTerminal,
+        agent.clone(),
+        Arc::clone(&emitter),
+        noop_journal(),
+    );
+
+    dispatcher
+        .send_message(
+            agent.id,
+            "hello",
+            vec![],
+            Uuid::now_v7(),
+            factory,
+            OnBusy::Enqueue,
+        )
+        .await;
+    within(
+        &emitter,
+        "agent_idle",
+        emitter.wait_for_type("agent_idle", 1),
+    )
+    .await;
+
+    let events = emitter.snapshot();
+    assert_eq!(
+        count_type(&events, "turn_end"),
+        1,
+        "the duplicate terminal is dropped, not forwarded"
+    );
+    // The post-terminal content from the same violating stream is dropped at
+    // the dispatcher boundary too — the turn is over on the wire, not just in
+    // the frontend reducer. Only the pre-terminal chunk crosses.
+    assert_eq!(
+        count_type(&events, "content_chunk"),
+        1,
+        "post-terminal turn-scoped content is dropped"
+    );
+    assert!(
+        !events.iter().any(|(_, v)| v.to_string().contains("stray")),
+        "the stray post-terminal chunk never reaches the wire"
+    );
+    // The turn still parks cleanly: idle arrives after the (single) terminal.
+    assert_eq!(count_type(&events, "agent_idle"), 1);
+}
+
+#[tokio::test]
 async fn wait_for_current_turn_registers_mid_flight_and_resolves_terminal() {
     // The substantive contract: a wait registered while a turn is in flight
     // (one this surface did not dispatch) resolves with that turn's terminal.

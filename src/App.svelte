@@ -578,8 +578,9 @@
   }
 
   function addEmptyPane(): void {
-    if (selection.activeProjectId === null) return;
-    createEmptyPane(selection.activeProjectId, activeRosterIds);
+    const projectId = selection.activeProjectId;
+    if (projectId === null) return;
+    createEmptyPane(projectId, activeRosterIds, selectionFor(projectId));
   }
 
   function restoreAllPanes(): void {

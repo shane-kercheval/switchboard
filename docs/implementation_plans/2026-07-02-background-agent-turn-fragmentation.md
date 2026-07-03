@@ -1,12 +1,19 @@
-# Fix: background-agent `<task-notification>` records fragment a Claude turn on reload
+# Fix: Claude background-agent dispatches fragment on reload and truncate live
 
-**Date:** 2026-07-02
+**Date:** 2026-07-02 (revised same day after live probes — see Evidence)
 **Status:** Planned
-**Scope:** `crates/harness/src/claude_code/session_file.rs` (turn-boundary fix), `crates/harness/src/forward.rs` (separator parity fix + doc correction + regression coverage), `docs/harness-behavior.md` (record the upstream change).
+**Scope:** `crates/harness/src/claude_code/session_file.rs` (turn-boundary fix), `crates/harness/src/forward.rs` (separator parity fix + doc correction + regression coverage), `crates/harness/src/parser.rs` + `crates/harness/src/claude_code/mod.rs` (live terminal fix), `crates/dispatcher/src/lib.rs` (defense-in-depth guard), `docs/harness-behavior.md` (record the upstream change).
 
 ## Problem
 
-Claude Code's background-agent feature (the `Agent`/Task tool run in the background) changed what lands in the **main** session file. When a background sub-agent completes, Claude Code injects a `<task-notification>…</task-notification>` record into the parent session file as a **`user`-role record with *string* content**, `promptSource: "sdk"`, *mid-turn* — and the same `claude -p` dispatch keeps responding afterward. So a single logical send now produces, on disk:
+Claude Code's background-agent feature (the `Agent`/Task tool with `run_in_background: true`) changed what one `claude -p` dispatch produces. When a background sub-agent completes, Claude Code injects a completion notification and the **same process keeps responding** — an additional internal response cycle per notification. One logical send now produces N+1 cycles (N = background completions), and the two representations of that dispatch speak **different vocabularies**:
+
+- **Disk** (main session file): each cycle ends with `stop_reason: end_turn`, and each notification lands as a `<task-notification>…</task-notification>` **`user`-role record with *string* content**, `promptSource: "sdk"`, mid-dispatch.
+- **Live stream** (`--output-format stream-json`): each cycle is a full `system/init` → content → **`result`** sequence — multiple `result` and `init` events in one process, one `session_id`. Notifications surface as `system` events (a task-lifecycle family whose names have already drifted across CLI versions: `task_started` / `task_progress` / `task_updated` / `task_notification` are all observed, plus unrelated `status` / `thinking_tokens` / `hook_*` subtypes); the sub-agent's relayed records are `parent_tool_use_id`-tagged (already correctly skipped).
+
+Each representation breaks Switchboard's "one send = one turn" model (system-design §7) in its own way: disk **fragments** the turn (Defect 1), live **truncates** it (Defect 2).
+
+On disk, a single logical send now produces:
 
 ```
 user (real prompt, string)
@@ -20,35 +27,63 @@ user (next real prompt, string)
 
 (Confirmed against a real captured session: `~/.claude/projects/-Users-shanekercheval-repos-bookmarks-migrate-auth/019f2398-…jsonl`.)
 
-The **disk parser** (`session_file.rs`) treats *every* `user`-string record as a turn boundary — it calls `close_current_agent(Complete)` **before** the housekeeping check, so even though the `<task-notification>` is correctly dropped (it never renders as a user bubble), the pending agent turn has already been closed. One dispatch fragments into **three** `Turn::Agent`s.
+### Evidence (probe-verified vs. inferred)
 
-This produces two user-visible defects, both verified:
+Two raw captures of real `claude -p` runs (CLI 2.1.198) using Switchboard's exact flags (`-p --output-format stream-json --include-partial-messages --verbose --dangerously-skip-permissions`):
 
-1. **Rendering:** on reload the one response renders as three separate agent messages (the "3 messages after navigating away and back"). The **live** path does not fragment (see below), so live and disk disagree on turn count for the same conversation.
+1. **One background agent** (archived in-repo as a **sanitized minimization** — `init` reduced to grammar-relevant keys, disk `attachment` records and `hookInfos` dropped, because the raw records embed local environment config: MCP server/connector lists, plugin paths, skills, slash commands, hook command lines; raw captures kept local only): `docs/research/archive/claude-background-agent-stream-probe.jsonl` (45-record stream) and `claude-background-agent-session-file-probe.jsonl` (its 14-record disk counterpart). Stream: 2 `init`; **both `result` events at the very end, back-to-back**, *after* all content. Disk: real prompt → assistant `end_turn` ("waiting") → `<task-notification>` user-string (`promptSource:"sdk"`) → assistant `end_turn` ("done"). The same sanitization rule applies to any fixture or future capture derived from a real run.
+2. **Two background agents** (245-line stream, not committed — its task bodies embed repo content): `init` at 3/189/218; `result` at **216/217 (mid-stream, back-to-back), then another full cycle, then 245**.
+
+Probe-verified:
+- N background completions → **N+1 `init`/`result` cycles** in one process, one `session_id`.
+- **`result` delivery timing is irregular**: exit-batched in capture 1, interleaved in capture 2. No in-stream marker reliably announces "this result is the last": capture 2 shows a new `init` *after* the result count matched the inits seen so far, and capture 1 shows an intermediate result arriving with zero pending background tasks — which together refute both boundary-detection heuristics (init/result count-matching and pending-task counting). **The only invariant both captures satisfy: the stream ends shortly after the final `result`.** This is what makes the EOF terminal in M3 the only sound design.
+- Per-result `usage` is per-cycle (capture 1: `output_tokens` 144, then 3); the relayed sub-agent `assistant` record is `parent_tool_use_id`-tagged and correctly skipped.
+
+Inferred, to be confirmed by M3 step 0:
+- `total_cost_usd` appears **cumulative** across a dispatch's results (0.0899 → 0.1663 in capture 1), i.e. the last result carries the dispatch total. Single observation, not yet proof.
+- Failure shapes (a failing background agent; cancellation between cycles) are unprobed.
+
+### Defect 1 — disk: one dispatch reconstructs as N+1 turns
+
+The **disk parser** (`session_file.rs`) treats *every* `user`-string record as a turn boundary — it calls `close_current_agent(Complete)` **before** the housekeeping check, so even though the `<task-notification>` is correctly dropped (it never renders as a user bubble), the pending agent turn has already been closed. One dispatch fragments into **three** `Turn::Agent`s (in the motivating session).
+
+User-visible, both verified:
+
+1. **Rendering:** on reload the one response renders as three separate agent messages (the "3 messages after navigating away and back").
 2. **Forwarding — the painful one:** the manual cross-agent forward resolves an *idle* source from disk via `latest_completed_agent_text` (`forward.rs:30`), which returns only the **most-recent completed** agent turn. That's the last fragment ("Both research passes are done…") — the earlier inventory and reasoning are silently dropped from what gets forwarded to the next agent.
 
-### Why this is disk-only (the live path is already correct)
+### Defect 2 — live: the turn ends at the first `result`, and later cycles are never read
 
-The live stream is bounded by the dispatcher's single `TurnStarted`/`TurnEnd` per `claude -p` process, so a dispatch is one live turn regardless of internal `end_turn` markers. The live parser's `parse_user_envelope` (`parser.rs:648`) only processes **array** content (tool_results); a `<task-notification>` carries **string** content, so it hits the `as_array` guard and returns `Skip` — it never closes anything. The dispatcher's `captured_text` accumulates *all* `Text`-kind chunks across the whole dispatch, so a forward taken from a live/just-finishing source already gets the whole thing. The asymmetry is entirely between "live = one turn" and "disk = three turns." **The fix makes disk match live.** No live-parser or dispatcher change is needed.
+An earlier draft of this plan asserted the live path was already correct ("the dispatcher emits a single `TurnStarted`/`TurnEnd` per process"). That was an unverified inference, and the probes disproved it. The actual live behavior:
 
-### Why the fix is safe / correct against Switchboard's turn model
+- `parser.rs::parse_result` emits a `TurnEnd` on **every** `result` envelope — it is documented as the sole-terminal emitter, and the upstream change broke that contract's premise.
+- `run_producer` (`claude_code/mod.rs`) **breaks out of its read loop at the first terminal** and stops reading stdout entirely. Later cycles never reach the dispatcher at all; the producer parks in `child.wait()`. A large post-result burst can fill the stdout pipe and stall the child indefinitely.
+- User-visible: the turn completes early in the UI; the closing synthesis (written after the last background agent reports in) never streams; a forward of the turn is truncated to the cycles read before the first result; the agent looks idle while still generating. Whether a given run *looks* broken depends on Claude's irregular result timing — exit-batched runs (capture 1) escape by luck; interleaved runs (capture 2) lose their tail.
+- Latent, currently unreachable only because the producer breaks first: the dispatcher forwards every `TurnEnd` and overwrites its post-terminal `terminal` stash with freshly-taken (usually empty) `captured_text` on each one (`lib.rs:1552-1572`) — `WaitForCurrentTurn` during the post-terminal drain would answer with wrong text, and `PeekCurrentTurn`/`FailFast` would treat the agent as free mid-generation. The frontend reducer is already idempotent (first `turn_end` wins; later chunks/terminals dropped).
+- Cost/usage: the turn reports the **first** result's per-cycle usage and cost; `parse_result` also `.take()`s `stable_message_id`/`first_message_id`, so any second terminal carries `None` — and in interleaved orderings the persisted spend joins to a mid-dispatch message id that won't match the reunified disk turn's final-message key after M1.
 
-- A background-agent dispatch is **one send → one turn** by Switchboard's own send/turn vocabulary (system-design §7). The journal records exactly one send for it. Reunifying the three disk fragments into one turn re-aligns the harness side with the one journal send (fewer merge-correlation surprises), and matches the live turn the user already saw.
+### Why the fix target is "one send = one turn = the process"
+
+- A background-agent dispatch is **one send → one turn** by Switchboard's own send/turn vocabulary (system-design §7). The journal records exactly one send for it. Both paths must converge on one `Turn::Agent` spanning the whole process: disk by treating `<task-notification>` records as mid-turn continuations (M1), live by ending the turn at process exit rather than at any individual `result` (M3). Reunifying re-aligns the harness side with the one journal send and repairs live↔disk dedup (both paths' `hydration_key` becomes the dispatch's first assistant `message.id`).
+- The live parser's `parse_user_envelope` (`parser.rs:648`) only processes **array** content; the disk-vocabulary `<task-notification>` user-string never appears in the stream anyway (probe-verified — live uses `system` events). The live defect is purely the multi-`result` terminal handling.
 - `<task-notification>` is the **only** known housekeeping record that is a *mid-turn continuation*. The other denylisted prefixes are genuine between-turn boundaries and must keep closing the turn:
-  - `<command-message>` / `<command-name>` and the `<local-command-*>` trio are user-initiated slash / `!bash` invocations that happen *between* turns.
+  - `<command-message>` / `<command-name>` and the `<local-command-*>` trio are user-initiated slash / `!bash` invocations that happen *between* turns (assistant output can follow a slash-command echo and must not merge backward).
   - Compaction summaries (`isCompactSummary`) are already diverted to a `Turn::System` marker earlier in `handle_user`, before the housekeeping drop.
 
 ## Non-goals (explicitly out of scope)
 
-- **The within-turn "separate bubbles" rendering.** Even as one turn, consecutive `Text` items render as separate `<Markdown>` blocks (the deliberate text/tool/text ordering contract in `reducers.ts` / `UnifiedTranscript.svelte`). This is pre-existing, applies to the live path too, and is a *separate* UI question (whether to visually coalesce adjacent text blocks within a turn). This plan does **not** change it. It is flagged here as an open follow-up, not built in.
-- Surfacing that background work happened (a marker for the dropped notifications). Not requested; keep dropping them.
-- Any change to how foreground sub-agents are handled — those come back as `tool_result` (array) blocks, are not turn boundaries, and already work.
+- **The within-turn "separate bubbles" rendering.** Even as one turn, consecutive `Text` items render as separate `<Markdown>` blocks on the disk path, while live coalesces adjacent chunks into one block with `\n\n` paragraphs (the deliberate text/tool/text ordering contract in `reducers.ts` / `UnifiedTranscript.svelte`). Visually near-identical (paragraph breaks either way); pre-existing for all multi-block turns. This plan does **not** change it. Flagged as an open follow-up, not built in.
+- **Surfacing background-agent progress in the UI** beyond keeping the heartbeat honest (M3 maps the task-lifecycle events to `Liveness`). The `task_progress` events carry human-readable descriptions ("Reading auth/session.py…") — a "background task running" hint is cheap future work, recorded in M4, not built here. The dropped `<task-notification>` bodies stay dropped.
+- Any change to how **foreground** sub-agents are handled — relayed records are `parent_tool_use_id`-tagged and already skipped (probe-verified), and their results come back as `tool_result` (array) blocks, not turn boundaries.
 
 ## Reference reading (read before implementing)
 
 - `crates/harness/src/claude_code/session_file.rs` — the whole file, especially the module doc (record mapping + lifecycle), `handle_user` (the `Value::String` arm and the pre-close ordering), `is_user_housekeeping`, `HOUSEKEEPING_PREFIXES`, `close_current_agent`, `finalize`/`eof_tail_status`.
-- `crates/harness/src/parser.rs` — `parse_user_envelope` (648) and the `parent_tool_use_id` short-circuit (145–177), to confirm the live path needs no change.
-- `crates/harness/src/forward.rs` — `latest_completed_agent_text` + `concat_text_items` (the consumer that the bug breaks; already correct *within* a turn).
+- `crates/harness/src/parser.rs` — `parse_result` (the sole-terminal contract M3 reworks), `parse_system_event` (init-only today; gains the task-event `Liveness` mapping), `parse_content_block_delta` (the `\n\n` block separator M2 mirrors), the `parent_tool_use_id` short-circuit (145–177), `parse_user_envelope` (648).
+- `crates/harness/src/claude_code/mod.rs` — `run_producer`: break-on-terminal, the `Ok(None)` EOF arm, `synthesize_truncation_turn_end`, and the cancel path (M3's main seam).
+- `crates/dispatcher/src/lib.rs` — the turn loop's `TurnEnd` arm: `terminal_seen`, the `captured_text` take, the `terminal` stash, `WaitForCurrentTurn`/`PeekCurrentTurn`/`FailFast` (M3's defense-in-depth guard).
+- `crates/harness/src/forward.rs` — `latest_completed_agent_text` + `concat_text_items` (the consumer that Defect 1 breaks; already correct *within* a turn).
+- The two archived captures (see Evidence) — ground truth for the stream and disk shapes; `crates/harness/src/bin/fake_claude.rs` + `crates/harness/tests/claude_adapter.rs` — the fixture-driven harness M3's tests plug into.
 - `docs/harness-behavior.md` — the gap register format (`Gnn`, ✅-closed style) and §3 split-source model, for the doc milestone.
 - `docs/system-design.md` §7 (sends and turns) — the one-send-one-turn framing the fix restores.
 
@@ -113,7 +148,7 @@ Outcomes:
 
 ### Implementation Outline
 
-**This is no longer a pure-test milestone.** The plan originally assumed `forward.rs` needed no change; that was based on the same false premise the reviewers and I corrected — that the disk join "mirrors live." It does not. The live path bakes a `\n\n` separator into each new text block's first chunk (`parser.rs:202-205`, `:273-278`; `pending_separator` persists across intervening tool calls), and the dispatcher accumulates that verbatim (`dispatcher/src/lib.rs:1507`), so live-forwarded text carries the breaks. The disk path's `concat_text_items` (`forward.rs:44-56`) joins with nothing. For any multi-block turn — which M1 now makes the common shape — the two diverge, violating the module's own "yield the same string / byte-identical bodies" promise (system-design §7 one-mechanism principle).
+**This is no longer a pure-test milestone.** The plan originally assumed `forward.rs` needed no change; that rested on a false premise — that the disk join "mirrors live." It does not. The live path bakes a `\n\n` separator into each new text block's first chunk (`parser.rs:202-205`, `:273-278`; `pending_separator` persists across intervening tool calls), and the dispatcher accumulates that verbatim (`dispatcher/src/lib.rs:1507`), so live-forwarded text carries the breaks. The disk path's `concat_text_items` (`forward.rs:44-56`) joins with nothing. For any multi-block turn — which M1 now makes the common shape — the two diverge, violating the module's own "yield the same string / byte-identical bodies" promise (system-design §7 one-mechanism principle).
 
 Load-bearing decisions:
 - **Join *non-empty* `Text`-kind items with `"\n\n"`** in `concat_text_items`, not all items and not with an empty separator. Skipping empties is required for exact parity: the disk parser emits a `TurnItem::Text` even for an empty-string text block, and the live side does **not** let an empty block consume the pending separator (`empty_text_block_does_not_consume_pending_separator`, `parser.rs`). A naive all-items join would yield `"first\n\n\n\nsecond"` where live yields `"first\n\nsecond"`. No leading separator before the first non-empty block (matches live's "separator only *between* blocks").
@@ -131,28 +166,93 @@ Load-bearing decisions:
 
 ---
 
-## Milestone 3 — Record the upstream behavior change
+## Milestone 3 — Live path: the turn ends at process exit, not at any `result`
 
 ### Goal & Outcome
 
-Document that background-agent `<task-notification>` records now appear mid-turn in the main Claude session file, and how Switchboard handles them, so the next harness-update review has the context.
+One `claude -p` dispatch = one `TurnEnd`, emitted when the process's stdout closes. All cycles stream into one live turn (text, tools, heartbeat), the forward/await waiters fire once with the whole text, the agent stays busy until genuinely done, and folded usage/cost lands on the single terminal.
+
+Design choice, made deliberately: **the turn is the process** (EOF terminal), not in-stream boundary detection. The Evidence section shows both practical boundary detectors are refuted by the existing captures, while "stream EOF follows the last result" holds in both. EOF also collapses every downstream symptom at once — captured text, waiters, idle-peek, `FailFast`, reducer, cost — because there is exactly one terminal again.
 
 Outcomes:
-- `docs/harness-behavior.md` gains a gap-register entry (in the existing `Gnn` style, marked closed) describing: the upstream change, that it fragmented disk turns and broke idle-source forwarding, and the fix (task-notifications are mid-turn continuations on the disk path; live was already correct). Cross-reference the `session_file.rs` handling and the M1/M2 tests.
+- A background-agent dispatch streams as one turn end-to-end: cycle-1 text, the `Agent` launch tool call, a live spinner through the background wait (no false `quiet_since`), later cycles' text appended, one `TurnEnd` at exit.
+- A live forward/await of that turn carries the whole text (byte-identical to the M2 disk forward).
+- Non-background dispatches: the terminal moves from the `result` line to process exit, which now **includes `Stop`-hook execution time** for users with hooks configured (measured in step-0 probe 4). If a hook holds the process open, the turn correctly shows as still running — the process genuinely isn't done — but the plan must not undersell this as "a few milliseconds" until the probe confirms typical magnitude.
+- The pipe-fill hang risk is gone: stdout is drained to EOF on every completed dispatch.
+
+### Step 0 — targeted probes (before implementation)
+
+Four cheap probes; record findings in `docs/harness-behavior.md` and archive **sanitized** captures next to the existing two **before** coding:
+
+1. **Terminal telemetry semantics (the full triple, not just cost):** across multiple results, pin the relationship between `result.usage` (per-cycle, snake_case), `total_cost_usd` (cumulative in the archived capture: 0.0899 → 0.1663), and `result.modelUsage` (camelCase; in the archived capture it is **byte-identical on both results** and already aggregates the sub-agent's tokens and the final cost — i.e. a third, whole-dispatch vocabulary). Check an interleaved ordering too (both archived results were exit-batched, so `modelUsage` may be an emission-time snapshot rather than always-final). Also probe a **multi-model dispatch** (parent + differently-modeled sub-agent): does `modelUsage` gain a second entry, and is dispatch cost the sum of `costUSD` across entries or the primary model's alone? This decides the fold rule in the parser section below.
+2. **Failing background agent:** what `task_notification` status arrives; does the parent still get one result per cycle; does any result carry `is_error`?
+3. **Kill between cycles:** confirm a kill after an intermediate success result yields a **non-zero exit / signal** — this validates the exit-status gate below. (An earlier draft claimed the existing truncation path covers this; it does not once any result has been folded — without the gate, the stash would emit `Completed` with partial text.)
+4. **Slow `Stop` hook:** a scratch project with a `Stop` hook that sleeps ~5s; measure the last-`result` → stdout-EOF gap and note which events (if any) arrive inside it. The EOF terminal makes turn completion include hook execution for **every** dispatch, not just background-agent ones — if the gap is user-visible, that's correct behavior (the process genuinely isn't done) but the Outcomes wording and M4 doc must say so instead of claiming "a few milliseconds."
 
 ### Implementation Outline
 
-Follow the existing gap-register entry format (see the ✅-closed entries like G19/G21). Keep it operational: what the record looks like, why it's a continuation not a boundary, where the handling lives, and the live-vs-disk asymmetry that made it disk-only. Note the within-turn multi-block rendering as a **known limitation / separate open question**, not something this change addressed. No README entry — the fix is transparent to users (nothing new for them to configure or work around).
+**Parser (`parser.rs`):**
+- `parse_result` no longer returns a `TurnEnd` for a successful result. It **folds** the result into `ParserState`, and the fold reads **whole-dispatch aggregate telemetry, not summed per-cycle fields**: token counts and cost from the final result's `modelUsage` (exact mapping pinned by step-0 probe 1 — note this is **new extraction surface**, not a tweak to `extract_usage_from_result`: `modelUsage` uses different field names (`inputTokens`/`cacheReadInputTokens`, camelCase) and needs the same pick-by-`result.model`-or-max-`inputTokens` selection rule `select_context_window` already implements — extend/reuse that path rather than duplicating it); context-window kept-last; **occupancy (`context_input_tokens`) stays what it is today** — the final parent assistant call's context, kept-last, conceptually separate from dispatch totals (the context bar must not silently become an aggregate-token display); spend/overage consumed as today; message ids read **without** `.take()` (kept-first / kept-last, matching the disk builder — this also removes the `None`-on-second-terminal trap). Returns `Liveness` — a result is turn progress, and the heartbeat must stay armed between cycles.
+- **Exception — fail fast:** an `is_error` / `api_error_status` / stashed-auth-failure result still returns `TurnEnd { Failed }` immediately, preserving today's failure semantics (the producer's break-on-terminal then stops the read, which is correct for a failed dispatch).
+- New `ParserState::take_final_turn_end(turn_id) -> Option<AdapterEvent>`: the stashed Completed terminal; `None` if no result was ever folded.
+- `parse_system_event` gains the `turn_id` parameter and inverts to a **denylist**: `init` keeps its special handling (emitting `SessionMeta` — now N+1 per dispatch; the consumer overwrite is idempotent, assert in tests, don't change); **every other `system` subtype maps to `Liveness { turn_id }`**. A fixed allowlist of task-event names is the wrong shape against a vendor vocabulary already observed to drift (G20 documents `task_started`/`task_progress`/`task_notification` at 2.1.170; the 2.1.198 captures add `task_updated` and `thinking_tokens`, and the trivial-task capture contains **no** `task_progress` at all). An unknown system event is still evidence the process is alive; `Liveness` renders nothing, so misclassifying a future content-bearing subtype degrades to exactly today's silent skip — never worse. This is what keeps multi-minute background waits from tripping the frontend's `quiet_since` indicator on a healthy turn.
+
+**Producer (`run_producer`, `claude_code/mod.rs`):**
+- The happy-path terminal moves to stdout EOF, **gated on the process exit status**: after the read loop, when `!terminal_seen && !cancelled`, first `child.wait().await` (a reorder of the existing reap, which already sits a few lines below — stdout has closed, so exit is imminent), then:
+  - **exit success + stashed result** → emit the stashed `Completed` terminal;
+  - **non-zero exit / signal + stashed result** → emit `TurnEnd { Failed, HarnessError }` carrying the stderr tail and a note that N cycles completed before the interruption. A folded intermediate success is **not** proof the dispatch finished — a kill between cycles must not mark the turn `Completed` with partial text, silently feeding forwards/workflows a partial answer as authoritative;
+  - **no stashed result** → `synthesize_truncation_turn_end` regardless of exit status (unchanged crash semantics).
+- The fail-fast path (error result mid-stream) keeps today's emit-then-reap with log-only exit reconciliation.
+- Break-on-terminal stays; it now only fires for failure terminals and malformed-JSON, where stopping early is correct.
+- Cancel path unchanged (kill, no terminal, dispatcher synthesizes Cancelled — the stashed pending terminal is simply dropped with the parser state).
+
+**Dispatcher (`lib.rs`) — defense-in-depth only:**
+- Guard the `TurnEnd` arm: if `terminal_seen` is already set, warn-log and drop the event instead of re-taking `captured_text`, re-firing waiters, and overwriting the `terminal` stash. Unreachable for a correct adapter; the cost of the sole-terminal contract being violated again is exactly the bug class this plan fixes.
+
+**Frontend:** no changes. A single `turn_end` restores the reducer's assumptions; `liveness` already re-arms the heartbeat.
+
+Comment discipline: the *why* on the EOF terminal cites the observed grammar (irregular result timing; EOF as the only reliable boundary) and points at the archived captures — behavior, not chronology.
 
 ### Definition of Done
 
-- `harness-behavior.md` entry added and internally consistent with the code comment from M1.
-- The "separate follow-up" (visual coalescing of adjacent within-turn text blocks) is recorded as an open item, not silently closed.
+- **Fixtures** in `crates/harness/tests/fixtures/claude/`: `background-agent.jsonl`, derived from the archived single-agent capture (exit-batched ordering; same sanitization rule as the archive), and a synthesized `background-agent-interleaved.jsonl` mirroring capture 2's sharp shape (result, result, init, more content, result — content *after* intermediate results). The interleaved fixture carries **realistically divergent** `usage`/`modelUsage`/`total_cost_usd` values per result (not copies), so the fold assertions mean something.
+- **Adapter integration tests** (via `fake_claude`, `tests/claude_adapter.rs`), for **both** fixtures: exactly one `TurnEnd`, outcome Completed; all cycles' text chunks present in the event stream (so `captured_text` spans every cycle, `\n\n`-separated); usage folded per the fold rules; `Liveness` events for the task-lifecycle records; N `SessionMeta` events tolerated.
+- **Exit-status gate tests** (via `fake_claude`'s existing `// exit:<N>` directive): `result(success) → // exit:1` and `result(success) → task_notification → // exit:1` (the shape a real kill-between-cycles produces) both yield `Failed`, not `Completed`; `result(success)` + clean exit yields `Completed` (the gate doesn't over-fail healthy runs).
+- **Parser unit tests:** two results fold (aggregate telemetry per the pinned fold rule, kept-last ids — no `.take()` regression); occupancy remains the final parent assistant's context, not an aggregate; an **unknown** system subtype (`"subtype":"totally_new"`) maps to `Liveness`; a failure result still fails fast; `take_final_turn_end` returns `None` with no results folded.
+- **Dispatcher test** (`MockHarnessAdapter`): a contract-violating stream emitting two `TurnEnd`s produces one terminal downstream (second dropped + logged), and `WaitForCurrentTurn` after the first answers with the full captured text.
+- **Live test** (`crates/harness/tests/live.rs`): `live_claude_background_agent_completes_as_one_turn` — the single-background-agent one-word probe prompt; assert one `TurnEnd` and captured text containing all cycle outputs. Named per the `live_claude_*` convention. Cost note: inherently above the one-word-reply discipline (~$0.10–0.20/run — it must genuinely run a sub-agent); acceptable in `make test-live-claude`, and the reason the default suite relies on the fixtures.
+
+---
+
+## Milestone 4 — Record the upstream behavior change
+
+### Goal & Outcome
+
+`docs/harness-behavior.md` gains a gap-register entry (existing `Gnn` style, marked closed) covering **both** defects and their one root cause, so the next harness-update review has the context.
+
+### Implementation Outline
+
+Follow the existing gap-register entry format (see the ✅-closed entries like G19/G21). Keep it operational:
+
+- The upstream change: background agents run the parent as N+1 init→result cycles, and the **live/disk vocabulary split** (stream: `system/task_*` events + multiple `result`s/`init`s; disk: `<task-notification>` user-strings + multiple `end_turn`s).
+- The grammar facts with explicit **probe-verified vs. inferred** markers, citing the archived captures (including step 0's) by path — especially the irregular result timing that rules out in-stream boundary detection. The distinction matters: this plan's first draft shipped an unverified inference as fact, and the register entry is where the next reviewer learns which claims to re-probe after a CLI bump.
+- How Switchboard handles it: disk = continuation predicate in `session_file.rs` (M1); live = exit-status-gated EOF terminal in `run_producer` + result folding in `parser.rs` (M3); forward = `\n\n` join parity (M2). Cross-reference the tests. Document the chosen telemetry contract: **`TurnUsage` = whole-dispatch totals as the harness's terminal aggregate reports them** (matching billing and the TUI), occupancy separate.
+- **Reconcile G20 in the same pass** — it is the existing record of this exact channel and now disagrees with the newest evidence: add `task_updated` (and `thinking_tokens`) with a verified-at-2.1.198 note, and update its "the progress channel was simply never wired up / Switchboard surfaces none of it" text — the channel now feeds the heartbeat via the denylist `Liveness` mapping (rich progress display remains the open UX decision G20 records).
+- Residuals recorded as open items, not silently closed: within-turn block coalescing (cosmetic); a kill mid-background-work reads as `Complete` with partial content **on reload from disk** (`eof_tail_status` sees the last cycle's `end_turn`; the *live* path now correctly fails via the exit-status gate — the residual is disk-side only, surfacing after a hard app kill where the hydrate-merge protection is gone); surfacing `task_progress` descriptions as a UI hint (future work); **historical cost re-attachment** — a pre-fix background-agent turn persisted at most one spend-sidecar entry (overage-gated), keyed to the `stable_message_id` seen at its first result, which in interleaved orderings is a mid-dispatch id — after M1 reunification that key no longer matches the turn's final-message key, so the cost badge silently stops re-attaching for that narrow historical slice (self-healing for all post-fix dispatches; documented, not migrated).
+- No README entry — the fix is transparent to users (nothing to configure or work around), and the resulting UX (spinner stays on through quiet background work) is expected behavior, not a limitation.
+
+### Definition of Done
+
+- `harness-behavior.md` entry added, internally consistent with the M1/M3 code comments, step-0 findings folded in.
+- The residuals above are recorded as open items, not silently closed.
 
 ---
 
 ## Verification
 
-- `make test` (Rust + frontend jsdom) green, including the new fixtures.
-- `make lint` clean.
-- No live-test change required (this is a fixture-only reconstruction concern), but a manual sanity check is worth doing once: load the real `019f2398-…` session in a dev instance, confirm the research turn now renders as one agent turn and that forwarding it carries the full inventory + conclusions.
+- `make test` (Rust + frontend jsdom) green, including the new fixtures; `make lint` clean.
+- `make test-live-claude` — the new background-agent live test plus the existing Claude live suite (M3 touches spawn/stream handling, so the adapter-touching-PR rule applies).
+- Manual sanity check in a dev instance:
+  - Dispatch a background-agent prompt; watch it stream as **one** turn including the post-notification synthesis, with no `quiet_since` flicker during background work.
+  - Switch projects away and back mid-turn (live turn protected by the hydrate merge) and again after completion (one identical turn from disk).
+  - Load the real `019f2398-…` session; the research turn renders as one agent turn, and forwarding it carries the full inventory + conclusions with paragraph breaks intact.

@@ -11,7 +11,12 @@
 //! ## Record mapping
 //!
 //! - `user` with string `message.content` → a fresh user prompt; closes
-//!   any pending agent turn and opens a new `Turn::User`.
+//!   any pending agent turn and opens a new `Turn::User`. **Exception:** a
+//!   background-agent completion notification (`<task-notification>…`,
+//!   housekeeping-classified) is injected *mid-dispatch* — the same
+//!   `claude -p` process keeps responding after it — so it continues the
+//!   pending agent turn instead of closing it (and emits no turn of its
+//!   own). See [`is_task_notification_housekeeping`].
 //! - `user` with array `message.content` containing `tool_result` blocks →
 //!   tool-result records that pair with the current agent turn's open
 //!   tools by `tool_use_id`; does **not** start a new user turn.
@@ -154,8 +159,13 @@ const HOUSEKEEPING_PREFIXES: [&str; 6] = [
     "<local-command-caveat>",
     "<local-command-stdout>",
     "<local-command-stderr>",
-    "<task-notification>",
+    TASK_NOTIFICATION_PREFIX,
 ];
+
+/// Leading tag of a background-agent completion notification — the one
+/// housekeeping record that is a mid-turn *continuation* rather than a
+/// turn boundary (see [`is_task_notification_housekeeping`]).
+const TASK_NOTIFICATION_PREFIX: &str = "<task-notification>";
 
 /// True when a `user` *string* record is Claude housekeeping (a slash-command
 /// wrapper, a task notification, or a meta marker) rather than a real prompt.
@@ -192,6 +202,31 @@ fn is_user_housekeeping(record: &Value, text: &str) -> bool {
         return !matches!(prompt_source, Some("typed" | "queued"));
     }
     false
+}
+
+/// True when a `user` string record is a background-agent completion
+/// notification. Claude Code injects these into the parent session file
+/// *mid-dispatch* when a backgrounded `Agent`/Task sub-agent finishes — the
+/// same `claude -p` process keeps responding afterward — so unlike every
+/// other housekeeping record they **continue** the current agent turn rather
+/// than bounding it: `handle_user` returns without closing the open turn
+/// (and without flushing its still-live deferred `tool_results`). Shape
+/// evidence: `docs/research/archive/claude-background-agent-session-file-probe.jsonl`.
+///
+/// The [`is_user_housekeeping`] conjunct is load-bearing, not redundant: it
+/// inherits the `promptSource: typed`/`queued` exemption, so a prompt the
+/// user literally *typed* starting with this tag stays a real prompt — and a
+/// real turn boundary. A bare prefix check here would silently drop that
+/// prompt (it has no journal copy to recover) and misattach the following
+/// response to the previous turn.
+///
+/// This check runs before the compaction diversion in `handle_user`; it
+/// relies on Claude keeping compaction summaries and task notifications
+/// disjoint. If a future record carried both `isCompactSummary` and a
+/// `<task-notification>` prefix, the notification continuation path would
+/// win and no compaction marker would be emitted.
+fn is_task_notification_housekeeping(record: &Value, text: &str) -> bool {
+    is_user_housekeeping(record, text) && text.trim_start().starts_with(TASK_NOTIFICATION_PREFIX)
 }
 
 /// Classify a real (non-housekeeping) `user` prompt by Claude's `promptSource`.
@@ -335,10 +370,21 @@ impl ReconstructionState {
         let content = message.and_then(|m| m.get("content"));
         match content {
             Some(Value::String(text)) => {
-                // A fresh user string record is a turn boundary whether it's a
-                // real prompt or Claude housekeeping — close any open agent turn
-                // and flush unmatched deferred tool_results (they belonged to the
-                // turn that just ended) either way.
+                // A background-agent completion notification is the one user
+                // string record that is NOT a turn boundary: it lands
+                // mid-dispatch and the same process keeps responding, so the
+                // current agent turn stays open — no close, and no deferred
+                // flush (the open turn's pending tool_results are still live).
+                // Still counted as housekeeping so the finalize warning stays
+                // meaningful.
+                if is_task_notification_housekeeping(record, text) {
+                    self.housekeeping_skipped += 1;
+                    return;
+                }
+                // Every other user string record is a turn boundary whether
+                // it's a real prompt or Claude housekeeping — close any open
+                // agent turn and flush unmatched deferred tool_results (they
+                // belonged to the turn that just ended) either way.
                 self.close_current_agent(TurnStatus::Complete);
                 self.flush_deferred_as_warnings();
                 // A compaction summary is not a user prompt, but unlike the other
@@ -2383,5 +2429,252 @@ mod tests {
             user_sources(&result.turns),
             vec![UserPromptSource::External]
         );
+    }
+
+    /// A background-agent completion notification as Claude writes it to the
+    /// main session file (shape: the archived
+    /// `claude-background-agent-session-file-probe.jsonl`). `prompt_source`
+    /// is optional because both `promptSource:"sdk"`-tagged and unmarked
+    /// notifications have been observed; both must behave identically.
+    fn task_notification_record(prompt_source: Option<&str>, ts: &str) -> Value {
+        let mut record = json!({
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": "<task-notification>\n<task-id>a5f72cb38c72f0202</task-id>\n<status>completed</status>\n<summary>Background task completed</summary>\n</task-notification>",
+            },
+            "timestamp": ts,
+        });
+        if let Some(source) = prompt_source {
+            record["promptSource"] = json!(source);
+        }
+        record
+    }
+
+    fn turn_roles(turns: &[Turn]) -> Vec<&'static str> {
+        turns
+            .iter()
+            .map(|t| match t {
+                Turn::User { .. } => "user",
+                Turn::Agent { .. } => "agent",
+                Turn::System { .. } => "system",
+            })
+            .collect()
+    }
+
+    /// Per-agent-turn list of `Text` item strings, in item order.
+    fn agent_text_items(turns: &[Turn]) -> Vec<Vec<String>> {
+        turns
+            .iter()
+            .filter_map(|t| match t {
+                Turn::Agent { items, .. } => Some(
+                    items
+                        .iter()
+                        .filter_map(|i| match i {
+                            TurnItem::Text { text, .. } => Some(text.clone()),
+                            _ => None,
+                        })
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn task_notification_reunifies_dispatch_into_one_turn() {
+        // The core background-agent shape: one dispatch whose response is
+        // interleaved with N completion notifications must reconstruct as ONE
+        // agent turn carrying all text blocks in order — not N+1 fragments.
+        // One notification is sdk-tagged and one unmarked: both observed
+        // shapes must be continuations.
+        let result = hydrate_records(&[
+            user_record_with_source("run research", "sdk", "2026-05-14T04:43:15Z"),
+            assistant_text_record("a", "claude-sonnet-4-6", "2026-05-14T04:43:16Z"),
+            task_notification_record(Some("sdk"), "2026-05-14T04:43:17Z"),
+            assistant_text_record("b", "claude-sonnet-4-6", "2026-05-14T04:43:18Z"),
+            task_notification_record(None, "2026-05-14T04:43:19Z"),
+            assistant_text_record("c", "claude-sonnet-4-6", "2026-05-14T04:43:20Z"),
+            user_record_with_source("next prompt", "sdk", "2026-05-14T04:43:21Z"),
+        ]);
+        assert_eq!(turn_roles(&result.turns), vec!["user", "agent", "user"]);
+        assert_eq!(
+            agent_text_items(&result.turns),
+            vec![vec!["a".to_owned(), "b".to_owned(), "c".to_owned()]],
+            "all three cycles' text blocks land in the one reunified turn, in order",
+        );
+    }
+
+    #[test]
+    fn task_notifications_still_count_as_housekeeping_skipped() {
+        // The finalize-time "denylist stopped matching" observability signal
+        // must keep counting notifications even though they no longer close
+        // turns. Asserted on the private state because the counter's only
+        // public effect is a debug log.
+        let mut state = ReconstructionState::new(Uuid::now_v7());
+        let records = [
+            user_record("prompt", "2026-05-14T04:43:15Z"),
+            assistant_text_record("a", "claude-sonnet-4-6", "2026-05-14T04:43:16Z"),
+            task_notification_record(Some("sdk"), "2026-05-14T04:43:17Z"),
+            assistant_text_record("b", "claude-sonnet-4-6", "2026-05-14T04:43:18Z"),
+            task_notification_record(None, "2026-05-14T04:43:19Z"),
+        ];
+        for (i, record) in records.iter().enumerate() {
+            state.ingest_record(i + 1, record);
+        }
+        assert_eq!(state.housekeeping_skipped, 2);
+    }
+
+    #[test]
+    fn task_notification_continues_turn_across_tool_call() {
+        // A notification sandwiched inside an in-flight tool call: the
+        // tool_use precedes it, its tool_result follows it. The turn must not
+        // split and the tool must still pair.
+        let result = hydrate_records(&[
+            user_record("prompt", "2026-05-14T04:43:15Z"),
+            assistant_with_stop(
+                "msg_1",
+                &tool_use_block("tool_1"),
+                Some("tool_use"),
+                "2026-05-14T04:43:16Z",
+            ),
+            task_notification_record(Some("sdk"), "2026-05-14T04:43:17Z"),
+            tool_result_record("tool_1", "2026-05-14T04:43:18Z"),
+            assistant_with_stop(
+                "msg_2",
+                &json!([{ "type": "text", "text": "after" }]),
+                Some("end_turn"),
+                "2026-05-14T04:43:19Z",
+            ),
+            user_record("next", "2026-05-14T04:43:20Z"),
+        ]);
+        assert_eq!(turn_roles(&result.turns), vec!["user", "agent", "user"]);
+        let Turn::Agent { items, .. } = &result.turns[1] else {
+            panic!("expected agent turn");
+        };
+        let tool_output = items.iter().find_map(|i| match i {
+            TurnItem::Tool { output, .. } => Some(output.clone()),
+            _ => None,
+        });
+        assert_eq!(tool_output, Some(Some("ok".to_owned())), "tool still pairs");
+        assert!(result.warnings.is_empty());
+    }
+
+    #[test]
+    fn task_notification_does_not_flush_deferred_tool_results() {
+        // The sharp no-flush case: a tool_result that arrived BEFORE its
+        // tool_use (the observed out-of-order disk write) is sitting in the
+        // deferred queue when the notification lands. The notification must
+        // not flush it — the turn is still open — so the later tool_use still
+        // late-binds it. A flush here would strand the result as a warning
+        // and leave the tool permanently open.
+        let result = hydrate_records(&[
+            user_record("prompt", "2026-05-14T04:43:15Z"),
+            tool_result_record("tool_1", "2026-05-14T04:43:16Z"),
+            task_notification_record(Some("sdk"), "2026-05-14T04:43:17Z"),
+            assistant_with_stop(
+                "msg_1",
+                &tool_use_block("tool_1"),
+                Some("end_turn"),
+                "2026-05-14T04:43:18Z",
+            ),
+        ]);
+        assert_eq!(turn_roles(&result.turns), vec!["user", "agent"]);
+        let Turn::Agent { items, .. } = &result.turns[1] else {
+            panic!("expected agent turn");
+        };
+        let tool_output = items.iter().find_map(|i| match i {
+            TurnItem::Tool { output, .. } => Some(output.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            tool_output,
+            Some(Some("ok".to_owned())),
+            "deferred tool_result survives the notification and late-binds",
+        );
+        assert!(result.warnings.is_empty(), "no stranded-deferred warning");
+    }
+
+    #[test]
+    fn typed_prompt_with_tag_prefix_still_closes_the_turn() {
+        // The boundary half of the typed-prompt exemption (the preservation
+        // half is `typed_prompt_starting_with_a_tag_is_preserved`): a prompt
+        // the user literally typed starting with the tag is a REAL prompt, so
+        // it must close the open agent turn — the following response is a new
+        // turn, not a continuation of the previous one.
+        let result = hydrate_records(&[
+            user_record_with_source("real prompt", "sdk", "2026-05-14T04:43:15Z"),
+            assistant_text_record("a", "claude-sonnet-4-6", "2026-05-14T04:43:16Z"),
+            user_record_with_source(
+                "<task-notification> explain this XML shape to me",
+                "typed",
+                "2026-05-14T04:43:17Z",
+            ),
+            assistant_text_record("b", "claude-sonnet-4-6", "2026-05-14T04:43:18Z"),
+        ]);
+        assert_eq!(
+            turn_roles(&result.turns),
+            vec!["user", "agent", "user", "agent"],
+        );
+        assert_eq!(
+            user_sources(&result.turns),
+            vec![UserPromptSource::Sdk, UserPromptSource::External],
+        );
+        assert_eq!(
+            agent_text_items(&result.turns),
+            vec![vec!["a".to_owned()], vec!["b".to_owned()]],
+        );
+    }
+
+    #[test]
+    fn task_notification_with_no_open_turn_is_dropped() {
+        // A notification can land before any assistant record (e.g. right
+        // after the prompt). Nothing is open to continue: it drops cleanly,
+        // and the following assistant content opens the turn as usual.
+        let result = hydrate_records(&[
+            user_record("prompt", "2026-05-14T04:43:15Z"),
+            task_notification_record(Some("sdk"), "2026-05-14T04:43:16Z"),
+            assistant_text_record("a", "claude-sonnet-4-6", "2026-05-14T04:43:17Z"),
+            user_record("next", "2026-05-14T04:43:18Z"),
+        ]);
+        assert_eq!(turn_roles(&result.turns), vec!["user", "agent", "user"]);
+    }
+
+    #[test]
+    fn command_wrapper_between_assistant_chunks_still_closes_the_turn() {
+        // Regression guard: the continuation exception is scoped to
+        // task-notifications only. A slash-command echo between assistant
+        // chunks remains a genuine boundary — the post-command response must
+        // not merge backward into the pre-command turn.
+        let result = hydrate_records(&[
+            user_record("prompt", "2026-05-14T04:43:15Z"),
+            assistant_text_record("a", "claude-sonnet-4-6", "2026-05-14T04:43:16Z"),
+            json!({"type":"user","message":{"role":"user","content":"<command-message>compact</command-message>"},"timestamp":"2026-05-14T04:43:17Z"}),
+            assistant_text_record("b", "claude-sonnet-4-6", "2026-05-14T04:43:18Z"),
+        ]);
+        assert_eq!(turn_roles(&result.turns), vec!["user", "agent", "agent"]);
+        assert_eq!(
+            agent_text_items(&result.turns),
+            vec![vec!["a".to_owned()], vec!["b".to_owned()]],
+        );
+    }
+
+    #[test]
+    fn dispatch_ending_on_task_notification_finalizes_complete() {
+        // EOF tail: a file ending on a notification (process exited, or a
+        // mid-flight read caught between cycles) closes the reunified turn at
+        // finalize with status derived from the last stop_reason (end_turn →
+        // Complete). The kill-mid-background-work partial-content case is an
+        // accepted, documented residual — see the plan's M4 residuals.
+        let result = hydrate_records(&[
+            user_record("prompt", "2026-05-14T04:43:15Z"),
+            assistant_text_record("a", "claude-sonnet-4-6", "2026-05-14T04:43:16Z"),
+            task_notification_record(Some("sdk"), "2026-05-14T04:43:17Z"),
+        ]);
+        assert_eq!(turn_roles(&result.turns), vec!["user", "agent"]);
+        let Turn::Agent { status, .. } = &result.turns[1] else {
+            panic!("expected agent turn");
+        };
+        assert_eq!(*status, TurnStatus::Complete);
     }
 }

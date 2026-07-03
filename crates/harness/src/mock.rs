@@ -75,6 +75,16 @@ pub enum MockScenario {
     /// §7) — only the terminal is suppressed, not the content.
     TerminalAfterCancel,
 
+    /// Emits `ContentChunk("real answer") → TurnEnd(Completed) →
+    /// ContentChunk("stray") → TurnEnd(Completed)` — a **contract-violating**
+    /// adapter that emits two terminals (the Claude multi-`result`
+    /// background-agent regression was exactly this bug class). The vehicle
+    /// for the dispatcher's duplicate-terminal guard: the second `TurnEnd`
+    /// must be dropped — not forwarded, not re-firing waiters, not
+    /// overwriting the post-terminal stash that `WaitForCurrentTurn` answers
+    /// from.
+    DuplicateTerminal,
+
     /// Emits a Codex-shaped post-terminal enrichment sequence:
     /// `ContentChunk → TurnEnd(Completed) → RateLimitEvent → SessionMeta`.
     /// Used in the dispatcher's `agent_idle_is_last_after_codex_post_terminal_enrichment_sequence`
@@ -361,6 +371,36 @@ impl HarnessAdapter for MockHarnessAdapter {
                         model: None,
                         effort: None,
                     });
+                });
+            }
+            MockScenario::DuplicateTerminal => {
+                tokio::spawn(async move {
+                    let _ = tx.send(AdapterEvent::ContentChunk {
+                        turn_id,
+                        kind: ContentKind::Text,
+                        text: "real answer".to_owned(),
+                    });
+                    let completed = AdapterEvent::TurnEnd {
+                        turn_id,
+                        outcome: TurnOutcome::Completed,
+                        ended_at: Utc::now(),
+                        usage: None,
+                        context_window_source: None,
+                        stable_message_id: None,
+                        first_message_id: None,
+                        spend: None,
+                        model: None,
+                        effort: None,
+                    };
+                    let _ = tx.send(completed.clone());
+                    // Contract violation from here on: content after the
+                    // terminal, then a second terminal.
+                    let _ = tx.send(AdapterEvent::ContentChunk {
+                        turn_id,
+                        kind: ContentKind::Text,
+                        text: "stray".to_owned(),
+                    });
+                    let _ = tx.send(completed);
                 });
             }
             MockScenario::CodexPostTerminalEnrichment => {

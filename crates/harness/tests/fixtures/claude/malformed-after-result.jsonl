@@ -1,0 +1,4 @@
+{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"cycle one done"}}}
+{"type":"assistant","message":{"id":"msg_glitch01","model":"claude-sonnet-5","role":"assistant","content":[{"type":"text","text":"cycle one done"}],"stop_reason":"end_turn","usage":{"input_tokens":50,"output_tokens":8}}}
+{"type":"result","subtype":"success","is_error":false,"api_error_status":null,"duration_ms":1000,"duration_api_ms":2000,"num_turns":1,"result":"cycle one done","stop_reason":"end_turn","session_id":"00000000-0000-7000-8000-000000000071","total_cost_usd":0.03,"usage":{"input_tokens":50,"output_tokens":8},"modelUsage":{"claude-sonnet-5":{"inputTokens":50,"outputTokens":8,"cacheReadInputTokens":10,"cacheCreationInputTokens":5,"costUSD":0.03,"contextWindow":1000000}},"permission_denials":[],"terminal_reason":"completed","uuid":"00000000-0000-7000-8000-000000000072"}
+{not valid json — glitch mid-dispatch

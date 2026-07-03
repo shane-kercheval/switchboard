@@ -1500,6 +1500,35 @@ async fn drain_turn(
                 if force_failed {
                     continue;
                 }
+                // Sole-terminal contract guard: after a turn's terminal, further
+                // turn-scoped events from the adapter are a contract violation
+                // (the Claude multi-`result` background-agent regression shipped
+                // exactly this pair — a duplicate terminal AND content after it).
+                // Drop them at this boundary so the turn is over on the wire,
+                // not just in the frontend reducer: a duplicate TurnEnd would
+                // re-take `captured_text` as empty, re-fire waiters, and
+                // overwrite the `terminal` stash that post-terminal
+                // `WaitForCurrentTurn` answers from. Agent-scoped enrichment
+                // (`RateLimitEvent`/`SessionMeta` — Codex and Antigravity emit
+                // these post-terminal by design) and the internal locator event
+                // keep flowing. The cancel path is unaffected: during the
+                // post-cancel drain `terminal_seen` is still false (the
+                // synthesized Cancelled comes later), so cancel's deliberate
+                // buffered-content forwarding survives.
+                if terminal_seen && event.is_turn_scoped() {
+                    if matches!(&event, AdapterEvent::TurnEnd { .. }) {
+                        tracing::warn!(
+                            agent_id = %agent_id, %turn_id,
+                            "duplicate TurnEnd from adapter after terminal — dropped (sole-terminal contract violation)"
+                        );
+                    } else {
+                        tracing::debug!(
+                            agent_id = %agent_id, %turn_id,
+                            "turn-scoped adapter event after terminal — dropped"
+                        );
+                    }
+                    continue;
+                }
                 // Accumulate the turn's text output (see the `captured_text`
                 // declaration for why this is always-on). Only `Text` kind, no
                 // `Thinking`; tool output never arrives as a `ContentChunk`.
@@ -1550,6 +1579,10 @@ async fn drain_turn(
                     continue;
                 }
                 if let AdapterEvent::TurnEnd { outcome, ended_at, .. } = &event {
+                    // A duplicate terminal was already dropped by the
+                    // turn-scoped guard above, so from here `terminal_seen`
+                    // is false and this is the turn's first terminal.
+                    //
                     // Cancellation latch: once cancel fired, the actor owns the
                     // terminal — drop a real terminal that races in afterwards
                     // so the synthesized Cancelled wins.

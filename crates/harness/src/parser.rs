@@ -60,9 +60,11 @@ pub struct ParserState {
     /// The stashed message is the authored Switchboard auth string
     /// (`CLAUDE_AUTH_MESSAGE`), not the harness's raw text — authoring
     /// happens at stash time. `parse_result` consumes via `.take()` and
-    /// refines the terminal `TurnEnd` from `HarnessError` to `AuthFailure`.
-    /// State-flag pattern: `parse_result` remains the sole `TurnEnd` emitter,
-    /// preserving the exactly-one-terminal-event invariant.
+    /// refines the fail-fast terminal `TurnEnd` from `HarnessError` to
+    /// `AuthFailure`. State-flag pattern: an auth failure always surfaces
+    /// through `parse_result`'s failure path (never a second terminal from
+    /// the assistant envelope), preserving the one-terminal-per-turn
+    /// invariant that the adapter's EOF emission completes.
     pending_auth_failure: Option<String>,
     /// Context-window occupancy of the **most recent** assistant message in
     /// this turn: `input_tokens + cache_read + cache_creation` for that one
@@ -107,6 +109,29 @@ pub struct ParserState {
     /// reads the same `message.model` from the session file. Claude exposes no
     /// per-turn effort, so `TurnEnd.effort` stays `None`.
     last_assistant_model: Option<String>,
+    /// Telemetry from the most recent **successful** `result`, kept-last,
+    /// awaiting emission as the turn's single Completed `TurnEnd` at stream
+    /// EOF ([`ParserState::take_final_turn_end`]). A background-agent dispatch
+    /// emits one `result` per internal init→result cycle, with **irregular
+    /// delivery timing** (mid-stream and exit-batched both observed) and no
+    /// in-stream marker for "this is the last one" — the only reliable
+    /// terminal boundary is the stream ending (probed against claude 2.1.198;
+    /// captures in `docs/research/archive/claude-background-agent-*.jsonl`).
+    /// Kept-last is whole-dispatch-correct: the final result's
+    /// `total_cost_usd` is the dispatch total (= Σ `modelUsage[*].costUSD`,
+    /// subagent work included) and its `modelUsage` holds whole-dispatch
+    /// per-model aggregates. Failure results bypass this stash and fail fast.
+    pending_completed_terminal: Option<PendingCompletedTerminal>,
+}
+
+/// The stashed payload of a successful `result`, pending emission at EOF.
+/// Only the result-derived fields live here; model and message ids are read
+/// from the [`ParserState`] kept-first/kept-last fields at emission time.
+#[derive(Debug)]
+struct PendingCompletedTerminal {
+    usage: Option<TurnUsage>,
+    context_window_source: Option<crate::events::ContextWindowSource>,
+    spend: Option<TurnSpend>,
 }
 
 impl ParserState {
@@ -120,6 +145,40 @@ impl ParserState {
     /// parser state.
     pub(crate) fn first_assistant_message_id(&self) -> Option<&str> {
         self.first_assistant_message_id.as_deref()
+    }
+
+    /// The turn's single terminal `TurnEnd`, built from the last successful
+    /// `result` folded by [`parse_result`] — or `None` if no successful result
+    /// arrived (the caller falls back to truncation synthesis). Called by the
+    /// adapter at stream EOF; the caller supplies the `outcome` because it
+    /// owns the exit-status gate: a folded intermediate result is not proof
+    /// the dispatch finished (a kill between background-agent cycles leaves a
+    /// stash behind), so only a clean process exit may pass `Completed` —
+    /// a dirty exit passes `Failed`, keeping the folded telemetry (partial
+    /// work is still billed) on the failure terminal.
+    pub(crate) fn take_final_turn_end(
+        &mut self,
+        turn_id: TurnId,
+        outcome: TurnOutcome,
+    ) -> Option<AdapterEvent> {
+        let pending = self.pending_completed_terminal.take()?;
+        Some(AdapterEvent::TurnEnd {
+            turn_id,
+            outcome,
+            ended_at: Utc::now(),
+            usage: pending.usage,
+            context_window_source: pending.context_window_source,
+            spend: pending.spend,
+            // Kept-last across the whole dispatch — the final non-subagent
+            // assistant model / message id (the cost-join key), and the
+            // kept-first id (the live↔disk dedup key). Read, not taken: the
+            // ids must survive every intermediate result so the single
+            // terminal carries whole-dispatch identity.
+            model: self.last_assistant_model.clone(),
+            effort: None,
+            stable_message_id: self.last_assistant_message_id.clone(),
+            first_message_id: self.first_assistant_message_id.clone(),
+        })
     }
 }
 
@@ -179,7 +238,7 @@ pub fn parse_line(
     match value.get("type").and_then(Value::as_str) {
         Some("stream_event") => parse_stream_event(&value, turn_id, state),
         Some("result") => parse_result(&value, turn_id, state),
-        Some("system") => parse_system_event(&value, agent_id),
+        Some("system") => parse_system_event(&value, turn_id, agent_id),
         Some("assistant") => parse_assistant_envelope(&value, turn_id, state),
         Some("user") => parse_user_envelope(&value, turn_id),
         Some("rate_limit_event") => parse_rate_limit_event(&value, agent_id, state),
@@ -295,29 +354,10 @@ fn parse_result(obj: &Value, turn_id: TurnId, state: &mut ParserState) -> ParseO
 
     // Consume the auth-failure stash (state-flag pattern). When the prior
     // `assistant` envelope flagged auth failure, refine the terminal
-    // outcome from `HarnessError` to `AuthFailure` — `parse_result` remains
-    // the sole `TurnEnd` emitter, preserving the single-terminal-event
-    // contract. Usage extraction below still runs (auth-failure results
-    // carry zero-valued telemetry, which is legitimate, not noise).
+    // outcome from `HarnessError` to `AuthFailure`. Usage extraction below
+    // still runs (auth-failure results carry zero-valued telemetry, which is
+    // legitimate, not noise).
     let auth_failure = state.pending_auth_failure.take();
-    let outcome = if let Some(auth_message) = auth_failure {
-        TurnOutcome::Failed {
-            kind: FailureKind::AuthFailure,
-            message: auth_message,
-        }
-    } else if is_error || has_api_error {
-        let message = obj
-            .get("result")
-            .and_then(Value::as_str)
-            .unwrap_or("harness reported an error")
-            .to_owned();
-        TurnOutcome::Failed {
-            kind: FailureKind::HarnessError,
-            message,
-        }
-    } else {
-        TurnOutcome::Completed
-    };
 
     let usage = extract_usage_from_result(obj, state.last_assistant_context_input_tokens);
 
@@ -341,52 +381,109 @@ fn parse_result(obj: &Value, turn_id: TurnId, state: &mut ParserState) -> ParseO
         overage_resets_at: state.pending_overage_resets_at,
     });
 
-    ParseOutcome::Event(AdapterEvent::TurnEnd {
-        turn_id,
-        outcome,
-        ended_at: Utc::now(),
+    // Failure results fail fast: the stream ends right after a failed result,
+    // and stopping the read early is correct for a failed dispatch. Message
+    // ids are read (not taken) so a failure terminal still carries the turn's
+    // identity keys.
+    let failure = if let Some(auth_message) = auth_failure {
+        Some(TurnOutcome::Failed {
+            kind: FailureKind::AuthFailure,
+            message: auth_message,
+        })
+    } else if is_error || has_api_error {
+        let message = obj
+            .get("result")
+            .and_then(Value::as_str)
+            .unwrap_or("harness reported an error")
+            .to_owned();
+        Some(TurnOutcome::Failed {
+            kind: FailureKind::HarnessError,
+            message,
+        })
+    } else {
+        None
+    };
+    if let Some(outcome) = failure {
+        return ParseOutcome::Event(AdapterEvent::TurnEnd {
+            turn_id,
+            outcome,
+            ended_at: Utc::now(),
+            usage,
+            context_window_source,
+            spend,
+            model: state.last_assistant_model.clone(),
+            effort: None,
+            stable_message_id: state.last_assistant_message_id.clone(),
+            first_message_id: state.first_assistant_message_id.clone(),
+        });
+    }
+
+    // A successful `result` is NOT the turn's terminal: a background-agent
+    // dispatch emits one per internal cycle and may keep producing content
+    // afterwards (see `ParserState::pending_completed_terminal`). Fold it —
+    // kept-last, whole-dispatch-correct — and surface it as turn progress so
+    // the heartbeat stays armed between cycles. The adapter emits the folded
+    // terminal at stream EOF via `take_final_turn_end`, gated on exit status.
+    state.pending_completed_terminal = Some(PendingCompletedTerminal {
         usage,
         context_window_source,
         spend,
-        // Live per-turn model = the final non-subagent assistant model. Claude
-        // exposes no per-turn effort.
-        model: state.last_assistant_model.clone(),
-        effort: None,
-        // The final assistant message's id — the durable join key for
-        // re-attaching cost/overage on reopen. `take()` so a fresh dispatch's
-        // state can't carry a stale id (defensive; state is per-turn anyway).
-        stable_message_id: state.last_assistant_message_id.take(),
-        // The first assistant message's id — the live↔disk dedup identity.
-        first_message_id: state.first_assistant_message_id.take(),
-    })
+    });
+    ParseOutcome::Event(AdapterEvent::Liveness { turn_id })
 }
 
 /// Pull `TurnUsage` from a `result` event.
 ///
-/// `input_tokens` and `output_tokens` are **required** numeric fields: if
-/// either is missing or non-numeric, returns `None`. Malformed or missing
-/// usage → `None`, never a fabricated zero-Some. Zero values from a real
-/// harness (auth-failure synthetic responses, certain edge cases) DO
-/// produce a valid `Some` — what matters is whether the
-/// schema is present, not whether the values are non-zero.
+/// **Token fields come from `result.modelUsage`** — per-model whole-dispatch
+/// aggregates, summed across entries. That is the *billing-consistent*
+/// vocabulary: the dispatch's `total_cost_usd` equals Σ
+/// `modelUsage[*].costUSD` exactly (probed against claude 2.1.198,
+/// multi-model), and it includes subagent work, unlike the per-cycle,
+/// parent-only `result.usage`. On a background-agent dispatch (multiple
+/// results), each result's `modelUsage` snapshots the whole dispatch so far —
+/// kept-last by the caller, the final one is the dispatch total.
+///
+/// **Fallback:** when `modelUsage` is empty/missing, or any entry lacks the
+/// required numeric `inputTokens`/`outputTokens`, fall back to the per-cycle
+/// `result.usage` shape — where `input_tokens`/`output_tokens` are required
+/// numeric fields and a miss returns `None`, never a fabricated zero-Some.
+/// Zero *values* from a real harness (auth-failure synthetic responses) DO
+/// produce a valid `Some` — what matters is schema presence, not non-zero.
 ///
 /// Populated for both Completed and Failed turns. The harness charges for
 /// partial work, so token counts on failure are meaningful telemetry.
-/// The token/cost fields come from the terminal `result.usage` (turn totals,
-/// matching how cost is billed). The **occupancy** field
-/// (`context_input_tokens`) does NOT: it is the final assistant message's
-/// per-call prompt size, threaded in via `last_call_context_input_tokens`,
-/// because `result.usage` sums across calls and would over-report a multi-call
-/// turn's window fullness (see `ParserState::last_assistant_context_input_tokens`).
+/// The **occupancy** field (`context_input_tokens`) comes from neither
+/// vocabulary: it is the final assistant message's per-call prompt size,
+/// threaded in via `last_call_context_input_tokens`, because both aggregates
+/// sum across calls and would over-report a multi-call turn's window
+/// fullness (see `ParserState::last_assistant_context_input_tokens`).
 fn extract_usage_from_result(
     obj: &Value,
     last_call_context_input_tokens: Option<u64>,
 ) -> Option<TurnUsage> {
-    let usage_obj = obj.get("usage")?;
+    let total_cost_usd = obj.get("total_cost_usd").and_then(Value::as_f64);
+    let context_window = select_context_window(obj);
 
+    if let Some(aggregate) = sum_model_usage_tokens(obj) {
+        return Some(TurnUsage {
+            input_tokens: aggregate.input,
+            output_tokens: aggregate.output,
+            cached_input_tokens: aggregate.cached_input,
+            cache_creation_input_tokens: aggregate.cache_creation,
+            context_input_tokens: last_call_context_input_tokens,
+            // Not present in `modelUsage`; the per-cycle shape may carry it.
+            reasoning_output_tokens: obj
+                .get("usage")
+                .and_then(|u| u.get("reasoning_output_tokens"))
+                .and_then(Value::as_u64),
+            context_window,
+            total_cost_usd,
+        });
+    }
+
+    let usage_obj = obj.get("usage")?;
     let input_tokens = usage_obj.get("input_tokens").and_then(Value::as_u64)?;
     let output_tokens = usage_obj.get("output_tokens").and_then(Value::as_u64)?;
-
     let cached_input_tokens = usage_obj
         .get("cache_read_input_tokens")
         .and_then(Value::as_u64)
@@ -398,22 +495,61 @@ fn extract_usage_from_result(
         .get("reasoning_output_tokens")
         .and_then(Value::as_u64);
 
-    let total_cost_usd = obj.get("total_cost_usd").and_then(Value::as_f64);
-    let context_window = select_context_window(obj);
-
     Some(TurnUsage {
         input_tokens,
         output_tokens,
         cached_input_tokens,
         cache_creation_input_tokens,
         // Occupancy = the final model call's prompt size, NOT the summed
-        // `result.usage` (which double-counts the shared cached prefix). See
+        // aggregate (which double-counts the shared cached prefix). See
         // `ParserState::last_assistant_context_input_tokens`.
         context_input_tokens: last_call_context_input_tokens,
         reasoning_output_tokens,
         context_window,
         total_cost_usd,
     })
+}
+
+/// Whole-dispatch token totals summed across `result.modelUsage` entries.
+/// `None` (→ caller falls back to `result.usage`) when `modelUsage` is
+/// empty/missing or any entry lacks the required `inputTokens`/`outputTokens`
+/// — an all-or-nothing rule so a partially-malformed aggregate never yields a
+/// silently-undercounted sum. Cache fields are optional per entry (`0` is a
+/// legitimate real value; absent contributes nothing) and reported only when
+/// at least one entry carries them.
+struct ModelUsageAggregate {
+    input: u64,
+    output: u64,
+    cached_input: Option<u64>,
+    cache_creation: Option<u64>,
+}
+
+fn sum_model_usage_tokens(result: &Value) -> Option<ModelUsageAggregate> {
+    let model_usage = result.get("modelUsage").and_then(Value::as_object)?;
+    if model_usage.is_empty() {
+        return None;
+    }
+
+    let mut aggregate = ModelUsageAggregate {
+        input: 0,
+        output: 0,
+        cached_input: None,
+        cache_creation: None,
+    };
+    for entry in model_usage.values() {
+        aggregate.input += entry.get("inputTokens").and_then(Value::as_u64)?;
+        aggregate.output += entry.get("outputTokens").and_then(Value::as_u64)?;
+        if let Some(cached) = entry.get("cacheReadInputTokens").and_then(Value::as_u64) {
+            *aggregate.cached_input.get_or_insert(0) += cached;
+        }
+        if let Some(created) = entry
+            .get("cacheCreationInputTokens")
+            .and_then(Value::as_u64)
+        {
+            *aggregate.cache_creation.get_or_insert(0) += created;
+        }
+    }
+    Some(aggregate)
 }
 
 /// Pick the right `contextWindow` from `result.modelUsage` per the selection
@@ -445,9 +581,20 @@ fn select_context_window(result: &Value) -> Option<u32> {
     u32::try_from(cw).ok()
 }
 
-fn parse_system_event(obj: &Value, agent_id: AgentId) -> ParseOutcome {
+/// Parse a `system` envelope. `init` carries session metadata; **every other
+/// subtype maps to `Liveness`** — a denylist, deliberately. The non-init
+/// vocabulary is vendor-controlled and has already drifted across CLI
+/// versions (`task_started`/`task_progress`/`task_notification` documented at
+/// 2.1.170; 2.1.198 added `task_updated` and `thinking_tokens`, plus
+/// `status`/`hook_*`), so a fixed allowlist of names silently stops re-arming
+/// the heartbeat on the next rename — flagging a healthy multi-minute
+/// background-agent wait as "gone quiet." An unknown system event is still
+/// evidence the process is alive; `Liveness` renders nothing, so
+/// misclassifying a future content-bearing subtype degrades to exactly the
+/// old silent skip, never worse.
+fn parse_system_event(obj: &Value, turn_id: TurnId, agent_id: AgentId) -> ParseOutcome {
     if obj.get("subtype").and_then(Value::as_str) != Some("init") {
-        return ParseOutcome::Skip;
+        return ParseOutcome::Event(AdapterEvent::Liveness { turn_id });
     }
 
     let model = obj
@@ -514,9 +661,10 @@ fn parse_mcp_server_status(v: &Value) -> Option<McpServerStatus> {
 /// **Auth-failure detection (state-flag pattern).** If the envelope carries
 /// top-level `"error": "authentication_failed"`, stash the displayable
 /// message on `state.pending_auth_failure` for `parse_result` to consume;
-/// do **not** emit a terminal event here. The result envelope remains the
-/// sole `TurnEnd` emitter; the stash just refines its `FailureKind` from
-/// `HarnessError` to `AuthFailure`.
+/// do **not** emit a terminal event here. Terminals come only from
+/// `parse_result`'s fail-fast failure path or the adapter's EOF emission of
+/// the folded result; the stash just refines the failure's `FailureKind`
+/// from `HarnessError` to `AuthFailure`.
 fn parse_assistant_envelope(obj: &Value, turn_id: TurnId, state: &mut ParserState) -> ParseOutcome {
     // Track this model call's prompt size for context-occupancy. Done before
     // the content/early-return below so the final *text-only* answer message
@@ -812,14 +960,94 @@ mod tests {
     }
 
     #[test]
-    fn result_success_yields_turn_end_completed() {
+    fn result_success_folds_terminal_and_yields_liveness() {
+        // A successful `result` is NOT the terminal (a background-agent
+        // dispatch emits one per internal cycle): it folds into the pending
+        // stash and surfaces as turn progress. The single terminal comes from
+        // `take_final_turn_end` at stream EOF, and the stash is consumed.
         let line = r#"{"type":"result","subtype":"success","is_error":false,"api_error_status":null,"result":"4"}"#;
-        match parse_one(line, tid()) {
-            ParseOutcome::Event(AdapterEvent::TurnEnd {
+        let mut state = ParserState::default();
+        let turn = tid();
+        assert!(matches!(
+            parse_line(line, turn, aid(), &mut state),
+            ParseOutcome::Event(AdapterEvent::Liveness { .. })
+        ));
+        match state.take_final_turn_end(turn, TurnOutcome::Completed) {
+            Some(AdapterEvent::TurnEnd {
                 outcome: TurnOutcome::Completed,
                 ..
             }) => {}
-            _ => panic!("expected TurnEnd(Completed)"),
+            other => panic!("expected the folded TurnEnd(Completed), got {other:?}"),
+        }
+        assert!(
+            state
+                .take_final_turn_end(turn, TurnOutcome::Completed)
+                .is_none(),
+            "the stash is consumed by the first take"
+        );
+    }
+
+    #[test]
+    fn take_final_turn_end_none_without_any_successful_result() {
+        // No result folded → None; the adapter falls back to truncation
+        // synthesis at EOF.
+        let mut state = ParserState::default();
+        assert!(
+            state
+                .take_final_turn_end(tid(), TurnOutcome::Completed)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn second_result_overwrites_the_folded_terminal_kept_last() {
+        // Kept-last is whole-dispatch-correct: each result's telemetry
+        // snapshots the dispatch so far, so the final one wins.
+        let mut state = ParserState::default();
+        let turn = tid();
+        let first = r#"{"type":"result","is_error":false,"result":"cycle 1","usage":{"input_tokens":10,"output_tokens":5},"total_cost_usd":0.05}"#;
+        let second = r#"{"type":"result","is_error":false,"result":"cycle 2","usage":{"input_tokens":20,"output_tokens":7},"total_cost_usd":0.14}"#;
+        let _ = parse_line(first, turn, aid(), &mut state);
+        let _ = parse_line(second, turn, aid(), &mut state);
+        match state.take_final_turn_end(turn, TurnOutcome::Completed) {
+            Some(AdapterEvent::TurnEnd {
+                usage: Some(usage), ..
+            }) => {
+                assert!((usage.total_cost_usd.unwrap() - 0.14).abs() < f64::EPSILON);
+                assert_eq!(usage.input_tokens, 20);
+            }
+            other => panic!("expected folded terminal with the last result's usage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn take_final_turn_end_with_failed_outcome_keeps_folded_telemetry() {
+        // The exit-status gate: a dirty process exit after an intermediate
+        // success result yields a Failed terminal that still carries the
+        // folded telemetry (partial work is billed) and the identity keys.
+        let mut state = ParserState::default();
+        let turn = tid();
+        let assistant = r#"{"type":"assistant","message":{"id":"msg_a1","content":[{"type":"text","text":"partial"}],"usage":{"input_tokens":10,"output_tokens":5}}}"#;
+        let result = r#"{"type":"result","is_error":false,"result":"cycle 1","usage":{"input_tokens":10,"output_tokens":5},"total_cost_usd":0.05}"#;
+        let _ = parse_line(assistant, turn, aid(), &mut state);
+        let _ = parse_line(result, turn, aid(), &mut state);
+        let outcome = TurnOutcome::Failed {
+            kind: FailureKind::HarnessError,
+            message: "harness was killed by a signal after an intermediate result".to_owned(),
+        };
+        match state.take_final_turn_end(turn, outcome) {
+            Some(AdapterEvent::TurnEnd {
+                outcome: TurnOutcome::Failed { .. },
+                usage: Some(usage),
+                stable_message_id,
+                first_message_id,
+                ..
+            }) => {
+                assert_eq!(usage.input_tokens, 10);
+                assert_eq!(stable_message_id.as_deref(), Some("msg_a1"));
+                assert_eq!(first_message_id.as_deref(), Some("msg_a1"));
+            }
+            other => panic!("expected Failed terminal carrying telemetry, got {other:?}"),
         }
     }
 
@@ -860,29 +1088,29 @@ mod tests {
     }
 
     /// Drives a sequence of lines through one shared `ParserState` (one turn)
-    /// and returns the `TurnEnd` usage. Needed because occupancy is now sourced
-    /// from the turn's assistant messages, not the lone `result` event.
+    /// and returns the folded terminal's usage — the same event the adapter
+    /// emits at stream EOF on a clean exit. Occupancy is sourced from the
+    /// turn's assistant messages, not the `result` events.
     fn turn_end_usage(lines: &[&str]) -> Option<TurnUsage> {
         let mut state = ParserState::default();
         let turn_id = tid();
         let agent_id = aid();
-        let mut last = None;
         for line in lines {
-            if let ParseOutcome::Event(AdapterEvent::TurnEnd { usage, .. }) =
-                parse_line(line, turn_id, agent_id, &mut state)
-            {
-                last = Some(usage);
-            }
+            let _ = parse_line(line, turn_id, agent_id, &mut state);
         }
-        last.expect("a TurnEnd was emitted")
+        match state.take_final_turn_end(turn_id, TurnOutcome::Completed) {
+            Some(AdapterEvent::TurnEnd { usage, .. }) => usage,
+            other => panic!("expected a folded terminal, got {other:?}"),
+        }
     }
 
     #[test]
     fn result_with_usage_populates_turn_usage() {
-        // Raw token/cost fields come from `result.usage` (turn totals);
-        // occupancy comes from the assistant message's per-call usage.
+        // Token/cost fields come from the `modelUsage` whole-dispatch
+        // aggregate (billing-consistent, subagents included); occupancy comes
+        // from the assistant message's per-call usage.
         let assistant = r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":100,"output_tokens":25,"cache_read_input_tokens":50,"cache_creation_input_tokens":30}}}"#;
-        let result = r#"{"type":"result","is_error":false,"api_error_status":null,"result":"ok","model":"claude-sonnet-4-6","usage":{"input_tokens":100,"output_tokens":25,"cache_read_input_tokens":50,"cache_creation_input_tokens":30},"modelUsage":{"claude-sonnet-4-6":{"inputTokens":100,"outputTokens":25,"contextWindow":200000}},"total_cost_usd":0.05}"#;
+        let result = r#"{"type":"result","is_error":false,"api_error_status":null,"result":"ok","model":"claude-sonnet-4-6","usage":{"input_tokens":100,"output_tokens":25,"cache_read_input_tokens":50,"cache_creation_input_tokens":30},"modelUsage":{"claude-sonnet-4-6":{"inputTokens":100,"outputTokens":25,"cacheReadInputTokens":50,"cacheCreationInputTokens":30,"costUSD":0.05,"contextWindow":200000}},"total_cost_usd":0.05}"#;
         let usage = turn_end_usage(&[assistant, result]).expect("Some(usage)");
         assert_eq!(usage.input_tokens, 100);
         assert_eq!(usage.output_tokens, 25);
@@ -892,6 +1120,22 @@ mod tests {
         assert_eq!(usage.context_input_tokens, Some(180));
         assert_eq!(usage.context_window, Some(200_000));
         assert!((usage.total_cost_usd.unwrap() - 0.05).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn multi_model_dispatch_sums_model_usage_across_entries() {
+        // A background-agent dispatch on a different model: `modelUsage` gains
+        // an entry per model and the turn's tokens are the whole-dispatch sum
+        // (probed 2.1.198: total_cost_usd == Σ modelUsage costUSD exactly).
+        let result = r#"{"type":"result","is_error":false,"result":"done","model":"claude-sonnet-5","usage":{"input_tokens":1444,"output_tokens":3},"modelUsage":{"claude-sonnet-5":{"inputTokens":6995,"outputTokens":182,"cacheReadInputTokens":87218,"cacheCreationInputTokens":12377,"costUSD":0.1241424,"contextWindow":1000000},"claude-haiku-4-5":{"inputTokens":10,"outputTokens":140,"cacheReadInputTokens":0,"cacheCreationInputTokens":11622,"costUSD":0.0152375,"contextWindow":200000}},"total_cost_usd":0.1393799}"#;
+        let usage = turn_end_usage(&[result]).expect("Some(usage)");
+        assert_eq!(usage.input_tokens, 7005, "6995 parent + 10 subagent");
+        assert_eq!(usage.output_tokens, 322, "182 parent + 140 subagent");
+        assert_eq!(usage.cached_input_tokens, Some(87_218));
+        assert_eq!(usage.cache_creation_input_tokens, Some(23_999));
+        assert!((usage.total_cost_usd.unwrap() - 0.139_379_9).abs() < f64::EPSILON);
+        // Context window still follows `select_context_window` (primary model).
+        assert_eq!(usage.context_window, Some(1_000_000));
     }
 
     #[test]
@@ -926,17 +1170,32 @@ mod tests {
     }
 
     #[test]
-    fn result_with_empty_model_usage_yields_no_context_window() {
+    fn result_with_empty_model_usage_falls_back_to_per_cycle_usage() {
+        // Empty `modelUsage` → no aggregate to sum and no context window; the
+        // per-cycle `result.usage` shape still populates the token fields.
         let line = r#"{"type":"result","is_error":false,"api_error_status":null,"result":"ok","usage":{"input_tokens":10,"output_tokens":3},"modelUsage":{},"total_cost_usd":0.01}"#;
-        match parse_one(line, tid()) {
-            ParseOutcome::Event(AdapterEvent::TurnEnd {
-                usage: Some(usage), ..
-            }) => {
-                assert_eq!(usage.context_window, None);
-                assert_eq!(usage.input_tokens, 10);
-            }
-            _ => panic!("expected TurnEnd with Some(usage)"),
-        }
+        let usage = turn_end_usage(&[line]).expect("Some(usage)");
+        assert_eq!(usage.context_window, None);
+        assert_eq!(usage.input_tokens, 10);
+    }
+
+    #[test]
+    fn model_usage_entry_missing_required_fields_falls_back_to_per_cycle_usage() {
+        // All-or-nothing aggregation: an entry without the required
+        // `outputTokens` must not yield a silently-undercounted sum — the
+        // whole aggregate is rejected and `result.usage` wins.
+        let line = r#"{"type":"result","is_error":false,"result":"ok","usage":{"input_tokens":10,"output_tokens":3},"modelUsage":{"claude-opus-4-8":{"inputTokens":3135,"contextWindow":1000000}}}"#;
+        let usage = turn_end_usage(&[line]).expect("Some(usage)");
+        assert_eq!(
+            usage.input_tokens, 10,
+            "per-cycle usage, not the partial aggregate"
+        );
+        assert_eq!(usage.output_tokens, 3);
+        assert_eq!(
+            usage.context_window,
+            Some(1_000_000),
+            "context window still selected"
+        );
     }
 
     #[test]
@@ -973,10 +1232,11 @@ mod tests {
     #[test]
     fn result_with_missing_usage_object_yields_none() {
         let line = r#"{"type":"result","is_error":false,"api_error_status":null,"result":"ok"}"#;
-        match parse_one(line, tid()) {
-            ParseOutcome::Event(AdapterEvent::TurnEnd { usage: None, .. }) => {}
-            _ => panic!("expected TurnEnd with None usage when usage field is absent"),
-        }
+        assert_eq!(
+            turn_end_usage(&[line]),
+            None,
+            "no usage schema at all → None, never a fabricated zero-Some"
+        );
     }
 
     #[test]
@@ -1045,9 +1305,28 @@ mod tests {
     }
 
     #[test]
-    fn system_non_init_subtype_is_skipped() {
-        let line = r#"{"type":"system","subtype":"compact_boundary","data":{}}"#;
-        assert!(matches!(parse_one(line, tid()), ParseOutcome::Skip));
+    fn system_non_init_subtypes_yield_liveness() {
+        // Denylist posture: `init` is the only system subtype with a semantic
+        // event; everything else — including subtypes that don't exist yet —
+        // is proof the process is alive. The task-lifecycle vocabulary has
+        // already drifted across CLI versions (`task_updated` appeared at
+        // 2.1.198), so an allowlist would silently stop re-arming the
+        // heartbeat on the next rename.
+        for line in [
+            r#"{"type":"system","subtype":"compact_boundary","data":{}}"#,
+            r#"{"type":"system","subtype":"task_started","task_id":"a1","description":"work"}"#,
+            r#"{"type":"system","subtype":"task_updated","task_id":"a1"}"#,
+            r#"{"type":"system","subtype":"task_notification","task_id":"a1","status":"completed"}"#,
+            r#"{"type":"system","subtype":"totally_new_future_subtype"}"#,
+        ] {
+            let turn = tid();
+            match parse_one(line, turn) {
+                ParseOutcome::Event(AdapterEvent::Liveness { turn_id }) => {
+                    assert_eq!(turn_id, turn);
+                }
+                other => panic!("expected Liveness for {line}, got {other:?}"),
+            }
+        }
     }
 
     #[test]
@@ -1196,9 +1475,10 @@ mod tests {
         let rl = format!(r#"{{"type":"rate_limit_event","rate_limit_info":{rate_limit_info}}}"#);
         parse_line(&rl, turn_id, agent_id, &mut state);
         let result = r#"{"type":"result","is_error":false,"api_error_status":null,"result":"ok","usage":{"input_tokens":10,"output_tokens":5}}"#;
-        match parse_line(result, turn_id, agent_id, &mut state) {
-            ParseOutcome::Event(AdapterEvent::TurnEnd { spend, .. }) => spend,
-            other => panic!("expected TurnEnd, got {other:?}"),
+        let _ = parse_line(result, turn_id, agent_id, &mut state);
+        match state.take_final_turn_end(turn_id, TurnOutcome::Completed) {
+            Some(AdapterEvent::TurnEnd { spend, .. }) => spend,
+            other => panic!("expected the folded terminal, got {other:?}"),
         }
     }
 
@@ -1353,11 +1633,19 @@ mod tests {
     }
 
     #[test]
-    fn result_missing_error_fields_defaults_to_completed() {
+    fn result_missing_error_fields_defaults_to_success_fold() {
+        // No `is_error` / `api_error_status` fields → treated as a successful
+        // result: folded (Liveness), terminal Completed at EOF.
         let line = r#"{"type":"result","result":"ok"}"#;
+        let mut state = ParserState::default();
+        let turn = tid();
         assert!(matches!(
-            parse_one(line, tid()),
-            ParseOutcome::Event(AdapterEvent::TurnEnd {
+            parse_line(line, turn, aid(), &mut state),
+            ParseOutcome::Event(AdapterEvent::Liveness { .. })
+        ));
+        assert!(matches!(
+            state.take_final_turn_end(turn, TurnOutcome::Completed),
+            Some(AdapterEvent::TurnEnd {
                 outcome: TurnOutcome::Completed,
                 ..
             })
@@ -1536,19 +1824,9 @@ mod tests {
     /// disk, so the stream parser must do the same in memory).
     #[test]
     fn subagent_delegation_fixture_collapses_to_parent_tool_call_pair() {
-        let fixture = include_str!("../tests/fixtures/claude/subagent-delegation.jsonl");
-        let mut state = ParserState::default();
-        let turn_id = tid();
-        let agent_id = aid();
-        let mut events: Vec<AdapterEvent> = Vec::new();
-        for line in fixture.lines().filter(|l| !l.trim().is_empty()) {
-            match parse_line(line, turn_id, agent_id, &mut state) {
-                ParseOutcome::Event(ev) => events.push(ev),
-                ParseOutcome::Events(evs) => events.extend(evs),
-                ParseOutcome::Skip => {}
-                ParseOutcome::Error(e) => panic!("unexpected parse error: {e}"),
-            }
-        }
+        let events = replay_fixture(include_str!(
+            "../tests/fixtures/claude/subagent-delegation.jsonl"
+        ));
 
         // Exactly one ToolStarted, naming the parent's `Agent` call.
         let tool_starteds: Vec<&AdapterEvent> = events
@@ -1613,7 +1891,9 @@ mod tests {
     }
 
     /// Collect the events from replaying every line of a Claude live fixture
-    /// through `parse_line` under one `ParserState` (one turn).
+    /// through `parse_line` under one `ParserState` (one turn), then append
+    /// the folded terminal exactly as the adapter does at stream EOF on a
+    /// clean exit — so the returned sequence is what a consumer actually sees.
     fn replay_fixture(fixture: &str) -> Vec<AdapterEvent> {
         let mut state = ParserState::default();
         let turn_id = tid();
@@ -1626,6 +1906,9 @@ mod tests {
                 ParseOutcome::Skip => {}
                 ParseOutcome::Error(e) => panic!("unexpected parse error: {e}"),
             }
+        }
+        if let Some(end) = state.take_final_turn_end(turn_id, TurnOutcome::Completed) {
+            events.push(end);
         }
         events
     }
@@ -1774,11 +2057,12 @@ mod tests {
             ParseOutcome::Event(AdapterEvent::ToolStarted { .. })
         ));
 
-        // Absent entirely (e.g. `result` events) → process normally.
+        // Absent entirely (e.g. `result` events) → process normally (a
+        // successful result folds and surfaces as Liveness, not Skip).
         let line = r#"{"type":"result","is_error":false,"result":"done"}"#;
         assert!(matches!(
             parse_one(line, tid()),
-            ParseOutcome::Event(AdapterEvent::TurnEnd { .. })
+            ParseOutcome::Event(AdapterEvent::Liveness { .. })
         ));
     }
 
@@ -1806,16 +2090,21 @@ mod tests {
 
         // Dispatch 2: a fresh ParserState (mirrors `run_producer`'s per-turn
         // reset). The next turn's `result` event must NOT see any auth-failure
-        // state, regardless of what happened earlier on a different state.
+        // state, regardless of what happened earlier on a different state — a
+        // successful result folds (Liveness) instead of failing fast.
         let mut state2 = ParserState::default();
         let turn_id_2 = tid();
         let success_line = r#"{"type":"result","subtype":"success","is_error":false,"api_error_status":null,"result":"ack"}"#;
         match parse_line(success_line, turn_id_2, agent_id, &mut state2) {
-            ParseOutcome::Event(AdapterEvent::TurnEnd {
+            ParseOutcome::Event(AdapterEvent::Liveness { .. }) => {}
+            other => panic!("expected the result to fold on the second dispatch, got {other:?}"),
+        }
+        assert!(matches!(
+            state2.take_final_turn_end(turn_id_2, TurnOutcome::Completed),
+            Some(AdapterEvent::TurnEnd {
                 outcome: TurnOutcome::Completed,
                 ..
-            }) => {}
-            other => panic!("expected TurnEnd(Completed) on the second dispatch, got {other:?}"),
-        }
+            })
+        ));
     }
 }

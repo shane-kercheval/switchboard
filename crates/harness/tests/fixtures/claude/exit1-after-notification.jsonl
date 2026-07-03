@@ -1,0 +1,4 @@
+{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"waiting"}}}
+{"type":"result","subtype":"success","is_error":false,"api_error_status":null,"duration_ms":1000,"duration_api_ms":2000,"num_turns":1,"result":"waiting","stop_reason":"end_turn","session_id":"00000000-0000-7000-8000-000000000061","total_cost_usd":0.02,"usage":{"input_tokens":5,"output_tokens":1},"modelUsage":{},"permission_denials":[],"terminal_reason":"completed","uuid":"00000000-0000-7000-8000-000000000062"}
+{"type":"system","subtype":"task_notification","task_id":"t1","tool_use_id":"toolu_x","status":"completed"}
+// exit:1

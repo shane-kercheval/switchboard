@@ -1,8 +1,8 @@
 # Fix: Claude background-agent dispatches fragment on reload and truncate live
 
 **Date:** 2026-07-02 (revised same day after live probes — see Evidence)
-**Status:** Planned
-**Scope:** `crates/harness/src/claude_code/session_file.rs` (turn-boundary fix), `crates/harness/src/forward.rs` (separator parity fix + doc correction + regression coverage), `crates/harness/src/parser.rs` + `crates/harness/src/claude_code/mod.rs` (live terminal fix), `crates/dispatcher/src/lib.rs` (defense-in-depth guard), `docs/harness-behavior.md` (record the upstream change).
+**Status:** Implemented (M1–M4 complete; operational record: `docs/harness-behavior.md` G22)
+**Scope:** `crates/harness/src/claude_code/session_file.rs` (turn-boundary fix), `crates/harness/src/forward.rs` (separator parity fix + doc correction + regression coverage), `crates/harness/src/parser.rs` + `crates/harness/src/claude_code/mod.rs` (live terminal fix), `crates/harness/src/events.rs` (`AdapterEvent::is_turn_scoped` lifecycle classification), `crates/dispatcher/src/lib.rs` (defense-in-depth guard), `docs/harness-behavior.md` (record the upstream change).
 
 ## Problem
 

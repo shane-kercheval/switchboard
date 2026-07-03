@@ -5,10 +5,12 @@
 //! Both the manual compose-bar forward and the workflow runtime resolve a
 //! source's text from the dispatcher's live capture for a turn that was in
 //! flight, and fall back to [`latest_completed_agent_text`] (a disk read) only
-//! for a source that was already idle — its file is settled, so the same
-//! `Text`-kind filter applied live and on disk yields the same string. Both then
-//! compose via [`compose_forwarded_message`], so a manual forward and a workflow
-//! `forward_from` produce byte-identical bodies — the system-design §7
+//! for a source that was already idle — its file is settled, and the disk join
+//! reproduces the live capture byte-for-byte: the same `Text`-kind filter, with
+//! `\n\n` between text blocks (the separator the live parser bakes into the
+//! first chunk of each new block; see `parser.rs`'s `pending_separator`). Both
+//! then compose via [`compose_forwarded_message`], so a manual forward and a
+//! workflow `forward_from` produce byte-identical bodies — the system-design §7
 //! one-mechanism principle. (`Thinking` reasoning and tool output are excluded
 //! everywhere.)
 
@@ -16,16 +18,20 @@ use crate::events::ContentKind;
 use crate::transcript::{Turn, TurnItem, TurnStatus};
 
 /// The text-only output of the most-recent **completed** agent turn in `turns`:
-/// its `Text`-kind items concatenated in arrival order, excluding `Thinking`
-/// reasoning and tool output. `None` when no completed agent turn exists; the
-/// returned string is itself empty when the completed turn produced only
-/// thinking / tool items. Callers treat both `None` and an empty / whitespace
-/// string as "no forwardable output" — the empty-source case.
+/// its non-empty `Text`-kind items joined with `\n\n`, in arrival order,
+/// excluding `Thinking` reasoning and tool output. `None` when no completed
+/// agent turn exists; the returned string is itself empty when the completed
+/// turn produced only thinking / tool items. Callers treat both `None` and an
+/// empty / whitespace string as "no forwardable output" — the empty-source
+/// case.
 ///
-/// Mirrors the dispatcher's live `captured_text` filter (which accumulates the
-/// same `Text`-kind `ContentChunk`s with no separators) so the disk-read manual
-/// path and the live-captured workflow path forward the same text for the same
-/// turn.
+/// Mirrors the dispatcher's live `captured_text`: the live parser synthesizes
+/// a `\n\n` separator onto the first chunk of each new text block after prior
+/// text (persisting across intervening tool calls, and not consumed by empty
+/// blocks — see `parser.rs`'s `pending_separator`), and the dispatcher
+/// accumulates that verbatim. Joining the on-disk per-block `Text` items the
+/// same way makes the disk-read manual path and the live-captured workflow
+/// path forward byte-identical text for the same turn.
 #[must_use]
 pub fn latest_completed_agent_text(turns: &[Turn]) -> Option<String> {
     turns.iter().rev().find_map(|turn| match turn {
@@ -38,9 +44,11 @@ pub fn latest_completed_agent_text(turns: &[Turn]) -> Option<String> {
     })
 }
 
-/// Concatenate a turn's `Text`-kind items in order, dropping `Thinking` and
-/// tool entries. No separator between items — consecutive on-disk text blocks
-/// reconstruct the same string the live stream accumulated chunk-by-chunk.
+/// Join a turn's non-empty `Text`-kind items with `\n\n`, in order, dropping
+/// `Thinking` and tool entries. Separator only *between* blocks (no leading
+/// separator), and empty items neither emit text nor produce a doubled
+/// separator — both matching the live parser exactly (an empty block does not
+/// consume its `pending_separator`, so live yields one `\n\n` there, not two).
 fn concat_text_items(items: &[TurnItem]) -> String {
     let mut out = String::new();
     for item in items {
@@ -48,7 +56,11 @@ fn concat_text_items(items: &[TurnItem]) -> String {
             kind: ContentKind::Text,
             text,
         } = item
+            && !text.is_empty()
         {
+            if !out.is_empty() {
+                out.push_str("\n\n");
+            }
             out.push_str(text);
         }
     }
@@ -162,33 +174,77 @@ mod tests {
     }
 
     #[test]
-    fn latest_text_is_text_only_turn_concatenated() {
+    fn latest_text_joins_blocks_with_paragraph_separator() {
+        // Each on-disk `Text` item is one content block; live bakes `\n\n`
+        // between blocks, so the disk join must too. (Intentional behavior
+        // change from the old glue-with-nothing join, which produced
+        // "…running.The codebase…" run-togethers that live never emits.)
         let turns = vec![agent_turn(
             TurnStatus::Complete,
             vec![text_item("hello "), text_item("world")],
         )];
         assert_eq!(
             latest_completed_agent_text(&turns).as_deref(),
-            Some("hello world")
+            Some("hello \n\nworld")
         );
     }
 
     #[test]
     fn latest_text_excludes_thinking_and_tool_output() {
         // A turn with interleaved thinking + tool calls: only `Text`-kind items
-        // survive, concatenated across the intervening tool call.
+        // survive, and the block separator persists across the intervening
+        // tool call — mirroring live's `pending_separator`, which a tool block
+        // does not reset.
         let turns = vec![agent_turn(
             TurnStatus::Complete,
             vec![
                 thinking_item("secret reasoning"),
-                text_item("visible before tool. "),
+                text_item("visible before tool."),
                 tool_item(),
                 text_item("visible after tool."),
             ],
         )];
         assert_eq!(
             latest_completed_agent_text(&turns).as_deref(),
-            Some("visible before tool. visible after tool.")
+            Some("visible before tool.\n\nvisible after tool.")
+        );
+    }
+
+    #[test]
+    fn latest_text_sentence_boundary_not_run_together() {
+        // The user-visible defect the separator fixes: consecutive response
+        // segments forwarded from disk must not glue into
+        // "…running.The codebase…".
+        let turns = vec![agent_turn(
+            TurnStatus::Complete,
+            vec![
+                text_item("Both research agents are running."),
+                text_item("The codebase inventory is complete."),
+            ],
+        )];
+        assert_eq!(
+            latest_completed_agent_text(&turns).as_deref(),
+            Some("Both research agents are running.\n\nThe codebase inventory is complete."),
+        );
+    }
+
+    #[test]
+    fn latest_text_empty_block_does_not_double_the_separator() {
+        // Parity with live's `empty_text_block_does_not_consume_pending_separator`:
+        // an empty text block between two non-empty ones yields ONE `\n\n`,
+        // not two — and no leading separator when the first block is empty.
+        let turns = vec![agent_turn(
+            TurnStatus::Complete,
+            vec![
+                text_item(""),
+                text_item("first"),
+                text_item(""),
+                text_item("second"),
+            ],
+        )];
+        assert_eq!(
+            latest_completed_agent_text(&turns).as_deref(),
+            Some("first\n\nsecond")
         );
     }
 

@@ -2677,4 +2677,43 @@ mod tests {
         };
         assert_eq!(*status, TurnStatus::Complete);
     }
+
+    #[test]
+    fn forward_of_reunified_dispatch_carries_all_cycles_text() {
+        // Cross-module regression at the seam where the original defect lived
+        // (reconstruction × forward, not either alone): an idle-source forward
+        // of a background-agent dispatch must carry EVERY cycle's text,
+        // paragraph-separated — not just the final fragment, and not glued
+        // run-together. Hermetic: injected home_dir via `hydrate_records`.
+        let result = hydrate_records(&[
+            user_record_with_source("run research", "sdk", "2026-05-14T04:43:15Z"),
+            assistant_text_record(
+                "Both research agents are running.",
+                "claude-sonnet-4-6",
+                "2026-05-14T04:43:16Z",
+            ),
+            task_notification_record(Some("sdk"), "2026-05-14T04:43:17Z"),
+            assistant_text_record(
+                "The codebase inventory is complete.",
+                "claude-sonnet-4-6",
+                "2026-05-14T04:43:18Z",
+            ),
+            task_notification_record(None, "2026-05-14T04:43:19Z"),
+            assistant_text_record(
+                "Both research passes are done.",
+                "claude-sonnet-4-6",
+                "2026-05-14T04:43:20Z",
+            ),
+        ]);
+        let forwarded = crate::forward::latest_completed_agent_text(&result.turns);
+        assert_eq!(
+            forwarded.as_deref(),
+            Some(
+                "Both research agents are running.\n\n\
+                 The codebase inventory is complete.\n\n\
+                 Both research passes are done."
+            ),
+            "the whole dispatch forwards, not just the last fragment",
+        );
+    }
 }

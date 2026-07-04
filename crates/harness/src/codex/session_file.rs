@@ -8,6 +8,12 @@
 //!   `TurnEnd.usage.context_window` (per-turn).
 //! - `event_msg/token_count.rate_limits` (non-null variant only) →
 //!   `RateLimitEvent.info` (per-turn).
+//! - `event_msg/token_count.info.last_token_usage` → per-turn token usage
+//!   overlaid onto `TurnEnd.usage`. The stream's `turn.completed.usage` is
+//!   **not** per-turn — codex-rs populates it from the thread-cumulative
+//!   `total_token_usage` counter, restored from the rollout on resume
+//!   (`exec/src/event_processor_with_jsonl_output.rs::usage_from_last_total`),
+//!   so its numbers grow without bound across sends.
 //! - `session_meta.payload.cli_version` → `SessionMeta.harness_version` (once
 //!   per session).
 //! - `turn_context.payload.model` (first one in file) → `SessionMeta.model`
@@ -105,6 +111,17 @@ pub struct Enrichment {
     /// `payload.base_instructions.text` replaced by a sentinel. Used as
     /// `SessionMeta.raw`. `None` if line 1 isn't a `session_meta` record.
     pub session_meta_raw: Option<Value>,
+    /// From the last `event_msg/token_count` record with non-null `info`
+    /// **within the current turn** (reset at each `task_started`, mirroring
+    /// the reload path's per-turn builder) — `info.last_token_usage` is the
+    /// final request's usage, i.e. the true per-turn context occupancy (see
+    /// module docs for why the stream's `turn.completed.usage` cannot
+    /// serve). Same source the reload path uses, so live and reloaded turns
+    /// carry identical telemetry. `None` when the current turn wrote no
+    /// parseable usage record — never a predecessor turn's value.
+    /// `context_window` is left `None` here; the adapter overlays it
+    /// separately from the `task_started`-derived [`Self::context_window`].
+    pub per_turn_usage: Option<TurnUsage>,
 }
 
 /// Compute the canonical session-file path glob's parent directory for a
@@ -389,17 +406,31 @@ pub fn parse_session_content(content: &str) -> Enrichment {
                         {
                             enrichment.context_window = u32::try_from(window).ok();
                         }
+                        // `per_turn_usage` is turn-scoped: a turn that writes
+                        // no parseable token_count must read as "unknown",
+                        // never inherit its predecessor's numbers. The reset
+                        // also covers the flush race (enrichment reading after
+                        // task_started but before this turn's token_count
+                        // lands). Window/rate-limits deliberately stay
+                        // whole-file last-wins — they are session-level
+                        // "latest known" state, not per-turn telemetry.
+                        enrichment.per_turn_usage = None;
                     }
                     "token_count" => {
-                        // Two variants share this type — only the one with
-                        // non-null `rate_limits` is what enrichment surfaces.
-                        // The info-only variant is ignored (the stream's
-                        // turn.completed.usage carries token totals).
-                        // Last-rate-limit-bearing-record-wins.
+                        // Two variants share this type; each feeds a different
+                        // enrichment field and either may be null on a given
+                        // record. Last-record-wins for both, independently.
                         if let Some(rate_limits) = p.get("rate_limits")
                             && !rate_limits.is_null()
                         {
                             enrichment.rate_limits = Some(rate_limits.clone());
+                        }
+                        if let Some(usage) = p
+                            .get("info")
+                            .filter(|v| !v.is_null())
+                            .and_then(|info| turn_usage_from_token_count_info(info, None))
+                        {
+                            enrichment.per_turn_usage = Some(usage);
                         }
                     }
                     _ => {}
@@ -410,6 +441,40 @@ pub fn parse_session_content(content: &str) -> Enrichment {
     }
 
     enrichment
+}
+
+/// Build a per-turn `TurnUsage` from a `token_count` record's non-null
+/// `info`. `info.last_token_usage` is the final request of the turn, so its
+/// input side IS the context occupancy — Codex's `cached_input_tokens` is a
+/// subset of `input_tokens`, so no summation (see `TurnUsage` docs). The
+/// fall-back to reading token fields off `info` itself is a defensive
+/// legacy branch inherited from the reload parser (which reads historical
+/// rollouts): no current record carries token fields at `info`'s top level,
+/// so absent `last_token_usage` this returns `None` in practice. Shared by
+/// the reload path and post-turn enrichment so both derive identical
+/// telemetry.
+///
+/// Missing/non-numeric `input_tokens` or `output_tokens` → `None` — same
+/// "no fabricated zero-Some" contract as the live parser. Load-bearing for
+/// the enrichment overlay: a degenerate record must not replace genuine
+/// stream telemetry with zeros.
+fn turn_usage_from_token_count_info(
+    info: &Value,
+    context_window: Option<u32>,
+) -> Option<TurnUsage> {
+    let last = info.get("last_token_usage").unwrap_or(info);
+    let input = last.get("input_tokens").and_then(Value::as_u64)?;
+    let output = last.get("output_tokens").and_then(Value::as_u64)?;
+    Some(TurnUsage {
+        input_tokens: input,
+        output_tokens: output,
+        cached_input_tokens: last.get("cached_input_tokens").and_then(Value::as_u64),
+        cache_creation_input_tokens: None,
+        context_input_tokens: Some(input),
+        reasoning_output_tokens: last.get("reasoning_output_tokens").and_then(Value::as_u64),
+        context_window,
+        total_cost_usd: None,
+    })
 }
 
 /// Strip `payload.base_instructions.text` from a `session_meta` record. The
@@ -797,30 +862,10 @@ impl CodexReconstruction {
                 let Some(info) = p.get("info").filter(|v| !v.is_null()) else {
                     return;
                 };
-                let last = info.get("last_token_usage").unwrap_or(info);
-                let input = last
-                    .get("input_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-                let output = last
-                    .get("output_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-                builder.usage = Some(TurnUsage {
-                    input_tokens: input,
-                    output_tokens: output,
-                    cached_input_tokens: last.get("cached_input_tokens").and_then(Value::as_u64),
-                    cache_creation_input_tokens: None,
-                    // Codex's cached count is a subset of `input_tokens`, so
-                    // the input-side occupancy is `input_tokens` alone — matches
-                    // the live parser (see `codex/parser.rs` and `TurnUsage` docs).
-                    context_input_tokens: Some(input),
-                    reasoning_output_tokens: last
-                        .get("reasoning_output_tokens")
-                        .and_then(Value::as_u64),
-                    context_window: builder.context_window,
-                    total_cost_usd: None,
-                });
+                if let Some(usage) = turn_usage_from_token_count_info(info, builder.context_window)
+                {
+                    builder.usage = Some(usage);
+                }
             }
             "mcp_tool_call_end" => {
                 let Some(call_id) = p.get("call_id").and_then(Value::as_str) else {
@@ -1145,9 +1190,11 @@ mod tests {
 
     #[test]
     fn parse_filters_token_count_info_only_variant() {
-        // The info-only token_count (rate_limits: null) must be ignored; the
-        // stream's turn.completed.usage carries token telemetry. Only the
-        // rate-limits-bearing variant feeds RateLimitEvent.
+        // The info-only token_count (rate_limits: null) must not populate
+        // rate_limits; only the rate-limits-bearing variant feeds
+        // RateLimitEvent. A degenerate info (no parseable token fields) must
+        // not fabricate a zero-valued per_turn_usage either — that would
+        // replace genuine stream telemetry in the adapter overlay.
         let content = r#"
 {"type":"session_meta","payload":{"cli_version":"0.130.0"}}
 {"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{}},"rate_limits":null}}
@@ -1157,6 +1204,74 @@ mod tests {
             enrichment.rate_limits.is_none(),
             "info-only token_count must not populate rate_limits"
         );
+        assert!(
+            enrichment.per_turn_usage.is_none(),
+            "degenerate info must not fabricate zero-valued per-turn usage"
+        );
+    }
+
+    #[test]
+    fn parse_extracts_per_turn_usage_from_last_token_usage_not_totals() {
+        // `info.last_token_usage` (final request = context occupancy) is the
+        // per-turn source; `total_token_usage` is the thread-cumulative
+        // counter and must be ignored. Last info-bearing record wins.
+        let content = r#"
+{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":2411599,"output_tokens":17372},"last_token_usage":{"input_tokens":141496,"cached_input_tokens":137600,"output_tokens":709,"reasoning_output_tokens":417}},"rate_limits":null}}
+{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":2555875,"output_tokens":18095},"last_token_usage":{"input_tokens":144276,"cached_input_tokens":141184,"output_tokens":723,"reasoning_output_tokens":298}},"rate_limits":null}}
+"#;
+        let enrichment = parse_session_content(content);
+        let usage = enrichment.per_turn_usage.expect("per-turn usage captured");
+        assert_eq!(usage.input_tokens, 144_276, "last record wins");
+        assert_eq!(usage.output_tokens, 723);
+        assert_eq!(usage.cached_input_tokens, Some(141_184));
+        assert_eq!(usage.reasoning_output_tokens, Some(298));
+        assert_eq!(
+            usage.context_input_tokens,
+            Some(144_276),
+            "occupancy is the final request's input side, not the cumulative total"
+        );
+        assert_eq!(
+            usage.context_window, None,
+            "window is overlaid separately from task_started"
+        );
+    }
+
+    #[test]
+    fn parse_resets_per_turn_usage_at_task_started_boundary() {
+        // A new turn that has written no parseable token_count yet must read
+        // as "unknown" — never inherit the previous turn's usage (which would
+        // stamp stale telemetry onto the current TurnEnd, and mask the flush
+        // race where enrichment reads before this turn's token_count lands).
+        let content = r#"
+{"type":"event_msg","payload":{"type":"task_started","model_context_window":258400}}
+{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":141496,"output_tokens":709}},"rate_limits":null}}
+{"type":"event_msg","payload":{"type":"task_started","model_context_window":258400}}
+"#;
+        let enrichment = parse_session_content(content);
+        assert!(
+            enrichment.per_turn_usage.is_none(),
+            "task_started must reset per_turn_usage — a prior turn's usage must not survive the boundary"
+        );
+    }
+
+    #[test]
+    fn parse_repopulates_per_turn_usage_after_task_started_reset() {
+        // The current turn's own token_count (after the boundary reset)
+        // populates the field with the current turn's values.
+        let content = r#"
+{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":141496,"output_tokens":709}},"rate_limits":null}}
+{"type":"event_msg","payload":{"type":"task_started","model_context_window":258400}}
+{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":144276,"output_tokens":723}},"rate_limits":null}}
+"#;
+        let enrichment = parse_session_content(content);
+        let usage = enrichment
+            .per_turn_usage
+            .expect("current turn's usage captured");
+        assert_eq!(
+            usage.input_tokens, 144_276,
+            "current turn's record, not the pre-boundary one"
+        );
+        assert_eq!(usage.output_tokens, 723);
     }
 
     #[test]
@@ -2096,6 +2211,62 @@ not valid json
         assert_eq!(usage.output_tokens, 50);
         assert_eq!(usage.cached_input_tokens, Some(20));
         assert_eq!(usage.context_window, Some(258_400));
+    }
+
+    #[test]
+    fn load_codex_transcript_degenerate_token_count_keeps_prior_usage() {
+        // A token_count whose info carries no parseable token fields must not
+        // clobber the turn's already-captured usage with zeros (the reload
+        // path used to fabricate a zero-Some here; the shared strict builder
+        // now skips the record — last-good-wins).
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        let agent_id = Uuid::now_v7();
+        let date = NaiveDate::from_ymd_opt(2026, 5, 14).unwrap();
+        let session_id = "019e27fa-ae19-7022-97a2-356e6e5f3365";
+        let valid_token_count = serde_json::json!({
+            "timestamp": "2026-05-14T19:33:23Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "last_token_usage": {
+                        "input_tokens": 100,
+                        "output_tokens": 50
+                    }
+                }
+            }
+        });
+        let degenerate_token_count = serde_json::json!({
+            "timestamp": "2026-05-14T19:33:24Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": { "total_token_usage": {} }
+            }
+        });
+        let content = jsonl_lines(&[
+            task_started(session_id, "2026-05-14T19:33:20Z", 258_400),
+            turn_context("gpt-5.4", "2026-05-14T19:33:20Z"),
+            user_message("hi", "2026-05-14T19:33:21Z"),
+            agent_message("hello", "2026-05-14T19:33:22Z"),
+            valid_token_count,
+            degenerate_token_count,
+            task_complete(session_id, "2026-05-14T19:33:25Z"),
+        ]);
+        write_session_at(home.path(), date, session_id, &content);
+
+        let result =
+            load_codex_transcript(home.path(), cwd.path(), session_id, Some(date), agent_id)
+                .unwrap();
+        let Turn::Agent { usage, .. } = &result.turns[1] else {
+            panic!("expected Agent turn");
+        };
+        let usage = usage
+            .as_ref()
+            .expect("usage populated from the valid record");
+        assert_eq!(usage.input_tokens, 100, "valid record's value survives");
+        assert_eq!(usage.output_tokens, 50);
     }
 
     #[test]

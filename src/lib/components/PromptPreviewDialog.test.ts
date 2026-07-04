@@ -65,7 +65,9 @@ describe("PromptPreviewDialog", () => {
     // Layout order: description, then arguments, then the template body.
     const description = screen.getByTestId("prompt-preview-description");
     const args = screen.getByTestId("prompt-preview-arguments");
-    expect(description.compareDocumentPosition(args) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(
+      description.compareDocumentPosition(args) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
     expect(args.compareDocumentPosition(body) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 

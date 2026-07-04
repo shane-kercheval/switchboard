@@ -963,6 +963,52 @@ async fn cross_midnight_uses_record_date_not_today() {
 }
 
 #[tokio::test]
+async fn enrichment_replaces_cumulative_stream_usage_with_per_turn_usage() {
+    // The stream's `turn.completed.usage` carries thread-cumulative totals
+    // (codex-rs fills it from `total_token_usage`, restored from the rollout
+    // on resume) — on a long session it reads several times the context
+    // window. The session file's `token_count.info.last_token_usage` is the
+    // real per-turn usage; the post-terminal enrichment must replace the
+    // stream numbers with it, or the context bar renders >100%.
+    let cwd = tempfile::TempDir::new().unwrap();
+    let home = tempfile::TempDir::new().unwrap();
+    let agent = codex_agent();
+
+    let session_content = r#"{"timestamp":"2026-01-01T00:00:00.000Z","type":"session_meta","payload":{"cli_version":"0.130.0"}}
+{"timestamp":"2026-01-01T00:00:01.000Z","type":"event_msg","payload":{"type":"task_started","model_context_window":258400}}
+{"timestamp":"2026-01-01T00:00:02.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":2555875,"cached_input_tokens":2151040,"output_tokens":18095,"reasoning_output_tokens":8409},"last_token_usage":{"input_tokens":144276,"cached_input_tokens":141184,"output_tokens":723,"reasoning_output_tokens":298}},"rate_limits":null}}
+"#;
+    let today = chrono::Local::now().date_naive();
+    stage_session_file(home.path(), today, FIXTURE_THREAD_ID, session_content);
+
+    let events = dispatch_with_home(&agent, cwd.path(), home.path(), &fixture("text-only")).await;
+
+    let usage = events
+        .iter()
+        .find_map(|e| match e {
+            AdapterEvent::TurnEnd { usage: Some(u), .. } => Some(u.clone()),
+            _ => None,
+        })
+        .expect("TurnEnd with usage");
+    // Per-turn values from last_token_usage — not the stream fixture's
+    // numbers (input 15568 / output 5) and not the cumulative totals.
+    assert_eq!(usage.input_tokens, 144_276);
+    assert_eq!(usage.output_tokens, 723);
+    assert_eq!(usage.cached_input_tokens, Some(141_184));
+    assert_eq!(usage.reasoning_output_tokens, Some(298));
+    assert_eq!(
+        usage.context_input_tokens,
+        Some(144_276),
+        "occupancy from the final request's input side"
+    );
+    assert_eq!(
+        usage.context_window,
+        Some(258_400),
+        "window overlay still applies on top of the per-turn usage"
+    );
+}
+
+#[tokio::test]
 async fn missing_session_file_emits_unenriched_turn_end_and_no_derived_events() {
     // No staged session file at all → load_with_retry returns
     // Enrichment::default() → TurnEnd has usage with context_window: None,
@@ -990,6 +1036,13 @@ async fn missing_session_file_emits_unenriched_turn_end_and_no_derived_events() 
             assert!(
                 u.context_window.is_none(),
                 "no session file → context_window stays None"
+            );
+            // The stream's counts are thread-cumulative, so without
+            // enrichment there is no occupancy value — the context bar
+            // hides rather than rendering the inflated number.
+            assert!(
+                u.context_input_tokens.is_none(),
+                "no session file → context_input_tokens stays None"
             );
         }
         other => panic!("expected TurnEnd(Completed) with Some(usage), got {other:?}"),

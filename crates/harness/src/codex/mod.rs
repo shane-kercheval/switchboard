@@ -605,9 +605,11 @@ async fn run_producer(
 ///    `partition_date` — never recompute the date from `Utc::today()` at
 ///    enrichment time; see [`session_file`] module docs).
 /// 2. Read the Codex session file with the 200ms + 200ms retry policy.
-/// 3. Emit the (now-enriched) `TurnEnd`. The enriched `context_window`
-///    overlays `usage.context_window` if `usage` was `Some`; if `usage` was
-///    `None` we don't fabricate a `TurnUsage` just to carry a context-window
+/// 3. Emit the (now-enriched) `TurnEnd`. If `usage` was `Some`, the session
+///    file's per-turn token usage replaces the stream's thread-cumulative
+///    numbers (see [`apply_per_turn_usage`]) and the enriched
+///    `context_window` overlays `usage.context_window`; if `usage` was
+///    `None` we don't fabricate a `TurnUsage` from enrichment alone
 ///    (preserves the strict "None means unparseable" contract).
 /// 4. Emit `RateLimitEvent` if rate-limit info was extracted.
 /// 5. Emit `SessionMeta` if this is the first turn AND the enrichment
@@ -650,11 +652,16 @@ async fn emit_terminal_with_enrichment(
         Enrichment::default()
     };
 
-    // Step 3: emit the enriched TurnEnd. The window (when present) comes from
+    // Step 3: emit the enriched TurnEnd. Token fields are replaced by the
+    // session file's per-turn usage first (the stream's are thread-cumulative
+    // — see `apply_per_turn_usage`), then the window overlays. Both come from
     // Codex's own session file — class B, already durable — so it's tagged
     // `SessionFileBacked` and the dispatcher does NOT re-persist it to the
     // metadata sidecar (mirrors the rate-limit gate below).
-    let enriched_usage = apply_context_window(usage, enrichment.context_window);
+    let enriched_usage = apply_context_window(
+        apply_per_turn_usage(usage, enrichment.per_turn_usage.clone()),
+        enrichment.context_window,
+    );
     let context_window_source = enriched_usage
         .as_ref()
         .and_then(|u| u.context_window)
@@ -741,6 +748,43 @@ fn apply_context_window(
             Some(u)
         }
         (None, _) => None,
+    }
+}
+
+/// Replace the stream-parsed token fields with the session file's per-turn
+/// usage.
+///
+/// **Precedence: session file wins** — deliberately the opposite of
+/// [`apply_context_window`]. Codex's exec stream populates
+/// `turn.completed.usage` from the **thread-cumulative** `total_token_usage`
+/// counter (`codex-rs/exec/src/event_processor_with_jsonl_output.rs`,
+/// `usage_from_last_total`), and `exec resume` restores that counter from
+/// the rollout — so the stream's numbers span the agent's whole life and
+/// grow without bound (a long session reads >900% on the context bar). The
+/// session file's `token_count.info.last_token_usage` is the final
+/// request's usage — real per-turn telemetry, and the same source the
+/// reload path uses, so live and reloaded turns carry identical values.
+///
+/// `context_window` and `total_cost_usd` are kept from the stream usage:
+/// the window keeps its stream-wins precedence in [`apply_context_window`]
+/// (the per-turn overlay never carries one), and cost is absent from
+/// `token_count` records.
+///
+/// Returns the stream usage unchanged when enrichment found no per-turn
+/// record, and `None` when the stream usage was `None` — enrichment refines
+/// existing telemetry, it does not fabricate it (same "None means
+/// unparseable" contract as [`apply_context_window`]).
+fn apply_per_turn_usage(
+    usage: Option<TurnUsage>,
+    per_turn: Option<TurnUsage>,
+) -> Option<TurnUsage> {
+    match (usage, per_turn) {
+        (Some(stream), Some(per_turn)) => Some(TurnUsage {
+            context_window: stream.context_window,
+            total_cost_usd: stream.total_cost_usd,
+            ..per_turn
+        }),
+        (stream, _) => stream,
     }
 }
 
@@ -1023,6 +1067,88 @@ mod tests {
         // Strict "None means unparseable usage" — never fabricate a Some
         // just to carry an enrichment-derived window.
         let result = apply_context_window(None, Some(258_400));
+        assert!(result.is_none());
+    }
+
+    /// Stream-shaped usage with Codex's thread-cumulative counts — the
+    /// numbers `turn.completed.usage` actually carries after many sends
+    /// (values from a real observed session that rendered a 996% context
+    /// bar before the per-turn overlay existed).
+    fn cumulative_stream_usage() -> TurnUsage {
+        TurnUsage {
+            input_tokens: 2_555_875,
+            output_tokens: 18_095,
+            cached_input_tokens: Some(2_151_040),
+            cache_creation_input_tokens: None,
+            context_input_tokens: None,
+            reasoning_output_tokens: Some(8_409),
+            context_window: None,
+            total_cost_usd: None,
+        }
+    }
+
+    fn per_turn_enrichment_usage() -> TurnUsage {
+        TurnUsage {
+            input_tokens: 144_276,
+            output_tokens: 723,
+            cached_input_tokens: Some(141_184),
+            cache_creation_input_tokens: None,
+            context_input_tokens: Some(144_276),
+            reasoning_output_tokens: Some(298),
+            context_window: None,
+            total_cost_usd: None,
+        }
+    }
+
+    #[test]
+    fn apply_per_turn_usage_replaces_cumulative_stream_tokens() {
+        let result = apply_per_turn_usage(
+            Some(cumulative_stream_usage()),
+            Some(per_turn_enrichment_usage()),
+        )
+        .expect("usage present");
+        assert_eq!(result.input_tokens, 144_276);
+        assert_eq!(result.output_tokens, 723);
+        assert_eq!(result.cached_input_tokens, Some(141_184));
+        assert_eq!(result.reasoning_output_tokens, Some(298));
+        assert_eq!(
+            result.context_input_tokens,
+            Some(144_276),
+            "occupancy comes from the session file's last_token_usage"
+        );
+    }
+
+    #[test]
+    fn apply_per_turn_usage_preserves_stream_window_and_cost() {
+        // The window keeps its stream-wins precedence in
+        // apply_context_window; the per-turn overlay must not clobber it.
+        let stream = TurnUsage {
+            context_window: Some(123_456),
+            total_cost_usd: Some(0.5),
+            ..cumulative_stream_usage()
+        };
+        let result = apply_per_turn_usage(Some(stream), Some(per_turn_enrichment_usage()))
+            .expect("usage present");
+        assert_eq!(result.context_window, Some(123_456));
+        assert_eq!(result.total_cost_usd, Some(0.5));
+    }
+
+    #[test]
+    fn apply_per_turn_usage_keeps_stream_usage_when_enrichment_absent() {
+        // Degraded path (session file unreadable / no info-bearing
+        // token_count): the cumulative numbers stay, but occupancy remains
+        // None so the context bar hides rather than inflates.
+        let result =
+            apply_per_turn_usage(Some(cumulative_stream_usage()), None).expect("stream usage kept");
+        assert_eq!(result.input_tokens, 2_555_875);
+        assert_eq!(result.context_input_tokens, None);
+    }
+
+    #[test]
+    fn apply_per_turn_usage_returns_none_when_usage_is_none() {
+        // Same strict contract as apply_context_window: enrichment refines
+        // telemetry, it does not fabricate it.
+        let result = apply_per_turn_usage(None, Some(per_turn_enrichment_usage()));
         assert!(result.is_none());
     }
 }

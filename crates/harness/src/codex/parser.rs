@@ -299,12 +299,17 @@ fn extract_usage_from_turn_completed(obj: &Value) -> Option<TurnUsage> {
         output_tokens,
         cached_input_tokens,
         cache_creation_input_tokens: None,
-        // Codex (OpenAI) reports `cached_input_tokens` as a *subset* already
-        // counted inside `input_tokens` (verified against captured fixtures:
-        // cached < input every time), so the input side occupying the window
-        // is `input_tokens` alone. Adding the cached count would double-count
-        // and inflate the bar. (Claude differs — see `TurnUsage` docs.)
-        context_input_tokens: Some(input_tokens),
+        // `turn.completed.usage` is NOT per-turn: codex-rs fills it from the
+        // thread-cumulative `total_token_usage` counter, restored from the
+        // rollout on resume (`exec/src/event_processor_with_jsonl_output.rs`,
+        // `usage_from_last_total`) — after many sends it reads several times
+        // the context window. Occupancy therefore cannot be derived from
+        // this event; the post-terminal session-file enrichment replaces the
+        // token fields with per-turn values and fills occupancy (see
+        // `codex/mod.rs::apply_per_turn_usage`). Leaving `None` here keeps
+        // the context bar hidden — rather than wildly inflated — on the
+        // degraded no-session-file path.
+        context_input_tokens: None,
         reasoning_output_tokens,
         context_window: None,
         total_cost_usd: None,
@@ -456,11 +461,11 @@ mod tests {
                 assert_eq!(u.output_tokens, 5);
                 assert_eq!(u.cached_input_tokens, Some(7552));
                 assert_eq!(u.cache_creation_input_tokens, None);
-                // No-double-count guard: Codex's cached count (7552) is a
-                // subset of input (15568), so the input-side occupancy is
-                // input alone — NOT input + cached (which would be 23120 and
-                // inflate the bar).
-                assert_eq!(u.context_input_tokens, Some(15568));
+                // The stream's counts are thread-cumulative, so occupancy
+                // cannot be derived here — it stays None until the
+                // post-terminal enrichment overlays per-turn usage from the
+                // session file.
+                assert_eq!(u.context_input_tokens, None);
                 assert_eq!(
                     u.context_window, None,
                     "context_window is enriched post-terminal from the session file"

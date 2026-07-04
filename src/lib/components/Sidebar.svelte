@@ -539,8 +539,9 @@
   /// `context_input_tokens` is the harness-reconciled input-side occupancy
   /// (see `TurnUsage`): for Claude it sums the disjoint cache fields (cached +
   /// cache-creation, which `input_tokens` alone excludes — the cause of the
-  /// near-0% bug), for Codex it is `input_tokens` alone (its cached count is a
-  /// subset, so adding it would double-count). Consuming the pre-reconciled
+  /// near-0% bug), for Codex the adapter substitutes the session file's
+  /// per-turn `last_token_usage` because the stream reports thread-cumulative
+  /// totals (the cause of the >900% bug). Consuming the pre-reconciled
   /// value keeps this formula harness-agnostic — do not re-add per-harness
   /// token summation here. Both it and `context_window` must be present;
   /// otherwise the bar is hidden.

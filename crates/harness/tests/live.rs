@@ -995,6 +995,11 @@ async fn live_codex_basic_turn_completes() {
     // Post-terminal enrichment must fire for Codex turns:
     // - TurnEnd.usage.context_window is enriched from the session file's
     //   task_started.model_context_window (Codex's stream doesn't carry it).
+    // - TurnEnd.usage token fields are replaced by the session file's
+    //   token_count.info.last_token_usage (the stream's turn.completed.usage
+    //   is thread-cumulative). The live parser stamps context_input_tokens
+    //   None, so a Some here proves the real CLI still writes the
+    //   last_token_usage shape the overlay depends on — drift guard.
     // - RateLimitEvent fires every turn from token_count.rate_limits.
     // - SessionMeta fires on the first turn carrying model + cli_version +
     //   the merged MCP servers / skills registries.
@@ -1003,6 +1008,14 @@ async fn live_codex_basic_turn_completes() {
             assert!(
                 u.context_window.is_some(),
                 "TurnEnd.usage.context_window must be enriched from session file (got None)"
+            );
+            let occupancy = u
+                .context_input_tokens
+                .expect("per-turn usage overlay must fill context_input_tokens from the session file's last_token_usage");
+            assert!(
+                occupancy > 0 && occupancy <= u64::from(u.context_window.unwrap()),
+                "occupancy must be a sane fraction of the window, got {occupancy} of {:?}",
+                u.context_window
             );
         }
         _ => panic!("expected TurnEnd with Some(usage), got: {terminal:?}"),

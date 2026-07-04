@@ -2135,6 +2135,24 @@ describe("ComposeBar — cross-agent forward", () => {
     expect(screen.queryByTestId(`forward-option-forward-pane:${reviewers}`)).toBeNull();
   });
 
+  it("@ menu pane rows carry the pane glyph in both Send to and Forward from sections", async () => {
+    const panes = await import("$lib/state/transcriptPanes.svelte");
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    const roster = [AGENT_A.id, AGENT_B.id];
+    const paneId = panes.moveAgentToNewPane(PROJECT_ID, roster, AGENT_B.id);
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    await fireEvent.input(textarea, { target: { value: "@" } });
+
+    const sendToPane = await screen.findByTestId(`recipient-option-pane:${paneId}`);
+    expect(within(sendToPane).getByTestId("pane-glyph")).toBeInTheDocument();
+    const forwardPane = await screen.findByTestId(`forward-option-forward-pane:${paneId}`);
+    expect(within(forwardPane).getByTestId("pane-glyph")).toBeInTheDocument();
+  });
+
   it("picks a forward source from the @ menu and dispatches a forward", async () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);

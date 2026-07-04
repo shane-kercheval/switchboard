@@ -1781,6 +1781,25 @@
   }
 </script>
 
+<!-- Split-rect pane glyph, shared by the @-menu's "Send to" and "Forward from"
+     pane rows so both sections mark pane entries identically. -->
+{#snippet paneGlyph()}
+  <svg
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    stroke-width="1.8"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+    class="text-accent h-4 w-4 shrink-0"
+    aria-hidden="true"
+    data-testid="pane-glyph"
+  >
+    <rect x="3" y="4" width="18" height="16" rx="2" />
+    <path d="M12 4v16" />
+  </svg>
+{/snippet}
+
 <div class="bg-raised px-4 pt-2 pb-4" bind:this={composeEl}>
   {#if activeWorkflowRun}
     <!-- A workflow occupies this project: the live progress view *replaces* the
@@ -2025,19 +2044,7 @@
                 <span class="text-fg">Clear</span>
                 <span class="text-muted ml-auto font-mono text-[13px]">{shortcut("esc")}</span>
               {:else if item.kind === "pane"}
-                <svg
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  stroke-width="1.8"
-                  stroke-linecap="round"
-                  stroke-linejoin="round"
-                  class="text-accent h-4 w-4"
-                  aria-hidden="true"
-                >
-                  <rect x="3" y="4" width="18" height="16" rx="2" />
-                  <path d="M12 4v16" />
-                </svg>
+                {@render paneGlyph()}
                 <span class="text-fg shrink-0">{item.pane.name}</span>
                 <!-- Member names in roster order (matching chip/pane-column
                    order); the menu spans the compose box, so names fit —
@@ -2106,6 +2113,7 @@
               </svg>
               {#if item.kind === "forward-pane"}
                 {@const paneIndex = paneLayout.panes.findIndex((p) => p.id === item.pane.id)}
+                {@render paneGlyph()}
                 <span class="text-fg shrink-0">{item.pane.name}</span>
                 <span class="text-muted min-w-0 truncate text-[11px]">
                   {agents

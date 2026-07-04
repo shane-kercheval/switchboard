@@ -1,8 +1,21 @@
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
-import { render, screen } from "@testing-library/svelte";
+import { fireEvent, render, screen } from "@testing-library/svelte";
 import WorkflowSteps from "./WorkflowSteps.svelte";
 import type { RecipientRef, StepPrompt, WorkflowStepInfo, WorkflowInputValue } from "$lib/types";
+
+// The prompt chip opens a content-preview dialog that fetches via IPC. The dialog
+// stays inert (no fetch) until a chip is clicked, so most tests never hit this.
+const invokeMock = vi.fn();
+vi.mock("@tauri-apps/api/core", () => ({
+  invoke: (cmd: string, args?: Record<string, unknown>) => invokeMock(cmd, args),
+}));
+
+// Reset call history + implementation between tests so a preview-fetch assertion
+// (`not.toHaveBeenCalled`) isn't polluted by a prior test's clicks.
+beforeEach(() => {
+  invokeMock.mockReset();
+});
 
 function slot(input: string): RecipientRef {
   return { kind: "slot", input };
@@ -247,9 +260,58 @@ describe("WorkflowSteps — collapse (send + its wait into one deliverable node)
   });
 
   it("shows an inline-text send as an 'inline prompt' chip", () => {
-    const steps = [kstep("send", "Hand off", [lit("a")], [], undefined, { kind: "inline" })];
+    const steps = [
+      kstep("send", "Hand off", [lit("a")], [], undefined, { kind: "inline", text: "go" }),
+    ];
     render(WorkflowSteps, { steps, mode: "preview", inputs: {} });
     expect(screen.getByTestId("workflow-step-prompt-0")).toHaveTextContent("inline prompt");
+  });
+
+  it("opens a content preview when a named prompt chip is clicked", async () => {
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "get_prompt_source") return Promise.resolve({ text: "Review {{ focus }}" });
+      if (cmd === "list_prompts") return Promise.resolve([]);
+      return Promise.reject(new Error(`unexpected command ${cmd}`));
+    });
+    const steps = [
+      kstep("send", "Code review", [lit("a")], [], undefined, {
+        kind: "named",
+        id: "builtin:code-review",
+      }),
+    ];
+    render(WorkflowSteps, { steps, mode: "preview", inputs: {} });
+
+    // Nothing fetched until the chip is clicked.
+    expect(invokeMock).not.toHaveBeenCalled();
+    const chip = screen.getByTestId("workflow-step-prompt-0");
+    expect(chip.tagName).toBe("BUTTON");
+    await fireEvent.click(chip);
+
+    const body = await screen.findByTestId("prompt-preview-body");
+    expect(body).toHaveTextContent("Review {{ focus }}");
+    expect(invokeMock).toHaveBeenCalledWith("get_prompt_source", {
+      provider: "builtin",
+      name: "code-review",
+    });
+  });
+
+  it("previews an inline prompt's text on click, without any backend call", async () => {
+    const steps = [
+      kstep("send", "Hand off", [lit("a")], [], undefined, {
+        kind: "inline",
+        text: "Summarize {{ responses }}",
+      }),
+    ];
+    render(WorkflowSteps, { steps, mode: "preview", inputs: {} });
+
+    const chip = screen.getByTestId("workflow-step-prompt-0");
+    expect(chip.tagName).toBe("BUTTON");
+    await fireEvent.click(chip);
+
+    const body = await screen.findByTestId("prompt-preview-body");
+    expect(body).toHaveTextContent("Summarize {{ responses }}");
+    // Inline text is on the step — no IPC.
+    expect(invokeMock).not.toHaveBeenCalled();
   });
 
   it("omits the prompt chip when a step runs no prompt", () => {

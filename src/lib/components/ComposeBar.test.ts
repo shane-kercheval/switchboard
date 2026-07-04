@@ -3256,7 +3256,7 @@ describe("ComposeBar — workflow run live view (swap / hold / stop)", () => {
           kind: "send",
           label: "Hand off",
           description: null,
-          prompt: { kind: "inline" },
+          prompt: { kind: "inline", text: "go" },
           recipients: [{ kind: "literal", name: "bob" }],
           feeds_from: [],
         },

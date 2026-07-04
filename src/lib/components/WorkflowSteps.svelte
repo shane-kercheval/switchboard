@@ -7,7 +7,7 @@
     WorkflowRunStatus,
   } from "$lib/types";
   import Spinner from "$lib/components/ui/Spinner.svelte";
-  import Tooltip from "$lib/components/ui/Tooltip.svelte";
+  import PromptPreviewDialog from "$lib/components/PromptPreviewDialog.svelte";
   import { cn } from "$lib/utils";
 
   /// The ordered step list for a workflow, in two modes:
@@ -168,12 +168,21 @@
   function promptLabel(p: StepPrompt): string {
     return p.kind === "inline" ? "inline prompt" : p.id;
   }
-  /// The hover tooltip: a plain sentence explaining what the chip means, since the
-  /// id itself is already on the chip.
-  function promptTooltip(label: string, p: StepPrompt): string {
-    return p.kind === "inline"
-      ? `The "${label}" step uses an inline prompt (no named prompt).`
-      : `The "${label}" step runs the ${p.id} prompt.`;
+  /// The chip button's accessible name — the visible text is only the raw id (or
+  /// "inline prompt"), which doesn't convey the click action to a screen reader.
+  /// An `aria-label` (not `title`, which would reintroduce a hover tooltip) adds
+  /// the action without any visual change.
+  function promptAriaLabel(p: StepPrompt): string {
+    return p.kind === "inline" ? "Preview inline prompt" : `Preview prompt ${p.id}`;
+  }
+  // Read-only content preview for a prompt chip. A named chip carries only the
+  // `provider:name` id (the dialog fetches the body/metadata); an inline chip
+  // carries its text (shown directly).
+  let previewOpen = $state(false);
+  let previewPrompt = $state<StepPrompt | null>(null);
+  function openPreview(p: StepPrompt): void {
+    previewPrompt = p;
+    previewOpen = true;
   }
 </script>
 
@@ -244,20 +253,18 @@
           {/if}
           {#if node.prompt}
             {@const prompt = node.prompt}
-            <Tooltip label={promptTooltip(node.label, prompt)}>
-              {#snippet trigger(props)}
-                <span
-                  {...props}
-                  class={cn(
-                    "border-border/70 text-muted ml-auto rounded border px-1.5 py-px text-[11px] leading-4",
-                    prompt.kind === "named" ? "font-mono" : "italic",
-                  )}
-                  data-testid={`workflow-step-prompt-${i}`}
-                >
-                  {promptLabel(prompt)}
-                </span>
-              {/snippet}
-            </Tooltip>
+            <button
+              type="button"
+              class={cn(
+                "border-border/70 text-muted hover:bg-panel hover:text-fg ml-auto rounded border px-1.5 py-px text-[11px] leading-4",
+                prompt.kind === "named" ? "font-mono" : "italic",
+              )}
+              data-testid={`workflow-step-prompt-${i}`}
+              aria-label={promptAriaLabel(prompt)}
+              onclick={() => openPreview(prompt)}
+            >
+              {promptLabel(prompt)}
+            </button>
           {/if}
         </span>
         {#if node.description}
@@ -279,3 +286,5 @@
     </li>
   {/each}
 </ol>
+
+<PromptPreviewDialog bind:open={previewOpen} prompt={previewPrompt} />

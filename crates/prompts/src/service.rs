@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 
-use crate::builtin::BuiltinProvider;
+use crate::builtin::{BuiltinProvider, builtin_prompt_source};
 use crate::config::{
     McpProviderConfig, McpSection, McpTransport, PromptConfig, is_valid_provider_name,
     resolve_local_dirs,
@@ -43,6 +43,14 @@ const PROVIDER_TIMEOUT: Duration = Duration::from_secs(10);
 /// bare string) keeps the wire shape stable as later milestones add fields.
 #[derive(Debug, Clone, Serialize)]
 pub struct RenderedPrompt {
+    pub text: String,
+}
+
+/// A prompt's raw, **unrendered** template body, for a read-only UI preview
+/// (e.g. a workflow step chip showing what a prompt says). A struct rather than a
+/// bare string keeps the wire shape stable, mirroring [`RenderedPrompt`].
+#[derive(Debug, Clone, Serialize)]
+pub struct PromptSource {
     pub text: String,
 }
 
@@ -183,6 +191,29 @@ impl PromptService {
             }
         };
         direct.into_iter().find(|p| p.name == name)
+    }
+
+    /// The raw, **unrendered** template body of a `builtin` or `local` prompt
+    /// (frontmatter stripped, `MiniJinja` placeholders intact), for a **read-only
+    /// preview** in the UI. Synchronous and offline.
+    ///
+    /// Returns `None` for an MCP provider: the MCP protocol exposes only rendered
+    /// output (`prompts/get`), never the un-rendered template, so a server-side
+    /// prompt has no source to show — the UI falls back to the cached metadata
+    /// (description + arguments). Also `None` for a prompt that doesn't resolve.
+    ///
+    /// Deliberately exposes the template, unlike [`render`](Self::render): the
+    /// body is shown to the *user* as a preview, never sent to an agent (agents
+    /// only ever receive rendered text). Built-ins resolve regardless of the
+    /// app's "show built-ins" toggle, matching [`get`](Self::get)/`render`.
+    #[must_use]
+    pub fn source(&self, provider: &str, name: &str) -> Option<PromptSource> {
+        let text = match provider {
+            BUILTIN_PROVIDER if self.include_builtins => builtin_prompt_source(name),
+            LOCAL_PROVIDER => self.local_provider().and_then(|local| local.source(name)),
+            _ => None,
+        }?;
+        Some(PromptSource { text })
     }
 
     /// Rebuild the cache from all configured providers.
@@ -794,6 +825,53 @@ mod tests {
             .await
             .unwrap();
         assert!(builtin.text.contains("Code Review Guidelines"));
+    }
+
+    #[tokio::test]
+    async fn source_returns_unrendered_body_for_local_and_builtin_none_for_mcp() {
+        let dir = TempDir::new().unwrap();
+        let prompts_dir = dir.path().join("prompts");
+        std::fs::create_dir(&prompts_dir).unwrap();
+        // A local prompt whose body carries a MiniJinja placeholder — the preview
+        // must show it verbatim, NOT rendered/substituted.
+        write(
+            &prompts_dir,
+            "p.md",
+            "---\nname: p\ndescription: d\narguments:\n  - name: focus\n---\nReview.\n{% if focus %}Focus: {{ focus }}{% endif %}\n",
+        );
+        // A configured MCP provider — its source is server-side, so None.
+        let config_path = dir.path().join("config.yaml");
+        std::fs::write(&config_path, http_provider_yaml("team", "https://a")).unwrap();
+        let service = PromptService::new(
+            config_path,
+            prompts_dir,
+            None,
+            Arc::new(InMemorySecretStore::new()),
+        );
+
+        // Local: the raw template body, placeholders intact (not rendered). No
+        // sync needed — source resolves builtin/local directly, like `get`.
+        let local = service.source(LOCAL_PROVIDER, "p").unwrap();
+        assert!(local.text.contains("{% if focus %}"));
+        assert!(local.text.contains("{{ focus }}"));
+        assert!(!local.text.contains("---")); // frontmatter stripped
+
+        // Built-in: the baked template body.
+        let builtin = service.source(BUILTIN_PROVIDER, "code-review").unwrap();
+        assert!(builtin.text.contains("Code Review Guidelines"));
+
+        // MCP: no un-rendered source available.
+        assert!(service.source("team", "anything").is_none());
+        // Unknown local prompt: None (not a panic/error).
+        assert!(service.source(LOCAL_PROVIDER, "nope").is_none());
+    }
+
+    #[tokio::test]
+    async fn disabled_service_has_no_prompt_source() {
+        let service = PromptService::disabled();
+        // Inert service exposes no built-in source even for a real built-in name.
+        assert!(service.source(BUILTIN_PROVIDER, "code-review").is_none());
+        assert!(service.source(LOCAL_PROVIDER, "x").is_none());
     }
 
     #[tokio::test]

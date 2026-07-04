@@ -26,6 +26,7 @@ import type {
   ProjectListing,
   ProjectSummary,
   Prompt,
+  PromptSource,
   RenderedPrompt,
   RepoListing,
   SendId,
@@ -532,6 +533,18 @@ export async function renderPrompt(
   args: Record<string, string>,
 ): Promise<RenderedPrompt> {
   return await invoke<RenderedPrompt>("render_prompt", { provider, name, args });
+}
+
+/// The raw, unrendered template body of `provider:name`, for a read-only preview.
+/// Resolves to `null` for an MCP provider (its template lives server-side and the
+/// protocol exposes no un-rendered source) or a prompt that doesn't resolve — the
+/// caller then falls back to the cached metadata (description + arguments). Cheap
+/// and offline for `builtin`/`local`; never substitutes arguments.
+export async function getPromptSource(
+  provider: string,
+  name: string,
+): Promise<PromptSource | null> {
+  return await invoke<PromptSource | null>("get_prompt_source", { provider, name });
 }
 
 // ── Workflows ─────────────────────────────────────────────────────────────────

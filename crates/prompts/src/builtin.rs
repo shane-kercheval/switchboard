@@ -116,6 +116,15 @@ pub fn builtin_prompt_content(name: &str) -> Option<&'static str> {
         .copied()
 }
 
+/// The **unrendered** template body of the built-in named `name` (frontmatter
+/// stripped, `MiniJinja` placeholders left intact), or `None` if there is no such
+/// built-in. Backs the read-only UI preview of a prompt. Distinct from
+/// [`builtin_prompt_content`], which returns the whole file (frontmatter + body)
+/// for "Copy to my prompts"; a preview wants only the prompt text the user reads.
+pub(crate) fn builtin_prompt_source(name: &str) -> Option<String> {
+    find_parsed(name).map(|parsed| parsed.body)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

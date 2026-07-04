@@ -281,4 +281,26 @@ mod tests {
             RunRecord::Started { steps, .. } if steps.is_empty()
         ));
     }
+
+    #[test]
+    fn legacy_inline_prompt_step_deserializes_with_empty_text() {
+        // `StepPrompt::Inline` gained a `text` field after these run files could
+        // already exist. An older build serialized an inline send's step prompt as
+        // `{"kind":"inline"}` (unit variant, no `text`). That whole `RunRecord` file
+        // must still deserialize — `read_run_files` drops the *entire* run on any
+        // parse failure, so a missing default would silently vanish a held run from
+        // the list on the first post-upgrade launch. The `#[serde(default)]` on
+        // `text` makes the legacy record decode with an empty inline body.
+        let legacy = r#"{"type":"started","workflow":"w","total_steps":1,"at":"2026-06-18T12:00:00Z","steps":[{"kind":"send","label":"Hand off","recipients":[{"kind":"literal","name":"a"}],"feeds_from":[],"prompt":{"kind":"inline"}}]}"#;
+        let record: RunRecord = serde_json::from_str(legacy).unwrap();
+        let RunRecord::Started { steps, .. } = record else {
+            panic!("expected Started");
+        };
+        assert_eq!(
+            steps[0].prompt,
+            Some(crate::display::StepPrompt::Inline {
+                text: String::new()
+            })
+        );
+    }
 }

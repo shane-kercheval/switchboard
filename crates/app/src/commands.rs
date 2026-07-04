@@ -1160,6 +1160,20 @@ pub async fn render_prompt_impl(
     Ok(state.prompts.render(provider, name, args).await?)
 }
 
+/// The raw, unrendered template body of a `builtin` or `local` prompt, for a
+/// read-only preview (e.g. a workflow step chip). `None` for an MCP provider —
+/// the protocol exposes no un-rendered source, so the UI falls back to the cached
+/// metadata — and for a prompt that doesn't resolve. Synchronous and offline;
+/// unlike `render` it never substitutes arguments (the template is shown to the
+/// user, never sent to an agent).
+pub fn get_prompt_source_impl(
+    state: &AppState,
+    provider: &str,
+    name: &str,
+) -> Option<switchboard_prompts::PromptSource> {
+    state.prompts.source(provider, name)
+}
+
 /// Configured MCP providers with their last-build status and whether a token is
 /// stored — drives the Settings provider list.
 pub fn list_mcp_providers_impl(state: &AppState) -> Vec<switchboard_prompts::McpProviderInfo> {

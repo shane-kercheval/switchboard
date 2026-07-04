@@ -9,11 +9,36 @@ import type { Prompt } from "$lib/types";
 /// contract for "this is a read-only built-in".
 export const BUILTIN_PROVIDER = "builtin";
 
+/// The reserved provider prefix for the user's local file-based prompt store.
+/// Mirrors Rust `LOCAL_PROVIDER`. Any other provider value is an MCP server's
+/// registered name.
+export const LOCAL_PROVIDER = "local";
+
+/// Whether a provider is one Switchboard resolves locally (built-in library or
+/// the local file store) rather than a remote MCP server. Local providers can
+/// surface a prompt's template; MCP providers cannot (the protocol renders
+/// server-side), which is why a null preview source means different things for
+/// each — a broken/deleted local prompt vs. an MCP prompt with no fetchable body.
+export function isLocalProvider(provider: string): boolean {
+  return provider === LOCAL_PROVIDER || provider === BUILTIN_PROVIDER;
+}
+
 /// Whether a prompt is an app-owned read-only built-in (vs. the user's own local
 /// or an MCP prompt). Built-ins are tagged read-only in the picker and offer a
 /// "Copy to my prompts" action instead of in-place editing.
 export function isBuiltinPrompt(prompt: Pick<Prompt, "provider">): boolean {
   return prompt.provider === BUILTIN_PROVIDER;
+}
+
+/// Split a `provider:name` prompt id into its parts at the **first** colon (the
+/// provider prefix is a reserved slug that never contains one; a name
+/// theoretically could). Returns null when there is no colon or when either half
+/// is empty — matching Rust `PromptId::parse`, which rejects empty parts. Callers
+/// treat null as an unresolvable id.
+export function parsePromptId(id: string): { provider: string; name: string } | null {
+  const i = id.indexOf(":");
+  if (i <= 0 || i === id.length - 1) return null;
+  return { provider: id.slice(0, i), name: id.slice(i + 1) };
 }
 
 /// The label to show a user for a prompt: its friendly `title` when the server

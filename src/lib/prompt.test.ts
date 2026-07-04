@@ -2,7 +2,9 @@ import { describe, expect, it } from "vitest";
 import {
   buildRenderArgs,
   combinePromptMessage,
+  isLocalProvider,
   missingRequiredArgs,
+  parsePromptId,
   promptDisplayName,
 } from "./prompt";
 import type { Prompt } from "./types";
@@ -17,6 +19,29 @@ function prompt(args: Prompt["arguments"]): Prompt {
     tags: [],
   };
 }
+
+describe("parsePromptId", () => {
+  it("splits on the first colon", () => {
+    expect(parsePromptId("local:code-review")).toEqual({ provider: "local", name: "code-review" });
+    // A name may itself contain a colon; only the first splits.
+    expect(parsePromptId("tiddly:a:b")).toEqual({ provider: "tiddly", name: "a:b" });
+  });
+
+  it("returns null for a missing colon or an empty half (matching Rust parity)", () => {
+    expect(parsePromptId("code-review")).toBeNull();
+    expect(parsePromptId("local:")).toBeNull();
+    expect(parsePromptId(":name")).toBeNull();
+    expect(parsePromptId("")).toBeNull();
+  });
+});
+
+describe("isLocalProvider", () => {
+  it("is true for the local file store and the built-in library, false for MCP names", () => {
+    expect(isLocalProvider("local")).toBe(true);
+    expect(isLocalProvider("builtin")).toBe(true);
+    expect(isLocalProvider("tiddly")).toBe(false);
+  });
+});
 
 describe("promptDisplayName", () => {
   it("prefers the friendly title", () => {

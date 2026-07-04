@@ -46,6 +46,11 @@
     prompt === null ? "Prompt" : prompt.kind === "named" ? prompt.id : "Inline prompt",
   );
 
+  /// Boxed-note styling for the status messages (server-rendered / unresolved /
+  /// unavailable), so they read as a distinct callout rather than blending into
+  /// the prompt's own description prose. Mirrors the composer's note box.
+  const CALLOUT = "border-border/70 bg-surface/40 text-muted rounded-md border px-2.5 py-2 text-xs";
+
   async function load(p: StepPrompt): Promise<void> {
     const seq = ++requestSeq;
     error = null;
@@ -114,30 +119,6 @@
         </p>
       {/if}
 
-      {#if loaded.source}
-        <pre
-          class="bg-panel text-fg border-border/70 max-h-[55vh] overflow-auto rounded border p-3 text-xs break-words whitespace-pre-wrap"
-          data-testid="prompt-preview-body">{loaded.source.text}</pre>
-      {:else if loaded.provider !== null && isLocalProvider(loaded.provider)}
-        <!-- A local/builtin prompt always has a template when it resolves, so a
-             null source here means it no longer resolves (deleted or malformed). -->
-        <p class="text-muted text-xs" data-testid="prompt-preview-unresolved">
-          This prompt could not be resolved — it may have been deleted or is malformed. Try Sync to
-          refresh the prompt list.
-        </p>
-      {:else if meta}
-        <!-- A known MCP prompt: the server renders it, so there's no template to show. -->
-        <p class="text-muted text-xs" data-testid="prompt-preview-no-source">
-          This prompt is rendered by its server, so its template isn't available to preview here.
-          Its declared arguments are shown below.
-        </p>
-      {:else}
-        <!-- Null source and no cached metadata: nothing to show either way. -->
-        <p class="text-muted text-sm" data-testid="prompt-preview-unavailable">
-          Preview unavailable — this prompt could not be resolved.
-        </p>
-      {/if}
-
       {#if meta && meta.arguments.length > 0}
         <div class="flex flex-col gap-1" data-testid="prompt-preview-arguments">
           <span class="text-fg text-xs font-medium">Arguments</span>
@@ -153,6 +134,30 @@
             {/each}
           </ul>
         </div>
+      {/if}
+
+      {#if loaded.source}
+        <pre
+          class="bg-panel text-fg border-border/70 max-h-[55vh] overflow-auto rounded border p-3 text-xs break-words whitespace-pre-wrap"
+          data-testid="prompt-preview-body">{loaded.source.text}</pre>
+      {:else if loaded.provider !== null && isLocalProvider(loaded.provider)}
+        <!-- A local/builtin prompt always has a template when it resolves, so a
+             null source here means it no longer resolves (deleted or malformed). -->
+        <p class={CALLOUT} role="note" data-testid="prompt-preview-unresolved">
+          This prompt could not be resolved — it may have been deleted or is malformed. Try Sync to
+          refresh the prompt list.
+        </p>
+      {:else if meta}
+        <!-- A known MCP prompt: the server renders it, so there's no template to show. -->
+        <p class={CALLOUT} role="note" data-testid="prompt-preview-no-source">
+          This prompt is rendered by the <span class="font-mono">{loaded.provider}</span> MCP server,
+          so its template can't be previewed here.
+        </p>
+      {:else}
+        <!-- Null source and no cached metadata: nothing to show either way. -->
+        <p class={CALLOUT} role="note" data-testid="prompt-preview-unavailable">
+          Preview unavailable — this prompt could not be resolved.
+        </p>
       {/if}
     {/if}
   </div>

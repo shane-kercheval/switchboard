@@ -62,6 +62,11 @@ describe("PromptPreviewDialog", () => {
     expect(screen.getByTestId("prompt-preview-description")).toHaveTextContent("Review the diff.");
     // No "server-rendered" fallback note when we have the source.
     expect(screen.queryByTestId("prompt-preview-no-source")).toBeNull();
+    // Layout order: description, then arguments, then the template body.
+    const description = screen.getByTestId("prompt-preview-description");
+    const args = screen.getByTestId("prompt-preview-arguments");
+    expect(description.compareDocumentPosition(args) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(args.compareDocumentPosition(body) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 
   it("falls back to metadata + arguments for an MCP prompt (no un-rendered source)", async () => {

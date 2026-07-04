@@ -12,7 +12,6 @@
     CornerUpRight,
     MessagesSquare,
     Send,
-    Share2,
   } from "@lucide/svelte";
   import {
     cancelSend,
@@ -1637,9 +1636,9 @@
               <p class="text-muted text-xs leading-5">
                 Every agent's CLI session keeps its own private history and context window, just
                 like a session in your terminal. An agent only ever sees the messages you send
-                <em>it</em> — never what you send the others. What you're reading here is all of those
-                conversations merged into a single view, with every reply labeled by the agent it came
-                from.
+                <em>it</em> — never what you send the others. What you're reading in this unified view
+                is all of those conversations merged together, with every reply labeled by the agent it
+                came from.
               </p>
             </div>
           </li>
@@ -1653,10 +1652,10 @@
             <div class="flex min-w-0 flex-col gap-0.5">
               <p class="text-fg text-xs font-medium">Split the view into panes</p>
               <p class="text-muted text-xs leading-5">
-                By default, every agent shares this one view. Panes let you regroup it: each pane
-                shows only the agents you place in it, side by side with the others. Add a pane with
-                the + button in the title bar, or move an agent into its own pane from its ⋯ menu in
-                the agents sidebar. Panes change only what you see — a message still goes to
+                By default, every agent shares this unified view. Panes let you regroup it: each
+                pane shows only the agents you place in it, side by side with the others. Add a pane
+                with the + button in the title bar, or move an agent into its own pane from its ⋯
+                menu in the agents sidebar. Panes change only what you see — a message still goes to
                 whichever agents you select.
               </p>
             </div>
@@ -1681,12 +1680,25 @@
             </div>
           </li>
           <li class="flex gap-3">
-            <Share2
-              size={16}
-              strokeWidth={1.8}
+            <!-- Custom fan-out glyph (one stem splitting into three branches,
+                 flowing left to right) — Lucide has no one-to-many icon that
+                 isn't a node graph. Drawn in Lucide's stroke style so it sits
+                 flush with the sibling icons. -->
+            <svg
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.8"
+              stroke-linecap="round"
+              stroke-linejoin="round"
               aria-hidden="true"
-              class="text-muted mt-0.5 shrink-0"
-            />
+              class="text-muted mt-0.5 h-4 w-4 shrink-0"
+            >
+              <path d="M3 12h6" />
+              <path d="M9 12c4 0 4-7 12-7" />
+              <path d="M9 12h12" />
+              <path d="M9 12c4 0 4 7 12 7" />
+            </svg>
             <div class="flex min-w-0 flex-col gap-0.5">
               <p class="text-fg text-xs font-medium">Send to several agents at once</p>
               <p class="text-muted text-xs leading-5">

@@ -701,7 +701,8 @@
                   <ul class="border-border flex flex-col gap-2 border-t pt-3 text-left leading-5">
                     <li>
                       Panes are windows onto the same conversation — each shows only its own agents'
-                      messages.
+                      messages. They change only what you see: a message still goes to whichever
+                      agents you select, wherever their panes are.
                     </li>
                     <li>
                       {shortcut("mod", "click")} a pane (or press {shortcut("mod", "alt", "1")}–9)

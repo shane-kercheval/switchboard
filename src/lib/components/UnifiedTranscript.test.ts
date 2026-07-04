@@ -131,6 +131,47 @@ describe("UnifiedTranscript", () => {
     render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     expect(screen.getByText(/no messages yet/i)).toBeInTheDocument();
+    // Without showOnboarding (split panes), the one-line placeholder renders,
+    // not the orientation block — the block must not repeat per pane.
+    expect(screen.getByText(/type a prompt below/i)).toBeInTheDocument();
+    expect(screen.queryByTestId("transcript-onboarding")).not.toBeInTheDocument();
+  });
+
+  it("renders the orientation block on the empty state when showOnboarding is set", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT], showOnboarding: true },
+    });
+
+    const block = screen.getByTestId("transcript-onboarding");
+    expect(block).toHaveTextContent(/each agent is its own conversation/i);
+    expect(block).toHaveTextContent(/split the view into panes/i);
+    expect(block).toHaveTextContent(/pick recipients, then send/i);
+    expect(block).toHaveTextContent(/send to several agents at once/i);
+    expect(block).toHaveTextContent(/relay with forward/i);
+    expect(screen.queryByText(/type a prompt below/i)).not.toBeInTheDocument();
+  });
+
+  it("hides the orientation block once any turn exists", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [
+      {
+        role: "user",
+        turn_id: "user-1",
+        agent_id: CLAUDE_AGENT.id,
+        started_at: "2026-05-16T00:00:00Z",
+        text: "first prompt",
+      },
+    ];
+
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT], showOnboarding: true },
+    });
+
+    expect(screen.queryByTestId("transcript-onboarding")).not.toBeInTheDocument();
   });
 
   it("merges turns across multiple agents in chronological order", async () => {
@@ -1381,6 +1422,45 @@ describe("UnifiedTranscript — markdown rendering", () => {
     });
     await waitFor(() => {
       expect(screen.getByTestId("turn")).toHaveTextContent("let x = 1;");
+    });
+  });
+
+  it("never auto-scrolls the empty state; the first rows re-pin to the bottom", async () => {
+    // A taller-than-viewport onboarding block must mount reading from the
+    // top — the bottom-pin contract is for conversations, and the empty state
+    // isn't one. Once the first rows arrive the chat contract takes over:
+    // pin to the newest message regardless of prior scroll position.
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT], showOnboarding: true },
+    });
+
+    const container = screen.getByTestId("unified-transcript");
+    Object.defineProperty(container, "scrollHeight", { configurable: true, value: 2000 });
+    Object.defineProperty(container, "clientHeight", { configurable: true, value: 500 });
+
+    // Let mount effects flush: the empty state must not have been scrolled.
+    await tick();
+    expect(container.scrollTop).toBe(0);
+
+    fireTo(`agent:${CLAUDE_AGENT.id}`, {
+      type: "turn_start",
+      turn_id: "turn-1",
+      message_id: "msg-1",
+      send_id: "msg-1",
+      started_at: "2026-05-16T00:00:00Z",
+    });
+    fireTo(`agent:${CLAUDE_AGENT.id}`, {
+      type: "content_chunk",
+      turn_id: "turn-1",
+      kind: "text",
+      text: "hello",
+    });
+
+    await waitFor(() => {
+      expect(container.scrollTop).toBe(2000);
     });
   });
 

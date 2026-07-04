@@ -182,7 +182,7 @@ Output is scoped to the current workflow run — see `docs/workflow-spec.md` §"
 
 Configure: when all of agents A, B, ..., N finish their current turns, combine their outputs into a single message using a wrapping prompt template, then send to agent X.
 
-Wrapping templates receive agent responses through two helper functions exposed by the workflow DSL — `aggregated_responses(agents)` returning the canonical text shape (the default for cross-platform prompts that take a single text-blob argument), and `responses_from(agents)` returning a name → text mapping for Switchboard-aware prompts that want to iterate with custom formatting. The author binds whichever helper they need into a step-local `template_vars` slot at workflow-authoring time. Agent names containing hyphens are normalized to underscores in mapping keys. See `docs/workflow-spec.md` for the exact surface, including the canonical text shape and the name-collision rules.
+Wrapping templates receive agent responses through two helper functions exposed by the workflow DSL — `aggregated_responses(agents)` returning the canonical text shape (the default for cross-platform prompts that take a single text-blob argument), and `responses_from(agents)` returning a name → text mapping the workflow author iterates in workflow-rendered text (an inline `text:` step or a `template_vars` binding) for custom per-agent formatting — the prompt receives only the resulting string. For a named prompt the workflow binds the rendered string into a step-local `template_vars` slot; an inline `text:` step renders the helper directly. Agent names containing hyphens are normalized to underscores in mapping keys. See `docs/workflow-spec.md` for the exact surface, including the canonical text shape and the name-collision rules.
 
 This is the most behaviorally-rich primitive. It implies waiting on multiple agents, accumulating their final responses, applying a template, and dispatching. Failure handling (one agent crashes mid-workflow) is covered in section 7. Output is scoped to the current workflow run — see `docs/workflow-spec.md` §"Output scope".
 
@@ -260,7 +260,7 @@ steps:
 
 When invoked, Switchboard prompts the user for each declared input plus any auto-derived prompt arguments (here, `code-review`'s optional `context`), then executes the steps.
 
-The example above uses `aggregated_responses(...)` — the helper that returns the reviewers' outputs pre-formatted in a canonical text shape — because typical aggregation prompts (especially cross-platform ones like `tiddly:ai-review-feedback`) take a single text-blob argument. A sibling helper `responses_from(...)` returns the same data as a name → text mapping for Switchboard-aware prompts that want to iterate with custom formatting. See `docs/workflow-spec.md` for both.
+The example above uses `aggregated_responses(...)` — the helper that returns the reviewers' outputs pre-formatted in a canonical text shape — because typical aggregation prompts (especially cross-platform ones like `tiddly:ai-review-feedback`) take a single text-blob argument. A sibling helper `responses_from(...)` returns the same data as a name → text mapping the workflow author iterates in workflow-rendered text (an inline `text:` step or a `template_vars` binding) for custom per-agent formatting — the prompt receives only the resulting string. See `docs/workflow-spec.md` for both.
 
 The DSL exposes both `wait_for` (single agent) and `wait_for_all` (multiple agents) as synchronization steps. See `docs/workflow-spec.md` for their exact semantics, including behavior when no in-flight turn exists at the synchronization point.
 
@@ -403,7 +403,7 @@ Switchboard normalizes the *user-invoked prompt* surface across agents. Model-in
 
 ### Wrapping templates
 
-Wrapping templates (used for fan-in) are prompts — from any provider — that take agent responses as a template argument. The workflow author binds the responses into a template variable using one of the DSL helpers (`aggregated_responses(agents)` for a canonical text blob, or `responses_from(agents)` for a name → text mapping). The template uses **Jinja2-compatible syntax**, rendered via [MiniJinja](https://github.com/mitsuhiko/minijinja) (a native Rust templating engine by the author of Jinja2, designed for Jinja2 compatibility — chosen so prompts move cleanly between Tiddly's Jinja2 and Switchboard's local rendering without surprises).
+Wrapping templates (used for fan-in) are the prompt — from any provider — or inline `text:` that receives agent responses. The workflow author feeds them via a DSL helper: `aggregated_responses(agents)` for a canonical text blob (bound into a `template_vars` argument or dropped into inline text), or `responses_from(agents)` for a name → text mapping iterated in workflow-rendered text. The template uses **Jinja2-compatible syntax**, rendered via [MiniJinja](https://github.com/mitsuhiko/minijinja) (a native Rust templating engine by the author of Jinja2, designed for Jinja2 compatibility — chosen so prompts move cleanly between Tiddly's Jinja2 and Switchboard's local rendering without surprises).
 
 The most common shape uses `aggregated_responses` and a single text argument — works with any cross-platform prompt that takes a string:
 
@@ -416,10 +416,10 @@ Summarize the recommendations and identify points of agreement and
 disagreement.
 ```
 
-For Switchboard-aware prompts that want full formatting control, `responses_from` returns a mapping the template iterates explicitly:
+For full formatting control, iterate the `responses_from` mapping yourself in the workflow's **rendered text** — an inline `text:` step, or the `template_vars` binding that feeds a prompt argument:
 
 ```jinja
-{% for name, response in responses.items() %}
+{% for name, response in responses_from(reviewers).items() %}
 ## {{ name }}
 
 {{ response }}
@@ -427,7 +427,7 @@ For Switchboard-aware prompts that want full formatting control, `responses_from
 {% endfor %}
 ```
 
-In both cases the variable name (`feedback`, `responses`) is whatever the workflow author bound into `template_vars`. Neither is an implicit ambient variable — the workflow's `template_vars` declaration carries the binding.
+The `aggregated_responses` case binds a **string** into a `template_var` (`feedback` above) that the prompt then interpolates. The `responses_from` case iterates the mapping in the workflow's own text to produce that string. Either way the workflow engine renders the helper **before** the prompt runs, and a named prompt receives only the finished **string** — never the mapping itself (so a bare `{{ responses_from(...) }}` stringifies the map; iterate it first).
 
 **Resolved in `docs/workflow-spec.md` §Templating** (MiniJinja subset, available variable scopes, built-in template functions).
 

@@ -242,15 +242,22 @@ Variables are resolved innermost first:
 
 | Function | Returns | Use when |
 |---|---|---|
-| `aggregated_responses(agents)` | text (canonical shape) | The receiving prompt takes a single text-blob argument. **Default for cross-platform prompts** (Tiddly, MCP servers, hand-authored prompts not aware of Switchboard's data shape). |
-| `responses_from(agents)` | mapping name → text | You're authoring a Switchboard-aware prompt and want full control over formatting (per-agent XML tags, conditional sections, custom delimiters). The prompt iterates over the mapping. |
-| `last_output(agent)` | text | Single agent's latest completed output. |
+| `aggregated_responses(agents)` | text (canonical shape) | **Default for fan-in.** One *or* many sources; the consumer takes a single string of labelled `=== START/END response from <name> ===` blocks. The consumer need not add per-response structure itself — an outer argument fence (like `analyze-ai-reviews`'s `"""`) is fine and common. |
+| `responses_from(agents)` | mapping name → text | **Escape hatch** for custom per-agent markup the canonical block can't express (XML tags, per-agent conditionals). Returns a map you must **iterate** — `{% for name, text in responses_from(agents).items() %}…{% endfor %}` — inside workflow-rendered text: an inline `text:` step *or* a `template_vars` argument binding. Never pass it bare (`{{ responses_from(...) }}` stringifies the map); the named prompt receives the finished string, never the map. |
+| `last_output(agent)` | text | **Exactly one source**, where the consumer wants clean, unlabelled text and frames that one response itself. Not for multiple sources. A `"""` fence alone does **not** imply `last_output` — a fence can bound a whole aggregated blob (→ `aggregated_responses`). |
 | `agent_names(agents)` | [text] | List of agent name strings — useful when iterating in a template. |
 
-**Picking between `aggregated_responses` and `responses_from`:**
+**Match the helper — source count first, then the consumer's formatting:**
 
-- If the user already has an aggregation prompt (e.g., a Tiddly prompt that wraps `{{ feedback }}` in some framing): use `aggregated_responses` and bind it to the prompt's argument name.
-- If you (or the user) is authoring a fresh aggregation prompt that wants per-agent formatting: use `responses_from` and iterate in the prompt's template.
+1. **Many sources** (an `[agent]` list)? → never `last_output` (it takes exactly one agent). Use `aggregated_responses`, or `responses_from` if you need custom markup.
+2. **One source** → what does the consumer want?
+   - Clean, unlabelled text — the consumer expects exactly one response (its argument is singular, its prose introduces one) → **`last_output(agent)`**.
+   - A labelled, delimited block, or the consumer is a fan-in slot that accepts "one or more" → **`aggregated_responses(agent)`** (it takes a single agent and adds the `=== START/END ===` boundary). Note: an outer `"""` fence tells you nothing here — `analyze-ai-reviews` fences `{{ review }}` yet wants the labelled block.
+3. **Custom per-agent structure** (XML tags, per-agent conditionals), one or many → **`responses_from(agents)`**, iterated with `.items()` in workflow-rendered text (an inline `text:` step or a `template_vars` binding).
+
+**A `"""` fence is not a signal for `last_output`.** `analyze-ai-reviews` wraps its `{{ review }}` argument in `"""…"""` yet takes `aggregated_responses(reviewers)` — its fence bounds the whole multi-review blob while the per-agent markers separate the reviews. Decide by source count and whether the consumer wants labelled blocks, not by whether it has a fence.
+
+**Reading the consumer:** a `builtin:` / `local:` prompt is a file you can open. For an MCP prompt the raw template isn't guaranteed over the protocol — some servers (e.g. Tiddly) expose it via their own tool; many don't — so the reliable signal is the prompt's **metadata**: an argument described as "one or more …" means fan-in → `aggregated_responses`. If you can't see the template and it's a fan-in into a string argument, default to `aggregated_responses`; reach for `last_output` only when the metadata or the user says the prompt expects exactly one clean response. (`forward_from` is always self-delimiting — see Forwarding below — so it needs no such choice.)
 
 **Output scope (important).** These helpers — and `forward_from` on `send` steps — see only turns that the **current workflow run** dispatched and observed reach terminal state via `wait_for`, `wait_for_all`, or a Mode-2 `pause_for_user` implicit wait. They do *not* see manual compose-bar dispatches the user made between workflow steps, turns from prior workflow runs, or turns from concurrent workflow runs against the same agent. If you call `last_output(agent)` and the workflow itself never dispatched to that agent, you get a runtime error — even if the agent has perfectly good output from elsewhere. Always pair a `send` with a `wait_for` (or use Mode-2 pause) before calling helpers on that agent. (Cross-iteration note: turns from earlier iterations of the same `for_each` *are* visible to helpers in later iterations — only `user_input` is per-iteration.)
 

@@ -311,7 +311,7 @@ A variable name that resolves in two scopes uses the innermost. A variable name 
 
 | Function | Returns | Notes |
 |---|---|---|
-| `responses_from(agents)` | mapping name → text | Maps each agent's name (with hyphens normalized to underscores) to that agent's latest completed turn output **for the current workflow run** (see "Output scope" below). The mapping preserves the input agent list order during iteration. Errors if any agent has no completed output yet from this workflow run. Agent-name uniqueness after hyphen→underscore normalization is enforced at agent-creation time (per system-design §3 Primitive 1), so collisions cannot occur here. Use this when authoring a Switchboard-aware aggregation prompt that wants to iterate over responses with custom formatting. |
+| `responses_from(agents)` | mapping name → text | Maps each agent's name (with hyphens normalized to underscores) to that agent's latest completed turn output **for the current workflow run** (see "Output scope" below). The mapping preserves the input agent list order during iteration. Errors if any agent has no completed output yet from this workflow run. Agent-name uniqueness after hyphen→underscore normalization is enforced at agent-creation time (per system-design §3 Primitive 1), so collisions cannot occur here. Use this when you need custom per-agent formatting: **iterate** the map with `.items()` in workflow-rendered text — an inline `text:` step or a `template_vars` binding. It cannot be passed bare (stringifies), and a named prompt never receives the map, only the rendered string it produces. |
 | `aggregated_responses(agents)` | text | Returns the same data as `responses_from(agents)` pre-formatted into a single string in the canonical aggregation shape (defined below). Use this when the receiving prompt takes a single text-blob argument — typical of cross-platform prompts (Tiddly, MCP servers, hand-authored prompts not aware of Switchboard's data shape). Same workflow-scope and ordering rules as `responses_from`. Errors if any agent has no completed output yet from this workflow run. |
 | `last_output(agent)` | text | Single agent's latest completed output **for the current workflow run** (see "Output scope" below). Errors if the agent has no completed output yet from this workflow run. |
 | `agent_names(agents)` | [text] | Maps a list of agent references to their string names. Useful when iterating in a template. |
@@ -350,10 +350,13 @@ A receiving prompt that simply wraps the aggregation in a single text argument (
 
 **Sentinel collision policy:** there is no escaping of `=== START` / `=== END` in agent output. If an agent's output literally contains a sentinel-shaped line, the receiving agent sees it as part of the forwarded content. This is judged acceptable: collisions are rare in practice (the sentinel pattern is distinctive), agents are good at recovering from minor delimitation noise, and escaping would obscure the structure for the common case. Authors who need strict delimitation can use `responses_from` and a custom template that wraps content explicitly (e.g., XML-style tags).
 
-#### Choosing between `responses_from` and `aggregated_responses`
+#### Choosing between `last_output`, `aggregated_responses`, and `responses_from`
 
-- **`aggregated_responses`** — default for the common case. Use when the receiving prompt has a single text argument and just wants the aggregated content. Works with any cross-platform prompt that takes a string.
-- **`responses_from`** — use when you're authoring a Switchboard-aware prompt and want full control over formatting (custom delimiters, XML tags, per-agent conditional logic, etc.). Returns structured data so the prompt template does the formatting.
+Two gates: **source count first, then the consumer's desired formatting.**
+
+- **`last_output(agent)`** — exactly one source, and the consumer wants clean, unlabelled text: it expects exactly one response (its argument is singular, its prose introduces one). Not valid for multiple sources. A `"""` fence does not select this helper — a fence can equally bound a whole aggregated blob.
+- **`aggregated_responses(agents)`** — one or many sources; the consumer takes a single string of labelled `=== START / END response from <name> ===` blocks (the canonical shape above). The default for fan-in. An outer argument fence does not change this — e.g. `builtin:analyze-ai-reviews`'s `{{ review }}` in `"""…"""`: the fence bounds the blob, the per-agent markers separate the responses.
+- **`responses_from`** — structured `name → text` map, for custom per-agent markup the canonical block can't express (custom delimiters, XML tags, per-agent conditionals). You must **iterate** it (`{% for name, text in responses_from(agents).items() %}…{% endfor %}`) inside workflow-rendered text — an inline `text:` step *or* a `template_vars` argument binding (both are rendered by the workflow engine). It cannot be passed bare (`{{ responses_from(...) }}` stringifies the map), and a named prompt never receives the map — only the finished string the iteration produces (prompt arguments are strings; see §`send` `template_vars`).
 
 ## Variable scoping
 
@@ -529,17 +532,17 @@ Here is feedback from AI coding agents:
 Summarize agreement and disagreement.
 ```
 
-If the workflow author wants full control over formatting (e.g., per-agent XML tags, conditional sections, custom delimiters), they can use `responses_from(reviewer_agents)` instead and iterate over the returned mapping in the prompt template:
+If the workflow author wants full control over formatting (e.g., per-agent XML tags, conditional sections, custom delimiters), they can use `responses_from(reviewer_agents)` and iterate the returned mapping in **workflow-rendered text** — an inline `text:` step, or a `template_vars` binding that feeds a prompt argument — with `.items()`:
 
 ```jinja
-{% for name, response in responses.items() %}
+{% for name, response in responses_from(reviewer_agents).items() %}
 ## {{ name }}
 {{ response }}
 
 {% endfor %}
 ```
 
-This authoring path is for Switchboard-aware prompts only — the iteration won't make sense in any other context.
+The iteration runs in the workflow's own render pass, not a prompt's: whatever consumes the result — a prompt argument or a later `text:` step — receives only the finished string this produces, never the mapping. Use the `.items()` method, not the `| items` filter (the author-facing template subset blocks the filter).
 
 ### 3. Milestone iteration (the per-milestone plan-implement-review loop)
 

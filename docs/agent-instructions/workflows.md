@@ -502,7 +502,7 @@ The invocation form shows `reviewers`, `worker`, and the auto-derived optional `
 
 ### `review-and-reconcile` (flagship)
 
-Reviewers review in parallel with `builtin:code-review`; a worker distills their feedback into a decision-ready verdict using `builtin:analyze-ai-reviews` (its required `review` argument filled with the reviewers' aggregated responses via `template_vars`); the reviewers respond to the analysis; the worker gives a final recommendation. It demonstrates a computed binding into a hardcoded prompt's argument, plus round-trip discussion via the `last_output` / `aggregated_responses` helpers in inline `text`.
+Reviewers review in parallel with `builtin:code-review`; a worker distills their feedback into a decision-ready verdict using `builtin:analyze-ai-reviews` (its required `review` argument filled with the reviewers' aggregated responses via `template_vars`); the reviewers respond to the analysis; the worker gives a final recommendation. It demonstrates a computed binding into a hardcoded prompt's argument, plus round-trip discussion via `aggregated_responses` in inline `text` (which delimits each forwarded response with `=== START/END response from … ===` markers, single agent or many).
 
 ```yaml
 name: review-and-reconcile
@@ -540,7 +540,7 @@ steps:
       text: |
         An analyst reviewed all of the feedback and responded:
 
-        {{ last_output(worker) }}
+        {{ aggregated_responses(worker) }}
 
         Do you agree with this analysis? Push back where you think it's wrong, and confirm where it's right.
   - label: Responses received

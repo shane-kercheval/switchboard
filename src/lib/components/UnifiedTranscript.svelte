@@ -12,6 +12,8 @@
     CornerUpRight,
     MessagesSquare,
     Send,
+    SquareSlash,
+    Workflow,
   } from "@lucide/svelte";
   import {
     cancelSend,
@@ -38,7 +40,7 @@
     heldForwardsFor,
     type HeldForward,
   } from "$lib/state/heldForwards.svelte";
-  import { cancelForward } from "$lib/api";
+  import { cancelForward, openExternalUrl } from "$lib/api";
   import { agentCopy } from "$lib/agentCopy.svelte";
   import { shortcut } from "$lib/platform";
   import { HARNESS_COLOR } from "$lib/harnessDisplay";
@@ -1611,6 +1613,21 @@
           >{text}</kbd
         >
       {/snippet}
+      <!-- External authoring-guide link. Shows the full URL (not a pretty
+           label) on purpose: the intended use is pasting it into a message so
+           an agent can fetch the guide, so the raw string is the payload. -->
+      {#snippet guideLink(url: string)}
+        <button
+          type="button"
+          class="text-accent text-left break-all hover:underline"
+          onclick={() =>
+            void openExternalUrl(url).catch((err: unknown) => {
+              console.error("[switchboard] open link failed", err);
+            })}
+        >
+          {url}
+        </button>
+      {/snippet}
       <div
         class="mx-auto flex w-full max-w-xl flex-col gap-5 px-4 py-8"
         data-testid="transcript-onboarding"
@@ -1726,12 +1743,53 @@
               </p>
             </div>
           </li>
+          <li class="flex gap-3">
+            <SquareSlash
+              size={16}
+              strokeWidth={1.8}
+              aria-hidden="true"
+              class="text-muted mt-0.5 shrink-0"
+            />
+            <div class="flex min-w-0 flex-col gap-0.5">
+              <p class="text-fg text-xs font-medium">Reuse saved prompts</p>
+              <p class="text-muted text-xs leading-5">
+                Type {@render kbd("/")} in an empty message box — or click
+                <span class="text-fg font-medium">Prompt</span> — to insert a saved prompt: a
+                reusable message template with fill-in fields, for anything you find yourself
+                retyping. Prompts are markdown files in a folder shared across all your projects —
+                open it with "Open local prompts folder…" in the Prompt menu. You can also pull
+                prompts from remote MCP servers (e.g. a hosted prompt library): add them under
+                "Prompt servers (MCP)" in Settings. An agent can write a local one for you; point it
+                at the authoring guide:
+                {@render guideLink(
+                  "https://github.com/shane-kercheval/switchboard/blob/main/docs/agent-instructions/prompts.md",
+                )}
+              </p>
+            </div>
+          </li>
+          <li class="flex gap-3">
+            <Workflow
+              size={16}
+              strokeWidth={1.8}
+              aria-hidden="true"
+              class="text-muted mt-0.5 shrink-0"
+            />
+            <div class="flex min-w-0 flex-col gap-0.5">
+              <p class="text-fg text-xs font-medium">Automate with workflows</p>
+              <p class="text-muted text-xs leading-5">
+                Click <span class="text-fg font-medium">Workflow</span> to run a multi-step sequence
+                over your agents — sends, forwards from one agent to another, and pauses for your
+                review, defined in a YAML file. Workflow files live in a folder shared across all
+                your projects — open it with "Open local workflows folder…" in the Workflow menu.
+                The best way to create one is to have an agent write it for you; point it at the
+                authoring guide:
+                {@render guideLink(
+                  "https://github.com/shane-kercheval/switchboard/blob/main/docs/agent-instructions/workflows.md",
+                )}
+              </p>
+            </div>
+          </li>
         </ul>
-        <p class="text-muted border-border border-t pt-3 text-xs leading-5">
-          More: type {@render kbd("/")} for a saved prompt ·
-          <span class="text-fg font-medium">Workflow</span>
-          runs a multi-step sequence across agents.
-        </p>
       </div>
     {:else}
       <p class="text-muted text-sm">No messages yet. Type a prompt below.</p>

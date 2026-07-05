@@ -151,6 +151,16 @@ describe("UnifiedTranscript", () => {
     expect(block).toHaveTextContent(/pick recipients, then send/i);
     expect(block).toHaveTextContent(/send to several agents at once/i);
     expect(block).toHaveTextContent(/relay with forward/i);
+    expect(block).toHaveTextContent(/reuse saved prompts/i);
+    expect(block).toHaveTextContent(/automate with workflows/i);
+    // The authoring-guide URLs render verbatim — the point is that the user
+    // can copy one into a message so an agent fetches the guide.
+    expect(block).toHaveTextContent(
+      "https://github.com/shane-kercheval/switchboard/blob/main/docs/agent-instructions/workflows.md",
+    );
+    expect(block).toHaveTextContent(
+      "https://github.com/shane-kercheval/switchboard/blob/main/docs/agent-instructions/prompts.md",
+    );
     expect(screen.queryByText(/type a prompt below/i)).not.toBeInTheDocument();
   });
 

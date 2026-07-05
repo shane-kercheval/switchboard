@@ -11,8 +11,33 @@ describe("tool input formatting", () => {
     ).toBe("Commit and push ledger accuracy batch");
   });
 
+  it("uses Codex command fields for the row preview", () => {
+    expect(toolInputPreview({ cmd: "git status --short" })).toBe("git status --short");
+    expect(toolInputPreview({ command: "pnpm test\n", cmd: "ignored" })).toBe("pnpm test");
+  });
+
+  it("uses Antigravity summary fields before command-line details", () => {
+    expect(
+      toolInputPreview({
+        toolSummary: '"Execute sleep"',
+        toolAction: '"Running sleep command"',
+        CommandLine: '"sleep 1"',
+      }),
+    ).toBe("Execute sleep");
+    expect(
+      toolInputPreview({
+        toolAction: '"Running sleep command"',
+        CommandLine: '"sleep 1"',
+      }),
+    ).toBe("Running sleep command");
+    expect(
+      toolInputPreview({
+        CommandLine: '"sleep 1"',
+      }),
+    ).toBe("sleep 1");
+  });
+
   it("falls back to common actionable fields", () => {
-    expect(toolInputPreview({ command: "pnpm test\n" })).toBe("pnpm test");
     expect(toolInputPreview({ file_path: "/tmp/example.txt", old_string: "before" })).toBe(
       "/tmp/example.txt",
     );
@@ -21,6 +46,44 @@ describe("tool input formatting", () => {
 
   it("uses compact JSON when no preferred field exists", () => {
     expect(toolInputPreview({ limit: 10, recursive: true })).toBe('{"limit":10,"recursive":true}');
+  });
+
+  it("unwraps JSON-string leaves in formatted Antigravity input", () => {
+    expect(
+      formatToolInput({
+        CommandLine: '"sleep 1"',
+        Cwd: '"/Users/shanekercheval/repos/temp"',
+        WaitMsBeforeAsync: "2000",
+        toolAction: '"Running sleep command"',
+        toolSummary: '"Execute sleep"',
+      }),
+    ).toBe(
+      JSON.stringify(
+        {
+          CommandLine: "sleep 1",
+          Cwd: "/Users/shanekercheval/repos/temp",
+          WaitMsBeforeAsync: "2000",
+          toolAction: "Running sleep command",
+          toolSummary: "Execute sleep",
+        },
+        null,
+        2,
+      ),
+    );
+  });
+
+  it("leaves ordinary non-secret command strings readable", () => {
+    expect(toolInputPreview({ command: 'grep -R "needle" src' })).toBe('grep -R "needle" src');
+    expect(formatToolInput({ command: 'grep -R "needle" src' })).toBe(
+      JSON.stringify({ command: 'grep -R "needle" src' }, null, 2),
+    );
+  });
+
+  it("keeps generic quoted string fields faithful", () => {
+    expect(toolInputPreview({ pattern: '"exact phrase"' })).toBe('"exact phrase"');
+    expect(formatToolInput({ pattern: '"exact phrase"' })).toBe(
+      JSON.stringify({ pattern: '"exact phrase"' }, null, 2),
+    );
   });
 
   it("pretty-prints full input while redacting obvious sensitive keys", () => {

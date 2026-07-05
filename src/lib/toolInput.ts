@@ -1,7 +1,10 @@
 const PREVIEW_KEYS = [
   "description",
+  "toolSummary",
+  "toolAction",
   "command",
   "cmd",
+  "CommandLine",
   "file_path",
   "path",
   "uri",
@@ -20,6 +23,7 @@ const COOKIE_HEADER_PATTERN = /(Cookie\s*:\s*)([^"'\r\n]+)/gi;
 const SECRET_ASSIGNMENT_PATTERN =
   /((?:api[_-]?key|access[_-]?token|auth[_-]?token|token)=)([^&\s"'\\]+)/gi;
 const API_KEY_PATTERN = /\bsk[-_][A-Za-z0-9_-]{8,}\b/g;
+const JSON_STRING_VALUE_KEYS = new Set(["toolSummary", "toolAction", "CommandLine", "Cwd"]);
 
 type JsonRecord = Record<string, unknown>;
 
@@ -73,16 +77,31 @@ function compactJson(value: unknown): string | undefined {
   return json === undefined ? undefined : oneLine(json);
 }
 
-function redacted(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(redacted);
-  if (typeof value === "string") return redactString(value);
+function redacted(value: unknown, key?: string): unknown {
+  if (Array.isArray(value)) return value.map((child) => redacted(child));
+  if (typeof value === "string") {
+    const displayValue =
+      key !== undefined && JSON_STRING_VALUE_KEYS.has(key) ? unwrapJsonString(value) : value;
+    return redactString(displayValue);
+  }
   if (!isRecord(value)) return value;
   return Object.fromEntries(
     Object.entries(value).map(([key, child]) => [
       key,
-      isSensitiveKey(key) ? "[redacted]" : redacted(child),
+      isSensitiveKey(key) ? "[redacted]" : redacted(child, key),
     ]),
   );
+}
+
+function unwrapJsonString(value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed.startsWith('"') || !trimmed.endsWith('"')) return value;
+  try {
+    const parsed: unknown = JSON.parse(trimmed);
+    return typeof parsed === "string" ? parsed : value;
+  } catch {
+    return value;
+  }
 }
 
 // Best-effort display redaction only; tool inputs can still contain secrets in

@@ -979,7 +979,7 @@ impl CodexReconstruction {
                         // Don't overwrite an MCP-result-supplied output.
                         if out.is_none() {
                             *out = Some(output.clone());
-                            *is_error = Some(false);
+                            *is_error = Some(function_call_output_is_error(&output));
                             *cat = completed_at;
                         }
                         matched = true;
@@ -1090,6 +1090,26 @@ fn decode_mcp_result(result: Option<&Value>) -> (String, bool) {
     } else {
         (String::new(), false)
     }
+}
+
+fn function_call_output_is_error(output: &str) -> bool {
+    output_exit_code(output).is_some_and(|code| code != 0)
+}
+
+fn output_exit_code(output: &str) -> Option<i64> {
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if trimmed == "Output:" {
+            break;
+        }
+        if let Some(rest) = trimmed.strip_prefix("Process exited with code ")
+            && let Some(code) = rest.split_whitespace().next()
+            && let Ok(parsed) = code.parse()
+        {
+            return Some(parsed);
+        }
+    }
+    None
 }
 
 /// Discriminate built-in vs MCP function-call name. MCP calls carry a
@@ -2096,15 +2116,120 @@ not valid json
                 kind,
                 name,
                 output,
+                is_error,
                 ..
             } => {
                 assert_eq!(tool_use_id, "call_xyz");
                 assert_eq!(*kind, ToolKind::Builtin);
                 assert_eq!(name, "exec_command");
                 assert_eq!(output.as_deref(), Some("stdout: ok"));
+                assert_eq!(*is_error, Some(false));
             }
             _ => panic!("expected Tool item"),
         }
+    }
+
+    #[test]
+    fn load_codex_transcript_function_call_output_nonzero_exit_is_error() {
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        let agent_id = Uuid::now_v7();
+        let date = NaiveDate::from_ymd_opt(2026, 5, 14).unwrap();
+        let session_id = "019e27fa-ae19-7022-97a2-356e6e5f3361";
+        let function_call = serde_json::json!({
+            "timestamp": "2026-05-14T19:33:22Z",
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "name": "exec_command",
+                "call_id": "call_xyz",
+                "arguments": r#"{"cmd":"git status"}"#
+            }
+        });
+        let function_call_output = serde_json::json!({
+            "timestamp": "2026-05-14T19:33:23Z",
+            "type": "response_item",
+            "payload": {
+                "type": "function_call_output",
+                "call_id": "call_xyz",
+                "output": "Chunk ID: abc\nWall time: 0.0000 seconds\nProcess exited with code 128\nOutput:\nfatal: not a git repository\n"
+            }
+        });
+        let content = jsonl_lines(&[
+            task_started(session_id, "2026-05-14T19:33:20Z", 258_400),
+            turn_context("gpt-5.4", "2026-05-14T19:33:20Z"),
+            user_message("run", "2026-05-14T19:33:21Z"),
+            function_call,
+            function_call_output,
+            task_complete(session_id, "2026-05-14T19:33:24Z"),
+        ]);
+        write_session_at(home.path(), date, session_id, &content);
+
+        let result =
+            load_codex_transcript(home.path(), cwd.path(), session_id, Some(date), agent_id)
+                .unwrap();
+        let Turn::Agent { items, .. } = &result.turns[1] else {
+            panic!("expected Agent turn");
+        };
+        assert!(matches!(
+            &items[0],
+            TurnItem::Tool {
+                is_error: Some(true),
+                output: Some(output),
+                ..
+            } if output.contains("Process exited with code 128")
+        ));
+    }
+
+    #[test]
+    fn load_codex_transcript_exit_code_phrase_in_output_body_is_not_error() {
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        let agent_id = Uuid::now_v7();
+        let date = NaiveDate::from_ymd_opt(2026, 5, 14).unwrap();
+        let session_id = "019e27fa-ae19-7022-97a2-356e6e5f3361";
+        let function_call = serde_json::json!({
+            "timestamp": "2026-05-14T19:33:22Z",
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "name": "exec_command",
+                "call_id": "call_xyz",
+                "arguments": r#"{"cmd":"echo"}"#
+            }
+        });
+        let function_call_output = serde_json::json!({
+            "timestamp": "2026-05-14T19:33:23Z",
+            "type": "response_item",
+            "payload": {
+                "type": "function_call_output",
+                "call_id": "call_xyz",
+                "output": "Chunk ID: abc\nWall time: 0.0000 seconds\nProcess exited with code 0\nOutput:\nProcess exited with code 128\n"
+            }
+        });
+        let content = jsonl_lines(&[
+            task_started(session_id, "2026-05-14T19:33:20Z", 258_400),
+            turn_context("gpt-5.4", "2026-05-14T19:33:20Z"),
+            user_message("run", "2026-05-14T19:33:21Z"),
+            function_call,
+            function_call_output,
+            task_complete(session_id, "2026-05-14T19:33:24Z"),
+        ]);
+        write_session_at(home.path(), date, session_id, &content);
+
+        let result =
+            load_codex_transcript(home.path(), cwd.path(), session_id, Some(date), agent_id)
+                .unwrap();
+        let Turn::Agent { items, .. } = &result.turns[1] else {
+            panic!("expected Agent turn");
+        };
+        assert!(matches!(
+            &items[0],
+            TurnItem::Tool {
+                is_error: Some(false),
+                ..
+            }
+        ));
     }
 
     #[test]

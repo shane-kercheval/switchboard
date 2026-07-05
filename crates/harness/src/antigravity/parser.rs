@@ -83,6 +83,14 @@ impl TranscriptRecord {
         self.source == "MODEL" && !self.is_planner_response()
     }
 
+    pub(crate) fn tool_result_is_error(&self) -> bool {
+        self.status.as_deref() == Some("FAILED")
+            || self
+                .content
+                .as_deref()
+                .is_some_and(tool_result_content_is_error)
+    }
+
     /// A planner response with non-empty `content` and no tool calls is the
     /// model's final answer — the signal that the turn produced output.
     /// Used for outcome classification (no structured terminal record
@@ -94,14 +102,51 @@ impl TranscriptRecord {
     }
 }
 
-/// Per-turn parser state. Tracks the FIFO of in-flight tool invocations so
-/// a tool-result record can be paired with the `ToolStarted` it completes —
-/// the transcript carries no tool id on result records, and Antigravity
-/// executes tools sequentially (one `PLANNER_RESPONSE` tool call, then its
-/// result record), so order-based pairing is correct.
+fn tool_result_content_is_error(content: &str) -> bool {
+    for line in content.lines() {
+        let trimmed = line.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        if matches!(lower.as_str(), "output:" | "stdout:" | "stderr:") {
+            break;
+        }
+        if lower.starts_with("the command failed with exit code:") {
+            return true;
+        }
+    }
+    false
+}
+
+/// Per-turn parser state. Tracks the FIFO of in-flight tool invocations and
+/// early tool results so a result record can be paired with the `ToolStarted`
+/// it completes. Antigravity's result records carry no tool id, and observed
+/// transcripts can write a result before the planner record that names the
+/// tool call, so both sides are buffered by arrival order.
 #[derive(Debug, Default)]
 pub struct AntigravityParserState {
-    pending_tool_ids: VecDeque<String>,
+    pending_tool_ids: VecDeque<PendingToolStart>,
+    pending_tool_results: VecDeque<PendingToolResult>,
+}
+
+#[derive(Debug)]
+struct PendingToolStart {
+    tool_use_id: String,
+    planner_step: i64,
+}
+
+#[derive(Debug)]
+struct PendingToolResult {
+    step_index: i64,
+    output: String,
+    is_error: bool,
+}
+
+impl AntigravityParserState {
+    pub fn unmatched_tool_result_steps(&self) -> Vec<i64> {
+        self.pending_tool_results
+            .iter()
+            .map(|result| result.step_index)
+            .collect()
+    }
 }
 
 /// Map one transcript record to the **live** adapter events it produces.
@@ -162,36 +207,67 @@ pub fn record_to_live_events(
             // bare `{step}:{name}` would collide and make UI/tool pairing
             // ambiguous.
             let tool_use_id = format!("{}:{}:{}", rec.step_index, call_index, call.name);
-            state.pending_tool_ids.push_back(tool_use_id.clone());
             out.push(AdapterEvent::ToolStarted {
                 turn_id,
-                tool_use_id,
+                tool_use_id: tool_use_id.clone(),
                 kind: classify_tool_kind(&call.name),
                 name: call.name.clone(),
                 input: call.args.clone(),
             });
+            if let Some(result) =
+                pop_plausible_result(&mut state.pending_tool_results, rec.step_index)
+            {
+                out.push(AdapterEvent::ToolCompleted {
+                    turn_id,
+                    tool_use_id,
+                    output: result.output,
+                    is_error: result.is_error,
+                });
+            } else {
+                state.pending_tool_ids.push_back(PendingToolStart {
+                    tool_use_id: tool_use_id.clone(),
+                    planner_step: rec.step_index,
+                });
+            }
         }
     }
 
     if rec.is_tool_result() {
-        // Pair with the oldest unmatched ToolStarted (FIFO). If no pending
-        // id (a tool result with no preceding start we saw — e.g., a resume
-        // cursor landing mid-pair), synthesize one from the record so the
-        // completion still surfaces rather than vanishing.
-        let tool_use_id = state
-            .pending_tool_ids
-            .pop_front()
-            .unwrap_or_else(|| format!("{}:{}", rec.step_index, rec.record_type));
-        let is_error = rec.status.as_deref() == Some("FAILED");
-        out.push(AdapterEvent::ToolCompleted {
-            turn_id,
-            tool_use_id,
-            output: rec.content.clone().unwrap_or_default(),
-            is_error,
-        });
+        let is_error = rec.tool_result_is_error();
+        let output = rec.content.clone().unwrap_or_default();
+        if let Some(pending) = state.pending_tool_ids.front()
+            && rec.step_index > pending.planner_step
+        {
+            let pending = state
+                .pending_tool_ids
+                .pop_front()
+                .expect("front checked above");
+            out.push(AdapterEvent::ToolCompleted {
+                turn_id,
+                tool_use_id: pending.tool_use_id,
+                output,
+                is_error,
+            });
+        } else {
+            state.pending_tool_results.push_back(PendingToolResult {
+                step_index: rec.step_index,
+                output,
+                is_error,
+            });
+        }
     }
 
     out
+}
+
+fn pop_plausible_result(
+    pending_results: &mut VecDeque<PendingToolResult>,
+    planner_step: i64,
+) -> Option<PendingToolResult> {
+    let idx = pending_results
+        .iter()
+        .position(|result| result.step_index > planner_step)?;
+    pending_results.remove(idx)
 }
 
 /// Tool-kind classification. The native tools (`run_command`, `view_file`,
@@ -352,6 +428,82 @@ mod tests {
     }
 
     #[test]
+    fn tool_result_before_planner_response_buffers_and_pairs() {
+        let result = parse(
+            r#"{"step_index":4,"source":"MODEL","type":"RUN_COMMAND","status":"DONE","content":"The command failed with exit code: 128\nOutput:\nfatal: not a git repository"}"#,
+        );
+        let started = parse(
+            r#"{"step_index":3,"source":"MODEL","type":"PLANNER_RESPONSE","tool_calls":[{"name":"run_command","args":{"CommandLine":"\"git status\""}}]}"#,
+        );
+        let mut state = AntigravityParserState::default();
+        let turn = tid();
+
+        assert!(
+            record_to_live_events(&result, turn, &mut state).is_empty(),
+            "early results wait for the planner tool id"
+        );
+        let events = record_to_live_events(&started, turn, &mut state);
+
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            &events[0],
+            AdapterEvent::ToolStarted { tool_use_id, name, .. }
+                if tool_use_id == "3:0:run_command" && name == "run_command"
+        ));
+        assert!(matches!(
+            &events[1],
+            AdapterEvent::ToolCompleted {
+                tool_use_id,
+                output,
+                is_error: true,
+                ..
+            } if tool_use_id == "3:0:run_command" && output.contains("fatal")
+        ));
+    }
+
+    #[test]
+    fn implausible_early_tool_result_does_not_attach_to_later_tool() {
+        let result = parse(
+            r#"{"step_index":2,"source":"MODEL","type":"RUN_COMMAND","status":"DONE","content":"orphan"}"#,
+        );
+        let started = parse(
+            r#"{"step_index":3,"source":"MODEL","type":"PLANNER_RESPONSE","tool_calls":[{"name":"run_command","args":{}}]}"#,
+        );
+        let mut state = AntigravityParserState::default();
+        let turn = tid();
+
+        assert!(record_to_live_events(&result, turn, &mut state).is_empty());
+        let events = record_to_live_events(&started, turn, &mut state);
+
+        assert_eq!(events.len(), 1, "only the tool start should emit");
+        assert!(matches!(&events[0], AdapterEvent::ToolStarted { .. }));
+        assert_eq!(state.unmatched_tool_result_steps(), vec![2]);
+    }
+
+    #[test]
+    fn command_failure_phrase_inside_output_body_is_not_error() {
+        let result = parse(
+            r#"{"step_index":4,"source":"MODEL","type":"RUN_COMMAND","status":"DONE","content":"Created At: now\nCompleted At: now\nOutput:\nThe command failed with exit code: 128"}"#,
+        );
+        let started = parse(
+            r#"{"step_index":3,"source":"MODEL","type":"PLANNER_RESPONSE","tool_calls":[{"name":"run_command","args":{}}]}"#,
+        );
+        let mut state = AntigravityParserState::default();
+        let turn = tid();
+
+        assert!(record_to_live_events(&result, turn, &mut state).is_empty());
+        let events = record_to_live_events(&started, turn, &mut state);
+
+        assert!(matches!(
+            &events[1],
+            AdapterEvent::ToolCompleted {
+                is_error: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn two_same_name_tool_calls_in_one_record_get_distinct_ids() {
         // The tool_calls array can carry multiple calls; two `run_command`s
         // in one planner record must not collide on tool_use_id.
@@ -372,14 +524,20 @@ mod tests {
     }
 
     #[test]
-    fn tool_result_failed_status_sets_is_error() {
+    fn tool_result_failed_command_text_sets_is_error() {
         let result = parse(
-            r#"{"step_index":3,"source":"MODEL","type":"RUN_COMMAND","status":"FAILED","content":"boom"}"#,
+            r#"{"step_index":3,"source":"MODEL","type":"RUN_COMMAND","status":"DONE","content":"The command failed with exit code: 1\nOutput:\nboom"}"#,
+        );
+        let started = parse(
+            r#"{"step_index":2,"source":"MODEL","type":"PLANNER_RESPONSE","tool_calls":[{"name":"run_command","args":{}}]}"#,
         );
         let mut state = AntigravityParserState::default();
-        let events = record_to_live_events(&result, tid(), &mut state);
+        let turn = tid();
+
+        assert!(record_to_live_events(&result, turn, &mut state).is_empty());
+        let events = record_to_live_events(&started, turn, &mut state);
         assert!(matches!(
-            &events[0],
+            &events[1],
             AdapterEvent::ToolCompleted { is_error: true, .. }
         ));
     }

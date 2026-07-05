@@ -3,18 +3,21 @@
   import Disclosure from "$lib/components/ui/Disclosure.svelte";
   import Badge from "$lib/components/ui/Badge.svelte";
   import Spinner from "$lib/components/ui/Spinner.svelte";
+  import { formatToolInput, toolInputPreview } from "$lib/toolInput";
   import { cn } from "$lib/utils";
 
   let { tool }: { tool: ToolCall } = $props();
 
   const isRunning = $derived(tool.completed_at === undefined && tool.stopped_at === undefined);
   const hasOutput = $derived(tool.output !== undefined && tool.output !== "");
+  const inputPreview = $derived(toolInputPreview(tool.input));
+  const formattedInput = $derived(formatToolInput(tool.input));
+  const hasInput = $derived(formattedInput !== undefined && formattedInput !== "");
 
-  // Open while running (so streaming output is visible) and collapsed once done.
-  // A manual toggle (`userOpen`) takes over from then on, so completion won't
-  // yank a panel the user opened shut.
+  // Start collapsed; the header preview carries the common case, and avoiding
+  // automatic expansion keeps concurrent/fast tool calls from moving the page.
   let userOpen = $state<boolean | null>(null);
-  const open = $derived(userOpen ?? isRunning);
+  const open = $derived(userOpen ?? false);
   function toggle(): void {
     userOpen = !open;
   }
@@ -35,7 +38,13 @@
     {:else}
       <Badge class="shrink-0">{kindLabel(tool.kind)}</Badge>
     {/if}
-    <span class="text-muted min-w-0 truncate font-mono">{tool.name}</span>
+    <span class="text-muted max-w-48 min-w-0 truncate font-mono">{tool.name}</span>
+    {#if inputPreview}
+      <span class="text-muted/70 shrink-0" aria-hidden="true">·</span>
+      <span class="text-muted min-w-0 flex-1 truncate font-mono" data-testid="tool-input-preview"
+        >{inputPreview}</span
+      >
+    {/if}
     <!-- Status as an icon: muted spinner while running, red alert on error, a
          muted check on success. Success stays quiet (gray, not green) so the
          common case doesn't draw the eye; errors get the one strong color. -->
@@ -113,13 +122,27 @@
     {/if}
   {/snippet}
 
-  {#if hasOutput}
-    <div class="border-border/70 border-t px-2.5 py-2">
-      <pre
-        class={cn(
-          "max-h-44 overflow-y-auto font-mono text-xs whitespace-pre-wrap",
-          tool.is_error ? "text-status-failed" : "text-muted",
-        )}>{tool.output}</pre>
+  {#if hasInput || hasOutput}
+    <div class="border-border/70 space-y-2 border-t px-2.5 py-2">
+      {#if hasInput}
+        <section class="space-y-1" aria-label="Tool input">
+          <div class="text-muted text-[10px] font-semibold tracking-wide uppercase">Input</div>
+          <pre
+            class="text-muted bg-panel/60 max-h-44 overflow-y-auto rounded px-2 py-1.5 font-mono text-xs whitespace-pre-wrap"
+            data-testid="tool-input">{formattedInput}</pre>
+        </section>
+      {/if}
+      {#if hasOutput}
+        <section class="space-y-1" aria-label="Tool output">
+          <div class="text-muted text-[10px] font-semibold tracking-wide uppercase">Output</div>
+          <pre
+            class={cn(
+              "max-h-44 overflow-y-auto font-mono text-xs whitespace-pre-wrap",
+              tool.is_error ? "text-status-failed" : "text-muted",
+            )}
+            data-testid="tool-output">{tool.output}</pre>
+        </section>
+      {/if}
     </div>
   {/if}
 </Disclosure>

@@ -153,12 +153,29 @@ struct AgentBuilder {
     last_seen_at: DateTime<Utc>,
     ended_at: Option<DateTime<Utc>>,
     items: Vec<TurnItem>,
-    /// Indices into `items` of `Tool` entries awaiting their result record,
-    /// FIFO — Antigravity executes tools sequentially and result records carry
-    /// no tool id, so order pairs them (same rule as the live path).
-    pending_tools: VecDeque<usize>,
+    /// Indices into `items` of `Tool` entries awaiting their result record.
+    /// Antigravity result records carry no tool id, so FIFO pairing is the
+    /// only available identity once both sides are present.
+    pending_tools: VecDeque<PendingToolStart>,
+    /// Result records can appear before the planner record that names the tool
+    /// call. Buffer them FIFO so reload follows the same tolerant pairing as
+    /// the live transcript tail.
+    pending_tool_results: VecDeque<PendingToolResult>,
     saw_terminal: bool,
     failed: bool,
+}
+
+struct PendingToolResult {
+    line_number: usize,
+    step_index: i64,
+    output: String,
+    is_error: bool,
+    completed_at: DateTime<Utc>,
+}
+
+struct PendingToolStart {
+    item_idx: usize,
+    planner_step: i64,
 }
 
 impl AgentBuilder {
@@ -171,6 +188,7 @@ impl AgentBuilder {
             ended_at: None,
             items: Vec::new(),
             pending_tools: VecDeque::new(),
+            pending_tool_results: VecDeque::new(),
             saw_terminal: false,
             failed: false,
         }
@@ -263,8 +281,8 @@ impl Reconstruction {
             .current
             .take()
             .unwrap_or_else(|| AgentBuilder::new(agent_id, ts));
-        builder.last_seen_at = ts;
-        let mut warning: Option<String> = None;
+        builder.started_at = builder.started_at.min(ts);
+        builder.last_seen_at = builder.last_seen_at.max(ts);
 
         if let Some(thinking) = &rec.thinking
             && !thinking.trim().is_empty()
@@ -280,17 +298,24 @@ impl Reconstruction {
                 for (call_index, call) in calls.iter().enumerate() {
                     let tool_use_id = format!("{}:{}:{}", rec.step_index, call_index, call.name);
                     let idx = builder.items.len();
+                    let result =
+                        pop_plausible_result(&mut builder.pending_tool_results, rec.step_index);
                     builder.items.push(TurnItem::Tool {
                         tool_use_id,
                         kind: classify_tool_kind(&call.name),
                         name: call.name.clone(),
                         input: call.args.clone(),
-                        output: None,
-                        is_error: None,
+                        output: result.as_ref().map(|r| r.output.clone()),
+                        is_error: result.as_ref().map(|r| r.is_error),
                         started_at: ts,
-                        completed_at: None,
+                        completed_at: result.as_ref().map(|r| r.completed_at),
                     });
-                    builder.pending_tools.push_back(idx);
+                    if result.is_none() {
+                        builder.pending_tools.push_back(PendingToolStart {
+                            item_idx: idx,
+                            planner_step: rec.step_index,
+                        });
+                    }
                 }
             }
             if rec.is_terminal_answer() {
@@ -301,39 +326,44 @@ impl Reconstruction {
                     });
                 }
                 builder.saw_terminal = true;
-                builder.ended_at = Some(ts);
+                builder.ended_at = Some(builder.ended_at.map_or(ts, |ended| ended.max(ts)));
             }
             if rec.status.as_deref() == Some("FAILED") {
                 builder.failed = true;
-                builder.ended_at = Some(ts);
+                builder.ended_at = Some(builder.ended_at.map_or(ts, |ended| ended.max(ts)));
             }
         } else if rec.is_tool_result() {
-            let is_error = rec.status.as_deref() == Some("FAILED");
+            let is_error = rec.tool_result_is_error();
             let output = rec.content.clone().unwrap_or_default();
-            if let Some(item_idx) = builder.pending_tools.pop_front() {
+            if let Some(pending) = builder.pending_tools.front()
+                && rec.step_index > pending.planner_step
+            {
+                let pending = builder
+                    .pending_tools
+                    .pop_front()
+                    .expect("front checked above");
                 if let Some(TurnItem::Tool {
                     output: out,
                     is_error: err,
                     completed_at: cat,
                     ..
-                }) = builder.items.get_mut(item_idx)
+                }) = builder.items.get_mut(pending.item_idx)
                 {
                     *out = Some(output);
                     *err = Some(is_error);
                     *cat = Some(ts);
                 }
             } else {
-                warning = Some(format!(
-                    "tool result (step {}) had no matching tool call",
-                    rec.step_index
-                ));
+                builder.pending_tool_results.push_back(PendingToolResult {
+                    line_number,
+                    step_index: rec.step_index,
+                    output,
+                    is_error,
+                    completed_at: ts,
+                });
             }
         }
-
         self.current = Some(builder);
-        if let Some(w) = warning {
-            self.warn(line_number, w);
-        }
     }
 
     /// Close the open agent turn (if any). Status is `Complete` only when a
@@ -344,6 +374,15 @@ impl Reconstruction {
         let Some(b) = self.current.take() else {
             return;
         };
+        for result in &b.pending_tool_results {
+            self.warn(
+                result.line_number,
+                format!(
+                    "tool result (step {}) had no matching tool call",
+                    result.step_index
+                ),
+            );
+        }
         let status = if b.failed {
             TurnStatus::Failed
         } else if b.saw_terminal {
@@ -355,7 +394,10 @@ impl Reconstruction {
             turn_id: b.turn_id,
             agent_id: b.agent_id,
             started_at: b.started_at,
-            ended_at: b.ended_at.or(Some(b.last_seen_at)),
+            ended_at: Some(
+                b.ended_at
+                    .map_or(b.last_seen_at, |ended| ended.max(b.last_seen_at)),
+            ),
             status,
             items: b.items,
             usage: None,
@@ -390,6 +432,16 @@ impl Reconstruction {
             warnings: self.warnings,
         }
     }
+}
+
+fn pop_plausible_result(
+    pending_results: &mut VecDeque<PendingToolResult>,
+    planner_step: i64,
+) -> Option<PendingToolResult> {
+    let idx = pending_results
+        .iter()
+        .position(|result| result.step_index > planner_step)?;
+    pending_results.remove(idx)
 }
 
 #[cfg(test)]
@@ -573,6 +625,88 @@ mod tests {
             other => panic!("expected tool item, got {other:?}"),
         }
         assert_eq!(agent_status(&t.turns[1]), TurnStatus::Complete);
+    }
+
+    #[test]
+    fn tool_results_before_planner_response_pair_on_reload() {
+        let content = concat!(
+            r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-07-05T18:03:33Z","content":"<USER_REQUEST>\ntest tools\n</USER_REQUEST>"}"#,
+            "\n",
+            r#"{"step_index":4,"source":"MODEL","type":"RUN_COMMAND","status":"DONE","created_at":"2026-07-05T18:03:45Z","content":"bash ok"}"#,
+            "\n",
+            r#"{"step_index":3,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-07-05T18:03:34Z","tool_calls":[{"name":"run_command","args":{"CommandLine":"\"bash\""}},{"name":"run_command","args":{"CommandLine":"\"git status\""}}]}"#,
+            "\n",
+            r#"{"step_index":5,"source":"MODEL","type":"RUN_COMMAND","status":"DONE","created_at":"2026-07-05T18:03:47Z","content":"The command failed with exit code: 128\nOutput:\nfatal: not a git repository"}"#,
+            "\n",
+            r#"{"step_index":6,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-07-05T18:03:48Z","content":"done"}"#,
+            "\n",
+        );
+        let t = parse_antigravity_transcript_content(content, agent_id());
+        let planner_ts: DateTime<Utc> = "2026-07-05T18:03:34Z".parse().unwrap();
+        let final_ts: DateTime<Utc> = "2026-07-05T18:03:48Z".parse().unwrap();
+        match &t.turns[1] {
+            Turn::Agent {
+                started_at,
+                ended_at,
+                ..
+            } => {
+                assert_eq!(*started_at, planner_ts);
+                assert_eq!(*ended_at, Some(final_ts));
+            }
+            other => panic!("expected agent turn, got {other:?}"),
+        }
+        let items = agent_items(&t.turns[1]);
+        assert_eq!(items.len(), 3, "two tools + final answer");
+        assert!(matches!(
+            &items[0],
+            TurnItem::Tool {
+                output: Some(output),
+                is_error: Some(false),
+                completed_at: Some(_),
+                ..
+            } if output == "bash ok"
+        ));
+        assert!(matches!(
+            &items[1],
+            TurnItem::Tool {
+                output: Some(output),
+                is_error: Some(true),
+                completed_at: Some(_),
+                ..
+            } if output.contains("fatal")
+        ));
+        assert_eq!(agent_status(&t.turns[1]), TurnStatus::Complete);
+        assert!(t.warnings.is_empty());
+    }
+
+    #[test]
+    fn implausible_early_tool_result_warns_instead_of_attaching_on_reload() {
+        let content = concat!(
+            r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-07-05T18:03:33Z","content":"<USER_REQUEST>\ntest tools\n</USER_REQUEST>"}"#,
+            "\n",
+            r#"{"step_index":2,"source":"MODEL","type":"RUN_COMMAND","status":"DONE","created_at":"2026-07-05T18:03:34Z","content":"orphan"}"#,
+            "\n",
+            r#"{"step_index":3,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-07-05T18:03:35Z","tool_calls":[{"name":"run_command","args":{"CommandLine":"\"git status\""}}]}"#,
+            "\n",
+            r#"{"step_index":4,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-07-05T18:03:36Z","content":"done"}"#,
+            "\n",
+        );
+        let t = parse_antigravity_transcript_content(content, agent_id());
+        let items = agent_items(&t.turns[1]);
+        assert!(matches!(
+            &items[0],
+            TurnItem::Tool {
+                output: None,
+                completed_at: None,
+                ..
+            }
+        ));
+        assert_eq!(t.warnings.len(), 1);
+        assert!(
+            t.warnings[0].reason.contains("no matching tool call"),
+            "warning explains the unmatched result: {}",
+            t.warnings[0].reason
+        );
     }
 
     #[test]

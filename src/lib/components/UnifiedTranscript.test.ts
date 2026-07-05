@@ -385,8 +385,9 @@ describe("UnifiedTranscript", () => {
     // "running…" or "error" annotation should appear.
     expect(tool).not.toHaveTextContent("running…");
     expect(tool).not.toHaveTextContent("error");
-    // Body block suppressed — no <pre> child.
-    expect(tool.querySelector("pre")).toBeNull();
+    // Empty output is suppressed; input can still render in the expanded body.
+    expect(tool.querySelector('[data-testid="tool-output"]')).toBeNull();
+    expect(tool.querySelector('[data-testid="tool-input"]')).not.toBeNull();
   });
 
   it("collapses completed tool output by default and hides the internal builtin label", async () => {
@@ -459,7 +460,7 @@ describe("UnifiedTranscript", () => {
     expect(tool.querySelector('[data-testid="tool-error"]')).not.toBeNull();
   });
 
-  it("expands running tool calls by default", async () => {
+  it("keeps running tool calls collapsed by default", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
     state.transcripts[CLAUDE_AGENT.id] = [
@@ -485,7 +486,7 @@ describe("UnifiedTranscript", () => {
     render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     const tool = screen.getByTestId("turn-tool");
-    expect(tool).toHaveAttribute("open");
+    expect(tool).not.toHaveAttribute("open");
     expect(tool.querySelector('[data-testid="tool-running"]')).not.toBeNull();
   });
 
@@ -2874,6 +2875,18 @@ describe("UnifiedTranscript live streaming cap", () => {
       items: [text(body)],
     };
   }
+  function complete(agent: AgentRecord, sendId: string, turnId: string, body: string): Turn {
+    return {
+      role: "agent",
+      turn_id: turnId,
+      agent_id: agent.id,
+      send_id: sendId,
+      started_at: "2026-05-16T00:00:01Z",
+      ended_at: "2026-05-16T00:00:02Z",
+      status: "complete",
+      items: [text(body)],
+    };
+  }
 
   it("caps a streaming standalone response and keeps the footer outside the cap", async () => {
     const state = await loadState();
@@ -2933,9 +2946,84 @@ describe("UnifiedTranscript live streaming cap", () => {
     expect(screen.getAllByTestId("turn-live-scroll")).toHaveLength(2);
     // Each column's footer stays outside its own cap.
     for (const scroll of screen.getAllByTestId("turn-live-scroll")) {
+      expect(scroll).toHaveClass("max-h-[75cqh]", "overflow-y-auto");
       expect(scroll.querySelector('[data-testid="turn-working"]')).toBeNull();
     }
     expect(screen.getAllByTestId("turn-working")).toHaveLength(2);
+  });
+
+  it("drops streaming fan-out caps once any sibling column finishes", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    await state.registerAgent(CODEX_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [
+      {
+        role: "user",
+        turn_id: "u-a",
+        agent_id: CLAUDE_AGENT.id,
+        send_id: "send-f",
+        started_at: "2026-05-16T00:00:00Z",
+        text: "fan",
+      },
+      complete(CLAUDE_AGENT, "send-f", "a-a", "alice final answer"),
+    ];
+    state.transcripts[CODEX_AGENT.id] = [
+      {
+        role: "user",
+        turn_id: "u-b",
+        agent_id: CODEX_AGENT.id,
+        send_id: "send-f",
+        started_at: "2026-05-16T00:00:00Z",
+        text: "fan",
+      },
+      streaming(CODEX_AGENT, "send-f", "a-b", "bob still streaming"),
+    ];
+
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT, CODEX_AGENT] },
+    });
+
+    expect(screen.getByText("alice final answer")).toBeInTheDocument();
+    const scroll = screen.getByTestId("turn-live-scroll");
+    expect(scroll).toHaveTextContent("bob still streaming");
+    expect(scroll).toHaveClass("overflow-visible");
+    expect(scroll).not.toHaveClass("max-h-[75cqh]", "overflow-y-auto");
+  });
+
+  it("keeps streaming fan-out caps while a sibling column is queued", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    await state.registerAgent(CODEX_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [
+      {
+        role: "user",
+        turn_id: "u-a",
+        agent_id: CLAUDE_AGENT.id,
+        send_id: "send-f",
+        started_at: "2026-05-16T00:00:00Z",
+        text: "fan",
+      },
+      streaming(CLAUDE_AGENT, "send-f", "a-a", "alice streaming"),
+    ];
+    state.transcripts[CODEX_AGENT.id] = [
+      {
+        role: "user",
+        turn_id: "u-b",
+        agent_id: CODEX_AGENT.id,
+        send_id: "send-f",
+        started_at: "2026-05-16T00:00:00Z",
+        text: "fan",
+      },
+    ];
+
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT, CODEX_AGENT] },
+    });
+
+    expect(screen.getByTestId("fanout-queued")).toHaveTextContent("Queued...");
+    const scroll = screen.getByTestId("turn-live-scroll");
+    expect(scroll).toHaveTextContent("alice streaming");
+    expect(scroll).toHaveClass("max-h-[75cqh]", "overflow-y-auto");
   });
 
   it("removes the cap once the turn completes, leaving the latest response expanded", async () => {

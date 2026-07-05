@@ -959,6 +959,7 @@
   turn: AgentTurn,
   live: boolean = true,
   mode: "full" | "answer" | "final" = "full",
+  liveCap: boolean = true,
 )}
   {#if mode === "final"}
     {@const answer = lastAnswerTextOf(turn)}
@@ -983,7 +984,10 @@
          short window shrinks it too. -->
     {@const liveKey = previewKeyForTurn(turn)}
     <div
-      class={cn("max-h-[75cqh] overflow-y-auto", (liveTopFade[liveKey] ?? false) && LIVE_TOP_FADE)}
+      class={cn(
+        liveCap ? "max-h-[75cqh] overflow-y-auto" : "overflow-visible",
+        liveCap && (liveTopFade[liveKey] ?? false) && LIVE_TOP_FADE,
+      )}
       data-testid="turn-live-scroll"
       use:liveScroll={{ key: liveKey, signal: liveSignalOf(turn) }}
     >
@@ -1833,6 +1837,10 @@
               return { key, defaultCompact: compactEnabled && !latestResponseKeys.has(key) };
             })}
           {@const fanoutCopyable = fanoutText(block.columns)}
+          {@const fanoutLiveCap = !block.columns.some((col) => {
+            const state = columnState(col.rows);
+            return state !== "queued" && state !== "streaming";
+          })}
           <div class="space-y-4" data-testid="fanout-group">
             {@render userMessage(block.user)}
             <!-- The group control lives with the responses (not the user prompt)
@@ -1929,6 +1937,8 @@
                           {#if r.kind === "agent"}{@render turnBody(
                               r.turn,
                               state === "streaming",
+                              "full",
+                              fanoutLiveCap,
                             )}{/if}
                         {/each}
                         {@render columnStatusChips(col.rows, colHasOutcome)}

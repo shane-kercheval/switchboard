@@ -680,6 +680,15 @@ async fn run_producer(ctx: ProducerCtx) {
             }
         }
     }
+    let unmatched_tool_result_steps = parser_state.unmatched_tool_result_steps();
+    if !unmatched_tool_result_steps.is_empty() {
+        tracing::warn!(
+            %turn_id,
+            agent_id = %agent_id,
+            unmatched_steps = ?unmatched_tool_result_steps,
+            "antigravity: transcript had tool result records that never matched a tool call"
+        );
+    }
 
     // Scan the per-dispatch CLI log only when the turn produced no answer —
     // a successful turn has nothing in the log we'd want to surface. Best-

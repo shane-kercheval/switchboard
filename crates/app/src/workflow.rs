@@ -1405,11 +1405,19 @@ mod tests {
         );
         assert!(worker_bodies[1].contains("give your final recommendation"));
         // Reviewers dispatched twice: the code review, then weighing in on the
-        // worker's verdict (which forwards `last_output(worker)`).
+        // worker's verdict (forwarded via `aggregated_responses(worker)`, so the
+        // analyst output is delimited by the same START/END markers as any other
+        // forwarded response).
         let rev1_bodies = bodies_for(rig.ids["rev-1"]);
         assert_eq!(rev1_bodies.len(), 2, "reviewer dispatched twice");
         assert!(rev1_bodies[0].contains("Code Review Guidelines"));
         assert!(rev1_bodies[1].contains("An analyst reviewed all of the feedback"));
+        assert!(
+            rev1_bodies[1].contains("=== START response from")
+                && rev1_bodies[1].contains("=== END response from"),
+            "the analyst verdict should be delimited, got: {}",
+            rev1_bodies[1]
+        );
     }
 
     #[tokio::test]

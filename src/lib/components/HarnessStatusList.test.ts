@@ -87,6 +87,26 @@ describe("HarnessStatusList", () => {
     expect(screen.getByTestId("harness-status")).not.toHaveTextContent("unsupported");
   });
 
+  it("lists Antigravity above Gemini, and Gemini carries the availability note", async () => {
+    // Display order deliberately deviates from ALL_HARNESSES here: Antigravity
+    // superseded Gemini for individual Google accounts, so Gemini sits last
+    // with a full-row note explaining who can still use it.
+    setup();
+    render(HarnessStatusList);
+    await waitFor(() => {
+      expect(screen.getByTestId("harness-row-gemini")).toBeInTheDocument();
+    });
+    const ids = screen.getAllByTestId(/^harness-row-/).map((el) => el.getAttribute("data-testid"));
+    expect(ids.indexOf("harness-row-antigravity")).toBeLessThan(ids.indexOf("harness-row-gemini"));
+    expect(ids).toHaveLength(ALL.length);
+
+    const note = screen.getByTestId("harness-note-gemini");
+    expect(note).toHaveTextContent(/no longer available on individual google accounts/i);
+    expect(note).toHaveTextContent(/organization plan/i);
+    // The note belongs to the Gemini row only.
+    expect(screen.getByTestId("harness-row-gemini")).toContainElement(note);
+  });
+
   it("separates the columns — a not-installed harness shows no auth status (auth is moot)", async () => {
     setup({ gemini: { installed: false, version: null, authed: false } });
     render(HarnessStatusList);

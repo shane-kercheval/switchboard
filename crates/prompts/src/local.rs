@@ -101,6 +101,16 @@ impl LocalProvider {
         out
     }
 
+    /// The **unrendered** template body of the local prompt named `name`
+    /// (frontmatter stripped, `MiniJinja` placeholders left intact), or `None` if
+    /// no such prompt resolves. Uses the same declared-order resolution as
+    /// `render` (malformed files skipped). Backs the read-only UI preview — the
+    /// body is shown to the user, never sent to an agent (agents only ever
+    /// receive rendered text via `render`).
+    pub(crate) fn source(&self, name: &str) -> Option<String> {
+        self.find(name).ok().map(|parsed| parsed.body)
+    }
+
     /// Synchronous render — find the named prompt and apply `MiniJinja`. The
     /// trait's `async render` delegates here.
     fn render_sync(
@@ -408,6 +418,22 @@ mod tests {
             }
             other => panic!("expected UnknownArgument, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn source_returns_unrendered_body_and_none_for_unknown() {
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "code-review.md", CODE_REVIEW);
+        let provider = LocalProvider::new(vec![dir.path().to_path_buf()]);
+
+        let body = provider.source("code-review").unwrap();
+        // The template is returned verbatim — placeholders NOT substituted.
+        assert!(body.contains("Review the changes."));
+        assert!(body.contains("{% if focus %}"));
+        assert!(body.contains("{{ focus }}"));
+        assert!(!body.contains("---")); // frontmatter is stripped
+
+        assert!(provider.source("nope").is_none());
     }
 
     #[test]

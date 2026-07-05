@@ -42,7 +42,7 @@ steps:
       text: |
         An analyst reviewed all of the feedback and responded:
 
-        {{ last_output(worker) }}
+        {{ aggregated_responses(worker) }}
 
         Do you agree with this analysis? Push back where you think it's wrong, and confirm where it's right.
   - label: Responses received

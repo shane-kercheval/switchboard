@@ -1,9 +1,20 @@
 <script lang="ts">
+  import { untrack } from "svelte";
   import type { AgentRecord, Attachment, ConversationItem, ProjectId } from "$lib/types";
   import { HEARTBEAT_TIMEOUT_MS } from "$lib/types";
   import { cn, formatDuration } from "$lib/utils";
   import { convertFileSrc } from "@tauri-apps/api/core";
-  import { ChevronRight, ChevronsDownUp, ChevronsUpDown } from "@lucide/svelte";
+  import {
+    ChevronRight,
+    ChevronsDownUp,
+    ChevronsUpDown,
+    Columns2,
+    CornerUpRight,
+    MessagesSquare,
+    Send,
+    SquareSlash,
+    Workflow,
+  } from "@lucide/svelte";
   import {
     cancelSend,
     getTranscriptRevision,
@@ -29,8 +40,9 @@
     heldForwardsFor,
     type HeldForward,
   } from "$lib/state/heldForwards.svelte";
-  import { cancelForward } from "$lib/api";
+  import { cancelForward, openExternalUrl } from "$lib/api";
   import { agentCopy } from "$lib/agentCopy.svelte";
+  import { shortcut } from "$lib/platform";
   import { HARNESS_COLOR } from "$lib/harnessDisplay";
   import Badge from "$lib/components/ui/Badge.svelte";
   import Disclosure from "$lib/components/ui/Disclosure.svelte";
@@ -66,6 +78,7 @@
     loadStatus = "complete",
     loadError,
     onRetryLoad,
+    showOnboarding = false,
   }: {
     /// The active project. Compact-transcript state and per-unit overrides are
     /// read/written keyed by this id, so the component never reaches into the
@@ -81,6 +94,12 @@
     /// Re-attempt the project conversation load. Supplied by the parent (which
     /// owns the project id). Absent → no Retry button rendered.
     onRetryLoad?: () => void;
+    /// Render the full orientation block (how sends, recipients, fan-out, and
+    /// Forward work) in the no-messages empty state instead of the one-line
+    /// placeholder. The host enables this only for the un-split default view —
+    /// one pane holding the whole roster — so the block appears exactly once
+    /// per blank project, never repeated in every split pane.
+    showOnboarding?: boolean;
   } = $props();
 
   /// Roster agents whose *own* history failed to load (the per-agent
@@ -677,6 +696,11 @@
     lastScrollHeight = container.scrollHeight;
   }
 
+  // Whether the previous reanchor pass saw conversation rows. Drives the
+  // empty→first-rows transition below; not reactive state (only reanchor
+  // reads/writes it).
+  let hadRows = false;
+
   /// Pin to the bottom when the user is already there; otherwise keep what the
   /// user is reading still: anchor-restore when the change landed elsewhere,
   /// gap-hold when it landed inside the anchor block or past the clamp (see
@@ -686,6 +710,22 @@
   /// position we just set — benign).
   function reanchor(): void {
     if (!container) return;
+    // The empty state — the one-line placeholder or the onboarding block — is
+    // a document, not a conversation: it reads top-down and has no "newest
+    // content" to follow, so auto-scroll never touches it. Without this, a
+    // taller-than-viewport onboarding block mounts scrolled to its tail.
+    // `untrack` keeps the scrollSignal effect's dependency set unchanged.
+    if (untrack(() => rows.length) === 0) {
+      hadRows = false;
+      return;
+    }
+    // First rows after the empty state: re-pin unconditionally, wherever the
+    // user had scrolled within the block — the conversation starts at the
+    // newest message and follows streaming, per the chat contract.
+    if (!hadRows) {
+      hadRows = true;
+      pinned = true;
+    }
     if (pinned) {
       container.scrollTop = container.scrollHeight;
       lastScrollHeight = container.scrollHeight;
@@ -919,6 +959,7 @@
   turn: AgentTurn,
   live: boolean = true,
   mode: "full" | "answer" | "final" = "full",
+  liveCap: boolean = true,
 )}
   {#if mode === "final"}
     {@const answer = lastAnswerTextOf(turn)}
@@ -943,7 +984,10 @@
          short window shrinks it too. -->
     {@const liveKey = previewKeyForTurn(turn)}
     <div
-      class={cn("max-h-[75cqh] overflow-y-auto", (liveTopFade[liveKey] ?? false) && LIVE_TOP_FADE)}
+      class={cn(
+        liveCap ? "max-h-[75cqh] overflow-y-auto" : "overflow-visible",
+        liveCap && (liveTopFade[liveKey] ?? false) && LIVE_TOP_FADE,
+      )}
       data-testid="turn-live-scroll"
       use:liveScroll={{ key: liveKey, signal: liveSignalOf(turn) }}
     >
@@ -1561,7 +1605,199 @@
   {/each}
 
   {#if rows.length === 0 && loadStatus === "complete" && failedAgents.length === 0}
-    <p class="text-muted text-sm">No messages yet. Type a prompt below.</p>
+    {#if showOnboarding}
+      <!-- Orientation block for a blank project. Leads with the mental model
+           (agents are isolated conversations; this view merges them) because
+           that's the part of the product a chat-shaped UI actively miscues,
+           then the three verbs (send, fan out, forward). Self-dismissing: it
+           vanishes with the first rendered row, so no persistence needed. -->
+      {#snippet kbd(text: string)}
+        <kbd
+          class="border-border bg-panel text-fg rounded border px-1 py-px font-mono text-[10px] whitespace-nowrap"
+          >{text}</kbd
+        >
+      {/snippet}
+      <!-- External authoring-guide link. Shows the full URL (not a pretty
+           label) on purpose: the intended use is pasting it into a message so
+           an agent can fetch the guide, so the raw string is the payload. -->
+      {#snippet guideLink(url: string)}
+        <button
+          type="button"
+          class="text-accent text-left break-all hover:underline"
+          onclick={() =>
+            void openExternalUrl(url).catch((err: unknown) => {
+              console.error("[switchboard] open link failed", err);
+            })}
+        >
+          {url}
+        </button>
+      {/snippet}
+      <div
+        class="mx-auto flex w-full max-w-xl flex-col gap-5 px-4 py-8"
+        data-testid="transcript-onboarding"
+      >
+        <div class="flex flex-col gap-1">
+          <p class="text-fg text-sm font-semibold">How this project works</p>
+          <p class="text-muted text-xs leading-5">
+            Each agent is one of the coding CLIs already installed on your machine — Switchboard
+            runs it for you, using your existing login and configuration. The CLIs do the actual
+            work; Switchboard is the window onto them.
+          </p>
+        </div>
+        <ul class="flex flex-col gap-4">
+          <li class="flex gap-3">
+            <MessagesSquare
+              size={16}
+              strokeWidth={1.8}
+              aria-hidden="true"
+              class="text-muted mt-0.5 shrink-0"
+            />
+            <div class="flex min-w-0 flex-col gap-0.5">
+              <p class="text-fg text-xs font-medium">Each agent is its own conversation</p>
+              <p class="text-muted text-xs leading-5">
+                Every agent's CLI session keeps its own private history and context window, just
+                like a session in your terminal. An agent only ever sees the messages you send
+                <em>it</em> — never what you send the others. What you're reading in this unified view
+                is all of those conversations merged together, with every reply labeled by the agent it
+                came from.
+              </p>
+            </div>
+          </li>
+          <li class="flex gap-3">
+            <Columns2
+              size={16}
+              strokeWidth={1.8}
+              aria-hidden="true"
+              class="text-muted mt-0.5 shrink-0"
+            />
+            <div class="flex min-w-0 flex-col gap-0.5">
+              <p class="text-fg text-xs font-medium">Split the view into panes</p>
+              <p class="text-muted text-xs leading-5">
+                By default, every agent shares this unified view. Panes let you regroup it: each
+                pane shows only the agents you place in it, side by side with the others. Add a pane
+                with the + button in the title bar, or move an agent into its own pane from its ⋯
+                menu in the agents sidebar. Panes change only what you see — a message still goes to
+                whichever agents you select.
+              </p>
+            </div>
+          </li>
+          <li class="flex gap-3">
+            <Send
+              size={16}
+              strokeWidth={1.8}
+              aria-hidden="true"
+              class="text-muted mt-0.5 shrink-0"
+            />
+            <div class="flex min-w-0 flex-col gap-0.5">
+              <p class="text-fg text-xs font-medium">Pick recipients, then send</p>
+              <p class="text-muted text-xs leading-5">
+                A message goes only to the agents selected in the <span class="text-fg font-medium"
+                  >To</span
+                >
+                row — click the chips, press {@render kbd(`${shortcut("mod", "1")}–9`)}, or type
+                {@render kbd("@name")}. Idle agents start immediately; busy agents queue the message
+                and run it when they finish.
+              </p>
+            </div>
+          </li>
+          <li class="flex gap-3">
+            <!-- Custom fan-out glyph (one stem splitting into three branches,
+                 flowing left to right) — Lucide has no one-to-many icon that
+                 isn't a node graph. Drawn in Lucide's stroke style so it sits
+                 flush with the sibling icons. -->
+            <svg
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.8"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              aria-hidden="true"
+              class="text-muted mt-0.5 h-4 w-4 shrink-0"
+            >
+              <path d="M3 12h6" />
+              <path d="M9 12c4 0 4-7 12-7" />
+              <path d="M9 12h12" />
+              <path d="M9 12c4 0 4 7 12 7" />
+            </svg>
+            <div class="flex min-w-0 flex-col gap-0.5">
+              <p class="text-fg text-xs font-medium">Send to several agents at once</p>
+              <p class="text-muted text-xs leading-5">
+                Select several recipients and send once — the same message is sent to each agent,
+                and each works on it independently in its own conversation. Use it to compare
+                different approaches to one task, or to put several agents on the same job in
+                parallel — for example, multiple reviewers each examining the same change. The
+                replies render side by side under your message.
+              </p>
+            </div>
+          </li>
+          <li class="flex gap-3">
+            <CornerUpRight
+              size={16}
+              strokeWidth={1.8}
+              aria-hidden="true"
+              class="text-muted mt-0.5 shrink-0"
+            />
+            <div class="flex min-w-0 flex-col gap-0.5">
+              <p class="text-fg text-xs font-medium">Relay with Forward</p>
+              <p class="text-muted text-xs leading-5">
+                <span class="text-fg font-medium">↪ Forward</span> sends an agent's latest reply to other
+                agents — for example, have one CLI review another's plan. If the source agent is still
+                working, the forward waits and delivers automatically when it finishes.
+              </p>
+            </div>
+          </li>
+          <li class="flex gap-3">
+            <SquareSlash
+              size={16}
+              strokeWidth={1.8}
+              aria-hidden="true"
+              class="text-muted mt-0.5 shrink-0"
+            />
+            <div class="flex min-w-0 flex-col gap-0.5">
+              <p class="text-fg text-xs font-medium">Reuse saved prompts</p>
+              <p class="text-muted text-xs leading-5">
+                Type {@render kbd("/")} in an empty message box — or click
+                <span class="text-fg font-medium">Prompt</span> — to insert a saved prompt: a
+                reusable message template with fill-in fields, for anything you find yourself
+                retyping. Prompts are markdown files in a folder shared across all your projects —
+                open it with "Open local prompts folder…" in the Prompt menu. You can also pull
+                prompts from remote MCP servers (e.g. a hosted prompt library): add them under
+                "Prompt servers (MCP)" in Settings. An agent can write a local one for you; point it
+                at the authoring guide:
+                {@render guideLink(
+                  "https://github.com/shane-kercheval/switchboard/blob/main/docs/agent-instructions/prompts.md",
+                )}
+              </p>
+            </div>
+          </li>
+          <li class="flex gap-3">
+            <Workflow
+              size={16}
+              strokeWidth={1.8}
+              aria-hidden="true"
+              class="text-muted mt-0.5 shrink-0"
+            />
+            <div class="flex min-w-0 flex-col gap-0.5">
+              <p class="text-fg text-xs font-medium">Automate with workflows</p>
+              <p class="text-muted text-xs leading-5">
+                Click <span class="text-fg font-medium">Workflow</span> to run a multi-step sequence
+                over your agents — sends, forwards from one agent to another, and pauses for your
+                review, defined in a YAML file. Workflow files live in a folder shared across all
+                your projects — open it with "Open local workflows folder…" in the Workflow menu.
+                The best way to create one is to have an agent write it for you; point it at the
+                authoring guide:
+                {@render guideLink(
+                  "https://github.com/shane-kercheval/switchboard/blob/main/docs/agent-instructions/workflows.md",
+                )}
+              </p>
+            </div>
+          </li>
+        </ul>
+      </div>
+    {:else}
+      <p class="text-muted text-sm">No messages yet. Type a prompt below.</p>
+    {/if}
   {/if}
 
   <!-- Upward-reveal sentinel: older history exists above the window. Kept OUTSIDE
@@ -1601,6 +1837,10 @@
               return { key, defaultCompact: compactEnabled && !latestResponseKeys.has(key) };
             })}
           {@const fanoutCopyable = fanoutText(block.columns)}
+          {@const fanoutLiveCap = !block.columns.some((col) => {
+            const state = columnState(col.rows);
+            return state !== "queued" && state !== "streaming";
+          })}
           <div class="space-y-4" data-testid="fanout-group">
             {@render userMessage(block.user)}
             <!-- The group control lives with the responses (not the user prompt)
@@ -1697,6 +1937,8 @@
                           {#if r.kind === "agent"}{@render turnBody(
                               r.turn,
                               state === "streaming",
+                              "full",
+                              fanoutLiveCap,
                             )}{/if}
                         {/each}
                         {@render columnStatusChips(col.rows, colHasOutcome)}

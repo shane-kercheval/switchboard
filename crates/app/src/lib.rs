@@ -43,8 +43,8 @@ use crate::commands::{
     commit_file_diff_impl, commit_ranges_impl, copy_builtin_prompt_impl, create_agent_impl,
     create_project_impl, delete_project_impl, editor_open_argv, fetch_repo_impl, file_diff_impl,
     forward_message_impl, forward_prompt_impl, get_harness_install_status_impl,
-    get_preferences_impl, init_directory_impl, list_agents_impl, list_mcp_providers_impl,
-    list_projects_impl, list_prompts_impl, list_tracked_repos_from_inputs,
+    get_preferences_impl, get_prompt_source_impl, init_directory_impl, list_agents_impl,
+    list_mcp_providers_impl, list_projects_impl, list_prompts_impl, list_tracked_repos_from_inputs,
     list_workspace_directories_impl, load_project_conversation_impl, load_transcript_impl,
     open_commit_file_difftool_impl, open_project_impl, open_worktree_file_difftool_impl,
     parse_uuid, pick_directory_impl, project_session_fingerprints_impl,
@@ -70,7 +70,7 @@ use switchboard_core::{AgentRecord, Attachment, HarnessKind, ProjectId, ProjectS
 use switchboard_git::{
     BranchKind, ChangeKind, ChangedFile, CommitChanges, FileDiff, GitCommitRange,
 };
-use switchboard_prompts::{McpProviderInfo, Prompt, RenderedPrompt};
+use switchboard_prompts::{McpProviderInfo, Prompt, PromptSource, RenderedPrompt};
 use switchboard_workflow::InputValue;
 use uuid::Uuid;
 
@@ -182,6 +182,18 @@ async fn render_prompt(
     render_prompt_impl(state.inner(), &provider, &name, &args)
         .await
         .map_err(|e| e.to_string())
+}
+
+/// The raw, unrendered template body of a `builtin` or `local` prompt, for a
+/// read-only preview. `null` for an MCP provider (no un-rendered source over the
+/// protocol) or a prompt that doesn't resolve — the caller falls back to metadata.
+#[tauri::command]
+async fn get_prompt_source(
+    state: State<'_, AppState>,
+    provider: String,
+    name: String,
+) -> Result<Option<PromptSource>, String> {
+    Ok(get_prompt_source_impl(state.inner(), &provider, &name))
 }
 
 /// Rebuild the cached prompt list from all configured providers. Wired to the
@@ -1375,6 +1387,7 @@ pub fn run() {
             set_preferences,
             list_prompts,
             render_prompt,
+            get_prompt_source,
             sync_prompts,
             list_mcp_providers,
             add_mcp_provider,

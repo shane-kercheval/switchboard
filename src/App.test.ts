@@ -2019,6 +2019,37 @@ describe("App", () => {
     expect(layout.panes[1]!.members).toEqual([]);
   });
 
+  it("narrows pane one to the compose-selected agents on the first split, leaving the rest unassigned", async () => {
+    const panes = await import("$lib/state/transcriptPanes.svelte");
+    const selection = await import("$lib/state/recipientSelection.svelte");
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [
+        agent({ id: "ag-1", project_id: "p-a", name: "alice" }),
+        agent({ id: "ag-2", project_id: "p-a", name: "bob" }),
+        agent({ id: "ag-3", project_id: "p-a", name: "carol" }),
+      ],
+    });
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument());
+    await fireEvent.click(screen.getByText("alpha"));
+    await waitFor(() => expect(screen.getByTestId("app-pane-add")).toBeInTheDocument());
+
+    selection.setRecipients("p-a", ["ag-1", "ag-3"]);
+    await fireEvent.click(screen.getByTestId("app-pane-add"));
+
+    const roster = ["ag-1", "ag-2", "ag-3"];
+    const layout = panes.layoutFor("p-a", roster);
+    expect(layout.panes).toHaveLength(2);
+    expect(layout.panes[0]!.members).toEqual(["ag-1", "ag-3"]);
+    expect(layout.panes[1]!.members).toEqual([]);
+    expect(panes.unassignedAgentIds("p-a", roster)).toEqual(["ag-2"]);
+    // The compose selection itself is untouched.
+    expect(selection.selectionFor("p-a")).toEqual(["ag-1", "ag-3"]);
+  });
+
   it("restores and switches minimized panes from the app header", async () => {
     const panes = await import("$lib/state/transcriptPanes.svelte");
     const state = await import("$lib/state/index.svelte");

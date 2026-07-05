@@ -188,6 +188,60 @@ describe("membership (move / new pane / unassign)", () => {
     assertOptionalMembership(layout, ROSTER);
   });
 
+  it("on the first split, narrows pane one to the given selected ids and leaves the rest unassigned", () => {
+    const paneId = createEmptyPane(P, ROSTER, ["a", "c"]);
+    const layout = layoutFor(P, ROSTER);
+    expect(layout.panes[0]!.members).toEqual(["a", "c"]);
+    expect(layout.panes[1]!.id).toBe(paneId);
+    expect(layout.panes[1]!.members).toEqual([]);
+    expect(unassignedAgentIds(P, ROSTER)).toEqual(["b"]);
+    assertOptionalMembership(layout, ROSTER);
+  });
+
+  it("ignores non-roster ids in the selection when narrowing pane one", () => {
+    createEmptyPane(P, ROSTER, ["a", "not-a-real-agent"]);
+    const layout = layoutFor(P, ROSTER);
+    expect(layout.panes[0]!.members).toEqual(["a"]);
+    assertOptionalMembership(layout, ROSTER);
+  });
+
+  it("drops a hidden-but-unselected agent's hidden entry when narrowing pane one", () => {
+    toggleAgentHidden(P, ROSTER, "a");
+    createEmptyPane(P, ROSTER, ["b", "c"]);
+    const layout = layoutFor(P, ROSTER);
+    expect(layout.panes[0]!.members).toEqual(["b", "c"]);
+    expect(layout.panes[0]!.hidden).toEqual([]);
+  });
+
+  it("does not narrow an already-split layout on a later + click", () => {
+    moveAgentToNewPane(P, ROSTER, "b");
+    createEmptyPane(P, ROSTER, ["a"]);
+    const layout = layoutFor(P, ROSTER);
+    expect(layout.panes).toHaveLength(3);
+    expect(layout.panes[0]!.members).toEqual(["a", "c"]);
+    expect(layout.panes[1]!.members).toEqual(["b"]);
+    expect(layout.panes[2]!.members).toEqual([]);
+  });
+
+  it("does not narrow a single customized pane reached by closing back down to one", () => {
+    // Split b off, then close that pane: back to a single pane, but it's
+    // [a, c] with b unassigned — NOT the untouched unified default, even
+    // though panes.length is 1 again.
+    const pane2 = moveAgentToNewPane(P, ROSTER, "b");
+    closePane(P, ROSTER, pane2);
+    expect(layoutFor(P, ROSTER).panes).toHaveLength(1);
+    expect(unassignedAgentIds(P, ROSTER)).toEqual(["b"]);
+
+    // Selecting the unassigned agent alongside an already-placed one must not
+    // narrow the surviving pane down and must not pull b in.
+    createEmptyPane(P, ROSTER, ["a", "b"]);
+    const layout = layoutFor(P, ROSTER);
+    expect(layout.panes).toHaveLength(2);
+    expect(layout.panes[0]!.members).toEqual(["a", "c"]);
+    expect(layout.panes[1]!.members).toEqual([]);
+    expect(unassignedAgentIds(P, ROSTER)).toEqual(["b"]);
+  });
+
   it("starts an empty pane minimized when the row cannot fit another expanded pane", () => {
     setPaneRowWidth(800);
     moveAgentToNewPane(P, ROSTER, "b");

@@ -425,11 +425,38 @@ function newPaneStartsMinimized(layout: PaneLayout): boolean {
   );
 }
 
-export function createEmptyPane(projectId: ProjectId, rosterIds: AgentId[]): PaneId {
+/// Create a new rightmost pane, always empty. If the layout is still the
+/// **true unified default** — a single pane holding the *entire* live roster,
+/// not just any one-pane layout (closing a pane back down to one also leaves
+/// one pane, but with the rest unassigned rather than everyone present) —
+/// that pane is narrowed from "the whole roster" down to `selectedIds`, the
+/// live compose selection, so hitting the app-header `+` while working with a
+/// subset of agents keeps exactly that subset in pane one instead of
+/// dragging every roster agent along; agents dropped this way become
+/// unassigned, not moved to the new pane. An empty `selectedIds`, or any
+/// layout that isn't the untouched unified default, leaves every existing
+/// pane's membership untouched.
+export function createEmptyPane(
+  projectId: ProjectId,
+  rosterIds: AgentId[],
+  selectedIds: AgentId[] = [],
+): PaneId {
   const paneId = newPaneId();
   update(projectId, rosterIds, (layout) => {
+    const isUnifiedDefault =
+      layout.panes.length === 1 && sameMembers(layout.panes[0]!.members, rosterIds);
+    // Pure-function locals, never reactive state — plain Sets are correct here.
+    // eslint-disable-next-line svelte/prefer-svelte-reactivity
+    const selected = new Set(selectedIds.filter((id) => rosterIds.includes(id)));
     const panes = [
-      ...layout.panes,
+      ...layout.panes.map((pane) => {
+        if (!isUnifiedDefault || selected.size === 0) return pane;
+        return {
+          ...pane,
+          members: rosterIds.filter((id) => selected.has(id)),
+          hidden: pane.hidden.filter((id) => selected.has(id)),
+        };
+      }),
       { id: paneId, name: nextPaneName(layout.panes), members: [], hidden: [] },
     ];
     const minimized = newPaneStartsMinimized(layout)

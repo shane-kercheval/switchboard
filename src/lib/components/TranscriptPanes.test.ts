@@ -427,7 +427,8 @@ describe("pane chrome (headers, rename, close)", () => {
     const layout = layoutFor(PROJECT_ID, ROSTER_IDS);
     expect(layout.panes[1]!.members).toEqual([]);
     expect(within(paneB).queryByText("hello from bob")).not.toBeInTheDocument();
-    expect(within(paneB).getByTestId("pane-empty")).toHaveTextContent(/add one .* pane header/i);
+    expect(within(paneB).getByTestId("pane-empty")).toHaveTextContent(/this pane is empty/i);
+    expect(within(paneB).getByTestId("pane-empty")).toHaveTextContent(/add an agent from the/i);
   });
 
   it("the pane actions menu adds an unassigned agent", async () => {
@@ -575,7 +576,14 @@ describe("visibility", () => {
     renderPanes();
 
     expect(layoutFor(PROJECT_ID, ROSTER_IDS).panes[1]!.id).toBe(paneId);
-    expect(within(paneEls()[1]!).getByTestId("pane-empty")).toHaveTextContent(/move one here/i);
+    const empty = within(paneEls()[1]!).getByTestId("pane-empty");
+    expect(empty).toHaveTextContent(/move one here/i);
+    // The populate instruction interpolates the actual pane name (the sidebar
+    // menu item literally reads "Move to {pane}").
+    expect(empty).toHaveTextContent(/move to pane 2/i);
+    // Pane-mechanics tips ride along: targeting, minimize indicators, maximize.
+    expect(empty).toHaveTextContent(/windows onto the same conversation/i);
+    expect(empty).toHaveTextContent(/spinner while their agents work/i);
   });
 
   it("an empty pane is not a send target: no header affordance, Cmd+click is inert", async () => {
@@ -882,5 +890,48 @@ describe("pane header shortcut hints", () => {
     expect(content).toHaveTextContent("Send to Pane 3");
     expect(content).toHaveTextContent(shortcut("mod", "alt", "3"));
     expect(content).not.toHaveTextContent(shortcut("mod", "alt", "2"));
+  });
+});
+
+describe("empty-project and onboarding states", () => {
+  it("a project with no agents shows the add-agent empty state instead of panes", async () => {
+    const onAddAgent = vi.fn();
+    render(TranscriptPanes, {
+      props: { projectId: PROJECT_ID, agents: [], onAddAgent },
+    });
+
+    expect(screen.getByTestId("project-no-agents")).toBeInTheDocument();
+    expect(screen.queryByTestId("transcript-panes")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("pane-empty")).not.toBeInTheDocument();
+
+    await fireEvent.click(screen.getByTestId("project-no-agents-add"));
+    expect(onAddAgent).toHaveBeenCalledTimes(1);
+  });
+
+  it("the add-agent CTA is omitted when no handler is wired", async () => {
+    render(TranscriptPanes, { props: { projectId: PROJECT_ID, agents: [] } });
+
+    expect(screen.getByTestId("project-no-agents")).toBeInTheDocument();
+    expect(screen.queryByTestId("project-no-agents-add")).not.toBeInTheDocument();
+  });
+
+  it("a blank un-split project shows the orientation block", async () => {
+    const state = await loadState();
+    await state.registerAgent(ALICE);
+    await state.registerAgent(BOB);
+    renderPanes();
+
+    expect(screen.getByTestId("transcript-onboarding")).toBeInTheDocument();
+  });
+
+  it("split panes keep the one-line empty state, not the orientation block", async () => {
+    const state = await loadState();
+    await state.registerAgent(ALICE);
+    await state.registerAgent(BOB);
+    moveAgentToNewPane(PROJECT_ID, ROSTER_IDS, BOB.id);
+    renderPanes();
+
+    expect(screen.queryByTestId("transcript-onboarding")).not.toBeInTheDocument();
+    expect(screen.getAllByText(/no messages yet/i).length).toBeGreaterThan(0);
   });
 });

@@ -15,6 +15,8 @@
   import { Check, Maximize2, Minimize2, MoreHorizontal, Pencil, Square, X } from "@lucide/svelte";
   import type { AgentRecord, ConversationItem, ProjectId } from "$lib/types";
   import UnifiedTranscript from "$lib/components/UnifiedTranscript.svelte";
+  import Button from "$lib/components/ui/Button.svelte";
+  import EmptyState from "$lib/components/ui/EmptyState.svelte";
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
   import DropdownMenu from "$lib/components/ui/DropdownMenu.svelte";
   import DropdownMenuItem from "$lib/components/ui/DropdownMenuItem.svelte";
@@ -57,6 +59,7 @@
     loadError,
     onRetryLoad,
     runWithBusy = (action: () => void) => action(),
+    onAddAgent,
   }: {
     projectId: ProjectId;
     agents: AgentRecord[];
@@ -68,6 +71,10 @@
     /// host's busy spinner. Supplied by `App` (the overlay lives there);
     /// defaults to running immediately so standalone/test mounts stay synchronous.
     runWithBusy?: (action: () => void) => void;
+    /// Open the add-agent flow — same handler as the sidebar's "+". Drives the
+    /// CTA on the zero-agent empty state; absent → the state renders without
+    /// a button (standalone/test mounts).
+    onAddAgent?: () => void;
   } = $props();
 
   const rosterIds = $derived(agents.map((a) => a.id));
@@ -381,336 +388,384 @@
   class="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden"
   data-testid="transcript-panes-shell"
 >
-  <div
-    bind:this={rowEl}
-    bind:clientWidth={rowWidth}
-    class="flex min-h-0 min-w-0 flex-1 overflow-hidden"
-    data-testid="transcript-panes"
-  >
-    {#each renderPanes as item, i (item.pane.id)}
-      {@const pane = item.pane}
-      {@const visible = paneAgents(pane)}
-      {@const cov = multiPane && !workflowActive ? coverage(pane) : "none"}
-      {@const active = paneIsActive(pane)}
-      {#if i > 0 && maximizedPane === null}
-        <div
-          role="separator"
-          aria-orientation="vertical"
-          aria-label="Resize panes"
-          data-testid={`pane-gutter-${i}`}
-          class="bg-border/80 hover:bg-accent/70 w-1 shrink-0 cursor-col-resize transition-colors"
-          onpointerdown={(event) => startResize(i - 1, event)}
-        ></div>
-      {/if}
-      <!-- Cmd+click targets the pane; plain clicks pass through untouched, so a
+  {#if agents.length === 0}
+    <!-- Brand-new project: no agents yet, so there is nothing to render panes
+         for and nothing to send to. Without this branch the empty-pane copy
+         below would show ("No agents in this pane…") while referencing pane
+         chrome that is hidden in the single-pane default — a dead end. -->
+    <EmptyState
+      title="Add an agent to get started"
+      description="An agent is one coding CLI session — Claude Code, Codex, and others — working in this project's directory. Add one to start the conversation; add several to fan work out and compare their results."
+      testid="project-no-agents"
+    >
+      {#snippet action()}
+        {#if onAddAgent}
+          <Button onclick={onAddAgent} data-testid="project-no-agents-add">Add agent</Button>
+        {/if}
+      {/snippet}
+    </EmptyState>
+  {:else}
+    <div
+      bind:this={rowEl}
+      bind:clientWidth={rowWidth}
+      class="flex min-h-0 min-w-0 flex-1 overflow-hidden"
+      data-testid="transcript-panes"
+    >
+      {#each renderPanes as item, i (item.pane.id)}
+        {@const pane = item.pane}
+        {@const visible = paneAgents(pane)}
+        {@const cov = multiPane && !workflowActive ? coverage(pane) : "none"}
+        {@const active = paneIsActive(pane)}
+        {#if i > 0 && maximizedPane === null}
+          <div
+            role="separator"
+            aria-orientation="vertical"
+            aria-label="Resize panes"
+            data-testid={`pane-gutter-${i}`}
+            class="bg-border/80 hover:bg-accent/70 w-1 shrink-0 cursor-col-resize transition-colors"
+            onpointerdown={(event) => startResize(i - 1, event)}
+          ></div>
+        {/if}
+        <!-- Cmd+click targets the pane; plain clicks pass through untouched, so a
          click-to-read can never re-aim a half-typed draft. Keyboard targeting
          exists via Cmd+Alt+1..N. -->
-      <!-- svelte-ignore a11y_click_events_have_key_events -->
-      <!-- svelte-ignore a11y_no_static_element_interactions -->
-      <section
-        class="relative flex min-w-0 flex-col overflow-hidden"
-        style:flex={`${renderFractions[i] ?? 1} 1 0%`}
-        style:min-width={multiPane && maximizedPane === null ? `${MIN_PANE_WIDTH_PX}px` : undefined}
-        data-testid="transcript-pane"
-        data-pane-id={pane.id}
-        data-coverage={multiPane && maximizedPane === null ? cov : undefined}
-        data-maximized={maximizedPane?.id === pane.id}
-        onclick={(event) => onPaneClick(pane, event)}
-        onpointerenter={() => {
-          hoveredPaneId = pane.id;
-          if (cmdOnlyHeld) cmdPointerMoved = true;
-        }}
-        onpointerleave={() => (hoveredPaneId = hoveredPaneId === pane.id ? null : hoveredPaneId)}
-      >
-        {#if paneChrome}
-          <header
-            class="border-border/80 bg-raised flex h-8 shrink-0 items-center gap-1 border-b px-2"
-            data-testid="pane-header"
-          >
-            {#if renamingPaneId === pane.id}
-              <input
-                use:focusSelect
-                bind:value={renameDraft}
-                autocorrect="off"
-                autocapitalize="off"
-                spellcheck="false"
-                class="text-fg border-border bg-panel focus-visible:ring-accent h-6 min-w-0 flex-1 rounded border px-1.5 text-xs font-semibold focus-visible:ring-1 focus-visible:outline-none"
-                aria-label="Pane name"
-                data-testid="pane-rename-input"
-                onkeydown={onRenameKeydown}
-                onblur={cancelRename}
-              />
-              <Tooltip label="Save pane name">
-                {#snippet trigger(props)}
-                  <button
-                    {...props}
-                    type="button"
-                    class={cn(ICON_BUTTON_CLASS, "hover:bg-border/60 shrink-0")}
-                    aria-label="Save pane name"
-                    data-testid="pane-rename-save"
-                    onmousedown={(event) => event.preventDefault()}
-                    onclick={commitRename}
-                  >
-                    <Check size={14} strokeWidth={2} aria-hidden="true" />
-                  </button>
-                {/snippet}
-              </Tooltip>
-            {:else}
-              {#if pane.members.length === 0}
-                <!-- An empty pane is not a send target — a "Send to" affordance
-                   here could only clear the recipient set. Plain name; the
-                   pane body explains how to populate it. -->
-                <span
-                  class="text-muted flex h-6 min-w-0 flex-1 items-center px-1.5 text-xs font-semibold"
-                  data-testid="pane-name"
-                >
-                  {pane.name}
-                </span>
-              {:else if multiPane}
-                <Tooltip
-                  label={`Send to ${pane.name}`}
-                  shortcut={item.originalIndex < 9
-                    ? shortcut("mod", "alt", String(item.originalIndex + 1))
-                    : undefined}
-                >
+        <!-- svelte-ignore a11y_click_events_have_key_events -->
+        <!-- svelte-ignore a11y_no_static_element_interactions -->
+        <section
+          class="relative flex min-w-0 flex-col overflow-hidden"
+          style:flex={`${renderFractions[i] ?? 1} 1 0%`}
+          style:min-width={multiPane && maximizedPane === null
+            ? `${MIN_PANE_WIDTH_PX}px`
+            : undefined}
+          data-testid="transcript-pane"
+          data-pane-id={pane.id}
+          data-coverage={multiPane && maximizedPane === null ? cov : undefined}
+          data-maximized={maximizedPane?.id === pane.id}
+          onclick={(event) => onPaneClick(pane, event)}
+          onpointerenter={() => {
+            hoveredPaneId = pane.id;
+            if (cmdOnlyHeld) cmdPointerMoved = true;
+          }}
+          onpointerleave={() => (hoveredPaneId = hoveredPaneId === pane.id ? null : hoveredPaneId)}
+        >
+          {#if paneChrome}
+            <header
+              class="border-border/80 bg-raised flex h-8 shrink-0 items-center gap-1 border-b px-2"
+              data-testid="pane-header"
+            >
+              {#if renamingPaneId === pane.id}
+                <input
+                  use:focusSelect
+                  bind:value={renameDraft}
+                  autocorrect="off"
+                  autocapitalize="off"
+                  spellcheck="false"
+                  class="text-fg border-border bg-panel focus-visible:ring-accent h-6 min-w-0 flex-1 rounded border px-1.5 text-xs font-semibold focus-visible:ring-1 focus-visible:outline-none"
+                  aria-label="Pane name"
+                  data-testid="pane-rename-input"
+                  onkeydown={onRenameKeydown}
+                  onblur={cancelRename}
+                />
+                <Tooltip label="Save pane name">
                   {#snippet trigger(props)}
                     <button
                       {...props}
                       type="button"
-                      class="hover:bg-panel flex h-6 min-w-0 items-center rounded px-1.5 text-left"
-                      data-testid="pane-target"
-                      onclick={() => targetPane(pane)}
+                      class={cn(ICON_BUTTON_CLASS, "hover:bg-border/60 shrink-0")}
+                      aria-label="Save pane name"
+                      data-testid="pane-rename-save"
+                      onmousedown={(event) => event.preventDefault()}
+                      onclick={commitRename}
                     >
-                      <span class="text-fg truncate text-xs font-semibold" data-testid="pane-name">
-                        {pane.name}
-                      </span>
+                      <Check size={14} strokeWidth={2} aria-hidden="true" />
                     </button>
                   {/snippet}
                 </Tooltip>
               {:else}
-                <span
-                  class="text-fg flex h-6 min-w-0 items-center px-1.5 text-xs font-semibold"
-                  data-testid="pane-name"
-                >
-                  {pane.name}
-                </span>
-              {/if}
-              <div class="flex min-w-0 flex-1 items-center gap-1 overflow-hidden">
-                {#each paneMemberAgents(pane) as member (member.id)}
+                {#if pane.members.length === 0}
+                  <!-- An empty pane is not a send target — a "Send to" affordance
+                   here could only clear the recipient set. Plain name; the
+                   pane body explains how to populate it. -->
                   <span
-                    class="border-border bg-panel text-fg inline-flex h-5 max-w-28 min-w-0 items-center gap-1 rounded-full border px-1.5 text-[11px]"
-                    data-testid="pane-member-chip"
-                    data-agent-id={member.id}
+                    class="text-muted flex h-6 min-w-0 flex-1 items-center px-1.5 text-xs font-semibold"
+                    data-testid="pane-name"
                   >
-                    <HarnessIcon harness={member.harness} size="sm" class="h-3 w-3 shrink-0" />
-                    <span class="truncate">{member.name}</span>
-                    <button
-                      type="button"
-                      class="text-muted hover:text-status-failed hover:border-status-failed hover:bg-status-failed-soft/70 -mr-1 inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-full border border-transparent"
-                      aria-label={`Remove ${member.name} from ${pane.name}`}
-                      data-testid="pane-member-remove"
-                      onclick={(event) => {
-                        event.stopPropagation();
-                        unassignAgentFromPane(projectId, rosterIds, member.id);
-                        deselectAgent(projectId, member.id);
-                      }}
-                    >
-                      <X size={10} strokeWidth={2} aria-hidden="true" />
-                    </button>
+                    {pane.name}
                   </span>
-                {/each}
-              </div>
-              {#if active}
-                <span
-                  class="text-muted inline-flex h-[26px] w-[26px] shrink-0 items-center justify-center"
-                  role="status"
-                  aria-label={`${pane.name} has running agents`}
-                  data-testid="pane-activity"
-                >
-                  <Spinner class="h-4 w-4" />
-                </span>
-              {/if}
-              {#if layout.panes.length > 2 && maximizedPane === null && renderPanes.length > 1}
-                <Tooltip label={`Minimize ${pane.name}`}>
-                  {#snippet trigger(props)}
-                    <button
-                      {...props}
-                      type="button"
-                      class={cn(ICON_BUTTON_CLASS, "hover:bg-border/60 shrink-0")}
-                      aria-label={`Minimize ${pane.name}`}
-                      data-testid="pane-minimize"
-                      onclick={(event) => {
-                        event.stopPropagation();
-                        minimizePaneBusy(pane);
-                      }}
+                {:else if multiPane}
+                  <Tooltip
+                    label={`Send to ${pane.name}`}
+                    shortcut={item.originalIndex < 9
+                      ? shortcut("mod", "alt", String(item.originalIndex + 1))
+                      : undefined}
+                  >
+                    {#snippet trigger(props)}
+                      <button
+                        {...props}
+                        type="button"
+                        class="hover:bg-panel flex h-6 min-w-0 items-center rounded px-1.5 text-left"
+                        data-testid="pane-target"
+                        onclick={() => targetPane(pane)}
+                      >
+                        <span
+                          class="text-fg truncate text-xs font-semibold"
+                          data-testid="pane-name"
+                        >
+                          {pane.name}
+                        </span>
+                      </button>
+                    {/snippet}
+                  </Tooltip>
+                {:else}
+                  <span
+                    class="text-fg flex h-6 min-w-0 items-center px-1.5 text-xs font-semibold"
+                    data-testid="pane-name"
+                  >
+                    {pane.name}
+                  </span>
+                {/if}
+                <div class="flex min-w-0 flex-1 items-center gap-1 overflow-hidden">
+                  {#each paneMemberAgents(pane) as member (member.id)}
+                    <span
+                      class="border-border bg-panel text-fg inline-flex h-5 max-w-28 min-w-0 items-center gap-1 rounded-full border px-1.5 text-[11px]"
+                      data-testid="pane-member-chip"
+                      data-agent-id={member.id}
                     >
-                      <Minimize2 size={12} strokeWidth={1.8} aria-hidden="true" />
-                    </button>
-                  {/snippet}
-                </Tooltip>
-              {/if}
-              {#if multiPane}
-                <Tooltip
-                  label={maximizedPane?.id === pane.id ? "Restore panes" : `Maximize ${pane.name}`}
-                >
-                  {#snippet trigger(props)}
-                    <button
-                      {...props}
-                      type="button"
-                      class={cn(ICON_BUTTON_CLASS, "hover:bg-border/60 shrink-0")}
-                      aria-label={maximizedPane?.id === pane.id
-                        ? "Restore panes"
-                        : `Maximize ${pane.name}`}
-                      data-testid="pane-maximize"
-                      onclick={(event) => {
-                        event.stopPropagation();
-                        toggleMaximizePaneBusy(pane);
-                      }}
-                    >
-                      {#if maximizedPane?.id === pane.id}
+                      <HarnessIcon harness={member.harness} size="sm" class="h-3 w-3 shrink-0" />
+                      <span class="truncate">{member.name}</span>
+                      <button
+                        type="button"
+                        class="text-muted hover:text-status-failed hover:border-status-failed hover:bg-status-failed-soft/70 -mr-1 inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-full border border-transparent"
+                        aria-label={`Remove ${member.name} from ${pane.name}`}
+                        data-testid="pane-member-remove"
+                        onclick={(event) => {
+                          event.stopPropagation();
+                          unassignAgentFromPane(projectId, rosterIds, member.id);
+                          deselectAgent(projectId, member.id);
+                        }}
+                      >
+                        <X size={10} strokeWidth={2} aria-hidden="true" />
+                      </button>
+                    </span>
+                  {/each}
+                </div>
+                {#if active}
+                  <span
+                    class="text-muted inline-flex h-[26px] w-[26px] shrink-0 items-center justify-center"
+                    role="status"
+                    aria-label={`${pane.name} has running agents`}
+                    data-testid="pane-activity"
+                  >
+                    <Spinner class="h-4 w-4" />
+                  </span>
+                {/if}
+                {#if layout.panes.length > 2 && maximizedPane === null && renderPanes.length > 1}
+                  <Tooltip label={`Minimize ${pane.name}`}>
+                    {#snippet trigger(props)}
+                      <button
+                        {...props}
+                        type="button"
+                        class={cn(ICON_BUTTON_CLASS, "hover:bg-border/60 shrink-0")}
+                        aria-label={`Minimize ${pane.name}`}
+                        data-testid="pane-minimize"
+                        onclick={(event) => {
+                          event.stopPropagation();
+                          minimizePaneBusy(pane);
+                        }}
+                      >
                         <Minimize2 size={12} strokeWidth={1.8} aria-hidden="true" />
-                      {:else}
-                        <Maximize2 size={12} strokeWidth={1.8} aria-hidden="true" />
-                      {/if}
-                    </button>
-                  {/snippet}
-                </Tooltip>
-              {/if}
-              <DropdownMenu
-                triggerLabel={`Actions for ${pane.name}`}
-                triggerTestid="pane-actions"
-                triggerClass={cn(ICON_BUTTON_CLASS, "hover:bg-border/60 shrink-0")}
-                contentTestid="pane-actions-menu"
-              >
-                {#snippet trigger()}
-                  <MoreHorizontal size={14} strokeWidth={1.8} aria-hidden="true" />
-                {/snippet}
-                {#each agents as agent (agent.id)}
-                  {@const alreadyInPane = pane.members.includes(agent.id)}
-                  {@const currentPane = layout.panes.find((p) => p.members.includes(agent.id))}
-                  <DropdownMenuItem
-                    onSelect={() => {
-                      moveAgentToPane(projectId, rosterIds, agent.id, pane.id);
-                      selectAgent(projectId, agent.id);
-                    }}
-                    disabled={alreadyInPane}
-                    class="gap-2"
-                    data-testid={`pane-add-agent-${agent.id}`}
+                      </button>
+                    {/snippet}
+                  </Tooltip>
+                {/if}
+                {#if multiPane}
+                  <Tooltip
+                    label={maximizedPane?.id === pane.id
+                      ? "Restore panes"
+                      : `Maximize ${pane.name}`}
                   >
-                    <HarnessIcon harness={agent.harness} size="sm" class="h-3.5 w-3.5 shrink-0" />
-                    <span class="min-w-0 flex-1 truncate">{agent.name}</span>
-                    {#if alreadyInPane}
-                      <span class="text-muted text-xs">in pane</span>
-                    {:else if currentPane !== undefined}
-                      <span class="text-muted text-xs">move</span>
-                    {:else}
-                      <span class="text-muted text-xs">add</span>
-                    {/if}
-                  </DropdownMenuItem>
-                {/each}
-                <DropdownMenuItem
-                  onSelect={() => startRename(pane)}
-                  class="gap-2"
-                  data-testid="pane-rename"
+                    {#snippet trigger(props)}
+                      <button
+                        {...props}
+                        type="button"
+                        class={cn(ICON_BUTTON_CLASS, "hover:bg-border/60 shrink-0")}
+                        aria-label={maximizedPane?.id === pane.id
+                          ? "Restore panes"
+                          : `Maximize ${pane.name}`}
+                        data-testid="pane-maximize"
+                        onclick={(event) => {
+                          event.stopPropagation();
+                          toggleMaximizePaneBusy(pane);
+                        }}
+                      >
+                        {#if maximizedPane?.id === pane.id}
+                          <Minimize2 size={12} strokeWidth={1.8} aria-hidden="true" />
+                        {:else}
+                          <Maximize2 size={12} strokeWidth={1.8} aria-hidden="true" />
+                        {/if}
+                      </button>
+                    {/snippet}
+                  </Tooltip>
+                {/if}
+                <DropdownMenu
+                  triggerLabel={`Actions for ${pane.name}`}
+                  triggerTestid="pane-actions"
+                  triggerClass={cn(ICON_BUTTON_CLASS, "hover:bg-border/60 shrink-0")}
+                  contentTestid="pane-actions-menu"
                 >
-                  <Pencil size={14} strokeWidth={1.8} aria-hidden="true" />
-                  Rename pane
-                </DropdownMenuItem>
-                {#if layout.panes.length > 1}
+                  {#snippet trigger()}
+                    <MoreHorizontal size={14} strokeWidth={1.8} aria-hidden="true" />
+                  {/snippet}
+                  {#each agents as agent (agent.id)}
+                    {@const alreadyInPane = pane.members.includes(agent.id)}
+                    {@const currentPane = layout.panes.find((p) => p.members.includes(agent.id))}
+                    <DropdownMenuItem
+                      onSelect={() => {
+                        moveAgentToPane(projectId, rosterIds, agent.id, pane.id);
+                        selectAgent(projectId, agent.id);
+                      }}
+                      disabled={alreadyInPane}
+                      class="gap-2"
+                      data-testid={`pane-add-agent-${agent.id}`}
+                    >
+                      <HarnessIcon harness={agent.harness} size="sm" class="h-3.5 w-3.5 shrink-0" />
+                      <span class="min-w-0 flex-1 truncate">{agent.name}</span>
+                      {#if alreadyInPane}
+                        <span class="text-muted text-xs">in pane</span>
+                      {:else if currentPane !== undefined}
+                        <span class="text-muted text-xs">move</span>
+                      {:else}
+                        <span class="text-muted text-xs">add</span>
+                      {/if}
+                    </DropdownMenuItem>
+                  {/each}
                   <DropdownMenuItem
-                    onSelect={() => handleClosePane(pane)}
-                    class="items-start gap-2"
-                    data-testid="pane-close"
+                    onSelect={() => startRename(pane)}
+                    class="gap-2"
+                    data-testid="pane-rename"
                   >
-                    <X size={14} strokeWidth={1.8} aria-hidden="true" class="mt-0.5 shrink-0" />
-                    <span class="flex min-w-0 flex-col">
-                      <span>Close pane</span>
-                      <span class="text-muted text-xs leading-4">
-                        Agents become unassigned and keep working.
-                      </span>
-                    </span>
+                    <Pencil size={14} strokeWidth={1.8} aria-hidden="true" />
+                    Rename pane
                   </DropdownMenuItem>
-                {/if}
-                {#if layout.panes.length > 1 || unassignedIds.length > 0}
-                  <DropdownMenuItem
-                    onSelect={handleReturnToUnified}
-                    class="items-start gap-2"
-                    data-testid="pane-return-unified"
-                  >
-                    <Square
-                      size={14}
-                      strokeWidth={1.8}
-                      aria-hidden="true"
-                      class="mt-0.5 shrink-0"
-                    />
-                    <span class="flex min-w-0 flex-col">
-                      <span>Return to unified view</span>
-                      <span class="text-muted text-xs leading-4">
-                        Show every agent together in one pane.
+                  {#if layout.panes.length > 1}
+                    <DropdownMenuItem
+                      onSelect={() => handleClosePane(pane)}
+                      class="items-start gap-2"
+                      data-testid="pane-close"
+                    >
+                      <X size={14} strokeWidth={1.8} aria-hidden="true" class="mt-0.5 shrink-0" />
+                      <span class="flex min-w-0 flex-col">
+                        <span>Close pane</span>
+                        <span class="text-muted text-xs leading-4">
+                          Agents become unassigned and keep working.
+                        </span>
                       </span>
-                    </span>
-                  </DropdownMenuItem>
-                {/if}
-              </DropdownMenu>
-            {/if}
-          </header>
-        {/if}
-        {#if visible.length === 0}
-          <div
-            class="text-muted flex flex-1 flex-col items-center justify-center gap-2 p-6 text-center text-xs"
-            data-testid="pane-empty"
-          >
-            {#if pane.members.length === 0}
-              <p>
-                No agents in this pane — add one from the pane header or move one here from the
-                agents sidebar.
-              </p>
-            {:else}
-              <p>All agents in this pane are hidden.</p>
-              <button
-                type="button"
-                class="text-accent hover:underline"
-                data-testid="pane-show-all"
-                onclick={() => showAllInPane(projectId, rosterIds, pane.id)}
-              >
-                Show all
-              </button>
-            {/if}
-          </div>
-        {:else}
-          <UnifiedTranscript
-            {projectId}
-            agents={visible}
-            {overlay}
-            {loadStatus}
-            {loadError}
-            {onRetryLoad}
-          />
-        {/if}
-        {#if multiPane && maximizedPane === null && cov !== "none"}
-          <div
-            class={cn(
-              "pointer-events-none absolute inset-0 z-10 ring-2 ring-inset",
-              COVERAGE_RING[cov],
-            )}
-            data-testid="pane-coverage"
-          ></div>
-        {/if}
-        {#if multiPane && maximizedPane === null && cmdOnlyHeld && cmdPointerMoved && hoveredPaneId === pane.id && pane.members.length > 0}
-          <div
-            class="ring-accent pointer-events-none absolute inset-0 z-10 flex items-start justify-center ring-2 ring-inset"
-            data-testid="pane-target-overlay"
-          >
-            <span
-              class="bg-accent-soft text-fg mt-10 rounded-full px-2.5 py-0.5 text-xs font-medium shadow"
+                    </DropdownMenuItem>
+                  {/if}
+                  {#if layout.panes.length > 1 || unassignedIds.length > 0}
+                    <DropdownMenuItem
+                      onSelect={handleReturnToUnified}
+                      class="items-start gap-2"
+                      data-testid="pane-return-unified"
+                    >
+                      <Square
+                        size={14}
+                        strokeWidth={1.8}
+                        aria-hidden="true"
+                        class="mt-0.5 shrink-0"
+                      />
+                      <span class="flex min-w-0 flex-col">
+                        <span>Return to unified view</span>
+                        <span class="text-muted text-xs leading-4">
+                          Show every agent together in one pane.
+                        </span>
+                      </span>
+                    </DropdownMenuItem>
+                  {/if}
+                </DropdownMenu>
+              {/if}
+            </header>
+          {/if}
+          {#if visible.length === 0}
+            <div
+              class="text-muted flex flex-1 flex-col items-center justify-center gap-2 p-6 text-center text-xs"
+              data-testid="pane-empty"
             >
-              Send to {pane.name} — {shortcut("mod", "click")}{item.originalIndex < 9
-                ? ` · ${shortcut("mod", "alt", String(item.originalIndex + 1))}`
-                : ""}
-            </span>
-          </div>
-        {/if}
-      </section>
-    {/each}
-  </div>
+              {#if pane.members.length === 0}
+                <div class="flex max-w-sm flex-col gap-3">
+                  <p class="text-fg font-medium">This pane is empty</p>
+                  <p class="leading-5">
+                    Add an agent from the ⋯ menu above, or move one here with "Move to {pane.name}"
+                    in an agent's ⋯ menu in the agents sidebar.
+                  </p>
+                  <ul class="border-border flex flex-col gap-2 border-t pt-3 text-left leading-5">
+                    <li>
+                      Panes are windows onto the same conversation — each shows only its own agents'
+                      messages. They change only what you see: a message still goes to whichever
+                      agents you select, wherever their panes are.
+                    </li>
+                    <li>
+                      {shortcut("mod", "click")} a pane (or press {shortcut("mod", "alt", "1")}–9)
+                      to make its agents the send recipients.
+                    </li>
+                    <li>
+                      Minimize panes you're not watching: their tab in the title bar shows a spinner
+                      while their agents work and a ✓ once they finish.
+                    </li>
+                    <li>
+                      Maximize focuses one pane; the rest wait as tabs in the title bar until you
+                      restore them.
+                    </li>
+                  </ul>
+                </div>
+              {:else}
+                <p>All agents in this pane are hidden.</p>
+                <button
+                  type="button"
+                  class="text-accent hover:underline"
+                  data-testid="pane-show-all"
+                  onclick={() => showAllInPane(projectId, rosterIds, pane.id)}
+                >
+                  Show all
+                </button>
+              {/if}
+            </div>
+          {:else}
+            <UnifiedTranscript
+              {projectId}
+              agents={visible}
+              {overlay}
+              {loadStatus}
+              {loadError}
+              {onRetryLoad}
+              showOnboarding={!paneChrome}
+            />
+          {/if}
+          {#if multiPane && maximizedPane === null && cov !== "none"}
+            <div
+              class={cn(
+                "pointer-events-none absolute inset-0 z-10 ring-2 ring-inset",
+                COVERAGE_RING[cov],
+              )}
+              data-testid="pane-coverage"
+            ></div>
+          {/if}
+          {#if multiPane && maximizedPane === null && cmdOnlyHeld && cmdPointerMoved && hoveredPaneId === pane.id && pane.members.length > 0}
+            <div
+              class="ring-accent pointer-events-none absolute inset-0 z-10 flex items-start justify-center ring-2 ring-inset"
+              data-testid="pane-target-overlay"
+            >
+              <span
+                class="bg-accent-soft text-fg mt-10 rounded-full px-2.5 py-0.5 text-xs font-medium shadow"
+              >
+                Send to {pane.name} — {shortcut("mod", "click")}{item.originalIndex < 9
+                  ? ` · ${shortcut("mod", "alt", String(item.originalIndex + 1))}`
+                  : ""}
+              </span>
+            </div>
+          {/if}
+        </section>
+      {/each}
+    </div>
+  {/if}
 </div>

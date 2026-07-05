@@ -109,8 +109,19 @@ pub enum ContextWindowSource {
 /// number for Codex). `context_window` for Claude comes from
 /// `result.modelUsage.<model>.contextWindow`; for Codex it's populated by
 /// post-terminal session-file enrichment. The remaining `*_tokens` fields
-/// mirror exactly what the harness reported — do not normalize them; the
-/// reconciled occupancy value lives in `context_input_tokens` instead.
+/// mirror what the harness reported *per turn* — do not normalize them; the
+/// reconciled occupancy value lives in `context_input_tokens` instead. For
+/// Codex "per turn" requires a substitution: the stream's
+/// `turn.completed.usage` carries **thread-cumulative** totals (restored
+/// from the rollout on resume), so the post-terminal enrichment replaces
+/// the token fields with the session file's per-turn `last_token_usage` —
+/// see `codex/mod.rs::apply_per_turn_usage`. That substitution holds
+/// **only when enrichment succeeds**: on the degraded path (session file
+/// unreadable, or the turn wrote no parseable usage record) the Codex
+/// token fields remain the stream's thread-cumulative values, and
+/// `context_input_tokens: None` is the sole guard keeping the UI honest —
+/// any future Codex token display must gate on it (or re-derive from the
+/// session file), never render the raw fields directly.
 ///
 /// `context_input_tokens` is **derived, not raw**: the total input-side
 /// tokens occupying the context window after this turn, reconciled by the

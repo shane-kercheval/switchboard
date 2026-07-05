@@ -69,13 +69,25 @@
   function openSetup(harness: HarnessKind): void {
     void api.openExternalUrl(HARNESS_SETUP_URL[harness]);
   }
+
+  /// Table-only display order: Antigravity ahead of Gemini — Antigravity
+  /// superseded Gemini for individual Google accounts (2026-06-18), and the
+  /// Gemini row carries the availability note, so it reads better last.
+  /// Derived from ALL_HARNESSES rather than a literal array so a new
+  /// HarnessKind can't be silently dropped from this table. The global
+  /// insertion order stays untouched — it governs auto-create sequencing
+  /// and the picker (see harnessDisplay).
+  const DISPLAY_ORDER: HarnessKind[] = [
+    ...ALL_HARNESSES.filter((h) => h !== "gemini"),
+    ...ALL_HARNESSES.filter((h) => h === "gemini"),
+  ];
 </script>
 
 <ul
   data-testid="harness-status"
   class="border-border divide-border/60 flex flex-col divide-y rounded-lg border"
 >
-  {#each ALL_HARNESSES as harness (harness)}
+  {#each DISPLAY_ORDER as harness (harness)}
     {@const install = harnessAvailability.status(harness)}
     {@const installing = install === null}
     {@const installed = install?.installed === true}
@@ -134,6 +146,16 @@
           <span class="text-warning">{HARNESS_LOGIN_HINT[harness]}</span>
         {/if}
       </span>
+
+      {#if harness === "gemini"}
+        <!-- Full-row availability note (spans all four grid columns).
+             Individual-tier Gemini access moved to Antigravity on 2026-06-18;
+             see docs/harness-update-review.md for the tier terminology. -->
+        <p class="text-muted col-span-4 pt-1 text-xs leading-5" data-testid="harness-note-gemini">
+          Gemini is no longer available on individual Google accounts — replaced by Antigravity. It
+          still works if you have an organization plan (Gemini Code Assist Standard or Enterprise).
+        </p>
+      {/if}
     </li>
   {/each}
 </ul>

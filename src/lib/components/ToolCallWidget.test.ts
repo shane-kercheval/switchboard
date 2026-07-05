@@ -36,9 +36,35 @@ function summaryOf(el: HTMLElement): HTMLElement {
 }
 
 describe("ToolCallWidget disclosure", () => {
-  it("opens while running and auto-collapses on completion when untouched", async () => {
+  it("shows a one-line input preview in the collapsed row", () => {
+    const { getByTestId } = render(ToolCallWidget, {
+      tool: { ...done, input: { command: "git status --short --branch && git log --oneline -1" } },
+    });
+
+    expect(getByTestId("tool-input-preview")).toHaveTextContent(
+      "git status --short --branch && git log --oneline -1",
+    );
+  });
+
+  it("renders input and output as separate expanded sections", async () => {
+    const { getByTestId } = render(ToolCallWidget, {
+      tool: {
+        ...done,
+        input: { file_path: "/tmp/file.txt", old_string: "before", new_string: "after" },
+      },
+    });
+    const tool = getByTestId("turn-tool");
+
+    await fireEvent.click(summaryOf(tool));
+
+    expect(getByTestId("tool-input")).toHaveTextContent('"file_path": "/tmp/file.txt"');
+    expect(getByTestId("tool-input")).toHaveTextContent('"old_string": "before"');
+    expect(getByTestId("tool-output")).toHaveTextContent("hi");
+  });
+
+  it("stays collapsed while running and after completion when untouched", async () => {
     const { getByTestId, rerender } = render(ToolCallWidget, { tool: running });
-    expect(getByTestId("turn-tool")).toHaveAttribute("open");
+    expect(getByTestId("turn-tool")).not.toHaveAttribute("open");
 
     await rerender({ tool: done });
     expect(getByTestId("turn-tool")).not.toHaveAttribute("open");
@@ -47,8 +73,6 @@ describe("ToolCallWidget disclosure", () => {
   it("does not yank the panel shut on completion once the user has toggled it", async () => {
     const { getByTestId, rerender } = render(ToolCallWidget, { tool: running });
     const tool = getByTestId("turn-tool");
-    // User collapses the running tool, then re-opens it — now it's their choice.
-    await fireEvent.click(summaryOf(tool));
     await fireEvent.click(summaryOf(tool));
     expect(tool).toHaveAttribute("open");
 

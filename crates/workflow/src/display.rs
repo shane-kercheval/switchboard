@@ -66,8 +66,20 @@ pub enum StepPrompt {
     /// A named prompt referenced by id (e.g. `builtin:code-review`). The id keeps
     /// its `provider:name` form; the view shows the name and the full id on hover.
     Named { id: String },
-    /// The send carries inline text rather than a named prompt.
-    Inline,
+    /// The send carries inline text rather than a named prompt. `text` is the raw
+    /// template as authored (`MiniJinja` placeholders intact), carried so the view
+    /// can preview it directly — there is no provider to fetch it from.
+    ///
+    /// `#[serde(default)]` is load-bearing: `WorkflowStepInfo` is persisted in
+    /// `RunRecord::Started` (see the struct doc above), and `Inline` was a unit
+    /// variant before `text` existed. A run file written by an older build
+    /// serializes it as `{"kind":"inline"}` with no `text`; without the default,
+    /// that record fails to deserialize and the whole run silently drops from the
+    /// list on the first post-upgrade launch. A legacy inline chip previews empty.
+    Inline {
+        #[serde(default)]
+        text: String,
+    },
 }
 
 /// A declared recipient reference. `Literal` is a hardcoded agent name; `Slot` is
@@ -145,10 +157,10 @@ fn step_info(labeled: &LabeledStep, inputs: &[InputDecl]) -> WorkflowStepInfo {
 fn send_prompt(s: &SendStep) -> Option<StepPrompt> {
     if let Some(id) = &s.prompt {
         Some(StepPrompt::Named { id: id.clone() })
-    } else if s.text.is_some() {
-        Some(StepPrompt::Inline)
     } else {
-        None
+        s.text
+            .as_ref()
+            .map(|text| StepPrompt::Inline { text: text.clone() })
     }
 }
 
@@ -354,7 +366,12 @@ mod tests {
                 id: "builtin:code-review".to_owned()
             })
         );
-        assert_eq!(steps[1].prompt, Some(StepPrompt::Inline));
+        assert_eq!(
+            steps[1].prompt,
+            Some(StepPrompt::Inline {
+                text: "hi".to_owned()
+            })
+        );
         // A pure-forward send runs no prompt and no inline text.
         assert_eq!(steps[2].prompt, None);
         // A wait runs no prompt.

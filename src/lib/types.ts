@@ -791,6 +791,13 @@ export type RenderedPrompt = {
   text: string;
 };
 
+// The raw, unrendered template body returned by `get_prompt_source` — for a
+// read-only preview. Available for `builtin`/`local` prompts; `get_prompt_source`
+// returns null for an MCP provider (no un-rendered source over the protocol).
+export type PromptSource = {
+  text: string;
+};
+
 // ── Workflows (system-design §7) ──────────────────────────────────────────────
 // Mirror the Rust types in `crates/app/src/workflow_commands.rs`.
 
@@ -867,8 +874,9 @@ export type WorkflowStepKind = "send" | "wait" | "pause" | "for_each";
 
 // The prompt a `send` step runs, surfaced as a "which prompt" chip: a named
 // prompt (`builtin:code-review`) or inline text. `null` on a step that runs no
-// prompt (a wait/pause, or a pure-forward send).
-export type StepPrompt = { kind: "named"; id: string } | { kind: "inline" };
+// prompt (a wait/pause, or a pure-forward send). Inline carries its raw template
+// text (placeholders intact) so the preview shows it without a provider lookup.
+export type StepPrompt = { kind: "named"; id: string } | { kind: "inline"; text: string };
 
 // One step as the progress/preview views render it. `recipients` are declared
 // (slots unresolved) on a `WorkflowFormDescriptor`, and resolved to concrete

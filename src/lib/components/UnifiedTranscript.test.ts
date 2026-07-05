@@ -131,6 +131,57 @@ describe("UnifiedTranscript", () => {
     render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     expect(screen.getByText(/no messages yet/i)).toBeInTheDocument();
+    // Without showOnboarding (split panes), the one-line placeholder renders,
+    // not the orientation block — the block must not repeat per pane.
+    expect(screen.getByText(/type a prompt below/i)).toBeInTheDocument();
+    expect(screen.queryByTestId("transcript-onboarding")).not.toBeInTheDocument();
+  });
+
+  it("renders the orientation block on the empty state when showOnboarding is set", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT], showOnboarding: true },
+    });
+
+    const block = screen.getByTestId("transcript-onboarding");
+    expect(block).toHaveTextContent(/each agent is its own conversation/i);
+    expect(block).toHaveTextContent(/split the view into panes/i);
+    expect(block).toHaveTextContent(/pick recipients, then send/i);
+    expect(block).toHaveTextContent(/send to several agents at once/i);
+    expect(block).toHaveTextContent(/relay with forward/i);
+    expect(block).toHaveTextContent(/reuse saved prompts/i);
+    expect(block).toHaveTextContent(/automate with workflows/i);
+    // The authoring-guide URLs render verbatim — the point is that the user
+    // can copy one into a message so an agent fetches the guide.
+    expect(block).toHaveTextContent(
+      "https://github.com/shane-kercheval/switchboard/blob/main/docs/agent-instructions/workflows.md",
+    );
+    expect(block).toHaveTextContent(
+      "https://github.com/shane-kercheval/switchboard/blob/main/docs/agent-instructions/prompts.md",
+    );
+    expect(screen.queryByText(/type a prompt below/i)).not.toBeInTheDocument();
+  });
+
+  it("hides the orientation block once any turn exists", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [
+      {
+        role: "user",
+        turn_id: "user-1",
+        agent_id: CLAUDE_AGENT.id,
+        started_at: "2026-05-16T00:00:00Z",
+        text: "first prompt",
+      },
+    ];
+
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT], showOnboarding: true },
+    });
+
+    expect(screen.queryByTestId("transcript-onboarding")).not.toBeInTheDocument();
   });
 
   it("merges turns across multiple agents in chronological order", async () => {
@@ -334,8 +385,9 @@ describe("UnifiedTranscript", () => {
     // "running…" or "error" annotation should appear.
     expect(tool).not.toHaveTextContent("running…");
     expect(tool).not.toHaveTextContent("error");
-    // Body block suppressed — no <pre> child.
-    expect(tool.querySelector("pre")).toBeNull();
+    // Empty output is suppressed; input can still render in the expanded body.
+    expect(tool.querySelector('[data-testid="tool-output"]')).toBeNull();
+    expect(tool.querySelector('[data-testid="tool-input"]')).not.toBeNull();
   });
 
   it("collapses completed tool output by default and hides the internal builtin label", async () => {
@@ -408,7 +460,7 @@ describe("UnifiedTranscript", () => {
     expect(tool.querySelector('[data-testid="tool-error"]')).not.toBeNull();
   });
 
-  it("expands running tool calls by default", async () => {
+  it("keeps running tool calls collapsed by default", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
     state.transcripts[CLAUDE_AGENT.id] = [
@@ -434,7 +486,7 @@ describe("UnifiedTranscript", () => {
     render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     const tool = screen.getByTestId("turn-tool");
-    expect(tool).toHaveAttribute("open");
+    expect(tool).not.toHaveAttribute("open");
     expect(tool.querySelector('[data-testid="tool-running"]')).not.toBeNull();
   });
 
@@ -1381,6 +1433,45 @@ describe("UnifiedTranscript — markdown rendering", () => {
     });
     await waitFor(() => {
       expect(screen.getByTestId("turn")).toHaveTextContent("let x = 1;");
+    });
+  });
+
+  it("never auto-scrolls the empty state; the first rows re-pin to the bottom", async () => {
+    // A taller-than-viewport onboarding block must mount reading from the
+    // top — the bottom-pin contract is for conversations, and the empty state
+    // isn't one. Once the first rows arrive the chat contract takes over:
+    // pin to the newest message regardless of prior scroll position.
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT], showOnboarding: true },
+    });
+
+    const container = screen.getByTestId("unified-transcript");
+    Object.defineProperty(container, "scrollHeight", { configurable: true, value: 2000 });
+    Object.defineProperty(container, "clientHeight", { configurable: true, value: 500 });
+
+    // Let mount effects flush: the empty state must not have been scrolled.
+    await tick();
+    expect(container.scrollTop).toBe(0);
+
+    fireTo(`agent:${CLAUDE_AGENT.id}`, {
+      type: "turn_start",
+      turn_id: "turn-1",
+      message_id: "msg-1",
+      send_id: "msg-1",
+      started_at: "2026-05-16T00:00:00Z",
+    });
+    fireTo(`agent:${CLAUDE_AGENT.id}`, {
+      type: "content_chunk",
+      turn_id: "turn-1",
+      kind: "text",
+      text: "hello",
+    });
+
+    await waitFor(() => {
+      expect(container.scrollTop).toBe(2000);
     });
   });
 
@@ -2784,6 +2875,18 @@ describe("UnifiedTranscript live streaming cap", () => {
       items: [text(body)],
     };
   }
+  function complete(agent: AgentRecord, sendId: string, turnId: string, body: string): Turn {
+    return {
+      role: "agent",
+      turn_id: turnId,
+      agent_id: agent.id,
+      send_id: sendId,
+      started_at: "2026-05-16T00:00:01Z",
+      ended_at: "2026-05-16T00:00:02Z",
+      status: "complete",
+      items: [text(body)],
+    };
+  }
 
   it("caps a streaming standalone response and keeps the footer outside the cap", async () => {
     const state = await loadState();
@@ -2843,9 +2946,84 @@ describe("UnifiedTranscript live streaming cap", () => {
     expect(screen.getAllByTestId("turn-live-scroll")).toHaveLength(2);
     // Each column's footer stays outside its own cap.
     for (const scroll of screen.getAllByTestId("turn-live-scroll")) {
+      expect(scroll).toHaveClass("max-h-[75cqh]", "overflow-y-auto");
       expect(scroll.querySelector('[data-testid="turn-working"]')).toBeNull();
     }
     expect(screen.getAllByTestId("turn-working")).toHaveLength(2);
+  });
+
+  it("drops streaming fan-out caps once any sibling column finishes", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    await state.registerAgent(CODEX_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [
+      {
+        role: "user",
+        turn_id: "u-a",
+        agent_id: CLAUDE_AGENT.id,
+        send_id: "send-f",
+        started_at: "2026-05-16T00:00:00Z",
+        text: "fan",
+      },
+      complete(CLAUDE_AGENT, "send-f", "a-a", "alice final answer"),
+    ];
+    state.transcripts[CODEX_AGENT.id] = [
+      {
+        role: "user",
+        turn_id: "u-b",
+        agent_id: CODEX_AGENT.id,
+        send_id: "send-f",
+        started_at: "2026-05-16T00:00:00Z",
+        text: "fan",
+      },
+      streaming(CODEX_AGENT, "send-f", "a-b", "bob still streaming"),
+    ];
+
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT, CODEX_AGENT] },
+    });
+
+    expect(screen.getByText("alice final answer")).toBeInTheDocument();
+    const scroll = screen.getByTestId("turn-live-scroll");
+    expect(scroll).toHaveTextContent("bob still streaming");
+    expect(scroll).toHaveClass("overflow-visible");
+    expect(scroll).not.toHaveClass("max-h-[75cqh]", "overflow-y-auto");
+  });
+
+  it("keeps streaming fan-out caps while a sibling column is queued", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    await state.registerAgent(CODEX_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [
+      {
+        role: "user",
+        turn_id: "u-a",
+        agent_id: CLAUDE_AGENT.id,
+        send_id: "send-f",
+        started_at: "2026-05-16T00:00:00Z",
+        text: "fan",
+      },
+      streaming(CLAUDE_AGENT, "send-f", "a-a", "alice streaming"),
+    ];
+    state.transcripts[CODEX_AGENT.id] = [
+      {
+        role: "user",
+        turn_id: "u-b",
+        agent_id: CODEX_AGENT.id,
+        send_id: "send-f",
+        started_at: "2026-05-16T00:00:00Z",
+        text: "fan",
+      },
+    ];
+
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT, CODEX_AGENT] },
+    });
+
+    expect(screen.getByTestId("fanout-queued")).toHaveTextContent("Queued...");
+    const scroll = screen.getByTestId("turn-live-scroll");
+    expect(scroll).toHaveTextContent("alice streaming");
+    expect(scroll).toHaveClass("max-h-[75cqh]", "overflow-y-auto");
   });
 
   it("removes the cap once the turn completes, leaving the latest response expanded", async () => {

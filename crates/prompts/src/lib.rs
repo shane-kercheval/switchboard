@@ -26,7 +26,7 @@ pub use builtin::builtin_prompt_content;
 pub use config::{McpProviderConfig, McpTransport, PromptConfig, resolve_local_dirs};
 pub use model::{BUILTIN_PROVIDER, LOCAL_PROVIDER, Prompt, PromptArgument, PromptId};
 pub use secret::{InMemorySecretStore, SecretStore, SecretStoreError};
-pub use service::{McpProviderInfo, PromptService, ProviderStatus, RenderedPrompt};
+pub use service::{McpProviderInfo, PromptService, PromptSource, ProviderStatus, RenderedPrompt};
 
 pub use error::PromptError;
 

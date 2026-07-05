@@ -578,8 +578,9 @@
   }
 
   function addEmptyPane(): void {
-    if (selection.activeProjectId === null) return;
-    createEmptyPane(selection.activeProjectId, activeRosterIds);
+    const projectId = selection.activeProjectId;
+    if (projectId === null) return;
+    createEmptyPane(projectId, activeRosterIds, selectionFor(projectId));
   }
 
   function restoreAllPanes(): void {
@@ -923,34 +924,49 @@
               {#each headerTabPanes as pane (pane.id)}
                 {@const active = paneIsActive(pane)}
                 {@const completed = paneTabIsCompleted(pane)}
-                <button
-                  type="button"
-                  class="border-border bg-panel text-fg hover:bg-raised inline-flex h-6.5 max-w-36 min-w-0 shrink items-center gap-1.5 rounded-full border px-2 text-xs"
-                  data-testid="app-pane-minimized-tab"
-                  data-pane-id={pane.id}
-                  onclick={() => selectHeaderPane(pane)}
+                <!-- The tooltip is where the spinner/✓ semantics are taught:
+                     the indicator is seen far more often than any empty-state
+                     prose, so the explanation lives on the indicator itself. -->
+                <Tooltip
+                  label={active
+                    ? `${pane.name} — agents are working. Click to open.`
+                    : completed
+                      ? `${pane.name} — agents finished since you last looked. Click to open.`
+                      : `Open ${pane.name}`}
+                  side="bottom"
                 >
-                  {#if active}
-                    <span
-                      class="inline-flex shrink-0 items-center justify-center"
-                      role="status"
-                      aria-label={`${pane.name} has running agents`}
-                      data-testid="app-pane-tab-activity"
+                  {#snippet trigger(props)}
+                    <button
+                      {...props}
+                      type="button"
+                      class="border-border bg-panel text-fg hover:bg-raised inline-flex h-6.5 max-w-36 min-w-0 shrink items-center gap-1.5 rounded-full border px-2 text-xs"
+                      data-testid="app-pane-minimized-tab"
+                      data-pane-id={pane.id}
+                      onclick={() => selectHeaderPane(pane)}
                     >
-                      <Spinner class="h-3.5 w-3.5" />
-                    </span>
-                  {:else if completed}
-                    <span
-                      class="text-accent inline-flex shrink-0 items-center justify-center"
-                      role="status"
-                      aria-label={`${pane.name} activity ended`}
-                      data-testid="app-pane-tab-completed"
-                    >
-                      <CircleCheck size={14} strokeWidth={1.8} aria-hidden="true" />
-                    </span>
-                  {/if}
-                  <span class="truncate font-medium">{pane.name}</span>
-                </button>
+                      {#if active}
+                        <span
+                          class="inline-flex shrink-0 items-center justify-center"
+                          role="status"
+                          aria-label={`${pane.name} has running agents`}
+                          data-testid="app-pane-tab-activity"
+                        >
+                          <Spinner class="h-3.5 w-3.5" />
+                        </span>
+                      {:else if completed}
+                        <span
+                          class="text-accent inline-flex shrink-0 items-center justify-center"
+                          role="status"
+                          aria-label={`${pane.name} activity ended`}
+                          data-testid="app-pane-tab-completed"
+                        >
+                          <CircleCheck size={14} strokeWidth={1.8} aria-hidden="true" />
+                        </span>
+                      {/if}
+                      <span class="truncate font-medium">{pane.name}</span>
+                    </button>
+                  {/snippet}
+                </Tooltip>
               {/each}
             </div>
             <!-- Shown whenever more than one pane is hidden — minimized into the
@@ -1199,6 +1215,7 @@
                   if (selection.activeProjectId !== null)
                     void retryProjectHydration(selection.activeProjectId);
                 }}
+                onAddAgent={openAddAgent}
               />
               <!-- Remount per project: besides re-seeding the per-project
                    draft/recipient state, this resets sendError, the @-menu, and

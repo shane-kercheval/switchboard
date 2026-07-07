@@ -153,9 +153,10 @@ export async function branchCommits(
   return await invoke<GitCommitRange[]>("branch_commits", { repoRoot, kind, name });
 }
 
-// The files one commit changed (vs. its first parent). No worktree needed, so it
-// serves branches with no local folder and remote-only branches. `found: false`
-// means the commit no longer resolves (gc'd / branch force-updated).
+// The selected commit's message body and changed files (vs. its first parent).
+// No worktree needed, so it serves branches with no local folder and remote-only
+// branches. `found: false` means the commit no longer resolves (gc'd / branch
+// force-updated).
 export async function commitChangedFiles(repoRoot: string, oid: string): Promise<CommitChanges> {
   return await invoke<CommitChanges>("commit_changed_files", { repoRoot, oid });
 }

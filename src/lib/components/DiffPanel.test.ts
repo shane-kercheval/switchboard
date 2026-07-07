@@ -22,6 +22,7 @@ vi.mock("$lib/native", () => ({
 const { _testing } = await import("$lib/preferences.svelte");
 
 afterEach(() => {
+  vi.useRealTimers();
   _testing.reset();
   invokeMock.mockReset();
   copyTextMock.mockReset();
@@ -74,13 +75,24 @@ const commitTarget = (over: Partial<Extract<DiffTarget, { kind: "commit" }>> = {
 // Both the worktree reads (changed_files/file_diff) and the commit reads
 // (commit_changed_files/commit_file_diff) are wired, so a test can assert which
 // pair the panel used for a given target kind.
-function wire(opts: { files?: ChangedFile[]; diff?: FileDiff; commitFound?: boolean } = {}) {
+function wire(
+  opts: {
+    files?: ChangedFile[];
+    diff?: FileDiff;
+    commitFound?: boolean;
+    commitBody?: string | null;
+  } = {},
+) {
   const files = opts.files ?? [{ path: "code.ts", change: "modified" }];
   invokeMock.mockImplementation((cmd: string, args?: Record<string, unknown>) => {
     if (cmd === "changed_files") return Promise.resolve(files);
     // The commit read returns the `{ found, files }` shape.
     if (cmd === "commit_changed_files")
-      return Promise.resolve({ found: opts.commitFound ?? true, files });
+      return Promise.resolve({
+        found: opts.commitFound ?? true,
+        body: opts.commitBody ?? null,
+        files,
+      });
     if (cmd === "file_diff" || cmd === "commit_file_diff")
       return Promise.resolve(opts.diff ?? diffFixture({ path: String(args?.file) }));
     if (cmd === "set_preferences") return Promise.resolve(null);
@@ -537,6 +549,46 @@ describe("DiffPanel (commit target)", () => {
     expect(filesCall?.[1]).toMatchObject({ repoRoot: "/repo", oid: "abc123def456" });
   });
 
+  it("shows the commit body in a scrollable dialog when present", async () => {
+    wire({
+      files: [{ path: "code.ts", change: "modified" }],
+      commitBody: "- Why this changed.\n- How reviewers should read it.",
+    });
+    render(DiffPanel, { props: { target: commitTarget(), onClose: noop } });
+
+    await waitFor(() => expect(screen.getByTestId("diff-view")).toBeInTheDocument());
+    expect(screen.getByTestId("commit-message-open")).toBeInTheDocument();
+    expect(screen.queryByTestId("dialog-content")).not.toBeInTheDocument();
+
+    await fireEvent.click(screen.getByTestId("commit-message-open"));
+
+    expect(screen.getByTestId("dialog-title")).toHaveTextContent("Commit message");
+    const body = screen.getByTestId("commit-message-body");
+    expect(body).toHaveTextContent("Why this changed.");
+    expect(body).toHaveTextContent("How reviewers should read it.");
+    expect(body.querySelector("ul")).not.toBeNull();
+    expect(body).toHaveClass("overflow-y-auto");
+  });
+
+  it("closes the commit message tooltip when opening the dialog", async () => {
+    wire({
+      files: [{ path: "code.ts", change: "modified" }],
+      commitBody: "Commit message.",
+    });
+    render(DiffPanel, { props: { target: commitTarget(), onClose: noop } });
+
+    await waitFor(() => expect(screen.getByTestId("commit-message-open")).toBeInTheDocument());
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    await fireEvent.pointerEnter(screen.getByTestId("commit-message-open"));
+    await vi.advanceTimersByTimeAsync(500);
+    expect(await screen.findByTestId("tooltip-content")).toHaveTextContent("Show commit message");
+
+    await fireEvent.click(screen.getByTestId("commit-message-open"));
+
+    expect(screen.getByTestId("dialog-content")).toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByTestId("tooltip-content")).not.toBeInTheDocument());
+  });
+
   it("opens the selected commit file in git difftool", async () => {
     wire({ files: [{ path: "code.ts", change: "modified" }] });
     render(DiffPanel, { props: { target: commitTarget(), onClose: noop } });
@@ -573,6 +625,7 @@ describe("DiffPanel (commit target)", () => {
     render(DiffPanel, { props: { target: commitTarget(), onClose: noop } });
     await waitFor(() => expect(screen.getByTestId("detail-commit-missing")).toBeInTheDocument());
     expect(screen.getByTestId("detail-commit-missing")).toHaveTextContent("no longer available");
+    expect(screen.queryByTestId("commit-message-open")).not.toBeInTheDocument();
     expect(screen.queryByTestId("detail-no-changes")).not.toBeInTheDocument();
   });
 });

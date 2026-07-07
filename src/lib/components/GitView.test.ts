@@ -90,10 +90,18 @@ const repo = (over: Partial<RepoListing["repo"]> = {}): RepoListing => ({
 });
 
 function wire(list: RepoListing[]) {
-  invokeMock.mockImplementation((cmd: string) => {
+  invokeMock.mockImplementation((cmd: string, args?: Record<string, unknown>) => {
     if (cmd === "list_tracked_repos") return Promise.resolve(list);
     if (cmd === "changed_files") return Promise.resolve([]);
-    if (cmd === "commit_changed_files") return Promise.resolve({ found: true, files: [] });
+    if (cmd === "commit_changed_files")
+      return Promise.resolve({
+        found: true,
+        body:
+          args?.oid === "c0ffee1234"
+            ? "Explain why this change exists.\n\nInclude reviewer notes."
+            : null,
+        files: [],
+      });
     if (cmd === "file_diff" || cmd === "commit_file_diff")
       return Promise.resolve({
         path: "",
@@ -572,6 +580,17 @@ describe("GitView", () => {
     const sharedRow = rowFor("shared commit");
     expect(within(sharedRow).getByTestId("branch-work-indicator")).toBeInTheDocument();
     expect(within(sharedRow).queryByTestId("unpushed-indicator")).not.toBeInTheDocument();
+
+    expect(firstRow).not.toHaveTextContent("Explain why this change exists.");
+    await fireEvent.click(firstRow);
+    expect(screen.getByTestId("detail-title")).toHaveTextContent("first commit");
+    expect(await screen.findByTestId("commit-message-open")).toBeInTheDocument();
+    await fireEvent.click(screen.getByTestId("commit-message-open"));
+    expect(screen.getByTestId("commit-message-body")).toHaveTextContent(
+      "Explain why this change exists.",
+    );
+    expect(screen.getByTestId("commit-message-body")).toHaveTextContent("Include reviewer notes.");
+    await fireEvent.click(screen.getByTestId("dialog-close"));
 
     await fireEvent.click(screen.getByTestId("detail-expand-toggle"));
     expect(screen.getByTestId("git-detail-sidebar")).toHaveAttribute("data-expanded", "true");

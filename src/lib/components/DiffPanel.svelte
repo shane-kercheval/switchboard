@@ -6,9 +6,18 @@
   /// ref) still shows real content. Loads are guarded against target/file races
   /// (a newer selection's result always wins).
   import { tick, untrack } from "svelte";
-  import { Code2, Copy, ExternalLink, Maximize2, Minimize2 } from "@lucide/svelte";
+  import {
+    Code2,
+    Copy,
+    ExternalLink,
+    Maximize2,
+    MessageSquareText,
+    Minimize2,
+  } from "@lucide/svelte";
   import { cn, basename } from "$lib/utils";
+  import Dialog from "$lib/components/ui/Dialog.svelte";
   import EmptyState from "$lib/components/ui/EmptyState.svelte";
+  import Markdown from "$lib/components/ui/Markdown.svelte";
   import Spinner from "$lib/components/ui/Spinner.svelte";
   import DiffView from "$lib/components/DiffView.svelte";
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
@@ -57,6 +66,9 @@
   let files = $state<ChangedFile[] | null>(null);
   let filesError = $state<string | null>(null);
   let selectedFile = $state<string | null>(null);
+  let commitBody = $state<string | null>(null);
+  let commitMessageOpen = $state(false);
+  let commitMessageTooltipOpen = $state(false);
   // For a commit target, whether the commit still resolved. `false` (gc'd /
   // force-updated) is shown distinctly from a commit that changed nothing.
   let commitFound = $state(true);
@@ -83,13 +95,18 @@
       ? `wt:${target.worktreePath}`
       : `c:${target.repoRoot}:${target.oid}`,
   );
+  const visibleCommitBody = $derived(
+    commitBody !== null && commitBody.trim().length > 0 ? commitBody.trim() : null,
+  );
 
   // Normalized to `{ found, files }` for both target kinds: a worktree read
   // always "found" (its absence is handled upstream by reconciliation), a commit
   // read carries the backend's found flag.
-  function loadFiles(t: DiffTarget): Promise<{ found: boolean; files: ChangedFile[] }> {
+  function loadFiles(
+    t: DiffTarget,
+  ): Promise<{ found: boolean; body: string | null; files: ChangedFile[] }> {
     return t.kind === "uncommitted"
-      ? changedFiles(t.worktreePath).then((files) => ({ found: true, files }))
+      ? changedFiles(t.worktreePath).then((files) => ({ found: true, body: null, files }))
       : commitChangedFiles(t.repoRoot, t.oid);
   }
 
@@ -113,6 +130,9 @@
       selectedFile = null;
       diff = null;
       commitFound = true;
+      commitBody = null;
+      commitMessageOpen = false;
+      commitMessageTooltipOpen = false;
     }
     filesError = null;
     void loadFiles(t)
@@ -120,6 +140,7 @@
         if (token !== filesToken || revision !== refreshRevision) return;
         filesKey = key;
         commitFound = result.found;
+        commitBody = result.found ? (result.body ?? null) : null;
         files = result.files;
         selectedFile = result.files.some((file) => file.path === previousFile)
           ? previousFile
@@ -129,6 +150,9 @@
         if (token !== filesToken || revision !== refreshRevision) return;
         filesKey = key;
         files = [];
+        commitBody = null;
+        commitMessageOpen = false;
+        commitMessageTooltipOpen = false;
         filesError = e instanceof Error ? e.message : String(e);
       });
   });
@@ -168,6 +192,14 @@
   });
 
   const language = $derived(selectedFile ? languageForPath(selectedFile) : "");
+
+  $effect(() => {
+    if (visibleCommitBody === null) commitMessageOpen = false;
+  });
+
+  $effect(() => {
+    if (commitMessageOpen) commitMessageTooltipOpen = false;
+  });
 
   // Drop the file-row hover highlight right after a keyboard move so the mouse-
   // hovered row doesn't stay lit next to the keyboard selection; pointer movement
@@ -317,8 +349,35 @@
   <!-- Header -->
   <div class="border-border/60 bg-raised flex min-h-11 items-center gap-3 border-b px-3 py-2">
     <div class="min-w-0 flex-1">
-      <div class="text-fg truncate text-sm leading-5 font-semibold" data-testid="detail-title">
-        {target.title}
+      <div class="flex min-w-0 items-center gap-1.5">
+        <div class="text-fg truncate text-sm leading-5 font-semibold" data-testid="detail-title">
+          {target.title}
+        </div>
+        {#if visibleCommitBody !== null}
+          <Tooltip
+            bind:open={commitMessageTooltipOpen}
+            label="Show commit message"
+            side="bottom"
+            disabled={commitMessageOpen}
+            ignoreNonKeyboardFocus
+          >
+            {#snippet trigger(props)}
+              <button
+                {...props}
+                type="button"
+                class={cn(ICON_BUTTON_CLASS, "hover:bg-border/60 h-5 w-5 shrink-0")}
+                aria-label="Show commit message"
+                data-testid="commit-message-open"
+                onclick={() => {
+                  commitMessageTooltipOpen = false;
+                  commitMessageOpen = true;
+                }}
+              >
+                <MessageSquareText size={13} strokeWidth={1.8} aria-hidden="true" />
+              </button>
+            {/snippet}
+          </Tooltip>
+        {/if}
       </div>
       {#if target.kind === "uncommitted"}
         <button
@@ -418,6 +477,20 @@
     >
       {externalActionError}
     </p>
+  {/if}
+
+  {#if visibleCommitBody !== null}
+    <Dialog bind:open={commitMessageOpen} title="Commit message" contentClass="max-w-2xl">
+      <div class="mb-3 min-w-0">
+        <div class="text-fg truncate text-sm leading-5 font-semibold">{target.title}</div>
+        {#if target.kind === "commit"}
+          <div class="text-muted truncate font-mono text-[11px] leading-4">{target.subtitle}</div>
+        {/if}
+      </div>
+      <div class="max-h-[60vh] overflow-y-auto" data-testid="commit-message-body">
+        <Markdown text={visibleCommitBody} />
+      </div>
+    </Dialog>
   {/if}
 
   <!-- Body: file list + diff -->

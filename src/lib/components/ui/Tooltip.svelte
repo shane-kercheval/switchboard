@@ -20,6 +20,9 @@
     delayDuration?: number;
     skipDelayDuration?: number;
     disableHoverableContent?: boolean;
+    disabled?: boolean;
+    ignoreNonKeyboardFocus?: boolean;
+    open?: boolean;
     /// Receives the bits-ui trigger props — spread them onto your element.
     trigger: Snippet<[Record<string, unknown>]>;
   };
@@ -41,13 +44,16 @@
     delayDuration = 500,
     skipDelayDuration = 300,
     disableHoverableContent = false,
+    disabled = false,
+    ignoreNonKeyboardFocus = false,
+    open = $bindable(false),
     trigger,
     ...rest
   }: Props = $props();
 </script>
 
 <Bits.Provider {delayDuration} {skipDelayDuration}>
-  <Bits.Root {disableHoverableContent}>
+  <Bits.Root bind:open {disableHoverableContent} {disabled} {ignoreNonKeyboardFocus}>
     <Bits.Trigger>
       {#snippet child({ props })}
         {@render trigger(props)}

@@ -4224,8 +4224,11 @@ fn merge_project_conversation(
     let mut journal_start: HashMap<AgentId, chrono::DateTime<chrono::Utc>> = HashMap::new();
     // Durable send↔turn links (`hydration_key → send_id`), per agent, from
     // `TurnLink` records. The key-join uses these to match content-bearing turns
-    // to their sends exactly, before the positional fallback runs.
+    // to their sends exactly, before the positional fallback runs. `agent_link_poison`
+    // holds keys seen with conflicting sends (see the `TurnLink` arm) — a poisoned
+    // key is excluded from the join so the anomaly degrades to positional.
     let mut agent_links: HashMap<AgentId, HashMap<String, SendId>> = HashMap::new();
+    let mut agent_link_poison: HashMap<AgentId, HashSet<String>> = HashMap::new();
     for record in journal {
         match record {
             switchboard_core::JournalRecord::Send {
@@ -4287,12 +4290,40 @@ fn merge_project_conversation(
                 hydration_key,
                 ..
             } => {
-                // A `hydration_key` is unique per turn, so last-write-wins is a
-                // no-op here; the map is the agent's key→send join for the merge.
-                agent_links
-                    .entry(agent_id)
-                    .or_default()
-                    .insert(hydration_key, send_id);
+                // A `hydration_key` is per-turn-unique, so in normal data each key
+                // maps to exactly one send. Enforce that invariant defensively
+                // rather than trusting it: if a key ever appears with a
+                // **conflicting** send_id — a stale/duplicate link (e.g. an
+                // enrichment read that raced the session-file flush, a future field
+                // reshape, a corrupt journal) — **poison** it: drop it so BOTH turns
+                // fall to positional, bounding any anomaly to "no worse than
+                // positional" rather than a silent mis-group (a last-write-wins
+                // `insert` would confidently reassign a turn to the wrong send). An
+                // idempotent same-key-same-send re-write is fine and never poisons;
+                // a poisoned key stays out even if it reappears later.
+                //
+                // NOTE: this catches a stale link whose key collides with a
+                // legitimately-linked turn. The one residual it does *not* catch is
+                // a stale key matching a turn that has **no** link (a pre-feature
+                // turn on the first post-M3 dispatch) — closed by the chronology
+                // guard that lands with the residual-boundary `{send_id, at}` work
+                // (a linked turn cannot predate the send it claims). Compound-rare
+                // (near-impossible stale read × one-time transition), documented.
+                let poison = agent_link_poison.entry(agent_id).or_default();
+                if poison.contains(&hydration_key) {
+                    continue;
+                }
+                let links = agent_links.entry(agent_id).or_default();
+                match links.get(&hydration_key) {
+                    Some(&existing) if existing != send_id => {
+                        links.remove(&hydration_key);
+                        poison.insert(hydration_key);
+                    }
+                    Some(_) => {} // same key, same send — idempotent, keep it
+                    None => {
+                        links.insert(hydration_key, send_id);
+                    }
+                }
             }
             // A future journal-record kind we don't yet render — degrade by
             // skipping it rather than failing the whole load.
@@ -12615,6 +12646,226 @@ mod tests {
             "the Unknown echo must be suppressed by the link, not re-imported"
         );
         assert_eq!(agent_send_ids(&merged), vec![Some(s1)]);
+    }
+
+    #[test]
+    fn merge_count_path_continuation_steals_send_known_defect() {
+        // KNOWN DEFECT (pre-existing, characterized not fixed): on the COUNT path
+        // (all-`Unknown` prompts — a pre-`promptSource` Claude session, or any
+        // keyless harness), a promptless continuation turn STEALS the next send,
+        // because `classify_turns_by_count` hands every agent turn a send by
+        // position — it has no "this turn had no prompt, skip it" notion (unlike the
+        // provenance path's `pending_send` and the key-join's link). The real
+        // matching prompt then renders a second time as imported, and the real reply
+        // renders ungrouped. Reachable TODAY for an old auto-compacted Claude
+        // session; the key-join dissolves it wherever links exist, but the keyless
+        // count path still carries it. Pinned here to make the failure mode visible
+        // and give the eventual positional-continuation guard a clear before/after —
+        // this is NOT desired behavior (gap register: docs/harness-behavior.md).
+        let agent = Uuid::now_v7();
+        let (s1, s2) = (Uuid::now_v7(), Uuid::now_v7());
+        let journal = vec![
+            send_record(s1, Uuid::now_v7(), agent, "prompt1", 1),
+            send_record(s2, Uuid::now_v7(), agent, "prompt2", 5),
+        ];
+        let turns = vec![
+            user_turn(Uuid::now_v7(), agent, "prompt1", 2), // Unknown → count path
+            agent_turn(Uuid::now_v7(), agent, "reply1", 3),
+            system_marker_turn(Uuid::now_v7(), agent, "compacted", 4),
+            agent_turn(Uuid::now_v7(), agent, "continuation", 5), // no preceding prompt
+            user_turn(Uuid::now_v7(), agent, "prompt2", 6),
+            agent_turn(Uuid::now_v7(), agent, "reply2", 7),
+        ];
+        let merged = merge_project_conversation(journal, vec![(agent, transcript_of(turns), None)]);
+
+        // The defect: prompt2 renders TWICE (journal copy + an imported duplicate).
+        assert_eq!(
+            user_texts(&merged),
+            vec!["prompt1", "prompt2", "prompt2"],
+            "KNOWN DEFECT: the count path duplicates prompt2 when a continuation steals its send"
+        );
+        // The continuation steals s2; the real reply2 is left ungrouped.
+        assert_eq!(
+            agent_send_ids(&merged),
+            vec![Some(s1), Some(s2), None],
+            "KNOWN DEFECT: continuation grabs s2, reply2 ungrouped"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn merge_codex_session_through_real_parser_key_joins() {
+        // End-to-end through the REAL Codex parser: two turns whose
+        // `turn_context.turn_id`s become `Turn::Agent.hydration_key`, plus journal
+        // `TurnLink`s carrying those same ids (the value the enrichment stamps live).
+        // The merge must key-join each Codex reply to its send — proving the M2 merge
+        // is harness-agnostic (no Codex-specific code) and that a Codex `Unknown`
+        // prompt's echo is suppressed by its link, not re-imported.
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        let session_id = "0199aaaa-bbbb-7ccc-8ddd-eeeeeeeeeeee";
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 5, 10).unwrap();
+        let agent = Uuid::now_v7();
+
+        let ev = |ts: &str, payload: serde_json::Value| serde_json::json!({"timestamp": ts, "type": "event_msg", "payload": payload});
+        let lines = [
+            serde_json::json!({"timestamp":"2026-05-10T04:43:14Z","type":"session_meta","payload":{"cli_version":"0.142.0"}}),
+            ev(
+                "2026-05-10T04:43:15Z",
+                serde_json::json!({"type":"task_started","turn_id":"task-1","model_context_window":250_000}),
+            ),
+            serde_json::json!({"timestamp":"2026-05-10T04:43:15Z","type":"turn_context","payload":{"model":"gpt-5.5","turn_id":"ctx-1"}}),
+            ev(
+                "2026-05-10T04:43:15Z",
+                serde_json::json!({"type":"user_message","message":"prompt one"}),
+            ),
+            ev(
+                "2026-05-10T04:43:16Z",
+                serde_json::json!({"type":"agent_message","message":"reply one"}),
+            ),
+            ev(
+                "2026-05-10T04:43:16Z",
+                serde_json::json!({"type":"task_complete","turn_id":"task-1"}),
+            ),
+            ev(
+                "2026-05-10T04:43:20Z",
+                serde_json::json!({"type":"task_started","turn_id":"task-2","model_context_window":250_000}),
+            ),
+            serde_json::json!({"timestamp":"2026-05-10T04:43:20Z","type":"turn_context","payload":{"model":"gpt-5.5","turn_id":"ctx-2"}}),
+            ev(
+                "2026-05-10T04:43:20Z",
+                serde_json::json!({"type":"user_message","message":"prompt two"}),
+            ),
+            ev(
+                "2026-05-10T04:43:21Z",
+                serde_json::json!({"type":"agent_message","message":"reply two"}),
+            ),
+            ev(
+                "2026-05-10T04:43:21Z",
+                serde_json::json!({"type":"task_complete","turn_id":"task-2"}),
+            ),
+        ];
+        let content = lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let staged = stage_codex_session_file(home.path(), date, session_id);
+        std::fs::write(&staged, content).unwrap();
+
+        let transcript = switchboard_harness::load_codex_transcript(
+            home.path(),
+            cwd.path(),
+            session_id,
+            Some(date),
+            agent,
+        )
+        .unwrap();
+        // Sanity: the parser stamped the turn_context.turn_ids as hydration keys.
+        let keys: Vec<Option<String>> = transcript
+            .turns
+            .iter()
+            .filter_map(|t| match t {
+                switchboard_harness::Turn::Agent { hydration_key, .. } => {
+                    Some(hydration_key.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            keys,
+            vec![Some("ctx-1".to_owned()), Some("ctx-2".to_owned())],
+            "the real Codex parser keys each turn by its turn_context.turn_id"
+        );
+
+        let (s1, s2) = (Uuid::now_v7(), Uuid::now_v7());
+        let journal = vec![
+            JournalRecord::Send {
+                send_id: s1,
+                turn_id: Uuid::now_v7(),
+                agent_id: agent,
+                prompt: "prompt one".to_owned(),
+                attachments: Vec::new(),
+                at: "2026-05-10T04:43:14Z".parse().unwrap(),
+            },
+            JournalRecord::Send {
+                send_id: s2,
+                turn_id: Uuid::now_v7(),
+                agent_id: agent,
+                prompt: "prompt two".to_owned(),
+                attachments: Vec::new(),
+                at: "2026-05-10T04:43:19Z".parse().unwrap(),
+            },
+            // The links the enrichment stamps live, keyed by turn_context.turn_id.
+            JournalRecord::TurnLink {
+                send_id: s1,
+                turn_id: Uuid::now_v7(),
+                agent_id: agent,
+                hydration_key: "ctx-1".to_owned(),
+                at: "2026-05-10T04:43:16Z".parse().unwrap(),
+            },
+            JournalRecord::TurnLink {
+                send_id: s2,
+                turn_id: Uuid::now_v7(),
+                agent_id: agent,
+                hydration_key: "ctx-2".to_owned(),
+                at: "2026-05-10T04:43:21Z".parse().unwrap(),
+            },
+        ];
+        let merged = merge_project_conversation(journal, vec![(agent, transcript, None)]);
+
+        assert_eq!(user_texts(&merged), vec!["prompt one", "prompt two"]);
+        assert!(
+            !merged
+                .items
+                .iter()
+                .any(|i| matches!(i, ConversationItem::UserMessage { send_id: None, .. })),
+            "Codex Unknown prompts are suppressed by their links, not re-imported"
+        );
+        assert_eq!(
+            agent_send_ids(&merged),
+            vec![Some(s1), Some(s2)],
+            "each Codex reply key-joins to its send by turn_context.turn_id"
+        );
+    }
+
+    #[test]
+    fn merge_conflicting_link_key_is_poisoned_not_mis_grouped() {
+        // Defensive hardening: a stale/duplicate `TurnLink` that maps a key to a
+        // CONFLICTING send (e.g. a raced Codex enrichment read stamping a prior
+        // turn's key onto a new send) must NOT silently reassign a turn to the wrong
+        // send. Here reply1 legitimately links k1→s1; a stale link then maps k1→s2.
+        // Last-write-wins would reassign reply1 (key k1) to s2 — a durable mis-group.
+        // The poison-drop excludes k1 entirely, so both replies fall to the
+        // positional path and pair correctly (reply1→s1, reply2→s2), no mis-group.
+        let agent = Uuid::now_v7();
+        let (s1, s2) = (Uuid::now_v7(), Uuid::now_v7());
+        let journal = vec![
+            send_record(s1, Uuid::now_v7(), agent, "prompt1", 1),
+            send_record(s2, Uuid::now_v7(), agent, "prompt2", 5),
+            link_record(s1, agent, "k1", 3), // reply1's legitimate link
+            link_record(s2, agent, "k1", 7), // STALE: reply2's link carrying k1, not k2
+        ];
+        let turns = vec![
+            user_turn_src(Uuid::now_v7(), agent, "prompt1", 2, UserPromptSource::Sdk),
+            agent_turn_keyed(Uuid::now_v7(), agent, "reply1", 3, "k1"),
+            user_turn_src(Uuid::now_v7(), agent, "prompt2", 6, UserPromptSource::Sdk),
+            agent_turn_keyed(Uuid::now_v7(), agent, "reply2", 7, "k2"),
+        ];
+        let merged = merge_project_conversation(journal, vec![(agent, transcript_of(turns), None)]);
+        assert_eq!(user_texts(&merged), vec!["prompt1", "prompt2"]);
+        assert!(
+            !merged
+                .items
+                .iter()
+                .any(|i| matches!(i, ConversationItem::UserMessage { send_id: None, .. })),
+            "no imported duplicate — poison degrades to positional, not corruption"
+        );
+        assert_eq!(
+            agent_send_ids(&merged),
+            vec![Some(s1), Some(s2)],
+            "poisoned key → positional fallback pairs correctly; reply1 NOT mis-grouped to s2"
+        );
     }
 
     #[test]

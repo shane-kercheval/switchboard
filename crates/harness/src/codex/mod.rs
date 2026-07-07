@@ -673,7 +673,7 @@ async fn emit_terminal_with_enrichment(
         usage: enriched_usage,
         context_window_source,
         // Codex has no cost/overage in v1 — no real-spend attribution, and no
-        // join key (the durable per-turn store is Claude-only).
+        // cost-join `stable_message_id` (that store is Claude-only).
         spend: None,
         // Per-turn model + effort from the current turn's `turn_context`
         // (last-wins in the enrichment re-read), not the first-wins `model`
@@ -681,7 +681,13 @@ async fn emit_terminal_with_enrichment(
         model: enrichment.current_turn_model.clone(),
         effort: enrichment.current_turn_effort.clone(),
         stable_message_id: None,
-        first_message_id: None,
+        // Durable send↔turn key: this turn's `turn_context.turn_id`, read from the
+        // same enrichment re-read the reload parser uses for `Turn::Agent.
+        // hydration_key` — so the dispatcher's `TurnLink` matches the parsed turn
+        // by construction (no live-stream parity gamble; the live stream's
+        // `task_started.turn_id` is a different, parser-rejected id). `None` when
+        // this turn wrote no `turn_context` → positional fallback for it.
+        first_message_id: enrichment.current_turn_id.clone(),
     });
 
     // Step 4: emit RateLimitEvent if rate-limit info was found. Codex's

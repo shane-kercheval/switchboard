@@ -107,6 +107,18 @@ pub struct Enrichment {
     /// `model_reasoning_effort` (verified @ codex 0.137.0).
     pub current_turn_model: Option<String>,
     pub current_turn_effort: Option<String>,
+    /// The **current turn's** `turn_context.turn_id` — the durable per-turn key,
+    /// the same field the reload parser stamps on `Turn::Agent.hydration_key`.
+    /// The live adapter stamps it on `TurnEnd.first_message_id` so the dispatcher
+    /// writes a `TurnLink` for the send↔turn key-join; because it is read from the
+    /// same on-disk record the parser reads, live-key == parsed-key holds **by
+    /// construction** (no live-stream parity gamble — the live stream carries
+    /// `task_started.turn_id`, a different id the parser deliberately rejects).
+    /// **Turn-scoped:** reset to `None` at each `task_started` (like
+    /// [`Self::per_turn_usage`]), so a turn that writes no `turn_context` reads as
+    /// `None`, never a predecessor turn's id — a stale key would mis-link a new
+    /// turn to an old send.
+    pub current_turn_id: Option<String>,
     /// The full `session_meta` line as JSON, with
     /// `payload.base_instructions.text` replaced by a sentinel. Used as
     /// `SessionMeta.raw`. `None` if line 1 isn't a `session_meta` record.
@@ -341,6 +353,23 @@ pub fn parse_session_file(path: &Path) -> Enrichment {
 
 /// Parse already-loaded session-file content. Exposed for testing without
 /// the FS read.
+/// Extract a `turn_context` record's `turn_id` — Codex's durable per-turn key.
+///
+/// **Load-bearing that this is the single source.** Both keying paths read it:
+/// the reload parser stamps it on `Turn::Agent.hydration_key`, and the live
+/// enrichment stamps it on `TurnEnd.first_message_id` (via
+/// [`Enrichment::current_turn_id`]). The M3 design's "live-key == parsed-key by
+/// construction" guarantee holds only because both call *this* one function — if
+/// the two extractions ever diverged, a Codex turn would silently mis-link to the
+/// wrong send. Deliberately **not** `task_started.turn_id` (a different id whose
+/// per-turn uniqueness is unconfirmed).
+fn turn_context_turn_id(payload: &Value) -> Option<String> {
+    payload
+        .get("turn_id")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
 #[must_use]
 pub fn parse_session_content(content: &str) -> Enrichment {
     let mut enrichment = Enrichment::default();
@@ -392,6 +421,10 @@ pub fn parse_session_content(content: &str) -> Enrichment {
                     enrichment.current_turn_model = model.map(str::to_owned);
                     enrichment.current_turn_effort =
                         p.get("effort").and_then(Value::as_str).map(str::to_owned);
+                    // The durable per-turn key — same field (and same helper) the
+                    // reload parser reads for `hydration_key`. Set here, reset at
+                    // `task_started` below.
+                    enrichment.current_turn_id = turn_context_turn_id(p);
                 }
             }
             "event_msg" => {
@@ -415,6 +448,10 @@ pub fn parse_session_content(content: &str) -> Enrichment {
                         // whole-file last-wins — they are session-level
                         // "latest known" state, not per-turn telemetry.
                         enrichment.per_turn_usage = None;
+                        // Turn-scoped, same reason: a turn with no `turn_context`
+                        // must read as no-key, never inherit a predecessor's id
+                        // (a stale key would mis-link a new turn to an old send).
+                        enrichment.current_turn_id = None;
                     }
                     "token_count" => {
                         // Two variants share this type; each feeds a different
@@ -767,8 +804,10 @@ impl CodexReconstruction {
                     self.current_effort =
                         p.get("effort").and_then(Value::as_str).map(str::to_owned);
                     if let Some(builder) = self.current_agent.as_mut() {
-                        builder.hydration_key =
-                            p.get("turn_id").and_then(Value::as_str).map(str::to_owned);
+                        // Same helper as the live enrichment — the two must read the
+                        // identical field or a Codex turn mis-links (see
+                        // `turn_context_turn_id`).
+                        builder.hydration_key = turn_context_turn_id(p);
                     }
                 }
             }
@@ -1027,9 +1066,11 @@ impl CodexReconstruction {
             effort: self.current_effort.clone(),
             // Codex has no cost/overage and no Claude-style `stable_message_id`
             // cost-join key, but its `turn_context.turn_id` is a re-parse-stable
-            // per-turn hydration key. Whether the *live* stream carries the same
-            // id (refresh eligibility) is unprobed, so the live `TurnEnd` leaves
-            // `hydration_key: None` for now.
+            // per-turn hydration key. The live adapter now emits the same id on
+            // `TurnEnd` (sourced from the post-terminal enrichment re-read — the
+            // durable send↔turn `TurnLink`), so link-eligibility is probe-verified.
+            // It is **not** refresh-eligible: the live key arrives only at terminal
+            // (from disk), not mid-stream, so `supports_refresh` stays off.
             spend: None,
             hydration_key: builder.hydration_key,
             stable_message_id: None,
@@ -1205,6 +1246,45 @@ mod tests {
             enrichment.model.as_deref(),
             Some("gpt-5.5"),
             "first turn_context.model wins"
+        );
+    }
+
+    #[test]
+    fn enrichment_current_turn_id_is_this_turns_turn_context_turn_id() {
+        // The durable send↔turn key: `current_turn_id` is the CURRENT turn's
+        // `turn_context.turn_id` — the tail turn's, matching what the reload parser
+        // stamps on that turn's `hydration_key`. On a resumed multi-turn file the
+        // last turn_context (this turn's) wins.
+        let content = r#"
+{"type":"event_msg","payload":{"type":"task_started","turn_id":"t-1"}}
+{"type":"turn_context","payload":{"model":"gpt-5.5","turn_id":"turn-one"}}
+{"type":"event_msg","payload":{"type":"task_started","turn_id":"t-2"}}
+{"type":"turn_context","payload":{"model":"gpt-5.5","turn_id":"turn-two"}}
+"#;
+        let enrichment = parse_session_content(content);
+        assert_eq!(
+            enrichment.current_turn_id.as_deref(),
+            Some("turn-two"),
+            "current_turn_id is the tail turn's turn_context.turn_id"
+        );
+    }
+
+    #[test]
+    fn enrichment_current_turn_id_resets_when_current_turn_has_no_turn_context() {
+        // Stale-key guard (load-bearing): a turn that opens (`task_started`) but
+        // writes NO `turn_context` must read as no-key — never inherit the prior
+        // turn's id. A stale key would mis-link this turn to an old send. The reset
+        // at `task_started` (mirroring the parser's fresh-per-turn builder) is what
+        // guarantees live-key == parsed-key by construction.
+        let content = r#"
+{"type":"event_msg","payload":{"type":"task_started","turn_id":"t-1"}}
+{"type":"turn_context","payload":{"model":"gpt-5.5","turn_id":"turn-one"}}
+{"type":"event_msg","payload":{"type":"task_started","turn_id":"t-2"}}
+"#;
+        let enrichment = parse_session_content(content);
+        assert_eq!(
+            enrichment.current_turn_id, None,
+            "a turn with no turn_context must read no-key, not the predecessor's id"
         );
     }
 

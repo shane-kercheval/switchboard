@@ -724,6 +724,7 @@ The capabilities and behaviors Switchboard needs from each harness, with notes o
 | Programmatic compaction | unavailable (auto only) | unavailable (auto only) | unavailable (auto only) | unavailable (server-side; auto behavior unverified) |
 | Capture permission denials | native (`result.permission_denials`) | presumed (verification deferred) | not yet probed | n/a (auto-approved via `--dangerously-skip-permissions`) |
 | Run agents concurrently | confirmed | presumed | confirmed | confirmed (distinct server-assigned UUIDs; no prefix-collision hazard) |
+| Durable send↔turn correlation | native (key-join on first assistant `message.id`) | native (key-join on `turn_context.turn_id` via enrichment; probe-verified) | out of scope (decommissioned) | **positional only** (no per-turn id — order/count fallback; G24) |
 
 **Per-row notes** (only where the matrix needs elaboration):
 

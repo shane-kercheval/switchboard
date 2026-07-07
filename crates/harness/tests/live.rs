@@ -25,6 +25,16 @@ fn turn_end_model_effort(events: &[AdapterEvent]) -> Option<(Option<String>, Opt
     })
 }
 
+/// The `first_message_id` (the live-emitted `hydration_key`) from the `TurnEnd`.
+fn turn_end_first_message_id(events: &[AdapterEvent]) -> Option<String> {
+    events.iter().find_map(|e| match e {
+        AdapterEvent::TurnEnd {
+            first_message_id, ..
+        } => first_message_id.clone(),
+        _ => None,
+    })
+}
+
 /// The `hydration_key` of every hydrated agent turn that has one, in order.
 fn agent_hydration_keys(t: &switchboard_harness::LoadedTranscript) -> Vec<String> {
     t.turns
@@ -2089,6 +2099,73 @@ async fn live_codex_model_and_effort_change_across_turns() {
         efforts,
         vec![Some("medium".to_owned()), Some("high".to_owned())],
         "per-turn effort on disk; got {efforts:?}"
+    );
+}
+
+/// Codex durable send↔turn key parity. The key on the live `TurnEnd`
+/// (`first_message_id`, sourced from the enrichment re-read of
+/// `turn_context.turn_id`) must equal the `hydration_key` the session-file parser
+/// reconstructs for the *same* turn — that equality is what makes the M2 `TurnLink`
+/// correlate the right turn. Because both come from the same on-disk field it should
+/// hold by construction; this proves the per-turn mirroring (reset at `task_started`)
+/// is implemented correctly and guards it against Codex CLI drift. Two turns so it
+/// also proves the key **varies per turn** (no stale-key carryover).
+#[tokio::test]
+#[ignore = "requires codex installed — run with: make test-live-codex"]
+async fn live_codex_hydration_key_matches_live_turn_end() {
+    let cwd = tempfile::TempDir::new().unwrap();
+    let adapter = CodexAdapter::new();
+    let agent_id = Uuid::now_v7();
+    let mut agent = live_codex_agent();
+    agent.id = agent_id;
+
+    let events1: Vec<AdapterEvent> = adapter
+        .dispatch(
+            &agent,
+            cwd.path(),
+            "Reply with the single word 'ack'.",
+            Uuid::now_v7(),
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("dispatch 1")
+        .collect()
+        .await;
+    let live_key_1 = turn_end_first_message_id(&events1).expect(
+        "Codex TurnEnd must carry a first_message_id (turn_context.turn_id via enrichment)",
+    );
+    let (thread_id, date) = codex_capture(&events1).expect("captured Codex locator");
+
+    agent.session_locator = Some(SessionLocator::Codex {
+        thread_id: thread_id.clone(),
+        partition_date: date,
+    });
+    let events2: Vec<AdapterEvent> = adapter
+        .dispatch(
+            &agent,
+            cwd.path(),
+            "Reply with the single word 'ack'.",
+            Uuid::now_v7(),
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("dispatch 2")
+        .collect()
+        .await;
+    let live_key_2 = turn_end_first_message_id(&events2).expect("turn 2 first_message_id");
+
+    let hydrated = load_codex_transcript(&home_dir(), cwd.path(), &thread_id, Some(date), agent_id)
+        .expect("hydrate");
+    let disk_keys = agent_hydration_keys(&hydrated);
+
+    assert_eq!(
+        disk_keys,
+        vec![live_key_1.clone(), live_key_2.clone()],
+        "each turn's live TurnEnd key must equal the parser's hydration_key, in order"
+    );
+    assert_ne!(
+        live_key_1, live_key_2,
+        "the per-turn key must vary across turns — a constant key would mean stale carryover"
     );
 }
 

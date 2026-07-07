@@ -137,10 +137,11 @@ pub enum Turn {
         /// carries a deliberately broader contract.
         ///
         /// Per harness: Claude the **first** non-subagent assistant `message.id`
-        /// (matches the live `TurnEnd`); Codex the `event_msg/task_started.turn_id`;
-        /// Gemini the turn's first `gemini` record `id`. `None` for Antigravity
-        /// (no native per-turn id) — the merge falls back to `turn_id` for
-        /// keyless turns.
+        /// (matches the live `TurnEnd`); Codex the `turn_context.turn_id` (**not**
+        /// `task_started.turn_id`, whose per-turn uniqueness is unconfirmed — see
+        /// `codex/session_file.rs`); Gemini the turn's first `gemini` record `id`.
+        /// `None` for Antigravity (no native per-turn id) — the merge falls back to
+        /// `turn_id` for keyless turns.
         ///
         /// **Not** `stable_message_id`: that one stays private (`skip_serializing`,
         /// Claude-only cost-join) and is the **final** assistant `message.id`.

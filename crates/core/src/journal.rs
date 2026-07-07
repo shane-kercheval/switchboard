@@ -5,14 +5,26 @@
 //! and an *outcome* marker for every non-completed turn), while harness
 //! session files own the **agents'** side (completed-turn content). The two
 //! partition cleanly — a completed turn's content comes from the harness file;
-//! a failed or cancelled turn's marker comes from here — so no correlation or
-//! de-dup between the two sources is needed.
+//! a failed or cancelled turn's marker comes from here.
+//!
+//! **Correlation is a durable key-join where one exists, positional otherwise.**
+//! Historically the two sources were matched only by position/count (no shared
+//! key), which desyncs when a stray harness record shifts everything after it.
+//! A [`JournalRecord::TurnLink`] now records a stable per-turn id
+//! (`hydration_key`) for a content-bearing turn, so the merge joins that turn to
+//! its send by key instead of counting — see [`JournalRecord::TurnLink`] and
+//! `crates/app/src/commands.rs::merge_project_conversation`. It carries a harness
+//! **identifier**, never agent content, so the "no agent content" invariant holds
+//! (same category as the `message.id` the cost sidecar already joins on).
+//! Positional correlation remains the fallback for turns/harnesses with no such
+//! key.
 //!
 //! One `journal.jsonl` lives per project (`projects/<id>/journal.jsonl`).
 //! Records are append-only and durable per-record (the fsync in
 //! [`crate::io::append_jsonl`]); they land at human-paced turn boundaries
-//! (one at turn-start, one at a non-completed terminal), so the fsync pressure
-//! is negligible.
+//! (a `Send` at turn-start, and at the terminal a `TurnLink` for a content-bearing
+//! turn and/or an `Outcome` for a non-completed one), so the fsync pressure is
+//! negligible.
 //!
 //! **Partial content of an aborted turn:** never persisted *here* — the journal
 //! holds only the outcome marker (failure reason / cancel source, no agent
@@ -81,6 +93,35 @@ pub enum JournalRecord {
         started_at: DateTime<Utc>,
         ended_at: DateTime<Utc>,
     },
+    /// The durable send↔turn key-join link. Written at a turn's terminal when the
+    /// adapter reports a stable per-turn `hydration_key` — for a **`Completed` or
+    /// `Failed`** turn (a crash-truncated `Failed` turn still tagged its terminal
+    /// with the first assistant `message.id`, and that partial content *is* on
+    /// disk and needs the same correlation as a completed turn). Absent for a
+    /// keyless harness (Antigravity) and for a terminal that ended before any
+    /// content/key (a cancel before output) — those keep positional correlation.
+    ///
+    /// `hydration_key` is the same stable id the harness session file stores on the
+    /// matching `Turn::Agent.hydration_key` (Claude: the first assistant
+    /// `message.id`), so the merge joins this turn to its send by key rather than
+    /// counting harness turns against journal sends. **It is an identifier, not
+    /// agent content** — the "journal stores no agent content" invariant (§3) is
+    /// about responses/tool-calls, not correlation ids; this is the same category
+    /// as the `message.id` the cost sidecar already keys on. Do not "simplify" it
+    /// away: without it the merge falls back to fragile positional correlation.
+    ///
+    /// `turn_id` is the dispatcher's (matching the sibling `Send`/`Outcome`
+    /// records for symmetry), distinct from the harness file's own turn ids.
+    /// **Best-effort:** a failed link write must not fail the turn (the content is
+    /// already on disk; the merge simply falls back to positional for it), unlike
+    /// the fail-closed `Send`.
+    TurnLink {
+        send_id: SendId,
+        turn_id: Uuid,
+        agent_id: AgentId,
+        hydration_key: String,
+        at: DateTime<Utc>,
+    },
 }
 
 /// Append one record to a project's `journal.jsonl`.
@@ -136,6 +177,50 @@ mod tests {
 
         let read = read_records(&path).unwrap();
         assert_eq!(read, vec![r1, r2]);
+    }
+
+    #[test]
+    fn turn_link_round_trips() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("journal.jsonl");
+        let send_id = Uuid::now_v7();
+        let agent = Uuid::now_v7();
+        let link = JournalRecord::TurnLink {
+            send_id,
+            turn_id: Uuid::now_v7(),
+            agent_id: agent,
+            hydration_key: "msg_first01".to_owned(),
+            at: Utc::now(),
+        };
+        append_record(&path, &send(send_id, agent, "hi")).unwrap();
+        append_record(&path, &link).unwrap();
+
+        let read = read_records(&path).unwrap();
+        assert_eq!(read.len(), 2);
+        assert_eq!(read[1], link);
+    }
+
+    #[test]
+    fn journal_without_link_records_reads_unchanged() {
+        // Backward compatibility: a journal written before `TurnLink` existed
+        // (only `Send` + `Outcome`) must read back exactly as before — the new
+        // variant is additive.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("journal.jsonl");
+        let s = Uuid::now_v7();
+        let a = Uuid::now_v7();
+        let r1 = send(s, a, "hi");
+        let r2 = JournalRecord::Outcome {
+            send_id: s,
+            turn_id: Uuid::now_v7(),
+            agent_id: a,
+            outcome: json!({"status": "failed", "kind": "harness_error", "message": "x"}),
+            started_at: Utc::now(),
+            ended_at: Utc::now(),
+        };
+        append_record(&path, &r1).unwrap();
+        append_record(&path, &r2).unwrap();
+        assert_eq!(read_records(&path).unwrap(), vec![r1, r2]);
     }
 
     #[test]

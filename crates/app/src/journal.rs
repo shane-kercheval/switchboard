@@ -98,4 +98,50 @@ impl ConversationJournal for ProjectJournal {
             );
         }
     }
+
+    fn record_link(
+        &self,
+        turn_id: TurnId,
+        agent_id: AgentId,
+        hydration_key: &str,
+        at: DateTime<Utc>,
+    ) {
+        let record = JournalRecord::TurnLink {
+            send_id: self.send_id,
+            turn_id,
+            agent_id,
+            hydration_key: hydration_key.to_owned(),
+            at,
+        };
+        // Best-effort: a lost link just drops this turn to positional correlation
+        // in the merge; the turn already produced content, so never fail it.
+        if let Err(e) = switchboard_core::journal::append_record(&self.journal_path, &record) {
+            tracing::warn!(
+                %agent_id,
+                error = %e,
+                "failed to journal turn link — turn proceeds; merge falls back to positional correlation for it"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    /// Best-effort contract: a failing link write must not panic or propagate —
+    /// the turn already produced content, so it just drops to positional. The
+    /// path's parent doesn't exist, so `append_record` errors; `record_link`
+    /// must swallow it. (`record_link` returns `()`, so the type already forbids
+    /// failing the turn; this guards the impl against a future `unwrap`.)
+    #[test]
+    fn record_link_swallows_write_errors() {
+        let journal = ProjectJournal::new(
+            PathBuf::from("/nonexistent-dir-xyz/journal.jsonl"),
+            Uuid::now_v7(),
+        );
+        journal.record_link(Uuid::now_v7(), Uuid::now_v7(), "msg_first", Utc::now());
+        // Reaching here (no panic) is the assertion.
+    }
 }

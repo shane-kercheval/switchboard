@@ -508,6 +508,24 @@ pub trait ConversationJournal: Send + Sync {
         started_at: DateTime<Utc>,
         ended_at: DateTime<Utc>,
     );
+
+    /// Written at a turn's terminal when the adapter reports a stable per-turn
+    /// `hydration_key` — for a **`Completed` or `Failed`** turn (a failed turn can
+    /// carry partial content on disk keyed by its first assistant `message.id`).
+    /// Records the durable send↔turn join so the transcript merge matches this
+    /// turn to its send by key instead of by counting.
+    ///
+    /// **Best-effort, like `record_outcome`** — and deliberately *not* fail-closed
+    /// like `record_send`: the turn already produced content, so a lost link just
+    /// drops that turn to positional correlation. Returns `()`; the impl logs on
+    /// failure. Not called for a keyless terminal (no `hydration_key`).
+    fn record_link(
+        &self,
+        turn_id: TurnId,
+        agent_id: AgentId,
+        hydration_key: &str,
+        at: DateTime<Utc>,
+    );
 }
 
 /// Sink for **stream-only** (class-C) metadata that has no harness-side
@@ -640,6 +658,7 @@ impl ConversationJournal for NoopJournal {
         _: DateTime<Utc>,
     ) {
     }
+    fn record_link(&self, _: TurnId, _: AgentId, _: &str, _: DateTime<Utc>) {}
 }
 
 /// Everything needed to run one turn, produced fresh by a
@@ -1578,7 +1597,13 @@ async fn drain_turn(
                     }
                     continue;
                 }
-                if let AdapterEvent::TurnEnd { outcome, ended_at, .. } = &event {
+                if let AdapterEvent::TurnEnd {
+                    outcome,
+                    ended_at,
+                    first_message_id,
+                    ..
+                } = &event
+                {
                     // A duplicate terminal was already dropped by the
                     // turn-scoped guard above, so from here `terminal_seen`
                     // is false and this is the turn's first terminal.
@@ -1592,6 +1617,19 @@ async fn drain_turn(
                     terminal_seen = true;
                     if !matches!(outcome, TurnOutcome::Completed) {
                         journal.record_outcome(turn_id, agent_id, outcome, started_at, *ended_at);
+                    }
+                    // Durable send↔turn key-join: whenever the terminal carries a
+                    // stable per-turn id (Claude's first assistant `message.id`),
+                    // record the link so the merge matches this turn to its send by
+                    // key, not by counting. Written for `Completed` AND `Failed`
+                    // (a failed-with-content turn's partial output is on disk and
+                    // needs the same correlation). Best-effort — a failed link
+                    // write must not fail the turn; it just drops to positional.
+                    // Complements the `Outcome` above: a failed-with-content turn
+                    // writes both (link correlates content, outcome supplies the
+                    // badge). A cancelled/keyless terminal writes neither here.
+                    if let Some(key) = first_message_id {
+                        journal.record_link(turn_id, agent_id, key, *ended_at);
                     }
                     // Fire the awaited-send + current-turn waiters with the real
                     // outcome. Only a completed turn carries forwardable text; a

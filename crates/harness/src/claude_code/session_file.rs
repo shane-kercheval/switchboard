@@ -1376,6 +1376,51 @@ mod tests {
         );
     }
 
+    /// A dispatch that spanned an auto-compaction parses into TWO agent turns: the
+    /// pre-compaction turn and the continuation. Their `hydration_key`s must
+    /// **differ** (each is its own turn's first assistant `message.id`) — the M2
+    /// key-join relies on this so the dispatcher's single link (pointing at the
+    /// dispatch's *first* message id) matches only the pre-compaction turn, leaving
+    /// the continuation un-grouped. A parser change that reused one key across the
+    /// split would silently re-group the continuation onto the wrong send.
+    #[test]
+    fn compaction_split_gives_continuation_a_distinct_hydration_key() {
+        let turns = load_turns(&[
+            user_record_with_source("go", "sdk", "2026-05-14T04:43:15Z"),
+            json!({
+                "type": "assistant",
+                "message": {
+                    "id": "msg_pre", "model": "claude-sonnet-4-6", "role": "assistant",
+                    "content": [{ "type": "text", "text": "pre" }],
+                    "stop_reason": "end_turn", "usage": { "input_tokens": 1, "output_tokens": 1 }
+                },
+                "timestamp": "2026-05-14T04:43:16Z",
+            }),
+            json!({"type":"user","message":{"role":"user","content":"This session is being continued…"},"isCompactSummary":true,"timestamp":"2026-05-14T04:43:17Z"}),
+            json!({
+                "type": "assistant",
+                "message": {
+                    "id": "msg_cont", "model": "claude-sonnet-4-6", "role": "assistant",
+                    "content": [{ "type": "text", "text": "cont" }],
+                    "stop_reason": "end_turn", "usage": { "input_tokens": 1, "output_tokens": 1 }
+                },
+                "timestamp": "2026-05-14T04:43:18Z",
+            }),
+        ]);
+        let keys: Vec<Option<String>> = turns
+            .iter()
+            .filter_map(|t| match t {
+                Turn::Agent { hydration_key, .. } => Some(hydration_key.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            keys,
+            vec![Some("msg_pre".to_owned()), Some("msg_cont".to_owned())],
+            "pre-compaction and continuation turns must carry distinct hydration keys"
+        );
+    }
+
     #[test]
     fn missing_session_file_returns_empty_transcript() {
         let home = TempDir::new().unwrap();

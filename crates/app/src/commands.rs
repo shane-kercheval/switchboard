@@ -3884,6 +3884,7 @@ type UserMessageGroup = (
 /// from the harness file because the journal doesn't own it), a system marker
 /// (rendered but deliberately not correlated to any send), or nothing (a
 /// journaled prompt the journal already renders).
+#[derive(Clone, Copy)]
 enum TurnRender {
     Agent(Option<SendId>),
     UserImported,
@@ -3906,8 +3907,17 @@ enum TurnRender {
 /// count path uses); on a single machine the harness records a prompt no earlier
 /// than Switchboard journaled its dispatch, so a genuine first send is never
 /// excluded.
+///
+/// **This is the positional fallback, not the primary correlation.** The durable
+/// key-join ([`classify_agent_turns`]) runs first and renders every key-linked
+/// turn (and suppresses its paired prompt) authoritatively; this classifier runs
+/// only over the **residual** — the turns and sends the key-join left unclaimed
+/// (keyless/legacy/in-flight) — via [`classify_residual`], which recomputes its
+/// offsets from that residual view. Takes `&[&Turn]` so the residual can be a
+/// slice of references without cloning the (heavy) agent turns. Supersedes the
+/// "correlate by order" posture (2026-06-07 plan) for key-bearing harnesses.
 fn classify_turns_by_provenance(
-    turns: &[switchboard_harness::Turn],
+    turns: &[&switchboard_harness::Turn],
     all_sends: &[SendId],
     journal_start: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Vec<TurnRender> {
@@ -3915,6 +3925,7 @@ fn classify_turns_by_provenance(
     let mut pending_send: Option<SendId> = None;
     turns
         .iter()
+        .copied()
         .map(|turn| match turn {
             switchboard_harness::Turn::Agent { .. } => TurnRender::Agent(pending_send.take()),
             switchboard_harness::Turn::System { .. } => TurnRender::SystemMarker,
@@ -3942,11 +3953,28 @@ fn classify_turns_by_provenance(
 }
 
 /// Count-based turn classification — the pre-provenance correlation, retained as
-/// the fallback for agents with no `promptSource` signal (older Claude files,
-/// other harnesses). Mirrors the historical inline logic exactly; see the call
-/// site for the front-offset / dangling rationale.
+/// the residual fallback for agents/turns with no `promptSource` signal *and* no
+/// durable link (older Claude files, keyless harnesses, in-flight turns). Runs
+/// over the key-join residual via [`classify_residual`], with all counts
+/// recomputed from that residual view.
+///
+/// Correlates by ORDER: the Nth (post-`turn_offset`) agent turn answers the Nth
+/// residual send. `turn_offset` is the count of leading **imported** (pre-journaling)
+/// agent turns — those older than the agent's first journaled send — so extra front
+/// turns get no send and the rest pair in order; extra sends at the back (in-flight /
+/// cancelled-before-output) have no turn and are dropped rather than mislabeling a
+/// completed turn. A user turn is dropped (journal owns it) exactly when it
+/// corresponds to a send: one *with* a reply iff that reply is journaled; a *dangling*
+/// (reply-less) one while `dangling_journaled` = sends-minus-journaled-replies remain.
+/// Two positional edges persist, both confined to the discouraged pattern of running
+/// the bare CLI on a session Switchboard is also driving, and both pinned by
+/// characterization tests: a send cancelled before its prompt was recorded makes
+/// `dangling_journaled` overcount by one; and two reply-less dangling sources are
+/// order-ambiguous (an imported dangling prompt before a journaled one is dropped and
+/// the journaled one duplicated). The durable key-join dissolves these for any turn
+/// that carries a link.
 fn classify_turns_by_count(
-    turns: &[switchboard_harness::Turn],
+    turns: &[&switchboard_harness::Turn],
     all_sends: &[SendId],
     turn_offset: usize,
     dangling_journaled: usize,
@@ -3956,6 +3984,7 @@ fn classify_turns_by_count(
     let mut dangling_seen = 0usize;
     turns
         .iter()
+        .copied()
         .map(|turn| match turn {
             switchboard_harness::Turn::Agent { .. } => {
                 let send_id = if agent_seen >= turn_offset {
@@ -3986,6 +4015,169 @@ fn classify_turns_by_count(
             _ => TurnRender::Skip,
         })
         .collect()
+}
+
+/// Classify one agent's harness turns into renders, using the **durable key-join**
+/// where a [`switchboard_core::JournalRecord::TurnLink`] exists and falling back
+/// to the positional classifiers ([`classify_residual`]) for everything else.
+///
+/// The key-join is exact and **authoritative**: a `Turn::Agent` whose
+/// `hydration_key` matches a link is grouped to that send regardless of position,
+/// so a stray/extra/missing harness record can no longer shift a *different*
+/// send's correlation. Positional correlation exists only for the residual —
+/// pre-feature turns, in-flight turns (no link yet), and keyless harnesses.
+///
+/// **Why the paired prompt is claimed alongside the linked reply (load-bearing):**
+/// the journal already renders a linked turn's user message (from its `Send`), so
+/// the harness's echoed copy of that prompt must be **suppressed**. If pass 1
+/// claimed only the agent turn + send and left the echoed prompt in the residual,
+/// steady state (every send claimed → empty residual send pool) would make the
+/// residual classifier render every prompt `UserImported` — reviving the exact
+/// duplication this join fixes. So pass 1 claims (prompt, reply, send) together,
+/// using the same reply/provenance pairing the positional walk uses — not fragile
+/// "immediately preceding" adjacency.
+///
+/// **Provenance-agnostic suppression (harness-shaped, not Claude-shaped):** a
+/// *link* is authoritative that the turn was Switchboard-dispatched, so its echoed
+/// prompt is journal-owned regardless of the harness's provenance tag. The pending
+/// candidate is therefore any in-window `Sdk`-or-`Unknown` prompt — `Sdk` (Claude)
+/// **and** `Unknown` (Codex and every non-Claude harness, whose prompts have no
+/// `promptSource`), so a linked Codex reply suppresses its echo the same way a
+/// Claude one does (this is what lets M3 add Codex links with no merge change).
+/// `External` (bare-TUI-typed, not journaled) and pre-journaling prompts are
+/// excluded, so a genuinely-imported prompt is never suppressed.
+fn classify_agent_turns(
+    turns: &[switchboard_harness::Turn],
+    all_sends: &[SendId],
+    links: &HashMap<String, SendId>,
+    journal_start: Option<chrono::DateTime<chrono::Utc>>,
+) -> Vec<TurnRender> {
+    // Pass 1 — key-join. Track the most-recent unconsumed correlating prompt (an
+    // in-window `Sdk`-or-`Unknown` user turn): it survives `System` markers and is
+    // taken at the NEXT agent turn — matched or not — exactly like the positional
+    // walk's `pending_send`. Only *commit* the claim (Skip the prompt, group the
+    // reply by key, claim the send) when that agent turn is key-linked; at an
+    // unlinked agent turn, discard the taken prompt so it can't pair with a later
+    // linked reply and steal the wrong send. `resolved` marks the slots pass 1
+    // rendered; the rest go to the residual — so the final `renders` is built
+    // totally (every slot written), no `Option`/`expect` in the merge path.
+    let mut renders: Vec<TurnRender> = vec![TurnRender::Skip; turns.len()];
+    let mut resolved: Vec<bool> = vec![false; turns.len()];
+    let mut claimed: HashSet<SendId> = HashSet::new();
+    let mut pending_prompt: Option<usize> = None;
+    for (i, turn) in turns.iter().enumerate() {
+        match turn {
+            switchboard_harness::Turn::User {
+                started_at, source, ..
+            } => {
+                use switchboard_harness::UserPromptSource::{Sdk, Unknown};
+                pending_prompt = (matches!(source, Sdk | Unknown)
+                    && journal_start.is_some_and(|start| *started_at >= start))
+                .then_some(i);
+            }
+            switchboard_harness::Turn::Agent { hydration_key, .. } => {
+                let paired_prompt = pending_prompt.take();
+                if let Some(send_id) = hydration_key.as_deref().and_then(|k| links.get(k).copied())
+                {
+                    renders[i] = TurnRender::Agent(Some(send_id));
+                    resolved[i] = true;
+                    claimed.insert(send_id);
+                    if let Some(pi) = paired_prompt {
+                        renders[pi] = TurnRender::Skip;
+                        resolved[pi] = true;
+                    }
+                }
+                // Unlinked agent turn: leave it (and its would-be prompt) unresolved
+                // for the residual to re-derive the pairing from scratch.
+            }
+            // A `System` marker (or any future non-boundary record) is not a reply
+            // boundary — leave the pending prompt intact so it still pairs with the
+            // next agent turn.
+            _ => {}
+        }
+    }
+
+    // Pass 2 — positional fallback over the residual (unresolved turns + unclaimed
+    // sends), with all offsets AND the provenance-vs-count decision recomputed from
+    // that residual view.
+    let residual_indices: Vec<usize> = (0..turns.len()).filter(|&i| !resolved[i]).collect();
+    let residual_turns: Vec<&switchboard_harness::Turn> =
+        residual_indices.iter().map(|&i| &turns[i]).collect();
+    let residual_sends: Vec<SendId> = all_sends
+        .iter()
+        .copied()
+        .filter(|s| !claimed.contains(s))
+        .collect();
+    let residual_renders = classify_residual(&residual_turns, &residual_sends, journal_start);
+    for (&oi, render) in residual_indices.iter().zip(residual_renders) {
+        renders[oi] = render;
+    }
+    renders
+}
+
+/// Positional classification of the key-join **residual** — the turns and sends
+/// the durable key-join left unclaimed. Recomputes `agent_turn_count` /
+/// `turn_offset` / `dangling_journaled` **and** the provenance-vs-count selection
+/// (`has_known_provenance` / `ambiguous_unknown`) from the residual view; feeding
+/// a shortened residual to counts derived from the *full* arrays silently
+/// misaligns (they index `all_sends` by position). `journal_start` stays the
+/// agent's original pre-history boundary (when Switchboard first dispatched to it)
+/// — a claimed send does not move that boundary.
+///
+/// **KNOWN RESIDUAL (pre-existing; slated for M3):** when a linked (claimed) send
+/// is followed by an *imported* bare-CLI turn and then a *later unclaimed* send,
+/// passing the original `journal_start` lets that imported turn look journaled and
+/// duplicate the later prompt — the pre-existing count-path bug, unchanged by the
+/// key-join (M2 is no-worse-than-positional here). The confirmed fix is to derive
+/// the residual boundary from the **earliest *unclaimed* send** instead (turns
+/// older than it are then correctly treated as pre-history); it needs per-agent
+/// sends carried as `{send_id, at}` and the empty-unclaimed-pool edge handled, so
+/// it lands with M3's fallback rework, not here. Inert for keyless/legacy agents
+/// (no claims ⇒ unclaimed == all sends ⇒ boundary unchanged).
+fn classify_residual(
+    turns: &[&switchboard_harness::Turn],
+    all_sends: &[SendId],
+    journal_start: Option<chrono::DateTime<chrono::Utc>>,
+) -> Vec<TurnRender> {
+    let agent_turn_count = turns
+        .iter()
+        .copied()
+        .filter(|t| matches!(t, switchboard_harness::Turn::Agent { .. }))
+        .count();
+    let turn_offset = match journal_start {
+        Some(start) => turns
+            .iter()
+            .copied()
+            .filter(|t| {
+                matches!(t, switchboard_harness::Turn::Agent { started_at, .. } if *started_at < start)
+            })
+            .count(),
+        None => agent_turn_count,
+    };
+    let journaled_replies = agent_turn_count - turn_offset;
+    let dangling_journaled = all_sends.len().saturating_sub(journaled_replies);
+    let has_known_provenance = turns.iter().copied().any(|t| {
+        matches!(t, switchboard_harness::Turn::User { source, .. }
+            if *source != switchboard_harness::UserPromptSource::Unknown)
+    });
+    let ambiguous_unknown = journal_start.is_some_and(|start| {
+        turns.iter().copied().any(|t| {
+            matches!(t,
+                switchboard_harness::Turn::User { source: switchboard_harness::UserPromptSource::Unknown, started_at, .. }
+                if *started_at >= start)
+        })
+    });
+    if has_known_provenance && !ambiguous_unknown {
+        classify_turns_by_provenance(turns, all_sends, journal_start)
+    } else {
+        classify_turns_by_count(
+            turns,
+            all_sends,
+            turn_offset,
+            dangling_journaled,
+            agent_turn_count,
+        )
+    }
 }
 
 /// Pure merge of the two conversation sources into the unified transcript. No
@@ -4030,6 +4222,10 @@ fn merge_project_conversation(
     // turns by timestamp rather than by `min(turns, sends)`, which can't tell a
     // leading imported turn from a trailing in-flight send when both are present.
     let mut journal_start: HashMap<AgentId, chrono::DateTime<chrono::Utc>> = HashMap::new();
+    // Durable send↔turn links (`hydration_key → send_id`), per agent, from
+    // `TurnLink` records. The key-join uses these to match content-bearing turns
+    // to their sends exactly, before the positional fallback runs.
+    let mut agent_links: HashMap<AgentId, HashMap<String, SendId>> = HashMap::new();
     for record in journal {
         match record {
             switchboard_core::JournalRecord::Send {
@@ -4085,6 +4281,19 @@ fn merge_project_conversation(
                     at: started_at,
                 });
             }
+            switchboard_core::JournalRecord::TurnLink {
+                send_id,
+                agent_id,
+                hydration_key,
+                ..
+            } => {
+                // A `hydration_key` is unique per turn, so last-write-wins is a
+                // no-op here; the map is the agent's key→send join for the merge.
+                agent_links
+                    .entry(agent_id)
+                    .or_default()
+                    .insert(hydration_key, send_id);
+            }
             // A future journal-record kind we don't yet render — degrade by
             // skipping it rather than failing the whole load.
             _ => {}
@@ -4108,146 +4317,29 @@ fn merge_project_conversation(
     let mut agents: Vec<AgentConversationMeta> = Vec::new();
     for (agent_id, transcript, load_error) in agent_transcripts {
         let turns = transcript.turns;
-        // Correlate harness turns to journaled sends by ORDER (the journal's
-        // turn_id is the dispatcher's, unrelated to the harness file's).
-        //
-        // Front-aligned against **all** sends (`agent_sends`, not completed-only):
-        // extra agent turns at the FRONT are pre-journaling history (older than the
-        // first journaled send — typically an attached session predating
-        // Switchboard) and get no send_id (rendered un-grouped); the rest pair with
-        // sends in order. Extra sends at the BACK have no harness turn — an
-        // in-flight send (turn still running) or a cancelled-before-output send —
-        // and are dropped here rather than mislabeling a completed turn.
-        //
-        // The offset is on the **turn** side (`turn_offset`), not the send side:
-        // do NOT skip leading sends (tail-anchoring), which would pair the last
-        // completed turn with a trailing in-flight send — see
-        // `merge_in_flight_send_does_not_mislabel_completed_turns`. Pairing against
-        // all sends is what lets a cancel-mid turn claim its own send (so its
-        // prompt drops); its cancelled status comes from the coexisting Outcome
-        // marker, not from this correlation. Residual: a cancelled-before-output
-        // send positioned *before* a content-bearing turn shifts subsequent labels
-        // by one (content mis-grouping, not prompt duplication — the journal still
-        // owns the prompt). User-visible symptom: a completed answer can render
-        // under a `cancelled` badge (wrong *status* on a real answer), not a
-        // duplicated or missing prompt. Pinned by characterization tests below;
-        // the deferred durable key-join dissolves it.
-        //
-        // `turn_offset` is the count of the agent's leading **imported** turns
-        // (pre-journaling history). Counting it as `agent_turns - min(turns, sends)`
-        // is wrong when the file has BOTH leading imported turns AND a trailing
-        // in-flight send: the `min` cancels them against each other, so the offset
-        // collapses to zero, the in-flight send is treated as already answered, and
-        // its dangling harness user turn is mis-rendered as an imported prompt — a
-        // duplicate of the journal's copy (the reported "prompt twice while
-        // Working…" bug). Instead, split at the agent's first journaled send: a turn
-        // older than that instant is pre-journaling (no send), a turn at/after it is
-        // Switchboard-dispatched. Imported turns are always the *leading* ones (the
-        // session file is chronological and history predates the first dispatch), so
-        // a count of them is exactly `turn_offset`.
-        //
-        // User turns are classified by their REPLY, not by a suffix count — so a
-        // non-journaled prompt that lands *after* journaled history (e.g. the user
-        // ran the CLI directly in the same dir between Switchboard sessions) is
-        // still handled. The journal renders a UserMessage for every `Send`
-        // (regardless of outcome), so a harness user turn is "journaled" (drop it,
-        // the journal owns it) exactly when it corresponds to a send:
-        //   - A user turn WITH a following reply is journaled iff that reply is
-        //     journaled (`agent_seen >= turn_offset`).
-        //   - A *dangling* user turn (no reply — a cancelled-before-output send or
-        //     an in-flight one, or an imported prompt with no reply yet) is
-        //     journaled while sends that produced no journaled reply remain to
-        //     account for it (`dangling_journaled` = sends minus journaled replies);
-        //     beyond that it's imported and rendered.
-        // This needs 1:1 prompt/reply alternation in the file (true for Claude and
-        // Codex — tool results fold into the agent turn). Two edges remain, BOTH
-        // confined to the already-discouraged pattern of running the bare CLI on a
-        // session Switchboard is also driving (the resume-in-terminal panel warns
-        // this corrupts the session file), and both pinned by characterization tests
-        // so the behavior stays a conscious decision:
-        //   - A send cancelled *before* the harness recorded its prompt has no
-        //     harness user turn, so `dangling_journaled` overcounts by one and can
-        //     drop a co-occurring imported dangling prompt.
-        //   - Among reply-less *dangling* turns, classification is still front-to-
-        //     back (the first `dangling_journaled` are treated as journaled). If an
-        //     *imported* dangling prompt precedes a *journaled* one (a bare-CLI
-        //     prompt, then an in-flight Switchboard send, with no reply to either),
-        //     the imported prompt is dropped and the journaled one duplicated. Order
-        //     alone can't disambiguate two reply-less dangling sources. (An imported
-        //     turn that DOES have a reply is handled — the reply has no send slot, so
-        //     the `reply_is_journaled` check below renders its prompt.)
-        let agent_turn_count = turns
-            .iter()
-            .filter(|t| matches!(t, switchboard_harness::Turn::Agent { .. }))
-            .count();
+        // Correlate this agent's harness turns to its journaled sends. The
+        // dispatcher's `turn_id` and the harness file's ids are different id
+        // spaces, so we join by the durable `hydration_key` where a `TurnLink`
+        // exists (`classify_agent_turns`, authoritative) and fall back to ORDER for
+        // the residual (`classify_turns_by_count`/`_by_provenance`). The residual's
+        // front-offset / dangling / straddling reasoning — and the two known
+        // positional edges it still carries (a cancelled-before-output send shifting
+        // labels; two reply-less dangling sources being order-ambiguous), confined
+        // to the discouraged bare-CLI-on-a-driven-session pattern and pinned by
+        // characterization tests — live in those helpers' docs. The key-join
+        // dissolves them for any turn that carries a link.
         let all_sends = agent_sends.get(&agent_id).map_or(&[][..], Vec::as_slice);
-        // Leading imported (pre-journaling) agent turns: those older than the first
-        // journaled send. With no sends, every turn is imported.
-        let turn_offset = match journal_start.get(&agent_id) {
-            Some(&start) => turns
-                .iter()
-                .filter(|t| {
-                    matches!(t, switchboard_harness::Turn::Agent { started_at, .. } if *started_at < start)
-                })
-                .count(),
-            None => agent_turn_count,
-        };
-        // Sends with no journaled reply yet (in-flight, or cancelled/failed before
-        // output) — the trailing send-excess that a dangling harness user turn can
-        // be attributed to. `saturating_sub` guards the bare-CLI-after-journaling
-        // case, where timestamp-journaled replies can outnumber sends.
-        let journaled_replies = agent_turn_count - turn_offset;
-        let dangling_journaled = all_sends.len().saturating_sub(journaled_replies);
-        // Prefer provenance when the agent's transcript carries it *unambiguously*
-        // (Claude `promptSource`): pairing `Sdk` prompts to sends is immune to the
-        // interior housekeeping/bare-CLI turns that desync the count-based path on
-        // long, compaction-heavy files. Two guards keep this from ever rendering a
-        // file worse than today:
-        //   - No signal at all (older Claude files, other harnesses — all turns
-        //     `Unknown`) → count path unchanged.
-        //   - A **straddling** file (history spanning the CLI version that
-        //     introduced `promptSource`) → count path. Such a file has marked
-        //     (`Sdk`) prompts AND unmarked (`Unknown`) ones inside the journaled
-        //     region. A journaled-region `Unknown` is a *pre-marker dispatch* (a
-        //     marker-bearing CLI tags genuine bare-CLI prompts `typed`/`queued`,
-        //     never absent), so the journal owns it — importing it would duplicate
-        //     it. Provenance can't tell that apart from a true import, so we defer
-        //     the whole agent to the count path. Pre-journaling `Unknown` (attached
-        //     history, older than the first send) does NOT count as straddling:
-        //     both paths correctly import it.
         let journal_start_at = journal_start.get(&agent_id).copied();
-        let has_known_provenance = turns.iter().any(|t| {
-            matches!(t, switchboard_harness::Turn::User { source, .. }
-                if *source != switchboard_harness::UserPromptSource::Unknown)
-        });
-        // A journaled-region `Unknown`-source *user* turn is a genuine
-        // pre-`promptSource` dispatch the journal owns — provenance can't tell it
-        // from a real import, so the whole agent defers to the count path. Harness
-        // *bookkeeping* (a bare `/compact`, a compaction summary) is NOT such a
-        // turn: the Claude parser now routes those to non-correlating
-        // `Turn::System` markers upstream (see
-        // `claude_code/session_file.rs::is_bare_slash_command_record`), so they no
-        // longer trip this guard. It therefore fires only for true pre-marker
-        // dispatch history — never merely because a bookkeeping record appeared in
-        // the journaled window (the reported bug).
-        let ambiguous_unknown = journal_start_at.is_some_and(|start| {
-            turns.iter().any(|t| {
-                matches!(t,
-                    switchboard_harness::Turn::User { source: switchboard_harness::UserPromptSource::Unknown, started_at, .. }
-                    if *started_at >= start)
-            })
-        });
-        let renders = if has_known_provenance && !ambiguous_unknown {
-            classify_turns_by_provenance(&turns, all_sends, journal_start_at)
-        } else {
-            classify_turns_by_count(
-                &turns,
-                all_sends,
-                turn_offset,
-                dangling_journaled,
-                agent_turn_count,
-            )
-        };
+        // Durable key-join first (authoritative), positional fallback for the
+        // residual. `classify_agent_turns` matches each content-bearing turn to its
+        // send by `hydration_key` (suppressing the harness-echoed prompt via the
+        // reply/provenance pairing), then classifies only the unclaimed turns/sends
+        // positionally — recomputing `turn_offset`/`dangling`/provenance-vs-count
+        // from that residual view. All the front-offset / dangling / straddling
+        // rationale lives in those helpers' docs now.
+        let empty_links = HashMap::new();
+        let links = agent_links.get(&agent_id).unwrap_or(&empty_links);
+        let renders = classify_agent_turns(&turns, all_sends, links, journal_start_at);
         for (turn, render) in turns.into_iter().zip(renders) {
             match (turn, render) {
                 (
@@ -11456,6 +11548,52 @@ mod tests {
         }
     }
 
+    /// An agent turn carrying a `hydration_key` — the durable join key a
+    /// `TurnLink` matches on.
+    fn agent_turn_keyed(turn_id: Uuid, agent_id: AgentId, text: &str, t: i64, key: &str) -> Turn {
+        let Turn::Agent {
+            started_at,
+            ended_at,
+            status,
+            items,
+            usage,
+            spend,
+            model,
+            effort,
+            stable_message_id,
+            ..
+        } = agent_turn(turn_id, agent_id, text, t)
+        else {
+            unreachable!()
+        };
+        Turn::Agent {
+            turn_id,
+            agent_id,
+            started_at,
+            ended_at,
+            status,
+            items,
+            usage,
+            spend,
+            model,
+            effort,
+            hydration_key: Some(key.to_owned()),
+            stable_message_id,
+        }
+    }
+
+    /// A `TurnLink` journal record joining `key` (an agent turn's `hydration_key`)
+    /// to `send_id`.
+    fn link_record(send_id: SendId, agent_id: AgentId, key: &str, t: i64) -> JournalRecord {
+        JournalRecord::TurnLink {
+            send_id,
+            turn_id: Uuid::now_v7(),
+            agent_id,
+            hydration_key: key.to_owned(),
+            at: at(t),
+        }
+    }
+
     /// A user turn with no provenance signal — routes the agent through the
     /// count-based fallback, so every existing `merge_*` test exercises today's
     /// behavior unchanged.
@@ -12343,6 +12481,286 @@ mod tests {
                 ] if command == "/compact"
             ),
             "both the SlashCommand and Compaction markers render, in order, got {markers:?}"
+        );
+    }
+
+    #[test]
+    fn merge_key_join_pairs_correctly_despite_spurious_extra_turn() {
+        // The core M2 guarantee: a spurious extra agent turn between two linked
+        // replies would shift EVERY positional label after it (reply2 would lose
+        // its send, the spurious turn would steal it). The key-join pairs each
+        // linked reply to its send regardless of position; the spurious turn falls
+        // to the residual, un-grouped and consuming no send.
+        let agent = Uuid::now_v7();
+        let (s1, s2) = (Uuid::now_v7(), Uuid::now_v7());
+        let journal = vec![
+            send_record(s1, Uuid::now_v7(), agent, "prompt1", 1),
+            send_record(s2, Uuid::now_v7(), agent, "prompt2", 5),
+            link_record(s1, agent, "k1", 3),
+            link_record(s2, agent, "k2", 7),
+        ];
+        let turns = vec![
+            user_turn_src(Uuid::now_v7(), agent, "prompt1", 2, UserPromptSource::Sdk),
+            agent_turn_keyed(Uuid::now_v7(), agent, "reply1", 3, "k1"),
+            // Spurious extra turn (no link) between the two linked replies.
+            agent_turn(Uuid::now_v7(), agent, "spurious", 4),
+            user_turn_src(Uuid::now_v7(), agent, "prompt2", 6, UserPromptSource::Sdk),
+            agent_turn_keyed(Uuid::now_v7(), agent, "reply2", 7, "k2"),
+        ];
+        let merged = merge_project_conversation(journal, vec![(agent, transcript_of(turns), None)]);
+
+        assert_eq!(user_texts(&merged), vec!["prompt1", "prompt2"]);
+        assert!(
+            !merged
+                .items
+                .iter()
+                .any(|i| matches!(i, ConversationItem::UserMessage { send_id: None, .. })),
+            "no imported duplicate"
+        );
+        // reply1→s1, spurious→None, reply2→s2 — by KEY, not shifted by the spurious.
+        assert_eq!(agent_send_ids(&merged), vec![Some(s1), None, Some(s2)]);
+    }
+
+    #[test]
+    fn merge_without_links_falls_back_to_positional_unchanged() {
+        // The same transcript with NO link records must classify exactly by the
+        // positional path — proving the key-join is purely additive and legacy
+        // journals are untouched. Here a spurious turn DOES shift positional
+        // labels (that's the pre-M2 behavior the links fix).
+        let agent = Uuid::now_v7();
+        let (s1, s2) = (Uuid::now_v7(), Uuid::now_v7());
+        let journal = vec![
+            send_record(s1, Uuid::now_v7(), agent, "prompt1", 1),
+            send_record(s2, Uuid::now_v7(), agent, "prompt2", 5),
+        ];
+        let turns = vec![
+            user_turn_src(Uuid::now_v7(), agent, "prompt1", 2, UserPromptSource::Sdk),
+            agent_turn_keyed(Uuid::now_v7(), agent, "reply1", 3, "k1"),
+            user_turn_src(Uuid::now_v7(), agent, "prompt2", 6, UserPromptSource::Sdk),
+            agent_turn_keyed(Uuid::now_v7(), agent, "reply2", 7, "k2"),
+        ];
+        let merged = merge_project_conversation(journal, vec![(agent, transcript_of(turns), None)]);
+        // With no links, the provenance path pairs the two Sdk prompts to the two
+        // sends in order — identical to today.
+        assert_eq!(user_texts(&merged), vec!["prompt1", "prompt2"]);
+        assert_eq!(agent_send_ids(&merged), vec![Some(s1), Some(s2)]);
+    }
+
+    #[test]
+    fn merge_mixed_legacy_and_linked_no_worse_than_positional() {
+        // One agent straddling the M2 rollout: an early UNLINKED turn (legacy) and
+        // a later LINKED turn, each interleaved with its own real prompt. The
+        // linked reply pairs by key; the legacy prompt/reply pair is re-derived by
+        // the residual positional path (recomputed offsets), NOT swapped.
+        let agent = Uuid::now_v7();
+        let (s1, s2) = (Uuid::now_v7(), Uuid::now_v7());
+        let journal = vec![
+            send_record(s1, Uuid::now_v7(), agent, "prompt1", 1),
+            send_record(s2, Uuid::now_v7(), agent, "prompt2", 5),
+            // Only the later turn has a link (the earlier predates M2).
+            link_record(s2, agent, "k2", 7),
+        ];
+        let turns = vec![
+            user_turn_src(Uuid::now_v7(), agent, "prompt1", 2, UserPromptSource::Sdk),
+            agent_turn(Uuid::now_v7(), agent, "reply1", 3), // unlinked (legacy)
+            user_turn_src(Uuid::now_v7(), agent, "prompt2", 6, UserPromptSource::Sdk),
+            agent_turn_keyed(Uuid::now_v7(), agent, "reply2", 7, "k2"),
+        ];
+        let merged = merge_project_conversation(journal, vec![(agent, transcript_of(turns), None)]);
+        assert_eq!(user_texts(&merged), vec!["prompt1", "prompt2"]);
+        assert!(
+            !merged
+                .items
+                .iter()
+                .any(|i| matches!(i, ConversationItem::UserMessage { send_id: None, .. })),
+            "no imported duplicate in the mixed case"
+        );
+        // reply1↔s1 (residual), reply2↔s2 (key) — pairing NOT swapped.
+        assert_eq!(agent_send_ids(&merged), vec![Some(s1), Some(s2)]);
+    }
+
+    #[test]
+    fn merge_key_join_suppresses_unknown_provenance_prompt() {
+        // The harness-shaped contract M3 relies on: a linked agent turn whose
+        // paired prompt is `Unknown` (Codex and every non-Claude harness — no
+        // `promptSource`) must still suppress that echoed prompt, exactly like an
+        // `Sdk` (Claude) one. Steady state, one linked turn, send claimed → empty
+        // residual pool: the prompt must render ONCE from the journal, with no
+        // imported duplicate. (Sdk-only suppression would leave the Unknown echo in
+        // the residual and re-import it — the original bug, via Codex.)
+        let agent = Uuid::now_v7();
+        let s1 = Uuid::now_v7();
+        let journal = vec![
+            send_record(s1, Uuid::now_v7(), agent, "codex prompt", 1),
+            link_record(s1, agent, "ck1", 3),
+        ];
+        let turns = vec![
+            // Unknown provenance — a Codex-shaped user prompt.
+            user_turn_src(
+                Uuid::now_v7(),
+                agent,
+                "codex prompt",
+                2,
+                UserPromptSource::Unknown,
+            ),
+            agent_turn_keyed(Uuid::now_v7(), agent, "codex reply", 3, "ck1"),
+        ];
+        let merged = merge_project_conversation(journal, vec![(agent, transcript_of(turns), None)]);
+        assert_eq!(user_texts(&merged), vec!["codex prompt"]);
+        assert!(
+            !merged
+                .items
+                .iter()
+                .any(|i| matches!(i, ConversationItem::UserMessage { send_id: None, .. })),
+            "the Unknown echo must be suppressed by the link, not re-imported"
+        );
+        assert_eq!(agent_send_ids(&merged), vec![Some(s1)]);
+    }
+
+    #[test]
+    fn merge_interleaved_unlinked_then_linked_does_not_swap_sends() {
+        // Correct interleaved linked/unlinked pairing: P1 → A1(unlinked) → P2 →
+        // A2(linked). A2 pairs to P2's send by key; A1 to P1's send via the
+        // residual — never A2 stealing P1's send. (Pass 1 clears the pending prompt
+        // at every agent turn, mirroring the positional walk's `pending_send.take()`
+        // — a defensive invariant. This test does not *isolate* that clear: the
+        // intervening P2 overwrites the pending prompt regardless, so it asserts the
+        // correct end-to-end pairing rather than the clear in isolation.)
+        let agent = Uuid::now_v7();
+        let (s1, s2) = (Uuid::now_v7(), Uuid::now_v7());
+        let journal = vec![
+            send_record(s1, Uuid::now_v7(), agent, "P1", 1),
+            send_record(s2, Uuid::now_v7(), agent, "P2", 5),
+            link_record(s2, agent, "k2", 7),
+        ];
+        let turns = vec![
+            user_turn_src(Uuid::now_v7(), agent, "P1", 2, UserPromptSource::Sdk),
+            agent_turn(Uuid::now_v7(), agent, "A1", 3),
+            user_turn_src(Uuid::now_v7(), agent, "P2", 6, UserPromptSource::Sdk),
+            agent_turn_keyed(Uuid::now_v7(), agent, "A2", 7, "k2"),
+        ];
+        let merged = merge_project_conversation(journal, vec![(agent, transcript_of(turns), None)]);
+        assert_eq!(
+            agent_send_ids(&merged),
+            vec![Some(s1), Some(s2)],
+            "A1↔P1 (residual), A2↔P2 (key) — pending must clear at the unlinked A1"
+        );
+    }
+
+    #[test]
+    fn merge_failed_with_content_key_linked_renders_content_and_marker() {
+        // A failed-with-partial-content turn that carries a link: the merge produces
+        // TWO items — the AgentTurn (its on-disk content, grouped to its send by
+        // key) AND the Outcome marker (the failed badge) — sharing one send_id, with
+        // NO duplicated prompt. (The backend keeps them separate; the frontend makes
+        // the marker authoritative in the column. This is the seam double-render
+        // bugs hide in.)
+        let agent = Uuid::now_v7();
+        let s1 = Uuid::now_v7();
+        let turn_uuid = Uuid::now_v7();
+        let failed_turn = match agent_turn_keyed(Uuid::now_v7(), agent, "partial", 3, "k1") {
+            Turn::Agent {
+                turn_id,
+                agent_id,
+                started_at,
+                ended_at,
+                items,
+                usage,
+                spend,
+                model,
+                effort,
+                hydration_key,
+                stable_message_id,
+                ..
+            } => Turn::Agent {
+                turn_id,
+                agent_id,
+                started_at,
+                ended_at,
+                status: TurnStatus::Failed,
+                items,
+                usage,
+                spend,
+                model,
+                effort,
+                hydration_key,
+                stable_message_id,
+            },
+            _ => unreachable!(),
+        };
+        let journal = vec![
+            send_record(s1, turn_uuid, agent, "do a thing", 1),
+            link_record(s1, agent, "k1", 3),
+            outcome_record(
+                s1,
+                turn_uuid,
+                agent,
+                serde_json::json!({"status": "failed", "kind": "harness_error", "message": "boom"}),
+                3,
+            ),
+        ];
+        let turns = vec![
+            user_turn_src(
+                Uuid::now_v7(),
+                agent,
+                "do a thing",
+                2,
+                UserPromptSource::Sdk,
+            ),
+            failed_turn,
+        ];
+        let merged = merge_project_conversation(journal, vec![(agent, transcript_of(turns), None)]);
+
+        // The prompt renders exactly once (journal), no imported duplicate.
+        assert_eq!(user_texts(&merged), vec!["do a thing"]);
+        assert!(
+            !merged
+                .items
+                .iter()
+                .any(|i| matches!(i, ConversationItem::UserMessage { send_id: None, .. })),
+        );
+        // The agent turn is grouped to s1 by key.
+        assert_eq!(agent_send_ids(&merged), vec![Some(s1)]);
+        // And a separate Outcome marker carries the same send_id (the failed badge).
+        let outcome_send = merged.items.iter().find_map(|i| match i {
+            ConversationItem::Outcome {
+                send_id, status, ..
+            } => Some((*send_id, *status)),
+            _ => None,
+        });
+        assert_eq!(
+            outcome_send,
+            Some((s1, OutcomeStatus::Failed)),
+            "the failed marker renders alongside the content, sharing the send_id"
+        );
+    }
+
+    #[test]
+    fn merge_post_compaction_continuation_is_unlinked_and_ungrouped() {
+        // A dispatch that spanned a `/compact` parses into TWO agent turns: the
+        // pre-compaction turn (whose first message id the link points at) and the
+        // continuation (its OWN, different key — no link). The continuation must
+        // render un-grouped (`send_id: None`) and consume no send, unchanged by the
+        // key-join.
+        let agent = Uuid::now_v7();
+        let s1 = Uuid::now_v7();
+        let journal = vec![
+            send_record(s1, Uuid::now_v7(), agent, "go", 1),
+            link_record(s1, agent, "k_first", 3),
+        ];
+        let turns = vec![
+            user_turn_src(Uuid::now_v7(), agent, "go", 2, UserPromptSource::Sdk),
+            agent_turn_keyed(Uuid::now_v7(), agent, "pre-compaction", 3, "k_first"),
+            system_marker_turn(Uuid::now_v7(), agent, "recap", 4),
+            // Continuation: a DIFFERENT key, no link → residual → Agent(None).
+            agent_turn_keyed(Uuid::now_v7(), agent, "continuation", 5, "k_continuation"),
+        ];
+        let merged = merge_project_conversation(journal, vec![(agent, transcript_of(turns), None)]);
+        assert_eq!(user_texts(&merged), vec!["go"]);
+        assert_eq!(
+            agent_send_ids(&merged),
+            vec![Some(s1), None],
+            "pre-compaction turn keyed to s1; continuation un-grouped, consuming no send"
         );
     }
 

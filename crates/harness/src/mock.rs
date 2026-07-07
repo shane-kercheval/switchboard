@@ -122,6 +122,17 @@ pub enum MockScenario {
         stable_message_id: Option<String>,
     },
 
+    /// Emits `ContentChunk → TurnEnd` carrying the given `first_message_id`, with
+    /// the outcome `Completed` (`fail == false`) or `Failed` (`fail == true`). The
+    /// vehicle for the dispatcher's durable send↔turn link gate: a terminal with a
+    /// key must write a `TurnLink` for **both** `Completed` and a
+    /// crash-truncated-with-content `Failed`; a terminal with `first_message_id ==
+    /// None` must write none.
+    TerminatesWithKey {
+        fail: bool,
+        first_message_id: Option<String>,
+    },
+
     /// Emits `ContentChunk → SessionLocatorCaptured(locator) → TurnEnd(Completed)`.
     /// The vehicle for the dispatcher's runtime-capture tests: drives the
     /// internal capture event so the dispatcher's injected `SessionLocatorSink`
@@ -534,6 +545,39 @@ impl HarnessAdapter for MockHarnessAdapter {
                         effort: None,
                         stable_message_id,
                         first_message_id: None,
+                    });
+                });
+            }
+            MockScenario::TerminatesWithKey {
+                fail,
+                ref first_message_id,
+            } => {
+                let first_message_id = first_message_id.clone();
+                tokio::spawn(async move {
+                    let _ = tx.send(AdapterEvent::ContentChunk {
+                        turn_id,
+                        kind: ContentKind::Text,
+                        text: "ack".to_owned(),
+                    });
+                    let outcome = if fail {
+                        TurnOutcome::Failed {
+                            kind: crate::events::FailureKind::AdapterFailure,
+                            message: "mock failure with partial content".to_owned(),
+                        }
+                    } else {
+                        TurnOutcome::Completed
+                    };
+                    let _ = tx.send(AdapterEvent::TurnEnd {
+                        turn_id,
+                        outcome,
+                        ended_at: Utc::now(),
+                        usage: None,
+                        context_window_source: None,
+                        spend: None,
+                        model: None,
+                        effort: None,
+                        stable_message_id: None,
+                        first_message_id,
                     });
                 });
             }

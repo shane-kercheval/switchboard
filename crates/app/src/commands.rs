@@ -4048,10 +4048,12 @@ fn classify_turns_by_count(
 /// excluded, so a genuinely-imported prompt is never suppressed.
 fn classify_agent_turns(
     turns: &[switchboard_harness::Turn],
-    all_sends: &[SendId],
+    all_sends: &[(SendId, chrono::DateTime<chrono::Utc>)],
     links: &HashMap<String, SendId>,
     journal_start: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Vec<TurnRender> {
+    let send_at: HashMap<SendId, chrono::DateTime<chrono::Utc>> =
+        all_sends.iter().copied().collect();
     // Pass 1 — key-join. Track the most-recent unconsumed correlating prompt (an
     // in-window `Sdk`-or-`Unknown` user turn): it survives `System` markers and is
     // taken at the NEXT agent turn — matched or not — exactly like the positional
@@ -4075,17 +4077,59 @@ fn classify_agent_turns(
                     && journal_start.is_some_and(|start| *started_at >= start))
                 .then_some(i);
             }
-            switchboard_harness::Turn::Agent { hydration_key, .. } => {
+            switchboard_harness::Turn::Agent {
+                hydration_key,
+                started_at,
+                ended_at,
+                ..
+            } => {
                 let paired_prompt = pending_prompt.take();
                 if let Some(send_id) = hydration_key.as_deref().and_then(|k| links.get(k).copied())
                 {
-                    renders[i] = TurnRender::Agent(Some(send_id));
-                    resolved[i] = true;
-                    claimed.insert(send_id);
-                    if let Some(pi) = paired_prompt {
-                        renders[pi] = TurnRender::Skip;
-                        resolved[pi] = true;
+                    // Chronology guard: a linked turn may claim a send only if that
+                    // send is in this agent's own history AND the turn did not end
+                    // before the send was dispatched. Both failures mean an anomalous
+                    // link — never trust it, fall back to positional:
+                    // - **send missing** (`send_at` has no entry): a corrupt or
+                    //   agent-mismatched link pointing at a send this agent never
+                    //   received — `is_some_and` rejects it (a phantom/cross-agent
+                    //   claim would be a confident mis-group).
+                    // - **turn predates its send**: a stale link — a prior turn's key
+                    //   mis-stamped onto a newer send (e.g. a raced Codex enrichment
+                    //   read the poison-drop misses because the prior turn had no link
+                    //   of its own). Keyed on `ended_at` (fallback `started_at`) for a
+                    //   whole-turn margin no local clock skew can cross — a legitimate
+                    //   reply always ends *after* its send.
+                    let turn_end = ended_at.unwrap_or(*started_at);
+                    let send_instant = send_at.get(&send_id).copied();
+                    let chronology_ok = send_instant.is_some_and(|s_at| turn_end >= s_at);
+                    if chronology_ok {
+                        renders[i] = TurnRender::Agent(Some(send_id));
+                        resolved[i] = true;
+                        claimed.insert(send_id);
+                        if let Some(pi) = paired_prompt {
+                            renders[pi] = TurnRender::Skip;
+                            resolved[pi] = true;
+                        }
+                    } else {
+                        // Breadcrumb: a declined durable link. There is NO legitimate
+                        // trigger in valid data (a real reply never predates its send;
+                        // a real link's send is always in the agent's history), so any
+                        // firing means a journal/CLI/timestamp invariant has shifted —
+                        // surface it rather than silently degrading to positional.
+                        // `send_instant: None` = missing/foreign send; `Some` with
+                        // `turn_end` earlier = predating. Ids/timestamps only, no
+                        // transcript content.
+                        tracing::warn!(
+                            hydration_key = hydration_key.as_deref().unwrap_or(""),
+                            %send_id,
+                            ?send_instant,
+                            ?turn_end,
+                            "declined an anomalous TurnLink (send missing from this agent, or turn predates its send) — falling back to positional correlation",
+                        );
                     }
+                    // A declined link leaves the turn unresolved → the residual
+                    // re-derives the pairing positionally, no mis-group.
                 }
                 // Unlinked agent turn: leave it (and its would-be prompt) unresolved
                 // for the residual to re-derive the pairing from scratch.
@@ -4105,10 +4149,25 @@ fn classify_agent_turns(
         residual_indices.iter().map(|&i| &turns[i]).collect();
     let residual_sends: Vec<SendId> = all_sends
         .iter()
-        .copied()
-        .filter(|s| !claimed.contains(s))
+        .filter(|(s, _)| !claimed.contains(s))
+        .map(|(s, _)| *s)
         .collect();
-    let residual_renders = classify_residual(&residual_turns, &residual_sends, journal_start);
+    // The residual's pre-history boundary is the **earliest unclaimed** send, not
+    // the agent's original first send: once the key-join claims an earlier send, a
+    // residual turn older than the earliest *still-unclaimed* send is genuinely
+    // pre-history for that residual view (this is what lets an imported bare-CLI turn
+    // between a claimed send and a later unclaimed send be classified correctly
+    // instead of stealing the later send — the pre-existing count-path residual the
+    // original boundary carried). Falls back to the original boundary when every
+    // send is claimed (nothing left to re-anchor on).
+    let residual_journal_start = all_sends
+        .iter()
+        .filter(|(s, _)| !claimed.contains(s))
+        .map(|(_, at)| *at)
+        .min()
+        .or(journal_start);
+    let residual_renders =
+        classify_residual(&residual_turns, &residual_sends, residual_journal_start);
     for (&oi, render) in residual_indices.iter().zip(residual_renders) {
         renders[oi] = render;
     }
@@ -4120,20 +4179,13 @@ fn classify_agent_turns(
 /// `turn_offset` / `dangling_journaled` **and** the provenance-vs-count selection
 /// (`has_known_provenance` / `ambiguous_unknown`) from the residual view; feeding
 /// a shortened residual to counts derived from the *full* arrays silently
-/// misaligns (they index `all_sends` by position). `journal_start` stays the
-/// agent's original pre-history boundary (when Switchboard first dispatched to it)
-/// — a claimed send does not move that boundary.
-///
-/// **KNOWN RESIDUAL (pre-existing; slated for M3):** when a linked (claimed) send
-/// is followed by an *imported* bare-CLI turn and then a *later unclaimed* send,
-/// passing the original `journal_start` lets that imported turn look journaled and
-/// duplicate the later prompt — the pre-existing count-path bug, unchanged by the
-/// key-join (M2 is no-worse-than-positional here). The confirmed fix is to derive
-/// the residual boundary from the **earliest *unclaimed* send** instead (turns
-/// older than it are then correctly treated as pre-history); it needs per-agent
-/// sends carried as `{send_id, at}` and the empty-unclaimed-pool edge handled, so
-/// it lands with M3's fallback rework, not here. Inert for keyless/legacy agents
-/// (no claims ⇒ unclaimed == all sends ⇒ boundary unchanged).
+/// misaligns (they index `all_sends` by position). The `journal_start` passed here
+/// is the **residual boundary** — the earliest *unclaimed* send's instant (computed
+/// by [`classify_agent_turns`]), which correctly treats a residual turn older than
+/// the earliest still-in-play send as pre-history. This fixed the pre-existing bug
+/// where an imported bare-CLI turn between a claimed send and a later unclaimed send
+/// was mis-classified as journaled and duplicated the later prompt. Inert for
+/// keyless/legacy agents (no claims ⇒ unclaimed == all sends ⇒ boundary unchanged).
 fn classify_residual(
     turns: &[&switchboard_harness::Turn],
     all_sends: &[SendId],
@@ -4215,7 +4267,8 @@ fn merge_project_conversation(
     // bug that double-rendered the prompt). A non-completed send's cancelled/failed
     // badge comes from its Outcome marker, which renders alongside the turn
     // (`ProjectConversation` render-both contract).
-    let mut agent_sends: HashMap<AgentId, Vec<SendId>> = HashMap::new();
+    let mut agent_sends: HashMap<AgentId, Vec<(SendId, chrono::DateTime<chrono::Utc>)>> =
+        HashMap::new();
     // Each agent's earliest journaled-send instant — the boundary between its
     // pre-journaling history (attached/imported turns, older than this) and its
     // Switchboard-dispatched turns. Used to count an agent's leading imported
@@ -4239,7 +4292,7 @@ fn merge_project_conversation(
                 attachments,
                 at,
             } => {
-                agent_sends.entry(agent_id).or_default().push(send_id);
+                agent_sends.entry(agent_id).or_default().push((send_id, at));
                 journal_start
                     .entry(agent_id)
                     .and_modify(|earliest| {
@@ -4303,12 +4356,12 @@ fn merge_project_conversation(
                 // a poisoned key stays out even if it reappears later.
                 //
                 // NOTE: this catches a stale link whose key collides with a
-                // legitimately-linked turn. The one residual it does *not* catch is
-                // a stale key matching a turn that has **no** link (a pre-feature
-                // turn on the first post-M3 dispatch) — closed by the chronology
-                // guard that lands with the residual-boundary `{send_id, at}` work
-                // (a linked turn cannot predate the send it claims). Compound-rare
-                // (near-impossible stale read × one-time transition), documented.
+                // legitimately-linked turn. The complementary case — a stale key
+                // matching a turn that has **no** link of its own (a pre-feature turn
+                // on the first post-M3 dispatch), so no collision fires — is caught by
+                // the chronology guard in `classify_agent_turns` (a linked turn cannot
+                // claim a send it ended before). Together they bound any stale link to
+                // "no worse than positional."
                 let poison = agent_link_poison.entry(agent_id).or_default();
                 if poison.contains(&hydration_key) {
                     continue;
@@ -4316,6 +4369,16 @@ fn merge_project_conversation(
                 let links = agent_links.entry(agent_id).or_default();
                 match links.get(&hydration_key) {
                     Some(&existing) if existing != send_id => {
+                        // Breadcrumb: two `TurnLink`s claim one key for different
+                        // sends. No legitimate trigger (per-turn keys are unique), so
+                        // any firing is a stale/corrupt link — surface it. Ids only.
+                        tracing::warn!(
+                            hydration_key = %hydration_key,
+                            existing_send = %existing,
+                            conflicting_send = %send_id,
+                            %agent_id,
+                            "conflicting TurnLink records for one hydration_key — poisoning the key (both turns fall back to positional)",
+                        );
                         links.remove(&hydration_key);
                         poison.insert(hydration_key);
                     }
@@ -12865,6 +12928,125 @@ mod tests {
             agent_send_ids(&merged),
             vec![Some(s1), Some(s2)],
             "poisoned key → positional fallback pairs correctly; reply1 NOT mis-grouped to s2"
+        );
+    }
+
+    #[test]
+    fn merge_imported_turn_between_claimed_and_unclaimed_send_no_duplicate() {
+        // The residual-boundary fix. An imported bare-CLI turn (no send) sits between
+        // a key-CLAIMED send (S1) and a later UNCLAIMED send (S2). The residual's
+        // pre-history boundary is the earliest *unclaimed* send (S2's), so the
+        // imported turn is correctly pre-history: it renders imported and consumes no
+        // send, S2's real prompt renders once and its reply groups to S2. With the
+        // OLD original-boundary this mis-classified — the imported turn stole S2, S2's
+        // prompt duplicated, its reply ungrouped (the pre-existing count-path bug).
+        let agent = Uuid::now_v7();
+        let (s1, s2) = (Uuid::now_v7(), Uuid::now_v7());
+        let journal = vec![
+            send_record(s1, Uuid::now_v7(), agent, "prompt1", 1),
+            send_record(s2, Uuid::now_v7(), agent, "prompt2", 6),
+            link_record(s1, agent, "k1", 3), // S1 claimed by key
+        ];
+        let turns = vec![
+            user_turn_src(Uuid::now_v7(), agent, "prompt1", 2, UserPromptSource::Sdk),
+            agent_turn_keyed(Uuid::now_v7(), agent, "reply1", 3, "k1"),
+            // Imported bare-CLI turn between S1 and S2 (Unknown, no send, no key).
+            user_turn(Uuid::now_v7(), agent, "bare-cli", 4),
+            agent_turn(Uuid::now_v7(), agent, "bare-reply", 5),
+            user_turn_src(Uuid::now_v7(), agent, "prompt2", 7, UserPromptSource::Sdk),
+            agent_turn(Uuid::now_v7(), agent, "reply2", 8), // S2's reply, unlinked
+        ];
+        let merged = merge_project_conversation(journal, vec![(agent, transcript_of(turns), None)]);
+
+        // prompt2 renders exactly once; the imported bare-cli prompt renders (it's a
+        // distinct text, not a duplicate of any journaled prompt).
+        assert_eq!(
+            user_texts(&merged),
+            vec!["prompt1", "bare-cli", "prompt2"],
+            "imported turn rendered; prompt2 NOT duplicated (old boundary duplicated it)"
+        );
+        // reply1→S1 (key), bare-reply ungrouped (imported), reply2→S2 (residual).
+        assert_eq!(
+            agent_send_ids(&merged),
+            vec![Some(s1), None, Some(s2)],
+            "bare-reply does NOT steal S2; reply2 groups to S2 (old boundary swapped these)"
+        );
+    }
+
+    #[test]
+    fn merge_chronology_guard_rejects_stale_link_predating_its_send() {
+        // The first-post-M3 stale-key case the poison-drop can't catch: a pre-feature
+        // turn (`reply_old`, key k_old) has NO link of its own, then a raced Codex
+        // enrichment stamps k_old onto a NEW send S2. No collision (k_old appears
+        // once), so poison doesn't fire — but the chronology guard does: reply_old
+        // ENDED long before S2 was dispatched, so its claim on S2 is rejected and it
+        // falls back to positional. Without the guard, reply_old would mis-group to S2.
+        let agent = Uuid::now_v7();
+        let (s1, s2) = (Uuid::now_v7(), Uuid::now_v7());
+        let journal = vec![
+            send_record(s1, Uuid::now_v7(), agent, "prompt_old", 1),
+            send_record(s2, Uuid::now_v7(), agent, "prompt_new", 10),
+            // STALE: reply_old's key k_old mis-stamped onto S2 (reply_old predates M3,
+            // so it has no legitimate link of its own — nothing to collide with).
+            link_record(s2, agent, "k_old", 12),
+        ];
+        let turns = vec![
+            user_turn_src(
+                Uuid::now_v7(),
+                agent,
+                "prompt_old",
+                2,
+                UserPromptSource::Sdk,
+            ),
+            agent_turn_keyed(Uuid::now_v7(), agent, "reply_old", 3, "k_old"), // ends at ~4
+            user_turn_src(
+                Uuid::now_v7(),
+                agent,
+                "prompt_new",
+                11,
+                UserPromptSource::Sdk,
+            ),
+            agent_turn_keyed(Uuid::now_v7(), agent, "reply_new", 12, "k_new"),
+        ];
+        let merged = merge_project_conversation(journal, vec![(agent, transcript_of(turns), None)]);
+
+        assert_eq!(user_texts(&merged), vec!["prompt_old", "prompt_new"]);
+        // reply_old→S1 (positional, guard rejected the stale k_old→S2 link),
+        // reply_new→S2 (positional). NOT reply_old→S2 (the mis-group the guard blocks).
+        assert_eq!(
+            agent_send_ids(&merged),
+            vec![Some(s1), Some(s2)],
+            "chronology guard: reply_old (ended before S2) is NOT claimed by the stale S2 link"
+        );
+    }
+
+    #[test]
+    fn merge_link_to_send_absent_from_agent_is_not_trusted() {
+        // The chronology guard's missing-send arm: a `TurnLink` whose `send_id` is not
+        // in this agent's own `Send` history (a corrupt or agent-mismatched record —
+        // e.g. a phantom or another agent's send) must NOT be trusted. Claiming it
+        // would group the turn under a send this agent never received (a confident,
+        // possibly cross-agent, mis-group). The turn instead falls to positional.
+        let agent = Uuid::now_v7();
+        let s1 = Uuid::now_v7();
+        let phantom_send = Uuid::now_v7(); // never journaled as a Send for this agent
+        let journal = vec![
+            send_record(s1, Uuid::now_v7(), agent, "prompt1", 1),
+            // The link points reply1's key at a send absent from the agent's history.
+            link_record(phantom_send, agent, "k1", 3),
+        ];
+        let turns = vec![
+            user_turn_src(Uuid::now_v7(), agent, "prompt1", 2, UserPromptSource::Sdk),
+            agent_turn_keyed(Uuid::now_v7(), agent, "reply1", 3, "k1"),
+        ];
+        let merged = merge_project_conversation(journal, vec![(agent, transcript_of(turns), None)]);
+
+        assert_eq!(user_texts(&merged), vec!["prompt1"]);
+        // reply1 pairs to S1 via positional, NOT the phantom send it was linked to.
+        assert_eq!(
+            agent_send_ids(&merged),
+            vec![Some(s1)],
+            "a link to a send absent from the agent is rejected → positional, no phantom grouping"
         );
     }
 

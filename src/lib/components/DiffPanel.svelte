@@ -17,6 +17,7 @@
   import { cn, basename } from "$lib/utils";
   import Dialog from "$lib/components/ui/Dialog.svelte";
   import EmptyState from "$lib/components/ui/EmptyState.svelte";
+  import Markdown from "$lib/components/ui/Markdown.svelte";
   import Spinner from "$lib/components/ui/Spinner.svelte";
   import DiffView from "$lib/components/DiffView.svelte";
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
@@ -470,11 +471,8 @@
           <div class="text-muted truncate font-mono text-[11px] leading-4">{target.subtitle}</div>
         {/if}
       </div>
-      <div
-        class="text-fg max-h-[60vh] overflow-y-auto text-sm leading-6 break-words whitespace-pre-wrap"
-        data-testid="commit-message-body"
-      >
-        {visibleCommitBody}
+      <div class="max-h-[60vh] overflow-y-auto" data-testid="commit-message-body">
+        <Markdown text={visibleCommitBody} />
       </div>
     </Dialog>
   {/if}

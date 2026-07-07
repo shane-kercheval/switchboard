@@ -551,7 +551,7 @@ describe("DiffPanel (commit target)", () => {
   it("shows the commit body in a scrollable dialog when present", async () => {
     wire({
       files: [{ path: "code.ts", change: "modified" }],
-      commitBody: "Why this changed.\n\nHow reviewers should read it.",
+      commitBody: "- Why this changed.\n- How reviewers should read it.",
     });
     render(DiffPanel, { props: { target: commitTarget(), onClose: noop } });
 
@@ -565,6 +565,7 @@ describe("DiffPanel (commit target)", () => {
     const body = screen.getByTestId("commit-message-body");
     expect(body).toHaveTextContent("Why this changed.");
     expect(body).toHaveTextContent("How reviewers should read it.");
+    expect(body.querySelector("ul")).not.toBeNull();
     expect(body).toHaveClass("overflow-y-auto");
   });
 

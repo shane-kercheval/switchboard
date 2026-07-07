@@ -22,6 +22,7 @@ vi.mock("$lib/native", () => ({
 const { _testing } = await import("$lib/preferences.svelte");
 
 afterEach(() => {
+  vi.useRealTimers();
   _testing.reset();
   invokeMock.mockReset();
   copyTextMock.mockReset();
@@ -567,6 +568,25 @@ describe("DiffPanel (commit target)", () => {
     expect(body).toHaveTextContent("How reviewers should read it.");
     expect(body.querySelector("ul")).not.toBeNull();
     expect(body).toHaveClass("overflow-y-auto");
+  });
+
+  it("closes the commit message tooltip when opening the dialog", async () => {
+    wire({
+      files: [{ path: "code.ts", change: "modified" }],
+      commitBody: "Commit message.",
+    });
+    render(DiffPanel, { props: { target: commitTarget(), onClose: noop } });
+
+    await waitFor(() => expect(screen.getByTestId("commit-message-open")).toBeInTheDocument());
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    await fireEvent.pointerEnter(screen.getByTestId("commit-message-open"));
+    await vi.advanceTimersByTimeAsync(500);
+    expect(await screen.findByTestId("tooltip-content")).toHaveTextContent("Show commit message");
+
+    await fireEvent.click(screen.getByTestId("commit-message-open"));
+
+    expect(screen.getByTestId("dialog-content")).toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByTestId("tooltip-content")).not.toBeInTheDocument());
   });
 
   it("opens the selected commit file in git difftool", async () => {

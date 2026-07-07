@@ -68,6 +68,7 @@
   let selectedFile = $state<string | null>(null);
   let commitBody = $state<string | null>(null);
   let commitMessageOpen = $state(false);
+  let commitMessageTooltipOpen = $state(false);
   // For a commit target, whether the commit still resolved. `false` (gc'd /
   // force-updated) is shown distinctly from a commit that changed nothing.
   let commitFound = $state(true);
@@ -131,6 +132,7 @@
       commitFound = true;
       commitBody = null;
       commitMessageOpen = false;
+      commitMessageTooltipOpen = false;
     }
     filesError = null;
     void loadFiles(t)
@@ -150,6 +152,7 @@
         files = [];
         commitBody = null;
         commitMessageOpen = false;
+        commitMessageTooltipOpen = false;
         filesError = e instanceof Error ? e.message : String(e);
       });
   });
@@ -192,6 +195,10 @@
 
   $effect(() => {
     if (visibleCommitBody === null) commitMessageOpen = false;
+  });
+
+  $effect(() => {
+    if (commitMessageOpen) commitMessageTooltipOpen = false;
   });
 
   // Drop the file-row hover highlight right after a keyboard move so the mouse-
@@ -347,7 +354,13 @@
           {target.title}
         </div>
         {#if visibleCommitBody !== null}
-          <Tooltip label="Show commit message" side="bottom">
+          <Tooltip
+            bind:open={commitMessageTooltipOpen}
+            label="Show commit message"
+            side="bottom"
+            disabled={commitMessageOpen}
+            ignoreNonKeyboardFocus
+          >
             {#snippet trigger(props)}
               <button
                 {...props}
@@ -355,7 +368,10 @@
                 class={cn(ICON_BUTTON_CLASS, "hover:bg-border/60 h-5 w-5 shrink-0")}
                 aria-label="Show commit message"
                 data-testid="commit-message-open"
-                onclick={() => (commitMessageOpen = true)}
+                onclick={() => {
+                  commitMessageTooltipOpen = false;
+                  commitMessageOpen = true;
+                }}
               >
                 <MessageSquareText size={13} strokeWidth={1.8} aria-hidden="true" />
               </button>

@@ -518,12 +518,13 @@ export type ChangedFile = {
   change: ChangeKind;
 };
 
-// Mirror of Rust `CommitChanges` — one commit's changed files plus whether the
-// commit still resolved. `found: false` (with empty `files`) means the commit is
-// gone (gc'd / branch force-updated), distinct from a real commit that changed
-// nothing.
+// Mirror of Rust `CommitChanges` — one selected commit's body and changed files,
+// plus whether the commit still resolved. `found: false` (with `body: null` and
+// empty `files`) means the commit is gone (gc'd / branch force-updated),
+// distinct from a real commit that changed nothing.
 export type CommitChanges = {
   found: boolean;
+  body: string | null;
   files: ChangedFile[];
 };
 

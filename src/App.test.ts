@@ -262,7 +262,7 @@ const invokeMock = vi.fn(async (cmd: string, args?: Record<string, unknown>): Pr
     case "changed_files":
       return [];
     case "commit_changed_files":
-      return { found: true, files: [] };
+      return { found: true, body: null, files: [] };
     case "file_diff":
     case "commit_file_diff":
       return {

@@ -155,10 +155,11 @@ pub enum WorktreeWarning {
     Prunable,
 }
 
-/// The result of reading one commit's changed files. `found` distinguishes a
-/// commit that genuinely changed nothing (valid, empty history — e.g. an empty
-/// merge or `--allow-empty`) from a commit that no longer resolves (garbage
-/// collected, or the branch was force-updated since the commit list was read).
+/// The result of reading one selected commit's body and changed files. `found`
+/// distinguishes a commit that genuinely changed nothing (valid, empty history
+/// — e.g. an empty merge or `--allow-empty`) from a commit that no longer
+/// resolves (garbage collected, or the branch was force-updated since the
+/// commit list was read).
 /// Both yield no files, but the UI explains them differently — "changed no files"
 /// vs. "no longer available, refresh." A vanished commit is a calm, non-error
 /// state (matching the rest of this layer's "absent is not a failure" stance),
@@ -168,6 +169,9 @@ pub struct CommitChanges {
     /// `false` when the commit oid is unparseable or no longer in the object
     /// store; `files` is then empty.
     pub found: bool,
+    /// Commit message body after the subject paragraph; `None` when absent, not
+    /// valid UTF-8, or the commit no longer resolves.
+    pub body: Option<String>,
     pub files: Vec<ChangedFile>,
 }
 
@@ -177,6 +181,7 @@ impl CommitChanges {
     pub fn missing() -> Self {
         Self {
             found: false,
+            body: None,
             files: Vec::new(),
         }
     }
@@ -290,8 +295,8 @@ pub enum DiffLineKind {
     Removed,
 }
 
-/// One commit's summary line for the branch commit list — identity, subject, and
-/// authorship. Deliberately *not* part of [`RepoView`]: commits are read on
+/// One commit's summary line for the branch commit list — identity, subject,
+/// and authorship. Deliberately *not* part of [`RepoView`]: commits are read on
 /// demand for the one selected branch, so a normal Git-view refresh never pays
 /// for a history walk across every branch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

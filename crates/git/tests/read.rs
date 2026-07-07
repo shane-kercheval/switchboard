@@ -1328,9 +1328,23 @@ fn commit_ranges_missing_branch_is_empty() {
 #[test]
 fn commit_summary_carries_identity_and_authorship() {
     let dir = repo_with_main();
+    write(dir.path(), "details.txt", "details\n");
+    git(dir.path(), &["add", "-A"]);
+    git(
+        dir.path(),
+        &[
+            "commit",
+            "-q",
+            "-m",
+            "subject line",
+            "-m",
+            "Body line one.\n\nBody line two.",
+        ],
+    );
+
     let ranges = commit_ranges(dir.path(), BranchKind::Local, "main").unwrap();
     let commit = &ranges[0].commits[0];
-    assert_eq!(commit.subject, "initial");
+    assert_eq!(commit.subject, "subject line");
     assert_eq!(commit.short_oid.len(), 7);
     assert!(commit.oid.starts_with(&commit.short_oid));
     assert_eq!(commit.author_name.as_deref(), Some("Test"));
@@ -1346,11 +1360,26 @@ fn commit_changed_files_lists_files_against_first_parent() {
     let dir = repo_with_main(); // "initial" adds README.md
     write(dir.path(), "added.txt", "new\n");
     write(dir.path(), "README.md", "hello\nmore\n");
-    commit_all(dir.path(), "second");
+    git(dir.path(), &["add", "-A"]);
+    git(
+        dir.path(),
+        &[
+            "commit",
+            "-q",
+            "-m",
+            "second",
+            "-m",
+            "Body line one.\n\nBody line two.",
+        ],
+    );
     let head = git(dir.path(), &["rev-parse", "HEAD"]);
 
     let changes = commit_changed_files(dir.path(), &head).unwrap();
     assert!(changes.found);
+    assert_eq!(
+        changes.body.as_deref(),
+        Some("Body line one.\n\nBody line two.")
+    );
     let files = &changes.files;
     let kind = |name: &str| files.iter().find(|f| f.path == name).map(|f| f.change);
     assert_eq!(kind("added.txt"), Some(ChangeKind::Added));
@@ -1470,6 +1499,7 @@ fn commit_diffs_for_invalid_or_unknown_oid_report_not_found() {
     for oid in ["not-a-hash", absent.as_str()] {
         let changes = commit_changed_files(dir.path(), oid).unwrap();
         assert!(!changes.found, "absent oid {oid:?} must report not-found");
+        assert!(changes.body.is_none());
         assert!(changes.files.is_empty());
         let diff = commit_file_diff(dir.path(), oid, "README.md").unwrap();
         assert!(diff.hunks.is_empty());

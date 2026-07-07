@@ -14110,13 +14110,24 @@ mod tests {
         git(repo.path(), &["commit", "-q", "-m", "add code"]);
         std::fs::write(repo.path().join("code.txt"), "a\nB\n").unwrap();
         git(repo.path(), &["add", "-A"]);
-        git(repo.path(), &["commit", "-q", "-m", "change code"]);
+        git(
+            repo.path(),
+            &[
+                "commit",
+                "-q",
+                "-m",
+                "change code",
+                "-m",
+                "Command-layer body.",
+            ],
+        );
         let head = head_oid(repo.path());
 
         let changes =
             commit_changed_files_impl(&roots_of(&repo), repo.path().to_str().unwrap(), &head)
                 .unwrap();
         assert!(changes.found);
+        assert_eq!(changes.body.as_deref(), Some("Command-layer body."));
         assert_eq!(changes.files.len(), 1);
         assert_eq!(changes.files[0].path, "code.txt");
 
@@ -14183,6 +14194,7 @@ mod tests {
         // commit), calmly — not an error.
         let changes = commit_changed_files_impl(&roots_of(&repo), root, &absent_oid).unwrap();
         assert!(!changes.found);
+        assert!(changes.body.is_none());
         assert!(changes.files.is_empty());
         assert!(
             commit_file_diff_impl(&roots_of(&repo), root, &absent_oid, "README.md")

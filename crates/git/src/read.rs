@@ -197,10 +197,10 @@ pub fn commit_ranges(path: &Path, kind: BranchKind, name: &str) -> Result<Vec<Gi
     Ok(ranges)
 }
 
-/// The files a single commit changed, relative to its first parent (or the empty
-/// tree for a root commit). This is the committed-history analogue of
-/// [`changed_files`]: it needs no worktree, so it works for a branch with no
-/// local folder or a remote-only branch.
+/// One selected commit's message body and changed files, relative to its first
+/// parent (or the empty tree for a root commit). This is the committed-history
+/// analogue of [`changed_files`]: it needs no worktree, so it works for a branch
+/// with no local folder or a remote-only branch.
 ///
 /// `oid` is the full hex id from a [`GitCommitSummary`]. An unparseable or
 /// no-longer-present id (a stale reference) yields [`CommitChanges`] with
@@ -212,18 +212,19 @@ pub fn commit_changed_files(path: &Path, oid: &str) -> Result<CommitChanges> {
         Err(e) if is_not_found(&e) => return Ok(CommitChanges::missing()),
         Err(e) => return Err(GitError::read(path, e)),
     };
-    let mut opts = DiffOptions::new();
-    let Some(mut diff) =
-        commit_tree_diff(&repo, oid, &mut opts).map_err(|e| GitError::read(path, e))?
-    else {
+    let Some(commit) = find_commit_by_oid(&repo, oid).map_err(|e| GitError::read(path, e))? else {
         return Ok(CommitChanges::missing());
     };
+    let body = commit.body().ok().flatten().map(str::to_owned);
+    let mut opts = DiffOptions::new();
+    let mut diff = commit_diff(&repo, &commit, &mut opts).map_err(|e| GitError::read(path, e))?;
     // Coalesce add+delete pairs into renames for a cleaner list (matches the
     // worktree read's rename handling).
     diff.find_similar(None)
         .map_err(|e| GitError::read(path, e))?;
     Ok(CommitChanges {
         found: true,
+        body,
         files: changed_files_from_diff(&diff),
     })
 }
@@ -1044,14 +1045,31 @@ fn commit_tree_diff<'r>(
     oid: &str,
     opts: &mut DiffOptions,
 ) -> std::result::Result<Option<Diff<'r>>, git2::Error> {
+    let Some(commit) = find_commit_by_oid(repo, oid)? else {
+        return Ok(None);
+    };
+    commit_diff(repo, &commit, opts).map(Some)
+}
+
+fn find_commit_by_oid<'r>(
+    repo: &'r Repository,
+    oid: &str,
+) -> std::result::Result<Option<git2::Commit<'r>>, git2::Error> {
     let Ok(oid) = Oid::from_str(oid) else {
         return Ok(None);
     };
-    let commit = match repo.find_commit(oid) {
-        Ok(commit) => commit,
-        Err(e) if is_not_found(&e) => return Ok(None),
-        Err(e) => return Err(e),
-    };
+    match repo.find_commit(oid) {
+        Ok(commit) => Ok(Some(commit)),
+        Err(e) if is_not_found(&e) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+fn commit_diff<'r>(
+    repo: &'r Repository,
+    commit: &git2::Commit<'r>,
+    opts: &mut DiffOptions,
+) -> std::result::Result<Diff<'r>, git2::Error> {
     let commit_tree = commit.tree()?;
     // First parent only: a merge commit diffs against its first parent, the
     // mainline view. A *true* root commit (no parents) diffs against the empty
@@ -1065,8 +1083,7 @@ fn commit_tree_diff<'r>(
     } else {
         Some(commit.parent(0)?.tree()?)
     };
-    let diff = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&commit_tree), Some(opts))?;
-    Ok(Some(diff))
+    repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&commit_tree), Some(opts))
 }
 
 /// Collect a tree-to-tree diff's deltas into [`ChangedFile`]s, newest path order.

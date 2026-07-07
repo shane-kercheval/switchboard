@@ -4220,6 +4220,16 @@ fn merge_project_conversation(
             matches!(t, switchboard_harness::Turn::User { source, .. }
                 if *source != switchboard_harness::UserPromptSource::Unknown)
         });
+        // A journaled-region `Unknown`-source *user* turn is a genuine
+        // pre-`promptSource` dispatch the journal owns — provenance can't tell it
+        // from a real import, so the whole agent defers to the count path. Harness
+        // *bookkeeping* (a bare `/compact`, a compaction summary) is NOT such a
+        // turn: the Claude parser now routes those to non-correlating
+        // `Turn::System` markers upstream (see
+        // `claude_code/session_file.rs::is_bare_slash_command_record`), so they no
+        // longer trip this guard. It therefore fires only for true pre-marker
+        // dispatch history — never merely because a bookkeeping record appeared in
+        // the journaled window (the reported bug).
         let ambiguous_unknown = journal_start_at.is_some_and(|start| {
             turns.iter().any(|t| {
                 matches!(t,
@@ -12222,6 +12232,117 @@ mod tests {
         assert!(
             agent_sends.contains(&Some(send_id)),
             "journaled agent turn grouped"
+        );
+    }
+
+    #[test]
+    fn merge_compaction_session_through_real_parser_does_not_duplicate_prompt() {
+        // The reported bug, end-to-end through the REAL Claude parser (not
+        // hand-built Turns), in the **verified on-disk order** of an auto-compaction:
+        // the bare `/compact` record comes FIRST (a non-correlating `SlashCommand`
+        // marker — it previously leaked into `Turn::User { Unknown }`, desyncing the
+        // merge), then the `compact_boundary`, then the `isCompactSummary` recap (a
+        // `Compaction` marker), then the `<command-name>` wrapper + `local-command`
+        // echo (dropped by the prefix denylist — note they land AFTER the bare
+        // record, seven-ish records later in the real file, which is why look-behind
+        // sibling-pairing can't work), then a continuation agent turn with no
+        // preceding prompt. With the bookkeeping out of the user channel, the merge
+        // stays on the provenance path: each journaled `sdk` prompt renders once, the
+        // continuation is un-grouped, and there is ZERO imported (`send_id: None`)
+        // duplicate of the newest prompt.
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        let canonical_cwd = cwd.path().canonicalize().unwrap();
+        let session_id = Uuid::now_v7();
+        let agent = Uuid::now_v7();
+
+        let lines = [
+            serde_json::json!({"type":"user","message":{"role":"user","content":"proceed a"},"promptSource":"sdk","timestamp":"2026-05-14T04:43:15Z"}),
+            serde_json::json!({"type":"assistant","message":{"model":"claude-sonnet-4-6","role":"assistant","content":[{"type":"text","text":"reply1"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}},"timestamp":"2026-05-14T04:43:16Z"}),
+            // Auto-compaction sequence — verified real record ORDER (sanitized content):
+            serde_json::json!({"type":"user","message":{"role":"user","content":"/compact"},"timestamp":"2026-05-14T04:43:17Z"}),
+            serde_json::json!({"type":"system","subtype":"compact_boundary","timestamp":"2026-05-14T04:43:18Z"}),
+            serde_json::json!({"type":"user","message":{"role":"user","content":"This session is being continued…"},"isCompactSummary":true,"timestamp":"2026-05-14T04:43:19Z"}),
+            // The `<command-name>` wrapper + stdout echo land AFTER the summary in the
+            // real file — dropped by the prefix denylist regardless of position.
+            serde_json::json!({"type":"user","message":{"role":"user","content":"<command-name>/compact</command-name>"},"timestamp":"2026-05-14T04:43:20Z"}),
+            serde_json::json!({"type":"user","message":{"role":"user","content":"<local-command-stdout>Compacted.</local-command-stdout>"},"timestamp":"2026-05-14T04:43:21Z"}),
+            // Post-compaction continuation — an agent turn with no preceding prompt.
+            serde_json::json!({"type":"assistant","message":{"model":"claude-sonnet-4-6","role":"assistant","content":[{"type":"text","text":"continuation"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}},"timestamp":"2026-05-14T04:43:22Z"}),
+            serde_json::json!({"type":"user","message":{"role":"user","content":"proceed b"},"promptSource":"sdk","timestamp":"2026-05-14T04:43:23Z"}),
+            serde_json::json!({"type":"assistant","message":{"model":"claude-sonnet-4-6","role":"assistant","content":[{"type":"text","text":"reply2"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}},"timestamp":"2026-05-14T04:43:24Z"}),
+        ];
+        let content = lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let target =
+            switchboard_harness::claude_session_file_path(home.path(), &canonical_cwd, &session_id);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, content).unwrap();
+
+        let transcript = switchboard_harness::load_claude_transcript(
+            home.path(),
+            &canonical_cwd,
+            session_id,
+            agent,
+        )
+        .unwrap();
+
+        let (s1, s2) = (Uuid::now_v7(), Uuid::now_v7());
+        let journal = vec![
+            JournalRecord::Send {
+                send_id: s1,
+                turn_id: Uuid::now_v7(),
+                agent_id: agent,
+                prompt: "proceed a".to_owned(),
+                attachments: Vec::new(),
+                at: "2026-05-14T04:43:14Z".parse().unwrap(),
+            },
+            JournalRecord::Send {
+                send_id: s2,
+                turn_id: Uuid::now_v7(),
+                agent_id: agent,
+                prompt: "proceed b".to_owned(),
+                attachments: Vec::new(),
+                at: "2026-05-14T04:43:23Z".parse().unwrap(),
+            },
+        ];
+
+        let merged = merge_project_conversation(journal, vec![(agent, transcript, None)]);
+
+        // Each journaled prompt renders exactly once (from the journal), and there
+        // is no imported (`send_id: None`) duplicate of the newest prompt.
+        assert_eq!(user_texts(&merged), vec!["proceed a", "proceed b"]);
+        assert!(
+            !merged
+                .items
+                .iter()
+                .any(|i| matches!(i, ConversationItem::UserMessage { send_id: None, .. })),
+            "the reported bug: no imported duplicate of a journaled prompt"
+        );
+        // reply1/reply2 pair to their sends; the continuation is un-grouped.
+        assert_eq!(agent_send_ids(&merged), vec![Some(s1), None, Some(s2)]);
+        // Both bookkeeping records surface as their respective non-correlating
+        // markers — the bare `/compact` as a SlashCommand, the recap as Compaction.
+        let markers: Vec<&SystemMarker> = merged
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                ConversationItem::SystemMarker { marker, .. } => Some(marker),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            matches!(
+                markers.as_slice(),
+                [
+                    SystemMarker::SlashCommand { command },
+                    SystemMarker::Compaction { .. },
+                ] if command == "/compact"
+            ),
+            "both the SlashCommand and Compaction markers render, in order, got {markers:?}"
         );
     }
 

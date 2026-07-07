@@ -168,13 +168,26 @@ protecting only the case it was meant for (genuine pre-`promptSource` dispatches
      the compaction summary path. Carry the command text.
    - **Drop approach (alternative):** treat them as housekeeping and emit no turn.
 
-   The detection predicate is **provenance-aware**: only reclassify when the record is
-   *not* a genuine user-typed prompt (`promptSource` ∉ {`typed`, `queued`}). A prompt
-   the user literally typed starting with `/` must stay a real, correlating prompt —
-   this mirrors the existing exemption in `is_user_housekeeping` and is the one edge
-   case that must not regress. Determine the exact shape signal (bare `/…` text vs. the
-   presence of the `<command-name>` sibling) by reading the compaction probe fixtures;
-   prefer the most specific signal Claude actually emits.
+   The detection predicate is **narrow and two-part**: reclassify only when
+   **`promptSource` is absent** (the record parses to `source: Unknown`) **AND** the
+   trimmed text is a **bare slash-command** (e.g. `/compact`). Both parts are
+   load-bearing:
+   - *Absent, not `∉ {typed,queued}`*: a dispatched prompt carries `promptSource: sdk`
+     and a bare-TUI prompt carries `typed`/`queued`. Keying on **absent** protects all
+     three (a user who types `/compact` into Switchboard's compose bar dispatches as
+     `sdk` and must stay a correlating prompt). This is stricter than the plan's earlier
+     wording, which wrongly included `sdk`.
+   - *Bare-slash shape required*: `promptSource`-absent alone is **not** housekeeping — a
+     genuinely dispatched prompt on a **pre-`promptSource` Claude CLI** is also absent
+     (the straddling case). Those render as normal prose, never `/compact`, so the shape
+     check is what separates housekeeping from a real pre-marker dispatch. Do **not** drop
+     it to "absent ⇒ reclassify."
+
+   Ground truth (traced from the reported session, shape confirmed): the leaking record
+   is `{"type":"user","message":{"role":"user","content":"/compact"}}` with **no**
+   `promptSource` and **no** `isMeta`; its `<command-name>/compact</command-name>` sibling
+   is already dropped by the existing prefix denylist. A committed fixture with these
+   exact bytes backs the parser test (see DoD).
 
 2. **Confirm the merge now stays on the provenance path.** With no in-window
    `Unknown`-source *user* turn, `ambiguous_unknown` is false and
@@ -198,9 +211,12 @@ a send slot* — with a pointer to the render/correlate split principle.
 ### Definition of Done
 
 - **Unit tests (parser):** a bare `/compact` record produces a non-correlating outcome
-  (marker or no turn), **not** a `Turn::User`; a genuinely `typed`/`queued` prompt
-  starting with `/` still produces a correlating `Turn::User`. Use the real compaction
-  record shape from the archived probe.
+  (marker or no turn), **not** a `Turn::User`; a `promptSource: sdk` record whose text is
+  `/compact` (user typed it into the compose bar) **stays** a correlating `Turn::User`;
+  a `typed`/`queued` `/…` prompt stays a correlating `Turn::User`. Assert against a
+  committed fixture carrying the real bytes (below) — compaction is absent from the
+  existing archived probes (they're all background-agent captures), so this is the
+  ground truth to add, not reconstruct.
 - **Integration test (merge):** a fixture transcript reproducing the reported scenario
   — N `sdk` prompts = N sends, plus a `/compact` and a post-compaction continuation
   turn — yields **zero** imported (`send_id: None`) user messages and the newest prompt

@@ -684,7 +684,12 @@ export type ConversationItem =
 // Mirror of Rust `SystemMarker` (`crates/harness/src/transcript.rs`,
 // `#[serde(tag = "marker_kind")]`). Discriminated union so a future marker kind
 // lands additively; reducers default-branch on an unknown `marker_kind`.
-export type SystemMarker = { marker_kind: "compaction"; summary: string };
+// `slash_command` is a state-changing slash command the harness recorded (Claude's
+// bare `/compact`; other commands added as their shapes are observed) — shown so
+// the user sees it ran, but non-correlating.
+export type SystemMarker =
+  | { marker_kind: "compaction"; summary: string }
+  | { marker_kind: "slash_command"; command: string };
 
 // Per-agent metadata carried alongside the merged items. `warnings` and
 // `load_error` are agent-scoped: one agent's transcript failing to load leaves

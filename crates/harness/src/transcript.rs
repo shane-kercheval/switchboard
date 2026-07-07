@@ -52,8 +52,7 @@ pub enum UserPromptSource {
 /// A non-conversational event the harness recorded between turns, surfaced in
 /// the transcript so the user can see it but deliberately invisible to the
 /// prompt↔send correlation (it is neither a user prompt nor an agent turn).
-/// Currently only context compaction; the enum is `#[non_exhaustive]` so a new
-/// kind (e.g. a state-changing slash command) is an additive variant, not a
+/// The enum is `#[non_exhaustive]` so a new kind is an additive variant, not a
 /// breaking change.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "marker_kind", rename_all = "snake_case")]
@@ -63,6 +62,17 @@ pub enum SystemMarker {
     /// continuation recap the harness wrote (Claude's `isCompactSummary`
     /// record); rendered collapsed since it is a large structured block.
     Compaction { summary: String },
+    /// A state-changing slash command the harness recorded into the user
+    /// channel — **confirmed for Claude's bare `/compact`**; other commands are
+    /// routed here as their real bare-record shapes are observed (the parser
+    /// matches an evidence-coupled allowlist, not a `/token` shape guess). This is
+    /// harness **bookkeeping, not a dispatched prompt** — it renders so the user
+    /// can see the command ran, but it must **never** consume a send slot or
+    /// advance a correlation counter (the render/correlate split; see
+    /// [`Turn::System`] and the merge classifiers). Routing these here is what
+    /// stops a bare `/compact` from masquerading as a correlating `Turn::User`
+    /// and desyncing the send↔turn join. `command` is the verbatim command text.
+    SlashCommand { command: String },
 }
 
 /// One reconstructed turn. Discriminated by `role` matching the event-vocabulary

@@ -270,17 +270,26 @@ pub enum AdapterEvent {
         /// the `NormalizedEvent` boundary (the frontend never sees it). `None`
         /// when the harness has no such id (non-Claude) or no assistant message.
         stable_message_id: Option<String>,
-        /// Live↔disk dedup identity: the **first** non-subagent assistant
-        /// message's Anthropic `message.id`. Distinct from `stable_message_id`
-        /// on purpose — the first id is *stable from the turn's first assistant message*
-        /// (a turn spans multiple assistant messages; the last one is a moving
-        /// target until the turn ends, so anchoring dedup on it makes a
-        /// mid-flight re-read mint a different key than the completed turn). The
-        /// first id is identical between a partial and a complete parse, so it
-        /// is what the hydrate merge dedups on. Routed to
-        /// `NormalizedEvent::TurnEnd.hydration_key`. `None` for non-Claude
-        /// (their live↔disk parity is unprobed; they stay `turn_id`-keyed) or
-        /// when the turn produced no assistant message.
+        /// The turn's durable **`hydration_key`** — the id that equals what the
+        /// session-file parser stamps on `Turn::Agent.hydration_key`, so the
+        /// dispatcher's `TurnLink` (M2) correlates this turn to its send, and the
+        /// frontend dedups a live turn against its on-disk copy. Named
+        /// `first_message_id` for historical reasons (Claude's source), but it is
+        /// harness-generic; routed to `NormalizedEvent::TurnEnd.hydration_key`.
+        /// Per harness: **Claude** the **first** non-subagent assistant `message.id`
+        /// (distinct from `stable_message_id`, the *final* id — the first id is
+        /// parse-invariant, so a mid-flight re-read mints the same key as the
+        /// completed turn); **Codex** the current turn's `turn_context.turn_id`,
+        /// read from the post-terminal enrichment re-read of the session file so it
+        /// equals the parsed key by construction (probe-verified live↔disk). `None`
+        /// for keyless harnesses (Antigravity), Gemini (live↔disk parity unprobed),
+        /// or a turn that produced no keyed record.
+        ///
+        /// TODO(rename): now that this carries two harnesses' keys (Claude's
+        /// `message.id`, Codex's `turn_context.turn_id`), the name is a misnomer;
+        /// rename to `hydration_key` (matching `NormalizedEvent` + the parser) in a
+        /// dedicated commit — it touches every adapter's `TurnEnd` emission + the
+        /// dispatcher read, so it's held out of the correlation work.
         first_message_id: Option<String>,
     },
     RateLimitEvent {
@@ -400,17 +409,16 @@ pub enum NormalizedEvent {
         /// in the footer. `None` = render nothing.
         effort: Option<String>,
         /// **Live-matched** hydration key — the same per-turn id this turn will
-        /// carry on disk, so a turn that streamed live *and* is later re-read
-        /// from the session file is recognized as one turn (the merge dedups on
-        /// it). This is the **first** non-subagent assistant `message.id`:
-        /// stable from the turn's first assistant message and identical between a partial
-        /// and a complete parse (the final id moves until the turn ends, so it
-        /// can't anchor a mid-flight re-read). Populated only for harnesses
-        /// whose live stream carries a disk-matching id (Claude). `None`
-        /// elsewhere (Codex/Gemini unprobed; Antigravity has none) — those turns
-        /// dedup by `turn_id` until a probe confirms parity. Frontend-facing;
-        /// the internal cost-join `stable_message_id` stays dropped at this
-        /// boundary.
+        /// carry on disk, so a turn that streamed live *and* is later re-read from
+        /// the session file is recognized as one turn (the merge dedups on it, and
+        /// the durable `TurnLink` correlates it to its send). Per harness: **Claude**
+        /// the first non-subagent assistant `message.id` (parse-invariant, so a
+        /// mid-flight re-read mints the same key); **Codex** the current turn's
+        /// `turn_context.turn_id` via the post-terminal enrichment re-read, so it
+        /// equals the parsed key by construction (probe-verified). `None` for
+        /// Antigravity (no per-turn id) and Gemini (live↔disk parity unprobed) —
+        /// those dedup by `turn_id`. Frontend-facing; the internal cost-join
+        /// `stable_message_id` stays dropped at this boundary.
         hydration_key: Option<String>,
     },
     RateLimitEvent {

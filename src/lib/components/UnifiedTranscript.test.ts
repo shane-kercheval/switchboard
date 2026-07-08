@@ -2707,6 +2707,35 @@ describe("UnifiedTranscript compact mode", () => {
     expect(details).toHaveTextContent("the recap text");
   });
 
+  it("renders a slash-command marker with the command text", async () => {
+    // A bare `/compact` (and future `/clear`, `/model`) surfaces as a
+    // non-correlating SlashCommand marker — shown so the user sees it ran, but it
+    // never grouped a send. It renders in its agent's lane, carrying the command.
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+
+    const overlay: ConversationItem[] = [
+      {
+        kind: "system_marker",
+        id: "marker-1",
+        agent_id: CLAUDE_AGENT.id,
+        marker: { marker_kind: "slash_command", command: "/compact" },
+        at: "2026-05-16T00:00:05Z",
+      },
+    ];
+
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT], overlay },
+    });
+
+    const marker = screen.getByTestId("slash-command-marker");
+    expect(marker).toHaveTextContent("/compact");
+    expect(marker.closest('[data-testid="system-marker"]')).toHaveAttribute(
+      "data-agent-id",
+      CLAUDE_AGENT.id,
+    );
+  });
+
   it("hides tool calls and thinking widgets in a compact completed response", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);

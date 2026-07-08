@@ -639,9 +639,11 @@ export type ConversationItem =
       kind: "agent_turn";
       turn_id: TurnId;
       agent_id: AgentId;
-      // Recovered by joining this turn's `turn_id` against the journal's Send
-      // records, so a historical fan-out's responses group by `send_id` exactly
-      // like live ones. Null when no Send matched (pre-journal / failed write).
+      // Assigned by the backend merge: a durable key-join on `hydration_key`
+      // (`TurnLink`) where one exists, positional fallback otherwise — so a
+      // historical fan-out's responses group by `send_id` exactly like live ones.
+      // Null when neither resolves a send (pre-journal history, keyless with no
+      // positional match, or a declined anomalous link).
       send_id?: SendId | null;
       started_at: string;
       ended_at?: string | null;
@@ -684,7 +686,12 @@ export type ConversationItem =
 // Mirror of Rust `SystemMarker` (`crates/harness/src/transcript.rs`,
 // `#[serde(tag = "marker_kind")]`). Discriminated union so a future marker kind
 // lands additively; reducers default-branch on an unknown `marker_kind`.
-export type SystemMarker = { marker_kind: "compaction"; summary: string };
+// `slash_command` is a state-changing slash command the harness recorded (Claude's
+// bare `/compact`; other commands added as their shapes are observed) — shown so
+// the user sees it ran, but non-correlating.
+export type SystemMarker =
+  | { marker_kind: "compaction"; summary: string }
+  | { marker_kind: "slash_command"; command: string };
 
 // Per-agent metadata carried alongside the merged items. `warnings` and
 // `load_error` are agent-scoped: one agent's transcript failing to load leaves

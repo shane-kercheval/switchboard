@@ -1535,6 +1535,15 @@
                 .marker.summary}</pre>
           </div>
         </Disclosure>
+      {:else if row.marker.marker_kind === "slash_command"}
+        <!-- A state-changing slash command the harness ran (e.g. `/compact`).
+             Shown so the user sees it happened; carries no correlating content. -->
+        <div
+          class="text-muted flex items-center gap-1.5 text-[10px] font-semibold tracking-wide uppercase"
+          data-testid="slash-command-marker"
+        >
+          Ran <span class="font-mono normal-case">{row.marker.command}</span>
+        </div>
       {/if}
       <!-- Unknown marker_kind: render nothing (degrade gracefully on a future
            variant this build doesn't model). -->
@@ -1544,8 +1553,13 @@
          lost. -->
     {@render messageMeta({
       at: row.at,
-      copyable: row.marker.marker_kind === "compaction" ? row.marker.summary : "",
-      label: "Copy summary",
+      copyable:
+        row.marker.marker_kind === "compaction"
+          ? row.marker.summary
+          : row.marker.marker_kind === "slash_command"
+            ? row.marker.command
+            : "",
+      label: row.marker.marker_kind === "slash_command" ? "Copy command" : "Copy summary",
       mt: "mt-2.5",
     })}
   </div>

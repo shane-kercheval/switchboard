@@ -189,6 +189,7 @@ impl DispatchContextFactory for TestFactory {
 struct RecordingJournal {
     sends: Mutex<Vec<(TurnId, String, Vec<Attachment>)>>,
     outcomes: Mutex<Vec<(TurnId, TurnOutcome)>>,
+    links: Mutex<Vec<(TurnId, String)>>,
 }
 
 impl ConversationJournal for RecordingJournal {
@@ -218,6 +219,18 @@ impl ConversationJournal for RecordingJournal {
             .lock()
             .unwrap()
             .push((turn_id, outcome.clone()));
+    }
+    fn record_link(
+        &self,
+        turn_id: TurnId,
+        _agent_id: AgentId,
+        hydration_key: &str,
+        _at: DateTime<Utc>,
+    ) {
+        self.links
+            .lock()
+            .unwrap()
+            .push((turn_id, hydration_key.to_owned()));
     }
 }
 
@@ -303,6 +316,7 @@ impl ConversationJournal for FailingJournal {
         _: DateTime<Utc>,
     ) {
     }
+    fn record_link(&self, _: TurnId, _: AgentId, _: &str, _: DateTime<Utc>) {}
 }
 
 /// Records every captured locator the dispatcher persists, so tests can assert
@@ -1757,6 +1771,149 @@ async fn failed_turn_journals_send_and_a_failed_outcome() {
     assert!(
         matches!(outcomes[0].1, TurnOutcome::Failed { .. }),
         "the journaled outcome is the failure"
+    );
+}
+
+/// Drives one turn through a keyed terminal and returns the journal so the
+/// caller can assert on the recorded send/outcome/link partition.
+async fn run_keyed_terminal(scenario: MockScenario) -> (Arc<RecordingJournal>, TurnId) {
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let journal = Arc::new(RecordingJournal::default());
+    let agent = agent_record();
+    let factory = TestFactory::new(
+        scenario,
+        agent.clone(),
+        Arc::clone(&emitter),
+        Arc::clone(&journal) as Arc<dyn ConversationJournal>,
+    );
+    dispatcher
+        .send_message(
+            agent.id,
+            "hi",
+            vec![],
+            Uuid::now_v7(),
+            factory,
+            OnBusy::Enqueue,
+        )
+        .await;
+    within(
+        &emitter,
+        "agent_idle",
+        emitter.wait_for_type("agent_idle", 1),
+    )
+    .await;
+    let turn_id = extract_turn_id(
+        &emitter
+            .snapshot()
+            .iter()
+            .find(|(_, v)| event_type(v) == "turn_start")
+            .expect("a turn_start")
+            .1,
+    );
+    (journal, turn_id)
+}
+
+#[tokio::test]
+async fn completed_turn_with_key_writes_a_link() {
+    // A completed turn whose terminal carries a `first_message_id` writes a
+    // `TurnLink` for the send↔turn key-join — and no outcome (it completed).
+    let (journal, turn_id) = run_keyed_terminal(MockScenario::TerminatesWithKey {
+        fail: false,
+        first_message_id: Some("msg_first01".to_owned()),
+    })
+    .await;
+    let links = journal.links.lock().unwrap();
+    assert_eq!(links.len(), 1, "a keyed completed terminal writes one link");
+    assert_eq!(links[0], (turn_id, "msg_first01".to_owned()));
+    assert!(
+        journal.outcomes.lock().unwrap().is_empty(),
+        "a completed turn writes no outcome"
+    );
+}
+
+#[tokio::test]
+async fn failed_turn_with_key_writes_both_link_and_outcome() {
+    // A crash-truncated-with-content Failed terminal carries a
+    // `first_message_id`: it writes BOTH a link (to correlate the partial
+    // on-disk content) AND an outcome (the failed badge). They are complementary.
+    let (journal, turn_id) = run_keyed_terminal(MockScenario::TerminatesWithKey {
+        fail: true,
+        first_message_id: Some("msg_first02".to_owned()),
+    })
+    .await;
+    let links = journal.links.lock().unwrap();
+    assert_eq!(
+        links.len(),
+        1,
+        "a keyed failed terminal still writes a link"
+    );
+    assert_eq!(links[0], (turn_id, "msg_first02".to_owned()));
+    let outcomes = journal.outcomes.lock().unwrap();
+    assert_eq!(outcomes.len(), 1, "the failed turn also writes its outcome");
+    assert!(matches!(outcomes[0].1, TurnOutcome::Failed { .. }));
+}
+
+#[tokio::test]
+async fn keyless_terminal_writes_no_link() {
+    // A terminal with `first_message_id: None` (a non-Claude harness, or a turn
+    // that emitted no assistant message) writes no link — it stays on positional.
+    let (journal, _turn_id) = run_keyed_terminal(MockScenario::TerminatesWithKey {
+        fail: false,
+        first_message_id: None,
+    })
+    .await;
+    assert!(
+        journal.links.lock().unwrap().is_empty(),
+        "no key ⇒ no link (positional correlation)"
+    );
+}
+
+#[tokio::test]
+async fn cancelled_turn_writes_no_link() {
+    // A cancel synthesizes a `Cancelled` terminal with no key, so no link — only
+    // the cancelled outcome (the real terminal, if any, is latched out).
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let journal = Arc::new(RecordingJournal::default());
+    let agent = agent_record();
+    let factory = TestFactory::new(
+        MockScenario::AwaitCancellation,
+        agent.clone(),
+        Arc::clone(&emitter),
+        Arc::clone(&journal) as Arc<dyn ConversationJournal>,
+    );
+    dispatcher
+        .send_message(
+            agent.id,
+            "task",
+            vec![],
+            Uuid::now_v7(),
+            factory,
+            OnBusy::Enqueue,
+        )
+        .await;
+    within(
+        &emitter,
+        "turn_start",
+        emitter.wait_for_type("turn_start", 1),
+    )
+    .await;
+    dispatcher.cancel(agent.id, CancelSource::User);
+    within(
+        &emitter,
+        "agent_idle",
+        emitter.wait_for_type("agent_idle", 1),
+    )
+    .await;
+    assert!(
+        journal.links.lock().unwrap().is_empty(),
+        "a cancelled (keyless) terminal writes no link"
+    );
+    assert_eq!(
+        journal.outcomes.lock().unwrap().len(),
+        1,
+        "only the cancelled outcome is written"
     );
 }
 

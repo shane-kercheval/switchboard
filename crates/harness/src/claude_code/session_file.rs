@@ -241,6 +241,51 @@ fn classify_prompt_source(record: &Value) -> UserPromptSource {
     }
 }
 
+/// Exact bare-record shapes for state-changing slash commands the harness echoes
+/// into the user channel as bookkeeping. **Evidence-coupled allowlist, not a
+/// shape heuristic** (deliberately): only `/compact` is confirmed ground truth
+/// (traced from the reported auto-compaction session — an argument-less bare
+/// `/compact` record with no `promptSource`). A syntactic "any lone `/token`"
+/// rule would be simultaneously *too broad* (it could reclassify a genuine
+/// provenance-less `/word` prompt from a pre-`promptSource` CLI, silently
+/// rewriting persisted history) and *too narrow* (it can't safely handle a
+/// command with arguments — `/compact <focus…>` is textually indistinguishable
+/// from prose that starts with `/compact`). So we match only what we've observed
+/// and extend the list as new bare-record shapes are confirmed — the opposite of
+/// the denylist treadmill, erring toward "treat as a real prompt."
+const KNOWN_BOOKKEEPING_SLASH_COMMANDS: [&str; 1] = ["/compact"];
+
+/// True when a `user` string record is a **known bare bookkeeping slash command**
+/// (see [`KNOWN_BOOKKEEPING_SLASH_COMMANDS`]) rather than a dispatched prompt. It
+/// renders as a non-correlating [`SystemMarker::SlashCommand`] so the user sees
+/// the command ran, but it must never consume a send slot or advance the send↔turn
+/// correlation (the render/correlate split — see
+/// [`crate::transcript::SystemMarker`]). Routing it here is the fix for the bare
+/// `/compact` that previously leaked into a `Turn::User { source: Unknown }` and
+/// desynced the merge.
+///
+/// Two-part and both parts load-bearing:
+/// - **No dispatch provenance** (`classify_prompt_source` → `Unknown`, i.e.
+///   `promptSource` absent). A prompt the user typed into Switchboard's compose
+///   bar dispatches as `sdk`, and a bare-TUI prompt is `typed`/`queued`; keying on
+///   the *absence* of provenance protects all three, so a real `/compact` a user
+///   dispatched stays a correlating prompt.
+/// - **Exact allowlist membership.** A genuine dispatch on a pre-`promptSource`
+///   CLI is also provenance-less (the "straddling" case), so matching an exact,
+///   confirmed command string — not a `/token` shape — is what separates observed
+///   bookkeeping from a real prompt that merely starts with `/`.
+///
+/// **Known limitation:** a *manual* `/compact <focus instructions>` (compact with
+/// arguments) is not matched — no text rule can be, since it's indistinguishable
+/// from prose. Rarer than auto-compact, surfaced by the finalize breadcrumb, and
+/// backstopped by the M2 durable key-join. The real structural signal would be the
+/// record's `parentUuid` chain (the auto-compact record is a child of the
+/// pre-compact `## Context Usage` hook), out of scope here.
+fn is_bare_slash_command_record(record: &Value, text: &str) -> bool {
+    matches!(classify_prompt_source(record), UserPromptSource::Unknown)
+        && KNOWN_BOOKKEEPING_SLASH_COMMANDS.contains(&text.trim())
+}
+
 /// In-progress reconstruction state. Walks records in order, opening a
 /// fresh `Turn::User` on each prompt and accumulating `assistant` records
 /// into the corresponding `Turn::Agent`.
@@ -268,6 +313,16 @@ struct ReconstructionState {
     /// [`is_user_housekeeping`]). Logged once at `finalize` so a denylist that
     /// stops matching (an unexpected zero on a compaction-heavy file) is visible.
     housekeeping_skipped: usize,
+    /// Count of provenance-less (`Unknown`) `user` prompts that begin with `/`
+    /// but were **not** matched as a known bookkeeping command
+    /// ([`KNOWN_BOOKKEEPING_SLASH_COMMANDS`]) — so they render as normal prompts.
+    /// A finalize breadcrumb (deliberately looser than the exact reclassification
+    /// match) so a *new* bare bookkeeping command (e.g. a future `/model …`, or a
+    /// `/compact <args>`) that re-triggers the send↔turn desync is diagnosable in
+    /// logs rather than surfacing only as a mystery duplicate. A non-zero count is
+    /// **expected and benign** for genuine prompts that start with a path/slash;
+    /// investigate only alongside an observed duplication.
+    commandish_not_reclassified: usize,
 }
 
 struct AgentTurnBuilder {
@@ -321,6 +376,7 @@ impl ReconstructionState {
             warnings: Vec::new(),
             pending_tool_results: Vec::new(),
             housekeeping_skipped: 0,
+            commandish_not_reclassified: 0,
         }
     }
 
@@ -416,7 +472,32 @@ impl ReconstructionState {
                     self.housekeeping_skipped += 1;
                     return;
                 }
+                // A bare slash command (`/compact`, …) is harness bookkeeping,
+                // not a dispatched prompt: surface it as a non-correlating marker
+                // so it renders but never consumes a send slot. This is the fix
+                // for the bare `/compact` that used to leak into a
+                // `Turn::User { source: Unknown }` and desync the merge — see
+                // [`is_bare_slash_command_record`] for why the predicate is narrow.
+                if is_bare_slash_command_record(record, text) {
+                    let started_at = parse_timestamp(record).unwrap_or_else(Utc::now);
+                    self.turns.push(Turn::System {
+                        turn_id: Uuid::now_v7(),
+                        agent_id: self.agent_id,
+                        started_at,
+                        marker: SystemMarker::SlashCommand {
+                            command: text.trim().to_owned(),
+                        },
+                    });
+                    return;
+                }
                 let source = classify_prompt_source(record);
+                // Breadcrumb: a provenance-less prompt that *looks* command-ish
+                // but wasn't reclassified. Benign for genuine path/slash prompts;
+                // a spike alongside a duplicate points at a new bare bookkeeping
+                // command to add to `KNOWN_BOOKKEEPING_SLASH_COMMANDS`.
+                if source == UserPromptSource::Unknown && text.trim_start().starts_with('/') {
+                    self.commandish_not_reclassified += 1;
+                }
                 let started_at = parse_timestamp(record).unwrap_or_else(Utc::now);
                 self.turns.push(Turn::User {
                     turn_id: Uuid::now_v7(),
@@ -704,6 +785,12 @@ impl ReconstructionState {
                 "dropped Claude housekeeping user records (slash-command / compaction / task-notification)"
             );
         }
+        if self.commandish_not_reclassified > 0 {
+            tracing::debug!(
+                count = self.commandish_not_reclassified,
+                "provenance-less user prompts beginning with '/' not matched as known bookkeeping commands (expected for genuine path/slash prompts; investigate only alongside an observed send↔turn duplicate)"
+            );
+        }
         let meta = self.first_model.map(|model| SessionMetaInfo {
             model,
             harness_version: String::new(),
@@ -940,6 +1027,156 @@ mod tests {
         *agent_statuses(records).last().expect("an agent turn")
     }
 
+    /// Load a set of records and return the reconstructed turns.
+    fn load_turns(records: &[Value]) -> Vec<Turn> {
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        let session_id = Uuid::now_v7();
+        let agent_id = Uuid::now_v7();
+        stage_session_file(home.path(), cwd.path(), session_id, &jsonl(records));
+        load_claude_transcript(home.path(), cwd.path(), session_id, agent_id)
+            .unwrap()
+            .turns
+    }
+
+    /// Ground truth (traced from the reported session, sanitized): the bare
+    /// `/compact` record has **no `promptSource` and no `isMeta`**, so it slipped
+    /// past `is_user_housekeeping` into a real `Turn::User { Unknown }` and
+    /// desynced the merge. It must now reclassify to a non-correlating
+    /// `SystemMarker::SlashCommand`, never a `Turn::User`.
+    #[test]
+    fn bare_slash_command_reclassifies_to_non_correlating_marker() {
+        let turns = load_turns(&[
+            user_record("first", "2026-05-14T04:43:15Z"),
+            assistant_text_record("1", "claude-sonnet-4-6", "2026-05-14T04:43:16Z"),
+            // The leaking record — bare `/compact`, provenance-less.
+            user_record("/compact", "2026-05-14T04:44:15Z"),
+        ]);
+        // No `Turn::User` for the `/compact` — only the genuine "first" prompt.
+        let user_texts: Vec<&str> = turns
+            .iter()
+            .filter_map(|t| match t {
+                Turn::User { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            user_texts,
+            vec!["first"],
+            "the bare /compact must not be a user turn"
+        );
+        // It renders as a SlashCommand marker carrying the command text.
+        let markers: Vec<&SystemMarker> = turns
+            .iter()
+            .filter_map(|t| match t {
+                Turn::System { marker, .. } => Some(marker),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            matches!(markers.as_slice(), [SystemMarker::SlashCommand { command }] if command == "/compact"),
+            "the bare /compact must render as a SlashCommand marker, got {markers:?}"
+        );
+    }
+
+    /// The `sdk` half of the predicate: a user who types `/compact` into
+    /// Switchboard's compose bar dispatches it as `promptSource: sdk`. That is a
+    /// genuine, journal-owned prompt and must **stay** a correlating `Turn::User`
+    /// (`Sdk`) — reclassifying it would break the send↔turn join for that turn.
+    #[test]
+    fn sdk_slash_command_prompt_stays_a_correlating_user_turn() {
+        let turns = load_turns(&[user_record_with_source(
+            "/compact",
+            "sdk",
+            "2026-05-14T04:43:15Z",
+        )]);
+        assert!(
+            matches!(
+                turns.as_slice(),
+                [Turn::User { text, source: UserPromptSource::Sdk, .. }] if text == "/compact"
+            ),
+            "an sdk-dispatched /compact must stay a correlating Sdk user turn, got {turns:?}"
+        );
+    }
+
+    /// `typed`/`queued` prompts that start with `/` are bare-TUI prompts the
+    /// journal never saw; they must stay correlating `Turn::User` (`External`),
+    /// mirroring the existing `is_user_housekeeping` exemption.
+    #[test]
+    fn typed_or_queued_slash_prompt_stays_a_correlating_user_turn() {
+        for provenance in ["typed", "queued"] {
+            let turns = load_turns(&[user_record_with_source(
+                "/compact",
+                provenance,
+                "2026-05-14T04:43:15Z",
+            )]);
+            assert!(
+                matches!(
+                    turns.as_slice(),
+                    [Turn::User {
+                        source: UserPromptSource::External,
+                        ..
+                    }]
+                ),
+                "a {provenance} /compact must stay a correlating External user turn, got {turns:?}"
+            );
+        }
+    }
+
+    /// The **load-bearing negative** for the allowlist: a provenance-less record
+    /// that is not a *confirmed* bookkeeping command must stay a correlating
+    /// `Turn::User { Unknown }` — never reclassified on a shape guess. This covers
+    /// the two ways over-broad detection could silently rewrite persisted history:
+    /// - normal **prose** (a genuine pre-`promptSource` dispatch — the "straddling"
+    ///   case), including lookalikes like `/tmp/foo …` and `/compact <prose>`;
+    /// - an **exact lone slash-token that is not on the allowlist** (`/review`,
+    ///   `/fix`) — the case a `/[A-Za-z]…` shape rule would have wrongly swallowed.
+    ///
+    /// Dropping the allowlist for a shape heuristic fails here.
+    #[test]
+    fn provenanceless_non_allowlisted_prompt_stays_a_correlating_user_turn() {
+        for text in [
+            "please run /compact on this",
+            "/tmp/foo is broken, fix it",
+            "/compact the logs into a summary",
+            "/review",
+            "/fix",
+        ] {
+            let turns = load_turns(&[user_record(text, "2026-05-14T04:43:15Z")]);
+            assert!(
+                matches!(
+                    turns.as_slice(),
+                    [Turn::User { source: UserPromptSource::Unknown, text: t, .. }] if t == text
+                ),
+                "provenance-less non-allowlisted {text:?} must stay a correlating Unknown user turn, got {turns:?}"
+            );
+        }
+    }
+
+    /// Known limitation, pinned: a *manual* `/compact <focus instructions>` (compact
+    /// with arguments) is **not** reclassified — no text rule can distinguish it from
+    /// prose that starts with `/compact`, so it stays a correlating `Turn::User`.
+    /// Rarer than auto-compact, surfaced by the finalize breadcrumb, backstopped by
+    /// the M2 key-join. This test documents the boundary so a future "loosen to accept
+    /// args" change is a conscious decision, not an accident.
+    #[test]
+    fn compact_with_arguments_is_not_reclassified() {
+        let turns = load_turns(&[user_record(
+            "/compact focus on the auth work",
+            "2026-05-14T04:43:15Z",
+        )]);
+        assert!(
+            matches!(
+                turns.as_slice(),
+                [Turn::User {
+                    source: UserPromptSource::Unknown,
+                    ..
+                }]
+            ),
+            "a /compact with arguments must stay a correlating user turn (known limitation), got {turns:?}"
+        );
+    }
+
     #[test]
     fn tail_terminal_stop_reasons_hydrate_complete() {
         // The full documented terminal set — `refusal` and
@@ -1136,6 +1373,51 @@ mod tests {
         assert!(
             matches!(status, TurnStatus::Streaming),
             "a final null stop_reason must clear the prior end_turn → Streaming, got {status:?}"
+        );
+    }
+
+    /// A dispatch that spanned an auto-compaction parses into TWO agent turns: the
+    /// pre-compaction turn and the continuation. Their `hydration_key`s must
+    /// **differ** (each is its own turn's first assistant `message.id`) — the M2
+    /// key-join relies on this so the dispatcher's single link (pointing at the
+    /// dispatch's *first* message id) matches only the pre-compaction turn, leaving
+    /// the continuation un-grouped. A parser change that reused one key across the
+    /// split would silently re-group the continuation onto the wrong send.
+    #[test]
+    fn compaction_split_gives_continuation_a_distinct_hydration_key() {
+        let turns = load_turns(&[
+            user_record_with_source("go", "sdk", "2026-05-14T04:43:15Z"),
+            json!({
+                "type": "assistant",
+                "message": {
+                    "id": "msg_pre", "model": "claude-sonnet-4-6", "role": "assistant",
+                    "content": [{ "type": "text", "text": "pre" }],
+                    "stop_reason": "end_turn", "usage": { "input_tokens": 1, "output_tokens": 1 }
+                },
+                "timestamp": "2026-05-14T04:43:16Z",
+            }),
+            json!({"type":"user","message":{"role":"user","content":"This session is being continued…"},"isCompactSummary":true,"timestamp":"2026-05-14T04:43:17Z"}),
+            json!({
+                "type": "assistant",
+                "message": {
+                    "id": "msg_cont", "model": "claude-sonnet-4-6", "role": "assistant",
+                    "content": [{ "type": "text", "text": "cont" }],
+                    "stop_reason": "end_turn", "usage": { "input_tokens": 1, "output_tokens": 1 }
+                },
+                "timestamp": "2026-05-14T04:43:18Z",
+            }),
+        ]);
+        let keys: Vec<Option<String>> = turns
+            .iter()
+            .filter_map(|t| match t {
+                Turn::Agent { hydration_key, .. } => Some(hydration_key.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            keys,
+            vec![Some("msg_pre".to_owned()), Some("msg_cont".to_owned())],
+            "pre-compaction and continuation turns must carry distinct hydration keys"
         );
     }
 
@@ -2322,7 +2604,9 @@ mod tests {
         ]);
         let markers = compaction_markers(&result.turns);
         assert_eq!(markers.len(), 1, "exactly one compaction marker");
-        let SystemMarker::Compaction { summary } = markers[0];
+        let SystemMarker::Compaction { summary } = markers[0] else {
+            panic!("expected a Compaction marker, got {:?}", markers[0]);
+        };
         assert_eq!(
             summary,
             "This session is being continued from a previous conversation…"

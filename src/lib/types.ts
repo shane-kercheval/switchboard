@@ -639,9 +639,11 @@ export type ConversationItem =
       kind: "agent_turn";
       turn_id: TurnId;
       agent_id: AgentId;
-      // Recovered by joining this turn's `turn_id` against the journal's Send
-      // records, so a historical fan-out's responses group by `send_id` exactly
-      // like live ones. Null when no Send matched (pre-journal / failed write).
+      // Assigned by the backend merge: a durable key-join on `hydration_key`
+      // (`TurnLink`) where one exists, positional fallback otherwise — so a
+      // historical fan-out's responses group by `send_id` exactly like live ones.
+      // Null when neither resolves a send (pre-journal history, keyless with no
+      // positional match, or a declined anomalous link).
       send_id?: SendId | null;
       started_at: string;
       ended_at?: string | null;

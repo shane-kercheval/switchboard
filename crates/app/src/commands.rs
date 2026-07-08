@@ -3722,9 +3722,12 @@ fn shell_quote_if_needed(token: &str) -> String {
 ///
 /// The three rendered kinds in `items` are disjoint by source (system-design
 /// §3 / §7 "Unified history after restart"): user messages come only from the
-/// journal, agent content only from harness files, failed/cancelled markers
-/// only from the journal — so no correlation or de-dup between sources is
-/// performed.
+/// journal, agent content only from harness files, failed/cancelled markers only
+/// from the journal — so the two sources are never *de-duped* against each other.
+/// They *are* **correlated**: each agent turn is joined to its send by a durable
+/// `hydration_key` (`TurnLink`) where one exists, and positionally otherwise, so
+/// its `send_id` groups it under the right user message (see
+/// `merge_project_conversation`).
 ///
 /// **Same-turn `AgentTurn` + `Outcome` overlap is intentional, not duplication.**
 /// A non-completed turn can legitimately produce *both* an
@@ -3778,11 +3781,11 @@ pub enum ConversationItem {
     /// that predates journaling has no `Send`, so it is surfaced as an imported
     /// `UserMessage` rather than lost.
     ///
-    /// `send_id` is recovered by joining this turn's `turn_id` against the
-    /// journal's `Send` records (which persist `send_id` + `turn_id` at
-    /// turn-start), so a fan-out's historical responses group the same way live
-    /// ones do. `None` when no journal `Send` matches (e.g. a turn whose
-    /// send-record write failed, or pre-journal history).
+    /// `send_id` is assigned by the conversation merge: a **durable key-join**
+    /// where a `TurnLink` records this turn's `hydration_key` (Claude/Codex), and a
+    /// **positional fallback** (order-alignment) for keyless/legacy/in-flight turns —
+    /// see `merge_project_conversation`. `None` when neither resolves a send (pre-journal
+    /// history, a keyless turn with no positional match, or a declined anomalous link).
     AgentTurn {
         turn_id: switchboard_harness::TurnId,
         agent_id: AgentId,
@@ -4054,6 +4057,13 @@ fn classify_agent_turns(
 ) -> Vec<TurnRender> {
     let send_at: HashMap<SendId, chrono::DateTime<chrono::Utc>> =
         all_sends.iter().copied().collect();
+    // Each send's dispatch-window upper bound: the NEXT send's `at`. `all_sends` is
+    // in dispatch order, which is chronological for one agent (the dispatcher runs
+    // its turns serially), so consecutive pairs give each send's window
+    // `[send.at, next_send.at)`. Absent for the last send (open-ended). Used by the
+    // pass-1 window guard to reject a link whose turn ran outside its send's window.
+    let next_send_at: HashMap<SendId, chrono::DateTime<chrono::Utc>> =
+        all_sends.windows(2).map(|w| (w[0].0, w[1].1)).collect();
     // Pass 1 — key-join. Track the most-recent unconsumed correlating prompt (an
     // in-window `Sdk`-or-`Unknown` user turn): it survives `System` markers and is
     // taken at the NEXT agent turn — matched or not — exactly like the positional
@@ -4073,9 +4083,24 @@ fn classify_agent_turns(
                 started_at, source, ..
             } => {
                 use switchboard_harness::UserPromptSource::{Sdk, Unknown};
-                pending_prompt = (matches!(source, Sdk | Unknown)
-                    && journal_start.is_some_and(|start| *started_at >= start))
-                .then_some(i);
+                // Only a dispatch-candidate prompt (in-window `Sdk`/`Unknown`) updates
+                // the pending slot; a non-candidate record (`External`/`queued` typed
+                // into the bare TUI, or a pre-journaling prompt) LEAVES the prior
+                // candidate intact rather than clearing it. Clearing would let an
+                // intervening bare-CLI record between an `Sdk` prompt and its own
+                // linked reply erase the pairing — the echo would then go unsuppressed,
+                // re-import, and the journaled prompt would render twice (worse than
+                // positional). The pending slot is cleared only by an agent turn (the
+                // reply boundary, `pending_prompt.take()` below) or overwritten by a
+                // newer candidate. Known residual: an `Unknown` record interleaved
+                // mid-turn between an `Sdk` prompt and its reply still overwrites the
+                // candidate — effectively unreachable (needs a legacy-`Unknown` record
+                // on a link-bearing modern session).
+                if matches!(source, Sdk | Unknown)
+                    && journal_start.is_some_and(|start| *started_at >= start)
+                {
+                    pending_prompt = Some(i);
+                }
             }
             switchboard_harness::Turn::Agent {
                 hydration_key,
@@ -4086,24 +4111,36 @@ fn classify_agent_turns(
                 let paired_prompt = pending_prompt.take();
                 if let Some(send_id) = hydration_key.as_deref().and_then(|k| links.get(k).copied())
                 {
-                    // Chronology guard: a linked turn may claim a send only if that
-                    // send is in this agent's own history AND the turn did not end
-                    // before the send was dispatched. Both failures mean an anomalous
-                    // link — never trust it, fall back to positional:
-                    // - **send missing** (`send_at` has no entry): a corrupt or
-                    //   agent-mismatched link pointing at a send this agent never
-                    //   received — `is_some_and` rejects it (a phantom/cross-agent
-                    //   claim would be a confident mis-group).
-                    // - **turn predates its send**: a stale link — a prior turn's key
-                    //   mis-stamped onto a newer send (e.g. a raced Codex enrichment
-                    //   read the poison-drop misses because the prior turn had no link
-                    //   of its own). Keyed on `ended_at` (fallback `started_at`) for a
-                    //   whole-turn margin no local clock skew can cross — a legitimate
-                    //   reply always ends *after* its send.
+                    // Window guard + claim-once: a linked turn may claim a send only if
+                    // the link is **provably** the right send, else it declines to
+                    // positional (never a confident mis-group). A turn belongs to the
+                    // send whose dispatch window `[send.at, next_send.at)` contains its
+                    // end instant — the dispatcher runs one turn per agent serially, so
+                    // a turn cannot span past the next send. Three ways a link is
+                    // anomalous, all declined:
+                    // - **send missing** (`send_at` has no entry): a corrupt/foreign
+                    //   link pointing at a send this agent never received — a phantom or
+                    //   cross-agent claim.
+                    // - **outside the window**: `turn_end < send.at` (a stale link — a
+                    //   prior turn's key mis-stamped onto a newer send) OR
+                    //   `turn_end > next_send.at` (a stale link to an *earlier* send —
+                    //   the turn actually ran in a later send's window). Keyed on
+                    //   `ended_at` (fallback `started_at`); both bounds have a real
+                    //   margin no local clock (single machine) can cross, since a
+                    //   legitimate reply ends after its own send and before the next.
+                    // - **already claimed**: two links naming one send (the last-send
+                    //   case the window's open upper bound can't catch) — the first turn
+                    //   keeps it; the second declines.
                     let turn_end = ended_at.unwrap_or(*started_at);
                     let send_instant = send_at.get(&send_id).copied();
-                    let chronology_ok = send_instant.is_some_and(|s_at| turn_end >= s_at);
-                    if chronology_ok {
+                    let window_ok = send_instant.is_some_and(|s_at| {
+                        turn_end >= s_at
+                            && next_send_at
+                                .get(&send_id)
+                                .is_none_or(|next| turn_end <= *next)
+                    });
+                    let already_claimed = claimed.contains(&send_id);
+                    if window_ok && !already_claimed {
                         renders[i] = TurnRender::Agent(Some(send_id));
                         resolved[i] = true;
                         claimed.insert(send_id);
@@ -4113,19 +4150,20 @@ fn classify_agent_turns(
                         }
                     } else {
                         // Breadcrumb: a declined durable link. There is NO legitimate
-                        // trigger in valid data (a real reply never predates its send;
-                        // a real link's send is always in the agent's history), so any
-                        // firing means a journal/CLI/timestamp invariant has shifted —
-                        // surface it rather than silently degrading to positional.
-                        // `send_instant: None` = missing/foreign send; `Some` with
-                        // `turn_end` earlier = predating. Ids/timestamps only, no
-                        // transcript content.
+                        // trigger in valid data, so any firing means a journal/CLI/
+                        // timestamp invariant has shifted — surface it rather than
+                        // silently degrading to positional. The fields distinguish the
+                        // cause (`send_instant: None` = missing/foreign; `turn_end`
+                        // vs the window = out-of-window; `already_claimed` = duplicate).
+                        // Ids/timestamps only, no transcript content.
                         tracing::warn!(
                             hydration_key = hydration_key.as_deref().unwrap_or(""),
                             %send_id,
                             ?send_instant,
+                            next_send = ?next_send_at.get(&send_id),
                             ?turn_end,
-                            "declined an anomalous TurnLink (send missing from this agent, or turn predates its send) — falling back to positional correlation",
+                            already_claimed,
+                            "declined an anomalous TurnLink (send missing, outside its dispatch window, or already claimed) — falling back to positional correlation",
                         );
                     }
                     // A declined link leaves the turn unresolved → the residual
@@ -4356,12 +4394,21 @@ fn merge_project_conversation(
                 // a poisoned key stays out even if it reappears later.
                 //
                 // NOTE: this catches a stale link whose key collides with a
-                // legitimately-linked turn. The complementary case — a stale key
-                // matching a turn that has **no** link of its own (a pre-feature turn
-                // on the first post-M3 dispatch), so no collision fires — is caught by
-                // the chronology guard in `classify_agent_turns` (a linked turn cannot
-                // claim a send it ended before). Together they bound any stale link to
-                // "no worse than positional."
+                // legitimately-linked turn. The complementary cases — a stale key
+                // matching a turn with **no** link of its own (no collision fires), a
+                // link naming a foreign/missing send, or two keys naming one send — are
+                // caught by the window guard + claim-once in `classify_agent_turns` (a
+                // link is trusted only when the turn ran within that send's dispatch
+                // window and the send isn't already claimed). Together they bound any
+                // stale/corrupt link to "no worse than positional."
+                //
+                // **Load-bearing axiom:** all of this presupposes a `hydration_key`
+                // identifies exactly ONE turn per agent. Key *reuse* across two turns
+                // (a harness that repeats an id, or a resumed/forked session that
+                // replays one) would defeat both layers — a link internally consistent
+                // for one turn would mis-group the other. Fresh Claude `message.id`s
+                // and Codex `turn_context.turn_id`s satisfy it today; a key-reusing
+                // harness must not be given a `TurnLink` without revisiting this.
                 let poison = agent_link_poison.entry(agent_id).or_default();
                 if poison.contains(&hydration_key) {
                     continue;
@@ -13047,6 +13094,119 @@ mod tests {
             agent_send_ids(&merged),
             vec![Some(s1)],
             "a link to a send absent from the agent is rejected → positional, no phantom grouping"
+        );
+    }
+
+    #[test]
+    fn merge_intervening_bare_cli_prompt_does_not_duplicate_journaled_prompt() {
+        // Regression: a non-dispatch user record (a bare-TUI `External` prompt typed
+        // on a session Switchboard is also driving) sits on disk BETWEEN an `Sdk`
+        // prompt and that turn's own linked reply. It must not erase the pairing —
+        // if it did, the linked reply would claim the send without suppressing the
+        // echoed `Sdk` prompt, which would then re-import and render the journaled
+        // prompt TWICE (worse than positional — the exact bug the key-join exists to
+        // remove). The `External` record renders imported; the journaled prompt once.
+        let agent = Uuid::now_v7();
+        let s1 = Uuid::now_v7();
+        let journal = vec![
+            send_record(s1, Uuid::now_v7(), agent, "P1", 1),
+            link_record(s1, agent, "k1", 3),
+        ];
+        let turns = vec![
+            user_turn_src(Uuid::now_v7(), agent, "P1", 2, UserPromptSource::Sdk),
+            // Bare-CLI typed record between the Sdk prompt and its reply.
+            user_turn_src(
+                Uuid::now_v7(),
+                agent,
+                "typed",
+                3,
+                UserPromptSource::External,
+            ),
+            agent_turn_keyed(Uuid::now_v7(), agent, "reply1", 4, "k1"),
+        ];
+        let merged = merge_project_conversation(journal, vec![(agent, transcript_of(turns), None)]);
+
+        // P1 renders exactly once (journaled), "typed" once (imported) — no P1 dup.
+        assert_eq!(
+            user_texts(&merged),
+            vec!["P1", "typed"],
+            "the intervening record must not erase the echo suppression → P1 not duplicated"
+        );
+        // The journaled P1 is owned by its Send; only the bare-CLI record is imported.
+        let imported: Vec<&str> = merged
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                ConversationItem::UserMessage {
+                    send_id: None,
+                    text,
+                    ..
+                } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            imported,
+            vec!["typed"],
+            "only the bare-CLI record imports; not P1"
+        );
+        assert_eq!(agent_send_ids(&merged), vec![Some(s1)]);
+    }
+
+    #[test]
+    fn merge_two_links_to_one_send_do_not_double_group() {
+        // Corrupt-link hardening (window guard): two links name send S1 — `k1→S1`
+        // (correct) and `k2→S1` (corrupt; k2's turn A2 actually belongs to S2). The
+        // window guard rejects A2's claim (A2 ended AFTER S2 was dispatched, so it
+        // can't be S1's reply), so A2 falls to positional and pairs to S2 — never
+        // double-grouped under S1. Poison-drop can't catch this (keys differ); the
+        // bare chronology lower-bound couldn't either (A2 ends after S1.at).
+        let agent = Uuid::now_v7();
+        let (s1, s2) = (Uuid::now_v7(), Uuid::now_v7());
+        let journal = vec![
+            send_record(s1, Uuid::now_v7(), agent, "P1", 1),
+            send_record(s2, Uuid::now_v7(), agent, "P2", 5),
+            link_record(s1, agent, "k1", 3),
+            link_record(s1, agent, "k2", 7), // corrupt: should be s2
+        ];
+        let turns = vec![
+            user_turn_src(Uuid::now_v7(), agent, "P1", 2, UserPromptSource::Sdk),
+            agent_turn_keyed(Uuid::now_v7(), agent, "A1", 3, "k1"),
+            user_turn_src(Uuid::now_v7(), agent, "P2", 6, UserPromptSource::Sdk),
+            agent_turn_keyed(Uuid::now_v7(), agent, "A2", 7, "k2"),
+        ];
+        let merged = merge_project_conversation(journal, vec![(agent, transcript_of(turns), None)]);
+        assert_eq!(user_texts(&merged), vec!["P1", "P2"]);
+        assert_eq!(
+            agent_send_ids(&merged),
+            vec![Some(s1), Some(s2)],
+            "A2 falls to positional (S2), not double-grouped under S1"
+        );
+    }
+
+    #[test]
+    fn merge_duplicate_link_to_last_send_claims_it_once() {
+        // Claim-once, isolated: two links name the LAST send S1 (no next send, so the
+        // window's upper bound is open and can't reject the second turn). Claim-once
+        // is then the sole guard: the first turn keeps S1, the second declines to
+        // positional (ungrouped, since no send remains) — never double-grouped.
+        let agent = Uuid::now_v7();
+        let s1 = Uuid::now_v7();
+        let journal = vec![
+            send_record(s1, Uuid::now_v7(), agent, "P1", 1),
+            link_record(s1, agent, "k1", 3),
+            link_record(s1, agent, "k2", 5), // corrupt duplicate to the last send
+        ];
+        let turns = vec![
+            user_turn_src(Uuid::now_v7(), agent, "P1", 2, UserPromptSource::Sdk),
+            agent_turn_keyed(Uuid::now_v7(), agent, "A1", 3, "k1"),
+            agent_turn_keyed(Uuid::now_v7(), agent, "A2", 5, "k2"),
+        ];
+        let merged = merge_project_conversation(journal, vec![(agent, transcript_of(turns), None)]);
+        assert_eq!(
+            agent_send_ids(&merged),
+            vec![Some(s1), None],
+            "S1 claimed once (A1); the duplicate-link A2 declines to positional, ungrouped"
         );
     }
 

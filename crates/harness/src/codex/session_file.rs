@@ -451,6 +451,12 @@ pub fn parse_session_content(content: &str) -> Enrichment {
                         // Turn-scoped, same reason: a turn with no `turn_context`
                         // must read as no-key, never inherit a predecessor's id
                         // (a stale key would mis-link a new turn to an old send).
+                        // **Correctness depends on record order:** this reset works
+                        // only because `turn_context` is written *after* `task_started`
+                        // within a turn — if Codex ever reordered them, the reset would
+                        // wipe the current turn's key and every Codex turn would go
+                        // keyless → positional. Guarded live by
+                        // `live_codex_hydration_key_matches_live_turn_end`.
                         enrichment.current_turn_id = None;
                     }
                     "token_count" => {

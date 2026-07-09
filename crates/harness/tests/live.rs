@@ -623,6 +623,98 @@ async fn live_claude_sonnet_thinking_is_redacted() {
 
 #[tokio::test]
 #[ignore = "requires claude installed — run with: make test-live"]
+async fn live_claude_haiku_thinking_is_not_redacted() {
+    // The only live coverage of the **un-redacted** thinking path.
+    //
+    // Thinking redaction is per-model and server-flag-gated: Opus 4.8 and
+    // Sonnet 5 redact the `thinking` block to empty, Haiku 4.5 does not
+    // (harness-behavior.md §3.2/§7.1). Three pieces of production code run
+    // *only* when a model returns real reasoning prose — `parser.rs` mapping a
+    // non-empty `thinking_delta` to `ContentKind::Thinking` (an empty one
+    // becomes `Liveness`), `claude_code/session_file.rs` reconstructing a
+    // non-empty `thinking` block on reopen, and the `ThinkingWidget` having
+    // anything to render. Every other Claude live test runs against a redacting
+    // model, so without this test those paths are exercised by unit tests and
+    // fixtures alone, and a break in the live↔parser contract would ship green.
+    //
+    // It doubles as the Haiku drift guard, in the direction that fails
+    // silently: if Haiku starts redacting, reasoning simply vanishes from the
+    // UI with no error. This assertion turns that into a red test.
+    //
+    // Counterpart to `live_claude_sonnet_thinking_is_redacted`, which pins the
+    // opposite behavior on the redacting models. Both must be re-probed
+    // per-model on a CLI bump — the gate has moved four times.
+    //
+    // Sensitive to the model *choosing* to reason: `ultrathink` + `--effort
+    // high` + a genuinely multi-step prompt reliably induce it (3/3 observed @
+    // 2.1.205), but engagement is probabilistic, not contractual. A failure
+    // here means either Haiku redacted (a real finding) or it answered without
+    // thinking (re-run before believing it). The answer stays tiny per cost
+    // discipline; Haiku is also the cheapest model.
+    let adapter = ClaudeCodeAdapter::new();
+    let mut agent = live_agent();
+    agent.model = Some("haiku".to_owned());
+    agent.effort = Some("high".to_owned());
+    let turn_id = Uuid::now_v7();
+
+    let stream = adapter
+        .dispatch(
+            &agent,
+            Path::new("/tmp"),
+            "ultrathink. Reason step by step whether 1000003 is prime, then reply \
+             with only yes or no.",
+            turn_id,
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("dispatch should succeed with real claude");
+    let events: Vec<AdapterEvent> = stream.collect().await;
+
+    let model = session_meta_model(&events).expect("Claude emits SessionMeta with model");
+    assert!(
+        model.contains("haiku"),
+        "selected `--model haiku` must surface in SessionMeta.model; got {model:?}"
+    );
+
+    // The reasoning prose arrives as `Thinking` content chunks — the path that
+    // exists only for a non-redacting model.
+    let thinking_text: String = events
+        .iter()
+        .filter_map(|e| match e {
+            AdapterEvent::ContentChunk {
+                kind: ContentKind::Thinking,
+                text,
+                ..
+            } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !thinking_text.trim().is_empty(),
+        "Haiku returned no un-redacted `Thinking` prose. Either the server redaction \
+         flag now covers Haiku — re-probe per-model (harness-behavior.md §3.2/§7.1), \
+         update the docs, and expect the ThinkingWidget to go blank for Haiku agents — \
+         or the model answered without reasoning (re-run to distinguish). events: {events:?}"
+    );
+
+    let terminal = events
+        .iter()
+        .find(|e| matches!(e, AdapterEvent::TurnEnd { .. }))
+        .expect("terminal TurnEnd");
+    assert!(
+        matches!(
+            terminal,
+            AdapterEvent::TurnEnd {
+                outcome: TurnOutcome::Completed,
+                ..
+            }
+        ),
+        "a thinking turn must still complete; got {terminal:?}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires claude installed — run with: make test-live"]
 async fn live_claude_multi_call_turn_context_occupancy_is_final_call() {
     // Context-occupancy drift guard for tool-use (multi-call) turns.
     //

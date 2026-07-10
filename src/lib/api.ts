@@ -249,8 +249,20 @@ export async function removeDirectory(path: string): Promise<void> {
 // The merged post-restart conversation for a project (journal user-messages +
 // harness agent content + journal outcome markers). Replaces per-agent
 // `loadTranscript` for the unified view.
-export async function loadProjectConversation(projectId: ProjectId): Promise<ProjectConversation> {
-  return await invoke<ProjectConversation>("load_project_conversation", { projectId });
+//
+// `draftAttachments` are staged paths the project's unsent compose draft still
+// points at. Loading a project garbage-collects every staged attachment the
+// journal doesn't reference; the backend cannot see a draft (it lives in this
+// process's localStorage), so an undeclared path is reclaimed and the restored
+// draft's chip dangles. Pass the draft's paths, or `[]` when there is no draft.
+export async function loadProjectConversation(
+  projectId: ProjectId,
+  draftAttachments: string[] = [],
+): Promise<ProjectConversation> {
+  return await invoke<ProjectConversation>("load_project_conversation", {
+    projectId,
+    draftAttachments,
+  });
 }
 
 // Cheap per-agent session-file freshness check (stat only, no parse) that gates

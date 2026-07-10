@@ -4692,10 +4692,16 @@ fn gc_unreferenced_attachments(attachments_dir: &Path, referenced: &HashSet<Path
     }
 }
 
+/// `draft_attachments` are staged files the caller's *unsent* compose draft still
+/// points at. A draft lives in the frontend's machine-local storage, which the
+/// backend cannot see, so the caller must declare its live references or the GC
+/// below would reclaim them — leaving the restored draft's chips dangling at
+/// deleted paths. Pass an empty slice when there is no draft.
 pub async fn load_project_conversation_impl(
     state: &AppState,
     project_id: ProjectId,
     home_dir: &Path,
+    draft_attachments: &[PathBuf],
 ) -> Result<ProjectConversation, AppError> {
     // Resolve the project and collect each agent's *owned* inputs while holding
     // the lock, then release it before doing any read+parse. `load_agent_transcript`
@@ -4707,14 +4713,14 @@ pub async fn load_project_conversation_impl(
     };
     let journal = switchboard_core::journal::read_records(&project.journal_path())?;
 
-    // Reclaim disk on load: delete any staged file no longer referenced by a
-    // `Send` record — orphans from a staged-but-unsent drop, or files whose
-    // conversation was removed. Pure function of on-disk state, so it's
-    // crash-safe (just re-runs next load) and needs no completion signal.
-    gc_unreferenced_attachments(
-        &project.attachments_dir(),
-        &collect_referenced_attachment_paths(&journal),
-    );
+    // Reclaim disk on load: delete any staged file referenced by neither a `Send`
+    // record nor the caller's live draft — orphans from a staged-but-unsent drop
+    // the user has since abandoned, or files whose conversation was removed.
+    // Pure function of (on-disk state, declared draft refs), so it's crash-safe
+    // (just re-runs next load) and needs no completion signal.
+    let mut referenced = collect_referenced_attachment_paths(&journal);
+    referenced.extend(draft_attachments.iter().cloned());
+    gc_unreferenced_attachments(&project.attachments_dir(), &referenced);
 
     let agents = project.list_agents()?;
 
@@ -10899,6 +10905,28 @@ mod tests {
     }
 
     #[test]
+    fn gc_keeps_a_file_referenced_only_by_a_live_draft() {
+        // The unsent-draft case: nothing in the journal points at this file, but
+        // the caller declared it. Without the declaration the restored chip would
+        // dangle at a path GC had already reclaimed.
+        let dir = TempDir::new().unwrap();
+        let drafted = dir.path().join("drafted.png");
+        let orphan = dir.path().join("orphan.png");
+        std::fs::write(&drafted, b"d").unwrap();
+        std::fs::write(&orphan, b"o").unwrap();
+
+        let mut referenced = collect_referenced_attachment_paths(&[]);
+        referenced.extend([drafted.clone()]);
+        gc_unreferenced_attachments(dir.path(), &referenced);
+
+        assert!(drafted.exists(), "draft-referenced file survives");
+        assert!(
+            !orphan.exists(),
+            "a file in neither the journal nor the draft is still reclaimed"
+        );
+    }
+
+    #[test]
     fn gc_missing_dir_is_a_noop() {
         let dir = TempDir::new().unwrap();
         let missing = dir.path().join("attachments");
@@ -14745,7 +14773,7 @@ mod tests {
         .unwrap();
 
         let home = tmp.path().to_path_buf();
-        let conv = load_project_conversation_impl(&state, project_id, &home)
+        let conv = load_project_conversation_impl(&state, project_id, &home, &[])
             .await
             .unwrap();
 
@@ -14774,13 +14802,47 @@ mod tests {
         let (_agent, project_id) = project_with_agent(&state, &tmp).await;
 
         let home = tmp.path().to_path_buf();
-        let conv = load_project_conversation_impl(&state, project_id, &home)
+        let conv = load_project_conversation_impl(&state, project_id, &home, &[])
             .await
             .unwrap();
 
         assert!(
             conv.items.is_empty(),
             "no journal ⇒ no user/outcome items; empty transcript adds none"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_project_conversation_spares_declared_draft_attachments() {
+        // Stage two files and send neither. Declaring one as a live draft
+        // reference must spare it from the load-time GC while the undeclared one
+        // is still reclaimed — the whole reason the parameter exists.
+        let (tmp, state, _) = fresh_state_with_mock();
+        let (_agent, project_id) = project_with_agent(&state, &tmp).await;
+
+        let source = tmp.path().join("drafted.png");
+        std::fs::write(&source, b"D").unwrap();
+        let drafted = stage_attachment_impl(&state, project_id, &source)
+            .await
+            .unwrap();
+        let source2 = tmp.path().join("abandoned.png");
+        std::fs::write(&source2, b"A").unwrap();
+        let abandoned = stage_attachment_impl(&state, project_id, &source2)
+            .await
+            .unwrap();
+
+        let home = tmp.path().to_path_buf();
+        load_project_conversation_impl(&state, project_id, &home, &[PathBuf::from(&drafted.path)])
+            .await
+            .unwrap();
+
+        assert!(
+            Path::new(&drafted.path).exists(),
+            "a staged file the caller declared as a live draft reference survives the load GC"
+        );
+        assert!(
+            !Path::new(&abandoned.path).exists(),
+            "a staged file referenced by neither the journal nor the draft is still reclaimed"
         );
     }
 

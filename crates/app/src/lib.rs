@@ -1008,12 +1008,17 @@ async fn open_commit_file_difftool(
 async fn load_project_conversation(
     state: State<'_, AppState>,
     project_id: String,
+    draft_attachments: Vec<String>,
 ) -> Result<ProjectConversation, String> {
     let id = parse_uuid(&project_id).map_err(|e| e.to_string())?;
     let home = std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_default();
-    load_project_conversation_impl(state.inner(), id, &home)
+    let drafts: Vec<std::path::PathBuf> = draft_attachments
+        .into_iter()
+        .map(std::path::PathBuf::from)
+        .collect();
+    load_project_conversation_impl(state.inner(), id, &home, &drafts)
         .await
         .map_err(|e| e.to_string())
 }

@@ -2441,6 +2441,16 @@ pub async fn stage_attachment_impl(
 /// Scoped to the project's own attachments dir on purpose: without that check this
 /// would be a general "does this path exist" probe callable from the webview.
 /// A path outside the dir is dropped exactly like a missing one.
+///
+/// Containment is checked on **canonical** paths. `Path::starts_with` is a lexical
+/// component match — it does not collapse `..`, so `<dir>/../../etc/hosts` starts
+/// with `<dir>` lexically while `is_file()` resolves it through the OS to a file
+/// well outside the dir. Canonicalizing both sides closes that, and incidentally a
+/// symlink inside the dir that points outside it. A candidate that fails to
+/// canonicalize doesn't exist (or isn't reachable) — the same "drop it" outcome.
+/// If the attachments dir itself can't be canonicalized (the user cleaned
+/// `.switchboard/`), none of the chips can exist, so return an empty list rather
+/// than erroring.
 pub fn existing_attachment_paths_impl(
     state: &AppState,
     project_id: ProjectId,
@@ -2450,12 +2460,17 @@ pub fn existing_attachment_paths_impl(
         Some(loaded) => loaded,
         None => find_project_in_directories(state, project_id)?,
     };
-    let attachments_dir = project.attachments_dir();
+    let Ok(canonical_dir) = std::fs::canonicalize(project.attachments_dir()) else {
+        return Ok(Vec::new());
+    };
     Ok(paths
         .into_iter()
-        .filter(|path| {
-            let path = Path::new(path);
-            path.starts_with(&attachments_dir) && path.is_file()
+        .filter(|path| match std::fs::canonicalize(path) {
+            // Return the caller's *original* string, not the canonical one — the
+            // frontend matches these against chip `path` values (see
+            // `pruneMissingAttachments`), which hold the pre-canonical staged path.
+            Ok(resolved) => resolved.starts_with(&canonical_dir) && resolved.is_file(),
+            Err(_) => false,
         })
         .collect())
 }
@@ -10968,6 +10983,102 @@ mod tests {
             vec![live.path],
             "only the staged file that still exists under the project's attachments dir survives"
         );
+    }
+
+    #[tokio::test]
+    async fn existing_attachment_paths_rejects_dotdot_traversal_out_of_the_dir() {
+        // The lexical-`starts_with` hole: a `..`-crafted path that resolves to a
+        // real file outside the attachments dir. It must be rejected, or the
+        // command is a general filesystem-existence oracle.
+        let (tmp, state, _) = fresh_state_with_mock();
+        let (_agent, project_id) = project_with_agent(&state, &tmp).await;
+        let project = lock(&state.projects).get(&project_id).cloned().unwrap();
+
+        // Ensure the attachments dir exists so it canonicalizes.
+        let attachments_dir = project.attachments_dir();
+        std::fs::create_dir_all(&attachments_dir).unwrap();
+
+        // Put the target one level *above* the attachments dir (depth-independent),
+        // and reach it with a single `..`. The path lexically starts with the dir
+        // but resolves outside it — the exact case lexical `starts_with` misses.
+        let parent = attachments_dir.parent().unwrap();
+        std::fs::write(parent.join("secret.txt"), b"S").unwrap();
+        let traversal = attachments_dir
+            .join("../secret.txt")
+            .to_string_lossy()
+            .into_owned();
+
+        let kept =
+            existing_attachment_paths_impl(&state, project_id, vec![traversal.clone()]).unwrap();
+        assert!(
+            kept.is_empty(),
+            "a `..` path resolving outside the attachments dir is rejected (got {kept:?})"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn existing_attachment_paths_rejects_symlink_pointing_outside_the_dir() {
+        let (tmp, state, _) = fresh_state_with_mock();
+        let (_agent, project_id) = project_with_agent(&state, &tmp).await;
+        let project = lock(&state.projects).get(&project_id).cloned().unwrap();
+        std::fs::create_dir_all(project.attachments_dir()).unwrap();
+
+        let outside = tmp.path().join("outside.txt");
+        std::fs::write(&outside, b"O").unwrap();
+        let link = project.attachments_dir().join("link.png");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+        let kept = existing_attachment_paths_impl(
+            &state,
+            project_id,
+            vec![link.to_string_lossy().into_owned()],
+        )
+        .unwrap();
+        assert!(
+            kept.is_empty(),
+            "a symlink inside the dir that points outside it is rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn existing_attachment_paths_returns_the_original_caller_string() {
+        // The frontend matches the result against chip `path` values, which hold the
+        // pre-canonical staged path — so a survivor must come back byte-identical,
+        // not canonicalized.
+        let (tmp, state, _) = fresh_state_with_mock();
+        let (_agent, project_id) = project_with_agent(&state, &tmp).await;
+
+        let source = tmp.path().join("live.png");
+        std::fs::write(&source, b"L").unwrap();
+        let live = stage_attachment_impl(&state, project_id, &source)
+            .await
+            .unwrap();
+
+        let kept =
+            existing_attachment_paths_impl(&state, project_id, vec![live.path.clone()]).unwrap();
+        assert_eq!(
+            kept,
+            vec![live.path],
+            "survivor is the caller's exact string"
+        );
+    }
+
+    #[tokio::test]
+    async fn existing_attachment_paths_empty_when_dir_is_gone() {
+        // A cleaned `.switchboard/` means no chip can exist — an empty list, not an
+        // error.
+        let (tmp, state, _) = fresh_state_with_mock();
+        let (_agent, project_id) = project_with_agent(&state, &tmp).await;
+        let project = lock(&state.projects).get(&project_id).cloned().unwrap();
+        let ghost = project
+            .attachments_dir()
+            .join("ghost.png")
+            .to_string_lossy()
+            .into_owned();
+
+        let kept = existing_attachment_paths_impl(&state, project_id, vec![ghost]).unwrap();
+        assert!(kept.is_empty());
     }
 
     #[test]

@@ -112,12 +112,22 @@
   // fields plus a local `id` for list keying / removal.
   //
   // **The compose snapshot is authoritative, not this component.** Chips persist
-  // across a project switch and a Git-view toggle (both of which unmount this bar),
-  // so every mutation writes through to `setAttachments`. Two consequences worth
-  // stating: a staging copy that finishes after this bar unmounts still belongs to
-  // the project it began under and lands in that project's snapshot; and the
-  // project loader must declare these paths (`draftAttachmentPaths`) or its GC
-  // reclaims the files behind chips we're still showing.
+  // across a project switch and a Git-view toggle (both of which unmount this bar).
+  // Two consequences worth stating: a staging copy that finishes after this bar
+  // unmounts still belongs to the project it began under and lands in that
+  // project's snapshot; and the project loader must declare these paths
+  // (`draftAttachmentPaths`) or its GC reclaims the files behind chips we're still
+  // showing.
+  //
+  // **Exactly two sanctioned write paths — do not invent a third.**
+  //   1. While mounted: mutate `attachmentChips`; the `$effect` below mirrors it to
+  //      `setAttachments`. `commitChips` is the convenience wrapper for a replace.
+  //   2. After unmount (a staging copy that outlived this instance): `addAttachmentChip`
+  //      writes the store directly, because no `$effect` runs on a dead component.
+  // A direct `attachmentChips = …` assignment that skips both is the exact bug this
+  // section already shipped once — a restore path that updated the UI but not the
+  // store, so the file was GC'd on the next load. The effect is the backstop that
+  // makes that class of mistake structurally impossible.
   type AttachmentChip = Attachment & { id: string };
   let attachmentChips = $state<AttachmentChip[]>(restoreChips(saved.attachments ?? []));
   let dragOver = $state(false);
@@ -381,6 +391,10 @@
   // against its source. Gates the persist effect so the not-yet-restored plain
   // placeholder can't overwrite the saved snapshot before restoration settles.
   let restoring = $state(saved.content.kind === "prompt" || saved.content.kind === "workflow");
+  // A workflow restore whose `list_workflows` failed. `restoring` stays true (so
+  // the snapshot is preserved), and the placeholder shows a retry/discard state
+  // instead of a spinner.
+  let workflowRestoreFailed = $state(false);
 
   async function loadPrompts(): Promise<void> {
     try {
@@ -475,20 +489,34 @@
 
   /// Resolve a saved workflow-mode invocation against the loaded workflow list.
   ///
-  /// Unlike `tryRestorePrompt`, this is one-shot with no cold-cache grace period:
-  /// `list_workflows` reads the local filesystem, so a miss means the workflow was
-  /// genuinely renamed or deleted, not that a remote cache hasn't warmed. A miss
-  /// falls back to plain mode rather than stranding the composer in a workflow that
-  /// can't be invoked.
+  /// Resolve a saved workflow-mode invocation against the loaded workflow list.
   ///
-  /// The saved field values are installed *before* `loadWorkflowForm`, whose
-  /// seeding is additive — it fills only fields not already present, so the
-  /// restored values survive and any field the workflow has gained since is seeded
-  /// empty.
-  function tryRestoreWorkflow(): void {
+  /// `listOk` distinguishes the two outcomes that a bare `find(...) === undefined`
+  /// conflates, and getting this wrong destroys user state:
+  /// - **list succeeded, workflow absent** → genuinely renamed/deleted. Fall back
+  ///   to plain mode; the persist effect then overwrites the saved snapshot, which
+  ///   is correct because the workflow is confirmed gone.
+  /// - **list failed** (transient FS/IPC error, permissions, corrupt file →
+  ///   `loadWorkflows` catches all into `workflows = []`) → we simply don't know.
+  ///   Keep the snapshot pending and `restoring` true (which gates the content
+  ///   persist effect, so plain content never overwrites the saved workflow), and
+  ///   surface a retry/discard state. Never let a failure erase the draft.
+  ///
+  /// Unlike `tryRestorePrompt`, the *absent* case is one-shot with no cold-cache
+  /// grace period: a successful local list that lacks the workflow is authoritative.
+  ///
+  /// Saved field values are installed *before* `loadWorkflowForm`, whose seeding is
+  /// additive — restored values survive and any field the workflow gained since is
+  /// seeded empty.
+  function tryRestoreWorkflow(listOk: boolean): void {
     const snapshot = pendingWorkflowRestore;
     if (snapshot === null) return;
+    if (!listOk) {
+      workflowRestoreFailed = true;
+      return; // snapshot + `restoring` stay put; the draft is preserved.
+    }
     pendingWorkflowRestore = null;
+    workflowRestoreFailed = false;
     restoring = false;
     const found = workflows.find(
       (w) => w.name === snapshot.name && w.is_builtin === snapshot.isBuiltin,
@@ -503,6 +531,21 @@
     workflowSyncSettled = false;
     mode = "workflow";
     void loadWorkflowForm(found);
+  }
+
+  /// Retry a workflow restore that failed to list. Re-lists and re-resolves.
+  function retryWorkflowRestore(): void {
+    workflowRestoreFailed = false;
+    void loadWorkflows().then(tryRestoreWorkflow);
+  }
+
+  /// Give up on a failed workflow restore and start fresh in plain mode. This is
+  /// the user's explicit choice, so releasing the snapshot (letting the persist
+  /// effect overwrite it) is intended here, unlike the transient-failure path.
+  function discardWorkflowRestore(): void {
+    pendingWorkflowRestore = null;
+    workflowRestoreFailed = false;
+    restoring = false;
   }
 
   /// The current compose content as a persistable snapshot. Single definition so
@@ -564,6 +607,17 @@
   // through explicitly, so a cleared set can't be overtaken by a same-frame unmount.
   $effect(() => {
     setForwards(projectId, currentForwards());
+  });
+
+  // Backstop mirroring `attachmentChips` → the snapshot (path 1 in the attachments
+  // header comment). Content/forwards have had this from the start; attachments did
+  // not, and a restore path that assigned chips without writing the store shipped a
+  // silent file-loss bug. With this effect, any mounted mutation of the chip list
+  // persists whether or not the mutating site remembered to. The synchronous
+  // `commitChips` writes still matter for send-clear (`persistComposeNow` flushes in
+  // the same frame, ahead of this scheduled effect); this covers everything else.
+  $effect(() => {
+    setAttachments(projectId, chipsToAttachments(attachmentChips));
   });
 
   // Persist the compose content per project (machine-local; see composeStore).
@@ -1304,12 +1358,18 @@
 
   // --- Workflows ------------------------------------------------------------
 
-  async function loadWorkflows(): Promise<void> {
+  /// Returns whether the list actually succeeded. The workflow-restore path needs
+  /// to tell "list succeeded, workflow absent" from "list failed" — collapsing
+  /// both into `workflows = []` is what let a transient failure erase a saved
+  /// invocation. Other callers ignore the result.
+  async function loadWorkflows(): Promise<boolean> {
     try {
       const list = await api.listWorkflows();
       workflows = Array.isArray(list) ? list : [];
+      return true;
     } catch {
       workflows = [];
+      return false;
     } finally {
       workflowsLoaded = true;
     }
@@ -1621,7 +1681,7 @@
       draft = body;
     }
     if (attachmentChips.length === 0 && attachments.length > 0) {
-      attachmentChips = attachments.map((a) => ({ ...a, id: crypto.randomUUID() }));
+      commitChips(restoreChips(attachments));
     }
     persistComposeNow();
   }
@@ -1747,7 +1807,7 @@
     promptArgSources = { ...argSources };
     promptAppendedSources = [...appendedSources];
     appendedText = appended;
-    attachmentChips = attachments.map((a) => ({ ...a, id: crypto.randomUUID() }));
+    commitChips(restoreChips(attachments));
     mode = "prompt";
     persistComposeNow();
   }
@@ -2576,7 +2636,34 @@
         </div>
       {/if}
 
-      {#if restoring}
+      {#if restoring && workflowRestoreFailed}
+        <!-- The workflow list failed to load, so we can't tell whether the saved
+           workflow still exists. The snapshot is held (not discarded) until the
+           user retries or explicitly starts over — a transient error must not
+           destroy a half-filled invocation. -->
+        <div
+          class="flex h-16 items-center gap-3 px-1 text-sm"
+          data-testid="compose-workflow-restore-failed"
+        >
+          <span class="text-muted">Couldn't load your saved workflow.</span>
+          <Button
+            size="sm"
+            variant="secondary"
+            onclick={retryWorkflowRestore}
+            data-testid="workflow-restore-retry"
+          >
+            Retry
+          </Button>
+          <Button
+            size="sm"
+            variant="ghost"
+            onclick={discardWorkflowRestore}
+            data-testid="workflow-restore-discard"
+          >
+            Start over
+          </Button>
+        </div>
+      {:else if restoring}
         <!-- A saved prompt- or workflow-mode draft is still resolving against its
            source (a possibly cold prompt cache; the local workflow list). Show a
            neutral placeholder rather than the plain textarea so the box doesn't

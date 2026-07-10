@@ -105,7 +105,8 @@ in a doc-comment on the command: *a draft is durable UI state the backend cannot
 must declare its live references.*
 
 **Store shape.** Bump `STORAGE_VERSION` in `composeStore.ts` and extend `ComposeSnapshot`. The
-existing v2→v3 migration path (parse, degrade malformed entries to an empty plain draft) is the
+existing unversioned→v2 migration path (`migrateUnversioned`: parse, degrade malformed entries to an
+empty plain draft) is the
 pattern to follow — an unknown or malformed extension field degrades to absent, never throws. The
 snapshot gains:
 
@@ -269,9 +270,12 @@ Plus new `hover` and `active` interaction tokens, and a new `focus` token.
 
 1. **No opacity modifiers on surface tokens.** `bg-panel/35` composes differently over every parent
    and produces shades nobody named. Ban `bg-{surface,panel,raised,border}/<n>`.
-2. **`border` is never a fill.** Ban `bg-border` in any form. The ~dozen `hover:bg-border/60` sites
-   across `DiffPanel`, `GitRepoNode`, `TranscriptPanes`, `SettingsView`, `Sidebar`,
-   `ProjectsSidebar`, `ui/AsyncIconButton`, `ui/CopyButton` become `hover:bg-hover`.
+2. **`border` is never a fill.** Ban `bg-border` in any form. `hover:bg-border/60` appears **31 times
+   across 13 files** — do not work from an enumerated list, `rg 'hover:bg-border' src/` and migrate
+   every hit to `hover:bg-hover`. Two of those hits are in **test files**
+   (`DiffPanel.test.ts`, `GitRepoNode.test.ts`), which assert the class string directly and will fail
+   if missed. Start with the shared primitives (`ui/iconButton.ts`, `ui/AsyncIconButton`,
+   `ui/CopyButton`) — migrating those fixes several consumers at once — then re-grep.
 
 A third rule is a code-review rule rather than a lint, because it needs a human eye: **no more than
 two nested neutral treatments, counting fills and borders together.** A bordered container's child
@@ -298,7 +302,8 @@ it fails the intermediate commits.
 
 1. Add `hover` / `active` / `focus` tokens to `app.css` (both light and dark mappings); no call-site
    changes.
-2. Replace every `hover:bg-border/*` and `bg-border` fill with `hover:bg-hover` / `bg-active`.
+2. Replace every `hover:bg-border/*` and `bg-border` fill with `hover:bg-hover` / `bg-active` — found
+   by grep, not by the list above, and including the two test files that assert the class.
 3. Collapse the redundant neutral values (`code-bg`, `code-bg-agent`, `code-bg-user`, and the
    `surface`/`panel` near-duplicates) onto the four-role ramp; remove opacity modifiers from surface
    tokens at every call site.
@@ -332,7 +337,8 @@ Today a tool call reaches the frontend as `{ name: String, input: serde_json::Va
 input never inspected by anything in Rust. For Claude, Gemini, and Antigravity this is rich: a Claude
 `Edit` call's `{file_path, old_string, new_string}` and a `TodoWrite`'s `{todos: [...]}` are sitting
 there, being pretty-printed as JSON. **Codex is the exception**: every builtin arrives as
-`name: "command_execution"` with `input` = the argv, and its file edits ride inside `apply_patch` as a
+`name: "command_execution"` whose `input` carries a single shell-command string (e.g.
+`"/bin/zsh -lc ls"`, not an argv array), and its file edits ride inside `apply_patch` as a
 shell heredoc. You cannot distinguish "edit a file" from "run the tests" without parsing the command.
 
 A frontend `switch (tool.name)` would render Claude beautifully and leave Codex as a JSON blob
@@ -380,6 +386,7 @@ pub enum ToolFacet {
 }
 
 pub struct EditedFile {
+    /// Absolute, normalized. See the path contract below.
     pub path: String,
     pub change: EditChange,          // Added | Modified | Deleted
     pub edits: Vec<EditPair>,        // one per Claude `Edit`; N per `MultiEdit` / `apply_patch`
@@ -388,6 +395,22 @@ pub struct EditedFile {
 
 pub struct EditPair { pub old: String, pub new: String }
 ```
+
+**The path contract — define this before anything consumes it.** Every `path` on every facet
+(`EditedFile`, `Write`, `Read`, `Search`) is an **absolute, normalized filesystem path**. Each adapter
+is responsible for resolving its harness's spelling against the agent's working directory before
+constructing the facet: harnesses do not agree on absoluteness, and Codex's `apply_patch` section
+paths are relative to the shell's cwd.
+
+Carry exactly one path field, not two. The frontend derives a project-relative *display* path at
+render time; a second wire field would be redundant state that can disagree with the first.
+
+This matters because M5 groups the turn's edits by file and resolves each to a git worktree. Without
+a normalization rule, the same file arriving under two spellings becomes two rows on the card, and a
+path outside the project silently gets a Git affordance that cannot work. **Add to the probe checklist
+below: record the observed absoluteness of edit/read/write paths for each harness in
+`harness-behavior.md`.** The contract does not depend on what the probe finds — the adapters normalize
+regardless — but the probe tells each adapter how much work normalizing is.
 
 Contract notes that must survive into the doc-comments:
 
@@ -399,9 +422,11 @@ Contract notes that must survive into the doc-comments:
   The renderer says "wrote file" and shows content, not a diff.
 - `Shell` does not carry an exit code. The facet is computed at `ToolStarted`, before the tool has
   run; failure is already carried by the existing `is_error` on `ToolCompleted`. Do not duplicate it.
-- Edit/write content is capped (choose a bound in the low hundreds of KB) with a `truncated` flag, so
-  a single enormous write cannot bloat a live event. The raw `input` is unchanged and remains the
-  escape hatch.
+- Edit/write content is capped (choose a bound in the low hundreds of KB) with a `truncated` flag.
+  **Be precise about what this buys:** it prevents the facet from *duplicating* a large payload. It
+  does **not** bound the event, because the raw `input` rides alongside, uncapped, exactly as it does
+  today. Bounding the raw input is out of scope; bounding what the *renderer* does with it is M4's job.
+  The raw `input` is unchanged and remains the escape hatch.
 - `Other` is the graceful-degradation variant for any tool we have not mapped, including Claude's
   `Task` (subagent dispatch), which is **deliberately not given a facet in this pass** — it renders
   via the generic path. Adding it later is additive.
@@ -517,6 +542,21 @@ has no other way to say it finished — and `status-failed` on failure. This rev
 inclination to drop the success glyph; the reason it survives is that it is now the *only* completion
 signal, which is worth a comment at the site.
 
+**Collapsed rows must be cheap — this is a real bug in the code being replaced.** Today
+`ui/Disclosure.svelte` is a native `<details>` whose body is rendered unconditionally
+(`{@render children()}`, outside any `{#if open}`), and `ToolCallWidget.svelte` derives `hasInput` from
+`formattedInput`, which is `JSON.stringify(input, null, 2)`. Because `hasInput` is read in the
+always-rendered body, **every tool call in the transcript formats its full raw input regardless of
+whether it is expanded.** A 500 KB `Write` builds a 500 KB string and a DOM node nobody asked for.
+Collapsing hides it and costs the same.
+
+The new row owns its own expansion state rather than delegating to `<details>`, so:
+
+- format and render the raw-input body only when the row is actually open, and
+- cap the *displayed* raw JSON with an explicit "truncated" affordance.
+
+This is not a bonus optimization; it is the reason M3's facet cap does not, on its own, bound anything.
+
 **Chrome on expansion, one level only.** Collapsed: nothing. Expanded: the output/diff sits on a
 single `panel` fill and nothing inside it gets a second fill. This is the M2 two-nested-treatments
 rule falling out naturally, and it is what keeps a forty-line shell output from bleeding into the
@@ -545,9 +585,10 @@ for rows nobody expands, it doubles the wire payload, and `DiffHunk` lives in `c
 
 **Commits:**
 
-1. Borderless row shell + verb vocabulary + status glyph + expansion-only chrome. All facets still
-   render the generic JSON body when expanded. This commit alone should make the transcript feel
-   different, and is independently revertable.
+1. Borderless row shell + verb vocabulary + status glyph + expansion-only chrome, **including the
+   lazy raw-input body** (format on open, cap the displayed JSON). All facets still render the generic
+   JSON body when expanded. This commit alone should make the transcript feel different, and is
+   independently revertable.
 2. `Shell` renderer (command + output).
 3. `Edit` renderer with inline diff (`pnpm add diff` lands here).
 4. `Write` / `Read` / `Search` / `Todo` renderers.
@@ -562,6 +603,10 @@ changes, so a "no-go" on the row design does not also revert the renderers.
   command truncates rather than wrapping; expanding shows raw `name` and `input` for every facet
   including specialized ones; a failed tool shows the failed status; a cancelled/stopped tool (the
   frontend-synthesized `stop_reason` in `types.ts`) still renders.
+- **Regression test for the eager-stringify bug**: a tool call whose `input` is multi-megabyte does
+  not produce the formatted string while collapsed. Assert on behavior (the body node is absent, or
+  `formatToolInput` is not called), not on internals. A separate test that an over-cap raw input
+  renders the truncation affordance when expanded.
 - Unit tests on the diff synthesis: a one-line change; a change with no trailing newline; an addition
   (`old` empty); a deletion (`new` empty); a `truncated` facet renders the truncation notice; a
   multi-file `Edit` renders one section per file.
@@ -615,25 +660,46 @@ summed across all of that turn's edits to it, and clicking navigates to the firs
 **Counts** come from the facet's `EditPair`s (count added/removed lines between `old` and `new`), not
 from git. A `Write` contributes all-added. A `truncated` edit contributes a count marked approximate.
 
-**Git-view navigation.** The Git view is repo-scoped. Opening it for a file requires resolving the
-file to a repo root and setting `gitView.svelte.ts`'s `diffTarget` to the uncommitted-changes target
-for that worktree — the same state the Git view already uses to select a diff. This is real plumbing
-but not new machinery. A project directory need not be a git repo; in that case omit the icon rather
-than rendering it broken.
+**Git-view navigation needs a state channel that does not exist yet.** The Git view is repo-scoped:
+`gitView.svelte.ts`'s `diffTarget` selects a repo/worktree or a commit, and carries **no concept of a
+file**. Which file is shown is private state inside `DiffPanel.svelte`, chosen *after* the file list
+loads — it keeps the previous selection if still present, otherwise falls to `files[0]`. Setting
+`diffTarget` alone therefore opens the Git view to the right worktree and displays the wrong file
+whenever the requested one is not first.
+
+So: extend the `diffTarget` variants with an optional initial file (repo-relative), and have
+`DiffPanel`'s load effect prefer it. Three constraints, all load-bearing:
+
+- **Apply the initial file only when the target key actually changed**, not on a same-target refresh.
+  `DiffPanel` already discriminates on `filesKey !== key`; reuse it. Otherwise a background refresh
+  yanks the user's current file selection back to the one the card requested minutes ago.
+- **Fall back to today's behavior when the requested file is absent from the change list** — the agent
+  edited it, but it may since have been committed or reverted. Show the first file, not an empty pane.
+- The path arrives from the facet as absolute (M3's contract) and must be converted to repo-relative
+  *after* resolving it under a tracked worktree. A path that resolves outside any tracked worktree
+  gets **no icon** — an agent can edit a file anywhere it has access, which is not a bug, and the card
+  must not offer a Git affordance that cannot work. Same for a project directory that is not a repo.
 
 **Commits:**
 
 1. The card: derive from facets, group by directory, counts. Rendered, inert.
 2. Filename click → scroll to and highlight the tool call.
-3. Git icon → open Git view at that file's current diff.
+3. `diffTarget` gains the initial-file channel; `DiffPanel` honors it. (Ships alone — no card change.)
+4. Git icon on the card → open Git view at that file's current diff.
 
 ### Definition of Done
 
 - Unit tests on the derivation: a turn with no edits yields no card; five edits to one file roll up
   to one row with summed counts; a multi-file `apply_patch` yields one row per file; a `Write`
   contributes all-added; edits from *other* agents' turns never appear on this agent's card.
+- Unit tests on path normalization at the card boundary: the same file arriving under two spellings
+  yields **one** row, not two; a path outside any tracked worktree yields no Git icon.
 - Component tests: clicking a filename scrolls to and highlights the right tool call when the same
   file was edited by several calls (it targets the first); the Git icon is absent in a non-git project.
+- Component tests on the initial-file channel: requesting the **second** file in the change list opens
+  that file's diff, not the first; a same-target refresh preserves the user's manual file selection
+  rather than reapplying the requested one; a requested file absent from the change list falls back to
+  the first file without error.
 - Manual verification of the multi-agent case: two agents editing the same file in overlapping turns
   produce two cards, each listing only its own agent's edits.
 - The attribution rationale and the shell-edit blind spot are recorded in the card's module comment.
@@ -764,16 +830,22 @@ discussion, never affirmed — leave it alone).
 
 ---
 
-## M8 — Agents sidebar and transcript polish
+## M8 — Agents sidebar and live-turn indicators
 
 Depends on M2. Last because it is the most taste-driven and the least coupled.
 
 ### Goal & Outcome
 
+Two unrelated surfaces, grouped because both are small and neither blocks anything.
+
 The agents sidebar is a stack of four monospace `key: value` rows per agent — `model: opus`,
 `effort: high`, `mcp: 2`, `skills: 5` — which reads as a debug dump. Everything has equal weight, and
 the things that change over time (status, context) are buried or absent. Agent names truncate to
 ambiguity: two different agents both render as `gpt-5-5-mi…`. That is a bug, not a nit.
+
+Separately, live turns announce themselves by pulsing their own label text (`animate-pulse` on the
+words `Working...` and `Queued...`). The text you are trying to read is the element that fades, and
+nothing tells you how long a turn has been running.
 
 When this milestone is done:
 
@@ -781,7 +853,8 @@ When this milestone is done:
 - An agent's run status is the most visually salient thing on its card.
 - Model and effort read as one line of secondary text; MCP and skills counts are compact chips.
 - The context bar survives unchanged — it is the best thing on the card.
-- Transcript message actions (copy, expand, forward) are quiet until hover or focus.
+- Live turns show a standard animated loading indicator; the label text itself never animates.
+- A running turn shows how long it has been running; a completed turn shows how long it took.
 
 ### Implementation Outline
 
@@ -797,22 +870,76 @@ expression; the dot is the fallback if the rule fights the sidebar's border.
 **Density.** `opus · high` as one secondary line. MCP and skills as icon+count chips. Keep the context
 bar as-is.
 
-**Message actions.** They sit at full opacity on every turn today. Quiet them to hover/focus. Focus
-visibility is non-negotiable — a keyboard user must still be able to reach and see them, so this is
-`opacity` on hover *and* `:focus-visible`, not `display: none`.
+### Live-turn indicators
+
+**One animation everywhere. The label and the number do the differentiating.** Do not encode state in
+the animation's color, tempo, or presence — that was considered and rejected as over-design. Queued,
+running, and no-response are all live states and all animate identically.
+
+Add `ui/LoadingDots.svelte`: three `<span>`s with a staggered opacity keyframe — the standard
+three-dot loader. A 1.4 s loop, per-dot delays of `0s` / `0.16s` / `0.32s`, opacity `0.2 → 1 → 0.2`.
+It must be a component with real spans, **not** an animated `…` text character: animating a glyph
+means swapping characters, which shifts layout. The dots inherit `currentColor` so they take the
+label's color for free. Under `prefers-reduced-motion` all three sit at full opacity, static.
+
+The label names the number, so exactly one number is on screen and its meaning is never ambiguous:
+
+| State | Renders |
+| --- | --- |
+| Queued | `Queued` + dots. No number — a queued send has no `started_at` (it is not a turn yet). |
+| Running | `Working` + dots + elapsed since `turn.started_at`. |
+| Past the no-response threshold | `No response` + dots + the existing silence counter. |
+| Complete | `Worked for 2m 14s`. No dots. |
+
+The only thing that changes at the heartbeat threshold is the word, and therefore the quantity the
+word names. `Working 2m 14s` means "working for 2m 14s"; `No response 1m 02s` means "no response for
+1m 02s". Both counters already have a home: elapsed is new, silence is `quietElapsedMs` and stays
+exactly as it is.
+
+Three facts to build against, all verified — do not re-derive them:
+
+- **The 1 Hz ticker already exists** (`UnifiedTranscript.svelte:578`). Reuse `now`; do not add a
+  per-turn `setInterval`. Its doc-comment currently asserts that `now` is read only inside the quiet
+  footer, so ticks trigger no re-render when nothing is quiet. **The elapsed counter breaks that
+  invariant** — running turns will now read `now` every second. The cost is one text node per running
+  turn per second, which is fine, but the comment must be rewritten rather than left to rot.
+- **`formatDuration` (`utils.ts:50`) renders `0m 09s`** for a nine-second turn. It is only used by the
+  silence counter today, where sub-minute values are impossible by construction (the counter starts at
+  one full `HEARTBEAT_TIMEOUT_MS` = 60 s). Elapsed turns are frequently under a minute, so it needs a
+  sub-minute form (`9s`). Extend it or add a sibling; do not leave `0m 09s` on the common case.
+- **An agent turn carries `started_at` and `ended_at`** (`state/types.ts:63-64`), so both the live
+  counter and the completed total derive from existing state. Nothing new crosses the wire.
+
+Scope note: `--status-processing` and `--warning` are currently the *same hex* in both themes
+(`#b45309` / `#fbbf24`). Any future design that tries to distinguish a state by swapping between them
+is a no-op. Not a problem here, since this design uses no state colors — recorded so the next person
+does not rediscover it the hard way.
 
 **Commits:**
 
 1. Agent name truncation fix.
 2. Agent card restructure (status prominence, model·effort line, mcp/skills chips).
-3. Transcript message actions quiet until hover/focus.
+3. `ui/LoadingDots.svelte`; replace `animate-pulse` at `UnifiedTranscript.svelte:1081` (working),
+   `:1101` (queued), and `:1432` (the held-forward `↪ waiting for…` line, which has the same pulsing
+   text problem).
+4. Elapsed counter on running turns; `formatDuration` sub-minute form; ticker doc-comment corrected.
+5. `Worked for 2m 14s` on completed turns.
 
 ### Definition of Done
 
 - Component test: a roster with two long shared-prefix names renders two distinguishable labels.
-- Component test: message actions are present in the accessibility tree at all times and become
-  visible on `:focus-visible` — the keyboard path must not regress.
 - Visual verification with agents in each status (idle, processing, failed, cancelled), light and dark.
+- Component tests on the live-turn footer: a queued turn renders dots and **no** number; a running turn
+  renders dots and an elapsed count; crossing the heartbeat threshold swaps the word to `No response`
+  and the number to the silence counter, with the dots unchanged; a completed turn renders
+  `Worked for …` and no dots.
+- Unit tests on `formatDuration`'s sub-minute form: `9s`, `59s`, `1m 00s`, `1h 04m`. The existing
+  silence-counter callers must keep their current output — that is the regression risk of touching a
+  shared formatter.
+- The elapsed counter must be deterministic in tests: inject the clock, never read wall time
+  (`AGENTS.md` forbids time-of-day dependencies in unit tests).
+- The ticking number must not be announced by assistive tech. Assert it is outside any `aria-live`
+  region; state transitions are what get announced, not seconds.
 
 ---
 
@@ -827,7 +954,7 @@ visibility is non-negotiable — a keyboard user must still be able to reach and
 | M5 changed-files card | M4 | no | new surface |
 | M6 resize + layout | — | no | primitive + persistence |
 | M7 Git view | M2 | no | polish |
-| M8 sidebar + transcript | M2 | no | polish |
+| M8 sidebar + live-turn indicators | M2 | no | polish |
 
 M1, M2, M3, and M6 have no dependencies on each other and could proceed in parallel if that is
 useful. M4 is the milestone the whole plan is pointed at.

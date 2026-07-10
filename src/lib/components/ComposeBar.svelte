@@ -15,8 +15,10 @@
     expandForwardSources,
     forwardSourceForAgent,
     forwardSourceAgentsForPane,
+    forwardReadiness,
     reconcileForwardSources,
     reconcileForwardSourceMap,
+    type ForwardReadiness,
     type ForwardSource,
   } from "$lib/state/heldForwards.svelte";
   import { buildLiveSendsMap } from "$lib/state/liveSends";
@@ -220,17 +222,12 @@
     forwardSources = forwardSources.filter((s) => forwardSourceKey(s) !== key);
   }
 
-  /// True when this agent already has a completed turn the forward can carry — a
-  /// forward source with no output yet is flagged on its chip up front.
-  function agentHasCompletedOutput(agentId: AgentId): boolean {
-    return (transcripts[agentId] ?? []).some(
-      (turn) => turn.role === "agent" && turn.status === "complete",
-    );
-  }
-
-  /// Whether a source has nothing to forward yet — an agent with no completed turn.
-  function sourceIsEmpty(source: ForwardSource): boolean {
-    return !agentHasCompletedOutput(source.id);
+  /// What an agent would contribute if forwarded from right now. The single source
+  /// of truth for every surface that flags a forward source — the chips, the
+  /// `@`-menu rows, and the per-field pickers in the prompt/workflow composers —
+  /// so they cannot disagree about the same agent.
+  function agentReadiness(agentId: AgentId): ForwardReadiness {
+    return forwardReadiness(transcripts[agentId]);
   }
 
   /// Agent names that actually carried output, for the partial-empty caption —
@@ -2297,8 +2294,8 @@
               {:else}
                 <HarnessIcon harness={item.agent.harness} size="sm" class="h-4 w-4" />
                 <span class="text-fg">{item.agent.name}</span>
-                {#if !agentHasCompletedOutput(item.agent.id)}
-                  <span class="text-muted ml-auto text-[11px] italic">no output yet</span>
+                {#if agentReadiness(item.agent.id) === "empty"}
+                  <span class="text-muted ml-auto text-[11px] italic">will be skipped</span>
                 {/if}
               {/if}
             </button>
@@ -2315,7 +2312,7 @@
           {#each forwardSources as source (forwardSourceKey(source))}
             <ForwardSourceChip
               {source}
-              empty={sourceIsEmpty(source)}
+              readiness={agentReadiness(source.id)}
               disabled={sending}
               onRemove={() => removeForwardSource(forwardSourceKey(source))}
             />
@@ -2451,7 +2448,7 @@
               panes={paneLayout.panes}
               onPickAgent={(agent) => addForwardSource(forwardSourceForAgent(agent))}
               onPickPane={(pane) => addPaneForwardSources(pane)}
-              agentHasOutput={agentHasCompletedOutput}
+              {agentReadiness}
               disabled={sending}
               showPaneShortcuts
               triggerTestid="compose-forward-button"
@@ -2598,7 +2595,7 @@
           {agents}
           loading={workflowFormLoading}
           syncSettled={workflowSyncSettled}
-          agentHasOutput={agentHasCompletedOutput}
+          {agentReadiness}
           panes={paneLayout.panes}
           bind:inputs={workflowInputs}
           bind:forwardSources={workflowForwardSources}
@@ -2628,7 +2625,7 @@
           bind:appendedSources={promptAppendedSources}
           {agents}
           panes={paneLayout.panes}
-          agentHasOutput={agentHasCompletedOutput}
+          {agentReadiness}
           focusFirstField={focusPromptFieldOnMount}
           onremove={removePrompt}
           recipients={recipientChips}

@@ -1,21 +1,25 @@
 <script lang="ts">
   import { cn } from "$lib/utils";
-  import type { ForwardSource } from "$lib/state/heldForwards.svelte";
+  import type { ForwardReadiness, ForwardSource } from "$lib/state/heldForwards.svelte";
 
   // A forward-source chip — the agent whose latest output will be forwarded.
   // Shared by the compose bar and the prompt/workflow composers' per-field
   // forwarding so every surface looks identical. Agents are the first-class unit:
   // a pane is expanded to one chip per member agent at pick time, so a chip always
-  // stands for a single agent. `empty` flags a source with no completed output
-  // yet; `onRemove` drops it.
+  // stands for a single agent. `onRemove` drops it.
+  //
+  // `readiness` is what this source will contribute at dispatch, and only `empty`
+  // is a warning — that source is *skipped* from the send. A boolean cannot express
+  // this: a `pending` agent (one still generating) is about to contribute normally,
+  // and flagging it as a failure told the user the opposite of what would happen.
   let {
     source,
-    empty = false,
+    readiness = "ready",
     disabled = false,
     onRemove,
   }: {
     source: ForwardSource;
-    empty?: boolean;
+    readiness?: ForwardReadiness;
     disabled?: boolean;
     onRemove: () => void;
   } = $props();
@@ -24,12 +28,12 @@
 <span
   class={cn(
     "inline-flex max-w-[14rem] items-center gap-1.5 rounded-full border py-px pr-1 pl-2 text-xs",
-    empty
+    readiness === "empty"
       ? "border-status-failed/40 bg-status-failed-soft/40 text-status-failed"
       : "border-border bg-panel text-fg",
   )}
   data-testid={`forward-source-chip-${source.name}`}
-  data-empty={empty}
+  data-readiness={readiness}
 >
   <svg
     viewBox="0 0 24 24"
@@ -45,9 +49,14 @@
     <path d="M4 18v-2a4 4 0 0 1 4-4h12" />
   </svg>
   <span class="truncate" title={source.name}>{source.name}</span>
-  {#if empty}
-    <span class="shrink-0 italic" title="This agent has no completed output to forward"
-      >no output</span
+  {#if readiness === "empty"}
+    <!-- Names the consequence, not the agent's state: an empty source is dropped
+         from the composed body, and if every source is empty the send doesn't
+         happen at all. -->
+    <span
+      class="shrink-0 italic"
+      title="This agent has no completed output, so it will be left out of the forward"
+      >will be skipped</span
     >
   {/if}
   <button

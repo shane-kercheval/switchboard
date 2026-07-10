@@ -2242,6 +2242,33 @@ describe("ComposeBar — cross-agent forward", () => {
     ];
   }
 
+  async function seedStreamingTurn(agentId: string, alsoCompleted = false): Promise<void> {
+    const state = await loadState();
+    const turns = alsoCompleted
+      ? [
+          {
+            role: "agent" as const,
+            turn_id: `t-done-${agentId}`,
+            agent_id: agentId,
+            started_at: "2026-05-16T00:00:00Z",
+            status: "complete" as const,
+            items: [{ item_kind: "text" as const, kind: "text" as const, text: "old" }],
+          },
+        ]
+      : [];
+    state.transcripts[agentId] = [
+      ...turns,
+      {
+        role: "agent",
+        turn_id: `t-live-${agentId}`,
+        agent_id: agentId,
+        started_at: "2026-05-16T00:00:01Z",
+        status: "streaming",
+        items: [],
+      },
+    ];
+  }
+
   async function resetHeldForwards(): Promise<void> {
     (await import("$lib/state/heldForwards.svelte"))._testing.reset();
   }
@@ -2439,18 +2466,70 @@ describe("ComposeBar — cross-agent forward", () => {
     });
   });
 
-  it("flags an idle-empty source on its chip", async () => {
+  it("warns on an idle-empty source, naming the consequence", async () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);
     await state.registerAgent(AGENT_B);
-    // AGENT_B has no completed turn → nothing to forward yet.
+    // AGENT_B is idle with no completed turn → the forward skips it entirely.
 
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
     await pickForwardSource(AGENT_B.id);
 
     const chipEl = screen.getByTestId("forward-source-chip-bob");
-    expect(chipEl).toHaveAttribute("data-empty", "true");
-    expect(chipEl).toHaveTextContent("no output");
+    expect(chipEl).toHaveAttribute("data-readiness", "empty");
+    expect(chipEl).toHaveTextContent("will be skipped");
+  });
+
+  it("does not warn on a source that is still streaming", async () => {
+    // The reported bug: a streaming agent rendered in the failed status colour with
+    // "no output", when the send in fact holds for that turn and forwards it.
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    await seedStreamingTurn(AGENT_B.id);
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    await pickForwardSource(AGENT_B.id);
+
+    const chipEl = screen.getByTestId("forward-source-chip-bob");
+    expect(chipEl).toHaveAttribute("data-readiness", "pending");
+    expect(chipEl).not.toHaveTextContent("will be skipped");
+  });
+
+  it("treats a completed turn plus a newer streaming one as pending, not ready", async () => {
+    // The forward awaits the in-flight turn and takes the *latest* completed output,
+    // so this agent is not ready — the send holds. A `hasCompleted || isStreaming`
+    // predicate would call it ready and mislead the user about what gets forwarded.
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    await seedStreamingTurn(AGENT_B.id, true);
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    await pickForwardSource(AGENT_B.id);
+
+    expect(screen.getByTestId("forward-source-chip-bob")).toHaveAttribute(
+      "data-readiness",
+      "pending",
+    );
+  });
+
+  it("the @-menu row and the chip agree about the same agent", async () => {
+    // Four surfaces asked this question independently before; a shared derivation
+    // is what stops them drifting.
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    await seedStreamingTurn(AGENT_B.id);
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    await fireEvent.input(textarea, { target: { value: "@" } });
+    const row = await screen.findByTestId(`forward-option-forward-agent:${AGENT_B.id}`);
+    expect(row).not.toHaveTextContent("will be skipped");
+
+    await fireEvent.click(row);
+    expect(screen.getByTestId("forward-source-chip-bob")).not.toHaveTextContent("will be skipped");
   });
 
   it("restores forward sources after an unmount/remount (project switch, Git view)", async () => {

@@ -6,6 +6,7 @@
   // chip to the compose set, or to one argument), so this component is purely the
   // menu — open/position/keyboard/click-outside come from `DropdownMenu`.
   import type { AgentRecord, AgentId } from "$lib/types";
+  import type { ForwardReadiness } from "$lib/state/heldForwards.svelte";
   import type { TranscriptPane } from "$lib/state/transcriptPanes.svelte";
   import DropdownMenu from "$lib/components/ui/DropdownMenu.svelte";
   import DropdownMenuItem from "$lib/components/ui/DropdownMenuItem.svelte";
@@ -18,7 +19,7 @@
     onPickAgent,
     onPickPane,
     disabled = false,
-    agentHasOutput,
+    agentReadiness,
     triggerClass,
     triggerTestid = "forward-picker-trigger",
     triggerLabel = "Forward output from an agent or pane",
@@ -31,9 +32,10 @@
     onPickAgent: (agent: AgentRecord) => void;
     onPickPane: (pane: TranscriptPane) => void;
     disabled?: boolean;
-    /// Optional: flag agents with no completed output yet ("no output") so the
-    /// user sees there's nothing to forward before picking.
-    agentHasOutput?: (id: AgentId) => boolean;
+    /// Optional: classify what each agent would contribute, so the user sees
+    /// before picking that a source will be skipped. Only `empty` is flagged —
+    /// a `pending` agent is still generating and will be waited for.
+    agentReadiness?: (id: AgentId) => ForwardReadiness;
     triggerClass?: string;
     triggerTestid?: string;
     triggerLabel?: string;
@@ -129,8 +131,8 @@
     >
       <HarnessIcon harness={agent.harness} size="sm" class="h-4 w-4 shrink-0" />
       <span class="text-fg">{agent.name}</span>
-      {#if agentHasOutput && !agentHasOutput(agent.id)}
-        <span class="text-muted ml-auto text-[11px] italic">no output</span>
+      {#if agentReadiness?.(agent.id) === "empty"}
+        <span class="text-muted ml-auto text-[11px] italic">will be skipped</span>
       {/if}
     </DropdownMenuItem>
   {/each}

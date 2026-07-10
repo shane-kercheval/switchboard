@@ -205,7 +205,7 @@ function setupForward(
   opts: {
     argSources?: Record<string, ForwardSource[]>;
     panes?: TranscriptPane[];
-    agentHasOutput?: (id: string) => boolean;
+    agentReadiness?: (id: string) => "ready" | "pending" | "empty";
   } = {},
 ): void {
   render(ForwardHarness, {
@@ -215,7 +215,7 @@ function setupForward(
       initialArgSources: opts.argSources ?? {},
       agents: [BOB, CAROL],
       panes: opts.panes ?? [],
-      agentHasOutput: opts.agentHasOutput,
+      agentReadiness: opts.agentReadiness,
     },
   });
 }
@@ -251,17 +251,32 @@ describe("PromptComposer per-argument forwarding", () => {
     await waitFor(() => expect(screen.queryByTestId("forward-source-chip-bob")).toBeNull());
   });
 
-  it("flags a source with no completed output on its chip", () => {
+  it("warns on a chip whose source will be skipped at dispatch", () => {
     setupForward(
       { focus: "", tone: "" },
       {
         argSources: { focus: [{ id: BOB.id, name: "bob" }] },
-        agentHasOutput: () => false,
+        agentReadiness: () => "empty",
       },
     );
     const chip = screen.getByTestId("forward-source-chip-bob");
-    expect(chip).toHaveAttribute("data-empty", "true");
-    expect(chip).toHaveTextContent("no output");
+    expect(chip).toHaveAttribute("data-readiness", "empty");
+    expect(chip).toHaveTextContent("will be skipped");
+  });
+
+  it("does not warn on a chip whose source is still generating", () => {
+    // The send holds for an in-flight turn and forwards it, so a `pending` source
+    // is about to contribute normally — flagging it would say the opposite.
+    setupForward(
+      { focus: "", tone: "" },
+      {
+        argSources: { focus: [{ id: BOB.id, name: "bob" }] },
+        agentReadiness: () => "pending",
+      },
+    );
+    const chip = screen.getByTestId("forward-source-chip-bob");
+    expect(chip).toHaveAttribute("data-readiness", "pending");
+    expect(chip).not.toHaveTextContent("will be skipped");
   });
 
   it("treats a required argument as satisfied once it has a forward source", () => {

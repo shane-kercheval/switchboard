@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { reconcileForwardSourceMap, reconcileForwardSources } from "./heldForwards.svelte";
+import {
+  forwardReadiness,
+  reconcileForwardSourceMap,
+  reconcileForwardSources,
+} from "./heldForwards.svelte";
 import type { ForwardSource } from "./heldForwards.svelte";
+import type { Turn } from "./types";
 import type { AgentRecord } from "$lib/types";
 
 const agent = (id: string, name: string): AgentRecord => ({
@@ -86,5 +91,66 @@ describe("reconcileForwardSourceMap", () => {
 
   it("returns an empty map for an empty map", () => {
     expect(reconcileForwardSourceMap({}, ROSTER)).toEqual({});
+  });
+});
+
+const agentTurn = (
+  status: "streaming" | "complete" | "failed" | "cancelled",
+  at: string,
+): Turn => ({
+  role: "agent",
+  turn_id: `turn-${at}`,
+  agent_id: "agent-a",
+  started_at: at,
+  status,
+  items: [],
+});
+
+const userTurn = (at: string): Turn => ({
+  role: "user",
+  turn_id: `user-${at}`,
+  agent_id: "agent-a",
+  started_at: at,
+  text: "hi",
+});
+
+describe("forwardReadiness", () => {
+  it("is empty for an agent with no turns", () => {
+    expect(forwardReadiness([])).toBe("empty");
+    expect(forwardReadiness(undefined)).toBe("empty");
+  });
+
+  it("is ready for an idle agent with a completed turn", () => {
+    expect(forwardReadiness([agentTurn("complete", "1")])).toBe("ready");
+  });
+
+  it("is pending while a turn is streaming", () => {
+    expect(forwardReadiness([agentTurn("streaming", "1")])).toBe("pending");
+  });
+
+  it("is pending for a completed turn followed by a newer streaming one", () => {
+    // The forward awaits the in-flight turn and then takes the *latest* completed
+    // output, so this agent is not ready — the send holds and forwards the new
+    // turn, not the old one. A `hasCompleted || isStreaming` predicate says "ready"
+    // here, which is the exact bug this function exists to prevent.
+    expect(forwardReadiness([agentTurn("complete", "1"), agentTurn("streaming", "2")])).toBe(
+      "pending",
+    );
+  });
+
+  it("is empty when the only turn failed or was cancelled", () => {
+    // No completed output to carry; the source will be skipped at dispatch.
+    expect(forwardReadiness([agentTurn("failed", "1")])).toBe("empty");
+    expect(forwardReadiness([agentTurn("cancelled", "1")])).toBe("empty");
+  });
+
+  it("is ready when a later turn failed but an earlier one completed", () => {
+    expect(forwardReadiness([agentTurn("complete", "1"), agentTurn("failed", "2")])).toBe("ready");
+  });
+
+  it("ignores user turns", () => {
+    // A user turn has no `status`; only agent turns carry forwardable output.
+    expect(forwardReadiness([userTurn("1")])).toBe("empty");
+    expect(forwardReadiness([userTurn("1"), agentTurn("complete", "2")])).toBe("ready");
   });
 });

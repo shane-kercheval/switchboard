@@ -8,6 +8,7 @@
     forwardSourceKey,
     forwardSourceForAgent,
     forwardSourceAgentsForPane,
+    type ForwardReadiness,
     type ForwardSource,
   } from "$lib/state/heldForwards.svelte";
   import {
@@ -41,7 +42,7 @@
     appendedSources = $bindable([]),
     agents = [],
     panes = [],
-    agentHasOutput,
+    agentReadiness,
     onremove,
     send,
     recipients,
@@ -61,9 +62,9 @@
     appendedSources?: ForwardSource[];
     agents?: AgentRecord[];
     panes?: TranscriptPane[];
-    /// Flags agents with no completed output yet, so the per-field picker and
-    /// chips can show "no output" before send.
-    agentHasOutput?: (id: AgentId) => boolean;
+    /// Classifies what each agent would contribute, so the per-field picker and
+    /// chips can warn before send that a source will be skipped.
+    agentReadiness?: (id: AgentId) => ForwardReadiness;
     onremove: () => void;
     /// The compose bar's send button, rendered in the footer row beside Preview
     /// so the two actions align. Optional so the component stands alone in tests.
@@ -78,10 +79,10 @@
     busy?: boolean;
   } = $props();
 
-  /// Whether a source has nothing to forward yet — an agent with no completed turn.
-  function sourceIsEmpty(source: ForwardSource): boolean {
-    if (!agentHasOutput) return false;
-    return !agentHasOutput(source.id);
+  /// What a source will contribute at dispatch. Absent the classifier (the
+  /// component stands alone in tests), assume it resolves normally.
+  function sourceReadiness(source: ForwardSource): ForwardReadiness {
+    return agentReadiness?.(source.id) ?? "ready";
   }
 
   // Each forwardable field (every argument, plus the appended text) owns its own
@@ -288,7 +289,7 @@
           onPickPane={(pane) => {
             for (const source of forwardSourceAgentsForPane(pane, agents)) onAdd(source);
           }}
-          {agentHasOutput}
+          {agentReadiness}
           disabled={busy}
           showPaneShortcuts
           triggerTestid={testid}
@@ -309,7 +310,7 @@
             {#each sources as source (forwardSourceKey(source))}
               <ForwardSourceChip
                 {source}
-                empty={sourceIsEmpty(source)}
+                readiness={sourceReadiness(source)}
                 disabled={busy}
                 onRemove={() => onRemove(forwardSourceKey(source))}
               />

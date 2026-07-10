@@ -10,6 +10,7 @@
     forwardSourceKey,
     forwardSourceForAgent,
     forwardSourceAgentsForPane,
+    type ForwardReadiness,
     type ForwardSource,
   } from "$lib/state/heldForwards.svelte";
   import { cn } from "$lib/utils";
@@ -34,7 +35,7 @@
     panes = [],
     loading = false,
     syncSettled = false,
-    agentHasOutput,
+    agentReadiness,
     inputs = $bindable(),
     forwardSources = $bindable({}),
     onremove,
@@ -53,10 +54,10 @@
     /// `unresolved` → "not found" escalation (before a sync settles, an unresolved
     /// MCP prompt is genuinely pending).
     syncSettled?: boolean;
-    /// Flags forward-source agents with no completed output yet ("no output"), so
-    /// the user sees there's nothing to forward before picking — parity with the
-    /// prompt composer's per-argument pickers.
-    agentHasOutput?: (id: string) => boolean;
+    /// Classifies what each forward-source agent would contribute, so the user
+    /// sees before picking that a source will be skipped — parity with the prompt
+    /// composer's per-argument pickers.
+    agentReadiness?: (id: string) => ForwardReadiness;
     /// Bound input values, keyed by name. Scalar inputs and derived args hold a
     /// string; list inputs hold a string[].
     inputs: Record<string, WorkflowInputValue>;
@@ -394,7 +395,7 @@
       <ForwardSourcePicker
         {agents}
         {panes}
-        {agentHasOutput}
+        {agentReadiness}
         onPickAgent={(agent) => addArgSource(name, forwardSourceForAgent(agent))}
         onPickPane={(pane) => {
           for (const source of forwardSourceAgentsForPane(pane, agents)) addArgSource(name, source);
@@ -418,6 +419,7 @@
         {#each sources as source (forwardSourceKey(source))}
           <ForwardSourceChip
             {source}
+            readiness={agentReadiness?.(source.id) ?? "ready"}
             onRemove={() => removeArgSource(name, forwardSourceKey(source))}
           />
         {/each}

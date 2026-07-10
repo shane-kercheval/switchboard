@@ -16,6 +16,7 @@
 // it. The hold lives here instead.
 
 import type { AgentId, AgentRecord, ProjectId, SendId } from "$lib/types";
+import type { Turn } from "$lib/state/types";
 import type { TranscriptPane } from "$lib/state/transcriptPanes.svelte";
 
 /// One forward source the user picked: always a single agent whose latest output
@@ -87,6 +88,38 @@ export function reconcileForwardSourceMap(
     if (kept.length > 0) out[field] = kept;
   }
   return out;
+}
+
+/// What a forward source will contribute when the send dispatches.
+///
+/// - `ready`   — the agent is idle with a completed turn; the forward resolves it now.
+/// - `pending` — the agent has a turn in flight; the send **holds** for it.
+/// - `empty`   — the agent is idle with nothing completed; the source is **skipped**,
+///               and if every source is empty the forward is invalidated entirely.
+export type ForwardReadiness = "ready" | "pending" | "empty";
+
+/// Classify what a source will contribute, from that agent's turns.
+///
+/// The rule comes from `forward_message_impl` (crates/app/src/commands.rs), which
+/// "holds outside any queue while each source agent's current in-flight turn
+/// settles, then composes … each non-empty source's latest **completed** output."
+/// Two consequences the shape of this function depends on:
+///
+/// 1. **An in-flight turn means `pending` regardless of history.** An agent with an
+///    older completed turn *and* a newer streaming one forwards the *new* turn, so
+///    it is not ready — the send waits. Readiness is therefore "has completed output
+///    AND nothing in flight", not "has completed output". A predicate written as
+///    `hasCompleted || isStreaming` gets exactly this case backwards.
+/// 2. **`empty` is a real warning.** `ForwardOutcome::Resolved` skips such a source
+///    from the composed body, and `Invalidated` fires when every source is empty.
+///
+/// A turn that only ever `failed` or `cancelled` leaves the agent `empty`: there is
+/// no completed output to carry.
+export function forwardReadiness(turns: readonly Turn[] | undefined): ForwardReadiness {
+  const agentTurns = (turns ?? []).filter((turn) => turn.role === "agent");
+  if (agentTurns.some((turn) => turn.status === "streaming")) return "pending";
+  if (agentTurns.some((turn) => turn.status === "complete")) return "ready";
+  return "empty";
 }
 
 /// A submitted-but-still-holding forward. Carries everything needed to render

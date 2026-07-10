@@ -422,7 +422,7 @@
             aria-orientation="vertical"
             aria-label="Resize panes"
             data-testid={`pane-gutter-${i}`}
-            class="bg-border/80 hover:bg-accent/70 w-1 shrink-0 cursor-col-resize transition-colors"
+            class="bg-active hover:bg-focus w-1 shrink-0 cursor-col-resize transition-colors"
             onpointerdown={(event) => startResize(i - 1, event)}
           ></div>
         {/if}
@@ -460,7 +460,7 @@
                   autocorrect="off"
                   autocapitalize="off"
                   spellcheck="false"
-                  class="text-fg border-border bg-panel focus-visible:ring-accent h-6 min-w-0 flex-1 rounded border px-1.5 text-xs font-semibold focus-visible:ring-1 focus-visible:outline-none"
+                  class="text-fg border-border bg-panel focus-visible:ring-focus h-6 min-w-0 flex-1 rounded border px-1.5 text-xs font-semibold focus-visible:ring-1 focus-visible:outline-none"
                   aria-label="Pane name"
                   data-testid="pane-rename-input"
                   onkeydown={onRenameKeydown}
@@ -471,7 +471,7 @@
                     <button
                       {...props}
                       type="button"
-                      class={cn(ICON_BUTTON_CLASS, "hover:bg-border/60 shrink-0")}
+                      class={cn(ICON_BUTTON_CLASS, "hover:bg-hover shrink-0")}
                       aria-label="Save pane name"
                       data-testid="pane-rename-save"
                       onmousedown={(event) => event.preventDefault()}
@@ -565,7 +565,7 @@
                       <button
                         {...props}
                         type="button"
-                        class={cn(ICON_BUTTON_CLASS, "hover:bg-border/60 shrink-0")}
+                        class={cn(ICON_BUTTON_CLASS, "hover:bg-hover shrink-0")}
                         aria-label={`Minimize ${pane.name}`}
                         data-testid="pane-minimize"
                         onclick={(event) => {
@@ -588,7 +588,7 @@
                       <button
                         {...props}
                         type="button"
-                        class={cn(ICON_BUTTON_CLASS, "hover:bg-border/60 shrink-0")}
+                        class={cn(ICON_BUTTON_CLASS, "hover:bg-hover shrink-0")}
                         aria-label={maximizedPane?.id === pane.id
                           ? "Restore panes"
                           : `Maximize ${pane.name}`}
@@ -610,7 +610,7 @@
                 <DropdownMenu
                   triggerLabel={`Actions for ${pane.name}`}
                   triggerTestid="pane-actions"
-                  triggerClass={cn(ICON_BUTTON_CLASS, "hover:bg-border/60 shrink-0")}
+                  triggerClass={cn(ICON_BUTTON_CLASS, "hover:bg-hover shrink-0")}
                   contentTestid="pane-actions-menu"
                 >
                   {#snippet trigger()}

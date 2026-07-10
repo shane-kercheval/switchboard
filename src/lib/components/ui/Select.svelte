@@ -16,7 +16,7 @@
   class={cn(
     "border-border bg-raised h-7 w-full cursor-pointer rounded-md border px-2 text-sm",
     "text-fg",
-    "focus-visible:ring-accent focus-visible:ring-2 focus-visible:outline-none",
+    "focus-visible:ring-focus focus-visible:ring-1 focus-visible:outline-none",
     "disabled:bg-panel disabled:cursor-not-allowed disabled:opacity-50",
     className,
   )}

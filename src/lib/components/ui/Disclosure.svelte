@@ -46,7 +46,7 @@
 </script>
 
 <details
-  class="bg-panel/35 group/disclosure max-w-[600px] rounded-md text-xs"
+  class="bg-panel group/disclosure max-w-[600px] rounded-md text-xs"
   data-testid={testid}
   open={controlled ? open : undefined}
   {...rest}

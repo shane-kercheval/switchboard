@@ -18,8 +18,10 @@
   // A non-`ready` state shows as **colour + a trailing icon**, not inline text: the
   // chip is width-constrained (several sit inline, and the name already truncates),
   // so a phrase like "still generating" blew the chip out. The icon carries a
-  // zero-delay tooltip with the full explanation, and an `aria-label` so the state
-  // reaches assistive tech without hover.
+  // zero-delay tooltip with the full explanation for pointer users; assistive tech
+  // gets the same consequence from a visually-hidden (`sr-only`) text node in the
+  // chip — an `aria-label` on the icon's role-less span is announced unreliably in
+  // WebKit/VoiceOver (the app's runtime), so the consequence is real DOM text.
   let {
     source,
     readiness = "ready",
@@ -32,18 +34,19 @@
     onRemove: () => void;
   } = $props();
 
-  // `null` for `ready` — no icon, no tooltip, neutral chip. Tooltip names the
-  // consequence (skipped / waited-for), the aria-label names the state tersely.
+  // `null` for `ready` — no icon, no tooltip, neutral chip. `tooltip` is the
+  // pointer explanation; `srText` is the same consequence phrased to read
+  // naturally after the agent name for a screen reader ("bob, will be skipped…").
   const stateHint = $derived(
     readiness === "empty"
       ? {
           tooltip: "This agent has no completed output, so it will be left out of the forward",
-          ariaLabel: "Will be skipped from the forward",
+          srText: "will be skipped from the forward",
         }
       : readiness === "pending"
         ? {
             tooltip: "Sending will wait for this agent's turn to finish",
-            ariaLabel: "Still generating",
+            srText: "still generating; sending will wait for its turn",
           }
         : null,
   );
@@ -76,6 +79,7 @@
   </svg>
   <span class="truncate" title={source.name}>{source.name}</span>
   {#if stateHint !== null}
+    <span class="sr-only">, {stateHint.srText}</span>
     <Tooltip label={stateHint.tooltip} delayDuration={0}>
       {#snippet trigger(props)}
         <span
@@ -83,7 +87,7 @@
           class="flex h-3.5 w-3.5 shrink-0 items-center justify-center"
           data-testid={`forward-source-state-${source.name}`}
           data-state-readiness={readiness}
-          aria-label={stateHint.ariaLabel}
+          aria-hidden="true"
         >
           {#if readiness === "empty"}
             <Ban class="h-3.5 w-3.5" aria-hidden="true" />
@@ -100,6 +104,7 @@
     data-testid={`forward-source-remove-${source.name}`}
     aria-label={`Remove forward source ${source.name}`}
     {disabled}
+    onmousedown={(e) => e.preventDefault()}
     onclick={onRemove}
   >
     <svg

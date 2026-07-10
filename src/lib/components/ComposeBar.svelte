@@ -131,6 +131,17 @@
   type AttachmentChip = Attachment & { id: string };
   let attachmentChips = $state<AttachmentChip[]>(restoreChips(saved.attachments ?? []));
   let dragOver = $state(false);
+  // Whether keyboard focus is anywhere inside the compose box. Drives the card's
+  // focus border (a border-color change, intentionally not a ring/glow — kept as
+  // thin as possible): the compose bar is the app's default keyboard target, so
+  // an always-on highlight says nothing — one that appears on focus and clears
+  // when focus moves to the Git view's keyboard nav, a dialog, or elsewhere is
+  // the real signal. Tracked at the container (not the plain textarea) so it also
+  // lights for prompt- and workflow-mode fields, which render inside this box.
+  // A focus-trapping menu opened from here (bits-ui portals its content out of
+  // the DOM subtree) counts as focus leaving — consistent with "a dialog took
+  // focus"; the ring returns when the menu closes.
+  let composeFocused = $state(false);
   // Bumped only on send-clear. A staging result captures the generation it began
   // under and is discarded if it has since moved on, so a slow copy can't
   // resurrect a chip into a composer whose contents were already dispatched.
@@ -229,6 +240,11 @@
   }
 
   function removeForwardSource(key: string): void {
+    // Focus the textarea *before* the reactive flush unmounts the chip's X, so
+    // focus never falls to <body> and the focus border never blinks off. (The
+    // X's own `onmousedown` preventDefault already keeps focus put for mouse
+    // clicks; this covers keyboard removal, where the X held focus.)
+    textareaEl?.focus();
     forwardSources = forwardSources.filter((s) => forwardSourceKey(s) !== key);
   }
 
@@ -2046,7 +2062,7 @@
             data-testid="workflow-run-stop"
             onclick={() => void stopWorkflowRun()}
             aria-label="Stop workflow"
-            class="text-muted hover:bg-status-failed-soft/70 hover:text-status-failed focus-visible:ring-accent inline-flex h-7 shrink-0 items-center gap-1 rounded-full px-2 text-xs transition-colors focus-visible:ring-2 focus-visible:outline-none"
+            class="text-muted hover:bg-status-failed-soft/70 hover:text-status-failed focus-visible:ring-focus inline-flex h-7 shrink-0 items-center gap-1 rounded-full px-2 text-xs transition-colors focus-visible:ring-1 focus-visible:outline-none"
           >
             <StopIcon class="size-4" />
             Stop
@@ -2056,7 +2072,7 @@
             type="button"
             data-testid="workflow-run-dismiss"
             onclick={() => void dismissWorkflowRun()}
-            class="text-muted hover:bg-panel hover:text-fg focus-visible:ring-accent inline-flex h-7 shrink-0 items-center rounded-full px-2.5 text-xs transition-colors focus-visible:ring-2 focus-visible:outline-none"
+            class="text-muted hover:bg-panel hover:text-fg focus-visible:ring-focus inline-flex h-7 shrink-0 items-center rounded-full px-2.5 text-xs transition-colors focus-visible:ring-1 focus-visible:outline-none"
           >
             Dismiss
           </button>
@@ -2091,10 +2107,16 @@
     <div
       class={cn(
         "border-border bg-raised relative rounded-xl border p-2.5 shadow-[0_10px_32px_rgba(0,0,0,0.08)] transition-colors",
-        dragOver ? "ring-accent border-accent ring-2" : "",
+        dragOver ? "border-accent" : composeFocused ? "border-focus" : "",
       )}
       data-testid="compose-box"
       data-drag-over={dragOver}
+      onfocusin={() => (composeFocused = true)}
+      onfocusout={(e) => {
+        // Keep the ring while focus moves *between* children of the box (field →
+        // button → chip); only clear when it genuinely leaves the container.
+        if (!e.currentTarget.contains(e.relatedTarget as Node | null)) composeFocused = false;
+      }}
     >
       {#if promptMenuOpen}
         <!-- Full compose-box width, floating just above the box (anchored to its
@@ -2140,8 +2162,8 @@
               {@const i = menuItems.findIndex((candidate) => candidate.key === item.key)}
               <button
                 type="button"
-                class={"hover:bg-panel/80 flex w-full cursor-pointer items-start gap-2 rounded-md px-2.5 py-1.5 text-left leading-5 outline-none select-none " +
-                  (i === highlighted ? "bg-panel/80" : "")}
+                class={"hover:bg-hover flex w-full cursor-pointer items-start gap-2 rounded-md px-2.5 py-1.5 text-left leading-5 outline-none select-none " +
+                  (i === highlighted ? "bg-hover" : "")}
                 data-testid={`file-option-${item.path}`}
                 role="option"
                 aria-selected={i === highlighted}
@@ -2199,8 +2221,8 @@
               {@const i = menuItems.findIndex((candidate) => candidate.key === item.key)}
               <button
                 type="button"
-                class={"hover:bg-panel/80 flex w-full cursor-pointer items-center gap-2 rounded-md px-2.5 py-1 text-left leading-5 outline-none select-none " +
-                  (i === highlighted ? "bg-panel/80" : "")}
+                class={"hover:bg-hover flex w-full cursor-pointer items-center gap-2 rounded-md px-2.5 py-1 text-left leading-5 outline-none select-none " +
+                  (i === highlighted ? "bg-hover" : "")}
                 data-testid={`attachment-option-${item.label}`}
                 role="option"
                 aria-selected={i === highlighted}
@@ -2239,8 +2261,8 @@
             {@const i = menuItems.findIndex((candidate) => candidate.key === item.key)}
             <button
               type="button"
-              class={"hover:bg-panel/80 flex w-full cursor-pointer items-center gap-2 rounded-md px-2.5 py-1 text-left leading-5 outline-none select-none " +
-                (i === highlighted ? "bg-panel/80" : "")}
+              class={"hover:bg-hover flex w-full cursor-pointer items-center gap-2 rounded-md px-2.5 py-1 text-left leading-5 outline-none select-none " +
+                (i === highlighted ? "bg-hover" : "")}
               data-testid={`recipient-option-${item.key}`}
               role="option"
               aria-selected={i === highlighted}
@@ -2315,8 +2337,8 @@
             {@const i = menuItems.findIndex((candidate) => candidate.key === item.key)}
             <button
               type="button"
-              class={"hover:bg-panel/80 flex w-full cursor-pointer items-center gap-2 rounded-md px-2.5 py-1 text-left leading-5 outline-none select-none " +
-                (i === highlighted ? "bg-panel/80" : "")}
+              class={"hover:bg-hover flex w-full cursor-pointer items-center gap-2 rounded-md px-2.5 py-1 text-left leading-5 outline-none select-none " +
+                (i === highlighted ? "bg-hover" : "")}
               data-testid={`forward-option-${item.key}`}
               role="option"
               aria-selected={i === highlighted}
@@ -2423,7 +2445,7 @@
                     {...props}
                     type="button"
                     class={cn(
-                      "focus-visible:ring-accent inline-flex h-6 items-center gap-1 rounded-full border px-2 text-xs transition-colors focus-visible:ring-2 focus-visible:outline-none",
+                      "focus-visible:ring-focus inline-flex h-6 items-center gap-1 rounded-full border px-2 text-xs transition-colors focus-visible:ring-1 focus-visible:outline-none",
                       selected
                         ? "bg-accent-soft text-fg border-transparent"
                         : "border-panel bg-panel text-muted hover:bg-raised hover:text-fg",
@@ -2518,7 +2540,7 @@
               triggerLabel="Forward an agent's output"
               tooltipLabel="Forward an agent's output"
               triggerClass={cn(
-                "text-muted hover:text-fg hover:bg-panel focus-visible:ring-accent flex h-6 items-center gap-1 rounded-full border border-transparent px-2 text-xs transition-colors focus-visible:ring-2 focus-visible:outline-none",
+                "text-muted hover:text-fg hover:bg-panel focus-visible:ring-focus flex h-6 items-center gap-1 rounded-full border border-transparent px-2 text-xs transition-colors focus-visible:ring-1 focus-visible:outline-none",
                 sending ? "cursor-not-allowed opacity-60" : "",
               )}
             />
@@ -2528,7 +2550,7 @@
                   {...props}
                   type="button"
                   class={cn(
-                    "text-muted hover:text-fg hover:bg-panel focus-visible:ring-accent flex h-6 items-center gap-1 rounded-full border border-transparent px-2 text-xs transition-colors focus-visible:ring-2 focus-visible:outline-none",
+                    "text-muted hover:text-fg hover:bg-panel focus-visible:ring-focus flex h-6 items-center gap-1 rounded-full border border-transparent px-2 text-xs transition-colors focus-visible:ring-1 focus-visible:outline-none",
                     sending ? "cursor-not-allowed opacity-60" : "",
                   )}
                   data-testid="compose-prompt-button"
@@ -2564,7 +2586,7 @@
                   {...props}
                   type="button"
                   class={cn(
-                    "text-muted hover:text-fg hover:bg-panel focus-visible:ring-accent flex h-6 items-center gap-1 rounded-full border border-transparent px-2 text-xs transition-colors focus-visible:ring-2 focus-visible:outline-none",
+                    "text-muted hover:text-fg hover:bg-panel focus-visible:ring-focus flex h-6 items-center gap-1 rounded-full border border-transparent px-2 text-xs transition-colors focus-visible:ring-1 focus-visible:outline-none",
                     sending ? "cursor-not-allowed opacity-60" : "",
                   )}
                   data-testid="compose-workflow-button"
@@ -2763,9 +2785,9 @@
         class={cn(
           "flex h-7 w-7 shrink-0 items-center justify-center rounded-full transition-colors",
           showStop
-            ? "bg-border text-muted hover:bg-status-failed-soft/70 hover:text-status-failed"
+            ? "bg-active text-muted hover:bg-status-failed-soft/70 hover:text-status-failed"
             : sendDisabled
-              ? "bg-border text-muted/50 cursor-not-allowed"
+              ? "bg-active text-muted/50 cursor-not-allowed"
               : "bg-primary text-primary-fg hover:bg-primary/90",
         )}
       >

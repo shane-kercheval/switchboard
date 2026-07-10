@@ -454,7 +454,7 @@
   /// style, `hover:bg-raised`), so their hover state matches the copy button in
   /// the same row.
   const META_ICON_BUTTON =
-    "text-muted hover:text-fg hover:bg-border/60 flex h-[26px] w-[26px] items-center justify-center rounded-full border border-transparent transition-colors";
+    "text-muted hover:text-fg hover:bg-hover flex h-[26px] w-[26px] items-center justify-center rounded-full border border-transparent transition-colors";
 
   /// Send ids that are queued (dispatched, not yet started) across the project's
   /// agents — the per-agent `pending_sends` minus any being cancelled. A
@@ -1051,7 +1051,7 @@
 {#snippet liveTurnControl(onclick: () => void, label: string, testid: string)}
   <button
     type="button"
-    class="border-muted/40 text-muted hover:border-status-failed/60 hover:bg-status-failed-soft/70 hover:text-status-failed focus-visible:ring-accent focus-visible:border-status-failed/60 focus-visible:bg-status-failed-soft/70 focus-visible:text-status-failed inline-flex h-[26px] w-[26px] items-center justify-center rounded-full border-[0.5px] transition-colors focus-visible:ring-2 focus-visible:outline-none"
+    class="border-muted/40 text-muted hover:border-status-failed/60 hover:bg-status-failed-soft/70 hover:text-status-failed focus-visible:ring-focus focus-visible:border-status-failed/60 focus-visible:bg-status-failed-soft/70 focus-visible:text-status-failed inline-flex h-[26px] w-[26px] items-center justify-center rounded-full border-[0.5px] transition-colors focus-visible:ring-1 focus-visible:outline-none"
     data-testid={testid}
     aria-label={label}
     {onclick}
@@ -1114,7 +1114,7 @@
        so an always-on control would just be noise. -->
   <button
     type="button"
-    class="text-muted hover:text-fg hover:bg-border/60 inline-flex items-center gap-1 rounded-full border border-transparent px-2 py-0.5 text-xs opacity-0 transition-colors group-focus-within:opacity-100 group-hover:opacity-100"
+    class="text-muted hover:text-fg hover:bg-hover inline-flex items-center gap-1 rounded-full border border-transparent px-2 py-0.5 text-xs opacity-0 transition-colors group-focus-within:opacity-100 group-hover:opacity-100"
     data-testid="turn-preview-toggle"
     aria-label={label}
     onclick={() => toggleKey(projectId, key, defaultCompact)}
@@ -1345,7 +1345,7 @@
   {@const caption =
     row.send_id !== undefined ? forwardCaptionFor(projectId, row.send_id) : undefined}
   <div class="group min-w-0 flex-1" data-testid="turn" data-role="user" data-forwarded={forwarded}>
-    <div class="w-full max-w-full overflow-hidden rounded-xl bg-blue-100/20 px-4 py-2">
+    <div class="bg-focus-soft w-full max-w-full overflow-hidden rounded-xl px-4 py-2">
       <!-- Clip wraps the content inside the bubble (not the bubble itself). The
            clip + `measureClip` mount ONLY while compact (mirroring agent rows): on
            expand the measurer unmounts and the retained `clipOverflow[key]=true`
@@ -1423,7 +1423,7 @@
   <div class="group min-w-0 flex-1" data-testid="held-forward" data-forward-id={held.forwardId}>
     {#if held.body.trim() !== ""}
       <div
-        class="border-accent/60 w-full max-w-full overflow-hidden rounded-xl border-l-2 bg-blue-100/20 px-4 py-2"
+        class="border-accent/60 bg-focus-soft w-full max-w-full overflow-hidden rounded-xl border-l-2 px-4 py-2"
       >
         <Markdown text={held.body} />
       </div>

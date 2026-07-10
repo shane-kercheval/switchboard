@@ -20,7 +20,7 @@
 
 <aside
   class={cn(
-    "bg-panel/80 flex shrink-0 flex-col",
+    "bg-panel flex shrink-0 flex-col",
     width,
     side === "left" ? "border-border/80 border-r" : "border-border/80 border-l",
   )}

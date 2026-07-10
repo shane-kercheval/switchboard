@@ -27,11 +27,13 @@
     return " ";
   }
 
-  // A side-by-side half's background follows the line it shows; an absent line
-  // (the padding side of an uneven change block) is a faint filler so the columns
-  // still read as aligned.
+  // A side-by-side half's background follows the line it shows. An absent line
+  // (the padding side of an uneven change block) gets no fill: alignment is a
+  // layout property — the row height already matches its sibling and the empty
+  // gutter signals "no line here" — so a fill added nothing structural, and a
+  // recessed neutral read as a prominent block rather than the intended nothing.
   function halfBg(line: DiffLine | null): string {
-    return line === null ? "bg-panel/40" : lineBg(line.origin);
+    return line === null ? "" : lineBg(line.origin);
   }
 </script>
 
@@ -57,7 +59,7 @@
   {:else}
     {#each diff.hunks as hunk, hi (hi)}
       <div
-        class="text-muted bg-panel/80 border-border/40 sticky top-0 z-10 border-y px-3 py-0.5 select-none"
+        class="text-muted bg-panel border-border/40 sticky top-0 z-10 border-y px-3 py-0.5 select-none"
       >
         {hunk.header}
       </div>

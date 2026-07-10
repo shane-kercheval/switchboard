@@ -10,22 +10,52 @@
    Components reference these semantic roles, never raw palette hues. Light
    and dark are two mappings of the SAME names; adding dark mode anywhere is
    "use the token." Groups:
-     - neutral surfaces (layered: surface → panel → raised → border → text)
+     - neutral surfaces (surface / raised / panel fills + the border line;
+       plus hover / active interaction fills). See ui-conventions.md.
      - primary (monochrome high-contrast action/selection)
-     - accent (teal — focus rings, links, selected emphasis; narrow use)
+     - accent (teal — links, selected-state emphasis; narrow use)
+     - focus (blue — the focus ring + pale user-input surfaces; the one blue)
      - destructive / warning action+caution surfaces
      - status (run state) — strong foreground + soft background, so a status
        chip/dot is `bg-status-{state}-soft text-status-{state}`.
    Harness identity is conveyed by `HarnessIcon` (brand artwork) and the
    `HARNESS_COLOR` map (transcript attribution), not by color tokens. */
 :root {
-  /* neutral surfaces */
+  /* neutral surfaces — three fills + one line, each with a single job:
+       surface  the app shell — the outermost background the rest sits on
+       raised   content: the reading pane, cards, popovers, menus, dialogs
+       panel    sidebars + recessed / inset: side panels, code blocks, inputs
+       border   lines only, never a fill
+     Sidebars are `panel`, not `surface` (see `SidebarPanel`). The rationale for
+     keeping this to four ("steps too small to read as hierarchy but numerous
+     enough to look muddy"), and the panel-context hover idiom (a hover target on
+     `panel` brightens to `raised`), live in ui-conventions.md. */
   --surface: #fafafa;
   --panel: #f4f4f5;
   --raised: #ffffff;
   --border: #e4e4e7;
   --fg: #18181b;
   --muted: #71717a;
+
+  /* neutral interaction — the fill under a hovered/pressed row or icon button.
+     Named for the interaction so no component reaches for `border` (a line) as
+     a fill. `hover` is deliberately a *subtle* wash (barely off white) — it sits
+     on white content rows and light menus, so a heavier gray reads as jarring.
+     `active` is one clear step stronger: pressed state, a toggle's off-track, a
+     progress groove, a resize seam, and an icon button that must stand out
+     against a row that is itself already hovered. */
+  --hover: #f6f6f7;
+  --active: #e2e2e5;
+
+  /* focus — blue, the app's one blue. A ring uses `--focus`; `--focus-soft` is
+     the pale tint for user-authored input surfaces (the compose focus wash, the
+     user + held-forward message bubbles). Deliberately blue, not the teal
+     `--accent`: a green ring on a text field reads as *valid*, not *focused*. */
+  --focus: #5f92e8;
+  /* Matches the near-white tint the user bubble had as raw `blue-100/20` over
+     the white transcript — this token only *names* that color, it doesn't
+     restyle the bubble. */
+  --focus-soft: #f8fbff;
 
   /* monochrome primary */
   --primary: #18181b;
@@ -86,25 +116,9 @@
   --syntax-constant: #0550ae;
   --syntax-tag: #116329;
 
-  /* Code-block surface — a hair lighter than `--panel`, still clearly gray
-     (not the white `--raised`). Its own token because no neutral surface sits
-     in this gap. */
-  --code-bg: #f8f8f9;
-
   /* Transcript scroll area — lighter than `--surface` so the reading area
      feels brighter than the surrounding chrome. */
   --transcript-bg: #ffffff;
-
-  /* Code-block surface per message role: agent messages sit on the transcript
-     bg, user messages on a panel/45 card that's nearly `--code-bg`, so each
-     needs its own contrast step to read as a distinct surface. */
-  --code-bg-agent: #f3f3f5;
-  --code-bg-user: #ebebee;
-  /* Copy-button hover/active fill. `--code-copy-hover` equals `--surface`
-     today but is named separately so the two can diverge. The `-user` variant
-     is lighter to sit on the darker user-message code surface. */
-  --code-copy-hover: #fafafa;
-  --code-copy-hover-user: #f6f6f8;
 }
 
 .dark {
@@ -114,6 +128,12 @@
   --border: #27272a;
   --fg: #fafafa;
   --muted: #a1a1aa;
+
+  --hover: #26262a;
+  --active: #303036;
+
+  --focus: #6398dd;
+  --focus-soft: #393c43;
 
   --primary: #fafafa;
   --primary-fg: #18181b;
@@ -152,18 +172,8 @@
   --syntax-constant: #79c0ff;
   --syntax-tag: #7ee787;
 
-  /* Lighter than the dark `--panel` so the block reads as a raised code surface. */
-  --code-bg: #1f1f23;
-
   /* Marginally lighter than the dark `--surface` for the reading area. */
   --transcript-bg: #111114;
-
-  /* Both roles share one dark code surface; the light-mode contrast step isn't
-     needed against the dark message backgrounds. */
-  --code-bg-agent: #232326;
-  --code-bg-user: #232326;
-  --code-copy-hover: #3f3f46;
-  --code-copy-hover-user: #3f3f46;
 }
 
 /* `inline` so the generated utilities reference the CSS variables by name
@@ -177,6 +187,12 @@
   --color-border: var(--border);
   --color-fg: var(--fg);
   --color-muted: var(--muted);
+
+  --color-hover: var(--hover);
+  --color-active: var(--active);
+
+  --color-focus: var(--focus);
+  --color-focus-soft: var(--focus-soft);
 
   --color-primary: var(--primary);
   --color-primary-fg: var(--primary-fg);
@@ -418,12 +434,13 @@ body {
     font-weight: 600;
   }
 
-  /* Fenced code block — a bordered panel matching the transcript's tool-call
-     boxes (bg-panel / border-border / rounded-md). */
+  /* Fenced code block — the recessed `panel` surface, matching the transcript's
+     tool-call boxes. One neutral for every code block regardless of message
+     role: the ramp is deliberately role-agnostic. */
   .md-code-block {
     margin: 0.5rem 0;
     border-radius: 0.375rem;
-    background-color: var(--code-bg);
+    background-color: var(--panel);
     overflow: hidden;
   }
   .md-code-header {
@@ -431,7 +448,7 @@ body {
     align-items: center;
     justify-content: space-between;
     padding: 0.25rem 0.25rem 0.25rem 0.625rem;
-    background-color: var(--code-bg);
+    background-color: var(--panel);
   }
   .md-code-lang {
     font-family: var(--font-mono);
@@ -466,9 +483,14 @@ body {
   .md-code-copy:focus-visible {
     opacity: 1;
   }
+  /* The copy button sits on the `--panel` code surface, which does not brighten
+     on hover, so `--hover` (tuned for white rows) is invisible here. Brighten to
+     `--raised` instead — the panel-context hover idiom (see ui-conventions.md and
+     `iconButton.ts`), and theme-consistent since `raised` is lighter than `panel`
+     in both light and dark. */
   .md-code-copy:hover:not([data-copied="true"]) {
     color: var(--fg);
-    background-color: var(--code-copy-hover);
+    background-color: var(--raised);
   }
   .md-code-copy svg {
     width: 1.0625rem;
@@ -562,20 +584,4 @@ body {
   .token.italic {
     font-style: italic;
   }
-}
-
-/* Per-message-role code surfaces. The role tokens carry their own light/dark
-   mappings, so these rules don't need `.dark` variants. */
-[data-role="agent"] .md-code-block,
-[data-role="agent"] .md-code-header {
-  background-color: var(--code-bg-agent);
-}
-
-[data-role="user"] .md-code-block,
-[data-role="user"] .md-code-header {
-  background-color: var(--code-bg-user);
-}
-
-[data-role="user"] .md-code-copy:hover:not([data-copied="true"]) {
-  background-color: var(--code-copy-hover-user);
 }

@@ -327,7 +327,7 @@
           data-testid="show-builtins-toggle"
           class={cn(
             "relative mt-0.5 inline-flex h-5 w-9 shrink-0 cursor-pointer items-center rounded-full transition-colors outline-none",
-            preferences.show_builtins ? "bg-accent" : "bg-border",
+            preferences.show_builtins ? "bg-accent" : "bg-active",
           )}
           onclick={() => void updatePreferences({ show_builtins: !preferences.show_builtins })}
         >
@@ -376,7 +376,7 @@
             <button
               {...props}
               type="button"
-              class={cn(ICON_BUTTON_CLASS, "hover:bg-border/60 shrink-0")}
+              class={cn(ICON_BUTTON_CLASS, "hover:bg-hover shrink-0")}
               aria-label="Open workflows folder in Finder"
               data-testid="workflows-open"
               disabled={workflowsDir === null}
@@ -424,7 +424,7 @@
             <button
               {...props}
               type="button"
-              class={cn(ICON_BUTTON_CLASS, "hover:bg-border/60 shrink-0")}
+              class={cn(ICON_BUTTON_CLASS, "hover:bg-hover shrink-0")}
               aria-label="Open local prompts folder in Finder"
               data-testid="local-prompts-open"
               disabled={promptsDir === null}

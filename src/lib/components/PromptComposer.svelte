@@ -431,7 +431,7 @@
 
   {#if busy}
     <div
-      class="bg-raised/70 absolute inset-0 z-10 flex items-center justify-center rounded-lg backdrop-blur-[1px]"
+      class="absolute inset-0 z-10 flex items-center justify-center rounded-lg backdrop-blur-sm"
       data-testid="prompt-rendering"
       role="status"
     >

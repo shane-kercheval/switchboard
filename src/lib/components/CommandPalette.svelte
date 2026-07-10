@@ -157,7 +157,7 @@
       spellcheck="false"
       placeholder="Type a command…"
       data-testid="command-palette-search"
-      class="border-border bg-panel text-fg placeholder:text-muted focus-visible:ring-accent w-full rounded-md border px-2.5 py-1.5 text-sm focus-visible:ring-2 focus-visible:outline-none"
+      class="border-border bg-raised text-fg placeholder:text-muted focus-visible:ring-focus w-full rounded-md border px-2.5 py-1.5 text-sm focus-visible:ring-1 focus-visible:outline-none"
     />
 
     <div
@@ -180,7 +180,7 @@
               class={cn(
                 "flex w-full items-center justify-between gap-3 rounded-md px-2.5 py-1 text-left outline-none select-none",
                 command.disabled ? "cursor-default opacity-40" : "cursor-pointer",
-                index === highlighted && !command.disabled ? "bg-panel/80" : "",
+                index === highlighted && !command.disabled ? "bg-hover" : "",
               )}
               data-testid={`command-option-${command.id}`}
               role="option"

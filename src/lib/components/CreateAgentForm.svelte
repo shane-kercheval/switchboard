@@ -300,7 +300,7 @@
     >
       {#each ALL_HARNESSES as kind (kind)}
         <label
-          class="{SEGMENTED_ITEM_CLASS} has-[:focus-visible]:ring-accent flex items-center justify-center has-[:focus-visible]:ring-2 {harnessOptionClass(
+          class="{SEGMENTED_ITEM_CLASS} has-[:focus-visible]:ring-focus flex items-center justify-center has-[:focus-visible]:ring-1 {harnessOptionClass(
             kind,
             selectable(kind),
           )}"

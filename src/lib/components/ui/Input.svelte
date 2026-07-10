@@ -20,7 +20,7 @@
   class={cn(
     "border-border bg-raised h-7 w-full rounded-full border px-2.5 text-sm",
     "text-fg placeholder:text-muted",
-    "focus-visible:ring-accent focus-visible:ring-2 focus-visible:outline-none",
+    "focus-visible:ring-focus focus-visible:ring-1 focus-visible:outline-none",
     "disabled:bg-panel disabled:cursor-not-allowed disabled:opacity-50",
     className,
   )}

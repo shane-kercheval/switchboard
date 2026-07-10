@@ -128,7 +128,7 @@
         <section class="space-y-1" aria-label="Tool input">
           <div class="text-muted text-[10px] font-semibold tracking-wide uppercase">Input</div>
           <pre
-            class="text-muted bg-panel/60 max-h-44 overflow-y-auto rounded px-2 py-1.5 font-mono text-xs whitespace-pre-wrap"
+            class="text-muted bg-panel max-h-44 overflow-y-auto rounded px-2 py-1.5 font-mono text-xs whitespace-pre-wrap"
             data-testid="tool-input">{formattedInput}</pre>
         </section>
       {/if}

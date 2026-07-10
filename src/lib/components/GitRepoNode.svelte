@@ -315,7 +315,7 @@
   <div class="group bg-raised flex min-h-10 items-center gap-2 px-3 py-2">
     <button
       type="button"
-      class="text-muted hover:bg-border/60 hover:text-fg flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-full transition-colors"
+      class="text-muted hover:bg-hover hover:text-fg flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-full transition-colors"
       aria-label={expanded ? "Collapse repo" : "Expand repo"}
       aria-expanded={expanded}
       onclick={() => (expanded = !expanded)}
@@ -360,7 +360,7 @@
           {#snippet trigger(props)}
             <span
               {...props}
-              class="text-warning hover:bg-border/60 inline-flex h-[26px] w-[26px] items-center justify-center rounded-full transition-colors"
+              class="text-warning hover:bg-hover inline-flex h-[26px] w-[26px] items-center justify-center rounded-full transition-colors"
               aria-label="Fetch failed"
               data-testid="repo-fetch-failed"
             >
@@ -386,7 +386,7 @@
       >
         <button
           type="button"
-          class={cn(ICON_BUTTON_CLASS, "hover:bg-border/60 shrink-0 disabled:opacity-50")}
+          class={cn(ICON_BUTTON_CLASS, "hover:bg-hover shrink-0 disabled:opacity-50")}
           aria-label="Refresh repo"
           data-testid="repo-refresh"
           disabled={busy}
@@ -414,7 +414,7 @@
           {#snippet trigger(props)}
             <AsyncIconButton
               {...props}
-              class={cn(ICON_BUTTON_CLASS, "hover:bg-border/60 shrink-0")}
+              class={cn(ICON_BUTTON_CLASS, "hover:bg-hover shrink-0")}
               label="Reveal repo in Finder"
               testid="repo-action-reveal"
               completeAfterMs={700}
@@ -433,7 +433,7 @@
           {#snippet trigger(props)}
             <AsyncIconButton
               {...props}
-              class={cn(ICON_BUTTON_CLASS, "hover:bg-border/60 shrink-0")}
+              class={cn(ICON_BUTTON_CLASS, "hover:bg-hover shrink-0")}
               label="Open repo in editor"
               testid="repo-action-editor"
               completeAfterMs={700}
@@ -452,7 +452,7 @@
           {#snippet trigger(props)}
             <AsyncIconButton
               {...props}
-              class={cn(ICON_BUTTON_CLASS, "hover:bg-border/60 shrink-0")}
+              class={cn(ICON_BUTTON_CLASS, "hover:bg-hover shrink-0")}
               label="Copy repo path"
               testid="repo-action-copy-path"
               action={() => {
@@ -551,7 +551,7 @@
                   // off the row's `data-selected` (a `group-data-` CSS variant),
                   // not a JS class — the trigger lives in a `{#snippet}` that
                   // doesn't re-render when the row's selected state changes.
-                  "hover:bg-border/60",
+                  "hover:bg-hover",
                   SELECTED_ROW_ICON_HOVER,
                   actionsOpen && "opacity-100",
                 )}

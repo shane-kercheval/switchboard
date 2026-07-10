@@ -118,7 +118,7 @@
       selected ? SEGMENTED_MAIN_ITEM_ACTIVE_CLASS : SEGMENTED_ITEM_INACTIVE_CLASS,
     );
   const addProjectClass =
-    "text-muted hover:bg-raised hover:text-fg focus-visible:ring-accent focus-visible:bg-raised focus-visible:text-fg inline-flex h-[26px] w-[26px] items-center justify-center rounded-full transition-colors focus-visible:ring-2 focus-visible:outline-none";
+    "text-muted hover:bg-raised hover:text-fg focus-visible:ring-focus focus-visible:bg-raised focus-visible:text-fg inline-flex h-[26px] w-[26px] items-center justify-center rounded-full transition-colors focus-visible:ring-1 focus-visible:outline-none";
 
   /// Inline rename editor (mirrors the agent-card rename in `Sidebar.svelte`).
   /// Only one row edits at a time, so a single `editingProjectId` + `draftName`
@@ -482,7 +482,15 @@
         {@const actionsOpen = openProjectActionsId === project.id}
         <div
           class={cn(
-            "group hover:bg-raised/70 flex w-full flex-col rounded-md",
+            // Documented exception to the panel-context hover idiom (elsewhere a
+            // hover target on `panel` brightens to `raised` — see
+            // ui-conventions.md). Here the *selected* row is already `raised`
+            // (white), so a `raised` hover would be indistinguishable from
+            // selection. The row instead lightens to `surface`, the off-white
+            // step between the panel sidebar and the white selected state — a
+            // visible hover that stays distinct from selected, using an existing
+            // token. (`bg-hover`, tuned for white rows, vanishes on this panel base.)
+            "group hover:bg-surface flex w-full flex-col rounded-md",
             (highlighted || actionsOpen) && "bg-raised hover:bg-raised",
           )}
           data-testid="project-row"
@@ -506,7 +514,7 @@
                     spellcheck="false"
                     class={cn(
                       "text-fg border-border bg-panel h-6 min-w-0 flex-1 rounded border px-1.5 text-[13px] font-semibold",
-                      "focus-visible:ring-accent focus-visible:ring-1 focus-visible:outline-none",
+                      "focus-visible:ring-focus focus-visible:ring-1 focus-visible:outline-none",
                       renameMessage && "border-status-failed",
                     )}
                     aria-label="Project name"
@@ -611,7 +619,7 @@
                       triggerLabel={`Actions for ${project.name}`}
                       triggerTestid="project-actions-trigger"
                       triggerTabindex={-1}
-                      triggerClass={cn(ICON_BUTTON_CLASS, "hover:bg-border/60 shrink-0")}
+                      triggerClass={cn(ICON_BUTTON_CLASS, "hover:bg-active shrink-0")}
                       contentTestid="project-actions-menu"
                     >
                       {#snippet trigger()}
@@ -754,7 +762,7 @@
                 {:else if busy || workflowRunning}
                   <button
                     type="button"
-                    class="group/cancel text-muted hover:bg-status-failed-soft/70 hover:text-status-failed focus-visible:ring-accent focus-visible:bg-status-failed-soft/70 focus-visible:text-status-failed inline-flex h-[26px] w-[26px] items-center justify-center rounded-full transition-colors focus-visible:ring-2 focus-visible:outline-none"
+                    class="group/cancel text-muted hover:bg-status-failed-soft/70 hover:text-status-failed focus-visible:ring-focus focus-visible:bg-status-failed-soft/70 focus-visible:text-status-failed inline-flex h-[26px] w-[26px] items-center justify-center rounded-full transition-colors focus-visible:ring-1 focus-visible:outline-none"
                     aria-label={workflowRunning ? "Stop workflow" : "Cancel all running agents"}
                     data-testid="project-cancel"
                     onclick={() =>

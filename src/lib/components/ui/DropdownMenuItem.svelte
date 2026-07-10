@@ -36,7 +36,7 @@
   {title}
   class={cn(
     "text-fg flex w-full items-center rounded-md px-2.5 py-1.5 text-left leading-5 outline-none select-none",
-    "data-highlighted:bg-panel/80 cursor-pointer",
+    "data-highlighted:bg-hover cursor-pointer",
     "data-disabled:text-muted/50 data-disabled:cursor-not-allowed",
     className,
   )}

@@ -99,7 +99,7 @@
           class={cn(
             "flex w-full flex-col gap-0.5 rounded-md px-2.5 py-1.5 text-left outline-none select-none",
             canPick ? "cursor-pointer" : "cursor-not-allowed opacity-70",
-            i === highlighted && canPick ? "bg-panel/80" : "",
+            i === highlighted && canPick ? "bg-hover" : "",
             builtin ? "pr-10" : "",
           )}
           data-testid={`workflow-option-${workflowKey(workflow)}`}
@@ -183,7 +183,7 @@
     spellcheck="false"
     placeholder="Search workflows…"
     data-testid="workflow-menu-search"
-    class="border-border bg-panel text-fg placeholder:text-muted focus-visible:ring-accent mt-1 w-full rounded-md border px-2.5 py-1.5 text-sm focus-visible:ring-2 focus-visible:outline-none"
+    class="border-border bg-raised text-fg placeholder:text-muted focus-visible:ring-focus mt-1 w-full rounded-md border px-2.5 py-1.5 text-sm focus-visible:ring-1 focus-visible:outline-none"
   />
   {#if onopenfolder}
     <button

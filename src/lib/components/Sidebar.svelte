@@ -870,7 +870,7 @@
         {@const confirmingRemove = removeConfirmAgentId === agent.id}
         <div
           class={cn(
-            "group bg-raised/90 hover:bg-border/40 rounded-md px-2.5 py-2 transition-colors",
+            "group bg-raised hover:bg-hover rounded-md px-2.5 py-2 transition-colors",
             dragState?.started === true &&
               dragState.agentId === agent.id &&
               "ring-accent/60 relative z-10 shadow-lg ring-1",
@@ -895,7 +895,7 @@
                 spellcheck="false"
                 class={cn(
                   "text-fg border-border bg-panel h-6 min-w-0 flex-1 rounded border px-1.5 text-[13px] font-semibold",
-                  "focus-visible:ring-accent focus-visible:ring-1 focus-visible:outline-none",
+                  "focus-visible:ring-focus focus-visible:ring-1 focus-visible:outline-none",
                   renameMessage && "border-status-failed",
                 )}
                 aria-label="Agent name"
@@ -980,7 +980,7 @@
                       type="button"
                       class={cn(
                         ICON_BUTTON_CLASS,
-                        "hover:bg-border/60 shrink-0",
+                        "hover:bg-hover shrink-0",
                         // The eye stays visible while the agent is hidden (it's
                         // the state indicator); otherwise it appears on hover
                         // like the actions trigger.
@@ -1004,7 +1004,7 @@
                 <DropdownMenu
                   triggerClass={cn(
                     ICON_BUTTON_CLASS,
-                    "hover:bg-border/60 shrink-0 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 data-[state=open]:opacity-100",
+                    "hover:bg-hover shrink-0 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 data-[state=open]:opacity-100",
                   )}
                   triggerLabel={`Actions for ${agent.name}`}
                   triggerTestid="agent-actions-trigger"
@@ -1455,7 +1455,7 @@
                 <div class="text-muted mb-0.5 text-[11px]">
                   context after last turn: {(util * 100).toFixed(0)}%
                 </div>
-                <div class="bg-border/80 h-1 w-full overflow-hidden rounded">
+                <div class="bg-active h-1 w-full overflow-hidden rounded">
                   <div
                     class="bg-fg h-full"
                     style:width="{Math.min(util * 100, 100).toFixed(1)}%"

@@ -365,7 +365,7 @@
               <button
                 {...props}
                 type="button"
-                class={cn(ICON_BUTTON_CLASS, "hover:bg-border/60 h-5 w-5 shrink-0")}
+                class={cn(ICON_BUTTON_CLASS, "hover:bg-hover h-5 w-5 shrink-0")}
                 aria-label="Show commit message"
                 data-testid="commit-message-open"
                 onclick={() => {
@@ -433,7 +433,7 @@
           <button
             {...props}
             type="button"
-            class={cn(ICON_BUTTON_CLASS, "hover:bg-border/60 shrink-0")}
+            class={cn(ICON_BUTTON_CLASS, "hover:bg-hover shrink-0")}
             aria-label={detailExpanded ? "Restore Git details panel" : "Expand Git details panel"}
             data-testid="detail-expand-toggle"
             onclick={onToggleDetailExpanded}
@@ -450,7 +450,7 @@
 
     <button
       type="button"
-      class={cn(ICON_BUTTON_CLASS, "hover:bg-border/60 shrink-0")}
+      class={cn(ICON_BUTTON_CLASS, "hover:bg-hover shrink-0")}
       aria-label="Close diff panel"
       data-testid="detail-close"
       onclick={onClose}
@@ -601,7 +601,7 @@
                           class={cn(
                             ICON_BUTTON_CLASS,
                             "h-6 w-6 shrink-0",
-                            "hover:bg-border/60",
+                            "hover:bg-hover",
                             SELECTED_ROW_ICON_HOVER,
                           )}
                           label={`Copy path for ${file.path}`}
@@ -622,7 +622,7 @@
                             class={cn(
                               ICON_BUTTON_CLASS,
                               "h-6 w-6 shrink-0",
-                              "hover:bg-border/60",
+                              "hover:bg-hover",
                               SELECTED_ROW_ICON_HOVER,
                             )}
                             label={`Open ${file.path} in editor`}
@@ -648,7 +648,7 @@
                         class={cn(
                           ICON_BUTTON_CLASS,
                           "h-6 w-6 shrink-0",
-                          "hover:bg-border/60",
+                          "hover:bg-hover",
                           SELECTED_ROW_ICON_HOVER,
                         )}
                         label={`Open ${file.path} in difftool`}

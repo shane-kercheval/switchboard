@@ -174,6 +174,40 @@ describe("ComposeBar", () => {
     expect(chip(AGENT_B.id)).toHaveAttribute("data-selected", "false");
   });
 
+  it("outlines the compose box while focus is anywhere inside it, not just the textarea", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+
+    const box = screen.getByTestId("compose-box");
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    const send = screen.getByTestId("compose-send");
+
+    // The compose bar is the default keyboard target, so a permanent highlight
+    // would say nothing — the focus border must be absent until focus lands here.
+    expect(box).not.toHaveClass("border-focus");
+
+    // Focus tracking is container-level (focusin bubbles), so any field inside
+    // the box lights the border — this is what makes prompt/workflow-mode fields
+    // highlight, not only the plain textarea.
+    await fireEvent.focusIn(textarea);
+    await tick();
+    expect(box).toHaveClass("border-focus");
+
+    // Moving focus to another child of the box (textarea → send button) keeps the
+    // border: the containment guard clears only when focus leaves the container.
+    await fireEvent.focusOut(textarea, { relatedTarget: send });
+    await fireEvent.focusIn(send);
+    await tick();
+    expect(box).toHaveClass("border-focus");
+
+    // Focus leaving the box entirely clears it.
+    await fireEvent.focusOut(send, { relatedTarget: document.body });
+    await tick();
+    expect(box).not.toHaveClass("border-focus");
+  });
+
   it("grows the message box with content up to its max height", async () => {
     const scrollHeight = vi.spyOn(HTMLTextAreaElement.prototype, "scrollHeight", "get");
     const getComputedStyleSpy = vi.spyOn(window, "getComputedStyle");
@@ -2540,11 +2574,13 @@ describe("ComposeBar — cross-agent forward", () => {
 
     const chipEl = screen.getByTestId("forward-source-chip-bob");
     expect(chipEl).toHaveAttribute("data-readiness", "empty");
-    // State is a colour + trailing icon (with a tooltip), not inline text.
+    // State is a colour + trailing icon (with a tooltip), not inline text; the
+    // consequence still reaches assistive tech as visually-hidden text.
     expect(screen.getByTestId("forward-source-state-bob")).toHaveAttribute(
       "data-state-readiness",
       "empty",
     );
+    expect(within(chipEl).getByText(/will be skipped from the forward/i)).toBeInTheDocument();
   });
 
   it("does not warn on a source that is still streaming", async () => {
@@ -2560,11 +2596,11 @@ describe("ComposeBar — cross-agent forward", () => {
 
     const chipEl = screen.getByTestId("forward-source-chip-bob");
     expect(chipEl).toHaveAttribute("data-readiness", "pending");
-    // Pending shows the "still generating" icon (tooltip + aria-label), not the
+    // Pending shows the "still generating" icon (tooltip + sr-only text), not the
     // empty warning; and never the failed status colour that read as a warning.
     const stateIcon = screen.getByTestId("forward-source-state-bob");
     expect(stateIcon).toHaveAttribute("data-state-readiness", "pending");
-    expect(stateIcon).toHaveAttribute("aria-label", "Still generating");
+    expect(within(chipEl).getByText(/still generating; sending will wait/i)).toBeInTheDocument();
     expect(chipEl.className).not.toContain("status-failed");
   });
 

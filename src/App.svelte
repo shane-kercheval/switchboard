@@ -975,7 +975,7 @@
             {#if headerTabPanes.length > 1}
               <button
                 type="button"
-                class="text-muted hover:text-fg hover:bg-border/60 inline-flex h-6.5 shrink-0 items-center rounded-full px-2 text-xs"
+                class="text-muted hover:text-fg hover:bg-hover inline-flex h-6.5 shrink-0 items-center rounded-full px-2 text-xs"
                 data-testid="app-pane-restore-all"
                 onclick={restoreAllPanes}
               >
@@ -1198,7 +1198,7 @@
             <div class="relative flex min-w-0 flex-1 flex-col overflow-hidden">
               {#if transcriptBusy}
                 <div
-                  class="bg-surface/30 absolute inset-0 z-50 flex items-center justify-center backdrop-blur-sm"
+                  class="absolute inset-0 z-50 flex items-center justify-center backdrop-blur-sm"
                   data-testid="transcript-busy-overlay"
                 >
                   <Spinner class="h-8 w-8" />

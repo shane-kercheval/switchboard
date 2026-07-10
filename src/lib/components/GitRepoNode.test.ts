@@ -184,7 +184,7 @@ describe("GitRepoNode actions-trigger hover", () => {
     // The trigger carries the gray default plus the selected-row white override;
     // CSS picks between them off the row's `data-selected`.
     const trigger = within(rows[0]!).getByTestId("worktree-actions-trigger");
-    expect(trigger.className).toContain("hover:bg-border/60");
+    expect(trigger.className).toContain("hover:bg-hover");
     expect(trigger.className).toContain("group-data-[selected=true]:hover:bg-raised");
   });
 

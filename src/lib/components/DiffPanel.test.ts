@@ -509,7 +509,7 @@ describe("DiffPanel (uncommitted target)", () => {
     // The action icons carry the gray default plus the selected-row white
     // override; CSS picks between them off the row's `data-selected`.
     const difftool = within(rowOf(0)).getByTestId("changed-file-difftool");
-    expect(difftool.className).toContain("hover:bg-border/60");
+    expect(difftool.className).toContain("hover:bg-hover");
     expect(difftool.className).toContain("group-data-[selected=true]:hover:bg-raised");
   });
 

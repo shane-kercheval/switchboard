@@ -200,7 +200,7 @@
   // height), minus the position number, which has no meaning here.
   function chipClass(selected: boolean): string {
     return cn(
-      "focus-visible:ring-accent inline-flex h-6 items-center gap-1 rounded-full border px-2 text-xs transition-colors focus-visible:ring-2 focus-visible:outline-none",
+      "focus-visible:ring-focus inline-flex h-6 items-center gap-1 rounded-full border px-2 text-xs transition-colors focus-visible:ring-1 focus-visible:outline-none",
       selected
         ? "bg-accent-soft text-fg border-transparent"
         : "border-panel bg-panel text-muted hover:bg-raised hover:text-fg",
@@ -214,7 +214,7 @@
   // aligns with the bordered agent chips beside it.
   function paneChipClass(selected: boolean): string {
     return cn(
-      "focus-visible:ring-accent inline-flex h-6 items-center gap-1 rounded-full border px-2 text-xs transition-colors focus-visible:ring-2 focus-visible:outline-none",
+      "focus-visible:ring-focus inline-flex h-6 items-center gap-1 rounded-full border px-2 text-xs transition-colors focus-visible:ring-1 focus-visible:outline-none",
       selected
         ? "bg-accent-soft text-fg border-transparent"
         : "border-transparent bg-transparent text-muted hover:bg-panel hover:text-fg",
@@ -305,7 +305,7 @@
          invoke. Slot recipients resolve live against `inputs` as the user binds
          agents below (the same shared step component the live run view uses). -->
     <div
-      class="border-border/70 bg-surface/40 rounded-md border px-2.5 py-2"
+      class="border-border/70 bg-panel rounded-md border px-2.5 py-2"
       data-testid="workflow-steps-preview"
     >
       <WorkflowSteps steps={descriptor.steps} mode="preview" {inputs} />
@@ -385,7 +385,7 @@
   <!-- Sets the pane chips (group selectors) apart from the agent chips (leaves)
        they govern, so the parent→child relationship reads at a glance. -->
   {#snippet groupDivider()}
-    <span class="bg-border/70 mx-0.5 w-px self-stretch" aria-hidden="true"></span>
+    <span class="border-border mx-0.5 self-stretch border-l" aria-hidden="true"></span>
   {/snippet}
 
   {#snippet forwardPicker(name: string)}

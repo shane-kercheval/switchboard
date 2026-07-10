@@ -158,7 +158,7 @@ describe("PromptComposer", () => {
 
     const status = screen.getByTestId("prompt-rendering");
     expect(status).toHaveTextContent("Rendering prompt");
-    expect(status).toHaveClass("absolute", "inset-0", "backdrop-blur-[1px]");
+    expect(status).toHaveClass("absolute", "inset-0", "backdrop-blur-sm");
     expect(screen.getByTestId("prompt-composer-content")).toHaveClass("opacity-55", "blur-[1px]");
     expect(status.querySelector(".animate-spin")).not.toBeNull();
     await fireEvent.click(screen.getByTestId("prompt-remove"));
@@ -265,6 +265,9 @@ describe("PromptComposer per-argument forwarding", () => {
       "data-state-readiness",
       "empty",
     );
+    // The consequence reaches assistive tech as real (visually-hidden) text, not
+    // an aria-label on a role-less icon span.
+    expect(within(chip).getByText(/will be skipped from the forward/i)).toBeInTheDocument();
   });
 
   it("does not warn on a chip whose source is still generating", () => {
@@ -281,7 +284,7 @@ describe("PromptComposer per-argument forwarding", () => {
     expect(chip).toHaveAttribute("data-readiness", "pending");
     const stateIcon = screen.getByTestId("forward-source-state-bob");
     expect(stateIcon).toHaveAttribute("data-state-readiness", "pending");
-    expect(stateIcon).toHaveAttribute("aria-label", "Still generating");
+    expect(within(chip).getByText(/still generating; sending will wait/i)).toBeInTheDocument();
     expect(chip.className).not.toContain("status-failed");
   });
 

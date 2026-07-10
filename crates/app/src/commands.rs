@@ -5348,35 +5348,53 @@ mod tests {
             .clone();
         let path = switchboard_harness::claude_session_file_path(home, &directory, &session_uuid);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let content = if text.is_empty() {
-            String::new()
-        } else {
-            [
-                serde_json::json!({
-                    "type": "user",
-                    "message": { "role": "user", "content": "hi" },
-                    "timestamp": "2026-06-17T00:00:00Z",
-                }),
-                serde_json::json!({
-                    "type": "assistant",
-                    "message": {
-                        "id": "m1",
-                        "model": "claude-sonnet-4-6",
-                        "role": "assistant",
-                        "content": [{ "type": "text", "text": text }],
-                        "stop_reason": "end_turn",
-                        "usage": { "input_tokens": 10, "output_tokens": 5 },
-                    },
-                    "timestamp": "2026-06-17T00:00:01Z",
-                }),
-            ]
-            .iter()
-            .map(|r| serde_json::to_string(r).unwrap())
-            .collect::<Vec<_>>()
-            .join("\n")
-        };
-        std::fs::write(&path, content).unwrap();
+        std::fs::write(&path, claude_session_jsonl(text)).unwrap();
         agent.id
+    }
+
+    /// A Claude session file holding one completed turn whose assistant text is
+    /// `text`. `text == ""` yields an empty file — a source with no forwardable
+    /// output.
+    fn claude_session_jsonl(text: &str) -> String {
+        if text.is_empty() {
+            return String::new();
+        }
+        [
+            serde_json::json!({
+                "type": "user",
+                "message": { "role": "user", "content": "hi" },
+                "timestamp": "2026-06-17T00:00:00Z",
+            }),
+            serde_json::json!({
+                "type": "assistant",
+                "message": {
+                    "id": "m1",
+                    "model": "claude-sonnet-4-6",
+                    "role": "assistant",
+                    "content": [{ "type": "text", "text": text }],
+                    "stop_reason": "end_turn",
+                    "usage": { "input_tokens": 10, "output_tokens": 5 },
+                },
+                "timestamp": "2026-06-17T00:00:01Z",
+            }),
+        ]
+        .iter()
+        .map(|r| serde_json::to_string(r).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n")
+    }
+
+    /// Replace a seeded source's completed-turn text on disk, modelling the
+    /// source producing *newer* output after a forward already resolved its
+    /// older output.
+    fn overwrite_source_text(state: &AppState, home: &Path, agent_id: AgentId, text: &str) {
+        let (project, agent) = lookup_agent(state, agent_id).unwrap();
+        let Some(SessionLocator::Uuid(session_uuid)) = agent.session_locator else {
+            panic!("a seeded source has a uuid session locator");
+        };
+        let path =
+            switchboard_harness::claude_session_file_path(home, &project.directory, &session_uuid);
+        std::fs::write(&path, claude_session_jsonl(text)).unwrap();
     }
 
     /// Assert a forward resolved, returning its composed body + skipped names.
@@ -5933,6 +5951,513 @@ mod tests {
         assert!(
             body.contains("fresh-live-output") && !body.contains("OLD-DISK"),
             "resolved the live-captured new text, not the stale disk turn: {body:?}"
+        );
+    }
+
+    /// Claude adapter for the forward↔queue tests. Records every dispatched
+    /// prompt in dispatch order, and parks its `park_at`-th dispatch until `gate`
+    /// fires — holding that turn deterministically in flight so a send queues
+    /// behind it and a `wait_for_current_turn` can register against it. Dispatch
+    /// `i` emits `texts[i]` as its single text chunk before completing, so a
+    /// current-turn waiter resolves *that* turn's live text. Recording the prompt
+    /// directly (rather than echoing it into the response) is what lets a test
+    /// assert what a **queued** send carried.
+    ///
+    /// `texts` and `park_at` index this adapter's **global** dispatch counter, and
+    /// `AppState` shares one adapter across every agent of a harness kind — so
+    /// exactly one agent may dispatch through it per test. A second dispatching
+    /// Claude agent would interleave into the same counter and silently draw
+    /// another agent's scripted turn.
+    struct GatedRecordingAdapter {
+        prompts: Arc<Mutex<Vec<String>>>,
+        texts: Vec<String>,
+        gate: Arc<tokio::sync::Notify>,
+        park_at: usize,
+        dispatches: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl HarnessAdapter for GatedRecordingAdapter {
+        fn probe(&self) -> Result<(), switchboard_harness::DispatchError> {
+            Ok(())
+        }
+        fn version(&self) -> Option<String> {
+            None
+        }
+        async fn dispatch(
+            &self,
+            _agent: &AgentRecord,
+            _cwd: &Path,
+            prompt: &str,
+            turn_id: switchboard_harness::TurnId,
+            _options: switchboard_harness::DispatchOptions,
+        ) -> Result<switchboard_harness::EventStream, switchboard_harness::DispatchError> {
+            let index = self
+                .dispatches
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            lock(&self.prompts).push(prompt.to_owned());
+            let text = self.texts.get(index).cloned().unwrap_or_default();
+            let park = index == self.park_at;
+            let gate = Arc::clone(&self.gate);
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            tokio::spawn(async move {
+                if !text.is_empty() {
+                    let _ = tx.send(switchboard_harness::AdapterEvent::ContentChunk {
+                        turn_id,
+                        kind: switchboard_harness::ContentKind::Text,
+                        text,
+                    });
+                }
+                // Park mid-turn (before the terminal) so a `wait_for_current_turn`
+                // registers against this turn, and a send to this agent enqueues.
+                if park {
+                    gate.notified().await;
+                }
+                let _ = tx.send(switchboard_harness::AdapterEvent::TurnEnd {
+                    turn_id,
+                    outcome: TurnOutcome::Completed,
+                    ended_at: chrono::Utc::now(),
+                    usage: None,
+                    context_window_source: None,
+                    stable_message_id: None,
+                    first_message_id: None,
+                    spend: None,
+                    model: None,
+                    effort: None,
+                });
+            });
+            Ok(Box::pin(
+                tokio_stream::wrappers::UnboundedReceiverStream::new(rx),
+            ))
+        }
+    }
+
+    /// Barrier proving `agent_id`'s actor has **processed** the
+    /// `WaitForCurrentTurn` a just-polled forward sent it — not merely that the
+    /// command reached the mailbox.
+    ///
+    /// Polling a forward once sends its wait command and returns; the actor may not
+    /// have serviced it yet. That matters because `drain_turn`'s `select!` is
+    /// `biased` toward the *stream*: if a turn's terminal is already buffered when
+    /// the actor next runs, it takes the terminal and then breaks on stream-end
+    /// without ever reaching the command arm, and the wait is answered later by the
+    /// idle arm as `Idle`. So a test must not release a parked turn until the wait
+    /// is registered.
+    ///
+    /// `is_turn_running` sends `PeekCurrentTurn` on the same FIFO mailbox, behind
+    /// the wait. Awaiting its reply therefore proves the wait was serviced first,
+    /// and a `true` reply proves it registered against a *live* turn rather than
+    /// being answered from the post-terminal stash. Call this after `poll!` and
+    /// strictly before releasing the gate — while the gate is still closed the
+    /// stream cannot yield a terminal, so the biased arm cannot preempt the command.
+    async fn await_wait_registered(state: &AppState, agent_id: AgentId) {
+        assert!(
+            state.dispatcher.is_turn_running(agent_id).await,
+            "the forward's wait must register while the source's turn is still live"
+        );
+    }
+
+    /// A [`GatedRecordingAdapter`] and the prompt log it writes to.
+    fn gated_adapter(
+        texts: &[&str],
+        gate: &Arc<tokio::sync::Notify>,
+        park_at: usize,
+    ) -> (Arc<dyn HarnessAdapter>, Arc<Mutex<Vec<String>>>) {
+        let prompts = Arc::new(Mutex::new(Vec::new()));
+        let adapter: Arc<dyn HarnessAdapter> = Arc::new(GatedRecordingAdapter {
+            prompts: Arc::clone(&prompts),
+            texts: texts.iter().map(|t| (*t).to_owned()).collect(),
+            gate: Arc::clone(gate),
+            park_at,
+            dispatches: std::sync::atomic::AtomicUsize::new(0),
+        });
+        (adapter, prompts)
+    }
+
+    /// A loaded project whose Claude adapter is a [`GatedRecordingAdapter`].
+    struct ForwardQueueFixture {
+        _tmp: TempDir,
+        home: TempDir,
+        state: AppState,
+        emitter: Arc<RecordingEmitter>,
+        /// Every prompt the Claude adapter dispatched, in order.
+        prompts: Arc<Mutex<Vec<String>>>,
+        /// Releases the parked turn.
+        gate: Arc<tokio::sync::Notify>,
+        project_id: ProjectId,
+    }
+
+    /// Stand up [`ForwardQueueFixture`]; `texts[i]` is the text the agent's
+    /// `i`-th turn streams before completing, and the `park_at`-th turn stays in
+    /// flight until [`ForwardQueueFixture::gate`] fires.
+    async fn forward_queue_fixture(texts: &[&str], park_at: usize) -> ForwardQueueFixture {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let (claude, prompts) = gated_adapter(texts, &gate, park_at);
+        let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
+        let emitter = Arc::new(RecordingEmitter::new());
+        let state = AppState::new(
+            claude,
+            Arc::clone(&mock),
+            Arc::clone(&mock),
+            Arc::clone(&mock),
+            emitter.clone() as Arc<dyn EventEmitter>,
+        );
+        let tmp = TempDir::new().unwrap();
+        init_directory_impl(&state, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let project = create_project_in_only_dir(&state, "proj");
+        set_active_project_impl(&state, project.id).unwrap();
+        ForwardQueueFixture {
+            _tmp: tmp,
+            home: TempDir::new().unwrap(),
+            state,
+            emitter,
+            prompts,
+            gate,
+            project_id: project.id,
+        }
+    }
+
+    #[tokio::test]
+    async fn cross_forward_snapshots_the_idle_sources_existing_output_and_queues_it() {
+        // Two agents forwarding at each other while one is mid-turn. `planner` is
+        // busy; a forward planner→reviewer *holds* on planner's turn and issues no
+        // send, so the dispatcher still sees reviewer as idle. A forward
+        // reviewer→planner therefore resolves reviewer's **already generated**
+        // output immediately and enqueues behind planner's running turn — it does
+        // not wait for, or pick up, the response reviewer is about to produce.
+        // (Panes are a frontend grouping, expanded to agent ids before the backend
+        // sees them, so this is the scenario with panes factored out.)
+        let f = forward_queue_fixture(&["PLANNER-LIVE", "PLANNER-SECOND"], 0).await;
+        let planner =
+            create_agent_impl(&f.state, "planner", HarnessKind::ClaudeCode, None, None).unwrap();
+        let reviewer = seed_source(
+            &f.state,
+            f.home.path(),
+            f.project_id,
+            "reviewer",
+            "REVIEWER-OLD",
+        );
+
+        send_msg(&f.state, planner.id, "long task").await.unwrap();
+        within(
+            &f.emitter,
+            "planner in flight",
+            f.emitter.wait_for_type("turn_start", 1),
+        )
+        .await;
+
+        // The forward planner→reviewer, driven to its hold *before* anything else
+        // runs. A Rust future is inert until polled, so a merely-constructed forward
+        // would register nothing and the rest of this test would prove only that
+        // "no forward exists" is harmless. One poll runs synchronously through to
+        // `wait_for_current_turn`'s mailbox send; `await_wait_registered` then proves
+        // planner's actor actually serviced it.
+        let held_id = Uuid::now_v7();
+        let held = forward_message_impl(
+            &f.state,
+            String::new(),
+            vec![planner.id],
+            held_id,
+            f.home.path(),
+        );
+        tokio::pin!(held);
+        assert!(
+            futures::poll!(held.as_mut()).is_pending(),
+            "the forward must hold on planner's in-flight turn, not resolve immediately"
+        );
+        assert!(
+            lock(&f.state.forwards).contains_key(&held_id),
+            "the held forward registered its cancel token, so it is genuinely in flight"
+        );
+        await_wait_registered(&f.state, planner.id).await;
+
+        // With that forward in flight, reviewer is still idle: a forward carries
+        // sources only — its recipient exists solely in the frontend — so nothing
+        // about it marks reviewer busy. This resolves without planner's turn ending.
+        // The timeout is the assertion: a regression that waits on planner deadlocks.
+        let outcome = tokio::time::timeout(
+            WAIT,
+            forward_message_impl(
+                &f.state,
+                "ship it".to_owned(),
+                vec![reviewer],
+                Uuid::now_v7(),
+                f.home.path(),
+            ),
+        )
+        .await
+        .expect("a forward from an idle source must not wait on an unrelated busy agent")
+        .unwrap();
+        let (body, _) = resolved(&outcome);
+        assert!(
+            body.contains("REVIEWER-OLD"),
+            "forwards reviewer's existing output: {body:?}"
+        );
+
+        // Dispatched at a busy planner, it enqueues behind the running turn.
+        send_msg(&f.state, planner.id, body).await.unwrap();
+
+        // Release planner's turn: the held forward resolves with planner's live text
+        // (the turn that just finished), and the queued send dispatches carrying the
+        // snapshot taken above. Its waiter is already registered, so no join-ordering
+        // trick is needed to sequence the release against it.
+        f.gate.notify_one();
+        let held = held.as_mut().await.unwrap();
+        let (held_body, _) = resolved(&held);
+        assert!(
+            held_body.contains("PLANNER-LIVE"),
+            "the held forward resolves planner's just-finished turn: {held_body:?}"
+        );
+
+        within(
+            &f.emitter,
+            "queued turn dispatches",
+            f.emitter.wait_for_type("turn_start", 2),
+        )
+        .await;
+        let prompts = lock(&f.prompts).clone();
+        assert_eq!(prompts.len(), 2, "the queued send dispatched exactly once");
+        assert!(
+            prompts[1].contains("REVIEWER-OLD"),
+            "the queued send dispatched with reviewer's snapshotted output: {:?}",
+            prompts[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_queued_forward_is_not_re_resolved_when_it_finally_dispatches() {
+        // The snapshot invariant, isolated: a forward resolves to literal text
+        // before dispatch, and the dispatcher's queued `WorkItem` holds that text —
+        // not a reference to the source. So newer source output landing while the
+        // send sits queued can never be substituted in at dispatch time.
+        let f = forward_queue_fixture(&["PLANNER-LIVE", "PLANNER-SECOND"], 0).await;
+        let planner =
+            create_agent_impl(&f.state, "planner", HarnessKind::ClaudeCode, None, None).unwrap();
+        let reviewer = seed_source(
+            &f.state,
+            f.home.path(),
+            f.project_id,
+            "reviewer",
+            "REVIEWER-OLD",
+        );
+
+        send_msg(&f.state, planner.id, "long task").await.unwrap();
+        within(
+            &f.emitter,
+            "planner in flight",
+            f.emitter.wait_for_type("turn_start", 1),
+        )
+        .await;
+
+        let outcome = forward_message_impl(
+            &f.state,
+            String::new(),
+            vec![reviewer],
+            Uuid::now_v7(),
+            f.home.path(),
+        )
+        .await
+        .unwrap();
+        let (body, _) = resolved(&outcome);
+        send_msg(&f.state, planner.id, body).await.unwrap();
+
+        // reviewer produces newer output while the forward is still queued.
+        overwrite_source_text(&f.state, f.home.path(), reviewer, "REVIEWER-NEW");
+
+        f.gate.notify_one();
+        within(
+            &f.emitter,
+            "queued turn dispatches",
+            f.emitter.wait_for_type("turn_start", 2),
+        )
+        .await;
+
+        let prompts = lock(&f.prompts).clone();
+        assert!(
+            prompts[1].contains("REVIEWER-OLD") && !prompts[1].contains("REVIEWER-NEW"),
+            "the queued send carries the text resolved at compose time, never re-read \
+             at dispatch: {:?}",
+            prompts[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_awaits_only_the_sources_current_turn_not_its_queued_backlog() {
+        // `wait_for_current_turn` fires at the terminal of the turn that was running
+        // when it registered. A source with work queued behind that turn resolves the
+        // *running* turn's text — forwarding does not wait for the source to drain to
+        // idle.
+        let f = forward_queue_fixture(&["TURN-ONE-TEXT", "TURN-TWO-TEXT"], 0).await;
+        let source =
+            create_agent_impl(&f.state, "reviewer", HarnessKind::ClaudeCode, None, None).unwrap();
+
+        send_msg(&f.state, source.id, "first").await.unwrap();
+        within(
+            &f.emitter,
+            "source in flight",
+            f.emitter.wait_for_type("turn_start", 1),
+        )
+        .await;
+        send_msg(&f.state, source.id, "second").await.unwrap();
+
+        // Register the forward's wait against turn one, and confirm it registered,
+        // before releasing that turn.
+        let outcome = forward_message_impl(
+            &f.state,
+            String::new(),
+            vec![source.id],
+            Uuid::now_v7(),
+            f.home.path(),
+        );
+        tokio::pin!(outcome);
+        assert!(futures::poll!(outcome.as_mut()).is_pending());
+        await_wait_registered(&f.state, source.id).await;
+
+        f.gate.notify_one();
+        let outcome = outcome.as_mut().await.unwrap();
+        let (body, _) = resolved(&outcome);
+        assert!(
+            body.contains("TURN-ONE-TEXT") && !body.contains("TURN-TWO-TEXT"),
+            "the forward resolves the turn that was running when it registered, not \
+             the one queued behind it: {body:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_registered_during_a_later_turn_resolves_that_later_turns_text() {
+        // The converse of `forward_awaits_only_the_sources_current_turn_…`: a forward
+        // that registers while the source's *second* turn is in flight resolves that
+        // turn's text. Together the two pin the rule to "the turn running when the
+        // forward registered" — and this direction proves a later turn's text is
+        // reachable in a forward body at all, so the sibling test's `!contains` is
+        // discriminating rather than vacuous.
+        let f = forward_queue_fixture(&["TURN-ONE-TEXT", "TURN-TWO-TEXT"], 1).await;
+        let source =
+            create_agent_impl(&f.state, "reviewer", HarnessKind::ClaudeCode, None, None).unwrap();
+
+        // Turn one completes on its own; turn two parks in flight.
+        send_msg(&f.state, source.id, "first").await.unwrap();
+        send_msg(&f.state, source.id, "second").await.unwrap();
+        within(
+            &f.emitter,
+            "turn two in flight",
+            f.emitter.wait_for_type("turn_start", 2),
+        )
+        .await;
+
+        let outcome = forward_message_impl(
+            &f.state,
+            String::new(),
+            vec![source.id],
+            Uuid::now_v7(),
+            f.home.path(),
+        );
+        tokio::pin!(outcome);
+        assert!(futures::poll!(outcome.as_mut()).is_pending());
+        await_wait_registered(&f.state, source.id).await;
+
+        f.gate.notify_one();
+        let outcome = outcome.as_mut().await.unwrap();
+        let (body, _) = resolved(&outcome);
+        assert!(
+            body.contains("TURN-TWO-TEXT") && !body.contains("TURN-ONE-TEXT"),
+            "resolves the turn that was running when the forward registered: {body:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mutually_forwarding_agents_do_not_deadlock() {
+        // alice forwards from bob while bob forwards from alice, both mid-turn. A
+        // forward waits on its source's *turn*, and a forward never blocks a turn,
+        // so two forwards pointing at each other cannot form a cycle. This is the
+        // property that would break if a forward ever took agent- or project-scoped
+        // state that a turn also needs — the timeout below is the assertion.
+        //
+        // The two agents take **different harness kinds** so each gets its own
+        // adapter: a `GatedRecordingAdapter`'s dispatch counter is per-adapter, and
+        // `AppState` shares one adapter across all agents of a kind.
+        let gate_alice = Arc::new(tokio::sync::Notify::new());
+        let gate_bob = Arc::new(tokio::sync::Notify::new());
+        let (claude, _) = gated_adapter(&["ALICE-LIVE"], &gate_alice, 0);
+        let (codex, _) = gated_adapter(&["BOB-LIVE"], &gate_bob, 0);
+        let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
+        let emitter = Arc::new(RecordingEmitter::new());
+        let state = AppState::new(
+            claude,
+            codex,
+            Arc::clone(&mock),
+            Arc::clone(&mock),
+            emitter.clone() as Arc<dyn EventEmitter>,
+        );
+        let tmp = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        init_directory_impl(&state, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let project = create_project_in_only_dir(&state, "proj");
+        set_active_project_impl(&state, project.id).unwrap();
+
+        let alice =
+            create_agent_impl(&state, "alice", HarnessKind::ClaudeCode, None, None).unwrap();
+        let bob = create_agent_impl(&state, "bob", HarnessKind::Codex, None, None).unwrap();
+
+        // Both agents park mid-turn.
+        send_msg(&state, alice.id, "alice work").await.unwrap();
+        send_msg(&state, bob.id, "bob work").await.unwrap();
+        within(
+            &emitter,
+            "both agents in flight",
+            emitter.wait_for_type("turn_start", 2),
+        )
+        .await;
+
+        // Register both forwards against the other's running turn, and confirm both
+        // waits were serviced, before releasing either. Neither agent has a session
+        // file, so a forward whose wait landed late would resolve `Idle` → empty disk
+        // → `Invalidated`, failing loudly at `resolved()` rather than silently
+        // reading a stale turn.
+        let alice_from_bob = forward_message_impl(
+            &state,
+            String::new(),
+            vec![bob.id],
+            Uuid::now_v7(),
+            home.path(),
+        );
+        let bob_from_alice = forward_message_impl(
+            &state,
+            String::new(),
+            vec![alice.id],
+            Uuid::now_v7(),
+            home.path(),
+        );
+        tokio::pin!(alice_from_bob, bob_from_alice);
+        assert!(futures::poll!(alice_from_bob.as_mut()).is_pending());
+        assert!(futures::poll!(bob_from_alice.as_mut()).is_pending());
+        await_wait_registered(&state, bob.id).await;
+        await_wait_registered(&state, alice.id).await;
+
+        gate_alice.notify_one();
+        gate_bob.notify_one();
+
+        let (from_bob, from_alice) = tokio::time::timeout(WAIT, async {
+            tokio::join!(alice_from_bob.as_mut(), bob_from_alice.as_mut())
+        })
+        .await
+        .expect("mutually forwarding agents must both resolve, not deadlock");
+
+        let from_bob = from_bob.unwrap();
+        let from_alice = from_alice.unwrap();
+        assert!(
+            resolved(&from_bob).0.contains("BOB-LIVE"),
+            "alice's forward resolves bob's just-finished turn: {:?}",
+            resolved(&from_bob).0
+        );
+        assert!(
+            resolved(&from_alice).0.contains("ALICE-LIVE"),
+            "bob's forward resolves alice's just-finished turn: {:?}",
+            resolved(&from_alice).0
         );
     }
 

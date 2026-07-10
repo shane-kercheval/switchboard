@@ -1,5 +1,7 @@
 <script lang="ts">
   import { cn } from "$lib/utils";
+  import { Ban, LoaderCircle } from "@lucide/svelte";
+  import Tooltip from "$lib/components/ui/Tooltip.svelte";
   import type { ForwardReadiness, ForwardSource } from "$lib/state/heldForwards.svelte";
 
   // A forward-source chip — the agent whose latest output will be forwarded.
@@ -12,6 +14,12 @@
   // is a warning — that source is *skipped* from the send. A boolean cannot express
   // this: a `pending` agent (one still generating) is about to contribute normally,
   // and flagging it as a failure told the user the opposite of what would happen.
+  //
+  // A non-`ready` state shows as **colour + a trailing icon**, not inline text: the
+  // chip is width-constrained (several sit inline, and the name already truncates),
+  // so a phrase like "still generating" blew the chip out. The icon carries a
+  // zero-delay tooltip with the full explanation, and an `aria-label` so the state
+  // reaches assistive tech without hover.
   let {
     source,
     readiness = "ready",
@@ -23,6 +31,22 @@
     disabled?: boolean;
     onRemove: () => void;
   } = $props();
+
+  // `null` for `ready` — no icon, no tooltip, neutral chip. Tooltip names the
+  // consequence (skipped / waited-for), the aria-label names the state tersely.
+  const stateHint = $derived(
+    readiness === "empty"
+      ? {
+          tooltip: "This agent has no completed output, so it will be left out of the forward",
+          ariaLabel: "Will be skipped from the forward",
+        }
+      : readiness === "pending"
+        ? {
+            tooltip: "Sending will wait for this agent's turn to finish",
+            ariaLabel: "Still generating",
+          }
+        : null,
+  );
 </script>
 
 <span
@@ -51,19 +75,24 @@
     <path d="M4 18v-2a4 4 0 0 1 4-4h12" />
   </svg>
   <span class="truncate" title={source.name}>{source.name}</span>
-  <!-- Each caption names the consequence, not the agent's state. An empty source is
-       dropped from the composed body (and if every source is empty the send doesn't
-       happen at all); a pending one makes the send wait. -->
-  {#if readiness === "empty"}
-    <span
-      class="shrink-0 italic"
-      title="This agent has no completed output, so it will be left out of the forward"
-      >will be skipped</span
-    >
-  {:else if readiness === "pending"}
-    <span class="shrink-0 italic" title="Sending will wait for this agent's turn to finish"
-      >still generating</span
-    >
+  {#if stateHint !== null}
+    <Tooltip label={stateHint.tooltip} delayDuration={0}>
+      {#snippet trigger(props)}
+        <span
+          {...props}
+          class="flex h-3.5 w-3.5 shrink-0 items-center justify-center"
+          data-testid={`forward-source-state-${source.name}`}
+          data-state-readiness={readiness}
+          aria-label={stateHint.ariaLabel}
+        >
+          {#if readiness === "empty"}
+            <Ban class="h-3.5 w-3.5" aria-hidden="true" />
+          {:else}
+            <LoaderCircle class="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
+          {/if}
+        </span>
+      {/snippet}
+    </Tooltip>
   {/if}
   <button
     type="button"

@@ -2540,7 +2540,11 @@ describe("ComposeBar — cross-agent forward", () => {
 
     const chipEl = screen.getByTestId("forward-source-chip-bob");
     expect(chipEl).toHaveAttribute("data-readiness", "empty");
-    expect(chipEl).toHaveTextContent("will be skipped");
+    // State is a colour + trailing icon (with a tooltip), not inline text.
+    expect(screen.getByTestId("forward-source-state-bob")).toHaveAttribute(
+      "data-state-readiness",
+      "empty",
+    );
   });
 
   it("does not warn on a source that is still streaming", async () => {
@@ -2556,9 +2560,11 @@ describe("ComposeBar — cross-agent forward", () => {
 
     const chipEl = screen.getByTestId("forward-source-chip-bob");
     expect(chipEl).toHaveAttribute("data-readiness", "pending");
-    expect(chipEl).toHaveTextContent("still generating");
-    expect(chipEl).not.toHaveTextContent("will be skipped");
-    // The failed status colour is what made the old chip read as a warning.
+    // Pending shows the "still generating" icon (tooltip + aria-label), not the
+    // empty warning; and never the failed status colour that read as a warning.
+    const stateIcon = screen.getByTestId("forward-source-state-bob");
+    expect(stateIcon).toHaveAttribute("data-state-readiness", "pending");
+    expect(stateIcon).toHaveAttribute("aria-label", "Still generating");
     expect(chipEl.className).not.toContain("status-failed");
   });
 
@@ -2596,7 +2602,11 @@ describe("ComposeBar — cross-agent forward", () => {
     expect(row).not.toHaveTextContent("will be skipped");
 
     await fireEvent.click(row);
-    expect(screen.getByTestId("forward-source-chip-bob")).toHaveTextContent("still generating");
+    // The chip carries the same pending state the row advertised.
+    expect(screen.getByTestId("forward-source-state-bob")).toHaveAttribute(
+      "data-state-readiness",
+      "pending",
+    );
   });
 
   it("restores forward sources after an unmount/remount (project switch, Git view)", async () => {

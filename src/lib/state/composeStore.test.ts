@@ -1,5 +1,18 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { _testing, flush, getCompose, setContent, setSelection } from "./composeStore";
+import type { ComposeForwards } from "./composeStore";
+import {
+  _testing,
+  draftAttachmentPaths,
+  emptyForwards,
+  flush,
+  getCompose,
+  setAttachments,
+  setContent,
+  setForwards,
+  setSelection,
+} from "./composeStore";
+import type { ForwardSource } from "./heldForwards.svelte";
+import type { Attachment } from "$lib/types";
 
 const P = "00000000-0000-7000-8000-0000000000ff";
 const STORAGE_KEY = "switchboard-compose";
@@ -228,5 +241,212 @@ describe("debounced persistence", () => {
     } finally {
       setItem.mockRestore();
     }
+  });
+});
+
+const ATTACHMENT: Attachment = {
+  label: "image-1",
+  kind: "image",
+  path: "/abs/.switchboard/projects/p/attachments/u__shot.png",
+  original_name: "shot.png",
+};
+
+const SOURCE_A: ForwardSource = { id: "agent-a", name: "opus-high" };
+const SOURCE_B: ForwardSource = { id: "agent-b", name: "sonnet-low" };
+
+describe("composeStore v3: attachments, forwards, workflow mode", () => {
+  it("reads a v2 blob as a v3 snapshot with the newer fields absent", () => {
+    // v2 → v3 added only optional fields, so no migration function exists. A v2
+    // blob must parse through the same path, not fall into `migrateUnversioned`
+    // (which would iterate the envelope's own keys and produce garbage).
+    localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({
+        version: 2,
+        projects: { [P]: { content: { kind: "plain", draft: "from v2" }, selectedIds: ["a"] } },
+      }),
+    );
+    _testing.reloadFromStorage();
+    expect(getCompose(P)).toEqual({
+      content: { kind: "plain", draft: "from v2" },
+      selectedIds: ["a"],
+    });
+  });
+
+  it("re-stamps a v2 blob as v3 on the next write", () => {
+    localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({ version: 2, projects: { [P]: { content: { kind: "plain", draft: "x" } } } }),
+    );
+    _testing.reloadFromStorage();
+    setContent(P, { kind: "plain", draft: "y" });
+    flush();
+    const raw: unknown = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "{}");
+    expect((raw as { version: number }).version).toBe(3);
+  });
+
+  it("round-trips staged attachments", () => {
+    setAttachments(P, [ATTACHMENT]);
+    flush();
+    _testing.reloadFromStorage();
+    expect(getCompose(P).attachments).toEqual([ATTACHMENT]);
+  });
+
+  it("omits the attachments key entirely when the chip list is empty", () => {
+    setAttachments(P, [ATTACHMENT]);
+    setAttachments(P, []);
+    flush();
+    _testing.reloadFromStorage();
+    expect(getCompose(P).attachments).toBeUndefined();
+    expect("attachments" in getCompose(P)).toBe(false);
+  });
+
+  it("degrades a malformed attachments array to no attachments rather than throwing", () => {
+    localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({
+        version: 3,
+        projects: {
+          [P]: {
+            content: { kind: "plain", draft: "d" },
+            attachments: [null, 5, { label: "no-path" }, "nope"],
+          },
+        },
+      }),
+    );
+    expect(() => _testing.reloadFromStorage()).not.toThrow();
+    expect(getCompose(P).attachments).toBeUndefined();
+    expect(getCompose(P).content).toEqual({ kind: "plain", draft: "d" });
+  });
+
+  it("maps an unrecognized attachment kind to 'unknown' rather than dropping the chip", () => {
+    // Cross-version tolerance: a newer build may write a kind this one predates.
+    localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({
+        version: 3,
+        projects: {
+          [P]: {
+            content: { kind: "plain", draft: "" },
+            attachments: [{ ...ATTACHMENT, kind: "hologram" }],
+          },
+        },
+      }),
+    );
+    _testing.reloadFromStorage();
+    expect(getCompose(P).attachments).toEqual([{ ...ATTACHMENT, kind: "unknown" }]);
+  });
+
+  it("round-trips all four forward-source families", () => {
+    const forwards: ComposeForwards = {
+      message: [SOURCE_A],
+      promptArgs: { focus: [SOURCE_B] },
+      promptAppended: [SOURCE_A, SOURCE_B],
+      workflowFields: { context: [SOURCE_B] },
+    };
+    setForwards(P, forwards);
+    flush();
+    _testing.reloadFromStorage();
+    expect(getCompose(P).forwards).toEqual(forwards);
+  });
+
+  it("omits the forwards key when every family is empty", () => {
+    setForwards(P, { message: [SOURCE_A], promptArgs: {}, promptAppended: [], workflowFields: {} });
+    setForwards(P, emptyForwards());
+    flush();
+    _testing.reloadFromStorage();
+    expect(getCompose(P).forwards).toBeUndefined();
+  });
+
+  it("drops structurally malformed forward sources but keeps the valid ones", () => {
+    localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({
+        version: 3,
+        projects: {
+          [P]: {
+            content: { kind: "plain", draft: "" },
+            forwards: { message: [SOURCE_A, { id: 7 }, null, { name: "no-id" }] },
+          },
+        },
+      }),
+    );
+    _testing.reloadFromStorage();
+    expect(getCompose(P).forwards?.message).toEqual([SOURCE_A]);
+  });
+
+  it("round-trips workflow-mode content including list-valued inputs", () => {
+    // `isBuiltin` is part of the identity: a built-in and a copied user workflow
+    // can share a name, so restore needs both to re-resolve the listing.
+    setContent(P, {
+      kind: "workflow",
+      name: "review-and-recommend",
+      isBuiltin: true,
+      inputs: { context: "check error paths", agents: ["a", "b"] },
+    });
+    flush();
+    _testing.reloadFromStorage();
+    expect(getCompose(P).content).toEqual({
+      kind: "workflow",
+      name: "review-and-recommend",
+      isBuiltin: true,
+      inputs: { context: "check error paths", agents: ["a", "b"] },
+    });
+  });
+
+  it("degrades workflow content missing its identity to an empty plain draft", () => {
+    localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({
+        version: 3,
+        projects: { [P]: { content: { kind: "workflow", name: "x" } } }, // no isBuiltin
+      }),
+    );
+    _testing.reloadFromStorage();
+    expect(getCompose(P).content).toEqual({ kind: "plain", draft: "" });
+  });
+
+  it("drops workflow inputs whose values are neither string nor string[]", () => {
+    localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({
+        version: 3,
+        projects: {
+          [P]: {
+            content: {
+              kind: "workflow",
+              name: "w",
+              isBuiltin: false,
+              inputs: { good: "ok", list: ["a"], bad: 5, alsoBad: [1, 2] },
+            },
+          },
+        },
+      }),
+    );
+    _testing.reloadFromStorage();
+    expect(getCompose(P).content).toEqual({
+      kind: "workflow",
+      name: "w",
+      isBuiltin: false,
+      inputs: { good: "ok", list: ["a"] },
+    });
+  });
+
+  it("draftAttachmentPaths reports the staged paths the GC must spare", () => {
+    expect(draftAttachmentPaths(P)).toEqual([]);
+    setAttachments(P, [ATTACHMENT]);
+    expect(draftAttachmentPaths(P)).toEqual([ATTACHMENT.path]);
+  });
+
+  it("attachments and forwards survive independently of content changes", () => {
+    setAttachments(P, [ATTACHMENT]);
+    setForwards(P, { ...emptyForwards(), message: [SOURCE_A] });
+    setContent(P, { kind: "plain", draft: "typed after attaching" });
+    flush();
+    _testing.reloadFromStorage();
+    const snapshot = getCompose(P);
+    expect(snapshot.attachments).toEqual([ATTACHMENT]);
+    expect(snapshot.forwards?.message).toEqual([SOURCE_A]);
+    expect(snapshot.content).toEqual({ kind: "plain", draft: "typed after attaching" });
   });
 });

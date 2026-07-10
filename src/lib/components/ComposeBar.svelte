@@ -45,14 +45,13 @@
     AgentId,
     AgentRecord,
     Attachment,
-    AttachmentKind,
     ProjectId,
     Prompt,
     WorkflowFormDescriptor,
     WorkflowInputValue,
     WorkflowListing,
   } from "$lib/types";
-  import { classifyKind } from "$lib/attachments";
+  import { classifyKind, nextLabel } from "$lib/attachments";
   import { getCurrentWebview } from "@tauri-apps/api/webview";
   import { isPermissionGranted, requestPermission } from "@tauri-apps/plugin-notification";
   import { buildRenderArgs, combinePromptMessage, missingRequiredArgs } from "$lib/prompt";
@@ -133,21 +132,6 @@
       path,
       original_name,
     }));
-  }
-
-  /// Next per-kind label, derived from the labels already present rather than a
-  /// running counter — a counter would restart at 1 on remount and collide with a
-  /// restored chip's label. Max-suffix + 1 keeps labels monotonic within a compose
-  /// session, so removing a chip never renumbers the survivors.
-  function nextLabel(kind: AttachmentKind, existing: Attachment[]): string {
-    const prefix = `${kind}-`;
-    let max = 0;
-    for (const attachment of existing) {
-      if (!attachment.label.startsWith(prefix)) continue;
-      const n = Number.parseInt(attachment.label.slice(prefix.length), 10);
-      if (Number.isFinite(n) && n > max) max = n;
-    }
-    return `${prefix}${max + 1}`;
   }
 
   /// Set the chip list and write it through. The only path that mutates chips

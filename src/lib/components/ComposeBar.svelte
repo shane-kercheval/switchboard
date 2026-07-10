@@ -15,16 +15,21 @@
     expandForwardSources,
     forwardSourceForAgent,
     forwardSourceAgentsForPane,
+    reconcileForwardSources,
+    reconcileForwardSourceMap,
     type ForwardSource,
   } from "$lib/state/heldForwards.svelte";
   import { buildLiveSendsMap } from "$lib/state/liveSends";
   import {
+    emptyForwards,
     flush,
     getCompose,
     setAttachments,
     setContent,
+    setForwards,
     setSelection,
     type ComposeContent,
+    type ComposeForwards,
     type PromptContent,
   } from "$lib/state/composeStore";
   import { recordProjectsActivityLocally } from "$lib/state/workspace.svelte";
@@ -183,10 +188,21 @@
 
   // Forward sources: agents whose latest output is forwarded into this send (the
   // §7 manual cross-agent forward). Picked from the `@`-menu's "Forward from"
-  // entries; a pane entry expands to its members at pick time. Session-only,
-  // cleared on send / restore — like attachment chips. A send with ≥1 forward
-  // source dispatches via `forward_message` instead of the normal send path.
-  let forwardSources = $state<ForwardSource[]>([]);
+  // entries; a pane entry expands to its members at pick time. A send with ≥1
+  // forward source dispatches via `forward_message` instead of the normal send path.
+  //
+  // Persisted (all four families below), so a project switch or Git-view toggle —
+  // both of which unmount this bar — doesn't silently discard a forward the user
+  // set up. Restored sources are reconciled against the live roster: an agent
+  // removed since the draft was written is dropped, a renamed one takes its
+  // current name.
+  // `untrack`: the mount-time roster is constant for this component's life (see
+  // the `saved` snapshot above), so reconciling against it once is deliberate, not
+  // a missed dependency.
+  const savedForwards = saved.forwards ?? emptyForwards();
+  let forwardSources = $state<ForwardSource[]>(
+    untrack(() => reconcileForwardSources(savedForwards.message, agents)),
+  );
 
   function addForwardSource(source: ForwardSource): void {
     if (forwardSources.some((s) => forwardSourceKey(s) === forwardSourceKey(source))) return;
@@ -308,10 +324,14 @@
   // Per-argument forward sources (live-UI-only, like `forwardSources`). A
   // prompt-mode send with any entry here — or in `promptAppendedSources` — routes
   // through the forward-prompt path.
-  let promptArgSources = $state<Record<string, ForwardSource[]>>({});
+  let promptArgSources = $state<Record<string, ForwardSource[]>>(
+    untrack(() => reconcileForwardSourceMap(savedForwards.promptArgs, agents)),
+  );
   // Forward sources for the appended-text field (the appended text is just
   // another forwardable field; the backend composes it into the appended tail).
-  let promptAppendedSources = $state<ForwardSource[]>([]);
+  let promptAppendedSources = $state<ForwardSource[]>(
+    untrack(() => reconcileForwardSources(savedForwards.promptAppended, agents)),
+  );
   let appendedText = $state<string>("");
   let promptMenuOpen = $state(false);
   let prompts = $state<Prompt[]>([]);
@@ -344,8 +364,11 @@
   let workflowSyncSettled = $state(false);
   let workflowInputs = $state<Record<string, WorkflowInputValue>>({});
   // Per-field forward sources for the workflow's fillable single-text fields,
-  // keyed by field name. Live-UI-only, reset whenever the workflow changes.
-  let workflowForwardSources = $state<Record<string, ForwardSource[]>>({});
+  // keyed by field name. Persisted with the other forward families; reset whenever
+  // the workflow changes (a field name means nothing across workflows).
+  let workflowForwardSources = $state<Record<string, ForwardSource[]>>(
+    untrack(() => reconcileForwardSourceMap(savedForwards.workflowFields, agents)),
+  );
   let invokingWorkflow = $state(false);
   // A saved prompt-mode draft to restore once the cache loads; consumed when
   // restoration settles. Null when the saved draft was plain.
@@ -452,17 +475,39 @@
       : { kind: "plain", draft };
   }
 
+  /// The four forward-source families as a persistable snapshot. Copied out of
+  /// reactive state rather than passed by reference — the store must not alias
+  /// live `$state`, or it would keep mutating after this bar is gone.
+  function currentForwards(): ComposeForwards {
+    const copyMap = (map: Record<string, ForwardSource[]>): Record<string, ForwardSource[]> =>
+      Object.fromEntries(Object.entries(map).map(([field, sources]) => [field, [...sources]]));
+    return {
+      message: [...forwardSources],
+      promptArgs: copyMap(promptArgSources),
+      promptAppended: [...promptAppendedSources],
+      workflowFields: copyMap(workflowForwardSources),
+    };
+  }
+
   // Drop any selected ids whose agent disappeared (agent removed at runtime).
   $effect(() => {
     const valid = selectedIds.filter((id) => agents.some((a) => a.id === id));
     if (valid.length !== selectedIds.length) setSelectedIds(valid);
   });
 
+  // Persist every forward-source family together — they are one field in the
+  // snapshot because a mode switch hides the inapplicable ones but must preserve
+  // them for the return trip. Like content, the send-clear path also writes
+  // through explicitly, so a cleared set can't be overtaken by a same-frame unmount.
+  $effect(() => {
+    setForwards(projectId, currentForwards());
+  });
+
   // Persist the compose content per project (machine-local; see composeStore).
   // Plain and prompt modes are distinct persisted states. Skipped while a saved
   // prompt-mode draft is still being restored, so the pre-restore plain
   // placeholder can't overwrite (and destroy) the saved snapshot. The send-clear
-  // path persists explicitly (`persistContentNow`) so it survives a same-frame
+  // path persists explicitly (`persistComposeNow`) so it survives a same-frame
   // unmount regardless of this effect's scheduling.
   $effect(() => {
     if (restoring) return;
@@ -1515,7 +1560,7 @@
     if (attachmentChips.length === 0 && attachments.length > 0) {
       attachmentChips = attachments.map((a) => ({ ...a, id: crypto.randomUUID() }));
     }
-    persistContentNow();
+    persistComposeNow();
   }
 
   /// Manual forward into a prompt's arguments (§7) — the prompt-composer analogue
@@ -1641,7 +1686,7 @@
     appendedText = appended;
     attachmentChips = attachments.map((a) => ({ ...a, id: crypto.randomUUID() }));
     mode = "prompt";
-    persistContentNow();
+    persistComposeNow();
   }
 
   /// Dispatch `text` to `targets` under one send_id. Shared by the plain, prompt,
@@ -1742,7 +1787,7 @@
         commitChips([]);
         sendGeneration += 1;
         mode = "plain";
-        persistContentNow();
+        persistComposeNow();
         return;
       }
 
@@ -1789,7 +1834,7 @@
       commitChips([]);
       sendGeneration += 1;
       mode = "plain";
-      persistContentNow();
+      persistComposeNow();
       return;
     }
 
@@ -1805,7 +1850,7 @@
       forwardSources = [];
       commitChips([]);
       sendGeneration += 1;
-      persistContentNow();
+      persistComposeNow();
       return;
     }
 
@@ -1816,15 +1861,24 @@
     draft = "";
     commitChips([]);
     sendGeneration += 1;
-    persistContentNow();
+    persistComposeNow();
   }
 
-  /// Persist the current compose content immediately — `flush()` writes through
-  /// and cancels the pending debounce — so a send-clear is durable even if the
-  /// component unmounts in the same frame (e.g. a project switch right after
-  /// sending), and a stale pre-send draft can never land after the clear.
-  function persistContentNow(): void {
+  /// Persist the current compose content and forward sources immediately —
+  /// `flush()` writes through and cancels the pending debounce — so a send-clear is
+  /// durable even if the component unmounts in the same frame (e.g. a project
+  /// switch right after sending), and a stale pre-send draft can never land after
+  /// the clear.
+  ///
+  /// Forwards are written synchronously here for the same reason as content: their
+  /// persist `$effect` is *scheduled*, so an unmount before it runs would `flush()`
+  /// the pre-clear forward set and resurrect it on the next mount. In the ordinary
+  /// path the effect plus `onDestroy`'s flush already cover this, and the window is
+  /// too narrow to drive from a jsdom test — so treat this as symmetry with the
+  /// content path, not a test-pinned guarantee.
+  function persistComposeNow(): void {
     setContent(projectId, currentContent());
+    setForwards(projectId, currentForwards());
     flush();
   }
 </script>

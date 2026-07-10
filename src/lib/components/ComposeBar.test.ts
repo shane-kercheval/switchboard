@@ -2453,6 +2453,65 @@ describe("ComposeBar — cross-agent forward", () => {
     expect(chipEl).toHaveTextContent("no output");
   });
 
+  it("restores forward sources after an unmount/remount (project switch, Git view)", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    const { unmount } = render(ComposeBar, {
+      props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] },
+    });
+    await pickForwardSource(AGENT_B.id);
+    await screen.findByTestId("forward-source-chip-bob");
+    unmount();
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    expect(await screen.findByTestId("forward-source-chip-bob")).toBeInTheDocument();
+  });
+
+  it("drops a restored forward source whose agent no longer exists", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    const { unmount } = render(ComposeBar, {
+      props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] },
+    });
+    await pickForwardSource(AGENT_B.id);
+    await screen.findByTestId("forward-source-chip-bob");
+    unmount();
+
+    // AGENT_B removed from the roster while we were away.
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await tick();
+    expect(screen.queryByTestId("forward-source-chip-bob")).toBeNull();
+  });
+
+  it("does not restore forward sources after a successful forward send", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    await seedCompletedTurn(AGENT_B.id);
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "forward_message") return { status: "resolved", body: "x", skipped: [] };
+      if (cmd === "send_message") return "msg-1";
+      return null;
+    });
+    const { unmount } = render(ComposeBar, {
+      props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] },
+    });
+    await pickForwardSource(AGENT_B.id);
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    await fireEvent.input(textarea, { target: { value: "go" } });
+    await fireEvent.click(screen.getByTestId("compose-send"));
+    await waitFor(() =>
+      expect(invokeMock.mock.calls.some(([c]) => c === "forward_message")).toBe(true),
+    );
+    unmount();
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    await tick();
+    expect(screen.queryByTestId("forward-source-chip-bob")).toBeNull();
+  });
+
   it("composes multiple forward sources in declared order", async () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);

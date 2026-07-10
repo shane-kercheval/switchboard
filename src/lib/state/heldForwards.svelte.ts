@@ -58,6 +58,37 @@ export function expandForwardSources(sources: ForwardSource[]): AgentId[] {
   return ids;
 }
 
+/// Reconcile persisted forward sources against the live roster, for restore.
+///
+/// A source names an agent that may have been removed or renamed since the draft
+/// was written. Removed agents are dropped — forwarding from them would fail at
+/// dispatch. Survivors take the roster's *current* name, because the chip's `name`
+/// is display-only and a stale one would show the user an agent that no longer
+/// exists under that label.
+export function reconcileForwardSources(
+  sources: readonly ForwardSource[],
+  agents: readonly AgentRecord[],
+): ForwardSource[] {
+  return sources
+    .map((source) => agents.find((agent) => agent.id === source.id))
+    .filter((agent): agent is AgentRecord => agent !== undefined)
+    .map(forwardSourceForAgent);
+}
+
+/// `reconcileForwardSources` across a per-field map, dropping fields left empty so
+/// a restored draft carries no keys for arguments whose every source is gone.
+export function reconcileForwardSourceMap(
+  map: Readonly<Record<string, ForwardSource[]>>,
+  agents: readonly AgentRecord[],
+): Record<string, ForwardSource[]> {
+  const out: Record<string, ForwardSource[]> = {};
+  for (const [field, sources] of Object.entries(map)) {
+    const kept = reconcileForwardSources(sources, agents);
+    if (kept.length > 0) out[field] = kept;
+  }
+  return out;
+}
+
 /// A submitted-but-still-holding forward. Carries everything needed to render
 /// the "waiting for {agent}…" entry and to restore the composer (typed body +
 /// source chips + recipients) if the hold is cancelled or invalidated.

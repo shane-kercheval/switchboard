@@ -31,6 +31,7 @@
     type ComposeContent,
     type ComposeForwards,
     type PromptContent,
+    type WorkflowContent,
   } from "$lib/state/composeStore";
   import { recordProjectsActivityLocally } from "$lib/state/workspace.svelte";
   import {
@@ -375,10 +376,14 @@
   let pendingRestore = $state<PromptContent | null>(
     saved.content.kind === "prompt" ? saved.content : null,
   );
-  // True while a saved prompt-mode draft is still being resolved against the
-  // cache. Gates the persist effect so the not-yet-restored plain placeholder
-  // can't overwrite the saved snapshot before restoration settles.
-  let restoring = $state(saved.content.kind === "prompt");
+  // A saved workflow-mode invocation to restore once the workflow list loads.
+  let pendingWorkflowRestore = $state<WorkflowContent | null>(
+    saved.content.kind === "workflow" ? saved.content : null,
+  );
+  // True while a saved prompt- or workflow-mode draft is still being resolved
+  // against its source. Gates the persist effect so the not-yet-restored plain
+  // placeholder can't overwrite the saved snapshot before restoration settles.
+  let restoring = $state(saved.content.kind === "prompt" || saved.content.kind === "workflow");
 
   async function loadPrompts(): Promise<void> {
     try {
@@ -420,8 +425,18 @@
     return () => void unlisten.then((u) => u());
   });
 
+  // A saved workflow-mode draft resolves against the local workflow list, which is
+  // not loaded until a menu opens — so fetch it here rather than waiting for one.
+  onMount(() => {
+    if (pendingWorkflowRestore === null) return;
+    void loadWorkflows().then(tryRestoreWorkflow);
+  });
+
   onMount(() => {
     if (!focusOnMount) return;
+    // A pending workflow restore owns the focus decision: it fires after its
+    // async list load, and focusing the textarea now would fight the form.
+    if (pendingWorkflowRestore !== null) return;
     if (pendingRestore === null) {
       requestAnimationFrame(() => textareaEl?.focus());
     } else {
@@ -461,18 +476,69 @@
     }
   }
 
+  /// Resolve a saved workflow-mode invocation against the loaded workflow list.
+  ///
+  /// Unlike `tryRestorePrompt`, this is one-shot with no cold-cache grace period:
+  /// `list_workflows` reads the local filesystem, so a miss means the workflow was
+  /// genuinely renamed or deleted, not that a remote cache hasn't warmed. A miss
+  /// falls back to plain mode rather than stranding the composer in a workflow that
+  /// can't be invoked.
+  ///
+  /// The saved field values are installed *before* `loadWorkflowForm`, whose
+  /// seeding is additive — it fills only fields not already present, so the
+  /// restored values survive and any field the workflow has gained since is seeded
+  /// empty.
+  function tryRestoreWorkflow(): void {
+    const snapshot = pendingWorkflowRestore;
+    if (snapshot === null) return;
+    pendingWorkflowRestore = null;
+    restoring = false;
+    const found = workflows.find(
+      (w) => w.name === snapshot.name && w.is_builtin === snapshot.isBuiltin,
+    );
+    if (found === undefined) {
+      if (focusOnMount) requestAnimationFrame(() => textareaEl?.focus());
+      return;
+    }
+    selectedWorkflow = found;
+    workflowForm = null;
+    workflowInputs = { ...snapshot.inputs };
+    workflowSyncSettled = false;
+    mode = "workflow";
+    void loadWorkflowForm(found);
+  }
+
   /// The current compose content as a persistable snapshot. Single definition so
-  /// the persist effect and the explicit send-clear persist agree.
+  /// the persist effect and the explicit send-clear persist agree. `content.kind`
+  /// is the mode, so each mode round-trips through its own variant.
   function currentContent(): ComposeContent {
-    return mode === "prompt" && selectedPrompt !== null
-      ? {
-          kind: "prompt",
-          provider: selectedPrompt.provider,
-          name: selectedPrompt.name,
-          args: { ...promptArgs },
-          appendedText,
-        }
-      : { kind: "plain", draft };
+    if (mode === "prompt" && selectedPrompt !== null) {
+      return {
+        kind: "prompt",
+        provider: selectedPrompt.provider,
+        name: selectedPrompt.name,
+        args: { ...promptArgs },
+        appendedText,
+      };
+    }
+    if (mode === "workflow" && selectedWorkflow !== null) {
+      return {
+        kind: "workflow",
+        name: selectedWorkflow.name,
+        // Part of the identity: a built-in and a same-named copied user workflow
+        // are different workflows, so restore needs both to re-resolve the listing.
+        isBuiltin: selectedWorkflow.is_builtin,
+        // List-valued inputs are arrays; copy them out of reactive state so the
+        // store never aliases live `$state`.
+        inputs: Object.fromEntries(
+          Object.entries(workflowInputs).map(([name, value]) => [
+            name,
+            Array.isArray(value) ? [...value] : value,
+          ]),
+        ),
+      };
+    }
+    return { kind: "plain", draft };
   }
 
   /// The four forward-source families as a persistable snapshot. Copied out of
@@ -2512,15 +2578,16 @@
       {/if}
 
       {#if restoring}
-        <!-- A saved prompt-mode draft is still resolving against the (possibly
-           cold) cache. Show a neutral placeholder rather than the plain textarea
-           so the box doesn't flash empty and look like the draft was lost. -->
+        <!-- A saved prompt- or workflow-mode draft is still resolving against its
+           source (a possibly cold prompt cache; the local workflow list). Show a
+           neutral placeholder rather than the plain textarea so the box doesn't
+           flash empty and look like the draft was lost. -->
         <div
           class="text-muted flex h-16 items-center gap-2 px-1 text-sm"
           data-testid="compose-restoring"
         >
           <Spinner class="h-4 w-4" />
-          Restoring prompt…
+          Restoring {pendingWorkflowRestore !== null ? "workflow" : "prompt"}…
         </div>
       {:else if mode === "workflow" && workflowForm !== null}
         <!-- Workflow mode: the invocation form spans the compose area. The compose

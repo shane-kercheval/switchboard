@@ -3463,6 +3463,143 @@ describe("ComposeBar — cross-agent forward", () => {
   });
 });
 
+describe("ComposeBar — workflow invocation survives navigation", () => {
+  const WORKFLOW = {
+    name: "review-and-recommend",
+    is_builtin: true,
+    description: "d",
+    inputs: [
+      { name: "reviewers", ty: "agent_list", optional: false, description: null },
+      { name: "worker", ty: "agent", optional: false, description: null },
+    ],
+    invocable: true,
+    parse_error: null,
+  };
+  const DESCRIPTOR = {
+    name: "review-and-recommend",
+    description: "d",
+    is_builtin: true,
+    invocable: true,
+    inputs: WORKFLOW.inputs,
+    steps: [],
+    derived_args: [
+      { name: "context", required: false, description: "Optional background", prompts: [] },
+    ],
+    compatibility: { state: "ok" },
+  };
+
+  function mockWorkflows(list: unknown[] = [WORKFLOW]): void {
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "list_workflows") return list;
+      if (cmd === "describe_workflow_form") return DESCRIPTOR;
+      if (cmd === "list_prompts") return [];
+      return null;
+    });
+  }
+
+  async function enterWorkflowModeAndFill(): Promise<void> {
+    await fireEvent.click(screen.getByTestId("compose-workflow-button"));
+    await waitFor(() => screen.getByTestId("workflow-option-builtin:review-and-recommend"));
+    await fireEvent.click(screen.getByTestId("workflow-option-builtin:review-and-recommend"));
+    await waitFor(() => screen.getByTestId("workflow-arg-input-context"));
+    await fireEvent.click(screen.getByTestId("workflow-agent-worker-alice"));
+    await fireEvent.input(screen.getByTestId("workflow-arg-input-context"), {
+      target: { value: "focus on error handling" },
+    });
+  }
+
+  it("restores workflow mode and its field values after an unmount/remount", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    mockWorkflows();
+    const { unmount } = render(ComposeBar, {
+      props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] },
+    });
+    await enterWorkflowModeAndFill();
+    unmount();
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+
+    // Back in workflow mode, not the plain textarea, with the typed value intact.
+    await waitFor(() => screen.getByTestId("workflow-composer"));
+    const context = (await screen.findByTestId(
+      "workflow-arg-input-context",
+    )) as HTMLTextAreaElement;
+    expect(context.value).toBe("focus on error handling");
+  });
+
+  it("falls back to plain mode when the saved workflow no longer exists", async () => {
+    // `list_workflows` reads the local filesystem, so a miss is a real deletion —
+    // not a cold cache — and must not strand the composer in an uninvocable form.
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    mockWorkflows();
+    const { unmount } = render(ComposeBar, {
+      props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] },
+    });
+    await enterWorkflowModeAndFill();
+    unmount();
+
+    mockWorkflows([]); // the workflow was deleted while we were away
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+
+    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
+    expect(screen.queryByTestId("workflow-composer")).toBeNull();
+    expect(screen.queryByTestId("compose-restoring")).toBeNull();
+  });
+
+  it("does not restore a same-named workflow of the other builtin-ness", async () => {
+    // A built-in and a copied user workflow can share a name; `isBuiltin` is part
+    // of the saved identity, so a copy must not silently stand in for the original.
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    mockWorkflows();
+    const { unmount } = render(ComposeBar, {
+      props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] },
+    });
+    await enterWorkflowModeAndFill();
+    unmount();
+
+    mockWorkflows([{ ...WORKFLOW, is_builtin: false }]);
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+
+    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
+    expect(screen.queryByTestId("workflow-composer")).toBeNull();
+  });
+
+  it("does not restore workflow mode after the workflow was invoked", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "list_workflows") return [WORKFLOW];
+      if (cmd === "describe_workflow_form") return DESCRIPTOR;
+      if (cmd === "list_prompts") return [];
+      if (cmd === "invoke_workflow") return "run-1";
+      if (cmd === "list_workflow_runs") return [];
+      return null;
+    });
+    const { unmount } = render(ComposeBar, {
+      props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] },
+    });
+    await enterWorkflowModeAndFill();
+    await fireEvent.click(screen.getByTestId("workflow-agent-reviewers-bob"));
+    await fireEvent.click(screen.getByTestId("workflow-invoke-button"));
+    await waitFor(() =>
+      expect(invokeMock.mock.calls.some(([c]) => c === "invoke_workflow")).toBe(true),
+    );
+    unmount();
+
+    workflowsTesting.reset();
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
+    expect(screen.queryByTestId("workflow-composer")).toBeNull();
+  });
+});
+
 describe("ComposeBar — workflow run live view (swap / hold / stop)", () => {
   function run(over: Partial<WorkflowRunInfo> = {}): WorkflowRunInfo {
     return {

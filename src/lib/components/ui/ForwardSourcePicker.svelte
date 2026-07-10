@@ -133,6 +133,8 @@
       <span class="text-fg">{agent.name}</span>
       {#if agentReadiness?.(agent.id) === "empty"}
         <span class="text-muted ml-auto text-[11px] italic">will be skipped</span>
+      {:else if agentReadiness?.(agent.id) === "pending"}
+        <span class="text-muted ml-auto text-[11px] italic">still generating</span>
       {/if}
     </DropdownMenuItem>
   {/each}

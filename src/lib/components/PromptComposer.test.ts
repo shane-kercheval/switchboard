@@ -276,7 +276,9 @@ describe("PromptComposer per-argument forwarding", () => {
     );
     const chip = screen.getByTestId("forward-source-chip-bob");
     expect(chip).toHaveAttribute("data-readiness", "pending");
+    expect(chip).toHaveTextContent("still generating");
     expect(chip).not.toHaveTextContent("will be skipped");
+    expect(chip.className).not.toContain("status-failed");
   });
 
   it("treats a required argument as satisfied once it has a forward source", () => {

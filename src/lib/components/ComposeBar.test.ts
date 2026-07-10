@@ -2493,7 +2493,10 @@ describe("ComposeBar — cross-agent forward", () => {
 
     const chipEl = screen.getByTestId("forward-source-chip-bob");
     expect(chipEl).toHaveAttribute("data-readiness", "pending");
+    expect(chipEl).toHaveTextContent("still generating");
     expect(chipEl).not.toHaveTextContent("will be skipped");
+    // The failed status colour is what made the old chip read as a warning.
+    expect(chipEl.className).not.toContain("status-failed");
   });
 
   it("treats a completed turn plus a newer streaming one as pending, not ready", async () => {
@@ -2526,10 +2529,11 @@ describe("ComposeBar — cross-agent forward", () => {
     const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
     await fireEvent.input(textarea, { target: { value: "@" } });
     const row = await screen.findByTestId(`forward-option-forward-agent:${AGENT_B.id}`);
+    expect(row).toHaveTextContent("still generating");
     expect(row).not.toHaveTextContent("will be skipped");
 
     await fireEvent.click(row);
-    expect(screen.getByTestId("forward-source-chip-bob")).not.toHaveTextContent("will be skipped");
+    expect(screen.getByTestId("forward-source-chip-bob")).toHaveTextContent("still generating");
   });
 
   it("restores forward sources after an unmount/remount (project switch, Git view)", async () => {

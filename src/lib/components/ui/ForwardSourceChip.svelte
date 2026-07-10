@@ -30,7 +30,9 @@
     "inline-flex max-w-[14rem] items-center gap-1.5 rounded-full border py-px pr-1 pl-2 text-xs",
     readiness === "empty"
       ? "border-status-failed/40 bg-status-failed-soft/40 text-status-failed"
-      : "border-border bg-panel text-fg",
+      : readiness === "pending"
+        ? "border-status-processing/40 bg-status-processing-soft/40 text-status-processing"
+        : "border-border bg-panel text-fg",
   )}
   data-testid={`forward-source-chip-${source.name}`}
   data-readiness={readiness}
@@ -49,14 +51,18 @@
     <path d="M4 18v-2a4 4 0 0 1 4-4h12" />
   </svg>
   <span class="truncate" title={source.name}>{source.name}</span>
+  <!-- Each caption names the consequence, not the agent's state. An empty source is
+       dropped from the composed body (and if every source is empty the send doesn't
+       happen at all); a pending one makes the send wait. -->
   {#if readiness === "empty"}
-    <!-- Names the consequence, not the agent's state: an empty source is dropped
-         from the composed body, and if every source is empty the send doesn't
-         happen at all. -->
     <span
       class="shrink-0 italic"
       title="This agent has no completed output, so it will be left out of the forward"
       >will be skipped</span
+    >
+  {:else if readiness === "pending"}
+    <span class="shrink-0 italic" title="Sending will wait for this agent's turn to finish"
+      >still generating</span
     >
   {/if}
   <button

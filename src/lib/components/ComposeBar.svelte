@@ -21,6 +21,7 @@
   import {
     flush,
     getCompose,
+    setAttachments,
     setContent,
     setSelection,
     type ComposeContent,
@@ -101,44 +102,99 @@
 
   // ── Attachments ─────────────────────────────────────────────────────────────
   // Dropped files staged on the backend; each chip carries the wire `Attachment`
-  // fields plus a local `id` for list keying / removal. Chips are **session-only**
-  // (deliberately not persisted in the compose snapshot): the load-time GC
-  // reclaims any staged-but-unsent file, so a restored chip would dangle at a
-  // deleted path — re-drop to re-attach.
+  // fields plus a local `id` for list keying / removal.
+  //
+  // **The compose snapshot is authoritative, not this component.** Chips persist
+  // across a project switch and a Git-view toggle (both of which unmount this bar),
+  // so every mutation writes through to `setAttachments`. Two consequences worth
+  // stating: a staging copy that finishes after this bar unmounts still belongs to
+  // the project it began under and lands in that project's snapshot; and the
+  // project loader must declare these paths (`draftAttachmentPaths`) or its GC
+  // reclaims the files behind chips we're still showing.
   type AttachmentChip = Attachment & { id: string };
-  let attachmentChips = $state<AttachmentChip[]>([]);
+  let attachmentChips = $state<AttachmentChip[]>(restoreChips(saved.attachments ?? []));
   let dragOver = $state(false);
-  // Per-kind label counters. Monotonic across a compose session: removing a chip
-  // never renumbers the survivors, so a label always refers to the same file.
-  const attachmentCounters: Record<AttachmentKind, number> = {
-    image: 0,
-    text: 0,
-    file: 0,
-    unknown: 0,
-  };
-  // Bumped whenever the chip set is committed (send) or abandoned (unmount).
-  // A staging result captures the generation it began under and is discarded if
-  // the generation has since moved on — so a slow copy can't land a chip in a
-  // composer that was already cleared. Plain, not `$state`: never rendered.
-  let composeGeneration = 0;
+  // Bumped only on send-clear. A staging result captures the generation it began
+  // under and is discarded if it has since moved on, so a slow copy can't
+  // resurrect a chip into a composer whose contents were already dispatched.
+  // Unmount deliberately does *not* bump: the result is still wanted, just in the
+  // snapshot rather than in this (dead) component's chip list.
+  let sendGeneration = 0;
+  let unmounted = false;
 
+  function restoreChips(attachments: Attachment[]): AttachmentChip[] {
+    return attachments.map((attachment) => ({ ...attachment, id: crypto.randomUUID() }));
+  }
+
+  function chipsToAttachments(chips: AttachmentChip[]): Attachment[] {
+    return chips.map(({ label, kind, path, original_name }) => ({
+      label,
+      kind,
+      path,
+      original_name,
+    }));
+  }
+
+  /// Next per-kind label, derived from the labels already present rather than a
+  /// running counter — a counter would restart at 1 on remount and collide with a
+  /// restored chip's label. Max-suffix + 1 keeps labels monotonic within a compose
+  /// session, so removing a chip never renumbers the survivors.
+  function nextLabel(kind: AttachmentKind, existing: Attachment[]): string {
+    const prefix = `${kind}-`;
+    let max = 0;
+    for (const attachment of existing) {
+      if (!attachment.label.startsWith(prefix)) continue;
+      const n = Number.parseInt(attachment.label.slice(prefix.length), 10);
+      if (Number.isFinite(n) && n > max) max = n;
+    }
+    return `${prefix}${max + 1}`;
+  }
+
+  /// Set the chip list and write it through. The only path that mutates chips
+  /// while this bar is mounted.
+  function commitChips(next: AttachmentChip[]): void {
+    attachmentChips = next;
+    setAttachments(projectId, chipsToAttachments(next));
+  }
+
+  /// Append a freshly staged file. Reads the snapshot (not `attachmentChips`) as
+  /// the base so it stays correct after this bar has unmounted.
   function addAttachmentChip(staged: { path: string; original_name: string }): void {
     const kind = classifyKind(staged.original_name);
-    attachmentCounters[kind] += 1;
-    attachmentChips = [
-      ...attachmentChips,
-      {
-        id: crypto.randomUUID(),
-        label: `${kind}-${attachmentCounters[kind]}`,
-        kind,
-        path: staged.path,
-        original_name: staged.original_name,
-      },
-    ];
+    const existing = getCompose(projectId).attachments ?? [];
+    const attachment: Attachment = {
+      label: nextLabel(kind, existing),
+      kind,
+      path: staged.path,
+      original_name: staged.original_name,
+    };
+    setAttachments(projectId, [...existing, attachment]);
+    if (!unmounted) {
+      attachmentChips = [...attachmentChips, { ...attachment, id: crypto.randomUUID() }];
+    }
   }
 
   function removeAttachmentChip(id: string): void {
-    attachmentChips = attachmentChips.filter((chip) => chip.id !== id);
+    commitChips(attachmentChips.filter((chip) => chip.id !== id));
+  }
+
+  /// Drop restored chips whose staged file no longer exists (a cleaned
+  /// `.switchboard/`, or an older build's GC). Only the *restored* paths are
+  /// candidates — a file attached while this check was in flight was never at risk
+  /// and must not be pruned by a stale answer.
+  async function pruneMissingAttachments(restored: Attachment[]): Promise<void> {
+    const candidates = new Set(restored.map((a) => a.path));
+    try {
+      const alive = new Set(await api.existingAttachmentPaths(projectId, [...candidates]));
+      if (unmounted) return;
+      const next = attachmentChips.filter(
+        (chip) => !candidates.has(chip.path) || alive.has(chip.path),
+      );
+      if (next.length !== attachmentChips.length) commitChips(next);
+    } catch {
+      // Leave the chips: a failed probe is not evidence the files are gone, and a
+      // genuinely missing file still surfaces as a send error.
+    }
   }
 
   // Forward sources: agents whose latest output is forwarded into this send (the
@@ -199,14 +255,15 @@
   /// attachments dir) and add a chip for it. A per-file failure surfaces in the
   /// send-error line and skips that file rather than aborting the rest.
   async function stageDroppedPaths(paths: string[]): Promise<void> {
-    const gen = composeGeneration;
+    const gen = sendGeneration;
     for (const path of paths) {
       try {
         const staged = await api.stageAttachment(projectId, path);
-        // The drop's compose session may have been sent or torn down while the
-        // copy was in flight; if so, discard the result rather than resurrecting
-        // a chip into a now-cleared (or different) composer.
-        if (gen !== composeGeneration) return;
+        // The drop's compose session may have been *sent* while the copy was in
+        // flight; if so, discard rather than resurrecting a chip into a cleared
+        // composer. An unmount is not a discard — `addAttachmentChip` writes to
+        // the originating project's snapshot either way.
+        if (gen !== sendGeneration) return;
         addAttachmentChip(staged);
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
@@ -222,6 +279,11 @@
   // coordinate mapping is platform/DPR-fragile and bought nothing for a single
   // drop target).
   onMount(() => {
+    // Restored chips are shown immediately (no flicker) and reconciled against
+    // disk in the background — a staged file can vanish out-of-band.
+    const restored = saved.attachments ?? [];
+    if (restored.length > 0) void pruneMissingAttachments(restored);
+
     // Guarded: `getCurrentWebview()` throws outside a Tauri webview (tests, any
     // non-Tauri host), where drag-drop simply isn't available.
     let dropSub: Promise<() => void> | undefined;
@@ -930,8 +992,10 @@
   onDestroy(() => {
     clearFileSearchTimer();
     fileSearchToken += 1;
-    // Abandon any in-flight staging for this (now unmounting) compose session.
-    composeGeneration += 1;
+    // In-flight staging is deliberately *not* abandoned: the copy belongs to this
+    // project's draft, and `addAttachmentChip` commits it to the snapshot whether
+    // or not this bar is still around to render the chip.
+    unmounted = true;
     // A mid-render unmount (project switch via the parent's `{#key}`) must not
     // leave the project's pane targeting frozen.
     setTargetingLocked(projectId, false);
@@ -1691,8 +1755,8 @@
         focusPromptFieldOnMount = false;
         appendedText = "";
         draft = "";
-        attachmentChips = [];
-        composeGeneration += 1;
+        commitChips([]);
+        sendGeneration += 1;
         mode = "plain";
         persistContentNow();
         return;
@@ -1738,8 +1802,8 @@
       draft = "";
       // Chips clear optimistically with the text (the optimistic user turn already
       // renders them); the staged files persist on disk for the send.
-      attachmentChips = [];
-      composeGeneration += 1;
+      commitChips([]);
+      sendGeneration += 1;
       mode = "plain";
       persistContentNow();
       return;
@@ -1755,8 +1819,8 @@
       dispatchForward(draft.trim(), [...forwardSources], attachments, [...selectedAgents]);
       draft = "";
       forwardSources = [];
-      attachmentChips = [];
-      composeGeneration += 1;
+      commitChips([]);
+      sendGeneration += 1;
       persistContentNow();
       return;
     }
@@ -1766,8 +1830,8 @@
     // message (recipients stay selected — sticky). Chips clear with the text;
     // their staged files persist on disk for the send.
     draft = "";
-    attachmentChips = [];
-    composeGeneration += 1;
+    commitChips([]);
+    sendGeneration += 1;
     persistContentNow();
   }
 

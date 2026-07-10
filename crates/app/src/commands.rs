@@ -2431,6 +2431,35 @@ pub async fn stage_attachment_impl(
         })?
 }
 
+/// Narrow `paths` to the staged attachments that still exist on disk.
+///
+/// Restoring a persisted compose draft must not resurrect a chip whose staged file
+/// was removed out-of-band (the user cleaned `.switchboard/`, or an older build's
+/// GC reclaimed it before drafts declared their references). The frontend prunes
+/// the survivors through this.
+///
+/// Scoped to the project's own attachments dir on purpose: without that check this
+/// would be a general "does this path exist" probe callable from the webview.
+/// A path outside the dir is dropped exactly like a missing one.
+pub fn existing_attachment_paths_impl(
+    state: &AppState,
+    project_id: ProjectId,
+    paths: Vec<String>,
+) -> Result<Vec<String>, AppError> {
+    let project = match lock(&state.projects).get(&project_id).cloned() {
+        Some(loaded) => loaded,
+        None => find_project_in_directories(state, project_id)?,
+    };
+    let attachments_dir = project.attachments_dir();
+    Ok(paths
+        .into_iter()
+        .filter(|path| {
+            let path = Path::new(path);
+            path.starts_with(&attachments_dir) && path.is_file()
+        })
+        .collect())
+}
+
 /// Select the harness adapter for an agent. Per-harness routing keyed on
 /// `agent.harness` — the substantive failure surface (routing Codex through the
 /// Claude adapter would silently spawn the wrong binary), pinned by the app
@@ -10901,6 +10930,43 @@ mod tests {
         assert!(
             !orphan.exists(),
             "unreferenced (orphan drop) file is deleted"
+        );
+    }
+
+    #[tokio::test]
+    async fn existing_attachment_paths_keeps_only_live_files_inside_the_project_dir() {
+        let (tmp, state, _) = fresh_state_with_mock();
+        let (_agent, project_id) = project_with_agent(&state, &tmp).await;
+
+        let source = tmp.path().join("live.png");
+        std::fs::write(&source, b"L").unwrap();
+        let live = stage_attachment_impl(&state, project_id, &source)
+            .await
+            .unwrap();
+
+        let project = lock(&state.projects).get(&project_id).cloned().unwrap();
+        let deleted = project.attachments_dir().join("gone.png");
+
+        // Outside the attachments dir but a real file: must still be rejected, or
+        // this command becomes a filesystem-probe surface for the webview.
+        let outside = tmp.path().join("outside.png");
+        std::fs::write(&outside, b"O").unwrap();
+
+        let kept = existing_attachment_paths_impl(
+            &state,
+            project_id,
+            vec![
+                live.path.clone(),
+                deleted.to_string_lossy().into_owned(),
+                outside.to_string_lossy().into_owned(),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            kept,
+            vec![live.path],
+            "only the staged file that still exists under the project's attachments dir survives"
         );
     }
 

@@ -122,6 +122,11 @@ beforeEach(async () => {
           original_name: name,
         };
       }
+      // Restored chips are reconciled against disk on mount. Default: every
+      // declared path still exists, so nothing is pruned.
+      if (cmd === "existing_attachment_paths") {
+        return (args as { paths?: string[] })?.paths ?? [];
+      }
       return null;
     },
   );
@@ -1812,6 +1817,161 @@ describe("ComposeBar — attachment lifecycle", () => {
     expect(err.textContent).toContain("Couldn't attach");
     expect(err.textContent).toContain("diagram.png");
     expect(screen.queryByTestId("attachment-chip-image-1")).toBeNull();
+  });
+});
+
+describe("ComposeBar — attachments survive navigation", () => {
+  it("restores a staged chip after an unmount/remount (project switch, Git view)", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    const { unmount } = render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+
+    fireDrop(["/a/diagram.png"]);
+    await screen.findByTestId("attachment-chip-image-1");
+    unmount();
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    expect(await screen.findByTestId("attachment-chip-image-1")).toBeInTheDocument();
+  });
+
+  it("does not restore chips after a successful send", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    invokeMock.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "stage_attachment") {
+        return { path: "/p/attachments/uuid__diagram.png", original_name: "diagram.png" };
+      }
+      if (cmd === "send_message") return "msg-1";
+      if (cmd === "existing_attachment_paths") return (args as { paths?: string[] })?.paths ?? [];
+      return null;
+    });
+    const { unmount } = render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+
+    fireDrop(["/a/diagram.png"]);
+    await screen.findByTestId("attachment-chip-image-1");
+    await fireEvent.click(screen.getByTestId("compose-send"));
+    await waitFor(() =>
+      expect(invokeMock.mock.calls.some(([c]) => c === "send_message")).toBe(true),
+    );
+    unmount();
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await tick();
+    expect(screen.queryByTestId("attachment-chip-image-1")).toBeNull();
+  });
+
+  it("commits a staging result that resolves after unmount to the originating project", async () => {
+    // A project switch tears down the bar mid-copy. The file was staged *for this
+    // project*, so it belongs in this project's snapshot — not discarded, and not
+    // leaked into whichever project the user switched to.
+    const state = await loadState();
+    const composeStore = await loadComposeStore();
+    await state.registerAgent(AGENT_A);
+
+    let releaseStage: (() => void) | undefined;
+    const staged = new Promise<void>((r) => (releaseStage = r));
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "stage_attachment") {
+        await staged;
+        return { path: "/p/attachments/uuid__late.png", original_name: "late.png" };
+      }
+      return null;
+    });
+
+    const { unmount } = render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    fireDrop(["/a/late.png"]);
+    unmount();
+
+    releaseStage?.();
+    await waitFor(() =>
+      expect(composeStore.getCompose(PROJECT_ID).attachments).toEqual([
+        {
+          label: "image-1",
+          kind: "image",
+          path: "/p/attachments/uuid__late.png",
+          original_name: "late.png",
+        },
+      ]),
+    );
+  });
+
+  it("numbers a chip attached after a restore without colliding with the restored label", async () => {
+    // A per-component counter would restart at 1 on remount and produce two
+    // `image-1` chips — and the label is what the user types into the message.
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    const { unmount } = render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    fireDrop(["/a/first.png"]);
+    await screen.findByTestId("attachment-chip-image-1");
+    unmount();
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await screen.findByTestId("attachment-chip-image-1");
+    fireDrop(["/a/second.png"]);
+
+    expect(await screen.findByTestId("attachment-chip-image-2")).toBeInTheDocument();
+  });
+
+  it("prunes a restored chip whose staged file no longer exists", async () => {
+    const state = await loadState();
+    const composeStore = await loadComposeStore();
+    await state.registerAgent(AGENT_A);
+    composeStore.setAttachments(PROJECT_ID, [
+      {
+        label: "image-1",
+        kind: "image",
+        path: "/p/attachments/gone.png",
+        original_name: "gone.png",
+      },
+    ]);
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "existing_attachment_paths") return []; // the file vanished
+      return null;
+    });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+
+    await waitFor(() => expect(screen.queryByTestId("attachment-chip-image-1")).toBeNull());
+    expect(composeStore.getCompose(PROJECT_ID).attachments).toBeUndefined();
+  });
+
+  it("does not prune a chip attached while the existence probe was in flight", async () => {
+    // The probe answers about the *restored* paths only. A stale answer must not
+    // sweep away a file the user dropped a moment ago.
+    const state = await loadState();
+    const composeStore = await loadComposeStore();
+    await state.registerAgent(AGENT_A);
+    composeStore.setAttachments(PROJECT_ID, [
+      {
+        label: "image-1",
+        kind: "image",
+        path: "/p/attachments/gone.png",
+        original_name: "gone.png",
+      },
+    ]);
+
+    let releaseProbe: (() => void) | undefined;
+    const probe = new Promise<void>((r) => (releaseProbe = r));
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "existing_attachment_paths") {
+        await probe;
+        return [];
+      }
+      if (cmd === "stage_attachment") {
+        return { path: "/p/attachments/uuid__fresh.png", original_name: "fresh.png" };
+      }
+      return null;
+    });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    fireDrop(["/a/fresh.png"]);
+    await screen.findByTestId("attachment-chip-image-2");
+
+    releaseProbe?.();
+
+    // The restored (missing) chip goes; the freshly attached one stays.
+    await waitFor(() => expect(screen.queryByTestId("attachment-chip-image-1")).toBeNull());
+    expect(screen.getByTestId("attachment-chip-image-2")).toBeInTheDocument();
   });
 });
 

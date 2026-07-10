@@ -380,6 +380,16 @@ export async function stageAttachment(
   return await invoke<StagedAttachment>("stage_attachment", { projectId, sourcePath });
 }
 
+// Narrow staged paths to those that still exist under this project's attachments
+// dir. A restored draft prunes its chips through this, so a chip whose file was
+// removed out-of-band (a cleaned `.switchboard/`) doesn't dangle in the composer.
+export async function existingAttachmentPaths(
+  projectId: ProjectId,
+  paths: string[],
+): Promise<string[]> {
+  return await invoke<string[]>("existing_attachment_paths", { projectId, paths });
+}
+
 // Cancel a whole send across its recipients (send-scoped, actor-decided): each
 // recipient cancels its in-flight turn iff it belongs to `sendId` and drops any
 // still-queued item of the send, never touching a later, unrelated turn. The

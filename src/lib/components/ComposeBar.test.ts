@@ -2466,6 +2466,69 @@ describe("ComposeBar — cross-agent forward", () => {
     });
   });
 
+  it("dispatches the resolved forward body verbatim to a busy recipient", async () => {
+    // The frontend half of the forward↔queue seam: the backend resolves a forward
+    // into literal text, and the frontend dispatches *that string* through the
+    // normal send path. A busy recipient therefore queues a send whose payload is
+    // already the source's snapshotted output — `send_message` never carries a
+    // reference to the source, so nothing can be re-resolved when the queued send
+    // finally dispatches.
+    const FORWARDED_BODY =
+      "=== START forwarded from bob ===\nREVIEWER-OLD\n=== END forwarded from bob ===";
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    await seedCompletedTurn(AGENT_B.id);
+
+    // Put recipient A genuinely mid-turn: its send is dispatched *and* the backend
+    // has confirmed the turn started. `turn_start` is what moves the runtime to
+    // "processing" and consumes the running send's pending entry — without it A
+    // would sit in "starting" with its entry still queued, a different state.
+    state.dispatchUserTurn(AGENT_A.id, "user-running", "long task", [], "send-running");
+    fireTo(`agent:${AGENT_A.id}`, {
+      type: "turn_start",
+      turn_id: "t-running",
+      message_id: "msg-running",
+      send_id: "send-running",
+      started_at: "2026-05-16T00:00:00Z",
+    });
+    await tick();
+    expect(state.runtimes[AGENT_A.id]?.run_status).toBe("processing");
+    expect(state.runtimes[AGENT_A.id]?.pending_sends ?? []).toHaveLength(0);
+
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "forward_message")
+        return { status: "resolved", body: FORWARDED_BODY, skipped: [] };
+      if (cmd === "send_message") return "msg-fwd";
+      return null;
+    });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    await pickForwardSource(AGENT_B.id);
+    await fireEvent.click(screen.getByTestId("compose-send"));
+
+    await waitFor(() => {
+      expect(invokeMock.mock.calls.filter(([c]) => c === "send_message")).toHaveLength(1);
+    });
+
+    const [, args] = invokeMock.mock.calls.find(([c]) => c === "send_message") as [
+      string,
+      Record<string, unknown>,
+    ];
+    expect(args.prompt).toBe(FORWARDED_BODY);
+    expect(args.agentId).toBe(AGENT_A.id);
+
+    // It lines up behind the running turn rather than replacing it: exactly one
+    // queued send, and A keeps streaming its current response. The optimistic user
+    // turn shows the same literal body.
+    expect(state.runtimes[AGENT_A.id]?.pending_sends ?? []).toHaveLength(1);
+    expect(state.runtimes[AGENT_A.id]?.run_status).toBe("processing");
+    const queuedTurn = (state.transcripts[AGENT_A.id] ?? [])
+      .filter((t) => t.role === "user")
+      .at(-1);
+    expect(queuedTurn && "text" in queuedTurn ? queuedTurn.text : undefined).toBe(FORWARDED_BODY);
+  });
+
   it("warns on an idle-empty source, naming the consequence", async () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);

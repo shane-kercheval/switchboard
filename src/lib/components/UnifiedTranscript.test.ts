@@ -2712,14 +2712,15 @@ describe("UnifiedTranscript compact mode", () => {
     expect(markers).toHaveLength(1);
     expect(markers[0]).toHaveAttribute("data-agent-id", CLAUDE_AGENT.id);
     expect(markers[0]!.querySelector('[data-testid="turn-agent-name"]')).not.toBeNull();
-    // The disclosure carries the recap behind a label, COLLAPSED by default — a
-    // regression that adds `open` (flooding long transcripts with full recaps)
-    // must fail here. `toHaveTextContent` alone wouldn't catch it: a closed
-    // `<details>` still keeps its body text in the DOM.
-    const details = screen.getByTestId("compaction-marker");
-    expect(details).not.toHaveAttribute("open");
-    expect(details).toHaveTextContent("Conversation compacted");
-    expect(details).toHaveTextContent("the recap text");
+    // The recap sits behind the label, COLLAPSED by default — a regression
+    // that mounts it open would flood long transcripts with full recaps. The
+    // body renders only while open, so its absence is the collapsed proof.
+    const marker = screen.getByTestId("compaction-marker");
+    expect(marker).toHaveTextContent("Conversation compacted");
+    expect(screen.queryByTestId("compaction-body")).toBeNull();
+
+    await fireEvent.click(within(marker).getByTestId("compaction-row"));
+    expect(screen.getByTestId("compaction-body")).toHaveTextContent("the recap text");
   });
 
   it("renders a slash-command marker with the command text", async () => {

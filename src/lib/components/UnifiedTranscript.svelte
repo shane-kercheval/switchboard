@@ -45,7 +45,7 @@
   import { shortcut } from "$lib/platform";
   import { HARNESS_COLOR } from "$lib/harnessDisplay";
   import Badge from "$lib/components/ui/Badge.svelte";
-  import Disclosure from "$lib/components/ui/Disclosure.svelte";
+  import CompactionMarker from "$lib/components/CompactionMarker.svelte";
   import HarnessIcon from "$lib/components/ui/HarnessIcon.svelte";
   import Markdown from "$lib/components/ui/Markdown.svelte";
   import CopyButton from "$lib/components/ui/CopyButton.svelte";
@@ -1002,7 +1002,7 @@
   {/if}
 {/snippet}
 
-<!-- Disclosure shown above a collapsed body when tool calls / reasoning are
+<!-- Indicator shown above a collapsed body when tool calls / reasoning are
      hidden — the cue a fade can't give. Always visible (it's signalling, not
      chrome) and clickable to expand the whole response. -->
 {#snippet hiddenItemsIndicator(key: string, label: string)}
@@ -1503,12 +1503,11 @@
 {/snippet}
 
 <!-- An agent-scoped inter-turn marker (compaction). Attributed to its agent (name
-     + harness icon + the agent's lane border), then rendered as a tool-style
-     `Disclosure` (gray box, chevron, collapsed by default) — the recap is a large
-     verbatim harness block the user rarely needs expanded. No status icon: a
-     compaction has no success/error state, so the header carries only the label.
-     NOT a project-wide centered divider — in a multi-agent project that would
-     misread as "the project compacted" and sever the per-agent lanes. -->
+     + harness icon + the agent's lane border), then rendered as a collapsed row
+     in the same grammar as tool calls and thinking — the recap is a large
+     verbatim harness block the user rarely needs expanded. NOT a project-wide
+     centered divider — in a multi-agent project that would misread as "the
+     project compacted" and sever the per-agent lanes. -->
 {#snippet systemMarkerRow(row: Extract<UnifiedRow, { kind: "system_marker" }>)}
   {@const harness = agentById[row.agent_id]?.harness}
   <div
@@ -1523,18 +1522,7 @@
     </div>
     <div class="border-l-[0.5px] pl-3" style:border-left-color={agentBorderColor(row.agent_id)}>
       {#if row.marker.marker_kind === "compaction"}
-        <Disclosure testid="compaction-marker">
-          {#snippet header()}
-            <span class="text-muted shrink-0 text-[10px] font-semibold tracking-wide uppercase">
-              Conversation compacted
-            </span>
-          {/snippet}
-          <div class="border-border/70 border-t px-2.5 py-2">
-            <pre
-              class="text-muted max-h-44 overflow-y-auto font-mono text-xs whitespace-pre-wrap">{row
-                .marker.summary}</pre>
-          </div>
-        </Disclosure>
+        <CompactionMarker summary={row.marker.summary} />
       {:else if row.marker.marker_kind === "slash_command"}
         <!-- A state-changing slash command the harness ran (e.g. `/compact`).
              Shown so the user sees it happened; carries no correlating content. -->

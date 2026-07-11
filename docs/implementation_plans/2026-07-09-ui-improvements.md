@@ -580,9 +580,10 @@ shipped:
   file path(s), the pattern, a todo summary — with the input preview kept only for MCP/generic
   facets. The raw tool name moved into the expanded raw-input section's label, so provenance stays
   reachable.
-- **`ThinkingWidget` restyled to the same row grammar** (brain icon · "Thinking" · muted preview ·
-  chevron; expanded body on `panel`, mounted lazily) so reasoning blocks sit in the same visual set
-  as the tool rows around them. `ui/Disclosure` remains for the compaction marker.
+- **`ThinkingWidget` and the compaction marker restyled to the same row grammar** (icon · label ·
+  muted preview · chevron; lazy body behind the left rule) so every transcript collapsible shares
+  one visual language. The compaction marker became `CompactionMarker.svelte`, which left
+  `ui/Disclosure` with zero consumers — it is deleted.
 - **Tool-row diffs are always unified**, ignoring the user's `diff_style` preference: side-by-side
   needs a 48rem minimum width, which cannot fit the row's 600px content cap without horizontal
   scrolling. The Git view still honors the preference.

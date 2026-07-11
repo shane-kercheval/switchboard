@@ -208,6 +208,10 @@ pub enum TurnItem {
         kind: ToolKind,
         name: String,
         input: serde_json::Value,
+        /// Normalized operation kind, stamped by the same per-harness
+        /// classifier the live stream parser uses — the two paths must
+        /// produce the same facet for the same logical call.
+        facet: crate::facets::ToolFacet,
         output: Option<String>,
         is_error: Option<bool>,
         started_at: DateTime<Utc>,
@@ -380,6 +384,7 @@ mod tests {
                     text: "thinking out loud".to_owned(),
                 },
                 TurnItem::Tool {
+                    facet: crate::facets::ToolFacet::Other,
                     tool_use_id: "tool_1".to_owned(),
                     kind: ToolKind::Builtin,
                     name: "Bash".to_owned(),

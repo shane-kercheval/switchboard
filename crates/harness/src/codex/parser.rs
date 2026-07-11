@@ -23,6 +23,7 @@ use serde_json::Value;
 use crate::events::{
     AdapterEvent, ContentKind, FailureKind, ToolKind, TurnId, TurnOutcome, TurnUsage,
 };
+use crate::facets::ToolFacet;
 use crate::parser::ParseOutcome;
 
 /// Per-dispatch state held by the Codex producer task.
@@ -114,13 +115,28 @@ fn parse_item_started(obj: &Value, turn_id: TurnId) -> ParseOutcome {
     };
 
     match item_type {
-        "command_execution" => ParseOutcome::Event(AdapterEvent::ToolStarted {
-            turn_id,
-            tool_use_id: id.to_owned(),
-            kind: ToolKind::Builtin,
-            name: "command_execution".to_owned(),
-            input: item.get("command").cloned().unwrap_or(Value::Null),
-        }),
+        "command_execution" => {
+            let input = item.get("command").cloned().unwrap_or(Value::Null);
+            // Live `command` is the wrapped string (`/bin/zsh -lc '…'`); the
+            // session file's `exec_command` carries the raw command + workdir.
+            // Same Shell facet either way — the spelling divergence is
+            // documented in harness-behavior §3.6.
+            let facet = match input.as_str() {
+                Some(command) => ToolFacet::Shell {
+                    command: command.to_owned(),
+                    cwd: None,
+                },
+                None => ToolFacet::Other,
+            };
+            ParseOutcome::Event(AdapterEvent::ToolStarted {
+                turn_id,
+                tool_use_id: id.to_owned(),
+                kind: ToolKind::Builtin,
+                name: "command_execution".to_owned(),
+                input,
+                facet,
+            })
+        }
         "mcp_tool_call" => {
             let server = item.get("server").and_then(Value::as_str).unwrap_or("");
             let tool = item.get("tool").and_then(Value::as_str).unwrap_or("");
@@ -128,10 +144,26 @@ fn parse_item_started(obj: &Value, turn_id: TurnId) -> ParseOutcome {
                 turn_id,
                 tool_use_id: id.to_owned(),
                 kind: ToolKind::Mcp,
+                facet: ToolFacet::Mcp {
+                    server: server.to_owned(),
+                    tool: tool.to_owned(),
+                },
                 name: format!("{server}.{tool}"),
                 input: item.get("arguments").cloned().unwrap_or(Value::Null),
             })
         }
+        // A structured edit announcement: paths + change-kinds, NO content
+        // (that lives only in the session file — the adapter upgrades this
+        // facet at turn end from the enrichment read). Previously this item
+        // type fell into the skip arm and Codex edits were invisible live.
+        "file_change" => ParseOutcome::Event(AdapterEvent::ToolStarted {
+            turn_id,
+            tool_use_id: id.to_owned(),
+            kind: ToolKind::Builtin,
+            facet: super::facets::file_change_facet(item),
+            name: "file_change".to_owned(),
+            input: item.get("changes").cloned().unwrap_or(Value::Null),
+        }),
         _ => ParseOutcome::Skip,
     }
 }
@@ -194,6 +226,20 @@ fn parse_item_completed(obj: &Value, turn_id: TurnId) -> ParseOutcome {
                 tool_use_id: id.to_owned(),
                 output,
                 is_error,
+            })
+        }
+        "file_change" => {
+            let Some(id) = item.get("id").and_then(Value::as_str) else {
+                return ParseOutcome::Skip;
+            };
+            // The completed item repeats `changes` + a status; there is no
+            // textual output on this channel (patch stdout lives in the
+            // session file).
+            ParseOutcome::Event(AdapterEvent::ToolCompleted {
+                turn_id,
+                tool_use_id: id.to_owned(),
+                output: String::new(),
+                is_error: item.get("status").and_then(Value::as_str) == Some("failed"),
             })
         }
         _ => ParseOutcome::Skip,
@@ -984,5 +1030,40 @@ mod tests {
             }
             other => panic!("expected ToolCompleted with is_error=true, got {other:?}"),
         }
+    }
+
+    // --- Fixture-driven facet coverage: recorded @ codex 0.143.0 (probe 2026-07-10) ---
+
+    #[test]
+    fn file_change_fixture_emits_edit_facet_without_content() {
+        use crate::facets::{EditChange, ToolFacet};
+        let (events, _) = parse_fixture("file-change.jsonl");
+        let started = events
+            .iter()
+            .find_map(|e| match e {
+                AdapterEvent::ToolStarted {
+                    tool_use_id,
+                    name,
+                    facet,
+                    ..
+                } if name == "file_change" => Some((tool_use_id.clone(), facet.clone())),
+                _ => None,
+            })
+            .expect("file_change ToolStarted");
+        let ToolFacet::Edit { files } = started.1 else {
+            panic!("expected Edit facet");
+        };
+        assert_eq!(files.len(), 2);
+        assert!(files[0].path.ends_with("alpha.txt"));
+        assert_eq!(files[0].change, EditChange::Modified);
+        assert!(files[0].edits.is_empty(), "live channel carries no content");
+        assert!(files[1].path.ends_with("zeta.txt"));
+        assert_eq!(files[1].change, EditChange::Added);
+        // The completion pairs by the same id and is not an error.
+        assert!(events.iter().any(|e| matches!(
+            e,
+            AdapterEvent::ToolCompleted { tool_use_id, is_error: false, .. }
+                if *tool_use_id == started.0
+        )));
     }
 }

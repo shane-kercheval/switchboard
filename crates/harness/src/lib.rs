@@ -20,6 +20,7 @@ pub mod antigravity;
 pub mod claude_code;
 pub mod codex;
 pub mod events;
+pub mod facets;
 pub mod forward;
 pub mod gemini;
 pub mod meta_sidecar;
@@ -43,6 +44,7 @@ pub use events::{
     MessageId, NormalizedEvent, RateLimitSource, ToolKind, TurnId, TurnOutcome, TurnSpend,
     TurnUsage,
 };
+pub use facets::{EditChange, EditPair, EditedFile, TodoItem, ToolFacet};
 pub use forward::{ForwardedBlock, compose_forwarded_message, latest_completed_agent_text};
 pub use gemini::GeminiAdapter;
 pub use gemini::session_file::{

@@ -6,6 +6,7 @@ import ToolCallWidget from "./ToolCallWidget.svelte";
 
 const running: ToolCall = {
   item_kind: "tool",
+  facet: { facet_kind: "other" },
   tool_use_id: "t1",
   kind: "builtin",
   name: "Bash",

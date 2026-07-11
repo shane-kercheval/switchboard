@@ -760,6 +760,7 @@ fn parse_assistant_envelope(obj: &Value, turn_id: TurnId, state: &mut ParserStat
                     turn_id,
                     tool_use_id: id.to_owned(),
                     kind: classify_claude_tool_kind(name),
+                    facet: crate::claude_code::facets::classify_claude_tool_facet(name, &input),
                     name: name.to_owned(),
                     input,
                 });

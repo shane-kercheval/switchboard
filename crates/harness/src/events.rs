@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use switchboard_core::{AgentId, SendId, SessionLocator};
 use uuid::Uuid;
 
+use crate::facets::ToolFacet;
+
 /// UUID v7 turn identifier — consistent with `AgentId` and `ProjectId`.
 pub type TurnId = Uuid;
 
@@ -188,7 +190,8 @@ pub struct TurnSpend {
 /// dispatcher-owned and synthesized before the stream is established. Excluding
 /// it here makes the invariant type-enforced: no adapter author can accidentally emit it.
 ///
-/// Variant scope: `ContentChunk`, `ToolStarted`, `ToolCompleted`, `TurnEnd` are
+/// Variant scope: `ContentChunk`, `ToolStarted`, `ToolCompleted`,
+/// `ToolFacetUpdated`, `TurnEnd` are
 /// turn-scoped (the `turn_id` self-discriminates the agent via the transcript
 /// map). `SessionMeta`, `RateLimitEvent` are agent-scoped and carry `agent_id`
 /// in the payload because they reach the frontend, which keys them by agent.
@@ -230,12 +233,27 @@ pub enum AdapterEvent {
         kind: ToolKind,
         name: String,
         input: serde_json::Value,
+        /// Normalized operation kind (see [`crate::facets::ToolFacet`]).
+        /// Computed by the harness's classifier at tool start; the raw
+        /// `name`/`input` above remain the provenance escape hatch.
+        facet: ToolFacet,
     },
     ToolCompleted {
         turn_id: TurnId,
         tool_use_id: String,
         output: String,
         is_error: bool,
+    },
+    /// Replaces an already-emitted tool call's facet with a richer one.
+    /// Codex-only today: its live `file_change` item carries paths but no
+    /// content, so the edit content arrives from the turn-end session-file
+    /// re-read after the tool row already exists (see
+    /// `docs/harness-behavior.md` §3.6). Emitted before the turn's `TurnEnd`;
+    /// a `tool_use_id` with no live row is ignored by the consumer.
+    ToolFacetUpdated {
+        turn_id: TurnId,
+        tool_use_id: String,
+        facet: ToolFacet,
     },
     TurnEnd {
         turn_id: TurnId,
@@ -387,12 +405,25 @@ pub enum NormalizedEvent {
         kind: ToolKind,
         name: String,
         input: serde_json::Value,
+        /// Normalized operation kind — the renderer's stable verb source.
+        /// See [`crate::facets::ToolFacet`]; unknown `facet_kind`s must
+        /// degrade to the generic (`other`) rendering path on the TS side.
+        facet: ToolFacet,
     },
     ToolCompleted {
         turn_id: TurnId,
         tool_use_id: String,
         output: String,
         is_error: bool,
+    },
+    /// Late facet enrichment for an already-rendered tool call (Codex edit
+    /// content arriving from the turn-end session-file read — see
+    /// [`AdapterEvent::ToolFacetUpdated`]). The frontend replaces the matching
+    /// item's facet in place; an unmatched `tool_use_id` is dropped.
+    ToolFacetUpdated {
+        turn_id: TurnId,
+        tool_use_id: String,
+        facet: ToolFacet,
     },
     TurnEnd {
         turn_id: TurnId,
@@ -515,6 +546,7 @@ impl AdapterEvent {
             | AdapterEvent::TurnIdentity { .. }
             | AdapterEvent::ToolStarted { .. }
             | AdapterEvent::ToolCompleted { .. }
+            | AdapterEvent::ToolFacetUpdated { .. }
             | AdapterEvent::TurnEnd { .. } => true,
             AdapterEvent::RateLimitEvent { .. }
             | AdapterEvent::SessionMeta { .. }
@@ -554,12 +586,23 @@ impl AdapterEvent {
                 kind,
                 name,
                 input,
+                facet,
             } => NormalizedEvent::ToolStarted {
                 turn_id,
                 tool_use_id,
                 kind,
                 name,
                 input,
+                facet,
+            },
+            AdapterEvent::ToolFacetUpdated {
+                turn_id,
+                tool_use_id,
+                facet,
+            } => NormalizedEvent::ToolFacetUpdated {
+                turn_id,
+                tool_use_id,
+                facet,
             },
             AdapterEvent::ToolCompleted {
                 turn_id,
@@ -958,6 +1001,7 @@ mod tests {
             turn_id: fresh_turn_id(),
             tool_use_id: "toolu_abc".to_owned(),
             kind: ToolKind::Builtin,
+            facet: ToolFacet::Other,
             name: "Bash".to_owned(),
             input: json!({"command": "ls"}),
         };
@@ -977,6 +1021,7 @@ mod tests {
             turn_id: fresh_turn_id(),
             tool_use_id: "toolu_xyz".to_owned(),
             kind: ToolKind::Mcp,
+            facet: ToolFacet::Other,
             name: "mcp__server__action".to_owned(),
             input: json!({}),
         };
@@ -999,6 +1044,39 @@ mod tests {
         assert_eq!(value["tool_use_id"], "toolu_abc");
         assert_eq!(value["output"], "hello\n");
         assert_eq!(value["is_error"], false);
+        let parsed: NormalizedEvent = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed, event);
+    }
+
+    // Pins the one new wire-crossing contract facets add: if the event's
+    // discriminant or payload keys drift, the frontend silently stops
+    // receiving Codex facet upgrades while both sides' own tests keep
+    // passing — this is the only test that watches the seam.
+    #[test]
+    fn tool_facet_updated_wire_shape() {
+        let event = NormalizedEvent::ToolFacetUpdated {
+            turn_id: fresh_turn_id(),
+            tool_use_id: "item_4".to_owned(),
+            facet: ToolFacet::Edit {
+                files: vec![crate::facets::EditedFile {
+                    path: "/tmp/alpha.txt".to_owned(),
+                    change: crate::facets::EditChange::Modified,
+                    edits: vec![crate::facets::EditPair {
+                        old: "foo".to_owned(),
+                        new: "bar".to_owned(),
+                    }],
+                    truncated: false,
+                }],
+            },
+        };
+        let value = serde_json::to_value(&event).unwrap();
+        assert_eq!(value["type"], "tool_facet_updated");
+        assert_eq!(value["tool_use_id"], "item_4");
+        assert_eq!(value["facet"]["facet_kind"], "edit");
+        assert_eq!(value["facet"]["files"][0]["path"], "/tmp/alpha.txt");
+        assert_eq!(value["facet"]["files"][0]["change"], "modified");
+        assert_eq!(value["facet"]["files"][0]["edits"][0]["old"], "foo");
+        assert_eq!(value["facet"]["files"][0]["edits"][0]["new"], "bar");
         let parsed: NormalizedEvent = serde_json::from_value(value).unwrap();
         assert_eq!(parsed, event);
     }
@@ -1184,6 +1262,7 @@ mod tests {
             turn_id: fresh_turn_id(),
             tool_use_id: "t".to_owned(),
             kind: ToolKind::Builtin,
+            facet: ToolFacet::Other,
             name: "Bash".to_owned(),
             input: json!({}),
         };

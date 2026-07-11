@@ -104,6 +104,7 @@ describe("transcriptReducer", () => {
       turns = reduce(turns, contentChunk(TURN_1, "before "));
       turns = reduce(turns, {
         type: "tool_started",
+        facet: { facet_kind: "other" },
         turn_id: TURN_1,
         tool_use_id: "tool-1",
         kind: "builtin",
@@ -158,6 +159,7 @@ describe("transcriptReducer", () => {
     function toolStarted(turnId: string, toolUseId: string, name = "Bash"): NormalizedEvent {
       return {
         type: "tool_started",
+        facet: { facet_kind: "other" },
         turn_id: turnId,
         tool_use_id: toolUseId,
         kind: "builtin",
@@ -189,6 +191,7 @@ describe("transcriptReducer", () => {
       const item = turn.items[0];
       expect(item).toMatchObject({
         item_kind: "tool",
+        facet: { facet_kind: "other" },
         tool_use_id: "tool-1",
         kind: "builtin",
         name: "Bash",
@@ -197,6 +200,56 @@ describe("transcriptReducer", () => {
       if (item?.item_kind !== "tool") throw new Error("unreachable");
       expect(item.output).toBeUndefined();
       expect(item.completed_at).toBeUndefined();
+    });
+
+    it("tool_facet_updated swaps the facet in place, preserving completion fields", () => {
+      // The real Codex sequence: the upgrade arrives from the turn-end
+      // session-file read, strictly after the tool started AND completed
+      // live (but before turn_end, so the turn is still streaming). The
+      // swap must not clobber the completion's output/error/timestamp —
+      // that preservation is a contract, not an accident of the spread.
+      let turns = reduce([], turnStart(TURN_1));
+      turns = reduce(turns, toolStarted(TURN_1, "tool-1"));
+      turns = reduce(turns, toolCompleted(TURN_1, "tool-1", "patched ok", false));
+      turns = reduce(turns, {
+        type: "tool_facet_updated",
+        turn_id: TURN_1,
+        tool_use_id: "tool-1",
+        facet: {
+          facet_kind: "edit",
+          files: [
+            {
+              path: "/tmp/a.txt",
+              change: "modified",
+              edits: [{ old: "foo", new: "bar" }],
+              truncated: false,
+            },
+          ],
+        },
+      });
+      const turn = turns[0];
+      if (turn?.role !== "agent") throw new Error("unreachable");
+      expect(turn.items[0]).toMatchObject({
+        item_kind: "tool",
+        tool_use_id: "tool-1",
+        facet: { facet_kind: "edit" },
+        output: "patched ok",
+        is_error: false,
+        completed_at: RECEIVED_AT,
+      });
+    });
+
+    it("tool_facet_updated for an unknown tool_use_id is dropped without error", () => {
+      let turns = reduce([], turnStart(TURN_1));
+      turns = reduce(turns, toolStarted(TURN_1, "tool-1"));
+      const before = turns;
+      turns = reduce(turns, {
+        type: "tool_facet_updated",
+        turn_id: TURN_1,
+        tool_use_id: "no-such-tool",
+        facet: { facet_kind: "other" },
+      });
+      expect(turns).toBe(before);
     });
 
     it("populates output/is_error/completed_at on tool_completed", () => {
@@ -534,6 +587,7 @@ describe("transcriptReducer", () => {
       let turns = reduce([], turnStart(TURN_1));
       turns = reduce(turns, {
         type: "tool_started",
+        facet: { facet_kind: "other" },
         turn_id: TURN_1,
         tool_use_id: "tool-done",
         kind: "builtin",
@@ -549,6 +603,7 @@ describe("transcriptReducer", () => {
       });
       turns = reduce(turns, {
         type: "tool_started",
+        facet: { facet_kind: "other" },
         turn_id: TURN_1,
         tool_use_id: "tool-pending",
         kind: "builtin",
@@ -583,6 +638,7 @@ describe("transcriptReducer", () => {
       let turns = reduce([], turnStart(TURN_1));
       turns = reduce(turns, {
         type: "tool_started",
+        facet: { facet_kind: "other" },
         turn_id: TURN_1,
         tool_use_id: "tool-done",
         kind: "builtin",
@@ -598,6 +654,7 @@ describe("transcriptReducer", () => {
       });
       turns = reduce(turns, {
         type: "tool_started",
+        facet: { facet_kind: "other" },
         turn_id: TURN_1,
         tool_use_id: "tool-pending",
         kind: "builtin",
@@ -790,6 +847,7 @@ describe("transcriptReducer", () => {
             items: [
               {
                 item_kind: "tool",
+                facet: { facet_kind: "other" },
                 tool_use_id: "t1",
                 kind: "builtin",
                 name: "Bash",
@@ -1188,6 +1246,7 @@ describe("transcriptReducer", () => {
         turns,
         {
           type: "tool_started",
+          facet: { facet_kind: "other" },
           turn_id: TURN_1,
           tool_use_id: "tool-1",
           kind: "builtin",

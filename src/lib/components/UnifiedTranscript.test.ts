@@ -318,6 +318,7 @@ describe("UnifiedTranscript", () => {
           { item_kind: "text", kind: "text", text: "Running… " },
           {
             item_kind: "tool",
+            facet: { facet_kind: "other" },
             tool_use_id: "tool-1",
             kind: "builtin",
             name: "Bash",
@@ -364,6 +365,7 @@ describe("UnifiedTranscript", () => {
         items: [
           {
             item_kind: "tool",
+            facet: { facet_kind: "other" },
             tool_use_id: "empty-tool",
             kind: "builtin",
             name: "read_file",
@@ -403,6 +405,7 @@ describe("UnifiedTranscript", () => {
         items: [
           {
             item_kind: "tool",
+            facet: { facet_kind: "other" },
             tool_use_id: "tool-1",
             kind: "builtin",
             name: "Bash",
@@ -440,6 +443,7 @@ describe("UnifiedTranscript", () => {
         items: [
           {
             item_kind: "tool",
+            facet: { facet_kind: "other" },
             tool_use_id: "tool-error",
             kind: "builtin",
             name: "Read",
@@ -473,6 +477,7 @@ describe("UnifiedTranscript", () => {
         items: [
           {
             item_kind: "tool",
+            facet: { facet_kind: "other" },
             tool_use_id: "tool-running",
             kind: "builtin",
             name: "Bash",
@@ -1020,6 +1025,7 @@ describe("UnifiedTranscript — fan-out groups", () => {
         items: [
           {
             item_kind: "tool",
+            facet: { facet_kind: "other" },
             tool_use_id: "t1",
             kind: "builtin",
             name: "Bash",
@@ -1301,6 +1307,7 @@ describe("UnifiedTranscript — markdown rendering", () => {
           { item_kind: "text", kind: "text", text: "Running **before** the tool" },
           {
             item_kind: "tool",
+            facet: { facet_kind: "other" },
             tool_use_id: "tool-1",
             kind: "builtin",
             name: "Bash",
@@ -1680,6 +1687,7 @@ describe("UnifiedTranscript — per-message copy", () => {
           { item_kind: "text", kind: "text", text: "Here is **step one**" },
           {
             item_kind: "tool",
+            facet: { facet_kind: "other" },
             tool_use_id: "tool-1",
             kind: "builtin",
             name: "Bash",
@@ -1720,6 +1728,7 @@ describe("UnifiedTranscript — per-message copy", () => {
           { item_kind: "text", kind: "text", text: "\nHere is **step one**\n\n" },
           {
             item_kind: "tool",
+            facet: { facet_kind: "other" },
             tool_use_id: "tool-1",
             kind: "builtin",
             name: "Bash",
@@ -1848,6 +1857,7 @@ describe("UnifiedTranscript — per-message copy", () => {
         items: [
           {
             item_kind: "tool",
+            facet: { facet_kind: "other" },
             tool_use_id: "tool-1",
             kind: "builtin",
             name: "read_file",
@@ -2078,6 +2088,7 @@ describe("UnifiedTranscript — per-message cost + overage", () => {
           { item_kind: "text", kind: "text", text: "done" },
           {
             item_kind: "tool",
+            facet: { facet_kind: "other" },
             tool_use_id: "tool-1",
             kind: "builtin",
             name: "Read",
@@ -2407,6 +2418,7 @@ describe("UnifiedTranscript compact mode", () => {
   const THINK = (text: string): Item => ({ item_kind: "text", kind: "thinking", text });
   const TOOL = (id: string): Item => ({
     item_kind: "tool",
+    facet: { facet_kind: "other" },
     tool_use_id: id,
     kind: "builtin",
     name: "bash",
@@ -3097,6 +3109,7 @@ describe("UnifiedTranscript fan-out group control", () => {
   const text = (t: string) => ({ item_kind: "text" as const, kind: "text" as const, text: t });
   const tool = (id: string) => ({
     item_kind: "tool" as const,
+    facet: { facet_kind: "other" as const } as const,
     tool_use_id: id,
     kind: "builtin" as const,
     name: "bash",
@@ -3364,6 +3377,7 @@ describe("UnifiedTranscript terminal-response collapse", () => {
           { item_kind: "text", kind: "text", text: "partial work before cancel" },
           {
             item_kind: "tool",
+            facet: { facet_kind: "other" },
             tool_use_id: "ct",
             kind: "builtin",
             name: "bash",
@@ -3416,6 +3430,7 @@ describe("UnifiedTranscript terminal-response collapse", () => {
           { item_kind: "text", kind: "text", text: "dangling text" },
           {
             item_kind: "tool",
+            facet: { facet_kind: "other" },
             tool_use_id: "dt",
             kind: "builtin",
             name: "bash",

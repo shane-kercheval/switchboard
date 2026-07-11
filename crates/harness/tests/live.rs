@@ -11,9 +11,9 @@ use futures::StreamExt;
 use switchboard_core::{AgentRecord, HarnessKind, SessionLocator};
 use switchboard_harness::{
     AdapterEvent, AntigravityAdapter, ClaudeCodeAdapter, CodexAdapter, ContentKind,
-    DispatchOptions, GeminiAdapter, HarnessAdapter, RateLimitSource, Turn, TurnOutcome,
-    UserPromptSource, load_antigravity_transcript, load_claude_transcript, load_codex_transcript,
-    load_gemini_transcript,
+    DispatchOptions, EditChange, GeminiAdapter, HarnessAdapter, RateLimitSource, ToolFacet, Turn,
+    TurnItem, TurnOutcome, UserPromptSource, load_antigravity_transcript, load_claude_transcript,
+    load_codex_transcript, load_gemini_transcript,
 };
 use uuid::Uuid;
 
@@ -2504,5 +2504,252 @@ async fn live_antigravity_model_change_announced_on_resume() {
             .and_then(Option::as_deref)
             .is_some_and(|m| m.contains("Claude Sonnet 4.6")),
         "hydrated last turn = Claude Sonnet 4.6; got {models:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Tool-facet drift guards (harness-behavior §3.6). These are the tests that
+// notice when a CLI vendor changes its tool wire shapes: the fixture-driven
+// facet tests prove the classifiers handle the *recorded* shapes; these prove
+// those shapes still arrive from the current CLI. Cost note: the edit-driving
+// tests deliberately sit above the one-word-reply discipline (~cents each) —
+// the model must genuinely edit files for the facet to exist.
+// ---------------------------------------------------------------------------
+
+/// `(tool_use_id, name, facet)` for every live `ToolStarted`.
+fn tool_started_facets(events: &[AdapterEvent]) -> Vec<(String, String, ToolFacet)> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            AdapterEvent::ToolStarted {
+                tool_use_id,
+                name,
+                facet,
+                ..
+            } => Some((tool_use_id.clone(), name.clone(), facet.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `(tool_use_id, facet)` for every hydrated tool item.
+fn hydrated_tool_facets(t: &switchboard_harness::LoadedTranscript) -> Vec<(String, ToolFacet)> {
+    t.turns
+        .iter()
+        .filter_map(|turn| match turn {
+            Turn::Agent { items, .. } => Some(items.iter().filter_map(|i| match i {
+                TurnItem::Tool {
+                    tool_use_id, facet, ..
+                } => Some((tool_use_id.clone(), facet.clone())),
+                _ => None,
+            })),
+            _ => None,
+        })
+        .flatten()
+        .collect()
+}
+
+#[tokio::test]
+#[ignore = "requires claude installed — run with: make test-live"]
+async fn live_claude_edit_emits_edit_facet() {
+    // One turn exercises Read/Edit/Write/Bash so a single dispatch covers
+    // four facet mappings; Grep is deliberately not requested (not every
+    // environment exposes it in the default toolset).
+    let cwd = tempfile::TempDir::new().unwrap();
+    std::fs::write(cwd.path().join("alpha.txt"), "foo\n").unwrap();
+    let adapter = ClaudeCodeAdapter::new();
+    let agent = live_agent();
+    let Some(switchboard_core::SessionLocator::Uuid(session_id)) = agent.session_locator else {
+        panic!("live_agent carries a Uuid locator");
+    };
+
+    let events: Vec<AdapterEvent> = adapter
+        .dispatch(
+            &agent,
+            cwd.path(),
+            "In the current directory, do these steps using exactly the named tool for each: \
+             1) Use the Read tool to read alpha.txt. \
+             2) Use the Edit tool to change foo to bar in alpha.txt. \
+             3) Use the Write tool to create epsilon.txt containing exactly: hello world \
+             4) Use the Bash tool to run: ls \
+             Then reply with the single word done.",
+            Uuid::now_v7(),
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("dispatch")
+        .collect()
+        .await;
+
+    let live = tool_started_facets(&events);
+    let facet_of = |tool: &str| -> &ToolFacet {
+        &live
+            .iter()
+            .find(|(_, n, _)| n == tool)
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected a {tool} call; got tools {:?}",
+                    live.iter().map(|(_, n, _)| n).collect::<Vec<_>>()
+                )
+            })
+            .2
+    };
+    let ToolFacet::Edit { files } = facet_of("Edit") else {
+        panic!("Edit must classify as an Edit facet — Claude's Edit input shape drifted");
+    };
+    assert_eq!(files[0].edits[0].old, "foo");
+    assert_eq!(files[0].edits[0].new, "bar");
+    assert!(matches!(facet_of("Read"), ToolFacet::Read { .. }));
+    assert!(matches!(facet_of("Write"), ToolFacet::Write { .. }));
+    assert!(matches!(facet_of("Bash"), ToolFacet::Shell { .. }));
+
+    // Two-call-site equivalence against the real session file: same
+    // tool_use_id ⇒ same facet.
+    let hydrated =
+        load_claude_transcript(&home_dir(), cwd.path(), session_id, agent.id).expect("hydrate");
+    let disk = hydrated_tool_facets(&hydrated);
+    let mut compared = 0;
+    for (id, name, live_facet) in &live {
+        if let Some((_, disk_facet)) = disk.iter().find(|(did, _)| did == id) {
+            assert_eq!(live_facet, disk_facet, "facet divergence for {name} ({id})");
+            compared += 1;
+        }
+    }
+    assert!(
+        compared >= 4,
+        "expected >=4 shared tool calls, compared {compared}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires codex installed — run with: make test-live"]
+async fn live_codex_apply_patch_emits_edit_facet() {
+    // The headline drift guard: Codex's edit split (live `file_change`
+    // paths-only → turn-end `ToolFacetUpdated` with patch content → disk
+    // `apply_patch` custom_tool_call) is the most shape-dependent path in
+    // the facet design. Also covers the Shell facet in the same turn.
+    let cwd = tempfile::TempDir::new().unwrap();
+    std::fs::write(cwd.path().join("alpha.txt"), "foo\n").unwrap();
+    let adapter = CodexAdapter::new();
+    let agent = live_codex_agent();
+
+    let events: Vec<AdapterEvent> = adapter
+        .dispatch(
+            &agent,
+            cwd.path(),
+            "Edit the file alpha.txt in the current directory, changing the word foo to bar. \
+             Then run the shell command: ls. Then reply with the single word done.",
+            Uuid::now_v7(),
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("dispatch")
+        .collect()
+        .await;
+
+    let live = tool_started_facets(&events);
+    // Live edit announcement: paths + kind, no content.
+    let (edit_id, _, live_edit) = live
+        .iter()
+        .find(|(_, n, _)| n == "file_change")
+        .expect("Codex must announce the edit as a live file_change item — shape drifted");
+    let ToolFacet::Edit { files: live_files } = live_edit else {
+        panic!("file_change must classify as Edit");
+    };
+    assert!(
+        live_files
+            .iter()
+            .any(|f| f.path.ends_with("alpha.txt") && matches!(f.change, EditChange::Modified)),
+        "live edit facet must name alpha.txt as modified: {live_files:?}"
+    );
+    assert!(
+        live.iter()
+            .any(|(_, _, f)| matches!(f, ToolFacet::Shell { .. }))
+    );
+
+    // The turn-end upgrade: content-bearing facet for the same row, emitted
+    // before TurnEnd (the dispatcher drops turn-scoped events post-terminal).
+    let upgrade_idx = events
+        .iter()
+        .position(|e| matches!(e, AdapterEvent::ToolFacetUpdated { tool_use_id, .. } if tool_use_id == edit_id))
+        .expect("the live edit row must receive a ToolFacetUpdated from the enrichment read");
+    let turn_end_idx = events
+        .iter()
+        .position(|e| matches!(e, AdapterEvent::TurnEnd { .. }))
+        .expect("TurnEnd");
+    assert!(upgrade_idx < turn_end_idx, "upgrade must precede TurnEnd");
+    let AdapterEvent::ToolFacetUpdated {
+        facet: upgraded, ..
+    } = &events[upgrade_idx]
+    else {
+        unreachable!();
+    };
+    let ToolFacet::Edit {
+        files: upgraded_files,
+    } = upgraded
+    else {
+        panic!("upgrade must carry an Edit facet");
+    };
+    assert!(
+        upgraded_files.iter().any(|f| !f.edits.is_empty()),
+        "the upgraded facet must carry before/after content"
+    );
+
+    // Disk side: the reload parser reconstructs the same content-bearing
+    // facet from the apply_patch record.
+    let (thread_id, date) = codex_capture(&events).expect("captured Codex locator");
+    let hydrated = load_codex_transcript(&home_dir(), cwd.path(), &thread_id, Some(date), agent.id)
+        .expect("hydrate");
+    let disk_edit = hydrated_tool_facets(&hydrated)
+        .into_iter()
+        .find_map(|(_, f)| match f {
+            ToolFacet::Edit { files } if files.iter().any(|x| !x.edits.is_empty()) => Some(files),
+            _ => None,
+        })
+        .expect("reloaded transcript must carry a content-bearing Edit facet (apply_patch)");
+    assert_eq!(
+        &disk_edit, upgraded_files,
+        "the upgraded live facet must equal the reload parser's facet"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires agy authenticated (run `agy`) — run with: make test-live"]
+async fn live_antigravity_run_command_emits_shell_facet() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let adapter = AntigravityAdapter::new();
+    let agent = live_antigravity_agent();
+
+    let events: Vec<AdapterEvent> = adapter
+        .dispatch(
+            &agent,
+            tmp.path(),
+            // `echo` (not `ls`) — the model satisfies "list the directory" with its
+            // dedicated `list_dir` tool, which never exercises the Shell mapping.
+            "Run the shell command: echo switchboard-facet-probe. Then reply with the single word done.",
+            Uuid::now_v7(),
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("dispatch")
+        .collect()
+        .await;
+
+    let live = tool_started_facets(&events);
+    let shell = live
+        .iter()
+        .find_map(|(_, n, f)| match f {
+            ToolFacet::Shell { command, .. } if n == "run_command" => Some(command.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "run_command must classify as a Shell facet with a decoded CommandLine; observed tool calls: {:?}",
+                live.iter().map(|(_, n, f)| (n.clone(), f.clone())).collect::<Vec<_>>()
+            )
+        });
+    assert!(
+        !shell.is_empty() && !shell.starts_with('\"'),
+        "CommandLine must decode transcript.jsonl's string-encoding, got {shell:?}"
     );
 }

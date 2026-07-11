@@ -51,6 +51,7 @@
 //! Ground-truth reference: `docs/research/archive/antigravity-cli-observed.md`.
 
 pub mod config;
+pub(crate) mod facets;
 pub mod parser;
 pub mod paths;
 pub mod session_file;

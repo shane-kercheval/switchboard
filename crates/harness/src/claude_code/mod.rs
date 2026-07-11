@@ -1,4 +1,5 @@
 pub mod config;
+pub(crate) mod facets;
 pub mod session_file;
 pub mod skills;
 

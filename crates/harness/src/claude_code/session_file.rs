@@ -640,6 +640,7 @@ impl ReconstructionState {
                     builder.items.push(TurnItem::Tool {
                         tool_use_id: id.to_owned(),
                         kind: classify_claude_tool_kind(name),
+                        facet: super::facets::classify_claude_tool_facet(name, &input),
                         name: name.to_owned(),
                         input,
                         output,

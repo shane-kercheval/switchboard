@@ -208,6 +208,27 @@ A *separate* axis from model (§3.3), with a **different capability set**. Verif
 
 **`parent_session_id` is absent from the stream.** Switchboard has no wire signal that a session is a fork — the new session's `system/init` looks identical to any fresh session. The branch relationship lives only in the on-disk `parentUuid` chain. Switchboard does not need to read or track this chain; it is the harness's internal tree, not Switchboard's.
 
+### 3.6 Tool vocabularies & facet mapping
+
+> **Status: probed live 2026-07-10** (claude 2.1.206, codex 0.143.0, agy 1.0.16; gemini 0.44.0 **unprobeable** — see G26). Captures live under `crates/harness/tests/fixtures/<harness>/` (`tool-vocabulary*`, `file-change*`, `apply-patch*`). Each adapter maps its raw tool vocabulary to a normalized `ToolFacet` (`crates/harness/src/facets.rs`) at both call sites (stream parser + session-file parser); the raw `name`/`input` ride alongside untouched.
+
+**Path absoluteness (probe checklist result).** Every observed file path is **absolute** in every harness: Claude `file_path`/`path`, Codex `apply_patch` section paths and `workdir`, Antigravity `TargetFile`/`AbsolutePath`/`SearchPath`. Adapters still normalize defensively (lexical join against the turn's cwd where one is known), but no harness currently requires it.
+
+**Claude (2.1.206).** Live stream `tool_use` blocks and on-disk session records carry identical `{name, input}` — one classifier serves both. Observed shapes: `Bash {command, description}` → Shell; `Read {file_path}` → Read; `Edit {file_path, old_string, new_string, replace_all}` → Edit (one file, one pair); `Write {file_path, content}` → Write; `Grep {pattern, path}` / `Glob {pattern, path}` → Search; `TaskCreate {subject, description}` / `TaskUpdate {taskId, status}` → Todo; `mcp__<server>__<tool>` → Mcp. **Vocabulary drift found by this probe:** `MultiEdit` and `TodoWrite` no longer exist in 2.1.206 (requested via `--tools` and silently dropped) — `Edit` absorbed multi-edit, the `Task*` family replaced todos. Both legacy names are still classified (historical session files may contain them) from their documented shapes — the only unverified mappings in the set (G27). `Task` (subagent dispatch) is deliberately unmapped → Other.
+
+**Codex (0.143.0).** Edits do **not** ride in shell heredocs (the pre-probe assumption). Two representations, asymmetric in content:
+
+| Path | Record | Carries |
+| --- | --- | --- |
+| live stream | `file_change` item: `{id, changes:[{path, kind:"update"\|"add"\|…}], status}` | **paths + change-kind only — no content, no diff** |
+| session file | `custom_tool_call` name `apply_patch`, `input` = patch text (`*** Begin Patch` / `*** Update File: <path>` / `@@` hunks / `*** Add File:` / `*** End Patch`); paired `custom_tool_call_output` by `call_id`; plus `event_msg` `patch_apply_end` with structured per-file `{type, unified_diff\|content, move_path}` | **full before/after content** |
+
+So a live Codex Edit facet carries the file list with empty edit pairs; the content-bearing facet is parsed from the session file's patch text. The adapter closes the gap at turn end: the **existing** post-terminal enrichment re-read (already performed every Codex turn for per-turn usage) also extracts the current turn's patch facets and emits a facet upgrade keyed to the live tool ids (correlated ordinally with a path-set guard), so diffs appear seconds after the turn completes without a reload. Shell divergence (pre-existing, unchanged): live `command_execution` `command` is the wrapped string (`/bin/zsh -lc '…'`), disk `function_call` name `exec_command` `arguments.cmd` is the raw command with `workdir` — same Shell facet, different `command` spelling and `name`. **Before facets landed, Codex edits were invisible entirely**: the live parser skipped unknown item types (`file_change` → drop) and the session-file parser handled only `function_call`/MCP records (`custom_tool_call` → drop). Unobserved and left to degrade gracefully: a `delete` change-kind, `*** Move to:` sections (§5).
+
+**Gemini (0.44.0).** Unprobeable — the CLI fails auth for individual accounts (G26). Facet classification is deliberately not built: both Gemini parsers stamp `Other`, which renders through the generic path exactly as before. The pre-sunset capture (`fixtures/gemini/tool-use.stream.jsonl`) shows `read_file {file_path}` / `update_topic {…}` under `tool_name`/`parameters` if mapping is ever revisited.
+
+**Antigravity (agy 1.0.16).** Richly structured — six builtin tools, full content, absolute paths (supersedes the shell-only reading of the older `tool-use.transcript.jsonl` capture): `run_command {CommandLine, Cwd, WaitMsBeforeAsync}` → Shell; `view_file {AbsolutePath}` → Read; `replace_file_content {TargetFile, TargetContent, ReplacementContent, StartLine, EndLine, AllowMultiple}` → Edit; `write_to_file {TargetFile, CodeContent, Overwrite}` → Write; `grep_search {Query, SearchPath, IsRegex, CaseInsensitive}` → Search; `list_dir {DirectoryPath}` → Other. **Arg encoding trap:** in `transcript.jsonl` (the file the adapter reads) every arg value is a *string containing JSON* — `"StartLine": "1"`, `"TargetContent": "\"foo\""` — so the classifier JSON-decodes each value, falling back to the raw string. (The sibling `transcript_full.jsonl` carries raw-typed args but is not the adapter's source.) `tool_calls` ride on `PLANNER_RESPONSE` records identically live (tail) and on reopen — one classifier, both paths.
+
 ---
 
 ## 4. Gap register (actionable)
@@ -261,8 +282,13 @@ Grouped by theme; this is the candidate scope for the failure/metadata-surfacing
 
 ---
 
+**Tool facets (§3.6):**
+- **G26 — Gemini CLI is auth-dead for individual accounts → no facet mapping, no live coverage.** `gemini` 0.44.0 fails all dispatch with `IneligibleTierError: This client is no longer supported for Gemini Code Assist for individuals` (the individual tier moved to Antigravity). Consequences: the §3.6 tool-vocabulary probe could not run for Gemini, facet classification is deliberately stamped `Other` on both Gemini paths (generic rendering, exactly the pre-facet behavior), and `make test-live-gemini` cannot run on an individual account — Gemini's existing live tests are dead until an eligible account exists. Revisit only if Gemini access returns; Antigravity is the successor surface.
+- **G27 — Claude legacy `TodoWrite` / `MultiEdit` facet mappings are documented-shape, not probe-verified.** Both tools were removed from Claude Code by 2.1.206 (§3.6), so they cannot be captured live; the classifiers map them from their documented shapes (`TodoWrite {todos:[{content, status, activeForm}]}`, `MultiEdit {file_path, edits:[{old_string, new_string}]}`) so historical session files render. Worst case if the shapes are wrong: those historical rows classify as `Other` and render generic — no crash. Closeable only with a pre-removal capture (older CLI or a user's old transcript).
+
 ## 5. Open captures / unverified
 
+- **Codex `file_change` `delete` kind and `*** Move to:` patch sections (§3.6)** — the probe exercised `update` and `add` only. An unknown change-kind maps to `Modified` and a move renders under its original path; both degrade, neither is verified against a real capture.
 - **Gemini `[Thought: true]` live-stream literal (§3.2)** — observed in-app inside a `message` stream-json event's `content`, under a newer/different model config than the original headless probe (which yielded `thoughts:[]` in the stream, never reasoning). Unknown whether it's a reasoning marker we should reclassify to `ContentKind::Thinking` (strip the prefix, emit the remainder) or plain model-authored text. Capture needs `gemini -p "<prompt>" --output-format stream-json` against that same config. Until captured, the live stream surfaces no Gemini reasoning and `[Thought: true]` falls through as `Text`.
 - **Gemini bad-token (401) auth shape** — never observed; our substring detector is a guess. Capture needs a *stale-but-present* token (a clean logout gives the exit-41 shape instead).
 - **Gemini hard quota wall** — none observed (it stalls/retries). Treated as "nothing to classify."

@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { FilePen, FilePlus, FileX, Wrench } from "@lucide/svelte";
 import type { ToolCall } from "$lib/state/types";
 import type { ToolFacet } from "$lib/types";
-import { toolDetail, toolIcon, toolRowState, toolVerb } from "$lib/toolRow";
+import { isGenericFacet, toolDetail, toolIcon, toolRowState, toolVerb } from "$lib/toolRow";
 
 const BASE: ToolCall = {
   item_kind: "tool",
@@ -174,6 +174,23 @@ describe("toolDetail", () => {
     ).toBe("find things");
     const unknown = { facet_kind: "hologram" } as unknown as ToolFacet;
     expect(toolDetail(unknown, { command: "echo hi" })).toBe("echo hi");
+  });
+});
+
+describe("isGenericFacet", () => {
+  it("treats other and unknown discriminants as generic, known kinds as specialized", () => {
+    expect(isGenericFacet({ facet_kind: "other" })).toBe(true);
+    expect(isGenericFacet({ facet_kind: "hologram" } as unknown as ToolFacet)).toBe(true);
+    expect(isGenericFacet({ facet_kind: "shell", command: "ls", cwd: null })).toBe(false);
+    expect(isGenericFacet({ facet_kind: "edit", files: [] })).toBe(false);
+    expect(isGenericFacet({ facet_kind: "write", path: "/x", content: "", truncated: false })).toBe(
+      false,
+    );
+    expect(isGenericFacet({ facet_kind: "read", path: "/x" })).toBe(false);
+    expect(isGenericFacet({ facet_kind: "search", pattern: "p", path: null })).toBe(false);
+    expect(isGenericFacet({ facet_kind: "todo", items: [] })).toBe(false);
+    // MCP is a known kind with no body renderer — deliberately NOT generic.
+    expect(isGenericFacet({ facet_kind: "mcp", server: "s", tool: "t" })).toBe(false);
   });
 });
 

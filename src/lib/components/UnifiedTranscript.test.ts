@@ -3469,6 +3469,148 @@ describe("UnifiedTranscript terminal-response collapse", () => {
     expect(screen.queryByTestId("turn-live-scroll")).toBeNull();
     expect(agentTurnEl().querySelector('[data-testid="turn-preview-toggle"]')).not.toBeNull();
   });
+
+  it("marks a content-less edit as unavailable on an outcome-closed streaming turn", async () => {
+    // The Codex edit placeholder must not promise "diff will appear when the
+    // turn completes" on a turn that will never complete: status is
+    // `streaming` on disk (killed mid-flight), but the outcome marker closed
+    // it, so the tool row must treat it as settled.
+    const state = await loadState();
+    await state.registerAgent(CODEX_AGENT);
+    state.transcripts[CODEX_AGENT.id] = [
+      {
+        role: "user",
+        turn_id: "u-1",
+        agent_id: CODEX_AGENT.id,
+        send_id: "s-1",
+        started_at: "2026-05-16T00:00:00Z",
+        text: "edit it",
+      },
+      {
+        role: "agent",
+        turn_id: "a-1",
+        agent_id: CODEX_AGENT.id,
+        send_id: "s-1",
+        started_at: "2026-05-16T00:00:01Z",
+        status: "streaming",
+        items: [
+          {
+            item_kind: "tool",
+            facet: {
+              facet_kind: "edit",
+              files: [{ path: "/repo/a.ts", change: "modified", edits: [], truncated: false }],
+            },
+            tool_use_id: "edit-1",
+            kind: "builtin",
+            name: "file_change",
+            input: {},
+            started_at: "2026-05-16T00:00:01Z",
+            completed_at: "2026-05-16T00:00:02Z",
+          },
+        ],
+      },
+    ];
+    const overlay: ConversationItem[] = [
+      {
+        kind: "outcome",
+        turn_id: "a-1",
+        send_id: "s-1",
+        agent_id: CODEX_AGENT.id,
+        status: "cancelled",
+        reason: null,
+        at: "2026-05-16T00:00:05Z",
+      },
+    ];
+
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CODEX_AGENT], overlay },
+    });
+
+    expect(screen.getByTestId("tool-edit-pending")).toHaveTextContent(
+      "Diff content unavailable for this edit.",
+    );
+  });
+
+  it("marks a content-less edit as unavailable in an outcome-closed fan-out column", async () => {
+    // Same contract through the fan-out rendering path: the closed column
+    // passes live=false into the shared turn body, so the placeholder must
+    // read settled there too.
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    await state.registerAgent(CODEX_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [
+      {
+        role: "user",
+        turn_id: "u-a",
+        agent_id: CLAUDE_AGENT.id,
+        send_id: "s-fan",
+        started_at: "2026-05-16T00:00:00Z",
+        text: "fan out",
+      },
+      {
+        role: "agent",
+        turn_id: "a-a",
+        agent_id: CLAUDE_AGENT.id,
+        send_id: "s-fan",
+        started_at: "2026-05-16T00:00:01Z",
+        status: "streaming",
+        items: [
+          {
+            item_kind: "tool",
+            facet: {
+              facet_kind: "edit",
+              files: [{ path: "/repo/a.ts", change: "modified", edits: [], truncated: false }],
+            },
+            tool_use_id: "edit-fan",
+            kind: "builtin",
+            name: "file_change",
+            input: {},
+            started_at: "2026-05-16T00:00:01Z",
+            completed_at: "2026-05-16T00:00:02Z",
+          },
+        ],
+      },
+    ];
+    state.transcripts[CODEX_AGENT.id] = [
+      {
+        role: "user",
+        turn_id: "u-b",
+        agent_id: CODEX_AGENT.id,
+        send_id: "s-fan",
+        started_at: "2026-05-16T00:00:00Z",
+        text: "fan out",
+      },
+      {
+        role: "agent",
+        turn_id: "a-b",
+        agent_id: CODEX_AGENT.id,
+        send_id: "s-fan",
+        started_at: "2026-05-16T00:00:02Z",
+        status: "complete",
+        items: [{ item_kind: "text", kind: "text", text: "bob reply" }],
+      },
+    ];
+    const overlay: ConversationItem[] = [
+      {
+        kind: "outcome",
+        turn_id: "o-a",
+        send_id: "s-fan",
+        agent_id: CLAUDE_AGENT.id,
+        status: "cancelled",
+        reason: null,
+        at: "2026-05-16T00:00:05Z",
+      },
+    ];
+
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT, CODEX_AGENT], overlay },
+    });
+
+    const column = screen.getAllByTestId("fanout-column")[0]!;
+    expect(within(column).getByTestId("tool-edit-pending")).toHaveTextContent(
+      "Diff content unavailable for this edit.",
+    );
+  });
 });
 
 describe("UnifiedTranscript loading state", () => {

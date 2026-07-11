@@ -28,7 +28,7 @@
   import { languageForPath } from "$lib/diff";
   import { synthesizeEditDiff } from "$lib/toolDiff";
   import { formatToolInput, redactDisplay } from "$lib/toolInput";
-  import { toolDetail, toolIcon, toolRowState, toolVerb } from "$lib/toolRow";
+  import { isGenericFacet, toolDetail, toolIcon, toolRowState, toolVerb } from "$lib/toolRow";
   import { cn } from "$lib/utils";
   import { CircleCheck, CircleDotDashed, Circle } from "@lucide/svelte";
 
@@ -46,11 +46,14 @@
   let open = $state(false);
   // Raw provenance for specialized facets sits behind its own reveal — the
   // facet body already shows the same information in readable form, so the
-  // JSON envelope is one click further. The generic facet has no body, so its
-  // raw input shows directly on expand.
+  // JSON envelope is one click further. Generic facets (`other` and any
+  // discriminant this build doesn't know) have no body, so their raw input
+  // shows directly on expand — an unknown kind must degrade to exactly the
+  // generic treatment, never a lesser one.
   let rawOpen = $state(false);
 
-  const showRaw = $derived(open && (facet.facet_kind === "other" || rawOpen));
+  const generic = $derived(isGenericFacet(facet));
+  const showRaw = $derived(open && (generic || rawOpen));
 
   /// Cap what the *renderer* does with the raw input: the wire payload is
   /// uncapped by design (the raw input is the provenance escape hatch), so the
@@ -253,7 +256,7 @@
         </section>
       {/if}
 
-      {#if open && facet.facet_kind !== "other"}
+      {#if open && !generic}
         <button
           type="button"
           class="text-muted hover:text-fg text-[11px] transition-colors"

@@ -2,16 +2,22 @@
 // tool row reuses `DiffView` — the same renderer the Git view uses — instead
 // of a second patch-shaped component.
 //
-// This is computed here, on the frontend, lazily (callers invoke it only when
-// a row is expanded) rather than in Rust at parse time: hunking eagerly would
-// do the work for rows nobody expands, double the wire payload, and drag a
-// `crates/git` type into `crates/harness`, which has no business depending
-// on it.
+// This is computed here, on the frontend, rather than in Rust at parse time:
+// shipping hunks would double the wire payload and drag a `crates/git` type
+// into `crates/harness`, which has no business depending on it. The sole
+// consumer (the tool row) invokes this eagerly for every MOUNTED edit row —
+// inline diffs are the point of that row — bounded by the facet content cap
+// and the transcript's render-windowing, not by expansion.
 //
 // Line numbers are **snippet-relative**: the facet carries no absolute file
 // offsets (neither Claude's `Edit` input nor Codex's `apply_patch` grammar
 // includes them), so each hunk header says so rather than presenting relative
-// numbers as if they were file positions.
+// numbers as if they were file positions. Note the header text and per-line
+// numbers are currently display-inert: the sole consumer renders through
+// DiffView's `compact` mode, which hides both. They are kept correct because
+// the `FileDiff`/`DiffLine` types require them and a future non-compact
+// consumer inherits honest values — but that path has not been visually
+// exercised yet.
 
 import { structuredPatch } from "diff";
 import type { DiffHunk, DiffLine, EditPair, EditedFile, FileDiff } from "$lib/types";

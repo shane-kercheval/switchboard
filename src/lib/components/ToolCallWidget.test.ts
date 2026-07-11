@@ -120,6 +120,20 @@ describe("ToolCallWidget collapsed row", () => {
     const { getByTestId } = render(ToolCallWidget, { tool: withFacet(facet) });
     expect(getByTestId("tool-verb")).toHaveTextContent("Bash");
   });
+
+  it("gives an unknown facet the full generic treatment on expand", async () => {
+    // Forward-compat contract: a facet kind this build doesn't know must
+    // behave exactly like the generic path — raw input directly on expand,
+    // no extra reveal — never a lesser degradation.
+    const facet = { facet_kind: "hologram" } as unknown as ToolFacet;
+    const { getByTestId, queryByTestId } = render(ToolCallWidget, {
+      tool: withFacet(facet, { input: { marker: "raw-envelope" } }),
+    });
+    await fireEvent.click(getByTestId("tool-row"));
+
+    expect(getByTestId("tool-input")).toHaveTextContent('"marker": "raw-envelope"');
+    expect(queryByTestId("tool-raw-toggle")).toBeNull();
+  });
 });
 
 describe("ToolCallWidget status glyphs", () => {

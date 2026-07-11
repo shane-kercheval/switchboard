@@ -116,6 +116,27 @@ function nonEmpty(value: string): string | undefined {
   return value === "" ? undefined : value;
 }
 
+/// Facet kinds this build gives specialized treatment somewhere in the tool
+/// row. Anything else — `"other"` or a discriminant added to the Rust
+/// `#[non_exhaustive]` enum after this build — must get the full GENERIC
+/// treatment, including the expanded body (raw input shown directly, no extra
+/// reveal). MCP is deliberately in this set: it has a specialized label and
+/// icon even though it has no body renderer, so it keeps its
+/// raw-behind-a-toggle behavior — a known kind, not a degradation case.
+const SPECIALIZED_FACET_KINDS = new Set([
+  "shell",
+  "edit",
+  "write",
+  "read",
+  "search",
+  "todo",
+  "mcp",
+]);
+
+export function isGenericFacet(facet: ToolFacet): boolean {
+  return !SPECIALIZED_FACET_KINDS.has(facet.facet_kind);
+}
+
 /// Facet → left-column icon. Unknown discriminants take the generic wrench,
 /// same degradation rule as the verb.
 export function toolIcon(facet: ToolFacet): ToolIconComponent {

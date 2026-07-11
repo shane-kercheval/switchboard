@@ -929,7 +929,11 @@
      cancelled/failed, so a turn the parser persisted as `streaming` (a turn
      cancelled mid-flight) doesn't reopen with a phantom live affordance on a
      dead turn. -->
-{#snippet turnItems(turn: AgentTurn)}
+<!-- `settled` is NOT derivable from `turn.status` alone: a turn persisted as
+     `streaming` (killed mid-flight) that an authoritative outcome marker has
+     closed is terminal — callers encode that via `live`, so they pass the
+     effective value rather than the widget re-deriving a naive one. -->
+{#snippet turnItems(turn: AgentTurn, settled: boolean)}
   {#each turn.items as item, i (i)}
     {#if item.item_kind === "text"}
       {#if item.kind === "thinking"}
@@ -938,7 +942,7 @@
         <Markdown text={item.text} />
       {/if}
     {:else}
-      <ToolCallWidget tool={item} turnSettled={turn.status !== "streaming"} />
+      <ToolCallWidget tool={item} turnSettled={settled} />
     {/if}
   {/each}
 {/snippet}
@@ -991,11 +995,13 @@
       data-testid="turn-live-scroll"
       use:liveScroll={{ key: liveKey, signal: liveSignalOf(turn) }}
     >
-      {@render turnItems(turn)}
+      {@render turnItems(turn, false)}
     </div>
     {@render workingFooter(turn)}
   {:else}
-    {@render turnItems(turn)}
+    <!-- This branch means the turn is not (streaming && live): it either ended
+         or an outcome marker closed a streaming-on-disk turn — settled both ways. -->
+    {@render turnItems(turn, true)}
     {#if turn.status === "failed" && turn.error}
       <div class="text-status-failed text-xs" data-testid="turn-error">{turn.error}</div>
     {/if}

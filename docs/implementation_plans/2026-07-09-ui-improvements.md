@@ -28,10 +28,10 @@ External docs:
 
 ## Working agreement
 
-**One commit per differentiable UI change.** Milestones group related work; each commit inside a
-milestone is a self-contained, revertable go/no-go decision point. A commit that changes two
-independent visual behaviors must be split. Per-commit granularity is specified in each milestone's
-implementation outline. Do not commit this plan document.
+**Commit strategy is out of this plan's scope.** The plan describes *what to build*, not how to slice
+commits. Implement a milestone, run it through a review cycle, then commit — one commit per milestone
+by default, with additional commits only for follow-up passes (a visual-tuning round, say). Do not
+commit this plan document.
 
 **Rationale must survive into the code.** Several decisions below were reached by weighing
 alternatives that are not recoverable from the codebase. Where a decision is non-obvious, carry the
@@ -163,7 +163,7 @@ Read that contract carefully; it defines all three states and leaves nothing to 
 
 The `Empty` caption is currently "no output," which describes the agent's state rather than the
 consequence to the user. "Will be skipped" is the more useful phrasing, since that is literally what
-`ForwardOutcome::Resolved { skipped }` does with it. Take that copy improvement in the same commit.
+`ForwardOutcome::Resolved { skipped }` does with it. Take that copy improvement as part of the same change.
 
 Note what this means for `Ready` vs `Pending`: readiness is **not** "has a completed turn." It is "has
 a completed turn *and* nothing in flight." An implementation that only adds an `is_streaming` check on
@@ -181,24 +181,8 @@ and `WorkflowComposer` passing it through. Move the tri-state derivation into
 a `ui/` primitive with a handful of call sites, and it is the correct one — a boolean cannot express
 this domain, which is how the bug happened.
 
-**Sequencing note.** This lands *after* the forward-source persistence commit, since both touch the
-same `forwardSources` code in `ComposeBar` and the persistence change is the more invasive of the two.
-
-**Commits:**
-
-1. Backend: `load_project_conversation_impl` accepts live-draft attachment paths and excludes them
-   from the GC. (Ships alone; no visible behavior change, but unblocks commit 3.)
-2. `composeStore` schema v3 + migration, with the new fields defined but not yet written by
-   ComposeBar.
-3. Attachments persisted; frontend passes draft paths to the load command.
-4. Forward sources persisted (message-level, prompt per-argument, workflow per-field).
-5. Workflow invocation state persisted.
-6. Tri-state forward-source readiness derivation in `heldForwards.svelte.ts`; all four call sites
-   adopt it. `ForwardSourceChip`'s `empty` boolean becomes a state.
-7. Pending-state visual treatment on the chip and the picker rows.
-
-Commits 6 and 7 are split so the derivation change (which alters *which* chips are flagged) is
-revertable independently of the visual treatment (which alters *how* they are flagged).
+**Sequencing note.** Do the forward-source persistence work *before* this, since both touch the same
+`forwardSources` code in `ComposeBar` and the persistence change is the more invasive of the two.
 
 ### Definition of Done
 
@@ -289,29 +273,14 @@ the ramp re-accreting. Keep it to those two mechanical rules; do not attempt to 
 green ring on a text field reads as *valid*, not *focused*. Introduce a `focus` token in blue,
 and — because blue must then mean one thing — convert the two raw-hue violations at
 `UnifiedTranscript.svelte` (`bg-blue-100/20`, on the user bubble and the held-forward bubble) to a
-named token in the same commit family. These are the only palette-hue violations in `src/`.
+named token in the same pass. These are the only palette-hue violations in `src/`.
 
 The compose ring appears on **actual textarea focus**, not permanently. The compose bar is the
 default keyboard target, so an always-on ring carries no information; a ring that disappears when
 focus moves into the Git view's keyboard-nav mode or a dialog is a real signal.
 
-**Sequencing is load-bearing.** Introduce tokens before rewriting call sites; land the lint last, or
-it fails the intermediate commits.
-
-**Commits:**
-
-1. Add `hover` / `active` / `focus` tokens to `app.css` (both light and dark mappings); no call-site
-   changes.
-2. Replace every `hover:bg-border/*` and `bg-border` fill with `hover:bg-hover` / `bg-active` — found
-   by grep, not by the list above, and including the two test files that assert the class.
-3. Collapse the redundant neutral values (`code-bg`, `code-bg-agent`, `code-bg-user`, and the
-   `surface`/`panel` near-duplicates) onto the four-role ramp; remove opacity modifiers from surface
-   tokens at every call site.
-4. Name the user-bubble blue; convert the two `bg-blue-100/20` sites.
-5. Compose-bar focus ring.
-6. The CI scan test for the two banned patterns.
-7. Rewrite the "neutral surfaces" section of `docs/ui-conventions.md` to state the four roles, the
-   two banned patterns, and the two-nested-treatments rule.
+**Sequencing is load-bearing.** Introduce tokens before rewriting call sites, and add the scan test
+last — it would fail against the intermediate states while call sites are still being migrated.
 
 ### Definition of Done
 
@@ -461,14 +430,6 @@ numbers (Codex uses context-anchored `@@` headers, not `@@ -a,b +c,d @@`). Facet
 line numbers, and M4's diff is snippet-scoped. This is a deliberate accepted limitation: you are
 reading the change, not navigating to it. Record it in the facet's doc-comment.
 
-**Commits:**
-
-1. Fixtures + `docs/harness-behavior.md` update from the probe. No code.
-2. `ToolFacet` type, wired into both event structs and `TurnItem::Tool`; Claude classifier; TS type
-   mirror; reducer passthrough. Facet unused by any renderer yet.
-3. Codex classifier, including the `apply_patch` parser.
-4. Gemini + Antigravity classifiers.
-
 ### Definition of Done
 
 - **Unit tests** per harness classifier, driven by the recorded fixtures: each of Edit, MultiEdit,
@@ -583,20 +544,6 @@ for rows nobody expands, it doubles the wire payload, and `DiffHunk` lives in `c
 
 **Multi-file edits** (Codex `apply_patch`) render one diff section per `EditedFile`.
 
-**Commits:**
-
-1. Borderless row shell + verb vocabulary + status glyph + expansion-only chrome, **including the
-   lazy raw-input body** (format on open, cap the displayed JSON). All facets still render the generic
-   JSON body when expanded. This commit alone should make the transcript feel different, and is
-   independently revertable.
-2. `Shell` renderer (command + output).
-3. `Edit` renderer with inline diff (`pnpm add diff` lands here).
-4. `Write` / `Read` / `Search` / `Todo` renderers.
-5. `Mcp` renderer.
-
-Commit 1 before the per-facet renderers is deliberate: it isolates the visual change from the content
-changes, so a "no-go" on the row design does not also revert the renderers.
-
 ### Definition of Done
 
 - Component tests on the tool row: collapsed row shows verb + detail + status for each facet; a long
@@ -680,13 +627,6 @@ So: extend the `diffTarget` variants with an optional initial file (repo-relativ
   gets **no icon** — an agent can edit a file anywhere it has access, which is not a bug, and the card
   must not offer a Git affordance that cannot work. Same for a project directory that is not a repo.
 
-**Commits:**
-
-1. The card: derive from facets, group by directory, counts. Rendered, inert.
-2. Filename click → scroll to and highlight the tool call.
-3. `diffTarget` gains the initial-file channel; `DiffPanel` honors it. (Ships alone — no card change.)
-4. Git icon on the card → open Git view at that file's current diff.
-
 ### Definition of Done
 
 - Unit tests on the derivation: a turn with no edits yields no card; five edits to one file roll up
@@ -746,19 +686,12 @@ verbatim here: this is a device-local appearance preference, and syncing it via 
 would be wrong. Carry that reasoning into the new store's module comment.
 
 **Sequencing.** Adopt the primitive in the *new* consumers first (sidebars, Git view, diff panel), and
-refactor `TranscriptPanes` onto it **last**, in its own commit, guarded by its existing tests. If that
-last refactor turns out to be risky, it is the one commit to drop — leaving `TranscriptPanes` on its
-own logic is a smaller sin than destabilizing a tested, load-bearing layout.
+refactor `TranscriptPanes` onto it **last**, guarded by its existing tests. If that last refactor turns
+out to be risky, it is the piece to drop — leaving `TranscriptPanes` on its own logic is a smaller sin
+than destabilizing a tested, load-bearing layout.
 
 `SidebarPanel`'s `width` prop is a Tailwind class today. It becomes a number; that is a breaking
 change to the primitive with two call sites, and it is the right one.
-
-**Commits:**
-
-1. `ui/` resize primitive (drag, min/max clamp, double-click reset). No consumers yet.
-2. Sidebars resizable; widths and collapse state persisted globally, clamped on read.
-3. `GitView.detailWidth` and `DiffPanel.fileListWidth` adopt the primitive and persist.
-4. `TranscriptPanes` adopts the primitive. (Droppable if risky.)
 
 ### Definition of Done
 
@@ -768,8 +701,8 @@ change to the primitive with two call sites, and it is the right one.
   pointer-up commits exactly once.
 - **A browser test** for the viewport clamp, since it is geometry-measurement-coupled and jsdom cannot
   exercise it. Per `AGENTS.md`, poll measured geometry (`expect.poll`), never a fixed sleep.
-- `TranscriptPanes`' existing tests pass unchanged after commit 4 — that is the whole safety argument
-  for doing it last.
+- `TranscriptPanes`' existing tests pass unchanged after that refactor — that is the whole safety
+  argument for doing it last.
 
 ---
 
@@ -812,12 +745,6 @@ correctly styled, and load-bearing context for identifying a commit.
 **Explicitly out of scope**: moving the changed-files column into the diff pane header (the pane earns
 its width), and reworking the `Show branches without folders` checkbox into a filter menu (raised in
 discussion, never affirmed — leave it alone).
-
-**Commits:**
-
-1. Unwind the three gray stacks.
-2. `+n / −n` counts per changed file.
-3. Commit subject promoted to `text-fg`.
 
 ### Definition of Done
 
@@ -880,7 +807,9 @@ Add `ui/LoadingDots.svelte`: three `<span>`s with a staggered opacity keyframe �
 three-dot loader. A 1.4 s loop, per-dot delays of `0s` / `0.16s` / `0.32s`, opacity `0.2 → 1 → 0.2`.
 It must be a component with real spans, **not** an animated `…` text character: animating a glyph
 means swapping characters, which shifts layout. The dots inherit `currentColor` so they take the
-label's color for free. Under `prefers-reduced-motion` all three sit at full opacity, static.
+label's color for free. Under `prefers-reduced-motion` all three sit at full opacity, static. Replace
+`animate-pulse` at every site where the label text itself pulses — the `Working` line, the `Queued`
+line, and the held-forward `↪ waiting for…` line, which has the same pulsing-text problem.
 
 The label names the number, so exactly one number is on screen and its meaning is never ambiguous:
 
@@ -914,16 +843,6 @@ Scope note: `--status-processing` and `--warning` are currently the *same hex* i
 (`#b45309` / `#fbbf24`). Any future design that tries to distinguish a state by swapping between them
 is a no-op. Not a problem here, since this design uses no state colors — recorded so the next person
 does not rediscover it the hard way.
-
-**Commits:**
-
-1. Agent name truncation fix.
-2. Agent card restructure (status prominence, model·effort line, mcp/skills chips).
-3. `ui/LoadingDots.svelte`; replace `animate-pulse` at `UnifiedTranscript.svelte:1081` (working),
-   `:1101` (queued), and `:1432` (the held-forward `↪ waiting for…` line, which has the same pulsing
-   text problem).
-4. Elapsed counter on running turns; `formatDuration` sub-minute form; ticker doc-comment corrected.
-5. `Worked for 2m 14s` on completed turns.
 
 ### Definition of Done
 

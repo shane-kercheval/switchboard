@@ -54,8 +54,8 @@ export type PaneLayout = {
 const STORAGE_KEY = "switchboard-transcript-panes";
 const STORAGE_VERSION = 1;
 
-/// Minimum pane width in px. Mirrors the GitView detail-panel clamp; the
-/// layout component applies it both to gutter drags and as a CSS floor.
+/// Minimum pane width in px. Mirrors `GIT_DETAIL_MIN_WIDTH` (layout.svelte.ts);
+/// the layout component applies it both to gutter drags and as a CSS floor.
 export const MIN_PANE_WIDTH_PX = 360;
 
 function newPaneId(): PaneId {

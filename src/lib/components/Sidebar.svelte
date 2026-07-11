@@ -36,6 +36,12 @@
     MODEL_OPTIONS,
     type SelectionOption,
   } from "$lib/agentSelection";
+  import {
+    AGENTS_SIDEBAR_DEFAULT_WIDTH,
+    layout,
+    SIDEBAR_MIN_WIDTH,
+    sidebarMaxWidth,
+  } from "$lib/layout.svelte";
   import DropdownMenu from "$lib/components/ui/DropdownMenu.svelte";
   import DropdownMenuItem from "$lib/components/ui/DropdownMenuItem.svelte";
   import SelectionPicker from "$lib/components/ui/SelectionPicker.svelte";
@@ -47,6 +53,7 @@
   } from "$lib/api";
   import { normalizeAgentName, validateAgentName, type NameValidation } from "$lib/agentName";
   import { cn, relativeTime } from "$lib/utils";
+  import ResizeHandle from "$lib/components/ui/ResizeHandle.svelte";
   import SidebarPanel from "$lib/components/ui/SidebarPanel.svelte";
   import SidebarSection from "$lib/components/ui/SidebarSection.svelte";
   import {
@@ -112,6 +119,9 @@
       toggleAgentHidden(projectId, rosterIds, agent.id);
     }
   }
+
+  /// Live width during a resize drag; the store commits on pointer-up.
+  let draftWidth = $state<number | null>(null);
 
   let sessionInfoByAgent = $state<Record<AgentId, AgentSessionInfo | null>>({});
   let sessionInfoStarted = $state<Record<AgentId, boolean>>({});
@@ -786,7 +796,25 @@
 
 <svelte:window onkeydown={onWindowKeydown} />
 
-<SidebarPanel side="right" width="w-60" testid="sidebar">
+<SidebarPanel side="right" width={draftWidth ?? layout.agentsSidebarWidth} testid="sidebar">
+  <ResizeHandle
+    value={() => draftWidth ?? layout.agentsSidebarWidth}
+    min={SIDEBAR_MIN_WIDTH}
+    max={sidebarMaxWidth}
+    edge="start"
+    label="Resize agents sidebar"
+    testid="agents-sidebar-resizer"
+    class="hover:bg-active absolute inset-y-0 left-0 z-10 w-1 transition-colors"
+    onDraft={(px) => (draftWidth = px)}
+    onCommit={(px) => {
+      layout.agentsSidebarWidth = px;
+      draftWidth = null;
+    }}
+    onReset={() => {
+      layout.agentsSidebarWidth = AGENTS_SIDEBAR_DEFAULT_WIDTH;
+      draftWidth = null;
+    }}
+  />
   <SidebarSection title="Agents">
     {#snippet action()}
       <div class="flex items-center gap-0.5">

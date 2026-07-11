@@ -623,6 +623,19 @@ shipped:
 
 ## M5 — Per-turn changed-files card
 
+**Status: SKIPPED (decided 2026-07-11, after M4 shipped) — superseded by M4's as-built inline
+diffs.** When this section was designed, tool rows hid their content behind expansion, so the card
+was the only at-a-glance view of a turn's edits. M4's final form renders every edit's diff inline
+in the transcript, attributed to its agent, which removed the card's primary value; the Git view
+already covers "this file's current diff" one keystroke away. The remaining unique value —
+per-agent aggregated `+n/−n` counts and jump-to-a-specific-edit navigation — was judged not worth
+a new derivation module plus the Git-view initial-file state channel (the riskiest piece, touching
+`DiffPanel`'s tested load effect). Nothing here was foundational: M6–M8 depend only on M2, and
+everything the card would consume (Edit/Write facets, `EditPair` counts) shipped in M3/M4 and
+stays — so this can be revived as specced if aggregated per-agent summaries are missed in real
+use. The long-turn "jump to a message/edit" need moves to M9's scoping pass, which addresses
+transcript navigation generally. The spec below is retained for that possible revival.
+
 ### Goal & Outcome
 
 A card at the end of a turn listing the files that agent edited during the turn, grouped by
@@ -758,6 +771,56 @@ change to the primitive with two call sites, and it is the right one.
   exercise it. Per `AGENTS.md`, poll measured geometry (`expect.poll`), never a fixed sleep.
 - `TranscriptPanes`' existing tests pass unchanged after that refactor — that is the whole safety
   argument for doing it last.
+
+### As-built decisions (recorded at implementation review)
+
+- **The primitive is the drag interaction, not a width model.** `ui/ResizeHandle.svelte` owns the
+  handle element, the pointer lifecycle, min/max clamping (inverted range → midpoint, generalizing
+  the pane row's too-narrow behavior), draft-vs-commit callbacks, and double-click reset. Consumers
+  own the geometry mapping: pixels for sidebars / Git view / diff panel; `TranscriptPanes` converts
+  the gutter's pixel value to fractions in its callbacks, so the fraction model is untouched.
+- **Window listeners, not pointer capture.** The browser drag tests (and the repo's established
+  resize idiom) dispatch `pointermove` on `window`; `setPointerCapture` would also throw on
+  synthetic pointerdowns. An armed-drag guard gives "commits exactly once" instead.
+- **`value` and `max` are thunks** read at drag time: the Git detail pane's start value can be a
+  *measured* CSS default (`w-2/3`) rather than a stored number, and maxima are live container
+  fractions.
+- **One store, one key.** `src/lib/layout.svelte.ts` (sibling of `theme.svelte.ts`) holds both
+  sidebars (`{width, open}`), `gitDetailWidth` (null = never dragged; reset returns to null and
+  the CSS default), and `diffFileListWidth` under a versioned envelope. Widths clamp on read
+  *and* write; sidebar max = min(480px, 40% viewport) floored at the 200px minimum.
+- **Three `SidebarPanel` call sites, not two** — the plan predates the agents-sidebar loading
+  shell (`App.svelte`), which shares the persisted agents width so project load doesn't jump.
+- **Collapse persistence is intent, not visibility.** Only the open/closed booleans persist;
+  App's derived gating (projects sidebar hidden in Git view / without content) is unchanged.
+- **Sidebar handles are hover-highlighted overlay strips** on the inner edge (no layout change,
+  current visuals preserved); Git view / diff panel handles keep their existing gutter styling.
+- **Preserved side effects:** GitView's and DiffPanel's window `pointermove` listeners doubled as
+  the keyboard-nav hover-suppression release; both survive as dedicated listeners. GitView's
+  expand-toggle now clears the drag draft (the old code cleared the resize flag).
+- **Pane gutter double-click equalizes the adjacent pair** — the natural "default" for a boundary
+  in a fraction model. `MIN_PANE_WIDTH_PX` stays where it was; the Git detail minimum moved into
+  the store (`GIT_DETAIL_MIN_WIDTH`), removing the mirrored-constant comment's other half.
+
+Post-review fixes (two AI reviewers, three confirmed findings):
+
+- **Live viewport bound is CSS, not a resize listener.** The store's clamp only ran at
+  read/write, so a mid-session window shrink left an oversized panel squeezing the content area.
+  Each pixel consumer now mirrors its clamp as a `max-width`
+  (`clamp(200px,40vw,480px)` on `SidebarPanel`, `85%` on the Git detail aside — the *actual*
+  container, tighter than the store's viewport approximation — `clamp(176px,55%,440px)` on the
+  diff file list). Deliberately **not** a store-rewriting resize listener: the stored preference
+  survives a transient shrink and re-expands when the window grows.
+- **Drags and keyboard steps start from the rendered width.** `ResizeHandle` clamps its start
+  value to `[min, max()]`, so an adjustment under a CSS cap begins from what's on screen, never
+  the invisible stored value (no first-pixel jump).
+- **Keyboard path (WAI-ARIA window splitter).** The handle is focusable with
+  `aria-valuenow/min/max`; arrow keys draft ±16px steps and commit once on key release — the
+  pointer's draft/commit-once contract transposed, so a held key doesn't write localStorage at
+  key-repeat rate.
+- **Interrupted drags finalize.** `pointercancel` and window blur commit what's on screen and
+  disarm, closing the stuck-drag class (armed handle resizing on bare pointer motion after a
+  Cmd-Tab). No new `onCancel` API; Escape-to-revert deliberately skipped until a real need.
 
 ---
 
@@ -1002,7 +1065,7 @@ and roughly where you are in it.
 | M2 token foundation | — | no | foundation |
 | M3 tool facets | — | yes | foundation |
 | M4 tool-call rows | M2, M3 | no | the headline change |
-| M5 changed-files card | M4 | no | new surface |
+| M5 changed-files card | M4 | no | **skipped** — superseded by M4's inline diffs |
 | M6 resize + layout | — | no | primitive + persistence |
 | M7 Git view | M2 | no | polish |
 | M8 sidebar + live-turn indicators | M2 | no | polish |

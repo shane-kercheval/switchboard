@@ -439,6 +439,8 @@ describe("App", () => {
     panes._testing.reset();
     const recipients = await import("$lib/state/recipientSelection.svelte");
     recipients._testing.reset();
+    const lay = await import("$lib/layout.svelte");
+    lay._testing.reset();
   });
 
   // --- harness availability banners (workspace empty → welcome) ---
@@ -946,7 +948,7 @@ describe("App", () => {
     // (sideways or vertically) once the real layout mounts for the next
     // loading state.
     expect(screen.getByTestId("project-loading-sidebar-shell")).toBeInTheDocument();
-    expect(screen.getByTestId("project-loading-sidebar-shell")).toHaveClass("w-60");
+    expect(screen.getByTestId("project-loading-sidebar-shell")).toHaveStyle({ width: "240px" });
     expect(screen.getByTestId("project-loading-compose-shell")).toBeInTheDocument();
 
     releaseOpen();

@@ -28,7 +28,14 @@
   import { validateProjectName, normalizeProjectName } from "$lib/projectName";
   import type { NameValidation } from "$lib/nameValidation";
   import { basename, cn, relativeTime } from "$lib/utils";
+  import {
+    layout,
+    PROJECTS_SIDEBAR_DEFAULT_WIDTH,
+    SIDEBAR_MIN_WIDTH,
+    sidebarMaxWidth,
+  } from "$lib/layout.svelte";
   import Input from "$lib/components/ui/Input.svelte";
+  import ResizeHandle from "$lib/components/ui/ResizeHandle.svelte";
   import SidebarPanel from "$lib/components/ui/SidebarPanel.svelte";
   import SidebarSection from "$lib/components/ui/SidebarSection.svelte";
   import Badge from "$lib/components/ui/Badge.svelte";
@@ -79,6 +86,9 @@
       console.warn("[switchboard] failed to cancel workflow run", e),
     );
   }
+
+  /// Live width during a resize drag; the store commits on pointer-up.
+  let draftWidth = $state<number | null>(null);
 
   let deleteConfirmProjectId = $state<ProjectId | null>(null);
   let deletingProjectId = $state<ProjectId | null>(null);
@@ -344,7 +354,28 @@
   }
 </script>
 
-<SidebarPanel side="left" width="w-72" testid="projects-sidebar">
+<SidebarPanel
+  side="left"
+  width={draftWidth ?? layout.projectsSidebarWidth}
+  testid="projects-sidebar"
+>
+  <ResizeHandle
+    value={() => draftWidth ?? layout.projectsSidebarWidth}
+    min={SIDEBAR_MIN_WIDTH}
+    max={sidebarMaxWidth}
+    label="Resize projects sidebar"
+    testid="projects-sidebar-resizer"
+    class="hover:bg-active absolute inset-y-0 right-0 z-10 w-1 transition-colors"
+    onDraft={(px) => (draftWidth = px)}
+    onCommit={(px) => {
+      layout.projectsSidebarWidth = px;
+      draftWidth = null;
+    }}
+    onReset={() => {
+      layout.projectsSidebarWidth = PROJECTS_SIDEBAR_DEFAULT_WIDTH;
+      draftWidth = null;
+    }}
+  />
   <div
     class="flex h-11 shrink-0 items-center justify-end px-3"
     data-tauri-drag-region

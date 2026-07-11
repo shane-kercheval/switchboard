@@ -40,6 +40,7 @@
     type TranscriptPane,
   } from "$lib/state/transcriptPanes.svelte";
   import { selectionFor, targetRecipients } from "$lib/state/recipientSelection.svelte";
+  import { layout } from "$lib/layout.svelte";
   import DevIndicator from "$lib/components/ui/DevIndicator.svelte";
   import { installDevTranscriptSeed } from "$lib/dev/seedTranscript";
   import { windowDragRegion } from "$lib/windowDrag";
@@ -100,8 +101,6 @@
   );
 
   let dirError = $state<string | null>(null);
-  let projectsSidebarOpen = $state<boolean>(true);
-  let agentsSidebarOpen = $state<boolean>(true);
   let settingsOpen = $state<boolean>(false);
   let editorShortcutError = $state<string | null>(null);
   let editorShortcutSeq = 0;
@@ -145,8 +144,8 @@
     if (event.altKey) {
       if (event.code === "KeyB") {
         event.preventDefault();
-        projectsSidebarOpen = !projectsSidebarOpen;
-        agentsSidebarOpen = !agentsSidebarOpen;
+        layout.projectsSidebarOpen = !layout.projectsSidebarOpen;
+        layout.agentsSidebarOpen = !layout.agentsSidebarOpen;
       } else if (/^Digit[1-9]$/.test(event.code)) {
         // ⌘⌥1..N targets pane N (leftmost = 1): replace the compose recipient
         // set with that pane's members. `event.code`, not `event.key` — Option
@@ -155,9 +154,9 @@
         // per-agent chip toggle in ComposeBar.
         if (selection.activeProjectId === null || settingsOpen || view.mode === "git") return;
         const rosterIds = activeAgents.map((a) => a.id);
-        const layout = layoutFor(selection.activeProjectId, rosterIds);
-        if (layout.panes.length < 2) return;
-        const pane = layout.panes[Number(event.code.slice(5)) - 1];
+        const paneLayout = layoutFor(selection.activeProjectId, rosterIds);
+        if (paneLayout.panes.length < 2) return;
+        const pane = paneLayout.panes[Number(event.code.slice(5)) - 1];
         // An empty pane keeps its positional number but is not a send target
         // (targeting it could only clear the recipient set, silently).
         if (pane === undefined || pane.members.length === 0) return;
@@ -201,10 +200,10 @@
       void openSelectionInEditor();
     } else if (key === "b" && event.shiftKey) {
       event.preventDefault();
-      agentsSidebarOpen = !agentsSidebarOpen;
+      layout.agentsSidebarOpen = !layout.agentsSidebarOpen;
     } else if (key === "b") {
       event.preventDefault();
-      projectsSidebarOpen = !projectsSidebarOpen;
+      layout.projectsSidebarOpen = !layout.projectsSidebarOpen;
     } else if (key === "n" && event.shiftKey) {
       event.preventDefault();
       if (hasActiveProject) openAddAgent();
@@ -429,7 +428,7 @@
   // The Git view is a full-width center-pane takeover (decision D1) — the
   // Projects sidebar hides while it's active and returns on toggle back.
   const projectsSidebarVisible = $derived(
-    projectsSidebarOpen && projectsSidebarHasContent && view.mode !== "git",
+    layout.projectsSidebarOpen && projectsSidebarHasContent && view.mode !== "git",
   );
   const showPaneHeaderControls = $derived(
     !settingsOpen &&
@@ -473,10 +472,10 @@
 
   $effect(() => {
     const projectId = selection.activeProjectId;
-    const layout = activePaneLayout;
-    if (projectId === null || layout === null) return;
+    const paneLayout = activePaneLayout;
+    if (projectId === null || paneLayout === null) return;
     const projectPrefix = `${projectId}:`;
-    const paneKeys = layout.panes.map((pane) => paneTabKey(projectId, pane.id));
+    const paneKeys = paneLayout.panes.map((pane) => paneTabKey(projectId, pane.id));
     const tabEntries = headerTabPanes.map((pane) => ({
       key: paneTabKey(projectId, pane.id),
       active: paneIsActive(pane),
@@ -561,12 +560,12 @@
     // maximized) remounts its transcript, so show the spinner first — exactly
     // like clicking a header tab. An already-visible target just re-targets, so
     // it runs immediately with no spurious spinner.
-    const layout = activePaneLayout;
+    const paneLayout = activePaneLayout;
     const targetHidden =
-      layout !== null &&
-      (layout.maximized !== null
-        ? layout.maximized !== pane.id
-        : layout.minimized.includes(pane.id));
+      paneLayout !== null &&
+      (paneLayout.maximized !== null
+        ? paneLayout.maximized !== pane.id
+        : paneLayout.minimized.includes(pane.id));
     if (targetHidden) {
       void withTranscriptBusy(() => {
         if (selection.activeProjectId !== projectId) return;
@@ -736,20 +735,20 @@
     });
     cmds.push({
       id: "nav.toggle-projects-sidebar",
-      title: projectsSidebarOpen ? "Hide projects sidebar" : "Show projects sidebar",
+      title: layout.projectsSidebarOpen ? "Hide projects sidebar" : "Show projects sidebar",
       group: "Navigation",
       shortcut: ["mod", "B"],
       run: () => {
-        projectsSidebarOpen = !projectsSidebarOpen;
+        layout.projectsSidebarOpen = !layout.projectsSidebarOpen;
       },
     });
     cmds.push({
       id: "nav.toggle-agents-sidebar",
-      title: agentsSidebarOpen ? "Hide agents sidebar" : "Show agents sidebar",
+      title: layout.agentsSidebarOpen ? "Hide agents sidebar" : "Show agents sidebar",
       group: "Navigation",
       shortcut: ["mod", "shift", "B"],
       run: () => {
-        agentsSidebarOpen = !agentsSidebarOpen;
+        layout.agentsSidebarOpen = !layout.agentsSidebarOpen;
       },
     });
     cmds.push({
@@ -845,7 +844,7 @@
           onAddProject={openProjectDialog}
           onOpenSettings={toggleSettings}
           onProjectSelect={() => (settingsOpen = false)}
-          onToggleSidebar={() => (projectsSidebarOpen = false)}
+          onToggleSidebar={() => (layout.projectsSidebarOpen = false)}
           {settingsOpen}
         />
       {/if}
@@ -881,7 +880,7 @@
         <!-- Title-bar Settings + re-open toggle appear only when the sidebar
              has content but is collapsed. In the no-project state there's no
              sidebar at all, so neither shows — the welcome screen stays clean. -->
-        {#if projectsSidebarHasContent && !projectsSidebarOpen}
+        {#if projectsSidebarHasContent && !layout.projectsSidebarOpen}
           <SettingsButton
             pressed={settingsOpen}
             testid="settings-button"
@@ -892,7 +891,7 @@
             expanded={false}
             label="Show projects sidebar"
             testid="projects-sidebar-toggle"
-            onclick={() => (projectsSidebarOpen = true)}
+            onclick={() => (layout.projectsSidebarOpen = true)}
           />
         {/if}
         {#if settingsOpen}
@@ -1066,10 +1065,10 @@
         {#if showAgentsToggle}
           <SidebarToggleButton
             side="right"
-            expanded={agentsSidebarOpen}
-            label={agentsSidebarOpen ? "Hide agents sidebar" : "Show agents sidebar"}
+            expanded={layout.agentsSidebarOpen}
+            label={layout.agentsSidebarOpen ? "Hide agents sidebar" : "Show agents sidebar"}
             testid="agents-sidebar-toggle"
-            onclick={() => (agentsSidebarOpen = !agentsSidebarOpen)}
+            onclick={() => (layout.agentsSidebarOpen = !layout.agentsSidebarOpen)}
             class="hover:bg-panel"
           />
         {/if}
@@ -1177,8 +1176,12 @@
                 </div>
               </div>
             </div>
-            {#if agentsSidebarOpen}
-              <SidebarPanel side="right" width="w-60" testid="project-loading-sidebar-shell">
+            {#if layout.agentsSidebarOpen}
+              <SidebarPanel
+                side="right"
+                width={layout.agentsSidebarWidth}
+                testid="project-loading-sidebar-shell"
+              >
                 <div></div>
               </SidebarPanel>
             {/if}
@@ -1228,7 +1231,7 @@
                 />
               {/key}
             </div>
-            {#if agentsSidebarOpen}
+            {#if layout.agentsSidebarOpen}
               <Sidebar
                 projectId={selection.activeProjectId!}
                 agents={activeAgents}

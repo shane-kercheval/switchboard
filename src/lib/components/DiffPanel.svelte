@@ -18,6 +18,7 @@
   import Dialog from "$lib/components/ui/Dialog.svelte";
   import EmptyState from "$lib/components/ui/EmptyState.svelte";
   import Markdown from "$lib/components/ui/Markdown.svelte";
+  import ResizeHandle from "$lib/components/ui/ResizeHandle.svelte";
   import Spinner from "$lib/components/ui/Spinner.svelte";
   import DiffView from "$lib/components/DiffView.svelte";
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
@@ -46,6 +47,12 @@
   import { preferences, updatePreferences } from "$lib/preferences.svelte";
   import type { ChangedFile, ChangeKind, DiffStyle, FileDiff } from "$lib/types";
   import { navFocus, hoverSuppressed, hoverableClass, nextIndex } from "$lib/state/gitView.svelte";
+  import {
+    DIFF_FILE_LIST_DEFAULT_WIDTH,
+    DIFF_FILE_LIST_MAX_WIDTH,
+    DIFF_FILE_LIST_MIN_WIDTH,
+    layout,
+  } from "$lib/layout.svelte";
   import { palette } from "$lib/state/commandPalette.svelte";
   import type { DiffTarget } from "$lib/state/gitView.svelte";
 
@@ -85,8 +92,15 @@
   let filesKey: string | null = null;
   let diffKey: string | null = null;
   let bodyEl = $state<HTMLDivElement | null>(null);
-  let fileListWidth = $state(256);
-  let resizingFiles = false;
+  /// Live width during a resize drag; the layout store commits on pointer-up.
+  let draftFileListWidth = $state<number | null>(null);
+  const fileListWidth = $derived(draftFileListWidth ?? layout.diffFileListWidth);
+
+  function fileListMaxWidth(): number {
+    return bodyEl === null
+      ? DIFF_FILE_LIST_MAX_WIDTH
+      : Math.min(DIFF_FILE_LIST_MAX_WIDTH, bodyEl.getBoundingClientRect().width * 0.55);
+  }
 
   // Stable identity for the selected target — changes when the user picks a
   // different commit or worktree, the signal the load effects key on.
@@ -288,25 +302,8 @@
     return openInEditor(worktreeFilePath(target.worktreePath, file.path));
   }
 
-  function startFileResize(event: PointerEvent): void {
-    resizingFiles = true;
-    event.preventDefault();
-  }
-
-  function onWindowPointerMove(event: PointerEvent): void {
+  function onWindowPointerMove(): void {
     if (hoverSuppressed.value) hoverSuppressed.value = false;
-    resizeFiles(event);
-  }
-
-  function resizeFiles(event: PointerEvent): void {
-    if (!resizingFiles || bodyEl === null) return;
-    const rect = bodyEl.getBoundingClientRect();
-    const max = Math.min(440, rect.width * 0.55);
-    fileListWidth = Math.min(max, Math.max(176, event.clientX - rect.left));
-  }
-
-  function endFileResize(): void {
-    resizingFiles = false;
   }
 
   let filesListEl = $state<HTMLUListElement | null>(null);
@@ -521,9 +518,11 @@
     {/if}
   {:else}
     <div class="flex min-h-0 flex-1 overflow-hidden" bind:this={bodyEl}>
-      <!-- Changed-files list -->
+      <!-- Changed-files list. The max-width mirrors fileListMaxWidth() in CSS
+           (55% of the body, capped at 440px) so a persisted width is bounded
+           live as the panel shrinks; keep the two formulas in sync. -->
       <div
-        class="border-border/60 bg-panel shrink-0 overflow-hidden border-r"
+        class="border-border/60 bg-panel max-w-[clamp(176px,55%,440px)] shrink-0 overflow-hidden border-r"
         style={`width: ${fileListWidth}px`}
       >
         <div
@@ -669,14 +668,23 @@
         </ul>
       </div>
 
-      <div
-        class="border-border/60 bg-panel hover:bg-raised w-1.5 shrink-0 cursor-col-resize border-r transition-colors"
-        role="separator"
-        aria-orientation="vertical"
-        aria-label="Resize changed files list"
-        data-testid="changed-files-resizer"
-        onpointerdown={startFileResize}
-      ></div>
+      <ResizeHandle
+        value={() => fileListWidth}
+        min={DIFF_FILE_LIST_MIN_WIDTH}
+        max={fileListMaxWidth}
+        label="Resize changed files list"
+        testid="changed-files-resizer"
+        class="border-border/60 bg-panel hover:bg-raised w-1.5 border-r transition-colors"
+        onDraft={(px) => (draftFileListWidth = px)}
+        onCommit={(px) => {
+          layout.diffFileListWidth = px;
+          draftFileListWidth = null;
+        }}
+        onReset={() => {
+          layout.diffFileListWidth = DIFF_FILE_LIST_DEFAULT_WIDTH;
+          draftFileListWidth = null;
+        }}
+      />
 
       <!-- Diff -->
       <div class="bg-raised min-w-0 flex-1 overflow-auto" data-testid="diff-scroll">
@@ -699,4 +707,5 @@
   {/if}
 </div>
 
-<svelte:window onpointermove={onWindowPointerMove} onpointerup={endFileResize} />
+<!-- Keyboard navigation suppresses hover highlights; any pointer motion restores them. -->
+<svelte:window onpointermove={onWindowPointerMove} />

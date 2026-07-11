@@ -387,7 +387,8 @@ describe("UnifiedTranscript", () => {
     // "running…" or "error" annotation should appear.
     expect(tool).not.toHaveTextContent("running…");
     expect(tool).not.toHaveTextContent("error");
-    // Empty output is suppressed; input can still render in the expanded body.
+    // Empty output is suppressed even when expanded; input still renders.
+    await fireEvent.click(within(tool).getByTestId("tool-row"));
     expect(tool.querySelector('[data-testid="tool-output"]')).toBeNull();
     expect(tool.querySelector('[data-testid="tool-input"]')).not.toBeNull();
   });
@@ -422,8 +423,9 @@ describe("UnifiedTranscript", () => {
     render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     const tool = screen.getByTestId("turn-tool");
-    expect(tool).not.toHaveAttribute("open");
-    expect(tool.querySelector("summary")).toHaveTextContent("Tool");
+    expect(tool.querySelector('[data-testid="tool-body"]')).toBeNull();
+    // An unmapped facet degrades to the raw tool name as the verb.
+    expect(within(tool).getByTestId("tool-verb")).toHaveTextContent("Bash");
     expect(tool).not.toHaveTextContent("builtin");
     // Success shows the quiet muted check, not the running/error indicators.
     expect(tool.querySelector('[data-testid="tool-done"]')).not.toBeNull();
@@ -460,7 +462,7 @@ describe("UnifiedTranscript", () => {
     render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     const tool = screen.getByTestId("turn-tool");
-    expect(tool).not.toHaveAttribute("open");
+    expect(tool.querySelector('[data-testid="tool-body"]')).toBeNull();
     expect(tool.querySelector('[data-testid="tool-error"]')).not.toBeNull();
   });
 
@@ -491,7 +493,7 @@ describe("UnifiedTranscript", () => {
     render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     const tool = screen.getByTestId("turn-tool");
-    expect(tool).not.toHaveAttribute("open");
+    expect(tool.querySelector('[data-testid="tool-body"]')).toBeNull();
     expect(tool.querySelector('[data-testid="tool-running"]')).not.toBeNull();
   });
 
@@ -1780,8 +1782,9 @@ describe("UnifiedTranscript — per-message copy", () => {
     expect(thinking).toBeInTheDocument();
     expect(screen.getByText("Final answer")).toBeInTheDocument();
 
-    // Collapsed by default.
-    expect((thinking as HTMLDetailsElement).open).toBe(false);
+    // Collapsed by default: no body until the user opens the row.
+    expect(screen.queryByTestId("thinking-body")).toBeNull();
+    await fireEvent.click(within(thinking).getByTestId("thinking-row"));
 
     // Reasoning lives in the thinking widget's body, not the answer container.
     expect(screen.getByTestId("thinking-body").textContent).toContain("secret reasoning");

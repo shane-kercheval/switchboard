@@ -938,7 +938,7 @@
         <Markdown text={item.text} />
       {/if}
     {:else}
-      <ToolCallWidget tool={item} />
+      <ToolCallWidget tool={item} turnSettled={turn.status !== "streaming"} />
     {/if}
   {/each}
 {/snippet}

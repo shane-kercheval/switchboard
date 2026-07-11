@@ -1,8 +1,19 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
 import { render, fireEvent } from "@testing-library/svelte";
 import type { ToolCall } from "$lib/state/types";
+import type { ToolFacet } from "$lib/types";
 import ToolCallWidget from "./ToolCallWidget.svelte";
+
+// Wrap the real formatter in a spy so the eager-stringify regression test can
+// assert it is never invoked for a collapsed row (the bug being replaced
+// formatted every tool call's raw input whether or not it was expanded).
+const formatToolInputSpy = vi.hoisted(() => vi.fn());
+vi.mock("$lib/toolInput", async (importOriginal) => {
+  const mod = await importOriginal<typeof import("$lib/toolInput")>();
+  formatToolInputSpy.mockImplementation(mod.formatToolInput);
+  return { ...mod, formatToolInput: formatToolInputSpy };
+});
 
 const running: ToolCall = {
   item_kind: "tool",
@@ -30,77 +41,348 @@ const stoppedFailed: ToolCall = {
   stop_reason: "failed",
 };
 
-function summaryOf(el: HTMLElement): HTMLElement {
-  const summary = el.querySelector("summary");
-  if (summary === null) throw new Error("expected a summary");
-  return summary as HTMLElement;
+function withFacet(facet: ToolFacet, overrides: Partial<ToolCall> = {}): ToolCall {
+  return { ...done, facet, ...overrides };
 }
 
-describe("ToolCallWidget disclosure", () => {
-  it("shows a one-line input preview in the collapsed row", () => {
-    const { getByTestId } = render(ToolCallWidget, {
-      tool: { ...done, input: { command: "git status --short --branch && git log --oneline -1" } },
-    });
+const EDIT_FACET: ToolFacet = {
+  facet_kind: "edit",
+  files: [
+    {
+      path: "/repo/src/a.ts",
+      change: "modified",
+      edits: [{ old: "line one\nline two\n", new: "line one\nline 2\n" }],
+      truncated: false,
+    },
+  ],
+};
 
-    expect(getByTestId("tool-input-preview")).toHaveTextContent(
-      "git status --short --branch && git log --oneline -1",
-    );
+describe("ToolCallWidget collapsed row", () => {
+  // Detail is facet-derived and never repeats the verb or the raw tool name —
+  // the raw name lives in the expanded raw-input label instead.
+  const cases: { facet: ToolFacet; verb: string; detail: string | null }[] = [
+    { facet: { facet_kind: "shell", command: "ls", cwd: null }, verb: "Command", detail: "ls" },
+    { facet: EDIT_FACET, verb: "Edit", detail: "/repo/src/a.ts" },
+    {
+      facet: { facet_kind: "write", path: "/repo/x", content: "c", truncated: false },
+      verb: "Write",
+      detail: "/repo/x",
+    },
+    { facet: { facet_kind: "read", path: "/repo/x" }, verb: "Read", detail: "/repo/x" },
+    {
+      facet: { facet_kind: "search", pattern: "todo", path: null },
+      verb: "Search",
+      detail: "todo",
+    },
+    { facet: { facet_kind: "todo", items: [] }, verb: "Todos", detail: null },
+    {
+      facet: { facet_kind: "mcp", server: "linear", tool: "create_issue" },
+      verb: "linear · create_issue",
+      detail: "sleep 1",
+    },
+    { facet: { facet_kind: "other" }, verb: "Bash", detail: "sleep 1" },
+  ];
+
+  for (const { facet, verb, detail } of cases) {
+    it(`shows verb, detail, and status for the ${facet.facet_kind} facet`, () => {
+      const { getByTestId, queryByTestId } = render(ToolCallWidget, { tool: withFacet(facet) });
+      expect(getByTestId("tool-verb")).toHaveTextContent(verb);
+      if (detail === null) {
+        expect(queryByTestId("tool-detail")).toBeNull();
+      } else {
+        expect(getByTestId("tool-detail")).toHaveTextContent(detail);
+      }
+      expect(getByTestId("tool-done")).toBeInTheDocument();
+    });
+  }
+
+  it("shows the input preview as the detail without a raw-name prefix", () => {
+    const { getByTestId } = render(ToolCallWidget, {
+      tool: { ...done, input: { command: "git log --oneline -3" } },
+    });
+    expect(getByTestId("tool-detail")).toHaveTextContent("git log --oneline -3");
+    expect(getByTestId("tool-detail")).not.toHaveTextContent("Bash:");
   });
 
-  it("renders input and output as separate expanded sections", async () => {
+  it("truncates a long detail rather than wrapping", () => {
     const { getByTestId } = render(ToolCallWidget, {
-      tool: {
-        ...done,
-        input: { file_path: "/tmp/file.txt", old_string: "before", new_string: "after" },
-      },
+      tool: { ...done, input: { command: `echo ${"x".repeat(500)}` } },
     });
-    const tool = getByTestId("turn-tool");
+    // jsdom has no layout, so assert the truncation contract via classes: a
+    // single-line ellipsis needs `truncate` and a shrinkable `min-w-0`.
+    const detail = getByTestId("tool-detail");
+    expect(detail.className).toContain("truncate");
+    expect(detail.className).toContain("min-w-0");
+  });
 
-    await fireEvent.click(summaryOf(tool));
+  it("degrades an unknown facet discriminant to the raw tool name", () => {
+    const facet = { facet_kind: "hologram" } as unknown as ToolFacet;
+    const { getByTestId } = render(ToolCallWidget, { tool: withFacet(facet) });
+    expect(getByTestId("tool-verb")).toHaveTextContent("Bash");
+  });
+});
+
+describe("ToolCallWidget status glyphs", () => {
+  it("shows a spinner while running", () => {
+    const { getByTestId, queryByTestId } = render(ToolCallWidget, { tool: running });
+    expect(getByTestId("tool-running")).toBeInTheDocument();
+    expect(queryByTestId("tool-done")).toBeNull();
+  });
+
+  it("shows the failed glyph for an is_error completion", () => {
+    const { getByTestId } = render(ToolCallWidget, {
+      tool: { ...done, is_error: true, output: "boom" },
+    });
+    expect(getByTestId("tool-error")).toBeInTheDocument();
+  });
+
+  it("renders a cancelled tool with the in-progress verb and cancelled glyph", () => {
+    const { getByTestId, queryByTestId } = render(ToolCallWidget, {
+      tool: { ...cancelled, facet: { facet_kind: "shell", command: "ls", cwd: null } },
+    });
+    expect(queryByTestId("tool-running")).toBeNull();
+    expect(getByTestId("tool-cancelled")).toBeInTheDocument();
+    // The label is state-invariant; the cancelled glyph carries the outcome.
+    expect(getByTestId("tool-verb")).toHaveTextContent("Command");
+  });
+
+  it("renders a stopped-failed tool with the failed glyph and unchanged label", () => {
+    const { getByTestId, queryByTestId } = render(ToolCallWidget, {
+      tool: { ...stoppedFailed, facet: { facet_kind: "shell", command: "ls", cwd: null } },
+    });
+    expect(queryByTestId("tool-running")).toBeNull();
+    expect(getByTestId("tool-error")).toBeInTheDocument();
+    expect(getByTestId("tool-verb")).toHaveTextContent("Command");
+  });
+});
+
+describe("ToolCallWidget expansion", () => {
+  it("starts collapsed with no body and stays collapsed across completion", async () => {
+    const { getByTestId, queryByTestId, rerender } = render(ToolCallWidget, { tool: running });
+    expect(queryByTestId("tool-body")).toBeNull();
+
+    await rerender({ tool: done });
+    expect(queryByTestId("tool-body")).toBeNull();
+    expect(getByTestId("tool-row")).toHaveAttribute("aria-expanded", "false");
+  });
+
+  it("keeps a user-opened panel open across completion", async () => {
+    const { getByTestId, rerender } = render(ToolCallWidget, { tool: running });
+    await fireEvent.click(getByTestId("tool-row"));
+    expect(getByTestId("tool-body")).toBeInTheDocument();
+
+    await rerender({ tool: done });
+    expect(getByTestId("tool-body")).toBeInTheDocument();
+  });
+
+  it("shows raw input directly on expand for the generic facet", async () => {
+    const { getByTestId } = render(ToolCallWidget, {
+      tool: { ...done, input: { file_path: "/tmp/file.txt", old_string: "before" } },
+    });
+    await fireEvent.click(getByTestId("tool-row"));
 
     expect(getByTestId("tool-input")).toHaveTextContent('"file_path": "/tmp/file.txt"');
-    expect(getByTestId("tool-input")).toHaveTextContent('"old_string": "before"');
     expect(getByTestId("tool-output")).toHaveTextContent("hi");
   });
 
-  it("stays collapsed while running and after completion when untouched", async () => {
-    const { getByTestId, rerender } = render(ToolCallWidget, { tool: running });
-    expect(getByTestId("turn-tool")).not.toHaveAttribute("open");
+  it("reaches raw input behind the toggle for every specialized facet", async () => {
+    const facets: ToolFacet[] = [
+      { facet_kind: "shell", command: "ls", cwd: null },
+      EDIT_FACET,
+      { facet_kind: "write", path: "/repo/x", content: "c", truncated: false },
+      { facet_kind: "read", path: "/repo/x" },
+      { facet_kind: "search", pattern: "todo", path: null },
+      { facet_kind: "todo", items: [] },
+      { facet_kind: "mcp", server: "linear", tool: "create_issue" },
+    ];
+    for (const facet of facets) {
+      const { getByTestId, queryByTestId, unmount } = render(ToolCallWidget, {
+        tool: withFacet(facet, { input: { marker: "raw-envelope" } }),
+      });
+      await fireEvent.click(getByTestId("tool-row"));
+      expect(queryByTestId("tool-input")).toBeNull();
 
-    await rerender({ tool: done });
-    expect(getByTestId("turn-tool")).not.toHaveAttribute("open");
+      await fireEvent.click(getByTestId("tool-raw-toggle"));
+      expect(getByTestId("tool-input")).toHaveTextContent('"marker": "raw-envelope"');
+      expect(getByTestId("tool-raw-name")).toHaveTextContent("Bash");
+      unmount();
+    }
   });
 
-  it("does not yank the panel shut on completion once the user has toggled it", async () => {
-    const { getByTestId, rerender } = render(ToolCallWidget, { tool: running });
-    const tool = getByTestId("turn-tool");
-    await fireEvent.click(summaryOf(tool));
-    expect(tool).toHaveAttribute("open");
+  it("suppresses the output section when output is empty", async () => {
+    const { getByTestId, queryByTestId } = render(ToolCallWidget, {
+      tool: { ...done, output: "" },
+    });
+    await fireEvent.click(getByTestId("tool-row"));
+    expect(queryByTestId("tool-output")).toBeNull();
+  });
+});
 
-    await rerender({ tool: done });
-    expect(tool).toHaveAttribute("open");
+describe("ToolCallWidget lazy raw input", () => {
+  it("does not format a huge input while collapsed", () => {
+    formatToolInputSpy.mockClear();
+    const huge = { blob: "x".repeat(2_000_000) };
+    const { queryByTestId } = render(ToolCallWidget, { tool: { ...done, input: huge } });
+
+    expect(queryByTestId("tool-input")).toBeNull();
+    expect(formatToolInputSpy).not.toHaveBeenCalled();
   });
 
-  it("lets the user expand a completed tool and keeps it open", async () => {
-    const { getByTestId } = render(ToolCallWidget, { tool: done });
-    const tool = getByTestId("turn-tool");
-    expect(tool).not.toHaveAttribute("open");
+  it("caps the displayed raw input with a truncation notice when expanded", async () => {
+    const huge = { blob: "x".repeat(2_000_000) };
+    const { getByTestId } = render(ToolCallWidget, { tool: { ...done, input: huge } });
+    await fireEvent.click(getByTestId("tool-row"));
 
-    await fireEvent.click(summaryOf(tool));
-    expect(tool).toHaveAttribute("open");
+    const rendered = getByTestId("tool-input").textContent ?? "";
+    expect(rendered.length).toBeLessThan(100_000);
+    expect(getByTestId("tool-input-truncated")).toBeInTheDocument();
   });
 
-  it("shows a cancelled icon for a tool that was pending when the turn stopped", () => {
-    const { getByTestId, queryByTestId } = render(ToolCallWidget, { tool: cancelled });
-    expect(queryByTestId("tool-running")).toBeNull();
-    expect(getByTestId("tool-cancelled")).toBeInTheDocument();
-    expect(getByTestId("turn-tool")).not.toHaveAttribute("open");
+  it("shows no truncation notice for a small input", async () => {
+    const { getByTestId, queryByTestId } = render(ToolCallWidget, { tool: done });
+    await fireEvent.click(getByTestId("tool-row"));
+    expect(getByTestId("tool-input")).toHaveTextContent('"command": "sleep 1"');
+    expect(queryByTestId("tool-input-truncated")).toBeNull();
+  });
+});
+
+describe("ToolCallWidget facet bodies", () => {
+  it("renders a shell body with the full command and cwd", async () => {
+    const { getByTestId } = render(ToolCallWidget, {
+      tool: withFacet({ facet_kind: "shell", command: "git status", cwd: "/repo" }),
+    });
+    await fireEvent.click(getByTestId("tool-row"));
+    expect(getByTestId("tool-command")).toHaveTextContent("git status");
+    expect(getByTestId("tool-body")).toHaveTextContent("in /repo");
   });
 
-  it("shows a failed icon for a tool that was pending when the turn failed", () => {
-    const { getByTestId, queryByTestId } = render(ToolCallWidget, { tool: stoppedFailed });
-    expect(queryByTestId("tool-running")).toBeNull();
-    expect(getByTestId("tool-error")).toBeInTheDocument();
-    expect(getByTestId("turn-tool")).not.toHaveAttribute("open");
+  it("redacts secrets in the displayed shell command", async () => {
+    const { getByTestId } = render(ToolCallWidget, {
+      tool: withFacet({
+        facet_kind: "shell",
+        command: "curl -H 'Authorization: Bearer abc123secret' https://api.example.com",
+        cwd: null,
+      }),
+    });
+    await fireEvent.click(getByTestId("tool-row"));
+    expect(getByTestId("tool-command")).toHaveTextContent("[redacted]");
+    expect(getByTestId("tool-command")).not.toHaveTextContent("abc123secret");
+  });
+
+  it("renders an edit as a diff of what the call changed", async () => {
+    const { getByTestId, container } = render(ToolCallWidget, { tool: withFacet(EDIT_FACET) });
+    await fireEvent.click(getByTestId("tool-row"));
+
+    const removed = Array.from(container.querySelectorAll('[data-origin="removed"]'));
+    const added = Array.from(container.querySelectorAll('[data-origin="added"]'));
+    expect(removed.map((el) => el.textContent)).toEqual(
+      expect.arrayContaining([expect.stringContaining("line two")]),
+    );
+    expect(added.map((el) => el.textContent)).toEqual(
+      expect.arrayContaining([expect.stringContaining("line 2")]),
+    );
+    expect(getByTestId("tool-body")).toHaveTextContent("snippet-relative");
+  });
+
+  it("renders one diff section per file for a multi-file edit", async () => {
+    const facet: ToolFacet = {
+      facet_kind: "edit",
+      files: [
+        {
+          path: "/repo/a.ts",
+          change: "modified",
+          edits: [{ old: "a\n", new: "b\n" }],
+          truncated: false,
+        },
+        {
+          path: "/repo/b.ts",
+          change: "added",
+          edits: [{ old: "", new: "new file\n" }],
+          truncated: false,
+        },
+      ],
+    };
+    const { getByTestId, getAllByTestId } = render(ToolCallWidget, { tool: withFacet(facet) });
+    await fireEvent.click(getByTestId("tool-row"));
+
+    const sections = getAllByTestId("tool-edit-file");
+    expect(sections).toHaveLength(2);
+    expect(sections[1]).toHaveTextContent("(added)");
+    expect(getByTestId("tool-verb")).toHaveTextContent("Edit");
+  });
+
+  it("shows a pending placeholder for a content-less edit on a live turn", async () => {
+    const facet: ToolFacet = {
+      facet_kind: "edit",
+      files: [{ path: "/repo/a.ts", change: "modified", edits: [], truncated: false }],
+    };
+    const { getByTestId } = render(ToolCallWidget, {
+      tool: withFacet(facet),
+      turnSettled: false,
+    });
+    await fireEvent.click(getByTestId("tool-row"));
+    expect(getByTestId("tool-edit-pending")).toHaveTextContent(
+      "Diff will appear when the turn completes.",
+    );
+  });
+
+  it("shows an unavailable notice for a content-less edit on a settled turn", async () => {
+    const facet: ToolFacet = {
+      facet_kind: "edit",
+      files: [{ path: "/repo/a.ts", change: "modified", edits: [], truncated: false }],
+    };
+    const { getByTestId } = render(ToolCallWidget, { tool: withFacet(facet), turnSettled: true });
+    await fireEvent.click(getByTestId("tool-row"));
+    expect(getByTestId("tool-edit-pending")).toHaveTextContent(
+      "Diff content unavailable for this edit.",
+    );
+  });
+
+  it("renders a truncated write with its content and a truncation notice", async () => {
+    const { getByTestId } = render(ToolCallWidget, {
+      tool: withFacet({
+        facet_kind: "write",
+        path: "/repo/big.txt",
+        content: "prefix of the file",
+        truncated: true,
+      }),
+    });
+    await fireEvent.click(getByTestId("tool-row"));
+    expect(getByTestId("tool-write-content")).toHaveTextContent("prefix of the file");
+    expect(getByTestId("tool-write-truncated")).toBeInTheDocument();
+  });
+
+  it("renders a todo facet as a checklist", async () => {
+    const facet: ToolFacet = {
+      facet_kind: "todo",
+      items: [
+        { content: "ship it", status: "completed" },
+        { content: "test it", status: "in_progress" },
+        { content: "doc it", status: "pending" },
+      ],
+    };
+    const { getByTestId } = render(ToolCallWidget, { tool: withFacet(facet) });
+    await fireEvent.click(getByTestId("tool-row"));
+
+    const list = getByTestId("tool-todo");
+    expect(list.querySelectorAll("li")).toHaveLength(3);
+    expect(list).toHaveTextContent("ship it");
+    expect(list).toHaveTextContent("test it");
+    expect(list).toHaveTextContent("doc it");
+  });
+
+  it("renders read and search facet details", async () => {
+    const read = render(ToolCallWidget, {
+      tool: withFacet({ facet_kind: "read", path: "/repo/src/main.rs" }),
+    });
+    await fireEvent.click(read.getByTestId("tool-row"));
+    expect(read.getByTestId("tool-read-path")).toHaveTextContent("/repo/src/main.rs");
+    read.unmount();
+
+    const search = render(ToolCallWidget, {
+      tool: withFacet({ facet_kind: "search", pattern: "TODO", path: "/repo/src" }),
+    });
+    await fireEvent.click(search.getByTestId("tool-row"));
+    expect(search.getByTestId("tool-search-detail")).toHaveTextContent("TODO in /repo/src");
   });
 });

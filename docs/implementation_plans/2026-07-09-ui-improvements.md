@@ -564,6 +564,46 @@ for rows nobody expands, it doubles the wire payload, and `DiffHunk` lives in `c
 - Visual verification against a real Claude turn and a real Codex turn, both with edits.
 - No browser test needed — nothing here is layout-measurement-coupled.
 
+### As-built decisions (recorded at implementation review)
+
+Resolved during implementation, confirmed by the engineer; recorded here so the plan matches what
+shipped:
+
+- **Verb vocabulary revised after visual review — supersedes the facet × state table above.**
+  Labels are state-invariant nouns: `Command`, `Edit`, `Write`, `Read`, `Search`, `Todos`, the
+  server/tool pair for MCP, the raw name for the generic facet. The status glyph (spinner / quiet
+  check / failed / cancelled) is the row's sole state signal; encoding state into the verb
+  duplicated it, and a noun also reads correctly for a tool cancelled mid-flight.
+- **Detail is facet-derived, not a raw-input preview.** The verb already names the operation, so
+  prefixing the raw tool name (`Bash:`, `run_command:`, `file_change:`) was pure duplication. The
+  detail is the facet's substance — the command line (display-redacted via `redactDisplay`), the
+  file path(s), the pattern, a todo summary — with the input preview kept only for MCP/generic
+  facets. The raw tool name moved into the expanded raw-input section's label, so provenance stays
+  reachable.
+- **`ThinkingWidget` restyled to the same row grammar** (brain icon · "Thinking" · muted preview ·
+  chevron; expanded body on `panel`, mounted lazily) so reasoning blocks sit in the same visual set
+  as the tool rows around them. `ui/Disclosure` remains for the compaction marker.
+- **Tool-row diffs are always unified**, ignoring the user's `diff_style` preference: side-by-side
+  needs a 48rem minimum width, which cannot fit the row's 600px content cap without horizontal
+  scrolling. The Git view still honors the preference.
+- **Content-less Codex edits get a placeholder.** This section predates M3's finding that a live
+  Codex `file_change` announces paths without content (content arrives via the turn-end facet
+  upgrade, and in a rare correlation-mismatch case never arrives). An Edit facet with empty `edits`
+  renders the path plus "Diff will appear when the turn completes" while the turn streams, or "Diff
+  content unavailable" on a settled turn — `ToolCallWidget` takes a `turnSettled` prop for the
+  distinction.
+- **Expanded-panel composition.** One recessed `panel` fill holds the facet body, then the tool
+  output when present, then the raw `name`+`input` JSON. For specialized facets the raw JSON sits
+  behind a "Show raw input" reveal (the facet body already shows the same information readably);
+  the generic facet has no body, so its raw input shows directly. `DiffView`'s `raised` canvas
+  inside the panel is the one deliberate second treatment — it sits at the M2 two-treatment
+  maximum and reads as a document in a well.
+- The old "TOOL"/"MCP"/"Plugin" kind label and `Badge` are gone from the row; the facet icon
+  (lucide) plus verb replace them. The raw-JSON display cap is 50 k characters.
+- New modules: `src/lib/toolRow.ts` (facet × state verb vocabulary, provenance detail, icon map)
+  and `src/lib/toolDiff.ts` (jsdiff `structuredPatch` → `FileDiff` synthesis; snippet-relative
+  hunk headers carry an explicit qualifier). Dependency added: `diff` (jsdiff v9, bundled types).
+
 ---
 
 ## M5 — Per-turn changed-files card

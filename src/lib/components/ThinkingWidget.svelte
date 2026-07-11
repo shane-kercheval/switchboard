@@ -2,9 +2,12 @@
   /// Reasoning as a borderless row matching the tool-call rows: brain icon ·
   /// "Thinking" label · muted one-line preview · chevron. Collapsed it is
   /// chrome-free so a thinking block sits in the same visual set as the tool
-  /// calls around it; expanding reveals the full reasoning on a single
-  /// recessed `panel` fill. The body (a full Markdown render of possibly-long
-  /// reasoning) mounts only while open, same lazy contract as the tool row.
+  /// calls around it; expanded, the reasoning hangs under the row behind a
+  /// thin left rule, directly on the reading surface — prose in a gray slab
+  /// read as the heaviest block on screen. The preview hides while open (the
+  /// body starts with the same line). The body (a full Markdown render of
+  /// possibly-long reasoning) mounts only while open, same lazy contract as
+  /// the tool row.
   import Markdown from "$lib/components/ui/Markdown.svelte";
   import { cn } from "$lib/utils";
   import { Brain } from "@lucide/svelte";
@@ -30,7 +33,7 @@
   let open = $state(false);
 </script>
 
-<div class="max-w-[600px] text-xs" data-testid="turn-thinking">
+<div class="text-xs" data-testid="turn-thinking">
   <button
     type="button"
     class="hover:bg-hover flex min-h-7 w-full items-center gap-2 rounded-md px-1.5 py-1 text-left"
@@ -40,7 +43,13 @@
   >
     <Brain class="text-muted h-3.5 w-3.5 shrink-0" aria-hidden="true" />
     <span class="text-fg shrink-0 font-medium">Thinking</span>
-    <span class="text-muted min-w-0 flex-1 truncate" data-testid="thinking-preview">{preview}</span>
+    {#if open}
+      <span class="flex-1"></span>
+    {:else}
+      <span class="text-muted min-w-0 flex-1 truncate" data-testid="thinking-preview"
+        >{preview}</span
+      >
+    {/if}
     <span
       class={cn(
         "text-muted flex h-4 w-4 shrink-0 items-center justify-center transition-transform",
@@ -51,7 +60,7 @@
   </button>
 
   {#if open}
-    <div class="bg-panel mt-1 rounded-md px-2.5 py-2" data-testid="thinking-body">
+    <div class="border-border/70 mt-1 ml-[13px] border-l py-0.5 pl-4" data-testid="thinking-body">
       <!-- `markdown-thinking` mutes the body (incl. headings) so opened
            reasoning reads as subordinate to the answer; the base
            `.markdown-body` color would otherwise match the answer exactly. -->

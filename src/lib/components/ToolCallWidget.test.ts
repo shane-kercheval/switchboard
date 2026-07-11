@@ -62,7 +62,7 @@ describe("ToolCallWidget collapsed row", () => {
   // the raw name lives in the expanded raw-input label instead.
   const cases: { facet: ToolFacet; verb: string; detail: string | null }[] = [
     { facet: { facet_kind: "shell", command: "ls", cwd: null }, verb: "Command", detail: "ls" },
-    { facet: EDIT_FACET, verb: "Edit", detail: "/repo/src/a.ts" },
+    { facet: EDIT_FACET, verb: "Edit", detail: null },
     {
       facet: { facet_kind: "write", path: "/repo/x", content: "c", truncated: false },
       verb: "Write",
@@ -164,6 +164,22 @@ describe("ToolCallWidget expansion", () => {
     await rerender({ tool: done });
     expect(queryByTestId("tool-body")).toBeNull();
     expect(getByTestId("tool-row")).toHaveAttribute("aria-expanded", "false");
+  });
+
+  it("hides the detail line while expanded and restores it on collapse", async () => {
+    const { getByTestId, queryByTestId } = render(ToolCallWidget, {
+      tool: withFacet({ facet_kind: "shell", command: "git status", cwd: null }),
+    });
+    expect(getByTestId("tool-detail")).toHaveTextContent("git status");
+
+    // The body shows the full untruncated command, so keeping the detail
+    // would duplicate it on adjacent lines.
+    await fireEvent.click(getByTestId("tool-row"));
+    expect(queryByTestId("tool-detail")).toBeNull();
+    expect(getByTestId("tool-command")).toHaveTextContent("git status");
+
+    await fireEvent.click(getByTestId("tool-row"));
+    expect(getByTestId("tool-detail")).toHaveTextContent("git status");
   });
 
   it("keeps a user-opened panel open across completion", async () => {
@@ -269,9 +285,14 @@ describe("ToolCallWidget facet bodies", () => {
     expect(getByTestId("tool-command")).not.toHaveTextContent("abc123secret");
   });
 
-  it("renders an edit as a diff of what the call changed", async () => {
-    const { getByTestId, container } = render(ToolCallWidget, { tool: withFacet(EDIT_FACET) });
-    await fireEvent.click(getByTestId("tool-row"));
+  it("renders an edit as a diff inline, without expanding", () => {
+    const { getByTestId, queryByTestId, container } = render(ToolCallWidget, {
+      tool: withFacet(EDIT_FACET),
+    });
+
+    // The diff is ambient; output and raw input stay behind expansion.
+    expect(queryByTestId("tool-output")).toBeNull();
+    expect(queryByTestId("tool-raw-toggle")).toBeNull();
 
     const removed = Array.from(container.querySelectorAll('[data-origin="removed"]'));
     const added = Array.from(container.querySelectorAll('[data-origin="added"]'));
@@ -281,7 +302,57 @@ describe("ToolCallWidget facet bodies", () => {
     expect(added.map((el) => el.textContent)).toEqual(
       expect.arrayContaining([expect.stringContaining("line 2")]),
     );
-    expect(getByTestId("tool-body")).toHaveTextContent("snippet-relative");
+    // Compact diff: no hunk-header bar, no line-number gutters — snippet-
+    // relative numbers would read as file positions.
+    expect(getByTestId("tool-body")).not.toHaveTextContent("@@");
+    expect(getByTestId("tool-body")).not.toHaveTextContent("snippet-relative");
+  });
+
+  it("labels a single-file creation as Write without a change marker", () => {
+    const facet: ToolFacet = {
+      facet_kind: "edit",
+      files: [
+        {
+          path: "/repo/new.txt",
+          change: "added",
+          edits: [{ old: "", new: "hi\n" }],
+          truncated: false,
+        },
+      ],
+    };
+    const { getByTestId } = render(ToolCallWidget, { tool: withFacet(facet) });
+    expect(getByTestId("tool-verb")).toHaveTextContent("Write");
+    expect(getByTestId("tool-body")).not.toHaveTextContent("(added)");
+  });
+
+  it("labels a single-file deletion as Delete", () => {
+    const facet: ToolFacet = {
+      facet_kind: "edit",
+      files: [
+        {
+          path: "/repo/old.txt",
+          change: "deleted",
+          edits: [{ old: "bye\n", new: "" }],
+          truncated: false,
+        },
+      ],
+    };
+    const { getByTestId } = render(ToolCallWidget, { tool: withFacet(facet) });
+    expect(getByTestId("tool-verb")).toHaveTextContent("Delete");
+    expect(getByTestId("tool-body")).not.toHaveTextContent("(deleted)");
+  });
+
+  it("reveals output and raw input on an edit row only when expanded", async () => {
+    const { getByTestId, queryByTestId } = render(ToolCallWidget, {
+      tool: withFacet(EDIT_FACET, { output: "edit applied" }),
+    });
+    expect(queryByTestId("tool-output")).toBeNull();
+
+    await fireEvent.click(getByTestId("tool-row"));
+    expect(getByTestId("tool-output")).toHaveTextContent("edit applied");
+    expect(getByTestId("tool-raw-toggle")).toBeInTheDocument();
+    // The diff stays visible in both states.
+    expect(getByTestId("tool-edit-file")).toBeInTheDocument();
   });
 
   it("renders one diff section per file for a multi-file edit", async () => {
@@ -303,7 +374,6 @@ describe("ToolCallWidget facet bodies", () => {
       ],
     };
     const { getByTestId, getAllByTestId } = render(ToolCallWidget, { tool: withFacet(facet) });
-    await fireEvent.click(getByTestId("tool-row"));
 
     const sections = getAllByTestId("tool-edit-file");
     expect(sections).toHaveLength(2);
@@ -320,7 +390,6 @@ describe("ToolCallWidget facet bodies", () => {
       tool: withFacet(facet),
       turnSettled: false,
     });
-    await fireEvent.click(getByTestId("tool-row"));
     expect(getByTestId("tool-edit-pending")).toHaveTextContent(
       "Diff will appear when the turn completes.",
     );
@@ -332,7 +401,6 @@ describe("ToolCallWidget facet bodies", () => {
       files: [{ path: "/repo/a.ts", change: "modified", edits: [], truncated: false }],
     };
     const { getByTestId } = render(ToolCallWidget, { tool: withFacet(facet), turnSettled: true });
-    await fireEvent.click(getByTestId("tool-row"));
     expect(getByTestId("tool-edit-pending")).toHaveTextContent(
       "Diff content unavailable for this edit.",
     );

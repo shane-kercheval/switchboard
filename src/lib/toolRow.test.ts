@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { FilePen, Wrench } from "@lucide/svelte";
+import { FilePen, FilePlus, FileX, Wrench } from "@lucide/svelte";
 import type { ToolCall } from "$lib/state/types";
 import type { ToolFacet } from "$lib/types";
 import { toolDetail, toolIcon, toolRowState, toolVerb } from "$lib/toolRow";
@@ -54,6 +54,35 @@ describe("toolVerb", () => {
     expect(toolVerb({ facet_kind: "read", path: "/x" }, "x")).toBe("Read");
     expect(toolVerb({ facet_kind: "search", pattern: "p", path: null }, "x")).toBe("Search");
     expect(toolVerb({ facet_kind: "todo", items: [] }, "x")).toBe("Todos");
+  });
+
+  it("reads a single-file edit by its change kind", () => {
+    const added: ToolFacet = {
+      facet_kind: "edit",
+      files: [{ path: "/a", change: "added", edits: [], truncated: false }],
+    };
+    const deleted: ToolFacet = {
+      facet_kind: "edit",
+      files: [{ path: "/a", change: "deleted", edits: [], truncated: false }],
+    };
+    const modified: ToolFacet = {
+      facet_kind: "edit",
+      files: [{ path: "/a", change: "modified", edits: [], truncated: false }],
+    };
+    expect(toolVerb(added, "x")).toBe("Write");
+    expect(toolVerb(deleted, "x")).toBe("Delete");
+    expect(toolVerb(modified, "x")).toBe("Edit");
+  });
+
+  it("keeps the Edit verb for multi-file patches regardless of change kinds", () => {
+    const multi: ToolFacet = {
+      facet_kind: "edit",
+      files: [
+        { path: "/a", change: "added", edits: [], truncated: false },
+        { path: "/b", change: "added", edits: [], truncated: false },
+      ],
+    };
+    expect(toolVerb(multi, "x")).toBe("Edit");
   });
 
   it("renders the mcp facet as the server/tool pair", () => {
@@ -151,6 +180,18 @@ describe("toolDetail", () => {
 describe("toolIcon", () => {
   it("maps known facets and degrades unknown discriminants to the generic icon", () => {
     expect(toolIcon({ facet_kind: "edit", files: [] })).toBe(FilePen);
+    expect(
+      toolIcon({
+        facet_kind: "edit",
+        files: [{ path: "/a", change: "added", edits: [], truncated: false }],
+      }),
+    ).toBe(FilePlus);
+    expect(
+      toolIcon({
+        facet_kind: "edit",
+        files: [{ path: "/a", change: "deleted", edits: [], truncated: false }],
+      }),
+    ).toBe(FileX);
     expect(toolIcon({ facet_kind: "other" })).toBe(Wrench);
     expect(toolIcon({ facet_kind: "hologram" } as unknown as ToolFacet)).toBe(Wrench);
   });

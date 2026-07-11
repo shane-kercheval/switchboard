@@ -592,12 +592,26 @@ shipped:
   renders the path plus "Diff will appear when the turn completes" while the turn streams, or "Diff
   content unavailable" on a settled turn — `ToolCallWidget` takes a `turnSettled` prop for the
   distinction.
-- **Expanded-panel composition.** One recessed `panel` fill holds the facet body, then the tool
-  output when present, then the raw `name`+`input` JSON. For specialized facets the raw JSON sits
+- **Expanded-body composition (revised after a second visual pass — the wrapping `panel` fill is
+  gone).** A slab per open row made a run of expanded tools wall-to-wall gray, and its first line
+  duplicated the row's still-visible detail. Instead the expanded content hangs under the row
+  behind a thin left rule (the fan-out column idiom), directly on the reading surface, and the
+  row's detail line hides while open since the body shows the full untruncated version. Fills mark
+  only true content blocks: the output / raw-JSON / written-content `pre`s on `panel` (that
+  token's documented job), the diff in a bordered canvas. For specialized facets the raw JSON sits
   behind a "Show raw input" reveal (the facet body already shows the same information readably);
-  the generic facet has no body, so its raw input shows directly. `DiffView`'s `raised` canvas
-  inside the panel is the one deliberate second treatment — it sits at the M2 two-treatment
-  maximum and reads as a document in a well.
+  the generic facet has no body, so its raw input shows directly.
+- **Edit diffs render inline, without expansion** (third visual pass): watching the changes
+  stream by is the point of the row, so an Edit facet's per-file diff sections are always visible
+  under the row; expansion reveals only output and raw input, and the edit row's detail line is
+  suppressed (the per-file headers carry the paths). Eager rendering is safe here — edit content
+  is capped at the facet level and off-window rows aren't mounted. The Codex placeholder shows
+  inline too and swaps to the real diff automatically when the facet upgrade lands at turn end.
+  A single-file edit reads by its change kind — `added` → **Write**, `deleted` → **Delete** —
+  because harnesses without a separate write tool (Codex) create files via patch; multi-file
+  patches keep **Edit** with per-file markers. Tool-row diffs render through a new `compact` mode
+  on `DiffView` (no hunk-header bars, no line-number gutters — snippet-relative numbers read as
+  file positions they aren't; hunks separated by a hairline). The Git view is untouched.
 - The old "TOOL"/"MCP"/"Plugin" kind label and `Badge` are gone from the row; the facet icon
   (lucide) plus verb replace them. The raw-JSON display cap is 50 k characters.
 - New modules: `src/lib/toolRow.ts` (facet × state verb vocabulary, provenance detail, icon map)

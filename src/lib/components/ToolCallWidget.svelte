@@ -2,17 +2,26 @@
   /// One tool call as a borderless row: facet icon · bold normalized verb ·
   /// muted provenance detail · chevron + status glyph. Collapsed it is chrome-
   /// free — a run of tool calls reads as a set held together by the icon
-  /// column, not by boxes. Expanding reveals the facet-specific content on a
-  /// single recessed `panel` fill; nothing inside that fill adds another
-  /// neutral treatment (the diff renderer is the one deliberate exception —
-  /// its `raised` canvas inside the panel reads as a document in a well and
-  /// sits at the two-treatment maximum).
+  /// column, not by boxes. Expanded content hangs under the row behind a thin
+  /// left rule (the same idiom as fan-out response columns), directly on the
+  /// reading surface — a wrapping fill made every open row a gray slab. Fills
+  /// mark only true content blocks: output / raw JSON / written content on
+  /// `panel` (that token's documented job), the diff in a bordered canvas.
+  /// The row's detail line hides while open: the body shows the full,
+  /// untruncated version, so keeping both duplicated every value.
   ///
   /// The body renders ONLY while open. This is load-bearing, not styling: the
   /// previous `<details>`-based widget rendered its body unconditionally and
   /// stringified every tool call's full raw input whether or not it was ever
   /// expanded — a 500 KB write built a 500 KB string and DOM node nobody asked
-  /// for. Formatting (raw JSON, diff synthesis) must stay gated behind `open`.
+  /// for. Formatting (raw JSON, output, Write content) must stay gated behind
+  /// `open`. The one deliberate exception: Edit facets render their diff
+  /// inline without expansion — watching the changes stream by is the point
+  /// of the row — which is safe to do eagerly because edit content is capped
+  /// at the facet level and off-window rows aren't mounted at all (transcript
+  /// render-windowing). Expansion on an edit row reveals only output and raw
+  /// input. Its detail line is suppressed in both states: the inline per-file
+  /// headers already carry the paths.
   import type { ToolCall } from "$lib/state/index.svelte";
   import DiffView from "$lib/components/DiffView.svelte";
   import Spinner from "$lib/components/ui/Spinner.svelte";
@@ -28,7 +37,7 @@
   const facet = $derived(tool.facet);
   const rowState = $derived(toolRowState(tool));
   const verb = $derived(toolVerb(facet, tool.name));
-  const detail = $derived(toolDetail(facet, tool.input));
+  const detail = $derived(facet.facet_kind === "edit" ? undefined : toolDetail(facet, tool.input));
   const FacetIcon = $derived(toolIcon(facet));
   const hasOutput = $derived(tool.output !== undefined && tool.output !== "");
 
@@ -61,7 +70,7 @@
   }
 </script>
 
-<div class="max-w-[600px] text-xs" data-testid="turn-tool" data-tool-use-id={tool.tool_use_id}>
+<div class="text-xs" data-testid="turn-tool" data-tool-use-id={tool.tool_use_id}>
   <button
     type="button"
     class="hover:bg-hover flex min-h-7 w-full items-center gap-2 rounded-md px-1.5 py-1 text-left"
@@ -71,7 +80,7 @@
   >
     <FacetIcon class="text-muted h-3.5 w-3.5 shrink-0" aria-hidden="true" />
     <span class="text-fg shrink-0 font-medium" data-testid="tool-verb">{verb}</span>
-    {#if detail !== undefined}
+    {#if detail !== undefined && !open}
       <span class="text-muted min-w-0 flex-1 truncate font-mono" data-testid="tool-detail"
         >{detail}</span
       >
@@ -145,8 +154,11 @@
     {/if}
   </button>
 
-  {#if open}
-    <div class="bg-panel mt-1 space-y-2 rounded-md px-2.5 py-2" data-testid="tool-body">
+  {#if open || facet.facet_kind === "edit"}
+    <div
+      class="border-border/70 mt-1 ml-[13px] space-y-2 border-l py-0.5 pl-4"
+      data-testid="tool-body"
+    >
       {#if facet.facet_kind === "shell"}
         <section class="space-y-1" aria-label="Command">
           <pre
@@ -161,7 +173,7 @@
           <section class="space-y-1" aria-label="File edit" data-testid="tool-edit-file">
             <div class="text-muted flex items-center gap-2 font-mono text-[11px]">
               <span class="min-w-0 truncate" title={file.path}>{file.path}</span>
-              {#if file.change !== "modified"}
+              {#if facet.files.length > 1 && file.change !== "modified"}
                 <span class="shrink-0">({file.change})</span>
               {/if}
             </div>
@@ -175,15 +187,16 @@
                   : "Diff will appear when the turn completes."}
               </p>
             {:else}
-              <div class="max-h-80 overflow-y-auto rounded">
+              <div class="border-border/60 max-h-80 overflow-y-auto rounded border">
                 <!-- Always unified: side-by-side needs a 48rem minimum width,
-                     which cannot fit this 600px-capped row without horizontal
-                     scrolling. The Git view still honors the user's diff-style
-                     preference; this diff is snippet-scoped and narrow. -->
+                     which a transcript row can't guarantee (pane splits and
+                     fan-out columns shrink it). The Git view still honors the
+                     user's diff-style preference; this diff is snippet-scoped. -->
                 <DiffView
                   diff={synthesizeEditDiff(file)}
                   style="unified"
                   language={languageForPath(file.path)}
+                  compact
                 />
               </div>
             {/if}
@@ -195,7 +208,7 @@
             {facet.path}
           </div>
           <pre
-            class="text-muted max-h-44 overflow-y-auto font-mono whitespace-pre-wrap"
+            class="text-muted bg-panel max-h-44 overflow-y-auto rounded px-2 py-1.5 font-mono whitespace-pre-wrap"
             data-testid="tool-write-content">{facet.content}</pre>
           {#if facet.truncated}
             <p class="text-muted text-[11px]" data-testid="tool-write-truncated">
@@ -228,19 +241,19 @@
         </ul>
       {/if}
 
-      {#if hasOutput}
+      {#if open && hasOutput}
         <section class="space-y-1" aria-label="Tool output">
           <div class="text-muted text-[10px] font-semibold tracking-wide uppercase">Output</div>
           <pre
             class={cn(
-              "max-h-44 overflow-y-auto font-mono whitespace-pre-wrap",
+              "bg-panel max-h-44 overflow-y-auto rounded px-2 py-1.5 font-mono whitespace-pre-wrap",
               tool.is_error ? "text-status-failed" : "text-muted",
             )}
             data-testid="tool-output">{tool.output}</pre>
         </section>
       {/if}
 
-      {#if facet.facet_kind !== "other"}
+      {#if open && facet.facet_kind !== "other"}
         <button
           type="button"
           class="text-muted hover:text-fg text-[11px] transition-colors"
@@ -259,7 +272,7 @@
             >
           </div>
           <pre
-            class="text-muted max-h-44 overflow-y-auto font-mono whitespace-pre-wrap"
+            class="text-muted bg-panel max-h-44 overflow-y-auto rounded px-2 py-1.5 font-mono whitespace-pre-wrap"
             data-testid="tool-input">{raw.text}</pre>
           {#if raw.truncated}
             <p class="text-muted text-[11px]" data-testid="tool-input-truncated">

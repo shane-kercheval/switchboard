@@ -12,6 +12,7 @@ import {
   FilePen,
   FilePlus,
   FileText,
+  FileX,
   ListChecks,
   Plug,
   Search,
@@ -46,7 +47,7 @@ export function toolVerb(facet: ToolFacet, rawName: string): string {
     case "shell":
       return "Command";
     case "edit":
-      return "Edit";
+      return editVerb(facet.files);
     case "write":
       return "Write";
     case "read":
@@ -62,6 +63,18 @@ export function toolVerb(facet: ToolFacet, rawName: string): string {
     default:
       return rawName;
   }
+}
+
+/// A single-file edit reads by its change kind: harnesses without a separate
+/// write tool (Codex creates files via an apply_patch "Add File") arrive as
+/// Edit facets, but the user is looking at a creation or a deletion, and the
+/// label should say so. Multi-file patches stay "Edit" with per-file markers.
+function editVerb(files: { change: string }[]): string {
+  if (files.length === 1) {
+    if (files[0]!.change === "added") return "Write";
+    if (files[0]!.change === "deleted") return "Delete";
+  }
+  return "Edit";
 }
 
 /// The muted detail: the facet's own substance — the command that ran, the
@@ -110,6 +123,8 @@ export function toolIcon(facet: ToolFacet): ToolIconComponent {
     case "shell":
       return SquareTerminal;
     case "edit":
+      if (facet.files.length === 1 && facet.files[0]!.change === "added") return FilePlus;
+      if (facet.files.length === 1 && facet.files[0]!.change === "deleted") return FileX;
       return FilePen;
     case "write":
       return FilePlus;

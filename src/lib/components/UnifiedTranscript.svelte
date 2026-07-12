@@ -998,6 +998,12 @@
     {@const liveKey = previewKeyForTurn(turn)}
     <div
       class={cn(
+        // Mirror the settled body's inter-item spacing: settled items are direct
+        // children of the `space-y-1.5` body, but streaming items live one level
+        // deeper inside this scroll wrapper, so it must carry the spacing itself
+        // — otherwise tool rows sit flush while streaming and gain their gap only
+        // once the turn settles.
+        "space-y-1.5",
         liveCap ? "max-h-[75cqh] overflow-y-auto" : "overflow-visible",
         liveCap && (liveTopFade[liveKey] ?? false) && LIVE_TOP_FADE,
       )}

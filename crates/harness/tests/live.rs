@@ -12,8 +12,8 @@ use switchboard_core::{AgentRecord, HarnessKind, SessionLocator};
 use switchboard_harness::{
     AdapterEvent, AntigravityAdapter, ClaudeCodeAdapter, CodexAdapter, ContentKind,
     DispatchOptions, EditChange, GeminiAdapter, HarnessAdapter, RateLimitSource, ToolFacet, Turn,
-    TurnItem, TurnOutcome, UserPromptSource, load_antigravity_transcript, load_claude_transcript,
-    load_codex_transcript, load_gemini_transcript,
+    TurnItem, TurnOutcome, UserPromptSource, claude_session_file_path, load_antigravity_transcript,
+    load_claude_transcript, load_codex_transcript, load_gemini_transcript,
 };
 use uuid::Uuid;
 
@@ -379,6 +379,58 @@ async fn live_claude_dispatched_prompt_classified_sdk() {
         source,
         UserPromptSource::Sdk,
         "an SDK dispatch must write promptSource:\"sdk\" (parsed as Sdk); a fallback to Unknown means the field drifted"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires claude installed — run with: make test-live"]
+async fn live_claude_dispatched_prompt_never_carries_is_meta() {
+    // `is_meta_continuation` (session_file.rs) rests on the invariant that a
+    // genuinely dispatched prompt never carries `isMeta:true` — if a CLI
+    // version stamped it on a real prompt, the parser would silently drop the
+    // prompt and merge the following turn backward into the previous one.
+    // Reads the raw session-file record for the dispatched prompt to catch
+    // that drift, mirroring the `promptSource:"sdk"` guard above.
+    const PROMPT: &str = "Reply with only the word ack and nothing else.";
+    let adapter = ClaudeCodeAdapter::new();
+    let agent = live_agent();
+    let Some(SessionLocator::Uuid(session_id)) = agent.session_locator else {
+        unreachable!("live claude agent has a uuid locator")
+    };
+    let turn_id = Uuid::now_v7();
+
+    let stream = adapter
+        .dispatch(
+            &agent,
+            Path::new("/tmp"),
+            PROMPT,
+            turn_id,
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("dispatch should succeed with real claude");
+    let _events: Vec<AdapterEvent> = stream.collect().await;
+
+    let cwd = Path::new("/tmp").canonicalize().expect("canonicalize /tmp");
+    let path = claude_session_file_path(&home_dir(), &cwd, &session_id);
+    let content = std::fs::read_to_string(&path).expect("session file readable");
+    let prompt_record = content
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|r| {
+            r.get("type").and_then(serde_json::Value::as_str) == Some("user")
+                && r.get("message")
+                    .and_then(|m| m.get("content"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some(PROMPT)
+        })
+        .expect("the dispatched prompt must appear as a raw user record");
+    assert_ne!(
+        prompt_record
+            .get("isMeta")
+            .and_then(serde_json::Value::as_bool),
+        Some(true),
+        "a dispatched prompt carrying isMeta would be dropped as a mid-turn continuation — the is_meta_continuation invariant drifted"
     );
 }
 

@@ -571,6 +571,7 @@ impl GeminiReconstruction {
             // `TurnEnd` leaves `hydration_key: None` for now.
             spend: None,
             hydration_key: builder.records.first().map(|r| r.id.clone()),
+            continuation_of: None,
             stable_message_id: None,
         });
     }

@@ -954,6 +954,135 @@ describe("transcriptReducer", () => {
     });
   });
 
+  describe("hydrate — compaction continuations", () => {
+    const TURN_3 = "00000000-0000-7000-8000-000000000013";
+    const TURN_4 = "00000000-0000-7000-8000-000000000014";
+
+    const diskAgentTurn = (
+      turnId: string,
+      key: string,
+      text: string,
+      continuationOf?: string,
+      status: "streaming" | "complete" | "failed" = "complete",
+    ) => ({
+      role: "agent" as const,
+      turn_id: turnId,
+      agent_id: AGENT_A,
+      started_at: "2026-05-16T00:00:01Z",
+      status,
+      items: [{ item_kind: "text" as const, kind: "text" as const, text }],
+      hydration_key: key,
+      continuation_of: continuationOf ?? null,
+    });
+
+    // A live turn that streamed the WHOLE dispatch (both compaction halves)
+    // as one turn and completed carrying the FIRST fragment's key — the
+    // resident the disk split must reconcile against.
+    const liveCompletedResident = (): Turn[] => {
+      let turns = reduce([], turnStart(TURN_1));
+      turns = reduce(turns, contentChunk(TURN_1, "pre and post compact content"));
+      turns = reduce(turns, {
+        type: "turn_end",
+        turn_id: TURN_1,
+        outcome: { status: "completed" },
+        ended_at: "2026-05-16T00:00:05Z",
+        hydration_key: "msg_a",
+      });
+      return turns;
+    };
+
+    it("drops a continuation whose pre-compact fragment collapsed into a live resident", () => {
+      const merged = reduce(liveCompletedResident(), {
+        type: "hydrate",
+        agent_id: AGENT_A,
+        turns: [
+          diskAgentTurn(TURN_2, "msg_a", "pre"),
+          diskAgentTurn(TURN_3, "msg_b", "post", "msg_a"),
+        ],
+      });
+      expect(merged).toHaveLength(1);
+      expect(merged[0]?.turn_id).toBe(TURN_1);
+    });
+
+    it("collapses a double-compaction chain transitively", () => {
+      const merged = reduce(liveCompletedResident(), {
+        type: "hydrate",
+        agent_id: AGENT_A,
+        turns: [
+          diskAgentTurn(TURN_2, "msg_a", "pre"),
+          diskAgentTurn(TURN_3, "msg_b", "mid", "msg_a"),
+          diskAgentTurn(TURN_4, "msg_c", "post", "msg_b"),
+        ],
+      });
+      expect(merged).toHaveLength(1);
+      expect(merged[0]?.turn_id).toBe(TURN_1);
+    });
+
+    it("renders the split on a fresh load (no resident to collapse into)", () => {
+      const merged = reduce([], {
+        type: "hydrate",
+        agent_id: AGENT_A,
+        turns: [
+          diskAgentTurn(TURN_2, "msg_a", "pre"),
+          diskAgentTurn(TURN_3, "msg_b", "post", "msg_a"),
+        ],
+      });
+      expect(merged).toHaveLength(2);
+    });
+
+    it("keeps the split stable across a later re-read (continuation key-matches its own resident)", () => {
+      // Reopen-then-refresh: the split loaded fresh, then the same file is
+      // re-parsed with fresh turn_ids. The continuation collapses into ITS OWN
+      // resident by key — the continuation rule must never fire for it (that
+      // would silently lose the post-compaction half on every refresh).
+      const first = reduce([], {
+        type: "hydrate",
+        agent_id: AGENT_A,
+        turns: [
+          diskAgentTurn(TURN_1, "msg_a", "pre"),
+          diskAgentTurn(TURN_2, "msg_b", "post", "msg_a"),
+        ],
+      });
+      const merged = reduce(first, {
+        type: "hydrate",
+        agent_id: AGENT_A,
+        turns: [
+          diskAgentTurn(TURN_3, "msg_a", "pre"),
+          diskAgentTurn(TURN_4, "msg_b", "post", "msg_a"),
+        ],
+      });
+      expect(merged).toHaveLength(2);
+      expect(merged.map((t) => t.turn_id).sort()).toEqual([TURN_1, TURN_2].sort());
+    });
+
+    it("renders the continuation when its fragment superseded a stranded streaming resident", () => {
+      // The resident is a stranded mid-flight disk partial (pre-compact
+      // content only) — not a live turn that streamed the whole dispatch. The
+      // terminal disk fragment supersedes it, so the resident never held the
+      // post-compaction half: the continuation must render (the deliberate
+      // reopen split), not collapse against content nobody has.
+      const stranded = reduce([], {
+        type: "hydrate",
+        agent_id: AGENT_A,
+        turns: [diskAgentTurn(TURN_1, "msg_a", "partial pre", undefined, "streaming")],
+      });
+      const merged = reduce(stranded, {
+        type: "hydrate",
+        agent_id: AGENT_A,
+        turns: [
+          diskAgentTurn(TURN_2, "msg_a", "pre"),
+          diskAgentTurn(TURN_3, "msg_b", "post", "msg_a"),
+        ],
+      });
+      expect(merged).toHaveLength(2);
+      const byKey = new Map(
+        merged.map((t) => [t.role === "agent" ? t.hydration_key : undefined, t]),
+      );
+      expect(byKey.get("msg_a")?.turn_id).toBe(TURN_2);
+      expect(byKey.get("msg_b")).toBeDefined();
+    });
+  });
+
   describe("hydrate — completeness-ranked supersession", () => {
     const TURN_3 = "00000000-0000-7000-8000-000000000003";
     const streamingPartial = (turnId: string, key: string): ReducerInput => ({

@@ -390,6 +390,12 @@ struct AgentTurnBuilder {
     /// `Complete`. Only consulted for the EOF tail turn — a turn closed by a
     /// following user prompt is definitively `Complete`. See `eof_tail_status`.
     last_stop_reason: Option<String>,
+    /// The `hydration_key` of the pre-compaction fragment this turn continues,
+    /// when this turn opened directly across a compaction boundary (see
+    /// [`ReconstructionState::compaction_continuation_key`]). Stamped onto
+    /// `Turn::Agent.continuation_of` so the frontend hydrate merge can collapse
+    /// the continuation into a live resident that already carries its content.
+    continuation_of: Option<String>,
 }
 
 struct DeferredToolResult {
@@ -453,6 +459,41 @@ impl ReconstructionState {
                 ),
             });
         }
+    }
+
+    /// The `hydration_key` a turn opening **now** would be continuing across a
+    /// compaction boundary, or `None` when the turn is a genuine fresh dispatch.
+    ///
+    /// Pure structural read of the reconstructed tail at turn-open time (no
+    /// cross-record state to clear): walk back over trailing `Turn::System`
+    /// markers — the auto-compact shape leaves `[…, fragment, SlashCommand
+    /// ("/compact"), Compaction]` on the tail — and if a Compaction marker was
+    /// among them and the first non-marker turn behind it is a keyed agent
+    /// turn, the new turn is that fragment's continuation. A real user prompt
+    /// in between (the manual TUI `/compact`-then-new-prompt case) is hit
+    /// first in the walk and breaks the link — a post-compaction *dispatch* is
+    /// a new turn, not a continuation. A summary at file start (session
+    /// continued from a previous conversation) finds no agent turn → `None`.
+    fn compaction_continuation_key(&self) -> Option<String> {
+        let mut saw_compaction = false;
+        for turn in self.turns.iter().rev() {
+            match turn {
+                Turn::System {
+                    marker: SystemMarker::Compaction { .. },
+                    ..
+                } => saw_compaction = true,
+                Turn::System { .. } => {}
+                Turn::Agent { hydration_key, .. } => {
+                    return if saw_compaction {
+                        hydration_key.clone()
+                    } else {
+                        None
+                    };
+                }
+                Turn::User { .. } => return None,
+            }
+        }
+        None
     }
 
     fn handle_user(&mut self, line_number: usize, record: &Value) {
@@ -577,6 +618,13 @@ impl ReconstructionState {
         }
 
         let timestamp = parse_timestamp(record).unwrap_or_else(Utc::now);
+        // Resolved only when this record OPENS a turn — an already-open builder
+        // keeps the link it was created with.
+        let continuation_of = if self.current_agent.is_none() {
+            self.compaction_continuation_key()
+        } else {
+            None
+        };
         let builder = self.current_agent.get_or_insert_with(|| AgentTurnBuilder {
             turn_id: Uuid::now_v7(),
             agent_id: self.agent_id,
@@ -588,6 +636,7 @@ impl ReconstructionState {
             first_message_id: None,
             last_model: None,
             last_stop_reason: None,
+            continuation_of,
         });
         builder.last_seen_at = timestamp;
 
@@ -793,6 +842,7 @@ impl ReconstructionState {
             // `message.id` — the cost-join key (cost lives on the final record).
             // Both round-trip identically to the live `TurnEnd`.
             hydration_key: builder.first_message_id,
+            continuation_of: builder.continuation_of,
             stable_message_id: builder.last_message_id,
         });
     }
@@ -1463,6 +1513,126 @@ mod tests {
             keys,
             vec![Some("msg_pre".to_owned()), Some("msg_cont".to_owned())],
             "pre-compaction and continuation turns must carry distinct hydration keys"
+        );
+    }
+
+    /// Per-agent-turn `(hydration_key, continuation_of)` pairs, in order.
+    fn key_links(turns: &[Turn]) -> Vec<(Option<String>, Option<String>)> {
+        turns
+            .iter()
+            .filter_map(|t| match t {
+                Turn::Agent {
+                    hydration_key,
+                    continuation_of,
+                    ..
+                } => Some((hydration_key.clone(), continuation_of.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn compaction_continuation_links_to_pre_compact_fragment() {
+        // Full auto-compact shape (traced from the real session): the bare
+        // `/compact` bookkeeping record lands between the fragment and the
+        // summary, so a SlashCommand marker sits on the tail — the link walk
+        // must skip it, not break on it. The continuation must name the
+        // pre-compact fragment's key so the hydrate merge can collapse it
+        // into a live resident spanning the compaction.
+        let turns = load_turns(&[
+            user_record_with_source("go", "sdk", "2026-05-14T04:43:15Z"),
+            assistant_with_stop(
+                "msg_pre",
+                &json!([{ "type": "text", "text": "pre" }]),
+                Some("end_turn"),
+                "2026-05-14T04:43:16Z",
+            ),
+            user_record("/compact", "2026-05-14T04:43:17Z"),
+            json!({"type":"user","message":{"role":"user","content":"This session is being continued…"},"isCompactSummary":true,"timestamp":"2026-05-14T04:43:18Z"}),
+            assistant_with_stop(
+                "msg_cont",
+                &json!([{ "type": "text", "text": "cont" }]),
+                Some("end_turn"),
+                "2026-05-14T04:43:19Z",
+            ),
+        ]);
+        assert_eq!(
+            key_links(&turns),
+            vec![
+                (Some("msg_pre".to_owned()), None),
+                (Some("msg_cont".to_owned()), Some("msg_pre".to_owned())),
+            ],
+        );
+    }
+
+    #[test]
+    fn prompt_after_compaction_breaks_the_continuation_link() {
+        // Manual TUI `/compact` followed by a NEW dispatch: the post-compaction
+        // turn answers a real prompt — a genuine new turn, never a
+        // continuation. The prompt record between the marker and the turn
+        // breaks the walk.
+        let turns = load_turns(&[
+            user_record_with_source("go", "sdk", "2026-05-14T04:43:15Z"),
+            assistant_with_stop(
+                "msg_a",
+                &json!([{ "type": "text", "text": "a" }]),
+                Some("end_turn"),
+                "2026-05-14T04:43:16Z",
+            ),
+            user_record("/compact", "2026-05-14T04:43:17Z"),
+            json!({"type":"user","message":{"role":"user","content":"This session is being continued…"},"isCompactSummary":true,"timestamp":"2026-05-14T04:43:18Z"}),
+            user_record_with_source("next task", "sdk", "2026-05-14T04:43:19Z"),
+            assistant_with_stop(
+                "msg_b",
+                &json!([{ "type": "text", "text": "b" }]),
+                Some("end_turn"),
+                "2026-05-14T04:43:20Z",
+            ),
+        ]);
+        assert_eq!(
+            key_links(&turns),
+            vec![
+                (Some("msg_a".to_owned()), None),
+                (Some("msg_b".to_owned()), None),
+            ],
+        );
+    }
+
+    #[test]
+    fn double_compaction_chains_continuation_links() {
+        // Two auto-compactions inside one dispatch: each fragment links to its
+        // immediate predecessor, so the hydrate merge can collapse the whole
+        // chain transitively.
+        let turns = load_turns(&[
+            user_record_with_source("go", "sdk", "2026-05-14T04:43:15Z"),
+            assistant_with_stop(
+                "msg_a",
+                &json!([{ "type": "text", "text": "a" }]),
+                Some("end_turn"),
+                "2026-05-14T04:43:16Z",
+            ),
+            json!({"type":"user","message":{"role":"user","content":"continued…"},"isCompactSummary":true,"timestamp":"2026-05-14T04:43:17Z"}),
+            assistant_with_stop(
+                "msg_b",
+                &json!([{ "type": "text", "text": "b" }]),
+                Some("end_turn"),
+                "2026-05-14T04:43:18Z",
+            ),
+            json!({"type":"user","message":{"role":"user","content":"continued again…"},"isCompactSummary":true,"timestamp":"2026-05-14T04:43:19Z"}),
+            assistant_with_stop(
+                "msg_c",
+                &json!([{ "type": "text", "text": "c" }]),
+                Some("end_turn"),
+                "2026-05-14T04:43:20Z",
+            ),
+        ]);
+        assert_eq!(
+            key_links(&turns),
+            vec![
+                (Some("msg_a".to_owned()), None),
+                (Some("msg_b".to_owned()), Some("msg_a".to_owned())),
+                (Some("msg_c".to_owned()), Some("msg_b".to_owned())),
+            ],
         );
     }
 

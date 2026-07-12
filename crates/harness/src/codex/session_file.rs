@@ -1179,6 +1179,7 @@ impl CodexReconstruction {
             // (from disk), not mid-stream, so `supports_refresh` stays off.
             spend: None,
             hydration_key: builder.hydration_key,
+            continuation_of: None,
             stable_message_id: None,
         });
     }

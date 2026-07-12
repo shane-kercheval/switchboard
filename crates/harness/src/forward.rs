@@ -160,6 +160,7 @@ mod tests {
             effort: None,
             spend: None,
             hydration_key: None,
+            continuation_of: None,
             stable_message_id: None,
         }
     }

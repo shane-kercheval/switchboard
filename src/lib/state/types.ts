@@ -96,6 +96,11 @@ export type Turn =
       /// live event (live-matched harnesses only) and carried from disk on
       /// hydrate. Load-bearing for idempotent re-reads; not rendered.
       hydration_key?: string;
+      /// The `hydration_key` of the pre-compaction fragment this turn continues
+      /// (disk-parsed Claude turns only; never set on live turns). The `hydrate`
+      /// merge uses it to collapse a compaction continuation into the live
+      /// resident that already carries its content. Not rendered.
+      continuation_of?: string;
       /// Populated when status = "failed". Preserved so retry UX can distinguish
       /// recoverable from non-recoverable failures (HarnessError → suggest retry;
       /// AdapterFailure → suggest "report bug"; AuthFailure → "run claude auth login").

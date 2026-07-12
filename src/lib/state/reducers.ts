@@ -359,6 +359,15 @@ export function transcriptReducer(
       //     in-flight turn" path — a live turn has *no* `hydration_key` until it
       //     ends, so it only ever matches via `turn_id`. Superseding it would
       //     also change its `turn_id` and orphan its still-arriving live events.
+      //   - **Compaction continuation** (a keyed disk turn matching no resident,
+      //     whose `continuation_of` names a kept resident's key — directly or
+      //     through an earlier collapsed fragment): dropped. The parser splits a
+      //     turn at a compaction boundary, but live the whole dispatch streamed
+      //     as ONE resident turn keyed by the first fragment — the continuation
+      //     is content that resident already carries. Exception: when the
+      //     pre-compact fragment superseded a stranded streaming resident this
+      //     same merge, the resident never held the post-compaction content, so
+      //     the continuation renders (the deliberate reopen split).
       //
       // **Scope: keyed AGENT turns only.** User turns (and keyless harnesses)
       // fall back to `turn_id`, fresh per parse, so they never dedup across
@@ -373,9 +382,38 @@ export function transcriptReducer(
       // collisions; brand-new disk turns are prepended (disk-order, as before).
       const replacements = new Map<string, Turn>();
       const fresh: Turn[] = [];
+      // Keys of compaction continuations collapsed this merge, so a chain
+      // (double compaction in one turn: C continues B continues A) resolves
+      // transitively — B collapses against the resident, then C collapses
+      // against B's recorded key.
+      const collapsedContinuations = new Set<string>();
+      // Keys whose collision resolved in the DISK copy's favor (a terminal
+      // disk fragment superseding a stranded streaming resident): that
+      // resident did NOT hold the full dispatch, so its compaction
+      // continuations must render (the deliberate reopen split) rather than
+      // collapse against content the resident never had.
+      const supersededKeys = new Set<string>();
       for (const d of disk) {
         const resident = residentByKey.get(dedupKey(d));
         if (resident === undefined) {
+          // A compaction continuation whose pre-compact fragment lives in a
+          // kept resident (directly, or through an earlier collapsed fragment)
+          // is content that resident already carries — the whole dispatch
+          // streamed live as ONE turn keyed by the FIRST fragment's key.
+          // Rendering it would duplicate the post-compaction half on every
+          // switch-back refresh. Drop it. On a fresh load (no resident)
+          // `continuation_of` resolves to nothing and the deliberate split
+          // renders as designed.
+          const agent = d.role === "agent" ? d : undefined;
+          const continuationOf = agent?.continuation_of;
+          if (
+            continuationOf !== undefined &&
+            !supersededKeys.has(continuationOf) &&
+            (residentByKey.has(continuationOf) || collapsedContinuations.has(continuationOf))
+          ) {
+            if (agent?.hydration_key != null) collapsedContinuations.add(agent.hydration_key);
+            continue;
+          }
           fresh.push(d);
         } else if (
           d.role === "agent" &&
@@ -383,7 +421,9 @@ export function transcriptReducer(
           d.hydration_key !== undefined &&
           d.hydration_key === resident.hydration_key
         ) {
-          replacements.set(dedupKey(d), resolveTurnCollision(resident, d, inFlightTurnId));
+          const survivor = resolveTurnCollision(resident, d, inFlightTurnId);
+          replacements.set(dedupKey(d), survivor);
+          if (survivor.turn_id !== resident.turn_id) supersededKeys.add(dedupKey(d));
         }
         // else: turn_id-fallback collision → keep the resident, drop `d`.
       }
@@ -500,6 +540,7 @@ function loadedTurnToTurn(t: LoadedTurn): Turn {
     model: t.model ?? undefined,
     effort: t.effort ?? undefined,
     hydration_key: t.hydration_key ?? undefined,
+    continuation_of: t.continuation_of ?? undefined,
   };
 }
 

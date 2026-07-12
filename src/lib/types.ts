@@ -342,6 +342,12 @@ export type LoadedTurn =
       // it so re-reading a session file never duplicates this turn. Absent for
       // keyless harnesses (Antigravity) — the merge falls back to `turn_id`.
       hydration_key?: string | null;
+      // The `hydration_key` of the pre-compaction fragment this turn continues
+      // (Claude; absent everywhere else). Live, the whole dispatch is ONE turn
+      // keyed by the first fragment's key, so a re-read's continuation matches
+      // no resident by key — this link lets the hydrate merge collapse it into
+      // the resident that already carries its content instead of duplicating.
+      continuation_of?: string | null;
     };
 
 export type LoadedTurnItem =
@@ -712,6 +718,9 @@ export type ConversationItem =
       spend?: TurnSpend | null;
       // Stable hydration key — same source + meaning as `LoadedTurn.hydration_key`.
       hydration_key?: string | null;
+      // Compaction-continuation link — same source + meaning as
+      // `LoadedTurn.continuation_of`.
+      continuation_of?: string | null;
     }
   | {
       kind: "outcome";

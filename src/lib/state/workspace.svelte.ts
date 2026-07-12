@@ -766,6 +766,9 @@ export async function hydrateProject(
           // Thread the stable hydration key through this hand-built remap — the
           // merge dedups on it, and a field not copied here is silently dropped.
           hydration_key: item.hydration_key ?? null,
+          // Likewise the compaction-continuation link — the merge uses it to
+          // collapse a continuation into the live resident that spans it.
+          continuation_of: item.continuation_of ?? null,
         });
         turnsByAgent.set(item.agent_id, arr);
       } else if (item.kind === "system_marker") {

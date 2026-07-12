@@ -38,16 +38,31 @@
 ///
 /// The persisted blob is versioned (`STORAGE_VERSION`) so the snapshot shape can
 /// evolve without corrupting older drafts. An unversioned blob (the string-only
-/// era) migrates in place: each entry's text becomes a plain-mode draft.
+/// era) migrates in place: each entry's text becomes a plain-mode draft. Versioned
+/// blobs share one envelope shape and every field added since v2 is optional, so a
+/// v2 blob parses as a v3 snapshot with the newer fields simply absent.
+///
+/// **Attachments carry a backend obligation.** A staged attachment file is
+/// reclaimed by the load-time GC unless the caller of `load_project_conversation`
+/// declares it (see `draftAttachmentPaths`). Persisting a chip without passing its
+/// path to that command restores a chip pointing at a deleted file.
 
-import type { AgentId, ProjectId } from "$lib/types";
+import type {
+  AgentId,
+  Attachment,
+  AttachmentKind,
+  ProjectId,
+  WorkflowInputValue,
+} from "$lib/types";
+import type { ForwardSource } from "$lib/state/heldForwards.svelte";
 
 const STORAGE_KEY = "switchboard-compose";
-const STORAGE_VERSION = 2;
+const STORAGE_VERSION = 3;
 
-/// The compose area's content, by mode. Plain mode is the normal textarea;
-/// prompt mode is the structured prompt composer (a chosen prompt + its argument
-/// values + appended free text). The two are distinct persisted states.
+/// The compose area's content, by mode — `kind` is the mode. Plain mode is the
+/// normal textarea; prompt mode is the structured prompt composer (a chosen prompt
+/// + its argument values + appended free text); workflow mode is a picked workflow
+/// and its half-filled invocation form. Each is a distinct persisted state.
 export type PlainContent = { kind: "plain"; draft: string };
 export type PromptContent = {
   kind: "prompt";
@@ -56,17 +71,62 @@ export type PromptContent = {
   args: Record<string, string>;
   appendedText: string;
 };
-export type ComposeContent = PlainContent | PromptContent;
+/// `name` alone is not a workflow's identity — a built-in and a same-named copied
+/// user workflow share a name — so `isBuiltin` is part of the saved key and both
+/// are needed to re-resolve the listing on restore.
+export type WorkflowContent = {
+  kind: "workflow";
+  name: string;
+  isBuiltin: boolean;
+  inputs: Record<string, WorkflowInputValue>;
+};
+export type ComposeContent = PlainContent | PromptContent | WorkflowContent;
+
+/// Every forward-source family the composer can hold, in one field because they
+/// are written together and are **mode-independent**: switching plain↔prompt↔workflow
+/// hides the inapplicable ones but preserves them for the return trip, exactly as
+/// `selectedIds` survives a mode switch.
+export type ComposeForwards = {
+  /// Message-level sources (plain mode).
+  message: ForwardSource[];
+  /// Prompt mode, keyed by argument name.
+  promptArgs: Record<string, ForwardSource[]>;
+  /// Prompt mode's appended-text field.
+  promptAppended: ForwardSource[];
+  /// Workflow mode, keyed by fillable field name.
+  workflowFields: Record<string, ForwardSource[]>;
+};
 
 /// A project's compose snapshot. `selectedIds === undefined` means "no saved
 /// selection — fall through to the default recipient"; an explicit `[]` means
 /// "the user deliberately deselected everyone" and is honored on restore. Keep
 /// this distinction deliberate — collapsing them loses deselect-all. `selectedIds`
 /// is mode-independent (recipients persist across a plain↔prompt switch).
-export type ComposeSnapshot = { content: ComposeContent; selectedIds?: AgentId[] };
+///
+/// `attachments` and `forwards` are omitted entirely when empty, so an untouched
+/// project's blob stays as small as it was before they existed.
+export type ComposeSnapshot = {
+  content: ComposeContent;
+  selectedIds?: AgentId[];
+  attachments?: Attachment[];
+  forwards?: ComposeForwards;
+};
 
 function emptyPlain(): PlainContent {
   return { kind: "plain", draft: "" };
+}
+
+export function emptyForwards(): ComposeForwards {
+  return { message: [], promptArgs: {}, promptAppended: [], workflowFields: {} };
+}
+
+function forwardsAreEmpty(forwards: ComposeForwards): boolean {
+  return (
+    forwards.message.length === 0 &&
+    forwards.promptAppended.length === 0 &&
+    Object.keys(forwards.promptArgs).length === 0 &&
+    Object.keys(forwards.workflowFields).length === 0
+  );
 }
 
 function isStringRecord(value: unknown): value is Record<string, string> {
@@ -76,6 +136,21 @@ function isStringRecord(value: unknown): value is Record<string, string> {
     !Array.isArray(value) &&
     Object.values(value).every((v) => typeof v === "string")
   );
+}
+
+function isWorkflowInputValue(value: unknown): value is WorkflowInputValue {
+  return (
+    typeof value === "string" || (Array.isArray(value) && value.every((x) => typeof x === "string"))
+  );
+}
+
+function parseWorkflowInputs(value: unknown): Record<string, WorkflowInputValue> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return {};
+  const out: Record<string, WorkflowInputValue> = {};
+  for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+    if (isWorkflowInputValue(item)) out[key] = item;
+  }
+  return out;
 }
 
 /// Parse one persisted content blob, degrading anything malformed to an empty
@@ -100,6 +175,17 @@ function parseContent(value: unknown): ComposeContent {
     }
     return emptyPlain();
   }
+  if (v.kind === "workflow") {
+    if (typeof v.name === "string" && typeof v.isBuiltin === "boolean") {
+      return {
+        kind: "workflow",
+        name: v.name,
+        isBuiltin: v.isBuiltin,
+        inputs: parseWorkflowInputs(v.inputs),
+      };
+    }
+    return emptyPlain();
+  }
   // Default/plain: tolerate a missing/non-string draft as empty.
   return { kind: "plain", draft: typeof v.draft === "string" ? v.draft : "" };
 }
@@ -110,13 +196,93 @@ function parseSelectedIds(value: unknown): AgentId[] | undefined {
     : undefined;
 }
 
+const ATTACHMENT_KINDS: readonly AttachmentKind[] = ["image", "text", "file", "unknown"];
+
+/// Attachments restore as-written. A chip whose staged file has since vanished is
+/// dropped by the consumer at restore time, not here — this layer only rejects
+/// structurally malformed entries.
+function parseAttachments(value: unknown): Attachment[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const out: Attachment[] = [];
+  for (const item of value) {
+    if (item === null || typeof item !== "object") continue;
+    const a = item as Record<string, unknown>;
+    if (
+      typeof a.label !== "string" ||
+      typeof a.path !== "string" ||
+      typeof a.original_name !== "string"
+    ) {
+      continue;
+    }
+    // An unrecognized kind (written by a newer build) renders as a generic file
+    // rather than dropping the chip — same cross-version posture as the wire type.
+    const kind = ATTACHMENT_KINDS.includes(a.kind as AttachmentKind)
+      ? (a.kind as AttachmentKind)
+      : "unknown";
+    out.push({ label: a.label, kind, path: a.path, original_name: a.original_name });
+  }
+  return out.length > 0 ? out : undefined;
+}
+
+function parseForwardSources(value: unknown): ForwardSource[] {
+  if (!Array.isArray(value)) return [];
+  const out: ForwardSource[] = [];
+  for (const item of value) {
+    if (item === null || typeof item !== "object") continue;
+    const s = item as Record<string, unknown>;
+    if (typeof s.id === "string" && typeof s.name === "string") {
+      out.push({ id: s.id as AgentId, name: s.name });
+    }
+  }
+  return out;
+}
+
+function parseForwardSourceMap(value: unknown): Record<string, ForwardSource[]> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return {};
+  const out: Record<string, ForwardSource[]> = {};
+  for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+    const sources = parseForwardSources(item);
+    if (sources.length > 0) out[key] = sources;
+  }
+  return out;
+}
+
+function parseForwards(value: unknown): ComposeForwards | undefined {
+  if (value === null || typeof value !== "object") return undefined;
+  const v = value as Record<string, unknown>;
+  const forwards: ComposeForwards = {
+    message: parseForwardSources(v.message),
+    promptArgs: parseForwardSourceMap(v.promptArgs),
+    promptAppended: parseForwardSources(v.promptAppended),
+    workflowFields: parseForwardSourceMap(v.workflowFields),
+  };
+  return forwardsAreEmpty(forwards) ? undefined : forwards;
+}
+
 function parseSnapshot(value: unknown): ComposeSnapshot | null {
   if (value === null || typeof value !== "object") return null;
-  const v = value as { content?: unknown; selectedIds?: unknown };
-  const content = parseContent(v.content);
+  const v = value as {
+    content?: unknown;
+    selectedIds?: unknown;
+    attachments?: unknown;
+    forwards?: unknown;
+  };
+  const snapshot: ComposeSnapshot = { content: parseContent(v.content) };
   const selectedIds = parseSelectedIds(v.selectedIds);
-  return selectedIds === undefined ? { content } : { content, selectedIds };
+  if (selectedIds !== undefined) snapshot.selectedIds = selectedIds;
+  const attachments = parseAttachments(v.attachments);
+  if (attachments !== undefined) snapshot.attachments = attachments;
+  const forwards = parseForwards(v.forwards);
+  if (forwards !== undefined) snapshot.forwards = forwards;
+  return snapshot;
 }
+
+/// Versioned blobs that `parseSnapshot` can read directly. v2 → v3 added only
+/// optional fields (`attachments`, `forwards`) and one `content` variant, so a v2
+/// snapshot parses as a v3 one with those absent — no per-version migration
+/// function needed, and the next write re-stamps it as v3. Anything not listed
+/// here is treated as the legacy unversioned shape.
+const READABLE_VERSIONS: readonly number[] = [2, 3];
 
 /// Migrate an unversioned (v1) blob: a flat `Record<ProjectId, { draft, selectedIds? }>`
 /// where the text was a bare string. Each entry becomes a plain-mode snapshot.
@@ -141,7 +307,7 @@ function readStored(): Record<ProjectId, ComposeSnapshot> {
     const parsed: unknown = JSON.parse(raw);
     if (parsed === null || typeof parsed !== "object") return {};
     const envelope = parsed as { version?: unknown; projects?: unknown };
-    if (envelope.version === STORAGE_VERSION) {
+    if (typeof envelope.version === "number" && READABLE_VERSIONS.includes(envelope.version)) {
       if (envelope.projects === null || typeof envelope.projects !== "object") return {};
       const out: Record<ProjectId, ComposeSnapshot> = {};
       for (const [id, value] of Object.entries(envelope.projects as Record<string, unknown>)) {
@@ -225,6 +391,33 @@ export function setContent(projectId: ProjectId, content: ComposeContent): void 
 export function setSelection(projectId: ProjectId, selectedIds: AgentId[]): void {
   store[projectId] = { ...(store[projectId] ?? { content: emptyPlain() }), selectedIds };
   schedulePersist();
+}
+
+/// Replace the staged attachment chips. An empty list drops the key entirely so an
+/// untouched project persists no `attachments` field.
+export function setAttachments(projectId: ProjectId, attachments: Attachment[]): void {
+  const next: ComposeSnapshot = { ...(store[projectId] ?? { content: emptyPlain() }) };
+  if (attachments.length > 0) next.attachments = [...attachments];
+  else delete next.attachments;
+  store[projectId] = next;
+  schedulePersist();
+}
+
+/// Replace every forward-source family at once — they are written together (one
+/// composer effect owns all four) and are mode-independent. All-empty drops the key.
+export function setForwards(projectId: ProjectId, forwards: ComposeForwards): void {
+  const next: ComposeSnapshot = { ...(store[projectId] ?? { content: emptyPlain() }) };
+  if (forwardsAreEmpty(forwards)) delete next.forwards;
+  else next.forwards = forwards;
+  store[projectId] = next;
+  schedulePersist();
+}
+
+/// Staged paths this project's unsent draft still references. Pass to
+/// `loadProjectConversation` — the backend GC deletes any staged attachment the
+/// journal doesn't reference, and it cannot see a draft that lives here.
+export function draftAttachmentPaths(projectId: ProjectId): string[] {
+  return (store[projectId]?.attachments ?? []).map((a) => a.path);
 }
 
 /// Test-only API surface. Production hydrates once at module load; tests use

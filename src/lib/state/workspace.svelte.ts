@@ -46,6 +46,7 @@ import { AUTO_SEED_ON_NEW_PROJECT } from "$lib/harnessDisplay";
 import { DEFAULT_EFFORT, DEFAULT_MODEL, defaultAgentName } from "$lib/agentSelection";
 import { currentIsoTimestamp } from "$lib/utils";
 import { buildLiveSendsMap } from "$lib/state/liveSends";
+import { draftAttachmentPaths } from "$lib/state/composeStore";
 import {
   applyAgentHydrate,
   markHydrationAttempted,
@@ -726,7 +727,11 @@ export async function hydrateProject(
     });
   }
   try {
-    const convo = await api.loadProjectConversation(projectId);
+    // Loading garbage-collects every staged attachment the journal doesn't
+    // reference. An unsent draft's chips live in localStorage, which the backend
+    // can't see, so declare their paths or the load deletes the files behind
+    // chips the composer is still showing.
+    const convo = await api.loadProjectConversation(projectId, draftAttachmentPaths(projectId));
 
     // Sends represented live in the slices this session own their rendering
     // there; drop the journal's copy of them from the overlay to avoid a doubled

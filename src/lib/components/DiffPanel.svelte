@@ -18,6 +18,7 @@
   import Dialog from "$lib/components/ui/Dialog.svelte";
   import EmptyState from "$lib/components/ui/EmptyState.svelte";
   import Markdown from "$lib/components/ui/Markdown.svelte";
+  import ResizeHandle from "$lib/components/ui/ResizeHandle.svelte";
   import Spinner from "$lib/components/ui/Spinner.svelte";
   import DiffView from "$lib/components/DiffView.svelte";
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
@@ -46,6 +47,12 @@
   import { preferences, updatePreferences } from "$lib/preferences.svelte";
   import type { ChangedFile, ChangeKind, DiffStyle, FileDiff } from "$lib/types";
   import { navFocus, hoverSuppressed, hoverableClass, nextIndex } from "$lib/state/gitView.svelte";
+  import {
+    DIFF_FILE_LIST_DEFAULT_WIDTH,
+    DIFF_FILE_LIST_MAX_WIDTH,
+    DIFF_FILE_LIST_MIN_WIDTH,
+    layout,
+  } from "$lib/layout.svelte";
   import { palette } from "$lib/state/commandPalette.svelte";
   import type { DiffTarget } from "$lib/state/gitView.svelte";
 
@@ -85,8 +92,15 @@
   let filesKey: string | null = null;
   let diffKey: string | null = null;
   let bodyEl = $state<HTMLDivElement | null>(null);
-  let fileListWidth = $state(256);
-  let resizingFiles = false;
+  /// Live width during a resize drag; the layout store commits on pointer-up.
+  let draftFileListWidth = $state<number | null>(null);
+  const fileListWidth = $derived(draftFileListWidth ?? layout.diffFileListWidth);
+
+  function fileListMaxWidth(): number {
+    return bodyEl === null
+      ? DIFF_FILE_LIST_MAX_WIDTH
+      : Math.min(DIFF_FILE_LIST_MAX_WIDTH, bodyEl.getBoundingClientRect().width * 0.55);
+  }
 
   // Stable identity for the selected target — changes when the user picks a
   // different commit or worktree, the signal the load effects key on.
@@ -204,7 +218,9 @@
   // Drop the file-row hover highlight right after a keyboard move so the mouse-
   // hovered row doesn't stay lit next to the keyboard selection; pointer movement
   // (handled below) clears the suppression and hover returns.
-  const hoverBg = $derived(hoverableClass("hover:bg-raised"));
+  // `bg-hover`, not `bg-raised`: the file rows sit on the raised list column,
+  // where `raised` would be invisible.
+  const hoverBg = $derived(hoverableClass("hover:bg-hover"));
 
   // The action-icons reveal (and the room the row text makes for it) is keyed on
   // the real mouse `:hover` via `group-hover`, so it must be suppressed alongside
@@ -288,25 +304,8 @@
     return openInEditor(worktreeFilePath(target.worktreePath, file.path));
   }
 
-  function startFileResize(event: PointerEvent): void {
-    resizingFiles = true;
-    event.preventDefault();
-  }
-
-  function onWindowPointerMove(event: PointerEvent): void {
+  function onWindowPointerMove(): void {
     if (hoverSuppressed.value) hoverSuppressed.value = false;
-    resizeFiles(event);
-  }
-
-  function resizeFiles(event: PointerEvent): void {
-    if (!resizingFiles || bodyEl === null) return;
-    const rect = bodyEl.getBoundingClientRect();
-    const max = Math.min(440, rect.width * 0.55);
-    fileListWidth = Math.min(max, Math.max(176, event.clientX - rect.left));
-  }
-
-  function endFileResize(): void {
-    resizingFiles = false;
   }
 
   let filesListEl = $state<HTMLUListElement | null>(null);
@@ -365,7 +364,7 @@
               <button
                 {...props}
                 type="button"
-                class={cn(ICON_BUTTON_CLASS, "hover:bg-border/60 h-5 w-5 shrink-0")}
+                class={cn(ICON_BUTTON_CLASS, "hover:bg-hover h-5 w-5 shrink-0")}
                 aria-label="Show commit message"
                 data-testid="commit-message-open"
                 onclick={() => {
@@ -433,7 +432,7 @@
           <button
             {...props}
             type="button"
-            class={cn(ICON_BUTTON_CLASS, "hover:bg-border/60 shrink-0")}
+            class={cn(ICON_BUTTON_CLASS, "hover:bg-hover shrink-0")}
             aria-label={detailExpanded ? "Restore Git details panel" : "Expand Git details panel"}
             data-testid="detail-expand-toggle"
             onclick={onToggleDetailExpanded}
@@ -450,7 +449,7 @@
 
     <button
       type="button"
-      class={cn(ICON_BUTTON_CLASS, "hover:bg-border/60 shrink-0")}
+      class={cn(ICON_BUTTON_CLASS, "hover:bg-hover shrink-0")}
       aria-label="Close diff panel"
       data-testid="detail-close"
       onclick={onClose}
@@ -521,14 +520,17 @@
     {/if}
   {:else}
     <div class="flex min-h-0 flex-1 overflow-hidden" bind:this={bodyEl}>
-      <!-- Changed-files list -->
+      <!-- Changed-files list. Raised like the diff it belongs to — the border
+           carries the column boundary, so the pane isn't a gray column with a
+           grayer header inside a white drawer. The max-width mirrors
+           fileListMaxWidth() in CSS (55% of the body, capped at 440px) so a
+           persisted width is bounded live as the panel shrinks; keep the two
+           formulas in sync. -->
       <div
-        class="border-border/60 bg-panel shrink-0 overflow-hidden border-r"
+        class="border-border/60 bg-raised max-w-[clamp(176px,55%,440px)] shrink-0 overflow-hidden border-r"
         style={`width: ${fileListWidth}px`}
       >
-        <div
-          class="border-border/60 bg-surface flex h-8 items-center justify-between border-b px-2"
-        >
+        <div class="border-border/60 flex h-8 items-center justify-between border-b px-2">
           <span class="text-muted text-[11px] font-semibold tracking-wide uppercase">
             Changed files
           </span>
@@ -581,11 +583,26 @@
                   <span class="min-w-0 flex-1">
                     <span class="block truncate" title={file.path}>{basename(file.path)}</span>
                     {#if directory}
-                      <span class="text-muted/80 block truncate font-mono text-[10px] leading-4">
+                      <span class="text-muted/60 block truncate font-mono text-[10px] leading-4">
                         {directory}
                       </span>
                     {/if}
                   </span>
+                  <!-- +n/−n magnitude, quiet mono like the commit timestamps.
+                       Absent for binary/oversized content (counts are null, not
+                       0) and for a pure rename (0/0 — the R badge already says
+                       everything). Lives inside the button, so the hover
+                       padding shift slides it left to make room for the
+                       revealed action icons. -->
+                  {#if file.additions !== null && file.deletions !== null && file.additions + file.deletions > 0}
+                    <span
+                      class="mt-0.5 ml-auto shrink-0 pl-2 font-mono text-[10px] leading-4"
+                      data-testid="changed-file-counts"
+                    >
+                      <span class="text-diff-added">+{file.additions}</span>
+                      <span class="text-diff-removed">−{file.deletions}</span>
+                    </span>
+                  {/if}
                 </button>
                 <div
                   class={cn(
@@ -601,7 +618,7 @@
                           class={cn(
                             ICON_BUTTON_CLASS,
                             "h-6 w-6 shrink-0",
-                            "hover:bg-border/60",
+                            "hover:bg-hover",
                             SELECTED_ROW_ICON_HOVER,
                           )}
                           label={`Copy path for ${file.path}`}
@@ -622,7 +639,7 @@
                             class={cn(
                               ICON_BUTTON_CLASS,
                               "h-6 w-6 shrink-0",
-                              "hover:bg-border/60",
+                              "hover:bg-hover",
                               SELECTED_ROW_ICON_HOVER,
                             )}
                             label={`Open ${file.path} in editor`}
@@ -648,7 +665,7 @@
                         class={cn(
                           ICON_BUTTON_CLASS,
                           "h-6 w-6 shrink-0",
-                          "hover:bg-border/60",
+                          "hover:bg-hover",
                           SELECTED_ROW_ICON_HOVER,
                         )}
                         label={`Open ${file.path} in difftool`}
@@ -669,14 +686,23 @@
         </ul>
       </div>
 
-      <div
-        class="border-border/60 bg-panel hover:bg-raised w-1.5 shrink-0 cursor-col-resize border-r transition-colors"
-        role="separator"
-        aria-orientation="vertical"
-        aria-label="Resize changed files list"
-        data-testid="changed-files-resizer"
-        onpointerdown={startFileResize}
-      ></div>
+      <ResizeHandle
+        value={() => fileListWidth}
+        min={DIFF_FILE_LIST_MIN_WIDTH}
+        max={fileListMaxWidth}
+        label="Resize changed files list"
+        testid="changed-files-resizer"
+        class="border-border/60 bg-panel hover:bg-focus w-1.5 border-r transition-colors"
+        onDraft={(px) => (draftFileListWidth = px)}
+        onCommit={(px) => {
+          layout.diffFileListWidth = px;
+          draftFileListWidth = null;
+        }}
+        onReset={() => {
+          layout.diffFileListWidth = DIFF_FILE_LIST_DEFAULT_WIDTH;
+          draftFileListWidth = null;
+        }}
+      />
 
       <!-- Diff -->
       <div class="bg-raised min-w-0 flex-1 overflow-auto" data-testid="diff-scroll">
@@ -699,4 +725,5 @@
   {/if}
 </div>
 
-<svelte:window onpointermove={onWindowPointerMove} onpointerup={endFileResize} />
+<!-- Keyboard navigation suppresses hover highlights; any pointer motion restores them. -->
+<svelte:window onpointermove={onWindowPointerMove} />

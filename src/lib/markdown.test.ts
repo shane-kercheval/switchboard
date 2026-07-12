@@ -1,5 +1,19 @@
 import { describe, expect, it } from "vitest";
-import { renderMarkdown } from "$lib/markdown";
+import { previewLine, renderMarkdown } from "$lib/markdown";
+
+describe("previewLine", () => {
+  it("takes the first non-empty line and strips inline markdown markers", () => {
+    expect(previewLine("\n\n# Hello **world**\nsecond")).toBe("Hello world");
+  });
+
+  it("strips a leading blockquote marker (the case the thinking-row preview missed)", () => {
+    expect(previewLine("> quoted thought\nmore")).toBe("quoted thought");
+  });
+
+  it("returns an empty string for blank input", () => {
+    expect(previewLine("\n  \n")).toBe("");
+  });
+});
 
 describe("renderMarkdown", () => {
   it("renders core Markdown constructs", () => {

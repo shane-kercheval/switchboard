@@ -34,12 +34,14 @@ export const HARNESS_LABEL: Record<HarnessKind, string> = {
 export const ALL_HARNESSES = Object.keys(HARNESS_LABEL) as HarnessKind[];
 
 /// Brand/icon-derived accent colors for transcript attribution and compact
-/// harness identity. Chosen from the actual icon artwork.
+/// harness identity. Chosen from the actual icon artwork — except gemini and
+/// antigravity, whose icons share both hues: the blue reads as Gemini's primary
+/// brand color, so Gemini takes it and Antigravity takes the green.
 export const HARNESS_COLOR: Record<HarnessKind, string> = {
   claude_code: "#d97757",
   codex: "#3831ff",
-  gemini: "#17b967",
-  antigravity: "#3187fe",
+  gemini: "#3187fe",
+  antigravity: "#17b967",
 };
 
 /// Official setup/install docs for each harness CLI. The single source for

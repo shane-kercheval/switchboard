@@ -27,6 +27,7 @@
 //! before any model call (verified against codex-cli 0.136.0).
 
 pub mod config;
+pub(crate) mod facets;
 pub mod parser;
 pub mod session_file;
 pub mod skills;
@@ -45,6 +46,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::adapter::{DispatchError, EventStream, HarnessAdapter};
 use crate::events::{AdapterEvent, FailureKind, TurnId, TurnOutcome, TurnUsage};
+use crate::facets::ToolFacet;
 
 use parser::{CodexParserState, parse_line};
 use session_file::{Enrichment, TokioSleeper};
@@ -354,6 +356,12 @@ async fn run_producer(
     // dispatcher's `AgentIdleGuard` releases at terminal time, not whenever
     // codex eventually decides to exit on its own.
     let mut force_kill_child = false;
+    // The turn's live `file_change` tool ids + their path sets, in emission
+    // order. At terminal these are zipped with the enrichment read's
+    // content-bearing patch facets (same order — both follow the turn's
+    // record order) to emit `ToolFacetUpdated`; the path-set match is the
+    // guard against a zip misalignment upgrading the wrong row.
+    let mut live_edit_calls: Vec<(String, Vec<String>)> = Vec::new();
 
     let mut lines = tokio::io::BufReader::new(stdout).lines();
 
@@ -512,10 +520,24 @@ async fn run_producer(
                                 ended_at,
                                 usage,
                                 is_first_turn,
+                                &live_edit_calls,
                             )
                             .await;
                         }
                         other => {
+                            if let AdapterEvent::ToolStarted {
+                                tool_use_id,
+                                name,
+                                facet: ToolFacet::Edit { files },
+                                ..
+                            } = &other
+                                && name == "file_change"
+                            {
+                                live_edit_calls.push((
+                                    tool_use_id.clone(),
+                                    files.iter().map(|f| f.path.clone()).collect(),
+                                ));
+                            }
                             let _ = tx.send(other);
                         }
                     }
@@ -636,6 +658,7 @@ async fn emit_terminal_with_enrichment(
     ended_at: chrono::DateTime<Utc>,
     usage: Option<TurnUsage>,
     is_first_turn: bool,
+    live_edit_calls: &[(String, Vec<String>)],
 ) {
     // Step 1: locate the rollout file from the locator (resume locator, or the
     // one captured this dispatch). Absent only if capture failed/never
@@ -651,6 +674,8 @@ async fn emit_terminal_with_enrichment(
         );
         Enrichment::default()
     };
+
+    emit_facet_upgrades(tx, turn_id, live_edit_calls, &enrichment.patch_facets);
 
     // Step 3: emit the enriched TurnEnd. Token fields are replaced by the
     // session file's per-turn usage first (the stream's are thread-cumulative
@@ -724,6 +749,93 @@ async fn emit_terminal_with_enrichment(
                 skills: fields.skills,
                 raw: fields.raw,
             });
+        }
+    }
+}
+
+/// Upgrade the turn's live `file_change` facets (paths, no content) with the
+/// session file's content-bearing patch facets. Must precede the `TurnEnd`:
+/// the dispatcher drops turn-scoped events after a terminal. There is no
+/// shared id between the two channels (live `item_N` vs disk `call_*`), so
+/// correlation is positional:
+///
+/// - **Counts equal** (the normal case): ordinal pairing, guarded per pair by
+///   path-set equality. Order is trusted because both channels record the
+///   same operation sequence — the same order-fidelity assumption the rest of
+///   the enrichment (usage, window) already rests on. Accepted residual: an
+///   equal-count order swap of two same-path entries is undetectable, but
+///   doubting equal-count order would indict the whole enrichment mechanism,
+///   not this guard.
+/// - **Counts mismatch**: alignment is genuinely in doubt, so ordinal
+///   position is abandoned entirely — pairs are joined by path-set key and
+///   upgraded only when that key occurs exactly once on *both* sides
+///   (unambiguous by construction). Duplicated or unmatched keys are skipped
+///   with a warning; those rows keep their path-only facet (the reload path
+///   still shows full content), which beats risking a plausible-looking diff
+///   on the wrong row.
+fn emit_facet_upgrades(
+    tx: &tokio::sync::mpsc::UnboundedSender<AdapterEvent>,
+    turn_id: TurnId,
+    live_edit_calls: &[(String, Vec<String>)],
+    patch_facets: &[ToolFacet],
+) {
+    if live_edit_calls.is_empty() {
+        return;
+    }
+    let counts_match = live_edit_calls.len() == patch_facets.len();
+    if !counts_match {
+        tracing::warn!(
+            live = live_edit_calls.len(),
+            disk = patch_facets.len(),
+            "Codex facet upgrade: live file_change count != session-file apply_patch count; falling back to unique path-set matching"
+        );
+    }
+    // Deterministic path-set key: sorted, joined paths.
+    let path_key = |paths: &mut Vec<String>| -> String {
+        paths.sort();
+        paths.join("\n")
+    };
+    let disk_entries: Vec<(String, &ToolFacet)> = patch_facets
+        .iter()
+        .filter_map(|facet| match facet {
+            ToolFacet::Edit { files } => {
+                let mut paths: Vec<String> = files.iter().map(|f| f.path.clone()).collect();
+                Some((path_key(&mut paths), facet))
+            }
+            _ => None,
+        })
+        .collect();
+
+    for (idx, (tool_use_id, live_paths)) in live_edit_calls.iter().enumerate() {
+        let live_key = path_key(&mut live_paths.clone());
+        let facet = if counts_match {
+            match disk_entries.get(idx) {
+                Some((disk_key, facet)) if *disk_key == live_key => Some(*facet),
+                _ => None,
+            }
+        } else {
+            let live_unique = live_edit_calls
+                .iter()
+                .filter(|(_, p)| path_key(&mut p.clone()) == live_key)
+                .count()
+                == 1;
+            let mut disk_matches = disk_entries.iter().filter(|(k, _)| *k == live_key);
+            match (live_unique, disk_matches.next(), disk_matches.next()) {
+                (true, Some((_, facet)), None) => Some(*facet),
+                _ => None,
+            }
+        };
+        if let Some(facet) = facet {
+            let _ = tx.send(AdapterEvent::ToolFacetUpdated {
+                turn_id,
+                tool_use_id: tool_use_id.clone(),
+                facet: facet.clone(),
+            });
+        } else {
+            tracing::warn!(
+                %tool_use_id,
+                "Codex facet upgrade: no unambiguous session-file patch for this file_change; leaving the path-only facet"
+            );
         }
     }
 }
@@ -1156,5 +1268,234 @@ mod tests {
         // telemetry, it does not fabricate it.
         let result = apply_per_turn_usage(None, Some(per_turn_enrichment_usage()));
         assert!(result.is_none());
+    }
+
+    /// The facet-upgrade emission contract: for each live `file_change` id
+    /// whose path set matches the session file's patch, a `ToolFacetUpdated`
+    /// with the content-bearing facet is emitted **before** `TurnEnd` (the
+    /// dispatcher drops turn-scoped events after a terminal, so ordering is
+    /// load-bearing); a path-set mismatch skips that upgrade.
+    #[tokio::test]
+    async fn facet_upgrade_emits_before_turn_end_with_path_guard() {
+        use crate::facets::ToolFacet;
+        let home = tempfile::TempDir::new().unwrap();
+        let cwd = tempfile::TempDir::new().unwrap();
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 7, 10).unwrap();
+        let thread_id = "00000000-0000-7000-8000-0000000000c1";
+        let dir = session_file::session_directory(home.path(), date);
+        std::fs::create_dir_all(&dir).unwrap();
+        let rollout = dir.join(format!("rollout-1747000000000-{thread_id}.jsonl"));
+        let patch =
+            "*** Begin Patch\n*** Update File: /tmp/alpha.txt\n@@\n-foo\n+bar\n*** End Patch\n";
+        let content = format!(
+            concat!(
+                "{{\"timestamp\":\"2026-07-10T00:00:01Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_started\",\"turn_id\":\"t1\"}}}}\n",
+                "{{\"timestamp\":\"2026-07-10T00:00:02Z\",\"type\":\"response_item\",\"payload\":{{\"type\":\"custom_tool_call\",\"call_id\":\"call_1\",\"name\":\"apply_patch\",\"input\":\"{patch}\"}}}}\n",
+            ),
+            patch = patch.replace('\n', "\\n"),
+        );
+        std::fs::write(&rollout, content).unwrap();
+
+        let locator = CodexLocator {
+            thread_id: thread_id.to_owned(),
+            partition_date: date,
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let turn_id = uuid::Uuid::now_v7();
+        let live_edit_calls = vec![
+            // Path set matches the patch → upgraded.
+            ("item_4".to_owned(), vec!["/tmp/alpha.txt".to_owned()]),
+            // No corresponding patch facet (zip exhausted) → left alone.
+            ("item_9".to_owned(), vec!["/tmp/other.txt".to_owned()]),
+        ];
+        emit_terminal_with_enrichment(
+            &tx,
+            Some(&locator),
+            home.path(),
+            cwd.path(),
+            switchboard_core::AgentId::now_v7(),
+            turn_id,
+            TurnOutcome::Completed,
+            Utc::now(),
+            None,
+            false,
+            &live_edit_calls,
+        )
+        .await;
+        drop(tx);
+
+        let mut events = Vec::new();
+        while let Some(e) = rx.recv().await {
+            events.push(e);
+        }
+        let upgrade_idx = events
+            .iter()
+            .position(|e| matches!(e, AdapterEvent::ToolFacetUpdated { .. }))
+            .expect("a ToolFacetUpdated for the matching row");
+        let turn_end_idx = events
+            .iter()
+            .position(|e| matches!(e, AdapterEvent::TurnEnd { .. }))
+            .expect("TurnEnd");
+        assert!(upgrade_idx < turn_end_idx, "upgrade must precede TurnEnd");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, AdapterEvent::ToolFacetUpdated { .. }))
+                .count(),
+            1,
+            "only the path-matched row upgrades"
+        );
+        match &events[upgrade_idx] {
+            AdapterEvent::ToolFacetUpdated {
+                tool_use_id,
+                facet: ToolFacet::Edit { files },
+                ..
+            } => {
+                assert_eq!(tool_use_id, "item_4");
+                assert_eq!(files[0].edits[0].old, "foo");
+                assert_eq!(files[0].edits[0].new, "bar");
+            }
+            other => panic!("expected Edit upgrade, got {other:?}"),
+        }
+    }
+
+    /// Same file edited twice in one turn with matching counts: ordinal
+    /// pairing is trusted and each row gets its *own* edit's content, in
+    /// order — the common case the count-mismatch fallback must not degrade.
+    #[tokio::test]
+    async fn facet_upgrade_same_file_twice_equal_counts_pairs_in_order() {
+        use crate::facets::ToolFacet;
+        let home = tempfile::TempDir::new().unwrap();
+        let cwd = tempfile::TempDir::new().unwrap();
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 7, 10).unwrap();
+        let thread_id = "00000000-0000-7000-8000-0000000000c2";
+        let dir = session_file::session_directory(home.path(), date);
+        std::fs::create_dir_all(&dir).unwrap();
+        let patch = |old: &str, new: &str| {
+            format!(
+                "*** Begin Patch\\n*** Update File: /tmp/alpha.txt\\n@@\\n-{old}\\n+{new}\\n*** End Patch\\n"
+            )
+        };
+        let content = format!(
+            concat!(
+                "{{\"timestamp\":\"2026-07-10T00:00:01Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_started\",\"turn_id\":\"t1\"}}}}\n",
+                "{{\"timestamp\":\"2026-07-10T00:00:02Z\",\"type\":\"response_item\",\"payload\":{{\"type\":\"custom_tool_call\",\"call_id\":\"call_1\",\"name\":\"apply_patch\",\"input\":\"{p1}\"}}}}\n",
+                "{{\"timestamp\":\"2026-07-10T00:00:03Z\",\"type\":\"response_item\",\"payload\":{{\"type\":\"custom_tool_call\",\"call_id\":\"call_2\",\"name\":\"apply_patch\",\"input\":\"{p2}\"}}}}\n",
+            ),
+            p1 = patch("foo", "bar"),
+            p2 = patch("bar", "baz"),
+        );
+        std::fs::write(
+            dir.join(format!("rollout-1747000000000-{thread_id}.jsonl")),
+            content,
+        )
+        .unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let live_edit_calls = vec![
+            ("item_1".to_owned(), vec!["/tmp/alpha.txt".to_owned()]),
+            ("item_2".to_owned(), vec!["/tmp/alpha.txt".to_owned()]),
+        ];
+        emit_terminal_with_enrichment(
+            &tx,
+            Some(&CodexLocator {
+                thread_id: thread_id.to_owned(),
+                partition_date: date,
+            }),
+            home.path(),
+            cwd.path(),
+            switchboard_core::AgentId::now_v7(),
+            uuid::Uuid::now_v7(),
+            TurnOutcome::Completed,
+            Utc::now(),
+            None,
+            false,
+            &live_edit_calls,
+        )
+        .await;
+        drop(tx);
+
+        let mut upgrades = Vec::new();
+        while let Some(e) = rx.recv().await {
+            if let AdapterEvent::ToolFacetUpdated {
+                tool_use_id,
+                facet: ToolFacet::Edit { files },
+                ..
+            } = e
+            {
+                upgrades.push((tool_use_id, files[0].edits[0].new.clone()));
+            }
+        }
+        assert_eq!(
+            upgrades,
+            vec![
+                ("item_1".to_owned(), "bar".to_owned()),
+                ("item_2".to_owned(), "baz".to_owned()),
+            ],
+            "equal counts: each row must receive its own edit's content, in order"
+        );
+    }
+
+    /// Count mismatch: ordinal position is abandoned. A duplicated path-set
+    /// is ambiguous → no upgrade for those rows; a uniquely-matchable
+    /// path-set IS upgraded even where an ordinal zip would have mis-paired
+    /// and dropped it (live `[x, y]`, disk `[y]`).
+    #[tokio::test]
+    async fn facet_upgrade_count_mismatch_uses_unique_path_matching() {
+        let home = tempfile::TempDir::new().unwrap();
+        let cwd = tempfile::TempDir::new().unwrap();
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 7, 10).unwrap();
+        let thread_id = "00000000-0000-7000-8000-0000000000c3";
+        let dir = session_file::session_directory(home.path(), date);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Disk carries ONE patch, for y.txt only.
+        let content = concat!(
+            "{\"timestamp\":\"2026-07-10T00:00:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"t1\"}}\n",
+            "{\"timestamp\":\"2026-07-10T00:00:02Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\",\"call_id\":\"call_1\",\"name\":\"apply_patch\",\"input\":\"*** Begin Patch\\n*** Update File: /tmp/y.txt\\n@@\\n-a\\n+b\\n*** End Patch\\n\"}}\n",
+        );
+        std::fs::write(
+            dir.join(format!("rollout-1747000000000-{thread_id}.jsonl")),
+            content,
+        )
+        .unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        // Three live rows, no disk patch for x.txt; x.txt is duplicated
+        // (ambiguous), y.txt is unique (recoverable).
+        let live_edit_calls = vec![
+            ("item_1".to_owned(), vec!["/tmp/x.txt".to_owned()]),
+            ("item_2".to_owned(), vec!["/tmp/x.txt".to_owned()]),
+            ("item_3".to_owned(), vec!["/tmp/y.txt".to_owned()]),
+        ];
+        emit_terminal_with_enrichment(
+            &tx,
+            Some(&CodexLocator {
+                thread_id: thread_id.to_owned(),
+                partition_date: date,
+            }),
+            home.path(),
+            cwd.path(),
+            switchboard_core::AgentId::now_v7(),
+            uuid::Uuid::now_v7(),
+            TurnOutcome::Completed,
+            Utc::now(),
+            None,
+            false,
+            &live_edit_calls,
+        )
+        .await;
+        drop(tx);
+
+        let mut upgrades = Vec::new();
+        while let Some(e) = rx.recv().await {
+            if let AdapterEvent::ToolFacetUpdated { tool_use_id, .. } = e {
+                upgrades.push(tool_use_id);
+            }
+        }
+        assert_eq!(
+            upgrades,
+            vec!["item_3".to_owned()],
+            "only the uniquely-matchable row upgrades; ambiguous duplicates stay path-only"
+        );
     }
 }

@@ -122,6 +122,11 @@ beforeEach(async () => {
           original_name: name,
         };
       }
+      // Restored chips are reconciled against disk on mount. Default: every
+      // declared path still exists, so nothing is pruned.
+      if (cmd === "existing_attachment_paths") {
+        return (args as { paths?: string[] })?.paths ?? [];
+      }
       return null;
     },
   );
@@ -167,6 +172,40 @@ describe("ComposeBar", () => {
 
     expect(chip(AGENT_A.id)).toHaveAttribute("data-selected", "true");
     expect(chip(AGENT_B.id)).toHaveAttribute("data-selected", "false");
+  });
+
+  it("outlines the compose box while focus is anywhere inside it, not just the textarea", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+
+    const box = screen.getByTestId("compose-box");
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    const send = screen.getByTestId("compose-send");
+
+    // The compose bar is the default keyboard target, so a permanent highlight
+    // would say nothing — the focus border must be absent until focus lands here.
+    expect(box).not.toHaveClass("border-focus");
+
+    // Focus tracking is container-level (focusin bubbles), so any field inside
+    // the box lights the border — this is what makes prompt/workflow-mode fields
+    // highlight, not only the plain textarea.
+    await fireEvent.focusIn(textarea);
+    await tick();
+    expect(box).toHaveClass("border-focus");
+
+    // Moving focus to another child of the box (textarea → send button) keeps the
+    // border: the containment guard clears only when focus leaves the container.
+    await fireEvent.focusOut(textarea, { relatedTarget: send });
+    await fireEvent.focusIn(send);
+    await tick();
+    expect(box).toHaveClass("border-focus");
+
+    // Focus leaving the box entirely clears it.
+    await fireEvent.focusOut(send, { relatedTarget: document.body });
+    await tick();
+    expect(box).not.toHaveClass("border-focus");
   });
 
   it("grows the message box with content up to its max height", async () => {
@@ -1815,6 +1854,161 @@ describe("ComposeBar — attachment lifecycle", () => {
   });
 });
 
+describe("ComposeBar — attachments survive navigation", () => {
+  it("restores a staged chip after an unmount/remount (project switch, Git view)", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    const { unmount } = render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+
+    fireDrop(["/a/diagram.png"]);
+    await screen.findByTestId("attachment-chip-image-1");
+    unmount();
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    expect(await screen.findByTestId("attachment-chip-image-1")).toBeInTheDocument();
+  });
+
+  it("does not restore chips after a successful send", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    invokeMock.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "stage_attachment") {
+        return { path: "/p/attachments/uuid__diagram.png", original_name: "diagram.png" };
+      }
+      if (cmd === "send_message") return "msg-1";
+      if (cmd === "existing_attachment_paths") return (args as { paths?: string[] })?.paths ?? [];
+      return null;
+    });
+    const { unmount } = render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+
+    fireDrop(["/a/diagram.png"]);
+    await screen.findByTestId("attachment-chip-image-1");
+    await fireEvent.click(screen.getByTestId("compose-send"));
+    await waitFor(() =>
+      expect(invokeMock.mock.calls.some(([c]) => c === "send_message")).toBe(true),
+    );
+    unmount();
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await tick();
+    expect(screen.queryByTestId("attachment-chip-image-1")).toBeNull();
+  });
+
+  it("commits a staging result that resolves after unmount to the originating project", async () => {
+    // A project switch tears down the bar mid-copy. The file was staged *for this
+    // project*, so it belongs in this project's snapshot — not discarded, and not
+    // leaked into whichever project the user switched to.
+    const state = await loadState();
+    const composeStore = await loadComposeStore();
+    await state.registerAgent(AGENT_A);
+
+    let releaseStage: (() => void) | undefined;
+    const staged = new Promise<void>((r) => (releaseStage = r));
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "stage_attachment") {
+        await staged;
+        return { path: "/p/attachments/uuid__late.png", original_name: "late.png" };
+      }
+      return null;
+    });
+
+    const { unmount } = render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    fireDrop(["/a/late.png"]);
+    unmount();
+
+    releaseStage?.();
+    await waitFor(() =>
+      expect(composeStore.getCompose(PROJECT_ID).attachments).toEqual([
+        {
+          label: "image-1",
+          kind: "image",
+          path: "/p/attachments/uuid__late.png",
+          original_name: "late.png",
+        },
+      ]),
+    );
+  });
+
+  it("numbers a chip attached after a restore without colliding with the restored label", async () => {
+    // A per-component counter would restart at 1 on remount and produce two
+    // `image-1` chips — and the label is what the user types into the message.
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    const { unmount } = render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    fireDrop(["/a/first.png"]);
+    await screen.findByTestId("attachment-chip-image-1");
+    unmount();
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await screen.findByTestId("attachment-chip-image-1");
+    fireDrop(["/a/second.png"]);
+
+    expect(await screen.findByTestId("attachment-chip-image-2")).toBeInTheDocument();
+  });
+
+  it("prunes a restored chip whose staged file no longer exists", async () => {
+    const state = await loadState();
+    const composeStore = await loadComposeStore();
+    await state.registerAgent(AGENT_A);
+    composeStore.setAttachments(PROJECT_ID, [
+      {
+        label: "image-1",
+        kind: "image",
+        path: "/p/attachments/gone.png",
+        original_name: "gone.png",
+      },
+    ]);
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "existing_attachment_paths") return []; // the file vanished
+      return null;
+    });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+
+    await waitFor(() => expect(screen.queryByTestId("attachment-chip-image-1")).toBeNull());
+    expect(composeStore.getCompose(PROJECT_ID).attachments).toBeUndefined();
+  });
+
+  it("does not prune a chip attached while the existence probe was in flight", async () => {
+    // The probe answers about the *restored* paths only. A stale answer must not
+    // sweep away a file the user dropped a moment ago.
+    const state = await loadState();
+    const composeStore = await loadComposeStore();
+    await state.registerAgent(AGENT_A);
+    composeStore.setAttachments(PROJECT_ID, [
+      {
+        label: "image-1",
+        kind: "image",
+        path: "/p/attachments/gone.png",
+        original_name: "gone.png",
+      },
+    ]);
+
+    let releaseProbe: (() => void) | undefined;
+    const probe = new Promise<void>((r) => (releaseProbe = r));
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "existing_attachment_paths") {
+        await probe;
+        return [];
+      }
+      if (cmd === "stage_attachment") {
+        return { path: "/p/attachments/uuid__fresh.png", original_name: "fresh.png" };
+      }
+      return null;
+    });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    fireDrop(["/a/fresh.png"]);
+    await screen.findByTestId("attachment-chip-image-2");
+
+    releaseProbe?.();
+
+    // The restored (missing) chip goes; the freshly attached one stays.
+    await waitFor(() => expect(screen.queryByTestId("attachment-chip-image-1")).toBeNull());
+    expect(screen.getByTestId("attachment-chip-image-2")).toBeInTheDocument();
+  });
+});
+
 describe("ComposeBar pane targeting", () => {
   const ROSTER = [AGENT_A.id, AGENT_B.id];
 
@@ -2082,6 +2276,33 @@ describe("ComposeBar — cross-agent forward", () => {
     ];
   }
 
+  async function seedStreamingTurn(agentId: string, alsoCompleted = false): Promise<void> {
+    const state = await loadState();
+    const turns = alsoCompleted
+      ? [
+          {
+            role: "agent" as const,
+            turn_id: `t-done-${agentId}`,
+            agent_id: agentId,
+            started_at: "2026-05-16T00:00:00Z",
+            status: "complete" as const,
+            items: [{ item_kind: "text" as const, kind: "text" as const, text: "old" }],
+          },
+        ]
+      : [];
+    state.transcripts[agentId] = [
+      ...turns,
+      {
+        role: "agent",
+        turn_id: `t-live-${agentId}`,
+        agent_id: agentId,
+        started_at: "2026-05-16T00:00:01Z",
+        status: "streaming",
+        items: [],
+      },
+    ];
+  }
+
   async function resetHeldForwards(): Promise<void> {
     (await import("$lib/state/heldForwards.svelte"))._testing.reset();
   }
@@ -2342,18 +2563,145 @@ describe("ComposeBar — cross-agent forward", () => {
     expect(queuedTurn && "text" in queuedTurn ? queuedTurn.text : undefined).toBe(FORWARDED_BODY);
   });
 
-  it("flags an idle-empty source on its chip", async () => {
+  it("warns on an idle-empty source, naming the consequence", async () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);
     await state.registerAgent(AGENT_B);
-    // AGENT_B has no completed turn → nothing to forward yet.
+    // AGENT_B is idle with no completed turn → the forward skips it entirely.
 
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
     await pickForwardSource(AGENT_B.id);
 
     const chipEl = screen.getByTestId("forward-source-chip-bob");
-    expect(chipEl).toHaveAttribute("data-empty", "true");
-    expect(chipEl).toHaveTextContent("no output");
+    expect(chipEl).toHaveAttribute("data-readiness", "empty");
+    // State is a colour + trailing icon (with a tooltip), not inline text; the
+    // consequence still reaches assistive tech as visually-hidden text.
+    expect(screen.getByTestId("forward-source-state-bob")).toHaveAttribute(
+      "data-state-readiness",
+      "empty",
+    );
+    expect(within(chipEl).getByText(/will be skipped from the forward/i)).toBeInTheDocument();
+  });
+
+  it("does not warn on a source that is still streaming", async () => {
+    // The reported bug: a streaming agent rendered in the failed status colour with
+    // "no output", when the send in fact holds for that turn and forwards it.
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    await seedStreamingTurn(AGENT_B.id);
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    await pickForwardSource(AGENT_B.id);
+
+    const chipEl = screen.getByTestId("forward-source-chip-bob");
+    expect(chipEl).toHaveAttribute("data-readiness", "pending");
+    // Pending shows the "still generating" icon (tooltip + sr-only text), not the
+    // empty warning; and never the failed status colour that read as a warning.
+    const stateIcon = screen.getByTestId("forward-source-state-bob");
+    expect(stateIcon).toHaveAttribute("data-state-readiness", "pending");
+    expect(within(chipEl).getByText(/still generating; sending will wait/i)).toBeInTheDocument();
+    expect(chipEl.className).not.toContain("status-failed");
+  });
+
+  it("treats a completed turn plus a newer streaming one as pending, not ready", async () => {
+    // The forward awaits the in-flight turn and takes the *latest* completed output,
+    // so this agent is not ready — the send holds. A `hasCompleted || isStreaming`
+    // predicate would call it ready and mislead the user about what gets forwarded.
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    await seedStreamingTurn(AGENT_B.id, true);
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    await pickForwardSource(AGENT_B.id);
+
+    expect(screen.getByTestId("forward-source-chip-bob")).toHaveAttribute(
+      "data-readiness",
+      "pending",
+    );
+  });
+
+  it("the @-menu row and the chip agree about the same agent", async () => {
+    // Four surfaces asked this question independently before; a shared derivation
+    // is what stops them drifting.
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    await seedStreamingTurn(AGENT_B.id);
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    await fireEvent.input(textarea, { target: { value: "@" } });
+    const row = await screen.findByTestId(`forward-option-forward-agent:${AGENT_B.id}`);
+    expect(row).toHaveTextContent("still generating");
+    expect(row).not.toHaveTextContent("will be skipped");
+
+    await fireEvent.click(row);
+    // The chip carries the same pending state the row advertised.
+    expect(screen.getByTestId("forward-source-state-bob")).toHaveAttribute(
+      "data-state-readiness",
+      "pending",
+    );
+  });
+
+  it("restores forward sources after an unmount/remount (project switch, Git view)", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    const { unmount } = render(ComposeBar, {
+      props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] },
+    });
+    await pickForwardSource(AGENT_B.id);
+    await screen.findByTestId("forward-source-chip-bob");
+    unmount();
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    expect(await screen.findByTestId("forward-source-chip-bob")).toBeInTheDocument();
+  });
+
+  it("drops a restored forward source whose agent no longer exists", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    const { unmount } = render(ComposeBar, {
+      props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] },
+    });
+    await pickForwardSource(AGENT_B.id);
+    await screen.findByTestId("forward-source-chip-bob");
+    unmount();
+
+    // AGENT_B removed from the roster while we were away.
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await tick();
+    expect(screen.queryByTestId("forward-source-chip-bob")).toBeNull();
+  });
+
+  it("does not restore forward sources after a successful forward send", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    await seedCompletedTurn(AGENT_B.id);
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "forward_message") return { status: "resolved", body: "x", skipped: [] };
+      if (cmd === "send_message") return "msg-1";
+      return null;
+    });
+    const { unmount } = render(ComposeBar, {
+      props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] },
+    });
+    await pickForwardSource(AGENT_B.id);
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    await fireEvent.input(textarea, { target: { value: "go" } });
+    await fireEvent.click(screen.getByTestId("compose-send"));
+    await waitFor(() =>
+      expect(invokeMock.mock.calls.some(([c]) => c === "forward_message")).toBe(true),
+    );
+    unmount();
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    await tick();
+    expect(screen.queryByTestId("forward-source-chip-bob")).toBeNull();
   });
 
   it("composes multiple forward sources in declared order", async () => {
@@ -2432,6 +2780,55 @@ describe("ComposeBar — cross-agent forward", () => {
         "aggregate this",
       );
     });
+  });
+
+  it("restored attachments after an invalidated forward reach the store, not just the DOM", async () => {
+    // Regression: the restore path assigned `attachmentChips` directly and
+    // `persistComposeNow` never wrote attachments, so the chip showed but the
+    // store stayed empty — and the next project load GC'd the staged file. Assert
+    // the store, because the DOM assertion already passed with the bug present.
+    const composeStore = await loadComposeStore();
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    await seedCompletedTurn(AGENT_B.id);
+    invokeMock.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "forward_message") return { status: "invalidated", reason: "bob's turn failed" };
+      if (cmd === "stage_attachment") {
+        const source = String((args as { sourcePath?: unknown })?.sourcePath ?? "drop");
+        const name = source.split("/").pop() ?? source;
+        return {
+          path: `/proj/.switchboard/projects/p/attachments/uuid__${name}`,
+          original_name: name,
+        };
+      }
+      if (cmd === "existing_attachment_paths") return (args as { paths?: string[] })?.paths ?? [];
+      return null;
+    });
+
+    const { unmount } = render(ComposeBar, {
+      props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] },
+    });
+    fireDrop(["/a/diagram.png"]);
+    await screen.findByTestId("attachment-chip-image-1");
+    await pickForwardSource(AGENT_B.id);
+    await fireEvent.input(screen.getByTestId("compose-textarea") as HTMLTextAreaElement, {
+      target: { value: "aggregate this" },
+    });
+    await fireEvent.click(screen.getByTestId("compose-send"));
+
+    // The chip is back in the DOM *and* mirrored to the store, so the load-time GC
+    // will spare its file.
+    await waitFor(() => expect(screen.getByTestId("attachment-chip-image-1")).toBeInTheDocument());
+    await waitFor(() => expect(composeStore.getCompose(PROJECT_ID).attachments?.length).toBe(1));
+    expect(composeStore.draftAttachmentPaths(PROJECT_ID)).toEqual([
+      "/proj/.switchboard/projects/p/attachments/uuid__diagram.png",
+    ]);
+
+    // And it survives the unmount/remount the whole milestone is about.
+    unmount();
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    expect(await screen.findByTestId("attachment-chip-image-1")).toBeInTheDocument();
   });
 
   it("seeds a held forward (no send_message issued during the hold)", async () => {
@@ -3304,6 +3701,252 @@ describe("ComposeBar — cross-agent forward", () => {
     // The stale unresolved reply is ignored — the form stays resolved.
     expect(screen.getByTestId("workflow-agent-worker-alice")).toBeInTheDocument();
     expect(screen.queryByTestId("workflow-resolving")).toBeNull();
+  });
+});
+
+describe("ComposeBar — workflow invocation survives navigation", () => {
+  const WORKFLOW = {
+    name: "review-and-recommend",
+    is_builtin: true,
+    description: "d",
+    inputs: [
+      { name: "reviewers", ty: "agent_list", optional: false, description: null },
+      { name: "worker", ty: "agent", optional: false, description: null },
+    ],
+    invocable: true,
+    parse_error: null,
+  };
+  const DESCRIPTOR = {
+    name: "review-and-recommend",
+    description: "d",
+    is_builtin: true,
+    invocable: true,
+    inputs: WORKFLOW.inputs,
+    steps: [],
+    derived_args: [
+      { name: "context", required: false, description: "Optional background", prompts: [] },
+    ],
+    compatibility: { state: "ok" },
+  };
+
+  function mockWorkflows(list: unknown[] = [WORKFLOW]): void {
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "list_workflows") return list;
+      if (cmd === "describe_workflow_form") return DESCRIPTOR;
+      if (cmd === "list_prompts") return [];
+      return null;
+    });
+  }
+
+  async function enterWorkflowModeAndFill(): Promise<void> {
+    await fireEvent.click(screen.getByTestId("compose-workflow-button"));
+    await waitFor(() => screen.getByTestId("workflow-option-builtin:review-and-recommend"));
+    await fireEvent.click(screen.getByTestId("workflow-option-builtin:review-and-recommend"));
+    await waitFor(() => screen.getByTestId("workflow-arg-input-context"));
+    await fireEvent.click(screen.getByTestId("workflow-agent-worker-alice"));
+    await fireEvent.input(screen.getByTestId("workflow-arg-input-context"), {
+      target: { value: "focus on error handling" },
+    });
+  }
+
+  it("restores workflow mode and its field values after an unmount/remount", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    mockWorkflows();
+    const { unmount } = render(ComposeBar, {
+      props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] },
+    });
+    await enterWorkflowModeAndFill();
+    unmount();
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+
+    // Back in workflow mode, not the plain textarea, with the typed value intact.
+    await waitFor(() => screen.getByTestId("workflow-composer"));
+    const context = (await screen.findByTestId(
+      "workflow-arg-input-context",
+    )) as HTMLTextAreaElement;
+    expect(context.value).toBe("focus on error handling");
+  });
+
+  it("falls back to plain mode when the saved workflow no longer exists", async () => {
+    // `list_workflows` reads the local filesystem, so a miss is a real deletion —
+    // not a cold cache — and must not strand the composer in an uninvocable form.
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    mockWorkflows();
+    const { unmount } = render(ComposeBar, {
+      props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] },
+    });
+    await enterWorkflowModeAndFill();
+    unmount();
+
+    mockWorkflows([]); // the workflow was deleted while we were away
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+
+    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
+    expect(screen.queryByTestId("workflow-composer")).toBeNull();
+    expect(screen.queryByTestId("compose-restoring")).toBeNull();
+  });
+
+  it("does not restore a same-named workflow of the other builtin-ness", async () => {
+    // A built-in and a copied user workflow can share a name; `isBuiltin` is part
+    // of the saved identity, so a copy must not silently stand in for the original.
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    mockWorkflows();
+    const { unmount } = render(ComposeBar, {
+      props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] },
+    });
+    await enterWorkflowModeAndFill();
+    unmount();
+
+    mockWorkflows([{ ...WORKFLOW, is_builtin: false }]);
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+
+    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
+    expect(screen.queryByTestId("workflow-composer")).toBeNull();
+  });
+
+  it("does not restore workflow mode after the workflow was invoked", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "list_workflows") return [WORKFLOW];
+      if (cmd === "describe_workflow_form") return DESCRIPTOR;
+      if (cmd === "list_prompts") return [];
+      if (cmd === "invoke_workflow") return "run-1";
+      if (cmd === "list_workflow_runs") return [];
+      return null;
+    });
+    const { unmount } = render(ComposeBar, {
+      props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] },
+    });
+    await enterWorkflowModeAndFill();
+    await fireEvent.click(screen.getByTestId("workflow-agent-reviewers-bob"));
+    await fireEvent.click(screen.getByTestId("workflow-invoke-button"));
+    await waitFor(() =>
+      expect(invokeMock.mock.calls.some(([c]) => c === "invoke_workflow")).toBe(true),
+    );
+    unmount();
+
+    workflowsTesting.reset();
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
+    expect(screen.queryByTestId("workflow-composer")).toBeNull();
+  });
+
+  it("preserves the saved workflow when list_workflows FAILS (not a confirmed deletion)", async () => {
+    // A transient FS/IPC error must not destroy a half-filled invocation. This is
+    // the case a bare `find(...) === undefined` conflated with a real deletion.
+    const composeStore = await loadComposeStore();
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    mockWorkflows();
+    const { unmount } = render(ComposeBar, {
+      props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] },
+    });
+    await enterWorkflowModeAndFill();
+    unmount();
+
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "list_workflows") throw new Error("filesystem hiccup");
+      if (cmd === "list_prompts") return [];
+      return null;
+    });
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+
+    // Retry/discard offered; NOT dropped into a plain composer.
+    await waitFor(() =>
+      expect(screen.getByTestId("compose-workflow-restore-failed")).toBeInTheDocument(),
+    );
+    expect(screen.queryByTestId("compose-textarea")).toBeNull();
+    // The snapshot is untouched in the store.
+    expect(composeStore.getCompose(PROJECT_ID).content.kind).toBe("workflow");
+  });
+
+  it("recovers the workflow when Retry succeeds after a failed list", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    mockWorkflows();
+    const { unmount } = render(ComposeBar, {
+      props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] },
+    });
+    await enterWorkflowModeAndFill();
+    unmount();
+
+    let listShouldFail = true;
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "list_workflows") {
+        if (listShouldFail) throw new Error("filesystem hiccup");
+        return [WORKFLOW];
+      }
+      if (cmd === "describe_workflow_form") return DESCRIPTOR;
+      if (cmd === "list_prompts") return [];
+      return null;
+    });
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    await screen.findByTestId("compose-workflow-restore-failed");
+
+    listShouldFail = false;
+    await fireEvent.click(screen.getByTestId("workflow-restore-retry"));
+
+    await waitFor(() => screen.getByTestId("workflow-composer"));
+    const context = (await screen.findByTestId(
+      "workflow-arg-input-context",
+    )) as HTMLTextAreaElement;
+    expect(context.value).toBe("focus on error handling");
+  });
+
+  it("clears the saved workflow when a SUCCESSFUL list confirms it is absent", async () => {
+    // The other direction of the distinction: a successful empty list is
+    // authoritative and *should* release the snapshot.
+    const composeStore = await loadComposeStore();
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    mockWorkflows();
+    const { unmount } = render(ComposeBar, {
+      props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] },
+    });
+    await enterWorkflowModeAndFill();
+    unmount();
+
+    mockWorkflows([]); // successful, empty
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+
+    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
+    await waitFor(() => expect(composeStore.getCompose(PROJECT_ID).content.kind).toBe("plain"));
+  });
+
+  it("Start over on a failed restore drops to a usable plain composer", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    mockWorkflows();
+    const { unmount } = render(ComposeBar, {
+      props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] },
+    });
+    await enterWorkflowModeAndFill();
+    unmount();
+
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "list_workflows") throw new Error("filesystem hiccup");
+      if (cmd === "list_prompts") return [];
+      return null;
+    });
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    await screen.findByTestId("compose-workflow-restore-failed");
+
+    await fireEvent.click(screen.getByTestId("workflow-restore-discard"));
+    expect(await screen.findByTestId("compose-textarea")).toBeInTheDocument();
+    expect(screen.queryByTestId("compose-workflow-restore-failed")).toBeNull();
   });
 });
 

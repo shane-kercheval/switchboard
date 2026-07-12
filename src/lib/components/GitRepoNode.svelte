@@ -87,7 +87,9 @@
 
   // Row hover is suppressed right after a keyboard move so the mouse-hovered row
   // doesn't stay lit alongside the keyboard selection; it returns on pointer move.
-  const hoverBg = $derived(hoverableClass("hover:bg-raised"));
+  // `bg-hover`, not `bg-raised`: these rows sit directly on the raised card (the
+  // branches drawer has no fill of its own), where `raised` would be invisible.
+  const hoverBg = $derived(hoverableClass("hover:bg-hover"));
 
   // The on-hover actions trigger (`…`) is keyed on the real mouse `:hover`, so it
   // must be suppressed alongside the row background — otherwise it lingers under
@@ -237,17 +239,55 @@
     return repo.local_branches.find((b) => b.name === s.name) ?? null;
   }
 
+  // The rendered commit list is capped until the user asks for the rest: it's
+  // a navigation aid, not a `git log` dump, and the backend's 50-commit read
+  // buried every other repo card under one branch's history. Expansion is
+  // keyed to the loaded ref, so selecting another branch re-collapses.
+  const COMMIT_PREVIEW_COUNT = 15;
+
+  let allCommitsShownFor = $state<string | null>(null);
+
+  const commitsRefKey = $derived(
+    branchCommits.ref === null
+      ? null
+      : `${branchCommits.ref.repoRoot}\n${branchCommits.ref.kind}\n${branchCommits.ref.name}`,
+  );
+
+  /// The ranges as rendered. Only the `recent` (local history) range is
+  /// previewed — `incoming` is the highest-signal set in the list (what a pull
+  /// brings) and usually small, so it always renders in full rather than being
+  /// buried behind the history's "Show more". A capped range drops its own
+  /// `truncated` note (the Show-more row supersedes it until expansion) and
+  /// carries `hidden` so the row renders inside that range's section.
+  const cappedCommits = $derived.by(() => {
+    const expanded = commitsRefKey !== null && allCommitsShownFor === commitsRefKey;
+    return branchCommits.ranges.map((range) => {
+      if (expanded || range.kind !== "recent" || range.commits.length <= COMMIT_PREVIEW_COUNT) {
+        return { range, hidden: 0 };
+      }
+      return {
+        range: {
+          ...range,
+          commits: range.commits.slice(0, COMMIT_PREVIEW_COUNT),
+          truncated: false,
+        },
+        hidden: range.commits.length - COMMIT_PREVIEW_COUNT,
+      };
+    });
+  });
+
   // The commit pane's navigable entries in display order: the uncommitted row
   // (when the selected branch's worktree is dirty) above the commits, matching
-  // what `commitList` renders.
+  // what `commitList` renders — including the preview cap, so arrow keys never
+  // land on a commit the list isn't showing.
   function commitNavItems(): CommitNavItem[] {
     const items: CommitNavItem[] = [];
     const branch = selectedLocalBranch();
     if (branch?.worktree != null && branchHasChanges(branch)) {
       items.push({ kind: "uncommitted", worktreePath: branch.worktree.path });
     }
-    for (const range of branchCommits.ranges) {
-      for (const commit of range.commits) items.push({ kind: "commit", commit });
+    for (const entry of cappedCommits) {
+      for (const commit of entry.range.commits) items.push({ kind: "commit", commit });
     }
     return items;
   }
@@ -307,15 +347,14 @@
   }
 </script>
 
-<div
-  class="border-border/70 bg-raised min-h-0 shrink-0 overflow-hidden rounded-md border"
-  data-testid="git-repo"
-  data-repo-root={repo.root}
->
-  <div class="group bg-raised flex min-h-10 items-center gap-2 px-3 py-2">
+<!-- A flat section, not a card: the repo header is the anchor and the
+     branches/commits hang beneath it on left rules, like the transcript's
+     rows. The box the card border drew is now drawn by hierarchy alone. -->
+<div class="min-h-0 shrink-0" data-testid="git-repo" data-repo-root={repo.root}>
+  <div class="group flex min-h-10 items-center gap-2 px-1 py-1">
     <button
       type="button"
-      class="text-muted hover:bg-border/60 hover:text-fg flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-full transition-colors"
+      class="text-muted hover:bg-hover hover:text-fg flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-full transition-colors"
       aria-label={expanded ? "Collapse repo" : "Expand repo"}
       aria-expanded={expanded}
       onclick={() => (expanded = !expanded)}
@@ -360,7 +399,7 @@
           {#snippet trigger(props)}
             <span
               {...props}
-              class="text-warning hover:bg-border/60 inline-flex h-[26px] w-[26px] items-center justify-center rounded-full transition-colors"
+              class="text-warning hover:bg-hover inline-flex h-[26px] w-[26px] items-center justify-center rounded-full transition-colors"
               aria-label="Fetch failed"
               data-testid="repo-fetch-failed"
             >
@@ -386,7 +425,7 @@
       >
         <button
           type="button"
-          class={cn(ICON_BUTTON_CLASS, "hover:bg-border/60 shrink-0 disabled:opacity-50")}
+          class={cn(ICON_BUTTON_CLASS, "hover:bg-hover shrink-0 disabled:opacity-50")}
           aria-label="Refresh repo"
           data-testid="repo-refresh"
           disabled={busy}
@@ -414,7 +453,7 @@
           {#snippet trigger(props)}
             <AsyncIconButton
               {...props}
-              class={cn(ICON_BUTTON_CLASS, "hover:bg-border/60 shrink-0")}
+              class={cn(ICON_BUTTON_CLASS, "hover:bg-hover shrink-0")}
               label="Reveal repo in Finder"
               testid="repo-action-reveal"
               completeAfterMs={700}
@@ -433,7 +472,7 @@
           {#snippet trigger(props)}
             <AsyncIconButton
               {...props}
-              class={cn(ICON_BUTTON_CLASS, "hover:bg-border/60 shrink-0")}
+              class={cn(ICON_BUTTON_CLASS, "hover:bg-hover shrink-0")}
               label="Open repo in editor"
               testid="repo-action-editor"
               completeAfterMs={700}
@@ -452,7 +491,7 @@
           {#snippet trigger(props)}
             <AsyncIconButton
               {...props}
-              class={cn(ICON_BUTTON_CLASS, "hover:bg-border/60 shrink-0")}
+              class={cn(ICON_BUTTON_CLASS, "hover:bg-hover shrink-0")}
               label="Copy repo path"
               testid="repo-action-copy-path"
               action={() => {
@@ -497,7 +536,13 @@
   {/if}
 
   {#if expanded}
-    <div class="border-border/60 bg-panel border-t px-2 py-1.5" data-testid="repo-branches">
+    <!-- The drawer hangs on a left rule instead of carrying a third neutral
+         fill (list → card → drawer was three stacked grays) — same idiom as
+         the commit list below it and the transcript's expanded tool rows. -->
+    <div
+      class="border-border/70 mt-1 mb-1.5 ml-4 border-l py-0.5 pr-2 pl-2"
+      data-testid="repo-branches"
+    >
       {#if !repo.available}
         <p class="text-muted px-2 py-2 text-xs">
           This repository is unavailable (moved or unmounted).
@@ -551,7 +596,7 @@
                   // off the row's `data-selected` (a `group-data-` CSS variant),
                   // not a JS class — the trigger lives in a `{#snippet}` that
                   // doesn't re-render when the row's selected state changes.
-                  "hover:bg-border/60",
+                  "hover:bg-hover",
                   SELECTED_ROW_ICON_HOVER,
                   actionsOpen && "opacity-100",
                 )}
@@ -758,7 +803,8 @@
       {@const hasUnpushed = branchCommits.ranges.some((range) =>
         range.commits.some((commit) => commit.unpushed),
       )}
-      {#each branchCommits.ranges as range (range.kind)}
+      {#each cappedCommits as entry (entry.range.kind)}
+        {@const range = entry.range}
         {#if range.commits.length > 0}
           <div
             class="text-muted/80 px-2 pt-1.5 pb-0.5 text-[10px] font-semibold tracking-wide uppercase"
@@ -784,11 +830,27 @@
               <span class="text-muted shrink-0 font-mono text-[11px]" title={commit.short_oid}>
                 {compactCommitTimestamp(commit)}
               </span>
-              <span class="min-w-0 flex-1 truncate" title={commit.subject}>{commit.subject}</span>
+              <!-- The subject is the row's payload — promoted to `text-fg` so
+                   the list reads as scannable subjects with recessed
+                   timestamps, not a uniform gray wall. Selection color still
+                   wins (the row's own `text-fg` when selected). -->
+              <span class="text-fg min-w-0 flex-1 truncate" title={commit.subject}
+                >{commit.subject}</span
+              >
             </button>
           {/each}
           {#if range.truncated}
             <p class="text-muted/70 px-2 py-1 text-[10px]">…older commits not shown</p>
+          {/if}
+          {#if entry.hidden > 0}
+            <button
+              type="button"
+              class="text-muted hover:text-fg px-2 py-1 text-[11px] transition-colors hover:underline"
+              data-testid="commit-show-more"
+              onclick={() => (allCommitsShownFor = commitsRefKey)}
+            >
+              Show {entry.hidden} more
+            </button>
           {/if}
         {/if}
       {/each}

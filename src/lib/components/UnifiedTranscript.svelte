@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { untrack } from "svelte";
+  import { tick, untrack } from "svelte";
   import type { AgentRecord, Attachment, ConversationItem, ProjectId } from "$lib/types";
   import { HEARTBEAT_TIMEOUT_MS } from "$lib/types";
   import { cn, formatDuration } from "$lib/utils";
@@ -45,14 +45,16 @@
   import { shortcut } from "$lib/platform";
   import { HARNESS_COLOR } from "$lib/harnessDisplay";
   import Badge from "$lib/components/ui/Badge.svelte";
-  import Disclosure from "$lib/components/ui/Disclosure.svelte";
+  import CompactionMarker from "$lib/components/CompactionMarker.svelte";
   import HarnessIcon from "$lib/components/ui/HarnessIcon.svelte";
   import Markdown from "$lib/components/ui/Markdown.svelte";
   import CopyButton from "$lib/components/ui/CopyButton.svelte";
+  import LoadingDots from "$lib/components/ui/LoadingDots.svelte";
   import Spinner from "$lib/components/ui/Spinner.svelte";
   import StatusChip from "$lib/components/ui/StatusChip.svelte";
   import StopIcon from "$lib/components/ui/StopIcon.svelte";
   import ToolCallWidget from "$lib/components/ToolCallWidget.svelte";
+  import { consumeJump, jumpRequest } from "$lib/state/transcriptJump.svelte";
   import ThinkingWidget from "$lib/components/ThinkingWidget.svelte";
   import ErrorDetailsDialog from "$lib/components/ui/ErrorDetailsDialog.svelte";
   import Button from "$lib/components/ui/Button.svelte";
@@ -79,6 +81,7 @@
     loadError,
     onRetryLoad,
     showOnboarding = false,
+    paneId,
   }: {
     /// The active project. Compact-transcript state and per-unit overrides are
     /// read/written keyed by this id, so the component never reaches into the
@@ -100,6 +103,9 @@
     /// one pane holding the whole roster — so the block appears exactly once
     /// per blank project, never repeated in every split pane.
     showOnboarding?: boolean;
+    /// The hosting pane's id — the address navigator jump requests are sent to
+    /// (`transcriptJump.svelte.ts`). Absent → this instance ignores jumps.
+    paneId?: string;
   } = $props();
 
   /// Roster agents whose *own* history failed to load (the per-agent
@@ -454,7 +460,7 @@
   /// style, `hover:bg-raised`), so their hover state matches the copy button in
   /// the same row.
   const META_ICON_BUTTON =
-    "text-muted hover:text-fg hover:bg-border/60 flex h-[26px] w-[26px] items-center justify-center rounded-full border border-transparent transition-colors";
+    "text-muted hover:text-fg hover:bg-hover flex h-[26px] w-[26px] items-center justify-center rounded-full border border-transparent transition-colors";
 
   /// Send ids that are queued (dispatched, not yet started) across the project's
   /// agents — the per-agent `pending_sends` minus any being cancelled. A
@@ -572,9 +578,11 @@
     });
   }
 
-  /// Ticking clock for the live "quiet" counter. Updated once per second while
-  /// the component is mounted; `now` is only read inside the quiet footer, so
-  /// when nothing is quiet these ticks trigger no re-render.
+  /// Ticking clock for the live footer's counters — the running turn's elapsed
+  /// time and the quiet "No response" silence. Updated once per second while
+  /// the component is mounted; `now` is read only inside live-turn footers, so
+  /// each tick re-renders one text node per running turn and nothing at all
+  /// when no turn is live.
   let now = $state(Date.now());
   $effect(() => {
     const id = setInterval(() => {
@@ -582,6 +590,12 @@
     }, 1000);
     return () => clearInterval(id);
   });
+
+  /// Elapsed time of a running turn. An unparseable `started_at` yields NaN,
+  /// which formatDuration clamps to "0s".
+  function turnElapsedMs(startedAt: string): number {
+    return now - Date.parse(startedAt);
+  }
 
   /// Elapsed silence for a quiet turn: the timer fired one full
   /// HEARTBEAT_TIMEOUT_MS after the last activity, so true silence is the time
@@ -849,6 +863,62 @@
     return () => io.disconnect();
   });
 
+  /// Navigator jump: bring one block to the top of this pane's view
+  /// (`transcriptJump.svelte.ts` requests, addressed by pane). Execution lives
+  /// here because all three phases touch this component's private state:
+  /// (1) re-pin the window cursor so the target mounts — a *tail* window, so
+  /// everything from the target down mounts, paying its markdown parse. The
+  /// cursor only ever lowers (monotonic, floored at 0), so a jump costs
+  /// nothing once its target is already in the window, but each jump to
+  /// something OLDER than the current top grows the window again — the cost is
+  /// per-deeper-jump, not once per conversation. Accepted: the user explicitly
+  /// asked to go there;
+  /// (2) after the flush, align the target block's top with the container top;
+  /// (3) adopt that position as the new anchor reference exactly the way
+  /// `reanchor` ends a pass — unpinned, gap captured — so the anchoring
+  /// machinery defends the jumped-to position instead of snapping back.
+  /// A consumed request can't linger: without consumption, a later remount of
+  /// this pane (minimize/restore) would re-execute a stale jump.
+  /// Whether `block` renders the row `key` — the request addresses rows, not
+  /// blocks, because grouping is pane-dependent (a fan-out is one `f:` block in
+  /// a pane showing several recipients but plain rows in a single-recipient
+  /// pane; row keys are stable across both shapes).
+  function blockContainsRow(block: RenderBlock, key: string): boolean {
+    if (block.kind === "row") return block.row.key === key;
+    return (
+      block.user.key === key || block.columns.some((col) => col.rows.some((r) => r.key === key))
+    );
+  }
+
+  let lastHandledJumpSeq = 0;
+  $effect(() => {
+    const seq = jumpRequest.seq;
+    const key = jumpRequest.rowKey;
+    if (seq === lastHandledJumpSeq || key === null) return;
+    if (paneId === undefined || jumpRequest.paneId !== paneId) return;
+    if (jumpRequest.projectId !== projectId) return;
+    lastHandledJumpSeq = seq;
+    consumeJump(seq);
+    const index = untrack(() => blocks.findIndex((block) => blockContainsRow(block, key)));
+    if (index === -1) return; // stale key — the row was pruned since indexing
+    const targetKey = untrack(() => blockKey(blocks[index]!));
+    if (index < untrack(() => firstVisibleIndex)) {
+      cursor = index;
+      frozenIdentity = untrack(() => windowIdentity);
+    }
+    void tick().then(() => {
+      if (!container) return;
+      const el = container.querySelector(`[data-block-key="${CSS.escape(targetKey)}"]`);
+      if (!(el instanceof HTMLElement)) return;
+      const delta = el.getBoundingClientRect().top - container.getBoundingClientRect().top;
+      container.scrollTop += delta;
+      pinned = false;
+      lastScrollHeight = container.scrollHeight;
+      distanceFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
+      captureAnchor();
+    });
+  });
+
   /// Top-edge fade for a capped live region, keyed by preview key: true once the
   /// region has scrolled down far enough that content sits above the visible top
   /// (so a mask cues "more above"). Stays off at the very top so the first line
@@ -929,7 +999,11 @@
      cancelled/failed, so a turn the parser persisted as `streaming` (a turn
      cancelled mid-flight) doesn't reopen with a phantom live affordance on a
      dead turn. -->
-{#snippet turnItems(turn: AgentTurn)}
+<!-- `settled` is NOT derivable from `turn.status` alone: a turn persisted as
+     `streaming` (killed mid-flight) that an authoritative outcome marker has
+     closed is terminal — callers encode that via `live`, so they pass the
+     effective value rather than the widget re-deriving a naive one. -->
+{#snippet turnItems(turn: AgentTurn, settled: boolean)}
   {#each turn.items as item, i (i)}
     {#if item.item_kind === "text"}
       {#if item.kind === "thinking"}
@@ -938,7 +1012,7 @@
         <Markdown text={item.text} />
       {/if}
     {:else}
-      <ToolCallWidget tool={item} />
+      <ToolCallWidget tool={item} turnSettled={settled} />
     {/if}
   {/each}
 {/snippet}
@@ -985,24 +1059,32 @@
     {@const liveKey = previewKeyForTurn(turn)}
     <div
       class={cn(
+        // Mirror the settled body's inter-item spacing: settled items are direct
+        // children of the `space-y-1.5` body, but streaming items live one level
+        // deeper inside this scroll wrapper, so it must carry the spacing itself
+        // — otherwise tool rows sit flush while streaming and gain their gap only
+        // once the turn settles.
+        "space-y-1.5",
         liveCap ? "max-h-[75cqh] overflow-y-auto" : "overflow-visible",
         liveCap && (liveTopFade[liveKey] ?? false) && LIVE_TOP_FADE,
       )}
       data-testid="turn-live-scroll"
       use:liveScroll={{ key: liveKey, signal: liveSignalOf(turn) }}
     >
-      {@render turnItems(turn)}
+      {@render turnItems(turn, false)}
     </div>
     {@render workingFooter(turn)}
   {:else}
-    {@render turnItems(turn)}
+    <!-- This branch means the turn is not (streaming && live): it either ended
+         or an outcome marker closed a streaming-on-disk turn — settled both ways. -->
+    {@render turnItems(turn, true)}
     {#if turn.status === "failed" && turn.error}
       <div class="text-status-failed text-xs" data-testid="turn-error">{turn.error}</div>
     {/if}
   {/if}
 {/snippet}
 
-<!-- Disclosure shown above a collapsed body when tool calls / reasoning are
+<!-- Indicator shown above a collapsed body when tool calls / reasoning are
      hidden — the cue a fade can't give. Always visible (it's signalling, not
      chrome) and clickable to expand the whole response. -->
 {#snippet hiddenItemsIndicator(key: string, label: string)}
@@ -1051,7 +1133,7 @@
 {#snippet liveTurnControl(onclick: () => void, label: string, testid: string)}
   <button
     type="button"
-    class="border-muted/40 text-muted hover:border-status-failed/60 hover:bg-status-failed-soft/70 hover:text-status-failed focus-visible:ring-accent focus-visible:border-status-failed/60 focus-visible:bg-status-failed-soft/70 focus-visible:text-status-failed inline-flex h-[26px] w-[26px] items-center justify-center rounded-full border-[0.5px] transition-colors focus-visible:ring-2 focus-visible:outline-none"
+    class="border-muted/40 text-muted hover:border-status-failed/60 hover:bg-status-failed-soft/70 hover:text-status-failed focus-visible:ring-focus focus-visible:border-status-failed/60 focus-visible:bg-status-failed-soft/70 focus-visible:text-status-failed inline-flex h-[26px] w-[26px] items-center justify-center rounded-full border-[0.5px] transition-colors focus-visible:ring-1 focus-visible:outline-none"
     data-testid={testid}
     aria-label={label}
     {onclick}
@@ -1073,18 +1155,22 @@
     data-testid="turn-working"
     data-quiet={quietSince !== undefined}
   >
-    <!-- Until the turn has been silent past HEARTBEAT_TIMEOUT_MS it just shows
-         "Working..." (no counter — the number would otherwise reset on every
-         event). Once quiet, it's still alive on the backend, so this is a soft
-         caution that counts up the silence — never a failure — and reverts to
-         "Working..." the moment activity resumes. -->
-    <span class="animate-pulse">
-      {#if quietSince !== undefined}
-        No response ({formatDuration(quietElapsedMs(quietSince))})...
-      {:else}
-        Working...
-      {/if}
-    </span>
+    <!-- The label names the number, so exactly one number is on screen:
+         "Working 2m 14s" = working *for* that long (elapsed since turn start);
+         once silent past HEARTBEAT_TIMEOUT_MS the word swaps to "No response"
+         and the number swaps to the silence counter — still alive on the
+         backend, a soft caution, never a failure — and both revert the moment
+         activity resumes. The dots animate; the text never does (the words
+         being read must not fade). -->
+    {#if quietSince !== undefined}
+      <span>No response</span>
+      <LoadingDots />
+      <span data-testid="turn-quiet-elapsed">{formatDuration(quietElapsedMs(quietSince))}</span>
+    {:else}
+      <span>Working</span>
+      <LoadingDots />
+      <span data-testid="turn-elapsed">{formatDuration(turnElapsedMs(turn.started_at))}</span>
+    {/if}
     {#if turn.send_id !== undefined}
       {@const sendId = turn.send_id}
       {@render liveTurnControl(
@@ -1098,7 +1184,8 @@
 
 {#snippet queuedFooter(agentId: string, sendId: string, labelTestid: string, controlTestid: string)}
   <div class="text-muted mt-2 flex items-center gap-2 text-xs" data-testid={labelTestid}>
-    <span class="animate-pulse">Queued...</span>
+    <span>Queued</span>
+    <LoadingDots />
     {@render liveTurnControl(
       () => cancelSend(sendId, [agentId]),
       `Cancel queued send for ${agentName(agentId)}`,
@@ -1114,7 +1201,7 @@
        so an always-on control would just be noise. -->
   <button
     type="button"
-    class="text-muted hover:text-fg hover:bg-border/60 inline-flex items-center gap-1 rounded-full border border-transparent px-2 py-0.5 text-xs opacity-0 transition-colors group-focus-within:opacity-100 group-hover:opacity-100"
+    class="text-muted hover:text-fg hover:bg-hover inline-flex items-center gap-1 rounded-full border border-transparent px-2 py-0.5 text-xs opacity-0 transition-colors group-focus-within:opacity-100 group-hover:opacity-100"
     data-testid="turn-preview-toggle"
     aria-label={label}
     onclick={() => toggleKey(projectId, key, defaultCompact)}
@@ -1345,7 +1432,7 @@
   {@const caption =
     row.send_id !== undefined ? forwardCaptionFor(projectId, row.send_id) : undefined}
   <div class="group min-w-0 flex-1" data-testid="turn" data-role="user" data-forwarded={forwarded}>
-    <div class="w-full max-w-full overflow-hidden rounded-xl bg-blue-100/20 px-4 py-2">
+    <div class="bg-focus-soft w-full max-w-full overflow-hidden rounded-xl px-4 py-2">
       <!-- Clip wraps the content inside the bubble (not the bubble itself). The
            clip + `measureClip` mount ONLY while compact (mirroring agent rows): on
            expand the measurer unmounts and the retained `clipOverflow[key]=true`
@@ -1417,19 +1504,22 @@
      "Queued…" — and a cancel control. Cancelling fires `cancel_forward`; the
      compose bar's awaiting `forward_message` then resolves cancelled, removes
      this entry, and restores the composer (text + source chips). -->
-{#snippet heldForwardRow(held: HeldForward, recipientsHere: string[])}
+{#snippet heldForwardRow(held: HeldForward)}
   {@const sourceNames = held.sources.map((s) => s.name).join(", ")}
-  {@const recipientNames = recipientsHere.map((id) => agentName(id)).join(", ")}
   <div class="group min-w-0 flex-1" data-testid="held-forward" data-forward-id={held.forwardId}>
     {#if held.body.trim() !== ""}
       <div
-        class="border-accent/60 w-full max-w-full overflow-hidden rounded-xl border-l-2 bg-blue-100/20 px-4 py-2"
+        class="border-accent/60 bg-focus-soft w-full max-w-full overflow-hidden rounded-xl border-l-2 px-4 py-2"
       >
         <Markdown text={held.body} />
       </div>
     {/if}
     <div class="text-muted mt-2 flex items-center gap-2 text-xs" data-testid="held-forward-waiting">
-      <span class="animate-pulse">↪ Forward to {recipientNames} — waiting for {sourceNames}…</span>
+      <!-- Names only the sources being waited on — the recipient is implicit
+           (this row renders in the recipient's own pane, under the forwarded
+           message body). -->
+      <span>↪ waiting for {sourceNames}</span>
+      <LoadingDots />
       {@render liveTurnControl(
         () => void cancelForward(held.forwardId),
         `Cancel forward (waiting for ${sourceNames})`,
@@ -1503,12 +1593,11 @@
 {/snippet}
 
 <!-- An agent-scoped inter-turn marker (compaction). Attributed to its agent (name
-     + harness icon + the agent's lane border), then rendered as a tool-style
-     `Disclosure` (gray box, chevron, collapsed by default) — the recap is a large
-     verbatim harness block the user rarely needs expanded. No status icon: a
-     compaction has no success/error state, so the header carries only the label.
-     NOT a project-wide centered divider — in a multi-agent project that would
-     misread as "the project compacted" and sever the per-agent lanes. -->
+     + harness icon + the agent's lane border), then rendered as a collapsed row
+     in the same grammar as tool calls and thinking — the recap is a large
+     verbatim harness block the user rarely needs expanded. NOT a project-wide
+     centered divider — in a multi-agent project that would misread as "the
+     project compacted" and sever the per-agent lanes. -->
 {#snippet systemMarkerRow(row: Extract<UnifiedRow, { kind: "system_marker" }>)}
   {@const harness = agentById[row.agent_id]?.harness}
   <div
@@ -1523,18 +1612,7 @@
     </div>
     <div class="border-l-[0.5px] pl-3" style:border-left-color={agentBorderColor(row.agent_id)}>
       {#if row.marker.marker_kind === "compaction"}
-        <Disclosure testid="compaction-marker">
-          {#snippet header()}
-            <span class="text-muted shrink-0 text-[10px] font-semibold tracking-wide uppercase">
-              Conversation compacted
-            </span>
-          {/snippet}
-          <div class="border-border/70 border-t px-2.5 py-2">
-            <pre
-              class="text-muted max-h-44 overflow-y-auto font-mono text-xs whitespace-pre-wrap">{row
-                .marker.summary}</pre>
-          </div>
-        </Disclosure>
+        <CompactionMarker summary={row.marker.summary} />
       {:else if row.marker.marker_kind === "slash_command"}
         <!-- A state-changing slash command the harness ran (e.g. `/compact`).
              Shown so the user sees it happened; carries no correlating content. -->
@@ -1829,7 +1907,10 @@
 
   <div bind:this={content} class="space-y-5">
     {#each visibleBlocks as block (block.kind === "fanout" ? block.key : block.row.key)}
-      <div data-testid="transcript-block">
+      <!-- data-block-key: the navigator jump's DOM handle — after the window
+           re-pins to mount an off-window target, the jump finds the block by
+           key to scroll it to the top. -->
+      <div data-testid="transcript-block" data-block-key={blockKey(block)}>
         {#if block.kind === "row"}
           {#if block.row.kind === "user"}
             {@render userMessage(block.row)}
@@ -2012,7 +2093,7 @@
          it lives in the project-keyed `heldForwards` store (survives navigation,
          lost on restart). -->
     {#each heldForwardsHere as entry (entry.held.forwardId)}
-      {@render heldForwardRow(entry.held, entry.recipients)}
+      {@render heldForwardRow(entry.held)}
     {/each}
   </div>
 </div>

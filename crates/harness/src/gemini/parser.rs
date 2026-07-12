@@ -246,10 +246,15 @@ fn parse_tool_use(obj: &Value, turn_id: TurnId, state: &mut GeminiParserState) -
     } else {
         ToolKind::Builtin
     };
+    // Facet classification is deliberately not built for Gemini — the CLI is
+    // auth-dead for individual accounts, so its tool vocabulary can't be
+    // probed or live-tested (harness-behavior G26). `Other` renders via the
+    // generic path, exactly the pre-facet behavior; mapping later is additive.
     ParseOutcome::Event(AdapterEvent::ToolStarted {
         turn_id,
         tool_use_id: id.to_owned(),
         kind,
+        facet: crate::facets::ToolFacet::Other,
         name: name.to_owned(),
         input: obj.get("parameters").cloned().unwrap_or(Value::Null),
     })

@@ -238,12 +238,28 @@ export function transcriptReducer(
         kind: input.kind,
         name: input.name,
         input: input.input,
+        facet: input.facet,
         started_at: receivedAt,
       };
       return updateTurn(turns, input.turn_id, {
         ...existing,
         items: [...existing.items, newTool],
       });
+    }
+
+    case "tool_facet_updated": {
+      const existing = findTurn(turns, input.turn_id);
+      if (existing === undefined || existing.role !== "agent") return turns;
+      if (existing.status !== "streaming") return turns;
+      const idx = existing.items.findIndex(
+        (item) => item.item_kind === "tool" && item.tool_use_id === input.tool_use_id,
+      );
+      if (idx === -1) return turns;
+      const prior = existing.items[idx];
+      if (prior?.item_kind !== "tool") return turns;
+      const updatedItems = [...existing.items];
+      updatedItems[idx] = { ...prior, facet: input.facet };
+      return updateTurn(turns, input.turn_id, { ...existing, items: updatedItems });
     }
 
     case "tool_completed": {
@@ -497,6 +513,7 @@ function loadedItemToItem(item: LoadedTurnItem): TurnItem {
     kind: item.kind,
     name: item.name,
     input: item.input,
+    facet: item.facet,
     output: item.output ?? undefined,
     is_error: item.is_error ?? undefined,
     started_at: item.started_at,

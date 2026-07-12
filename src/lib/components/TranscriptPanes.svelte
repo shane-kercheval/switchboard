@@ -21,6 +21,7 @@
   import DropdownMenu from "$lib/components/ui/DropdownMenu.svelte";
   import DropdownMenuItem from "$lib/components/ui/DropdownMenuItem.svelte";
   import HarnessIcon from "$lib/components/ui/HarnessIcon.svelte";
+  import ResizeHandle from "$lib/components/ui/ResizeHandle.svelte";
   import Spinner from "$lib/components/ui/Spinner.svelte";
   import { ICON_BUTTON_CLASS } from "$lib/components/ui/iconButton";
   import { cn } from "$lib/utils";
@@ -241,25 +242,18 @@
     cmdOnlyHeld = false;
     cmdPointerMoved = false;
   }
-  function onWindowPointerMove(event: PointerEvent): void {
-    resizeMove(event);
+  function onWindowPointerMove(): void {
     if (cmdOnlyHeld) cmdPointerMoved = true;
   }
 
   // ── Gutter resize ───────────────────────────────────────────────────────────
-  // Generalized from GitView's detail-panel resize: pointer-down on gutter i
-  // adjusts panes i and i+1, both clamped to MIN_PANE_WIDTH_PX against the live
-  // row width. Drafted locally during the drag; committed (and persisted) once
-  // on pointer-up.
+  // `ResizeHandle` owns the drag; this section maps its pixel value (the left
+  // pane's display width) back onto the fraction model, both panes clamped to
+  // MIN_PANE_WIDTH_PX against the live row width. Context derives from the
+  // *committed* fractions, which are stable during a drag — the draft only
+  // affects rendering.
   let rowEl = $state<HTMLDivElement | null>(null);
   let rowWidth = $state(0);
-  let resizing = $state<{
-    leftIndex: number;
-    rightIndex: number;
-    visibleSum: number;
-    pairSum: number;
-    leftStart: number;
-  } | null>(null);
   let draftFractions = $state<number[] | null>(null);
 
   const effectiveFractions = $derived(draftFractions ?? layout.fractions);
@@ -279,49 +273,69 @@
     return items.map((item) => (fractions[item.originalIndex] ?? 0) / sum);
   }
 
-  function startResize(visibleIndex: number, event: PointerEvent): void {
-    const fractions = layout.fractions;
+  type GutterContext = {
+    leftIndex: number;
+    rightIndex: number;
+    leftDisplay: number;
+    visibleSum: number;
+    pairSum: number;
+    rowPx: number;
+  };
+
+  function gutterContext(visibleIndex: number): GutterContext | null {
+    if (rowEl === null) return null;
+    const rowPx = rowEl.getBoundingClientRect().width;
+    if (rowPx <= 0) return null;
     const items = renderPanes;
     const left = items[visibleIndex];
     const right = items[visibleIndex + 1];
-    if (left === undefined || right === undefined) return;
+    if (left === undefined || right === undefined) return null;
+    const fractions = layout.fractions;
     const display = displayedFractions(items, fractions);
-    const visibleSum = items.reduce((acc, item) => acc + (fractions[item.originalIndex] ?? 0), 0);
-    resizing = {
+    return {
       leftIndex: left.originalIndex,
       rightIndex: right.originalIndex,
-      visibleSum,
+      leftDisplay: display[visibleIndex] ?? 0,
+      visibleSum: items.reduce((acc, item) => acc + (fractions[item.originalIndex] ?? 0), 0),
       pairSum: (display[visibleIndex] ?? 0) + (display[visibleIndex + 1] ?? 0),
-      leftStart: display.slice(0, visibleIndex).reduce((acc, f) => acc + f, 0),
+      rowPx,
     };
-    draftFractions = [...fractions];
-    event.preventDefault();
   }
 
-  function resizeMove(event: PointerEvent): void {
-    if (resizing === null || rowEl === null) return;
-    const rect = rowEl.getBoundingClientRect();
-    if (rect.width <= 0) return;
-    const { leftIndex, rightIndex, visibleSum, pairSum, leftStart } = resizing;
-    const minF = MIN_PANE_WIDTH_PX / rect.width;
-    const boundary = (event.clientX - rect.left) / rect.width;
-    let left = boundary - leftStart;
-    const lo = minF;
-    const hi = pairSum - minF;
-    // Row too narrow for both panes at min width → hold the pair at an even
-    // split rather than inverting the clamp range.
-    left = hi < lo ? pairSum / 2 : Math.min(hi, Math.max(lo, left));
-    const next = [...(draftFractions ?? layout.fractions)];
-    next[leftIndex] = left * visibleSum;
-    next[rightIndex] = (pairSum - left) * visibleSum;
-    draftFractions = next;
+  function gutterValuePx(visibleIndex: number): number {
+    const ctx = gutterContext(visibleIndex);
+    return ctx === null ? MIN_PANE_WIDTH_PX : ctx.leftDisplay * ctx.rowPx;
   }
 
-  function endResize(): void {
-    if (resizing !== null && draftFractions !== null) {
-      setFractions(projectId, rosterIds, draftFractions);
-    }
-    resizing = null;
+  function gutterMaxPx(visibleIndex: number): number {
+    const ctx = gutterContext(visibleIndex);
+    return ctx === null ? MIN_PANE_WIDTH_PX : ctx.pairSum * ctx.rowPx - MIN_PANE_WIDTH_PX;
+  }
+
+  function fractionsForGutter(visibleIndex: number, px: number): number[] | null {
+    const ctx = gutterContext(visibleIndex);
+    if (ctx === null) return null;
+    const left = px / ctx.rowPx;
+    const next = [...layout.fractions];
+    next[ctx.leftIndex] = left * ctx.visibleSum;
+    next[ctx.rightIndex] = (ctx.pairSum - left) * ctx.visibleSum;
+    return next;
+  }
+
+  function commitGutter(visibleIndex: number, px: number): void {
+    const next = fractionsForGutter(visibleIndex, px);
+    if (next !== null) setFractions(projectId, rosterIds, next);
+    draftFractions = null;
+  }
+
+  /// Double-click "reset to default" for a boundary: equalize the adjacent pair.
+  function resetGutter(visibleIndex: number): void {
+    const ctx = gutterContext(visibleIndex);
+    if (ctx === null) return;
+    const next = [...layout.fractions];
+    next[ctx.leftIndex] = (ctx.pairSum / 2) * ctx.visibleSum;
+    next[ctx.rightIndex] = (ctx.pairSum / 2) * ctx.visibleSum;
+    setFractions(projectId, rosterIds, next);
     draftFractions = null;
   }
 
@@ -378,7 +392,6 @@
 
 <svelte:window
   onpointermove={onWindowPointerMove}
-  onpointerup={endResize}
   onkeydown={onWindowKeydown}
   onkeyup={onWindowKeyup}
   onblur={onWindowBlur}
@@ -417,14 +430,17 @@
         {@const cov = multiPane && !workflowActive ? coverage(pane) : "none"}
         {@const active = paneIsActive(pane)}
         {#if i > 0 && maximizedPane === null}
-          <div
-            role="separator"
-            aria-orientation="vertical"
-            aria-label="Resize panes"
-            data-testid={`pane-gutter-${i}`}
-            class="bg-border/80 hover:bg-accent/70 w-1 shrink-0 cursor-col-resize transition-colors"
-            onpointerdown={(event) => startResize(i - 1, event)}
-          ></div>
+          <ResizeHandle
+            value={() => gutterValuePx(i - 1)}
+            min={MIN_PANE_WIDTH_PX}
+            max={() => gutterMaxPx(i - 1)}
+            label="Resize panes"
+            testid={`pane-gutter-${i}`}
+            class="bg-active hover:bg-focus w-1 transition-colors"
+            onDraft={(px) => (draftFractions = fractionsForGutter(i - 1, px))}
+            onCommit={(px) => commitGutter(i - 1, px)}
+            onReset={() => resetGutter(i - 1)}
+          />
         {/if}
         <!-- Cmd+click targets the pane; plain clicks pass through untouched, so a
          click-to-read can never re-aim a half-typed draft. Keyboard targeting
@@ -460,7 +476,7 @@
                   autocorrect="off"
                   autocapitalize="off"
                   spellcheck="false"
-                  class="text-fg border-border bg-panel focus-visible:ring-accent h-6 min-w-0 flex-1 rounded border px-1.5 text-xs font-semibold focus-visible:ring-1 focus-visible:outline-none"
+                  class="text-fg border-border bg-panel focus-visible:ring-focus h-6 min-w-0 flex-1 rounded border px-1.5 text-xs font-semibold focus-visible:ring-1 focus-visible:outline-none"
                   aria-label="Pane name"
                   data-testid="pane-rename-input"
                   onkeydown={onRenameKeydown}
@@ -471,7 +487,7 @@
                     <button
                       {...props}
                       type="button"
-                      class={cn(ICON_BUTTON_CLASS, "hover:bg-border/60 shrink-0")}
+                      class={cn(ICON_BUTTON_CLASS, "hover:bg-hover shrink-0")}
                       aria-label="Save pane name"
                       data-testid="pane-rename-save"
                       onmousedown={(event) => event.preventDefault()}
@@ -565,7 +581,7 @@
                       <button
                         {...props}
                         type="button"
-                        class={cn(ICON_BUTTON_CLASS, "hover:bg-border/60 shrink-0")}
+                        class={cn(ICON_BUTTON_CLASS, "hover:bg-hover shrink-0")}
                         aria-label={`Minimize ${pane.name}`}
                         data-testid="pane-minimize"
                         onclick={(event) => {
@@ -588,7 +604,7 @@
                       <button
                         {...props}
                         type="button"
-                        class={cn(ICON_BUTTON_CLASS, "hover:bg-border/60 shrink-0")}
+                        class={cn(ICON_BUTTON_CLASS, "hover:bg-hover shrink-0")}
                         aria-label={maximizedPane?.id === pane.id
                           ? "Restore panes"
                           : `Maximize ${pane.name}`}
@@ -610,7 +626,7 @@
                 <DropdownMenu
                   triggerLabel={`Actions for ${pane.name}`}
                   triggerTestid="pane-actions"
-                  triggerClass={cn(ICON_BUTTON_CLASS, "hover:bg-border/60 shrink-0")}
+                  triggerClass={cn(ICON_BUTTON_CLASS, "hover:bg-hover shrink-0")}
                   contentTestid="pane-actions-menu"
                 >
                   {#snippet trigger()}
@@ -739,6 +755,7 @@
               {loadError}
               {onRetryLoad}
               showOnboarding={!paneChrome}
+              paneId={pane.id}
             />
           {/if}
           {#if multiPane && maximizedPane === null && cov !== "none"}

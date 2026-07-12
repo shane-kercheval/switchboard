@@ -82,7 +82,7 @@ function redacted(value: unknown, key?: string): unknown {
   if (typeof value === "string") {
     const displayValue =
       key !== undefined && JSON_STRING_VALUE_KEYS.has(key) ? unwrapJsonString(value) : value;
-    return redactString(displayValue);
+    return redactDisplay(displayValue);
   }
   if (!isRecord(value)) return value;
   return Object.fromEntries(
@@ -105,8 +105,9 @@ function unwrapJsonString(value: string): string {
 }
 
 // Best-effort display redaction only; tool inputs can still contain secrets in
-// formats we do not recognize.
-function redactString(value: string): string {
+// formats we do not recognize. Exported so facet-derived display strings (a
+// shell facet's command line) get the same treatment as the JSON paths above.
+export function redactDisplay(value: string): string {
   return value
     .replace(AUTH_BEARER_PATTERN, "$1[redacted]")
     .replace(COOKIE_HEADER_PATTERN, "$1[redacted]")

@@ -121,6 +121,7 @@ afterEach(async () => {
   const { _testing } = await loadState();
   _testing.reset();
   previewState.reset();
+  (await import("$lib/state/transcriptJump.svelte"))._testing.reset();
 });
 
 describe("UnifiedTranscript", () => {
@@ -318,6 +319,7 @@ describe("UnifiedTranscript", () => {
           { item_kind: "text", kind: "text", text: "Running… " },
           {
             item_kind: "tool",
+            facet: { facet_kind: "other" },
             tool_use_id: "tool-1",
             kind: "builtin",
             name: "Bash",
@@ -364,6 +366,7 @@ describe("UnifiedTranscript", () => {
         items: [
           {
             item_kind: "tool",
+            facet: { facet_kind: "other" },
             tool_use_id: "empty-tool",
             kind: "builtin",
             name: "read_file",
@@ -385,7 +388,8 @@ describe("UnifiedTranscript", () => {
     // "running…" or "error" annotation should appear.
     expect(tool).not.toHaveTextContent("running…");
     expect(tool).not.toHaveTextContent("error");
-    // Empty output is suppressed; input can still render in the expanded body.
+    // Empty output is suppressed even when expanded; input still renders.
+    await fireEvent.click(within(tool).getByTestId("tool-row"));
     expect(tool.querySelector('[data-testid="tool-output"]')).toBeNull();
     expect(tool.querySelector('[data-testid="tool-input"]')).not.toBeNull();
   });
@@ -403,6 +407,7 @@ describe("UnifiedTranscript", () => {
         items: [
           {
             item_kind: "tool",
+            facet: { facet_kind: "other" },
             tool_use_id: "tool-1",
             kind: "builtin",
             name: "Bash",
@@ -419,8 +424,9 @@ describe("UnifiedTranscript", () => {
     render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     const tool = screen.getByTestId("turn-tool");
-    expect(tool).not.toHaveAttribute("open");
-    expect(tool.querySelector("summary")).toHaveTextContent("Tool");
+    expect(tool.querySelector('[data-testid="tool-body"]')).toBeNull();
+    // An unmapped facet degrades to the raw tool name as the verb.
+    expect(within(tool).getByTestId("tool-verb")).toHaveTextContent("Bash");
     expect(tool).not.toHaveTextContent("builtin");
     // Success shows the quiet muted check, not the running/error indicators.
     expect(tool.querySelector('[data-testid="tool-done"]')).not.toBeNull();
@@ -440,6 +446,7 @@ describe("UnifiedTranscript", () => {
         items: [
           {
             item_kind: "tool",
+            facet: { facet_kind: "other" },
             tool_use_id: "tool-error",
             kind: "builtin",
             name: "Read",
@@ -456,7 +463,7 @@ describe("UnifiedTranscript", () => {
     render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     const tool = screen.getByTestId("turn-tool");
-    expect(tool).not.toHaveAttribute("open");
+    expect(tool.querySelector('[data-testid="tool-body"]')).toBeNull();
     expect(tool.querySelector('[data-testid="tool-error"]')).not.toBeNull();
   });
 
@@ -473,6 +480,7 @@ describe("UnifiedTranscript", () => {
         items: [
           {
             item_kind: "tool",
+            facet: { facet_kind: "other" },
             tool_use_id: "tool-running",
             kind: "builtin",
             name: "Bash",
@@ -486,7 +494,7 @@ describe("UnifiedTranscript", () => {
     render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     const tool = screen.getByTestId("turn-tool");
-    expect(tool).not.toHaveAttribute("open");
+    expect(tool.querySelector('[data-testid="tool-body"]')).toBeNull();
     expect(tool.querySelector('[data-testid="tool-running"]')).not.toBeNull();
   });
 
@@ -506,7 +514,7 @@ describe("UnifiedTranscript", () => {
 
     render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CODEX_AGENT] } });
 
-    expect(screen.getByTestId("turn-working")).toHaveTextContent("Working...");
+    expect(screen.getByTestId("turn-working")).toHaveTextContent("Working");
   });
 
   it("keeps the Working... footer at the bottom once items arrive", async () => {
@@ -526,7 +534,7 @@ describe("UnifiedTranscript", () => {
     render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CODEX_AGENT] } });
 
     expect(screen.getByTestId("turn")).toHaveTextContent("ack");
-    expect(screen.getByTestId("turn-working")).toHaveTextContent("Working...");
+    expect(screen.getByTestId("turn-working")).toHaveTextContent("Working");
   });
 
   it("shows the soft, counting-up 'No response' variant when the in-flight turn is quiet", async () => {
@@ -552,7 +560,7 @@ describe("UnifiedTranscript", () => {
 
     const footer = screen.getByTestId("turn-working");
     expect(footer).toHaveTextContent("No response");
-    expect(footer).not.toHaveTextContent("Working...");
+    expect(footer).not.toHaveTextContent("Working");
     expect(footer).toHaveAttribute("data-quiet", "true");
   });
 
@@ -580,7 +588,7 @@ describe("UnifiedTranscript", () => {
     render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CODEX_AGENT] } });
 
     const footer = screen.getByTestId("turn-working");
-    expect(footer).toHaveTextContent("Working...");
+    expect(footer).toHaveTextContent("Working");
     expect(footer).toHaveAttribute("data-quiet", "false");
   });
 
@@ -603,13 +611,18 @@ describe("UnifiedTranscript", () => {
         started_at: "2026-05-16T00:00:00Z",
       });
       await tick();
-      expect(screen.getByTestId("turn-working")).toHaveTextContent("Working...");
+      expect(screen.getByTestId("turn-working")).toHaveTextContent("Working");
 
       // Past the silence threshold → the quiet counter appears.
       vi.advanceTimersByTime(HEARTBEAT_TIMEOUT_MS + 1000);
       await tick();
       expect(screen.getByTestId("turn-working")).toHaveTextContent("No response");
       expect(screen.getByTestId("turn-working")).toHaveAttribute("data-quiet", "true");
+      // The word swaps and the number swaps (elapsed → silence counter); the
+      // dots are unchanged. Exactly one number on screen.
+      expect(screen.getByTestId("turn-quiet-elapsed")).toBeInTheDocument();
+      expect(screen.queryByTestId("turn-elapsed")).toBeNull();
+      expect(screen.getByTestId("turn-working").querySelector(".loading-dots")).not.toBeNull();
 
       // Activity resumes → back to Working...
       fireTo(`agent:${CODEX_AGENT.id}`, {
@@ -619,7 +632,7 @@ describe("UnifiedTranscript", () => {
         text: "hi",
       });
       await tick();
-      expect(screen.getByTestId("turn-working")).toHaveTextContent("Working...");
+      expect(screen.getByTestId("turn-working")).toHaveTextContent("Working");
       expect(screen.getByTestId("turn-working")).toHaveAttribute("data-quiet", "false");
     } finally {
       vi.useRealTimers();
@@ -664,7 +677,7 @@ describe("UnifiedTranscript", () => {
     expect(screen.queryByText("streaming…")).toBeNull();
     expect(screen.getByTestId("turn")).toHaveTextContent("hello");
     expect(screen.getByTestId("turn")).toHaveTextContent("world");
-    expect(screen.getByTestId("turn-working")).toHaveTextContent("Working...");
+    expect(screen.getByTestId("turn-working")).toHaveTextContent("Working");
   });
 
   it("shows a live cancel control for a streaming standalone turn (send-scoped)", async () => {
@@ -693,6 +706,62 @@ describe("UnifiedTranscript", () => {
     );
   });
 
+  it("shows a ticking elapsed counter on a running turn, deterministic under an injected clock", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-05-16T00:01:14Z"));
+      const state = await loadState();
+      await state.registerAgent(CODEX_AGENT);
+      state.transcripts[CODEX_AGENT.id] = [
+        {
+          role: "agent",
+          turn_id: "agent-1",
+          agent_id: CODEX_AGENT.id,
+          started_at: "2026-05-16T00:00:00Z",
+          status: "streaming",
+          items: [],
+        },
+      ];
+
+      render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CODEX_AGENT] } });
+
+      const footer = screen.getByTestId("turn-working");
+      expect(screen.getByTestId("turn-elapsed")).toHaveTextContent("1m 14s");
+      expect(footer.querySelector(".loading-dots")).not.toBeNull();
+      // The ticking number must not be announced by assistive tech: it sits
+      // outside any aria-live region (state transitions announce, not seconds).
+      expect(screen.getByTestId("turn-elapsed").closest("[aria-live]")).toBeNull();
+
+      vi.advanceTimersByTime(2000);
+      await tick();
+      expect(screen.getByTestId("turn-elapsed")).toHaveTextContent("1m 16s");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("renders no live footer and no dots on a completed turn", async () => {
+    const state = await loadState();
+    await state.registerAgent(CODEX_AGENT);
+    state.transcripts[CODEX_AGENT.id] = [
+      {
+        role: "agent",
+        turn_id: "agent-1",
+        agent_id: CODEX_AGENT.id,
+        started_at: "2026-05-16T00:00:00Z",
+        ended_at: "2026-05-16T00:02:14Z",
+        status: "complete",
+        items: [{ item_kind: "text", kind: "text", text: "done" }],
+      },
+    ];
+
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CODEX_AGENT] } });
+
+    expect(screen.queryByTestId("turn-working")).toBeNull();
+    expect(screen.queryByTestId("turn-elapsed")).toBeNull();
+    expect(document.querySelector(".loading-dots")).toBeNull();
+  });
+
   it("shows a queued… indicator + cancel for a queued single-recipient send", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
@@ -711,7 +780,10 @@ describe("UnifiedTranscript", () => {
 
     render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
-    expect(screen.getByTestId("turn-queued")).toHaveTextContent("Queued...");
+    expect(screen.getByTestId("turn-queued")).toHaveTextContent("Queued");
+    // Dots + label only — a queued send is not a turn yet, so no number.
+    expect(screen.getByTestId("turn-queued").querySelector(".loading-dots")).not.toBeNull();
+    expect(screen.getByTestId("turn-queued").textContent).not.toMatch(/\d/);
     // The cancel control targets the queued send (send-scoped).
     await fireEvent.click(screen.getByTestId("turn-live-control"));
     expect(invokeMock).toHaveBeenCalledWith(
@@ -900,7 +972,7 @@ describe("UnifiedTranscript — fan-out groups", () => {
       props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT, CODEX_AGENT] },
     });
 
-    expect(screen.getByTestId("fanout-queued")).toHaveTextContent("Queued...");
+    expect(screen.getByTestId("fanout-queued")).toHaveTextContent("Queued");
     const columns = screen.getAllByTestId("fanout-column");
     expect(columns[1]).toHaveAttribute("data-state", "queued");
   });
@@ -918,7 +990,7 @@ describe("UnifiedTranscript — fan-out groups", () => {
 
     const queuedCancel = screen.getByTestId("fanout-card-cancel");
     const streamingCancel = screen.getByTestId("turn-live-control");
-    expect(screen.getByTestId("turn-working")).toHaveTextContent("Working...");
+    expect(screen.getByTestId("turn-working")).toHaveTextContent("Working");
     await fireEvent.click(queuedCancel);
     expect(invokeMock).toHaveBeenCalledWith(
       "cancel_send",
@@ -1020,6 +1092,7 @@ describe("UnifiedTranscript — fan-out groups", () => {
         items: [
           {
             item_kind: "tool",
+            facet: { facet_kind: "other" },
             tool_use_id: "t1",
             kind: "builtin",
             name: "Bash",
@@ -1301,6 +1374,7 @@ describe("UnifiedTranscript — markdown rendering", () => {
           { item_kind: "text", kind: "text", text: "Running **before** the tool" },
           {
             item_kind: "tool",
+            facet: { facet_kind: "other" },
             tool_use_id: "tool-1",
             kind: "builtin",
             name: "Bash",
@@ -1680,6 +1754,7 @@ describe("UnifiedTranscript — per-message copy", () => {
           { item_kind: "text", kind: "text", text: "Here is **step one**" },
           {
             item_kind: "tool",
+            facet: { facet_kind: "other" },
             tool_use_id: "tool-1",
             kind: "builtin",
             name: "Bash",
@@ -1720,6 +1795,7 @@ describe("UnifiedTranscript — per-message copy", () => {
           { item_kind: "text", kind: "text", text: "\nHere is **step one**\n\n" },
           {
             item_kind: "tool",
+            facet: { facet_kind: "other" },
             tool_use_id: "tool-1",
             kind: "builtin",
             name: "Bash",
@@ -1771,8 +1847,9 @@ describe("UnifiedTranscript — per-message copy", () => {
     expect(thinking).toBeInTheDocument();
     expect(screen.getByText("Final answer")).toBeInTheDocument();
 
-    // Collapsed by default.
-    expect((thinking as HTMLDetailsElement).open).toBe(false);
+    // Collapsed by default: no body until the user opens the row.
+    expect(screen.queryByTestId("thinking-body")).toBeNull();
+    await fireEvent.click(within(thinking).getByTestId("thinking-row"));
 
     // Reasoning lives in the thinking widget's body, not the answer container.
     expect(screen.getByTestId("thinking-body").textContent).toContain("secret reasoning");
@@ -1848,6 +1925,7 @@ describe("UnifiedTranscript — per-message copy", () => {
         items: [
           {
             item_kind: "tool",
+            facet: { facet_kind: "other" },
             tool_use_id: "tool-1",
             kind: "builtin",
             name: "read_file",
@@ -2078,6 +2156,7 @@ describe("UnifiedTranscript — per-message cost + overage", () => {
           { item_kind: "text", kind: "text", text: "done" },
           {
             item_kind: "tool",
+            facet: { facet_kind: "other" },
             tool_use_id: "tool-1",
             kind: "builtin",
             name: "Read",
@@ -2407,6 +2486,7 @@ describe("UnifiedTranscript compact mode", () => {
   const THINK = (text: string): Item => ({ item_kind: "text", kind: "thinking", text });
   const TOOL = (id: string): Item => ({
     item_kind: "tool",
+    facet: { facet_kind: "other" },
     tool_use_id: id,
     kind: "builtin",
     name: "bash",
@@ -2697,14 +2777,15 @@ describe("UnifiedTranscript compact mode", () => {
     expect(markers).toHaveLength(1);
     expect(markers[0]).toHaveAttribute("data-agent-id", CLAUDE_AGENT.id);
     expect(markers[0]!.querySelector('[data-testid="turn-agent-name"]')).not.toBeNull();
-    // The disclosure carries the recap behind a label, COLLAPSED by default — a
-    // regression that adds `open` (flooding long transcripts with full recaps)
-    // must fail here. `toHaveTextContent` alone wouldn't catch it: a closed
-    // `<details>` still keeps its body text in the DOM.
-    const details = screen.getByTestId("compaction-marker");
-    expect(details).not.toHaveAttribute("open");
-    expect(details).toHaveTextContent("Conversation compacted");
-    expect(details).toHaveTextContent("the recap text");
+    // The recap sits behind the label, COLLAPSED by default — a regression
+    // that mounts it open would flood long transcripts with full recaps. The
+    // body renders only while open, so its absence is the collapsed proof.
+    const marker = screen.getByTestId("compaction-marker");
+    expect(marker).toHaveTextContent("Conversation compacted");
+    expect(screen.queryByTestId("compaction-body")).toBeNull();
+
+    await fireEvent.click(within(marker).getByTestId("compaction-row"));
+    expect(screen.getByTestId("compaction-body")).toHaveTextContent("the recap text");
   });
 
   it("renders a slash-command marker with the command text", async () => {
@@ -3049,7 +3130,7 @@ describe("UnifiedTranscript live streaming cap", () => {
       props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT, CODEX_AGENT] },
     });
 
-    expect(screen.getByTestId("fanout-queued")).toHaveTextContent("Queued...");
+    expect(screen.getByTestId("fanout-queued")).toHaveTextContent("Queued");
     const scroll = screen.getByTestId("turn-live-scroll");
     expect(scroll).toHaveTextContent("alice streaming");
     expect(scroll).toHaveClass("max-h-[75cqh]", "overflow-y-auto");
@@ -3097,6 +3178,7 @@ describe("UnifiedTranscript fan-out group control", () => {
   const text = (t: string) => ({ item_kind: "text" as const, kind: "text" as const, text: t });
   const tool = (id: string) => ({
     item_kind: "tool" as const,
+    facet: { facet_kind: "other" as const } as const,
     tool_use_id: id,
     kind: "builtin" as const,
     name: "bash",
@@ -3364,6 +3446,7 @@ describe("UnifiedTranscript terminal-response collapse", () => {
           { item_kind: "text", kind: "text", text: "partial work before cancel" },
           {
             item_kind: "tool",
+            facet: { facet_kind: "other" },
             tool_use_id: "ct",
             kind: "builtin",
             name: "bash",
@@ -3416,6 +3499,7 @@ describe("UnifiedTranscript terminal-response collapse", () => {
           { item_kind: "text", kind: "text", text: "dangling text" },
           {
             item_kind: "tool",
+            facet: { facet_kind: "other" },
             tool_use_id: "dt",
             kind: "builtin",
             name: "bash",
@@ -3449,6 +3533,148 @@ describe("UnifiedTranscript terminal-response collapse", () => {
     expect(screen.queryByTestId("turn-working")).toBeNull();
     expect(screen.queryByTestId("turn-live-scroll")).toBeNull();
     expect(agentTurnEl().querySelector('[data-testid="turn-preview-toggle"]')).not.toBeNull();
+  });
+
+  it("marks a content-less edit as unavailable on an outcome-closed streaming turn", async () => {
+    // The Codex edit placeholder must not promise "diff will appear when the
+    // turn completes" on a turn that will never complete: status is
+    // `streaming` on disk (killed mid-flight), but the outcome marker closed
+    // it, so the tool row must treat it as settled.
+    const state = await loadState();
+    await state.registerAgent(CODEX_AGENT);
+    state.transcripts[CODEX_AGENT.id] = [
+      {
+        role: "user",
+        turn_id: "u-1",
+        agent_id: CODEX_AGENT.id,
+        send_id: "s-1",
+        started_at: "2026-05-16T00:00:00Z",
+        text: "edit it",
+      },
+      {
+        role: "agent",
+        turn_id: "a-1",
+        agent_id: CODEX_AGENT.id,
+        send_id: "s-1",
+        started_at: "2026-05-16T00:00:01Z",
+        status: "streaming",
+        items: [
+          {
+            item_kind: "tool",
+            facet: {
+              facet_kind: "edit",
+              files: [{ path: "/repo/a.ts", change: "modified", edits: [], truncated: false }],
+            },
+            tool_use_id: "edit-1",
+            kind: "builtin",
+            name: "file_change",
+            input: {},
+            started_at: "2026-05-16T00:00:01Z",
+            completed_at: "2026-05-16T00:00:02Z",
+          },
+        ],
+      },
+    ];
+    const overlay: ConversationItem[] = [
+      {
+        kind: "outcome",
+        turn_id: "a-1",
+        send_id: "s-1",
+        agent_id: CODEX_AGENT.id,
+        status: "cancelled",
+        reason: null,
+        at: "2026-05-16T00:00:05Z",
+      },
+    ];
+
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CODEX_AGENT], overlay },
+    });
+
+    expect(screen.getByTestId("tool-edit-pending")).toHaveTextContent(
+      "Diff content unavailable for this edit.",
+    );
+  });
+
+  it("marks a content-less edit as unavailable in an outcome-closed fan-out column", async () => {
+    // Same contract through the fan-out rendering path: the closed column
+    // passes live=false into the shared turn body, so the placeholder must
+    // read settled there too.
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    await state.registerAgent(CODEX_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [
+      {
+        role: "user",
+        turn_id: "u-a",
+        agent_id: CLAUDE_AGENT.id,
+        send_id: "s-fan",
+        started_at: "2026-05-16T00:00:00Z",
+        text: "fan out",
+      },
+      {
+        role: "agent",
+        turn_id: "a-a",
+        agent_id: CLAUDE_AGENT.id,
+        send_id: "s-fan",
+        started_at: "2026-05-16T00:00:01Z",
+        status: "streaming",
+        items: [
+          {
+            item_kind: "tool",
+            facet: {
+              facet_kind: "edit",
+              files: [{ path: "/repo/a.ts", change: "modified", edits: [], truncated: false }],
+            },
+            tool_use_id: "edit-fan",
+            kind: "builtin",
+            name: "file_change",
+            input: {},
+            started_at: "2026-05-16T00:00:01Z",
+            completed_at: "2026-05-16T00:00:02Z",
+          },
+        ],
+      },
+    ];
+    state.transcripts[CODEX_AGENT.id] = [
+      {
+        role: "user",
+        turn_id: "u-b",
+        agent_id: CODEX_AGENT.id,
+        send_id: "s-fan",
+        started_at: "2026-05-16T00:00:00Z",
+        text: "fan out",
+      },
+      {
+        role: "agent",
+        turn_id: "a-b",
+        agent_id: CODEX_AGENT.id,
+        send_id: "s-fan",
+        started_at: "2026-05-16T00:00:02Z",
+        status: "complete",
+        items: [{ item_kind: "text", kind: "text", text: "bob reply" }],
+      },
+    ];
+    const overlay: ConversationItem[] = [
+      {
+        kind: "outcome",
+        turn_id: "o-a",
+        send_id: "s-fan",
+        agent_id: CLAUDE_AGENT.id,
+        status: "cancelled",
+        reason: null,
+        at: "2026-05-16T00:00:05Z",
+      },
+    ];
+
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT, CODEX_AGENT], overlay },
+    });
+
+    const column = screen.getAllByTestId("fanout-column")[0]!;
+    expect(within(column).getByTestId("tool-edit-pending")).toHaveTextContent(
+      "Diff content unavailable for this edit.",
+    );
   });
 });
 
@@ -3624,10 +3850,11 @@ describe("UnifiedTranscript — cross-agent forward", () => {
     expect(screen.queryByTestId("held-forward")).toBeNull();
   });
 
-  it("shows only this pane's recipients in the held row — resolvable, never 'unknown'", async () => {
-    // The "Forward to unknown" regression: a fan-out forward whose recipients span
-    // panes must, in each pane, name only the recipients that pane contains (so
-    // the name always resolves) — not every recipient.
+  it("names only the sources in the held row — the recipient is implicit in its own pane", async () => {
+    // The row renders in the recipient's pane under the forwarded body, so
+    // naming the recipient was redundant (and once caused a cross-pane
+    // "Forward to unknown" bug — structurally impossible now that recipient
+    // names left the row entirely).
     const state = await loadState();
     const held = await loadHeld();
     await state.registerAgent(CLAUDE_AGENT);
@@ -3640,11 +3867,10 @@ describe("UnifiedTranscript — cross-agent forward", () => {
       recipients: [CLAUDE_AGENT.id, CODEX_AGENT.id],
     });
 
-    // This pane holds only claude; the held row names claude, not the other
-    // recipient (which lives in a different pane) and never "unknown".
     render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
     const heldEl = await screen.findByTestId("held-forward");
-    expect(heldEl).toHaveTextContent("Forward to alice");
+    expect(heldEl).toHaveTextContent("waiting for bob");
+    expect(heldEl).not.toHaveTextContent("alice");
     expect(heldEl).not.toHaveTextContent("unknown");
   });
 
@@ -4072,6 +4298,86 @@ describe("UnifiedTranscript render windowing", () => {
     });
     await tick();
     expect(screen.queryByTestId("reveal-sentinel")).not.toBeNull();
+  });
+
+  // Navigator jump: an addressed request re-pins the window cursor so the
+  // target mounts. Scroll geometry is browser-tested (jsdom has no layout);
+  // these cover the addressing, mounting, and consumption contract.
+  it("a jump request re-pins the window to mount an off-window block, then is consumed", async () => {
+    const state = await loadState();
+    const jump = await import("$lib/state/transcriptJump.svelte");
+    await state.registerAgent(CLAUDE_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = agentTurns(CLAUDE_AGENT, OVER);
+
+    render(UnifiedTranscript, {
+      props: {
+        projectId: PROJECT_ID,
+        agents: [CLAUDE_AGENT],
+        loadStatus: "complete",
+        paneId: "pane-x",
+      },
+    });
+    await tick();
+    expect(screen.queryByText("msg 0-0")).toBeNull();
+
+    jump.requestJump(PROJECT_ID, "pane-x", `a:aturn-${CLAUDE_AGENT.id}-0-0`);
+    await tick();
+    await tick();
+
+    // The tail window grew (target..tail all mounted) rather than re-pinning
+    // to the tail, and the oldest message is in the DOM.
+    expect(screen.queryByText("msg 0-0")).not.toBeNull();
+    expect(blockCount()).toBe(OVER);
+    expect(jump.jumpRequest.rowKey).toBeNull(); // consumed
+  });
+
+  it("ignores a request addressed to a different pane, leaving it pending", async () => {
+    const state = await loadState();
+    const jump = await import("$lib/state/transcriptJump.svelte");
+    await state.registerAgent(CLAUDE_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = agentTurns(CLAUDE_AGENT, OVER);
+
+    render(UnifiedTranscript, {
+      props: {
+        projectId: PROJECT_ID,
+        agents: [CLAUDE_AGENT],
+        loadStatus: "complete",
+        paneId: "pane-x",
+      },
+    });
+    await tick();
+
+    jump.requestJump(PROJECT_ID, "pane-other", `a:aturn-${CLAUDE_AGENT.id}-0-0`);
+    await tick();
+    await tick();
+
+    expect(blockCount()).toBe(WINDOW);
+    // Pending for the addressed pane (which mounts on reveal), not consumed here.
+    expect(jump.jumpRequest.rowKey).toBe(`a:aturn-${CLAUDE_AGENT.id}-0-0`);
+  });
+
+  it("consumes a stale key without moving the window", async () => {
+    const state = await loadState();
+    const jump = await import("$lib/state/transcriptJump.svelte");
+    await state.registerAgent(CLAUDE_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = agentTurns(CLAUDE_AGENT, OVER);
+
+    render(UnifiedTranscript, {
+      props: {
+        projectId: PROJECT_ID,
+        agents: [CLAUDE_AGENT],
+        loadStatus: "complete",
+        paneId: "pane-x",
+      },
+    });
+    await tick();
+
+    jump.requestJump(PROJECT_ID, "pane-x", "a:no-such-turn");
+    await tick();
+    await tick();
+
+    expect(blockCount()).toBe(WINDOW);
+    expect(jump.jumpRequest.rowKey).toBeNull();
   });
 
   // Reaching the sentinel mounts the next older batch; repeating walks back to

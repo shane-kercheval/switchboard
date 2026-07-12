@@ -49,7 +49,7 @@
   /// Boxed-note styling for the status messages (server-rendered / unresolved /
   /// unavailable), so they read as a distinct callout rather than blending into
   /// the prompt's own description prose. Mirrors the composer's note box.
-  const CALLOUT = "border-border/70 bg-surface/40 text-muted rounded-md border px-2.5 py-2 text-xs";
+  const CALLOUT = "border-border/70 bg-panel text-muted rounded-md border px-2.5 py-2 text-xs";
 
   async function load(p: StepPrompt): Promise<void> {
     const seq = ++requestSeq;

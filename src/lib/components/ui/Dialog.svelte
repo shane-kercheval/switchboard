@@ -32,6 +32,9 @@
     /// Optional override for the content max-width. Defaults to `max-w-md`
     /// which matches the standalone CreateAgentForm layout.
     contentClass?: string;
+    /// Extra classes on the backdrop overlay — e.g. `backdrop-blur-sm` to blur
+    /// the content behind the modal.
+    overlayClass?: string;
     /// When false, the modal can't be dismissed (escape, click-outside, or the
     /// header ✕ are all suppressed). Used to keep a modal up while an
     /// irreversible action it kicked off is mid-flight — e.g. the New Project
@@ -51,6 +54,7 @@
     children,
     onClose,
     contentClass,
+    overlayClass,
     dismissible = true,
     onOpenAutoFocus,
   }: Props = $props();
@@ -63,12 +67,15 @@
 
 <BitsDialog.Root {open} onOpenChange={handleOpenChange}>
   <BitsDialog.Portal>
-    <BitsDialog.Overlay class="fixed inset-0 z-40 bg-black/40" data-testid="dialog-overlay" />
+    <BitsDialog.Overlay
+      class={cn("fixed inset-0 z-40 bg-black/40", overlayClass)}
+      data-testid="dialog-overlay"
+    />
     <BitsDialog.Content
-      class={[
+      class={cn(
         "border-border/90 bg-raised fixed top-1/2 left-1/2 z-50 w-[calc(100vw-2rem)] -translate-x-1/2 -translate-y-1/2 rounded-lg border shadow-[0_18px_60px_rgba(0,0,0,0.22)]",
         contentClass ?? "max-w-md",
-      ].join(" ")}
+      )}
       data-testid="dialog-content"
       onEscapeKeydown={(e) => {
         if (!dismissible) e.preventDefault();

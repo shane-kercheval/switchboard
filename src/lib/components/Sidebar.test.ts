@@ -231,8 +231,10 @@ describe("Sidebar", () => {
 
     expect(screen.getByTestId("agent-harness-icon")).toBeInTheDocument();
     const trigger = screen.getByTestId("agent-actions-trigger");
-    expect(trigger).toHaveClass("opacity-0");
-    expect(trigger).toHaveClass("group-hover:opacity-100");
+    // `hidden`, not `opacity-0`: a transparent icon still reserves its width,
+    // and that gutter is what truncated names. Reveal is display-based.
+    expect(trigger).toHaveClass("hidden");
+    expect(trigger).toHaveClass("group-hover:inline-flex");
 
     const menu = await openAgentActions();
     expect(await screen.findByTestId("agent-action-resume")).toBeInTheDocument();
@@ -244,13 +246,14 @@ describe("Sidebar", () => {
         item.textContent?.trim(),
       ),
     ).toEqual([
+      "Rename",
       "Resume in terminal",
       "Open session file",
       "Change model",
       "Change effort",
       "Delete agent",
     ]);
-    expect(menu.querySelectorAll('[role="menuitem"] svg')).toHaveLength(5);
+    expect(menu.querySelectorAll('[role="menuitem"] svg')).toHaveLength(6);
   });
 
   it("shows only currently available menu actions", async () => {
@@ -571,9 +574,8 @@ describe("Sidebar", () => {
     // No selected model on this agent → the SessionMeta model shows as the
     // observed fallback; mcp/skills counts stay in the meta block.
     expect(screen.getByTestId("agent-observed-model")).toHaveTextContent("claude-sonnet-4-6");
-    const meta = screen.getByTestId("agent-meta");
-    expect(meta).toHaveTextContent("mcp: 1");
-    expect(meta).toHaveTextContent("skills: 1");
+    expect(screen.getByTestId("agent-mcp-chip")).toHaveTextContent("1");
+    expect(screen.getByTestId("agent-skills-chip")).toHaveTextContent("1");
   });
 
   // --- Model / effort: change actions + intent display -----------------------
@@ -746,6 +748,36 @@ describe("Sidebar", () => {
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
 
     expect(screen.getByTestId("agent-selected-effort")).toHaveTextContent("high");
+  });
+
+  it("gives the name the full row until hover: shared-prefix names stay distinguishable at rest", async () => {
+    const state = await loadState();
+    const a = {
+      ...CLAUDE_AGENT,
+      id: "00000000-0000-7000-8000-000000000aa1",
+      name: "gpt-5-5-minimal",
+    };
+    const b = {
+      ...CLAUDE_AGENT,
+      id: "00000000-0000-7000-8000-000000000aa2",
+      name: "gpt-5-5-minimal-2",
+    };
+    await state.registerAgent(a);
+    await state.registerAgent(b);
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [a, b] } });
+
+    const names = screen.getAllByTestId("agent-name").map((el) => el.textContent?.trim());
+    expect(names).toEqual(["gpt-5-5-minimal", "gpt-5-5-minimal-2"]);
+    // The room comes from the action icons being `hidden` (display: none —
+    // zero width) until hover/focus, rather than `opacity-0` (invisible but
+    // still reserving a two-icon gutter). The name truncates only while the
+    // icons are revealed.
+    for (const toggle of screen.getAllByTestId("agent-visibility-toggle")) {
+      expect(toggle).toHaveClass("hidden");
+    }
+    for (const trigger of screen.getAllByTestId("agent-actions-trigger")) {
+      expect(trigger).toHaveClass("hidden");
+    }
   });
 });
 
@@ -1176,34 +1208,45 @@ describe("Sidebar agent-scoped event tolerance", () => {
 
 /// Inline rename editor. The card's name swaps to an <input> with live
 /// validation; Enter / the save icon commit, Escape / blur cancel (never
-/// persist on blur). Double-click on the name row is the entry point. Commits
-/// route through the mocked workspace `renameAgent`; the backend stays
+/// persist on blur). The entry point is the "Rename" action in the ⋯ menu —
+/// deliberately NOT a name double-click, which fought the collapse toggle.
+/// Commits route through the mocked workspace `renameAgent`; the backend stays
 /// authoritative, the frontend check is UX.
 describe("Sidebar inline rename", () => {
-  async function enterEditViaDoubleClick(agent: AgentRecord): Promise<HTMLInputElement> {
+  async function enterEditViaMenu(agent: AgentRecord): Promise<HTMLInputElement> {
     const state = await loadState();
     await state.registerAgent(agent);
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
-    const toggle = screen.getByTestId("agent-name").closest("button");
-    if (!toggle) throw new Error("expected the agent name to sit in a toggle button");
-    await fireEvent.dblClick(toggle);
+    await openAgentActions();
+    await fireEvent.click(await screen.findByTestId("agent-action-rename"));
     return (await screen.findByTestId("agent-rename-input")) as HTMLInputElement;
   }
 
-  it("double-click on the name row enters edit mode seeded with the current name", async () => {
-    const input = await enterEditViaDoubleClick(CLAUDE_AGENT);
+  it("the Rename action enters edit mode seeded with the current name", async () => {
+    const input = await enterEditViaMenu(CLAUDE_AGENT);
     expect(input).toHaveValue("alice");
     // The name span / toggle button is gone while editing.
     expect(screen.queryByTestId("agent-name")).toBeNull();
   });
 
+  it("double-clicking the name row does not rename (it only toggles collapse)", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+    const toggle = screen.getByTestId("agent-name").closest("button");
+    if (!toggle) throw new Error("expected the agent name to sit in a toggle button");
+    await fireEvent.dblClick(toggle);
+    expect(screen.queryByTestId("agent-rename-input")).toBeNull();
+    expect(screen.getByTestId("agent-name")).toBeInTheDocument();
+  });
+
   it("the input is not nested inside the collapse toggle (no nested interactive)", async () => {
-    const input = await enterEditViaDoubleClick(CLAUDE_AGENT);
+    const input = await enterEditViaMenu(CLAUDE_AGENT);
     expect(input.closest("button")).toBeNull();
   });
 
   it("Enter commits the new name via renameAgent and exits edit mode", async () => {
-    const input = await enterEditViaDoubleClick(CLAUDE_AGENT);
+    const input = await enterEditViaMenu(CLAUDE_AGENT);
     await fireEvent.input(input, { target: { value: "alice2" } });
     await fireEvent.keyDown(input, { key: "Enter" });
 
@@ -1212,7 +1255,7 @@ describe("Sidebar inline rename", () => {
   });
 
   it("the save icon commits the new name via renameAgent", async () => {
-    const input = await enterEditViaDoubleClick(CLAUDE_AGENT);
+    const input = await enterEditViaMenu(CLAUDE_AGENT);
     await fireEvent.input(input, { target: { value: "alice2" } });
 
     const save = screen.getByTestId("agent-rename-save");
@@ -1226,14 +1269,14 @@ describe("Sidebar inline rename", () => {
   });
 
   it("trims the draft before submitting (validated value equals submitted value)", async () => {
-    const input = await enterEditViaDoubleClick(CLAUDE_AGENT);
+    const input = await enterEditViaMenu(CLAUDE_AGENT);
     await fireEvent.input(input, { target: { value: "  alice2  " } });
     await fireEvent.keyDown(input, { key: "Enter" });
     expect(renameAgentMock).toHaveBeenCalledWith(CLAUDE_AGENT.id, "alice2");
   });
 
   it("Escape reverts without calling renameAgent", async () => {
-    const input = await enterEditViaDoubleClick(CLAUDE_AGENT);
+    const input = await enterEditViaMenu(CLAUDE_AGENT);
     await fireEvent.input(input, { target: { value: "alice2" } });
     await fireEvent.keyDown(input, { key: "Escape" });
 
@@ -1243,7 +1286,7 @@ describe("Sidebar inline rename", () => {
   });
 
   it("blur (click-away) reverts without calling renameAgent — never persists on blur", async () => {
-    const input = await enterEditViaDoubleClick(CLAUDE_AGENT);
+    const input = await enterEditViaMenu(CLAUDE_AGENT);
     await fireEvent.input(input, { target: { value: "alice2" } });
     await fireEvent.blur(input);
 
@@ -1253,7 +1296,7 @@ describe("Sidebar inline rename", () => {
   });
 
   it("renaming to the agent's own name (case variant) is allowed — exclude-self", async () => {
-    const input = await enterEditViaDoubleClick(CLAUDE_AGENT);
+    const input = await enterEditViaMenu(CLAUDE_AGENT);
     // "Alice" canonicalizes to "alice" (the agent's own); exclude-self means it
     // is not a duplicate, and it differs verbatim, so it commits.
     await fireEvent.input(input, { target: { value: "Alice" } });
@@ -1263,7 +1306,7 @@ describe("Sidebar inline rename", () => {
   });
 
   it("an unchanged name skips the backend round-trip and just exits", async () => {
-    const input = await enterEditViaDoubleClick(CLAUDE_AGENT);
+    const input = await enterEditViaMenu(CLAUDE_AGENT);
     await fireEvent.keyDown(input, { key: "Enter" });
     expect(renameAgentMock).not.toHaveBeenCalled();
     await waitFor(() => expect(screen.queryByTestId("agent-rename-input")).toBeNull());
@@ -1275,10 +1318,8 @@ describe("Sidebar inline rename", () => {
     await state.registerAgent(CODEX_AGENT);
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT, CODEX_AGENT] } });
 
-    const [firstName] = screen.getAllByTestId("agent-name");
-    const toggle = firstName?.closest("button");
-    if (!toggle) throw new Error("expected a toggle button");
-    await fireEvent.dblClick(toggle);
+    await openAgentActions(0);
+    await fireEvent.click(await screen.findByTestId("agent-action-rename"));
     const input = (await screen.findByTestId("agent-rename-input")) as HTMLInputElement;
 
     await fireEvent.input(input, { target: { value: "bob" } });
@@ -1295,7 +1336,7 @@ describe("Sidebar inline rename", () => {
   });
 
   it("an emptied field disables save without showing a nag message", async () => {
-    const input = await enterEditViaDoubleClick(CLAUDE_AGENT);
+    const input = await enterEditViaMenu(CLAUDE_AGENT);
     await fireEvent.input(input, { target: { value: "" } });
     expect(screen.getByTestId("agent-rename-save")).toBeDisabled();
     // `empty` is suppressed — no scary message mid-edit (aria-invalid still set).
@@ -1314,7 +1355,7 @@ describe("Sidebar inline rename", () => {
         }),
     );
 
-    const input = await enterEditViaDoubleClick(CLAUDE_AGENT);
+    const input = await enterEditViaMenu(CLAUDE_AGENT);
     await fireEvent.input(input, { target: { value: "alice2" } });
     await fireEvent.keyDown(input, { key: "Enter" });
     await fireEvent.keyDown(input, { key: "Enter" });
@@ -1326,7 +1367,7 @@ describe("Sidebar inline rename", () => {
 
   it("a backend rejection keeps edit mode and surfaces the error", async () => {
     renameAgentMock.mockRejectedValueOnce(new Error("registry locked"));
-    const input = await enterEditViaDoubleClick(CLAUDE_AGENT);
+    const input = await enterEditViaMenu(CLAUDE_AGENT);
     await fireEvent.input(input, { target: { value: "alice2" } });
     await fireEvent.keyDown(input, { key: "Enter" });
 

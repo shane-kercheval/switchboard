@@ -70,6 +70,7 @@ pub fn changed_files(path: &Path) -> Result<Vec<ChangedFile>> {
         .statuses(Some(&mut opts))
         .map_err(|e| GitError::read(path, e))?;
 
+    let counts = worktree_line_counts(&repo);
     let mut files = Vec::new();
     for entry in statuses.iter() {
         let status = entry.status();
@@ -82,9 +83,12 @@ pub fn changed_files(path: &Path) -> Result<Vec<ChangedFile>> {
         // For a rename, prefer the new path from the relevant diff delta.
         let file_path = renamed_target(&entry).or_else(|| entry.path().ok().map(str::to_owned));
         if let Some(file_path) = file_path {
+            let (additions, deletions) = counts.get(&file_path).copied().unwrap_or((None, None));
             files.push(ChangedFile {
                 path: file_path,
                 change,
+                additions,
+                deletions,
             });
         }
     }
@@ -217,6 +221,9 @@ pub fn commit_changed_files(path: &Path, oid: &str) -> Result<CommitChanges> {
     };
     let body = commit.body().ok().flatten().map(str::to_owned);
     let mut opts = DiffOptions::new();
+    // Line counts are computed per delta below; past the inline-diff cap a
+    // file is flagged binary (counts `None`) instead of loaded.
+    opts.max_size(i64::try_from(TOO_LARGE_TO_DIFF_BYTES).unwrap_or(i64::MAX));
     let mut diff = commit_diff(&repo, &commit, &mut opts).map_err(|e| GitError::read(path, e))?;
     // Coalesce add+delete pairs into renames for a cleaner list (matches the
     // worktree read's rename handling).
@@ -1089,7 +1096,7 @@ fn commit_diff<'r>(
 /// Collect a tree-to-tree diff's deltas into [`ChangedFile`]s, newest path order.
 fn changed_files_from_diff(diff: &Diff<'_>) -> Vec<ChangedFile> {
     let mut files = Vec::new();
-    for delta in diff.deltas() {
+    for (idx, delta) in diff.deltas().enumerate() {
         let Some(change) = classify_delta(delta.status()) else {
             continue;
         };
@@ -1100,14 +1107,84 @@ fn changed_files_from_diff(diff: &Diff<'_>) -> Vec<ChangedFile> {
             .or_else(|| delta.old_file().path())
             .map(|p| p.to_string_lossy().into_owned());
         if let Some(file_path) = file_path {
+            let (additions, deletions) = delta_line_counts(diff, idx);
             files.push(ChangedFile {
                 path: file_path,
                 change,
+                additions,
+                deletions,
             });
         }
     }
     files.sort_by(|a, b| a.path.cmp(&b.path));
     files
+}
+
+/// Added/removed line counts for one delta of `diff`, or `(None, None)` when
+/// the content isn't line-countable — binary, or flagged binary by the
+/// caller's `max_size` cap. A per-delta patch failure also degrades to `None`:
+/// counts are display sugar and must never fail a file listing.
+fn delta_line_counts(diff: &Diff<'_>, idx: usize) -> (Option<u32>, Option<u32>) {
+    match git2::Patch::from_diff(diff, idx) {
+        Ok(Some(patch)) if !patch.delta().flags().is_binary() => match patch.line_stats() {
+            Ok((_context, additions, deletions)) => {
+                (u32::try_from(additions).ok(), u32::try_from(deletions).ok())
+            }
+            Err(_) => (None, None),
+        },
+        _ => (None, None),
+    }
+}
+
+/// Best-effort per-file line counts for the working tree vs. HEAD (staged +
+/// unstaged + untracked), keyed by repo-relative path (the new path for a
+/// rename, matching how [`changed_files`] keys its rows). The status walk owns
+/// *which* files are listed; this parallel diff only supplies their counts, so
+/// any failure degrades to an empty map rather than failing the listing.
+///
+/// Kept as a parallel diff even though it re-walks the tree the status read
+/// already walked: measured on synthetic repos (up to a 20k-file tree with
+/// 300 changed files) the added cost — tree re-walk plus per-file patch
+/// generation — stayed well within the Git view's refresh cadence. Re-check
+/// if this path ever gets hot; the alternative is deriving counts from the
+/// status entries' own deltas, as the commit path does.
+fn worktree_line_counts(repo: &Repository) -> HashMap<String, (Option<u32>, Option<u32>)> {
+    let mut opts = DiffOptions::new();
+    opts.include_untracked(true)
+        .recurse_untracked_dirs(true)
+        .show_untracked_content(true)
+        // Past the inline-diff cap a file is flagged binary instead of loaded,
+        // so counting lines never pulls a huge blob into memory.
+        .max_size(i64::try_from(TOO_LARGE_TO_DIFF_BYTES).unwrap_or(i64::MAX));
+    let diff = match head_tree(repo) {
+        Some(tree) => repo.diff_tree_to_workdir_with_index(Some(&tree), Some(&mut opts)),
+        None => repo.diff_tree_to_workdir_with_index(None, Some(&mut opts)),
+    };
+    let Ok(mut diff) = diff else {
+        return HashMap::new();
+    };
+    // Pair add+delete into renames so the counts key matches the status walk's
+    // renamed-target path and a rename shows its real edit size. This must
+    // track `StatusOptions`' rename detection above (both currently on
+    // libgit2's default similarity threshold): the two subsystems decide
+    // "rename" independently, and if they diverge the join misses and renamed
+    // rows silently lose their counts.
+    if diff.find_similar(None).is_err() {
+        return HashMap::new();
+    }
+    let mut counts = HashMap::new();
+    for (idx, delta) in diff.deltas().enumerate() {
+        let Some(path) = delta
+            .new_file()
+            .path()
+            .or_else(|| delta.old_file().path())
+            .map(|p| p.to_string_lossy().into_owned())
+        else {
+            continue;
+        };
+        counts.insert(path, delta_line_counts(&diff, idx));
+    }
+    counts
 }
 
 /// Map a tree-to-tree delta status to a [`ChangeKind`]. There is no `Untracked`

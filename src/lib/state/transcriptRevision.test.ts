@@ -81,6 +81,7 @@ describe("transcript revision (the re-anchor change signal)", () => {
       bumps(() =>
         fireTo(`agent:${AGENT_A}`, {
           type: "tool_started",
+          facet: { facet_kind: "other" },
           turn_id: TURN_1,
           tool_use_id: "t1",
           kind: "builtin",

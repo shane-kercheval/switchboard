@@ -59,6 +59,7 @@ describe("answerTextOf", () => {
         { item_kind: "text", kind: "text", text: "Step one." },
         {
           item_kind: "tool",
+          facet: { facet_kind: "other" },
           tool_use_id: "t1",
           kind: "builtin",
           name: "Bash",
@@ -134,6 +135,7 @@ describe("lastAnswerTextOf", () => {
         { item_kind: "text", kind: "text", text: "Step one." },
         {
           item_kind: "tool",
+          facet: { facet_kind: "other" },
           tool_use_id: "t1",
           kind: "builtin",
           name: "Bash",
@@ -162,6 +164,7 @@ describe("lastAnswerTextOf", () => {
         { item_kind: "text", kind: "thinking", text: "private reasoning" },
         {
           item_kind: "tool",
+          facet: { facet_kind: "other" },
           tool_use_id: "t1",
           kind: "builtin",
           name: "Bash",

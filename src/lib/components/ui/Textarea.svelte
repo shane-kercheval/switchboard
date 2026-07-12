@@ -93,7 +93,7 @@
   class={cn(
     "border-border bg-raised w-full resize-none rounded-md border px-3 py-2 text-sm",
     "text-fg placeholder:text-muted",
-    "focus-visible:ring-accent focus-visible:ring-2 focus-visible:outline-none",
+    "focus-visible:ring-focus focus-visible:ring-1 focus-visible:outline-none",
     "disabled:bg-panel disabled:cursor-not-allowed disabled:opacity-50",
     // The native path scrolls internally past the cap; the JS path toggles
     // this inline per resize.

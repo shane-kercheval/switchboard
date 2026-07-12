@@ -20,6 +20,7 @@ import type {
   MessageId,
   ParseWarning,
   SendId,
+  ToolFacet,
   ToolKind,
   TurnId,
   TurnSpend,
@@ -135,6 +136,11 @@ export type ToolCall = {
   kind: ToolKind;
   name: string;
   input: unknown;
+  /// Mirrors wire `tool_started.facet` — the normalized operation the
+  /// renderer branches on (unknown `facet_kind` → generic path). May be
+  /// replaced in place by a later `tool_facet_updated` (Codex edit content
+  /// arriving at turn end).
+  facet: ToolFacet;
   output?: string;
   is_error?: boolean;
   started_at: string;

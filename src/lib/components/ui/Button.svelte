@@ -23,7 +23,7 @@
   // Pill-shaped (`rounded-full`) to match the app's circular icon language.
   const base =
     "inline-flex items-center justify-center rounded-full font-medium transition-colors " +
-    "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent " +
+    "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-focus " +
     "disabled:cursor-not-allowed disabled:opacity-50";
 
   // `primary` uses the brand accent (not a flat black) so the main action

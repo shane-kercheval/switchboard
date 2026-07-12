@@ -353,6 +353,7 @@ describe("heartbeat orchestration", () => {
     vi.advanceTimersByTime(HEARTBEAT_TIMEOUT_MS - 100);
     fireTo(`agent:${AGENT_A}`, {
       type: "tool_started",
+      facet: { facet_kind: "other" },
       turn_id: TURN_1,
       tool_use_id: "tool-1",
       kind: "builtin",
@@ -1123,6 +1124,7 @@ describe("listener boundary stamps tool started_at / completed_at", () => {
     });
     fireTo(`agent:${AGENT_A}`, {
       type: "tool_started",
+      facet: { facet_kind: "other" },
       turn_id: TURN_1,
       tool_use_id: "tool-1",
       kind: "builtin",

@@ -47,16 +47,20 @@ export function formatHomePath(path: string, home: string | null | undefined): s
   return path;
 }
 
-// Compact elapsed-duration label ("2m 03s" / "1h 04m"), used by the transcript
-// footer's "No response (…)" silence counter. Seconds-precision under an hour;
-// minute-precision past one hour. Negative/NaN inputs clamp to "0m 00s".
+// Compact elapsed-duration label ("9s" / "2m 03s" / "1h 04m"), used by the
+// transcript footer's live counters (elapsed and the "No response (…)"
+// silence). Bare seconds under a minute — running turns are frequently that
+// short, and "0m 09s" reads as a malfunction. The silence counter never hits
+// that branch (it starts at one full heartbeat threshold = 60s), so its
+// existing output is unchanged. Negative/NaN inputs clamp to "0s".
 export function formatDuration(ms: number): string {
   const totalSec = Number.isFinite(ms) ? Math.max(0, Math.floor(ms / 1000)) : 0;
   const h = Math.floor(totalSec / 3600);
   const m = Math.floor((totalSec % 3600) / 60);
   const s = totalSec % 60;
   const pad = (n: number): string => String(n).padStart(2, "0");
-  return h > 0 ? `${h}h ${pad(m)}m` : `${m}m ${pad(s)}s`;
+  if (h > 0) return `${h}h ${pad(m)}m`;
+  return m > 0 ? `${m}m ${pad(s)}s` : `${s}s`;
 }
 
 export function currentIsoTimestamp(now: Date = new Date()): string {

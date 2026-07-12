@@ -1,9 +1,27 @@
 import { describe, expect, it } from "vitest";
-import type { EditedFile } from "$lib/types";
-import { synthesizeEditDiff } from "$lib/toolDiff";
+import type { DiffLine, EditedFile, FileDiff } from "$lib/types";
+import { synthesizeEditDiff, truncateDiff } from "$lib/toolDiff";
 
 function file(edits: { old: string; new: string }[], truncated = false): EditedFile {
   return { path: "/repo/src/a.ts", change: "modified", edits, truncated };
+}
+
+function line(content: string): DiffLine {
+  return { origin: "added", old_lineno: null, new_lineno: 1, content };
+}
+
+function fileDiff(hunkSizes: number[]): FileDiff {
+  return {
+    path: "/repo/src/a.ts",
+    binary: false,
+    truncated: false,
+    too_large: false,
+    too_large_bytes: null,
+    hunks: hunkSizes.map((n, h) => ({
+      header: `@@ hunk ${h} @@`,
+      lines: Array.from({ length: n }, (_, i) => line(`h${h}l${i}`)),
+    })),
+  };
 }
 
 describe("synthesizeEditDiff", () => {
@@ -78,5 +96,31 @@ describe("synthesizeEditDiff", () => {
   it("produces no hunks for identical before/after content", () => {
     const diff = synthesizeEditDiff(file([{ old: "same\n", new: "same\n" }]));
     expect(diff.hunks).toHaveLength(0);
+  });
+});
+
+describe("truncateDiff", () => {
+  it("returns the diff unchanged when it already fits", () => {
+    const diff = fileDiff([3, 2]);
+    const result = truncateDiff(diff, 5);
+    expect(result.hiddenLines).toBe(0);
+    expect(result.diff).toBe(diff); // same reference — no copy
+  });
+
+  it("keeps whole hunks up to the cap and drops the rest", () => {
+    const result = truncateDiff(fileDiff([3, 3, 3]), 6);
+    expect(result.hiddenLines).toBe(3);
+    expect(result.diff.hunks).toHaveLength(2);
+    expect(result.diff.hunks.flatMap((h) => h.lines)).toHaveLength(6);
+  });
+
+  it("trims a hunk that straddles the cap, keeping its header and leading lines", () => {
+    const result = truncateDiff(fileDiff([2, 5]), 4);
+    expect(result.hiddenLines).toBe(3); // 7 total − 4 kept
+    expect(result.diff.hunks).toHaveLength(2);
+    expect(result.diff.hunks[1]!.lines).toHaveLength(2);
+    expect(result.diff.hunks[1]!.header).toBe("@@ hunk 1 @@");
+    // The original diff is not mutated.
+    expect(result.diff).not.toBe(fileDiff([2, 5]));
   });
 });

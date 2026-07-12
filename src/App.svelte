@@ -11,6 +11,7 @@
   import ProjectsSidebar from "$lib/components/ProjectsSidebar.svelte";
   import SettingsView from "$lib/components/SettingsView.svelte";
   import Sidebar from "$lib/components/Sidebar.svelte";
+  import TranscriptNavigator from "$lib/components/TranscriptNavigator.svelte";
   import TranscriptPanes from "$lib/components/TranscriptPanes.svelte";
   import WelcomeScreen from "$lib/components/WelcomeScreen.svelte";
   import Dialog from "$lib/components/ui/Dialog.svelte";
@@ -41,6 +42,7 @@
   } from "$lib/state/transcriptPanes.svelte";
   import { selectionFor, targetRecipients } from "$lib/state/recipientSelection.svelte";
   import { layout } from "$lib/layout.svelte";
+  import { navigatorState, toggleNavigator, openNavigator } from "$lib/state/transcriptJump.svelte";
   import DevIndicator from "$lib/components/ui/DevIndicator.svelte";
   import { installDevTranscriptSeed } from "$lib/dev/seedTranscript";
   import { windowDragRegion } from "$lib/windowDrag";
@@ -134,6 +136,25 @@
     // navigation/Escape); suppress every other window-level shortcut so a chord
     // typed into the palette doesn't also fire its global action.
     if (palette.open) return;
+
+    // ⌘F opens the transcript navigator (find a message). Handled before the
+    // editable-target guard so it works from the compose box too — there is no
+    // native find in the webview to preserve. Only in a project transcript.
+    if (
+      (event.metaKey || event.ctrlKey) &&
+      !event.shiftKey &&
+      !event.altKey &&
+      event.key.toLowerCase() === "f"
+    ) {
+      if (canOpenNavigator) {
+        event.preventDefault();
+        toggleNavigator();
+      }
+      return;
+    }
+    // The open navigator is a focus-trapped modal; suppress other window chords
+    // while it owns the keyboard, mirroring the palette above.
+    if (navigatorState.open) return;
 
     if (isEditableShortcutTarget(event.target) && !isComposerShortcutTarget(event.target)) return;
 
@@ -437,6 +458,19 @@
       rosterLoaded &&
       activeAgents.length > 0,
   );
+  // The navigator needs a project transcript with messages to navigate — the
+  // same condition as its header button being shown.
+  const canOpenNavigator = $derived(showPaneHeaderControls);
+
+  // The navigator's open flag is global (so ⌘F and the palette can drive it),
+  // but the component that can close it only mounts while a project transcript
+  // shows. Without this, switching to Git/settings/no-project unmounts the
+  // navigator with the flag still set — the modal vanishes but the "navigator
+  // owns the keyboard" guard keeps swallowing shortcuts, and returning to the
+  // project resurrects it. Close it at the owning (app) level instead.
+  $effect(() => {
+    if (!canOpenNavigator && navigatorState.open) navigatorState.open = false;
+  });
 
   // Compact-transcript header control. The action is a normalize, not a blind
   // invert: with manual per-unit overrides present it resets (enable compact +
@@ -762,6 +796,15 @@
 
     if (inProjects) {
       cmds.push({
+        id: "project.find-message",
+        title: "Find message…",
+        group: "Project",
+        shortcut: ["mod", "F"],
+        keywords: "navigate jump search transcript scroll",
+        disabled: !canOpenNavigator,
+        run: () => openNavigator(),
+      });
+      cmds.push({
         id: "project.next-ready",
         title: "Switch to next ready project",
         group: "Project",
@@ -1014,7 +1057,16 @@
                 </button>
               {/snippet}
             </Tooltip>
+            <TranscriptNavigator
+              projectId={selection.activeProjectId!}
+              agents={activeAgents}
+              overlay={activeConvo?.items ?? []}
+            />
           </div>
+          <!-- Hairline between the project-transcript controls (panes,
+               navigator, compact) and the app-level view switcher. A border,
+               not a bg fill — `border` is a line token (see token-ramp scan). -->
+          <div class="border-border h-4 shrink-0 border-l" aria-hidden="true"></div>
         {/if}
 
         <!-- Top-level view toggle: Projects | Git (⌘⇧G). Session-only; settings

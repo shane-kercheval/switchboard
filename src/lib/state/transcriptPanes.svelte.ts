@@ -62,9 +62,17 @@ function newPaneId(): PaneId {
   return crypto.randomUUID();
 }
 
+/// The un-touched default layout's pane id is a stable sentinel, NOT a random
+/// UUID: `layoutFor` builds the default fresh on every read until a mutation
+/// persists it, so a random id would differ between two reads of the same
+/// project — and cross-component consumers (the navigator's jump addressing)
+/// would resolve a pane id no mounted pane has. Uniqueness only matters within
+/// one project's layout, and cross-project keys already namespace by project.
+const DEFAULT_PANE_ID: PaneId = "pane-default";
+
 function defaultLayout(rosterIds: AgentId[]): PaneLayout {
   return {
-    panes: [{ id: newPaneId(), name: "Pane 1", members: [...rosterIds], hidden: [] }],
+    panes: [{ id: DEFAULT_PANE_ID, name: "Pane 1", members: [...rosterIds], hidden: [] }],
     fractions: [1],
     minimized: [],
     maximized: null,

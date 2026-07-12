@@ -29,6 +29,17 @@ import "prismjs/components/prism-sql";
 import "prismjs/components/prism-diff";
 import "prismjs/components/prism-markdown";
 
+/// A one-line plain-text preview of markdown source: the first non-empty line
+/// with the common inline syntax markers (`*_`#>`) stripped, so a collapsed
+/// preview reads as text rather than literal `**…**` / `> …`. Shared by every
+/// "first line of this message" preview (the transcript's thinking rows, the
+/// message navigator) so they can't drift apart. NOT used for the compaction
+/// marker, whose recap is shown verbatim by design.
+export function previewLine(text: string): string {
+  const line = text.split("\n").find((l) => l.trim() !== "") ?? "";
+  return line.replace(/[*_`#>]/g, "").trim();
+}
+
 /// Escape the five HTML-significant characters so raw text renders literally.
 /// Shared so the diff renderer's over-long-line path escapes identically — one
 /// sanitizer-adjacent helper, hardened in one place.

@@ -70,3 +70,30 @@ function pairHunks(pair: EditPair): DiffHunk[] {
     };
   });
 }
+
+/// Keep the first `maxLines` diff lines (across hunks) for the collapsed inline
+/// preview, returning the trimmed `FileDiff` and how many lines were hidden.
+/// A partially-kept hunk keeps its header but only its leading lines. Returns
+/// the diff unchanged (`hiddenLines: 0`) when it already fits — the caller then
+/// shows no fade and no "expand" affordance.
+export function truncateDiff(
+  diff: FileDiff,
+  maxLines: number,
+): { diff: FileDiff; hiddenLines: number } {
+  const total = diff.hunks.reduce((n, hunk) => n + hunk.lines.length, 0);
+  if (total <= maxLines) return { diff, hiddenLines: 0 };
+
+  const hunks: DiffHunk[] = [];
+  let remaining = maxLines;
+  for (const hunk of diff.hunks) {
+    if (remaining <= 0) break;
+    if (hunk.lines.length <= remaining) {
+      hunks.push(hunk);
+      remaining -= hunk.lines.length;
+    } else {
+      hunks.push({ ...hunk, lines: hunk.lines.slice(0, remaining) });
+      remaining = 0;
+    }
+  }
+  return { diff: { ...diff, hunks }, hiddenLines: total - maxLines };
+}

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { untrack } from "svelte";
+  import { tick, untrack } from "svelte";
   import type { AgentRecord, Attachment, ConversationItem, ProjectId } from "$lib/types";
   import { HEARTBEAT_TIMEOUT_MS } from "$lib/types";
   import { cn, formatDuration } from "$lib/utils";
@@ -54,6 +54,7 @@
   import StatusChip from "$lib/components/ui/StatusChip.svelte";
   import StopIcon from "$lib/components/ui/StopIcon.svelte";
   import ToolCallWidget from "$lib/components/ToolCallWidget.svelte";
+  import { consumeJump, jumpRequest } from "$lib/state/transcriptJump.svelte";
   import ThinkingWidget from "$lib/components/ThinkingWidget.svelte";
   import ErrorDetailsDialog from "$lib/components/ui/ErrorDetailsDialog.svelte";
   import Button from "$lib/components/ui/Button.svelte";
@@ -80,6 +81,7 @@
     loadError,
     onRetryLoad,
     showOnboarding = false,
+    paneId,
   }: {
     /// The active project. Compact-transcript state and per-unit overrides are
     /// read/written keyed by this id, so the component never reaches into the
@@ -101,6 +103,9 @@
     /// one pane holding the whole roster — so the block appears exactly once
     /// per blank project, never repeated in every split pane.
     showOnboarding?: boolean;
+    /// The hosting pane's id — the address navigator jump requests are sent to
+    /// (`transcriptJump.svelte.ts`). Absent → this instance ignores jumps.
+    paneId?: string;
   } = $props();
 
   /// Roster agents whose *own* history failed to load (the per-agent
@@ -856,6 +861,62 @@
     );
     io.observe(node);
     return () => io.disconnect();
+  });
+
+  /// Navigator jump: bring one block to the top of this pane's view
+  /// (`transcriptJump.svelte.ts` requests, addressed by pane). Execution lives
+  /// here because all three phases touch this component's private state:
+  /// (1) re-pin the window cursor so the target mounts — a *tail* window, so
+  /// everything from the target down mounts, paying its markdown parse. The
+  /// cursor only ever lowers (monotonic, floored at 0), so a jump costs
+  /// nothing once its target is already in the window, but each jump to
+  /// something OLDER than the current top grows the window again — the cost is
+  /// per-deeper-jump, not once per conversation. Accepted: the user explicitly
+  /// asked to go there;
+  /// (2) after the flush, align the target block's top with the container top;
+  /// (3) adopt that position as the new anchor reference exactly the way
+  /// `reanchor` ends a pass — unpinned, gap captured — so the anchoring
+  /// machinery defends the jumped-to position instead of snapping back.
+  /// A consumed request can't linger: without consumption, a later remount of
+  /// this pane (minimize/restore) would re-execute a stale jump.
+  /// Whether `block` renders the row `key` — the request addresses rows, not
+  /// blocks, because grouping is pane-dependent (a fan-out is one `f:` block in
+  /// a pane showing several recipients but plain rows in a single-recipient
+  /// pane; row keys are stable across both shapes).
+  function blockContainsRow(block: RenderBlock, key: string): boolean {
+    if (block.kind === "row") return block.row.key === key;
+    return (
+      block.user.key === key || block.columns.some((col) => col.rows.some((r) => r.key === key))
+    );
+  }
+
+  let lastHandledJumpSeq = 0;
+  $effect(() => {
+    const seq = jumpRequest.seq;
+    const key = jumpRequest.rowKey;
+    if (seq === lastHandledJumpSeq || key === null) return;
+    if (paneId === undefined || jumpRequest.paneId !== paneId) return;
+    if (jumpRequest.projectId !== projectId) return;
+    lastHandledJumpSeq = seq;
+    consumeJump(seq);
+    const index = untrack(() => blocks.findIndex((block) => blockContainsRow(block, key)));
+    if (index === -1) return; // stale key — the row was pruned since indexing
+    const targetKey = untrack(() => blockKey(blocks[index]!));
+    if (index < untrack(() => firstVisibleIndex)) {
+      cursor = index;
+      frozenIdentity = untrack(() => windowIdentity);
+    }
+    void tick().then(() => {
+      if (!container) return;
+      const el = container.querySelector(`[data-block-key="${CSS.escape(targetKey)}"]`);
+      if (!(el instanceof HTMLElement)) return;
+      const delta = el.getBoundingClientRect().top - container.getBoundingClientRect().top;
+      container.scrollTop += delta;
+      pinned = false;
+      lastScrollHeight = container.scrollHeight;
+      distanceFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
+      captureAnchor();
+    });
   });
 
   /// Top-edge fade for a capped live region, keyed by preview key: true once the
@@ -1846,7 +1907,10 @@
 
   <div bind:this={content} class="space-y-5">
     {#each visibleBlocks as block (block.kind === "fanout" ? block.key : block.row.key)}
-      <div data-testid="transcript-block">
+      <!-- data-block-key: the navigator jump's DOM handle — after the window
+           re-pins to mount an off-window target, the jump finds the block by
+           key to scroll it to the top. -->
+      <div data-testid="transcript-block" data-block-key={blockKey(block)}>
         {#if block.kind === "row"}
           {#if block.row.kind === "user"}
             {@render userMessage(block.row)}

@@ -1144,6 +1144,61 @@ When this milestone is done:
 - Visual verification (light + dark): popover anchoring at the right header edge, preview panel to
   the left, divider placement, long-list scrolling.
 
+### As-built decisions (recorded at implementation review)
+
+- **Jumps address row keys, not block keys.** Block grouping is pane-dependent (a fan-out is one
+  `f:` block in a pane showing several recipients but plain rows in a single-recipient pane); row
+  keys are stable across both shapes, so the executing transcript resolves the containing block
+  itself. An agent response inside a fan-out lands at its block's top — the send with the response
+  column right under it. This is a **separate v1 contract**, not implied by the list-granularity
+  choice: picking send + response as the navigator's retrieval unit doesn't by itself dictate the
+  scroll target, so landing a fan-out response on its send block is a deliberate v1 decision
+  (pinned by a browser test). Per-response scroll precision (a `subRowKey` + per-column anchors) is
+  deferred until the visual pass shows it's actually needed — no speculative plumbing.
+- **The jump is a consumed, pane-addressed store request** (`state/transcriptJump.svelte.ts`),
+  executed inside `UnifiedTranscript` because all three phases touch private state: window-cursor
+  re-pin → mount → scroll → adopt the position as the anchor reference exactly the way `reanchor`
+  ends a pass, so the anchoring machinery defends the jumped-to position. Consumption exists for
+  the reveal path: a minimized pane's freshly-mounted transcript picks the pending request up on
+  mount, and a consumed request can't replay on later remounts.
+- **Fixed a latent pane-identity bug found by the jump's browser test**: an untouched project's
+  default layout was rebuilt with a *random* pane UUID on every `layoutFor` read, so two readers
+  disagreed about the same pane's id. The default pane id is now a stable sentinel
+  (`"pane-default"`); uniqueness only matters within one project's layout.
+- **Accepted cost, recorded**: jumping far back mounts everything from the target to the tail (the
+  window is a tail window), paying the deferred markdown parse once — the user explicitly asked to
+  go there, and the cursor only grows, so it's one-time per conversation.
+- **Index entries carry no tool/thinking prose** (search is prose-only per the scoped rules), but
+  tool-only turns preview via the tool-row vocabulary (`Command · cargo test`) and thinking-only
+  turns via their first cleaned line. The index derives only while the popover is open, so a
+  closed navigator costs nothing per streamed chunk.
+- **Eye-hidden agents disable their entries** (tooltip names the agent) — same treatment as
+  unassigned: their rows render in no pane, so a jump would land on nothing.
+- The header divider is a `border-l` line, not a `bg-border` fill — the M2 token scan enforces
+  border-as-line, and caught the first attempt.
+
+Post-visual-review rework (the popover became a centered overlay):
+
+- **Form changed from a header popover to a centered, focus-trapped overlay** (engineer decision at
+  visual review — the 24rem popover squished the search next to the filter and gave no room to see
+  the list was scrollable). It now reuses the command-palette idiom: a `Dialog` over a dimmed,
+  `backdrop-blur-sm` transcript, list on the left, larger preview on the right. Dialog gained an
+  `overlayClass` prop for the blur. Search gets its own full-width row; the role filter, a new
+  **sort toggle**, and a message count share a second row.
+- **Newest-first by default** with a sort-direction toggle (the index is chronological; the
+  component reverses for descending). The common use is "jump to something recent," so the newest
+  message is at the top without a scroll — accepting that the list order is then opposite the
+  transcript's.
+- **Opened three ways via a shared `navigatorState` store**: the header button (moved to the right
+  of the compact toggle, left of the divider), **⌘F** (handled before the editable-target guard so
+  it works from the compose box — there's no native find to preserve; gated to a project
+  transcript), and a **"Find message…" command-palette entry**. The open navigator suppresses other
+  window chords while it owns the keyboard, mirroring the palette.
+- **Scroll affordance**: both the list and the preview fade at whichever edge has more content
+  (`scrollFade` action toggles `data-fade-*`, CSS masks the faded edge). Preview prose dropped to
+  `text-sm` with tightened block spacing.
+- **Disabled (unassigned/hidden-agent) entries use the app `Tooltip`**, not the native `title`.
+
 ---
 
 ## Cross-milestone summary

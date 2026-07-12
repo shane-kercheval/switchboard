@@ -121,6 +121,7 @@ afterEach(async () => {
   const { _testing } = await loadState();
   _testing.reset();
   previewState.reset();
+  (await import("$lib/state/transcriptJump.svelte"))._testing.reset();
 });
 
 describe("UnifiedTranscript", () => {
@@ -4297,6 +4298,86 @@ describe("UnifiedTranscript render windowing", () => {
     });
     await tick();
     expect(screen.queryByTestId("reveal-sentinel")).not.toBeNull();
+  });
+
+  // Navigator jump: an addressed request re-pins the window cursor so the
+  // target mounts. Scroll geometry is browser-tested (jsdom has no layout);
+  // these cover the addressing, mounting, and consumption contract.
+  it("a jump request re-pins the window to mount an off-window block, then is consumed", async () => {
+    const state = await loadState();
+    const jump = await import("$lib/state/transcriptJump.svelte");
+    await state.registerAgent(CLAUDE_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = agentTurns(CLAUDE_AGENT, OVER);
+
+    render(UnifiedTranscript, {
+      props: {
+        projectId: PROJECT_ID,
+        agents: [CLAUDE_AGENT],
+        loadStatus: "complete",
+        paneId: "pane-x",
+      },
+    });
+    await tick();
+    expect(screen.queryByText("msg 0-0")).toBeNull();
+
+    jump.requestJump(PROJECT_ID, "pane-x", `a:aturn-${CLAUDE_AGENT.id}-0-0`);
+    await tick();
+    await tick();
+
+    // The tail window grew (target..tail all mounted) rather than re-pinning
+    // to the tail, and the oldest message is in the DOM.
+    expect(screen.queryByText("msg 0-0")).not.toBeNull();
+    expect(blockCount()).toBe(OVER);
+    expect(jump.jumpRequest.rowKey).toBeNull(); // consumed
+  });
+
+  it("ignores a request addressed to a different pane, leaving it pending", async () => {
+    const state = await loadState();
+    const jump = await import("$lib/state/transcriptJump.svelte");
+    await state.registerAgent(CLAUDE_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = agentTurns(CLAUDE_AGENT, OVER);
+
+    render(UnifiedTranscript, {
+      props: {
+        projectId: PROJECT_ID,
+        agents: [CLAUDE_AGENT],
+        loadStatus: "complete",
+        paneId: "pane-x",
+      },
+    });
+    await tick();
+
+    jump.requestJump(PROJECT_ID, "pane-other", `a:aturn-${CLAUDE_AGENT.id}-0-0`);
+    await tick();
+    await tick();
+
+    expect(blockCount()).toBe(WINDOW);
+    // Pending for the addressed pane (which mounts on reveal), not consumed here.
+    expect(jump.jumpRequest.rowKey).toBe(`a:aturn-${CLAUDE_AGENT.id}-0-0`);
+  });
+
+  it("consumes a stale key without moving the window", async () => {
+    const state = await loadState();
+    const jump = await import("$lib/state/transcriptJump.svelte");
+    await state.registerAgent(CLAUDE_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = agentTurns(CLAUDE_AGENT, OVER);
+
+    render(UnifiedTranscript, {
+      props: {
+        projectId: PROJECT_ID,
+        agents: [CLAUDE_AGENT],
+        loadStatus: "complete",
+        paneId: "pane-x",
+      },
+    });
+    await tick();
+
+    jump.requestJump(PROJECT_ID, "pane-x", "a:no-such-turn");
+    await tick();
+    await tick();
+
+    expect(blockCount()).toBe(WINDOW);
+    expect(jump.jumpRequest.rowKey).toBeNull();
   });
 
   // Reaching the sentinel mounts the next older batch; repeating walks back to

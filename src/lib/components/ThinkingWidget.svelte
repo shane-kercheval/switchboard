@@ -9,6 +9,7 @@
   /// possibly-long reasoning) mounts only while open, same lazy contract as
   /// the tool row.
   import Markdown from "$lib/components/ui/Markdown.svelte";
+  import { previewLine } from "$lib/markdown";
   import { cn } from "$lib/utils";
   import { Brain } from "@lucide/svelte";
 
@@ -16,17 +17,10 @@
 
   // The first non-empty line, for the collapsed glimpse. Reasoning reaches us
   // as a whole block (no harness delta-streams it), so there is nothing to
-  // "watch build" — a one-line preview is all the closed state needs. Markdown
-  // emphasis/heading markers are stripped: the preview renders as plain text,
-  // where literal `**…**` is noise.
-  const preview = $derived(
-    (
-      text
-        .trim()
-        .split("\n")
-        .find((l) => l.trim() !== "") ?? ""
-    ).replace(/[*_`#]/g, ""),
-  );
+  // "watch build" — a one-line preview is all the closed state needs. Shares
+  // the one `previewLine` helper (markdown markers stripped) with the message
+  // navigator so the two can't drift apart.
+  const preview = $derived(previewLine(text));
 
   // Collapsed by default: reasoning is subordinate to the answer, so it stays
   // out of the way until the user opens it.

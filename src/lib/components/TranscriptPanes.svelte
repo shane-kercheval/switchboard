@@ -755,6 +755,7 @@
               {loadError}
               {onRetryLoad}
               showOnboarding={!paneChrome}
+              paneId={pane.id}
             />
           {/if}
           {#if multiPane && maximizedPane === null && cov !== "none"}

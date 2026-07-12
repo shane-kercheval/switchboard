@@ -441,6 +441,8 @@ describe("App", () => {
     recipients._testing.reset();
     const lay = await import("$lib/layout.svelte");
     lay._testing.reset();
+    const jump = await import("$lib/state/transcriptJump.svelte");
+    jump._testing.reset();
   });
 
   // --- harness availability banners (workspace empty → welcome) ---
@@ -2019,6 +2021,75 @@ describe("App", () => {
     const layout = panes.layoutFor("p-a", ["ag-1", "ag-2"]);
     expect(layout.panes).toHaveLength(2);
     expect(layout.panes[1]!.members).toEqual([]);
+  });
+
+  it("⌘F opens the transcript navigator, and the palette exposes it", async () => {
+    const jump = await import("$lib/state/transcriptJump.svelte");
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [agent({ id: "ag-1", project_id: "p-a", name: "alice" })],
+    });
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument());
+    await fireEvent.click(screen.getByText("alpha"));
+    await waitFor(() =>
+      expect(screen.getByTestId("transcript-navigator-toggle")).toBeInTheDocument(),
+    );
+
+    await fireEvent.keyDown(window, { key: "f", metaKey: true });
+    await waitFor(() => expect(jump.navigatorState.open).toBe(true));
+    // ⌘F toggles back closed.
+    await fireEvent.keyDown(window, { key: "f", metaKey: true });
+    await waitFor(() => expect(jump.navigatorState.open).toBe(false));
+
+    // The command palette lists "Find message…" and running it opens the navigator.
+    await fireEvent.keyDown(window, { key: "p", metaKey: true, shiftKey: true });
+    await waitFor(() => expect(screen.getByTestId("command-palette")).toBeInTheDocument());
+    await fireEvent.click(screen.getByTestId("command-option-project.find-message"));
+    expect(jump.navigatorState.open).toBe(true);
+  });
+
+  it("closes the navigator when its transcript context goes away (switching to Git)", async () => {
+    const jump = await import("$lib/state/transcriptJump.svelte");
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [agent({ id: "ag-1", project_id: "p-a", name: "alice" })],
+    });
+    backend.trackedRepos = [
+      {
+        repo: {
+          root: DIR_A,
+          name: "alpha-repo",
+          default_branch: "main",
+          available: true,
+          is_bare: false,
+          local_branches: [],
+          remote_branches: [],
+          detached_worktrees: [],
+        },
+        linked_projects: {},
+      } satisfies RepoListing,
+    ];
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument());
+    await fireEvent.click(screen.getByText("alpha"));
+    await waitFor(() =>
+      expect(screen.getByTestId("transcript-navigator-toggle")).toBeInTheDocument(),
+    );
+
+    await fireEvent.keyDown(window, { key: "f", metaKey: true });
+    await waitFor(() => expect(jump.navigatorState.open).toBe(true));
+
+    // Switch to the Git view by clicking the toggle (a pointer path — the
+    // keyboard is deliberately swallowed while the navigator owns it). The
+    // navigator's owning component unmounts; the global open flag must not
+    // survive it, or it would keep swallowing shortcuts and resurrect on return.
+    await fireEvent.click(screen.getByTestId("view-toggle-git"));
+    await waitFor(() => expect(jump.navigatorState.open).toBe(false));
   });
 
   it("narrows pane one to the compose-selected agents on the first split, leaving the rest unassigned", async () => {

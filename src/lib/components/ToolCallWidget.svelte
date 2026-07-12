@@ -19,14 +19,16 @@
   /// inline without expansion — watching the changes stream by is the point
   /// of the row — which is safe to do eagerly because edit content is capped
   /// at the facet level and off-window rows aren't mounted at all (transcript
-  /// render-windowing). Expansion on an edit row reveals only output and raw
-  /// input. Its detail line is suppressed in both states: the inline per-file
-  /// headers already carry the paths.
+  /// render-windowing). The inline diff is further capped to a preview length
+  /// (both while streaming and once settled — flipping full→capped when a turn
+  /// ends would be jarring); expanding the row un-caps it and reveals output +
+  /// raw input. Its detail line is suppressed in both states: the inline
+  /// per-file headers already carry the paths.
   import type { ToolCall } from "$lib/state/index.svelte";
   import DiffView from "$lib/components/DiffView.svelte";
   import Spinner from "$lib/components/ui/Spinner.svelte";
   import { languageForPath } from "$lib/diff";
-  import { synthesizeEditDiff } from "$lib/toolDiff";
+  import { synthesizeEditDiff, truncateDiff } from "$lib/toolDiff";
   import { formatToolInput, redactDisplay } from "$lib/toolInput";
   import { isGenericFacet, toolDetail, toolIcon, toolRowState, toolVerb } from "$lib/toolRow";
   import { cn } from "$lib/utils";
@@ -59,6 +61,11 @@
   /// uncapped by design (the raw input is the provenance escape hatch), so the
   /// display is where a multi-megabyte input must stop.
   const RAW_DISPLAY_CAP = 50_000;
+
+  /// Inline edit diffs preview at most this many lines (per file) until the row
+  /// is expanded — a large edit shouldn't dominate the transcript, but you can
+  /// still watch the first chunk stream in and expand for the rest.
+  const EDIT_DIFF_PREVIEW_LINES = 40;
 
   function cappedRawInput(input: unknown): { text: string; truncated: boolean } {
     const formatted = formatToolInput(input) ?? "";
@@ -190,18 +197,42 @@
                   : "Diff will appear when the turn completes."}
               </p>
             {:else}
-              <div class="border-border/60 max-h-80 overflow-y-auto rounded border">
-                <!-- Always unified: side-by-side needs a 48rem minimum width,
-                     which a transcript row can't guarantee (pane splits and
-                     fan-out columns shrink it). The Git view still honors the
-                     user's diff-style preference; this diff is snippet-scoped. -->
-                <DiffView
-                  diff={synthesizeEditDiff(file)}
-                  style="unified"
-                  language={languageForPath(file.path)}
-                  compact
-                />
+              {@const fullDiff = synthesizeEditDiff(file)}
+              {@const preview = truncateDiff(fullDiff, EDIT_DIFF_PREVIEW_LINES)}
+              {@const capped = !open && preview.hiddenLines > 0}
+              <!-- Cap the inline diff to a preview length in BOTH states
+                   (streaming and settled) — flipping a diff from full to capped
+                   the instant a turn finishes would be jarring. Expanding the
+                   row (chevron, or the hint below) shows the diff in FULL, at
+                   full height — never a shorter scroll box than the preview.
+                   Always unified: side-by-side needs a 48rem minimum the
+                   transcript row can't guarantee; the Git view honors the
+                   diff-style pref. -->
+              <div class="border-border/60 overflow-hidden rounded border">
+                <div
+                  class={cn(
+                    capped &&
+                      "[mask-image:linear-gradient(to_bottom,black_calc(100%_-_3rem),transparent)]",
+                  )}
+                >
+                  <DiffView
+                    diff={capped ? preview.diff : fullDiff}
+                    style="unified"
+                    language={languageForPath(file.path)}
+                    compact
+                  />
+                </div>
               </div>
+              {#if capped}
+                <button
+                  type="button"
+                  class="text-muted hover:text-fg text-[11px] transition-colors"
+                  data-testid="tool-edit-expand"
+                  onclick={() => (open = true)}
+                >
+                  Show {preview.hiddenLines} more {preview.hiddenLines === 1 ? "line" : "lines"}
+                </button>
+              {/if}
             {/if}
           </section>
         {/each}

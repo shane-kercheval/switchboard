@@ -356,6 +356,37 @@ describe("ToolCallWidget facet bodies", () => {
     expect(getByTestId("tool-body")).not.toHaveTextContent("(deleted)");
   });
 
+  it("caps a large edit diff to a preview and reveals the rest on expand", async () => {
+    // A 60-line insertion is past the 40-line inline preview cap.
+    const big = Array.from({ length: 60 }, (_, i) => `line ${i}`).join("\n") + "\n";
+    const facet: ToolFacet = {
+      facet_kind: "edit",
+      files: [
+        { path: "/repo/big.ts", change: "added", edits: [{ old: "", new: big }], truncated: false },
+      ],
+    };
+    const { getByTestId, queryByTestId, container } = render(ToolCallWidget, {
+      tool: withFacet(facet),
+    });
+
+    // Collapsed: capped preview shows a "Show N more lines" affordance and only
+    // the first 40 diff lines are rendered.
+    const expand = getByTestId("tool-edit-expand");
+    expect(expand).toHaveTextContent("Show 20 more lines");
+    expect(container.querySelectorAll('[data-origin="added"]')).toHaveLength(40);
+
+    // Expanding via the hint opens the row and renders the full diff.
+    await fireEvent.click(expand);
+    expect(queryByTestId("tool-edit-expand")).toBeNull();
+    expect(container.querySelectorAll('[data-origin="added"]')).toHaveLength(60);
+  });
+
+  it("does not cap an edit diff that fits under the preview limit", () => {
+    const { queryByTestId, container } = render(ToolCallWidget, { tool: withFacet(EDIT_FACET) });
+    expect(queryByTestId("tool-edit-expand")).toBeNull();
+    expect(container.querySelector('[data-origin="added"]')).not.toBeNull();
+  });
+
   it("reveals output and raw input on an edit row only when expanded", async () => {
     const { getByTestId, queryByTestId } = render(ToolCallWidget, {
       tool: withFacet(EDIT_FACET, { output: "edit applied" }),

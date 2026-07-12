@@ -38,10 +38,13 @@
     return v === "" ? "no-override" : v;
   }
 
-  const columnCount = $derived(
-    Math.max(1, options.length > 6 ? Math.ceil(options.length / 2) : options.length),
-  );
+  // Always one row: one equal-width column per option. Sets with more than
+  // five options (the only current case is Codex's eight effort levels, all
+  // short single-word labels) step down to a smaller font + tighter padding so
+  // they still fit on one line instead of wrapping to a second row.
+  const columnCount = $derived(Math.max(1, options.length));
   const gridStyle = $derived(`grid-template-columns: repeat(${columnCount}, minmax(0, 1fr));`);
+  const compact = $derived(options.length > 5);
 </script>
 
 <div
@@ -51,7 +54,13 @@
   data-testid={testid}
   data-value={value}
   style={styleAttr === undefined ? gridStyle : `${gridStyle} ${styleAttr}`}
-  class={cn(SEGMENTED_CONTAINER_CLASS, "grid w-full", disabled && "opacity-60", className)}
+  class={cn(
+    SEGMENTED_CONTAINER_CLASS,
+    "grid w-full",
+    compact && "gap-0.5",
+    disabled && "opacity-60",
+    className,
+  )}
   {...rest}
 >
   {#each options as option (option.value)}
@@ -66,6 +75,7 @@
       class={cn(
         SEGMENTED_ITEM_CLASS,
         "flex min-w-0 items-center justify-center truncate text-center",
+        compact && "px-1 text-[11px]",
         selected ? SEGMENTED_ITEM_ACTIVE_CLASS : SEGMENTED_ITEM_INACTIVE_CLASS,
         disabled && "cursor-not-allowed",
       )}

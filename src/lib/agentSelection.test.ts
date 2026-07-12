@@ -10,6 +10,7 @@ import {
   EFFORT_OPTIONS,
   MODEL_OPTIONS,
   defaultAgentName,
+  effortOptionsFor,
 } from "./agentSelection";
 import { canonicalizeForUniqueness, validateAgentName } from "./agentName";
 
@@ -47,6 +48,45 @@ describe("agentSelection capability tables stay consistent", () => {
   }
 });
 
+describe("effortOptionsFor", () => {
+  const values = (harness: Parameters<typeof effortOptionsFor>[0], model: string | undefined) =>
+    effortOptionsFor(harness, model).map((o) => o.value);
+
+  it("withholds max/ultra for pre-5.6 Codex models (they 400 on those levels)", () => {
+    const v = values("codex", "gpt-5.5");
+    expect(v).not.toContain("max");
+    expect(v).not.toContain("ultra");
+    // The lower levels are untouched.
+    expect(v).toEqual(["none", "minimal", "low", "medium", "high", "xhigh"]);
+  });
+
+  it("offers the full list for the GPT-5.6 family", () => {
+    for (const model of ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]) {
+      expect(values("codex", model)).toEqual(EFFORT_OPTIONS.codex.map((o) => o.value));
+    }
+  });
+
+  it("is permissive for an unknown/off-catalog or unset Codex model", () => {
+    // Unknown validity stays reactive rather than pre-filtered.
+    expect(values("codex", "gpt-9.9-experimental")).toEqual(
+      EFFORT_OPTIONS.codex.map((o) => o.value),
+    );
+    expect(values("codex", undefined)).toEqual(EFFORT_OPTIONS.codex.map((o) => o.value));
+  });
+
+  it("returns the harness list unchanged for non-Codex harnesses", () => {
+    expect(effortOptionsFor("claude_code", "opus")).toEqual(EFFORT_OPTIONS.claude_code);
+  });
+
+  it("keeps the Codex default effort valid for every curated Codex model (safe clamp target)", () => {
+    // The create form resets effort to DEFAULT_EFFORT when a model switch drops
+    // the current level — that fallback must be offered by every model.
+    for (const { value: model } of MODEL_OPTIONS.codex) {
+      expect(values("codex", model)).toContain(DEFAULT_EFFORT.codex);
+    }
+  });
+});
+
 describe("defaultAgentName", () => {
   it("derives model-effort for a fully-capable harness", () => {
     expect(defaultAgentName("claude_code", "opus", "high")).toBe("opus-high");
@@ -54,8 +94,9 @@ describe("defaultAgentName", () => {
   });
 
   it("hyphenates dots in the model id so the name is a valid slug", () => {
+    expect(defaultAgentName("codex", "gpt-5.6-terra", "medium")).toBe("gpt-5-6-terra-medium");
     expect(defaultAgentName("codex", "gpt-5.5", "medium")).toBe("gpt-5-5-medium");
-    expect(defaultAgentName("codex", "gpt-5.4-mini", "low")).toBe("gpt-5-4-mini-low");
+    expect(defaultAgentName("codex", "gpt-5.6-luna", "low")).toBe("gpt-5-6-luna-low");
   });
 
   it("uses just the model when the harness has no effort axis", () => {

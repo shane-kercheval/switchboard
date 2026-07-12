@@ -1277,15 +1277,16 @@ async fn live_codex_basic_turn_completes() {
 #[tokio::test]
 #[ignore = "requires codex installed — run with: make test-live"]
 async fn live_codex_model_and_effort_dispatch() {
-    // `-m <model>` is plan-gated (only the account's entitled model is
-    // accepted), so we pin the entitled `gpt-5.5` rather than switching models;
-    // the across-turns *effort* assertion lives elsewhere. Here we prove the flags
-    // are accepted end-to-end (dispatch completes, model surfaces in
-    // SessionMeta) — a rejected `-m`/`-c` would 400 and fail the turn.
+    // `-m <model>` is plan-gated (only the account's entitled models are
+    // accepted), so we pin `gpt-5.6-luna` — the cheapest current-generation
+    // model — rather than switching models; the across-turns *effort*
+    // assertion lives elsewhere. Here we prove the flags are accepted
+    // end-to-end (dispatch completes, model surfaces in SessionMeta) — a
+    // rejected `-m`/`-c` would 400 and fail the turn.
     let tmp = tempfile::TempDir::new().unwrap();
     let adapter = CodexAdapter::new();
     let mut agent = live_codex_agent();
-    agent.model = Some("gpt-5.5".to_owned());
+    agent.model = Some("gpt-5.6-luna".to_owned());
     agent.effort = Some("high".to_owned());
     let turn_id = Uuid::now_v7();
 
@@ -1317,8 +1318,8 @@ async fn live_codex_model_and_effort_dispatch() {
     );
     let model = session_meta_model(&events).expect("Codex emits SessionMeta with model on turn 1");
     assert!(
-        model.contains("gpt-5"),
-        "selected `-m gpt-5.5` must surface in SessionMeta.model; got {model:?}"
+        model.contains("luna"),
+        "selected `-m gpt-5.6-luna` must surface in SessionMeta.model; got {model:?}"
     );
 }
 
@@ -2174,7 +2175,8 @@ async fn live_claude_model_and_effort_change_across_turns() {
 #[tokio::test]
 #[ignore = "requires codex installed — run with: make test-live"]
 async fn live_codex_model_and_effort_change_across_turns() {
-    // Codex model is plan-gated to `gpt-5.5`, so we vary *effort* `medium`→`high`
+    // Codex models are plan-gated, so we pin the cheapest current-generation
+    // model (`gpt-5.6-luna`) and vary *effort* `medium`→`high`
     // (the readback field is `turn_context.effort`). Asserts the per-turn effort
     // switch on the emitted `TurnEnd` AND on a real-file hydration.
     let cwd = tempfile::TempDir::new().unwrap();
@@ -2182,7 +2184,7 @@ async fn live_codex_model_and_effort_change_across_turns() {
     let agent_id = Uuid::now_v7();
     let mut agent = live_codex_agent();
     agent.id = agent_id;
-    agent.model = Some("gpt-5.5".to_owned());
+    agent.model = Some("gpt-5.6-luna".to_owned());
     agent.effort = Some("medium".to_owned());
 
     let events1: Vec<AdapterEvent> = adapter

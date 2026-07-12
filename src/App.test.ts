@@ -638,7 +638,7 @@ describe("App", () => {
     await waitFor(() => expect(createAgentCalls()).toHaveLength(3));
     expect(createAgentCalls()).toEqual([
       { name: "opus-high", harness: "claude_code" },
-      { name: "gpt-5-5-medium", harness: "codex" },
+      { name: "gpt-5-6-terra-medium", harness: "codex" },
       { name: "antigravity", harness: "antigravity" },
     ]);
     // Auto-seeded → the roster is populated, not the empty first-agent prompt.
@@ -652,7 +652,7 @@ describe("App", () => {
       .map(([, a]) => a as { name: string; harness: string; model?: string; effort?: string });
     expect(seededArgs).toEqual([
       { name: "opus-high", harness: "claude_code", model: "opus", effort: "high" },
-      { name: "gpt-5-5-medium", harness: "codex", model: "gpt-5.5", effort: "medium" },
+      { name: "gpt-5-6-terra-medium", harness: "codex", model: "gpt-5.6-terra", effort: "medium" },
       { name: "antigravity", harness: "antigravity", model: undefined, effort: undefined },
     ]);
   });
@@ -679,7 +679,7 @@ describe("App", () => {
     await waitFor(() => expect(createAgentCalls()).toHaveLength(2));
     expect(createAgentCalls()).toEqual([
       { name: "opus-high", harness: "claude_code" },
-      { name: "gpt-5-5-medium", harness: "codex" },
+      { name: "gpt-5-6-terra-medium", harness: "codex" },
     ]);
   });
 

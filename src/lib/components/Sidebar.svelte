@@ -35,8 +35,9 @@
   import {
     DEFAULT_EFFORT,
     DEFAULT_MODEL,
-    EFFORT_OPTIONS,
     MODEL_OPTIONS,
+    MODEL_PRESENTATION,
+    effortOptionsFor,
     type SelectionOption,
   } from "$lib/agentSelection";
   import {
@@ -172,9 +173,33 @@
       : withCurrentOption(
           editing.axis === "model"
             ? MODEL_OPTIONS[editingAgent.harness]
-            : EFFORT_OPTIONS[editingAgent.harness],
+            : effortOptionsFor(editingAgent.harness, editingAgent.model ?? undefined),
           editing.axis === "model" ? editingAgent.model : editingAgent.effort,
         ),
+  );
+
+  /// True when the model dialog must show a persisted model that isn't in the
+  /// curated list (an attached session, or a since-removed id). Its label is
+  /// vendor-shaped and unbounded, so a segmented pill would truncate it — drop
+  /// to a dropdown for that case (only the model axis; effort values are always
+  /// short enum tokens).
+  const editModelOffCatalog = $derived(
+    editing?.axis === "model" &&
+      editingAgent !== null &&
+      editingAgent.model != null &&
+      editingAgent.model !== "" &&
+      !MODEL_OPTIONS[editingAgent.harness].some((o) => o.value === editingAgent.model),
+  );
+
+  /// Presentation for the change dialog: effort is always segmented; the model
+  /// axis follows the shared `MODEL_PRESENTATION` map (dropdown for Gemini),
+  /// falling back to a dropdown when an off-catalog value is injected.
+  const editPresentation = $derived<"segmented" | "dropdown">(
+    editing?.axis === "model" &&
+      editingAgent !== null &&
+      (MODEL_PRESENTATION[editingAgent.harness] === "dropdown" || editModelOffCatalog)
+      ? "dropdown"
+      : "segmented",
   );
 
   function canChangeModel(agent: AgentRecord): boolean {
@@ -1589,7 +1614,7 @@
   open={editing !== null}
   onClose={closeChange}
   title={editing?.axis === "effort" ? "Change effort" : "Change model"}
-  contentClass="max-w-sm"
+  contentClass="max-w-lg"
   dismissible={!editBusy}
 >
   <div class="space-y-3" data-testid="change-selection-panel">
@@ -1603,7 +1628,7 @@
         disabled={editBusy}
         testid="change-select"
         ariaLabel={editing?.axis === "effort" ? "Reasoning effort" : "Model"}
-        presentation={editing?.axis === "effort" ? "segmented" : "auto"}
+        presentation={editPresentation}
       />
     </label>
     <p class="text-muted text-xs leading-relaxed">Takes effect on the next message.</p>

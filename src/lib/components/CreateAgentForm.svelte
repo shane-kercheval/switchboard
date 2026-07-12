@@ -11,9 +11,10 @@
   import {
     DEFAULT_EFFORT,
     DEFAULT_MODEL,
-    EFFORT_OPTIONS,
     MODEL_OPTIONS,
+    MODEL_PRESENTATION,
     defaultAgentName,
+    effortOptionsFor,
     type SelectionOption,
   } from "$lib/agentSelection";
   import { normalizeAgentName, validateAgentName } from "$lib/agentName";
@@ -105,7 +106,22 @@
   const modelSupported = $derived(SUPPORTS_MODEL_SELECTION[harness]);
   const effortSupported = $derived(SUPPORTS_EFFORT_SELECTION[harness]);
   const modelOptions = $derived<SelectionOption[]>(MODEL_OPTIONS[harness]);
-  const effortOptions = $derived<SelectionOption[]>(EFFORT_OPTIONS[harness]);
+  /// Effort options are model-scoped (Codex withholds `max`/`ultra` on pre-5.6
+  /// models). `selectModel` keeps `effort` inside this set when the model
+  /// changes; this derived is the display/submit source of truth.
+  const effortOptions = $derived<SelectionOption[]>(effortOptionsFor(harness, model));
+
+  /// Change the model and, if the previous effort isn't valid for the new model
+  /// (Codex `max`/`ultra` → a pre-5.6 model), reset effort to the harness
+  /// default (always a supported level). Kept as an explicit setter — adjacent
+  /// to the trigger, like `selectHarness` — rather than an `$effect`, so there's
+  /// no hidden reactive dependency writing `effort`.
+  function selectModel(next: string): void {
+    model = next;
+    if (effort !== UNSET && !effortOptionsFor(harness, next).some((o) => o.value === effort)) {
+      effort = defaultEffortFor(harness);
+    }
+  }
 
   /// Per-harness gate, looked up by kind (no per-harness branches). Missing
   /// availability defaults to "available". Two predicates from
@@ -338,11 +354,12 @@
       <label class="block space-y-1">
         <span class="text-muted text-xs">Model</span>
         <SelectionPicker
-          bind:value={model}
+          bind:value={() => model, selectModel}
           options={modelOptions}
           disabled={busy}
           testid="model-select"
           ariaLabel="Model"
+          presentation={MODEL_PRESENTATION[harness]}
         />
       </label>
     {:else}
@@ -363,7 +380,6 @@
           disabled={busy}
           testid="effort-select"
           ariaLabel="Reasoning effort"
-          presentation="segmented"
         />
         {#if harness === "claude_code"}
           <span class="text-muted block text-xs">
@@ -471,7 +487,7 @@
 {:else}
   <!-- Standalone: page-fill centered card + heading. -->
   <div class="flex h-full flex-col items-center justify-center gap-6 p-8">
-    <div class="border-border bg-raised w-full max-w-md space-y-4 rounded-md border p-5">
+    <div class="border-border bg-raised w-full max-w-lg space-y-4 rounded-md border p-5">
       <div class="space-y-1">
         <h2 class="text-fg text-lg font-semibold">Create an agent</h2>
         <p class="text-muted text-sm">Agents live inside the active project.</p>

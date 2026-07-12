@@ -20,7 +20,7 @@ describe("SegmentedSelect", () => {
     expect(screen.getByTestId("sel-option-sonnet")).toHaveAttribute("aria-checked", "false");
   });
 
-  it("splits long option sets into two balanced rows", () => {
+  it("keeps every option on a single row (one column each)", () => {
     render(SegmentedSelect, {
       props: {
         options: Array.from({ length: 8 }, (_, i) => ({
@@ -33,8 +33,29 @@ describe("SegmentedSelect", () => {
       },
     });
     expect(screen.getByTestId("sel")).toHaveStyle({
-      gridTemplateColumns: "repeat(4, minmax(0, 1fr))",
+      gridTemplateColumns: "repeat(8, minmax(0, 1fr))",
     });
+  });
+
+  it("shrinks segment text past five options so they still fit one row", () => {
+    const five = Array.from({ length: 5 }, (_, i) => ({
+      label: `Option ${i + 1}`,
+      value: `o${i + 1}`,
+    }));
+    const { rerender } = render(SegmentedSelect, {
+      props: { options: five, value: "o1", testid: "sel", ariaLabel: "Model" },
+    });
+    // Five or fewer keeps the default segment typography.
+    expect(screen.getByTestId("sel-option-o1")).not.toHaveClass("text-[11px]");
+
+    rerender({
+      options: [...five, { label: "Option 6", value: "o6" }],
+      value: "o1",
+      testid: "sel",
+      ariaLabel: "Model",
+    });
+    // Six or more steps down to the compact size.
+    expect(screen.getByTestId("sel-option-o1")).toHaveClass("text-[11px]");
   });
 
   it("reflects a click change to the selected value", async () => {

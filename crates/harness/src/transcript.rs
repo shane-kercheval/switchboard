@@ -151,6 +151,26 @@ pub enum Turn {
         /// moves until the turn ends. Do not collapse them.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         hydration_key: Option<String>,
+        /// The `hydration_key` of the turn this one **continues across a
+        /// compaction boundary** — set on the post-compaction fragment when the
+        /// parser splits one dispatch at a compaction marker (Claude; `None`
+        /// everywhere else). Live, the whole dispatch streams as ONE turn keyed
+        /// by the *first* fragment's key, so on a same-session re-read the
+        /// continuation matches no resident by key; this link lets the hydrate
+        /// merge recognize it as content the resident already carries (and drop
+        /// it) instead of rendering it as a duplicate turn. On a fresh load (no
+        /// resident) it is inert — the split renders as designed.
+        ///
+        /// **Assumed, not checked:** the collapse trusts that a live
+        /// compaction-spanning dispatch streams as ONE turn whose identity is
+        /// the *first* fragment's id (`TurnEnd.first_message_id` is keep-first;
+        /// the multi-cycle fold keeps one terminal). A Claude drift toward
+        /// per-compaction stream terminals would break that — and would first
+        /// fail the background-agent fold suite and
+        /// `live_claude_background_agent_completes_as_one_turn` loudly, long
+        /// before this collapse misfired. See gap G28 in harness-behavior.md.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        continuation_of: Option<String>,
         /// The final assistant message's Anthropic `message.id` (Claude only) —
         /// the join key the overlay uses to look up this turn's persisted
         /// cost/overage. Internal plumbing: set by the session-file parser,
@@ -404,6 +424,7 @@ mod tests {
             model: None,
             effort: None,
             hydration_key: Some("msg_anchor01".to_owned()),
+            continuation_of: None,
             stable_message_id: None,
         };
         let value = serde_json::to_value(&turn).unwrap();

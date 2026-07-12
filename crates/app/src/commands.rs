@@ -3859,6 +3859,12 @@ pub enum ConversationItem {
         /// already-loaded copy. `None` for keyless harnesses (Antigravity).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         hydration_key: Option<String>,
+        /// The pre-compaction fragment this turn continues (see
+        /// [`switchboard_harness::Turn`]), carried through so the frontend
+        /// merge can collapse a compaction continuation into a live resident
+        /// instead of rendering it as a duplicate turn.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        continuation_of: Option<String>,
     },
     /// A non-completed-turn marker (failed or cancelled), sourced from the
     /// journal. Carries no agent content; `reason` is a best-effort
@@ -4540,6 +4546,7 @@ fn merge_project_conversation(
                         effort,
                         spend,
                         hydration_key,
+                        continuation_of,
                         ..
                     },
                     TurnRender::Agent(send_id),
@@ -4557,6 +4564,7 @@ fn merge_project_conversation(
                         effort,
                         spend,
                         hydration_key,
+                        continuation_of,
                     });
                 }
                 (
@@ -8723,6 +8731,7 @@ mod tests {
             model: None,
             effort: None,
             hydration_key: None,
+            continuation_of: None,
             stable_message_id: None,
         }
     }
@@ -8864,6 +8873,7 @@ mod tests {
             model: None,
             effort: None,
             hydration_key: None,
+            continuation_of: None,
             stable_message_id: message_id.map(str::to_owned),
         }
     }
@@ -12415,6 +12425,7 @@ mod tests {
             model: None,
             effort: None,
             hydration_key: None,
+            continuation_of: None,
             stable_message_id: None,
         }
     }
@@ -12449,6 +12460,7 @@ mod tests {
             model,
             effort,
             hydration_key: Some(key.to_owned()),
+            continuation_of: None,
             stable_message_id,
         }
     }
@@ -13993,6 +14005,7 @@ mod tests {
                 model,
                 effort,
                 hydration_key,
+                continuation_of,
                 stable_message_id,
                 ..
             } => Turn::Agent {
@@ -14007,6 +14020,7 @@ mod tests {
                 model,
                 effort,
                 hydration_key,
+                continuation_of,
                 stable_message_id,
             },
             _ => unreachable!(),
@@ -14739,6 +14753,7 @@ mod tests {
                 model,
                 effort,
                 hydration_key,
+                continuation_of,
                 stable_message_id,
                 ..
             } => Turn::Agent {
@@ -14753,6 +14768,7 @@ mod tests {
                 model,
                 effort,
                 hydration_key,
+                continuation_of,
                 stable_message_id,
             },
             other => other,
@@ -15316,6 +15332,7 @@ mod tests {
             model: None,
             effort: None,
             hydration_key: None,
+            continuation_of: None,
             stable_message_id: None,
         };
         let journal = vec![

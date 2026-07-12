@@ -168,19 +168,24 @@ const HOUSEKEEPING_PREFIXES: [&str; 6] = [
 const TASK_NOTIFICATION_PREFIX: &str = "<task-notification>";
 
 /// True when a `user` *string* record is Claude housekeeping (a slash-command
-/// wrapper, a task notification, or a meta marker) rather than a real prompt.
-/// **Checked before [`classify_prompt_source`]** because some housekeeping
-/// records carry `promptSource: "sdk"`; mapping first would let them masquerade
-/// as a dispatched send and consume a journal slot.
+/// wrapper, a task notification, or a compaction summary) rather than a real
+/// prompt. **Checked before [`classify_prompt_source`]** because some
+/// housekeeping records carry `promptSource: "sdk"`; mapping first would let
+/// them masquerade as a dispatched send and consume a journal slot.
+///
+/// `isMeta` records are deliberately **not** matched here: they are mid-turn
+/// continuations intercepted earlier by [`is_meta_continuation`], and a
+/// disjunct for them in this predicate would falsely advertise a boundary
+/// rule this module no longer applies.
 ///
 /// Compaction summaries (`isCompactSummary`) are diverted to a `Turn::System`
 /// marker by `handle_user` *before* this predicate is consulted, so the
-/// `isCompactSummary` arm below is defensive — it keeps the "not a prompt"
-/// guarantee if that diversion is ever bypassed.
+/// `isCompactSummary` arm below is defensive there — but it stays load-bearing
+/// through [`is_task_notification_housekeeping`], which relies on it to keep
+/// notification precedence for a hypothetical combined record (see that
+/// function's disjointness note).
 fn is_user_housekeeping(record: &Value, text: &str) -> bool {
-    if record.get("isCompactSummary").and_then(Value::as_bool) == Some(true)
-        || record.get("isMeta").and_then(Value::as_bool) == Some(true)
-    {
+    if record.get("isCompactSummary").and_then(Value::as_bool) == Some(true) {
         return true;
     }
     let prompt_source = record.get("promptSource").and_then(Value::as_str);
@@ -227,6 +232,35 @@ fn is_user_housekeeping(record: &Value, text: &str) -> bool {
 /// win and no compaction marker would be emitted.
 fn is_task_notification_housekeeping(record: &Value, text: &str) -> bool {
     is_user_housekeeping(record, text) && text.trim_start().starts_with(TASK_NOTIFICATION_PREFIX)
+}
+
+/// True when a `user` string record is an `isMeta` metadata row — a
+/// mid-turn **continuation**, not a turn boundary. Claude Code writes these
+/// *inside* a running dispatch: the observed shape is the `[Image: original
+/// WxH…]` description row it appends right after a `tool_result` whose content
+/// is an image (any tool that reads a screenshot), landing between two
+/// assistant records of the same turn. Treating it as a boundary splits one
+/// dispatched turn into several disk turns, each minting its own
+/// `hydration_key` — the live turn only ever carries the *first* fragment's
+/// key, so on a re-read every later fragment fails the hydrate merge's
+/// key-dedup and lands as a duplicate turn (and as fragmentation on reopen).
+/// Same continuation semantics as the `<task-notification>` record, for the
+/// same reason: the process keeps responding after it.
+///
+/// A compaction summary also carries meta-ish flags but **is** a genuine
+/// boundary (the turn's context was rebuilt; the continuation deliberately
+/// gets a distinct key), so `isCompactSummary` is excluded and keeps flowing
+/// to the boundary + `SystemMarker::Compaction` path in `handle_user`.
+///
+/// **Load-bearing invariant:** a genuinely dispatched prompt
+/// (`promptSource` sdk/typed/queued) never carries `isMeta` — if a future
+/// CLI stamped it on a real prompt, that prompt would be silently dropped
+/// here and the following turn would merge backward into the previous one.
+/// Guarded live by `live_claude_dispatched_prompt_never_carries_is_meta`,
+/// mirroring the `promptSource:"sdk"` drift guard.
+fn is_meta_continuation(record: &Value) -> bool {
+    record.get("isMeta").and_then(Value::as_bool) == Some(true)
+        && record.get("isCompactSummary").and_then(Value::as_bool) != Some(true)
 }
 
 /// Classify a real (non-housekeeping) `user` prompt by Claude's `promptSource`.
@@ -356,6 +390,12 @@ struct AgentTurnBuilder {
     /// `Complete`. Only consulted for the EOF tail turn — a turn closed by a
     /// following user prompt is definitively `Complete`. See `eof_tail_status`.
     last_stop_reason: Option<String>,
+    /// The `hydration_key` of the pre-compaction fragment this turn continues,
+    /// when this turn opened directly across a compaction boundary (see
+    /// [`ReconstructionState::compaction_continuation_key`]). Stamped onto
+    /// `Turn::Agent.continuation_of` so the frontend hydrate merge can collapse
+    /// the continuation into a live resident that already carries its content.
+    continuation_of: Option<String>,
 }
 
 struct DeferredToolResult {
@@ -421,6 +461,41 @@ impl ReconstructionState {
         }
     }
 
+    /// The `hydration_key` a turn opening **now** would be continuing across a
+    /// compaction boundary, or `None` when the turn is a genuine fresh dispatch.
+    ///
+    /// Pure structural read of the reconstructed tail at turn-open time (no
+    /// cross-record state to clear): walk back over trailing `Turn::System`
+    /// markers — the auto-compact shape leaves `[…, fragment, SlashCommand
+    /// ("/compact"), Compaction]` on the tail — and if a Compaction marker was
+    /// among them and the first non-marker turn behind it is a keyed agent
+    /// turn, the new turn is that fragment's continuation. A real user prompt
+    /// in between (the manual TUI `/compact`-then-new-prompt case) is hit
+    /// first in the walk and breaks the link — a post-compaction *dispatch* is
+    /// a new turn, not a continuation. A summary at file start (session
+    /// continued from a previous conversation) finds no agent turn → `None`.
+    fn compaction_continuation_key(&self) -> Option<String> {
+        let mut saw_compaction = false;
+        for turn in self.turns.iter().rev() {
+            match turn {
+                Turn::System {
+                    marker: SystemMarker::Compaction { .. },
+                    ..
+                } => saw_compaction = true,
+                Turn::System { .. } => {}
+                Turn::Agent { hydration_key, .. } => {
+                    return if saw_compaction {
+                        hydration_key.clone()
+                    } else {
+                        None
+                    };
+                }
+                Turn::User { .. } => return None,
+            }
+        }
+        None
+    }
+
     fn handle_user(&mut self, line_number: usize, record: &Value) {
         let message = record.get("message");
         let content = message.and_then(|m| m.get("content"));
@@ -434,6 +509,16 @@ impl ReconstructionState {
                 // Still counted as housekeeping so the finalize warning stays
                 // meaningful.
                 if is_task_notification_housekeeping(record, text) {
+                    self.housekeeping_skipped += 1;
+                    return;
+                }
+                // An `isMeta` metadata row (e.g. the `[Image: …]` description
+                // written after an image-bearing tool_result) is likewise a
+                // mid-turn continuation: no close, no deferred flush — the
+                // open turn's pending tool_results are still live. See
+                // `is_meta_continuation` for why a boundary here would split
+                // the turn and duplicate it on re-read.
+                if is_meta_continuation(record) {
                     self.housekeeping_skipped += 1;
                     return;
                 }
@@ -533,6 +618,13 @@ impl ReconstructionState {
         }
 
         let timestamp = parse_timestamp(record).unwrap_or_else(Utc::now);
+        // Resolved only when this record OPENS a turn — an already-open builder
+        // keeps the link it was created with.
+        let continuation_of = if self.current_agent.is_none() {
+            self.compaction_continuation_key()
+        } else {
+            None
+        };
         let builder = self.current_agent.get_or_insert_with(|| AgentTurnBuilder {
             turn_id: Uuid::now_v7(),
             agent_id: self.agent_id,
@@ -544,6 +636,7 @@ impl ReconstructionState {
             first_message_id: None,
             last_model: None,
             last_stop_reason: None,
+            continuation_of,
         });
         builder.last_seen_at = timestamp;
 
@@ -749,6 +842,7 @@ impl ReconstructionState {
             // `message.id` — the cost-join key (cost lives on the final record).
             // Both round-trip identically to the live `TurnEnd`.
             hydration_key: builder.first_message_id,
+            continuation_of: builder.continuation_of,
             stable_message_id: builder.last_message_id,
         });
     }
@@ -1419,6 +1513,126 @@ mod tests {
             keys,
             vec![Some("msg_pre".to_owned()), Some("msg_cont".to_owned())],
             "pre-compaction and continuation turns must carry distinct hydration keys"
+        );
+    }
+
+    /// Per-agent-turn `(hydration_key, continuation_of)` pairs, in order.
+    fn key_links(turns: &[Turn]) -> Vec<(Option<String>, Option<String>)> {
+        turns
+            .iter()
+            .filter_map(|t| match t {
+                Turn::Agent {
+                    hydration_key,
+                    continuation_of,
+                    ..
+                } => Some((hydration_key.clone(), continuation_of.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn compaction_continuation_links_to_pre_compact_fragment() {
+        // Full auto-compact shape (traced from the real session): the bare
+        // `/compact` bookkeeping record lands between the fragment and the
+        // summary, so a SlashCommand marker sits on the tail — the link walk
+        // must skip it, not break on it. The continuation must name the
+        // pre-compact fragment's key so the hydrate merge can collapse it
+        // into a live resident spanning the compaction.
+        let turns = load_turns(&[
+            user_record_with_source("go", "sdk", "2026-05-14T04:43:15Z"),
+            assistant_with_stop(
+                "msg_pre",
+                &json!([{ "type": "text", "text": "pre" }]),
+                Some("end_turn"),
+                "2026-05-14T04:43:16Z",
+            ),
+            user_record("/compact", "2026-05-14T04:43:17Z"),
+            json!({"type":"user","message":{"role":"user","content":"This session is being continued…"},"isCompactSummary":true,"timestamp":"2026-05-14T04:43:18Z"}),
+            assistant_with_stop(
+                "msg_cont",
+                &json!([{ "type": "text", "text": "cont" }]),
+                Some("end_turn"),
+                "2026-05-14T04:43:19Z",
+            ),
+        ]);
+        assert_eq!(
+            key_links(&turns),
+            vec![
+                (Some("msg_pre".to_owned()), None),
+                (Some("msg_cont".to_owned()), Some("msg_pre".to_owned())),
+            ],
+        );
+    }
+
+    #[test]
+    fn prompt_after_compaction_breaks_the_continuation_link() {
+        // Manual TUI `/compact` followed by a NEW dispatch: the post-compaction
+        // turn answers a real prompt — a genuine new turn, never a
+        // continuation. The prompt record between the marker and the turn
+        // breaks the walk.
+        let turns = load_turns(&[
+            user_record_with_source("go", "sdk", "2026-05-14T04:43:15Z"),
+            assistant_with_stop(
+                "msg_a",
+                &json!([{ "type": "text", "text": "a" }]),
+                Some("end_turn"),
+                "2026-05-14T04:43:16Z",
+            ),
+            user_record("/compact", "2026-05-14T04:43:17Z"),
+            json!({"type":"user","message":{"role":"user","content":"This session is being continued…"},"isCompactSummary":true,"timestamp":"2026-05-14T04:43:18Z"}),
+            user_record_with_source("next task", "sdk", "2026-05-14T04:43:19Z"),
+            assistant_with_stop(
+                "msg_b",
+                &json!([{ "type": "text", "text": "b" }]),
+                Some("end_turn"),
+                "2026-05-14T04:43:20Z",
+            ),
+        ]);
+        assert_eq!(
+            key_links(&turns),
+            vec![
+                (Some("msg_a".to_owned()), None),
+                (Some("msg_b".to_owned()), None),
+            ],
+        );
+    }
+
+    #[test]
+    fn double_compaction_chains_continuation_links() {
+        // Two auto-compactions inside one dispatch: each fragment links to its
+        // immediate predecessor, so the hydrate merge can collapse the whole
+        // chain transitively.
+        let turns = load_turns(&[
+            user_record_with_source("go", "sdk", "2026-05-14T04:43:15Z"),
+            assistant_with_stop(
+                "msg_a",
+                &json!([{ "type": "text", "text": "a" }]),
+                Some("end_turn"),
+                "2026-05-14T04:43:16Z",
+            ),
+            json!({"type":"user","message":{"role":"user","content":"continued…"},"isCompactSummary":true,"timestamp":"2026-05-14T04:43:17Z"}),
+            assistant_with_stop(
+                "msg_b",
+                &json!([{ "type": "text", "text": "b" }]),
+                Some("end_turn"),
+                "2026-05-14T04:43:18Z",
+            ),
+            json!({"type":"user","message":{"role":"user","content":"continued again…"},"isCompactSummary":true,"timestamp":"2026-05-14T04:43:19Z"}),
+            assistant_with_stop(
+                "msg_c",
+                &json!([{ "type": "text", "text": "c" }]),
+                Some("end_turn"),
+                "2026-05-14T04:43:20Z",
+            ),
+        ]);
+        assert_eq!(
+            key_links(&turns),
+            vec![
+                (Some("msg_a".to_owned()), None),
+                (Some("msg_b".to_owned()), Some("msg_a".to_owned())),
+                (Some("msg_c".to_owned()), Some("msg_b".to_owned())),
+            ],
         );
     }
 
@@ -2736,6 +2950,21 @@ mod tests {
         record
     }
 
+    /// The `isMeta` image-description row Claude writes right after a
+    /// `tool_result` whose content is an image (shape traced from a real
+    /// session file).
+    fn image_meta_record(ts: &str) -> Value {
+        json!({
+            "type": "user",
+            "isMeta": true,
+            "message": {
+                "role": "user",
+                "content": "[Image: original 2722x1824, displayed at 2000x1340. Multiply coordinates by 1.36 to map to original.]",
+            },
+            "timestamp": ts,
+        })
+    }
+
     fn turn_roles(turns: &[Turn]) -> Vec<&'static str> {
         turns
             .iter()
@@ -2926,11 +3155,130 @@ mod tests {
     }
 
     #[test]
+    fn image_meta_row_does_not_split_the_turn() {
+        // Ground truth (traced from a real duplication incident): reading a
+        // screenshot mid-turn makes Claude write an `isMeta` "[Image: …]" user
+        // row right after the tool_result. It must be a continuation: one
+        // dispatched turn stays ONE disk turn with ONE `hydration_key` (the
+        // first assistant message id — the same key the live turn carries), so
+        // a refresh re-read collapses into the resident instead of prepending
+        // the post-image fragments as duplicate turns.
+        let result = hydrate_records(&[
+            user_record_with_source("look at these screenshots", "sdk", "2026-05-14T04:43:15Z"),
+            assistant_with_stop(
+                "msg_1",
+                &tool_use_block("tool_1"),
+                Some("tool_use"),
+                "2026-05-14T04:43:16Z",
+            ),
+            tool_result_record("tool_1", "2026-05-14T04:43:17Z"),
+            image_meta_record("2026-05-14T04:43:17Z"),
+            assistant_with_stop(
+                "msg_2",
+                &tool_use_block("tool_2"),
+                Some("tool_use"),
+                "2026-05-14T04:43:18Z",
+            ),
+            tool_result_record("tool_2", "2026-05-14T04:43:19Z"),
+            image_meta_record("2026-05-14T04:43:19Z"),
+            assistant_with_stop(
+                "msg_3",
+                &json!([{ "type": "text", "text": "the diff is clipped" }]),
+                Some("end_turn"),
+                "2026-05-14T04:43:20Z",
+            ),
+            user_record_with_source("next", "sdk", "2026-05-14T04:43:21Z"),
+        ]);
+        assert_eq!(turn_roles(&result.turns), vec!["user", "agent", "user"]);
+        let Turn::Agent {
+            hydration_key,
+            items,
+            status,
+            ..
+        } = &result.turns[1]
+        else {
+            panic!("expected agent turn");
+        };
+        assert_eq!(
+            hydration_key.as_deref(),
+            Some("msg_1"),
+            "key stays the first assistant message id — parse-invariant and equal to the live turn's",
+        );
+        let tools = items
+            .iter()
+            .filter(|i| matches!(i, TurnItem::Tool { .. }))
+            .count();
+        assert_eq!(tools, 2, "both tool calls stay in the one turn");
+        assert_eq!(*status, TurnStatus::Complete);
+        assert!(result.warnings.is_empty());
+    }
+
+    #[test]
+    fn image_meta_rows_still_count_as_housekeeping_skipped() {
+        // Same observability contract as the task-notification continuation:
+        // the finalize-time skip counter must keep counting rows that no
+        // longer close turns.
+        let mut state = ReconstructionState::new(Uuid::now_v7());
+        let records = [
+            user_record("prompt", "2026-05-14T04:43:15Z"),
+            assistant_text_record("a", "claude-sonnet-4-6", "2026-05-14T04:43:16Z"),
+            image_meta_record("2026-05-14T04:43:17Z"),
+            assistant_text_record("b", "claude-sonnet-4-6", "2026-05-14T04:43:18Z"),
+        ];
+        for (i, record) in records.iter().enumerate() {
+            state.ingest_record(i + 1, record);
+        }
+        assert_eq!(state.housekeeping_skipped, 1);
+    }
+
+    #[test]
+    fn non_image_meta_row_is_also_a_continuation() {
+        // Pins the deliberate breadth of `is_meta_continuation`: the rule is
+        // flag-based (`isMeta`), not text-shape-based (`[Image: …]`), because a
+        // genuine turn boundary is always marked by a real prompt record — so
+        // continuation is safe for the whole class, and a text match would tie
+        // correctness to display strings the CLI can reword. Narrowing the
+        // predicate to the image shape should fail this test, not silently
+        // reintroduce the split-and-duplicate bug for the next metadata shape.
+        let result = hydrate_records(&[
+            user_record_with_source("prompt", "sdk", "2026-05-14T04:43:15Z"),
+            assistant_text_record("a", "claude-sonnet-4-6", "2026-05-14T04:43:16Z"),
+            json!({"type":"user","message":{"role":"user","content":"some future metadata marker"},"isMeta":true,"timestamp":"2026-05-14T04:43:17Z"}),
+            assistant_text_record("b", "claude-sonnet-4-6", "2026-05-14T04:43:18Z"),
+            user_record_with_source("next", "sdk", "2026-05-14T04:43:19Z"),
+        ]);
+        assert_eq!(turn_roles(&result.turns), vec!["user", "agent", "user"]);
+        assert_eq!(
+            agent_text_items(&result.turns),
+            vec![vec!["a".to_owned(), "b".to_owned()]],
+            "both assistant chunks stay in the one turn across the unknown isMeta row",
+        );
+    }
+
+    #[test]
+    fn compact_summary_carrying_is_meta_still_bounds_and_marks() {
+        // Defensive guard on the predicate's exclusion: a compaction summary
+        // that also carried `isMeta` must remain a genuine boundary and keep
+        // emitting its Compaction marker — never a silent mid-turn skip.
+        let result = hydrate_records(&[
+            user_record("prompt", "2026-05-14T04:43:15Z"),
+            assistant_text_record("a", "claude-sonnet-4-6", "2026-05-14T04:43:16Z"),
+            json!({"type":"user","message":{"role":"user","content":"This session is being continued…"},"isCompactSummary":true,"isMeta":true,"timestamp":"2026-05-14T04:43:17Z"}),
+            assistant_text_record("b", "claude-sonnet-4-6", "2026-05-14T04:43:18Z"),
+        ]);
+        assert_eq!(
+            turn_roles(&result.turns),
+            vec!["user", "agent", "system", "agent"]
+        );
+    }
+
+    #[test]
     fn command_wrapper_between_assistant_chunks_still_closes_the_turn() {
         // Regression guard: the continuation exception is scoped to
-        // task-notifications only. A slash-command echo between assistant
-        // chunks remains a genuine boundary — the post-command response must
-        // not merge backward into the pre-command turn.
+        // task-notifications and `isMeta` metadata rows only. A slash-command
+        // echo between assistant chunks remains a genuine boundary — the
+        // post-command response must not merge backward into the pre-command
+        // turn.
         let result = hydrate_records(&[
             user_record("prompt", "2026-05-14T04:43:15Z"),
             assistant_text_record("a", "claude-sonnet-4-6", "2026-05-14T04:43:16Z"),

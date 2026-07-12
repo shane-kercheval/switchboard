@@ -54,6 +54,22 @@ beforeEach(() => {
   reorderAgentsMock.mockResolvedValue(undefined);
 });
 
+test("agent card hover stays distinct from the sidebar panel", async () => {
+  render(SidebarHost, { projectId: PROJECT_ID, agents: THREE_AGENTS });
+
+  const card = page.getByTestId("sidebar-agent").first();
+  const sidebar = page.getByTestId("sidebar");
+  await card.hover();
+
+  await expect
+    .poll(
+      () =>
+        getComputedStyle(card.element()).backgroundColor !==
+        getComputedStyle(sidebar.element()).backgroundColor,
+    )
+    .toBe(true);
+});
+
 // ---------------------------------------------------------------------------
 // CSS visibility — what jsdom physically cannot exercise
 // ---------------------------------------------------------------------------

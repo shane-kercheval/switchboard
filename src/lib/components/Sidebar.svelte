@@ -926,7 +926,7 @@
         {@const confirmingRemove = removeConfirmAgentId === agent.id}
         <div
           class={cn(
-            "group bg-raised hover:bg-hover rounded-md px-2.5 py-2 transition-colors",
+            "group bg-raised hover:bg-surface rounded-md px-2.5 py-2 transition-colors",
             dragState?.started === true &&
               dragState.agentId === agent.id &&
               "ring-accent/60 relative z-10 shadow-lg ring-1",

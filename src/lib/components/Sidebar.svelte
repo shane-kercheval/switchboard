@@ -10,6 +10,7 @@
     Gauge,
     GripVertical,
     MoreHorizontal,
+    Pencil,
     Plug,
     SlidersHorizontal,
     Square,
@@ -964,15 +965,14 @@
               </button>
             {:else}
               {@const agentHidden = isAgentHidden(projectId, rosterIds, agent.id)}
-              <!-- Double-click the name row to rename. Single-click still
-                   toggles collapse; a double-click toggles it twice (net no
-                   change) before edit mode opens. -->
+              <!-- The whole name row toggles collapse. Rename lives in the
+                   actions (⋯) menu — not a name double-click, which fought the
+                   collapse toggle (two toggles fired before edit opened). -->
               <button
                 type="button"
                 class="flex min-w-0 flex-1 items-center gap-1.5 text-left"
                 aria-expanded={!isCollapsed}
                 onclick={() => toggleCollapsed(agent.id)}
-                ondblclick={() => startEdit(agent)}
               >
                 <!-- Leading slot: the drag grip, hover/focus-revealed (multi-
                      agent rosters only). `invisible` (not `hidden`) so the slot
@@ -1072,6 +1072,19 @@
                       Confirm delete
                     </DropdownMenuItem>
                   {:else}
+                    <DropdownMenuItem
+                      onSelect={() => startEdit(agent)}
+                      class="gap-2"
+                      data-testid="agent-action-rename"
+                    >
+                      <Pencil
+                        size={14}
+                        strokeWidth={1.8}
+                        class="text-muted shrink-0"
+                        aria-hidden="true"
+                      />
+                      Rename
+                    </DropdownMenuItem>
                     {#if active}
                       <DropdownMenuItem
                         onSelect={() => stopAgent(agent.id)}

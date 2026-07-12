@@ -246,13 +246,14 @@ describe("Sidebar", () => {
         item.textContent?.trim(),
       ),
     ).toEqual([
+      "Rename",
       "Resume in terminal",
       "Open session file",
       "Change model",
       "Change effort",
       "Delete agent",
     ]);
-    expect(menu.querySelectorAll('[role="menuitem"] svg')).toHaveLength(5);
+    expect(menu.querySelectorAll('[role="menuitem"] svg')).toHaveLength(6);
   });
 
   it("shows only currently available menu actions", async () => {
@@ -1207,34 +1208,45 @@ describe("Sidebar agent-scoped event tolerance", () => {
 
 /// Inline rename editor. The card's name swaps to an <input> with live
 /// validation; Enter / the save icon commit, Escape / blur cancel (never
-/// persist on blur). Double-click on the name row is the entry point. Commits
-/// route through the mocked workspace `renameAgent`; the backend stays
+/// persist on blur). The entry point is the "Rename" action in the ⋯ menu —
+/// deliberately NOT a name double-click, which fought the collapse toggle.
+/// Commits route through the mocked workspace `renameAgent`; the backend stays
 /// authoritative, the frontend check is UX.
 describe("Sidebar inline rename", () => {
-  async function enterEditViaDoubleClick(agent: AgentRecord): Promise<HTMLInputElement> {
+  async function enterEditViaMenu(agent: AgentRecord): Promise<HTMLInputElement> {
     const state = await loadState();
     await state.registerAgent(agent);
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
-    const toggle = screen.getByTestId("agent-name").closest("button");
-    if (!toggle) throw new Error("expected the agent name to sit in a toggle button");
-    await fireEvent.dblClick(toggle);
+    await openAgentActions();
+    await fireEvent.click(await screen.findByTestId("agent-action-rename"));
     return (await screen.findByTestId("agent-rename-input")) as HTMLInputElement;
   }
 
-  it("double-click on the name row enters edit mode seeded with the current name", async () => {
-    const input = await enterEditViaDoubleClick(CLAUDE_AGENT);
+  it("the Rename action enters edit mode seeded with the current name", async () => {
+    const input = await enterEditViaMenu(CLAUDE_AGENT);
     expect(input).toHaveValue("alice");
     // The name span / toggle button is gone while editing.
     expect(screen.queryByTestId("agent-name")).toBeNull();
   });
 
+  it("double-clicking the name row does not rename (it only toggles collapse)", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+    const toggle = screen.getByTestId("agent-name").closest("button");
+    if (!toggle) throw new Error("expected the agent name to sit in a toggle button");
+    await fireEvent.dblClick(toggle);
+    expect(screen.queryByTestId("agent-rename-input")).toBeNull();
+    expect(screen.getByTestId("agent-name")).toBeInTheDocument();
+  });
+
   it("the input is not nested inside the collapse toggle (no nested interactive)", async () => {
-    const input = await enterEditViaDoubleClick(CLAUDE_AGENT);
+    const input = await enterEditViaMenu(CLAUDE_AGENT);
     expect(input.closest("button")).toBeNull();
   });
 
   it("Enter commits the new name via renameAgent and exits edit mode", async () => {
-    const input = await enterEditViaDoubleClick(CLAUDE_AGENT);
+    const input = await enterEditViaMenu(CLAUDE_AGENT);
     await fireEvent.input(input, { target: { value: "alice2" } });
     await fireEvent.keyDown(input, { key: "Enter" });
 
@@ -1243,7 +1255,7 @@ describe("Sidebar inline rename", () => {
   });
 
   it("the save icon commits the new name via renameAgent", async () => {
-    const input = await enterEditViaDoubleClick(CLAUDE_AGENT);
+    const input = await enterEditViaMenu(CLAUDE_AGENT);
     await fireEvent.input(input, { target: { value: "alice2" } });
 
     const save = screen.getByTestId("agent-rename-save");
@@ -1257,14 +1269,14 @@ describe("Sidebar inline rename", () => {
   });
 
   it("trims the draft before submitting (validated value equals submitted value)", async () => {
-    const input = await enterEditViaDoubleClick(CLAUDE_AGENT);
+    const input = await enterEditViaMenu(CLAUDE_AGENT);
     await fireEvent.input(input, { target: { value: "  alice2  " } });
     await fireEvent.keyDown(input, { key: "Enter" });
     expect(renameAgentMock).toHaveBeenCalledWith(CLAUDE_AGENT.id, "alice2");
   });
 
   it("Escape reverts without calling renameAgent", async () => {
-    const input = await enterEditViaDoubleClick(CLAUDE_AGENT);
+    const input = await enterEditViaMenu(CLAUDE_AGENT);
     await fireEvent.input(input, { target: { value: "alice2" } });
     await fireEvent.keyDown(input, { key: "Escape" });
 
@@ -1274,7 +1286,7 @@ describe("Sidebar inline rename", () => {
   });
 
   it("blur (click-away) reverts without calling renameAgent — never persists on blur", async () => {
-    const input = await enterEditViaDoubleClick(CLAUDE_AGENT);
+    const input = await enterEditViaMenu(CLAUDE_AGENT);
     await fireEvent.input(input, { target: { value: "alice2" } });
     await fireEvent.blur(input);
 
@@ -1284,7 +1296,7 @@ describe("Sidebar inline rename", () => {
   });
 
   it("renaming to the agent's own name (case variant) is allowed — exclude-self", async () => {
-    const input = await enterEditViaDoubleClick(CLAUDE_AGENT);
+    const input = await enterEditViaMenu(CLAUDE_AGENT);
     // "Alice" canonicalizes to "alice" (the agent's own); exclude-self means it
     // is not a duplicate, and it differs verbatim, so it commits.
     await fireEvent.input(input, { target: { value: "Alice" } });
@@ -1294,7 +1306,7 @@ describe("Sidebar inline rename", () => {
   });
 
   it("an unchanged name skips the backend round-trip and just exits", async () => {
-    const input = await enterEditViaDoubleClick(CLAUDE_AGENT);
+    const input = await enterEditViaMenu(CLAUDE_AGENT);
     await fireEvent.keyDown(input, { key: "Enter" });
     expect(renameAgentMock).not.toHaveBeenCalled();
     await waitFor(() => expect(screen.queryByTestId("agent-rename-input")).toBeNull());
@@ -1306,10 +1318,8 @@ describe("Sidebar inline rename", () => {
     await state.registerAgent(CODEX_AGENT);
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT, CODEX_AGENT] } });
 
-    const [firstName] = screen.getAllByTestId("agent-name");
-    const toggle = firstName?.closest("button");
-    if (!toggle) throw new Error("expected a toggle button");
-    await fireEvent.dblClick(toggle);
+    await openAgentActions(0);
+    await fireEvent.click(await screen.findByTestId("agent-action-rename"));
     const input = (await screen.findByTestId("agent-rename-input")) as HTMLInputElement;
 
     await fireEvent.input(input, { target: { value: "bob" } });
@@ -1326,7 +1336,7 @@ describe("Sidebar inline rename", () => {
   });
 
   it("an emptied field disables save without showing a nag message", async () => {
-    const input = await enterEditViaDoubleClick(CLAUDE_AGENT);
+    const input = await enterEditViaMenu(CLAUDE_AGENT);
     await fireEvent.input(input, { target: { value: "" } });
     expect(screen.getByTestId("agent-rename-save")).toBeDisabled();
     // `empty` is suppressed — no scary message mid-edit (aria-invalid still set).
@@ -1345,7 +1355,7 @@ describe("Sidebar inline rename", () => {
         }),
     );
 
-    const input = await enterEditViaDoubleClick(CLAUDE_AGENT);
+    const input = await enterEditViaMenu(CLAUDE_AGENT);
     await fireEvent.input(input, { target: { value: "alice2" } });
     await fireEvent.keyDown(input, { key: "Enter" });
     await fireEvent.keyDown(input, { key: "Enter" });
@@ -1357,7 +1367,7 @@ describe("Sidebar inline rename", () => {
 
   it("a backend rejection keeps edit mode and surfaces the error", async () => {
     renameAgentMock.mockRejectedValueOnce(new Error("registry locked"));
-    const input = await enterEditViaDoubleClick(CLAUDE_AGENT);
+    const input = await enterEditViaMenu(CLAUDE_AGENT);
     await fireEvent.input(input, { target: { value: "alice2" } });
     await fireEvent.keyDown(input, { key: "Enter" });
 

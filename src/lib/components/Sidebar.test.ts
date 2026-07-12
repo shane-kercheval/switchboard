@@ -659,9 +659,29 @@ describe("Sidebar", () => {
     await screen.findByTestId("change-select");
     expect(pickerValue("change-select")).toBe("future-opus");
     expect(pickerHasOption("change-select", "future-opus")).toBe(true);
+    // An off-catalog value has an unbounded, vendor-shaped label that a
+    // segmented pill would truncate — so the dialog drops to a native select
+    // where the current model stays fully readable.
+    expect(screen.getByTestId("change-select")).toBeInstanceOf(HTMLSelectElement);
     await fireEvent.click(screen.getByTestId("change-save"));
 
     expect(setAgentModelMock).toHaveBeenCalledExactlyOnceWith(agent.id, "future-opus");
+  });
+
+  it("Change model uses the segmented toggle for an in-catalog model", async () => {
+    const state = await loadState();
+    const agent = { ...CLAUDE_AGENT, model: "opus" };
+    await state.registerAgent(agent);
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
+
+    await openAgentActions();
+    await waitFor(() => expect(screen.getByTestId("agent-change-model")).toBeInTheDocument());
+    await fireEvent.click(screen.getByTestId("agent-change-model"));
+
+    const picker = await screen.findByTestId("change-select");
+    // A curated short list stays a toggle, not a dropdown.
+    expect(picker).not.toBeInstanceOf(HTMLSelectElement);
+    expect(picker).toHaveAttribute("role", "radiogroup");
   });
 
   it("keeps the change dialog open and non-dismissible while saving", async () => {

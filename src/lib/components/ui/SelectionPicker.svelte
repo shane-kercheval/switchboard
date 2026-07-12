@@ -10,7 +10,7 @@
     disabled?: boolean;
     testid?: string;
     ariaLabel: string;
-    presentation?: "auto" | "segmented";
+    presentation?: "segmented" | "dropdown";
   };
 
   let {
@@ -19,11 +19,11 @@
     disabled = false,
     testid,
     ariaLabel,
-    presentation = "auto",
+    presentation = "segmented",
     ...rest
   }: Props = $props();
 
-  const usesSegmented = $derived(presentation === "segmented" || options.length <= 4);
+  const usesSegmented = $derived(presentation === "segmented");
 </script>
 
 {#if usesSegmented}

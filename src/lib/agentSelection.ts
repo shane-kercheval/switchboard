@@ -31,8 +31,10 @@ export const MODEL_OPTIONS: Record<HarnessKind, SelectionOption[]> = {
     { label: "Haiku", value: "haiku" },
   ],
   codex: [
+    { label: "GPT-5.6 Sol", value: "gpt-5.6-sol" },
+    { label: "GPT-5.6 Terra", value: "gpt-5.6-terra" },
+    { label: "GPT-5.6 Luna", value: "gpt-5.6-luna" },
     { label: "GPT-5.5", value: "gpt-5.5" },
-    { label: "GPT-5.4 mini", value: "gpt-5.4-mini" },
   ],
   gemini: [
     { label: "Auto", value: "auto" },
@@ -47,9 +49,28 @@ export const MODEL_OPTIONS: Record<HarnessKind, SelectionOption[]> = {
   antigravity: [],
 };
 
+/// How the **model** picker renders per harness — the single source of truth
+/// both the create form and the sidebar change-model dialog read, so the two
+/// can't drift. Segmented (a toggle) for the short curated lists; a dropdown
+/// only for Gemini, whose list is long with long labels that would truncate as
+/// pills. Effort is always segmented (every effort set is short single words),
+/// so there is no `EFFORT_PRESENTATION`. Antigravity's value is inert — it has
+/// no model picker (the form shows a note instead). The sidebar additionally
+/// falls back to a dropdown when it must show an off-catalog persisted value
+/// whose label length is unbounded (see `Sidebar.svelte`).
+export const MODEL_PRESENTATION: Record<HarnessKind, "segmented" | "dropdown"> = {
+  claude_code: "segmented",
+  codex: "segmented",
+  gemini: "dropdown",
+  antigravity: "segmented",
+};
+
 /// Per-harness effort options. Empty for Gemini (config-only) and Antigravity
 /// (folded into the model name). Codex `none` is a *real* level (forces no
-/// extended reasoning), distinct from leaving effort unset.
+/// extended reasoning), distinct from leaving effort unset. This is the **full**
+/// per-harness set; Codex effort validity is additionally **per-model** (see
+/// `effortOptionsFor`), so a form scoped to a chosen model must derive its
+/// options through that helper rather than reading this map directly.
 export const EFFORT_OPTIONS: Record<HarnessKind, SelectionOption[]> = {
   claude_code: [
     { label: "Low", value: "low" },
@@ -65,10 +86,50 @@ export const EFFORT_OPTIONS: Record<HarnessKind, SelectionOption[]> = {
     { label: "Medium", value: "medium" },
     { label: "High", value: "high" },
     { label: "XHigh", value: "xhigh" },
+    { label: "Max", value: "max" },
+    { label: "Ultra", value: "ultra" },
   ],
   gemini: [],
   antigravity: [],
 };
+
+/// Codex effort levels only the GPT-5.6 model family accepts. Earlier Codex
+/// models 400 on these — verified live @ codex 0.144.1: `gpt-5.5 + max` is
+/// rejected with the server enumerating `none…xhigh`, while Sol/Terra/Luna
+/// accept every level (incl. `ultra`). A Codex model not in
+/// `CODEX_MAX_ULTRA_MODELS` is offered the list minus these levels.
+const CODEX_HIGH_TIER_EFFORTS: ReadonlySet<string> = new Set(["max", "ultra"]);
+
+/// Codex models that accept `max`/`ultra`. **When adding a Codex model that
+/// supports them, add it here** (the "Model catalog" step in
+/// `docs/harness-update-review.md`), else the picker silently withholds those
+/// levels for it.
+const CODEX_MAX_ULTRA_MODELS: ReadonlySet<string> = new Set([
+  "gpt-5.6-sol",
+  "gpt-5.6-terra",
+  "gpt-5.6-luna",
+]);
+
+/// The effort options valid for a given harness **and model**. Only Codex is
+/// model-dependent: `max`/`ultra` are withheld from **curated** Codex models
+/// known to reject them (`gpt-5.5`) rather than offered as a first-class picker
+/// state that fails at turn time. A null/unset or **off-catalog** model (e.g. an
+/// attached session running an id we don't curate) stays permissive — its
+/// validity is unknown, so we keep it reactive, matching the model picker's own
+/// "curated suggestions, not a validated allow-list" policy. A new curated
+/// Codex model is treated as legacy until added to `CODEX_MAX_ULTRA_MODELS`
+/// (fail-safe: withhold the risky levels until confirmed). Account/plan gating
+/// remains reactive for every harness.
+export function effortOptionsFor(
+  harness: HarnessKind,
+  model: string | undefined,
+): SelectionOption[] {
+  const base = EFFORT_OPTIONS[harness];
+  if (harness !== "codex" || model == null || model === "") return base;
+  const isCuratedLegacy =
+    MODEL_OPTIONS.codex.some((o) => o.value === model) && !CODEX_MAX_ULTRA_MODELS.has(model);
+  return isCuratedLegacy ? base.filter((o) => !CODEX_HIGH_TIER_EFFORTS.has(o.value)) : base;
+}
 
 /// Create-form preselected model per harness. `undefined` only where the
 /// harness has no model capability (Antigravity). Attach does NOT use these —
@@ -76,7 +137,7 @@ export const EFFORT_OPTIONS: Record<HarnessKind, SelectionOption[]> = {
 /// session's existing model.
 export const DEFAULT_MODEL: Record<HarnessKind, string | undefined> = {
   claude_code: "opus",
-  codex: "gpt-5.5",
+  codex: "gpt-5.6-terra",
   gemini: "auto",
   antigravity: undefined,
 };

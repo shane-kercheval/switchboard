@@ -9,13 +9,13 @@ const compactOptions = [
   { label: "Haiku", value: "haiku" },
 ];
 
-const longOptions = Array.from({ length: 5 }, (_, i) => ({
+const manyOptions = Array.from({ length: 8 }, (_, i) => ({
   label: `Option ${i + 1}`,
   value: `option-${i + 1}`,
 }));
 
 describe("SelectionPicker", () => {
-  it("uses the segmented control for compact option sets", () => {
+  it("defaults to the segmented control, even for large option sets", () => {
     render(SelectionPicker, {
       props: { options: compactOptions, value: "opus", testid: "picker", ariaLabel: "Model" },
     });
@@ -23,26 +23,32 @@ describe("SelectionPicker", () => {
     expect(screen.getByTestId("picker-option-sonnet")).toBeInTheDocument();
   });
 
-  it("uses a native select for long model option sets", () => {
+  it("keeps a segmented control (single row) for many short-label options", () => {
     render(SelectionPicker, {
-      props: { options: longOptions, value: "option-1", testid: "picker", ariaLabel: "Model" },
+      props: {
+        options: manyOptions,
+        value: "option-1",
+        testid: "picker",
+        ariaLabel: "Reasoning effort",
+      },
+    });
+    // Every option renders as a radio segment — no wrap to a dropdown.
+    expect(screen.getByTestId("picker")).toHaveAttribute("role", "radiogroup");
+    expect(screen.getByTestId("picker-option-option-8")).toBeInTheDocument();
+  });
+
+  it("uses a native select only when the dropdown presentation is requested", () => {
+    render(SelectionPicker, {
+      props: {
+        options: manyOptions,
+        value: "option-1",
+        testid: "picker",
+        ariaLabel: "Model",
+        presentation: "dropdown",
+      },
     });
     const select = screen.getByTestId("picker") as HTMLSelectElement;
     expect(select.tagName).toBe("SELECT");
     expect(select.value).toBe("option-1");
-  });
-
-  it("can force segmented presentation for short-label effort options", () => {
-    render(SelectionPicker, {
-      props: {
-        options: longOptions,
-        value: "option-1",
-        testid: "picker",
-        ariaLabel: "Reasoning effort",
-        presentation: "segmented",
-      },
-    });
-    expect(screen.getByTestId("picker")).toHaveAttribute("role", "radiogroup");
-    expect(screen.getByTestId("picker-option-option-5")).toBeInTheDocument();
   });
 });

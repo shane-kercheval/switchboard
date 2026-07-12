@@ -63,6 +63,37 @@ test("the live cap is bounded to ~3/4 of the transcript area and clips overflow"
     .toBeLessThan(4);
 });
 
+test("the stop control stays fixed when elapsed seconds gain a digit", async () => {
+  await registerAgent(ALICE);
+  seedTurns(ALICE.id, [
+    agentTurn({
+      id: "agent-streaming",
+      agentId: ALICE.id,
+      at: new Date(Date.now() - 7_500).toISOString(),
+      status: "streaming",
+      sendId: "send-timer",
+      items: [textItem("working")],
+    }),
+  ]);
+
+  mountTranscript({ projectId: PROJECT_ID, agents: [ALICE] });
+
+  const timer = page.getByTestId("turn-elapsed");
+  const stop = page.getByTestId("turn-live-control");
+  const xAtNineSeconds = await vi.waitUntil(
+    () => {
+      if (timer.element().textContent?.trim() !== "9s") return false;
+      return stop.element().getBoundingClientRect().x;
+    },
+    { timeout: 3_000, interval: 20 },
+  );
+
+  await expect
+    .poll(() => timer.element().textContent?.trim(), { timeout: 2_500, interval: 20 })
+    .toBe("10s");
+  expect(stop.element().getBoundingClientRect().x).toBeCloseTo(xAtNineSeconds, 1);
+});
+
 // BUG GUARD for the content-change scroll gate (`scrollHeight === lastScrollHeight`
 // in `onScroll`). Observed red: with that gate removed (so `onScroll` recomputes
 // `pinned` on every scroll, including the browser's clamp as the live cap drops),

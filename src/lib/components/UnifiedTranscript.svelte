@@ -1165,11 +1165,15 @@
     {#if quietSince !== undefined}
       <span>No response</span>
       <LoadingDots />
-      <span data-testid="turn-quiet-elapsed">{formatDuration(quietElapsedMs(quietSince))}</span>
+      <span class="w-[7ch] text-right tabular-nums" data-testid="turn-quiet-elapsed"
+        >{formatDuration(quietElapsedMs(quietSince))}</span
+      >
     {:else}
       <span>Working</span>
       <LoadingDots />
-      <span data-testid="turn-elapsed">{formatDuration(turnElapsedMs(turn.started_at))}</span>
+      <span class="w-[7ch] text-right tabular-nums" data-testid="turn-elapsed"
+        >{formatDuration(turnElapsedMs(turn.started_at))}</span
+      >
     {/if}
     {#if turn.send_id !== undefined}
       {@const sendId = turn.send_id}

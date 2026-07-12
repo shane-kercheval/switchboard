@@ -9,20 +9,20 @@
   import PromptComposer from "./PromptComposer.svelte";
   import type { Prompt, AgentRecord, AgentId } from "$lib/types";
   import type { TranscriptPane } from "$lib/state/transcriptPanes.svelte";
-  import type { ForwardSource } from "$lib/state/heldForwards.svelte";
+  import type { ForwardReadiness, ForwardSource } from "$lib/state/heldForwards.svelte";
 
   let {
     prompt,
     agents,
     panes = [],
-    agentHasOutput,
+    agentReadiness,
     initialArgs,
     initialArgSources = {},
   }: {
     prompt: Prompt;
     agents: AgentRecord[];
     panes?: TranscriptPane[];
-    agentHasOutput?: (id: AgentId) => boolean;
+    agentReadiness?: (id: AgentId) => ForwardReadiness;
     initialArgs: Record<string, string>;
     initialArgSources?: Record<string, ForwardSource[]>;
   } = $props();
@@ -43,6 +43,6 @@
   bind:argSources
   {agents}
   {panes}
-  {agentHasOutput}
+  {agentReadiness}
   onremove={() => {}}
 />

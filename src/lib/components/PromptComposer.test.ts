@@ -158,7 +158,7 @@ describe("PromptComposer", () => {
 
     const status = screen.getByTestId("prompt-rendering");
     expect(status).toHaveTextContent("Rendering prompt");
-    expect(status).toHaveClass("absolute", "inset-0", "backdrop-blur-[1px]");
+    expect(status).toHaveClass("absolute", "inset-0", "backdrop-blur-sm");
     expect(screen.getByTestId("prompt-composer-content")).toHaveClass("opacity-55", "blur-[1px]");
     expect(status.querySelector(".animate-spin")).not.toBeNull();
     await fireEvent.click(screen.getByTestId("prompt-remove"));
@@ -205,7 +205,7 @@ function setupForward(
   opts: {
     argSources?: Record<string, ForwardSource[]>;
     panes?: TranscriptPane[];
-    agentHasOutput?: (id: string) => boolean;
+    agentReadiness?: (id: string) => "ready" | "pending" | "empty";
   } = {},
 ): void {
   render(ForwardHarness, {
@@ -215,7 +215,7 @@ function setupForward(
       initialArgSources: opts.argSources ?? {},
       agents: [BOB, CAROL],
       panes: opts.panes ?? [],
-      agentHasOutput: opts.agentHasOutput,
+      agentReadiness: opts.agentReadiness,
     },
   });
 }
@@ -251,17 +251,41 @@ describe("PromptComposer per-argument forwarding", () => {
     await waitFor(() => expect(screen.queryByTestId("forward-source-chip-bob")).toBeNull());
   });
 
-  it("flags a source with no completed output on its chip", () => {
+  it("warns on a chip whose source will be skipped at dispatch", () => {
     setupForward(
       { focus: "", tone: "" },
       {
         argSources: { focus: [{ id: BOB.id, name: "bob" }] },
-        agentHasOutput: () => false,
+        agentReadiness: () => "empty",
       },
     );
     const chip = screen.getByTestId("forward-source-chip-bob");
-    expect(chip).toHaveAttribute("data-empty", "true");
-    expect(chip).toHaveTextContent("no output");
+    expect(chip).toHaveAttribute("data-readiness", "empty");
+    expect(screen.getByTestId("forward-source-state-bob")).toHaveAttribute(
+      "data-state-readiness",
+      "empty",
+    );
+    // The consequence reaches assistive tech as real (visually-hidden) text, not
+    // an aria-label on a role-less icon span.
+    expect(within(chip).getByText(/will be skipped from the forward/i)).toBeInTheDocument();
+  });
+
+  it("does not warn on a chip whose source is still generating", () => {
+    // The send holds for an in-flight turn and forwards it, so a `pending` source
+    // is about to contribute normally — flagging it would say the opposite.
+    setupForward(
+      { focus: "", tone: "" },
+      {
+        argSources: { focus: [{ id: BOB.id, name: "bob" }] },
+        agentReadiness: () => "pending",
+      },
+    );
+    const chip = screen.getByTestId("forward-source-chip-bob");
+    expect(chip).toHaveAttribute("data-readiness", "pending");
+    const stateIcon = screen.getByTestId("forward-source-state-bob");
+    expect(stateIcon).toHaveAttribute("data-state-readiness", "pending");
+    expect(within(chip).getByText(/still generating; sending will wait/i)).toBeInTheDocument();
+    expect(chip.className).not.toContain("status-failed");
   });
 
   it("treats a required argument as satisfied once it has a forward source", () => {

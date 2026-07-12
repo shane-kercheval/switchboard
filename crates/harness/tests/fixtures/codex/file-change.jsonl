@@ -1,0 +1,8 @@
+{"type":"thread.started","thread_id":"00000000-0000-7000-8000-000000000030"}
+{"type":"turn.started"}
+{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"/bin/zsh -lc 'git status --short'","aggregated_output":"","exit_code":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"/bin/zsh -lc 'git status --short'","aggregated_output":"fatal: not a git repository (or any of the parent directories): .git\n","exit_code":128,"status":"failed"}}
+{"type":"item.started","item":{"id":"item_4","type":"file_change","changes":[{"path":"/private/tmp/facet-probe/scratch/alpha.txt","kind":"update"},{"path":"/private/tmp/facet-probe/scratch/zeta.txt","kind":"add"}],"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_4","type":"file_change","changes":[{"path":"/private/tmp/facet-probe/scratch/alpha.txt","kind":"update"},{"path":"/private/tmp/facet-probe/scratch/zeta.txt","kind":"add"}],"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_8","type":"agent_message","text":"done"}}
+{"type":"turn.completed","usage":{"input_tokens":61559,"cached_input_tokens":47616,"output_tokens":396,"reasoning_output_tokens":0}}

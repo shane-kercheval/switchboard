@@ -105,7 +105,7 @@
           type="button"
           class={cn(
             "flex w-full cursor-pointer flex-col gap-0.5 rounded-md px-2.5 py-1.5 text-left outline-none select-none",
-            i === highlighted ? "bg-panel/80" : "",
+            i === highlighted ? "bg-hover" : "",
             builtin ? "pr-10" : "",
           )}
           data-testid={`prompt-option-${promptKey(prompt)}`}
@@ -175,7 +175,7 @@
     spellcheck="false"
     placeholder="Search prompts…"
     data-testid="prompt-menu-search"
-    class="border-border bg-panel text-fg placeholder:text-muted focus-visible:ring-accent mt-1 w-full rounded-md border px-2.5 py-1.5 text-sm focus-visible:ring-2 focus-visible:outline-none"
+    class="border-border bg-raised text-fg placeholder:text-muted focus-visible:ring-focus mt-1 w-full rounded-md border px-2.5 py-1.5 text-sm focus-visible:ring-1 focus-visible:outline-none"
   />
   {#if onopenfolder}
     <button

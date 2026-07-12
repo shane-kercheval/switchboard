@@ -15,16 +15,25 @@
     expandForwardSources,
     forwardSourceForAgent,
     forwardSourceAgentsForPane,
+    forwardReadiness,
+    reconcileForwardSources,
+    reconcileForwardSourceMap,
+    type ForwardReadiness,
     type ForwardSource,
   } from "$lib/state/heldForwards.svelte";
   import { buildLiveSendsMap } from "$lib/state/liveSends";
   import {
+    emptyForwards,
     flush,
     getCompose,
+    setAttachments,
     setContent,
+    setForwards,
     setSelection,
     type ComposeContent,
+    type ComposeForwards,
     type PromptContent,
+    type WorkflowContent,
   } from "$lib/state/composeStore";
   import { recordProjectsActivityLocally } from "$lib/state/workspace.svelte";
   import {
@@ -44,14 +53,13 @@
     AgentId,
     AgentRecord,
     Attachment,
-    AttachmentKind,
     ProjectId,
     Prompt,
     WorkflowFormDescriptor,
     WorkflowInputValue,
     WorkflowListing,
   } from "$lib/types";
-  import { classifyKind } from "$lib/attachments";
+  import { classifyKind, nextLabel } from "$lib/attachments";
   import { getCurrentWebview } from "@tauri-apps/api/webview";
   import { isPermissionGranted, requestPermission } from "@tauri-apps/plugin-notification";
   import { buildRenderArgs, combinePromptMessage, missingRequiredArgs } from "$lib/prompt";
@@ -101,52 +109,124 @@
 
   // ── Attachments ─────────────────────────────────────────────────────────────
   // Dropped files staged on the backend; each chip carries the wire `Attachment`
-  // fields plus a local `id` for list keying / removal. Chips are **session-only**
-  // (deliberately not persisted in the compose snapshot): the load-time GC
-  // reclaims any staged-but-unsent file, so a restored chip would dangle at a
-  // deleted path — re-drop to re-attach.
+  // fields plus a local `id` for list keying / removal.
+  //
+  // **The compose snapshot is authoritative, not this component.** Chips persist
+  // across a project switch and a Git-view toggle (both of which unmount this bar).
+  // Two consequences worth stating: a staging copy that finishes after this bar
+  // unmounts still belongs to the project it began under and lands in that
+  // project's snapshot; and the project loader must declare these paths
+  // (`draftAttachmentPaths`) or its GC reclaims the files behind chips we're still
+  // showing.
+  //
+  // **Exactly two sanctioned write paths — do not invent a third.**
+  //   1. While mounted: mutate `attachmentChips`; the `$effect` below mirrors it to
+  //      `setAttachments`. `commitChips` is the convenience wrapper for a replace.
+  //   2. After unmount (a staging copy that outlived this instance): `addAttachmentChip`
+  //      writes the store directly, because no `$effect` runs on a dead component.
+  // A direct `attachmentChips = …` assignment that skips both is the exact bug this
+  // section already shipped once — a restore path that updated the UI but not the
+  // store, so the file was GC'd on the next load. The effect is the backstop that
+  // makes that class of mistake structurally impossible.
   type AttachmentChip = Attachment & { id: string };
-  let attachmentChips = $state<AttachmentChip[]>([]);
+  let attachmentChips = $state<AttachmentChip[]>(restoreChips(saved.attachments ?? []));
   let dragOver = $state(false);
-  // Per-kind label counters. Monotonic across a compose session: removing a chip
-  // never renumbers the survivors, so a label always refers to the same file.
-  const attachmentCounters: Record<AttachmentKind, number> = {
-    image: 0,
-    text: 0,
-    file: 0,
-    unknown: 0,
-  };
-  // Bumped whenever the chip set is committed (send) or abandoned (unmount).
-  // A staging result captures the generation it began under and is discarded if
-  // the generation has since moved on — so a slow copy can't land a chip in a
-  // composer that was already cleared. Plain, not `$state`: never rendered.
-  let composeGeneration = 0;
+  // Whether keyboard focus is anywhere inside the compose box. Drives the card's
+  // focus border (a border-color change, intentionally not a ring/glow — kept as
+  // thin as possible): the compose bar is the app's default keyboard target, so
+  // an always-on highlight says nothing — one that appears on focus and clears
+  // when focus moves to the Git view's keyboard nav, a dialog, or elsewhere is
+  // the real signal. Tracked at the container (not the plain textarea) so it also
+  // lights for prompt- and workflow-mode fields, which render inside this box.
+  // A focus-trapping menu opened from here (bits-ui portals its content out of
+  // the DOM subtree) counts as focus leaving — consistent with "a dialog took
+  // focus"; the ring returns when the menu closes.
+  let composeFocused = $state(false);
+  // Bumped only on send-clear. A staging result captures the generation it began
+  // under and is discarded if it has since moved on, so a slow copy can't
+  // resurrect a chip into a composer whose contents were already dispatched.
+  // Unmount deliberately does *not* bump: the result is still wanted, just in the
+  // snapshot rather than in this (dead) component's chip list.
+  let sendGeneration = 0;
+  let unmounted = false;
 
+  function restoreChips(attachments: Attachment[]): AttachmentChip[] {
+    return attachments.map((attachment) => ({ ...attachment, id: crypto.randomUUID() }));
+  }
+
+  function chipsToAttachments(chips: AttachmentChip[]): Attachment[] {
+    return chips.map(({ label, kind, path, original_name }) => ({
+      label,
+      kind,
+      path,
+      original_name,
+    }));
+  }
+
+  /// Set the chip list and write it through. The only path that mutates chips
+  /// while this bar is mounted.
+  function commitChips(next: AttachmentChip[]): void {
+    attachmentChips = next;
+    setAttachments(projectId, chipsToAttachments(next));
+  }
+
+  /// Append a freshly staged file. Reads the snapshot (not `attachmentChips`) as
+  /// the base so it stays correct after this bar has unmounted.
   function addAttachmentChip(staged: { path: string; original_name: string }): void {
     const kind = classifyKind(staged.original_name);
-    attachmentCounters[kind] += 1;
-    attachmentChips = [
-      ...attachmentChips,
-      {
-        id: crypto.randomUUID(),
-        label: `${kind}-${attachmentCounters[kind]}`,
-        kind,
-        path: staged.path,
-        original_name: staged.original_name,
-      },
-    ];
+    const existing = getCompose(projectId).attachments ?? [];
+    const attachment: Attachment = {
+      label: nextLabel(kind, existing),
+      kind,
+      path: staged.path,
+      original_name: staged.original_name,
+    };
+    setAttachments(projectId, [...existing, attachment]);
+    if (!unmounted) {
+      attachmentChips = [...attachmentChips, { ...attachment, id: crypto.randomUUID() }];
+    }
   }
 
   function removeAttachmentChip(id: string): void {
-    attachmentChips = attachmentChips.filter((chip) => chip.id !== id);
+    commitChips(attachmentChips.filter((chip) => chip.id !== id));
+  }
+
+  /// Drop restored chips whose staged file no longer exists (a cleaned
+  /// `.switchboard/`, or an older build's GC). Only the *restored* paths are
+  /// candidates — a file attached while this check was in flight was never at risk
+  /// and must not be pruned by a stale answer.
+  async function pruneMissingAttachments(restored: Attachment[]): Promise<void> {
+    const candidates = new Set(restored.map((a) => a.path));
+    try {
+      const alive = new Set(await api.existingAttachmentPaths(projectId, [...candidates]));
+      if (unmounted) return;
+      const next = attachmentChips.filter(
+        (chip) => !candidates.has(chip.path) || alive.has(chip.path),
+      );
+      if (next.length !== attachmentChips.length) commitChips(next);
+    } catch {
+      // Leave the chips: a failed probe is not evidence the files are gone, and a
+      // genuinely missing file still surfaces as a send error.
+    }
   }
 
   // Forward sources: agents whose latest output is forwarded into this send (the
   // §7 manual cross-agent forward). Picked from the `@`-menu's "Forward from"
-  // entries; a pane entry expands to its members at pick time. Session-only,
-  // cleared on send / restore — like attachment chips. A send with ≥1 forward
-  // source dispatches via `forward_message` instead of the normal send path.
-  let forwardSources = $state<ForwardSource[]>([]);
+  // entries; a pane entry expands to its members at pick time. A send with ≥1
+  // forward source dispatches via `forward_message` instead of the normal send path.
+  //
+  // Persisted (all four families below), so a project switch or Git-view toggle —
+  // both of which unmount this bar — doesn't silently discard a forward the user
+  // set up. Restored sources are reconciled against the live roster: an agent
+  // removed since the draft was written is dropped, a renamed one takes its
+  // current name.
+  // `untrack`: the mount-time roster is constant for this component's life (see
+  // the `saved` snapshot above), so reconciling against it once is deliberate, not
+  // a missed dependency.
+  const savedForwards = saved.forwards ?? emptyForwards();
+  let forwardSources = $state<ForwardSource[]>(
+    untrack(() => reconcileForwardSources(savedForwards.message, agents)),
+  );
 
   function addForwardSource(source: ForwardSource): void {
     if (forwardSources.some((s) => forwardSourceKey(s) === forwardSourceKey(source))) return;
@@ -160,20 +240,20 @@
   }
 
   function removeForwardSource(key: string): void {
+    // Focus the textarea *before* the reactive flush unmounts the chip's X, so
+    // focus never falls to <body> and the focus border never blinks off. (The
+    // X's own `onmousedown` preventDefault already keeps focus put for mouse
+    // clicks; this covers keyboard removal, where the X held focus.)
+    textareaEl?.focus();
     forwardSources = forwardSources.filter((s) => forwardSourceKey(s) !== key);
   }
 
-  /// True when this agent already has a completed turn the forward can carry — a
-  /// forward source with no output yet is flagged on its chip up front.
-  function agentHasCompletedOutput(agentId: AgentId): boolean {
-    return (transcripts[agentId] ?? []).some(
-      (turn) => turn.role === "agent" && turn.status === "complete",
-    );
-  }
-
-  /// Whether a source has nothing to forward yet — an agent with no completed turn.
-  function sourceIsEmpty(source: ForwardSource): boolean {
-    return !agentHasCompletedOutput(source.id);
+  /// What an agent would contribute if forwarded from right now. The single source
+  /// of truth for every surface that flags a forward source — the chips, the
+  /// `@`-menu rows, and the per-field pickers in the prompt/workflow composers —
+  /// so they cannot disagree about the same agent.
+  function agentReadiness(agentId: AgentId): ForwardReadiness {
+    return forwardReadiness(transcripts[agentId]);
   }
 
   /// Agent names that actually carried output, for the partial-empty caption —
@@ -199,14 +279,15 @@
   /// attachments dir) and add a chip for it. A per-file failure surfaces in the
   /// send-error line and skips that file rather than aborting the rest.
   async function stageDroppedPaths(paths: string[]): Promise<void> {
-    const gen = composeGeneration;
+    const gen = sendGeneration;
     for (const path of paths) {
       try {
         const staged = await api.stageAttachment(projectId, path);
-        // The drop's compose session may have been sent or torn down while the
-        // copy was in flight; if so, discard the result rather than resurrecting
-        // a chip into a now-cleared (or different) composer.
-        if (gen !== composeGeneration) return;
+        // The drop's compose session may have been *sent* while the copy was in
+        // flight; if so, discard rather than resurrecting a chip into a cleared
+        // composer. An unmount is not a discard — `addAttachmentChip` writes to
+        // the originating project's snapshot either way.
+        if (gen !== sendGeneration) return;
         addAttachmentChip(staged);
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
@@ -222,6 +303,11 @@
   // coordinate mapping is platform/DPR-fragile and bought nothing for a single
   // drop target).
   onMount(() => {
+    // Restored chips are shown immediately (no flicker) and reconciled against
+    // disk in the background — a staged file can vanish out-of-band.
+    const restored = saved.attachments ?? [];
+    if (restored.length > 0) void pruneMissingAttachments(restored);
+
     // Guarded: `getCurrentWebview()` throws outside a Tauri webview (tests, any
     // non-Tauri host), where drag-drop simply isn't available.
     let dropSub: Promise<() => void> | undefined;
@@ -262,10 +348,14 @@
   // Per-argument forward sources (live-UI-only, like `forwardSources`). A
   // prompt-mode send with any entry here — or in `promptAppendedSources` — routes
   // through the forward-prompt path.
-  let promptArgSources = $state<Record<string, ForwardSource[]>>({});
+  let promptArgSources = $state<Record<string, ForwardSource[]>>(
+    untrack(() => reconcileForwardSourceMap(savedForwards.promptArgs, agents)),
+  );
   // Forward sources for the appended-text field (the appended text is just
   // another forwardable field; the backend composes it into the appended tail).
-  let promptAppendedSources = $state<ForwardSource[]>([]);
+  let promptAppendedSources = $state<ForwardSource[]>(
+    untrack(() => reconcileForwardSources(savedForwards.promptAppended, agents)),
+  );
   let appendedText = $state<string>("");
   let promptMenuOpen = $state(false);
   let prompts = $state<Prompt[]>([]);
@@ -298,18 +388,29 @@
   let workflowSyncSettled = $state(false);
   let workflowInputs = $state<Record<string, WorkflowInputValue>>({});
   // Per-field forward sources for the workflow's fillable single-text fields,
-  // keyed by field name. Live-UI-only, reset whenever the workflow changes.
-  let workflowForwardSources = $state<Record<string, ForwardSource[]>>({});
+  // keyed by field name. Persisted with the other forward families; reset whenever
+  // the workflow changes (a field name means nothing across workflows).
+  let workflowForwardSources = $state<Record<string, ForwardSource[]>>(
+    untrack(() => reconcileForwardSourceMap(savedForwards.workflowFields, agents)),
+  );
   let invokingWorkflow = $state(false);
   // A saved prompt-mode draft to restore once the cache loads; consumed when
   // restoration settles. Null when the saved draft was plain.
   let pendingRestore = $state<PromptContent | null>(
     saved.content.kind === "prompt" ? saved.content : null,
   );
-  // True while a saved prompt-mode draft is still being resolved against the
-  // cache. Gates the persist effect so the not-yet-restored plain placeholder
-  // can't overwrite the saved snapshot before restoration settles.
-  let restoring = $state(saved.content.kind === "prompt");
+  // A saved workflow-mode invocation to restore once the workflow list loads.
+  let pendingWorkflowRestore = $state<WorkflowContent | null>(
+    saved.content.kind === "workflow" ? saved.content : null,
+  );
+  // True while a saved prompt- or workflow-mode draft is still being resolved
+  // against its source. Gates the persist effect so the not-yet-restored plain
+  // placeholder can't overwrite the saved snapshot before restoration settles.
+  let restoring = $state(saved.content.kind === "prompt" || saved.content.kind === "workflow");
+  // A workflow restore whose `list_workflows` failed. `restoring` stays true (so
+  // the snapshot is preserved), and the placeholder shows a retry/discard state
+  // instead of a spinner.
+  let workflowRestoreFailed = $state(false);
 
   async function loadPrompts(): Promise<void> {
     try {
@@ -351,8 +452,18 @@
     return () => void unlisten.then((u) => u());
   });
 
+  // A saved workflow-mode draft resolves against the local workflow list, which is
+  // not loaded until a menu opens — so fetch it here rather than waiting for one.
+  onMount(() => {
+    if (pendingWorkflowRestore === null) return;
+    void loadWorkflows().then(tryRestoreWorkflow);
+  });
+
   onMount(() => {
     if (!focusOnMount) return;
+    // A pending workflow restore owns the focus decision: it fires after its
+    // async list load, and focusing the textarea now would fight the form.
+    if (pendingWorkflowRestore !== null) return;
     if (pendingRestore === null) {
       requestAnimationFrame(() => textareaEl?.focus());
     } else {
@@ -392,18 +503,112 @@
     }
   }
 
+  /// Resolve a saved workflow-mode invocation against the loaded workflow list.
+  ///
+  /// Resolve a saved workflow-mode invocation against the loaded workflow list.
+  ///
+  /// `listOk` distinguishes the two outcomes that a bare `find(...) === undefined`
+  /// conflates, and getting this wrong destroys user state:
+  /// - **list succeeded, workflow absent** → genuinely renamed/deleted. Fall back
+  ///   to plain mode; the persist effect then overwrites the saved snapshot, which
+  ///   is correct because the workflow is confirmed gone.
+  /// - **list failed** (transient FS/IPC error, permissions, corrupt file →
+  ///   `loadWorkflows` catches all into `workflows = []`) → we simply don't know.
+  ///   Keep the snapshot pending and `restoring` true (which gates the content
+  ///   persist effect, so plain content never overwrites the saved workflow), and
+  ///   surface a retry/discard state. Never let a failure erase the draft.
+  ///
+  /// Unlike `tryRestorePrompt`, the *absent* case is one-shot with no cold-cache
+  /// grace period: a successful local list that lacks the workflow is authoritative.
+  ///
+  /// Saved field values are installed *before* `loadWorkflowForm`, whose seeding is
+  /// additive — restored values survive and any field the workflow gained since is
+  /// seeded empty.
+  function tryRestoreWorkflow(listOk: boolean): void {
+    const snapshot = pendingWorkflowRestore;
+    if (snapshot === null) return;
+    if (!listOk) {
+      workflowRestoreFailed = true;
+      return; // snapshot + `restoring` stay put; the draft is preserved.
+    }
+    pendingWorkflowRestore = null;
+    workflowRestoreFailed = false;
+    restoring = false;
+    const found = workflows.find(
+      (w) => w.name === snapshot.name && w.is_builtin === snapshot.isBuiltin,
+    );
+    if (found === undefined) {
+      if (focusOnMount) requestAnimationFrame(() => textareaEl?.focus());
+      return;
+    }
+    selectedWorkflow = found;
+    workflowForm = null;
+    workflowInputs = { ...snapshot.inputs };
+    workflowSyncSettled = false;
+    mode = "workflow";
+    void loadWorkflowForm(found);
+  }
+
+  /// Retry a workflow restore that failed to list. Re-lists and re-resolves.
+  function retryWorkflowRestore(): void {
+    workflowRestoreFailed = false;
+    void loadWorkflows().then(tryRestoreWorkflow);
+  }
+
+  /// Give up on a failed workflow restore and start fresh in plain mode. This is
+  /// the user's explicit choice, so releasing the snapshot (letting the persist
+  /// effect overwrite it) is intended here, unlike the transient-failure path.
+  function discardWorkflowRestore(): void {
+    pendingWorkflowRestore = null;
+    workflowRestoreFailed = false;
+    restoring = false;
+  }
+
   /// The current compose content as a persistable snapshot. Single definition so
-  /// the persist effect and the explicit send-clear persist agree.
+  /// the persist effect and the explicit send-clear persist agree. `content.kind`
+  /// is the mode, so each mode round-trips through its own variant.
   function currentContent(): ComposeContent {
-    return mode === "prompt" && selectedPrompt !== null
-      ? {
-          kind: "prompt",
-          provider: selectedPrompt.provider,
-          name: selectedPrompt.name,
-          args: { ...promptArgs },
-          appendedText,
-        }
-      : { kind: "plain", draft };
+    if (mode === "prompt" && selectedPrompt !== null) {
+      return {
+        kind: "prompt",
+        provider: selectedPrompt.provider,
+        name: selectedPrompt.name,
+        args: { ...promptArgs },
+        appendedText,
+      };
+    }
+    if (mode === "workflow" && selectedWorkflow !== null) {
+      return {
+        kind: "workflow",
+        name: selectedWorkflow.name,
+        // Part of the identity: a built-in and a same-named copied user workflow
+        // are different workflows, so restore needs both to re-resolve the listing.
+        isBuiltin: selectedWorkflow.is_builtin,
+        // List-valued inputs are arrays; copy them out of reactive state so the
+        // store never aliases live `$state`.
+        inputs: Object.fromEntries(
+          Object.entries(workflowInputs).map(([name, value]) => [
+            name,
+            Array.isArray(value) ? [...value] : value,
+          ]),
+        ),
+      };
+    }
+    return { kind: "plain", draft };
+  }
+
+  /// The four forward-source families as a persistable snapshot. Copied out of
+  /// reactive state rather than passed by reference — the store must not alias
+  /// live `$state`, or it would keep mutating after this bar is gone.
+  function currentForwards(): ComposeForwards {
+    const copyMap = (map: Record<string, ForwardSource[]>): Record<string, ForwardSource[]> =>
+      Object.fromEntries(Object.entries(map).map(([field, sources]) => [field, [...sources]]));
+    return {
+      message: [...forwardSources],
+      promptArgs: copyMap(promptArgSources),
+      promptAppended: [...promptAppendedSources],
+      workflowFields: copyMap(workflowForwardSources),
+    };
   }
 
   // Drop any selected ids whose agent disappeared (agent removed at runtime).
@@ -412,11 +617,30 @@
     if (valid.length !== selectedIds.length) setSelectedIds(valid);
   });
 
+  // Persist every forward-source family together — they are one field in the
+  // snapshot because a mode switch hides the inapplicable ones but must preserve
+  // them for the return trip. Like content, the send-clear path also writes
+  // through explicitly, so a cleared set can't be overtaken by a same-frame unmount.
+  $effect(() => {
+    setForwards(projectId, currentForwards());
+  });
+
+  // Backstop mirroring `attachmentChips` → the snapshot (path 1 in the attachments
+  // header comment). Content/forwards have had this from the start; attachments did
+  // not, and a restore path that assigned chips without writing the store shipped a
+  // silent file-loss bug. With this effect, any mounted mutation of the chip list
+  // persists whether or not the mutating site remembered to. The synchronous
+  // `commitChips` writes still matter for send-clear (`persistComposeNow` flushes in
+  // the same frame, ahead of this scheduled effect); this covers everything else.
+  $effect(() => {
+    setAttachments(projectId, chipsToAttachments(attachmentChips));
+  });
+
   // Persist the compose content per project (machine-local; see composeStore).
   // Plain and prompt modes are distinct persisted states. Skipped while a saved
   // prompt-mode draft is still being restored, so the pre-restore plain
   // placeholder can't overwrite (and destroy) the saved snapshot. The send-clear
-  // path persists explicitly (`persistContentNow`) so it survives a same-frame
+  // path persists explicitly (`persistComposeNow`) so it survives a same-frame
   // unmount regardless of this effect's scheduling.
   $effect(() => {
     if (restoring) return;
@@ -930,8 +1154,10 @@
   onDestroy(() => {
     clearFileSearchTimer();
     fileSearchToken += 1;
-    // Abandon any in-flight staging for this (now unmounting) compose session.
-    composeGeneration += 1;
+    // In-flight staging is deliberately *not* abandoned: the copy belongs to this
+    // project's draft, and `addAttachmentChip` commits it to the snapshot whether
+    // or not this bar is still around to render the chip.
+    unmounted = true;
     // A mid-render unmount (project switch via the parent's `{#key}`) must not
     // leave the project's pane targeting frozen.
     setTargetingLocked(projectId, false);
@@ -1148,12 +1374,18 @@
 
   // --- Workflows ------------------------------------------------------------
 
-  async function loadWorkflows(): Promise<void> {
+  /// Returns whether the list actually succeeded. The workflow-restore path needs
+  /// to tell "list succeeded, workflow absent" from "list failed" — collapsing
+  /// both into `workflows = []` is what let a transient failure erase a saved
+  /// invocation. Other callers ignore the result.
+  async function loadWorkflows(): Promise<boolean> {
     try {
       const list = await api.listWorkflows();
       workflows = Array.isArray(list) ? list : [];
+      return true;
     } catch {
       workflows = [];
+      return false;
     } finally {
       workflowsLoaded = true;
     }
@@ -1465,9 +1697,9 @@
       draft = body;
     }
     if (attachmentChips.length === 0 && attachments.length > 0) {
-      attachmentChips = attachments.map((a) => ({ ...a, id: crypto.randomUUID() }));
+      commitChips(restoreChips(attachments));
     }
-    persistContentNow();
+    persistComposeNow();
   }
 
   /// Manual forward into a prompt's arguments (§7) — the prompt-composer analogue
@@ -1591,9 +1823,9 @@
     promptArgSources = { ...argSources };
     promptAppendedSources = [...appendedSources];
     appendedText = appended;
-    attachmentChips = attachments.map((a) => ({ ...a, id: crypto.randomUUID() }));
+    commitChips(restoreChips(attachments));
     mode = "prompt";
-    persistContentNow();
+    persistComposeNow();
   }
 
   /// Dispatch `text` to `targets` under one send_id. Shared by the plain, prompt,
@@ -1691,10 +1923,10 @@
         focusPromptFieldOnMount = false;
         appendedText = "";
         draft = "";
-        attachmentChips = [];
-        composeGeneration += 1;
+        commitChips([]);
+        sendGeneration += 1;
         mode = "plain";
-        persistContentNow();
+        persistComposeNow();
         return;
       }
 
@@ -1738,10 +1970,10 @@
       draft = "";
       // Chips clear optimistically with the text (the optimistic user turn already
       // renders them); the staged files persist on disk for the send.
-      attachmentChips = [];
-      composeGeneration += 1;
+      commitChips([]);
+      sendGeneration += 1;
       mode = "plain";
-      persistContentNow();
+      persistComposeNow();
       return;
     }
 
@@ -1755,9 +1987,9 @@
       dispatchForward(draft.trim(), [...forwardSources], attachments, [...selectedAgents]);
       draft = "";
       forwardSources = [];
-      attachmentChips = [];
-      composeGeneration += 1;
-      persistContentNow();
+      commitChips([]);
+      sendGeneration += 1;
+      persistComposeNow();
       return;
     }
 
@@ -1766,17 +1998,26 @@
     // message (recipients stay selected — sticky). Chips clear with the text;
     // their staged files persist on disk for the send.
     draft = "";
-    attachmentChips = [];
-    composeGeneration += 1;
-    persistContentNow();
+    commitChips([]);
+    sendGeneration += 1;
+    persistComposeNow();
   }
 
-  /// Persist the current compose content immediately — `flush()` writes through
-  /// and cancels the pending debounce — so a send-clear is durable even if the
-  /// component unmounts in the same frame (e.g. a project switch right after
-  /// sending), and a stale pre-send draft can never land after the clear.
-  function persistContentNow(): void {
+  /// Persist the current compose content and forward sources immediately —
+  /// `flush()` writes through and cancels the pending debounce — so a send-clear is
+  /// durable even if the component unmounts in the same frame (e.g. a project
+  /// switch right after sending), and a stale pre-send draft can never land after
+  /// the clear.
+  ///
+  /// Forwards are written synchronously here for the same reason as content: their
+  /// persist `$effect` is *scheduled*, so an unmount before it runs would `flush()`
+  /// the pre-clear forward set and resurrect it on the next mount. In the ordinary
+  /// path the effect plus `onDestroy`'s flush already cover this, and the window is
+  /// too narrow to drive from a jsdom test — so treat this as symmetry with the
+  /// content path, not a test-pinned guarantee.
+  function persistComposeNow(): void {
     setContent(projectId, currentContent());
+    setForwards(projectId, currentForwards());
     flush();
   }
 </script>
@@ -1821,7 +2062,7 @@
             data-testid="workflow-run-stop"
             onclick={() => void stopWorkflowRun()}
             aria-label="Stop workflow"
-            class="text-muted hover:bg-status-failed-soft/70 hover:text-status-failed focus-visible:ring-accent inline-flex h-7 shrink-0 items-center gap-1 rounded-full px-2 text-xs transition-colors focus-visible:ring-2 focus-visible:outline-none"
+            class="text-muted hover:bg-status-failed-soft/70 hover:text-status-failed focus-visible:ring-focus inline-flex h-7 shrink-0 items-center gap-1 rounded-full px-2 text-xs transition-colors focus-visible:ring-1 focus-visible:outline-none"
           >
             <StopIcon class="size-4" />
             Stop
@@ -1831,7 +2072,7 @@
             type="button"
             data-testid="workflow-run-dismiss"
             onclick={() => void dismissWorkflowRun()}
-            class="text-muted hover:bg-panel hover:text-fg focus-visible:ring-accent inline-flex h-7 shrink-0 items-center rounded-full px-2.5 text-xs transition-colors focus-visible:ring-2 focus-visible:outline-none"
+            class="text-muted hover:bg-panel hover:text-fg focus-visible:ring-focus inline-flex h-7 shrink-0 items-center rounded-full px-2.5 text-xs transition-colors focus-visible:ring-1 focus-visible:outline-none"
           >
             Dismiss
           </button>
@@ -1866,10 +2107,16 @@
     <div
       class={cn(
         "border-border bg-raised relative rounded-xl border p-2.5 shadow-[0_10px_32px_rgba(0,0,0,0.08)] transition-colors",
-        dragOver ? "ring-accent border-accent ring-2" : "",
+        dragOver ? "border-accent" : composeFocused ? "border-focus" : "",
       )}
       data-testid="compose-box"
       data-drag-over={dragOver}
+      onfocusin={() => (composeFocused = true)}
+      onfocusout={(e) => {
+        // Keep the ring while focus moves *between* children of the box (field →
+        // button → chip); only clear when it genuinely leaves the container.
+        if (!e.currentTarget.contains(e.relatedTarget as Node | null)) composeFocused = false;
+      }}
     >
       {#if promptMenuOpen}
         <!-- Full compose-box width, floating just above the box (anchored to its
@@ -1915,8 +2162,8 @@
               {@const i = menuItems.findIndex((candidate) => candidate.key === item.key)}
               <button
                 type="button"
-                class={"hover:bg-panel/80 flex w-full cursor-pointer items-start gap-2 rounded-md px-2.5 py-1.5 text-left leading-5 outline-none select-none " +
-                  (i === highlighted ? "bg-panel/80" : "")}
+                class={"hover:bg-hover flex w-full cursor-pointer items-start gap-2 rounded-md px-2.5 py-1.5 text-left leading-5 outline-none select-none " +
+                  (i === highlighted ? "bg-hover" : "")}
                 data-testid={`file-option-${item.path}`}
                 role="option"
                 aria-selected={i === highlighted}
@@ -1974,8 +2221,8 @@
               {@const i = menuItems.findIndex((candidate) => candidate.key === item.key)}
               <button
                 type="button"
-                class={"hover:bg-panel/80 flex w-full cursor-pointer items-center gap-2 rounded-md px-2.5 py-1 text-left leading-5 outline-none select-none " +
-                  (i === highlighted ? "bg-panel/80" : "")}
+                class={"hover:bg-hover flex w-full cursor-pointer items-center gap-2 rounded-md px-2.5 py-1 text-left leading-5 outline-none select-none " +
+                  (i === highlighted ? "bg-hover" : "")}
                 data-testid={`attachment-option-${item.label}`}
                 role="option"
                 aria-selected={i === highlighted}
@@ -2014,8 +2261,8 @@
             {@const i = menuItems.findIndex((candidate) => candidate.key === item.key)}
             <button
               type="button"
-              class={"hover:bg-panel/80 flex w-full cursor-pointer items-center gap-2 rounded-md px-2.5 py-1 text-left leading-5 outline-none select-none " +
-                (i === highlighted ? "bg-panel/80" : "")}
+              class={"hover:bg-hover flex w-full cursor-pointer items-center gap-2 rounded-md px-2.5 py-1 text-left leading-5 outline-none select-none " +
+                (i === highlighted ? "bg-hover" : "")}
               data-testid={`recipient-option-${item.key}`}
               role="option"
               aria-selected={i === highlighted}
@@ -2090,8 +2337,8 @@
             {@const i = menuItems.findIndex((candidate) => candidate.key === item.key)}
             <button
               type="button"
-              class={"hover:bg-panel/80 flex w-full cursor-pointer items-center gap-2 rounded-md px-2.5 py-1 text-left leading-5 outline-none select-none " +
-                (i === highlighted ? "bg-panel/80" : "")}
+              class={"hover:bg-hover flex w-full cursor-pointer items-center gap-2 rounded-md px-2.5 py-1 text-left leading-5 outline-none select-none " +
+                (i === highlighted ? "bg-hover" : "")}
               data-testid={`forward-option-${item.key}`}
               role="option"
               aria-selected={i === highlighted}
@@ -2129,8 +2376,10 @@
               {:else}
                 <HarnessIcon harness={item.agent.harness} size="sm" class="h-4 w-4" />
                 <span class="text-fg">{item.agent.name}</span>
-                {#if !agentHasCompletedOutput(item.agent.id)}
-                  <span class="text-muted ml-auto text-[11px] italic">no output yet</span>
+                {#if agentReadiness(item.agent.id) === "empty"}
+                  <span class="text-muted ml-auto text-[11px] italic">will be skipped</span>
+                {:else if agentReadiness(item.agent.id) === "pending"}
+                  <span class="text-muted ml-auto text-[11px] italic">still generating</span>
                 {/if}
               {/if}
             </button>
@@ -2147,7 +2396,7 @@
           {#each forwardSources as source (forwardSourceKey(source))}
             <ForwardSourceChip
               {source}
-              empty={sourceIsEmpty(source)}
+              readiness={agentReadiness(source.id)}
               disabled={sending}
               onRemove={() => removeForwardSource(forwardSourceKey(source))}
             />
@@ -2196,7 +2445,7 @@
                     {...props}
                     type="button"
                     class={cn(
-                      "focus-visible:ring-accent inline-flex h-6 items-center gap-1 rounded-full border px-2 text-xs transition-colors focus-visible:ring-2 focus-visible:outline-none",
+                      "focus-visible:ring-focus inline-flex h-6 items-center gap-1 rounded-full border px-2 text-xs transition-colors focus-visible:ring-1 focus-visible:outline-none",
                       selected
                         ? "bg-accent-soft text-fg border-transparent"
                         : "border-panel bg-panel text-muted hover:bg-raised hover:text-fg",
@@ -2283,7 +2532,7 @@
               panes={paneLayout.panes}
               onPickAgent={(agent) => addForwardSource(forwardSourceForAgent(agent))}
               onPickPane={(pane) => addPaneForwardSources(pane)}
-              agentHasOutput={agentHasCompletedOutput}
+              {agentReadiness}
               disabled={sending}
               showPaneShortcuts
               triggerTestid="compose-forward-button"
@@ -2291,7 +2540,7 @@
               triggerLabel="Forward an agent's output"
               tooltipLabel="Forward an agent's output"
               triggerClass={cn(
-                "text-muted hover:text-fg hover:bg-panel focus-visible:ring-accent flex h-6 items-center gap-1 rounded-full border border-transparent px-2 text-xs transition-colors focus-visible:ring-2 focus-visible:outline-none",
+                "text-muted hover:text-fg hover:bg-panel focus-visible:ring-focus flex h-6 items-center gap-1 rounded-full border border-transparent px-2 text-xs transition-colors focus-visible:ring-1 focus-visible:outline-none",
                 sending ? "cursor-not-allowed opacity-60" : "",
               )}
             />
@@ -2301,7 +2550,7 @@
                   {...props}
                   type="button"
                   class={cn(
-                    "text-muted hover:text-fg hover:bg-panel focus-visible:ring-accent flex h-6 items-center gap-1 rounded-full border border-transparent px-2 text-xs transition-colors focus-visible:ring-2 focus-visible:outline-none",
+                    "text-muted hover:text-fg hover:bg-panel focus-visible:ring-focus flex h-6 items-center gap-1 rounded-full border border-transparent px-2 text-xs transition-colors focus-visible:ring-1 focus-visible:outline-none",
                     sending ? "cursor-not-allowed opacity-60" : "",
                   )}
                   data-testid="compose-prompt-button"
@@ -2337,7 +2586,7 @@
                   {...props}
                   type="button"
                   class={cn(
-                    "text-muted hover:text-fg hover:bg-panel focus-visible:ring-accent flex h-6 items-center gap-1 rounded-full border border-transparent px-2 text-xs transition-colors focus-visible:ring-2 focus-visible:outline-none",
+                    "text-muted hover:text-fg hover:bg-panel focus-visible:ring-focus flex h-6 items-center gap-1 rounded-full border border-transparent px-2 text-xs transition-colors focus-visible:ring-1 focus-visible:outline-none",
                     sending ? "cursor-not-allowed opacity-60" : "",
                   )}
                   data-testid="compose-workflow-button"
@@ -2409,16 +2658,44 @@
         </div>
       {/if}
 
-      {#if restoring}
-        <!-- A saved prompt-mode draft is still resolving against the (possibly
-           cold) cache. Show a neutral placeholder rather than the plain textarea
-           so the box doesn't flash empty and look like the draft was lost. -->
+      {#if restoring && workflowRestoreFailed}
+        <!-- The workflow list failed to load, so we can't tell whether the saved
+           workflow still exists. The snapshot is held (not discarded) until the
+           user retries or explicitly starts over — a transient error must not
+           destroy a half-filled invocation. -->
+        <div
+          class="flex h-16 items-center gap-3 px-1 text-sm"
+          data-testid="compose-workflow-restore-failed"
+        >
+          <span class="text-muted">Couldn't load your saved workflow.</span>
+          <Button
+            size="sm"
+            variant="secondary"
+            onclick={retryWorkflowRestore}
+            data-testid="workflow-restore-retry"
+          >
+            Retry
+          </Button>
+          <Button
+            size="sm"
+            variant="ghost"
+            onclick={discardWorkflowRestore}
+            data-testid="workflow-restore-discard"
+          >
+            Start over
+          </Button>
+        </div>
+      {:else if restoring}
+        <!-- A saved prompt- or workflow-mode draft is still resolving against its
+           source (a possibly cold prompt cache; the local workflow list). Show a
+           neutral placeholder rather than the plain textarea so the box doesn't
+           flash empty and look like the draft was lost. -->
         <div
           class="text-muted flex h-16 items-center gap-2 px-1 text-sm"
           data-testid="compose-restoring"
         >
           <Spinner class="h-4 w-4" />
-          Restoring prompt…
+          Restoring {pendingWorkflowRestore !== null ? "workflow" : "prompt"}…
         </div>
       {:else if mode === "workflow" && workflowForm !== null}
         <!-- Workflow mode: the invocation form spans the compose area. The compose
@@ -2429,7 +2706,7 @@
           {agents}
           loading={workflowFormLoading}
           syncSettled={workflowSyncSettled}
-          agentHasOutput={agentHasCompletedOutput}
+          {agentReadiness}
           panes={paneLayout.panes}
           bind:inputs={workflowInputs}
           bind:forwardSources={workflowForwardSources}
@@ -2459,7 +2736,7 @@
           bind:appendedSources={promptAppendedSources}
           {agents}
           panes={paneLayout.panes}
-          agentHasOutput={agentHasCompletedOutput}
+          {agentReadiness}
           focusFirstField={focusPromptFieldOnMount}
           onremove={removePrompt}
           recipients={recipientChips}
@@ -2508,9 +2785,9 @@
         class={cn(
           "flex h-7 w-7 shrink-0 items-center justify-center rounded-full transition-colors",
           showStop
-            ? "bg-border text-muted hover:bg-status-failed-soft/70 hover:text-status-failed"
+            ? "bg-active text-muted hover:bg-status-failed-soft/70 hover:text-status-failed"
             : sendDisabled
-              ? "bg-border text-muted/50 cursor-not-allowed"
+              ? "bg-active text-muted/50 cursor-not-allowed"
               : "bg-primary text-primary-fg hover:bg-primary/90",
         )}
       >

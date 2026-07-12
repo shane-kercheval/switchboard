@@ -193,6 +193,11 @@ pub struct ChangedFile {
     /// Repo-relative path. For a rename this is the new path.
     pub path: String,
     pub change: ChangeKind,
+    /// Added/removed line counts. `None` means not line-countable — binary
+    /// content or a file past the diff size cap (the `-` placeholder in
+    /// `git diff --numstat`), distinct from a real 0.
+    pub additions: Option<u32>,
+    pub deletions: Option<u32>,
 }
 
 /// The kind of change to a file in the working tree.

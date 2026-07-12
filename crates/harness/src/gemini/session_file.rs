@@ -531,9 +531,12 @@ impl GeminiReconstruction {
                     ToolKind::Builtin
                 };
                 let tc_ts = tc.timestamp.unwrap_or(builder.last_seen_at);
+                // Gemini facets are deliberately unmapped (auth-dead CLI —
+                // harness-behavior G26); `Other` = generic rendering.
                 items.push(TurnItem::Tool {
                     tool_use_id: tc.id.clone(),
                     kind,
+                    facet: crate::facets::ToolFacet::Other,
                     name: tc.name.clone(),
                     input: tc.args.clone(),
                     output: tc.output.clone(),
@@ -568,6 +571,7 @@ impl GeminiReconstruction {
             // `TurnEnd` leaves `hydration_key: None` for now.
             spend: None,
             hydration_key: builder.records.first().map(|r| r.id.clone()),
+            continuation_of: None,
             stable_message_id: None,
         });
     }

@@ -41,6 +41,21 @@ export function textItem(text: string): Item {
   return { item_kind: "text", kind: "text", text };
 }
 
+export function toolItem(opts: { id: string; name?: string; command?: string }): Item {
+  return {
+    item_kind: "tool",
+    facet: { facet_kind: "other" },
+    tool_use_id: opts.id,
+    kind: "builtin",
+    name: opts.name ?? "Bash",
+    input: { command: opts.command ?? "echo hi" },
+    output: "ok\n",
+    is_error: false,
+    started_at: "2026-05-16T00:00:01Z",
+    completed_at: "2026-05-16T00:00:02Z",
+  };
+}
+
 export function userTurn(opts: {
   id: string;
   agentId: string;

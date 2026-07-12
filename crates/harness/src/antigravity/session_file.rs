@@ -303,6 +303,9 @@ impl Reconstruction {
                     builder.items.push(TurnItem::Tool {
                         tool_use_id,
                         kind: classify_tool_kind(&call.name),
+                        facet: super::facets::classify_antigravity_tool_facet(
+                            &call.name, &call.args,
+                        ),
                         name: call.name.clone(),
                         input: call.args.clone(),
                         output: result.as_ref().map(|r| r.output.clone()),
@@ -412,6 +415,7 @@ impl Reconstruction {
             // eligible for hydration-key-based re-parse.
             spend: None,
             hydration_key: None,
+            continuation_of: None,
             stable_message_id: None,
         });
     }

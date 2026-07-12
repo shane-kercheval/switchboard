@@ -211,6 +211,7 @@ pub fn record_to_live_events(
                 turn_id,
                 tool_use_id: tool_use_id.clone(),
                 kind: classify_tool_kind(&call.name),
+                facet: super::facets::classify_antigravity_tool_facet(&call.name, &call.args),
                 name: call.name.clone(),
                 input: call.args.clone(),
             });

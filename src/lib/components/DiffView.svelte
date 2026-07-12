@@ -8,7 +8,18 @@
   import { formatFileSize, highlightDiffLine, toSideBySide } from "$lib/diff";
   import type { DiffLine, FileDiff, DiffStyle } from "$lib/types";
 
-  let { diff, style, language }: { diff: FileDiff; style: DiffStyle; language: string } = $props();
+  let {
+    diff,
+    style,
+    language,
+    compact = false,
+  }: { diff: FileDiff; style: DiffStyle; language: string; compact?: boolean } = $props();
+
+  // Compact mode is for snippet-scoped diffs (the tool-call row): hunk
+  // headers and line-number gutters are hidden — snippet-relative numbers
+  // read as file positions they aren't — keeping just the ± markers and
+  // line fills, with a hairline between hunks. Unified-style only; the Git
+  // view never passes it.
 
   // Pre-fold each hunk for side-by-side once per diff/style change (not per render).
   const sideBySideHunks = $derived(
@@ -27,11 +38,13 @@
     return " ";
   }
 
-  // A side-by-side half's background follows the line it shows; an absent line
-  // (the padding side of an uneven change block) is a faint filler so the columns
-  // still read as aligned.
+  // A side-by-side half's background follows the line it shows. An absent line
+  // (the padding side of an uneven change block) gets no fill: alignment is a
+  // layout property — the row height already matches its sibling and the empty
+  // gutter signals "no line here" — so a fill added nothing structural, and a
+  // recessed neutral read as a prominent block rather than the intended nothing.
   function halfBg(line: DiffLine | null): string {
-    return line === null ? "bg-panel/40" : lineBg(line.origin);
+    return line === null ? "" : lineBg(line.origin);
   }
 </script>
 
@@ -56,11 +69,15 @@
     <p class="text-muted px-3 py-6 text-center text-sm" data-testid="diff-empty">No changes.</p>
   {:else}
     {#each diff.hunks as hunk, hi (hi)}
-      <div
-        class="text-muted bg-panel/80 border-border/40 sticky top-0 z-10 border-y px-3 py-0.5 select-none"
-      >
-        {hunk.header}
-      </div>
+      {#if !compact}
+        <div
+          class="text-muted bg-panel border-border/40 sticky top-0 z-10 border-y px-3 py-0.5 select-none"
+        >
+          {hunk.header}
+        </div>
+      {:else if hi > 0}
+        <div class="border-border/40 border-t" aria-hidden="true"></div>
+      {/if}
 
       {#if style === "unified"}
         {#each hunk.lines as line, li (li)}
@@ -69,8 +86,10 @@
             data-testid="diff-line"
             data-origin={line.origin}
           >
-            {@render gutter(line.old_lineno)}
-            {@render gutter(line.new_lineno)}
+            {#if !compact}
+              {@render gutter(line.old_lineno)}
+              {@render gutter(line.new_lineno)}
+            {/if}
             <span class="text-muted w-4 shrink-0 text-center select-none"
               >{marker(line.origin)}</span
             >

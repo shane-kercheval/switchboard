@@ -48,6 +48,40 @@ export type ContentKind = "text" | "thinking";
 // reserved-but-not-currently-emitted (a forward-compat pattern).
 export type ToolKind = "builtin" | "mcp" | "plugin" | "other";
 
+// Normalized tool-call operation, mirroring Rust `ToolFacet`
+// (crates/harness/src/facets.rs — the doc-comments there carry the full
+// contract: absolute paths, no line numbers, content caps). The Rust enum is
+// `#[non_exhaustive]`, so a renderer branching on `facet_kind` must default
+// any unrecognized discriminant to the generic (`other`) path rather than
+// rendering blank.
+export type ToolFacet =
+  | { facet_kind: "edit"; files: EditedFile[] }
+  | { facet_kind: "write"; path: string; content: string; truncated: boolean }
+  | { facet_kind: "read"; path: string }
+  | { facet_kind: "shell"; command: string; cwd?: string | null }
+  | { facet_kind: "search"; pattern: string; path?: string | null }
+  | { facet_kind: "todo"; items: TodoItem[] }
+  | { facet_kind: "mcp"; server: string; tool: string }
+  | { facet_kind: "other" };
+
+export type EditedFile = {
+  path: string;
+  change: EditChange;
+  // Empty means content-unavailable (a live Codex edit announces paths
+  // without content; the facet is upgraded from the session file at turn
+  // end), not "no change".
+  edits: EditPair[];
+  truncated: boolean;
+};
+
+export type EditChange = "added" | "modified" | "deleted";
+
+export type EditPair = { old: string; new: string };
+
+// `status` is the harness's own vocabulary (opaque); `content` may be a bare
+// task id for status-only updates (Claude `TaskUpdate` carries no text).
+export type TodoItem = { content: string; status: string };
+
 export type McpServerStatus = { name: string; status: string };
 
 // Per-turn usage carried on `turn_end.usage`. `total_cost_usd` is Claude
@@ -154,6 +188,7 @@ export type NormalizedEvent =
       name: string;
       // serde_json::Value on the Rust side; arbitrary JSON shape here.
       input: unknown;
+      facet: ToolFacet;
     }
   | {
       type: "tool_completed";
@@ -161,6 +196,17 @@ export type NormalizedEvent =
       tool_use_id: string;
       output: string;
       is_error: boolean;
+    }
+  // Late facet enrichment for an already-rendered tool call, emitted before
+  // the turn's `turn_end`. Codex-only today: its live `file_change` item
+  // carries paths but no content, so edit content arrives from the turn-end
+  // session-file re-read. The reducer swaps the matching item's facet in
+  // place; an unmatched `tool_use_id` is dropped.
+  | {
+      type: "tool_facet_updated";
+      turn_id: TurnId;
+      tool_use_id: string;
+      facet: ToolFacet;
     }
   | {
       type: "turn_end";
@@ -296,6 +342,12 @@ export type LoadedTurn =
       // it so re-reading a session file never duplicates this turn. Absent for
       // keyless harnesses (Antigravity) — the merge falls back to `turn_id`.
       hydration_key?: string | null;
+      // The `hydration_key` of the pre-compaction fragment this turn continues
+      // (Claude; absent everywhere else). Live, the whole dispatch is ONE turn
+      // keyed by the first fragment's key, so a re-read's continuation matches
+      // no resident by key — this link lets the hydrate merge collapse it into
+      // the resident that already carries its content instead of duplicating.
+      continuation_of?: string | null;
     };
 
 export type LoadedTurnItem =
@@ -306,6 +358,7 @@ export type LoadedTurnItem =
       kind: ToolKind;
       name: string;
       input: unknown;
+      facet: ToolFacet;
       output?: string | null;
       is_error?: boolean | null;
       started_at: string;
@@ -516,6 +569,10 @@ export type ChangeKind = "modified" | "added" | "deleted" | "renamed" | "untrack
 export type ChangedFile = {
   path: string;
   change: ChangeKind;
+  // Added/removed line counts; null = not line-countable (binary or past the
+  // diff size cap), distinct from a real 0.
+  additions: number | null;
+  deletions: number | null;
 };
 
 // Mirror of Rust `CommitChanges` — one selected commit's body and changed files,
@@ -661,6 +718,9 @@ export type ConversationItem =
       spend?: TurnSpend | null;
       // Stable hydration key — same source + meaning as `LoadedTurn.hydration_key`.
       hydration_key?: string | null;
+      // Compaction-continuation link — same source + meaning as
+      // `LoadedTurn.continuation_of`.
+      continuation_of?: string | null;
     }
   | {
       kind: "outcome";

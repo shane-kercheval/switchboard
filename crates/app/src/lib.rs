@@ -41,21 +41,21 @@ use crate::commands::{
     check_claude_binary_impl, check_codex_auth_impl, check_codex_binary_impl,
     check_gemini_auth_impl, check_gemini_binary_impl, commit_changed_files_impl,
     commit_file_diff_impl, commit_ranges_impl, copy_builtin_prompt_impl, create_agent_impl,
-    create_project_impl, delete_project_impl, editor_open_argv, fetch_repo_impl, file_diff_impl,
-    forward_message_impl, forward_prompt_impl, get_harness_install_status_impl,
-    get_preferences_impl, get_prompt_source_impl, init_directory_impl, list_agents_impl,
-    list_mcp_providers_impl, list_projects_impl, list_prompts_impl, list_tracked_repos_from_inputs,
-    list_workspace_directories_impl, load_project_conversation_impl, load_transcript_impl,
-    open_commit_file_difftool_impl, open_project_impl, open_worktree_file_difftool_impl,
-    parse_uuid, pick_directory_impl, project_session_fingerprints_impl,
-    read_tracked_repo_from_inputs, remove_agent_impl, remove_directory_impl,
-    remove_mcp_provider_impl, remove_queued_message_impl, remove_tracked_repo_impl,
-    rename_agent_impl, rename_project_impl, render_prompt_impl, reorder_agents_impl,
-    reveal_in_finder_argv, search_project_files_in_root, search_project_files_root_impl,
-    send_message_impl, set_active_project_impl, set_agent_effort_impl, set_agent_model_impl,
-    set_preferences_impl, set_project_archived_impl, stage_attachment_impl,
-    sync_prompts_and_notify, terminal_open_argv, test_mcp_connection_impl, tracked_repos_inputs,
-    tracked_roots, validate_external_url,
+    create_project_impl, delete_project_impl, editor_open_argv, existing_attachment_paths_impl,
+    fetch_repo_impl, file_diff_impl, forward_message_impl, forward_prompt_impl,
+    get_harness_install_status_impl, get_preferences_impl, get_prompt_source_impl,
+    init_directory_impl, list_agents_impl, list_mcp_providers_impl, list_projects_impl,
+    list_prompts_impl, list_tracked_repos_from_inputs, list_workspace_directories_impl,
+    load_project_conversation_impl, load_transcript_impl, open_commit_file_difftool_impl,
+    open_project_impl, open_worktree_file_difftool_impl, parse_uuid, pick_directory_impl,
+    project_session_fingerprints_impl, read_tracked_repo_from_inputs, remove_agent_impl,
+    remove_directory_impl, remove_mcp_provider_impl, remove_queued_message_impl,
+    remove_tracked_repo_impl, rename_agent_impl, rename_project_impl, render_prompt_impl,
+    reorder_agents_impl, reveal_in_finder_argv, search_project_files_in_root,
+    search_project_files_root_impl, send_message_impl, set_active_project_impl,
+    set_agent_effort_impl, set_agent_model_impl, set_preferences_impl, set_project_archived_impl,
+    stage_attachment_impl, sync_prompts_and_notify, terminal_open_argv, test_mcp_connection_impl,
+    tracked_repos_inputs, tracked_roots, validate_external_url,
 };
 use crate::preferences::Preferences;
 use crate::state::AppState;
@@ -580,6 +580,16 @@ async fn stage_attachment(
 }
 
 #[tauri::command]
+async fn existing_attachment_paths(
+    state: State<'_, AppState>,
+    project_id: String,
+    paths: Vec<String>,
+) -> Result<Vec<String>, String> {
+    let pid = parse_uuid(&project_id).map_err(|e| e.to_string())?;
+    existing_attachment_paths_impl(state.inner(), pid, paths).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 async fn remove_queued_message(
     state: State<'_, AppState>,
     agent_id: String,
@@ -1008,12 +1018,17 @@ async fn open_commit_file_difftool(
 async fn load_project_conversation(
     state: State<'_, AppState>,
     project_id: String,
+    draft_attachments: Vec<String>,
 ) -> Result<ProjectConversation, String> {
     let id = parse_uuid(&project_id).map_err(|e| e.to_string())?;
     let home = std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_default();
-    load_project_conversation_impl(state.inner(), id, &home)
+    let drafts: Vec<std::path::PathBuf> = draft_attachments
+        .into_iter()
+        .map(std::path::PathBuf::from)
+        .collect();
+    load_project_conversation_impl(state.inner(), id, &home, &drafts)
         .await
         .map_err(|e| e.to_string())
 }
@@ -1423,6 +1438,7 @@ pub fn run() {
             search_project_files,
             send_message,
             stage_attachment,
+            existing_attachment_paths,
             remove_queued_message,
             cancel_turn,
             cancel_agent,

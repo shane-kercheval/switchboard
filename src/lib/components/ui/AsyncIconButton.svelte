@@ -81,7 +81,7 @@
     (disabled || state === "pending") && "cursor-not-allowed opacity-50",
     state === "done"
       ? "bg-accent-soft text-accent hover:bg-accent-soft hover:text-accent"
-      : "text-muted hover:text-fg hover:bg-border/60",
+      : "text-muted hover:text-fg hover:bg-hover",
   )}
   data-testid={testid}
   data-state={state}

@@ -134,6 +134,13 @@ pub struct Enrichment {
     /// `context_window` is left `None` here; the adapter overlays it
     /// separately from the `task_started`-derived [`Self::context_window`].
     pub per_turn_usage: Option<TurnUsage>,
+    /// The **current turn's** content-bearing `Edit` facets, one per
+    /// `apply_patch` `custom_tool_call`, in record order. Turn-scoped (reset at
+    /// each `task_started`, like [`Self::per_turn_usage`]). The adapter zips
+    /// these onto the turn's live `file_change` tool ids and emits
+    /// `ToolFacetUpdated` — the disk read is the only place a Codex edit's
+    /// content exists (harness-behavior §3.6).
+    pub patch_facets: Vec<crate::facets::ToolFacet>,
 }
 
 /// Compute the canonical session-file path glob's parent directory for a
@@ -374,6 +381,9 @@ fn turn_context_turn_id(payload: &Value) -> Option<String> {
 pub fn parse_session_content(content: &str) -> Enrichment {
     let mut enrichment = Enrichment::default();
     let mut model_set = false; // first-turn_context wins (set-once gate)
+    // Running shell cwd (turn_context precedes the turn's tool records) —
+    // resolves relative apply_patch paths; observed paths are absolute.
+    let mut current_cwd: Option<std::path::PathBuf> = None;
 
     for (idx, line) in content.lines().enumerate() {
         if line.trim().is_empty() {
@@ -425,6 +435,27 @@ pub fn parse_session_content(content: &str) -> Enrichment {
                     // reload parser reads for `hydration_key`. Set here, reset at
                     // `task_started` below.
                     enrichment.current_turn_id = turn_context_turn_id(p);
+                    current_cwd = p
+                        .get("cwd")
+                        .and_then(Value::as_str)
+                        .map(std::path::PathBuf::from);
+                }
+            }
+            // The current turn's apply_patch calls — the content-bearing side
+            // of the Codex edit split (the live `file_change` has paths only).
+            // Same parse the reload path uses, so the upgraded live facet
+            // equals the reloaded one.
+            "response_item" => {
+                if let Some(p) = payload
+                    && p.get("type").and_then(Value::as_str) == Some("custom_tool_call")
+                    && p.get("name").and_then(Value::as_str) == Some("apply_patch")
+                    && let Some(input) = p.get("input").and_then(Value::as_str)
+                    && let Some(files) =
+                        super::facets::parse_apply_patch(input, current_cwd.as_deref())
+                {
+                    enrichment
+                        .patch_facets
+                        .push(crate::facets::ToolFacet::Edit { files });
                 }
             }
             "event_msg" => {
@@ -458,6 +489,10 @@ pub fn parse_session_content(content: &str) -> Enrichment {
                         // keyless → positional. Guarded live by
                         // `live_codex_hydration_key_matches_live_turn_end`.
                         enrichment.current_turn_id = None;
+                        // Turn-scoped for the same reason: the facet upgrade
+                        // must never replay a *previous* turn's patches onto
+                        // this turn's file_change rows.
+                        enrichment.patch_facets.clear();
                     }
                     "token_count" => {
                         // Two variants share this type; each feeds a different
@@ -730,6 +765,11 @@ struct CodexReconstruction {
     /// agent-scoped first-wins model that feeds `SessionMeta`.
     current_model: Option<String>,
     current_effort: Option<String>,
+    /// The shell cwd from the most-recent `turn_context` — resolves relative
+    /// `apply_patch` section paths to the absolute paths the facet contract
+    /// requires (observed paths are already absolute; this is the defensive
+    /// lexical join).
+    current_cwd: Option<std::path::PathBuf>,
 }
 
 struct CodexAgentBuilder {
@@ -767,6 +807,7 @@ impl CodexReconstruction {
             warnings: Vec::new(),
             current_model: None,
             current_effort: None,
+            current_cwd: None,
         }
     }
 
@@ -809,6 +850,10 @@ impl CodexReconstruction {
                     self.current_model = p.get("model").and_then(Value::as_str).map(str::to_owned);
                     self.current_effort =
                         p.get("effort").and_then(Value::as_str).map(str::to_owned);
+                    self.current_cwd = p
+                        .get("cwd")
+                        .and_then(Value::as_str)
+                        .map(std::path::PathBuf::from);
                     if let Some(builder) = self.current_agent.as_mut() {
                         // Same helper as the live enrichment — the two must read the
                         // identical field or a Codex turn mis-links (see
@@ -974,6 +1019,19 @@ impl CodexReconstruction {
                     .unwrap_or(Value::Null);
                 let namespace = p.get("namespace").and_then(Value::as_str);
                 let (kind, name) = classify_codex_function_call(raw_name, namespace);
+                let facet = match kind {
+                    ToolKind::Mcp => match name.split_once('.') {
+                        Some((server, tool)) => crate::facets::ToolFacet::Mcp {
+                            server: server.to_owned(),
+                            tool: tool.to_owned(),
+                        },
+                        None => crate::facets::ToolFacet::Other,
+                    },
+                    _ if raw_name == "exec_command" => {
+                        super::facets::exec_command_facet(&arguments)
+                    }
+                    _ => crate::facets::ToolFacet::Other,
+                };
                 let started_at = timestamp.unwrap_or_else(Utc::now);
                 let Some(builder) = self.current_agent.as_mut() else {
                     return;
@@ -981,6 +1039,7 @@ impl CodexReconstruction {
                 let item = TurnItem::Tool {
                     tool_use_id: call_id.to_owned(),
                     kind,
+                    facet,
                     name,
                     input: arguments,
                     output: None,
@@ -996,7 +1055,9 @@ impl CodexReconstruction {
                     let _ = apply_mcp_result(&mut builder.items, call_id, &result);
                 }
             }
-            "function_call_output" => {
+            "custom_tool_call" => self.handle_custom_tool_call(line_number, p, timestamp),
+            // Same `{call_id, output}` pairing shape as function_call_output.
+            "function_call_output" | "custom_tool_call_output" => {
                 let Some(call_id) = p.get("call_id").and_then(Value::as_str) else {
                     self.warn(line_number, "function_call_output missing call_id");
                     return;
@@ -1054,6 +1115,45 @@ impl CodexReconstruction {
         }
     }
 
+    /// Codex's edit channel on disk: `apply_patch` arrives as a
+    /// `custom_tool_call` whose `input` is the raw patch text — the *only*
+    /// place the edit's content exists (the live `file_change` item carries
+    /// paths without content). Before this handler existed the record fell
+    /// through the wildcard arm and Codex edits were invisible on reload.
+    fn handle_custom_tool_call(
+        &mut self,
+        line_number: usize,
+        p: &Value,
+        timestamp: Option<DateTime<Utc>>,
+    ) {
+        let Some(call_id) = p.get("call_id").and_then(Value::as_str) else {
+            self.warn(line_number, "custom_tool_call missing call_id");
+            return;
+        };
+        let raw_name = p.get("name").and_then(Value::as_str).unwrap_or("");
+        let input = p.get("input").and_then(Value::as_str).unwrap_or("");
+        let facet = if raw_name == "apply_patch" {
+            super::facets::apply_patch_facet(input, self.current_cwd.as_deref())
+        } else {
+            crate::facets::ToolFacet::Other
+        };
+        let started_at = timestamp.unwrap_or_else(Utc::now);
+        let Some(builder) = self.current_agent.as_mut() else {
+            return;
+        };
+        builder.items.push(TurnItem::Tool {
+            tool_use_id: call_id.to_owned(),
+            kind: ToolKind::Builtin,
+            facet,
+            name: raw_name.to_owned(),
+            input: Value::String(input.to_owned()),
+            output: None,
+            is_error: None,
+            started_at,
+            completed_at: None,
+        });
+    }
+
     fn close_current_agent(&mut self, status: TurnStatus) {
         let Some(builder) = self.current_agent.take() else {
             return;
@@ -1079,6 +1179,7 @@ impl CodexReconstruction {
             // (from disk), not mid-stream, so `supports_refresh` stays off.
             spend: None,
             hydration_key: builder.hydration_key,
+            continuation_of: None,
             stable_message_id: None,
         });
     }
@@ -1179,6 +1280,7 @@ fn apply_mcp_result(items: &mut [TurnItem], call_id: &str, result: &McpResult) -
         if let TurnItem::Tool {
             tool_use_id,
             kind,
+            facet,
             name,
             output,
             is_error,
@@ -1190,6 +1292,12 @@ fn apply_mcp_result(items: &mut [TurnItem], call_id: &str, result: &McpResult) -
             *kind = ToolKind::Mcp;
             if !result.server.is_empty() && !result.tool.is_empty() {
                 *name = format!("{}.{}", result.server, result.tool);
+                // The late MCP identity must also correct the facet, or a
+                // namespace-less function_call keeps a stale non-Mcp facet.
+                *facet = crate::facets::ToolFacet::Mcp {
+                    server: result.server.clone(),
+                    tool: result.tool.clone(),
+                };
             }
             *output = Some(result.output.clone());
             *is_error = Some(result.is_error);
@@ -2606,5 +2714,118 @@ not valid json
             }
             _ => panic!("expected Text item"),
         }
+    }
+
+    // --- Fixture-driven facet coverage: recorded @ codex 0.143.0 (probe 2026-07-10) ---
+
+    #[test]
+    fn apply_patch_fixture_hydrates_edit_facet_with_content() {
+        use crate::facets::{EditChange, ToolFacet};
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        let agent_id = Uuid::now_v7();
+        let date = NaiveDate::from_ymd_opt(2026, 7, 10).unwrap();
+        let session_id = "00000000-0000-7000-8000-000000000031";
+        let content = std::fs::read_to_string(fixture_path("apply-patch.session.jsonl")).unwrap();
+        write_session_at(home.path(), date, session_id, &content);
+
+        let result =
+            load_codex_transcript(home.path(), cwd.path(), session_id, Some(date), agent_id)
+                .unwrap();
+
+        let tools: Vec<_> = result
+            .turns
+            .iter()
+            .filter_map(|t| match t {
+                Turn::Agent { items, .. } => Some(items.iter().filter_map(|i| match i {
+                    TurnItem::Tool {
+                        name,
+                        facet,
+                        output,
+                        ..
+                    } => Some((name.clone(), facet.clone(), output.clone())),
+                    TurnItem::Text { .. } => None,
+                })),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+
+        let (_, patch_facet, patch_output) = tools
+            .iter()
+            .find(|(name, _, _)| name == "apply_patch")
+            .expect("apply_patch tool item");
+        let ToolFacet::Edit { files } = patch_facet else {
+            panic!("expected Edit facet, got {patch_facet:?}");
+        };
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].change, EditChange::Modified);
+        assert_eq!(files[0].edits[0].old, "foo");
+        assert_eq!(files[0].edits[0].new, "bar");
+        assert_eq!(files[1].change, EditChange::Added);
+        assert_eq!(files[1].edits[0].new, "hello world");
+        // custom_tool_call_output paired by call_id.
+        assert!(
+            patch_output
+                .as_deref()
+                .is_some_and(|o| o.starts_with("Exit code: 0")),
+            "custom_tool_call_output must pair onto the apply_patch item; got {patch_output:?}"
+        );
+
+        let (_, exec_facet, _) = tools
+            .iter()
+            .find(|(name, _, _)| name == "exec_command")
+            .expect("exec_command tool item");
+        let ToolFacet::Shell { command, cwd } = exec_facet else {
+            panic!("expected Shell facet, got {exec_facet:?}");
+        };
+        assert!(!command.is_empty());
+        assert!(cwd.is_some(), "disk exec_command carries workdir");
+    }
+
+    /// Codex's equivalence contract is files + change-kinds, not content:
+    /// the live `file_change` structurally cannot carry the edit text (it
+    /// exists only in the session file), so the two channels must agree on
+    /// *which files changed and how* — the same predicate the adapter's
+    /// facet-upgrade path guard uses before replacing a live facet.
+    #[test]
+    fn codex_stream_and_session_edit_facets_agree_on_files_and_kinds() {
+        use crate::facets::ToolFacet;
+        // Disk side: the enrichment read collects the turn's patch facets.
+        let content = std::fs::read_to_string(fixture_path("apply-patch.session.jsonl")).unwrap();
+        let enrichment = parse_session_content(&content);
+        assert_eq!(enrichment.patch_facets.len(), 1);
+        let ToolFacet::Edit { files: disk } = &enrichment.patch_facets[0] else {
+            panic!("expected Edit facet");
+        };
+
+        // Live side: the stream fixture's file_change item (recorded from
+        // the same probe turn).
+        let stream = std::fs::read_to_string(fixture_path("file-change.jsonl")).unwrap();
+        let mut state = crate::codex::parser::CodexParserState::default();
+        let turn_id = Uuid::now_v7();
+        let mut live: Option<Vec<(String, crate::facets::EditChange)>> = None;
+        for line in stream.lines().filter(|l| !l.trim().is_empty()) {
+            if let crate::parser::ParseOutcome::Event(crate::events::AdapterEvent::ToolStarted {
+                name,
+                facet: ToolFacet::Edit { files },
+                ..
+            }) = crate::codex::parser::parse_line(line, turn_id, &mut state)
+                && name == "file_change"
+            {
+                live = Some(files.iter().map(|f| (f.path.clone(), f.change)).collect());
+            }
+        }
+        let live = live.expect("live file_change Edit facet");
+
+        let disk_set: std::collections::HashSet<_> =
+            disk.iter().map(|f| (f.path.clone(), f.change)).collect();
+        let live_set: std::collections::HashSet<_> = live.into_iter().collect();
+        assert_eq!(
+            disk_set, live_set,
+            "live and disk must agree on files + change kinds — this equality is also the adapter's upgrade-path guard"
+        );
+        // And the content asymmetry is real: disk has pairs, live had none.
+        assert!(disk.iter().any(|f| !f.edits.is_empty()));
     }
 }

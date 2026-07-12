@@ -20,6 +20,7 @@ import type {
   MessageId,
   ParseWarning,
   SendId,
+  ToolFacet,
   ToolKind,
   TurnId,
   TurnSpend,
@@ -91,10 +92,19 @@ export type Turn =
       model?: string;
       effort?: string;
       /// Stable hydration key — the dedup identity the `hydrate` merge keys on
-      /// (falling back to `turn_id` when absent). Stamped at turn end from the
-      /// live event (live-matched harnesses only) and carried from disk on
-      /// hydrate. Load-bearing for idempotent re-reads; not rendered.
+      /// (falling back to `turn_id` when absent). Stamped **early** by the
+      /// `turn_identity` event (first assistant message — see the reducer's
+      /// `turn_identity` arm), finalized/fallback-filled at `turn_end`, and
+      /// carried from disk on hydrate. The early stamp is load-bearing, not
+      /// optional cleanup: mid-stream refresh dedup and the compaction-
+      /// continuation collapse both key on the live turn already carrying it
+      /// while streaming. Not rendered.
       hydration_key?: string;
+      /// The `hydration_key` of the pre-compaction fragment this turn continues
+      /// (disk-parsed Claude turns only; never set on live turns). The `hydrate`
+      /// merge uses it to collapse a compaction continuation into the live
+      /// resident that already carries its content. Not rendered.
+      continuation_of?: string;
       /// Populated when status = "failed". Preserved so retry UX can distinguish
       /// recoverable from non-recoverable failures (HarnessError → suggest retry;
       /// AdapterFailure → suggest "report bug"; AuthFailure → "run claude auth login").
@@ -135,6 +145,11 @@ export type ToolCall = {
   kind: ToolKind;
   name: string;
   input: unknown;
+  /// Mirrors wire `tool_started.facet` — the normalized operation the
+  /// renderer branches on (unknown `facet_kind` → generic path). May be
+  /// replaced in place by a later `tool_facet_updated` (Codex edit content
+  /// arriving at turn end).
+  facet: ToolFacet;
   output?: string;
   is_error?: boolean;
   started_at: string;

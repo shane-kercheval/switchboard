@@ -137,6 +137,7 @@ mod tests {
         TurnItem::Tool {
             tool_use_id: "t1".to_owned(),
             kind: ToolKind::Builtin,
+            facet: crate::facets::ToolFacet::Other,
             name: "Bash".to_owned(),
             input: serde_json::json!({"cmd": "ls"}),
             output: Some("file output that must not be forwarded".to_owned()),
@@ -159,6 +160,7 @@ mod tests {
             effort: None,
             spend: None,
             hydration_key: None,
+            continuation_of: None,
             stable_message_id: None,
         }
     }

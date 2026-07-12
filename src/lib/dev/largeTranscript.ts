@@ -43,6 +43,7 @@ function textItem(text: string, kind: "text" | "thinking" = "text"): TurnItem {
 function toolItem(step: number, n: number): TurnItem {
   return {
     item_kind: "tool",
+    facet: { facet_kind: "other" },
     tool_use_id: `seed-tool-${step}-${n}`,
     kind: "builtin",
     name: n % 2 === 0 ? "Read" : "Bash",

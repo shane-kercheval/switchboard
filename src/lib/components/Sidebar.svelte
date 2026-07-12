@@ -10,11 +10,14 @@
     Gauge,
     GripVertical,
     MoreHorizontal,
+    Pencil,
+    Plug,
     SlidersHorizontal,
     Square,
     Terminal,
     Trash2,
     X,
+    Zap,
   } from "@lucide/svelte";
   import { flip } from "svelte/animate";
   import type { AgentRecord, AgentId, ProjectId } from "$lib/types";
@@ -37,6 +40,12 @@
     effortOptionsFor,
     type SelectionOption,
   } from "$lib/agentSelection";
+  import {
+    AGENTS_SIDEBAR_DEFAULT_WIDTH,
+    layout,
+    SIDEBAR_MIN_WIDTH,
+    sidebarMaxWidth,
+  } from "$lib/layout.svelte";
   import DropdownMenu from "$lib/components/ui/DropdownMenu.svelte";
   import DropdownMenuItem from "$lib/components/ui/DropdownMenuItem.svelte";
   import SelectionPicker from "$lib/components/ui/SelectionPicker.svelte";
@@ -48,6 +57,7 @@
   } from "$lib/api";
   import { normalizeAgentName, validateAgentName, type NameValidation } from "$lib/agentName";
   import { cn, relativeTime } from "$lib/utils";
+  import ResizeHandle from "$lib/components/ui/ResizeHandle.svelte";
   import SidebarPanel from "$lib/components/ui/SidebarPanel.svelte";
   import SidebarSection from "$lib/components/ui/SidebarSection.svelte";
   import {
@@ -113,6 +123,9 @@
       toggleAgentHidden(projectId, rosterIds, agent.id);
     }
   }
+
+  /// Live width during a resize drag; the store commits on pointer-up.
+  let draftWidth = $state<number | null>(null);
 
   let sessionInfoByAgent = $state<Record<AgentId, AgentSessionInfo | null>>({});
   let sessionInfoStarted = $state<Record<AgentId, boolean>>({});
@@ -811,7 +824,25 @@
 
 <svelte:window onkeydown={onWindowKeydown} />
 
-<SidebarPanel side="right" width="w-60" testid="sidebar">
+<SidebarPanel side="right" width={draftWidth ?? layout.agentsSidebarWidth} testid="sidebar">
+  <ResizeHandle
+    value={() => draftWidth ?? layout.agentsSidebarWidth}
+    min={SIDEBAR_MIN_WIDTH}
+    max={sidebarMaxWidth}
+    edge="start"
+    label="Resize agents sidebar"
+    testid="agents-sidebar-resizer"
+    class="hover:bg-focus absolute inset-y-0 left-0 z-10 w-1 transition-colors"
+    onDraft={(px) => (draftWidth = px)}
+    onCommit={(px) => {
+      layout.agentsSidebarWidth = px;
+      draftWidth = null;
+    }}
+    onReset={() => {
+      layout.agentsSidebarWidth = AGENTS_SIDEBAR_DEFAULT_WIDTH;
+      draftWidth = null;
+    }}
+  />
   <SidebarSection title="Agents">
     {#snippet action()}
       <div class="flex items-center gap-0.5">
@@ -895,7 +926,7 @@
         {@const confirmingRemove = removeConfirmAgentId === agent.id}
         <div
           class={cn(
-            "group bg-raised/90 hover:bg-border/40 rounded-md px-2.5 py-2 transition-colors",
+            "group bg-raised hover:bg-hover rounded-md px-2.5 py-2 transition-colors",
             dragState?.started === true &&
               dragState.agentId === agent.id &&
               "ring-accent/60 relative z-10 shadow-lg ring-1",
@@ -920,7 +951,7 @@
                 spellcheck="false"
                 class={cn(
                   "text-fg border-border bg-panel h-6 min-w-0 flex-1 rounded border px-1.5 text-[13px] font-semibold",
-                  "focus-visible:ring-accent focus-visible:ring-1 focus-visible:outline-none",
+                  "focus-visible:ring-focus focus-visible:ring-1 focus-visible:outline-none",
                   renameMessage && "border-status-failed",
                 )}
                 aria-label="Agent name"
@@ -959,15 +990,14 @@
               </button>
             {:else}
               {@const agentHidden = isAgentHidden(projectId, rosterIds, agent.id)}
-              <!-- Double-click the name row to rename. Single-click still
-                   toggles collapse; a double-click toggles it twice (net no
-                   change) before edit mode opens. -->
+              <!-- The whole name row toggles collapse. Rename lives in the
+                   actions (⋯) menu — not a name double-click, which fought the
+                   collapse toggle (two toggles fired before edit opened). -->
               <button
                 type="button"
                 class="flex min-w-0 flex-1 items-center gap-1.5 text-left"
                 aria-expanded={!isCollapsed}
                 onclick={() => toggleCollapsed(agent.id)}
-                ondblclick={() => startEdit(agent)}
               >
                 <!-- Leading slot: the drag grip, hover/focus-revealed (multi-
                      agent rosters only). `invisible` (not `hidden`) so the slot
@@ -1005,13 +1035,16 @@
                       type="button"
                       class={cn(
                         ICON_BUTTON_CLASS,
-                        "hover:bg-border/60 shrink-0",
+                        "hover:bg-hover shrink-0",
                         // The eye stays visible while the agent is hidden (it's
                         // the state indicator); otherwise it appears on hover
-                        // like the actions trigger.
+                        // like the actions trigger. `hidden`, not `opacity-0`:
+                        // an invisible button still reserves its width, and
+                        // that reserved gutter is what was truncating names —
+                        // the name takes the full row until the icons reveal.
                         agentHidden
                           ? "text-muted"
-                          : "opacity-0 group-focus-within:opacity-100 group-hover:opacity-100",
+                          : "hidden group-focus-within:inline-flex group-hover:inline-flex",
                       )}
                       aria-label={agentHidden ? `Show ${agent.name}` : `Hide ${agent.name}`}
                       aria-pressed={agentHidden}
@@ -1029,7 +1062,8 @@
                 <DropdownMenu
                   triggerClass={cn(
                     ICON_BUTTON_CLASS,
-                    "hover:bg-border/60 shrink-0 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 data-[state=open]:opacity-100",
+                    "hover:bg-hover shrink-0",
+                    "hidden group-focus-within:inline-flex group-hover:inline-flex data-[state=open]:inline-flex",
                   )}
                   triggerLabel={`Actions for ${agent.name}`}
                   triggerTestid="agent-actions-trigger"
@@ -1063,6 +1097,19 @@
                       Confirm delete
                     </DropdownMenuItem>
                   {:else}
+                    <DropdownMenuItem
+                      onSelect={() => startEdit(agent)}
+                      class="gap-2"
+                      data-testid="agent-action-rename"
+                    >
+                      <Pencil
+                        size={14}
+                        strokeWidth={1.8}
+                        class="text-muted shrink-0"
+                        aria-hidden="true"
+                      />
+                      Rename
+                    </DropdownMenuItem>
                     {#if active}
                       <DropdownMenuItem
                         onSelect={() => stopAgent(agent.id)}
@@ -1338,37 +1385,50 @@
                  transcript footer carries the actual runtime history (which may
                  show a resolved id even when intent is an alias). -->
             {#if agent.model || runtime?.meta?.model || agent.effort}
+              <!-- One secondary line, `opus · high` — configuration is context,
+                   not a table of key: value pairs. An observed (session-derived)
+                   model keeps its explanatory tooltip instead of a label. -->
               <div
-                class="text-muted mt-1.5 space-y-0.5 text-xs leading-4"
+                class="text-muted mt-1.5 truncate text-xs leading-4"
                 data-testid="agent-selection"
               >
                 {#if agent.model}
-                  <div class="truncate" title={agent.model} data-testid="agent-selected-model">
-                    model: <span class="font-mono">{agent.model}</span>
-                  </div>
+                  <span title={agent.model} data-testid="agent-selected-model">{agent.model}</span>
                 {:else if runtime?.meta?.model}
-                  <div
-                    class="truncate"
-                    title={runtime.meta.model}
-                    data-testid="agent-observed-model"
+                  <span
+                    title={`${runtime.meta.model} — observed from the session (no model selected)`}
+                    data-testid="agent-observed-model">{runtime.meta.model}</span
                   >
-                    observed: <span class="font-mono">{runtime.meta.model}</span>
-                  </div>
+                {/if}
+                {#if (agent.model || runtime?.meta?.model) && agent.effort}
+                  <span aria-hidden="true"> · </span>
                 {/if}
                 {#if agent.effort}
-                  <div class="truncate" data-testid="agent-selected-effort">
-                    effort: <span class="font-mono">{agent.effort}</span>
-                  </div>
+                  <span data-testid="agent-selected-effort">{agent.effort}</span>
                 {/if}
               </div>
             {/if}
             {#if runtime?.meta && (runtime.meta.mcp_servers.length > 0 || runtime.meta.skills.length > 0)}
-              <div class="text-muted mt-1.5 space-y-0.5 text-xs leading-4" data-testid="agent-meta">
+              <div class="mt-1.5 flex items-center gap-1" data-testid="agent-meta">
                 {#if runtime.meta.mcp_servers.length > 0}
-                  <div>mcp: {runtime.meta.mcp_servers.length}</div>
+                  {@const mcpCount = runtime.meta.mcp_servers.length}
+                  <span
+                    class="bg-panel text-muted inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px]"
+                    title={`${mcpCount} MCP server${mcpCount === 1 ? "" : "s"}`}
+                    data-testid="agent-mcp-chip"
+                  >
+                    <Plug size={11} strokeWidth={1.8} aria-hidden="true" />{mcpCount}
+                  </span>
                 {/if}
                 {#if runtime.meta.skills.length > 0}
-                  <div>skills: {runtime.meta.skills.length}</div>
+                  {@const skillCount = runtime.meta.skills.length}
+                  <span
+                    class="bg-panel text-muted inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px]"
+                    title={`${skillCount} skill${skillCount === 1 ? "" : "s"}`}
+                    data-testid="agent-skills-chip"
+                  >
+                    <Zap size={11} strokeWidth={1.8} aria-hidden="true" />{skillCount}
+                  </span>
                 {/if}
               </div>
             {/if}
@@ -1480,7 +1540,7 @@
                 <div class="text-muted mb-0.5 text-[11px]">
                   context after last turn: {(util * 100).toFixed(0)}%
                 </div>
-                <div class="bg-border/80 h-1 w-full overflow-hidden rounded">
+                <div class="bg-active h-1 w-full overflow-hidden rounded">
                   <div
                     class="bg-fg h-full"
                     style:width="{Math.min(util * 100, 100).toFixed(1)}%"

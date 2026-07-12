@@ -2431,6 +2431,50 @@ pub async fn stage_attachment_impl(
         })?
 }
 
+/// Narrow `paths` to the staged attachments that still exist on disk.
+///
+/// Restoring a persisted compose draft must not resurrect a chip whose staged file
+/// was removed out-of-band (the user cleaned `.switchboard/`, or an older build's
+/// GC reclaimed it before drafts declared their references). The frontend prunes
+/// the survivors through this.
+///
+/// Scoped to the project's own attachments dir on purpose: without that check this
+/// would be a general "does this path exist" probe callable from the webview.
+/// A path outside the dir is dropped exactly like a missing one.
+///
+/// Containment is checked on **canonical** paths. `Path::starts_with` is a lexical
+/// component match — it does not collapse `..`, so `<dir>/../../etc/hosts` starts
+/// with `<dir>` lexically while `is_file()` resolves it through the OS to a file
+/// well outside the dir. Canonicalizing both sides closes that, and incidentally a
+/// symlink inside the dir that points outside it. A candidate that fails to
+/// canonicalize doesn't exist (or isn't reachable) — the same "drop it" outcome.
+/// If the attachments dir itself can't be canonicalized (the user cleaned
+/// `.switchboard/`), none of the chips can exist, so return an empty list rather
+/// than erroring.
+pub fn existing_attachment_paths_impl(
+    state: &AppState,
+    project_id: ProjectId,
+    paths: Vec<String>,
+) -> Result<Vec<String>, AppError> {
+    let project = match lock(&state.projects).get(&project_id).cloned() {
+        Some(loaded) => loaded,
+        None => find_project_in_directories(state, project_id)?,
+    };
+    let Ok(canonical_dir) = std::fs::canonicalize(project.attachments_dir()) else {
+        return Ok(Vec::new());
+    };
+    Ok(paths
+        .into_iter()
+        .filter(|path| match std::fs::canonicalize(path) {
+            // Return the caller's *original* string, not the canonical one — the
+            // frontend matches these against chip `path` values (see
+            // `pruneMissingAttachments`), which hold the pre-canonical staged path.
+            Ok(resolved) => resolved.starts_with(&canonical_dir) && resolved.is_file(),
+            Err(_) => false,
+        })
+        .collect())
+}
+
 /// Select the harness adapter for an agent. Per-harness routing keyed on
 /// `agent.harness` — the substantive failure surface (routing Codex through the
 /// Claude adapter would silently spawn the wrong binary), pinned by the app
@@ -3815,6 +3859,12 @@ pub enum ConversationItem {
         /// already-loaded copy. `None` for keyless harnesses (Antigravity).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         hydration_key: Option<String>,
+        /// The pre-compaction fragment this turn continues (see
+        /// [`switchboard_harness::Turn`]), carried through so the frontend
+        /// merge can collapse a compaction continuation into a live resident
+        /// instead of rendering it as a duplicate turn.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        continuation_of: Option<String>,
     },
     /// A non-completed-turn marker (failed or cancelled), sourced from the
     /// journal. Carries no agent content; `reason` is a best-effort
@@ -4496,6 +4546,7 @@ fn merge_project_conversation(
                         effort,
                         spend,
                         hydration_key,
+                        continuation_of,
                         ..
                     },
                     TurnRender::Agent(send_id),
@@ -4513,6 +4564,7 @@ fn merge_project_conversation(
                         effort,
                         spend,
                         hydration_key,
+                        continuation_of,
                     });
                 }
                 (
@@ -4692,10 +4744,16 @@ fn gc_unreferenced_attachments(attachments_dir: &Path, referenced: &HashSet<Path
     }
 }
 
+/// `draft_attachments` are staged files the caller's *unsent* compose draft still
+/// points at. A draft lives in the frontend's machine-local storage, which the
+/// backend cannot see, so the caller must declare its live references or the GC
+/// below would reclaim them — leaving the restored draft's chips dangling at
+/// deleted paths. Pass an empty slice when there is no draft.
 pub async fn load_project_conversation_impl(
     state: &AppState,
     project_id: ProjectId,
     home_dir: &Path,
+    draft_attachments: &[PathBuf],
 ) -> Result<ProjectConversation, AppError> {
     // Resolve the project and collect each agent's *owned* inputs while holding
     // the lock, then release it before doing any read+parse. `load_agent_transcript`
@@ -4707,14 +4765,14 @@ pub async fn load_project_conversation_impl(
     };
     let journal = switchboard_core::journal::read_records(&project.journal_path())?;
 
-    // Reclaim disk on load: delete any staged file no longer referenced by a
-    // `Send` record — orphans from a staged-but-unsent drop, or files whose
-    // conversation was removed. Pure function of on-disk state, so it's
-    // crash-safe (just re-runs next load) and needs no completion signal.
-    gc_unreferenced_attachments(
-        &project.attachments_dir(),
-        &collect_referenced_attachment_paths(&journal),
-    );
+    // Reclaim disk on load: delete any staged file referenced by neither a `Send`
+    // record nor the caller's live draft — orphans from a staged-but-unsent drop
+    // the user has since abandoned, or files whose conversation was removed.
+    // Pure function of (on-disk state, declared draft refs), so it's crash-safe
+    // (just re-runs next load) and needs no completion signal.
+    let mut referenced = collect_referenced_attachment_paths(&journal);
+    referenced.extend(draft_attachments.iter().cloned());
+    gc_unreferenced_attachments(&project.attachments_dir(), &referenced);
 
     let agents = project.list_agents()?;
 
@@ -8673,6 +8731,7 @@ mod tests {
             model: None,
             effort: None,
             hydration_key: None,
+            continuation_of: None,
             stable_message_id: None,
         }
     }
@@ -8814,6 +8873,7 @@ mod tests {
             model: None,
             effort: None,
             hydration_key: None,
+            continuation_of: None,
             stable_message_id: message_id.map(str::to_owned),
         }
     }
@@ -11423,6 +11483,161 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn existing_attachment_paths_keeps_only_live_files_inside_the_project_dir() {
+        let (tmp, state, _) = fresh_state_with_mock();
+        let (_agent, project_id) = project_with_agent(&state, &tmp).await;
+
+        let source = tmp.path().join("live.png");
+        std::fs::write(&source, b"L").unwrap();
+        let live = stage_attachment_impl(&state, project_id, &source)
+            .await
+            .unwrap();
+
+        let project = lock(&state.projects).get(&project_id).cloned().unwrap();
+        let deleted = project.attachments_dir().join("gone.png");
+
+        // Outside the attachments dir but a real file: must still be rejected, or
+        // this command becomes a filesystem-probe surface for the webview.
+        let outside = tmp.path().join("outside.png");
+        std::fs::write(&outside, b"O").unwrap();
+
+        let kept = existing_attachment_paths_impl(
+            &state,
+            project_id,
+            vec![
+                live.path.clone(),
+                deleted.to_string_lossy().into_owned(),
+                outside.to_string_lossy().into_owned(),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            kept,
+            vec![live.path],
+            "only the staged file that still exists under the project's attachments dir survives"
+        );
+    }
+
+    #[tokio::test]
+    async fn existing_attachment_paths_rejects_dotdot_traversal_out_of_the_dir() {
+        // The lexical-`starts_with` hole: a `..`-crafted path that resolves to a
+        // real file outside the attachments dir. It must be rejected, or the
+        // command is a general filesystem-existence oracle.
+        let (tmp, state, _) = fresh_state_with_mock();
+        let (_agent, project_id) = project_with_agent(&state, &tmp).await;
+        let project = lock(&state.projects).get(&project_id).cloned().unwrap();
+
+        // Ensure the attachments dir exists so it canonicalizes.
+        let attachments_dir = project.attachments_dir();
+        std::fs::create_dir_all(&attachments_dir).unwrap();
+
+        // Put the target one level *above* the attachments dir (depth-independent),
+        // and reach it with a single `..`. The path lexically starts with the dir
+        // but resolves outside it — the exact case lexical `starts_with` misses.
+        let parent = attachments_dir.parent().unwrap();
+        std::fs::write(parent.join("secret.txt"), b"S").unwrap();
+        let traversal = attachments_dir
+            .join("../secret.txt")
+            .to_string_lossy()
+            .into_owned();
+
+        let kept =
+            existing_attachment_paths_impl(&state, project_id, vec![traversal.clone()]).unwrap();
+        assert!(
+            kept.is_empty(),
+            "a `..` path resolving outside the attachments dir is rejected (got {kept:?})"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn existing_attachment_paths_rejects_symlink_pointing_outside_the_dir() {
+        let (tmp, state, _) = fresh_state_with_mock();
+        let (_agent, project_id) = project_with_agent(&state, &tmp).await;
+        let project = lock(&state.projects).get(&project_id).cloned().unwrap();
+        std::fs::create_dir_all(project.attachments_dir()).unwrap();
+
+        let outside = tmp.path().join("outside.txt");
+        std::fs::write(&outside, b"O").unwrap();
+        let link = project.attachments_dir().join("link.png");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+        let kept = existing_attachment_paths_impl(
+            &state,
+            project_id,
+            vec![link.to_string_lossy().into_owned()],
+        )
+        .unwrap();
+        assert!(
+            kept.is_empty(),
+            "a symlink inside the dir that points outside it is rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn existing_attachment_paths_returns_the_original_caller_string() {
+        // The frontend matches the result against chip `path` values, which hold the
+        // pre-canonical staged path — so a survivor must come back byte-identical,
+        // not canonicalized.
+        let (tmp, state, _) = fresh_state_with_mock();
+        let (_agent, project_id) = project_with_agent(&state, &tmp).await;
+
+        let source = tmp.path().join("live.png");
+        std::fs::write(&source, b"L").unwrap();
+        let live = stage_attachment_impl(&state, project_id, &source)
+            .await
+            .unwrap();
+
+        let kept =
+            existing_attachment_paths_impl(&state, project_id, vec![live.path.clone()]).unwrap();
+        assert_eq!(
+            kept,
+            vec![live.path],
+            "survivor is the caller's exact string"
+        );
+    }
+
+    #[tokio::test]
+    async fn existing_attachment_paths_empty_when_dir_is_gone() {
+        // A cleaned `.switchboard/` means no chip can exist — an empty list, not an
+        // error.
+        let (tmp, state, _) = fresh_state_with_mock();
+        let (_agent, project_id) = project_with_agent(&state, &tmp).await;
+        let project = lock(&state.projects).get(&project_id).cloned().unwrap();
+        let ghost = project
+            .attachments_dir()
+            .join("ghost.png")
+            .to_string_lossy()
+            .into_owned();
+
+        let kept = existing_attachment_paths_impl(&state, project_id, vec![ghost]).unwrap();
+        assert!(kept.is_empty());
+    }
+
+    #[test]
+    fn gc_keeps_a_file_referenced_only_by_a_live_draft() {
+        // The unsent-draft case: nothing in the journal points at this file, but
+        // the caller declared it. Without the declaration the restored chip would
+        // dangle at a path GC had already reclaimed.
+        let dir = TempDir::new().unwrap();
+        let drafted = dir.path().join("drafted.png");
+        let orphan = dir.path().join("orphan.png");
+        std::fs::write(&drafted, b"d").unwrap();
+        std::fs::write(&orphan, b"o").unwrap();
+
+        let mut referenced = collect_referenced_attachment_paths(&[]);
+        referenced.extend([drafted.clone()]);
+        gc_unreferenced_attachments(dir.path(), &referenced);
+
+        assert!(drafted.exists(), "draft-referenced file survives");
+        assert!(
+            !orphan.exists(),
+            "a file in neither the journal nor the draft is still reclaimed"
+        );
+    }
+
     #[test]
     fn gc_missing_dir_is_a_noop() {
         let dir = TempDir::new().unwrap();
@@ -12210,6 +12425,7 @@ mod tests {
             model: None,
             effort: None,
             hydration_key: None,
+            continuation_of: None,
             stable_message_id: None,
         }
     }
@@ -12244,6 +12460,7 @@ mod tests {
             model,
             effort,
             hydration_key: Some(key.to_owned()),
+            continuation_of: None,
             stable_message_id,
         }
     }
@@ -13788,6 +14005,7 @@ mod tests {
                 model,
                 effort,
                 hydration_key,
+                continuation_of,
                 stable_message_id,
                 ..
             } => Turn::Agent {
@@ -13802,6 +14020,7 @@ mod tests {
                 model,
                 effort,
                 hydration_key,
+                continuation_of,
                 stable_message_id,
             },
             _ => unreachable!(),
@@ -14534,6 +14753,7 @@ mod tests {
                 model,
                 effort,
                 hydration_key,
+                continuation_of,
                 stable_message_id,
                 ..
             } => Turn::Agent {
@@ -14548,6 +14768,7 @@ mod tests {
                 model,
                 effort,
                 hydration_key,
+                continuation_of,
                 stable_message_id,
             },
             other => other,
@@ -15111,6 +15332,7 @@ mod tests {
             model: None,
             effort: None,
             hydration_key: None,
+            continuation_of: None,
             stable_message_id: None,
         };
         let journal = vec![
@@ -15270,7 +15492,7 @@ mod tests {
         .unwrap();
 
         let home = tmp.path().to_path_buf();
-        let conv = load_project_conversation_impl(&state, project_id, &home)
+        let conv = load_project_conversation_impl(&state, project_id, &home, &[])
             .await
             .unwrap();
 
@@ -15299,13 +15521,47 @@ mod tests {
         let (_agent, project_id) = project_with_agent(&state, &tmp).await;
 
         let home = tmp.path().to_path_buf();
-        let conv = load_project_conversation_impl(&state, project_id, &home)
+        let conv = load_project_conversation_impl(&state, project_id, &home, &[])
             .await
             .unwrap();
 
         assert!(
             conv.items.is_empty(),
             "no journal ⇒ no user/outcome items; empty transcript adds none"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_project_conversation_spares_declared_draft_attachments() {
+        // Stage two files and send neither. Declaring one as a live draft
+        // reference must spare it from the load-time GC while the undeclared one
+        // is still reclaimed — the whole reason the parameter exists.
+        let (tmp, state, _) = fresh_state_with_mock();
+        let (_agent, project_id) = project_with_agent(&state, &tmp).await;
+
+        let source = tmp.path().join("drafted.png");
+        std::fs::write(&source, b"D").unwrap();
+        let drafted = stage_attachment_impl(&state, project_id, &source)
+            .await
+            .unwrap();
+        let source2 = tmp.path().join("abandoned.png");
+        std::fs::write(&source2, b"A").unwrap();
+        let abandoned = stage_attachment_impl(&state, project_id, &source2)
+            .await
+            .unwrap();
+
+        let home = tmp.path().to_path_buf();
+        load_project_conversation_impl(&state, project_id, &home, &[PathBuf::from(&drafted.path)])
+            .await
+            .unwrap();
+
+        assert!(
+            Path::new(&drafted.path).exists(),
+            "a staged file the caller declared as a live draft reference survives the load GC"
+        );
+        assert!(
+            !Path::new(&abandoned.path).exists(),
+            "a staged file referenced by neither the journal nor the draft is still reclaimed"
         );
     }
 

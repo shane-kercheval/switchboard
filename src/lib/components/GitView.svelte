@@ -9,6 +9,8 @@
   import { cn } from "$lib/utils";
   import Button from "$lib/components/ui/Button.svelte";
   import EmptyState from "$lib/components/ui/EmptyState.svelte";
+  import ResizeHandle from "$lib/components/ui/ResizeHandle.svelte";
+  import { GIT_DETAIL_MIN_WIDTH, layout } from "$lib/layout.svelte";
   import Spinner from "$lib/components/ui/Spinner.svelte";
   import GitRepoNode from "$lib/components/GitRepoNode.svelte";
   import DiffPanel from "$lib/components/DiffPanel.svelte";
@@ -56,30 +58,26 @@
   // Drives the right inspector.
   const panel = $derived(diffTarget.current);
   let splitEl = $state<HTMLDivElement | null>(null);
-  let detailWidth = $state<number | null>(null);
+  let detailEl = $state<HTMLElement | null>(null);
+  /// Live width during a resize drag; the layout store commits on pointer-up.
+  /// `layout.gitDetailWidth` stays null until the first drag, keeping the CSS
+  /// default (2/3 of the split) — double-click reset returns to it.
+  let draftDetailWidth = $state<number | null>(null);
+  const detailWidth = $derived(draftDetailWidth ?? layout.gitDetailWidth);
   let detailExpanded = $state(false);
-  let resizingDetail = false;
 
-  function startDetailResize(event: PointerEvent): void {
-    resizingDetail = true;
-    event.preventDefault();
+  function detailStartWidth(): number {
+    return detailWidth ?? detailEl?.getBoundingClientRect().width ?? GIT_DETAIL_MIN_WIDTH;
   }
 
-  function onWindowPointerMove(event: PointerEvent): void {
+  function detailMaxWidth(): number {
+    return splitEl === null
+      ? Number.POSITIVE_INFINITY
+      : splitEl.getBoundingClientRect().width * 0.85;
+  }
+
+  function onWindowPointerMove(): void {
     if (hoverSuppressed.value) hoverSuppressed.value = false;
-    resizeDetail(event);
-  }
-
-  function resizeDetail(event: PointerEvent): void {
-    if (!resizingDetail || splitEl === null) return;
-    const rect = splitEl.getBoundingClientRect();
-    const max = rect.width * 0.85;
-    const width = rect.right - event.clientX;
-    detailWidth = Math.min(max, Math.max(360, width));
-  }
-
-  function endDetailResize(): void {
-    resizingDetail = false;
   }
 
   function handleKeydown(event: KeyboardEvent): void {
@@ -106,7 +104,9 @@
   }
 
   function toggleDetailExpanded(): void {
-    resizingDetail = false;
+    // Expanding mid-drag unmounts the resize handle (ending the drag); drop
+    // any uncommitted draft so it can't pin the width after un-expanding.
+    draftDetailWidth = null;
     detailExpanded = !detailExpanded;
   }
 
@@ -393,7 +393,7 @@
   <div class="flex min-h-0 flex-1 overflow-hidden" bind:this={splitEl} data-testid="git-split">
     {#if !detailExpanded}
       <div
-        class="git-scrollbar bg-surface flex min-h-0 min-w-0 flex-1 [scrollbar-gutter:stable] flex-col gap-2 overflow-y-scroll p-3"
+        class="git-scrollbar bg-raised flex min-h-0 min-w-0 flex-1 [scrollbar-gutter:stable] flex-col gap-1 overflow-y-scroll p-2"
         data-testid="git-repo-list"
       >
         {#if gitView.status === "loading" && gitView.repos.length === 0}
@@ -433,19 +433,35 @@
         {/if}
       </div>
 
-      <div
-        class="border-border/60 bg-panel hover:bg-raised w-1.5 shrink-0 cursor-col-resize border-x transition-colors"
-        role="separator"
-        aria-orientation="vertical"
-        aria-label="Resize diff panel"
-        data-testid="git-detail-resizer"
-        onpointerdown={startDetailResize}
-      ></div>
+      <ResizeHandle
+        value={detailStartWidth}
+        min={GIT_DETAIL_MIN_WIDTH}
+        max={detailMaxWidth}
+        edge="start"
+        label="Resize diff panel"
+        testid="git-detail-resizer"
+        class="border-border/60 bg-panel hover:bg-focus w-1.5 border-x transition-colors"
+        onDraft={(px) => (draftDetailWidth = px)}
+        onCommit={(px) => {
+          layout.gitDetailWidth = px;
+          draftDetailWidth = null;
+        }}
+        onReset={() => {
+          layout.gitDetailWidth = null;
+          draftDetailWidth = null;
+        }}
+      />
     {/if}
     <aside
+      bind:this={detailEl}
       class={cn(
         "border-border/60 bg-raised flex min-h-0 flex-col border-l",
-        detailExpanded ? "min-w-0 flex-1 border-l-0" : "shrink-0",
+        // The live max-width mirrors detailMaxWidth() in CSS (85% of the split
+        // container — the *actual* container, tighter than the store's
+        // viewport-based read clamp), so a persisted width is capped the
+        // moment the container shrinks. Never applied while expanded: that
+        // state is flex-1 and must fill the row.
+        detailExpanded ? "min-w-0 flex-1 border-l-0" : "max-w-[85%] shrink-0",
         !detailExpanded && detailWidth === null && "w-2/3",
       )}
       style={!detailExpanded && detailWidth !== null ? `width: ${detailWidth}px` : undefined}
@@ -471,4 +487,5 @@
   </div>
 </div>
 
-<svelte:window onpointermove={onWindowPointerMove} onpointerup={endDetailResize} />
+<!-- Keyboard navigation suppresses hover highlights; any pointer motion restores them. -->
+<svelte:window onpointermove={onWindowPointerMove} />

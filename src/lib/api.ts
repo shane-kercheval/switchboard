@@ -249,8 +249,20 @@ export async function removeDirectory(path: string): Promise<void> {
 // The merged post-restart conversation for a project (journal user-messages +
 // harness agent content + journal outcome markers). Replaces per-agent
 // `loadTranscript` for the unified view.
-export async function loadProjectConversation(projectId: ProjectId): Promise<ProjectConversation> {
-  return await invoke<ProjectConversation>("load_project_conversation", { projectId });
+//
+// `draftAttachments` are staged paths the project's unsent compose draft still
+// points at. Loading a project garbage-collects every staged attachment the
+// journal doesn't reference; the backend cannot see a draft (it lives in this
+// process's localStorage), so an undeclared path is reclaimed and the restored
+// draft's chip dangles. Pass the draft's paths, or `[]` when there is no draft.
+export async function loadProjectConversation(
+  projectId: ProjectId,
+  draftAttachments: string[] = [],
+): Promise<ProjectConversation> {
+  return await invoke<ProjectConversation>("load_project_conversation", {
+    projectId,
+    draftAttachments,
+  });
 }
 
 // Cheap per-agent session-file freshness check (stat only, no parse) that gates
@@ -366,6 +378,16 @@ export async function stageAttachment(
   sourcePath: string,
 ): Promise<StagedAttachment> {
   return await invoke<StagedAttachment>("stage_attachment", { projectId, sourcePath });
+}
+
+// Narrow staged paths to those that still exist under this project's attachments
+// dir. A restored draft prunes its chips through this, so a chip whose file was
+// removed out-of-band (a cleaned `.switchboard/`) doesn't dangle in the composer.
+export async function existingAttachmentPaths(
+  projectId: ProjectId,
+  paths: string[],
+): Promise<string[]> {
+  return await invoke<string[]>("existing_attachment_paths", { projectId, paths });
 }
 
 // Cancel a whole send across its recipients (send-scoped, actor-decided): each

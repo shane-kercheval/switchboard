@@ -10,11 +10,13 @@
     Gauge,
     GripVertical,
     MoreHorizontal,
+    Plug,
     SlidersHorizontal,
     Square,
     Terminal,
     Trash2,
     X,
+    Zap,
   } from "@lucide/svelte";
   import { flip } from "svelte/animate";
   import type { AgentRecord, AgentId, ProjectId } from "$lib/types";
@@ -1011,10 +1013,13 @@
                         "hover:bg-hover shrink-0",
                         // The eye stays visible while the agent is hidden (it's
                         // the state indicator); otherwise it appears on hover
-                        // like the actions trigger.
+                        // like the actions trigger. `hidden`, not `opacity-0`:
+                        // an invisible button still reserves its width, and
+                        // that reserved gutter is what was truncating names —
+                        // the name takes the full row until the icons reveal.
                         agentHidden
                           ? "text-muted"
-                          : "opacity-0 group-focus-within:opacity-100 group-hover:opacity-100",
+                          : "hidden group-focus-within:inline-flex group-hover:inline-flex",
                       )}
                       aria-label={agentHidden ? `Show ${agent.name}` : `Hide ${agent.name}`}
                       aria-pressed={agentHidden}
@@ -1032,7 +1037,8 @@
                 <DropdownMenu
                   triggerClass={cn(
                     ICON_BUTTON_CLASS,
-                    "hover:bg-hover shrink-0 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 data-[state=open]:opacity-100",
+                    "hover:bg-hover shrink-0",
+                    "hidden group-focus-within:inline-flex group-hover:inline-flex data-[state=open]:inline-flex",
                   )}
                   triggerLabel={`Actions for ${agent.name}`}
                   triggerTestid="agent-actions-trigger"
@@ -1341,37 +1347,50 @@
                  transcript footer carries the actual runtime history (which may
                  show a resolved id even when intent is an alias). -->
             {#if agent.model || runtime?.meta?.model || agent.effort}
+              <!-- One secondary line, `opus · high` — configuration is context,
+                   not a table of key: value pairs. An observed (session-derived)
+                   model keeps its explanatory tooltip instead of a label. -->
               <div
-                class="text-muted mt-1.5 space-y-0.5 text-xs leading-4"
+                class="text-muted mt-1.5 truncate text-xs leading-4"
                 data-testid="agent-selection"
               >
                 {#if agent.model}
-                  <div class="truncate" title={agent.model} data-testid="agent-selected-model">
-                    model: <span class="font-mono">{agent.model}</span>
-                  </div>
+                  <span title={agent.model} data-testid="agent-selected-model">{agent.model}</span>
                 {:else if runtime?.meta?.model}
-                  <div
-                    class="truncate"
-                    title={runtime.meta.model}
-                    data-testid="agent-observed-model"
+                  <span
+                    title={`${runtime.meta.model} — observed from the session (no model selected)`}
+                    data-testid="agent-observed-model">{runtime.meta.model}</span
                   >
-                    observed: <span class="font-mono">{runtime.meta.model}</span>
-                  </div>
+                {/if}
+                {#if (agent.model || runtime?.meta?.model) && agent.effort}
+                  <span aria-hidden="true"> · </span>
                 {/if}
                 {#if agent.effort}
-                  <div class="truncate" data-testid="agent-selected-effort">
-                    effort: <span class="font-mono">{agent.effort}</span>
-                  </div>
+                  <span data-testid="agent-selected-effort">{agent.effort}</span>
                 {/if}
               </div>
             {/if}
             {#if runtime?.meta && (runtime.meta.mcp_servers.length > 0 || runtime.meta.skills.length > 0)}
-              <div class="text-muted mt-1.5 space-y-0.5 text-xs leading-4" data-testid="agent-meta">
+              <div class="mt-1.5 flex items-center gap-1" data-testid="agent-meta">
                 {#if runtime.meta.mcp_servers.length > 0}
-                  <div>mcp: {runtime.meta.mcp_servers.length}</div>
+                  {@const mcpCount = runtime.meta.mcp_servers.length}
+                  <span
+                    class="bg-panel text-muted inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px]"
+                    title={`${mcpCount} MCP server${mcpCount === 1 ? "" : "s"}`}
+                    data-testid="agent-mcp-chip"
+                  >
+                    <Plug size={11} strokeWidth={1.8} aria-hidden="true" />{mcpCount}
+                  </span>
                 {/if}
                 {#if runtime.meta.skills.length > 0}
-                  <div>skills: {runtime.meta.skills.length}</div>
+                  {@const skillCount = runtime.meta.skills.length}
+                  <span
+                    class="bg-panel text-muted inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px]"
+                    title={`${skillCount} skill${skillCount === 1 ? "" : "s"}`}
+                    data-testid="agent-skills-chip"
+                  >
+                    <Zap size={11} strokeWidth={1.8} aria-hidden="true" />{skillCount}
+                  </span>
                 {/if}
               </div>
             {/if}

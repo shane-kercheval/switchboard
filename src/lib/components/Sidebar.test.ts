@@ -231,8 +231,10 @@ describe("Sidebar", () => {
 
     expect(screen.getByTestId("agent-harness-icon")).toBeInTheDocument();
     const trigger = screen.getByTestId("agent-actions-trigger");
-    expect(trigger).toHaveClass("opacity-0");
-    expect(trigger).toHaveClass("group-hover:opacity-100");
+    // `hidden`, not `opacity-0`: a transparent icon still reserves its width,
+    // and that gutter is what truncated names. Reveal is display-based.
+    expect(trigger).toHaveClass("hidden");
+    expect(trigger).toHaveClass("group-hover:inline-flex");
 
     const menu = await openAgentActions();
     expect(await screen.findByTestId("agent-action-resume")).toBeInTheDocument();
@@ -571,9 +573,8 @@ describe("Sidebar", () => {
     // No selected model on this agent → the SessionMeta model shows as the
     // observed fallback; mcp/skills counts stay in the meta block.
     expect(screen.getByTestId("agent-observed-model")).toHaveTextContent("claude-sonnet-4-6");
-    const meta = screen.getByTestId("agent-meta");
-    expect(meta).toHaveTextContent("mcp: 1");
-    expect(meta).toHaveTextContent("skills: 1");
+    expect(screen.getByTestId("agent-mcp-chip")).toHaveTextContent("1");
+    expect(screen.getByTestId("agent-skills-chip")).toHaveTextContent("1");
   });
 
   // --- Model / effort: change actions + intent display -----------------------
@@ -746,6 +747,36 @@ describe("Sidebar", () => {
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
 
     expect(screen.getByTestId("agent-selected-effort")).toHaveTextContent("high");
+  });
+
+  it("gives the name the full row until hover: shared-prefix names stay distinguishable at rest", async () => {
+    const state = await loadState();
+    const a = {
+      ...CLAUDE_AGENT,
+      id: "00000000-0000-7000-8000-000000000aa1",
+      name: "gpt-5-5-minimal",
+    };
+    const b = {
+      ...CLAUDE_AGENT,
+      id: "00000000-0000-7000-8000-000000000aa2",
+      name: "gpt-5-5-minimal-2",
+    };
+    await state.registerAgent(a);
+    await state.registerAgent(b);
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [a, b] } });
+
+    const names = screen.getAllByTestId("agent-name").map((el) => el.textContent?.trim());
+    expect(names).toEqual(["gpt-5-5-minimal", "gpt-5-5-minimal-2"]);
+    // The room comes from the action icons being `hidden` (display: none —
+    // zero width) until hover/focus, rather than `opacity-0` (invisible but
+    // still reserving a two-icon gutter). The name truncates only while the
+    // icons are revealed.
+    for (const toggle of screen.getAllByTestId("agent-visibility-toggle")) {
+      expect(toggle).toHaveClass("hidden");
+    }
+    for (const trigger of screen.getAllByTestId("agent-actions-trigger")) {
+      expect(trigger).toHaveClass("hidden");
+    }
   });
 });
 

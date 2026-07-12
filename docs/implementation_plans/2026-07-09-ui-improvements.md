@@ -1013,6 +1013,36 @@ does not rediscover it the hard way.
 - The ticking number must not be announced by assistive tech. Assert it is outside any `aria-live`
   region; state transitions are what get announced, not seconds.
 
+### As-built decisions (recorded at implementation review)
+
+- **No completed-turn duration** (engineer decision at review). The plan's `Worked for 2m 14s` state
+  would have rendered under *every* settled turn in the transcript — hydrated history included —
+  which is new information under every past turn, not a restyle. Dropped: completed turns render no
+  live footer, no dots, nothing new. The elapsed counter exists only while a turn runs. The DoD's
+  completed-turn test asserts absence instead.
+- **No status dot** (engineer decision at visual review). A first pass added an idle/processing
+  dot (the DoD's "failed, cancelled" states don't exist at the agent level — `run_status` is
+  deliberately `idle | starting | processing`; failures render in the transcript). Rejected on
+  sight: the card's name row has no room to spend, and idle-vs-processing wasn't worth the pixels.
+  The "run status is the most salient thing on the card" outcome is dropped with it.
+- **Name truncation fixed by reclaiming the icon gutter, not by wrapping.** A first-pass two-line
+  wrap was rejected at visual review. The real thief was the hover-revealed action icons
+  (eye + actions trigger): `opacity-0` kept them invisible but still reserved a two-icon gutter on
+  every card. They are now `hidden` (zero width) until hover/focus/open, so the single-line name
+  keeps the full row width at rest and truncates only while the icons are actually shown —
+  shared-prefix names are distinguishable exactly when the user is reading, and the eye stays
+  visible while an agent is hidden (it's the state indicator).
+- **`formatDuration` gained the bare-seconds form in place** (`9s` under a minute); the silence
+  counter can't hit that branch (starts at one heartbeat threshold = 60s), so its output is
+  unchanged — asserted by the untouched ≥1m test cases.
+- **Chips are hand-rolled quiet spans** (`bg-panel`, icon + count, tooltip with the full phrase),
+  not `Badge` — Badge's uppercase-label semantics don't fit a count. Plug = MCP, Zap = skills.
+- The `now` ticker's doc-comment was rewritten (running turns now read it every second); elapsed
+  derives from the existing `started_at` — nothing new crosses the wire.
+- **Held-forward row names only its sources** (`↪ waiting for bob`): the row renders in the
+  recipient's own pane under the forwarded body, so naming the recipient was redundant — and the
+  old cross-pane "Forward to unknown" resolution bug is structurally impossible now.
+
 ---
 
 ## M9 — Transcript message navigator (TBD — not yet scoped)

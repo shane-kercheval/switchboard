@@ -513,7 +513,7 @@ describe("UnifiedTranscript", () => {
 
     render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CODEX_AGENT] } });
 
-    expect(screen.getByTestId("turn-working")).toHaveTextContent("Working...");
+    expect(screen.getByTestId("turn-working")).toHaveTextContent("Working");
   });
 
   it("keeps the Working... footer at the bottom once items arrive", async () => {
@@ -533,7 +533,7 @@ describe("UnifiedTranscript", () => {
     render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CODEX_AGENT] } });
 
     expect(screen.getByTestId("turn")).toHaveTextContent("ack");
-    expect(screen.getByTestId("turn-working")).toHaveTextContent("Working...");
+    expect(screen.getByTestId("turn-working")).toHaveTextContent("Working");
   });
 
   it("shows the soft, counting-up 'No response' variant when the in-flight turn is quiet", async () => {
@@ -559,7 +559,7 @@ describe("UnifiedTranscript", () => {
 
     const footer = screen.getByTestId("turn-working");
     expect(footer).toHaveTextContent("No response");
-    expect(footer).not.toHaveTextContent("Working...");
+    expect(footer).not.toHaveTextContent("Working");
     expect(footer).toHaveAttribute("data-quiet", "true");
   });
 
@@ -587,7 +587,7 @@ describe("UnifiedTranscript", () => {
     render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CODEX_AGENT] } });
 
     const footer = screen.getByTestId("turn-working");
-    expect(footer).toHaveTextContent("Working...");
+    expect(footer).toHaveTextContent("Working");
     expect(footer).toHaveAttribute("data-quiet", "false");
   });
 
@@ -610,13 +610,18 @@ describe("UnifiedTranscript", () => {
         started_at: "2026-05-16T00:00:00Z",
       });
       await tick();
-      expect(screen.getByTestId("turn-working")).toHaveTextContent("Working...");
+      expect(screen.getByTestId("turn-working")).toHaveTextContent("Working");
 
       // Past the silence threshold → the quiet counter appears.
       vi.advanceTimersByTime(HEARTBEAT_TIMEOUT_MS + 1000);
       await tick();
       expect(screen.getByTestId("turn-working")).toHaveTextContent("No response");
       expect(screen.getByTestId("turn-working")).toHaveAttribute("data-quiet", "true");
+      // The word swaps and the number swaps (elapsed → silence counter); the
+      // dots are unchanged. Exactly one number on screen.
+      expect(screen.getByTestId("turn-quiet-elapsed")).toBeInTheDocument();
+      expect(screen.queryByTestId("turn-elapsed")).toBeNull();
+      expect(screen.getByTestId("turn-working").querySelector(".loading-dots")).not.toBeNull();
 
       // Activity resumes → back to Working...
       fireTo(`agent:${CODEX_AGENT.id}`, {
@@ -626,7 +631,7 @@ describe("UnifiedTranscript", () => {
         text: "hi",
       });
       await tick();
-      expect(screen.getByTestId("turn-working")).toHaveTextContent("Working...");
+      expect(screen.getByTestId("turn-working")).toHaveTextContent("Working");
       expect(screen.getByTestId("turn-working")).toHaveAttribute("data-quiet", "false");
     } finally {
       vi.useRealTimers();
@@ -671,7 +676,7 @@ describe("UnifiedTranscript", () => {
     expect(screen.queryByText("streaming…")).toBeNull();
     expect(screen.getByTestId("turn")).toHaveTextContent("hello");
     expect(screen.getByTestId("turn")).toHaveTextContent("world");
-    expect(screen.getByTestId("turn-working")).toHaveTextContent("Working...");
+    expect(screen.getByTestId("turn-working")).toHaveTextContent("Working");
   });
 
   it("shows a live cancel control for a streaming standalone turn (send-scoped)", async () => {
@@ -700,6 +705,62 @@ describe("UnifiedTranscript", () => {
     );
   });
 
+  it("shows a ticking elapsed counter on a running turn, deterministic under an injected clock", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-05-16T00:01:14Z"));
+      const state = await loadState();
+      await state.registerAgent(CODEX_AGENT);
+      state.transcripts[CODEX_AGENT.id] = [
+        {
+          role: "agent",
+          turn_id: "agent-1",
+          agent_id: CODEX_AGENT.id,
+          started_at: "2026-05-16T00:00:00Z",
+          status: "streaming",
+          items: [],
+        },
+      ];
+
+      render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CODEX_AGENT] } });
+
+      const footer = screen.getByTestId("turn-working");
+      expect(screen.getByTestId("turn-elapsed")).toHaveTextContent("1m 14s");
+      expect(footer.querySelector(".loading-dots")).not.toBeNull();
+      // The ticking number must not be announced by assistive tech: it sits
+      // outside any aria-live region (state transitions announce, not seconds).
+      expect(screen.getByTestId("turn-elapsed").closest("[aria-live]")).toBeNull();
+
+      vi.advanceTimersByTime(2000);
+      await tick();
+      expect(screen.getByTestId("turn-elapsed")).toHaveTextContent("1m 16s");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("renders no live footer and no dots on a completed turn", async () => {
+    const state = await loadState();
+    await state.registerAgent(CODEX_AGENT);
+    state.transcripts[CODEX_AGENT.id] = [
+      {
+        role: "agent",
+        turn_id: "agent-1",
+        agent_id: CODEX_AGENT.id,
+        started_at: "2026-05-16T00:00:00Z",
+        ended_at: "2026-05-16T00:02:14Z",
+        status: "complete",
+        items: [{ item_kind: "text", kind: "text", text: "done" }],
+      },
+    ];
+
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CODEX_AGENT] } });
+
+    expect(screen.queryByTestId("turn-working")).toBeNull();
+    expect(screen.queryByTestId("turn-elapsed")).toBeNull();
+    expect(document.querySelector(".loading-dots")).toBeNull();
+  });
+
   it("shows a queued… indicator + cancel for a queued single-recipient send", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
@@ -718,7 +779,10 @@ describe("UnifiedTranscript", () => {
 
     render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
-    expect(screen.getByTestId("turn-queued")).toHaveTextContent("Queued...");
+    expect(screen.getByTestId("turn-queued")).toHaveTextContent("Queued");
+    // Dots + label only — a queued send is not a turn yet, so no number.
+    expect(screen.getByTestId("turn-queued").querySelector(".loading-dots")).not.toBeNull();
+    expect(screen.getByTestId("turn-queued").textContent).not.toMatch(/\d/);
     // The cancel control targets the queued send (send-scoped).
     await fireEvent.click(screen.getByTestId("turn-live-control"));
     expect(invokeMock).toHaveBeenCalledWith(
@@ -907,7 +971,7 @@ describe("UnifiedTranscript — fan-out groups", () => {
       props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT, CODEX_AGENT] },
     });
 
-    expect(screen.getByTestId("fanout-queued")).toHaveTextContent("Queued...");
+    expect(screen.getByTestId("fanout-queued")).toHaveTextContent("Queued");
     const columns = screen.getAllByTestId("fanout-column");
     expect(columns[1]).toHaveAttribute("data-state", "queued");
   });
@@ -925,7 +989,7 @@ describe("UnifiedTranscript — fan-out groups", () => {
 
     const queuedCancel = screen.getByTestId("fanout-card-cancel");
     const streamingCancel = screen.getByTestId("turn-live-control");
-    expect(screen.getByTestId("turn-working")).toHaveTextContent("Working...");
+    expect(screen.getByTestId("turn-working")).toHaveTextContent("Working");
     await fireEvent.click(queuedCancel);
     expect(invokeMock).toHaveBeenCalledWith(
       "cancel_send",
@@ -3065,7 +3129,7 @@ describe("UnifiedTranscript live streaming cap", () => {
       props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT, CODEX_AGENT] },
     });
 
-    expect(screen.getByTestId("fanout-queued")).toHaveTextContent("Queued...");
+    expect(screen.getByTestId("fanout-queued")).toHaveTextContent("Queued");
     const scroll = screen.getByTestId("turn-live-scroll");
     expect(scroll).toHaveTextContent("alice streaming");
     expect(scroll).toHaveClass("max-h-[75cqh]", "overflow-y-auto");
@@ -3785,10 +3849,11 @@ describe("UnifiedTranscript — cross-agent forward", () => {
     expect(screen.queryByTestId("held-forward")).toBeNull();
   });
 
-  it("shows only this pane's recipients in the held row — resolvable, never 'unknown'", async () => {
-    // The "Forward to unknown" regression: a fan-out forward whose recipients span
-    // panes must, in each pane, name only the recipients that pane contains (so
-    // the name always resolves) — not every recipient.
+  it("names only the sources in the held row — the recipient is implicit in its own pane", async () => {
+    // The row renders in the recipient's pane under the forwarded body, so
+    // naming the recipient was redundant (and once caused a cross-pane
+    // "Forward to unknown" bug — structurally impossible now that recipient
+    // names left the row entirely).
     const state = await loadState();
     const held = await loadHeld();
     await state.registerAgent(CLAUDE_AGENT);
@@ -3801,11 +3866,10 @@ describe("UnifiedTranscript — cross-agent forward", () => {
       recipients: [CLAUDE_AGENT.id, CODEX_AGENT.id],
     });
 
-    // This pane holds only claude; the held row names claude, not the other
-    // recipient (which lives in a different pane) and never "unknown".
     render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
     const heldEl = await screen.findByTestId("held-forward");
-    expect(heldEl).toHaveTextContent("Forward to alice");
+    expect(heldEl).toHaveTextContent("waiting for bob");
+    expect(heldEl).not.toHaveTextContent("alice");
     expect(heldEl).not.toHaveTextContent("unknown");
   });
 

@@ -49,6 +49,7 @@
   import HarnessIcon from "$lib/components/ui/HarnessIcon.svelte";
   import Markdown from "$lib/components/ui/Markdown.svelte";
   import CopyButton from "$lib/components/ui/CopyButton.svelte";
+  import LoadingDots from "$lib/components/ui/LoadingDots.svelte";
   import Spinner from "$lib/components/ui/Spinner.svelte";
   import StatusChip from "$lib/components/ui/StatusChip.svelte";
   import StopIcon from "$lib/components/ui/StopIcon.svelte";
@@ -572,9 +573,11 @@
     });
   }
 
-  /// Ticking clock for the live "quiet" counter. Updated once per second while
-  /// the component is mounted; `now` is only read inside the quiet footer, so
-  /// when nothing is quiet these ticks trigger no re-render.
+  /// Ticking clock for the live footer's counters — the running turn's elapsed
+  /// time and the quiet "No response" silence. Updated once per second while
+  /// the component is mounted; `now` is read only inside live-turn footers, so
+  /// each tick re-renders one text node per running turn and nothing at all
+  /// when no turn is live.
   let now = $state(Date.now());
   $effect(() => {
     const id = setInterval(() => {
@@ -582,6 +585,12 @@
     }, 1000);
     return () => clearInterval(id);
   });
+
+  /// Elapsed time of a running turn. An unparseable `started_at` yields NaN,
+  /// which formatDuration clamps to "0s".
+  function turnElapsedMs(startedAt: string): number {
+    return now - Date.parse(startedAt);
+  }
 
   /// Elapsed silence for a quiet turn: the timer fired one full
   /// HEARTBEAT_TIMEOUT_MS after the last activity, so true silence is the time
@@ -1079,18 +1088,22 @@
     data-testid="turn-working"
     data-quiet={quietSince !== undefined}
   >
-    <!-- Until the turn has been silent past HEARTBEAT_TIMEOUT_MS it just shows
-         "Working..." (no counter — the number would otherwise reset on every
-         event). Once quiet, it's still alive on the backend, so this is a soft
-         caution that counts up the silence — never a failure — and reverts to
-         "Working..." the moment activity resumes. -->
-    <span class="animate-pulse">
-      {#if quietSince !== undefined}
-        No response ({formatDuration(quietElapsedMs(quietSince))})...
-      {:else}
-        Working...
-      {/if}
-    </span>
+    <!-- The label names the number, so exactly one number is on screen:
+         "Working 2m 14s" = working *for* that long (elapsed since turn start);
+         once silent past HEARTBEAT_TIMEOUT_MS the word swaps to "No response"
+         and the number swaps to the silence counter — still alive on the
+         backend, a soft caution, never a failure — and both revert the moment
+         activity resumes. The dots animate; the text never does (the words
+         being read must not fade). -->
+    {#if quietSince !== undefined}
+      <span>No response</span>
+      <LoadingDots />
+      <span data-testid="turn-quiet-elapsed">{formatDuration(quietElapsedMs(quietSince))}</span>
+    {:else}
+      <span>Working</span>
+      <LoadingDots />
+      <span data-testid="turn-elapsed">{formatDuration(turnElapsedMs(turn.started_at))}</span>
+    {/if}
     {#if turn.send_id !== undefined}
       {@const sendId = turn.send_id}
       {@render liveTurnControl(
@@ -1104,7 +1117,8 @@
 
 {#snippet queuedFooter(agentId: string, sendId: string, labelTestid: string, controlTestid: string)}
   <div class="text-muted mt-2 flex items-center gap-2 text-xs" data-testid={labelTestid}>
-    <span class="animate-pulse">Queued...</span>
+    <span>Queued</span>
+    <LoadingDots />
     {@render liveTurnControl(
       () => cancelSend(sendId, [agentId]),
       `Cancel queued send for ${agentName(agentId)}`,
@@ -1423,9 +1437,8 @@
      "Queued…" — and a cancel control. Cancelling fires `cancel_forward`; the
      compose bar's awaiting `forward_message` then resolves cancelled, removes
      this entry, and restores the composer (text + source chips). -->
-{#snippet heldForwardRow(held: HeldForward, recipientsHere: string[])}
+{#snippet heldForwardRow(held: HeldForward)}
   {@const sourceNames = held.sources.map((s) => s.name).join(", ")}
-  {@const recipientNames = recipientsHere.map((id) => agentName(id)).join(", ")}
   <div class="group min-w-0 flex-1" data-testid="held-forward" data-forward-id={held.forwardId}>
     {#if held.body.trim() !== ""}
       <div
@@ -1435,7 +1448,11 @@
       </div>
     {/if}
     <div class="text-muted mt-2 flex items-center gap-2 text-xs" data-testid="held-forward-waiting">
-      <span class="animate-pulse">↪ Forward to {recipientNames} — waiting for {sourceNames}…</span>
+      <!-- Names only the sources being waited on — the recipient is implicit
+           (this row renders in the recipient's own pane, under the forwarded
+           message body). -->
+      <span>↪ waiting for {sourceNames}</span>
+      <LoadingDots />
       {@render liveTurnControl(
         () => void cancelForward(held.forwardId),
         `Cancel forward (waiting for ${sourceNames})`,
@@ -2006,7 +2023,7 @@
          it lives in the project-keyed `heldForwards` store (survives navigation,
          lost on restart). -->
     {#each heldForwardsHere as entry (entry.held.forwardId)}
-      {@render heldForwardRow(entry.held, entry.recipients)}
+      {@render heldForwardRow(entry.held)}
     {/each}
   </div>
 </div>

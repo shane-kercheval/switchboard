@@ -617,6 +617,9 @@ shipped:
   that creates a file represent the same user-visible change, so both render as an all-added compact
   diff with the same collapsed preview and full captured content on expansion. Output and raw input
   remain behind expansion; a facet-level truncation still surfaces DiffView's notice.
+- **Inline edit and write previews show 25 lines per file.** Forty lines made a single tool call
+  dominate the transcript before the user chose to expand it; 25 preserves enough context to scan
+  while keeping the surrounding conversation visible.
 - The old "TOOL"/"MCP"/"Plugin" kind label and `Badge` are gone from the row; the facet icon
   (lucide) plus verb replace them. The raw-JSON display cap is 50 k characters.
 - New modules: `src/lib/toolRow.ts` (facet × state verb vocabulary, provenance detail, icon map)

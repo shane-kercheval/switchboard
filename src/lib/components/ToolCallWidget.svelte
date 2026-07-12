@@ -67,10 +67,10 @@
   /// display is where a multi-megabyte input must stop.
   const RAW_DISPLAY_CAP = 50_000;
 
-  /// Inline edit diffs preview at most this many lines (per file) until the row
-  /// is expanded — a large edit shouldn't dominate the transcript, but you can
-  /// still watch the first chunk stream in and expand for the rest.
-  const EDIT_DIFF_PREVIEW_LINES = 40;
+  /// Inline file diffs preview at most this many lines (per file) until the row
+  /// is expanded — a large change shouldn't dominate the transcript, but you
+  /// can still watch the first chunk stream in and expand for the rest.
+  const INLINE_DIFF_PREVIEW_LINES = 25;
 
   function cappedRawInput(input: unknown): { text: string; truncated: boolean } {
     const formatted = formatToolInput(input) ?? "";
@@ -96,7 +96,7 @@
 
 {#snippet inlineDiff(file: EditedFile, expandTestid: string)}
   {@const fullDiff = synthesizeEditDiff(file)}
-  {@const preview = truncateDiff(fullDiff, EDIT_DIFF_PREVIEW_LINES)}
+  {@const preview = truncateDiff(fullDiff, INLINE_DIFF_PREVIEW_LINES)}
   {@const capped = !open && preview.hiddenLines > 0}
   <!-- Cap the inline diff in both live and settled states — flipping full to
        capped when a turn ends would be jarring. Expansion shows all captured

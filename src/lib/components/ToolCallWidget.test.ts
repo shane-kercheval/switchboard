@@ -357,7 +357,7 @@ describe("ToolCallWidget facet bodies", () => {
   });
 
   it("caps a large edit diff to a preview and reveals the rest on expand", async () => {
-    // A 60-line insertion is past the 40-line inline preview cap.
+    // A 60-line insertion is past the 25-line inline preview cap.
     const big = Array.from({ length: 60 }, (_, i) => `line ${i}`).join("\n") + "\n";
     const facet: ToolFacet = {
       facet_kind: "edit",
@@ -370,10 +370,10 @@ describe("ToolCallWidget facet bodies", () => {
     });
 
     // Collapsed: capped preview shows a "Show N more lines" affordance and only
-    // the first 40 diff lines are rendered.
+    // the first 25 diff lines are rendered.
     const expand = getByTestId("tool-edit-expand");
-    expect(expand).toHaveTextContent("Show 20 more lines");
-    expect(container.querySelectorAll('[data-origin="added"]')).toHaveLength(40);
+    expect(expand).toHaveTextContent("Show 35 more lines");
+    expect(container.querySelectorAll('[data-origin="added"]')).toHaveLength(25);
 
     // Expanding via the hint opens the row and renders the full diff.
     await fireEvent.click(expand);
@@ -475,8 +475,8 @@ describe("ToolCallWidget facet bodies", () => {
       tool: withFacet({ facet_kind: "write", path: "/repo/big.txt", content, truncated: false }),
     });
 
-    expect(getByTestId("tool-write-expand")).toHaveTextContent("Show 20 more lines");
-    expect(container.querySelectorAll('[data-origin="added"]')).toHaveLength(40);
+    expect(getByTestId("tool-write-expand")).toHaveTextContent("Show 35 more lines");
+    expect(container.querySelectorAll('[data-origin="added"]')).toHaveLength(25);
 
     await fireEvent.click(getByTestId("tool-write-expand"));
     expect(queryByTestId("tool-write-expand")).toBeNull();

@@ -21,7 +21,7 @@ import { buildLargeTranscript } from "$lib/dev/largeTranscript";
 
 // Large-transcript rendering behaviors in real WebKit, against the same
 // generator the dev seeding hook uses: the measureClip-driven collapse toggle
-// appearing when a clipped unit scrolls into view, the streaming inner pin
+// appearing when a clipped unit scrolls into view, standalone streaming content
 // surviving a scroll away and back, and fan-outs grouping into columns. (These
 // once also asserted `content-visibility` containment, removed when windowing
 // took over bounding the mounted set — see UnifiedTranscript.)
@@ -59,11 +59,9 @@ test("a clipped unit scrolled into view shows its collapse toggle", async () => 
     .toBe(true);
 });
 
-test("an unfollowed streaming unit keeps its inner pin and content through scroll away and return", async () => {
-  // The one inner-scroll case (liveScroll exists only while streaming): the
-  // user scrolls away, the live-capped unit leaves the viewport while it keeps
-  // growing, then the user scrolls back — the inner region must still be
-  // bottom-pinned on the newest content, with nothing missing.
+test("an unfollowed standalone stream keeps its content through scroll away and return", async () => {
+  // The user scrolls away while the live unit keeps growing, then returns to
+  // the transcript bottom. The complete streamed content must still be present.
   await registerAgent(ALICE);
   const history = buildLargeTranscript({ agentIds: [ALICE.id], exchanges: 40 })[ALICE.id]!;
   const streaming = (length: number) =>
@@ -99,15 +97,9 @@ test("an unfollowed streaming unit keeps its inner pin and content through scrol
     })
     .toBeLessThan(32);
 
-  // Full content present, inner pin on the newest line.
-  const cap = (): HTMLElement => page.getByTestId("turn-live-scroll").element() as HTMLElement;
-  await expect.poll(() => cap().textContent?.includes("Line 80 of")).toBe(true);
-  await expect
-    .poll(() => {
-      const el = cap();
-      return el.scrollHeight - el.scrollTop - el.clientHeight;
-    })
-    .toBeLessThan(4);
+  const live = (): HTMLElement => page.getByTestId("turn-live-scroll").element() as HTMLElement;
+  await expect.poll(() => live().textContent?.includes("Line 80 of")).toBe(true);
+  expect(getComputedStyle(live()).overflowY).toBe("visible");
 });
 
 test("the generator's fan-outs render as fan-out groups", async () => {

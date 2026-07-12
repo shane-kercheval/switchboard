@@ -1575,7 +1575,7 @@
           </div>
         {/if}
       {:else}
-        {@render turnBody(turn, !ownedByOutcome)}
+        {@render turnBody(turn, !ownedByOutcome, "full", false)}
       {/if}
       <!-- Terminal status chip last (after the indicator and the body), so the
            collapsed and expanded views agree. Outside any height clip → always

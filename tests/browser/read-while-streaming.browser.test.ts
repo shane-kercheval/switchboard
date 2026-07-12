@@ -84,9 +84,9 @@ function fire(channel: string, event: NormalizedEvent): void {
 test("a streaming response growing just below never moves an unpinned reader", async () => {
   await registerAgent(ALICE);
   const history = buildLargeTranscript({ agentIds: [ALICE.id], exchanges: 30 })[ALICE.id]!;
-  // Start the stream SMALL (below the live cap) so its block genuinely grows
-  // with each chunk while the reader sits a few hundred px above — the
-  // position where the pre-fix jump reproduced.
+  // Start the stream small so its block grows substantially with each chunk
+  // while the reader sits a few hundred px above — the position where the
+  // pre-fix jump reproduced.
   seedTurns(ALICE.id, [...history, streamingTurn(3)]);
 
   mountTranscript({ projectId: PROJECT_ID, agents: [ALICE] });

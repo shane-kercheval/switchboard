@@ -16,7 +16,7 @@ Add a project-scoped compact transcript mode that makes long conversations easie
 - Fan-out group-level expand/collapse-all-responses control.
 - Completed-turn preview styling with gradient fade.
 - Tool call suppression and hidden-tool placeholder in compact completed turns.
-- Live-streaming response height cap with internal bottom-pinning while streaming.
+- Live-streaming fan-out column height caps with internal bottom-pinning.
 - Latest completed agent response exception.
 
 **Out of scope:**
@@ -50,7 +50,7 @@ When compact mode is on:
 - The latest completed agent response remains expanded by default. If the latest send was fan-out, all completed agent columns in that latest fan-out group remain expanded by default.
 - Manual per-message or per-column overrides win over the default latest-response rule.
 
-While an agent is streaming, its response is not converted into the faded completed preview. Instead, the live body renders normally inside a capped region, for example `max-height: min(600px, 60vh)`, with internal overflow and bottom-pinning so the latest activity stays visible. The working/quiet/cancel affordances remain visible. When streaming completes, the live cap is removed and that response becomes the latest completed agent response, expanded by default.
+While an agent is streaming, its response is not converted into the faded completed preview. A standalone response renders at full height and uses the transcript's outer scrollbar. Concurrent fan-out columns use capped regions with internal overflow and bottom-pinning so no one agent can take over the group. The working/quiet/cancel affordances remain visible. When streaming completes, that response becomes the latest completed agent response, expanded by default.
 
 Fan-out groups have two levels of control:
 
@@ -75,7 +75,7 @@ Transcript virtualization is planned separately after this feature. This feature
 - Compact state and overrides must be keyed only by stable data-derived ids, never DOM position, list index, or whether an element is currently mounted. Virtualization will unmount off-screen transcript units.
 - The latest completed response rule must be computed from transcript data (`Turn`/`UnifiedRow`/`RenderBlock`), not from rendered DOM presence. This plan defines "latest" by completion recency (`ended_at ?? started_at`) among complete agent turns.
 - Expand/collapse and streaming updates change visible block heights at runtime. Treat those as ordinary item resize events for the future virtualizer; do not design code that assumes heights only change while streaming or that off-screen blocks remain mounted.
-- The live cap introduces an inner scroll container inside a transcript item. The future virtualizer will own the outer transcript pin-to-bottom behavior; M3's inner bottom-pin must be scoped to the capped live content element only.
+- Fan-out live caps introduce inner scroll containers inside a transcript item. The future virtualizer will own the outer transcript pin-to-bottom behavior; the inner bottom-pin must be scoped to capped fan-out content only.
 
 ## Milestone 1 - Project-scoped compact state
 
@@ -141,7 +141,7 @@ Determine default compactness per visible unit:
 - Streaming rows do not use completed-preview compactness.
 - Queued rows and outcome-only rows do not get compact toggles.
 
-The "latest completed agent response set" is based on completion recency, not rendered transcript order. Among agent turns with `status === "complete"`, choose the turn with the greatest `ended_at ?? started_at`. If that turn has a `send_id` that belongs to a fan-out group, treat all completed agent columns in that fan-out group as the latest set. Failed, cancelled, queued, and streaming rows do not qualify as latest completed responses. While a newer send is still streaming, the previous latest completed response remains expanded and the streaming response uses the live cap.
+The "latest completed agent response set" is based on completion recency, not rendered transcript order. Among agent turns with `status === "complete"`, choose the turn with the greatest `ended_at ?? started_at`. If that turn has a `send_id` that belongs to a fan-out group, treat all completed agent columns in that fan-out group as the latest set. Failed, cancelled, queued, and streaming rows do not qualify as latest completed responses. While a newer send is still streaming, the previous latest completed response remains expanded and the streaming response uses the live presentation described below.
 
 Add compact controls to `messageMeta`:
 
@@ -185,22 +185,22 @@ Current-code alignment (post-merge of attachments + reopen-dedup work):
 
 ### Goal & outcome
 
-Streaming responses remain visible without taking over the transcript. The live body is height-capped and internally follows the latest activity; once the turn completes, it becomes the latest completed response and expands fully.
+Standalone streaming responses render at full height and follow the transcript's outer scroll. Concurrent fan-out columns are height-capped and internally follow their latest activity so one verbose agent cannot take over the group. Once a turn completes, it becomes the latest completed response and expands fully.
 
 ### Implementation outline
 
-Split streaming rendering into a capped content region and a sibling live footer. Do not wrap the existing whole `turnBody` snippet with the live cap, because `turnBody` already renders `workingFooter` (the working/quiet label and cancel control) at its end. The cap applies only to streamed text/tool content; `workingFooter` renders outside the scrollable region for both standalone rows and fan-out columns.
+Split streaming rendering into a content region and a sibling live footer. Do not wrap the existing whole `turnBody` snippet, because `turnBody` already renders `workingFooter` (the working/quiet label and cancel control) at its end. The height cap applies only to concurrent fan-out text/tool content; standalone content remains overflow-visible. `workingFooter` renders outside the content region in both cases.
 
 Current-code alignment (post-merge of reopen-dedup work): `turnBody` now takes a second `live: boolean` parameter that gates the working footer (`turn.status === "streaming" && live`). Callers pass `!ownedByOutcome` (standalone) and `state === "streaming"` (fan-out) so a cancelled-mid turn that the harness persisted as `streaming` does not reopen with a phantom live footer. The cap work must thread through this signature: rather than wrapping `turnBody` whole, render the streamed text/tool items inside the capped region and the footer as a sibling outside it — i.e. either pass `live: false` into the capped `turnBody` and render `workingFooter` separately below the cap, or factor the item loop out of `turnBody` so the cap wraps only the items. Either way, preserve the existing outcome-marker gating (`ownedByOutcome` / `colHasOutcome` still suppress the footer for outcome-owned turns).
 
-Add a live content wrapper for streaming agent responses:
+Add a live content wrapper for streaming agent responses. Standalone wrappers remain overflow-visible; concurrent fan-out wrappers use:
 
 - `max-height: min(600px, 60vh)` or a nearby value that feels right in the app.
 - `overflow-y: auto`.
 - `data-testid="turn-live-scroll"` for focused tests and browser inspection.
 - Bottom-pin each internal live body when new content arrives.
 
-Each capped live region needs independent pinning state keyed by its streaming unit. The existing outer transcript auto-pin still keeps the transcript near the active rows, but once live content is capped the outer container stops growing with every streamed token/tool update; the inner live region's bottom-pin is therefore required for latest activity to remain visible.
+Each capped fan-out region needs independent pinning state keyed by its streaming unit. The existing outer transcript auto-pin keeps standalone responses near the active rows, but once fan-out content is capped the outer container stops growing with every streamed token/tool update; the inner live region's bottom-pin is therefore required for latest activity to remain visible.
 
 Inner pinning contract:
 
@@ -216,11 +216,11 @@ Do not apply completed-preview fade or completed tool suppression to streaming c
 
 ### Definition of done
 
-- Streaming standalone responses are height-capped while streaming.
+- Streaming standalone responses render at full height and use the outer transcript scroll.
 - Streaming fan-out columns are height-capped independently.
 - New streamed content remains visible near the bottom of the capped region.
 - Cancel/working/quiet affordances render outside `turn-live-scroll` and remain visible and usable.
-- On completion, the live cap is removed and the response is expanded as the latest completed response.
+- On completion, the live presentation is removed and the response is expanded as the latest completed response.
 
 ## Milestone 4 - Fan-out group controls
 
@@ -295,15 +295,15 @@ Tests should cover:
 - Fan-out group toggle expands/collapses only that fan-out's agent columns.
 - Compact completed responses hide tool calls and thinking widgets.
 - Tool-only compact responses show a hidden-tools placeholder.
-- Streaming responses use live cap, not completed preview.
+- Streaming fan-out columns use live caps, not completed previews.
 - `turn-working` renders outside `turn-live-scroll`.
-- Streaming completion removes the live cap and leaves the latest response expanded.
+- Streaming completion removes the live presentation and leaves the latest response expanded.
 
 Because the riskiest behavior is visual layout and real scroll behavior, do not rely only on jsdom component tests. Before considering the feature done, run the app and verify in a real browser/in-app browser with:
 
 - Long completed text: compact preview fades and clips without fading short messages.
 - Tool-only completed response: compact placeholder is visible.
-- Long streaming standalone response: live content is capped, bottom-pinned, and cancel/working controls stay visible.
+- Long streaming standalone response: live content uses the outer transcript scroll and cancel/working controls stay visible.
 - Long streaming fan-out responses: each column caps and bottom-pins independently.
 
 Run the focused frontend tests first, then the broader checks required for the touched surface:

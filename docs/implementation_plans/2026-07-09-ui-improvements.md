@@ -873,6 +873,41 @@ discussion, never affirmed — leave it alone).
 - Existing Git-view tests pass; add a test for the counts derivation only if it involves logic beyond
   reading `FileDiff`'s existing structure.
 
+### As-built decisions (recorded at implementation review)
+
+- **The `+n/−n` counts were a backend feature, not a frontend derivation.** The plan implied counts
+  might fall out of `FileDiff`; they can't — `FileDiff` loads lazily for the selected file only.
+  `ChangedFile` (git crate + TS mirror) gained `additions`/`deletions` as `Option<u32>`: `None` for
+  binary or oversized content (the `git diff --numstat` `-` placeholder), computed per delta via
+  libgit2 line stats. The commit path counts on the tree diff it already holds; the worktree path
+  keeps its status-walk enumeration (it owns staged/unstaged/untracked semantics) and joins counts
+  from a parallel workdir diff keyed by path — any counts failure degrades to `None`, never fails
+  the listing. `max_size` on both diffs keeps huge blobs from being loaded just to count lines. A
+  rename keys by its new path and, via `find_similar`, shows the real edit size.
+- **Counts render right-aligned in quiet mono** (green `+n` / red `−n` on the `diff-*` tokens),
+  inside the row button so the hover padding shift slides them clear of the revealed action icons.
+  Hidden when both are zero — a pure rename's `R` badge already says everything.
+- **Commit list previews 15 commits with a "Show N more" row** (user-requested during review of the
+  live view: one branch's 50-commit read buried every other repo card). Expansion is keyed to the
+  loaded ref, so selecting another branch re-collapses; a partially-hidden range's "…older commits
+  not shown" note is superseded by the Show-more row; keyboard nav walks only rendered commits.
+- **Row hovers moved `bg-raised` → `bg-hover`** in the drawer and file list: their surfaces are now
+  raised (or transparent on raised), where `raised` hover is invisible — the exact pairing
+  `app.css`'s `.md-code-copy` comment documents.
+- **File paths dimmed a step** (`text-muted/80` → `/60`): the filename is what's scanned; the
+  repeated directory prefix was competing with it.
+- **Post-review measurements and fixes**: the parallel-diff counts cost was benchmarked with tree
+  size and changed-count varied independently (the duplicated tree walk and the per-file patch
+  cost are separate terms); worst case measured ~84ms at a 20k-file tree with 300 changes —
+  accepted, recorded qualitatively in `worktree_line_counts`'s comment. The two rename detectors'
+  silent coupling got a comment plus a heavy-edit rename test (deliberately above the similarity
+  threshold, not at it).
+- **Live-view iteration (user-driven)**: the preview cap applies to the `recent` range only —
+  `incoming` (what a pull brings) always renders in full; the Show-more row lives inside the
+  history section. Resize-handle hover unified on the focus blue across all six handles (idle
+  looks stay per-context). Repo cards flattened to sections — border/rounding/fill dropped, the
+  header row anchors and branches/commits hang on left rules; list padding tightened.
+
 ---
 
 ## M8 — Agents sidebar and live-turn indicators

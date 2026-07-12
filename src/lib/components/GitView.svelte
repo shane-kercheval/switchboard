@@ -393,7 +393,7 @@
   <div class="flex min-h-0 flex-1 overflow-hidden" bind:this={splitEl} data-testid="git-split">
     {#if !detailExpanded}
       <div
-        class="git-scrollbar bg-surface flex min-h-0 min-w-0 flex-1 [scrollbar-gutter:stable] flex-col gap-2 overflow-y-scroll p-3"
+        class="git-scrollbar bg-raised flex min-h-0 min-w-0 flex-1 [scrollbar-gutter:stable] flex-col gap-1 overflow-y-scroll p-2"
         data-testid="git-repo-list"
       >
         {#if gitView.status === "loading" && gitView.repos.length === 0}
@@ -440,7 +440,7 @@
         edge="start"
         label="Resize diff panel"
         testid="git-detail-resizer"
-        class="border-border/60 bg-panel hover:bg-raised w-1.5 border-x transition-colors"
+        class="border-border/60 bg-panel hover:bg-focus w-1.5 border-x transition-colors"
         onDraft={(px) => (draftDetailWidth = px)}
         onCommit={(px) => {
           layout.gitDetailWidth = px;

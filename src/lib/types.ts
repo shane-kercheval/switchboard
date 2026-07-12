@@ -563,6 +563,10 @@ export type ChangeKind = "modified" | "added" | "deleted" | "renamed" | "untrack
 export type ChangedFile = {
   path: string;
   change: ChangeKind;
+  // Added/removed line counts; null = not line-countable (binary or past the
+  // diff size cap), distinct from a real 0.
+  additions: number | null;
+  deletions: number | null;
 };
 
 // Mirror of Rust `CommitChanges` — one selected commit's body and changed files,

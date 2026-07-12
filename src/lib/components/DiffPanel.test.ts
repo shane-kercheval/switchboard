@@ -72,6 +72,12 @@ const commitTarget = (over: Partial<Extract<DiffTarget, { kind: "commit" }>> = {
   ...over,
 });
 
+// ChangedFile rows in these tests default to countless entries; tests that
+// assert the counts column pass explicit values.
+function changedFile(path: string, change: ChangedFile["change"] = "modified"): ChangedFile {
+  return { path, change, additions: null, deletions: null };
+}
+
 // Both the worktree reads (changed_files/file_diff) and the commit reads
 // (commit_changed_files/commit_file_diff) are wired, so a test can assert which
 // pair the panel used for a given target kind.
@@ -83,7 +89,7 @@ function wire(
     commitBody?: string | null;
   } = {},
 ) {
-  const files = opts.files ?? [{ path: "code.ts", change: "modified" }];
+  const files = opts.files ?? [changedFile("code.ts")];
   invokeMock.mockImplementation((cmd: string, args?: Record<string, unknown>) => {
     if (cmd === "changed_files") return Promise.resolve(files);
     // The commit read returns the `{ found, files }` shape.
@@ -105,7 +111,7 @@ const noop = (): void => {};
 
 describe("DiffPanel (uncommitted target)", () => {
   it("auto-selects the first changed file and renders its diff", async () => {
-    wire({ files: [{ path: "code.ts", change: "modified" }] });
+    wire({ files: [changedFile("code.ts")] });
     const { container } = render(DiffPanel, { props: { target: wtTarget(), onClose: noop } });
 
     await waitFor(() => expect(screen.getByTestId("diff-view")).toBeInTheDocument());
@@ -115,6 +121,23 @@ describe("DiffPanel (uncommitted target)", () => {
     expect(text).toContain("const NEW = 3;");
     expect(container.querySelector('[data-origin="removed"]')).not.toBeNull();
     expect(container.querySelector('[data-origin="added"]')).not.toBeNull();
+  });
+
+  it("shows +/− counts per file, omitting binary and pure-rename rows", async () => {
+    wire({
+      files: [
+        { path: "code.ts", change: "modified", additions: 12, deletions: 3 },
+        { path: "logo.png", change: "modified", additions: null, deletions: null },
+        { path: "moved.ts", change: "renamed", additions: 0, deletions: 0 },
+      ],
+    });
+    render(DiffPanel, { props: { target: wtTarget(), onClose: noop } });
+    await waitFor(() => expect(screen.getAllByTestId("changed-file")).toHaveLength(3));
+
+    const counts = screen.getAllByTestId("changed-file-counts");
+    expect(counts).toHaveLength(1);
+    expect(counts[0]!.textContent).toContain("+12");
+    expect(counts[0]!.textContent).toContain("−3");
   });
 
   it("reads via the worktree commands, not the commit commands", async () => {
@@ -148,8 +171,7 @@ describe("DiffPanel (uncommitted target)", () => {
 
   it("shows difftool launch success even when the external tool stays open", async () => {
     invokeMock.mockImplementation((cmd: string, args?: Record<string, unknown>) => {
-      if (cmd === "changed_files")
-        return Promise.resolve([{ path: "code.ts", change: "modified" }]);
+      if (cmd === "changed_files") return Promise.resolve([changedFile("code.ts")]);
       if (cmd === "file_diff") return Promise.resolve(diffFixture({ path: String(args?.file) }));
       if (cmd === "open_worktree_file_difftool") return new Promise<never>(() => {});
       return Promise.resolve(null);
@@ -170,7 +192,7 @@ describe("DiffPanel (uncommitted target)", () => {
   });
 
   it("copies the selected worktree file's absolute path", async () => {
-    wire({ files: [{ path: "src/code.ts", change: "modified" }] });
+    wire({ files: [changedFile("src/code.ts")] });
     render(DiffPanel, {
       props: { target: wtTarget({ worktreePath: "/wt/project/" }), onClose: noop },
     });
@@ -185,7 +207,7 @@ describe("DiffPanel (uncommitted target)", () => {
   });
 
   it("opens the selected worktree file in the configured editor", async () => {
-    wire({ files: [{ path: "src/code.ts", change: "modified" }] });
+    wire({ files: [changedFile("src/code.ts")] });
     render(DiffPanel, {
       props: { target: wtTarget({ worktreePath: "/wt/project/" }), onClose: noop },
     });
@@ -202,7 +224,7 @@ describe("DiffPanel (uncommitted target)", () => {
   });
 
   it("does not show the editor action for a deleted worktree file", async () => {
-    wire({ files: [{ path: "src/removed.ts", change: "deleted" }] });
+    wire({ files: [changedFile("src/removed.ts", "deleted")] });
     render(DiffPanel, {
       props: { target: wtTarget({ worktreePath: "/wt/project/" }), onClose: noop },
     });
@@ -255,7 +277,7 @@ describe("DiffPanel (uncommitted target)", () => {
 
   it("shows a placeholder for a binary file, not a rendered diff body", async () => {
     wire({
-      files: [{ path: "logo.png", change: "modified" }],
+      files: [changedFile("logo.png")],
       diff: diffFixture({ path: "logo.png", binary: true, hunks: [] }),
     });
     render(DiffPanel, { props: { target: wtTarget(), onClose: noop } });
@@ -265,7 +287,7 @@ describe("DiffPanel (uncommitted target)", () => {
 
   it("shows a too-large placeholder with the file size, not a rendered body", async () => {
     wire({
-      files: [{ path: "recording.json", change: "added" }],
+      files: [changedFile("recording.json", "added")],
       diff: diffFixture({
         path: "recording.json",
         too_large: true,
@@ -281,7 +303,7 @@ describe("DiffPanel (uncommitted target)", () => {
 
   it("renders malicious file content as inert text (no executable HTML)", async () => {
     wire({
-      files: [{ path: "evil.txt", change: "added" }],
+      files: [changedFile("evil.txt", "added")],
       diff: diffFixture({
         path: "evil.txt",
         hunks: [
@@ -315,14 +337,14 @@ describe("DiffPanel (uncommitted target)", () => {
   });
 
   it("reloads files when the target's worktree path changes", async () => {
-    wire({ files: [{ path: "code.ts", change: "modified" }] });
+    wire({ files: [changedFile("code.ts")] });
     const { rerender } = render(DiffPanel, {
       props: { target: wtTarget({ worktreePath: "/wt-a" }), onClose: noop },
     });
     await waitFor(() => expect(screen.getByTestId("diff-view")).toBeInTheDocument());
 
     invokeMock.mockClear();
-    wire({ files: [{ path: "other.ts", change: "added" }] });
+    wire({ files: [changedFile("other.ts", "added")] });
     await rerender({ target: wtTarget({ worktreePath: "/wt-b" }), onClose: noop });
 
     await waitFor(() =>
@@ -345,10 +367,7 @@ describe("DiffPanel (uncommitted target)", () => {
             changedFilesResolve = resolve;
           });
         }
-        return Promise.resolve([
-          { path: "a.ts", change: "modified" },
-          { path: "b.ts", change: "modified" },
-        ]);
+        return Promise.resolve([changedFile("a.ts"), changedFile("b.ts")]);
       }
       if (cmd === "file_diff") {
         if (body === "refreshed") {
@@ -390,10 +409,7 @@ describe("DiffPanel (uncommitted target)", () => {
     expect(screen.queryByTestId("detail-loading")).not.toBeInTheDocument();
     expect(screen.getByTestId("diff-view")).toHaveTextContent("b.ts:initial");
 
-    changedFilesResolve?.([
-      { path: "a.ts", change: "modified" },
-      { path: "b.ts", change: "modified" },
-    ]);
+    changedFilesResolve?.([changedFile("a.ts"), changedFile("b.ts")]);
     diffResolve?.(
       diffFixture({
         path: "b.ts",
@@ -415,11 +431,7 @@ describe("DiffPanel (uncommitted target)", () => {
 
   it("navigates the file list with arrow keys once a file has focus", async () => {
     wire({
-      files: [
-        { path: "a.ts", change: "modified" },
-        { path: "b.ts", change: "modified" },
-        { path: "c.ts", change: "modified" },
-      ],
+      files: [changedFile("a.ts"), changedFile("b.ts"), changedFile("c.ts")],
     });
     render(DiffPanel, { props: { target: wtTarget(), onClose: noop } });
     await waitFor(() => expect(screen.getByTestId("diff-view")).toBeInTheDocument());
@@ -453,10 +465,7 @@ describe("DiffPanel (uncommitted target)", () => {
 
   it("drops the file-row hover highlight and action icons on keyboard nav, restoring on pointer move", async () => {
     wire({
-      files: [
-        { path: "a.ts", change: "modified" },
-        { path: "b.ts", change: "modified" },
-      ],
+      files: [changedFile("a.ts"), changedFile("b.ts")],
     });
     render(DiffPanel, { props: { target: wtTarget(), onClose: noop } });
     await waitFor(() => expect(screen.getByTestId("diff-view")).toBeInTheDocument());
@@ -467,8 +476,8 @@ describe("DiffPanel (uncommitted target)", () => {
     // Row 0 is auto-selected (stays blue, no row hover); row 1 is non-selected
     // and carries the white hover class.
     expect(rowOf(0).className).toContain("bg-selected");
-    expect(rowOf(0).className).not.toContain("hover:bg-raised");
-    expect(rowOf(1).className).toContain("hover:bg-raised");
+    expect(rowOf(0).className).not.toContain("hover:bg-hover");
+    expect(rowOf(1).className).toContain("hover:bg-hover");
 
     // The action-icons reveal is also keyed on hover, so it must suppress too.
     const actionsOf = (i: number): HTMLElement =>
@@ -480,21 +489,18 @@ describe("DiffPanel (uncommitted target)", () => {
     await tick();
     // Row 1 is now the keyboard selection; the non-selected row 0 drops its hover
     // background AND its action-icons reveal so nothing lingers under the cursor.
-    expect(rowOf(0).className).not.toContain("hover:bg-raised");
+    expect(rowOf(0).className).not.toContain("hover:bg-hover");
     expect(actionsOf(0).className).not.toContain("group-hover:opacity-100");
 
     await fireEvent.pointerMove(window);
     await tick();
-    expect(rowOf(0).className).toContain("hover:bg-raised");
+    expect(rowOf(0).className).toContain("hover:bg-hover");
     expect(actionsOf(0).className).toContain("group-hover:opacity-100");
   });
 
   it("marks the selected row so its action icons hover white via a group-data variant", async () => {
     wire({
-      files: [
-        { path: "a.ts", change: "modified" },
-        { path: "b.ts", change: "modified" },
-      ],
+      files: [changedFile("a.ts"), changedFile("b.ts")],
     });
     render(DiffPanel, { props: { target: wtTarget(), onClose: noop } });
     await waitFor(() => expect(screen.getByTestId("diff-view")).toBeInTheDocument());
@@ -515,10 +521,7 @@ describe("DiffPanel (uncommitted target)", () => {
 
   it("does not navigate files while the command palette is open", async () => {
     wire({
-      files: [
-        { path: "a.ts", change: "modified" },
-        { path: "b.ts", change: "modified" },
-      ],
+      files: [changedFile("a.ts"), changedFile("b.ts")],
     });
     render(DiffPanel, { props: { target: wtTarget(), onClose: noop } });
     await waitFor(() => expect(screen.getByTestId("diff-view")).toBeInTheDocument());
@@ -534,7 +537,7 @@ describe("DiffPanel (uncommitted target)", () => {
 
 describe("DiffPanel (commit target)", () => {
   it("renders a commit's diff via the commit commands, not the worktree commands", async () => {
-    wire({ files: [{ path: "code.ts", change: "modified" }] });
+    wire({ files: [changedFile("code.ts")] });
     render(DiffPanel, { props: { target: commitTarget(), onClose: noop } });
 
     await waitFor(() => expect(screen.getByTestId("diff-view")).toBeInTheDocument());
@@ -551,7 +554,7 @@ describe("DiffPanel (commit target)", () => {
 
   it("shows the commit body in a scrollable dialog when present", async () => {
     wire({
-      files: [{ path: "code.ts", change: "modified" }],
+      files: [changedFile("code.ts")],
       commitBody: "- Why this changed.\n- How reviewers should read it.",
     });
     render(DiffPanel, { props: { target: commitTarget(), onClose: noop } });
@@ -572,7 +575,7 @@ describe("DiffPanel (commit target)", () => {
 
   it("closes the commit message tooltip when opening the dialog", async () => {
     wire({
-      files: [{ path: "code.ts", change: "modified" }],
+      files: [changedFile("code.ts")],
       commitBody: "Commit message.",
     });
     render(DiffPanel, { props: { target: commitTarget(), onClose: noop } });
@@ -590,7 +593,7 @@ describe("DiffPanel (commit target)", () => {
   });
 
   it("opens the selected commit file in git difftool", async () => {
-    wire({ files: [{ path: "code.ts", change: "modified" }] });
+    wire({ files: [changedFile("code.ts")] });
     render(DiffPanel, { props: { target: commitTarget(), onClose: noop } });
     await waitFor(() => expect(screen.getByTestId("diff-view")).toBeInTheDocument());
 
@@ -604,7 +607,7 @@ describe("DiffPanel (commit target)", () => {
   });
 
   it("does not show copy-path actions for commit files", async () => {
-    wire({ files: [{ path: "code.ts", change: "modified" }] });
+    wire({ files: [changedFile("code.ts")] });
     render(DiffPanel, { props: { target: commitTarget(), onClose: noop } });
     await waitFor(() => expect(screen.getByTestId("diff-view")).toBeInTheDocument());
 

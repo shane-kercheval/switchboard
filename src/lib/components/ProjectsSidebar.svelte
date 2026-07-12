@@ -365,7 +365,7 @@
     max={sidebarMaxWidth}
     label="Resize projects sidebar"
     testid="projects-sidebar-resizer"
-    class="hover:bg-active absolute inset-y-0 right-0 z-10 w-1 transition-colors"
+    class="hover:bg-focus absolute inset-y-0 right-0 z-10 w-1 transition-colors"
     onDraft={(px) => (draftWidth = px)}
     onCommit={(px) => {
       layout.projectsSidebarWidth = px;

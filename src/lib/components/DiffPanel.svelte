@@ -218,7 +218,9 @@
   // Drop the file-row hover highlight right after a keyboard move so the mouse-
   // hovered row doesn't stay lit next to the keyboard selection; pointer movement
   // (handled below) clears the suppression and hover returns.
-  const hoverBg = $derived(hoverableClass("hover:bg-raised"));
+  // `bg-hover`, not `bg-raised`: the file rows sit on the raised list column,
+  // where `raised` would be invisible.
+  const hoverBg = $derived(hoverableClass("hover:bg-hover"));
 
   // The action-icons reveal (and the room the row text makes for it) is keyed on
   // the real mouse `:hover` via `group-hover`, so it must be suppressed alongside
@@ -518,16 +520,17 @@
     {/if}
   {:else}
     <div class="flex min-h-0 flex-1 overflow-hidden" bind:this={bodyEl}>
-      <!-- Changed-files list. The max-width mirrors fileListMaxWidth() in CSS
-           (55% of the body, capped at 440px) so a persisted width is bounded
-           live as the panel shrinks; keep the two formulas in sync. -->
+      <!-- Changed-files list. Raised like the diff it belongs to — the border
+           carries the column boundary, so the pane isn't a gray column with a
+           grayer header inside a white drawer. The max-width mirrors
+           fileListMaxWidth() in CSS (55% of the body, capped at 440px) so a
+           persisted width is bounded live as the panel shrinks; keep the two
+           formulas in sync. -->
       <div
-        class="border-border/60 bg-panel max-w-[clamp(176px,55%,440px)] shrink-0 overflow-hidden border-r"
+        class="border-border/60 bg-raised max-w-[clamp(176px,55%,440px)] shrink-0 overflow-hidden border-r"
         style={`width: ${fileListWidth}px`}
       >
-        <div
-          class="border-border/60 bg-surface flex h-8 items-center justify-between border-b px-2"
-        >
+        <div class="border-border/60 flex h-8 items-center justify-between border-b px-2">
           <span class="text-muted text-[11px] font-semibold tracking-wide uppercase">
             Changed files
           </span>
@@ -580,11 +583,26 @@
                   <span class="min-w-0 flex-1">
                     <span class="block truncate" title={file.path}>{basename(file.path)}</span>
                     {#if directory}
-                      <span class="text-muted/80 block truncate font-mono text-[10px] leading-4">
+                      <span class="text-muted/60 block truncate font-mono text-[10px] leading-4">
                         {directory}
                       </span>
                     {/if}
                   </span>
+                  <!-- +n/−n magnitude, quiet mono like the commit timestamps.
+                       Absent for binary/oversized content (counts are null, not
+                       0) and for a pure rename (0/0 — the R badge already says
+                       everything). Lives inside the button, so the hover
+                       padding shift slides it left to make room for the
+                       revealed action icons. -->
+                  {#if file.additions !== null && file.deletions !== null && file.additions + file.deletions > 0}
+                    <span
+                      class="mt-0.5 ml-auto shrink-0 pl-2 font-mono text-[10px] leading-4"
+                      data-testid="changed-file-counts"
+                    >
+                      <span class="text-diff-added">+{file.additions}</span>
+                      <span class="text-diff-removed">−{file.deletions}</span>
+                    </span>
+                  {/if}
                 </button>
                 <div
                   class={cn(
@@ -674,7 +692,7 @@
         max={fileListMaxWidth}
         label="Resize changed files list"
         testid="changed-files-resizer"
-        class="border-border/60 bg-panel hover:bg-raised w-1.5 border-r transition-colors"
+        class="border-border/60 bg-panel hover:bg-focus w-1.5 border-r transition-colors"
         onDraft={(px) => (draftFileListWidth = px)}
         onCommit={(px) => {
           layout.diffFileListWidth = px;

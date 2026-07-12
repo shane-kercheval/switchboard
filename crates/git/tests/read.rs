@@ -648,6 +648,97 @@ fn changed_files_covers_staged_unstaged_untracked() {
 }
 
 #[test]
+fn changed_files_carries_line_counts_per_kind() {
+    let repo = repo_with_main();
+    write(repo.path(), "tracked.txt", "one\ntwo\nthree\n");
+    commit_all(repo.path(), "add tracked");
+
+    // One line replaced (1+/1−), one untracked (all additions), one staged add.
+    write(repo.path(), "tracked.txt", "one\nCHANGED\nthree\n");
+    write(repo.path(), "untracked.txt", "a\nb\n");
+    write(repo.path(), "staged-add.txt", "s\n");
+    git(repo.path(), &["add", "staged-add.txt"]);
+
+    let files = changed_files(repo.path()).unwrap();
+    let counts = |n: &str| {
+        files
+            .iter()
+            .find(|f| f.path == n)
+            .map(|f| (f.additions, f.deletions))
+    };
+    assert_eq!(counts("tracked.txt"), Some((Some(1), Some(1))));
+    assert_eq!(counts("untracked.txt"), Some((Some(2), Some(0))));
+    assert_eq!(counts("staged-add.txt"), Some((Some(1), Some(0))));
+}
+
+#[test]
+fn changed_files_reports_no_counts_for_binary_content() {
+    let repo = repo_with_main();
+    std::fs::write(repo.path().join("blob.bin"), [0u8, 159, 146, 150, 0, 1]).unwrap();
+
+    let files = changed_files(repo.path()).unwrap();
+    let binary = files.iter().find(|f| f.path == "blob.bin").unwrap();
+    assert_eq!(binary.change, ChangeKind::Untracked);
+    assert_eq!(
+        (binary.additions, binary.deletions),
+        (None, None),
+        "binary counts must be absent, not zero — the UI renders them differently"
+    );
+}
+
+#[test]
+fn changed_files_counts_key_a_rename_by_its_new_path() {
+    let repo = repo_with_main();
+    write(repo.path(), "old-name.txt", "one\ntwo\nthree\nfour\n");
+    commit_all(repo.path(), "add file");
+    git(repo.path(), &["mv", "old-name.txt", "new-name.txt"]);
+    write(repo.path(), "new-name.txt", "one\ntwo\nthree\nEDITED\n");
+    git(repo.path(), &["add", "new-name.txt"]);
+
+    let files = changed_files(repo.path()).unwrap();
+    let renamed = files.iter().find(|f| f.path == "new-name.txt").unwrap();
+    assert_eq!(renamed.change, ChangeKind::Renamed);
+    // The rename pairs old→new, so counts reflect the real edit — not the
+    // whole file re-added.
+    assert_eq!((renamed.additions, renamed.deletions), (Some(1), Some(1)));
+}
+
+#[test]
+fn changed_files_counts_survive_a_heavily_edited_rename() {
+    // The listing (status walk) and the counts (parallel tree diff) each run
+    // their own rename detection; the counts join only lands if both classify
+    // the file as the same rename. A heavy — but clearly above-threshold —
+    // edit pins that agreement. Deliberately NOT a borderline-similarity case:
+    // that would test libgit2's heuristic, not this crate's contract.
+    let repo = repo_with_main();
+    let original: String = (0..10).fold(String::new(), |mut s, i| {
+        use std::fmt::Write as _;
+        let _ = writeln!(s, "line {i}");
+        s
+    });
+    write(repo.path(), "old-name.txt", &original);
+    commit_all(repo.path(), "add file");
+
+    git(repo.path(), &["mv", "old-name.txt", "new-name.txt"]);
+    // Rewrite 3 of 10 lines (~70% similar — well above the ~50% default).
+    let edited = original
+        .replace("line 1\n", "rewritten 1\n")
+        .replace("line 4\n", "rewritten 4\n")
+        .replace("line 8\n", "rewritten 8\n");
+    write(repo.path(), "new-name.txt", &edited);
+    git(repo.path(), &["add", "-A"]);
+
+    let files = changed_files(repo.path()).unwrap();
+    let renamed = files.iter().find(|f| f.path == "new-name.txt").unwrap();
+    assert_eq!(renamed.change, ChangeKind::Renamed);
+    assert_eq!(
+        (renamed.additions, renamed.deletions),
+        (Some(3), Some(3)),
+        "both rename detectors must agree so the counts join lands"
+    );
+}
+
+#[test]
 fn file_diff_returns_structured_hunks_with_line_numbers() {
     let repo = repo_with_main();
     write(repo.path(), "code.txt", "line one\nline two\nline three\n");
@@ -1386,6 +1477,16 @@ fn commit_changed_files_lists_files_against_first_parent() {
     assert_eq!(kind("README.md"), Some(ChangeKind::Modified));
     // Unchanged tree entries are not listed.
     assert_eq!(files.len(), 2);
+    // Committed-history counts come from the same tree diff as the listing.
+    let counts = |name: &str| {
+        files
+            .iter()
+            .find(|f| f.path == name)
+            .map(|f| (f.additions, f.deletions))
+    };
+    assert_eq!(counts("added.txt"), Some((Some(1), Some(0))));
+    // README.md went from "hello\n" (repo_with_main) to "hello\nmore\n".
+    assert_eq!(counts("README.md"), Some((Some(1), Some(0))));
 }
 
 #[test]

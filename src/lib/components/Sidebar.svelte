@@ -804,7 +804,7 @@
     edge="start"
     label="Resize agents sidebar"
     testid="agents-sidebar-resizer"
-    class="hover:bg-active absolute inset-y-0 left-0 z-10 w-1 transition-colors"
+    class="hover:bg-focus absolute inset-y-0 left-0 z-10 w-1 transition-colors"
     onDraft={(px) => (draftWidth = px)}
     onCommit={(px) => {
       layout.agentsSidebarWidth = px;

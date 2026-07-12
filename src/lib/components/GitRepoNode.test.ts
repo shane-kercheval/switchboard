@@ -168,6 +168,84 @@ describe("GitRepoNode commit keyboard navigation", () => {
   });
 });
 
+describe("GitRepoNode commit list preview cap", () => {
+  function manyCommits(count: number, offset = 0): GitCommitSummary[] {
+    return Array.from({ length: count }, (_, i) =>
+      commit(`oid${String(i + offset).padStart(4, "0")}`, `subject ${i + offset}`),
+    );
+  }
+
+  function selectMainWith(commitRanges: GitCommitRange[]): void {
+    branchSelection.current = { repoRoot: "/a", kind: "local", name: "main" };
+    branchCommits.ref = branchSelection.current;
+    branchCommits.status = "loaded";
+    branchCommits.ranges = commitRanges;
+  }
+
+  it("caps the rendered list at 15; Show more reveals the rest and disappears", async () => {
+    selectMainWith([
+      { kind: "recent", label: "Recent commits", truncated: false, commits: manyCommits(40) },
+    ]);
+    render(GitRepoNode, { props: props("/a") });
+    await tick();
+
+    expect(screen.getAllByTestId("commit-row")).toHaveLength(15);
+    const more = screen.getByTestId("commit-show-more");
+    expect(more).toHaveTextContent("Show 25 more");
+
+    await fireEvent.click(more);
+    expect(screen.getAllByTestId("commit-row")).toHaveLength(40);
+    expect(screen.queryByTestId("commit-show-more")).not.toBeInTheDocument();
+  });
+
+  it("renders no Show-more row at or under the cap", async () => {
+    selectMainWith([
+      { kind: "recent", label: "Recent commits", truncated: false, commits: manyCommits(15) },
+    ]);
+    render(GitRepoNode, { props: props("/a") });
+    await tick();
+
+    expect(screen.getAllByTestId("commit-row")).toHaveLength(15);
+    expect(screen.queryByTestId("commit-show-more")).not.toBeInTheDocument();
+  });
+
+  it("never hides incoming commits: the cap previews local history only, and re-collapses on a ref switch", async () => {
+    const twoRanges: GitCommitRange[] = [
+      { kind: "recent", label: "Recent commits", truncated: false, commits: manyCommits(20) },
+      { kind: "incoming", label: "Incoming commits", truncated: true, commits: manyCommits(5, 20) },
+    ];
+    selectMainWith(twoRanges);
+    render(GitRepoNode, { props: props("/a") });
+    await tick();
+
+    // 15 previewed history commits + ALL 5 incoming — what a pull brings must
+    // never sit behind Show more. The Show-more row counts only the hidden
+    // history and renders inside that section, before the incoming label.
+    expect(screen.getAllByTestId("commit-row")).toHaveLength(20);
+    const more = screen.getByTestId("commit-show-more");
+    expect(more).toHaveTextContent("Show 5 more");
+    const incomingLabel = screen.getByText("Incoming commits");
+    expect(
+      more.compareDocumentPosition(incomingLabel) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    // The untouched incoming range keeps its backend-real truncation note.
+    expect(screen.getByText("…older commits not shown")).toBeInTheDocument();
+
+    await fireEvent.click(more);
+    expect(screen.getAllByTestId("commit-row")).toHaveLength(25);
+    expect(screen.queryByTestId("commit-show-more")).not.toBeInTheDocument();
+
+    // Loading a different ref re-collapses the preview.
+    branchCommits.ref = { repoRoot: "/a", kind: "local", name: "other" };
+    branchCommits.ranges = [
+      { kind: "recent", label: "Recent commits", truncated: false, commits: manyCommits(20) },
+    ];
+    await tick();
+    expect(screen.getAllByTestId("commit-row")).toHaveLength(15);
+    expect(screen.getByTestId("commit-show-more")).toHaveTextContent("Show 5 more");
+  });
+});
+
 describe("GitRepoNode actions-trigger hover", () => {
   it("marks a selected (blue) branch row so its actions trigger hovers white", async () => {
     selectRepoA(); // selects `main` in /a

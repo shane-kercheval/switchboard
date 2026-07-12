@@ -1045,80 +1045,104 @@ does not rediscover it the hard way.
 
 ---
 
-## M9 — Transcript message navigator (TBD — not yet scoped)
+## M9 — Transcript message navigator
 
-**Status: placeholder.** Captured so the idea isn't lost; the outline, boundaries, and DoD below are
-sketches, not commitments. Do **not** implement from this section — it needs a scoping pass first, and
-it depends on the tool-facet and row work (M3/M4) settling, since what a "message" previews is affected
-by them.
+Depends on M3/M4 (tool facets give tool-only turns a sensible preview) — both shipped. Scoped
+2026-07-12 with the engineer; decisions below are settled product calls, not open questions.
 
-### The idea
+### Goal & Outcome
 
-A long transcript is only navigable by scrolling. There's no way to see the shape of a conversation at
-a glance or jump to a specific message without hunting. The proposal is a lightweight navigator — a
-table-of-contents for the transcript — that lets you scan every message and jump to one without
-scrolling through the intervening content.
+A long transcript is only navigable by scrolling: no way to see the conversation's shape at a glance
+or jump to a specific message without hunting. The navigator is a header-invoked popover — a
+table-of-contents with search — that lists **every message** and jumps the transcript to the one you
+pick.
 
-The seed form: an unobtrusive marker in the transcript's left gutter, one per message (or per turn).
-Hovering a marker pops a small preview card — the message's first line or two, attributed — so you can
-skim the whole conversation by running down the gutter. Clicking jumps the transcript to that message.
-The markers double as a position map: their spacing and density show you how long the conversation is
-and roughly where you are in it.
+Form (decided): a new header icon between the `+` (add pane) control and the compact toggle opens a
+non-modal popover anchored at the right edge of the header. Inside: a search input, a role filter,
+and a scrollable flat list of all messages in transcript order. Hovering (or arrow-keying) an entry
+shows a larger preview panel to the entry's left (the Spotlight pattern — list right, preview left,
+which is where the screen space is). Clicking/↵ jumps the transcript so that message lands at the top
+of the view. Zero persistent chrome; costs nothing until invoked.
 
-### Variations to weigh during scoping (pick, combine, or reject)
+Rejected alternatives from the original sketch, for the record: gutter markers (saturate on long
+histories, fight the M4 left-rule idiom), a persistent outline rail (permanent horizontal cost for
+occasional use), a minimap (most rendering work, least readable). A palette-source contribution
+(reusing `setCommandSource`) can layer on later using the same index — complement, not the form.
 
-- **Gutter markers + hover preview** (the seed). Minimal chrome, always visible, no mode. Risk: in a
-  multi-hundred-message conversation the gutter saturates — markers need to collapse or cluster.
-- **A collapsible outline rail** — a dedicated narrow panel (toggleable, like the sidebars) listing
-  every message as a one-line entry: attribution + first line + a relative timestamp. More scannable
-  than gutter dots for a long history, at the cost of horizontal space. Could reuse the M6 resize
-  primitive.
-- **A command-palette / quick-open jump** (⌘-something) — a searchable list of messages, type to
-  filter, ↵ to jump. Best for "find that message about X"; complements rather than replaces a visual
-  map. Leans on nothing new except an index.
-- **A minimap** — a zoomed-out render of the whole transcript down the side (à la a code editor's
-  minimap), with the viewport shown as a lens. Strongest position-map, weakest at reading content,
-  and the most rendering work.
-- **Unit granularity** — markers per *message*, per *turn*, or per *send* (§7 vocabulary). A per-send
-  entry is coarsest and matches how the user thinks about what they asked; per-message is finest and
-  matches what they're scanning for. Likely the real design question underneath all the form choices.
-- **Filtering** — should the navigator show only user sends (a "what did I ask" spine), only a chosen
-  agent's responses, only failures, or everything? A filter turns a ToC into a triage tool.
-
-### Constraints the scoping pass must respect
-
-- **The transcript is render-windowed.** `UnifiedTranscript.svelte` mounts only a tail window of blocks
-  (see its render-windowing comment); off-window messages are in memory but not in the DOM. So the
-  navigator must derive its entries from the **row model** (`buildUnifiedRows` / `UnifiedRow` in
-  `src/lib/state/unified.ts`), never from the DOM, and clicking a far-off entry must **re-pin the render
-  window** to include the target before scrolling — the same top-cursor machinery the window already
-  uses. This is the single biggest reason this isn't a trivial feature and the first thing to design.
-- **Multi-agent structure.** A send fans out to N agents rendered as side-by-side columns. A message
-  entry has to decide what it points at — the user's send, or one agent's response within it — and how
-  it attributes a preview that may correspond to several columns. This interacts with the unified-row
-  grouping directly.
-- **Compact mode already exists.** Per-unit compact/expand (`transcriptPreview.svelte.ts`) is a
-  different lever on the same problem (shrink long units in place vs. index them). The navigator should
-  compose with it, not fight it — decide whether jumping to a compacted unit expands it.
-- **Preview text** comes from the same content the transcript renders; a message whose first content is
-  a tool call or thinking block needs a sensible preview, which is easier once M3/M4 give tool calls a
-  normalized shape.
-
-### Rough shape of outcomes (to be firmed up)
+When this milestone is done:
 
 - Scan the whole conversation and read a preview of any message without scrolling the transcript.
-- Jump directly to any message, including one outside the current render window, landing with it in view.
-- The navigator reflects live updates as new turns arrive, and degrades gracefully on a very long
-  history rather than saturating.
+- Type to filter messages by content; filter by role (All · You · Agents).
+- Jump to any message — including one outside the render window, and one whose pane is minimized or
+  maximized-over — landing with it at the top of the view.
+- The list reflects live updates as turns arrive.
+- A hairline vertical divider separates the header's app-level controls (Projects/Git switcher) from
+  the project-transcript controls (+ pane, navigator, compact, sidebar toggle).
 
-### Open questions for the scoping pass
+### Settled decisions
 
-- Which form (or combination) — gutter markers, outline rail, quick-open, minimap?
-- Granularity: message, turn, or send?
-- Does it earn persistent screen space, or is it hover/toggle-only?
-- Filtering: in scope for v1 of the feature, or later?
-- How does "jump to message" interact with render-windowing performance on the longest transcripts we
-  support?
+- **Entries: every message, flat and sequential** (engineer decision — sends are often near-identical
+  re-used prompts; the send *and* its responses are both retrieval context). One entry per user send
+  (the row model already collapses a fan-out's user copies) and one attributed entry per agent
+  response. Not a per-send spine.
+- **Jump/pane rules reuse `revealPane`** — the same primitive behind ⌘⌥N and `@panename` targeting,
+  so navigator jumps behave like every other pane-targeting gesture: a minimized target pane is
+  restored; while another pane is maximized the target *replaces* it (focus stays focus). Agent
+  message → its (unique) pane. User message → the leftmost pane containing any recipient. One pane
+  moves per click; others untouched. An agent in **no** pane renders nowhere, so its entries show
+  disabled with a tooltip naming the agent.
+- **Search**: case-insensitive substring over whitespace-collapsed text, no fuzzy matching — the
+  projects-sidebar search precedent. Searches the message's full prose (user text; an agent turn's
+  text items concatenated), not just the preview line. Tool calls and thinking excluded in v1
+  (they'd drown prose hits; a later toggle if missed). Preview line: first non-empty line, markdown
+  syntax stripped (the M4 thinking-preview rule).
+- **Role filter**: segmented `All · You · Agents` (existing `SegmentedSelect`), filtering both the
+  list and the search domain.
+- **Hover preview panel**: ~150ms debounce (no flashing while running down the list); content capped
+  (~1,500 chars) and rendered as markdown — cheap at that size, never a full 20k-char mount per
+  hover. ↑/↓ moves a highlight with the preview following; ↵ jumps; the whole popover is
+  keyboard-operable.
+- **Compact mode composes without a rule**: jumping never auto-expands anything — the row you land
+  on is visible regardless of per-unit compact state.
+
+### Constraints (verified against the code)
+
+- **The transcript is render-windowed** (`UnifiedTranscript.svelte` — top-cursor tail window; the
+  cursor only grows upward and freezes per conversation identity). Off-window messages are in memory
+  but **not in the DOM**. The navigator must derive entries from the row model
+  (`buildUnifiedRows` / `UnifiedRow`, `src/lib/state/unified.ts`), never the DOM; a jump must lower
+  the cursor to mount the target (paying its markdown parse), wait for mount, then scroll — while
+  suppressing the scroll-anchoring machinery whose whole job is preventing exactly that viewport
+  motion. This is the risk, which is why the jump primitive is built and browser-tested first.
+- **No backend, no wire changes** — everything derives from state already in memory.
+
+### Implementation Outline
+
+- **M9.1 — jump primitive (riskiest first).** `jumpToRow(key)` on `UnifiedTranscript`: re-pin the
+  window cursor to include the target block, mount, scroll it to the top with anchor suppression.
+  Pane layer integrates `revealPane` per the rules above. Browser tests: an off-window target on a
+  long seeded transcript lands at top; a jump into a minimized pane restores it; a jump while
+  another pane is maximized swaps the maximized pane.
+- **M9.2 — message index.** Pure derivation `UnifiedRow[] → entries` (key, role, attribution,
+  timestamp, preview line, searchable prose) plus the search/role-filter functions. Unit tests:
+  fan-out dedup, attachment-only sends (filename as preview), forwards, tool-only turns (facet-based
+  preview), markdown stripping, whitespace-collapsed matching.
+- **M9.3 — the popover.** Header button + divider, search input, role segmented control, scrollable
+  list, hover/keyboard preview panel, click/↵ → jump, live-append behavior, Esc/outside-click close.
+  Component tests for filtering, keyboard nav, disabled unassigned-agent entries; visual pass is the
+  engineer's.
+
+### Definition of Done
+
+- Browser test: jumping to a message far outside the render window lands it at the top of the view
+  (measured geometry, `expect.poll`); the render window grew rather than re-pinned to tail.
+- Browser or component tests for the two pane-reveal rules (minimized restore; maximized replace).
+- Unit tests on the index derivation and matching rules listed in M9.2.
+- Component tests: type-to-filter narrows the list; role filter restricts list and search; ↑/↓/↵
+  navigate and jump; a disabled entry (agent in no pane) does not jump and names the agent.
+- The preview panel renders capped content only; no full-message mount on hover.
+- Visual verification (light + dark): popover anchoring at the right header edge, preview panel to
+  the left, divider placement, long-list scrolling.
 
 ---
 
@@ -1134,11 +1158,11 @@ and roughly where you are in it.
 | M6 resize + layout | — | no | primitive + persistence |
 | M7 Git view | M2 | no | polish |
 | M8 sidebar + live-turn indicators | M2 | no | polish |
-| M9 transcript message navigator | M3/M4 (likely) | TBD | **placeholder — not scoped** |
+| M9 transcript message navigator | M3/M4, M6 | no | scoped — popover ToC + search + jump |
 
 M1, M2, M3, and M6 have no dependencies on each other and could proceed in parallel if that is
-useful. M4 is the milestone the whole plan is pointed at. **M9 is a captured idea, not a committed
-milestone** — it needs its own scoping pass before it enters the sequence.
+useful. M4 is the milestone the whole plan is pointed at. M9 was scoped 2026-07-12 (it entered the
+plan as a captured idea) and is the last remaining milestone.
 
 Run `make check` before opening the PR; it includes the browser suite, which `make test` does not.
 Adapter-touching work (M3) additionally requires `make test-live-claude` and `make test-live-codex`.

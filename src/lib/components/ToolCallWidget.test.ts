@@ -66,7 +66,7 @@ describe("ToolCallWidget collapsed row", () => {
     {
       facet: { facet_kind: "write", path: "/repo/x", content: "c", truncated: false },
       verb: "Write",
-      detail: "/repo/x",
+      detail: null,
     },
     { facet: { facet_kind: "read", path: "/repo/x" }, verb: "Read", detail: "/repo/x" },
     {
@@ -451,7 +451,39 @@ describe("ToolCallWidget facet bodies", () => {
     );
   });
 
-  it("renders a truncated write with its content and a truncation notice", async () => {
+  it("renders a write inline as an all-added diff", () => {
+    const { getByTestId, queryByTestId, container } = render(ToolCallWidget, {
+      tool: withFacet({
+        facet_kind: "write",
+        path: "/repo/new.txt",
+        content: "first line\nsecond line\n",
+        truncated: false,
+      }),
+    });
+    expect(getByTestId("tool-write-file")).toHaveTextContent("/repo/new.txt");
+    expect(queryByTestId("tool-detail")).toBeNull();
+    const added = Array.from(container.querySelectorAll('[data-origin="added"]'));
+    expect(added).toHaveLength(2);
+    expect(added[0]).toHaveTextContent("first line");
+    expect(added[1]).toHaveTextContent("second line");
+    expect(container.querySelector('[data-origin="removed"]')).toBeNull();
+  });
+
+  it("caps a large write preview and reveals all lines on expand", async () => {
+    const content = Array.from({ length: 60 }, (_, i) => `line ${i}`).join("\n") + "\n";
+    const { getByTestId, queryByTestId, container } = render(ToolCallWidget, {
+      tool: withFacet({ facet_kind: "write", path: "/repo/big.txt", content, truncated: false }),
+    });
+
+    expect(getByTestId("tool-write-expand")).toHaveTextContent("Show 20 more lines");
+    expect(container.querySelectorAll('[data-origin="added"]')).toHaveLength(40);
+
+    await fireEvent.click(getByTestId("tool-write-expand"));
+    expect(queryByTestId("tool-write-expand")).toBeNull();
+    expect(container.querySelectorAll('[data-origin="added"]')).toHaveLength(60);
+  });
+
+  it("shows the facet truncation notice on an inline write diff", () => {
     const { getByTestId } = render(ToolCallWidget, {
       tool: withFacet({
         facet_kind: "write",
@@ -460,9 +492,7 @@ describe("ToolCallWidget facet bodies", () => {
         truncated: true,
       }),
     });
-    await fireEvent.click(getByTestId("tool-row"));
-    expect(getByTestId("tool-write-content")).toHaveTextContent("prefix of the file");
-    expect(getByTestId("tool-write-truncated")).toBeInTheDocument();
+    expect(getByTestId("diff-truncated")).toHaveTextContent("Diff truncated");
   });
 
   it("renders a todo facet as a checklist", async () => {

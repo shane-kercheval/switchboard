@@ -76,12 +76,8 @@
     return resolveJumpPane(projectId, rosterIds, entry.agentIds);
   }
 
-  const PREVIEW_CAP = 1500;
-
-  function previewProse(entry: NavigatorEntry): { text: string; truncated: boolean } {
-    const source = entry.prose.trim() === "" ? entry.preview : entry.prose;
-    if (source.length <= PREVIEW_CAP) return { text: source, truncated: false };
-    return { text: source.slice(0, PREVIEW_CAP), truncated: true };
+  function previewProse(entry: NavigatorEntry): string {
+    return entry.prose.trim() === "" ? entry.preview : entry.prose;
   }
 
   const previewEntry = $derived(
@@ -328,17 +324,12 @@
             <span class="font-medium">{previewEntry.attribution}</span>
             <span class="font-mono">{relativeTime(previewEntry.at)}</span>
           </div>
-          {#if preview.text === ""}
+          {#if preview === ""}
             <p class="text-muted text-xs">No text content.</p>
           {:else}
             <div class="navigator-preview-prose text-sm">
-              <Markdown text={preview.text} />
+              <Markdown text={preview} />
             </div>
-          {/if}
-          {#if preview.truncated}
-            <p class="text-muted mt-2 text-[11px]" data-testid="navigator-preview-truncated">
-              Preview truncated — jump to read the full message.
-            </p>
           {/if}
         {:else}
           <p class="text-muted/70 mt-1 text-xs select-none">

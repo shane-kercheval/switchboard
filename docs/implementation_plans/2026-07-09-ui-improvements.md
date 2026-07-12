@@ -1098,10 +1098,9 @@ When this milestone is done:
   syntax stripped (the M4 thinking-preview rule).
 - **Role filter**: segmented `All · You · Agents` (existing `SegmentedSelect`), filtering both the
   list and the search domain.
-- **Hover preview panel**: ~150ms debounce (no flashing while running down the list); content capped
-  (~1,500 chars) and rendered as markdown — cheap at that size, never a full 20k-char mount per
-  hover. ↑/↓ moves a highlight with the preview following; ↵ jumps; the whole popover is
-  keyboard-operable.
+- **Hover preview panel**: ~150ms debounce (no flashing while running down the list); full content
+  rendered as markdown in its own scrollable region. ↑/↓ moves a highlight with the preview
+  following; ↵ jumps; the whole popover is keyboard-operable.
 - **Compact mode composes without a rule**: jumping never auto-expands anything — the row you land
   on is visible regardless of per-unit compact state.
 
@@ -1140,7 +1139,7 @@ When this milestone is done:
 - Unit tests on the index derivation and matching rules listed in M9.2.
 - Component tests: type-to-filter narrows the list; role filter restricts list and search; ↑/↓/↵
   navigate and jump; a disabled entry (agent in no pane) does not jump and names the agent.
-- The preview panel renders capped content only; no full-message mount on hover.
+- The preview panel renders the complete selected message in its own scrollable region.
 - Visual verification (light + dark): popover anchoring at the right header edge, preview panel to
   the left, divider placement, long-list scrolling.
 
@@ -1198,6 +1197,11 @@ Post-visual-review rework (the popover became a centered overlay):
   (`scrollFade` action toggles `data-fade-*`, CSS masks the faded edge). Preview prose dropped to
   `text-sm` with tightened block spacing.
 - **Disabled (unassigned/hidden-agent) entries use the app `Tooltip`**, not the native `title`.
+- **The centered dialog previews the complete message.** The original 1,500-character cap protected
+  the smaller hover popover from repeatedly mounting large Markdown bodies. The dialog now gives
+  the preview most of the window and its own vertical scroll region, so truncating available content
+  conflicts with the dialog's purpose. The hover debounce still avoids rendering messages while the
+  pointer merely passes over rows.
 
 ---
 

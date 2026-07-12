@@ -140,6 +140,29 @@ describe("TranscriptNavigator", () => {
     expect(screen.queryByTestId("transcript-navigator")).toBeNull(); // closed
   });
 
+  it("renders the complete selected message in the scrollable preview", async () => {
+    await seed();
+    const turn = state.transcripts[ALICE.id]?.[1];
+    if (turn?.role !== "agent") throw new Error("expected seeded agent turn");
+    turn.items = [
+      {
+        item_kind: "text",
+        kind: "text",
+        text: `start ${"x".repeat(1_600)} complete-message-tail`,
+      },
+    ];
+    render(TranscriptNavigator, { props: props() });
+    await openNavigator();
+
+    await fireEvent.keyDown(screen.getByTestId("navigator-search"), { key: "ArrowDown" });
+    await tick();
+
+    const preview = screen.getByTestId("navigator-preview");
+    expect(preview).toHaveClass("overflow-y-auto");
+    expect(preview).toHaveTextContent("complete-message-tail");
+    expect(screen.queryByTestId("navigator-preview-truncated")).toBeNull();
+  });
+
   it("clicking an entry jumps and closes the overlay", async () => {
     await seed();
     render(TranscriptNavigator, { props: props() });

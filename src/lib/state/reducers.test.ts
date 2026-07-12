@@ -991,6 +991,22 @@ describe("transcriptReducer", () => {
       return turns;
     };
 
+    // No-duplicate AND no-loss: the collapse drops disk fragments on the trust
+    // that the surviving resident carries their content — so these assert the
+    // survivor's items, not just that one turn remains. This is the assertion
+    // that fails loudly if a refactor ever makes the collapse fire against a
+    // resident that doesn't hold the post-compaction half.
+    const expectSurvivorCarriesContent = (survivor: Turn | undefined): void => {
+      if (survivor === undefined || survivor.role !== "agent") {
+        throw new Error("expected agent turn");
+      }
+      expect(
+        survivor.items.some(
+          (i) => i.item_kind === "text" && i.text === "pre and post compact content",
+        ),
+      ).toBe(true);
+    };
+
     it("drops a continuation whose pre-compact fragment collapsed into a live resident", () => {
       const merged = reduce(liveCompletedResident(), {
         type: "hydrate",
@@ -1002,6 +1018,7 @@ describe("transcriptReducer", () => {
       });
       expect(merged).toHaveLength(1);
       expect(merged[0]?.turn_id).toBe(TURN_1);
+      expectSurvivorCarriesContent(merged[0]);
     });
 
     it("collapses a double-compaction chain transitively", () => {
@@ -1016,6 +1033,7 @@ describe("transcriptReducer", () => {
       });
       expect(merged).toHaveLength(1);
       expect(merged[0]?.turn_id).toBe(TURN_1);
+      expectSurvivorCarriesContent(merged[0]);
     });
 
     it("renders the split on a fresh load (no resident to collapse into)", () => {
@@ -1079,7 +1097,13 @@ describe("transcriptReducer", () => {
         merged.map((t) => [t.role === "agent" ? t.hydration_key : undefined, t]),
       );
       expect(byKey.get("msg_a")?.turn_id).toBe(TURN_2);
-      expect(byKey.get("msg_b")).toBeDefined();
+      const continuation = byKey.get("msg_b");
+      if (continuation === undefined || continuation.role !== "agent") {
+        throw new Error("expected the continuation to render as an agent turn");
+      }
+      expect(continuation.items.some((i) => i.item_kind === "text" && i.text === "post")).toBe(
+        true,
+      );
     });
   });
 

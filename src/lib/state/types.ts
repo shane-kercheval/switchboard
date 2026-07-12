@@ -92,9 +92,13 @@ export type Turn =
       model?: string;
       effort?: string;
       /// Stable hydration key — the dedup identity the `hydrate` merge keys on
-      /// (falling back to `turn_id` when absent). Stamped at turn end from the
-      /// live event (live-matched harnesses only) and carried from disk on
-      /// hydrate. Load-bearing for idempotent re-reads; not rendered.
+      /// (falling back to `turn_id` when absent). Stamped **early** by the
+      /// `turn_identity` event (first assistant message — see the reducer's
+      /// `turn_identity` arm), finalized/fallback-filled at `turn_end`, and
+      /// carried from disk on hydrate. The early stamp is load-bearing, not
+      /// optional cleanup: mid-stream refresh dedup and the compaction-
+      /// continuation collapse both key on the live turn already carrying it
+      /// while streaming. Not rendered.
       hydration_key?: string;
       /// The `hydration_key` of the pre-compaction fragment this turn continues
       /// (disk-parsed Claude turns only; never set on live turns). The `hydrate`

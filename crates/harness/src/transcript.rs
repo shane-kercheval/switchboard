@@ -160,6 +160,15 @@ pub enum Turn {
         /// merge recognize it as content the resident already carries (and drop
         /// it) instead of rendering it as a duplicate turn. On a fresh load (no
         /// resident) it is inert — the split renders as designed.
+        ///
+        /// **Assumed, not checked:** the collapse trusts that a live
+        /// compaction-spanning dispatch streams as ONE turn whose identity is
+        /// the *first* fragment's id (`TurnEnd.first_message_id` is keep-first;
+        /// the multi-cycle fold keeps one terminal). A Claude drift toward
+        /// per-compaction stream terminals would break that — and would first
+        /// fail the background-agent fold suite and
+        /// `live_claude_background_agent_completes_as_one_turn` loudly, long
+        /// before this collapse misfired. See gap G28 in harness-behavior.md.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         continuation_of: Option<String>,
         /// The final assistant message's Anthropic `message.id` (Claude only) —

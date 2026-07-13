@@ -80,6 +80,11 @@ pub struct ParserState {
     /// ~N× for an N-call (tool-use) turn. Mirrors the session-file path, which
     /// keeps the last assistant record's usage.
     last_assistant_context_input_tokens: Option<u64>,
+    /// Complete context occupancy after the most recent parent assistant call:
+    /// that call's reconciled input side plus its own output. Kept separately
+    /// from the terminal result's whole-dispatch output aggregate, which can
+    /// include auxiliary/subagent output that never entered the parent context.
+    last_assistant_context_tokens_after_turn: Option<u64>,
     /// Overage state from the most recent `rate_limit_event` this turn, stashed
     /// so the terminal `result` can stamp the completing turn's `TurnSpend`.
     /// Claude streams the `rate_limit_event` *before* the terminal `result`
@@ -359,16 +364,30 @@ fn parse_result(obj: &Value, turn_id: TurnId, state: &mut ParserState) -> ParseO
     // legitimate, not noise).
     let auth_failure = state.pending_auth_failure.take();
 
-    let usage = extract_usage_from_result(obj, state.last_assistant_context_input_tokens);
+    let context_window = select_context_window(
+        obj,
+        state.last_assistant_model.as_deref(),
+        state.last_assistant_context_tokens_after_turn,
+    );
+    let usage = extract_usage_from_result(
+        obj,
+        state.last_assistant_context_input_tokens,
+        state.last_assistant_context_tokens_after_turn,
+        context_window
+            .as_ref()
+            .map(|selected| selected.context_window),
+    );
 
     // Claude's context window is stream-only (`result.modelUsage`), absent from
     // the session file — so when this turn carries one, tag it `StreamOnly` for
     // the dispatcher to persist to the metadata sidecar. `None` when there's no
     // window (nothing to persist).
-    let context_window_source = usage
-        .as_ref()
-        .and_then(|u| u.context_window)
-        .map(|_| crate::events::ContextWindowSource::StreamOnly);
+    let context_window_source =
+        context_window
+            .as_ref()
+            .map(|selected| crate::events::ContextWindowSource::StreamOnly {
+                model: selected.model.clone(),
+            });
 
     // Stamp the turn's real-spend attribution from the overage state seen on
     // this turn's `rate_limit_event` (which precedes the `result` — verified).
@@ -460,9 +479,10 @@ fn parse_result(obj: &Value, turn_id: TurnId, state: &mut ParserState) -> ParseO
 fn extract_usage_from_result(
     obj: &Value,
     last_call_context_input_tokens: Option<u64>,
+    last_call_context_tokens_after_turn: Option<u64>,
+    context_window: Option<u32>,
 ) -> Option<TurnUsage> {
     let total_cost_usd = obj.get("total_cost_usd").and_then(Value::as_f64);
-    let context_window = select_context_window(obj);
 
     if let Some(aggregate) = sum_model_usage_tokens(obj) {
         return Some(TurnUsage {
@@ -471,6 +491,7 @@ fn extract_usage_from_result(
             cached_input_tokens: aggregate.cached_input,
             cache_creation_input_tokens: aggregate.cache_creation,
             context_input_tokens: last_call_context_input_tokens,
+            context_tokens_after_turn: last_call_context_tokens_after_turn,
             // Not present in `modelUsage`; the per-cycle shape may carry it.
             reasoning_output_tokens: obj
                 .get("usage")
@@ -504,6 +525,7 @@ fn extract_usage_from_result(
         // aggregate (which double-counts the shared cached prefix). See
         // `ParserState::last_assistant_context_input_tokens`.
         context_input_tokens: last_call_context_input_tokens,
+        context_tokens_after_turn: last_call_context_tokens_after_turn,
         reasoning_output_tokens,
         context_window,
         total_cost_usd,
@@ -537,48 +559,97 @@ fn sum_model_usage_tokens(result: &Value) -> Option<ModelUsageAggregate> {
         cache_creation: None,
     };
     for entry in model_usage.values() {
-        aggregate.input += entry.get("inputTokens").and_then(Value::as_u64)?;
-        aggregate.output += entry.get("outputTokens").and_then(Value::as_u64)?;
-        if let Some(cached) = entry.get("cacheReadInputTokens").and_then(Value::as_u64) {
-            *aggregate.cached_input.get_or_insert(0) += cached;
+        if !checked_add_model_usage(
+            &mut aggregate.input,
+            entry.get("inputTokens").and_then(Value::as_u64)?,
+            "inputTokens",
+        ) || !checked_add_model_usage(
+            &mut aggregate.output,
+            entry.get("outputTokens").and_then(Value::as_u64)?,
+            "outputTokens",
+        ) {
+            return None;
+        }
+        if let Some(cached) = entry.get("cacheReadInputTokens").and_then(Value::as_u64)
+            && !checked_add_model_usage(
+                aggregate.cached_input.get_or_insert(0),
+                cached,
+                "cacheReadInputTokens",
+            )
+        {
+            return None;
         }
         if let Some(created) = entry
             .get("cacheCreationInputTokens")
             .and_then(Value::as_u64)
+            && !checked_add_model_usage(
+                aggregate.cache_creation.get_or_insert(0),
+                created,
+                "cacheCreationInputTokens",
+            )
         {
-            *aggregate.cache_creation.get_or_insert(0) += created;
+            return None;
         }
     }
     Some(aggregate)
 }
 
-/// Pick the right `contextWindow` from `result.modelUsage` per the selection
-/// rule:
+fn checked_add_model_usage(total: &mut u64, value: u64, field: &str) -> bool {
+    let Some(sum) = total.checked_add(value) else {
+        tracing::warn!(
+            field,
+            "Claude modelUsage aggregate overflow — falling back to result.usage"
+        );
+        return false;
+    };
+    *total = sum;
+    true
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SelectedContextWindow {
+    model: String,
+    context_window: u32,
+}
+
+/// Select a model-bound `contextWindow` from `result.modelUsage`.
 ///
-/// 1. If `result.model` matches a `modelUsage` key, use that entry.
-/// 2. Otherwise, use the entry with the largest `inputTokens` (the primary
-///    model did the heavy lifting; routing / subordinate models have minimal
-///    tokens).
-/// 3. Empty or missing `modelUsage` → `None`.
-fn select_context_window(result: &Value) -> Option<u32> {
+/// The final parent assistant model is authoritative. The result-level model
+/// is used only when no assistant model was observed, and a sole-entry fallback
+/// is allowed only when neither identifier exists. An identifier that fails to
+/// match does not fall through: guessing would risk binding an auxiliary
+/// model's window to the parent turn. A numerically impossible window is also
+/// rejected before it can reach persistence or the UI.
+fn select_context_window(
+    result: &Value,
+    final_assistant_model: Option<&str>,
+    context_tokens_after_turn: Option<u64>,
+) -> Option<SelectedContextWindow> {
     let model_usage = result.get("modelUsage").and_then(Value::as_object)?;
     if model_usage.is_empty() {
         return None;
     }
 
-    let primary_model = result.get("model").and_then(Value::as_str);
-    if let Some(model) = primary_model
-        && let Some(entry) = model_usage.get(model)
-        && let Some(cw) = entry.get("contextWindow").and_then(Value::as_u64)
+    let model = if let Some(model) = final_assistant_model {
+        model
+    } else if let Some(model) = result.get("model").and_then(Value::as_str) {
+        model
+    } else if model_usage.len() == 1 {
+        model_usage.keys().next()?.as_str()
+    } else {
+        return None;
+    };
+    let entry = model_usage.get(model)?;
+    let context_window = u32::try_from(entry.get("contextWindow")?.as_u64()?).ok()?;
+    if context_window == 0
+        || context_tokens_after_turn.is_some_and(|occupancy| occupancy > u64::from(context_window))
     {
-        return u32::try_from(cw).ok();
+        return None;
     }
-
-    let max_entry = model_usage
-        .values()
-        .max_by_key(|v| v.get("inputTokens").and_then(Value::as_u64).unwrap_or(0))?;
-    let cw = max_entry.get("contextWindow").and_then(Value::as_u64)?;
-    u32::try_from(cw).ok()
+    Some(SelectedContextWindow {
+        model: model.to_owned(),
+        context_window,
+    })
 }
 
 /// Parse a `system` envelope. `init` carries session metadata; **every other
@@ -687,7 +758,22 @@ fn parse_assistant_envelope(obj: &Value, turn_id: TurnId, state: &mut ParserStat
             .get("cache_creation_input_tokens")
             .and_then(Value::as_u64)
             .unwrap_or(0);
-        state.last_assistant_context_input_tokens = Some(input + cache_read + cache_creation);
+        let output = usage.get("output_tokens").and_then(Value::as_u64);
+        let context_input = input
+            .checked_add(cache_read)
+            .and_then(|tokens| tokens.checked_add(cache_creation));
+        let context_after_turn = context_input
+            .zip(output)
+            .and_then(|(tokens, output)| tokens.checked_add(output));
+        if context_input.is_none()
+            || (context_input.is_some() && output.is_some() && context_after_turn.is_none())
+        {
+            tracing::warn!(
+                "Claude parent context-token arithmetic overflow — context utilization unavailable"
+            );
+        }
+        state.last_assistant_context_input_tokens = context_input;
+        state.last_assistant_context_tokens_after_turn = context_after_turn;
     }
 
     // Track this message's Anthropic id as the turn's durable join key (keep
@@ -1119,8 +1205,37 @@ mod tests {
         assert_eq!(usage.cache_creation_input_tokens, Some(30));
         // Occupancy from the assistant message: 100 + 50 + 30.
         assert_eq!(usage.context_input_tokens, Some(180));
+        assert_eq!(usage.context_tokens_after_turn, Some(205));
         assert_eq!(usage.context_window, Some(200_000));
         assert!((usage.total_cost_usd.unwrap() - 0.05).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn parent_context_overflow_hides_derived_occupancy_without_losing_raw_usage() {
+        let assistant = r#"{"type":"assistant","message":{"id":"m1","model":"claude-sonnet-5","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":18446744073709551615,"cache_read_input_tokens":1,"output_tokens":1}}}"#;
+        let result = r#"{"type":"result","is_error":false,"result":"ok","usage":{"input_tokens":7,"output_tokens":8},"modelUsage":{"claude-sonnet-5":{"inputTokens":7,"outputTokens":8,"contextWindow":200000}}}"#;
+
+        let usage = turn_end_usage(&[assistant, result]).expect("Some(usage)");
+
+        assert_eq!(usage.input_tokens, 7);
+        assert_eq!(usage.output_tokens, 8);
+        assert_eq!(usage.context_input_tokens, None);
+        assert_eq!(usage.context_tokens_after_turn, None);
+        assert_eq!(usage.context_window, Some(200_000));
+    }
+
+    #[test]
+    fn aggregate_overflow_falls_back_without_poisoning_parent_context() {
+        let assistant = r#"{"type":"assistant","message":{"id":"m1","model":"claude-sonnet-5","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":100,"output_tokens":10}}}"#;
+        let result = r#"{"type":"result","is_error":false,"result":"ok","usage":{"input_tokens":7,"output_tokens":8},"modelUsage":{"claude-sonnet-5":{"inputTokens":18446744073709551615,"outputTokens":1,"contextWindow":200000},"auxiliary":{"inputTokens":1,"outputTokens":1,"contextWindow":200000}}}"#;
+
+        let usage = turn_end_usage(&[assistant, result]).expect("Some(usage)");
+
+        assert_eq!(usage.input_tokens, 7, "overflowed aggregate falls back");
+        assert_eq!(usage.output_tokens, 8);
+        assert_eq!(usage.context_input_tokens, Some(100));
+        assert_eq!(usage.context_tokens_after_turn, Some(110));
+        assert_eq!(usage.context_window, Some(200_000));
     }
 
     #[test]
@@ -1167,6 +1282,12 @@ mod tests {
         // which would ~2x over-report).
         assert_eq!(usage.context_input_tokens, Some(22_477));
         assert_ne!(usage.context_input_tokens, Some(44_865));
+        assert_eq!(usage.context_tokens_after_turn, Some(22_478));
+        assert_ne!(
+            usage.context_tokens_after_turn,
+            Some(22_477 + 85),
+            "whole-dispatch output must not be mixed into final-parent occupancy"
+        );
         assert_eq!(usage.context_window, Some(1_000_000));
     }
 
@@ -1241,41 +1362,87 @@ mod tests {
     }
 
     #[test]
-    fn select_context_window_prefers_top_level_model() {
-        // result.model points at the primary; even if the routing model has more
-        // input tokens, the primary wins.
+    fn select_context_window_prefers_final_assistant_model() {
         let result = json!({
-            "model": "claude-opus-4-7[1m]",
+            "model": "claude-haiku-4-5",
             "modelUsage": {
                 "claude-haiku-4-5": {"inputTokens": 10_000, "contextWindow": 200_000},
-                "claude-opus-4-7[1m]": {"inputTokens": 50, "contextWindow": 1_000_000}
+                "claude-sonnet-5": {"inputTokens": 50, "contextWindow": 1_000_000}
             }
         });
-        assert_eq!(select_context_window(&result), Some(1_000_000));
+        assert_eq!(
+            select_context_window(&result, Some("claude-sonnet-5"), Some(600_000)),
+            Some(SelectedContextWindow {
+                model: "claude-sonnet-5".to_owned(),
+                context_window: 1_000_000,
+            })
+        );
     }
 
     #[test]
-    fn select_context_window_falls_back_to_largest_input_tokens() {
-        // No top-level model field — pick the entry with the largest inputTokens.
+    fn select_context_window_does_not_guess_across_multiple_entries() {
         let result = json!({
             "modelUsage": {
                 "subordinate": {"inputTokens": 50, "contextWindow": 64000},
                 "primary": {"inputTokens": 5000, "contextWindow": 200_000}
             }
         });
-        assert_eq!(select_context_window(&result), Some(200_000));
+        assert_eq!(select_context_window(&result, None, Some(10_000)), None);
+    }
+
+    #[test]
+    fn select_context_window_uses_sole_entry_without_model_identifiers() {
+        let result = json!({
+            "modelUsage": {
+                "claude-sonnet-5": {"inputTokens": 5, "contextWindow": 1_000_000}
+            }
+        });
+        assert_eq!(
+            select_context_window(&result, None, Some(600_000)),
+            Some(SelectedContextWindow {
+                model: "claude-sonnet-5".to_owned(),
+                context_window: 1_000_000,
+            })
+        );
+    }
+
+    #[test]
+    fn select_context_window_does_not_fall_through_on_model_mismatch() {
+        let result = json!({
+            "model": "missing-result-model",
+            "modelUsage": {
+                "claude-sonnet-5": {"inputTokens": 5, "contextWindow": 1_000_000}
+            }
+        });
+        assert_eq!(
+            select_context_window(&result, Some("missing-assistant-model"), Some(10)),
+            None
+        );
+    }
+
+    #[test]
+    fn select_context_window_rejects_window_smaller_than_parent_occupancy() {
+        let result = json!({
+            "modelUsage": {
+                "claude-sonnet-5": {"inputTokens": 5, "contextWindow": 200_000}
+            }
+        });
+        assert_eq!(
+            select_context_window(&result, Some("claude-sonnet-5"), Some(596_970)),
+            None
+        );
     }
 
     #[test]
     fn select_context_window_empty_modelusage_returns_none() {
         let result = json!({"modelUsage": {}});
-        assert_eq!(select_context_window(&result), None);
+        assert_eq!(select_context_window(&result, None, None), None);
     }
 
     #[test]
     fn select_context_window_missing_modelusage_returns_none() {
         let result = json!({"result": "ok"});
-        assert_eq!(select_context_window(&result), None);
+        assert_eq!(select_context_window(&result, None, None), None);
     }
 
     #[test]

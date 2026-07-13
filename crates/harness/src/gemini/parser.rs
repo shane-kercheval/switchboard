@@ -384,6 +384,7 @@ fn extract_usage(stats: Option<&Value>) -> TurnUsage {
         // the bar stays hidden; leave the reconciled value `None` rather than
         // guess at its (unverified) cache accounting.
         context_input_tokens: None,
+        context_tokens_after_turn: None,
         reasoning_output_tokens: None,
         context_window: None,
         total_cost_usd: None,

@@ -92,14 +92,14 @@ pub enum RateLimitSource {
 /// discriminator carried on [`AdapterEvent::TurnEnd`] and dropped at the
 /// [`NormalizedEvent`] boundary, so the dispatcher persists only the class-C
 /// (stream-only) window without a `match harness {…}`.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum ContextWindowSource {
     /// Stream-only (class C): Claude's `result.modelUsage.<model>.contextWindow`,
     /// absent from the session file. The dispatcher persists it to the metadata
     /// sidecar so the context bar survives restart.
-    StreamOnly,
+    StreamOnly { model: String },
     /// Already durable in the harness's own session file (class B): Codex's
     /// post-terminal session-file enrichment fills the window. Not re-persisted.
     SessionFileBacked,
@@ -133,9 +133,15 @@ pub enum ContextWindowSource {
 /// For Codex, `cached_input_tokens` is a subset already inside
 /// `input_tokens`, so the input side is just `input_tokens` — adding the
 /// cached count would double-count. Keeping this reconciliation here (not in
-/// the frontend) lets the context-utilization formula stay harness-agnostic:
-/// `(context_input_tokens + output_tokens) / context_window`. `None` where a
-/// harness doesn't compute it (e.g. Gemini, which exposes no window anyway).
+/// the frontend) lets context accounting stay harness-agnostic.
+///
+/// `context_tokens_after_turn` is the complete occupancy value the sidebar
+/// renders. It belongs to the same final parent model call as
+/// `context_input_tokens`, and includes only that call's output. This is
+/// intentionally distinct from `output_tokens`: Claude's latter field is a
+/// whole-dispatch billing aggregate that may include auxiliary/subagent output
+/// which never entered the parent's context. `None` where a harness doesn't
+/// compute context occupancy (e.g. Gemini, which exposes no window anyway).
 ///
 /// Populated when the harness reports usage on its terminal event. Claude
 /// carries it on both `Completed` and `Failed` turns; Codex carries it on
@@ -150,6 +156,7 @@ pub struct TurnUsage {
     pub cached_input_tokens: Option<u64>,
     pub cache_creation_input_tokens: Option<u64>,
     pub context_input_tokens: Option<u64>,
+    pub context_tokens_after_turn: Option<u64>,
     pub reasoning_output_tokens: Option<u64>,
     pub context_window: Option<u32>,
     pub total_cost_usd: Option<f64>,
@@ -264,6 +271,8 @@ pub enum AdapterEvent {
         /// dispatcher persists it to the metadata sidecar. `None` when the turn
         /// carries no window. Internal: dropped at the `NormalizedEvent`
         /// boundary (the frontend reads the window off `usage`, not the source).
+        /// A stream-only source carries the exact selected model key, coupling
+        /// the persisted scalar to its provenance in one type.
         context_window_source: Option<ContextWindowSource>,
         /// Per-turn real-spend attribution (cost/overage gate). Stamped by the
         /// adapter; carried through to the frontend (unlike
@@ -871,6 +880,7 @@ mod tests {
                 cached_input_tokens: Some(50),
                 cache_creation_input_tokens: Some(30),
                 context_input_tokens: Some(180),
+                context_tokens_after_turn: Some(205),
                 reasoning_output_tokens: Some(5),
                 context_window: Some(200_000),
                 total_cost_usd: Some(0.0125),

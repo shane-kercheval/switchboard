@@ -682,6 +682,7 @@ fn parse_tokens(value: &Value) -> TurnUsage {
         // Gemini exposes no context window — occupancy is never computed and
         // the bar stays hidden; leave the reconciled value `None`.
         context_input_tokens: None,
+        context_tokens_after_turn: None,
         reasoning_output_tokens: None,
         context_window: None,
         total_cost_usd: None,

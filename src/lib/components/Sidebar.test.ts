@@ -199,6 +199,7 @@ describe("Sidebar", () => {
           input_tokens: 100,
           output_tokens: 20,
           context_input_tokens: 100,
+          context_tokens_after_turn: 120,
           context_window: 200_000,
         },
       },
@@ -421,6 +422,7 @@ describe("Sidebar", () => {
           input_tokens: 100,
           output_tokens: 20,
           context_input_tokens: 100,
+          context_tokens_after_turn: 120,
           context_window: 200_000,
         },
       },
@@ -483,8 +485,9 @@ describe("Sidebar", () => {
     await state.registerAgent(CLAUDE_AGENT);
 
     // The Claude bug fixture: caching makes raw `input_tokens` tiny (only the
-    // new prompt), but `context_input_tokens` carries the full cached prefix.
-    // The bar must reflect the reconciled occupancy, not the marginal input.
+    // new prompt), while `context_tokens_after_turn` carries the full parent
+    // call occupancy. The bar must reflect that value, not marginal input or
+    // aggregate billing output.
     state.transcripts[CLAUDE_AGENT.id] = [
       {
         role: "agent",
@@ -498,6 +501,7 @@ describe("Sidebar", () => {
           input_tokens: 5_000,
           output_tokens: 10_000,
           context_input_tokens: 130_000,
+          context_tokens_after_turn: 140_000,
           context_window: 200_000,
         },
       },
@@ -531,6 +535,7 @@ describe("Sidebar", () => {
           cached_input_tokens: 60_000,
           output_tokens: 20_000,
           context_input_tokens: 80_000,
+          context_tokens_after_turn: 100_000,
           context_window: 200_000,
         },
       },
@@ -543,7 +548,7 @@ describe("Sidebar", () => {
     expect(screen.getByTestId("agent-context-bar")).toHaveTextContent("50%");
   });
 
-  it("hides the context bar when context_input_tokens is absent", async () => {
+  it("hides the context bar when post-turn occupancy is absent", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
 
@@ -561,6 +566,153 @@ describe("Sidebar", () => {
         usage: {
           input_tokens: 60_000,
           output_tokens: 10_000,
+          context_window: 200_000,
+        },
+      },
+    ];
+
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    expect(screen.queryByTestId("agent-context-bar")).toBeNull();
+  });
+
+  it("does not fall back to an older percentage when the latest terminal window is absent", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [
+      {
+        role: "agent",
+        turn_id: "turn-old",
+        agent_id: CLAUDE_AGENT.id,
+        started_at: "2026-05-16T00:00:00Z",
+        ended_at: "2026-05-16T00:00:01Z",
+        status: "complete",
+        items: [],
+        usage: {
+          input_tokens: 90_000,
+          output_tokens: 10_000,
+          context_input_tokens: 90_000,
+          context_tokens_after_turn: 100_000,
+          context_window: 200_000,
+        },
+      },
+      {
+        role: "agent",
+        turn_id: "turn-latest",
+        agent_id: CLAUDE_AGENT.id,
+        started_at: "2026-05-16T00:01:00Z",
+        ended_at: "2026-05-16T00:01:01Z",
+        status: "complete",
+        items: [],
+        usage: {
+          input_tokens: 120_000,
+          output_tokens: 10_000,
+          context_input_tokens: 120_000,
+          context_tokens_after_turn: 130_000,
+        },
+      },
+    ];
+
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    expect(screen.queryByTestId("agent-context-bar")).toBeNull();
+  });
+
+  it("keeps the last completed percentage while a newer turn is streaming", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [
+      {
+        role: "agent",
+        turn_id: "turn-complete",
+        agent_id: CLAUDE_AGENT.id,
+        started_at: "2026-05-16T00:00:00Z",
+        ended_at: "2026-05-16T00:00:01Z",
+        status: "complete",
+        items: [],
+        usage: {
+          input_tokens: 90_000,
+          output_tokens: 10_000,
+          context_input_tokens: 90_000,
+          context_tokens_after_turn: 100_000,
+          context_window: 200_000,
+        },
+      },
+      {
+        role: "agent",
+        turn_id: "turn-streaming",
+        agent_id: CLAUDE_AGENT.id,
+        started_at: "2026-05-16T00:01:00Z",
+        status: "streaming",
+        items: [],
+      },
+    ];
+
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    expect(screen.getByTestId("agent-context-bar")).toHaveTextContent("50%");
+  });
+
+  it("uses parent-call occupancy instead of aggregate billing output", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [
+      {
+        role: "agent",
+        turn_id: "turn-latest",
+        agent_id: CLAUDE_AGENT.id,
+        started_at: "2026-05-16T00:01:00Z",
+        ended_at: "2026-05-16T00:01:01Z",
+        status: "complete",
+        items: [],
+        usage: {
+          input_tokens: 600_000,
+          output_tokens: 300_000,
+          context_input_tokens: 140_000,
+          context_tokens_after_turn: 150_000,
+          context_window: 200_000,
+        },
+      },
+    ];
+
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    expect(screen.getByTestId("agent-context-bar")).toHaveTextContent("75%");
+  });
+
+  it("hides an impossible utilization instead of clamping it to 100%", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [
+      {
+        role: "agent",
+        turn_id: "turn-old",
+        agent_id: CLAUDE_AGENT.id,
+        started_at: "2026-05-16T00:00:00Z",
+        ended_at: "2026-05-16T00:00:01Z",
+        status: "complete",
+        items: [],
+        usage: {
+          input_tokens: 90_000,
+          output_tokens: 10_000,
+          context_input_tokens: 90_000,
+          context_tokens_after_turn: 100_000,
+          context_window: 200_000,
+        },
+      },
+      {
+        role: "agent",
+        turn_id: "turn-latest",
+        agent_id: CLAUDE_AGENT.id,
+        started_at: "2026-05-16T00:01:00Z",
+        ended_at: "2026-05-16T00:01:01Z",
+        status: "complete",
+        items: [],
+        usage: {
+          input_tokens: 2,
+          output_tokens: 2_223,
+          context_input_tokens: 594_747,
+          context_tokens_after_turn: 596_970,
           context_window: 200_000,
         },
       },

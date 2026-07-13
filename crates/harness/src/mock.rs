@@ -103,11 +103,14 @@ pub enum MockScenario {
     RateLimitWithSource(crate::events::RateLimitSource),
 
     /// Emits `ContentChunk → TurnEnd(Completed)` whose `usage` carries the given
-    /// `context_window`, tagged with the given [`ContextWindowSource`]. The
+    /// context occupancy and `context_window`, tagged with the given
+    /// [`ContextWindowSource`]. The
     /// vehicle for the dispatcher's context-window persistence gate: run with
     /// `StreamOnly` (must persist) and `SessionFileBacked` (must not).
     CompletesWithContextWindow {
         context_window: u32,
+        context_tokens_after_turn: Option<u64>,
+        stable_message_id: Option<String>,
         source: ContextWindowSource,
     },
 
@@ -242,7 +245,7 @@ impl HarnessAdapter for MockHarnessAdapter {
                         ended_at: Utc::now(),
                         usage: None,
                         context_window_source: None,
-                        stable_message_id: None,
+                        stable_message_id: Some("mock-message".to_owned()),
                         first_message_id: None,
                         spend: None,
                         model: None,
@@ -481,8 +484,12 @@ impl HarnessAdapter for MockHarnessAdapter {
             }
             MockScenario::CompletesWithContextWindow {
                 context_window,
-                source,
+                context_tokens_after_turn,
+                ref stable_message_id,
+                ref source,
             } => {
+                let source = source.clone();
+                let stable_message_id = stable_message_id.clone();
                 tokio::spawn(async move {
                     let _ = tx.send(AdapterEvent::ContentChunk {
                         turn_id,
@@ -499,6 +506,7 @@ impl HarnessAdapter for MockHarnessAdapter {
                             cached_input_tokens: None,
                             cache_creation_input_tokens: None,
                             context_input_tokens: Some(100),
+                            context_tokens_after_turn,
                             reasoning_output_tokens: None,
                             context_window: Some(context_window),
                             total_cost_usd: None,
@@ -507,7 +515,7 @@ impl HarnessAdapter for MockHarnessAdapter {
                         spend: None,
                         model: None,
                         effort: None,
-                        stable_message_id: None,
+                        stable_message_id,
                         first_message_id: None,
                     });
                 });
@@ -535,6 +543,7 @@ impl HarnessAdapter for MockHarnessAdapter {
                             cached_input_tokens: None,
                             cache_creation_input_tokens: None,
                             context_input_tokens: Some(100),
+                            context_tokens_after_turn: Some(125),
                             reasoning_output_tokens: None,
                             context_window: None,
                             total_cost_usd,

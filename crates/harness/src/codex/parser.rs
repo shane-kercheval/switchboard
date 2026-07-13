@@ -356,6 +356,7 @@ fn extract_usage_from_turn_completed(obj: &Value) -> Option<TurnUsage> {
         // the context bar hidden — rather than wildly inflated — on the
         // degraded no-session-file path.
         context_input_tokens: None,
+        context_tokens_after_turn: None,
         reasoning_output_tokens,
         context_window: None,
         total_cost_usd: None,

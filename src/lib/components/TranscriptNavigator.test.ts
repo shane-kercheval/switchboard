@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
 import { tick } from "svelte";
-import { fireEvent, render, screen } from "@testing-library/svelte";
+import { fireEvent, render, screen, waitFor } from "@testing-library/svelte";
 import TranscriptNavigator from "./TranscriptNavigator.svelte";
 import type { AgentRecord } from "$lib/types";
 
@@ -34,6 +34,7 @@ const BOB: AgentRecord = {
 };
 
 afterEach(() => {
+  vi.useRealTimers();
   state._testing.reset();
   jump._testing.reset();
   panes._testing.reset();
@@ -96,6 +97,49 @@ describe("TranscriptNavigator", () => {
 
     await fireEvent.click(screen.getByTestId("navigator-sort"));
     expect(rowKeys()).toEqual(["u:send-1", "a:turn-a", "a:turn-b"]);
+  });
+
+  it("keeps the find tooltip closed after opening and closing the dialog", async () => {
+    await seed();
+    render(TranscriptNavigator, { props: props() });
+
+    const toggle = screen.getByTestId("transcript-navigator-toggle");
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    await fireEvent.pointerEnter(toggle);
+    await vi.advanceTimersByTimeAsync(500);
+    expect(await screen.findByTestId("tooltip-content")).toHaveTextContent("Find messages");
+
+    await fireEvent.click(toggle);
+    expect(screen.getByTestId("dialog-content")).toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByTestId("tooltip-content")).not.toBeInTheDocument());
+
+    await fireEvent.click(screen.getByTestId("dialog-close"));
+    await waitFor(() => expect(screen.queryByTestId("dialog-content")).not.toBeInTheDocument());
+    await tick();
+    await vi.advanceTimersByTimeAsync(500);
+    expect(screen.queryByTestId("tooltip-content")).not.toBeInTheDocument();
+  });
+
+  it("keeps a visible find tooltip closed when the dialog opens externally", async () => {
+    await seed();
+    render(TranscriptNavigator, { props: props() });
+
+    const toggle = screen.getByTestId("transcript-navigator-toggle");
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    await fireEvent.pointerEnter(toggle);
+    await vi.advanceTimersByTimeAsync(500);
+    expect(await screen.findByTestId("tooltip-content")).toHaveTextContent("Find messages");
+
+    jump.navigatorState.open = true;
+    await tick();
+    expect(screen.getByTestId("dialog-content")).toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByTestId("tooltip-content")).not.toBeInTheDocument());
+
+    await fireEvent.click(screen.getByTestId("dialog-close"));
+    await waitFor(() => expect(screen.queryByTestId("dialog-content")).not.toBeInTheDocument());
+    await tick();
+    await vi.advanceTimersByTimeAsync(500);
+    expect(screen.queryByTestId("tooltip-content")).not.toBeInTheDocument();
   });
 
   it("type-to-filter narrows the list; the role filter composes with it", async () => {

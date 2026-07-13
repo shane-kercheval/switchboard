@@ -910,16 +910,18 @@ impl CodexReconstruction {
             "user_message" => {
                 // Push to `self.turns` directly, not into `builder.items`:
                 // Codex emits `task_started` BEFORE `user_message`, so the
-                // agent builder is already open here. The user turn should
-                // appear chronologically before the agent turn the builder
-                // will eventually close (on `task_complete`). Since the
-                // open agent turn isn't yet in `self.turns`, a direct push
-                // at the current tail naturally places the user turn first;
-                // the agent turn slots in after on close.
+                // agent builder is already open here. Anchor the user turn to
+                // that task start so timestamp-sorted imported transcripts keep
+                // the prompt directly above the reply. For Switchboard-dispatched
+                // turns, the journal Send is written before the Codex task starts,
+                // so this anchor still remains inside the journaled send window.
                 let Some(message) = p.get("message").and_then(Value::as_str) else {
                     return;
                 };
-                let started_at = timestamp.unwrap_or_else(Utc::now);
+                let started_at = self.current_agent.as_ref().map_or_else(
+                    || timestamp.unwrap_or_else(Utc::now),
+                    |builder| builder.started_at,
+                );
                 let user_turn = Turn::User {
                     turn_id: Uuid::now_v7(),
                     agent_id: self.agent_id,
@@ -2239,9 +2241,27 @@ not valid json
                 .unwrap();
 
         assert_eq!(result.turns.len(), 2);
-        assert!(matches!(&result.turns[0], Turn::User { text, .. } if text == "hi"));
+        let user_started_at = match &result.turns[0] {
+            Turn::User {
+                text, started_at, ..
+            } => {
+                assert_eq!(text, "hi");
+                *started_at
+            }
+            other => panic!("expected User turn, got {other:?}"),
+        };
         match &result.turns[1] {
-            Turn::Agent { items, status, .. } => {
+            Turn::Agent {
+                items,
+                status,
+                started_at,
+                ..
+            } => {
+                assert_eq!(
+                    user_started_at, *started_at,
+                    "Codex writes user_message after task_started, but the imported prompt must \
+                     share the task anchor so timestamp-sorted views keep prompt before reply"
+                );
                 assert!(matches!(status, TurnStatus::Complete));
                 assert_eq!(items.len(), 1);
                 assert!(matches!(&items[0], TurnItem::Text { text, .. } if text == "hello"));
@@ -2250,6 +2270,25 @@ not valid json
         }
         let meta = result.meta.unwrap();
         assert_eq!(meta.model, "gpt-5.4");
+    }
+
+    #[test]
+    fn user_message_without_open_task_uses_its_own_timestamp() {
+        let agent_id = Uuid::now_v7();
+        let content = jsonl_lines(&[user_message("orphan prompt", "2026-05-14T19:33:21Z")]);
+
+        let result = parse_codex_transcript_content(&content, agent_id);
+
+        assert_eq!(result.turns.len(), 1);
+        match &result.turns[0] {
+            Turn::User {
+                text, started_at, ..
+            } => {
+                assert_eq!(text, "orphan prompt");
+                assert_eq!(started_at.to_rfc3339(), "2026-05-14T19:33:21+00:00");
+            }
+            other => panic!("expected User turn, got {other:?}"),
+        }
     }
 
     #[test]

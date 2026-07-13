@@ -100,6 +100,10 @@ export type TurnUsage = {
   // input_tokens). Context utilization consumes this directly so the frontend
   // formula stays harness-agnostic. `null` where a harness doesn't compute it.
   context_input_tokens?: number | null;
+  // Complete occupancy after the final parent call, including only that call's
+  // output. Kept distinct from aggregate billing output, which may include
+  // auxiliary/subagent work outside the parent's context.
+  context_tokens_after_turn?: number | null;
   reasoning_output_tokens?: number | null;
   context_window?: number | null;
   total_cost_usd?: number | null;

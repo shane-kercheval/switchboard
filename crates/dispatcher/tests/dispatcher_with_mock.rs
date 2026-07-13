@@ -241,11 +241,12 @@ impl ConversationJournal for RecordingJournal {
 /// One recorded `record_turn_spend` call: agent, the message-id join key, the
 /// turn's cost, the overage snapshot, and the capture time.
 type TurnSpendCall = (AgentId, String, Option<f64>, TurnSpend, DateTime<Utc>);
+type ContextWindowCall = (AgentId, u32, String, String, DateTime<Utc>);
 
 #[derive(Default)]
 struct RecordingMetadataCache {
     calls: Mutex<Vec<(AgentId, serde_json::Value, DateTime<Utc>)>>,
-    context_window_calls: Mutex<Vec<(AgentId, u32, DateTime<Utc>)>>,
+    context_window_calls: Mutex<Vec<ContextWindowCall>>,
     turn_spend_calls: Mutex<Vec<TurnSpendCall>>,
 }
 
@@ -266,12 +267,17 @@ impl MetadataCache for RecordingMetadataCache {
         &self,
         agent_id: AgentId,
         context_window: u32,
+        model: String,
+        message_id: String,
         captured_at: DateTime<Utc>,
     ) {
-        self.context_window_calls
-            .lock()
-            .unwrap()
-            .push((agent_id, context_window, captured_at));
+        self.context_window_calls.lock().unwrap().push((
+            agent_id,
+            context_window,
+            model,
+            message_id,
+            captured_at,
+        ));
     }
 
     fn record_turn_spend(
@@ -1199,7 +1205,11 @@ async fn stream_only_context_window_is_persisted_to_metadata_cache() {
     let factory = TestFactory::sequence_with_metadata(
         [MockScenario::CompletesWithContextWindow {
             context_window: 200_000,
-            source: ContextWindowSource::StreamOnly,
+            context_tokens_after_turn: Some(125),
+            stable_message_id: Some("mock-message".to_owned()),
+            source: ContextWindowSource::StreamOnly {
+                model: "mock-model".to_owned(),
+            },
         }],
         agent.clone(),
         Arc::clone(&emitter),
@@ -1231,12 +1241,146 @@ async fn stream_only_context_window_is_persisted_to_metadata_cache() {
         1,
         "a StreamOnly context window must be persisted exactly once"
     );
-    let (recorded_agent, context_window, captured_at) = &calls[0];
+    let (recorded_agent, context_window, model, message_id, captured_at) = &calls[0];
     assert_eq!(*recorded_agent, agent.id);
     assert_eq!(*context_window, 200_000);
+    assert_eq!(model, "mock-model");
+    assert_eq!(message_id, "mock-message");
     assert!(
         *captured_at >= before && *captured_at <= after,
         "captured_at must be stamped at record time (roughly now)"
+    );
+}
+
+#[tokio::test]
+async fn impossible_stream_only_context_window_is_not_persisted() {
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+    let metadata = Arc::new(RecordingMetadataCache::default());
+    let factory = TestFactory::sequence_with_metadata(
+        [MockScenario::CompletesWithContextWindow {
+            context_window: 100,
+            context_tokens_after_turn: Some(125),
+            stable_message_id: Some("mock-message".to_owned()),
+            source: ContextWindowSource::StreamOnly {
+                model: "mock-model".to_owned(),
+            },
+        }],
+        agent.clone(),
+        Arc::clone(&emitter),
+        noop_journal(),
+        Arc::clone(&metadata) as Arc<dyn MetadataCache>,
+    );
+
+    dispatcher
+        .send_message(
+            agent.id,
+            "hello",
+            vec![],
+            Uuid::now_v7(),
+            factory,
+            OnBusy::Enqueue,
+        )
+        .await;
+    within(
+        &emitter,
+        "agent_idle",
+        emitter.wait_for_type("agent_idle", 1),
+    )
+    .await;
+
+    assert!(
+        metadata.context_window_calls.lock().unwrap().is_empty(),
+        "a window smaller than the parent post-turn occupancy must not be persisted"
+    );
+}
+
+#[tokio::test]
+async fn stream_only_window_without_parent_occupancy_is_not_persisted() {
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+    let metadata = Arc::new(RecordingMetadataCache::default());
+    let factory = TestFactory::sequence_with_metadata(
+        [MockScenario::CompletesWithContextWindow {
+            context_window: 200_000,
+            context_tokens_after_turn: None,
+            stable_message_id: Some("mock-message".to_owned()),
+            source: ContextWindowSource::StreamOnly {
+                model: "mock-model".to_owned(),
+            },
+        }],
+        agent.clone(),
+        Arc::clone(&emitter),
+        noop_journal(),
+        Arc::clone(&metadata) as Arc<dyn MetadataCache>,
+    );
+
+    dispatcher
+        .send_message(
+            agent.id,
+            "hello",
+            vec![],
+            Uuid::now_v7(),
+            factory,
+            OnBusy::Enqueue,
+        )
+        .await;
+    within(
+        &emitter,
+        "agent_idle",
+        emitter.wait_for_type("agent_idle", 1),
+    )
+    .await;
+
+    assert!(
+        metadata.context_window_calls.lock().unwrap().is_empty(),
+        "a window without valid parent occupancy must not be persisted"
+    );
+}
+
+#[tokio::test]
+async fn stream_only_window_without_message_join_key_is_not_persisted() {
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+    let metadata = Arc::new(RecordingMetadataCache::default());
+    let factory = TestFactory::sequence_with_metadata(
+        [MockScenario::CompletesWithContextWindow {
+            context_window: 200_000,
+            context_tokens_after_turn: Some(125),
+            stable_message_id: None,
+            source: ContextWindowSource::StreamOnly {
+                model: "mock-model".to_owned(),
+            },
+        }],
+        agent.clone(),
+        Arc::clone(&emitter),
+        noop_journal(),
+        Arc::clone(&metadata) as Arc<dyn MetadataCache>,
+    );
+
+    dispatcher
+        .send_message(
+            agent.id,
+            "hello",
+            vec![],
+            Uuid::now_v7(),
+            factory,
+            OnBusy::Enqueue,
+        )
+        .await;
+    within(
+        &emitter,
+        "agent_idle",
+        emitter.wait_for_type("agent_idle", 1),
+    )
+    .await;
+
+    assert!(
+        metadata.context_window_calls.lock().unwrap().is_empty(),
+        "a window without its exact assistant-message join key must not be persisted"
     );
 }
 
@@ -1252,6 +1396,8 @@ async fn session_file_backed_context_window_is_not_persisted() {
     let factory = TestFactory::sequence_with_metadata(
         [MockScenario::CompletesWithContextWindow {
             context_window: 272_000,
+            context_tokens_after_turn: Some(125),
+            stable_message_id: Some("mock-message".to_owned()),
             source: ContextWindowSource::SessionFileBacked,
         }],
         agent.clone(),

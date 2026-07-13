@@ -11,9 +11,10 @@ use futures::StreamExt;
 use switchboard_core::{AgentRecord, HarnessKind, SessionLocator};
 use switchboard_harness::{
     AdapterEvent, AntigravityAdapter, ClaudeCodeAdapter, CodexAdapter, ContentKind,
-    DispatchOptions, EditChange, GeminiAdapter, HarnessAdapter, RateLimitSource, ToolFacet, Turn,
-    TurnItem, TurnOutcome, UserPromptSource, claude_session_file_path, load_antigravity_transcript,
-    load_claude_transcript, load_codex_transcript, load_gemini_transcript,
+    ContextWindowSource, DispatchOptions, EditChange, GeminiAdapter, HarnessAdapter,
+    RateLimitSource, ToolFacet, Turn, TurnItem, TurnOutcome, UserPromptSource,
+    claude_session_file_path, load_antigravity_transcript, load_claude_transcript,
+    load_codex_transcript, load_gemini_transcript,
 };
 use uuid::Uuid;
 
@@ -818,6 +819,8 @@ async fn live_claude_multi_call_turn_context_occupancy_is_final_call() {
     let AdapterEvent::TurnEnd {
         outcome: TurnOutcome::Completed,
         usage: Some(usage),
+        context_window_source,
+        model,
         ..
     } = terminal
     else {
@@ -831,20 +834,41 @@ async fn live_claude_multi_call_turn_context_occupancy_is_final_call() {
     let occupancy = usage
         .context_input_tokens
         .expect("context_input_tokens must be populated for a Claude turn");
+    let occupancy_after_turn = usage
+        .context_tokens_after_turn
+        .expect("context_tokens_after_turn must be populated for a Claude turn");
 
     assert!(occupancy > 0, "occupancy must be non-zero, got 0");
+    assert!(
+        occupancy_after_turn >= occupancy,
+        "post-turn occupancy must include the final parent call's output"
+    );
     assert!(
         occupancy < summed_total,
         "occupancy ({occupancy}) must be the FINAL call's prompt size — strictly less than the \
          across-call sum `result.usage` reports ({summed_total}). Equal/greater means the adapter \
          regressed to using the summed total, which over-reports the context bar on tool-use turns."
     );
-    if let Some(window) = usage.context_window {
-        assert!(
-            occupancy <= u64::from(window),
-            "occupancy ({occupancy}) must not exceed the context window ({window})"
-        );
-    }
+    let window = usage
+        .context_window
+        .expect("a normal Claude multi-call turn must report a context window");
+    let ContextWindowSource::StreamOnly {
+        model: selected_model,
+    } = context_window_source
+        .as_ref()
+        .expect("a Claude context window must carry stream-only provenance")
+    else {
+        panic!("Claude context window must be stream-only");
+    };
+    assert_eq!(
+        Some(selected_model),
+        model.as_ref(),
+        "the selected modelUsage key must exactly equal the resolved final assistant model"
+    );
+    assert!(
+        occupancy_after_turn <= u64::from(window),
+        "post-turn occupancy ({occupancy_after_turn}) must not exceed the context window ({window})"
+    );
 }
 
 #[tokio::test]

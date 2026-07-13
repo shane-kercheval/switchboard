@@ -3407,18 +3407,14 @@ fn apply_turnmeta_overlay(
 ///   session-file rate-limit) that's already durable and authoritative — it
 ///   wins, and carries no `as_of` qualifier because it isn't a stale snapshot.
 /// - **Context window** (per-turn): Claude's window is stream-only, so a
-///   hydrated turn has `usage.context_window == None` and the context bar would
-///   blank until the next send. Fill it on the most recent agent turn the bar
-///   would actually read — i.e. one with `usage`, a usable `context_input_tokens`,
-///   and no usable window. The selection **must mirror `contextUtilization` in
-///   `Sidebar.svelte`**: that scans newest→oldest and skips any agent turn
-///   missing *either* a window or `context_input_tokens`. If the overlay filled
-///   a turn the bar then skips (e.g. one lacking `context_input_tokens`), the
-///   snapshot would go unread and the bar would stay blank — the exact failure
-///   this milestone targets. So scan past non-qualifying turns rather than
-///   stopping at the first turn with `usage`. No agent turn qualifies → no-op
-///   (bar stays hidden); never synthesize a turn or a `TurnUsage`. No `as_of`
-///   qualifier — a model's window is fixed, so the value doesn't go stale.
+///   hydrated turn has `usage.context_window == None`. Reattach the latest
+///   snapshot only to the exact final assistant message that produced it,
+///   additionally requiring the same resolved model and a numerically possible
+///   occupancy. A transcript can advance outside Switchboard, and effective
+///   capacity can differ for the same model across capability/beta state, so a
+///   positional or model-only overlay would present stale telemetry as current.
+///   Legacy snapshots without both provenance fields clean-hide. Never
+///   synthesize a turn or `TurnUsage`.
 ///
 /// A `None` sidecar (missing/corrupt) is a no-op. Mirrors the frontend
 /// reducer's hydrate fill-if-empty semantics.
@@ -3437,22 +3433,26 @@ fn apply_meta_sidecar_overlay(
         transcript.last_rate_limit_as_of = Some(snapshot.captured_at);
     }
 
-    if let Some(snapshot) = sidecar.context_window {
+    if let Some(snapshot) = sidecar.context_window
+        && let (Some(snapshot_model), Some(snapshot_message_id)) =
+            (snapshot.model, snapshot.message_id)
+    {
         for turn in transcript.turns.iter_mut().rev() {
             if let switchboard_harness::Turn::Agent {
-                usage: Some(usage), ..
+                usage: Some(usage),
+                model,
+                stable_message_id: Some(message_id),
+                ..
             } = turn
+                && message_id == &snapshot_message_id
             {
-                // Match `contextUtilization`: the bar reads the latest agent
-                // turn with BOTH a usable window and `context_input_tokens`. A
-                // turn missing `context_input_tokens` is skipped by the bar, so
-                // the overlay skips it too (scan to an earlier qualifying turn)
-                // rather than filling an unread turn. `Some(0)` is "no usable
-                // window" on both sides.
-                if usage.context_input_tokens.is_none() {
-                    continue;
-                }
-                if usage.context_window.is_none() || usage.context_window == Some(0) {
+                if (usage.context_window.is_none() || usage.context_window == Some(0))
+                    && model.as_deref() == Some(snapshot_model.as_str())
+                    && snapshot.context_window > 0
+                    && usage
+                        .context_tokens_after_turn
+                        .is_some_and(|occupancy| occupancy <= u64::from(snapshot.context_window))
+                {
                     usage.context_window = Some(snapshot.context_window);
                 }
                 break;
@@ -3793,6 +3793,9 @@ pub struct ProjectConversation {
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[non_exhaustive]
+// Agent turns intrinsically carry the full transcript payload; boxing this IPC
+// shape would add indirection and churn every merge/render consumer.
+#[allow(clippy::large_enum_variant)]
 pub enum ConversationItem {
     /// The user's side of the conversation, from one of two sources:
     /// - A **dispatched send** from the journal (the common case): `send_id` is
@@ -8703,10 +8706,9 @@ mod tests {
         assert!(transcript.last_rate_limit_as_of.is_none());
     }
 
-    /// An agent turn carrying `usage` with the given `context_input_tokens` and
-    /// `context_window`. `context_input_tokens: None` models a turn that
-    /// terminated before any assistant content streamed (the bar skips it).
+    /// An agent turn carrying the final assistant message join key plus usage.
     fn overlay_agent_turn(
+        message_id: &str,
         context_input_tokens: Option<u64>,
         context_window: Option<u32>,
     ) -> switchboard_harness::Turn {
@@ -8723,16 +8725,17 @@ mod tests {
                 cached_input_tokens: None,
                 cache_creation_input_tokens: None,
                 context_input_tokens,
+                context_tokens_after_turn: context_input_tokens.map(|tokens| tokens + 25),
                 reasoning_output_tokens: None,
                 context_window,
                 total_cost_usd: None,
             }),
             spend: None,
-            model: None,
+            model: Some("claude-sonnet-5".to_owned()),
             effort: None,
             hydration_key: None,
             continuation_of: None,
-            stable_message_id: None,
+            stable_message_id: Some(message_id.to_owned()),
         }
     }
 
@@ -8743,12 +8746,17 @@ mod tests {
         }
     }
 
-    fn context_window_sidecar(window: u32) -> switchboard_harness::meta_sidecar::MetaSidecar {
+    fn context_window_sidecar(
+        message_id: &str,
+        window: u32,
+    ) -> switchboard_harness::meta_sidecar::MetaSidecar {
         switchboard_harness::meta_sidecar::MetaSidecar {
             schema_version: 1,
             rate_limit: None,
             context_window: Some(switchboard_harness::meta_sidecar::ContextWindowSnapshot {
                 context_window: window,
+                model: Some("claude-sonnet-5".to_owned()),
+                message_id: Some(message_id.to_owned()),
                 captured_at: chrono::Utc::now(),
             }),
         }
@@ -8761,12 +8769,15 @@ mod tests {
         // window. The snapshot fills it so the bar renders on reopen.
         let mut transcript = switchboard_harness::LoadedTranscript {
             turns: vec![
-                overlay_agent_turn(Some(100), None),
-                overlay_agent_turn(Some(100), None),
+                overlay_agent_turn("msg-old", Some(100), None),
+                overlay_agent_turn("msg-latest", Some(100), None),
             ],
             ..Default::default()
         };
-        apply_meta_sidecar_overlay(&mut transcript, Some(context_window_sidecar(200_000)));
+        apply_meta_sidecar_overlay(
+            &mut transcript,
+            Some(context_window_sidecar("msg-latest", 200_000)),
+        );
         assert_eq!(
             overlay_turn_window(&transcript.turns[1]),
             Some(200_000),
@@ -8780,30 +8791,99 @@ mod tests {
     }
 
     #[test]
-    fn overlay_skips_latest_turn_lacking_context_input_tokens() {
-        // Regression guard for overlay/bar divergence: the LATEST agent turn has
-        // usage + window-absent but NO context_input_tokens (e.g. it terminated
-        // before any assistant content), so the bar skips it and reads an
-        // earlier turn. The overlay must fill that earlier turn — the one the
-        // bar actually reads — not the latest. Filling the latest would leave
-        // the snapshot unread and the bar blank.
+    fn overlay_ignores_legacy_context_window_without_model_provenance() {
+        let mut transcript = switchboard_harness::LoadedTranscript {
+            turns: vec![overlay_agent_turn("msg-final", Some(100), None)],
+            ..Default::default()
+        };
+        let mut sidecar = context_window_sidecar("msg-final", 200_000);
+        sidecar
+            .context_window
+            .as_mut()
+            .expect("context snapshot")
+            .model = None;
+
+        apply_meta_sidecar_overlay(&mut transcript, Some(sidecar));
+
+        assert_eq!(overlay_turn_window(&transcript.turns[0]), None);
+    }
+
+    #[test]
+    fn overlay_ignores_legacy_context_window_without_message_provenance() {
+        let mut transcript = switchboard_harness::LoadedTranscript {
+            turns: vec![overlay_agent_turn("msg-final", Some(100), None)],
+            ..Default::default()
+        };
+        let mut sidecar = context_window_sidecar("msg-final", 200_000);
+        sidecar
+            .context_window
+            .as_mut()
+            .expect("context snapshot")
+            .message_id = None;
+
+        apply_meta_sidecar_overlay(&mut transcript, Some(sidecar));
+
+        assert_eq!(overlay_turn_window(&transcript.turns[0]), None);
+    }
+
+    #[test]
+    fn overlay_ignores_context_window_for_a_different_model() {
+        let mut transcript = switchboard_harness::LoadedTranscript {
+            turns: vec![overlay_agent_turn("msg-final", Some(100), None)],
+            ..Default::default()
+        };
+        let mut sidecar = context_window_sidecar("msg-final", 200_000);
+        sidecar
+            .context_window
+            .as_mut()
+            .expect("context snapshot")
+            .model = Some("claude-haiku-4-5".to_owned());
+
+        apply_meta_sidecar_overlay(&mut transcript, Some(sidecar));
+
+        assert_eq!(overlay_turn_window(&transcript.turns[0]), None);
+    }
+
+    #[test]
+    fn overlay_ignores_window_smaller_than_post_turn_occupancy() {
+        let mut transcript = switchboard_harness::LoadedTranscript {
+            turns: vec![overlay_agent_turn("msg-final", Some(100), None)],
+            ..Default::default()
+        };
+
+        apply_meta_sidecar_overlay(
+            &mut transcript,
+            Some(context_window_sidecar("msg-final", 100)),
+        );
+
+        assert_eq!(overlay_turn_window(&transcript.turns[0]), None);
+    }
+
+    #[test]
+    fn overlay_binds_snapshot_to_exact_older_turn() {
+        // The transcript advanced outside Switchboard after the snapshot was
+        // written. Reattach only to its source turn; the sidebar separately
+        // refuses to present that older value as current.
         let mut transcript = switchboard_harness::LoadedTranscript {
             turns: vec![
-                overlay_agent_turn(Some(100), None), // earlier: qualifies
-                overlay_agent_turn(None, None),      // latest: no context_input → bar skips
+                overlay_agent_turn("msg-snapshot", Some(100), None),
+                overlay_agent_turn("msg-out-of-band", Some(120), None),
             ],
             ..Default::default()
         };
-        apply_meta_sidecar_overlay(&mut transcript, Some(context_window_sidecar(200_000)));
+        apply_meta_sidecar_overlay(
+            &mut transcript,
+            Some(context_window_sidecar("msg-snapshot", 200_000)),
+        );
         assert_eq!(
             overlay_turn_window(&transcript.turns[0]),
             Some(200_000),
-            "the earlier turn the bar reads must be filled"
+            "the exact source turn gets its persisted denominator"
         );
         assert_eq!(
             overlay_turn_window(&transcript.turns[1]),
             None,
-            "the latest turn (skipped by the bar) must not be filled"
+            "a newer same-model turn must not inherit the snapshot"
         );
     }
 
@@ -8821,7 +8901,10 @@ mod tests {
             }],
             ..Default::default()
         };
-        apply_meta_sidecar_overlay(&mut transcript, Some(context_window_sidecar(200_000)));
+        apply_meta_sidecar_overlay(
+            &mut transcript,
+            Some(context_window_sidecar("msg-missing", 200_000)),
+        );
         assert_eq!(transcript.turns.len(), 1, "no synthetic turn is created");
         assert!(matches!(
             transcript.turns[0],
@@ -8834,10 +8917,13 @@ mod tests {
         // Codex-shape (class B): the session file already supplied the window.
         // The snapshot must not clobber it.
         let mut transcript = switchboard_harness::LoadedTranscript {
-            turns: vec![overlay_agent_turn(Some(100), Some(272_000))],
+            turns: vec![overlay_agent_turn("msg-final", Some(100), Some(272_000))],
             ..Default::default()
         };
-        apply_meta_sidecar_overlay(&mut transcript, Some(context_window_sidecar(200_000)));
+        apply_meta_sidecar_overlay(
+            &mut transcript,
+            Some(context_window_sidecar("msg-final", 200_000)),
+        );
         assert_eq!(
             overlay_turn_window(&transcript.turns[0]),
             Some(272_000),
@@ -8865,6 +8951,7 @@ mod tests {
                 cached_input_tokens: None,
                 cache_creation_input_tokens: None,
                 context_input_tokens: Some(100),
+                context_tokens_after_turn: Some(125),
                 reasoning_output_tokens: None,
                 context_window: None,
                 total_cost_usd: cost,

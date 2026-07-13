@@ -548,7 +548,8 @@ pub trait MetadataCache: Send + Sync {
         captured_at: DateTime<Utc>,
     );
 
-    /// Persist the latest context-window size for `agent_id`. Last-write-wins.
+    /// Persist the latest context-window size and its source-message join key
+    /// for `agent_id`. Last-write-wins.
     /// Stream-only for Claude (the window lives in `result.modelUsage`, never
     /// in the session file), so it must be cached to let the context bar
     /// render on reopen instead of blanking until the next turn.
@@ -556,6 +557,8 @@ pub trait MetadataCache: Send + Sync {
         &self,
         agent_id: AgentId,
         context_window: u32,
+        model: String,
+        message_id: String,
         captured_at: DateTime<Utc>,
     );
 
@@ -583,7 +586,7 @@ pub struct NoopMetadataCache;
 
 impl MetadataCache for NoopMetadataCache {
     fn record_rate_limit(&self, _: AgentId, _: serde_json::Value, _: DateTime<Utc>) {}
-    fn record_context_window(&self, _: AgentId, _: u32, _: DateTime<Utc>) {}
+    fn record_context_window(&self, _: AgentId, _: u32, _: String, _: String, _: DateTime<Utc>) {}
     fn record_turn_spend(
         &self,
         _: AgentId,
@@ -1663,12 +1666,22 @@ async fn drain_turn(
                 // above, so this only fires for a real completed/failed turn.
                 if let AdapterEvent::TurnEnd {
                     usage: Some(usage),
-                    context_window_source: Some(ContextWindowSource::StreamOnly),
+                    context_window_source: Some(ContextWindowSource::StreamOnly { model }),
+                    stable_message_id: Some(message_id),
                     ..
                 } = &event
                     && let Some(context_window) = usage.context_window
+                    && usage.context_tokens_after_turn.is_some_and(|occupancy| {
+                        occupancy <= u64::from(context_window)
+                    })
                 {
-                    metadata.record_context_window(agent_id, context_window, Utc::now());
+                    metadata.record_context_window(
+                        agent_id,
+                        context_window,
+                        model.clone(),
+                        message_id.clone(),
+                        Utc::now(),
+                    );
                 }
                 // Persist the turn's stream-only cost + overage so the inline
                 // cost / "using credits" marker re-attaches to the right message

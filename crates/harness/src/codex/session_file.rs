@@ -543,12 +543,19 @@ fn turn_usage_from_token_count_info(
     let last = info.get("last_token_usage").unwrap_or(info);
     let input = last.get("input_tokens").and_then(Value::as_u64)?;
     let output = last.get("output_tokens").and_then(Value::as_u64)?;
+    let context_tokens_after_turn = input.checked_add(output);
+    if context_tokens_after_turn.is_none() {
+        tracing::warn!(
+            "Codex session context-token arithmetic overflow — context utilization unavailable"
+        );
+    }
     Some(TurnUsage {
         input_tokens: input,
         output_tokens: output,
         cached_input_tokens: last.get("cached_input_tokens").and_then(Value::as_u64),
         cache_creation_input_tokens: None,
         context_input_tokens: Some(input),
+        context_tokens_after_turn,
         reasoning_output_tokens: last.get("reasoning_output_tokens").and_then(Value::as_u64),
         context_window,
         total_cost_usd: None,
@@ -1450,6 +1457,25 @@ mod tests {
             usage.context_window, None,
             "window is overlaid separately from task_started"
         );
+    }
+
+    #[test]
+    fn token_count_overflow_preserves_raw_tokens_and_hides_derived_occupancy() {
+        let info = serde_json::json!({
+            "last_token_usage": {
+                "input_tokens": u64::MAX,
+                "output_tokens": 1
+            }
+        });
+
+        let usage = turn_usage_from_token_count_info(&info, Some(200_000))
+            .expect("raw token fields remain valid");
+
+        assert_eq!(usage.input_tokens, u64::MAX);
+        assert_eq!(usage.output_tokens, 1);
+        assert_eq!(usage.context_input_tokens, Some(u64::MAX));
+        assert_eq!(usage.context_tokens_after_turn, None);
+        assert_eq!(usage.context_window, Some(200_000));
     }
 
     #[test]

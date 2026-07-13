@@ -88,6 +88,8 @@ impl MetadataCache for ProjectMetadataCache {
         &self,
         agent_id: AgentId,
         context_window: u32,
+        model: String,
+        message_id: String,
         captured_at: DateTime<Utc>,
     ) {
         // Same per-agent wiring guard as `record_rate_limit`: the path was
@@ -109,6 +111,8 @@ impl MetadataCache for ProjectMetadataCache {
         if let Err(e) = switchboard_harness::meta_sidecar::write_context_window(
             &self.sidecar_path,
             context_window,
+            model,
+            message_id,
             captured_at,
         ) {
             tracing::warn!(

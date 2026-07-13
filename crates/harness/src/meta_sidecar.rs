@@ -18,9 +18,9 @@
 //! `<directory>/.switchboard/projects/<project-id>/sessions/<agent-id>.meta.json`.
 //!
 //! **Last-write-wins per field, not an append-log.** Each write replaces the
-//! whole file with the latest snapshot. Correlating snapshots to individual
-//! messages (per-`send_id`) was considered and deferred — if ever needed it
-//! lands additively in the journal at turn-start, not here.
+//! field's latest snapshot. The context-window snapshot carries its source
+//! message id only to validate which hydrated turn owns that one value; it
+//! does not retain per-message history.
 //!
 //! **Best-effort, not load-bearing.** A missing file reads as empty; a
 //! corrupt file logs and reads as empty (never fails hydration). Writes that
@@ -63,14 +63,23 @@ pub struct RateLimitSnapshot {
 /// Claude (`result.modelUsage.<model>.contextWindow`), absent from the session
 /// file, so it must be cached to let the context bar render on reopen.
 ///
-/// `captured_at` is recorded for parity with `RateLimitSnapshot`, but the
-/// context bar shows no staleness qualifier off it: a model's window is fixed,
-/// so the value doesn't go stale (it only changes if the agent switches model,
-/// at which point the next turn overwrites it).
+/// `captured_at` is recorded for parity with `RateLimitSnapshot`. The snapshot
+/// is reattached only to the exact assistant message that produced it: the same
+/// model can have different effective capacity across capability/beta state,
+/// so model identity alone is not a durable turn join.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ContextWindowSnapshot {
     /// The model's total context-window size in tokens.
     pub context_window: u32,
+    /// Exact resolved `modelUsage` key that supplied the window. Legacy
+    /// snapshots have no provenance and are deliberately not overlaid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Final non-subagent assistant message id for the turn that reported this
+    /// window. Legacy snapshots have no join key and are deliberately not
+    /// overlaid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
     /// Wall-clock time this snapshot was captured (ISO-8601 UTC on disk).
     pub captured_at: DateTime<Utc>,
 }
@@ -186,12 +195,16 @@ pub fn write_rate_limit(
 pub fn write_context_window(
     path: &Path,
     context_window: u32,
+    model: String,
+    message_id: String,
     captured_at: DateTime<Utc>,
 ) -> Result<(), MetaSidecarError> {
     let mut sidecar = read(path).unwrap_or_default();
     sidecar.schema_version = SCHEMA_VERSION;
     sidecar.context_window = Some(ContextWindowSnapshot {
         context_window,
+        model: Some(model),
+        message_id: Some(message_id),
         captured_at,
     });
     persist(path, &sidecar)
@@ -340,11 +353,20 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("agent.meta.json");
         let captured = ts("2026-05-31T12:00:00Z");
-        write_context_window(&path, 200_000, captured).unwrap();
+        write_context_window(
+            &path,
+            200_000,
+            "claude-sonnet-5".to_owned(),
+            "msg-final".to_owned(),
+            captured,
+        )
+        .unwrap();
 
         let read_back = read(&path).expect("sidecar present after write");
         let cw = read_back.context_window.expect("context_window populated");
         assert_eq!(cw.context_window, 200_000);
+        assert_eq!(cw.model.as_deref(), Some("claude-sonnet-5"));
+        assert_eq!(cw.message_id.as_deref(), Some("msg-final"));
         assert_eq!(cw.captured_at, captured);
         assert_eq!(read_back.schema_version, SCHEMA_VERSION);
     }
@@ -361,7 +383,14 @@ mod tests {
             ts("2026-05-31T12:00:00Z"),
         )
         .unwrap();
-        write_context_window(&path, 1_000_000, ts("2026-05-31T12:05:00Z")).unwrap();
+        write_context_window(
+            &path,
+            1_000_000,
+            "claude-sonnet-5".to_owned(),
+            "msg-final".to_owned(),
+            ts("2026-05-31T12:05:00Z"),
+        )
+        .unwrap();
 
         let read_back = read(&path).expect("sidecar present");
         assert_eq!(
@@ -392,6 +421,25 @@ mod tests {
             read_back.context_window.is_none(),
             "absent context_window reads as None, not an error"
         );
+    }
+
+    #[test]
+    fn legacy_context_window_without_model_provenance_still_reads() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("agent.meta.json");
+        std::fs::write(
+            &path,
+            r#"{"schema_version":1,"context_window":{"context_window":200000,"captured_at":"2026-05-31T12:00:00Z"}}"#,
+        )
+        .unwrap();
+
+        let snapshot = read(&path)
+            .expect("legacy sidecar remains parseable")
+            .context_window
+            .expect("legacy context window remains represented");
+        assert_eq!(snapshot.context_window, 200_000);
+        assert_eq!(snapshot.model, None);
+        assert_eq!(snapshot.message_id, None);
     }
 
     #[test]

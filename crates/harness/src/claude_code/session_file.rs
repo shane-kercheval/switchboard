@@ -972,19 +972,30 @@ fn parse_usage(usage: &serde_json::Map<String, Value>) -> TurnUsage {
     let cache_creation_input_tokens = usage
         .get("cache_creation_input_tokens")
         .and_then(Value::as_u64);
+    let reported_output_tokens = usage.get("output_tokens").and_then(Value::as_u64);
+    let output_tokens = reported_output_tokens.unwrap_or(0);
+    let context_input_tokens = input_tokens
+        .checked_add(cached_input_tokens.unwrap_or(0))
+        .and_then(|tokens| tokens.checked_add(cache_creation_input_tokens.unwrap_or(0)));
+    let context_tokens_after_turn = context_input_tokens
+        .zip(reported_output_tokens)
+        .and_then(|(tokens, output)| tokens.checked_add(output));
+    if context_input_tokens.is_none()
+        || (context_input_tokens.is_some()
+            && reported_output_tokens.is_some()
+            && context_tokens_after_turn.is_none())
+    {
+        tracing::warn!(
+            "Claude session context-token arithmetic overflow — context utilization unavailable"
+        );
+    }
     TurnUsage {
         input_tokens,
-        output_tokens: usage
-            .get("output_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
+        output_tokens,
         cached_input_tokens,
         cache_creation_input_tokens,
-        context_input_tokens: Some(
-            input_tokens
-                + cached_input_tokens.unwrap_or(0)
-                + cache_creation_input_tokens.unwrap_or(0),
-        ),
+        context_input_tokens,
+        context_tokens_after_turn,
         reasoning_output_tokens: usage.get("reasoning_output_tokens").and_then(Value::as_u64),
         context_window: None,
         total_cost_usd: None,
@@ -1696,6 +1707,22 @@ mod tests {
         }
         let meta = result.meta.unwrap();
         assert_eq!(meta.model, "claude-sonnet-4-6");
+    }
+
+    #[test]
+    fn parse_usage_overflow_preserves_raw_tokens_and_hides_derived_occupancy() {
+        let value = json!({
+            "input_tokens": u64::MAX,
+            "cache_read_input_tokens": 1,
+            "output_tokens": 2
+        });
+        let usage = parse_usage(value.as_object().expect("usage object"));
+
+        assert_eq!(usage.input_tokens, u64::MAX);
+        assert_eq!(usage.cached_input_tokens, Some(1));
+        assert_eq!(usage.output_tokens, 2);
+        assert_eq!(usage.context_input_tokens, None);
+        assert_eq!(usage.context_tokens_after_turn, None);
     }
 
     #[test]

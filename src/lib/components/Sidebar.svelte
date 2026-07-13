@@ -610,9 +610,9 @@
     }
   }
 
-  /// Context utilization — `(context_input_tokens + output_tokens) /
-  /// context_window` from the most recent completed agent turn. Forward-looking
-  /// signal ("how full will the next turn's context be").
+  /// Context utilization — `context_tokens_after_turn / context_window` from
+  /// the most recent completed agent turn. Forward-looking signal ("how full
+  /// will the next turn's context be").
   ///
   /// `context_input_tokens` is the harness-reconciled input-side occupancy
   /// (see `TurnUsage`): for Claude it sums the disjoint cache fields (cached +
@@ -621,19 +621,27 @@
   /// per-turn `last_token_usage` because the stream reports thread-cumulative
   /// totals (the cause of the >900% bug). Consuming the pre-reconciled
   /// value keeps this formula harness-agnostic — do not re-add per-harness
-  /// token summation here. Both it and `context_window` must be present;
-  /// otherwise the bar is hidden.
+  /// token summation here. `context_tokens_after_turn` also keeps Claude's
+  /// whole-dispatch billing output separate from the final parent call's
+  /// occupancy. Both it and `context_window` must be present; otherwise the bar
+  /// is hidden. An impossible occupancy is hidden rather than clamped, so bad
+  /// telemetry never masquerades as a plausible 100%.
   function contextUtilization(agentId: AgentId): number | undefined {
     const turns = transcripts[agentId] ?? [];
     for (let i = turns.length - 1; i >= 0; i--) {
       const turn = turns[i];
-      if (turn?.role !== "agent" || turn.usage === undefined) continue;
+      // A streaming turn has no terminal usage yet, so keep showing the last
+      // completed state while it runs. Once a terminal usage record exists it
+      // is authoritative: missing/invalid operands clean-hide rather than
+      // falling back to an older, stale percentage.
+      if (turn?.role !== "agent" || turn.status === "streaming" || turn.usage === undefined)
+        continue;
       const window = turn.usage.context_window;
-      if (window === undefined || window === null || window === 0) continue;
-      const contextInput = turn.usage.context_input_tokens;
-      if (contextInput === undefined || contextInput === null) continue;
-      const outputTokens = turn.usage.output_tokens ?? 0;
-      return (contextInput + outputTokens) / window;
+      if (window === undefined || window === null || window === 0) return undefined;
+      const occupancy = turn.usage.context_tokens_after_turn;
+      if (occupancy === undefined || occupancy === null) return undefined;
+      if (occupancy > window) return undefined;
+      return occupancy / window;
     }
     return undefined;
   }

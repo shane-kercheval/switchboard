@@ -598,8 +598,8 @@ shipped:
   duplicated the row's still-visible detail. Instead the expanded content hangs under the row
   behind a thin left rule (the fan-out column idiom), directly on the reading surface, and the
   row's detail line hides while open since the body shows the full untruncated version. Fills mark
-  only true content blocks: the output / raw-JSON / written-content `pre`s on `panel` (that token's
-  documented job), edits in a bordered diff canvas. For specialized facets the raw JSON sits
+  only true content blocks: the output / raw-JSON `pre`s on `panel` (that token's documented job),
+  edits and writes in a bordered diff canvas. For specialized facets the raw JSON sits
   behind a "Show raw input" reveal (the facet body already shows the same information readably);
   the generic facet has no body, so its raw input shows directly.
 - **Edit diffs render inline, without expansion** (third visual pass): watching the changes
@@ -613,18 +613,20 @@ shipped:
   patches keep **Edit** with per-file markers. Tool-row diffs render through a new `compact` mode
   on `DiffView` (no hunk-header bars, no line-number gutters — snippet-relative numbers read as
   file positions they aren't; hunks separated by a hairline). The Git view is untouched.
-- **Write facets render inline content, never a fabricated diff.** The facet carries the new content
-  but no prior snapshot and may overwrite an existing file, so an all-added diff would make an
-  unsupported creation claim. The collapsed row shows the first 25 content lines; expansion shows
-  all captured content plus output/raw input, and facet truncation remains explicit.
+- **Write facets infer file creation and render as all-added diffs.** Dedicated writes do not carry a
+  prior snapshot, but creation is overwhelmingly the common behavior, so the UI favors consistency
+  with patch-based file creation and accepts that a rare overwrite will appear all-added. The
+  collapsed row builds and shows only the first 25 diff lines; expansion shows all captured content
+  plus output/raw input, and facet truncation remains explicit.
 - **Inline edit and write previews show 25 lines per file.** Forty lines made a single tool call
   dominate the transcript before the user chose to expand it; 25 preserves enough context to scan
   while keeping the surrounding conversation visible.
 - The old "TOOL"/"MCP"/"Plugin" kind label and `Badge` are gone from the row; the facet icon
   (lucide) plus verb replace them. The raw-JSON display cap is 50 k characters.
 - New modules: `src/lib/toolRow.ts` (facet × state verb vocabulary, provenance detail, icon map)
-  and `src/lib/toolDiff.ts` (jsdiff `structuredPatch` → `FileDiff` synthesis; snippet-relative
-  hunk headers carry an explicit qualifier). Dependency added: `diff` (jsdiff v9, bundled types).
+  and `src/lib/toolDiff.ts` (jsdiff `structuredPatch` → `FileDiff` synthesis for edits, plus direct
+  capped all-added synthesis for writes; snippet-relative edit hunk headers carry an explicit
+  qualifier). Dependency added: `diff` (jsdiff v9, bundled types).
 
 ---
 
@@ -1039,11 +1041,12 @@ does not rediscover it the hard way.
   keeps the full row width at rest and truncates only while the icons are actually shown —
   shared-prefix names are distinguishable exactly when the user is reading, and the eye stays
   visible while an agent is hidden (it's the state indicator).
-- **Only actionable card regions hover.** The raised card itself is static because clicking its
-  body has no action. A taller name-row button carries the collapse hover without spending name
-  width on a chevron. The drag grip occupies a reserved far-right slot after the harness icon, so
-  the name stays left-aligned and hover does not shift the icon. Double-clicking only the name enters
-  rename. Eye, actions, and rename-save controls use the stronger on-raised treatment.
+- **The card surface toggles its details and receives an outline hover.** The name is excluded so a
+  single click does nothing and a name-only double-click enters rename; buttons and text selection
+  are excluded as well. Collapse/expand remains available explicitly in the actions menu. The drag
+  grip is absent at rest and appears at the far right on hover/focus, intentionally shifting the
+  harness icon left instead of reserving empty space. Eye, actions, and rename-save controls use the
+  stronger on-raised treatment. A small top inset keeps the first card clear of the section edge.
 - **`formatDuration` gained the bare-seconds form in place** (`9s` under a minute); the silence
   counter can't hit that branch (starts at one heartbeat threshold = 60s), so its output is
   unchanged — asserted by the untouched ≥1m test cases.

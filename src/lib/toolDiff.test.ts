@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { DiffLine, EditedFile, FileDiff } from "$lib/types";
-import { synthesizeEditDiff, truncateDiff } from "$lib/toolDiff";
+import { synthesizeEditDiff, synthesizeWriteDiff, truncateDiff } from "$lib/toolDiff";
 
 function file(edits: { old: string; new: string }[], truncated = false): EditedFile {
   return { path: "/repo/src/a.ts", change: "modified", edits, truncated };
@@ -122,5 +122,27 @@ describe("truncateDiff", () => {
     expect(result.diff.hunks[1]!.header).toBe("@@ hunk 1 @@");
     // The original diff is not mutated.
     expect(result.diff).not.toBe(fileDiff([2, 5]));
+  });
+});
+
+describe("synthesizeWriteDiff", () => {
+  it("infers creation and emits only added lines without a trailing phantom line", () => {
+    const { diff, hiddenLines } = synthesizeWriteDiff("/repo/new.ts", "one\ntwo\n", false);
+
+    expect(hiddenLines).toBe(0);
+    expect(diff.hunks[0]!.lines).toEqual([
+      { origin: "added", old_lineno: null, new_lineno: 1, content: "one" },
+      { origin: "added", old_lineno: null, new_lineno: 2, content: "two" },
+    ]);
+  });
+
+  it("constructs only the requested preview prefix and reports hidden lines", () => {
+    const content = Array.from({ length: 60 }, (_, index) => `line ${index}`).join("\n");
+    const { diff, hiddenLines } = synthesizeWriteDiff("/repo/new.ts", content, true, 25);
+
+    expect(diff.hunks[0]!.lines).toHaveLength(25);
+    expect(diff.hunks[0]!.lines[24]!.content).toBe("line 24");
+    expect(diff.truncated).toBe(true);
+    expect(hiddenLines).toBe(35);
   });
 });

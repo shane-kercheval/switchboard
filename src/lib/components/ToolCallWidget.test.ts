@@ -451,7 +451,7 @@ describe("ToolCallWidget facet bodies", () => {
     );
   });
 
-  it("renders write content inline without claiming the file was created", () => {
+  it("infers a dedicated write is a creation and renders every line as added", () => {
     const { getByTestId, queryByTestId, container } = render(ToolCallWidget, {
       tool: withFacet({
         facet_kind: "write",
@@ -462,8 +462,9 @@ describe("ToolCallWidget facet bodies", () => {
     });
     expect(getByTestId("tool-write-file")).toHaveTextContent("/repo/new.txt");
     expect(queryByTestId("tool-detail")).toBeNull();
-    expect(getByTestId("tool-write-content").textContent).toBe("first line\nsecond line\n");
-    expect(container.querySelector('[data-origin="added"]')).toBeNull();
+    expect(getByTestId("tool-write-content")).toHaveTextContent("first line");
+    expect(getByTestId("tool-write-content")).toHaveTextContent("second line");
+    expect(container.querySelectorAll('[data-origin="added"]')).toHaveLength(2);
     expect(container.querySelector('[data-origin="removed"]')).toBeNull();
   });
 
@@ -491,7 +492,7 @@ describe("ToolCallWidget facet bodies", () => {
         truncated: true,
       }),
     });
-    expect(getByTestId("tool-write-truncated")).toHaveTextContent("Content truncated");
+    expect(getByTestId("diff-truncated")).toHaveTextContent("Diff truncated");
   });
 
   it("renders a todo facet as a checklist", async () => {

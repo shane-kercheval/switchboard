@@ -84,6 +84,9 @@ test("the stop control stays fixed when elapsed seconds gain a digit", async () 
 
   const timer = page.getByTestId("turn-elapsed");
   const stop = page.getByTestId("turn-live-control");
+  expect(stop.element().getBoundingClientRect().x).toBeLessThan(
+    timer.element().getBoundingClientRect().x,
+  );
   const xAtNineSeconds = await vi.waitUntil(
     () => {
       if (timer.element().textContent?.trim() !== "9s") return false;

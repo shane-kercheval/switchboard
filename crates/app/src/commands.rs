@@ -13545,6 +13545,102 @@ mod tests {
     }
 
     #[test]
+    fn merge_imported_codex_session_orders_prompts_before_replies() {
+        // Codex records `task_started` before it echoes `user_message`. Attached
+        // sessions have no journal send anchor, so the imported prompt/reply pair
+        // relies on the parser giving both rows the same task anchor.
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        let session_id = "0199aaaa-bbbb-7ccc-8ddd-eeeeeeeeeeee";
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 5, 10).unwrap();
+        let agent = Uuid::now_v7();
+
+        let ev = |ts: &str, payload: serde_json::Value| serde_json::json!({"timestamp": ts, "type": "event_msg", "payload": payload});
+        let lines = [
+            serde_json::json!({"timestamp":"2026-05-10T04:43:14Z","type":"session_meta","payload":{"cli_version":"0.142.0"}}),
+            ev(
+                "2026-05-10T04:43:15Z",
+                serde_json::json!({"type":"task_started","turn_id":"task-1","model_context_window":250_000}),
+            ),
+            ev(
+                "2026-05-10T04:43:16Z",
+                serde_json::json!({"type":"user_message","message":"prompt one"}),
+            ),
+            ev(
+                "2026-05-10T04:43:17Z",
+                serde_json::json!({"type":"agent_message","message":"reply one"}),
+            ),
+            ev(
+                "2026-05-10T04:43:18Z",
+                serde_json::json!({"type":"task_complete","turn_id":"task-1"}),
+            ),
+            ev(
+                "2026-05-10T04:43:20Z",
+                serde_json::json!({"type":"task_started","turn_id":"task-2","model_context_window":250_000}),
+            ),
+            ev(
+                "2026-05-10T04:43:21Z",
+                serde_json::json!({"type":"user_message","message":"prompt two"}),
+            ),
+            ev(
+                "2026-05-10T04:43:22Z",
+                serde_json::json!({"type":"agent_message","message":"reply two"}),
+            ),
+            ev(
+                "2026-05-10T04:43:23Z",
+                serde_json::json!({"type":"task_complete","turn_id":"task-2"}),
+            ),
+        ];
+        let content = lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let staged = stage_codex_session_file(home.path(), date, session_id);
+        std::fs::write(&staged, content).unwrap();
+
+        let transcript = switchboard_harness::load_codex_transcript(
+            home.path(),
+            cwd.path(),
+            session_id,
+            Some(date),
+            agent,
+        )
+        .unwrap();
+        let merged = merge_project_conversation(Vec::new(), vec![(agent, transcript, None)]);
+
+        let rendered: Vec<String> = merged
+            .items
+            .iter()
+            .map(|item| match item {
+                ConversationItem::UserMessage { text, .. } => format!("user:{text}"),
+                ConversationItem::AgentTurn { items, .. } => {
+                    let text = items
+                        .iter()
+                        .find_map(|item| match item {
+                            TurnItem::Text { text, .. } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .unwrap_or("");
+                    format!("agent:{text}")
+                }
+                ConversationItem::SystemMarker { .. } => "system".to_owned(),
+                ConversationItem::Outcome { .. } => "outcome".to_owned(),
+            })
+            .collect();
+        assert_eq!(
+            rendered,
+            vec![
+                "user:prompt one",
+                "agent:reply one",
+                "user:prompt two",
+                "agent:reply two",
+            ],
+            "attached Codex sessions render each imported prompt before its reply"
+        );
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn merge_codex_session_through_real_parser_key_joins() {
         // End-to-end through the REAL Codex parser: two turns whose

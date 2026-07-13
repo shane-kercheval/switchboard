@@ -5,8 +5,8 @@
   /// column, not by boxes. Expanded content hangs under the row behind a thin
   /// left rule (the same idiom as fan-out response columns), directly on the
   /// reading surface — a wrapping fill made every open row a gray slab. Fills
-  /// mark only true content blocks: output / raw JSON / written content on
-  /// `panel` (that token's documented job), the diff in a bordered canvas.
+  /// mark only true content blocks: output / raw JSON on `panel` (that token's
+  /// documented job), file edits and writes in a bordered diff canvas.
   /// The row's detail line hides while open: the body shows the full,
   /// untruncated version, so keeping both duplicated every value.
   ///
@@ -14,21 +14,21 @@
   /// previous `<details>`-based widget rendered its body unconditionally and
   /// stringified every tool call's full raw input whether or not it was ever
   /// expanded — a 500 KB write built a 500 KB string and DOM node nobody asked
-  /// for. Formatting (raw JSON, output, Write content) must stay gated behind
-  /// `open`. The one deliberate exception: Edit facets render their diff
-  /// inline without expansion — watching the changes stream by is the point
-  /// of the row — which is safe to do eagerly because edit content is capped
-  /// at the facet level and off-window rows aren't mounted at all (transcript
-  /// render-windowing). The inline diff is further capped to a preview length
+  /// for. Formatting raw JSON and output must stay gated behind `open`. The
+  /// deliberate exception: Edit and Write facets render their diff inline —
+  /// watching file changes stream by is the point of the row. This is safe to
+  /// do eagerly because facet content is capped and off-window rows aren't
+  /// mounted at all (transcript render-windowing). Inline content is further capped to a preview length
   /// (both while streaming and once settled — flipping full→capped when a turn
   /// ends would be jarring); expanding the row un-caps it and reveals output +
   /// raw input. Its detail line is suppressed in both states: the inline
   /// per-file headers already carry the paths.
   import type { ToolCall } from "$lib/state/index.svelte";
+  import type { EditedFile } from "$lib/types";
   import DiffView from "$lib/components/DiffView.svelte";
   import Spinner from "$lib/components/ui/Spinner.svelte";
   import { languageForPath } from "$lib/diff";
-  import { synthesizeEditDiff, truncateDiff } from "$lib/toolDiff";
+  import { synthesizeEditDiff, synthesizeWriteDiff, truncateDiff } from "$lib/toolDiff";
   import { formatToolInput, redactDisplay } from "$lib/toolInput";
   import { isGenericFacet, toolDetail, toolIcon, toolRowState, toolVerb } from "$lib/toolRow";
   import { cn } from "$lib/utils";
@@ -39,7 +39,11 @@
   const facet = $derived(tool.facet);
   const rowState = $derived(toolRowState(tool));
   const verb = $derived(toolVerb(facet, tool.name));
-  const detail = $derived(facet.facet_kind === "edit" ? undefined : toolDetail(facet, tool.input));
+  const detail = $derived(
+    facet.facet_kind === "edit" || facet.facet_kind === "write"
+      ? undefined
+      : toolDetail(facet, tool.input),
+  );
   const FacetIcon = $derived(toolIcon(facet));
   const hasOutput = $derived(tool.output !== undefined && tool.output !== "");
 
@@ -62,10 +66,10 @@
   /// display is where a multi-megabyte input must stop.
   const RAW_DISPLAY_CAP = 50_000;
 
-  /// Inline edit diffs preview at most this many lines (per file) until the row
-  /// is expanded — a large edit shouldn't dominate the transcript, but you can
-  /// still watch the first chunk stream in and expand for the rest.
-  const EDIT_DIFF_PREVIEW_LINES = 40;
+  /// Inline file diffs preview at most this many lines (per file) until the row
+  /// is expanded — a large change shouldn't dominate the transcript, but you
+  /// can still watch the first chunk stream in and expand for the rest.
+  const INLINE_DIFF_PREVIEW_LINES = 25;
 
   function cappedRawInput(input: unknown): { text: string; truncated: boolean } {
     const formatted = formatToolInput(input) ?? "";
@@ -79,6 +83,40 @@
     return Circle;
   }
 </script>
+
+{#snippet inlineDiff(file: EditedFile, expandTestid: string)}
+  {@const fullDiff = synthesizeEditDiff(file)}
+  {@const preview = truncateDiff(fullDiff, INLINE_DIFF_PREVIEW_LINES)}
+  {@const capped = !open && preview.hiddenLines > 0}
+  <!-- Cap the inline diff in both live and settled states — flipping full to
+       capped when a turn ends would be jarring. Expansion shows all captured
+       content at full height. Always unified: side-by-side needs more width
+       than a transcript row can guarantee. -->
+  <div class="border-border/60 overflow-hidden rounded border">
+    <div
+      class={cn(
+        capped && "[mask-image:linear-gradient(to_bottom,black_calc(100%_-_3rem),transparent)]",
+      )}
+    >
+      <DiffView
+        diff={capped ? preview.diff : fullDiff}
+        style="unified"
+        language={languageForPath(file.path)}
+        compact
+      />
+    </div>
+  </div>
+  {#if capped}
+    <button
+      type="button"
+      class="text-muted hover:text-fg text-[11px] transition-colors"
+      data-testid={expandTestid}
+      onclick={() => (open = true)}
+    >
+      Show {preview.hiddenLines} more {preview.hiddenLines === 1 ? "line" : "lines"}
+    </button>
+  {/if}
+{/snippet}
 
 <div class="text-xs" data-testid="turn-tool" data-tool-use-id={tool.tool_use_id}>
   <button
@@ -164,7 +202,7 @@
     {/if}
   </button>
 
-  {#if open || facet.facet_kind === "edit"}
+  {#if open || facet.facet_kind === "edit" || facet.facet_kind === "write"}
     <div
       class="border-border/70 mt-1 ml-[13px] space-y-2 border-l py-0.5 pl-4"
       data-testid="tool-body"
@@ -197,57 +235,49 @@
                   : "Diff will appear when the turn completes."}
               </p>
             {:else}
-              {@const fullDiff = synthesizeEditDiff(file)}
-              {@const preview = truncateDiff(fullDiff, EDIT_DIFF_PREVIEW_LINES)}
-              {@const capped = !open && preview.hiddenLines > 0}
-              <!-- Cap the inline diff to a preview length in BOTH states
-                   (streaming and settled) — flipping a diff from full to capped
-                   the instant a turn finishes would be jarring. Expanding the
-                   row (chevron, or the hint below) shows the diff in FULL, at
-                   full height — never a shorter scroll box than the preview.
-                   Always unified: side-by-side needs a 48rem minimum the
-                   transcript row can't guarantee; the Git view honors the
-                   diff-style pref. -->
-              <div class="border-border/60 overflow-hidden rounded border">
-                <div
-                  class={cn(
-                    capped &&
-                      "[mask-image:linear-gradient(to_bottom,black_calc(100%_-_3rem),transparent)]",
-                  )}
-                >
-                  <DiffView
-                    diff={capped ? preview.diff : fullDiff}
-                    style="unified"
-                    language={languageForPath(file.path)}
-                    compact
-                  />
-                </div>
-              </div>
-              {#if capped}
-                <button
-                  type="button"
-                  class="text-muted hover:text-fg text-[11px] transition-colors"
-                  data-testid="tool-edit-expand"
-                  onclick={() => (open = true)}
-                >
-                  Show {preview.hiddenLines} more {preview.hiddenLines === 1 ? "line" : "lines"}
-                </button>
-              {/if}
+              {@render inlineDiff(file, "tool-edit-expand")}
             {/if}
           </section>
         {/each}
       {:else if facet.facet_kind === "write"}
-        <section class="space-y-1" aria-label="File write">
+        {@const rendered = synthesizeWriteDiff(
+          facet.path,
+          facet.content,
+          facet.truncated,
+          open ? undefined : INLINE_DIFF_PREVIEW_LINES,
+        )}
+        {@const capped = rendered.hiddenLines > 0}
+        <section class="space-y-1" aria-label="File write" data-testid="tool-write-file">
           <div class="text-muted truncate font-mono text-[11px]" title={facet.path}>
             {facet.path}
           </div>
-          <pre
-            class="text-muted bg-panel max-h-44 overflow-y-auto rounded px-2 py-1.5 font-mono whitespace-pre-wrap"
-            data-testid="tool-write-content">{facet.content}</pre>
-          {#if facet.truncated}
-            <p class="text-muted text-[11px]" data-testid="tool-write-truncated">
-              Content truncated — the full write is larger than shown.
-            </p>
+          <div
+            class="border-border/60 overflow-hidden rounded border"
+            data-testid="tool-write-content"
+          >
+            <div
+              class={cn(
+                capped &&
+                  "[mask-image:linear-gradient(to_bottom,black_calc(100%_-_3rem),transparent)]",
+              )}
+            >
+              <DiffView
+                diff={rendered.diff}
+                style="unified"
+                language={languageForPath(facet.path)}
+                compact
+              />
+            </div>
+          </div>
+          {#if capped}
+            <button
+              type="button"
+              class="text-muted hover:text-fg text-[11px] transition-colors"
+              data-testid="tool-write-expand"
+              onclick={() => (open = true)}
+            >
+              Show {rendered.hiddenLines} more {rendered.hiddenLines === 1 ? "line" : "lines"}
+            </button>
           {/if}
         </section>
       {:else if facet.facet_kind === "read"}

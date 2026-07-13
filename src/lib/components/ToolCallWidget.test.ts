@@ -66,7 +66,7 @@ describe("ToolCallWidget collapsed row", () => {
     {
       facet: { facet_kind: "write", path: "/repo/x", content: "c", truncated: false },
       verb: "Write",
-      detail: "/repo/x",
+      detail: null,
     },
     { facet: { facet_kind: "read", path: "/repo/x" }, verb: "Read", detail: "/repo/x" },
     {
@@ -357,7 +357,7 @@ describe("ToolCallWidget facet bodies", () => {
   });
 
   it("caps a large edit diff to a preview and reveals the rest on expand", async () => {
-    // A 60-line insertion is past the 40-line inline preview cap.
+    // A 60-line insertion is past the 25-line inline preview cap.
     const big = Array.from({ length: 60 }, (_, i) => `line ${i}`).join("\n") + "\n";
     const facet: ToolFacet = {
       facet_kind: "edit",
@@ -370,10 +370,10 @@ describe("ToolCallWidget facet bodies", () => {
     });
 
     // Collapsed: capped preview shows a "Show N more lines" affordance and only
-    // the first 40 diff lines are rendered.
+    // the first 25 diff lines are rendered.
     const expand = getByTestId("tool-edit-expand");
-    expect(expand).toHaveTextContent("Show 20 more lines");
-    expect(container.querySelectorAll('[data-origin="added"]')).toHaveLength(40);
+    expect(expand).toHaveTextContent("Show 35 more lines");
+    expect(container.querySelectorAll('[data-origin="added"]')).toHaveLength(25);
 
     // Expanding via the hint opens the row and renders the full diff.
     await fireEvent.click(expand);
@@ -451,7 +451,39 @@ describe("ToolCallWidget facet bodies", () => {
     );
   });
 
-  it("renders a truncated write with its content and a truncation notice", async () => {
+  it("infers a dedicated write is a creation and renders every line as added", () => {
+    const { getByTestId, queryByTestId, container } = render(ToolCallWidget, {
+      tool: withFacet({
+        facet_kind: "write",
+        path: "/repo/new.txt",
+        content: "first line\nsecond line\n",
+        truncated: false,
+      }),
+    });
+    expect(getByTestId("tool-write-file")).toHaveTextContent("/repo/new.txt");
+    expect(queryByTestId("tool-detail")).toBeNull();
+    expect(getByTestId("tool-write-content")).toHaveTextContent("first line");
+    expect(getByTestId("tool-write-content")).toHaveTextContent("second line");
+    expect(container.querySelectorAll('[data-origin="added"]')).toHaveLength(2);
+    expect(container.querySelector('[data-origin="removed"]')).toBeNull();
+  });
+
+  it("caps a large write preview and reveals all lines on expand", async () => {
+    const content = Array.from({ length: 60 }, (_, i) => `line ${i}`).join("\n") + "\n";
+    const { getByTestId, queryByTestId } = render(ToolCallWidget, {
+      tool: withFacet({ facet_kind: "write", path: "/repo/big.txt", content, truncated: false }),
+    });
+
+    expect(getByTestId("tool-write-expand")).toHaveTextContent("Show 35 more lines");
+    expect(getByTestId("tool-write-content")).toHaveTextContent("line 24");
+    expect(getByTestId("tool-write-content")).not.toHaveTextContent("line 25");
+
+    await fireEvent.click(getByTestId("tool-write-expand"));
+    expect(queryByTestId("tool-write-expand")).toBeNull();
+    expect(getByTestId("tool-write-content")).toHaveTextContent("line 59");
+  });
+
+  it("shows the facet truncation notice on inline write content", () => {
     const { getByTestId } = render(ToolCallWidget, {
       tool: withFacet({
         facet_kind: "write",
@@ -460,9 +492,7 @@ describe("ToolCallWidget facet bodies", () => {
         truncated: true,
       }),
     });
-    await fireEvent.click(getByTestId("tool-row"));
-    expect(getByTestId("tool-write-content")).toHaveTextContent("prefix of the file");
-    expect(getByTestId("tool-write-truncated")).toBeInTheDocument();
+    expect(getByTestId("diff-truncated")).toHaveTextContent("Diff truncated");
   });
 
   it("renders a todo facet as a checklist", async () => {

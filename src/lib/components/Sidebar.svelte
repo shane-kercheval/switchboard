@@ -3,6 +3,7 @@
     ArrowDown,
     ArrowUp,
     Check,
+    ChevronsUpDown,
     Columns2,
     Eye,
     EyeOff,
@@ -78,7 +79,7 @@
   import Dialog from "$lib/components/ui/Dialog.svelte";
   import ErrorDetailsDialog from "$lib/components/ui/ErrorDetailsDialog.svelte";
   import CopyButton from "$lib/components/ui/CopyButton.svelte";
-  import { ICON_BUTTON_CLASS } from "$lib/components/ui/iconButton";
+  import { ICON_BUTTON_CLASS, ICON_BUTTON_ON_RAISED_CLASS } from "$lib/components/ui/iconButton";
 
   /// Cap the per-tooltip warning rows so a session with a long tail
   /// (50+) doesn't render a wall of text. Anything beyond is summarized
@@ -329,6 +330,35 @@
     if (removeConfirmAgentId === agentId) removeConfirmAgentId = null;
   }
 
+  function cardClickToggles(event: MouseEvent): boolean {
+    if (!(event.target instanceof Element)) return false;
+    if (event.target.closest('[data-testid="agent-name"]') !== null) return false;
+    const interactive = event.target.closest(
+      "button, a, input, textarea, select, [role], [tabindex], [data-agent-card-control]",
+    );
+    if (interactive !== null && interactive !== event.currentTarget) return false;
+    const selection = window.getSelection();
+    return selection === null || selection.isCollapsed;
+  }
+
+  function onAgentCardClick(agentId: AgentId, event: MouseEvent): void {
+    if (cardClickToggles(event)) toggleCollapsed(agentId);
+  }
+
+  function onAgentCardDoubleClick(agent: AgentRecord, event: MouseEvent): void {
+    if (!(event.target instanceof Element)) return;
+    if (event.target.closest('[data-testid="agent-name"]') === null) return;
+    event.preventDefault();
+    startEdit(agent);
+  }
+
+  function onAgentCardKeydown(agentId: AgentId, event: KeyboardEvent): void {
+    if (event.target !== event.currentTarget || (event.key !== "Enter" && event.key !== " "))
+      return;
+    event.preventDefault();
+    toggleCollapsed(agentId);
+  }
+
   function agentRowPointerActions(node: HTMLElement, agentId: AgentId): { destroy: () => void } {
     const handlePointerEnter = (): void => {
       hoveredAgentId = agentId;
@@ -338,10 +368,17 @@
       if (hoveredAgentId === agentId) hoveredAgentId = null;
       cancelRemove(agentId);
     };
+    const handleClick = (event: MouseEvent): void => onAgentCardClick(agentId, event);
+    const handleDoubleClick = (event: MouseEvent): void => {
+      const agent = agents.find((candidate) => candidate.id === agentId);
+      if (agent !== undefined) onAgentCardDoubleClick(agent, event);
+    };
     // Alt+Arrow reorders the focused card (the menu items advertise the
     // chord). Skipped while typing — Alt+Arrow is a text-caret motion inside
     // the rename input.
     const handleKeydown = (event: KeyboardEvent): void => {
+      onAgentCardKeydown(agentId, event);
+      if (event.defaultPrevented) return;
       if (!event.altKey || (event.key !== "ArrowUp" && event.key !== "ArrowDown")) return;
       if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement)
         return;
@@ -351,11 +388,15 @@
     };
     node.addEventListener("pointerenter", handlePointerEnter);
     node.addEventListener("pointerleave", handlePointerLeave);
+    node.addEventListener("click", handleClick);
+    node.addEventListener("dblclick", handleDoubleClick);
     node.addEventListener("keydown", handleKeydown);
     return {
       destroy: () => {
         node.removeEventListener("pointerenter", handlePointerEnter);
         node.removeEventListener("pointerleave", handlePointerLeave);
+        node.removeEventListener("click", handleClick);
+        node.removeEventListener("dblclick", handleDoubleClick);
         node.removeEventListener("keydown", handleKeydown);
       },
     };
@@ -365,15 +406,14 @@
   // Roster order is the canonical display order app-wide (these cards, the
   // compose chips and their ⌘1..9 numbering, pane columns), so all reorder
   // gestures funnel into one commit path. Two gestures: Move up/down (menu
-  // items + Alt+Arrow), and dragging the grip that replaces the collapse
-  // chevron on hover.
+  // items + Alt+Arrow), and dragging the far-right hover grip.
 
   let reorderError = $state<{ agentId: AgentId; message: string } | null>(null);
 
   /// In-flight grip drag. `order` is the local preview the cards render from
   /// while dragging; the store is only touched on drop. `started` gates the
-  /// slop threshold — an un-started drag is just a pressed grip, and resolves
-  /// to the grip's normal click (collapse toggle).
+  /// slop threshold — an un-started drag is just a pressed grip and has no
+  /// effect.
   let dragState = $state<{
     agentId: AgentId;
     pointerId: number;
@@ -905,7 +945,7 @@
     {#if agents.length === 0}
       <p class="text-muted px-3 py-3 text-xs">No agents in this project yet.</p>
     {/if}
-    <div class="flex flex-col gap-1.5 px-2 pb-2" bind:this={agentListEl}>
+    <div class="flex flex-col gap-1.5 px-2 pt-1 pb-2" bind:this={agentListEl}>
       {#each displayAgents as agent (agent.id)}
         {@const runtime = runtimes[agent.id]}
         {@const util = contextUtilization(agent.id)}
@@ -924,15 +964,22 @@
         {@const active = isActive(agent.id)}
         {@const sessionInfo = sessionInfoByAgent[agent.id]}
         {@const confirmingRemove = removeConfirmAgentId === agent.id}
+        <!-- A native button cannot contain the card's controls. The focusable
+             composite surface mirrors its pointer toggle on Enter/Space, while
+             each nested control keeps its own semantics. -->
+        <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
         <div
           class={cn(
-            "group bg-raised hover:bg-hover rounded-md px-2.5 py-2 transition-colors",
+            "group bg-raised hover:ring-active focus-visible:ring-focus cursor-pointer rounded-md px-2.5 py-2 transition-shadow hover:shadow-sm hover:ring-1 focus-visible:ring-1 focus-visible:outline-none",
             dragState?.started === true &&
               dragState.agentId === agent.id &&
               "ring-accent/60 relative z-10 shadow-lg ring-1",
           )}
           data-testid="sidebar-agent"
           data-agent-id={agent.id}
+          data-collapsed={isCollapsed}
+          tabindex="0"
+          aria-label={`${agent.name}, ${isCollapsed ? "collapsed" : "expanded"}. Press Enter or Space to toggle details.`}
           use:agentRowPointerActions={agent.id}
           animate:flip={{ duration: dragState?.started === true ? 0 : 150 }}
         >
@@ -965,7 +1012,7 @@
               <button
                 type="button"
                 class={cn(
-                  ICON_BUTTON_CLASS,
+                  ICON_BUTTON_ON_RAISED_CLASS,
                   "shrink-0 disabled:cursor-not-allowed disabled:opacity-50",
                 )}
                 disabled={!canSave}
@@ -990,40 +1037,15 @@
               </button>
             {:else}
               {@const agentHidden = isAgentHidden(projectId, rosterIds, agent.id)}
-              <!-- The whole name row toggles collapse. Rename lives in the
-                   actions (⋯) menu — not a name double-click, which fought the
-                   collapse toggle (two toggles fired before edit opened). -->
-              <button
-                type="button"
-                class="flex min-w-0 flex-1 items-center gap-1.5 text-left"
-                aria-expanded={!isCollapsed}
-                onclick={() => toggleCollapsed(agent.id)}
-              >
-                <!-- Leading slot: the drag grip, hover/focus-revealed (multi-
-                     agent rosters only). `invisible` (not `hidden`) so the slot
-                     keeps its width and the name never shifts on hover. The
-                     collapse affordance is the whole header row (aria-expanded
-                     carries the state); a click on the grip still toggles
-                     collapse — only a drag past the slop threshold reorders. -->
-                {#if agents.length > 1}
-                  <span
-                    class={cn(
-                      "text-muted h-3 w-3 shrink-0 cursor-grab touch-none active:cursor-grabbing",
-                      dragState?.agentId === agent.id
-                        ? "visible"
-                        : "invisible group-focus-within:visible group-hover:visible",
-                    )}
-                    data-testid="agent-drag-grip"
-                    aria-hidden="true"
-                    use:gripDrag={agent.id}
-                  >
-                    <GripVertical size={12} strokeWidth={1.8} />
-                  </span>
-                {/if}
-                <span class="text-fg truncate text-[13px] font-semibold" data-testid="agent-name">
+              <div class="flex min-h-7 min-w-0 flex-1 items-center px-1.5 text-left">
+                <span
+                  class="text-fg cursor-text truncate text-[13px] font-semibold"
+                  data-testid="agent-name"
+                  title="Double-click to rename"
+                >
                   {agent.name}
                 </span>
-              </button>
+              </div>
               <div class="flex shrink-0 items-center gap-0.5">
                 <Tooltip
                   label={agentHidden ? `Show ${agent.name}` : `Hide ${agent.name} (⌥-click: solo)`}
@@ -1034,8 +1056,8 @@
                       {...props}
                       type="button"
                       class={cn(
-                        ICON_BUTTON_CLASS,
-                        "hover:bg-hover shrink-0",
+                        ICON_BUTTON_ON_RAISED_CLASS,
+                        "shrink-0",
                         // The eye stays visible while the agent is hidden (it's
                         // the state indicator); otherwise it appears on hover
                         // like the actions trigger. `hidden`, not `opacity-0`:
@@ -1061,8 +1083,8 @@
                 </Tooltip>
                 <DropdownMenu
                   triggerClass={cn(
-                    ICON_BUTTON_CLASS,
-                    "hover:bg-hover shrink-0",
+                    ICON_BUTTON_ON_RAISED_CLASS,
+                    "shrink-0",
                     "hidden group-focus-within:inline-flex group-hover:inline-flex data-[state=open]:inline-flex",
                   )}
                   triggerLabel={`Actions for ${agent.name}`}
@@ -1109,6 +1131,19 @@
                         aria-hidden="true"
                       />
                       Rename
+                    </DropdownMenuItem>
+                    <DropdownMenuItem
+                      onSelect={() => toggleCollapsed(agent.id)}
+                      class="gap-2"
+                      data-testid="agent-action-collapse"
+                    >
+                      <ChevronsUpDown
+                        size={14}
+                        strokeWidth={1.8}
+                        class="text-muted shrink-0"
+                        aria-hidden="true"
+                      />
+                      {isCollapsed ? "Expand" : "Collapse"}
                     </DropdownMenuItem>
                     {#if active}
                       <DropdownMenuItem
@@ -1283,6 +1318,22 @@
                   {/if}
                 </DropdownMenu>
                 <HarnessIcon harness={agent.harness} size="md" testid="agent-harness-icon" />
+                {#if agents.length > 1}
+                  <span
+                    class={cn(
+                      "text-muted h-3 w-3 shrink-0 cursor-grab touch-none items-center justify-center active:cursor-grabbing",
+                      dragState?.agentId === agent.id
+                        ? "inline-flex"
+                        : "hidden group-focus-within:inline-flex group-hover:inline-flex",
+                    )}
+                    data-testid="agent-drag-grip"
+                    data-agent-card-control
+                    aria-hidden="true"
+                    use:gripDrag={agent.id}
+                  >
+                    <GripVertical size={12} strokeWidth={1.8} />
+                  </span>
+                {/if}
               </div>
             {/if}
           </div>

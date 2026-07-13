@@ -54,16 +54,31 @@ beforeEach(() => {
   reorderAgentsMock.mockResolvedValue(undefined);
 });
 
+test("the clickable card surface gains an outline and icon controls retain distinct hovers", async () => {
+  render(SidebarHost, { projectId: PROJECT_ID, agents: THREE_AGENTS });
+
+  const card = page.getByTestId("sidebar-agent").first();
+  const cardResting = getComputedStyle(card.element()).backgroundColor;
+  const restingShadow = getComputedStyle(card.element()).boxShadow;
+  await card.hover();
+  expect(getComputedStyle(card.element()).backgroundColor).toBe(cardResting);
+  await expect.poll(() => getComputedStyle(card.element()).boxShadow !== restingShadow).toBe(true);
+
+  await card.hover();
+  const visibility = page.getByTestId("agent-visibility-toggle").first();
+  await visibility.hover();
+  await expect
+    .poll(() => getComputedStyle(visibility.element()).backgroundColor !== cardResting)
+    .toBe(true);
+});
+
 // ---------------------------------------------------------------------------
 // CSS visibility — what jsdom physically cannot exercise
 // ---------------------------------------------------------------------------
 
-// The grip is `invisible` (visibility:hidden, slot width preserved) by
-// default; `group-focus-within:visible` reveals it when any element inside the
-// card's `group` div receives focus. This tests real WebKit CSS cascade —
-// jsdom has no layout engine, so hidden elements still receive events there
-// and this class swap goes unverified.
-test("drag grip is hidden by default and visible when focus enters its card", async () => {
+// The grip is display:none by default, so it reserves no empty slot. Hover
+// reveals it at the far right and intentionally shifts the harness icon left.
+test("drag grip is unreserved by default and appears at the far right on hover", async () => {
   render(SidebarHost, { projectId: PROJECT_ID, agents: THREE_AGENTS });
 
   // All three grips start hidden (Tailwind `hidden` = display:none).
@@ -71,18 +86,16 @@ test("drag grip is hidden by default and visible when focus enters its card", as
     await expect.element(page.getByTestId("agent-drag-grip").nth(i)).not.toBeVisible();
   }
 
-  // Programmatic focus on the collapse-toggle button (the first button inside
-  // the card) triggers `:focus-within` on the `group` ancestor, which the
-  // `group-focus-within:block` modifier responds to.
-  const collapseBtn = page
-    .getByTestId("sidebar-agent")
-    .nth(0)
-    .getByRole("button")
-    .first()
-    .element() as HTMLButtonElement;
-  collapseBtn.focus();
+  const card = page.getByTestId("sidebar-agent").nth(0);
+  const harness = page.getByTestId("agent-harness-icon").nth(0).element() as HTMLElement;
+  const harnessXBeforeHover = harness.getBoundingClientRect().x;
+  await card.hover();
 
   await expect.element(page.getByTestId("agent-drag-grip").nth(0)).toBeVisible();
+  expect(
+    (page.getByTestId("agent-drag-grip").nth(0).element() as HTMLElement).getBoundingClientRect().x,
+  ).toBeGreaterThan(harness.getBoundingClientRect().x);
+  expect(harness.getBoundingClientRect().x).toBeLessThan(harnessXBeforeHover);
   // Other cards' grips are unaffected.
   await expect.element(page.getByTestId("agent-drag-grip").nth(1)).not.toBeVisible();
 });
@@ -91,17 +104,11 @@ test("drag grip is hidden by default and visible when focus enters its card", as
 // Drag gesture — midpoint math against real card geometry
 // ---------------------------------------------------------------------------
 
-/// Reveal card 0's grip via focus-within and return it ready to drag. The
+/// Reveal card 0's grip via hover and return it ready to drag. The
 /// drag listens on `window` for the gesture's lifetime, so events dispatched
 /// on the grip reach it by bubbling — the same path real pointer events take.
 async function armedGrip(): Promise<{ grip: HTMLElement; gripRect: DOMRect }> {
-  const collapseBtn = page
-    .getByTestId("sidebar-agent")
-    .nth(0)
-    .getByRole("button")
-    .first()
-    .element() as HTMLButtonElement;
-  collapseBtn.focus();
+  await page.getByTestId("sidebar-agent").nth(0).hover();
   await expect.element(page.getByTestId("agent-drag-grip").nth(0)).toBeVisible();
   const grip = page.getByTestId("agent-drag-grip").nth(0).element() as HTMLElement;
   return { grip, gripRect: grip.getBoundingClientRect() };

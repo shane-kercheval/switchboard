@@ -598,8 +598,8 @@ shipped:
   duplicated the row's still-visible detail. Instead the expanded content hangs under the row
   behind a thin left rule (the fan-out column idiom), directly on the reading surface, and the
   row's detail line hides while open since the body shows the full untruncated version. Fills mark
-  only true content blocks: the output / raw-JSON / written-content `pre`s on `panel` (that
-  token's documented job), the diff in a bordered canvas. For specialized facets the raw JSON sits
+  only true content blocks: the output / raw-JSON `pre`s on `panel` (that token's documented job),
+  edits and writes in a bordered diff canvas. For specialized facets the raw JSON sits
   behind a "Show raw input" reveal (the facet body already shows the same information readably);
   the generic facet has no body, so its raw input shows directly.
 - **Edit diffs render inline, without expansion** (third visual pass): watching the changes
@@ -613,11 +613,20 @@ shipped:
   patches keep **Edit** with per-file markers. Tool-row diffs render through a new `compact` mode
   on `DiffView` (no hunk-header bars, no line-number gutters — snippet-relative numbers read as
   file positions they aren't; hunks separated by a hairline). The Git view is untouched.
+- **Write facets infer file creation and render as all-added diffs.** Dedicated writes do not carry a
+  prior snapshot, but creation is overwhelmingly the common behavior, so the UI favors consistency
+  with patch-based file creation and accepts that a rare overwrite will appear all-added. The
+  collapsed row builds and shows only the first 25 diff lines; expansion shows all captured content
+  plus output/raw input, and facet truncation remains explicit.
+- **Inline edit and write previews show 25 lines per file.** Forty lines made a single tool call
+  dominate the transcript before the user chose to expand it; 25 preserves enough context to scan
+  while keeping the surrounding conversation visible.
 - The old "TOOL"/"MCP"/"Plugin" kind label and `Badge` are gone from the row; the facet icon
   (lucide) plus verb replace them. The raw-JSON display cap is 50 k characters.
 - New modules: `src/lib/toolRow.ts` (facet × state verb vocabulary, provenance detail, icon map)
-  and `src/lib/toolDiff.ts` (jsdiff `structuredPatch` → `FileDiff` synthesis; snippet-relative
-  hunk headers carry an explicit qualifier). Dependency added: `diff` (jsdiff v9, bundled types).
+  and `src/lib/toolDiff.ts` (jsdiff `structuredPatch` → `FileDiff` synthesis for edits, plus direct
+  capped all-added synthesis for writes; snippet-relative edit hunk headers carry an explicit
+  qualifier). Dependency added: `diff` (jsdiff v9, bundled types).
 
 ---
 
@@ -1032,6 +1041,12 @@ does not rediscover it the hard way.
   keeps the full row width at rest and truncates only while the icons are actually shown —
   shared-prefix names are distinguishable exactly when the user is reading, and the eye stays
   visible while an agent is hidden (it's the state indicator).
+- **The card surface toggles its details and receives an outline hover.** The name is excluded so a
+  single click does nothing and a name-only double-click enters rename; buttons and text selection
+  are excluded as well. Collapse/expand remains available explicitly in the actions menu. The drag
+  grip is absent at rest and appears at the far right on hover/focus, intentionally shifting the
+  harness icon left instead of reserving empty space. Eye, actions, and rename-save controls use the
+  stronger on-raised treatment. A small top inset keeps the first card clear of the section edge.
 - **`formatDuration` gained the bare-seconds form in place** (`9s` under a minute); the silence
   counter can't hit that branch (starts at one heartbeat threshold = 60s), so its output is
   unchanged — asserted by the untouched ≥1m test cases.
@@ -1098,10 +1113,9 @@ When this milestone is done:
   syntax stripped (the M4 thinking-preview rule).
 - **Role filter**: segmented `All · You · Agents` (existing `SegmentedSelect`), filtering both the
   list and the search domain.
-- **Hover preview panel**: ~150ms debounce (no flashing while running down the list); content capped
-  (~1,500 chars) and rendered as markdown — cheap at that size, never a full 20k-char mount per
-  hover. ↑/↓ moves a highlight with the preview following; ↵ jumps; the whole popover is
-  keyboard-operable.
+- **Hover preview panel**: ~150ms debounce (no flashing while running down the list); full content
+  rendered as markdown in its own scrollable region. ↑/↓ moves a highlight with the preview
+  following; ↵ jumps; the whole popover is keyboard-operable.
 - **Compact mode composes without a rule**: jumping never auto-expands anything — the row you land
   on is visible regardless of per-unit compact state.
 
@@ -1140,7 +1154,7 @@ When this milestone is done:
 - Unit tests on the index derivation and matching rules listed in M9.2.
 - Component tests: type-to-filter narrows the list; role filter restricts list and search; ↑/↓/↵
   navigate and jump; a disabled entry (agent in no pane) does not jump and names the agent.
-- The preview panel renders capped content only; no full-message mount on hover.
+- The preview panel renders the complete selected message in its own scrollable region.
 - Visual verification (light + dark): popover anchoring at the right header edge, preview panel to
   the left, divider placement, long-list scrolling.
 
@@ -1198,6 +1212,14 @@ Post-visual-review rework (the popover became a centered overlay):
   (`scrollFade` action toggles `data-fade-*`, CSS masks the faded edge). Preview prose dropped to
   `text-sm` with tightened block spacing.
 - **Disabled (unassigned/hidden-agent) entries use the app `Tooltip`**, not the native `title`.
+- **The centered dialog previews the complete message.** The original 1,500-character cap protected
+  the smaller hover popover from repeatedly mounting large Markdown bodies. The dialog now gives
+  the preview most of the window and its own vertical scroll region, so truncating available content
+  conflicts with the dialog's purpose. The hover debounce still avoids rendering messages while the
+  pointer merely passes over rows.
+- **Each preview selection starts at its own top.** The scrollable preview container persists while
+  its Markdown content changes, so retaining the previous message's scroll offset could hide the new
+  attribution and opening. Selection resets `scrollTop` after mount and refreshes both edge fades.
 
 ---
 

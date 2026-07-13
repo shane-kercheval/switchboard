@@ -49,6 +49,7 @@
   let hoverTimer: ReturnType<typeof setTimeout> | null = null;
   let searchEl = $state<HTMLInputElement | null>(null);
   let listEl = $state<HTMLElement | null>(null);
+  let previewEl = $state<HTMLElement | null>(null);
 
   const open = $derived(navigatorState.open);
   const rosterIds = $derived(agents.map((a) => a.id));
@@ -76,17 +77,24 @@
     return resolveJumpPane(projectId, rosterIds, entry.agentIds);
   }
 
-  const PREVIEW_CAP = 1500;
-
-  function previewProse(entry: NavigatorEntry): { text: string; truncated: boolean } {
-    const source = entry.prose.trim() === "" ? entry.preview : entry.prose;
-    if (source.length <= PREVIEW_CAP) return { text: source, truncated: false };
-    return { text: source.slice(0, PREVIEW_CAP), truncated: true };
+  function previewProse(entry: NavigatorEntry): string {
+    return entry.prose.trim() === "" ? entry.preview : entry.prose;
   }
 
   const previewEntry = $derived(
     previewKey === null ? undefined : filtered.find((e) => e.rowKey === previewKey),
   );
+
+  $effect(() => {
+    const key = previewKey;
+    const node = previewEl;
+    if (key === null || node === null) return;
+    void tick().then(() => {
+      if (previewKey !== key || previewEl !== node) return;
+      node.scrollTop = 0;
+      updateScrollFade(node);
+    });
+  });
 
   function onOpen(): void {
     query = "";
@@ -157,13 +165,15 @@
   /// signals there's more above/below before the user tries to scroll. The
   /// mask is CSS (`data-fade-*` → `[mask-image]`); the action keeps the flags
   /// current on scroll and on content resize.
+  function updateScrollFade(node: HTMLElement): void {
+    const top = node.scrollTop > 4;
+    const bottom = node.scrollTop + node.clientHeight < node.scrollHeight - 4;
+    node.toggleAttribute("data-fade-top", top);
+    node.toggleAttribute("data-fade-bottom", bottom);
+  }
+
   function scrollFade(node: HTMLElement): { destroy: () => void } {
-    function update(): void {
-      const top = node.scrollTop > 4;
-      const bottom = node.scrollTop + node.clientHeight < node.scrollHeight - 4;
-      node.toggleAttribute("data-fade-top", top);
-      node.toggleAttribute("data-fade-bottom", bottom);
-    }
+    const update = () => updateScrollFade(node);
     node.addEventListener("scroll", update, { passive: true });
     const ro = new ResizeObserver(update);
     ro.observe(node);
@@ -318,6 +328,7 @@
       </div>
 
       <div
+        bind:this={previewEl}
         use:scrollFade
         class="navigator-fade bg-panel min-w-0 flex-1 overflow-y-auto rounded-md px-3 py-2"
         data-testid="navigator-preview"
@@ -328,17 +339,12 @@
             <span class="font-medium">{previewEntry.attribution}</span>
             <span class="font-mono">{relativeTime(previewEntry.at)}</span>
           </div>
-          {#if preview.text === ""}
+          {#if preview === ""}
             <p class="text-muted text-xs">No text content.</p>
           {:else}
             <div class="navigator-preview-prose text-sm">
-              <Markdown text={preview.text} />
+              <Markdown text={preview} />
             </div>
-          {/if}
-          {#if preview.truncated}
-            <p class="text-muted mt-2 text-[11px]" data-testid="navigator-preview-truncated">
-              Preview truncated — jump to read the full message.
-            </p>
           {/if}
         {:else}
           <p class="text-muted/70 mt-1 text-xs select-none">

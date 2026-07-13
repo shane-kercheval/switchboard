@@ -183,7 +183,7 @@ describe("Sidebar", () => {
   // the reducer + UnifiedTranscript suites). The sidebar's job here is the
   // collapsible per-agent detail card.
 
-  it("collapses an agent's detail card when its header is toggled", async () => {
+  it("collapses an agent's detail card when its non-control surface is clicked", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
     state.transcripts[CLAUDE_AGENT.id] = [
@@ -209,14 +209,31 @@ describe("Sidebar", () => {
     // Expanded by default → details (the context bar) are visible.
     expect(screen.getByTestId("agent-context-bar")).toBeInTheDocument();
 
-    const header = screen.getByTestId("agent-name").closest("button");
-    if (!header) throw new Error("expected the agent name to sit in a toggle button");
-    expect(header).toHaveAttribute("aria-expanded", "true");
-
-    await fireEvent.click(header);
-
-    expect(header).toHaveAttribute("aria-expanded", "false");
+    await fireEvent.click(screen.getByTestId("sidebar-agent"));
     expect(screen.queryByTestId("agent-context-bar")).toBeNull();
+
+    await openAgentActions();
+    await fireEvent.click(await screen.findByTestId("agent-action-collapse"));
+    expect(screen.getByTestId("agent-context-bar")).toBeInTheDocument();
+
+    const card = screen.getByTestId("sidebar-agent");
+    card.focus();
+    await fireEvent.keyDown(card, { key: " " });
+    expect(screen.queryByTestId("agent-context-bar")).toBeNull();
+  });
+
+  it("does not collapse the card when a click completes text selection", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+    const selection = vi.spyOn(window, "getSelection").mockReturnValue({
+      isCollapsed: false,
+    } as Selection);
+
+    const card = screen.getByTestId("sidebar-agent");
+    await fireEvent.click(card);
+    expect(card).toHaveAttribute("data-collapsed", "false");
+    selection.mockRestore();
   });
 
   it("renders the harness icon and a hover-revealed actions menu trigger", async () => {
@@ -247,13 +264,14 @@ describe("Sidebar", () => {
       ),
     ).toEqual([
       "Rename",
+      "Collapse",
       "Resume in terminal",
       "Open session file",
       "Change model",
       "Change effort",
       "Delete agent",
     ]);
-    expect(menu.querySelectorAll('[role="menuitem"] svg')).toHaveLength(6);
+    expect(menu.querySelectorAll('[role="menuitem"] svg')).toHaveLength(7);
   });
 
   it("shows only currently available menu actions", async () => {
@@ -1228,10 +1246,9 @@ describe("Sidebar agent-scoped event tolerance", () => {
 
 /// Inline rename editor. The card's name swaps to an <input> with live
 /// validation; Enter / the save icon commit, Escape / blur cancel (never
-/// persist on blur). The entry point is the "Rename" action in the ⋯ menu —
-/// deliberately NOT a name double-click, which fought the collapse toggle.
-/// Commits route through the mocked workspace `renameAgent`; the backend stays
-/// authoritative, the frontend check is UX.
+/// persist on blur). Entry points are the "Rename" action in the ⋯ menu and a
+/// name-only double-click. Commits route through the mocked workspace
+/// `renameAgent`; the backend stays authoritative, the frontend check is UX.
 describe("Sidebar inline rename", () => {
   async function enterEditViaMenu(agent: AgentRecord): Promise<HTMLInputElement> {
     const state = await loadState();
@@ -1245,19 +1262,20 @@ describe("Sidebar inline rename", () => {
   it("the Rename action enters edit mode seeded with the current name", async () => {
     const input = await enterEditViaMenu(CLAUDE_AGENT);
     expect(input).toHaveValue("alice");
-    // The name span / toggle button is gone while editing.
+    // The name span is gone while editing.
     expect(screen.queryByTestId("agent-name")).toBeNull();
   });
 
-  it("double-clicking the name row does not rename (it only toggles collapse)", async () => {
+  it("double-clicking the name text enters rename without changing collapse state", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
-    const toggle = screen.getByTestId("agent-name").closest("button");
-    if (!toggle) throw new Error("expected the agent name to sit in a toggle button");
-    await fireEvent.dblClick(toggle);
-    expect(screen.queryByTestId("agent-rename-input")).toBeNull();
-    expect(screen.getByTestId("agent-name")).toBeInTheDocument();
+    await fireEvent.click(screen.getByTestId("agent-name"));
+    expect(screen.getByTestId("sidebar-agent")).toHaveAttribute("data-collapsed", "false");
+    await fireEvent.dblClick(screen.getByTestId("agent-name"));
+    expect(await screen.findByTestId("agent-rename-input")).toBeInTheDocument();
+    await fireEvent.keyDown(screen.getByTestId("agent-rename-input"), { key: "Escape" });
+    expect(screen.getByTestId("sidebar-agent")).toHaveAttribute("data-collapsed", "false");
   });
 
   it("the input is not nested inside the collapse toggle (no nested interactive)", async () => {
@@ -1539,6 +1557,14 @@ describe("Sidebar — agent reordering", () => {
     const menu = await openAgentActions(0);
     expect(within(menu).queryByTestId("agent-move-up")).not.toBeInTheDocument();
     expect(within(menu).queryByTestId("agent-move-down")).not.toBeInTheDocument();
+  });
+
+  it("a plain drag-grip click does not toggle the card", async () => {
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: THREE_AGENTS } });
+    const card = screen.getAllByTestId("sidebar-agent")[0]!;
+    expect(card).toHaveAttribute("data-collapsed", "false");
+    await fireEvent.click(grip(0));
+    expect(card).toHaveAttribute("data-collapsed", "false");
   });
 
   it("Alt+ArrowDown with focus inside a card moves that agent down", async () => {

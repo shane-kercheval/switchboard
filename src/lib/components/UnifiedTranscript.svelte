@@ -1155,6 +1155,14 @@
     data-testid="turn-working"
     data-quiet={quietSince !== undefined}
   >
+    {#if turn.send_id !== undefined}
+      {@const sendId = turn.send_id}
+      {@render liveTurnControl(
+        () => cancelSend(sendId, [turn.agent_id]),
+        `Cancel turn for ${agentName(turn.agent_id)}`,
+        "turn-live-control",
+      )}
+    {/if}
     <!-- The label names the number, so exactly one number is on screen:
          "Working 2m 14s" = working *for* that long (elapsed since turn start);
          once silent past HEARTBEAT_TIMEOUT_MS the word swaps to "No response"
@@ -1165,32 +1173,28 @@
     {#if quietSince !== undefined}
       <span>No response</span>
       <LoadingDots />
-      <span data-testid="turn-quiet-elapsed">{formatDuration(quietElapsedMs(quietSince))}</span>
+      <span class="tabular-nums" data-testid="turn-quiet-elapsed"
+        >{formatDuration(quietElapsedMs(quietSince))}</span
+      >
     {:else}
       <span>Working</span>
       <LoadingDots />
-      <span data-testid="turn-elapsed">{formatDuration(turnElapsedMs(turn.started_at))}</span>
-    {/if}
-    {#if turn.send_id !== undefined}
-      {@const sendId = turn.send_id}
-      {@render liveTurnControl(
-        () => cancelSend(sendId, [turn.agent_id]),
-        `Cancel turn for ${agentName(turn.agent_id)}`,
-        "turn-live-control",
-      )}
+      <span class="tabular-nums" data-testid="turn-elapsed"
+        >{formatDuration(turnElapsedMs(turn.started_at))}</span
+      >
     {/if}
   </div>
 {/snippet}
 
 {#snippet queuedFooter(agentId: string, sendId: string, labelTestid: string, controlTestid: string)}
   <div class="text-muted mt-2 flex items-center gap-2 text-xs" data-testid={labelTestid}>
-    <span>Queued</span>
-    <LoadingDots />
     {@render liveTurnControl(
       () => cancelSend(sendId, [agentId]),
       `Cancel queued send for ${agentName(agentId)}`,
       controlTestid,
     )}
+    <span>Queued</span>
+    <LoadingDots />
   </div>
 {/snippet}
 
@@ -1515,16 +1519,16 @@
       </div>
     {/if}
     <div class="text-muted mt-2 flex items-center gap-2 text-xs" data-testid="held-forward-waiting">
-      <!-- Names only the sources being waited on — the recipient is implicit
-           (this row renders in the recipient's own pane, under the forwarded
-           message body). -->
-      <span>↪ waiting for {sourceNames}</span>
-      <LoadingDots />
       {@render liveTurnControl(
         () => void cancelForward(held.forwardId),
         `Cancel forward (waiting for ${sourceNames})`,
         "held-forward-cancel",
       )}
+      <!-- Names only the sources being waited on — the recipient is implicit
+           (this row renders in the recipient's own pane, under the forwarded
+           message body). -->
+      <span>↪ waiting for {sourceNames}</span>
+      <LoadingDots />
     </div>
   </div>
 {/snippet}
@@ -1571,7 +1575,7 @@
           </div>
         {/if}
       {:else}
-        {@render turnBody(turn, !ownedByOutcome)}
+        {@render turnBody(turn, !ownedByOutcome, "full", false)}
       {/if}
       <!-- Terminal status chip last (after the indicator and the body), so the
            collapsed and expanded views agree. Outside any height clip → always

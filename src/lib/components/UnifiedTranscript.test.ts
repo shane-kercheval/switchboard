@@ -2968,11 +2968,11 @@ describe("UnifiedTranscript compact mode", () => {
   });
 });
 
-describe("UnifiedTranscript live streaming cap", () => {
+describe("UnifiedTranscript live streaming layout", () => {
   // jsdom has no layout, so the bottom-pin scroll math can't be exercised here
-  // (verified in the real-app walkthrough). These cover the DOM contract: the
-  // cap wraps streamed content, the live footer sits outside it, and the cap is
-  // gone once the turn completes.
+  // (covered by browser tests). These cover the DOM contract: standalone
+  // responses use the outer transcript scroll, concurrent fan-out columns cap
+  // independently, and the live footer stays outside the content wrapper.
   const text = (t: string) => ({ item_kind: "text" as const, kind: "text" as const, text: t });
   function streaming(agent: AgentRecord, sendId: string, turnId: string, body: string): Turn {
     return {
@@ -2998,7 +2998,7 @@ describe("UnifiedTranscript live streaming cap", () => {
     };
   }
 
-  it("caps a streaming standalone response and keeps the footer outside the cap", async () => {
+  it("leaves a streaming standalone response uncapped and keeps the footer outside", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
     state.transcripts[CLAUDE_AGENT.id] = [
@@ -3016,8 +3016,11 @@ describe("UnifiedTranscript live streaming cap", () => {
     render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     const scroll = screen.getByTestId("turn-live-scroll");
-    expect(scroll).toHaveTextContent("streaming output"); // streamed content is inside the cap
-    // The working/cancel footer is rendered as a sibling, never inside the cap.
+    expect(scroll).toHaveTextContent("streaming output");
+    expect(scroll).toHaveClass("overflow-visible");
+    expect(scroll).not.toHaveClass("max-h-[75cqh]", "overflow-y-auto");
+    // The working/cancel footer is rendered as a sibling, never inside the
+    // streaming content wrapper.
     expect(scroll.querySelector('[data-testid="turn-working"]')).toBeNull();
     expect(screen.getByTestId("turn-working")).toBeInTheDocument();
   });

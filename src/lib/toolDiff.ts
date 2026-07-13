@@ -39,6 +39,47 @@ export function synthesizeEditDiff(file: EditedFile): FileDiff {
   };
 }
 
+/// Dedicated Write facets do not carry prior file content. The product treats
+/// them as file creation because that is overwhelmingly the common case; a
+/// rare overwrite will therefore still be presented as an all-added diff.
+/// Build only the requested prefix so a collapsed large write does not pay to
+/// allocate diff rows that are not mounted.
+export function synthesizeWriteDiff(
+  path: string,
+  content: string,
+  truncated: boolean,
+  maxLines?: number,
+): { diff: FileDiff; hiddenLines: number } {
+  const lines = content === "" ? [] : content.split("\n");
+  if (content.endsWith("\n")) lines.pop();
+  const visibleLines = maxLines === undefined ? lines : lines.slice(0, maxLines);
+  const diffLines: DiffLine[] = visibleLines.map((line, index) => ({
+    origin: "added",
+    old_lineno: null,
+    new_lineno: index + 1,
+    content: line,
+  }));
+  return {
+    diff: {
+      path,
+      binary: false,
+      truncated,
+      too_large: false,
+      too_large_bytes: null,
+      hunks:
+        diffLines.length === 0
+          ? []
+          : [
+              {
+                header: `@@ -0,0 +1,${lines.length} @@`,
+                lines: diffLines,
+              },
+            ],
+    },
+    hiddenLines: lines.length - visibleLines.length,
+  };
+}
+
 function pairHunks(pair: EditPair): DiffHunk[] {
   const patch = structuredPatch("", "", pair.old, pair.new, undefined, undefined, {
     context: CONTEXT_LINES,

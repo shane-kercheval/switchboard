@@ -57,8 +57,9 @@ pub enum ToolFacet {
     },
     /// A whole file written. Distinct from `Edit` even though a write is
     /// arguably an edit with an empty "before": the harness gives us the new
-    /// content but *not* the prior content, so an honest renderer says
-    /// "wrote file" and shows content — never a diff.
+    /// content but *not* the prior content. The UI intentionally infers
+    /// creation because dedicated writes overwhelmingly create files,
+    /// accepting that rare overwrites appear as all-added diffs.
     Write {
         path: String,
         content: String,

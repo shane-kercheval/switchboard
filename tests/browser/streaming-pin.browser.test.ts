@@ -10,21 +10,18 @@ vi.mock("$lib/native", () => ({ copyText: vi.fn(async () => undefined) }));
 
 import { mountTranscript } from "./mount";
 import { registerAgent, seedTurns, resetState, distanceFromBottom } from "./harness";
-import { ALICE, PROJECT_ID, agentTurn, longText, textItem, userTurn } from "./fixtures";
+import { ALICE, BOB, PROJECT_ID, agentTurn, longText, textItem, userTurn } from "./fixtures";
 
-// Behavior 6: the streaming live cap is sized to the transcript AREA (the
-// `[container-type:size]` ancestor via `75cqh`), not the viewport — so it never
-// exceeds ~3/4 of the available height and scales with it.
-// Behavior 4: a tall streaming response is capped while live and, on completion,
-// the view STAYS PINNED at the bottom so the finished response's end remains in
-// view (the reported "jerk away from the bottom" bug). jsdom can't see either:
-// `cqh`/`max-height` aren't applied and there's no scroll geometry.
+// Standalone streaming responses use the transcript's outer scroll rather than
+// introducing a nested scrollbar. The view stays pinned while the response
+// grows and when it completes. jsdom has no scroll geometry, so these contracts
+// need real WebKit.
 
 beforeEach(() => {
   resetState();
 });
 
-test("the live cap is bounded to ~3/4 of the transcript area and clips overflow", async () => {
+test("a standalone live response uses the transcript's outer scroll", async () => {
   await registerAgent(ALICE);
   seedTurns(ALICE.id, [
     agentTurn({
@@ -37,38 +34,73 @@ test("the live cap is bounded to ~3/4 of the transcript area and clips overflow"
 
   mountTranscript({ projectId: PROJECT_ID, agents: [ALICE] });
 
-  const cap = page.getByTestId("turn-live-scroll");
-  await expect.element(cap).toBeInTheDocument();
-
-  // Capped to the transcript area, not the viewport: the live region is no taller
-  // than ~75% of the transcript container (allow a px of rounding), and its
-  // content overflows that cap (so it genuinely scrolls inside).
-  await expect
-    .poll(() => {
-      const capEl = page.getByTestId("turn-live-scroll").element() as HTMLElement;
-      const transcript = page.getByTestId("unified-transcript").element() as HTMLElement;
-      return capEl.clientHeight <= transcript.clientHeight * 0.75 + 1;
-    })
-    .toBe(true);
-  const capEl = cap.element() as HTMLElement;
-  expect(capEl.scrollHeight - capEl.clientHeight).toBeGreaterThan(1);
-
-  // …and it is pinned to the tail: `liveScroll` scrolls the cap to the bottom so
-  // the user sees the newest streamed tokens, not the start of the response.
-  await expect
-    .poll(() => {
-      const el = page.getByTestId("turn-live-scroll").element() as HTMLElement;
-      return el.scrollHeight - el.scrollTop - el.clientHeight;
-    })
-    .toBeLessThan(4);
+  const live = page.getByTestId("turn-live-scroll");
+  await expect.element(live).toBeInTheDocument();
+  expect(getComputedStyle(live.element()).overflowY).toBe("visible");
+  await expect.poll(() => distanceFromBottom()).toBeLessThan(32);
 });
 
-// BUG GUARD for the content-change scroll gate (`scrollHeight === lastScrollHeight`
-// in `onScroll`). Observed red: with that gate removed (so `onScroll` recomputes
-// `pinned` on every scroll, including the browser's clamp as the live cap drops),
-// this test fails — the view unpins on completion and the finished response's end
-// is stranded below the fold (the reported "jerk away from the bottom" bug).
-// Confirmed failing against that revert, then reverted back.
+test("concurrent fan-out responses retain independent live caps", async () => {
+  await registerAgent(ALICE);
+  await registerAgent(BOB);
+  const column = (agentId: string, turnId: string) => [
+    userTurn({ id: `user-${turnId}`, agentId, text: "compare", sendId: "send-fanout" }),
+    agentTurn({
+      id: turnId,
+      agentId,
+      status: "streaming" as const,
+      sendId: "send-fanout",
+      items: [textItem(longText(60))],
+    }),
+  ];
+  seedTurns(ALICE.id, column(ALICE.id, "alice-streaming"));
+  seedTurns(BOB.id, column(BOB.id, "bob-streaming"));
+
+  mountTranscript({ projectId: PROJECT_ID, agents: [ALICE, BOB] });
+
+  const caps = page.getByTestId("turn-live-scroll");
+  await expect.poll(() => caps.elements().length).toBe(2);
+  const transcript = page.getByTestId("unified-transcript").element() as HTMLElement;
+  for (const cap of caps.elements()) {
+    await expect.poll(() => cap.clientHeight <= transcript.clientHeight * 0.75 + 1).toBe(true);
+    expect(cap.scrollHeight - cap.clientHeight).toBeGreaterThan(1);
+  }
+});
+
+test("the stop control stays fixed when elapsed seconds gain a digit", async () => {
+  await registerAgent(ALICE);
+  seedTurns(ALICE.id, [
+    agentTurn({
+      id: "agent-streaming",
+      agentId: ALICE.id,
+      at: new Date(Date.now() - 7_500).toISOString(),
+      status: "streaming",
+      sendId: "send-timer",
+      items: [textItem("working")],
+    }),
+  ]);
+
+  mountTranscript({ projectId: PROJECT_ID, agents: [ALICE] });
+
+  const timer = page.getByTestId("turn-elapsed");
+  const stop = page.getByTestId("turn-live-control");
+  expect(stop.element().getBoundingClientRect().x).toBeLessThan(
+    timer.element().getBoundingClientRect().x,
+  );
+  const xAtNineSeconds = await vi.waitUntil(
+    () => {
+      if (timer.element().textContent?.trim() !== "9s") return false;
+      return stop.element().getBoundingClientRect().x;
+    },
+    { timeout: 3_000, interval: 20 },
+  );
+
+  await expect
+    .poll(() => timer.element().textContent?.trim(), { timeout: 2_500, interval: 20 })
+    .toBe("10s");
+  expect(stop.element().getBoundingClientRect().x).toBeCloseTo(xAtNineSeconds, 1);
+});
+
 test("on stream completion the view stays pinned with the response end in view", async () => {
   await registerAgent(ALICE);
   // A prior tall turn above the streaming one, so the outer transcript scrolls
@@ -86,13 +118,12 @@ test("on stream completion the view stays pinned with the response end in view",
 
   mountTranscript({ projectId: PROJECT_ID, agents: [ALICE] });
 
-  // Streaming: live cap present and the outer transcript is pinned to the bottom.
+  // Streaming: live wrapper present and the outer transcript is pinned to the bottom.
   await expect.element(page.getByTestId("turn-live-scroll")).toBeInTheDocument();
   await expect.poll(() => distanceFromBottom()).toBeLessThan(32);
 
-  // Complete the turn in place (same turn_id): the live cap is removed and the
-  // full response renders, growing the content. The view must follow to stay at
-  // the bottom — not unpin and strand the end below the fold.
+  // Complete the turn in place (same turn_id): the live wrapper is removed. The
+  // view must stay at the bottom rather than stranding the response end below it.
   seedTurns(ALICE.id, [
     userTurn({ id: "user-1", agentId: ALICE.id, text: longText(20) }),
     agentTurn({

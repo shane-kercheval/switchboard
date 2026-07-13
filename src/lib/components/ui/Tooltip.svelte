@@ -59,23 +59,25 @@
         {@render trigger(props)}
       {/snippet}
     </Bits.Trigger>
-    <Portal>
-      <Bits.Content
-        {side}
-        sideOffset={6}
-        data-testid="tooltip-content"
-        class="bg-primary text-primary-fg z-50 rounded-lg px-2.5 py-1.5 shadow-[0_10px_28px_rgba(0,0,0,0.20)]"
-      >
-        <Bits.Arrow class="fill-primary" />
-        {#if rest.children}
-          {@render rest.children()}
-        {:else}
-          <div class="text-[13px] font-medium">{rest.label}</div>
-          {#if rest.shortcut}
-            <div class="text-primary-fg/70 mt-1 font-mono text-[13px]">{rest.shortcut}</div>
+    {#if !disabled}
+      <Portal>
+        <Bits.Content
+          {side}
+          sideOffset={6}
+          data-testid="tooltip-content"
+          class="bg-primary text-primary-fg z-50 rounded-lg px-2.5 py-1.5 shadow-[0_10px_28px_rgba(0,0,0,0.20)]"
+        >
+          <Bits.Arrow class="fill-primary" />
+          {#if rest.children}
+            {@render rest.children()}
+          {:else}
+            <div class="text-[13px] font-medium">{rest.label}</div>
+            {#if rest.shortcut}
+              <div class="text-primary-fg/70 mt-1 font-mono text-[13px]">{rest.shortcut}</div>
+            {/if}
           {/if}
-        {/if}
-      </Bits.Content>
-    </Portal>
+        </Bits.Content>
+      </Portal>
+    {/if}
   </Bits.Root>
 </Bits.Provider>

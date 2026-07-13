@@ -42,6 +42,8 @@
   /// the most recent message should be at the top rather than after a scroll.
   let descending = $state(true);
   let highlighted = $state(0);
+  let findTooltipOpen = $state(false);
+  let findTooltipSuppressed = $state(false);
   /// The entry whose full text shows in the preview panel. Keyboard moves set
   /// it immediately (the preview follows the highlight); hover sets it through
   /// a short debounce so running the cursor down the list doesn't flash panels.
@@ -53,6 +55,12 @@
 
   const open = $derived(navigatorState.open);
   const rosterIds = $derived(agents.map((a) => a.id));
+
+  $effect(() => {
+    if (!open) return;
+    if (findTooltipOpen) findTooltipSuppressed = true;
+    findTooltipOpen = false;
+  });
 
   /// Index only while open — the derivation walks every turn, and a closed
   /// navigator shouldn't pay it on each streamed chunk.
@@ -107,7 +115,22 @@
 
   function close(): void {
     navigatorState.open = false;
+    findTooltipOpen = false;
     if (hoverTimer !== null) clearTimeout(hoverTimer);
+  }
+
+  function manageFindTooltipSuppression(node: HTMLElement): { destroy: () => void } {
+    const release = () => {
+      if (!open) findTooltipSuppressed = false;
+    };
+    node.addEventListener("pointerenter", release);
+    node.addEventListener("pointerleave", release);
+    return {
+      destroy: () => {
+        node.removeEventListener("pointerenter", release);
+        node.removeEventListener("pointerleave", release);
+      },
+    };
   }
 
   function setHighlighted(index: number): void {
@@ -193,7 +216,13 @@
   ];
 </script>
 
-<Tooltip label="Find messages (⌘F)" side="bottom">
+<Tooltip
+  bind:open={findTooltipOpen}
+  label="Find messages (⌘F)"
+  side="bottom"
+  disabled={open || findTooltipSuppressed}
+  ignoreNonKeyboardFocus
+>
   {#snippet trigger(props)}
     <button
       {...props}
@@ -203,7 +232,12 @@
       aria-expanded={open}
       data-testid="transcript-navigator-toggle"
       data-tauri-no-drag
-      onclick={() => (navigatorState.open = true)}
+      use:manageFindTooltipSuppression
+      onclick={() => {
+        findTooltipOpen = false;
+        findTooltipSuppressed = true;
+        navigatorState.open = true;
+      }}
     >
       <TableOfContents size={16} aria-hidden="true" />
     </button>
@@ -243,6 +277,7 @@
           options={ROLE_OPTIONS}
           ariaLabel="Filter by sender"
           testid="navigator-role"
+          class="h-[26px] py-0"
         />
       </div>
       <Tooltip label={descending ? "Newest first" : "Oldest first"} side="bottom">

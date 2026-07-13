@@ -1213,6 +1213,9 @@ Post-visual-review rework (the popover became a centered overlay):
   the preview most of the window and its own vertical scroll region, so truncating available content
   conflicts with the dialog's purpose. The hover debounce still avoids rendering messages while the
   pointer merely passes over rows.
+- **Each preview selection starts at its own top.** The scrollable preview container persists while
+  its Markdown content changes, so retaining the previous message's scroll offset could hide the new
+  attribution and opening. Selection resets `scrollTop` after mount and refreshes both edge fades.
 
 ---
 

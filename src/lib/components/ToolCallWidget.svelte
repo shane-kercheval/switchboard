@@ -5,8 +5,8 @@
   /// column, not by boxes. Expanded content hangs under the row behind a thin
   /// left rule (the same idiom as fan-out response columns), directly on the
   /// reading surface — a wrapping fill made every open row a gray slab. Fills
-  /// mark only true content blocks: output / raw JSON on `panel` (that token's
-  /// documented job), file changes in a bordered diff canvas.
+  /// mark only true content blocks: output / raw JSON / written content on
+  /// `panel` (that token's documented job), edits in a bordered diff canvas.
   /// The row's detail line hides while open: the body shows the full,
   /// untruncated version, so keeping both duplicated every value.
   ///
@@ -15,17 +15,17 @@
   /// stringified every tool call's full raw input whether or not it was ever
   /// expanded — a 500 KB write built a 500 KB string and DOM node nobody asked
   /// for. Formatting raw JSON and output must stay gated behind `open`. The
-  /// deliberate exception: Edit and Write facets render their diff inline
-  /// without expansion — watching file changes stream by is the point of the
-  /// row — which is safe to do eagerly because facet content is capped and
-  /// off-window rows aren't mounted at all (transcript render-windowing). The
-  /// inline diff is further capped to a preview length
+  /// deliberate exception: Edit facets render their diff inline, and Write
+  /// facets render their new content inline — watching file changes stream by
+  /// is the point of the row. This is safe to do eagerly because facet content
+  /// is capped and off-window rows aren't mounted at all (transcript
+  /// render-windowing). Inline content is further capped to a preview length
   /// (both while streaming and once settled — flipping full→capped when a turn
   /// ends would be jarring); expanding the row un-caps it and reveals output +
   /// raw input. Its detail line is suppressed in both states: the inline
   /// per-file headers already carry the paths.
   import type { ToolCall } from "$lib/state/index.svelte";
-  import type { EditedFile, ToolFacet } from "$lib/types";
+  import type { EditedFile } from "$lib/types";
   import DiffView from "$lib/components/DiffView.svelte";
   import Spinner from "$lib/components/ui/Spinner.svelte";
   import { languageForPath } from "$lib/diff";
@@ -84,12 +84,13 @@
     return Circle;
   }
 
-  function writtenFile(write: Extract<ToolFacet, { facet_kind: "write" }>): EditedFile {
+  function previewWriteContent(content: string): { text: string; hiddenLines: number } {
+    const lines = content.split("\n");
+    if (content.endsWith("\n")) lines.pop();
+    if (lines.length <= INLINE_DIFF_PREVIEW_LINES) return { text: content, hiddenLines: 0 };
     return {
-      path: write.path,
-      change: "added",
-      edits: [{ old: "", new: write.content }],
-      truncated: write.truncated,
+      text: `${lines.slice(0, INLINE_DIFF_PREVIEW_LINES).join("\n")}\n`,
+      hiddenLines: lines.length - INLINE_DIFF_PREVIEW_LINES,
     };
   }
 </script>
@@ -250,12 +251,30 @@
           </section>
         {/each}
       {:else if facet.facet_kind === "write"}
-        {@const file = writtenFile(facet)}
+        {@const preview = previewWriteContent(facet.content)}
+        {@const capped = !open && preview.hiddenLines > 0}
         <section class="space-y-1" aria-label="File write" data-testid="tool-write-file">
           <div class="text-muted truncate font-mono text-[11px]" title={facet.path}>
             {facet.path}
           </div>
-          {@render inlineDiff(file, "tool-write-expand")}
+          <pre
+            class="text-muted bg-panel overflow-x-auto rounded px-2 py-1.5 font-mono whitespace-pre-wrap"
+            data-testid="tool-write-content">{capped ? preview.text : facet.content}</pre>
+          {#if capped}
+            <button
+              type="button"
+              class="text-muted hover:text-fg text-[11px] transition-colors"
+              data-testid="tool-write-expand"
+              onclick={() => (open = true)}
+            >
+              Show {preview.hiddenLines} more {preview.hiddenLines === 1 ? "line" : "lines"}
+            </button>
+          {/if}
+          {#if facet.truncated}
+            <p class="text-muted text-[11px]" data-testid="tool-write-truncated">
+              Content truncated — the full write is larger than shown.
+            </p>
+          {/if}
         </section>
       {:else if facet.facet_kind === "read"}
         <div class="text-muted font-mono text-[11px]" data-testid="tool-read-path">

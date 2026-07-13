@@ -598,8 +598,8 @@ shipped:
   duplicated the row's still-visible detail. Instead the expanded content hangs under the row
   behind a thin left rule (the fan-out column idiom), directly on the reading surface, and the
   row's detail line hides while open since the body shows the full untruncated version. Fills mark
-  only true content blocks: the output / raw-JSON `pre`s on `panel` (that token's documented job),
-  file changes in a bordered diff canvas. For specialized facets the raw JSON sits
+  only true content blocks: the output / raw-JSON / written-content `pre`s on `panel` (that token's
+  documented job), edits in a bordered diff canvas. For specialized facets the raw JSON sits
   behind a "Show raw input" reveal (the facet body already shows the same information readably);
   the generic facet has no body, so its raw input shows directly.
 - **Edit diffs render inline, without expansion** (third visual pass): watching the changes
@@ -613,10 +613,10 @@ shipped:
   patches keep **Edit** with per-file markers. Tool-row diffs render through a new `compact` mode
   on `DiffView` (no hunk-header bars, no line-number gutters — snippet-relative numbers read as
   file positions they aren't; hunks separated by a hairline). The Git view is untouched.
-- **Write facets use the same inline diff treatment as added files.** A dedicated write and a patch
-  that creates a file represent the same user-visible change, so both render as an all-added compact
-  diff with the same collapsed preview and full captured content on expansion. Output and raw input
-  remain behind expansion; a facet-level truncation still surfaces DiffView's notice.
+- **Write facets render inline content, never a fabricated diff.** The facet carries the new content
+  but no prior snapshot and may overwrite an existing file, so an all-added diff would make an
+  unsupported creation claim. The collapsed row shows the first 25 content lines; expansion shows
+  all captured content plus output/raw input, and facet truncation remains explicit.
 - **Inline edit and write previews show 25 lines per file.** Forty lines made a single tool call
   dominate the transcript before the user chose to expand it; 25 preserves enough context to scan
   while keeping the surrounding conversation visible.

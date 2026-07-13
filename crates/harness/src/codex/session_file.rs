@@ -18,6 +18,9 @@
 //!   per session).
 //! - `turn_context.payload.model` (first one in file) → `SessionMeta.model`
 //!   (once per session).
+//! - Tool records for hydration: legacy `function_call` / standalone
+//!   `apply_patch` calls, newer `exec` wrappers, and the structured
+//!   `event_msg/patch_apply_end` shape shared by both rollout generations.
 //!
 //! ## ID-space distinction
 //!
@@ -135,11 +138,11 @@ pub struct Enrichment {
     /// separately from the `task_started`-derived [`Self::context_window`].
     pub per_turn_usage: Option<TurnUsage>,
     /// The **current turn's** content-bearing `Edit` facets, one per
-    /// `apply_patch` `custom_tool_call`, in record order. Turn-scoped (reset at
-    /// each `task_started`, like [`Self::per_turn_usage`]). The adapter zips
-    /// these onto the turn's live `file_change` tool ids and emits
-    /// `ToolFacetUpdated` — the disk read is the only place a Codex edit's
-    /// content exists (harness-behavior §3.6).
+    /// legacy `apply_patch` calls or `patch_apply_end` events, in record order.
+    /// Turn-scoped (reset at each `task_started`, like
+    /// [`Self::per_turn_usage`]). The adapter zips these onto the turn's live
+    /// `file_change` tool ids and emits `ToolFacetUpdated` — rollout records are
+    /// the only place a Codex edit's content exists (harness-behavior §3.6).
     pub patch_facets: Vec<crate::facets::ToolFacet>,
 }
 
@@ -381,6 +384,7 @@ fn turn_context_turn_id(payload: &Value) -> Option<String> {
 pub fn parse_session_content(content: &str) -> Enrichment {
     let mut enrichment = Enrichment::default();
     let mut model_set = false; // first-turn_context wins (set-once gate)
+    let mut patch_call_ids: Vec<Option<String>> = Vec::new();
     // Running shell cwd (turn_context precedes the turn's tool records) —
     // resolves relative apply_patch paths; observed paths are absolute.
     let mut current_cwd: Option<std::path::PathBuf> = None;
@@ -441,27 +445,15 @@ pub fn parse_session_content(content: &str) -> Enrichment {
                         .map(std::path::PathBuf::from);
                 }
             }
-            // The current turn's apply_patch calls — the content-bearing side
-            // of the Codex edit split (the live `file_change` has paths only).
-            // Same parse the reload path uses, so the upgraded live facet
-            // equals the reloaded one.
-            "response_item" => {
-                if let Some(p) = payload
-                    && p.get("type").and_then(Value::as_str) == Some("custom_tool_call")
-                    && p.get("name").and_then(Value::as_str) == Some("apply_patch")
-                    && let Some(input) = p.get("input").and_then(Value::as_str)
-                    && let Some(files) =
-                        super::facets::parse_apply_patch(input, current_cwd.as_deref())
-                {
-                    enrichment
-                        .patch_facets
-                        .push(crate::facets::ToolFacet::Edit { files });
-                }
-            }
+            "response_item" => capture_legacy_patch_facet(
+                payload,
+                current_cwd.as_deref(),
+                &mut enrichment,
+                &mut patch_call_ids,
+            ),
             "event_msg" => {
                 let Some(p) = payload else { continue };
-                let event_type = p.get("type").and_then(Value::as_str).unwrap_or("");
-                match event_type {
+                match p.get("type").and_then(Value::as_str).unwrap_or("") {
                     "task_started" => {
                         // Last-task_started-wins. On resumed sessions the
                         // file accumulates one task_started per turn; the
@@ -493,6 +485,7 @@ pub fn parse_session_content(content: &str) -> Enrichment {
                         // must never replay a *previous* turn's patches onto
                         // this turn's file_change rows.
                         enrichment.patch_facets.clear();
+                        patch_call_ids.clear();
                     }
                     "token_count" => {
                         // Two variants share this type; each feeds a different
@@ -511,6 +504,17 @@ pub fn parse_session_content(content: &str) -> Enrichment {
                             enrichment.per_turn_usage = Some(usage);
                         }
                     }
+                    "patch_apply_end" => {
+                        let facet = super::facets::patch_apply_end_facet(p);
+                        if matches!(facet, crate::facets::ToolFacet::Edit { .. }) {
+                            upsert_patch_facet(
+                                &mut enrichment.patch_facets,
+                                &mut patch_call_ids,
+                                p.get("call_id").and_then(Value::as_str),
+                                facet,
+                            );
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -519,6 +523,52 @@ pub fn parse_session_content(content: &str) -> Enrichment {
     }
 
     enrichment
+}
+
+fn capture_legacy_patch_facet(
+    payload: Option<&Value>,
+    current_cwd: Option<&std::path::Path>,
+    enrichment: &mut Enrichment,
+    patch_call_ids: &mut Vec<Option<String>>,
+) {
+    let Some(payload) = payload else {
+        return;
+    };
+    if payload.get("type").and_then(Value::as_str) != Some("custom_tool_call")
+        || payload.get("name").and_then(Value::as_str) != Some("apply_patch")
+    {
+        return;
+    }
+    let Some(input) = payload.get("input").and_then(Value::as_str) else {
+        return;
+    };
+    let Some(files) = super::facets::parse_apply_patch(input, current_cwd) else {
+        return;
+    };
+    upsert_patch_facet(
+        &mut enrichment.patch_facets,
+        patch_call_ids,
+        payload.get("call_id").and_then(Value::as_str),
+        crate::facets::ToolFacet::Edit { files },
+    );
+}
+
+fn upsert_patch_facet(
+    facets: &mut Vec<crate::facets::ToolFacet>,
+    call_ids: &mut Vec<Option<String>>,
+    call_id: Option<&str>,
+    facet: crate::facets::ToolFacet,
+) {
+    if let Some(call_id) = call_id
+        && let Some(index) = call_ids
+            .iter()
+            .position(|existing| existing.as_deref() == Some(call_id))
+    {
+        facets[index] = facet;
+        return;
+    }
+    facets.push(facet);
+    call_ids.push(call_id.map(str::to_owned));
 }
 
 /// Build a per-turn `TurnUsage` from a `token_count` record's non-null
@@ -966,6 +1016,7 @@ impl CodexReconstruction {
                     builder.usage = Some(usage);
                 }
             }
+            "patch_apply_end" => self.handle_patch_apply_end(line_number, p, timestamp),
             "mcp_tool_call_end" => {
                 let Some(call_id) = p.get("call_id").and_then(Value::as_str) else {
                     self.warn(line_number, "mcp_tool_call_end missing call_id");
@@ -1071,11 +1122,7 @@ impl CodexReconstruction {
                     self.warn(line_number, "function_call_output missing call_id");
                     return;
                 };
-                let output = p
-                    .get("output")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_owned();
+                let output = decode_function_call_output(p.get("output"));
                 let completed_at = timestamp;
                 let Some(builder) = self.current_agent.as_mut() else {
                     return;
@@ -1084,6 +1131,7 @@ impl CodexReconstruction {
                 for item in &mut builder.items {
                     if let TurnItem::Tool {
                         tool_use_id,
+                        input,
                         output: out,
                         is_error,
                         completed_at: cat,
@@ -1094,8 +1142,13 @@ impl CodexReconstruction {
                         // Don't overwrite an MCP-result-supplied output.
                         if out.is_none() {
                             *out = Some(output.clone());
-                            *is_error = Some(function_call_output_is_error(&output));
                             *cat = completed_at;
+                        }
+                        // Structured result events (notably patch_apply_end)
+                        // are authoritative over this format-sensitive
+                        // fallback, regardless of which record arrived first.
+                        if is_error.is_none() {
+                            *is_error = Some(function_call_output_is_error(&output, input));
                         }
                         matched = true;
                         break;
@@ -1124,11 +1177,10 @@ impl CodexReconstruction {
         }
     }
 
-    /// Codex's edit channel on disk: `apply_patch` arrives as a
-    /// `custom_tool_call` whose `input` is the raw patch text — the *only*
-    /// place the edit's content exists (the live `file_change` item carries
-    /// paths without content). Before this handler existed the record fell
-    /// through the wildcard arm and Codex edits were invisible on reload.
+    /// Legacy Codex edit channel: `apply_patch` arrives as a `custom_tool_call`
+    /// whose `input` is raw patch text. Newer rollouts use an `exec` wrapper;
+    /// edit content remains available through `patch_apply_end`, handled by
+    /// `handle_patch_apply_end`.
     fn handle_custom_tool_call(
         &mut self,
         line_number: usize,
@@ -1141,10 +1193,11 @@ impl CodexReconstruction {
         };
         let raw_name = p.get("name").and_then(Value::as_str).unwrap_or("");
         let input = p.get("input").and_then(Value::as_str).unwrap_or("");
-        let facet = if raw_name == "apply_patch" {
-            super::facets::apply_patch_facet(input, self.current_cwd.as_deref())
-        } else {
-            crate::facets::ToolFacet::Other
+        let facet = match raw_name {
+            "apply_patch" => super::facets::apply_patch_facet(input, self.current_cwd.as_deref()),
+            "exec" => decode_single_exec_wrapper(input)
+                .map_or(crate::facets::ToolFacet::Other, |decoded| decoded.facet),
+            _ => crate::facets::ToolFacet::Other,
         };
         let started_at = timestamp.unwrap_or_else(Utc::now);
         let Some(builder) = self.current_agent.as_mut() else {
@@ -1160,6 +1213,54 @@ impl CodexReconstruction {
             is_error: None,
             started_at,
             completed_at: None,
+        });
+    }
+
+    fn handle_patch_apply_end(
+        &mut self,
+        line_number: usize,
+        payload: &Value,
+        timestamp: Option<DateTime<Utc>>,
+    ) {
+        let Some(call_id) = payload.get("call_id").and_then(Value::as_str) else {
+            self.warn(line_number, "patch_apply_end missing call_id");
+            return;
+        };
+        let facet = super::facets::patch_apply_end_facet(payload);
+        if !matches!(facet, crate::facets::ToolFacet::Edit { .. }) {
+            self.warn(line_number, "patch_apply_end missing structured changes");
+            return;
+        }
+        let is_error = payload.get("success").and_then(Value::as_bool) == Some(false)
+            || payload.get("status").and_then(Value::as_str) == Some("failed");
+        let Some(builder) = self.current_agent.as_mut() else {
+            return;
+        };
+        if let Some(TurnItem::Tool {
+            facet: existing_facet,
+            is_error: existing_error,
+            completed_at,
+            ..
+        }) = builder.items.iter_mut().find(
+            |item| matches!(item, TurnItem::Tool { tool_use_id, .. } if tool_use_id == call_id),
+        ) {
+            *existing_facet = facet;
+            *existing_error = Some(is_error);
+            *completed_at = timestamp;
+            return;
+        }
+
+        let output = patch_apply_end_output(payload);
+        builder.items.push(TurnItem::Tool {
+            tool_use_id: call_id.to_owned(),
+            kind: ToolKind::Builtin,
+            facet,
+            name: "apply_patch".to_owned(),
+            input: payload.get("changes").cloned().unwrap_or(Value::Null),
+            output: Some(output),
+            is_error: Some(is_error),
+            started_at: timestamp.unwrap_or(builder.last_seen_at),
+            completed_at: timestamp,
         });
     }
 
@@ -1249,8 +1350,114 @@ fn decode_mcp_result(result: Option<&Value>) -> (String, bool) {
     }
 }
 
-fn function_call_output_is_error(output: &str) -> bool {
-    output_exit_code(output).is_some_and(|code| code != 0)
+fn decode_function_call_output(output: Option<&Value>) -> String {
+    let Some(output) = output else {
+        return String::new();
+    };
+    if let Some(text) = output.as_str() {
+        return text.to_owned();
+    }
+    output.as_array().map_or_else(
+        || serde_json::to_string(output).unwrap_or_default(),
+        |blocks| {
+            blocks
+                .iter()
+                .filter_map(|block| block.get("text").and_then(Value::as_str))
+                .collect::<String>()
+        },
+    )
+}
+
+fn patch_apply_end_output(payload: &Value) -> String {
+    ["stdout", "stderr"]
+        .into_iter()
+        .filter_map(|field| payload.get(field).and_then(Value::as_str))
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+struct DecodedExecWrapper {
+    facet: crate::facets::ToolFacet,
+    emits_full_result: bool,
+}
+
+/// Decode only the canonical single-call wrapper emitted by Codex. Arbitrary
+/// JavaScript, dynamic arguments, and wrappers that batch operations stay
+/// generic because one durable call id/output cannot represent their nested
+/// operations faithfully.
+fn decode_single_exec_wrapper(script: &str) -> Option<DecodedExecWrapper> {
+    let rest = script.trim().strip_prefix("const ")?;
+    let binding_end = rest
+        .find(|character: char| !is_javascript_identifier_continue(character))
+        .unwrap_or(rest.len());
+    let binding = rest.get(..binding_end)?;
+    if !binding
+        .chars()
+        .next()
+        .is_some_and(is_javascript_identifier_start)
+    {
+        return None;
+    }
+
+    let rest = rest.get(binding_end..)?.trim_start();
+    let rest = rest.strip_prefix('=')?.trim_start();
+    let rest = rest.strip_prefix("await")?.trim_start();
+    let rest = rest.strip_prefix("tools.exec_command(")?;
+    let mut values = serde_json::Deserializer::from_str(rest).into_iter::<Value>();
+    let arguments = values.next()?.ok()?;
+    let rest = rest.get(values.byte_offset()..)?.trim_start();
+    let rest = rest.strip_prefix(')')?.trim_start();
+    let rest = rest.strip_prefix(';')?.trim_start();
+
+    let full_result = format!("text({binding});");
+    let output_only = format!("text({binding}.output);");
+    let emits_full_result = if rest == full_result {
+        true
+    } else if rest == output_only {
+        false
+    } else {
+        return None;
+    };
+
+    let facet = super::facets::exec_command_facet(&arguments);
+    if !matches!(facet, crate::facets::ToolFacet::Shell { .. }) {
+        return None;
+    }
+    Some(DecodedExecWrapper {
+        facet,
+        emits_full_result,
+    })
+}
+
+fn is_javascript_identifier_start(character: char) -> bool {
+    character == '_' || character == '$' || character.is_ascii_alphabetic()
+}
+
+fn is_javascript_identifier_continue(character: char) -> bool {
+    is_javascript_identifier_start(character) || character.is_ascii_digit()
+}
+
+fn function_call_output_is_error(output: &str, input: &Value) -> bool {
+    if output.lines().next() == Some("Script failed") {
+        return true;
+    }
+    if output_exit_code(output).is_some_and(|code| code != 0) {
+        return true;
+    }
+    input.as_str().is_some_and(|script| {
+        decode_single_exec_wrapper(script).is_some_and(|decoded| decoded.emits_full_result)
+    }) && structured_script_exit_code(output).is_some_and(|code| code != 0)
+}
+
+fn structured_script_exit_code(output: &str) -> Option<i64> {
+    let body = output.split_once("\nOutput:\n")?.1;
+    body.lines().find_map(|line| {
+        serde_json::from_str::<Value>(line)
+            .ok()?
+            .get("exit_code")?
+            .as_i64()
+    })
 }
 
 fn output_exit_code(output: &str) -> Option<i64> {
@@ -2781,7 +2988,181 @@ not valid json
         }
     }
 
-    // --- Fixture-driven facet coverage: recorded @ codex 0.143.0 (probe 2026-07-10) ---
+    // --- Fixture-driven facet coverage ---
+
+    #[test]
+    fn exec_wrapper_fixture_hydrates_output_failure_and_structured_edit() {
+        use crate::facets::ToolFacet;
+        let agent_id = Uuid::now_v7();
+        let content = std::fs::read_to_string(fixture_path("exec-wrapper.session.jsonl")).unwrap();
+
+        let enrichment = parse_session_content(&content);
+        assert_eq!(
+            enrichment.patch_facets.len(),
+            1,
+            "patch_apply_end must feed live facet enrichment without a standalone apply_patch call"
+        );
+
+        let result = parse_codex_transcript_content(&content, agent_id);
+        let Turn::Agent { items, .. } = result
+            .turns
+            .iter()
+            .find(|turn| matches!(turn, Turn::Agent { .. }))
+            .expect("agent turn")
+        else {
+            unreachable!();
+        };
+        let exec = items
+            .iter()
+            .find(|item| matches!(item, TurnItem::Tool { name, .. } if name == "exec"))
+            .expect("exec wrapper tool");
+        assert!(matches!(
+            exec,
+            TurnItem::Tool {
+                facet: ToolFacet::Shell { command, cwd },
+                output: Some(output),
+                is_error: Some(true),
+                ..
+            } if command == "cat alpha.txt"
+                && cwd.as_deref() == Some("/private/tmp/facet-probe/scratch")
+                && output.contains("failure-marker")
+        ));
+
+        let edit = items
+            .iter()
+            .find(|item| matches!(item, TurnItem::Tool { name, .. } if name == "apply_patch"))
+            .expect("patch_apply_end edit tool");
+        let TurnItem::Tool {
+            facet: ToolFacet::Edit { files },
+            output,
+            is_error,
+            ..
+        } = edit
+        else {
+            panic!("expected content-bearing Edit facet");
+        };
+        assert_eq!(files[0].edits[0].old, "foo");
+        assert_eq!(files[0].edits[0].new, "bar");
+        assert!(
+            output
+                .as_deref()
+                .is_some_and(|text| text.contains("Success"))
+        );
+        assert_eq!(*is_error, Some(false));
+    }
+
+    #[test]
+    fn ambiguous_exec_wrappers_remain_generic_and_do_not_borrow_nested_exit_codes() {
+        let agent_id = Uuid::now_v7();
+        let content =
+            std::fs::read_to_string(fixture_path("exec-wrapper-ambiguous.session.jsonl")).unwrap();
+        let result = parse_codex_transcript_content(&content, agent_id);
+        let Turn::Agent { items, .. } = result
+            .turns
+            .iter()
+            .find(|turn| matches!(turn, Turn::Agent { .. }))
+            .expect("agent turn")
+        else {
+            unreachable!();
+        };
+        let tools: Vec<_> = items
+            .iter()
+            .filter_map(|item| match item {
+                TurnItem::Tool {
+                    facet, is_error, ..
+                } => Some((facet, is_error)),
+                TurnItem::Text { .. } => None,
+            })
+            .collect();
+        assert_eq!(tools.len(), 3);
+        for (facet, is_error) in tools {
+            assert_eq!(*facet, crate::facets::ToolFacet::Other);
+            assert_eq!(*is_error, Some(false));
+        }
+    }
+
+    #[test]
+    fn explicit_patch_failure_wins_over_output_heuristic_in_both_record_orders() {
+        let call = serde_json::json!({
+            "timestamp": "2026-07-13T20:00:03Z",
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call",
+                "call_id": "call_patch_failed",
+                "name": "apply_patch",
+                "input": "*** Begin Patch\n*** Update File: /tmp/alpha.txt\n@@\n-old\n+new\n*** End Patch\n"
+            }
+        });
+        let patch_failed = serde_json::json!({
+            "timestamp": "2026-07-13T20:00:05Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "patch_apply_end",
+                "call_id": "call_patch_failed",
+                "success": false,
+                "status": "failed",
+                "stdout": "",
+                "stderr": "patch rejected",
+                "changes": {
+                    "/tmp/alpha.txt": {
+                        "type": "update",
+                        "unified_diff": "@@ -1 +1 @@\n-old\n+new\n"
+                    }
+                }
+            }
+        });
+        let output = serde_json::json!({
+            "timestamp": "2026-07-13T20:00:04Z",
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call_output",
+                "call_id": "call_patch_failed",
+                "output": "Exit code: 0\nOutput:\npatch rejected"
+            }
+        });
+
+        for output_first in [false, true] {
+            let mut records = vec![
+                task_started("turn_patch_failed", "2026-07-13T20:00:00Z", 258_400),
+                turn_context("gpt-5.6-sol", "2026-07-13T20:00:01Z"),
+                user_message("apply a patch", "2026-07-13T20:00:02Z"),
+                call.clone(),
+            ];
+            if output_first {
+                records.extend([output.clone(), patch_failed.clone()]);
+            } else {
+                records.extend([patch_failed.clone(), output.clone()]);
+            }
+            records.push(task_complete("turn_patch_failed", "2026-07-13T20:00:06Z"));
+
+            let result = parse_codex_transcript_content(&jsonl_lines(&records), Uuid::now_v7());
+            let Turn::Agent { items, .. } = &result.turns[1] else {
+                panic!("expected agent turn");
+            };
+            assert!(matches!(
+                &items[0],
+                TurnItem::Tool {
+                    facet: crate::facets::ToolFacet::Edit { .. },
+                    output: Some(output),
+                    is_error: Some(true),
+                    ..
+                } if output.contains("patch rejected")
+            ));
+        }
+    }
+
+    #[test]
+    fn patch_apply_end_replaces_legacy_apply_patch_enrichment_instead_of_duplicating() {
+        let content = std::fs::read_to_string(fixture_path("apply-patch.session.jsonl")).unwrap();
+        let enrichment = parse_session_content(&content);
+        assert_eq!(
+            enrichment.patch_facets.len(),
+            1,
+            "the legacy apply_patch call and its patch_apply_end share one call_id"
+        );
+    }
+
+    // Recorded @ codex 0.143.0 (probe 2026-07-10).
 
     #[test]
     fn apply_patch_fixture_hydrates_edit_facet_with_content() {

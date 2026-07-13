@@ -3,7 +3,6 @@
     ArrowDown,
     ArrowUp,
     Check,
-    ChevronRight,
     Columns2,
     Eye,
     EyeOff,
@@ -991,23 +990,6 @@
               </button>
             {:else}
               {@const agentHidden = isAgentHidden(projectId, rosterIds, agent.id)}
-              <!-- The drag grip is separate from the collapse button: dragging
-                   reorders, while a plain grip click is intentionally inert. -->
-              {#if agents.length > 1}
-                <span
-                  class={cn(
-                    "text-muted h-3 w-3 shrink-0 cursor-grab touch-none active:cursor-grabbing",
-                    dragState?.agentId === agent.id
-                      ? "visible"
-                      : "invisible group-focus-within:visible group-hover:visible",
-                  )}
-                  data-testid="agent-drag-grip"
-                  aria-hidden="true"
-                  use:gripDrag={agent.id}
-                >
-                  <GripVertical size={12} strokeWidth={1.8} />
-                </span>
-              {/if}
               <!-- The full remaining header row toggles collapse. The name's
                    double-click is a narrow rename shortcut; its two preceding
                    click events toggle twice, leaving collapse state unchanged. -->
@@ -1024,15 +1006,6 @@
                   startEdit(agent);
                 }}
               >
-                <ChevronRight
-                  size={12}
-                  strokeWidth={1.8}
-                  class={cn(
-                    "text-muted shrink-0 transition-transform",
-                    !isCollapsed && "rotate-90",
-                  )}
-                  aria-hidden="true"
-                />
                 <span class="text-fg truncate text-[13px] font-semibold" data-testid="agent-name">
                   {agent.name}
                 </span>
@@ -1296,6 +1269,23 @@
                   {/if}
                 </DropdownMenu>
                 <HarnessIcon harness={agent.harness} size="md" testid="agent-harness-icon" />
+                <!-- The far-right grip keeps a compact slot so the harness icon
+                     never jumps when the hover/focus affordance appears. -->
+                {#if agents.length > 1}
+                  <span
+                    class={cn(
+                      "text-muted h-3 w-3 shrink-0 cursor-grab touch-none active:cursor-grabbing",
+                      dragState?.agentId === agent.id
+                        ? "visible"
+                        : "invisible group-focus-within:visible group-hover:visible",
+                    )}
+                    data-testid="agent-drag-grip"
+                    aria-hidden="true"
+                    use:gripDrag={agent.id}
+                  >
+                    <GripVertical size={12} strokeWidth={1.8} />
+                  </span>
+                {/if}
               </div>
             {/if}
           </div>

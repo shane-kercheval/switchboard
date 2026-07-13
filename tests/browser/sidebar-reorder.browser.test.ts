@@ -105,6 +105,12 @@ test("drag grip is hidden by default and visible when focus enters its card", as
   collapseBtn.focus();
 
   await expect.element(page.getByTestId("agent-drag-grip").nth(0)).toBeVisible();
+  expect(
+    (page.getByTestId("agent-drag-grip").nth(0).element() as HTMLElement).getBoundingClientRect().x,
+  ).toBeGreaterThan(
+    (page.getByTestId("agent-harness-icon").nth(0).element() as HTMLElement).getBoundingClientRect()
+      .x,
+  );
   // Other cards' grips are unaffected.
   await expect.element(page.getByTestId("agent-drag-grip").nth(1)).not.toBeVisible();
 });

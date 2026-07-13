@@ -54,19 +54,25 @@ beforeEach(() => {
   reorderAgentsMock.mockResolvedValue(undefined);
 });
 
-test("agent card hover stays distinct from the sidebar panel", async () => {
+test("only actionable card controls receive hover fills", async () => {
   render(SidebarHost, { projectId: PROJECT_ID, agents: THREE_AGENTS });
 
   const card = page.getByTestId("sidebar-agent").first();
-  const sidebar = page.getByTestId("sidebar");
+  const cardResting = getComputedStyle(card.element()).backgroundColor;
   await card.hover();
+  expect(getComputedStyle(card.element()).backgroundColor).toBe(cardResting);
 
+  const collapse = page.getByTestId("agent-collapse-toggle").first();
+  await collapse.hover();
   await expect
-    .poll(
-      () =>
-        getComputedStyle(card.element()).backgroundColor !==
-        getComputedStyle(sidebar.element()).backgroundColor,
-    )
+    .poll(() => getComputedStyle(collapse.element()).backgroundColor !== cardResting)
+    .toBe(true);
+
+  await card.hover();
+  const visibility = page.getByTestId("agent-visibility-toggle").first();
+  await visibility.hover();
+  await expect
+    .poll(() => getComputedStyle(visibility.element()).backgroundColor !== cardResting)
     .toBe(true);
 });
 

@@ -3,6 +3,7 @@
     ArrowDown,
     ArrowUp,
     Check,
+    ChevronRight,
     Columns2,
     Eye,
     EyeOff,
@@ -78,7 +79,7 @@
   import Dialog from "$lib/components/ui/Dialog.svelte";
   import ErrorDetailsDialog from "$lib/components/ui/ErrorDetailsDialog.svelte";
   import CopyButton from "$lib/components/ui/CopyButton.svelte";
-  import { ICON_BUTTON_CLASS } from "$lib/components/ui/iconButton";
+  import { ICON_BUTTON_CLASS, ICON_BUTTON_ON_RAISED_CLASS } from "$lib/components/ui/iconButton";
 
   /// Cap the per-tooltip warning rows so a session with a long tail
   /// (50+) doesn't render a wall of text. Anything beyond is summarized
@@ -926,7 +927,7 @@
         {@const confirmingRemove = removeConfirmAgentId === agent.id}
         <div
           class={cn(
-            "group bg-raised hover:bg-surface rounded-md px-2.5 py-2 transition-colors",
+            "group bg-raised rounded-md px-2.5 py-2",
             dragState?.started === true &&
               dragState.agentId === agent.id &&
               "ring-accent/60 relative z-10 shadow-lg ring-1",
@@ -965,7 +966,7 @@
               <button
                 type="button"
                 class={cn(
-                  ICON_BUTTON_CLASS,
+                  ICON_BUTTON_ON_RAISED_CLASS,
                   "shrink-0 disabled:cursor-not-allowed disabled:opacity-50",
                 )}
                 disabled={!canSave}
@@ -990,36 +991,48 @@
               </button>
             {:else}
               {@const agentHidden = isAgentHidden(projectId, rosterIds, agent.id)}
-              <!-- The whole name row toggles collapse. Rename lives in the
-                   actions (⋯) menu — not a name double-click, which fought the
-                   collapse toggle (two toggles fired before edit opened). -->
+              <!-- The drag grip is separate from the collapse button: dragging
+                   reorders, while a plain grip click is intentionally inert. -->
+              {#if agents.length > 1}
+                <span
+                  class={cn(
+                    "text-muted h-3 w-3 shrink-0 cursor-grab touch-none active:cursor-grabbing",
+                    dragState?.agentId === agent.id
+                      ? "visible"
+                      : "invisible group-focus-within:visible group-hover:visible",
+                  )}
+                  data-testid="agent-drag-grip"
+                  aria-hidden="true"
+                  use:gripDrag={agent.id}
+                >
+                  <GripVertical size={12} strokeWidth={1.8} />
+                </span>
+              {/if}
+              <!-- The full remaining header row toggles collapse. The name's
+                   double-click is a narrow rename shortcut; its two preceding
+                   click events toggle twice, leaving collapse state unchanged. -->
               <button
                 type="button"
-                class="flex min-w-0 flex-1 items-center gap-1.5 text-left"
+                class="hover:bg-panel focus-visible:ring-focus flex min-h-7 min-w-0 flex-1 items-center gap-1.5 rounded-md px-1.5 text-left transition-colors focus-visible:ring-1 focus-visible:outline-none"
                 aria-expanded={!isCollapsed}
+                data-testid="agent-collapse-toggle"
                 onclick={() => toggleCollapsed(agent.id)}
+                ondblclick={(event) => {
+                  if (!(event.target instanceof Element)) return;
+                  if (event.target.closest('[data-testid="agent-name"]') === null) return;
+                  event.preventDefault();
+                  startEdit(agent);
+                }}
               >
-                <!-- Leading slot: the drag grip, hover/focus-revealed (multi-
-                     agent rosters only). `invisible` (not `hidden`) so the slot
-                     keeps its width and the name never shifts on hover. The
-                     collapse affordance is the whole header row (aria-expanded
-                     carries the state); a click on the grip still toggles
-                     collapse — only a drag past the slop threshold reorders. -->
-                {#if agents.length > 1}
-                  <span
-                    class={cn(
-                      "text-muted h-3 w-3 shrink-0 cursor-grab touch-none active:cursor-grabbing",
-                      dragState?.agentId === agent.id
-                        ? "visible"
-                        : "invisible group-focus-within:visible group-hover:visible",
-                    )}
-                    data-testid="agent-drag-grip"
-                    aria-hidden="true"
-                    use:gripDrag={agent.id}
-                  >
-                    <GripVertical size={12} strokeWidth={1.8} />
-                  </span>
-                {/if}
+                <ChevronRight
+                  size={12}
+                  strokeWidth={1.8}
+                  class={cn(
+                    "text-muted shrink-0 transition-transform",
+                    !isCollapsed && "rotate-90",
+                  )}
+                  aria-hidden="true"
+                />
                 <span class="text-fg truncate text-[13px] font-semibold" data-testid="agent-name">
                   {agent.name}
                 </span>
@@ -1034,8 +1047,8 @@
                       {...props}
                       type="button"
                       class={cn(
-                        ICON_BUTTON_CLASS,
-                        "hover:bg-hover shrink-0",
+                        ICON_BUTTON_ON_RAISED_CLASS,
+                        "shrink-0",
                         // The eye stays visible while the agent is hidden (it's
                         // the state indicator); otherwise it appears on hover
                         // like the actions trigger. `hidden`, not `opacity-0`:
@@ -1061,8 +1074,8 @@
                 </Tooltip>
                 <DropdownMenu
                   triggerClass={cn(
-                    ICON_BUTTON_CLASS,
-                    "hover:bg-hover shrink-0",
+                    ICON_BUTTON_ON_RAISED_CLASS,
+                    "shrink-0",
                     "hidden group-focus-within:inline-flex group-hover:inline-flex data-[state=open]:inline-flex",
                   )}
                   triggerLabel={`Actions for ${agent.name}`}

@@ -1039,6 +1039,10 @@ does not rediscover it the hard way.
   keeps the full row width at rest and truncates only while the icons are actually shown —
   shared-prefix names are distinguishable exactly when the user is reading, and the eye stays
   visible while an agent is hidden (it's the state indicator).
+- **Only actionable card regions hover.** The raised card itself is static because clicking its
+  body has no action. A taller name-row button carries the collapse hover and a chevron; the drag
+  grip sits outside it so a plain grip click is inert. Double-clicking only the name enters rename.
+  Eye, actions, and rename-save controls use the stronger on-raised icon-button treatment.
 - **`formatDuration` gained the bare-seconds form in place** (`9s` under a minute); the silence
   counter can't hit that branch (starts at one heartbeat threshold = 60s), so its output is
   unchanged — asserted by the untouched ≥1m test cases.

@@ -1,17 +1,17 @@
 //! Codex tool-facet classification, including the `apply_patch` parser.
 //!
-//! Codex's edit story is split across its two channels (probe 2026-07-10 @
-//! 0.143.0; `docs/harness-behavior.md` §3.6):
+//! Codex's edit story is split across its two channels (probes 2026-07-10 @
+//! 0.143.0 and 2026-07-13 @ 0.144.3; `docs/harness-behavior.md` §3.6):
 //!
 //! - **Live stream**: a `file_change` item carries `changes: [{path, kind}]`
 //!   — which files and how, but *no content*. [`file_change_facet`] builds an
 //!   `Edit` facet with empty pair lists (= content unavailable).
-//! - **Session file**: a `custom_tool_call` named `apply_patch` carries the
-//!   full patch text. [`parse_apply_patch`] reconstructs per-file
-//!   before/after strings so the frontend keeps one uniform `Edit` renderer —
-//!   we deliberately normalize *into* before/after pairs rather than *out to*
-//!   hunks, because the diff is computed lazily at render time and a single
-//!   representation keeps one renderer.
+//! - **Session file**: legacy rollouts carry both a `custom_tool_call` named
+//!   `apply_patch` and `event_msg/patch_apply_end`; newer rollouts may wrap tool
+//!   work in a `custom_tool_call` named `exec`, leaving the pre-existing
+//!   `patch_apply_end` as the only structured edit-content source.
+//!   [`parse_apply_patch`] and [`patch_apply_end_facet`] normalize both content
+//!   sources into the same before/after representation.
 //!
 //! The adapter closes the live-content gap at turn end: the post-terminal
 //! enrichment re-read (already performed every turn for usage/window) also
@@ -197,6 +197,104 @@ pub(crate) fn apply_patch_facet(input: &str, cwd: Option<&Path>) -> ToolFacet {
     }
 }
 
+/// Facet for a session-file `event_msg/patch_apply_end`. The event predates
+/// Codex 0.144.3, but becomes the only structured edit-content source when a
+/// rollout persists an `exec` wrapper instead of a standalone `apply_patch`.
+pub(crate) fn patch_apply_end_facet(payload: &Value) -> ToolFacet {
+    let Some(changes) = payload.get("changes").and_then(Value::as_object) else {
+        return ToolFacet::Other;
+    };
+    let files: Vec<EditedFile> = changes
+        .iter()
+        .map(|(path, change)| patch_apply_end_file(path, change))
+        .collect();
+    if files.is_empty() {
+        ToolFacet::Other
+    } else {
+        ToolFacet::Edit { files }
+    }
+}
+
+fn patch_apply_end_file(path: &str, change: &Value) -> EditedFile {
+    match change.get("type").and_then(Value::as_str).unwrap_or("") {
+        "add" => {
+            let content = change.get("content").and_then(Value::as_str).unwrap_or("");
+            let content = content.strip_suffix('\n').unwrap_or(content);
+            let (new, truncated) = cap_content(content);
+            EditedFile {
+                path: path.to_owned(),
+                change: EditChange::Added,
+                edits: vec![EditPair {
+                    old: String::new(),
+                    new,
+                }],
+                truncated,
+            }
+        }
+        "delete" | "remove" => EditedFile {
+            path: path.to_owned(),
+            change: EditChange::Deleted,
+            edits: Vec::new(),
+            truncated: false,
+        },
+        _ => {
+            let (edits, truncated) = change
+                .get("unified_diff")
+                .and_then(Value::as_str)
+                .map(parse_unified_diff)
+                .unwrap_or_default();
+            EditedFile {
+                path: path.to_owned(),
+                change: EditChange::Modified,
+                edits,
+                truncated,
+            }
+        }
+    }
+}
+
+fn parse_unified_diff(diff: &str) -> (Vec<EditPair>, bool) {
+    let mut edits = Vec::new();
+    let mut old = Vec::new();
+    let mut new = Vec::new();
+    let mut in_hunk = false;
+    let mut truncated = false;
+
+    let flush = |old: &mut Vec<&str>, new: &mut Vec<&str>, truncated: &mut bool| {
+        if old.is_empty() && new.is_empty() {
+            return None;
+        }
+        let (old_text, old_truncated) = cap_content(&old.join("\n"));
+        let (new_text, new_truncated) = cap_content(&new.join("\n"));
+        *truncated |= old_truncated || new_truncated;
+        old.clear();
+        new.clear();
+        Some(EditPair {
+            old: old_text,
+            new: new_text,
+        })
+    };
+
+    for line in diff.lines() {
+        if line.starts_with("@@") {
+            edits.extend(flush(&mut old, &mut new, &mut truncated));
+            in_hunk = true;
+        } else if in_hunk && line != "\\ No newline at end of file" {
+            if let Some(removed) = line.strip_prefix('-') {
+                old.push(removed);
+            } else if let Some(added) = line.strip_prefix('+') {
+                new.push(added);
+            } else {
+                let context = line.strip_prefix(' ').unwrap_or(line);
+                old.push(context);
+                new.push(context);
+            }
+        }
+    }
+    edits.extend(flush(&mut old, &mut new, &mut truncated));
+    (edits, truncated)
+}
+
 fn change_kind(kind: &str) -> EditChange {
     match kind {
         "add" => EditChange::Added,
@@ -334,6 +432,40 @@ mod tests {
         assert!(parse_apply_patch("", None).is_none());
         assert!(parse_apply_patch("*** Begin Patch\ngarbage\n*** End Patch\n", None).is_none());
         assert_eq!(apply_patch_facet("echo hi", None), ToolFacet::Other);
+    }
+
+    #[test]
+    fn patch_apply_end_maps_structured_changes_with_content() {
+        let facet = patch_apply_end_facet(&json!({
+            "changes": {
+                "/tmp/alpha.txt": {
+                    "type": "update",
+                    "unified_diff": "@@ -1 +1 @@\n-foo\n+bar\n"
+                },
+                "/tmp/new.txt": {"type": "add", "content": "hello\n"},
+                "/tmp/gone.txt": {"type": "delete"}
+            }
+        }));
+        let ToolFacet::Edit { files } = facet else {
+            panic!("expected Edit");
+        };
+        let updated = files
+            .iter()
+            .find(|file| file.path == "/tmp/alpha.txt")
+            .unwrap();
+        assert_eq!(updated.edits[0].old, "foo");
+        assert_eq!(updated.edits[0].new, "bar");
+        let added = files
+            .iter()
+            .find(|file| file.path == "/tmp/new.txt")
+            .unwrap();
+        assert_eq!(added.edits[0].new, "hello");
+        let deleted = files
+            .iter()
+            .find(|file| file.path == "/tmp/gone.txt")
+            .unwrap();
+        assert_eq!(deleted.change, EditChange::Deleted);
+        assert!(deleted.edits.is_empty());
     }
 
     #[test]

@@ -247,7 +247,7 @@ describe("GitRepoNode commit list preview cap", () => {
 });
 
 describe("GitRepoNode actions-trigger hover", () => {
-  it("uses the stronger row-action hover for neutral repo header actions", async () => {
+  it("uses the shared control hover for neutral repo header actions", async () => {
     render(GitRepoNode, { props: props("/a") });
     await tick();
 
@@ -257,7 +257,7 @@ describe("GitRepoNode actions-trigger hover", () => {
       "repo-action-editor",
       "repo-action-copy-path",
     ]) {
-      expect(screen.getByTestId(testid).className).toContain("hover:bg-active");
+      expect(screen.getByTestId(testid).className).toContain("hover:bg-control-hover");
     }
     expect(screen.getByTestId("repo-action-remove").className).toContain(
       "hover:bg-status-failed-soft",
@@ -276,7 +276,7 @@ describe("GitRepoNode actions-trigger hover", () => {
     expect(rows[0]).toHaveAttribute("data-selected", "true");
     expect(rows[1]).toHaveAttribute("data-selected", "false");
 
-    // The trigger carries the stronger gray default plus the selected-row white override;
+    // The trigger carries the stronger row-action hover plus the selected-row white override;
     // CSS picks between them off the row's `data-selected`.
     const trigger = within(rows[0]!).getByTestId("worktree-actions-trigger");
     expect(trigger.className).toContain("hover:bg-active");

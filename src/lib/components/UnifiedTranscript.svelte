@@ -455,12 +455,10 @@
   }
 
   /// Shared footprint for the in-transcript meta-row icon buttons (preview
-  /// toggle, fan-out toggle-all). Intentionally mirrors `CopyButton` — the
-  /// control they sit beside — rather than `ICON_BUTTON_CLASS` (the app-chrome
-  /// style, `hover:bg-raised`), so their hover state matches the copy button in
-  /// the same row.
+  /// toggle, fan-out toggle-all). Mirrors `CopyButton` so adjacent compact
+  /// controls share the same hover treatment.
   const META_ICON_BUTTON =
-    "text-muted hover:text-fg hover:bg-hover flex h-[26px] w-[26px] items-center justify-center rounded-full border border-transparent transition-colors";
+    "text-muted hover:text-fg hover:bg-control-hover flex h-[26px] w-[26px] items-center justify-center rounded-full border border-transparent transition-colors";
 
   /// Send ids that are queued (dispatched, not yet started) across the project's
   /// agents — the per-agent `pending_sends` minus any being cancelled. A
@@ -1205,7 +1203,7 @@
        so an always-on control would just be noise. -->
   <button
     type="button"
-    class="text-muted hover:text-fg hover:bg-hover inline-flex items-center gap-1 rounded-full border border-transparent px-2 py-0.5 text-xs opacity-0 transition-colors group-focus-within:opacity-100 group-hover:opacity-100"
+    class="text-muted hover:text-fg hover:bg-control-hover inline-flex items-center gap-1 rounded-full border border-transparent px-2 py-0.5 text-xs opacity-0 transition-colors group-focus-within:opacity-100 group-hover:opacity-100"
     data-testid="turn-preview-toggle"
     aria-label={label}
     onclick={() => toggleKey(projectId, key, defaultCompact)}

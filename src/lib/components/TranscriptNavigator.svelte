@@ -227,7 +227,7 @@
     <button
       {...props}
       type="button"
-      class={cn(ICON_BUTTON_CLASS, "hover:bg-panel shrink-0")}
+      class={cn(ICON_BUTTON_CLASS, "shrink-0")}
       aria-label="Find messages"
       aria-expanded={open}
       data-testid="transcript-navigator-toggle"
@@ -285,7 +285,7 @@
           <button
             {...props}
             type="button"
-            class={cn(ICON_BUTTON_CLASS, "hover:bg-panel shrink-0")}
+            class={cn(ICON_BUTTON_CLASS, "shrink-0")}
             aria-label={descending ? "Sort: newest first" : "Sort: oldest first"}
             data-testid="navigator-sort"
             onclick={() => (descending = !descending)}

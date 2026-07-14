@@ -24,7 +24,7 @@
   import AsyncIconButton from "$lib/components/ui/AsyncIconButton.svelte";
   import DropdownMenu from "$lib/components/ui/DropdownMenu.svelte";
   import DropdownMenuItem from "$lib/components/ui/DropdownMenuItem.svelte";
-  import { ICON_BUTTON_CLASS, ROW_ACTION_ICON_HOVER } from "$lib/components/ui/iconButton";
+  import { ICON_BUTTON_CLASS, ROW_ACTION_ICON_CLASS } from "$lib/components/ui/iconButton";
   import {
     localBranchIndicators,
     remoteBranchIndicators,
@@ -354,7 +354,7 @@
   <div class="group flex min-h-10 items-center gap-2 px-1 py-1">
     <button
       type="button"
-      class="text-muted hover:bg-hover hover:text-fg flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-full transition-colors"
+      class="text-muted hover:bg-control-hover hover:text-fg flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-full transition-colors"
       aria-label={expanded ? "Collapse repo" : "Expand repo"}
       aria-expanded={expanded}
       onclick={() => (expanded = !expanded)}
@@ -399,7 +399,7 @@
           {#snippet trigger(props)}
             <span
               {...props}
-              class="text-warning hover:bg-hover inline-flex h-[26px] w-[26px] items-center justify-center rounded-full transition-colors"
+              class="text-warning hover:bg-control-hover inline-flex h-[26px] w-[26px] items-center justify-center rounded-full transition-colors"
               aria-label="Fetch failed"
               data-testid="repo-fetch-failed"
             >
@@ -425,7 +425,7 @@
       >
         <button
           type="button"
-          class={cn(ICON_BUTTON_CLASS, ROW_ACTION_ICON_HOVER, "shrink-0 disabled:opacity-50")}
+          class={cn(ICON_BUTTON_CLASS, "shrink-0 disabled:opacity-50")}
           aria-label="Refresh repo"
           data-testid="repo-refresh"
           disabled={busy}
@@ -453,7 +453,7 @@
           {#snippet trigger(props)}
             <AsyncIconButton
               {...props}
-              class={cn(ICON_BUTTON_CLASS, ROW_ACTION_ICON_HOVER, "shrink-0")}
+              class={cn(ICON_BUTTON_CLASS, "shrink-0")}
               label="Reveal repo in Finder"
               testid="repo-action-reveal"
               completeAfterMs={700}
@@ -472,7 +472,7 @@
           {#snippet trigger(props)}
             <AsyncIconButton
               {...props}
-              class={cn(ICON_BUTTON_CLASS, ROW_ACTION_ICON_HOVER, "shrink-0")}
+              class={cn(ICON_BUTTON_CLASS, "shrink-0")}
               label="Open repo in editor"
               testid="repo-action-editor"
               completeAfterMs={700}
@@ -491,7 +491,7 @@
           {#snippet trigger(props)}
             <AsyncIconButton
               {...props}
-              class={cn(ICON_BUTTON_CLASS, ROW_ACTION_ICON_HOVER, "shrink-0")}
+              class={cn(ICON_BUTTON_CLASS, "shrink-0")}
               label="Copy repo path"
               testid="repo-action-copy-path"
               action={() => {
@@ -588,15 +588,14 @@
                 triggerLabel={`Actions for ${branch.name}`}
                 triggerTestid="worktree-actions-trigger"
                 triggerClass={cn(
-                  ICON_BUTTON_CLASS,
+                  ROW_ACTION_ICON_CLASS,
                   "shrink-0 opacity-0 group-focus-within:opacity-100 data-[state=open]:opacity-100",
                   triggerHoverReveal,
-                  // Stronger gray hover, overridden to the white `bg-raised` fill
+                  // Standard control hover, overridden to the white `bg-raised` fill
                   // on a selected (blue) row so it reads against the blue. Driven
                   // off the row's `data-selected` (a `group-data-` CSS variant),
                   // not a JS class — the trigger lives in a `{#snippet}` that
                   // doesn't re-render when the row's selected state changes.
-                  ROW_ACTION_ICON_HOVER,
                   actionsOpen && "opacity-100",
                 )}
                 contentTestid="worktree-actions-menu"

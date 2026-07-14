@@ -91,7 +91,7 @@
         </BitsDialog.Title>
         {#if dismissible}
           <BitsDialog.Close
-            class={cn(ICON_BUTTON_CLASS, "hover:bg-panel")}
+            class={ICON_BUTTON_CLASS}
             aria-label="Close dialog"
             data-testid="dialog-close"
           >

@@ -79,7 +79,7 @@
   import Dialog from "$lib/components/ui/Dialog.svelte";
   import ErrorDetailsDialog from "$lib/components/ui/ErrorDetailsDialog.svelte";
   import CopyButton from "$lib/components/ui/CopyButton.svelte";
-  import { ICON_BUTTON_CLASS, ICON_BUTTON_ON_RAISED_CLASS } from "$lib/components/ui/iconButton";
+  import { ICON_BUTTON_CLASS, ICON_BUTTON_ON_PANEL_CLASS } from "$lib/components/ui/iconButton";
 
   /// Cap the per-tooltip warning rows so a session with a long tail
   /// (50+) doesn't render a wall of text. Anything beyond is summarized
@@ -909,7 +909,7 @@
         {#if agents.length > 0}
           <button
             type="button"
-            class={ICON_BUTTON_CLASS}
+            class={ICON_BUTTON_ON_PANEL_CLASS}
             aria-label={allExpanded ? "Collapse all agents" : "Expand all agents"}
             title={allExpanded ? "Collapse all" : "Expand all"}
             data-testid="sidebar-toggle-all"
@@ -938,7 +938,7 @@
         {#if onAddAgent}
           <button
             type="button"
-            class={ICON_BUTTON_CLASS}
+            class={ICON_BUTTON_ON_PANEL_CLASS}
             title="Add agent"
             aria-label="Add agent"
             data-testid="sidebar-add-agent"
@@ -1020,7 +1020,7 @@
               <button
                 type="button"
                 class={cn(
-                  ICON_BUTTON_ON_RAISED_CLASS,
+                  ICON_BUTTON_CLASS,
                   "shrink-0 disabled:cursor-not-allowed disabled:opacity-50",
                 )}
                 disabled={!canSave}
@@ -1064,7 +1064,7 @@
                       {...props}
                       type="button"
                       class={cn(
-                        ICON_BUTTON_ON_RAISED_CLASS,
+                        ICON_BUTTON_CLASS,
                         "shrink-0",
                         // The eye stays visible while the agent is hidden (it's
                         // the state indicator); otherwise it appears on hover
@@ -1091,7 +1091,7 @@
                 </Tooltip>
                 <DropdownMenu
                   triggerClass={cn(
-                    ICON_BUTTON_ON_RAISED_CLASS,
+                    ICON_BUTTON_CLASS,
                     "shrink-0",
                     "hidden group-focus-within:inline-flex group-hover:inline-flex data-[state=open]:inline-flex",
                   )}

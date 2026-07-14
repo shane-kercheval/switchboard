@@ -547,8 +547,11 @@ describe("ProjectsSidebar — delete", () => {
   it("keeps the card highlighted and actions open while the menu is open", async () => {
     await renderWith([projectIn(A1, "alpha", "/work/a")]);
     const row = screen.getByTestId("project-row");
+    const trigger = screen.getByTestId("project-actions-trigger");
 
     expect(row).toHaveAttribute("data-actions-open", "false");
+    expect(trigger.className).toContain("hover:bg-active");
+    expect(trigger.className).toContain("group-data-[actions-open=true]:hover:bg-control-hover");
     await openProjectActions();
 
     expect(row).toHaveAttribute("data-actions-open", "true");
@@ -557,6 +560,18 @@ describe("ProjectsSidebar — delete", () => {
     await fireEvent.keyDown(screen.getByTestId("project-action-show-git"), { key: "Escape" });
 
     await waitFor(() => expect(row).toHaveAttribute("data-actions-open", "false"));
+  });
+
+  it("uses the white-surface icon hover on an active project row", async () => {
+    const ws = await loadWorkspace();
+    ws.selection.activeProjectId = A1;
+    await renderWith([projectIn(A1, "alpha", "/work/a")]);
+
+    const row = screen.getByTestId("project-row");
+    const trigger = screen.getByTestId("project-actions-trigger");
+    expect(row).toHaveAttribute("data-active", "true");
+    expect(trigger.className).toContain("hover:bg-active");
+    expect(trigger.className).toContain("group-data-[active=true]:hover:bg-control-hover");
   });
 
   it("does not restore a stale open menu after project actions unmount", async () => {

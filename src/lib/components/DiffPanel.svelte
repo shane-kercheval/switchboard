@@ -23,7 +23,7 @@
   import DiffView from "$lib/components/DiffView.svelte";
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
   import AsyncIconButton from "$lib/components/ui/AsyncIconButton.svelte";
-  import { ICON_BUTTON_CLASS, ROW_ACTION_ICON_HOVER } from "$lib/components/ui/iconButton";
+  import { ICON_BUTTON_CLASS, ROW_ACTION_ICON_CLASS } from "$lib/components/ui/iconButton";
   import {
     SEGMENTED_MAIN_CONTAINER_CLASS,
     SEGMENTED_MAIN_ITEM_CLASS,
@@ -367,7 +367,7 @@
               <button
                 {...props}
                 type="button"
-                class={cn(ICON_BUTTON_CLASS, "hover:bg-hover h-5 w-5 shrink-0")}
+                class={cn(ICON_BUTTON_CLASS, "h-5 w-5 shrink-0")}
                 aria-label="Show commit message"
                 data-testid="commit-message-open"
                 onclick={() => {
@@ -435,7 +435,7 @@
           <button
             {...props}
             type="button"
-            class={cn(ICON_BUTTON_CLASS, "hover:bg-hover shrink-0")}
+            class={cn(ICON_BUTTON_CLASS, "shrink-0")}
             aria-label={detailExpanded ? "Restore Git details panel" : "Expand Git details panel"}
             data-testid="detail-expand-toggle"
             onclick={onToggleDetailExpanded}
@@ -452,7 +452,7 @@
 
     <button
       type="button"
-      class={cn(ICON_BUTTON_CLASS, "hover:bg-hover shrink-0")}
+      class={cn(ICON_BUTTON_CLASS, "shrink-0")}
       aria-label="Close diff panel"
       data-testid="detail-close"
       onclick={onClose}
@@ -550,7 +550,7 @@
             {@const isSelected = file.path === selectedFile}
             <li>
               <!-- `data-selected` drives the action-icons' hover color via the
-                   shared `ROW_ACTION_ICON_HOVER` `group-data-` variant: the
+                   shared `ROW_ACTION_ICON_CLASS` `group-data-` variant: the
                    icons hover a stronger gray by default and white (`bg-raised`) on a
                    selected (blue) row so they read against the blue. CSS (not a
                    JS class) because the buttons live inside Tooltip `{#snippet}`s,
@@ -619,7 +619,7 @@
                     {#snippet trigger(props)}
                       <AsyncIconButton
                         {...props}
-                        class={cn(ICON_BUTTON_CLASS, "h-6 w-6 shrink-0", ROW_ACTION_ICON_HOVER)}
+                        class={cn(ROW_ACTION_ICON_CLASS, "h-6 w-6 shrink-0")}
                         label={`Copy path for ${file.path}`}
                         testid="changed-file-copy-path"
                         action={() => copyFilePath(file)}
@@ -635,7 +635,7 @@
                       {#snippet trigger(props)}
                         <AsyncIconButton
                           {...props}
-                          class={cn(ICON_BUTTON_CLASS, "h-6 w-6 shrink-0", ROW_ACTION_ICON_HOVER)}
+                          class={cn(ROW_ACTION_ICON_CLASS, "h-6 w-6 shrink-0")}
                           label={`Open ${file.path} in editor`}
                           testid="changed-file-editor"
                           completeAfterMs={700}
@@ -655,7 +655,7 @@
                     {#snippet trigger(props)}
                       <AsyncIconButton
                         {...props}
-                        class={cn(ICON_BUTTON_CLASS, "h-6 w-6 shrink-0", ROW_ACTION_ICON_HOVER)}
+                        class={cn(ROW_ACTION_ICON_CLASS, "h-6 w-6 shrink-0")}
                         label={`Open ${file.path} in difftool`}
                         testid="changed-file-difftool"
                         completeAfterMs={700}

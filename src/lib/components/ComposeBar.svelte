@@ -68,7 +68,7 @@
   import HarnessIcon from "$lib/components/ui/HarnessIcon.svelte";
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
   import ClearIcon from "$lib/components/ui/ClearIcon.svelte";
-  import { ICON_BUTTON_ON_RAISED_CLASS } from "$lib/components/ui/iconButton";
+  import { ICON_BUTTON_CLASS } from "$lib/components/ui/iconButton";
   import PromptMenu from "$lib/components/PromptMenu.svelte";
   import PromptComposer from "$lib/components/PromptComposer.svelte";
   import WorkflowMenu from "$lib/components/WorkflowMenu.svelte";
@@ -2407,7 +2407,7 @@
                  drop at once. -->
             <button
               type="button"
-              class={cn(ICON_BUTTON_ON_RAISED_CLASS, "ml-0.5 shrink-0 disabled:opacity-50")}
+              class={cn(ICON_BUTTON_CLASS, "ml-0.5 shrink-0 disabled:opacity-50")}
               data-testid="forward-sources-clear"
               aria-label="Clear forward sources"
               title="Clear forward sources"
@@ -2502,7 +2502,7 @@
                   <button
                     {...props}
                     type="button"
-                    class={cn(ICON_BUTTON_ON_RAISED_CLASS, "ml-0.5")}
+                    class={cn(ICON_BUTTON_CLASS, "ml-0.5")}
                     data-testid="recipient-clear"
                     aria-label="Clear recipients"
                     disabled={sending}
@@ -2635,7 +2635,7 @@
               <span class="truncate" title={chip.original_name}>{chip.original_name}</span>
               <button
                 type="button"
-                class="text-muted hover:text-fg hover:bg-raised flex h-4 w-4 shrink-0 items-center justify-center rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-50"
+                class="text-muted hover:text-fg hover:bg-control-hover flex h-4 w-4 shrink-0 items-center justify-center rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-50"
                 data-testid={`attachment-chip-remove-${chip.label}`}
                 aria-label={`Remove ${chip.original_name}`}
                 disabled={sending}

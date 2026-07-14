@@ -131,7 +131,7 @@
       <h1 class="text-fg text-2xl font-semibold">Settings</h1>
       <button
         type="button"
-        class={cn(ICON_BUTTON_CLASS, "hover:bg-panel")}
+        class={ICON_BUTTON_CLASS}
         aria-label="Close settings"
         data-testid="settings-close"
         onclick={onClose}
@@ -376,7 +376,7 @@
             <button
               {...props}
               type="button"
-              class={cn(ICON_BUTTON_CLASS, "hover:bg-hover shrink-0")}
+              class={cn(ICON_BUTTON_CLASS, "shrink-0")}
               aria-label="Open workflows folder in Finder"
               data-testid="workflows-open"
               disabled={workflowsDir === null}
@@ -424,7 +424,7 @@
             <button
               {...props}
               type="button"
-              class={cn(ICON_BUTTON_CLASS, "hover:bg-hover shrink-0")}
+              class={cn(ICON_BUTTON_CLASS, "shrink-0")}
               aria-label="Open local prompts folder in Finder"
               data-testid="local-prompts-open"
               disabled={promptsDir === null}

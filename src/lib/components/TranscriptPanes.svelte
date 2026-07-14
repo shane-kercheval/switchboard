@@ -487,7 +487,7 @@
                     <button
                       {...props}
                       type="button"
-                      class={cn(ICON_BUTTON_CLASS, "hover:bg-hover shrink-0")}
+                      class={cn(ICON_BUTTON_CLASS, "shrink-0")}
                       aria-label="Save pane name"
                       data-testid="pane-rename-save"
                       onmousedown={(event) => event.preventDefault()}
@@ -581,7 +581,7 @@
                       <button
                         {...props}
                         type="button"
-                        class={cn(ICON_BUTTON_CLASS, "hover:bg-hover shrink-0")}
+                        class={cn(ICON_BUTTON_CLASS, "shrink-0")}
                         aria-label={`Minimize ${pane.name}`}
                         data-testid="pane-minimize"
                         onclick={(event) => {
@@ -604,7 +604,7 @@
                       <button
                         {...props}
                         type="button"
-                        class={cn(ICON_BUTTON_CLASS, "hover:bg-hover shrink-0")}
+                        class={cn(ICON_BUTTON_CLASS, "shrink-0")}
                         aria-label={maximizedPane?.id === pane.id
                           ? "Restore panes"
                           : `Maximize ${pane.name}`}
@@ -626,7 +626,7 @@
                 <DropdownMenu
                   triggerLabel={`Actions for ${pane.name}`}
                   triggerTestid="pane-actions"
-                  triggerClass={cn(ICON_BUTTON_CLASS, "hover:bg-hover shrink-0")}
+                  triggerClass={cn(ICON_BUTTON_CLASS, "shrink-0")}
                   contentTestid="pane-actions-menu"
                 >
                   {#snippet trigger()}

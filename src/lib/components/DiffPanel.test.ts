@@ -529,7 +529,7 @@ describe("DiffPanel (uncommitted target)", () => {
     expect(rowOf(0)).toHaveAttribute("data-selected", "true");
     expect(rowOf(1)).toHaveAttribute("data-selected", "false");
 
-    // The action icons carry the stronger gray default plus the selected-row white
+    // The action icons carry the stronger row-action hover plus the selected-row white
     // override; CSS picks between them off the row's `data-selected`.
     const difftool = within(rowOf(0)).getByTestId("changed-file-difftool");
     expect(difftool.className).toContain("hover:bg-active");

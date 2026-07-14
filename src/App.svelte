@@ -1029,7 +1029,7 @@
                 <button
                   {...props}
                   type="button"
-                  class={cn(ICON_BUTTON_CLASS, "hover:bg-panel shrink-0")}
+                  class={cn(ICON_BUTTON_CLASS, "shrink-0")}
                   aria-label="Add empty pane"
                   data-testid="app-pane-add"
                   onclick={addEmptyPane}
@@ -1047,7 +1047,7 @@
                   aria-label={compactLabel}
                   data-testid="transcript-compact-toggle"
                   data-tauri-no-drag
-                  class={cn(ICON_BUTTON_CLASS, "hover:bg-panel shrink-0")}
+                  class={cn(ICON_BUTTON_CLASS, "shrink-0")}
                 >
                   {#if compactEnabled}
                     <ChevronsUpDown size={ICON_SIZE} aria-hidden="true" />
@@ -1109,11 +1109,7 @@
             Git
           </button>
         </div>
-        <CommandPaletteButton
-          testid="command-palette-button"
-          onclick={() => togglePalette()}
-          class="hover:bg-panel"
-        />
+        <CommandPaletteButton testid="command-palette-button" onclick={() => togglePalette()} />
         {#if showAgentsToggle}
           <SidebarToggleButton
             side="right"
@@ -1121,7 +1117,6 @@
             label={layout.agentsSidebarOpen ? "Hide agents sidebar" : "Show agents sidebar"}
             testid="agents-sidebar-toggle"
             onclick={() => (layout.agentsSidebarOpen = !layout.agentsSidebarOpen)}
-            class="hover:bg-panel"
           />
         {/if}
       </div>

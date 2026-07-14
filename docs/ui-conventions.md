@@ -25,14 +25,17 @@ Three fills and one line, each with exactly one job:
 
 Note that **sidebars are `panel`, not `surface`** (`SidebarPanel` paints `bg-panel`): they read as recessed side rails against the `raised` content pane, and `surface` is the shell behind everything.
 
-Plus two neutral **interaction** fills — `hover` (the wash under a hovered row or icon button on a `raised`/white surface) and `active` (one step stronger: a pressed control, a toggle's off-track, a progress groove, a resize seam) — and the blue `focus` token (below).
+Plus three neutral **interaction** fills — `hover` (the subtle wash under a large row or menu item), `control-hover` (the more visible fill under a compact icon or pill control), and `active` (the strongest interaction step, used for pressed controls, tracks/grooves, and compact actions nested in an already-hovered row) — and the blue `focus` token (below).
 
 Keep the ramp to these. It was once ~15 near-identical grays (several within a percent or two of luminance); the steps were too small to read as hierarchy yet numerous enough to look muddy. Depth comes from *stepping* these few layers, not from adding shades or shadows.
 
-**Hover contrast depends on the surface underneath, so hover has two contexts — no new token, just a direction:**
+**Match hover strength to target size, not to whichever surface token happens to sit underneath:**
 
-- On a **`raised`/white** surface (menus, content rows, cards), a hover target uses **`bg-hover`** — a subtle darkening wash. An action icon revealed inside a row that is itself hovered uses the stronger **`bg-active`**, so its circular hover affordance remains visible; on a selected blue row, use **`ROW_ACTION_ICON_HOVER`** to switch that icon hover to `bg-raised`.
-- On a **`panel`** surface (sidebars, code blocks, the Git-view panels), `bg-hover` is nearly invisible (it's a hair off `panel`), so a hover target **brightens to `raised`** instead — `ICON_BUTTON_CLASS`, the selected-row override in `ROW_ACTION_ICON_HOVER` (`iconButton.ts`), the DiffPanel resize handle, and the code-block copy button all do this. It's theme-consistent: `raised` is lighter than `panel` in both light and dark.
+- A **large row or menu item** uses `bg-hover`. Its area makes the subtle wash legible without turning lists into heavy gray blocks.
+- A **compact neutral control on `raised` or `surface`** uses `bg-control-hover` through `ICON_BUTTON_CLASS` or its primitive's equivalent.
+- A **compact control resting directly on a `panel` sidebar** uses `ICON_BUTTON_ON_PANEL_CLASS` and brightens to `bg-raised`. The same header controls fall back to `ICON_BUTTON_CLASS` when the sidebar is closed and they move onto a white surface.
+- An **action icon inside a selectable row** uses `ROW_ACTION_ICON_CLASS`. It uses `bg-active` so its direct hover remains visible inside the row's gray hover; on a selected blue row it switches to `bg-raised`.
+- Don't use `bg-active` as a general stronger-hover fallback. Its hover use is limited to nested row actions; otherwise reserve it for pressed/latched states, tracks, grooves, and resize seams.
 - **One documented exception:** a row on a `panel` sidebar whose *selected* state is already `raised` (the projects sidebar) can't use `raised` for hover — it would be indistinguishable from selected — so it lightens to `surface`, the off-white step between panel and white. This is the *only* sanctioned use of `surface` as a hover fill; don't generalize it.
 
 **Two banned patterns, both mechanically enforced** by `tests/token-ramp-scan.test.ts`:
@@ -43,6 +46,8 @@ Keep the ramp to these. It was once ~15 near-identical grays (several within a p
 **A third rule is review-only, not tooled: at most two nested neutral treatments, counting fills and borders together.** A bordered container's child gets a fill *or* nothing, not both — otherwise a borderless design collapses back into nested boxes. A text scan can't count nesting, so this one relies on a human eye in review rather than the test; watch for it.
 
 Blue means exactly one thing: **`focus`**. Inputs, buttons, and menus show it as a thin focus **ring**; the compose box shows it as a **border-color** change (deliberately border-only, to keep that large card's highlight minimal). `focus-soft` is the pale tint for user-authored input surfaces (the user and held-forward message bubbles). It is deliberately blue, not the teal `accent` — a green highlight on a text field reads as *valid*, not *focused*. It shows on actual focus and clears when focus leaves, so it signals *where keyboard focus is* rather than sitting on permanently.
+
+Segmented controls share one color system regardless of size: a `raised` track, `panel` hover for inactive options, and the named neutral `segment-selected` fill for the active option. Standard form controls and compact page-header controls may differ in height and type size, but not in color semantics.
 
 ## Reach for a primitive before hand-rolling
 

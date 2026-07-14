@@ -48,13 +48,13 @@
   import { workflowRuns, cancelRun } from "$lib/state/workflows.svelte";
   import DropdownMenu from "$lib/components/ui/DropdownMenu.svelte";
   import DropdownMenuItem from "$lib/components/ui/DropdownMenuItem.svelte";
-  import { ICON_BUTTON_CLASS } from "$lib/components/ui/iconButton";
+  import { ICON_BUTTON_ON_PANEL_CLASS, ROW_ACTION_ICON_CLASS } from "$lib/components/ui/iconButton";
   import { openInEditor, openInTerminal, revealInFinder } from "$lib/api";
   import {
-    SEGMENTED_CONTAINER_CLASS,
-    SEGMENTED_ITEM_INACTIVE_CLASS,
+    SEGMENTED_MAIN_CONTAINER_CLASS,
     SEGMENTED_MAIN_ITEM_ACTIVE_CLASS,
     SEGMENTED_MAIN_ITEM_CLASS,
+    SEGMENTED_MAIN_ITEM_INACTIVE_CLASS,
   } from "$lib/components/ui/segmentedControl";
   import { windowDragRegion } from "$lib/windowDrag";
 
@@ -125,10 +125,16 @@
   const segmentClass = (selected: boolean): string =>
     cn(
       SEGMENTED_MAIN_ITEM_CLASS,
-      selected ? SEGMENTED_MAIN_ITEM_ACTIVE_CLASS : SEGMENTED_ITEM_INACTIVE_CLASS,
+      selected ? SEGMENTED_MAIN_ITEM_ACTIVE_CLASS : SEGMENTED_MAIN_ITEM_INACTIVE_CLASS,
     );
-  const addProjectClass =
-    "text-muted hover:bg-raised hover:text-fg focus-visible:ring-focus focus-visible:bg-raised focus-visible:text-fg inline-flex h-[26px] w-[26px] items-center justify-center rounded-full transition-colors focus-visible:ring-1 focus-visible:outline-none";
+  const addProjectClass = cn(
+    ICON_BUTTON_ON_PANEL_CLASS,
+    "focus-visible:ring-focus focus-visible:bg-raised focus-visible:text-fg transition-colors focus-visible:ring-1 focus-visible:outline-none",
+  );
+  const projectRowActionClass = cn(
+    ROW_ACTION_ICON_CLASS,
+    "group-data-[active=true]:hover:bg-control-hover group-data-[actions-open=true]:hover:bg-control-hover",
+  );
 
   /// Inline rename editor (mirrors the agent-card rename in `Sidebar.svelte`).
   /// Only one row edits at a time, so a single `editingProjectId` + `draftName`
@@ -381,12 +387,18 @@
     data-tauri-drag-region
     use:windowDragRegion
   >
-    <SettingsButton pressed={settingsOpen} testid="settings-button" onclick={onOpenSettings} />
+    <SettingsButton
+      pressed={settingsOpen}
+      testid="settings-button"
+      class="hover:bg-raised"
+      onclick={onOpenSettings}
+    />
     <SidebarToggleButton
       side="left"
       expanded={true}
       label="Hide projects sidebar"
       testid="projects-sidebar-toggle"
+      class="hover:bg-raised"
       onclick={onToggleSidebar}
     />
   </div>
@@ -404,7 +416,7 @@
     {#snippet action()}
       <div class="flex items-center gap-1.5">
         <div
-          class={cn(SEGMENTED_CONTAINER_CLASS, "flex")}
+          class={cn(SEGMENTED_MAIN_CONTAINER_CLASS, "flex")}
           role="tablist"
           aria-label="Filter projects"
           data-testid="project-view-toggle"
@@ -561,7 +573,7 @@
                   <button
                     type="button"
                     class={cn(
-                      ICON_BUTTON_CLASS,
+                      projectRowActionClass,
                       "shrink-0 disabled:cursor-not-allowed disabled:opacity-50",
                     )}
                     disabled={!canSave}
@@ -650,7 +662,7 @@
                       triggerLabel={`Actions for ${project.name}`}
                       triggerTestid="project-actions-trigger"
                       triggerTabindex={-1}
-                      triggerClass={cn(ICON_BUTTON_CLASS, "hover:bg-active shrink-0")}
+                      triggerClass={cn(projectRowActionClass, "shrink-0")}
                       contentTestid="project-actions-menu"
                     >
                       {#snippet trigger()}

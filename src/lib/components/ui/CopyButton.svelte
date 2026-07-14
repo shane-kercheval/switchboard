@@ -37,7 +37,7 @@
     className,
     copied
       ? "bg-accent-soft text-accent hover:bg-accent-soft hover:text-accent"
-      : "text-muted hover:text-fg hover:bg-hover",
+      : "text-muted hover:text-fg hover:bg-control-hover",
   )}
   data-testid={testid}
   data-copied={copied ? "true" : undefined}

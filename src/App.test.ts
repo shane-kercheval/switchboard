@@ -2359,7 +2359,7 @@ describe("App", () => {
     expect(selection.selectionFor("p-a")).toEqual(["ag-1"]);
 
     // Split, then ⌘⌥2 targets the new pane and ⌘⌥1 the leftmost — full
-    // replace semantics, same meaning as clicking the pane header.
+    // replace semantics, same meaning as Cmd+clicking the pane.
     panes.moveAgentToNewPane("p-a", roster, "ag-2");
     await fireEvent.keyDown(window, { key: "2", code: "Digit2", metaKey: true, altKey: true });
     expect(selection.selectionFor("p-a")).toEqual(["ag-2"]);

@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/svelte";
+import { fireEvent, render, screen, within } from "@testing-library/svelte";
 import type { AgentRecord, ConversationItem, NormalizedEvent } from "$lib/types";
 // Static import so the component-tree transform happens at module collection,
 // not inside the first test's timeout (cold CI transforms have no vite cache).
@@ -8,7 +8,6 @@ import type { AgentRecord, ConversationItem, NormalizedEvent } from "$lib/types"
 import TranscriptPanes from "./TranscriptPanes.svelte";
 import {
   layoutFor,
-  minimizePane,
   moveAgentToPane,
   moveAgentToNewPane,
   toggleAgentHidden,
@@ -23,7 +22,6 @@ import {
 import { setProjectCompact, _testing as previewState } from "$lib/state/transcriptPreview.svelte";
 import { workflowRuns, _testing as workflowState } from "$lib/state/workflows.svelte";
 import { tick } from "svelte";
-import { shortcut } from "$lib/platform";
 
 const listeners = new Map<string, (e: { payload: NormalizedEvent }) => void>();
 vi.mock("@tauri-apps/api/event", () => ({
@@ -312,6 +310,31 @@ describe("pane chrome (headers, rename, close)", () => {
     expect(selectionFor(PROJECT_ID)).toEqual([]);
   });
 
+  it("renames by double-clicking the pane name while a single click stays inert", async () => {
+    await seedTwoAgentTranscripts();
+    moveAgentToNewPane(PROJECT_ID, ROSTER_IDS, BOB.id);
+    setRecipients(PROJECT_ID, [ALICE.id]);
+    renderPanes();
+
+    const name = screen.getAllByTestId("pane-name")[1]!;
+    await fireEvent.click(name);
+    expect(selectionFor(PROJECT_ID)).toEqual([ALICE.id]);
+    expect(screen.queryByTestId("pane-rename-input")).not.toBeInTheDocument();
+
+    await fireEvent.dblClick(name);
+    const input = screen.getByTestId("pane-rename-input");
+    expect(input).toHaveValue("Pane 2");
+    expect(selectionFor(PROJECT_ID)).toEqual([ALICE.id]);
+
+    await fireEvent.input(input, { target: { value: "reviewers" } });
+    await fireEvent.keyDown(input, { key: "Enter" });
+    expect(screen.getAllByTestId("pane-name")[1]).toHaveTextContent("reviewers");
+    expect(selectionFor(PROJECT_ID)).toEqual([ALICE.id]);
+
+    await fireEvent.click(screen.getAllByTestId("pane-name")[1]!, { metaKey: true });
+    expect(selectionFor(PROJECT_ID)).toEqual([BOB.id]);
+  });
+
   it("closing one of two panes dismisses that pane's agents, leaving the survivor", async () => {
     await seedTwoAgentTranscripts();
     moveAgentToNewPane(PROJECT_ID, ROSTER_IDS, BOB.id);
@@ -596,9 +619,8 @@ describe("visibility", () => {
     renderPanes();
 
     const paneB = paneEls()[1]!;
-    // The name renders, but not as the "Send to" button.
+    // The name remains available for rename, but not as a send target.
     expect(within(paneB).getByTestId("pane-name")).toBeInTheDocument();
-    expect(within(paneB).queryByTestId("pane-target")).not.toBeInTheDocument();
 
     // Cmd+click targeting an empty pane would only clear the recipient set.
     await fireEvent.click(paneB, { metaKey: true });
@@ -607,16 +629,6 @@ describe("visibility", () => {
 });
 
 describe("targeting", () => {
-  it("header click replaces the recipient set with the pane's members", async () => {
-    await seedTwoAgentTranscripts();
-    moveAgentToNewPane(PROJECT_ID, ROSTER_IDS, BOB.id);
-    setRecipients(PROJECT_ID, [ALICE.id]);
-    renderPanes();
-
-    await fireEvent.click(screen.getAllByTestId("pane-target")[1]!);
-    expect(selectionFor(PROJECT_ID)).toEqual([BOB.id]);
-  });
-
   it("Cmd+click anywhere in a pane targets it; plain click never does", async () => {
     await seedTwoAgentTranscripts();
     moveAgentToNewPane(PROJECT_ID, ROSTER_IDS, BOB.id);
@@ -835,61 +847,6 @@ describe("Cmd-held target overlay", () => {
 
     await fireEvent.blur(window);
     expect(screen.queryByTestId("pane-target-overlay")).not.toBeInTheDocument();
-  });
-});
-
-describe("pane header shortcut hints", () => {
-  beforeEach(() => {
-    vi.useFakeTimers({ shouldAdvanceTime: true });
-  });
-
-  afterEach(() => {
-    vi.useRealTimers();
-  });
-
-  it("only shows Cmd+Alt shortcut hints for panes 1 through 9", async () => {
-    const agents = Array.from({ length: 10 }, (_, i) => numberedAgent(i + 1));
-    const rosterIds = agents.map((agent) => agent.id);
-    for (const agent of agents.slice(1)) {
-      moveAgentToNewPane(PROJECT_ID, rosterIds, agent.id);
-    }
-    render(TranscriptPanes, { props: { projectId: PROJECT_ID, agents } });
-
-    const targets = screen.getAllByTestId("pane-target");
-    expect(targets).toHaveLength(10);
-
-    await fireEvent.pointerEnter(targets[8]!);
-    await vi.advanceTimersByTimeAsync(500);
-    let content = await waitFor(() => screen.getByTestId("tooltip-content"));
-    expect(content).toHaveTextContent("Send to Pane 9");
-    expect(content).toHaveTextContent(shortcut("mod", "alt", "9"));
-
-    await fireEvent.pointerLeave(targets[8]!);
-    await fireEvent.pointerEnter(targets[9]!);
-    await vi.advanceTimersByTimeAsync(500);
-    content = await waitFor(() => screen.getByTestId("tooltip-content"));
-    expect(content).toHaveTextContent("Send to Pane 10");
-    expect(content).not.toHaveTextContent(shortcut("mod", "alt", "10"));
-  });
-
-  it("keeps shortcut hints aligned to full pane order when a pane is minimized", async () => {
-    const carol = numberedAgent(3);
-    const agents = [ALICE, BOB, carol];
-    const rosterIds = agents.map((agent) => agent.id);
-    const pane2 = moveAgentToNewPane(PROJECT_ID, rosterIds, BOB.id);
-    moveAgentToNewPane(PROJECT_ID, rosterIds, carol.id);
-    minimizePane(PROJECT_ID, rosterIds, pane2);
-    render(TranscriptPanes, { props: { projectId: PROJECT_ID, agents } });
-
-    const targets = screen.getAllByTestId("pane-target");
-    expect(targets).toHaveLength(2);
-
-    await fireEvent.pointerEnter(targets[1]!);
-    await vi.advanceTimersByTimeAsync(500);
-    const content = await waitFor(() => screen.getByTestId("tooltip-content"));
-    expect(content).toHaveTextContent("Send to Pane 3");
-    expect(content).toHaveTextContent(shortcut("mod", "alt", "3"));
-    expect(content).not.toHaveTextContent(shortcut("mod", "alt", "2"));
   });
 });
 

@@ -1,7 +1,7 @@
 // The compose recipient set, per project — the **single source of truth for
 // "who receives the send."**
 //
-// Pane targeting (header click, Cmd+click, `@panename`, Cmd+Alt+N) and the
+// Pane targeting (Cmd+click, `@panename`, Cmd+Alt+N) and the
 // pane coverage borders are all lenses over this one value: gestures *write*
 // it, visuals *derive* from it. There is deliberately no stored
 // "targeted pane" / "docked pane" anywhere — a second stored representation of
@@ -46,8 +46,8 @@ export function setRecipients(projectId: ProjectId, ids: AgentId[]): void {
   store[projectId] = ids;
 }
 
-/// Replace the recipient set from a user-targeting gesture (pane header,
-/// Cmd+click, `@panename`, Cmd+Alt+N) with the pane's full member list
+/// Replace the recipient set from a user-targeting gesture (Cmd+click,
+/// `@panename`, Cmd+Alt+N) with the pane's full member list
 /// (replace semantics — same meaning as `@agentname`). Refused (returns
 /// false) while targeting is locked for the project.
 export function targetRecipients(projectId: ProjectId, ids: AgentId[]): boolean {

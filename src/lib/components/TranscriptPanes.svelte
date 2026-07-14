@@ -135,7 +135,7 @@
   }
 
   /// Replace the recipient set with the pane's members — the meaning of every
-  /// targeting gesture (header click, Cmd+click, `@panename`, Cmd+Alt+N).
+  /// targeting gesture (Cmd+click, `@panename`, Cmd+Alt+N).
   /// An empty pane is not a send target anywhere: targeting it could only
   /// clear the recipient set, silently. Goes through `targetRecipients` so the
   /// prompt-render targeting freeze applies (see recipientSelection).
@@ -340,9 +340,9 @@
   }
 
   // ── Inline pane rename ──────────────────────────────────────────────────────
-  // Mirrors the sidebar's agent-rename pattern: explicit edit affordance opens
-  // an inline input; Enter/check commits, Escape/blur cancels. The header
-  // text itself is the *target* gesture, so the two affordances never collide.
+  // Mirrors the sidebar's agent-rename pattern: double-clicking the name or
+  // choosing Rename opens an inline input; Enter/check commits, Escape/blur
+  // cancels. Plain name clicks stay inert so they cannot re-target a draft.
   let renamingPaneId = $state<string | null>(null);
   let renameDraft = $state("");
 
@@ -498,48 +498,23 @@
                   {/snippet}
                 </Tooltip>
               {:else}
-                {#if pane.members.length === 0}
-                  <!-- An empty pane is not a send target — a "Send to" affordance
-                   here could only clear the recipient set. Plain name; the
-                   pane body explains how to populate it. -->
-                  <span
-                    class="text-muted flex h-6 min-w-0 flex-1 items-center px-1.5 text-xs font-semibold"
-                    data-testid="pane-name"
-                  >
-                    {pane.name}
-                  </span>
-                {:else if multiPane}
-                  <Tooltip
-                    label={`Send to ${pane.name}`}
-                    shortcut={item.originalIndex < 9
-                      ? shortcut("mod", "alt", String(item.originalIndex + 1))
-                      : undefined}
-                  >
-                    {#snippet trigger(props)}
-                      <button
-                        {...props}
-                        type="button"
-                        class="hover:bg-panel flex h-6 min-w-0 items-center rounded px-1.5 text-left"
-                        data-testid="pane-target"
-                        onclick={() => targetPane(pane)}
-                      >
-                        <span
-                          class="text-fg truncate text-xs font-semibold"
-                          data-testid="pane-name"
-                        >
-                          {pane.name}
-                        </span>
-                      </button>
-                    {/snippet}
-                  </Tooltip>
-                {:else}
-                  <span
-                    class="text-fg flex h-6 min-w-0 items-center px-1.5 text-xs font-semibold"
-                    data-testid="pane-name"
-                  >
-                    {pane.name}
-                  </span>
-                {/if}
+                <!-- Keyboard users can start the same edit from Rename in the pane menu. -->
+                <!-- svelte-ignore a11y_no_static_element_interactions -->
+                <span
+                  class={cn(
+                    "flex h-6 min-w-0 items-center truncate px-1.5 text-xs font-semibold",
+                    pane.members.length === 0 ? "text-muted" : "text-fg",
+                  )}
+                  data-testid="pane-name"
+                  title="Double-click to rename"
+                  ondblclick={(event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    startRename(pane);
+                  }}
+                >
+                  {pane.name}
+                </span>
                 <div class="flex min-w-0 flex-1 items-center gap-1 overflow-hidden">
                   {#each paneMemberAgents(pane) as member (member.id)}
                     <span

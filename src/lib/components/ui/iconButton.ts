@@ -15,10 +15,7 @@ export const ICON_BUTTON_ON_RAISED_CLASS = `${ICON_BUTTON_BASE} hover:bg-panel`;
 
 export const ICON_SIZE = 18;
 
-/// Hover treatment for an action icon on a *selected* row — a list/tree row that
-/// sets `data-selected` on its `group` element. The row's selected fill makes the
-/// icons' default gray hover muddy, so this overrides it to the white `bg-raised`
-/// fill. Apply the gray default explicitly alongside it (`hover:bg-hover`):
-/// this handles only the selected case, deliberately, so both states are named at
-/// the call site. Generic affordance; the Git view is its only consumer today.
-export const SELECTED_ROW_ICON_HOVER = "group-data-[selected=true]:hover:bg-raised";
+/// Hover treatment for an action icon nested in a selectable row. The stronger
+/// neutral default stays visible when the row itself already has `bg-hover`; a
+/// selected blue row overrides it to the light `bg-raised` fill.
+export const ROW_ACTION_ICON_HOVER = "hover:bg-active group-data-[selected=true]:hover:bg-raised";

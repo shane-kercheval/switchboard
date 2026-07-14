@@ -223,6 +223,23 @@ describe("DiffPanel (uncommitted target)", () => {
     );
   });
 
+  it("orders copy before editor and difftool for uncommitted files", async () => {
+    wire({ files: [changedFile("src/code.ts")] });
+    render(DiffPanel, { props: { target: wtTarget(), onClose: noop } });
+    await waitFor(() => expect(screen.getByTestId("diff-view")).toBeInTheDocument());
+
+    const row = screen.getByTestId("changed-file").parentElement;
+    const actionTestIds = Array.from(
+      row?.querySelectorAll('[data-testid^="changed-file-"]') ?? [],
+    ).map((element) => element.getAttribute("data-testid"));
+
+    expect(actionTestIds).toEqual([
+      "changed-file-copy-path",
+      "changed-file-editor",
+      "changed-file-difftool",
+    ]);
+  });
+
   it("does not show the editor action for a deleted worktree file", async () => {
     wire({ files: [changedFile("src/removed.ts", "deleted")] });
     render(DiffPanel, {
@@ -512,10 +529,10 @@ describe("DiffPanel (uncommitted target)", () => {
     expect(rowOf(0)).toHaveAttribute("data-selected", "true");
     expect(rowOf(1)).toHaveAttribute("data-selected", "false");
 
-    // The action icons carry the gray default plus the selected-row white
+    // The action icons carry the stronger gray default plus the selected-row white
     // override; CSS picks between them off the row's `data-selected`.
     const difftool = within(rowOf(0)).getByTestId("changed-file-difftool");
-    expect(difftool.className).toContain("hover:bg-hover");
+    expect(difftool.className).toContain("hover:bg-active");
     expect(difftool.className).toContain("group-data-[selected=true]:hover:bg-raised");
   });
 
@@ -606,12 +623,17 @@ describe("DiffPanel (commit target)", () => {
     });
   });
 
-  it("does not show copy-path actions for commit files", async () => {
+  it("copies a commit file's repo-root-based path", async () => {
     wire({ files: [changedFile("code.ts")] });
     render(DiffPanel, { props: { target: commitTarget(), onClose: noop } });
     await waitFor(() => expect(screen.getByTestId("diff-view")).toBeInTheDocument());
 
-    expect(screen.queryByTestId("changed-file-copy-path")).not.toBeInTheDocument();
+    await fireEvent.click(screen.getByLabelText("Copy path for code.ts"));
+
+    expect(copyTextMock).toHaveBeenCalledWith("/repo/code.ts");
+    await waitFor(() =>
+      expect(screen.getByTestId("changed-file-copy-path")).toHaveAttribute("data-state", "done"),
+    );
   });
 
   it("shows a calm empty state for a commit that changed no files", async () => {

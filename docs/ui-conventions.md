@@ -31,8 +31,8 @@ Keep the ramp to these. It was once ~15 near-identical grays (several within a p
 
 **Hover contrast depends on the surface underneath, so hover has two contexts — no new token, just a direction:**
 
-- On a **`raised`/white** surface (menus, content rows, cards), a hover target uses **`bg-hover`** — a subtle darkening wash.
-- On a **`panel`** surface (sidebars, code blocks, the Git-view panels), `bg-hover` is nearly invisible (it's a hair off `panel`), so a hover target **brightens to `raised`** instead — `ICON_BUTTON_CLASS`, `SELECTED_ROW_ICON_HOVER` (`iconButton.ts`), the DiffPanel resize handle, and the code-block copy button all do this. It's theme-consistent: `raised` is lighter than `panel` in both light and dark.
+- On a **`raised`/white** surface (menus, content rows, cards), a hover target uses **`bg-hover`** — a subtle darkening wash. An action icon revealed inside a row that is itself hovered uses the stronger **`bg-active`**, so its circular hover affordance remains visible; on a selected blue row, use **`ROW_ACTION_ICON_HOVER`** to switch that icon hover to `bg-raised`.
+- On a **`panel`** surface (sidebars, code blocks, the Git-view panels), `bg-hover` is nearly invisible (it's a hair off `panel`), so a hover target **brightens to `raised`** instead — `ICON_BUTTON_CLASS`, the selected-row override in `ROW_ACTION_ICON_HOVER` (`iconButton.ts`), the DiffPanel resize handle, and the code-block copy button all do this. It's theme-consistent: `raised` is lighter than `panel` in both light and dark.
 - **One documented exception:** a row on a `panel` sidebar whose *selected* state is already `raised` (the projects sidebar) can't use `raised` for hover — it would be indistinguishable from selected — so it lightens to `surface`, the off-white step between panel and white. This is the *only* sanctioned use of `surface` as a hover fill; don't generalize it.
 
 **Two banned patterns, both mechanically enforced** by `tests/token-ramp-scan.test.ts`:

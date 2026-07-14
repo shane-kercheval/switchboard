@@ -24,7 +24,7 @@
   import AsyncIconButton from "$lib/components/ui/AsyncIconButton.svelte";
   import DropdownMenu from "$lib/components/ui/DropdownMenu.svelte";
   import DropdownMenuItem from "$lib/components/ui/DropdownMenuItem.svelte";
-  import { ICON_BUTTON_CLASS, SELECTED_ROW_ICON_HOVER } from "$lib/components/ui/iconButton";
+  import { ICON_BUTTON_CLASS, ROW_ACTION_ICON_HOVER } from "$lib/components/ui/iconButton";
   import {
     localBranchIndicators,
     remoteBranchIndicators,
@@ -425,7 +425,7 @@
       >
         <button
           type="button"
-          class={cn(ICON_BUTTON_CLASS, "hover:bg-hover shrink-0 disabled:opacity-50")}
+          class={cn(ICON_BUTTON_CLASS, ROW_ACTION_ICON_HOVER, "shrink-0 disabled:opacity-50")}
           aria-label="Refresh repo"
           data-testid="repo-refresh"
           disabled={busy}
@@ -453,7 +453,7 @@
           {#snippet trigger(props)}
             <AsyncIconButton
               {...props}
-              class={cn(ICON_BUTTON_CLASS, "hover:bg-hover shrink-0")}
+              class={cn(ICON_BUTTON_CLASS, ROW_ACTION_ICON_HOVER, "shrink-0")}
               label="Reveal repo in Finder"
               testid="repo-action-reveal"
               completeAfterMs={700}
@@ -472,7 +472,7 @@
           {#snippet trigger(props)}
             <AsyncIconButton
               {...props}
-              class={cn(ICON_BUTTON_CLASS, "hover:bg-hover shrink-0")}
+              class={cn(ICON_BUTTON_CLASS, ROW_ACTION_ICON_HOVER, "shrink-0")}
               label="Open repo in editor"
               testid="repo-action-editor"
               completeAfterMs={700}
@@ -491,7 +491,7 @@
           {#snippet trigger(props)}
             <AsyncIconButton
               {...props}
-              class={cn(ICON_BUTTON_CLASS, "hover:bg-hover shrink-0")}
+              class={cn(ICON_BUTTON_CLASS, ROW_ACTION_ICON_HOVER, "shrink-0")}
               label="Copy repo path"
               testid="repo-action-copy-path"
               action={() => {
@@ -591,13 +591,12 @@
                   ICON_BUTTON_CLASS,
                   "shrink-0 opacity-0 group-focus-within:opacity-100 data-[state=open]:opacity-100",
                   triggerHoverReveal,
-                  // Default gray hover, overridden to the white `bg-raised` fill
+                  // Stronger gray hover, overridden to the white `bg-raised` fill
                   // on a selected (blue) row so it reads against the blue. Driven
                   // off the row's `data-selected` (a `group-data-` CSS variant),
                   // not a JS class — the trigger lives in a `{#snippet}` that
                   // doesn't re-render when the row's selected state changes.
-                  "hover:bg-hover",
-                  SELECTED_ROW_ICON_HOVER,
+                  ROW_ACTION_ICON_HOVER,
                   actionsOpen && "opacity-100",
                 )}
                 contentTestid="worktree-actions-menu"

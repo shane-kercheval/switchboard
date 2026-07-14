@@ -1,7 +1,8 @@
 import { expect, test, vi } from "vitest";
 import { page } from "vitest/browser";
 
-// The changed-files action icons (AsyncIconButton) hover gray by default. On a
+// The changed-files action icons (AsyncIconButton) use a stronger gray than the
+// row hover by default. On a
 // selected (blue) row that's overridden to the white `bg-raised` hover via a
 // `group-data-[selected=true]` variant on the row. jsdom can't evaluate the
 // cascade (`:hover` + group-data specificity), so this asserts the real computed
@@ -42,7 +43,7 @@ const TARGET = {
 const WHITE = "rgb(255, 255, 255)"; // light-mode `--raised`
 const TRANSPARENT = "rgba(0, 0, 0, 0)"; // no background at all
 
-test("a selected row's action icon hovers white; an unselected row's hovers a non-white gray", async () => {
+test("a selected row's action icon hovers white; an unselected row's is stronger than its row hover", async () => {
   mountDiffPanel({ target: TARGET });
 
   const rows = page.getByTestId("changed-file");
@@ -54,14 +55,16 @@ test("a selected row's action icon hovers white; an unselected row's hovers a no
   await difftools.nth(0).hover();
   await expect.poll(() => getComputedStyle(difftools.nth(0).element()).backgroundColor).toBe(WHITE);
 
-  // The unselected row's icon hovers gray — assert an actual fill (not white,
-  // and not transparent), so a regression that drops the hover entirely fails.
+  // The unselected row's icon hovers a stronger gray than the row itself.
   await rows.nth(1).hover();
   await difftools.nth(1).hover();
-  const unselectedBg = await vi.waitUntil(() => {
-    const bg = getComputedStyle(difftools.nth(1).element()).backgroundColor;
-    return bg !== TRANSPARENT ? bg : null;
+  const unselectedColors = await vi.waitUntil(() => {
+    const row = rows.nth(1).element().parentElement as HTMLElement;
+    const rowBg = getComputedStyle(row).backgroundColor;
+    const iconBg = getComputedStyle(difftools.nth(1).element()).backgroundColor;
+    return iconBg !== TRANSPARENT && iconBg !== rowBg ? { rowBg, iconBg } : null;
   });
-  expect(unselectedBg).not.toBe(WHITE);
-  expect(unselectedBg).not.toBe(TRANSPARENT);
+  expect(unselectedColors.iconBg).not.toBe(WHITE);
+  expect(unselectedColors.iconBg).not.toBe(TRANSPARENT);
+  expect(unselectedColors.iconBg).not.toBe(unselectedColors.rowBg);
 });

@@ -410,6 +410,9 @@
       ? layoutFor(selection.activeProjectId, activeRosterIds)
       : null,
   );
+  const canCyclePanes = $derived(
+    (activePaneLayout?.panes.filter((pane) => pane.members.length > 0).length ?? 0) > 1,
+  );
   const activeMaximizedPane = $derived(
     activePaneLayout?.maximized === null || activePaneLayout === null
       ? null
@@ -576,16 +579,17 @@
     });
   }
 
-  /// Cycle the targeted pane by position (⌘⇧[ = -1, ⌘⇧] = +1). Reuses the
-  /// ⌘⌥N reveal-on-target path so a maximized pane re-maximizes, a hidden one is
-  /// restored, and a refused target (prompt-render lock) changes nothing.
+  /// Cycle the targeted pane by position (⌘⇧[ = -1, ⌘⇧] = +1). A visible pane
+  /// only needs a recipient update; routing it through the persisted layout
+  /// store would invalidate every transcript derivation for a no-op reveal. A
+  /// hidden target still uses the reveal path so it is restored atomically.
   function cyclePane(direction: 1 | -1): void {
     const projectId = selection.activeProjectId;
     if (projectId === null || settingsOpen || view.mode === "git") return;
     const rosterIds = activeAgents.map((a) => a.id);
     const pane = paneToCycleTo(projectId, rosterIds, selectionFor(projectId), direction);
     if (pane === null) return;
-    const reveal = (): void => {
+    const targetAndReveal = (): void => {
       if (targetRecipients(projectId, [...pane.members])) {
         revealPane(projectId, rosterIds, pane.id);
       }
@@ -603,10 +607,10 @@
     if (targetHidden) {
       void withTranscriptBusy(() => {
         if (selection.activeProjectId !== projectId) return;
-        reveal();
+        targetAndReveal();
       });
     } else {
-      reveal();
+      targetRecipients(projectId, [...pane.members]);
     }
   }
 
@@ -812,6 +816,24 @@
         keywords: "next ready completed unread",
         disabled: nextUnreadCompletedProjectId() === null,
         run: () => selectNextUnreadCompletedProject(),
+      });
+      cmds.push({
+        id: "project.next-pane",
+        title: "Next pane",
+        group: "Project",
+        shortcut: ["mod", "shift", "]"],
+        keywords: "switch cycle right forward tab",
+        disabled: !canCyclePanes,
+        run: () => cyclePane(1),
+      });
+      cmds.push({
+        id: "project.previous-pane",
+        title: "Previous pane",
+        group: "Project",
+        shortcut: ["mod", "shift", "["],
+        keywords: "switch cycle left back tab",
+        disabled: !canCyclePanes,
+        run: () => cyclePane(-1),
       });
       cmds.push({
         id: "project.add-agent",

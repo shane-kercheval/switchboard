@@ -2405,9 +2405,13 @@ describe("App", () => {
     const roster = ["ag-1", "ag-2"];
     panes.moveAgentToNewPane("p-a", roster, "ag-2"); // pane 1: alice, pane 2: bob
     selection.setRecipients("p-a", ["ag-1"]);
+    flushSync();
+    const setItemSpy = vi.spyOn(Storage.prototype, "setItem");
 
     // ⌘⇧] → next pane (bob); again wraps back to alice. `code`, not `key`
-    // (Shift+bracket produces "{"/"}").
+    // (Shift+bracket produces "{"/"}"). Both panes are already visible, so
+    // cycling must not rewrite the pane-layout store and invalidate the long
+    // transcript trees beneath it.
     await fireEvent.keyDown(window, {
       key: "}",
       code: "BracketRight",
@@ -2415,6 +2419,9 @@ describe("App", () => {
       shiftKey: true,
     });
     expect(selection.selectionFor("p-a")).toEqual(["ag-2"]);
+    expect(setItemSpy.mock.calls.some(([key]) => key === "switchboard-transcript-panes")).toBe(
+      false,
+    );
     await fireEvent.keyDown(window, {
       key: "}",
       code: "BracketRight",
@@ -2431,6 +2438,50 @@ describe("App", () => {
       shiftKey: true,
     });
     expect(selection.selectionFor("p-a")).toEqual(["ag-2"]);
+
+    setItemSpy.mockRestore();
+    panes._testing.reset();
+    selection._testing.reset();
+  });
+
+  it("cycles panes from the command palette", async () => {
+    const panes = await import("$lib/state/transcriptPanes.svelte");
+    const selection = await import("$lib/state/recipientSelection.svelte");
+    panes._testing.reset();
+    selection._testing.reset();
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [
+        agent({ id: "ag-1", project_id: "p-a", name: "alice" }),
+        agent({ id: "ag-2", project_id: "p-a", name: "bob" }),
+      ],
+    });
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument());
+    await fireEvent.click(screen.getByText("alpha"));
+    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
+
+    const roster = ["ag-1", "ag-2"];
+    panes.moveAgentToNewPane("p-a", roster, "ag-2");
+    selection.setRecipients("p-a", ["ag-1"]);
+
+    await fireEvent.keyDown(window, { key: "P", code: "KeyP", metaKey: true, shiftKey: true });
+    await waitFor(() => expect(screen.getByTestId("command-palette")).toBeInTheDocument());
+    await fireEvent.input(screen.getByTestId("command-palette-search"), {
+      target: { value: "next pane" },
+    });
+    await fireEvent.click(screen.getByTestId("command-option-project.next-pane"));
+    expect(selection.selectionFor("p-a")).toEqual(["ag-2"]);
+
+    await fireEvent.keyDown(window, { key: "P", code: "KeyP", metaKey: true, shiftKey: true });
+    await waitFor(() => expect(screen.getByTestId("command-palette")).toBeInTheDocument());
+    await fireEvent.input(screen.getByTestId("command-palette-search"), {
+      target: { value: "previous pane" },
+    });
+    await fireEvent.click(screen.getByTestId("command-option-project.previous-pane"));
+    expect(selection.selectionFor("p-a")).toEqual(["ag-1"]);
 
     panes._testing.reset();
     selection._testing.reset();

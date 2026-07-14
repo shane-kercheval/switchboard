@@ -1,5 +1,5 @@
 import { beforeEach, expect, test, vi } from "vitest";
-import { page } from "vitest/browser";
+import { page, userEvent } from "vitest/browser";
 
 // `vi.hoisted` makes this reference available inside the hoisted `vi.mock`
 // factory below — plain `const` declarations run after hoisting and would be
@@ -98,6 +98,57 @@ test("drag grip is unreserved by default and appears at the far right on hover",
   expect(harness.getBoundingClientRect().x).toBeLessThan(harnessXBeforeHover);
   // Other cards' grips are unaffected.
   await expect.element(page.getByTestId("agent-drag-grip").nth(1)).not.toBeVisible();
+});
+
+test("pointer focus does not pin a card's hover controls after the pointer leaves", async () => {
+  render(SidebarHost, { projectId: PROJECT_ID, agents: THREE_AGENTS });
+
+  const firstCard = page.getByTestId("sidebar-agent").nth(0);
+  await firstCard.click({ position: { x: 4, y: 4 } });
+  expect(document.activeElement).toBe(firstCard.element());
+
+  await page.getByTestId("sidebar-agent").nth(1).hover();
+
+  await expect.element(page.getByTestId("agent-visibility-toggle").nth(0)).not.toBeVisible();
+  await expect.element(page.getByTestId("agent-actions-trigger").nth(0)).not.toBeVisible();
+  await expect.element(page.getByTestId("agent-drag-grip").nth(0)).not.toBeVisible();
+  await expect.element(page.getByTestId("agent-actions-trigger").nth(1)).toBeVisible();
+});
+
+test("keyboard focus reveals the card controls and keeps them visible within the card", async () => {
+  render(SidebarHost, { projectId: PROJECT_ID, agents: THREE_AGENTS });
+
+  const firstCard = page.getByTestId("sidebar-agent").nth(0);
+  for (let i = 0; i < 4 && document.activeElement !== firstCard.element(); i += 1) {
+    await userEvent.tab();
+  }
+  expect(document.activeElement).toBe(firstCard.element());
+  expect(firstCard.element().matches(":focus-visible")).toBe(true);
+  await expect.element(page.getByTestId("agent-actions-trigger").nth(0)).toBeVisible();
+
+  await userEvent.tab();
+  expect(document.activeElement).toBe(page.getByTestId("agent-visibility-toggle").nth(0).element());
+  await expect.element(page.getByTestId("agent-actions-trigger").nth(0)).toBeVisible();
+});
+
+test("an open actions trigger keeps the entire card action cluster stable", async () => {
+  render(SidebarHost, { projectId: PROJECT_ID, agents: THREE_AGENTS });
+
+  const card = page.getByTestId("sidebar-agent").nth(0);
+  await card.hover();
+  const trigger = page.getByTestId("agent-actions-trigger").nth(0).element();
+  // The menu primitive owns this state; setting it directly isolates the card's
+  // real CSS latch without coupling this layout test to the portaled menu lifecycle.
+  trigger.setAttribute("data-state", "open");
+  await page.getByTestId("sidebar-agent").nth(1).hover();
+
+  await expect.element(page.getByTestId("agent-visibility-toggle").nth(0)).toBeVisible();
+  await expect.element(page.getByTestId("agent-actions-trigger").nth(0)).toBeVisible();
+  await expect.element(page.getByTestId("agent-drag-grip").nth(0)).toBeVisible();
+
+  trigger.setAttribute("data-state", "closed");
+  await expect.element(page.getByTestId("agent-visibility-toggle").nth(0)).not.toBeVisible();
+  await expect.element(page.getByTestId("agent-drag-grip").nth(0)).not.toBeVisible();
 });
 
 // ---------------------------------------------------------------------------

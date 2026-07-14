@@ -1074,7 +1074,7 @@
                         // the name takes the full row until the icons reveal.
                         agentHidden
                           ? "text-muted"
-                          : "hidden group-focus-within:inline-flex group-hover:inline-flex",
+                          : "hidden group-hover:inline-flex group-focus-visible:inline-flex group-has-[:focus-visible]:inline-flex group-has-[[data-state=open]]:inline-flex",
                       )}
                       aria-label={agentHidden ? `Show ${agent.name}` : `Hide ${agent.name}`}
                       aria-pressed={agentHidden}
@@ -1093,7 +1093,7 @@
                   triggerClass={cn(
                     ICON_BUTTON_CLASS,
                     "shrink-0",
-                    "hidden group-focus-within:inline-flex group-hover:inline-flex data-[state=open]:inline-flex",
+                    "hidden group-focus-visible:inline-flex group-has-[:focus-visible]:inline-flex group-hover:inline-flex data-[state=open]:inline-flex",
                   )}
                   triggerLabel={`Actions for ${agent.name}`}
                   triggerTestid="agent-actions-trigger"
@@ -1332,7 +1332,7 @@
                       "text-muted h-3 w-3 shrink-0 cursor-grab touch-none items-center justify-center active:cursor-grabbing",
                       dragState?.agentId === agent.id
                         ? "inline-flex"
-                        : "hidden group-focus-within:inline-flex group-hover:inline-flex",
+                        : "hidden group-hover:inline-flex group-focus-visible:inline-flex group-has-[:focus-visible]:inline-flex group-has-[[data-state=open]]:inline-flex",
                     )}
                     data-testid="agent-drag-grip"
                     data-agent-card-control

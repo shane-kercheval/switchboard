@@ -43,7 +43,11 @@ import type {
 import { tick, untrack } from "svelte";
 import { harnessAvailability, refreshHarnessAvailability } from "$lib/harnessAvailability.svelte";
 import { AUTO_SEED_ON_NEW_PROJECT } from "$lib/harnessDisplay";
-import { DEFAULT_EFFORT, DEFAULT_MODEL, defaultAgentName } from "$lib/agentSelection";
+import {
+  NEW_PROJECT_DEFAULT_EFFORT,
+  NEW_PROJECT_DEFAULT_MODEL,
+  defaultAgentName,
+} from "$lib/agentSelection";
 import { currentIsoTimestamp } from "$lib/utils";
 import { buildLiveSendsMap } from "$lib/state/liveSends";
 import { draftAttachmentPaths } from "$lib/state/composeStore";
@@ -422,14 +426,15 @@ async function seedAgentsForInstalledHarnesses(projectId: ProjectId): Promise<vo
     // fresh project by default.
     if (!AUTO_SEED_ON_NEW_PROJECT[harness]) continue;
     try {
-      // Seed the same harness defaults the create form preselects, so every
-      // auto-created agent is born with a known, displayed model/effort
+      // Every auto-created agent is born with a known, displayed model/effort
       // (`undefined` for a no-capability harness → backend stores `None`).
+      const model = NEW_PROJECT_DEFAULT_MODEL[harness];
+      const effort = NEW_PROJECT_DEFAULT_EFFORT[harness];
       const agent = await api.createAgent(
-        defaultAgentName(harness, DEFAULT_MODEL[harness], DEFAULT_EFFORT[harness]),
+        defaultAgentName(harness, model, effort),
         harness,
-        DEFAULT_MODEL[harness],
-        DEFAULT_EFFORT[harness],
+        model,
+        effort,
       );
       if (selection.activeProjectId !== projectId) break;
       await registerAgent(agent);

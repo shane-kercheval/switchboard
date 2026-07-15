@@ -23,7 +23,7 @@ use serde_json::Value;
 use crate::events::{
     AdapterEvent, ContentKind, FailureKind, ToolKind, TurnId, TurnOutcome, TurnUsage,
 };
-use crate::facets::ToolFacet;
+use crate::facets::{ToolFacet, classify_mcp_tool_facet};
 use crate::parser::ParseOutcome;
 
 /// Per-dispatch state held by the Codex producer task.
@@ -140,17 +140,14 @@ fn parse_item_started(obj: &Value, turn_id: TurnId) -> ParseOutcome {
         "mcp_tool_call" => {
             let server = item.get("server").and_then(Value::as_str).unwrap_or("");
             let tool = item.get("tool").and_then(Value::as_str).unwrap_or("");
+            let input = item.get("arguments").cloned().unwrap_or(Value::Null);
             ParseOutcome::Event(AdapterEvent::ToolStarted {
                 turn_id,
                 tool_use_id: id.to_owned(),
                 kind: ToolKind::Mcp,
-                facet: ToolFacet::Mcp {
-                    server: server.to_owned(),
-                    tool: tool.to_owned(),
-                    mutation: None,
-                },
+                facet: classify_mcp_tool_facet(server, tool, &input),
                 name: format!("{server}.{tool}"),
-                input: item.get("arguments").cloned().unwrap_or(Value::Null),
+                input,
             })
         }
         // A structured edit announcement: paths + change-kinds, NO content
@@ -675,6 +672,80 @@ mod tests {
             "MCP output extracts result.content[*].text: {}",
             tool_completed.0
         );
+    }
+
+    #[test]
+    fn mcp_mutation_starts_are_enriched_across_success_and_failure() {
+        let (events, _) = parse_fixture("mcp-content-mutations.jsonl");
+        let starts: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                AdapterEvent::ToolStarted {
+                    tool_use_id,
+                    name,
+                    input,
+                    facet,
+                    ..
+                } => Some((tool_use_id, name, input, facet)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(starts.len(), 2);
+        assert_eq!(starts[0].0, "item_edit");
+        assert_eq!(starts[0].1, "notes_alias.edit_content");
+        assert!(matches!(
+            starts[0].3,
+            ToolFacet::Mcp {
+                mutation: Some(mutation),
+                ..
+            } if matches!(
+                mutation.as_ref(),
+                crate::facets::McpMutation::TextEdit {
+                    target,
+                    before,
+                    after,
+                    ..
+                } if target == "note · note-example"
+                    && before == "before text"
+                    && after == "after text"
+            )
+        ));
+        assert_eq!(starts[1].0, "item_create");
+        assert_eq!(starts[1].1, "prompts_alias.create_prompt");
+        assert!(matches!(
+            starts[1].3,
+            ToolFacet::Mcp {
+                mutation: Some(mutation),
+                ..
+            } if matches!(
+                mutation.as_ref(),
+                crate::facets::McpMutation::TextCreation {
+                    target,
+                    content,
+                    ..
+                } if target == "prompt · sample-prompt" && content == "Prompt body"
+            )
+        ));
+
+        let completions: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                AdapterEvent::ToolCompleted {
+                    tool_use_id,
+                    output,
+                    is_error,
+                    ..
+                } => Some((tool_use_id, output, is_error)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(completions.len(), 2);
+        assert_eq!(completions[0].0, "item_edit");
+        assert_eq!(completions[0].1, "edit ok");
+        assert!(!completions[0].2);
+        assert_eq!(completions[1].0, "item_create");
+        assert_eq!(completions[1].1, "creation rejected");
+        assert!(completions[1].2);
     }
 
     // --- Inline-constructed coverage for paths the captured fixtures don't cover ---

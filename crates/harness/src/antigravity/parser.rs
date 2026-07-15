@@ -23,7 +23,7 @@ use std::collections::VecDeque;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::events::{AdapterEvent, ContentKind, ToolKind, TurnId};
+use crate::events::{AdapterEvent, ContentKind, TurnId};
 
 /// One record (line) of `transcript.jsonl`. The fields below are the subset
 /// Switchboard consumes; `#[serde]` ignores any additional fields, so the type
@@ -231,11 +231,12 @@ pub fn record_to_live_events(
             // bare `{step}:{name}` would collide and make UI/tool pairing
             // ambiguous.
             let tool_use_id = format!("{}:{}:{}", rec.step_index, call_index, call.name);
+            let (kind, facet) = super::facets::classify_antigravity_tool(&call.name, &call.args);
             out.push(AdapterEvent::ToolStarted {
                 turn_id,
                 tool_use_id: tool_use_id.clone(),
-                kind: classify_tool_kind(&call.name),
-                facet: super::facets::classify_antigravity_tool_facet(&call.name, &call.args),
+                kind,
+                facet,
                 name: call.name.clone(),
                 input: call.args.clone(),
             });
@@ -295,15 +296,6 @@ fn pop_plausible_result(
     pending_results.remove(idx)
 }
 
-/// Tool-kind classification. The native tools (`run_command`, `view_file`,
-/// `edit_file`, ...) are `Builtin`; `CortexStepMcpTool`-dispatched MCP tools
-/// would be `Mcp`, but the transcript records the underlying tool name, not
-/// the Cortex step type, so we can't reliably distinguish MCP here yet.
-/// Defaults to `Builtin`; refine when an MCP probe pins the name shape.
-pub(crate) fn classify_tool_kind(_name: &str) -> ToolKind {
-    ToolKind::Builtin
-}
-
 /// Detect Antigravity's unauthenticated-dispatch signal on a stdout line.
 ///
 /// Verified shapes (captured from a real logged-out `agy -p` run): the
@@ -339,7 +331,7 @@ pub fn first_error_line(stdout_lines: &[String]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::TurnOutcome;
+    use crate::events::{ToolKind, TurnOutcome};
     use uuid::Uuid;
 
     fn tid() -> TurnId {
@@ -489,6 +481,78 @@ mod tests {
         assert_eq!(completions[2].0, "12:0:run_command");
         assert!(completions[2].1.contains("command not found"));
         assert!(completions.iter().all(|(_, _, is_error)| *is_error));
+        assert!(state.pending_tool_ids.is_empty());
+    }
+
+    #[test]
+    fn adjacent_mcp_wrappers_pair_normal_and_invalid_results_fifo() {
+        let records = [
+            r#"{"step_index":8,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"call_mcp_tool","args":{"ServerName":"\"notes_alias\"","ToolName":"\"edit_content\"","Arguments":"{\"id\":\"note-example\",\"type\":\"note\",\"old_str\":\"before\",\"new_str\":\"after\"}"}}]}"#,
+            r#"{"step_index":9,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"call_mcp_tool","args":{"ServerName":"\"prompts_alias\"","ToolName":"\"create_prompt\"","Arguments":"{\"name\":\"sample-prompt\",\"content\":\"Prompt body\"}"}}]}"#,
+            r#"{"step_index":10,"source":"MODEL","type":"CortexStepMcpTool","status":"DONE","content":"edit ok"}"#,
+            r#"{"step_index":11,"source":"SYSTEM","type":"ERROR_MESSAGE","status":"DONE","error":"There was a problem parsing the tool call. Error Message: invalid tool call error (invalid_args) creation rejected"}"#,
+        ];
+        let mut state = AntigravityParserState::default();
+        let turn = tid();
+        let events: Vec<_> = records
+            .iter()
+            .flat_map(|line| record_to_live_events(&parse(line), turn, &mut state))
+            .collect();
+
+        let starts: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                AdapterEvent::ToolStarted {
+                    tool_use_id,
+                    kind,
+                    facet,
+                    name,
+                    ..
+                } => Some((tool_use_id, kind, facet, name)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(starts.len(), 2);
+        assert!(starts.iter().all(|(_, kind, _, _)| **kind == ToolKind::Mcp));
+        assert!(
+            starts
+                .iter()
+                .all(|(_, _, _, name)| *name == "call_mcp_tool")
+        );
+        assert!(matches!(
+            starts[0].2,
+            crate::facets::ToolFacet::Mcp {
+                mutation: Some(mutation),
+                ..
+            } if matches!(mutation.as_ref(), crate::facets::McpMutation::TextEdit { .. })
+        ));
+        assert!(matches!(
+            starts[1].2,
+            crate::facets::ToolFacet::Mcp {
+                mutation: Some(mutation),
+                ..
+            } if matches!(mutation.as_ref(), crate::facets::McpMutation::TextCreation { .. })
+        ));
+
+        let completions: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                AdapterEvent::ToolCompleted {
+                    tool_use_id,
+                    output,
+                    is_error,
+                    ..
+                } => Some((tool_use_id, output, is_error)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(completions.len(), 2);
+        assert_eq!(completions[0].0, "8:0:call_mcp_tool");
+        assert_eq!(completions[0].1, "edit ok");
+        assert!(!completions[0].2);
+        assert_eq!(completions[1].0, "9:0:call_mcp_tool");
+        assert!(completions[1].1.contains("creation rejected"));
+        assert!(completions[1].2);
         assert!(state.pending_tool_ids.is_empty());
     }
 

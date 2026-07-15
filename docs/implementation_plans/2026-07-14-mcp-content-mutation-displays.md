@@ -342,6 +342,11 @@ writing classification code. Do not make a synthetic fixture conform to the hist
 matches, the outline below becomes the pinned implementation contract and the stale parser comment
 must be replaced with the verified rule.
 
+**Evidence recorded 2026-07-14:** a read-only `get_context` invocation on `agy 1.1.2` confirmed the
+historical wrapper exactly. The sanitized wrapper record is pinned in
+`tests/fixtures/antigravity/mcp-tool-wrapper.transcript.jsonl`; its surrounding result and terminal
+records are synthetic so the fixture contains no private MCP content.
+
 ### Goal & Outcome
 
 - Antigravity's generic `call_mcp_tool` transcript rows become correctly identified MCP calls with

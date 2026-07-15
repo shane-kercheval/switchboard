@@ -11,6 +11,14 @@
 //! full structured vocabulary with content and absolute paths, superseding
 //! the older shell-only capture.
 //!
+//! MCP calls were re-probed read-only @ agy 1.1.2 on 2026-07-14. The
+//! transcript records the raw dispatcher name `call_mcp_tool` with encoded
+//! `ServerName`, `ToolName`, and `Arguments` fields rather than exposing the
+//! underlying tool as the raw call. The raw wrapper remains the tool name/input
+//! for provenance; only kind and facet use the decoded identity and arguments.
+//! The sanitized wrapper record, with synthetic surrounding result/answer
+//! records, is `tests/fixtures/antigravity/mcp-tool-wrapper.transcript.jsonl`.
+//!
 //! **Arg encoding.** In `transcript.jsonl` every arg value is a *string
 //! containing a JSON literal* (`"StartLine": "1"`, `"TargetContent":
 //! "\"foo\""`). [`arg_str`] decodes one level when the inner literal is a
@@ -20,7 +28,43 @@
 
 use serde_json::Value;
 
-use crate::facets::{EditChange, EditPair, EditedFile, ToolFacet, cap_content};
+use crate::events::ToolKind;
+use crate::facets::{
+    EditChange, EditPair, EditedFile, ToolFacet, cap_content, classify_mcp_tool_facet,
+};
+
+/// Classify one raw Antigravity tool call. A valid `call_mcp_tool` wrapper is
+/// normalized to MCP identity and semantic arguments; malformed wrappers and
+/// native tools retain the existing builtin/generic behavior.
+pub(crate) fn classify_antigravity_tool(name: &str, args: &Value) -> (ToolKind, ToolFacet) {
+    if let Some((server, tool, arguments)) = decode_mcp_wrapper(name, args) {
+        return (
+            ToolKind::Mcp,
+            classify_mcp_tool_facet(&server, &tool, &arguments),
+        );
+    }
+    (
+        ToolKind::Builtin,
+        classify_antigravity_tool_facet(name, args),
+    )
+}
+
+fn decode_mcp_wrapper(name: &str, args: &Value) -> Option<(String, String, Value)> {
+    if name != "call_mcp_tool" {
+        return None;
+    }
+    let server = arg_str(args, "ServerName")?;
+    let tool = arg_str(args, "ToolName")?;
+    if server.trim().is_empty() || tool.trim().is_empty() {
+        return None;
+    }
+    let raw_arguments = args.get("Arguments").and_then(Value::as_str)?;
+    let arguments = serde_json::from_str::<Value>(raw_arguments).ok()?;
+    if !arguments.is_object() {
+        return None;
+    }
+    Some((server, tool, arguments))
+}
 
 /// Classify one Antigravity tool call. Missing required args → `Other`
 /// (never fabricate a facet from a partial shape). Paths pass through as-is:
@@ -100,6 +144,16 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn mcp_wrapper(server: &str, tool: &str, arguments: &Value) -> Value {
+        json!({
+            "ServerName": serde_json::to_string(server).unwrap(),
+            "ToolName": serde_json::to_string(tool).unwrap(),
+            "Arguments": serde_json::to_string(arguments).unwrap(),
+            "toolAction": "\"Synthetic action\"",
+            "toolSummary": "\"Synthetic summary\""
+        })
+    }
+
     // Args exactly as transcript.jsonl encodes them (JSON-encoded strings).
     #[test]
     fn run_command_decodes_encoded_args() {
@@ -127,6 +181,120 @@ mod tests {
                 cwd: None
             }
         );
+    }
+
+    #[test]
+    fn mcp_wrapper_decodes_generic_read_only_call() {
+        let (kind, facet) = classify_antigravity_tool(
+            "call_mcp_tool",
+            &mcp_wrapper("notes_alias", "get_context", &json!({})),
+        );
+        assert_eq!(kind, ToolKind::Mcp);
+        assert_eq!(
+            facet,
+            ToolFacet::Mcp {
+                server: "notes_alias".to_owned(),
+                tool: "get_context".to_owned(),
+                mutation: None,
+            }
+        );
+    }
+
+    #[test]
+    fn mcp_wrapper_enriches_all_mutation_families() {
+        let (_, edit) = classify_antigravity_tool(
+            "call_mcp_tool",
+            &mcp_wrapper(
+                "notes_alias",
+                "edit_content",
+                &json!({
+                    "id": "note-example",
+                    "type": "note",
+                    "old_str": "before text",
+                    "new_str": "after text"
+                }),
+            ),
+        );
+        assert!(matches!(
+            edit,
+            ToolFacet::Mcp {
+                mutation: Some(mutation),
+                ..
+            } if matches!(mutation.as_ref(), crate::facets::McpMutation::TextEdit { .. })
+        ));
+
+        let (_, creation) = classify_antigravity_tool(
+            "call_mcp_tool",
+            &mcp_wrapper(
+                "prompts_alias",
+                "create_prompt",
+                &json!({"name": "sample-prompt", "content": "Prompt body"}),
+            ),
+        );
+        assert!(matches!(
+            creation,
+            ToolFacet::Mcp {
+                mutation: Some(mutation),
+                ..
+            } if matches!(mutation.as_ref(), crate::facets::McpMutation::TextCreation { .. })
+        ));
+
+        let (_, record) = classify_antigravity_tool(
+            "call_mcp_tool",
+            &mcp_wrapper(
+                "notes_alias",
+                "create_bookmark",
+                &json!({"url": "https://example.com", "title": "Example"}),
+            ),
+        );
+        assert!(matches!(
+            record,
+            ToolFacet::Mcp {
+                mutation: Some(mutation),
+                ..
+            } if matches!(mutation.as_ref(), crate::facets::McpMutation::RecordCreation { .. })
+        ));
+    }
+
+    #[test]
+    fn malformed_mcp_wrappers_degrade_to_builtin_other() {
+        let cases = [
+            json!({
+                "ToolName": "\"get_context\"",
+                "Arguments": "{}"
+            }),
+            json!({
+                "ServerName": "\"\"",
+                "ToolName": "\"get_context\"",
+                "Arguments": "{}"
+            }),
+            json!({
+                "ServerName": "\"notes_alias\"",
+                "Arguments": "{}"
+            }),
+            json!({
+                "ServerName": "\"notes_alias\"",
+                "ToolName": "\"\"",
+                "Arguments": "{}"
+            }),
+            json!({
+                "ServerName": "\"notes_alias\"",
+                "ToolName": "\"get_context\"",
+                "Arguments": "not-json"
+            }),
+            json!({
+                "ServerName": "\"notes_alias\"",
+                "ToolName": "\"get_context\"",
+                "Arguments": "[]"
+            }),
+        ];
+
+        for args in cases {
+            assert_eq!(
+                classify_antigravity_tool("call_mcp_tool", &args),
+                (ToolKind::Builtin, ToolFacet::Other)
+            );
+        }
     }
 
     #[test]
@@ -276,5 +444,72 @@ mod tests {
         assert_eq!(c, "hello world");
         assert!(matches!(facet_for("grep_search"), ToolFacet::Search { .. }));
         assert_eq!(*facet_for("list_dir"), ToolFacet::Other);
+    }
+
+    #[test]
+    fn current_mcp_wrapper_fixture_matches_live_and_hydrated_facets() {
+        use super::super::parser::{
+            AntigravityParserState, TranscriptRecord, record_to_live_events,
+        };
+        use super::super::session_file::parse_antigravity_transcript_content;
+        use crate::events::AdapterEvent;
+        use crate::transcript::{Turn, TurnItem};
+
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/antigravity/mcp-tool-wrapper.transcript.jsonl");
+        let content = std::fs::read_to_string(path).unwrap();
+        let mut state = AntigravityParserState::default();
+        let turn_id = uuid::Uuid::now_v7();
+        let mut live_facet = None;
+        let mut live_completed = None;
+        for line in content.lines().filter(|line| !line.trim().is_empty()) {
+            let record: TranscriptRecord = serde_json::from_str(line).unwrap();
+            for event in record_to_live_events(&record, turn_id, &mut state) {
+                match event {
+                    AdapterEvent::ToolStarted {
+                        kind,
+                        name,
+                        input,
+                        facet,
+                        ..
+                    } => {
+                        assert_eq!(kind, ToolKind::Mcp);
+                        assert_eq!(name, "call_mcp_tool");
+                        assert_eq!(input["ServerName"], "\"notes_alias\"");
+                        live_facet = Some(facet);
+                    }
+                    AdapterEvent::ToolCompleted {
+                        output, is_error, ..
+                    } => live_completed = Some((output, is_error)),
+                    _ => {}
+                }
+            }
+        }
+
+        let transcript = parse_antigravity_transcript_content(&content, uuid::Uuid::now_v7());
+        let hydrated = transcript
+            .turns
+            .iter()
+            .find_map(|turn| match turn {
+                Turn::Agent { items, .. } => items.iter().find_map(|item| match item {
+                    TurnItem::Tool {
+                        facet,
+                        output,
+                        is_error,
+                        ..
+                    } => Some((facet, output, is_error)),
+                    TurnItem::Text { .. } => None,
+                }),
+                Turn::User { .. } | Turn::System { .. } => None,
+            })
+            .expect("hydrated MCP tool");
+
+        assert_eq!(live_facet.as_ref(), Some(hydrated.0));
+        assert_eq!(
+            live_completed,
+            Some(("context available".to_owned(), false))
+        );
+        assert_eq!(hydrated.1.as_deref(), Some("context available"));
+        assert_eq!(*hydrated.2, Some(false));
     }
 }

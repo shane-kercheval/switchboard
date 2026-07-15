@@ -27,7 +27,7 @@ use crate::transcript::{
     TurnStatus, merge_meta_with_loaders,
 };
 
-use super::parser::{TranscriptRecord, classify_tool_kind};
+use super::parser::TranscriptRecord;
 use super::{extract_model_from_record, paths, user_request_body};
 
 /// Load an Antigravity conversation's transcript into a [`LoadedTranscript`].
@@ -301,12 +301,12 @@ impl Reconstruction {
                     let idx = builder.items.len();
                     let result =
                         pop_plausible_result(&mut builder.pending_tool_results, rec.step_index);
+                    let (kind, facet) =
+                        super::facets::classify_antigravity_tool(&call.name, &call.args);
                     builder.items.push(TurnItem::Tool {
                         tool_use_id,
-                        kind: classify_tool_kind(&call.name),
-                        facet: super::facets::classify_antigravity_tool_facet(
-                            &call.name, &call.args,
-                        ),
+                        kind,
+                        facet,
                         name: call.name.clone(),
                         input: call.args.clone(),
                         output: result.as_ref().map(|r| r.output.clone()),
@@ -676,6 +676,64 @@ mod tests {
         assert_eq!(tools[2].0, "run_command");
         assert!(tools[2].1.contains("command not found"));
         assert!(tools.iter().all(|(_, _, is_error)| *is_error));
+        assert!(transcript.warnings.is_empty());
+    }
+
+    #[test]
+    fn adjacent_mcp_wrappers_pair_normal_and_invalid_results_on_reload() {
+        let content = concat!(
+            r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-07-14T23:38:49Z","content":"<USER_REQUEST>\ntest MCP tools\n</USER_REQUEST>"}"#,
+            "\n",
+            r#"{"step_index":8,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-07-14T23:38:50Z","tool_calls":[{"name":"call_mcp_tool","args":{"ServerName":"\"notes_alias\"","ToolName":"\"edit_content\"","Arguments":"{\"id\":\"note-example\",\"type\":\"note\",\"old_str\":\"before\",\"new_str\":\"after\"}"}}]}"#,
+            "\n",
+            r#"{"step_index":9,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-07-14T23:38:51Z","tool_calls":[{"name":"call_mcp_tool","args":{"ServerName":"\"prompts_alias\"","ToolName":"\"create_prompt\"","Arguments":"{\"name\":\"sample-prompt\",\"content\":\"Prompt body\"}"}}]}"#,
+            "\n",
+            r#"{"step_index":10,"source":"MODEL","type":"CortexStepMcpTool","status":"DONE","created_at":"2026-07-14T23:38:52Z","content":"edit ok"}"#,
+            "\n",
+            r#"{"step_index":11,"source":"SYSTEM","type":"ERROR_MESSAGE","status":"DONE","created_at":"2026-07-14T23:38:53Z","error":"There was a problem parsing the tool call. Error Message: invalid tool call error (invalid_args) creation rejected"}"#,
+            "\n",
+            r#"{"step_index":12,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-07-14T23:38:54Z","content":"done"}"#,
+            "\n",
+        );
+        let transcript = parse_antigravity_transcript_content(content, agent_id());
+        let items = agent_items(&transcript.turns[1]);
+        let tools: Vec<_> = items
+            .iter()
+            .filter_map(|item| match item {
+                TurnItem::Tool {
+                    facet,
+                    output,
+                    is_error,
+                    ..
+                } => Some((facet, output, is_error)),
+                TurnItem::Text { .. } => None,
+            })
+            .collect();
+
+        assert_eq!(tools.len(), 2);
+        assert!(matches!(
+            tools[0].0,
+            crate::facets::ToolFacet::Mcp {
+                mutation: Some(mutation),
+                ..
+            } if matches!(mutation.as_ref(), crate::facets::McpMutation::TextEdit { .. })
+        ));
+        assert_eq!(tools[0].1.as_deref(), Some("edit ok"));
+        assert_eq!(*tools[0].2, Some(false));
+        assert!(matches!(
+            tools[1].0,
+            crate::facets::ToolFacet::Mcp {
+                mutation: Some(mutation),
+                ..
+            } if matches!(mutation.as_ref(), crate::facets::McpMutation::TextCreation { .. })
+        ));
+        assert!(
+            tools[1]
+                .1
+                .as_deref()
+                .is_some_and(|output| output.contains("creation rejected"))
+        );
+        assert_eq!(*tools[1].2, Some(true));
         assert!(transcript.warnings.is_empty());
     }
 

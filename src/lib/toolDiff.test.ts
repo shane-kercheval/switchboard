@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 import type { DiffLine, EditedFile, FileDiff } from "$lib/types";
 import {
+  COLLAPSED_EDIT_LINE_BUDGET,
+  COLLAPSED_EDIT_SOURCE_BUDGET,
+  shouldDeferFileEditPreview,
+  shouldDeferMcpTextEditPreview,
   synthesizeEditDiff,
   synthesizeMcpTextCreationDiff,
   synthesizeMcpTextEditDiff,
@@ -29,6 +33,53 @@ function fileDiff(hunkSizes: number[]): FileDiff {
     })),
   };
 }
+
+function logicalLines(count: number, prefix = "line"): string {
+  return Array.from({ length: count }, (_, index) => `${prefix}${index}`).join("\n");
+}
+
+describe("collapsed edit preview budgets", () => {
+  it.each([
+    [COLLAPSED_EDIT_SOURCE_BUDGET - 1, false],
+    [COLLAPSED_EDIT_SOURCE_BUDGET, false],
+    [COLLAPSED_EDIT_SOURCE_BUDGET + 1, true],
+  ])("handles a %i-code-unit MCP edit at the source boundary", (length, deferred) => {
+    expect(shouldDeferMcpTextEditPreview("x".repeat(length), "")).toBe(deferred);
+  });
+
+  it.each([
+    [COLLAPSED_EDIT_LINE_BUDGET - 1, false],
+    [COLLAPSED_EDIT_LINE_BUDGET, false],
+    [COLLAPSED_EDIT_LINE_BUDGET + 1, true],
+  ])("handles %i combined MCP lines at the line boundary", (lineCount, deferred) => {
+    const beforeLines = Math.floor(lineCount / 2);
+    const afterLines = lineCount - beforeLines;
+    expect(
+      shouldDeferMcpTextEditPreview(
+        logicalLines(beforeLines, "before"),
+        logicalLines(afterLines, "after"),
+      ),
+    ).toBe(deferred);
+  });
+
+  it("aggregates multiple edit pairs and files before allowing collapsed synthesis", () => {
+    const files: EditedFile[] = [
+      file([{ old: "a".repeat(9_000), new: "b".repeat(9_000) }]),
+      { ...file([{ old: "c".repeat(9_000), new: "d".repeat(9_000) }]), path: "/repo/b.ts" },
+    ];
+
+    expect(shouldDeferFileEditPreview([files[0]!])).toBe(false);
+    expect(shouldDeferFileEditPreview([files[1]!])).toBe(false);
+    expect(shouldDeferFileEditPreview(files)).toBe(true);
+  });
+
+  it("defers many short lines even when their aggregate source is below the size budget", () => {
+    const before = logicalLines(251, "a");
+    const after = logicalLines(250, "b");
+    expect(before.length + after.length).toBeLessThan(COLLAPSED_EDIT_SOURCE_BUDGET);
+    expect(shouldDeferMcpTextEditPreview(before, after)).toBe(true);
+  });
+});
 
 describe("synthesizeEditDiff", () => {
   it("renders a one-line change as one removed and one added line", () => {

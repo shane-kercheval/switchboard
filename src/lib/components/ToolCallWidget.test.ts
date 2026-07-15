@@ -15,6 +15,13 @@ vi.mock("$lib/toolInput", async (importOriginal) => {
   return { ...mod, formatToolInput: formatToolInputSpy };
 });
 
+const structuredPatchSpy = vi.hoisted(() => vi.fn());
+vi.mock("diff", async (importOriginal) => {
+  const mod = await importOriginal<typeof import("diff")>();
+  structuredPatchSpy.mockImplementation(mod.structuredPatch);
+  return { ...mod, structuredPatch: structuredPatchSpy };
+});
+
 const running: ToolCall = {
   item_kind: "tool",
   facet: { facet_kind: "other" },
@@ -132,6 +139,10 @@ function withMcpFacet(facet: ToolFacet, overrides: Partial<ToolCall> = {}): Tool
     output: "minimal server output",
     ...overrides,
   });
+}
+
+function unrelatedLines(count: number, prefix: string): string {
+  return Array.from({ length: count }, (_, index) => `${prefix}${index}`).join("\n");
 }
 
 describe("ToolCallWidget collapsed row", () => {
@@ -627,6 +638,42 @@ describe("ToolCallWidget facet bodies", () => {
     expect(getByTestId("tool-verb")).toHaveTextContent("Edit");
   });
 
+  it("defers every diff in an oversized multi-file row until expansion", async () => {
+    const facet: ToolFacet = {
+      facet_kind: "edit",
+      files: [
+        {
+          path: "/repo/a.ts",
+          change: "modified",
+          edits: [{ old: unrelatedLines(126, "a-old-"), new: unrelatedLines(126, "a-new-") }],
+          truncated: false,
+        },
+        {
+          path: "/repo/b.ts",
+          change: "modified",
+          edits: [{ old: unrelatedLines(126, "b-old-"), new: unrelatedLines(126, "b-new-") }],
+          truncated: false,
+        },
+      ],
+    };
+    structuredPatchSpy.mockClear();
+    const { getByTestId, getAllByTestId, queryByTestId } = render(ToolCallWidget, {
+      tool: withFacet(facet),
+    });
+
+    const sections = getAllByTestId("tool-edit-file");
+    expect(sections).toHaveLength(2);
+    expect(sections[0]).toHaveTextContent("/repo/a.ts");
+    expect(sections[1]).toHaveTextContent("/repo/b.ts");
+    expect(queryByTestId("diff-view")).toBeNull();
+    expect(structuredPatchSpy).not.toHaveBeenCalled();
+
+    await fireEvent.click(getByTestId("tool-edit-deferred"));
+    expect(queryByTestId("tool-edit-deferred")).toBeNull();
+    expect(getAllByTestId("diff-view")).toHaveLength(2);
+    expect(structuredPatchSpy).toHaveBeenCalledTimes(2);
+  });
+
   it("shows a pending placeholder for a content-less edit on a live turn", async () => {
     const facet: ToolFacet = {
       facet_kind: "edit",
@@ -763,6 +810,41 @@ describe("ToolCallWidget MCP mutation bodies", () => {
     expect(container.querySelector('[data-origin="removed"]')).not.toBeNull();
     expect(container.querySelector('[data-origin="added"]')).not.toBeNull();
     expect(getByTestId("tool-body")).not.toHaveTextContent("snippet-relative");
+  });
+
+  it("defers a many-short-line MCP edit before synthesis and renders it on expansion", async () => {
+    const before = unrelatedLines(251, "before-");
+    const after = unrelatedLines(250, "after-");
+    structuredPatchSpy.mockClear();
+    const { getByTestId, queryByTestId, container } = render(ToolCallWidget, {
+      tool: withMcpFacet(mcpTextEdit("note · large", { before, after })),
+    });
+
+    expect(getByTestId("tool-mcp-edit-deferred")).toHaveTextContent(
+      "Large edit — expand to view full diff",
+    );
+    expect(queryByTestId("diff-view")).toBeNull();
+    expect(structuredPatchSpy).not.toHaveBeenCalled();
+
+    await fireEvent.click(getByTestId("tool-mcp-edit-deferred"));
+    expect(queryByTestId("tool-mcp-edit-deferred")).toBeNull();
+    expect(getByTestId("diff-view")).toBeInTheDocument();
+    expect(container.querySelector('[data-origin="removed"]')).not.toBeNull();
+    expect(container.querySelector('[data-origin="added"]')).not.toBeNull();
+    expect(structuredPatchSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("defers a source-large MCP edit before synthesis", () => {
+    structuredPatchSpy.mockClear();
+    const { getByTestId, queryByTestId } = render(ToolCallWidget, {
+      tool: withMcpFacet(
+        mcpTextEdit("note · large source", { before: "x".repeat(40_000), after: "updated" }),
+      ),
+    });
+
+    expect(getByTestId("tool-mcp-edit-deferred")).toBeInTheDocument();
+    expect(queryByTestId("diff-view")).toBeNull();
+    expect(structuredPatchSpy).not.toHaveBeenCalled();
   });
 
   it.each([

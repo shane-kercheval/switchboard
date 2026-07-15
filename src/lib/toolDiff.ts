@@ -26,6 +26,55 @@ import type { DiffHunk, DiffLine, EditPair, EditedFile, FileDiff } from "$lib/ty
 // scopes tightly; 3 matches conventional diff output.
 const CONTEXT_LINES = 3;
 
+// Collapsed edit work is synchronous. Bound the complete tool row by both
+// source size and logical lines before invoking the line-oriented diff: a
+// byte-like cap alone still admits thousands of short, unrelated lines. The
+// row scope prevents a multi-file tool from multiplying individually-safe
+// diff calls. Expansion intentionally bypasses these budgets.
+export const COLLAPSED_EDIT_SOURCE_BUDGET = 32_768;
+export const COLLAPSED_EDIT_LINE_BUDGET = 500;
+
+interface EditPreviewBudget {
+  sourceUnits: number;
+  logicalLines: number;
+}
+
+function addToEditPreviewBudget(budget: EditPreviewBudget, value: string): boolean {
+  budget.sourceUnits += value.length;
+  if (budget.sourceUnits > COLLAPSED_EDIT_SOURCE_BUDGET) return true;
+  if (value.length === 0) return false;
+
+  budget.logicalLines += 1;
+  if (budget.logicalLines > COLLAPSED_EDIT_LINE_BUDGET) return true;
+
+  let newline = value.indexOf("\n");
+  while (newline !== -1) {
+    budget.logicalLines += 1;
+    if (budget.logicalLines > COLLAPSED_EDIT_LINE_BUDGET) return true;
+    newline = value.indexOf("\n", newline + 1);
+  }
+  return false;
+}
+
+function addPairToEditPreviewBudget(budget: EditPreviewBudget, pair: EditPair): boolean {
+  return addToEditPreviewBudget(budget, pair.old) || addToEditPreviewBudget(budget, pair.new);
+}
+
+export function shouldDeferFileEditPreview(files: readonly EditedFile[]): boolean {
+  const budget: EditPreviewBudget = { sourceUnits: 0, logicalLines: 0 };
+  for (const file of files) {
+    for (const edit of file.edits) {
+      if (addPairToEditPreviewBudget(budget, edit)) return true;
+    }
+  }
+  return false;
+}
+
+export function shouldDeferMcpTextEditPreview(before: string, after: string): boolean {
+  const budget: EditPreviewBudget = { sourceUnits: 0, logicalLines: 0 };
+  return addPairToEditPreviewBudget(budget, { old: before, new: after });
+}
+
 export function synthesizeEditDiff(file: EditedFile): FileDiff {
   return synthesizeTextEditDiff(file.path, file.edits, file.truncated);
 }

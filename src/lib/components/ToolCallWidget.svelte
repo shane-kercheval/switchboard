@@ -24,8 +24,11 @@
   /// (transcript render-windowing). Inline content is further capped to a
   /// preview length (both while streaming and once settled — flipping
   /// full→capped when a turn ends would be jarring); expanding the row un-caps
-  /// it and reveals output + raw input. File-facet detail is suppressed in both
-  /// states because the inline per-file headers already carry the paths.
+  /// it and reveals output + raw input. Oversized edit rows also defer complete
+  /// structured-diff synthesis until expansion; computing the full diff merely
+  /// to recover an exact hidden-line count would defeat the collapsed budget.
+  /// File-facet detail is suppressed in both states because the inline per-file
+  /// headers already carry the paths.
   import type { ToolCall } from "$lib/state/index.svelte";
   import type { FileDiff } from "$lib/types";
   import DiffView from "$lib/components/DiffView.svelte";
@@ -36,6 +39,8 @@
     synthesizeMcpTextCreationDiff,
     synthesizeMcpTextEditDiff,
     synthesizeWriteDiff,
+    shouldDeferFileEditPreview,
+    shouldDeferMcpTextEditPreview,
     truncateDiff,
   } from "$lib/toolDiff";
   import { formatToolInput, redactDisplay } from "$lib/toolInput";
@@ -189,6 +194,17 @@
   {/if}
 {/snippet}
 
+{#snippet deferredEditPreview(testid: string)}
+  <button
+    type="button"
+    class="text-muted hover:text-fg text-[11px] transition-colors"
+    data-testid={testid}
+    onclick={() => (open = true)}
+  >
+    Large edit — expand to view full diff
+  </button>
+{/snippet}
+
 {#snippet inlineAddedContent(
   rendered: { diff: FileDiff; hiddenLines: number },
   language: string,
@@ -316,6 +332,7 @@
           {/if}
         </section>
       {:else if !interrupted && facet.facet_kind === "edit"}
+        {@const deferred = !open && shouldDeferFileEditPreview(facet.files)}
         {#each facet.files as file (file.path)}
           <section class="space-y-1" aria-label="File edit" data-testid="tool-edit-file">
             <div class="text-muted flex items-center gap-2 font-mono text-[11px]">
@@ -333,7 +350,7 @@
                   ? "Diff content unavailable for this edit."
                   : "Diff will appear when the turn completes."}
               </p>
-            {:else}
+            {:else if !deferred}
               {@render inlineDiff(
                 synthesizeEditDiff(file),
                 languageForPath(file.path),
@@ -342,6 +359,9 @@
             {/if}
           </section>
         {/each}
+        {#if deferred}
+          {@render deferredEditPreview("tool-edit-deferred")}
+        {/if}
       {:else if !interrupted && facet.facet_kind === "write"}
         {@const rendered = synthesizeWriteDiff(
           facet.path,
@@ -361,17 +381,26 @@
           )}
         </section>
       {:else if !interrupted && mutation?.mutation_kind === "text_edit"}
+        {@const deferred = !open && shouldDeferMcpTextEditPreview(mutation.before, mutation.after)}
         <section class="space-y-1" aria-label="Requested content edit" data-testid="tool-mcp-edit">
           {#if open}
             <div class="text-muted truncate font-mono text-[11px]" data-testid="tool-mcp-target">
               {mutationTarget()}
             </div>
           {/if}
-          {@render inlineDiff(
-            synthesizeMcpTextEditDiff(mutation.before, mutation.after, mutation.content_truncated),
-            "markdown",
-            "tool-mcp-edit-expand",
-          )}
+          {#if deferred}
+            {@render deferredEditPreview("tool-mcp-edit-deferred")}
+          {:else}
+            {@render inlineDiff(
+              synthesizeMcpTextEditDiff(
+                mutation.before,
+                mutation.after,
+                mutation.content_truncated,
+              ),
+              "markdown",
+              "tool-mcp-edit-expand",
+            )}
+          {/if}
         </section>
       {:else if !interrupted && mutation?.mutation_kind === "text_creation"}
         <section

@@ -68,8 +68,9 @@
   const mutation = $derived(knownMcpMutation(facet));
   const rowState = $derived(toolRowState(tool));
   const verb = $derived(toolVerb(facet, tool.name));
+  const deleteFacet = $derived(facet.facet_kind === "edit" && verb === "Delete");
   const detail = $derived(
-    facet.facet_kind === "edit" || facet.facet_kind === "write"
+    facet.facet_kind === "edit" || facet.facet_kind === "write" || facet.facet_kind === "read"
       ? undefined
       : toolDetail(facet, tool.input),
   );
@@ -78,7 +79,9 @@
   const cancelled = $derived(rowState === "cancelled");
   const interrupted = $derived(failed || cancelled);
   const fileContentFacet = $derived(facet.facet_kind === "edit" || facet.facet_kind === "write");
-  const inlineContentFacet = $derived(fileContentFacet || mutation !== undefined);
+  const inlineContentFacet = $derived(
+    fileContentFacet || facet.facet_kind === "read" || mutation !== undefined,
+  );
   const outputPreview = $derived(boundedOutputPreview(tool.output));
   // Collapsed rows use only the bounded preview result. Once the user expands
   // the row, scanning the retained full value is intentional: it determines
@@ -141,6 +144,10 @@
   /// reveals the full captured field, matching diff previews.
   const RECORD_FIELD_PREVIEW_SOURCE_CAP = 2_048;
   const RECORD_FIELD_PREVIEW_TEXT_CAP = 500;
+
+  // Paths below the compact header are content, not one-line metadata. Allow
+  // breaks anywhere because absolute paths often contain no natural spaces.
+  const FILE_PATH_CLASS = "min-w-0 whitespace-normal [overflow-wrap:anywhere]";
 
   function boundedOutputPreview(value: string | undefined): {
     text: string;
@@ -363,35 +370,39 @@
         </section>
       {:else if !interrupted && facet.facet_kind === "edit"}
         {#each facet.files as file, index (file.path)}
-          {@const diff = collapsedFileDiffs[index]}
           <section class="space-y-1" aria-label="File edit" data-testid="tool-edit-file">
-            <div class="text-muted flex items-center gap-2 font-mono text-[11px]">
-              <span class="min-w-0 truncate" title={file.path}>{file.path}</span>
-              {#if facet.files.length > 1 && file.change !== "modified"}
+            <div class="text-muted flex items-start gap-2 font-mono text-[11px]">
+              <span class={cn(FILE_PATH_CLASS, "flex-1")} data-testid="tool-edit-path">
+                {file.path}
+              </span>
+              {#if verb === "Edit" && facet.files.length > 1 && file.change !== "modified"}
                 <span class="shrink-0">({file.change})</span>
               {/if}
             </div>
-            {#if file.edits.length === 0}
-              <!-- A live Codex edit announces paths without content; the facet
-                   is upgraded from the session file at turn end. Empty edits on
-                   a settled turn mean the content never became available. -->
-              <p class="text-muted" data-testid="tool-edit-pending">
-                {turnSettled
-                  ? "Diff content unavailable for this edit."
-                  : "Diff will appear when the turn completes."}
-              </p>
-            {:else if diff !== undefined}
-              {@render inlineDiff(diff, languageForPath(file.path), "tool-edit-expand")}
-            {:else if open}
-              <AsyncToolDiff
-                sourceKind="file"
-                {file}
-                coordinator={expandedDiffCoordinator}
-                language={languageForPath(file.path)}
-                testid="tool-edit-async"
-              />
-            {:else}
-              {@render deferredEditPreview("tool-edit-deferred")}
+            {#if !deleteFacet || open}
+              {@const diff = collapsedFileDiffs[index]}
+              {#if file.edits.length === 0}
+                <!-- A live Codex edit announces paths without content; the facet
+                     is upgraded from the session file at turn end. Empty edits on
+                     a settled turn mean the content never became available. -->
+                <p class="text-muted" data-testid="tool-edit-pending">
+                  {turnSettled
+                    ? "Diff content unavailable for this edit."
+                    : "Diff will appear when the turn completes."}
+                </p>
+              {:else if diff !== undefined}
+                {@render inlineDiff(diff, languageForPath(file.path), "tool-edit-expand")}
+              {:else if open}
+                <AsyncToolDiff
+                  sourceKind="file"
+                  {file}
+                  coordinator={expandedDiffCoordinator}
+                  language={languageForPath(file.path)}
+                  testid="tool-edit-async"
+                />
+              {:else}
+                {@render deferredEditPreview("tool-edit-deferred")}
+              {/if}
             {/if}
           </section>
         {/each}
@@ -403,7 +414,10 @@
           open ? undefined : INLINE_DIFF_PREVIEW_LINES,
         )}
         <section class="space-y-1" aria-label="File write" data-testid="tool-write-file">
-          <div class="text-muted truncate font-mono text-[11px]" title={facet.path}>
+          <div
+            class={cn("text-muted font-mono text-[11px]", FILE_PATH_CLASS)}
+            data-testid="tool-write-path"
+          >
             {facet.path}
           </div>
           {@render inlineAddedContent(
@@ -499,8 +513,11 @@
             </p>
           {/if}
         </section>
-      {:else if open && facet.facet_kind === "read"}
-        <div class="text-muted font-mono text-[11px]" data-testid="tool-read-path">
+      {:else if !interrupted && facet.facet_kind === "read"}
+        <div
+          class={cn("text-muted font-mono text-[11px]", FILE_PATH_CLASS)}
+          data-testid="tool-read-path"
+        >
           {facet.path}
         </div>
       {:else if open && facet.facet_kind === "search"}

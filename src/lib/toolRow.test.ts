@@ -122,15 +122,31 @@ describe("toolVerb", () => {
     expect(toolVerb(modified, "x")).toBe("Edit");
   });
 
-  it("keeps the Edit verb for multi-file patches regardless of change kinds", () => {
-    const multi: ToolFacet = {
+  it("uses the operation verb for homogeneous multi-file patches and Edit for mixed patches", () => {
+    const added: ToolFacet = {
       facet_kind: "edit",
       files: [
         { path: "/a", change: "added", edits: [], truncated: false },
         { path: "/b", change: "added", edits: [], truncated: false },
       ],
     };
-    expect(toolVerb(multi, "x")).toBe("Edit");
+    const deleted: ToolFacet = {
+      facet_kind: "edit",
+      files: [
+        { path: "/a", change: "deleted", edits: [], truncated: false },
+        { path: "/b", change: "deleted", edits: [], truncated: false },
+      ],
+    };
+    const mixed: ToolFacet = {
+      facet_kind: "edit",
+      files: [
+        { path: "/a", change: "modified", edits: [], truncated: false },
+        { path: "/b", change: "deleted", edits: [], truncated: false },
+      ],
+    };
+    expect(toolVerb(added, "x")).toBe("Write");
+    expect(toolVerb(deleted, "x")).toBe("Delete");
+    expect(toolVerb(mixed, "x")).toBe("Edit");
   });
 
   it("renders the mcp facet as the server/tool pair", () => {
@@ -279,6 +295,15 @@ describe("toolIcon", () => {
       toolIcon({
         facet_kind: "edit",
         files: [{ path: "/a", change: "deleted", edits: [], truncated: false }],
+      }),
+    ).toBe(FileX);
+    expect(
+      toolIcon({
+        facet_kind: "edit",
+        files: [
+          { path: "/a", change: "deleted", edits: [], truncated: false },
+          { path: "/b", change: "deleted", edits: [], truncated: false },
+        ],
       }),
     ).toBe(FileX);
     expect(toolIcon({ facet_kind: "other" })).toBe(Wrench);

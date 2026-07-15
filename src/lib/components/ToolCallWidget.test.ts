@@ -194,7 +194,7 @@ describe("ToolCallWidget collapsed row", () => {
       verb: "Write",
       detail: null,
     },
-    { facet: { facet_kind: "read", path: "/repo/x" }, verb: "Read", detail: "/repo/x" },
+    { facet: { facet_kind: "read", path: "/repo/x" }, verb: "Read", detail: null },
     {
       facet: { facet_kind: "search", pattern: "todo", path: null },
       verb: "Search",
@@ -589,7 +589,7 @@ describe("ToolCallWidget facet bodies", () => {
     expect(getByTestId("tool-body")).not.toHaveTextContent("(added)");
   });
 
-  it("labels a single-file deletion as Delete", () => {
+  it("keeps a single-file deletion quiet until expanded", async () => {
     const facet: ToolFacet = {
       facet_kind: "edit",
       files: [
@@ -601,14 +601,63 @@ describe("ToolCallWidget facet bodies", () => {
         },
       ],
     };
+    structuredPatchSpy.mockClear();
     const { getByTestId, queryByTestId, container } = render(ToolCallWidget, {
       tool: withFacet(facet),
     });
     expect(getByTestId("tool-verb")).toHaveTextContent("Delete");
+    expect(queryByTestId("tool-detail")).toBeNull();
+    expect(getByTestId("tool-edit-path")).toHaveTextContent("/repo/old.txt");
+    expect(container.querySelector('[data-origin="removed"]')).toBeNull();
+    expect(structuredPatchSpy).not.toHaveBeenCalled();
+
+    await fireEvent.click(getByTestId("tool-row"));
     expect(getByTestId("tool-body")).not.toHaveTextContent("(deleted)");
     expect(queryByTestId("tool-edit-pending")).toBeNull();
     expect(container.querySelector('[data-origin="removed"]')).toHaveTextContent("bye");
     expect(container.querySelector('[data-origin="added"]')).toBeNull();
+  });
+
+  it("keeps a homogeneous multi-file deletion quiet until expanded", async () => {
+    const facet: ToolFacet = {
+      facet_kind: "edit",
+      files: [
+        {
+          path: "/repo/old-a.txt",
+          change: "deleted",
+          edits: [{ old: "first\n", new: "" }],
+          truncated: false,
+        },
+        {
+          path: "/repo/old-b.txt",
+          change: "deleted",
+          edits: [{ old: "second\n", new: "" }],
+          truncated: false,
+        },
+      ],
+    };
+    structuredPatchSpy.mockClear();
+    const { getByTestId, getAllByTestId, queryByTestId, container } = render(ToolCallWidget, {
+      tool: withFacet(facet),
+    });
+
+    expect(getByTestId("tool-verb")).toHaveTextContent("Delete");
+    expect(queryByTestId("tool-detail")).toBeNull();
+    expect(getAllByTestId("tool-edit-path").map((path) => path.textContent?.trim())).toEqual([
+      "/repo/old-a.txt",
+      "/repo/old-b.txt",
+    ]);
+    expect(container.querySelector('[data-origin="removed"]')).toBeNull();
+    expect(structuredPatchSpy).not.toHaveBeenCalled();
+
+    await fireEvent.click(getByTestId("tool-row"));
+    for (const section of getAllByTestId("tool-edit-file")) {
+      expect(section).not.toHaveTextContent("(deleted)");
+    }
+    const removed = Array.from(container.querySelectorAll('[data-origin="removed"]'));
+    expect(removed.map((line) => line.textContent)).toEqual(
+      expect.arrayContaining([expect.stringContaining("first"), expect.stringContaining("second")]),
+    );
   });
 
   it("caps a large edit diff to a preview and reveals the rest on expand", async () => {
@@ -818,8 +867,12 @@ describe("ToolCallWidget facet bodies", () => {
     const read = render(ToolCallWidget, {
       tool: withFacet({ facet_kind: "read", path: "/repo/src/main.rs" }),
     });
+    expect(read.queryByTestId("tool-detail")).toBeNull();
+    expect(read.getByTestId("tool-read-path")).toHaveTextContent("/repo/src/main.rs");
+    expect(read.queryByTestId("tool-output")).toBeNull();
     await fireEvent.click(read.getByTestId("tool-row"));
     expect(read.getByTestId("tool-read-path")).toHaveTextContent("/repo/src/main.rs");
+    expect(read.getByTestId("tool-output")).toHaveTextContent("hi");
     read.unmount();
 
     const search = render(ToolCallWidget, {

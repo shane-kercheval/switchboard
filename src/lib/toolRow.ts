@@ -65,15 +65,13 @@ export function toolVerb(facet: ToolFacet, rawName: string): string {
   }
 }
 
-/// A single-file edit reads by its change kind: harnesses without a separate
-/// write tool (Codex creates files via an apply_patch "Add File") arrive as
-/// Edit facets, but the user is looking at a creation or a deletion, and the
-/// label should say so. Multi-file patches stay "Edit" with per-file markers.
+/// A homogeneous patch reads by its change kind: harnesses without separate
+/// write/delete tools arrive as Edit facets, but the user is looking at a
+/// creation or deletion regardless of how many files the call touched. Mixed
+/// patches stay "Edit" and identify exceptional change kinds per file.
 function editVerb(files: { change: string }[]): string {
-  if (files.length === 1) {
-    if (files[0]!.change === "added") return "Write";
-    if (files[0]!.change === "deleted") return "Delete";
-  }
+  if (files.length > 0 && files.every((file) => file.change === "added")) return "Write";
+  if (files.length > 0 && files.every((file) => file.change === "deleted")) return "Delete";
   return "Edit";
 }
 
@@ -168,8 +166,8 @@ export function toolIcon(facet: ToolFacet): ToolIconComponent {
     case "shell":
       return SquareTerminal;
     case "edit":
-      if (facet.files.length === 1 && facet.files[0]!.change === "added") return FilePlus;
-      if (facet.files.length === 1 && facet.files[0]!.change === "deleted") return FileX;
+      if (editVerb(facet.files) === "Write") return FilePlus;
+      if (editVerb(facet.files) === "Delete") return FileX;
       return FilePen;
     case "write":
       return FilePlus;

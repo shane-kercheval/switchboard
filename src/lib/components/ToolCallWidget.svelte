@@ -15,38 +15,66 @@
   /// stringified every tool call's full raw input whether or not it was ever
   /// expanded — a 500 KB write built a 500 KB string and DOM node nobody asked
   /// for. Formatting raw JSON and output must stay gated behind `open`. The
-  /// deliberate exception: successful/running Edit and Write facets render
-  /// their diff inline — watching file changes stream by is the point of the
-  /// row. A failed/cancelled file operation suppresses that attempted content
-  /// and shows its status output instead; the Git view is authoritative for
-  /// what actually changed. Facet content is capped and off-window rows aren't
-  /// mounted at all (transcript render-windowing). Inline content is further
-  /// capped to a preview length (both while streaming and once settled —
-  /// flipping full→capped when a turn ends would be jarring); expanding the row
-  /// un-caps it and reveals output + raw input. Its detail line is suppressed in
-  /// both states: the inline per-file headers already carry the paths.
+  /// deliberate exception: successful/running Edit and Write facets and
+  /// input-derived MCP mutation previews render inline — watching requested
+  /// changes stream by is the point of the row. A failed/cancelled operation
+  /// suppresses that attempted content and shows its status output instead;
+  /// the Git view or remote service is authoritative for what actually changed.
+  /// Facet content is capped and off-window rows aren't mounted at all
+  /// (transcript render-windowing). Inline content is further capped to a
+  /// preview length (both while streaming and once settled — flipping
+  /// full→capped when a turn ends would be jarring); expanding the row un-caps
+  /// it and reveals output + raw input. Collapsed edits get a short exact-diff
+  /// attempt: ordinary and large-but-simple changes keep their preview, while
+  /// a genuinely complex comparison is prepared asynchronously on expansion.
+  /// File-facet detail is suppressed in both states because the inline per-file
+  /// headers already carry the paths.
   import type { ToolCall } from "$lib/state/index.svelte";
-  import type { EditedFile } from "$lib/types";
+  import type { FileDiff } from "$lib/types";
+  import { onDestroy } from "svelte";
+  import AsyncToolDiff from "$lib/components/AsyncToolDiff.svelte";
   import DiffView from "$lib/components/DiffView.svelte";
+  import AsyncIconButton from "$lib/components/ui/AsyncIconButton.svelte";
   import Spinner from "$lib/components/ui/Spinner.svelte";
+  import Tooltip from "$lib/components/ui/Tooltip.svelte";
+  import { ROW_ACTION_ICON_CLASS } from "$lib/components/ui/iconButton";
   import { languageForPath } from "$lib/diff";
-  import { synthesizeEditDiff, synthesizeWriteDiff, truncateDiff } from "$lib/toolDiff";
+  import {
+    COLLAPSED_EDIT_DIFF_TIMEOUT_MS,
+    createExpandedDiffCoordinator,
+    synthesizeCollapsedEditDiffs,
+    synthesizeMcpTextCreationDiff,
+    synthesizeMcpTextEditDiff,
+    synthesizeWriteDiff,
+    truncateDiff,
+  } from "$lib/toolDiff";
   import { formatToolInput, redactDisplay } from "$lib/toolInput";
-  import { isGenericFacet, toolDetail, toolIcon, toolRowState, toolVerb } from "$lib/toolRow";
+  import { copyText } from "$lib/native";
+  import {
+    isGenericFacet,
+    knownMcpMutation,
+    toolDetail,
+    toolIcon,
+    toolRowState,
+    toolVerb,
+  } from "$lib/toolRow";
   import { cn } from "$lib/utils";
-  import { CircleCheck, CircleDotDashed, Circle } from "@lucide/svelte";
+  import { CircleCheck, CircleDotDashed, Circle, Copy } from "@lucide/svelte";
 
   let { tool, turnSettled = true }: { tool: ToolCall; turnSettled?: boolean } = $props();
 
   // Start collapsed; the row itself carries the common case, and avoiding
   // automatic expansion keeps concurrent/fast tool calls from moving the page.
   let open = $state(false);
+  let expandedDiffCoordinator = $state(createExpandedDiffCoordinator());
 
   const facet = $derived(tool.facet);
+  const mutation = $derived(knownMcpMutation(facet));
   const rowState = $derived(toolRowState(tool));
   const verb = $derived(toolVerb(facet, tool.name));
+  const deleteFacet = $derived(facet.facet_kind === "edit" && verb === "Delete");
   const detail = $derived(
-    facet.facet_kind === "edit" || facet.facet_kind === "write"
+    facet.facet_kind === "edit" || facet.facet_kind === "write" || facet.facet_kind === "read"
       ? undefined
       : toolDetail(facet, tool.input),
   );
@@ -55,6 +83,9 @@
   const cancelled = $derived(rowState === "cancelled");
   const interrupted = $derived(failed || cancelled);
   const fileContentFacet = $derived(facet.facet_kind === "edit" || facet.facet_kind === "write");
+  const inlineContentFacet = $derived(
+    fileContentFacet || facet.facet_kind === "read" || mutation !== undefined,
+  );
   const outputPreview = $derived(boundedOutputPreview(tool.output));
   // Collapsed rows use only the bounded preview result. Once the user expands
   // the row, scanning the retained full value is intentional: it determines
@@ -68,6 +99,21 @@
         ? outputPreview.text
         : "Tool failed without error details."
       : "Tool cancelled before completion.",
+  );
+  const collapsedFileDiffs = $derived.by(() =>
+    facet.facet_kind === "edit"
+      ? synthesizeCollapsedEditDiffs(facet.files, COLLAPSED_EDIT_DIFF_TIMEOUT_MS)
+      : [],
+  );
+  const collapsedMcpEditDiff = $derived.by(() =>
+    mutation?.mutation_kind === "text_edit"
+      ? synthesizeMcpTextEditDiff(
+          mutation.before,
+          mutation.after,
+          mutation.content_truncated,
+          COLLAPSED_EDIT_DIFF_TIMEOUT_MS,
+        )
+      : undefined,
   );
 
   // Raw provenance for specialized facets sits behind its own reveal — the
@@ -97,6 +143,16 @@
   const OUTPUT_PREVIEW_SOURCE_CAP = 2_048;
   const OUTPUT_PREVIEW_TEXT_CAP = 240;
 
+  /// Bookmark fields are inline too, so their collapsed representation must
+  /// not mount a complete backend-capped value. Expansion intentionally
+  /// reveals the full captured field, matching diff previews.
+  const RECORD_FIELD_PREVIEW_SOURCE_CAP = 2_048;
+  const RECORD_FIELD_PREVIEW_TEXT_CAP = 500;
+
+  // Paths below the compact header are content, not one-line metadata. Allow
+  // breaks anywhere because absolute paths often contain no natural spaces.
+  const FILE_PATH_CLASS = "min-w-0 whitespace-normal [overflow-wrap:anywhere]";
+
   function boundedOutputPreview(value: string | undefined): {
     text: string;
     hasContent: boolean;
@@ -117,15 +173,41 @@
     return { text: formatted.slice(0, RAW_DISPLAY_CAP), truncated: true };
   }
 
+  function mutationTarget(): string {
+    if (mutation === undefined) return "";
+    return `${mutation.target}${mutation.target_truncated ? "…" : ""}`;
+  }
+
+  function boundedRecordFieldPreview(value: string): { text: string; truncated: boolean } {
+    const source = value.slice(0, RECORD_FIELD_PREVIEW_SOURCE_CAP);
+    const normalized = source.replace(/\s+/g, " ").trim();
+    const text = normalized.slice(0, RECORD_FIELD_PREVIEW_TEXT_CAP).trimEnd();
+    const truncated =
+      normalized.length > RECORD_FIELD_PREVIEW_TEXT_CAP ||
+      value.length > RECORD_FIELD_PREVIEW_SOURCE_CAP;
+    return { text: truncated ? `${text}…` : text, truncated };
+  }
+
   function todoStatusIcon(status: string): typeof Circle {
     if (status === "completed") return CircleCheck;
     if (status === "in_progress") return CircleDotDashed;
     return Circle;
   }
+
+  function setOpen(next: boolean): void {
+    if (next === open) return;
+    if (next) {
+      expandedDiffCoordinator = createExpandedDiffCoordinator();
+    } else {
+      expandedDiffCoordinator.cancel();
+    }
+    open = next;
+  }
+
+  onDestroy(() => expandedDiffCoordinator.cancel());
 </script>
 
-{#snippet inlineDiff(file: EditedFile, expandTestid: string)}
-  {@const fullDiff = synthesizeEditDiff(file)}
+{#snippet inlineDiff(fullDiff: FileDiff, language: string, expandTestid: string)}
   {@const preview = truncateDiff(fullDiff, INLINE_DIFF_PREVIEW_LINES)}
   {@const capped = !open && preview.hiddenLines > 0}
   <!-- Cap the inline diff in both live and settled states — flipping full to
@@ -138,12 +220,7 @@
         capped && "[mask-image:linear-gradient(to_bottom,black_calc(100%_-_3rem),transparent)]",
       )}
     >
-      <DiffView
-        diff={capped ? preview.diff : fullDiff}
-        style="unified"
-        language={languageForPath(file.path)}
-        compact
-      />
+      <DiffView diff={capped ? preview.diff : fullDiff} style="unified" {language} compact />
     </div>
   </div>
   {#if capped}
@@ -151,11 +228,71 @@
       type="button"
       class="text-muted hover:text-fg text-[11px] transition-colors"
       data-testid={expandTestid}
-      onclick={() => (open = true)}
+      onclick={() => setOpen(true)}
     >
       Show {preview.hiddenLines} more {preview.hiddenLines === 1 ? "line" : "lines"}
     </button>
   {/if}
+{/snippet}
+
+{#snippet deferredEditPreview(testid: string)}
+  <button
+    type="button"
+    class="text-muted hover:text-fg text-[11px] transition-colors"
+    data-testid={testid}
+    onclick={() => setOpen(true)}
+  >
+    Complex edit — expand to prepare diff
+  </button>
+{/snippet}
+
+{#snippet inlineAddedContent(
+  rendered: { diff: FileDiff; hiddenLines: number },
+  language: string,
+  contentTestid: string,
+  expandTestid: string,
+)}
+  {@const capped = rendered.hiddenLines > 0}
+  <div class="border-border/60 overflow-hidden rounded border" data-testid={contentTestid}>
+    <div
+      class={cn(
+        capped && "[mask-image:linear-gradient(to_bottom,black_calc(100%_-_3rem),transparent)]",
+      )}
+    >
+      <DiffView diff={rendered.diff} style="unified" {language} compact />
+    </div>
+  </div>
+  {#if capped}
+    <button
+      type="button"
+      class="text-muted hover:text-fg text-[11px] transition-colors"
+      data-testid={expandTestid}
+      onclick={() => setOpen(true)}
+    >
+      Show {rendered.hiddenLines} more {rendered.hiddenLines === 1 ? "line" : "lines"}
+    </button>
+  {/if}
+{/snippet}
+
+{#snippet copyPathAction(path: string)}
+  <div
+    class="pointer-events-none mr-0.5 shrink-0 opacity-0 transition-opacity group-focus-within/path:pointer-events-auto group-focus-within/path:opacity-100 group-hover/path:pointer-events-auto group-hover/path:opacity-100"
+  >
+    <Tooltip label="Copy path" side="top">
+      {#snippet trigger(props)}
+        <AsyncIconButton
+          {...props}
+          class={cn(ROW_ACTION_ICON_CLASS, "h-6 w-6")}
+          label={`Copy path for ${path}`}
+          testid="tool-path-copy"
+          action={() => copyText(path)}
+          onError={(error) => console.error("[switchboard] copy tool path failed", error)}
+        >
+          <Copy size={14} strokeWidth={1.8} aria-hidden="true" />
+        </AsyncIconButton>
+      {/snippet}
+    </Tooltip>
+  </div>
 {/snippet}
 
 <div class="text-xs" data-testid="turn-tool" data-tool-use-id={tool.tool_use_id}>
@@ -164,7 +301,7 @@
     class="hover:bg-hover flex min-h-7 w-full items-center gap-2 rounded-md px-1.5 py-1 text-left"
     aria-expanded={open}
     data-testid="tool-row"
-    onclick={() => (open = !open)}
+    onclick={() => setOpen(!open)}
   >
     <FacetIcon class="text-muted h-3.5 w-3.5 shrink-0" aria-hidden="true" />
     <span class="text-fg shrink-0 font-medium" data-testid="tool-verb">{verb}</span>
@@ -242,7 +379,7 @@
     {/if}
   </button>
 
-  {#if open || fileContentFacet || interrupted}
+  {#if open || inlineContentFacet || interrupted}
     <div
       class="border-border/70 mt-1 ml-[13px] space-y-2 border-l py-0.5 pl-4"
       data-testid="tool-body"
@@ -257,25 +394,44 @@
           {/if}
         </section>
       {:else if !interrupted && facet.facet_kind === "edit"}
-        {#each facet.files as file (file.path)}
+        {#each facet.files as file, index (file.path)}
           <section class="space-y-1" aria-label="File edit" data-testid="tool-edit-file">
-            <div class="text-muted flex items-center gap-2 font-mono text-[11px]">
-              <span class="min-w-0 truncate" title={file.path}>{file.path}</span>
-              {#if facet.files.length > 1 && file.change !== "modified"}
+            <div
+              class="group/path text-muted flex items-start gap-2 font-mono text-[11px]"
+              data-testid="tool-path-row"
+            >
+              <span class={cn(FILE_PATH_CLASS, "flex-1")} data-testid="tool-edit-path">
+                {file.path}
+              </span>
+              {#if verb === "Edit" && facet.files.length > 1 && file.change !== "modified"}
                 <span class="shrink-0">({file.change})</span>
               {/if}
+              {@render copyPathAction(file.path)}
             </div>
-            {#if file.edits.length === 0}
-              <!-- A live Codex edit announces paths without content; the facet
-                   is upgraded from the session file at turn end. Empty edits on
-                   a settled turn mean the content never became available. -->
-              <p class="text-muted" data-testid="tool-edit-pending">
-                {turnSettled
-                  ? "Diff content unavailable for this edit."
-                  : "Diff will appear when the turn completes."}
-              </p>
-            {:else}
-              {@render inlineDiff(file, "tool-edit-expand")}
+            {#if !deleteFacet || open}
+              {@const diff = collapsedFileDiffs[index]}
+              {#if file.edits.length === 0}
+                <!-- A live Codex edit announces paths without content; the facet
+                     is upgraded from the session file at turn end. Empty edits on
+                     a settled turn mean the content never became available. -->
+                <p class="text-muted" data-testid="tool-edit-pending">
+                  {turnSettled
+                    ? "Diff content unavailable for this edit."
+                    : "Diff will appear when the turn completes."}
+                </p>
+              {:else if diff !== undefined}
+                {@render inlineDiff(diff, languageForPath(file.path), "tool-edit-expand")}
+              {:else if open}
+                <AsyncToolDiff
+                  sourceKind="file"
+                  {file}
+                  coordinator={expandedDiffCoordinator}
+                  language={languageForPath(file.path)}
+                  testid="tool-edit-async"
+                />
+              {:else}
+                {@render deferredEditPreview("tool-edit-deferred")}
+              {/if}
             {/if}
           </section>
         {/each}
@@ -286,43 +442,118 @@
           facet.truncated,
           open ? undefined : INLINE_DIFF_PREVIEW_LINES,
         )}
-        {@const capped = rendered.hiddenLines > 0}
         <section class="space-y-1" aria-label="File write" data-testid="tool-write-file">
-          <div class="text-muted truncate font-mono text-[11px]" title={facet.path}>
-            {facet.path}
-          </div>
           <div
-            class="border-border/60 overflow-hidden rounded border"
-            data-testid="tool-write-content"
+            class="group/path text-muted flex items-start gap-2 font-mono text-[11px]"
+            data-testid="tool-path-row"
           >
-            <div
-              class={cn(
-                capped &&
-                  "[mask-image:linear-gradient(to_bottom,black_calc(100%_-_3rem),transparent)]",
-              )}
-            >
-              <DiffView
-                diff={rendered.diff}
-                style="unified"
-                language={languageForPath(facet.path)}
-                compact
-              />
-            </div>
+            <span class={cn(FILE_PATH_CLASS, "flex-1")} data-testid="tool-write-path">
+              {facet.path}
+            </span>
+            {@render copyPathAction(facet.path)}
           </div>
-          {#if capped}
-            <button
-              type="button"
-              class="text-muted hover:text-fg text-[11px] transition-colors"
-              data-testid="tool-write-expand"
-              onclick={() => (open = true)}
-            >
-              Show {rendered.hiddenLines} more {rendered.hiddenLines === 1 ? "line" : "lines"}
-            </button>
+          {@render inlineAddedContent(
+            rendered,
+            languageForPath(facet.path),
+            "tool-write-content",
+            "tool-write-expand",
+          )}
+        </section>
+      {:else if !interrupted && mutation?.mutation_kind === "text_edit"}
+        <section class="space-y-1" aria-label="Requested content edit" data-testid="tool-mcp-edit">
+          {#if open}
+            <div class="text-muted truncate font-mono text-[11px]" data-testid="tool-mcp-target">
+              {mutationTarget()}
+            </div>
+          {/if}
+          {#if collapsedMcpEditDiff !== undefined}
+            {@render inlineDiff(collapsedMcpEditDiff, "markdown", "tool-mcp-edit-expand")}
+          {:else if open}
+            <AsyncToolDiff
+              sourceKind="mcp"
+              before={mutation.before}
+              after={mutation.after}
+              contentTruncated={mutation.content_truncated}
+              coordinator={expandedDiffCoordinator}
+              language="markdown"
+              testid="tool-mcp-edit-async"
+            />
+          {:else}
+            {@render deferredEditPreview("tool-mcp-edit-deferred")}
           {/if}
         </section>
-      {:else if open && facet.facet_kind === "read"}
-        <div class="text-muted font-mono text-[11px]" data-testid="tool-read-path">
-          {facet.path}
+      {:else if !interrupted && mutation?.mutation_kind === "text_creation"}
+        <section
+          class="space-y-1"
+          aria-label="Requested content creation"
+          data-testid="tool-mcp-creation"
+        >
+          {#if open}
+            <div class="text-muted truncate font-mono text-[11px]" data-testid="tool-mcp-target">
+              {mutationTarget()}
+            </div>
+          {/if}
+          {#if mutation.content === ""}
+            <p class="text-muted" data-testid="tool-mcp-empty-creation">
+              Created without body content.
+            </p>
+          {:else}
+            {@const rendered = synthesizeMcpTextCreationDiff(
+              mutation.content,
+              mutation.content_truncated,
+              open ? undefined : INLINE_DIFF_PREVIEW_LINES,
+            )}
+            {@render inlineAddedContent(
+              rendered,
+              "markdown",
+              "tool-mcp-creation-content",
+              "tool-mcp-creation-expand",
+            )}
+          {/if}
+        </section>
+      {:else if !interrupted && mutation?.mutation_kind === "record_creation"}
+        <section
+          class="space-y-1"
+          aria-label="Requested record creation"
+          data-testid="tool-mcp-record-creation"
+        >
+          {#if open}
+            <div class="text-muted truncate font-mono text-[11px]" data-testid="tool-mcp-target">
+              {mutationTarget()}
+            </div>
+          {/if}
+          <dl class="border-border/60 divide-border/40 divide-y overflow-hidden rounded border">
+            {#each mutation.fields as field, index (`${field.label}:${index}`)}
+              {@const preview = boundedRecordFieldPreview(field.value)}
+              <div class="bg-diff-added-soft flex min-w-0 gap-3 px-2 py-1">
+                <dt class="text-muted w-20 shrink-0 font-medium">{field.label}</dt>
+                <dd
+                  class={cn(
+                    "text-fg min-w-0 flex-1 break-words",
+                    open ? "whitespace-pre-wrap" : "truncate",
+                  )}
+                  data-testid="tool-mcp-record-field"
+                >
+                  {open ? field.value : preview.text}
+                </dd>
+              </div>
+            {/each}
+          </dl>
+          {#if mutation.fields_truncated}
+            <p class="text-muted text-[11px]" data-testid="tool-mcp-record-truncated">
+              Bookmark details truncated.
+            </p>
+          {/if}
+        </section>
+      {:else if !interrupted && facet.facet_kind === "read"}
+        <div
+          class="group/path text-muted flex items-start gap-2 font-mono text-[11px]"
+          data-testid="tool-path-row"
+        >
+          <span class={cn(FILE_PATH_CLASS, "flex-1")} data-testid="tool-read-path">
+            {facet.path}
+          </span>
+          {@render copyPathAction(facet.path)}
         </div>
       {:else if open && facet.facet_kind === "search"}
         <div class="text-muted font-mono text-[11px]" data-testid="tool-search-detail">

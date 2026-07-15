@@ -1,0 +1,1 @@
+{"type":"assistant","message":{"model":"claude-sonnet-5","id":"msg_mcp_mutation","type":"message","role":"assistant","content":[{"type":"tool_use","id":"toolu_mcp_mutation","name":"mcp__notes_alias__edit_content","input":{"id":"note-example","type":"note","old_str":"before text","new_str":"after text"}}],"stop_reason":"tool_use"}}

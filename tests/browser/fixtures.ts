@@ -1,4 +1,4 @@
-import type { AgentRecord } from "$lib/types";
+import type { AgentRecord, ToolFacet } from "$lib/types";
 import type { Turn } from "$lib/state/index.svelte";
 
 // Shared seed data for the transcript browser specs. Mirrors the agent/turn shapes the
@@ -41,10 +41,15 @@ export function textItem(text: string): Item {
   return { item_kind: "text", kind: "text", text };
 }
 
-export function toolItem(opts: { id: string; name?: string; command?: string }): Item {
+export function toolItem(opts: {
+  id: string;
+  name?: string;
+  command?: string;
+  facet?: ToolFacet;
+}): Item {
   return {
     item_kind: "tool",
-    facet: { facet_kind: "other" },
+    facet: opts.facet ?? { facet_kind: "other" },
     tool_use_id: opts.id,
     kind: "builtin",
     name: opts.name ?? "Bash",

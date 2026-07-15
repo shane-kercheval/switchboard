@@ -1,8 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
-import { render, fireEvent } from "@testing-library/svelte";
+import { render, fireEvent, waitFor } from "@testing-library/svelte";
+import type { StructuredPatch } from "diff";
 import type { ToolCall } from "$lib/state/types";
 import type { ToolFacet } from "$lib/types";
+import { createExpandedDiffCoordinator } from "$lib/toolDiff";
+import AsyncToolDiff from "./AsyncToolDiff.svelte";
 import ToolCallWidget from "./ToolCallWidget.svelte";
 
 // Wrap the real formatter in a spy so the eager-stringify regression test can
@@ -14,6 +17,18 @@ vi.mock("$lib/toolInput", async (importOriginal) => {
   formatToolInputSpy.mockImplementation(mod.formatToolInput);
   return { ...mod, formatToolInput: formatToolInputSpy };
 });
+
+const structuredPatchSpy = vi.hoisted(() => vi.fn());
+vi.mock("diff", async (importOriginal) => {
+  const mod = await importOriginal<typeof import("diff")>();
+  structuredPatchSpy.mockImplementation(mod.structuredPatch);
+  return { ...mod, structuredPatch: structuredPatchSpy };
+});
+
+const copyTextMock = vi.hoisted(() => vi.fn(async (_text: string): Promise<void> => undefined));
+vi.mock("$lib/native", () => ({
+  copyText: (text: string) => copyTextMock(text),
+}));
 
 const running: ToolCall = {
   item_kind: "tool",
@@ -57,6 +72,122 @@ const EDIT_FACET: ToolFacet = {
   ],
 };
 
+function mcpTextEdit(
+  target = "note · note-example",
+  overrides: Partial<{
+    target_truncated: boolean;
+    before: string;
+    after: string;
+    content_truncated: boolean;
+  }> = {},
+): ToolFacet {
+  return {
+    facet_kind: "mcp",
+    server: "notes_alias",
+    tool: "edit_content",
+    mutation: {
+      mutation_kind: "text_edit",
+      target,
+      target_truncated: false,
+      before: "old line\n",
+      after: "new line\n",
+      content_truncated: false,
+      ...overrides,
+    },
+  };
+}
+
+function mcpTextCreation(
+  target = "note · New note",
+  content = "# Heading\n\nCreated body\n",
+  contentTruncated = false,
+): ToolFacet {
+  return {
+    facet_kind: "mcp",
+    server: "notes_alias",
+    tool: "create_note",
+    mutation: {
+      mutation_kind: "text_creation",
+      target,
+      target_truncated: false,
+      content,
+      content_truncated: contentTruncated,
+    },
+  };
+}
+
+function mcpRecordCreation(
+  fieldsTruncated = false,
+  fields = [
+    { label: "Title", value: "Example" },
+    { label: "URL", value: "https://example.com" },
+    { label: "Description", value: "Useful reference" },
+    { label: "Tags", value: "research, example" },
+  ],
+): ToolFacet {
+  return {
+    facet_kind: "mcp",
+    server: "notes_alias",
+    tool: "create_bookmark",
+    mutation: {
+      mutation_kind: "record_creation",
+      target: "bookmark · Example",
+      target_truncated: false,
+      fields,
+      fields_truncated: fieldsTruncated,
+    },
+  };
+}
+
+function withMcpFacet(facet: ToolFacet, overrides: Partial<ToolCall> = {}): ToolCall {
+  return withFacet(facet, {
+    kind: "mcp",
+    name: "mcp__notes_alias__mutation",
+    input: { marker: "raw MCP input" },
+    output: "minimal server output",
+    ...overrides,
+  });
+}
+
+function unrelatedLines(count: number, prefix: string): string {
+  return Array.from({ length: count }, (_, index) => `${prefix}${index}`).join("\n");
+}
+
+function mockAsyncPatchResult(
+  result: "success" | "unavailable" = "success",
+  removed = "before",
+  added = "after",
+): () => void {
+  let deliver = (): void => {
+    throw new Error("Async patch computation did not start");
+  };
+  structuredPatchSpy.mockImplementationOnce((...args: unknown[]) => {
+    const options = args[6] as { callback: (patch: StructuredPatch | undefined) => void };
+    deliver = () =>
+      options.callback(
+        result === "unavailable"
+          ? undefined
+          : {
+              oldFileName: "",
+              newFileName: "",
+              oldHeader: "",
+              newHeader: "",
+              hunks: [
+                {
+                  oldStart: 1,
+                  oldLines: 1,
+                  newStart: 1,
+                  newLines: 1,
+                  lines: [`-${removed}`, `+${added}`],
+                },
+              ],
+            },
+      );
+    return undefined;
+  });
+  return () => deliver();
+}
+
 describe("ToolCallWidget collapsed row", () => {
   // Detail is facet-derived and never repeats the verb or the raw tool name —
   // the raw name lives in the expanded raw-input label instead.
@@ -68,7 +199,7 @@ describe("ToolCallWidget collapsed row", () => {
       verb: "Write",
       detail: null,
     },
-    { facet: { facet_kind: "read", path: "/repo/x" }, verb: "Read", detail: "/repo/x" },
+    { facet: { facet_kind: "read", path: "/repo/x" }, verb: "Read", detail: null },
     {
       facet: { facet_kind: "search", pattern: "todo", path: null },
       verb: "Search",
@@ -461,9 +592,10 @@ describe("ToolCallWidget facet bodies", () => {
     const { getByTestId } = render(ToolCallWidget, { tool: withFacet(facet) });
     expect(getByTestId("tool-verb")).toHaveTextContent("Write");
     expect(getByTestId("tool-body")).not.toHaveTextContent("(added)");
+    expect(getByTestId("tool-path-copy")).toBeInTheDocument();
   });
 
-  it("labels a single-file deletion as Delete", () => {
+  it("keeps a single-file deletion quiet until expanded", async () => {
     const facet: ToolFacet = {
       facet_kind: "edit",
       files: [
@@ -475,9 +607,69 @@ describe("ToolCallWidget facet bodies", () => {
         },
       ],
     };
-    const { getByTestId } = render(ToolCallWidget, { tool: withFacet(facet) });
+    structuredPatchSpy.mockClear();
+    const { getByTestId, queryByTestId, container } = render(ToolCallWidget, {
+      tool: withFacet(facet),
+    });
     expect(getByTestId("tool-verb")).toHaveTextContent("Delete");
+    expect(queryByTestId("tool-detail")).toBeNull();
+    expect(getByTestId("tool-edit-path")).toHaveTextContent("/repo/old.txt");
+    expect(container.querySelector('[data-origin="removed"]')).toBeNull();
+    expect(structuredPatchSpy).not.toHaveBeenCalled();
+
+    await fireEvent.click(getByTestId("tool-row"));
     expect(getByTestId("tool-body")).not.toHaveTextContent("(deleted)");
+    expect(queryByTestId("tool-edit-pending")).toBeNull();
+    expect(container.querySelector('[data-origin="removed"]')).toHaveTextContent("bye");
+    expect(container.querySelector('[data-origin="added"]')).toBeNull();
+  });
+
+  it("keeps a homogeneous multi-file deletion quiet until expanded", async () => {
+    const facet: ToolFacet = {
+      facet_kind: "edit",
+      files: [
+        {
+          path: "/repo/old-a.txt",
+          change: "deleted",
+          edits: [{ old: "first\n", new: "" }],
+          truncated: false,
+        },
+        {
+          path: "/repo/old-b.txt",
+          change: "deleted",
+          edits: [{ old: "second\n", new: "" }],
+          truncated: false,
+        },
+      ],
+    };
+    structuredPatchSpy.mockClear();
+    copyTextMock.mockClear();
+    const { getByTestId, getAllByTestId, queryByTestId, container } = render(ToolCallWidget, {
+      tool: withFacet(facet),
+    });
+
+    expect(getByTestId("tool-verb")).toHaveTextContent("Delete");
+    expect(queryByTestId("tool-detail")).toBeNull();
+    expect(getAllByTestId("tool-edit-path").map((path) => path.textContent?.trim())).toEqual([
+      "/repo/old-a.txt",
+      "/repo/old-b.txt",
+    ]);
+    expect(container.querySelector('[data-origin="removed"]')).toBeNull();
+    expect(structuredPatchSpy).not.toHaveBeenCalled();
+
+    await fireEvent.click(getAllByTestId("tool-path-copy")[1]!);
+    expect(copyTextMock).toHaveBeenCalledWith("/repo/old-b.txt");
+    expect(getByTestId("tool-row")).toHaveAttribute("aria-expanded", "false");
+    expect(structuredPatchSpy).not.toHaveBeenCalled();
+
+    await fireEvent.click(getByTestId("tool-row"));
+    for (const section of getAllByTestId("tool-edit-file")) {
+      expect(section).not.toHaveTextContent("(deleted)");
+    }
+    const removed = Array.from(container.querySelectorAll('[data-origin="removed"]'));
+    expect(removed.map((line) => line.textContent)).toEqual(
+      expect.arrayContaining([expect.stringContaining("first"), expect.stringContaining("second")]),
+    );
   });
 
   it("caps a large edit diff to a preview and reveals the rest on expand", async () => {
@@ -546,8 +738,54 @@ describe("ToolCallWidget facet bodies", () => {
 
     const sections = getAllByTestId("tool-edit-file");
     expect(sections).toHaveLength(2);
+    expect(getAllByTestId("tool-path-copy")).toHaveLength(2);
     expect(sections[1]).toHaveTextContent("(added)");
     expect(getByTestId("tool-verb")).toHaveTextContent("Edit");
+  });
+
+  it("prepares only timed-out file diffs asynchronously on expansion", async () => {
+    const facet: ToolFacet = {
+      facet_kind: "edit",
+      files: [
+        {
+          path: "/repo/a.ts",
+          change: "modified",
+          edits: [{ old: unrelatedLines(126, "a-old-"), new: unrelatedLines(126, "a-new-") }],
+          truncated: false,
+        },
+        {
+          path: "/repo/b.ts",
+          change: "modified",
+          edits: [{ old: unrelatedLines(126, "b-old-"), new: unrelatedLines(126, "b-new-") }],
+          truncated: false,
+        },
+      ],
+    };
+    structuredPatchSpy.mockClear();
+    structuredPatchSpy.mockReturnValueOnce(undefined);
+    const { getAllByTestId, queryByTestId } = render(ToolCallWidget, {
+      tool: withFacet(facet),
+    });
+
+    const sections = getAllByTestId("tool-edit-file");
+    expect(sections).toHaveLength(2);
+    expect(sections[0]).toHaveTextContent("/repo/a.ts");
+    expect(sections[1]).toHaveTextContent("/repo/b.ts");
+    expect(queryByTestId("diff-view")).toBeNull();
+    expect(getAllByTestId("tool-edit-deferred")).toHaveLength(2);
+    expect(structuredPatchSpy).toHaveBeenCalledTimes(1);
+
+    const finishFirst = mockAsyncPatchResult();
+    const finishSecond = mockAsyncPatchResult();
+    await fireEvent.click(getAllByTestId("tool-edit-deferred")[0]!);
+    expect(queryByTestId("tool-edit-deferred")).toBeNull();
+    expect(getAllByTestId("tool-edit-async-loading")).toHaveLength(2);
+    expect(structuredPatchSpy).toHaveBeenCalledTimes(2);
+    finishFirst();
+    await waitFor(() => expect(structuredPatchSpy).toHaveBeenCalledTimes(3));
+    finishSecond();
+    await waitFor(() => expect(getAllByTestId("diff-view")).toHaveLength(2));
+    expect(structuredPatchSpy).toHaveBeenCalledTimes(3);
   });
 
   it("shows a pending placeholder for a content-less edit on a live turn", async () => {
@@ -639,11 +877,19 @@ describe("ToolCallWidget facet bodies", () => {
   });
 
   it("renders read and search facet details", async () => {
+    copyTextMock.mockClear();
     const read = render(ToolCallWidget, {
       tool: withFacet({ facet_kind: "read", path: "/repo/src/main.rs" }),
     });
+    expect(read.queryByTestId("tool-detail")).toBeNull();
+    expect(read.getByTestId("tool-read-path")).toHaveTextContent("/repo/src/main.rs");
+    expect(read.queryByTestId("tool-output")).toBeNull();
+    await fireEvent.click(read.getByTestId("tool-path-copy"));
+    expect(copyTextMock).toHaveBeenCalledWith("/repo/src/main.rs");
+    expect(read.getByTestId("tool-row")).toHaveAttribute("aria-expanded", "false");
     await fireEvent.click(read.getByTestId("tool-row"));
     expect(read.getByTestId("tool-read-path")).toHaveTextContent("/repo/src/main.rs");
+    expect(read.getByTestId("tool-output")).toHaveTextContent("hi");
     read.unmount();
 
     const search = render(ToolCallWidget, {
@@ -651,5 +897,380 @@ describe("ToolCallWidget facet bodies", () => {
     });
     await fireEvent.click(search.getByTestId("tool-row"));
     expect(search.getByTestId("tool-search-detail")).toHaveTextContent("TODO in /repo/src");
+  });
+});
+
+describe("ToolCallWidget MCP mutation bodies", () => {
+  it.each([
+    ["note", mcpTextEdit("note · note-example"), "note · note-example"],
+    ["bookmark", mcpTextEdit("bookmark · bookmark-example"), "bookmark · bookmark-example"],
+    [
+      "prompt",
+      {
+        facet_kind: "mcp",
+        server: "prompts_alias",
+        tool: "edit_prompt_content",
+        mutation: {
+          mutation_kind: "text_edit",
+          target: "prompt · review-code",
+          target_truncated: false,
+          before: "Review {{ old }}\n",
+          after: "Review {{ changes }}\n",
+          content_truncated: false,
+        },
+      } satisfies ToolFacet,
+      "prompt · review-code",
+    ],
+  ])("renders a %s text edit as an inline compact diff", (_kind, facet, target) => {
+    const { getByTestId, queryByTestId, container } = render(ToolCallWidget, {
+      tool: withMcpFacet(facet),
+    });
+
+    expect(getByTestId("tool-mcp-edit")).toBeInTheDocument();
+    expect(getByTestId("tool-detail")).toHaveTextContent(target);
+    expect(queryByTestId("tool-output")).toBeNull();
+    expect(container.querySelector('[data-origin="removed"]')).not.toBeNull();
+    expect(container.querySelector('[data-origin="added"]')).not.toBeNull();
+    expect(getByTestId("tool-body")).not.toHaveTextContent("snippet-relative");
+  });
+
+  it("prepares a timed-out MCP edit asynchronously on expansion", async () => {
+    const before = unrelatedLines(251, "before-");
+    const after = unrelatedLines(250, "after-");
+    structuredPatchSpy.mockClear();
+    structuredPatchSpy.mockReturnValueOnce(undefined);
+    const { getByTestId, queryByTestId, container } = render(ToolCallWidget, {
+      tool: withMcpFacet(mcpTextEdit("note · large", { before, after })),
+    });
+
+    expect(getByTestId("tool-mcp-edit-deferred")).toHaveTextContent(
+      "Complex edit — expand to prepare diff",
+    );
+    expect(queryByTestId("diff-view")).toBeNull();
+    expect(structuredPatchSpy).toHaveBeenCalledTimes(1);
+
+    const finish = mockAsyncPatchResult();
+    await fireEvent.click(getByTestId("tool-mcp-edit-deferred"));
+    expect(queryByTestId("tool-mcp-edit-deferred")).toBeNull();
+    expect(getByTestId("tool-mcp-edit-async-loading")).toHaveTextContent("Preparing full diff…");
+    finish();
+    await waitFor(() => expect(getByTestId("diff-view")).toBeInTheDocument());
+    expect(container.querySelector('[data-origin="removed"]')).not.toBeNull();
+    expect(container.querySelector('[data-origin="added"]')).not.toBeNull();
+    expect(structuredPatchSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps a 100K-character simple addition as an inline preview", () => {
+    structuredPatchSpy.mockClear();
+    const { getByTestId, queryByTestId } = render(ToolCallWidget, {
+      tool: withMcpFacet(
+        mcpTextEdit("note · large source", { before: "", after: "x".repeat(100_000) }),
+      ),
+    });
+
+    expect(queryByTestId("tool-mcp-edit-deferred")).toBeNull();
+    expect(getByTestId("diff-view")).toBeInTheDocument();
+    expect(structuredPatchSpy).toHaveBeenCalledTimes(1);
+    const timeout = (structuredPatchSpy.mock.calls[0]?.[6] as { timeout: number }).timeout;
+    expect(timeout).toBeGreaterThan(0);
+    expect(timeout).toBeLessThanOrEqual(25);
+  });
+
+  it("reports when an expanded complex edit exceeds the asynchronous safety ceiling", async () => {
+    structuredPatchSpy.mockClear();
+    structuredPatchSpy.mockReturnValueOnce(undefined);
+    const { getByTestId } = render(ToolCallWidget, {
+      tool: withMcpFacet(mcpTextEdit("note · pathological")),
+    });
+
+    const finish = mockAsyncPatchResult("unavailable");
+    await fireEvent.click(getByTestId("tool-mcp-edit-deferred"));
+    expect(getByTestId("tool-mcp-edit-async-loading")).toBeInTheDocument();
+    finish();
+    await waitFor(() =>
+      expect(getByTestId("tool-mcp-edit-async-unavailable")).toHaveTextContent(
+        "too complex to render inline",
+      ),
+    );
+  });
+
+  it.each([
+    ["note", mcpTextCreation("note · Release notes", "# Release\n\nReady.\n")],
+    [
+      "prompt",
+      {
+        facet_kind: "mcp",
+        server: "prompts_alias",
+        tool: "create_prompt",
+        mutation: {
+          mutation_kind: "text_creation",
+          target: "prompt · summarize",
+          target_truncated: false,
+          content: "Summarize {{ context }}\n",
+          content_truncated: false,
+        },
+      } satisfies ToolFacet,
+    ],
+  ])("renders a %s creation as all-added Markdown content", (kind, facet) => {
+    const { getByTestId, container } = render(ToolCallWidget, {
+      tool: withMcpFacet(facet),
+    });
+
+    expect(getByTestId("tool-mcp-creation-content")).toBeInTheDocument();
+    expect(container.querySelectorAll('[data-origin="added"]')).not.toHaveLength(0);
+    expect(container.querySelector('[data-origin="removed"]')).toBeNull();
+    if (kind === "note") {
+      expect(container.querySelector(".token")).not.toBeNull();
+    } else {
+      expect(getByTestId("tool-mcp-creation-content")).toHaveTextContent("{{ context }}");
+    }
+  });
+
+  it("renders bookmark creation as structured added fields, not a diff", () => {
+    const { getByTestId, getAllByTestId, queryByTestId } = render(ToolCallWidget, {
+      tool: withMcpFacet(mcpRecordCreation()),
+    });
+
+    const record = getByTestId("tool-mcp-record-creation");
+    expect(record).toHaveTextContent("Title");
+    expect(record).toHaveTextContent("https://example.com");
+    expect(getAllByTestId("tool-mcp-record-field")).toHaveLength(4);
+    expect(queryByTestId("diff-view")).toBeNull();
+  });
+
+  it("keeps an empty text creation legible without mounting an empty diff", () => {
+    const { getByTestId, queryByTestId } = render(ToolCallWidget, {
+      tool: withMcpFacet(mcpTextCreation("note · Empty note", "")),
+    });
+
+    expect(getByTestId("tool-detail")).toHaveTextContent("note · Empty note");
+    expect(getByTestId("tool-mcp-empty-creation")).toHaveTextContent(
+      "Created without body content.",
+    );
+    expect(queryByTestId("diff-view")).toBeNull();
+  });
+
+  it("mounts only the bounded target plus an ellipsis and never puts it in a title", async () => {
+    const boundedTarget = `note · ${"é".repeat(233)}`;
+    const fullTarget = `${boundedTarget}${"é".repeat(2000)}`;
+    const facet = mcpTextEdit(boundedTarget, { target_truncated: true });
+    const { getByTestId, queryByTestId, container } = render(ToolCallWidget, {
+      tool: withMcpFacet(facet, { input: { title: fullTarget } }),
+    });
+
+    const detail = getByTestId("tool-detail");
+    expect(detail).toHaveTextContent(`${boundedTarget}…`);
+    expect(detail).not.toHaveAttribute("title");
+    expect(container.textContent).not.toContain(fullTarget);
+    expect(queryByTestId("diff-truncated")).toBeNull();
+
+    await fireEvent.click(getByTestId("tool-row"));
+    expect(getByTestId("tool-mcp-target")).toHaveTextContent(`${boundedTarget}…`);
+    expect(getByTestId("tool-mcp-target")).not.toHaveAttribute("title");
+    expect(container.textContent).not.toContain(fullTarget);
+  });
+
+  it("uses content truncation, but not target truncation, for the diff warning", () => {
+    const targetOnly = render(ToolCallWidget, {
+      tool: withMcpFacet(mcpTextEdit("note · bounded", { target_truncated: true })),
+    });
+    expect(targetOnly.queryByTestId("diff-truncated")).toBeNull();
+    targetOnly.unmount();
+
+    const content = render(ToolCallWidget, {
+      tool: withMcpFacet(mcpTextEdit("note · normal", { content_truncated: true })),
+    });
+    expect(content.getByTestId("diff-truncated")).toHaveTextContent("Diff truncated");
+  });
+
+  it("uses record-specific copy for capped bookmark fields", () => {
+    const { getByTestId, queryByTestId } = render(ToolCallWidget, {
+      tool: withMcpFacet(mcpRecordCreation(true)),
+    });
+    expect(getByTestId("tool-mcp-record-truncated")).toHaveTextContent(
+      "Bookmark details truncated.",
+    );
+    expect(queryByTestId("diff-truncated")).toBeNull();
+  });
+
+  it("bounds bookmark field text while collapsed and reveals captured text on expansion", async () => {
+    const longValue = `begin ${"x".repeat(20_000)} end`;
+    const { getByTestId } = render(ToolCallWidget, {
+      tool: withMcpFacet(mcpRecordCreation(false, [{ label: "Description", value: longValue }])),
+    });
+    const collapsed = getByTestId("tool-mcp-record-field").textContent ?? "";
+    expect(collapsed.length).toBeLessThan(600);
+    expect(collapsed.endsWith("…")).toBe(true);
+
+    await fireEvent.click(getByTestId("tool-row"));
+    expect(getByTestId("tool-mcp-record-field").textContent).toBe(longValue);
+  });
+
+  it("caps a long text mutation at 25 lines and reveals captured content on expansion", async () => {
+    const content = Array.from({ length: 60 }, (_, index) => `line ${index}`).join("\n") + "\n";
+    const { getByTestId, queryByTestId, container } = render(ToolCallWidget, {
+      tool: withMcpFacet(mcpTextCreation("prompt · long", content)),
+    });
+
+    expect(getByTestId("tool-mcp-creation-expand")).toHaveTextContent("Show 35 more lines");
+    expect(container.querySelectorAll('[data-origin="added"]')).toHaveLength(25);
+    await fireEvent.click(getByTestId("tool-mcp-creation-expand"));
+    expect(queryByTestId("tool-mcp-creation-expand")).toBeNull();
+    expect(container.querySelectorAll('[data-origin="added"]')).toHaveLength(60);
+  });
+
+  for (const [mutationKind, facet] of [
+    ["edit", mcpTextEdit()],
+    ["creation", mcpTextCreation()],
+  ] as const) {
+    for (const [status, overrides] of [
+      ["failed", { is_error: true, output: "mutation failed" }],
+      [
+        "cancelled",
+        {
+          completed_at: undefined,
+          is_error: undefined,
+          output: undefined,
+          stopped_at: "2026-05-16T00:00:02Z",
+          stop_reason: "cancelled" as const,
+        },
+      ],
+    ] as const) {
+      it(`suppresses a ${status} MCP ${mutationKind} body and retains raw input`, async () => {
+        const { getByTestId, queryByTestId } = render(ToolCallWidget, {
+          tool: withMcpFacet(facet, overrides),
+        });
+        expect(queryByTestId("tool-mcp-edit")).toBeNull();
+        expect(queryByTestId("tool-mcp-creation")).toBeNull();
+        expect(getByTestId("tool-status-preview")).toBeInTheDocument();
+
+        await fireEvent.click(getByTestId("tool-row"));
+        expect(getByTestId("tool-raw-toggle")).toBeInTheDocument();
+        await fireEvent.click(getByTestId("tool-raw-toggle"));
+        expect(getByTestId("tool-input")).toHaveTextContent("raw MCP input");
+      });
+    }
+  }
+
+  it("keeps successful output collapsed and reveals output plus provenance on expansion", async () => {
+    const { getByTestId, queryByTestId } = render(ToolCallWidget, {
+      tool: withMcpFacet(mcpTextEdit()),
+    });
+    expect(queryByTestId("tool-output")).toBeNull();
+    expect(getByTestId("tool-mcp-edit")).toBeInTheDocument();
+
+    await fireEvent.click(getByTestId("tool-row"));
+    expect(getByTestId("tool-output")).toHaveTextContent("minimal server output");
+    expect(getByTestId("tool-mcp-edit")).toBeInTheDocument();
+    expect(getByTestId("tool-mcp-target")).toHaveTextContent("note · note-example");
+    await fireEvent.click(getByTestId("tool-raw-toggle"));
+    expect(getByTestId("tool-input")).toHaveTextContent("raw MCP input");
+  });
+
+  it("does not eagerly format a large raw input for an inline mutation", () => {
+    formatToolInputSpy.mockClear();
+    const { queryByTestId } = render(ToolCallWidget, {
+      tool: withMcpFacet(mcpTextEdit(), { input: { blob: "x".repeat(2_000_000) } }),
+    });
+    expect(queryByTestId("tool-input")).toBeNull();
+    expect(formatToolInputSpy).not.toHaveBeenCalled();
+  });
+
+  it("degrades basic and unknown mutation facets to the existing MCP body", async () => {
+    const facets = [
+      { facet_kind: "mcp", server: "notes_alias", tool: "get_context" } satisfies ToolFacet,
+      {
+        facet_kind: "mcp",
+        server: "notes_alias",
+        tool: "future_mutation",
+        mutation: { mutation_kind: "future_shape", target: "future" },
+      } as unknown as ToolFacet,
+    ];
+    for (const facet of facets) {
+      const view = render(ToolCallWidget, {
+        tool: withMcpFacet(facet, { input: { query: "generic preview" } }),
+      });
+      expect(view.getByTestId("tool-detail")).toHaveTextContent("generic preview");
+      expect(view.queryByTestId("tool-body")).toBeNull();
+      await fireEvent.click(view.getByTestId("tool-row"));
+      expect(view.getByTestId("tool-raw-toggle")).toBeInTheDocument();
+      expect(view.queryByTestId("tool-mcp-edit")).toBeNull();
+      expect(view.queryByTestId("tool-mcp-creation")).toBeNull();
+      expect(view.queryByTestId("tool-mcp-record-creation")).toBeNull();
+      view.unmount();
+    }
+  });
+});
+
+describe("AsyncToolDiff lifecycle", () => {
+  it("skips a superseded queued version and renders only the newest result", async () => {
+    structuredPatchSpy.mockClear();
+    const finishStale = mockAsyncPatchResult("success", "stale-before", "stale-after");
+    const coordinator = createExpandedDiffCoordinator();
+    const view = render(AsyncToolDiff, {
+      sourceKind: "mcp",
+      before: "old source",
+      after: "old result",
+      contentTruncated: false,
+      coordinator,
+      language: "markdown",
+      testid: "async-race",
+    });
+    await waitFor(() => expect(structuredPatchSpy).toHaveBeenCalledTimes(1));
+
+    await view.rerender({
+      sourceKind: "mcp",
+      before: "superseded source",
+      after: "superseded result",
+      contentTruncated: false,
+      coordinator,
+      language: "markdown",
+      testid: "async-race",
+    });
+    await view.rerender({
+      sourceKind: "mcp",
+      before: "current source",
+      after: "current result",
+      contentTruncated: false,
+      coordinator,
+      language: "markdown",
+      testid: "async-race",
+    });
+    const finishCurrent = mockAsyncPatchResult("success", "current-before", "current-after");
+    finishStale();
+    await waitFor(() => expect(structuredPatchSpy).toHaveBeenCalledTimes(2));
+
+    expect(structuredPatchSpy.mock.calls[1]?.[2]).toBe("current source");
+    expect(structuredPatchSpy.mock.calls[1]?.[3]).toBe("current result");
+    expect(view.container).not.toHaveTextContent("stale-before");
+    expect(view.container).not.toHaveTextContent("stale-after");
+    expect(view.container).not.toHaveTextContent("superseded source");
+    expect(view.container).not.toHaveTextContent("superseded result");
+    finishCurrent();
+    await waitFor(() => expect(view.getByTestId("async-race")).toBeInTheDocument());
+    expect(view.container).toHaveTextContent("current-before");
+    expect(view.container).toHaveTextContent("current-after");
+  });
+
+  it("ignores a pending result after unmount", async () => {
+    structuredPatchSpy.mockClear();
+    const finish = mockAsyncPatchResult();
+    const coordinator = createExpandedDiffCoordinator();
+    const view = render(AsyncToolDiff, {
+      sourceKind: "mcp",
+      before: "before",
+      after: "after",
+      contentTruncated: false,
+      coordinator,
+      language: "markdown",
+      testid: "async-unmount",
+    });
+    await waitFor(() => expect(structuredPatchSpy).toHaveBeenCalledTimes(1));
+
+    view.unmount();
+    finish();
+    await Promise.resolve();
+
+    expect(view.container).toBeEmptyDOMElement();
   });
 });

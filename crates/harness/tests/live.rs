@@ -863,7 +863,7 @@ async fn live_claude_multi_call_turn_context_occupancy_is_final_call() {
     assert_eq!(
         Some(selected_model),
         model.as_ref(),
-        "the selected modelUsage key must exactly equal the resolved final assistant model"
+        "context-window provenance must retain the resolved final assistant model"
     );
     assert!(
         occupancy_after_turn <= u64::from(window),

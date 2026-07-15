@@ -5,9 +5,11 @@
 // This is computed here, on the frontend, rather than in Rust at parse time:
 // shipping hunks would double the wire payload and drag a `crates/git` type
 // into `crates/harness`, which has no business depending on it. The sole
-// consumer (the tool row) invokes this eagerly for every MOUNTED edit row —
-// inline diffs are the point of that row — bounded by the facet content cap
-// and the transcript's render-windowing, not by expansion.
+// consumer (the tool row) attempts this for every MOUNTED edit row — inline
+// diffs are the point of that row. Collapsed synthesis has a short computation
+// deadline; only a comparison that actually exceeds it waits for expansion and
+// the yielding async path. Facet content caps and transcript render-windowing
+// bound the source and number of mounted rows independently.
 //
 // Line numbers are **snippet-relative**: the facet carries no absolute file
 // offsets (neither Claude's `Edit` input nor Codex's `apply_patch` grammar
@@ -20,22 +22,205 @@
 // exercised yet.
 
 import { structuredPatch } from "diff";
+import type { StructuredPatch } from "diff";
 import type { DiffHunk, DiffLine, EditPair, EditedFile, FileDiff } from "$lib/types";
 
 // jsdiff default context (4) wastes rows on content the snippet already
 // scopes tightly; 3 matches conventional diff output.
 const CONTEXT_LINES = 3;
 
-export function synthesizeEditDiff(file: EditedFile): FileDiff {
+// Collapsed rows get one short synchronous attempt across the whole tool row. Actual diff
+// complexity is a better predictor than source bytes or line count: large
+// additions and sparse edits are cheap, while much smaller unrelated inputs
+// can be expensive. Twenty-five milliseconds fits this transcript's chunked
+// update cadence while still aborting comparisons that would visibly stall it.
+export const COLLAPSED_EDIT_DIFF_TIMEOUT_MS = 25;
+
+// Expansion is explicit permission to prepare the exceptional diff, but it
+// must still yield to streaming and interaction. The async jsdiff path does
+// that; this generous ceiling only guards pathological capped inputs from
+// consuming work indefinitely.
+export const EXPANDED_EDIT_DIFF_TIMEOUT_MS = 5_000;
+
+type MonotonicClock = () => number;
+
+export interface ExpandedDiffCoordinator {
+  run(
+    task: (timeoutMs: number) => Promise<FileDiff | undefined>,
+    signal?: AbortSignal,
+  ): Promise<FileDiff | undefined>;
+  cancel(): void;
+}
+
+function monotonicNow(): number {
+  return performance.now();
+}
+
+/**
+ * Serialize expanded comparisons behind one row-wide deadline. A single row
+ * may contain many files, but expanding it is one user action and must not
+ * multiply main-thread work by granting every file a fresh safety ceiling.
+ */
+export function createExpandedDiffCoordinator(
+  timeoutMs = EXPANDED_EDIT_DIFF_TIMEOUT_MS,
+  now: MonotonicClock = monotonicNow,
+): ExpandedDiffCoordinator {
+  let tail: Promise<void> = Promise.resolve();
+  let startedAt: number | undefined;
+  let cancelled = false;
+
   return {
-    path: file.path,
+    run(task, signal) {
+      const result = tail.then(async () => {
+        if (cancelled || signal?.aborted === true) return undefined;
+        startedAt ??= now();
+        const remainingMs = timeoutMs - (now() - startedAt);
+        if (remainingMs <= 0) return undefined;
+        return task(remainingMs);
+      });
+      // A failed comparison makes only its own row unavailable; it must not
+      // strand later queued files behind a rejected promise.
+      tail = result.then(
+        () => undefined,
+        () => undefined,
+      );
+      return result;
+    },
+    cancel() {
+      cancelled = true;
+    },
+  };
+}
+
+export function synthesizeEditDiff(file: EditedFile): FileDiff;
+export function synthesizeEditDiff(file: EditedFile, timeoutMs: number): FileDiff | undefined;
+export function synthesizeEditDiff(file: EditedFile, timeoutMs?: number): FileDiff | undefined {
+  return synthesizeTextEditDiff(file.path, file.edits, file.truncated, timeoutMs);
+}
+
+export function synthesizeEditDiffAsync(
+  file: EditedFile,
+  timeoutMs = EXPANDED_EDIT_DIFF_TIMEOUT_MS,
+): Promise<FileDiff | undefined> {
+  return synthesizeTextEditDiffAsync(file.path, file.edits, file.truncated, timeoutMs);
+}
+
+/**
+ * Attempt all filesystem previews under one absolute deadline. Once a file
+ * cannot finish, later files are deferred without starting more comparisons;
+ * completed earlier files keep their useful previews.
+ */
+export function synthesizeCollapsedEditDiffs(
+  files: EditedFile[],
+  timeoutMs = COLLAPSED_EDIT_DIFF_TIMEOUT_MS,
+  now: MonotonicClock = monotonicNow,
+): Array<FileDiff | undefined> {
+  const deadline = now() + timeoutMs;
+  const results: Array<FileDiff | undefined> = [];
+  let deferred = false;
+  for (const file of files) {
+    if (deferred || file.edits.length === 0) {
+      results.push(undefined);
+      continue;
+    }
+    const result = synthesizeTextEditDiff(
+      file.path,
+      file.edits,
+      file.truncated,
+      undefined,
+      deadline,
+      now,
+    );
+    results.push(result);
+    deferred = result === undefined;
+  }
+  return results;
+}
+
+/// MCP edits are remote snippet changes, not filesystem edits. Keep the
+/// required `FileDiff.path` empty so this adapter cannot accidentally confer
+/// file actions if the shared diff renderer gains them later.
+export function synthesizeMcpTextEditDiff(
+  before: string,
+  after: string,
+  contentTruncated: boolean,
+): FileDiff;
+export function synthesizeMcpTextEditDiff(
+  before: string,
+  after: string,
+  contentTruncated: boolean,
+  timeoutMs: number,
+): FileDiff | undefined;
+export function synthesizeMcpTextEditDiff(
+  before: string,
+  after: string,
+  contentTruncated: boolean,
+  timeoutMs?: number,
+): FileDiff | undefined {
+  return synthesizeTextEditDiff("", [{ old: before, new: after }], contentTruncated, timeoutMs);
+}
+
+export function synthesizeMcpTextEditDiffAsync(
+  before: string,
+  after: string,
+  contentTruncated: boolean,
+  timeoutMs = EXPANDED_EDIT_DIFF_TIMEOUT_MS,
+): Promise<FileDiff | undefined> {
+  return synthesizeTextEditDiffAsync(
+    "",
+    [{ old: before, new: after }],
+    contentTruncated,
+    timeoutMs,
+  );
+}
+
+function synthesizeTextEditDiff(
+  path: string,
+  edits: EditPair[],
+  contentTruncated: boolean,
+  timeoutMs?: number,
+  sharedDeadline?: number,
+  now: MonotonicClock = monotonicNow,
+): FileDiff | undefined {
+  const deadline = sharedDeadline ?? (timeoutMs === undefined ? undefined : now() + timeoutMs);
+  const hunks: DiffHunk[] = [];
+  for (const pair of edits) {
+    const pairResult = pairHunks(pair, deadline, now);
+    if (pairResult === undefined) return undefined;
+    hunks.push(...pairResult);
+  }
+  return textEditFileDiff(path, hunks, contentTruncated);
+}
+
+async function synthesizeTextEditDiffAsync(
+  path: string,
+  edits: EditPair[],
+  contentTruncated: boolean,
+  timeoutMs: number,
+  now: MonotonicClock = monotonicNow,
+): Promise<FileDiff | undefined> {
+  const deadline = now() + timeoutMs;
+  const hunks: DiffHunk[] = [];
+  // Run pairs sequentially. Starting several async Myers comparisons together
+  // would multiply CPU work even though each one yields to the event loop.
+  for (const pair of edits) {
+    const pairResult = await pairHunksAsync(pair, deadline, now);
+    if (pairResult === undefined) return undefined;
+    hunks.push(...pairResult);
+  }
+  return textEditFileDiff(path, hunks, contentTruncated);
+}
+
+function textEditFileDiff(path: string, hunks: DiffHunk[], contentTruncated: boolean): FileDiff {
+  return {
+    path,
     binary: false,
     // The facet cap truncated the before/after content, so the hunks below
     // are computed from a prefix — surface DiffView's existing notice.
-    truncated: file.truncated,
+    truncated: contentTruncated,
     too_large: false,
     too_large_bytes: null,
-    hunks: file.edits.flatMap((pair) => pairHunks(pair)),
+    hunks,
   };
 }
 
@@ -80,15 +265,72 @@ export function synthesizeWriteDiff(
   };
 }
 
-function pairHunks(pair: EditPair): DiffHunk[] {
-  const patch = structuredPatch("", "", pair.old, pair.new, undefined, undefined, {
-    context: CONTEXT_LINES,
+/// MCP text creation uses the same all-added representation as a file write,
+/// but deliberately carries no path because the target names a remote record.
+export function synthesizeMcpTextCreationDiff(
+  content: string,
+  contentTruncated: boolean,
+  maxLines?: number,
+): { diff: FileDiff; hiddenLines: number } {
+  return synthesizeWriteDiff("", content, contentTruncated, maxLines);
+}
+
+function remainingTime(deadline: number | undefined, now: MonotonicClock): number | undefined {
+  if (deadline === undefined) return undefined;
+  return deadline - now();
+}
+
+function pairHunks(
+  pair: EditPair,
+  deadline: number | undefined,
+  now: MonotonicClock,
+): DiffHunk[] | undefined {
+  const timeoutMs = remainingTime(deadline, now);
+  if (timeoutMs !== undefined && timeoutMs <= 0) return undefined;
+  const patch =
+    timeoutMs === undefined
+      ? structuredPatch("", "", pair.old, pair.new, undefined, undefined, {
+          context: CONTEXT_LINES,
+        })
+      : structuredPatch("", "", pair.old, pair.new, undefined, undefined, {
+          context: CONTEXT_LINES,
+          timeout: timeoutMs,
+        });
+  return patch === undefined ? undefined : patchHunks(patch, deadline, now);
+}
+
+function pairHunksAsync(
+  pair: EditPair,
+  deadline: number,
+  now: MonotonicClock,
+): Promise<DiffHunk[] | undefined> {
+  const timeoutMs = remainingTime(deadline, now);
+  if (timeoutMs === undefined || timeoutMs <= 0) return Promise.resolve(undefined);
+  return new Promise((resolve) => {
+    structuredPatch("", "", pair.old, pair.new, undefined, undefined, {
+      context: CONTEXT_LINES,
+      timeout: timeoutMs,
+      callback: (patch) =>
+        resolve(patch === undefined ? undefined : patchHunks(patch, deadline, now)),
+    });
   });
-  return patch.hunks.map((hunk) => {
+}
+
+function patchHunks(
+  patch: StructuredPatch,
+  deadline?: number,
+  now: MonotonicClock = monotonicNow,
+): DiffHunk[] | undefined {
+  const result: DiffHunk[] = [];
+  for (const hunk of patch.hunks) {
+    if (deadline !== undefined && now() >= deadline) return undefined;
     const lines: DiffLine[] = [];
     let oldLine = hunk.oldStart;
     let newLine = hunk.newStart;
-    for (const raw of hunk.lines) {
+    for (const [index, raw] of hunk.lines.entries()) {
+      // Conversion is normally tiny, but it is still part of the collapsed
+      // deadline. Check periodically without adding a clock read per line.
+      if (index % 256 === 0 && deadline !== undefined && now() >= deadline) return undefined;
       // "\ No newline at end of file" markers carry no content to render and
       // have no line number on either side.
       if (raw.startsWith("\\")) continue;
@@ -105,11 +347,13 @@ function pairHunks(pair: EditPair): DiffHunk[] {
         newLine += 1;
       }
     }
-    return {
+    result.push({
       header: `@@ -${hunk.oldStart},${hunk.oldLines} +${hunk.newStart},${hunk.newLines} @@ · snippet-relative`,
       lines,
-    };
-  });
+    });
+  }
+  if (deadline !== undefined && now() >= deadline) return undefined;
+  return result;
 }
 
 /// Keep the first `maxLines` diff lines (across hunks) for the collapsed inline

@@ -1,0 +1,8 @@
+{"timestamp":"2026-07-14T12:00:00Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn_mcp_mutations","model_context_window":258400}}
+{"timestamp":"2026-07-14T12:00:01Z","type":"turn_context","payload":{"model":"gpt-5.6-sol","effort":"high"}}
+{"timestamp":"2026-07-14T12:00:02Z","type":"event_msg","payload":{"type":"user_message","message":"Update sample content"}}
+{"timestamp":"2026-07-14T12:00:03Z","type":"response_item","payload":{"type":"function_call","name":"edit_content","namespace":"mcp__notes_alias__","call_id":"item_edit","arguments":"{\"id\":\"note-example\",\"type\":\"note\",\"old_str\":\"before text\",\"new_str\":\"after text\"}"}}
+{"timestamp":"2026-07-14T12:00:04Z","type":"response_item","payload":{"type":"function_call","name":"create_prompt","call_id":"item_create","arguments":"{\"name\":\"sample-prompt\",\"content\":\"Prompt body\"}"}}
+{"timestamp":"2026-07-14T12:00:05Z","type":"event_msg","payload":{"type":"mcp_tool_call_end","call_id":"item_create","invocation":{"server":"prompts_alias","tool":"create_prompt"},"result":{"Err":"creation rejected"}}}
+{"timestamp":"2026-07-14T12:00:06Z","type":"event_msg","payload":{"type":"mcp_tool_call_end","call_id":"item_edit","invocation":{"server":"notes_alias","tool":"edit_content"},"result":{"Ok":{"content":[{"type":"text","text":"edit ok"}],"isError":false}}}}
+{"timestamp":"2026-07-14T12:00:07Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn_mcp_mutations"}}

@@ -61,8 +61,37 @@ export type ToolFacet =
   | { facet_kind: "shell"; command: string; cwd?: string | null }
   | { facet_kind: "search"; pattern: string; path?: string | null }
   | { facet_kind: "todo"; items: TodoItem[] }
-  | { facet_kind: "mcp"; server: string; tool: string }
+  | { facet_kind: "mcp"; server: string; tool: string; mutation?: McpMutation }
   | { facet_kind: "other" };
+
+// Input-derived requested changes for structurally recognized MCP tools. The
+// target is a bounded display label, not a filesystem path or authoritative
+// remote snapshot. Unknown mutation discriminants degrade to basic MCP UI.
+export type McpMutation =
+  | {
+      mutation_kind: "text_edit";
+      target: string;
+      target_truncated: boolean;
+      before: string;
+      after: string;
+      content_truncated: boolean;
+    }
+  | {
+      mutation_kind: "text_creation";
+      target: string;
+      target_truncated: boolean;
+      content: string;
+      content_truncated: boolean;
+    }
+  | {
+      mutation_kind: "record_creation";
+      target: string;
+      target_truncated: boolean;
+      fields: McpMutationField[];
+      fields_truncated: boolean;
+    };
+
+export type McpMutationField = { label: string; value: string };
 
 export type EditedFile = {
   path: string;

@@ -87,6 +87,59 @@ pub fn transcript_path(home_dir: &Path, conversation_id: Uuid) -> PathBuf {
         .join("transcript.jsonl")
 }
 
+/// The richer transcript written by current Antigravity versions. It carries
+/// the same record sequence as `transcript.jsonl`, but tool arguments retain
+/// their native JSON types and are not clipped by the compact log formatter.
+#[must_use]
+pub(crate) fn full_transcript_path(home_dir: &Path, conversation_id: Uuid) -> PathBuf {
+    conversation_brain_dir(home_dir, conversation_id)
+        .join(".system_generated")
+        .join("logs")
+        .join("transcript_full.jsonl")
+}
+
+/// Prefer the lossless transcript only after it is at least as complete as the
+/// compact representation. Antigravity writes the files independently, so
+/// existence alone is not proof that the full file has caught up.
+#[must_use]
+pub(crate) fn preferred_transcript_path(home_dir: &Path, conversation_id: Uuid) -> PathBuf {
+    let compact = transcript_path(home_dir, conversation_id);
+    let full = full_transcript_path(home_dir, conversation_id);
+    let full_lines = complete_line_count(&full);
+    if full_lines > 0 && full_lines >= complete_line_count(&compact) {
+        full
+    } else {
+        compact
+    }
+}
+
+/// Return the full transcript only when it can safely inherit a cursor that
+/// has already emitted `cursor` compact records.
+#[must_use]
+pub(crate) fn caught_up_full_transcript_path(
+    home_dir: &Path,
+    conversation_id: Uuid,
+    cursor: usize,
+) -> Option<PathBuf> {
+    let full = full_transcript_path(home_dir, conversation_id);
+    let full_lines = complete_line_count(&full);
+    (full_lines > 0 && full_lines >= cursor).then_some(full)
+}
+
+#[must_use]
+pub(crate) fn complete_line_count(path: &Path) -> usize {
+    std::fs::read_to_string(path).map_or(0, |content| match content.rfind('\n') {
+        Some(idx) => content[..=idx].lines().count(),
+        None => 0,
+    })
+}
+
+#[must_use]
+pub(crate) fn is_full_transcript_path(path: &Path) -> bool {
+    path.file_name()
+        .is_some_and(|name| name == "transcript_full.jsonl")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -102,6 +155,23 @@ mod tests {
                 "/Users/test/.gemini/antigravity-cli/brain/01234567-89ab-cdef-0123-456789abcdef/.system_generated/logs/transcript.jsonl"
             )
         );
+    }
+
+    #[test]
+    fn preferred_transcript_uses_full_only_after_it_catches_compact() {
+        let home = tempfile::tempdir().unwrap();
+        let uuid = Uuid::now_v7();
+        let compact = transcript_path(home.path(), uuid);
+        let full = full_transcript_path(home.path(), uuid);
+        std::fs::create_dir_all(compact.parent().unwrap()).unwrap();
+        assert_eq!(preferred_transcript_path(home.path(), uuid), compact);
+
+        std::fs::write(&compact, "compact one\ncompact two\n").unwrap();
+        std::fs::write(&full, "full one\n").unwrap();
+        assert_eq!(preferred_transcript_path(home.path(), uuid), compact);
+
+        std::fs::write(&full, "full one\nfull two\n").unwrap();
+        assert_eq!(preferred_transcript_path(home.path(), uuid), full);
     }
 
     #[test]

@@ -1079,14 +1079,10 @@ impl CodexReconstruction {
                     .unwrap_or(Value::Null);
                 let namespace = p.get("namespace").and_then(Value::as_str);
                 let (kind, name) = classify_codex_function_call(raw_name, namespace);
-                let facet = match kind {
-                    ToolKind::Mcp => match name.split_once('.') {
-                        Some((server, tool)) => crate::facets::ToolFacet::Mcp {
-                            server: server.to_owned(),
-                            tool: tool.to_owned(),
-                        },
-                        None => crate::facets::ToolFacet::Other,
-                    },
+                let facet = match codex_mcp_server(namespace) {
+                    Some(server) => {
+                        crate::facets::classify_mcp_tool_facet(server, raw_name, &arguments)
+                    }
                     _ if raw_name == "exec_command" => {
                         super::facets::exec_command_facet(&arguments)
                     }
@@ -1480,13 +1476,16 @@ fn output_exit_code(output: &str) -> Option<i64> {
 /// `namespace: "mcp__<server>__"` field; the surfaced name is
 /// `<server>.<tool>` (matching the stream-side emission).
 fn classify_codex_function_call(name: &str, namespace: Option<&str>) -> (ToolKind, String) {
-    if let Some(ns) = namespace
-        && ns.starts_with("mcp__")
-    {
-        let server = ns.trim_start_matches("mcp__").trim_end_matches("__");
+    if let Some(server) = codex_mcp_server(namespace) {
         return (ToolKind::Mcp, format!("{server}.{name}"));
     }
     (ToolKind::Builtin, name.to_owned())
+}
+
+fn codex_mcp_server(namespace: Option<&str>) -> Option<&str> {
+    namespace
+        .and_then(|value| value.strip_prefix("mcp__"))
+        .map(|value| value.trim_end_matches("__"))
 }
 
 /// Apply an MCP completion to the matching open tool item. Returns `true`
@@ -1498,6 +1497,7 @@ fn apply_mcp_result(items: &mut [TurnItem], call_id: &str, result: &McpResult) -
             kind,
             facet,
             name,
+            input,
             output,
             is_error,
             completed_at,
@@ -1508,12 +1508,11 @@ fn apply_mcp_result(items: &mut [TurnItem], call_id: &str, result: &McpResult) -
             *kind = ToolKind::Mcp;
             if !result.server.is_empty() && !result.tool.is_empty() {
                 *name = format!("{}.{}", result.server, result.tool);
-                // The late MCP identity must also correct the facet, or a
-                // namespace-less function_call keeps a stale non-Mcp facet.
-                *facet = crate::facets::ToolFacet::Mcp {
-                    server: result.server.clone(),
-                    tool: result.tool.clone(),
-                };
+                // A namespace-less function call learns its MCP identity only
+                // from this result. Reclassify the retained arguments so that
+                // correcting provenance cannot discard mutation semantics.
+                *facet =
+                    crate::facets::classify_mcp_tool_facet(&result.server, &result.tool, input);
             }
             *output = Some(result.output.clone());
             *is_error = Some(result.is_error);
@@ -1531,10 +1530,110 @@ mod tests {
     use std::sync::Mutex;
     use tempfile::TempDir;
 
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct ToolSnapshot {
+        tool_use_id: String,
+        name: String,
+        input: Value,
+        facet: crate::facets::ToolFacet,
+        output: Option<String>,
+        is_error: Option<bool>,
+    }
+
     fn fixture_path(name: &str) -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/codex")
             .join(name)
+    }
+
+    fn hydrated_tool_snapshots(content: &str) -> Vec<ToolSnapshot> {
+        parse_codex_transcript_content(content, Uuid::now_v7())
+            .turns
+            .into_iter()
+            .filter_map(|turn| match turn {
+                Turn::Agent { items, .. } => Some(items),
+                Turn::User { .. } | Turn::System { .. } => None,
+            })
+            .flatten()
+            .filter_map(|item| match item {
+                TurnItem::Tool {
+                    tool_use_id,
+                    name,
+                    input,
+                    facet,
+                    output,
+                    is_error,
+                    ..
+                } => Some(ToolSnapshot {
+                    tool_use_id,
+                    name,
+                    input,
+                    facet,
+                    output,
+                    is_error,
+                }),
+                TurnItem::Text { .. } => None,
+            })
+            .collect()
+    }
+
+    fn apply_live_tool_event(
+        snapshots: &mut Vec<ToolSnapshot>,
+        event: crate::events::AdapterEvent,
+    ) {
+        match event {
+            crate::events::AdapterEvent::ToolStarted {
+                tool_use_id,
+                name,
+                input,
+                facet,
+                ..
+            } => snapshots.push(ToolSnapshot {
+                tool_use_id,
+                name,
+                input,
+                facet,
+                output: None,
+                is_error: None,
+            }),
+            crate::events::AdapterEvent::ToolCompleted {
+                tool_use_id,
+                output,
+                is_error,
+                ..
+            } => {
+                let snapshot = snapshots
+                    .iter_mut()
+                    .find(|snapshot| snapshot.tool_use_id == tool_use_id)
+                    .unwrap_or_else(|| panic!("completion without start for {tool_use_id}"));
+                snapshot.output = Some(output);
+                snapshot.is_error = Some(is_error);
+            }
+            _ => {}
+        }
+    }
+
+    fn live_tool_snapshots(content: &str) -> Vec<ToolSnapshot> {
+        let mut state = crate::codex::parser::CodexParserState::default();
+        let turn_id = Uuid::now_v7();
+        let mut snapshots = Vec::new();
+        for line in content.lines().filter(|line| !line.trim().is_empty()) {
+            match crate::codex::parser::parse_line(line, turn_id, &mut state) {
+                crate::parser::ParseOutcome::Event(event) => {
+                    apply_live_tool_event(&mut snapshots, event);
+                }
+                crate::parser::ParseOutcome::Events(events) => {
+                    for event in events {
+                        apply_live_tool_event(&mut snapshots, event);
+                    }
+                }
+                crate::parser::ParseOutcome::Skip => {}
+                crate::parser::ParseOutcome::Error(error) => {
+                    panic!("stream fixture parse failed: {error}");
+                }
+            }
+        }
+        snapshots
     }
 
     #[test]
@@ -2757,6 +2856,70 @@ not valid json
             }
             _ => panic!("expected Tool item"),
         }
+    }
+
+    #[test]
+    fn mcp_mutation_fixture_reclassifies_late_identity_by_call_id() {
+        let content =
+            std::fs::read_to_string(fixture_path("mcp-content-mutations.session.jsonl")).unwrap();
+        let tools = hydrated_tool_snapshots(&content);
+
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].tool_use_id, "item_edit");
+        assert_eq!(tools[0].name, "notes_alias.edit_content");
+        assert_eq!(tools[0].output.as_deref(), Some("edit ok"));
+        assert_eq!(tools[0].is_error, Some(false));
+        assert!(matches!(
+            &tools[0].facet,
+            crate::facets::ToolFacet::Mcp {
+                mutation: Some(mutation),
+                ..
+            } if matches!(
+                mutation.as_ref(),
+                crate::facets::McpMutation::TextEdit {
+                    target,
+                    before,
+                    after,
+                    ..
+                } if target == "note · note-example"
+                    && before == "before text"
+                    && after == "after text"
+            )
+        ));
+
+        assert_eq!(tools[1].tool_use_id, "item_create");
+        assert_eq!(tools[1].name, "prompts_alias.create_prompt");
+        assert_eq!(tools[1].output.as_deref(), Some("creation rejected"));
+        assert_eq!(tools[1].is_error, Some(true));
+        assert!(matches!(
+            &tools[1].facet,
+            crate::facets::ToolFacet::Mcp {
+                server,
+                tool,
+                mutation: Some(mutation),
+            } if server == "prompts_alias"
+                && tool == "create_prompt"
+                && matches!(
+                    mutation.as_ref(),
+                    crate::facets::McpMutation::TextCreation {
+                        target,
+                        content,
+                        ..
+                    } if target == "prompt · sample-prompt" && content == "Prompt body"
+                )
+        ));
+    }
+
+    #[test]
+    fn mcp_mutation_fixture_matches_live_and_hydrated_representations() {
+        let live = std::fs::read_to_string(fixture_path("mcp-content-mutations.jsonl")).unwrap();
+        let session =
+            std::fs::read_to_string(fixture_path("mcp-content-mutations.session.jsonl")).unwrap();
+
+        assert_eq!(
+            live_tool_snapshots(&live),
+            hydrated_tool_snapshots(&session)
+        );
     }
 
     #[test]

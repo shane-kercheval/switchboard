@@ -1,6 +1,24 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { DiffLine, EditedFile, FileDiff } from "$lib/types";
-import { synthesizeEditDiff, synthesizeWriteDiff, truncateDiff } from "$lib/toolDiff";
+import {
+  COLLAPSED_EDIT_DIFF_TIMEOUT_MS,
+  EXPANDED_EDIT_DIFF_TIMEOUT_MS,
+  createExpandedDiffCoordinator,
+  synthesizeCollapsedEditDiffs,
+  synthesizeEditDiff,
+  synthesizeEditDiffAsync,
+  synthesizeMcpTextCreationDiff,
+  synthesizeMcpTextEditDiff,
+  synthesizeWriteDiff,
+  truncateDiff,
+} from "$lib/toolDiff";
+
+const structuredPatchSpy = vi.hoisted(() => vi.fn());
+vi.mock("diff", async (importOriginal) => {
+  const mod = await importOriginal<typeof import("diff")>();
+  structuredPatchSpy.mockImplementation(mod.structuredPatch);
+  return { ...mod, structuredPatch: structuredPatchSpy };
+});
 
 function file(edits: { old: string; new: string }[], truncated = false): EditedFile {
   return { path: "/repo/src/a.ts", change: "modified", edits, truncated };
@@ -23,6 +41,222 @@ function fileDiff(hunkSizes: number[]): FileDiff {
     })),
   };
 }
+
+describe("abortable edit synthesis", () => {
+  it("returns no collapsed diff when jsdiff reaches the computation deadline", () => {
+    structuredPatchSpy.mockReturnValueOnce(undefined);
+
+    const result = synthesizeMcpTextEditDiff(
+      "before",
+      "after",
+      false,
+      COLLAPSED_EDIT_DIFF_TIMEOUT_MS,
+    );
+
+    expect(result).toBeUndefined();
+    expect(structuredPatchSpy).toHaveBeenLastCalledWith(
+      "",
+      "",
+      "before",
+      "after",
+      undefined,
+      undefined,
+      expect.objectContaining({ timeout: expect.any(Number) }),
+    );
+    const timeout = (structuredPatchSpy.mock.calls.at(-1)?.[6] as { timeout: number }).timeout;
+    expect(timeout).toBeGreaterThan(0);
+    expect(timeout).toBeLessThanOrEqual(COLLAPSED_EDIT_DIFF_TIMEOUT_MS);
+  });
+
+  it("keeps a large simple addition eligible for an inline preview", () => {
+    const result = synthesizeMcpTextEditDiff(
+      "",
+      "x".repeat(100_000),
+      false,
+      COLLAPSED_EDIT_DIFF_TIMEOUT_MS,
+    );
+
+    expect(result).toBeDefined();
+    expect(result?.hunks.flatMap((hunk) => hunk.lines)).toHaveLength(1);
+  });
+
+  it("returns no expanded diff when the asynchronous safety ceiling is reached", async () => {
+    structuredPatchSpy.mockImplementationOnce((...args: unknown[]) => {
+      const options = args[6] as { timeout: number; callback: (patch: undefined) => void };
+      expect(options.timeout).toBeGreaterThan(0);
+      expect(options.timeout).toBeLessThanOrEqual(EXPANDED_EDIT_DIFF_TIMEOUT_MS);
+      options.callback(undefined);
+      return undefined;
+    });
+
+    await expect(synthesizeEditDiffAsync(file([{ old: "before", new: "after" }]))).resolves.toBe(
+      undefined,
+    );
+  });
+
+  it("shares one collapsed deadline across files and does not start work after exhaustion", () => {
+    structuredPatchSpy.mockClear();
+    let now = 0;
+    structuredPatchSpy
+      .mockImplementationOnce((...args: unknown[]) => {
+        const options = args[6] as { timeout: number };
+        expect(options.timeout).toBe(25);
+        now = 10;
+        return {
+          hunks: [{ oldStart: 1, oldLines: 1, newStart: 1, newLines: 1, lines: ["-a", "+b"] }],
+        };
+      })
+      .mockImplementationOnce((...args: unknown[]) => {
+        const options = args[6] as { timeout: number };
+        expect(options.timeout).toBe(15);
+        now = 26;
+        return {
+          hunks: [{ oldStart: 1, oldLines: 1, newStart: 1, newLines: 1, lines: ["-c", "+d"] }],
+        };
+      });
+
+    const files = ["a", "b", "c"].map((name) => ({
+      path: `/repo/${name}.ts`,
+      change: "modified" as const,
+      edits: [{ old: `${name}-old`, new: `${name}-new` }],
+      truncated: false,
+    }));
+    const results = synthesizeCollapsedEditDiffs(files, 25, () => now);
+
+    expect(results[0]).toBeDefined();
+    expect(results[1]).toBeUndefined();
+    expect(results[2]).toBeUndefined();
+    expect(structuredPatchSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("includes patch conversion in the collapsed deadline", () => {
+    structuredPatchSpy.mockClear();
+    let clockReads = 0;
+    const now = (): number => {
+      clockReads += 1;
+      return clockReads >= 5 ? 26 : 0;
+    };
+    structuredPatchSpy.mockReturnValueOnce({
+      hunks: [
+        {
+          oldStart: 1,
+          oldLines: 600,
+          newStart: 1,
+          newLines: 600,
+          lines: Array.from({ length: 600 }, (_, index) => ` line ${index}`),
+        },
+      ],
+    });
+
+    const results = synthesizeCollapsedEditDiffs(
+      [file([{ old: "before", new: "after" }])],
+      25,
+      now,
+    );
+
+    expect(results).toEqual([undefined]);
+  });
+});
+
+describe("expanded diff coordination", () => {
+  it("runs queued files sequentially and gives later work only the row's remaining time", async () => {
+    let now = 0;
+    let finishFirst: ((value: FileDiff) => void) | undefined;
+    const coordinator = createExpandedDiffCoordinator(5_000, () => now);
+    const starts: Array<[string, number]> = [];
+    const first = coordinator.run(
+      (timeoutMs) =>
+        new Promise<FileDiff>((resolve) => {
+          starts.push(["first", timeoutMs]);
+          finishFirst = resolve;
+        }),
+    );
+    const second = coordinator.run(async (timeoutMs) => {
+      starts.push(["second", timeoutMs]);
+      return fileDiff([1]);
+    });
+
+    await Promise.resolve();
+    expect(starts).toEqual([["first", 5_000]]);
+    now = 125;
+    finishFirst?.(fileDiff([1]));
+    await first;
+    await second;
+
+    expect(starts).toEqual([
+      ["first", 5_000],
+      ["second", 4_875],
+    ]);
+  });
+
+  it("does not start queued work after the row deadline expires", async () => {
+    let now = 0;
+    let finishFirst: ((value: FileDiff) => void) | undefined;
+    const coordinator = createExpandedDiffCoordinator(5_000, () => now);
+    const first = coordinator.run(
+      () =>
+        new Promise<FileDiff>((resolve) => {
+          finishFirst = resolve;
+        }),
+    );
+    const secondTask = vi.fn(async () => fileDiff([1]));
+    const second = coordinator.run(secondTask);
+
+    await Promise.resolve();
+    now = 5_001;
+    finishFirst?.(fileDiff([1]));
+    await first;
+
+    await expect(second).resolves.toBeUndefined();
+    expect(secondTask).not.toHaveBeenCalled();
+  });
+
+  it("cancels queued work without affecting the result already in flight", async () => {
+    let finishFirst: ((value: FileDiff) => void) | undefined;
+    const coordinator = createExpandedDiffCoordinator();
+    const first = coordinator.run(
+      () =>
+        new Promise<FileDiff>((resolve) => {
+          finishFirst = resolve;
+        }),
+    );
+    const secondTask = vi.fn(async () => fileDiff([1]));
+    const second = coordinator.run(secondTask);
+
+    await Promise.resolve();
+    coordinator.cancel();
+    finishFirst?.(fileDiff([1]));
+    await expect(first).resolves.toBeDefined();
+    await expect(second).resolves.toBeUndefined();
+    expect(secondTask).not.toHaveBeenCalled();
+  });
+
+  it("skips one aborted queued job and still starts the current job behind it", async () => {
+    let finishFirst: ((value: FileDiff) => void) | undefined;
+    const coordinator = createExpandedDiffCoordinator();
+    const first = coordinator.run(
+      () =>
+        new Promise<FileDiff>((resolve) => {
+          finishFirst = resolve;
+        }),
+    );
+    const obsoleteController = new AbortController();
+    const obsoleteTask = vi.fn(async () => fileDiff([1]));
+    const obsolete = coordinator.run(obsoleteTask, obsoleteController.signal);
+    const currentTask = vi.fn(async () => fileDiff([1]));
+    const current = coordinator.run(currentTask);
+
+    await Promise.resolve();
+    obsoleteController.abort();
+    finishFirst?.(fileDiff([1]));
+    await first;
+
+    await expect(obsolete).resolves.toBeUndefined();
+    await expect(current).resolves.toBeDefined();
+    expect(obsoleteTask).not.toHaveBeenCalled();
+    expect(currentTask).toHaveBeenCalledOnce();
+  });
+});
 
 describe("synthesizeEditDiff", () => {
   it("renders a one-line change as one removed and one added line", () => {
@@ -144,5 +378,41 @@ describe("synthesizeWriteDiff", () => {
     expect(diff.hunks[0]!.lines[24]!.content).toBe("line 24");
     expect(diff.truncated).toBe(true);
     expect(hiddenLines).toBe(35);
+  });
+});
+
+describe("MCP text mutation diffs", () => {
+  it("renders snippet-relative removals and additions without a filesystem path", () => {
+    const diff = synthesizeMcpTextEditDiff(
+      "# Template\nHello {{ name }}\nNo trailing newline",
+      "# Template\nHello {{ user }}\nNo trailing newline",
+      false,
+    );
+
+    expect(diff.path).toBe("");
+    expect(diff.truncated).toBe(false);
+    expect(diff.hunks[0]!.header).toContain("snippet-relative");
+    expect(diff.hunks.flatMap((hunk) => hunk.lines)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ origin: "removed", content: "Hello {{ name }}" }),
+        expect.objectContaining({ origin: "added", content: "Hello {{ user }}" }),
+      ]),
+    );
+  });
+
+  it("forwards only content truncation and creates all-added Markdown content", () => {
+    const edit = synthesizeMcpTextEditDiff("before", "after", true);
+    expect(edit.truncated).toBe(true);
+
+    const { diff, hiddenLines } = synthesizeMcpTextCreationDiff(
+      "# Prompt\n\nUse {{ context }}\n",
+      false,
+    );
+    expect(diff.path).toBe("");
+    expect(diff.truncated).toBe(false);
+    expect(hiddenLines).toBe(0);
+    expect(diff.hunks.flatMap((hunk) => hunk.lines).every((line) => line.origin === "added")).toBe(
+      true,
+    );
   });
 });

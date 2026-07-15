@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { untrack } from "svelte";
   import type { HTMLTextareaAttributes } from "svelte/elements";
   import { cn } from "$lib/utils";
 
@@ -29,7 +30,7 @@
   // the consumer passes cap both paths identically; past the cap, overflow
   // gives the internal scrollbar.
   const fieldSizing =
-    autosize &&
+    untrack(() => autosize) &&
     typeof CSS !== "undefined" &&
     typeof CSS.supports === "function" &&
     CSS.supports("field-sizing", "content");

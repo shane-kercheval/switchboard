@@ -20,7 +20,7 @@ import {
   Wrench,
 } from "@lucide/svelte";
 import type { ToolCall } from "$lib/state/types";
-import type { ToolFacet } from "$lib/types";
+import type { McpMutation, ToolFacet } from "$lib/types";
 import { redactDisplay, toolInputPreview } from "$lib/toolInput";
 
 /// All lucide icons share one component shape; alias it off a concrete icon
@@ -65,15 +65,13 @@ export function toolVerb(facet: ToolFacet, rawName: string): string {
   }
 }
 
-/// A single-file edit reads by its change kind: harnesses without a separate
-/// write tool (Codex creates files via an apply_patch "Add File") arrive as
-/// Edit facets, but the user is looking at a creation or a deletion, and the
-/// label should say so. Multi-file patches stay "Edit" with per-file markers.
+/// A homogeneous patch reads by its change kind: harnesses without separate
+/// write/delete tools arrive as Edit facets, but the user is looking at a
+/// creation or deletion regardless of how many files the call touched. Mixed
+/// patches stay "Edit" and identify exceptional change kinds per file.
 function editVerb(files: { change: string }[]): string {
-  if (files.length === 1) {
-    if (files[0]!.change === "added") return "Write";
-    if (files[0]!.change === "deleted") return "Delete";
-  }
+  if (files.length > 0 && files.every((file) => file.change === "added")) return "Write";
+  if (files.length > 0 && files.every((file) => file.change === "deleted")) return "Delete";
   return "Edit";
 }
 
@@ -95,10 +93,34 @@ export function toolDetail(facet: ToolFacet, input: unknown): string | undefined
       return facet.path ? `${facet.pattern} in ${facet.path}` : nonEmpty(facet.pattern);
     case "todo":
       return todoSummary(facet.items);
+    case "mcp": {
+      const mutation = knownMcpMutation(facet);
+      return mutation
+        ? `${mutation.target}${mutation.target_truncated ? "…" : ""}`
+        : toolInputPreview(input);
+    }
     default:
-      // mcp, other, and unknown discriminants: the input preview (already
-      // redacted) is the only substance available.
+      // Other and unknown discriminants: the input preview (already redacted)
+      // is the only substance available.
       return toolInputPreview(input);
+  }
+}
+
+/// Return only mutation variants this frontend understands. The backend enum
+/// is non-exhaustive, so a newer mutation discriminant may arrive at runtime;
+/// treating it as absent preserves the complete basic-MCP fallback instead of
+/// mounting an empty specialized body.
+export function knownMcpMutation(facet: ToolFacet): McpMutation | undefined {
+  if (facet.facet_kind !== "mcp") return undefined;
+  const candidate: unknown = facet.mutation;
+  if (typeof candidate !== "object" || candidate === null) return undefined;
+  switch ((candidate as { mutation_kind?: unknown }).mutation_kind) {
+    case "text_edit":
+    case "text_creation":
+    case "record_creation":
+      return candidate as McpMutation;
+    default:
+      return undefined;
   }
 }
 
@@ -144,8 +166,8 @@ export function toolIcon(facet: ToolFacet): ToolIconComponent {
     case "shell":
       return SquareTerminal;
     case "edit":
-      if (facet.files.length === 1 && facet.files[0]!.change === "added") return FilePlus;
-      if (facet.files.length === 1 && facet.files[0]!.change === "deleted") return FileX;
+      if (editVerb(facet.files) === "Write") return FilePlus;
+      if (editVerb(facet.files) === "Delete") return FileX;
       return FilePen;
     case "write":
       return FilePlus;

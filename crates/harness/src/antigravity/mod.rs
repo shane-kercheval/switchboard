@@ -29,7 +29,7 @@
 //! - **Transcript-sourced content; stdout is a control channel.** All
 //!   displayed content — assistant text, `thinking`, and tool lifecycle
 //!   (`ToolStarted` / `ToolCompleted`) — comes from tailing the conversation's
-//!   `transcript.jsonl` (see [`paths`]). stdout is **not** used for content:
+//!   the preferred full transcript (or compact fallback; see [`paths`]). stdout is **not** used for content:
 //!   on a resume turn `agy` replays the whole conversation's prior answers to
 //!   stdout, which would make each turn accumulate every earlier answer. The
 //!   transcript records one completed `PLANNER_RESPONSE` per turn and the
@@ -76,7 +76,7 @@ use crate::events::{AdapterEvent, FailureKind, McpServerStatus, TurnId, TurnOutc
 
 use parser::{
     AntigravityParserState, TranscriptRecord, first_error_line, is_auth_failure_line,
-    record_to_live_events,
+    record_to_live_events, record_to_live_events_with_encoding,
 };
 
 /// The binary name on PATH. Centralized so the adapter and the pre-adapter
@@ -429,10 +429,13 @@ async fn run_producer(ctx: ProducerCtx) {
 
     let spawn_time = SystemTime::now();
     let mut conversation_id = resume_id;
-    let mut transcript_path = conversation_id.map(|u| paths::transcript_path(&home_dir, u));
+    let mut transcript_path =
+        conversation_id.map(|u| paths::preferred_transcript_path(&home_dir, u));
     // Resume: skip records already on disk from prior turns so only the new
     // turn's records emit. First turn: cursor 0, transcript not yet created.
-    let mut cursor = transcript_path.as_deref().map_or(0, count_complete_lines);
+    let mut cursor = transcript_path
+        .as_deref()
+        .map_or(0, paths::complete_line_count);
 
     let mut parser_state = AntigravityParserState::default();
     let mut stdout_lines = tokio::io::BufReader::new(stdout).lines();
@@ -504,7 +507,7 @@ async fn run_producer(ctx: ProducerCtx) {
                     match capture_conversation_id(&log_file_path, &home_dir, spawn_time, &prompt) {
                         CaptureOutcome::Bound(uuid) => {
                             conversation_id = Some(uuid);
-                            transcript_path = Some(paths::transcript_path(&home_dir, uuid));
+                            transcript_path = Some(paths::preferred_transcript_path(&home_dir, uuid));
                             cursor = 0;
                             // First-turn capture: emit the locator so the
                             // dispatcher persists it to the registry. The
@@ -518,6 +521,28 @@ async fn run_producer(ctx: ProducerCtx) {
                     }
                 }
                 if let Some(path) = &transcript_path {
+                    drain_transcript(
+                        path,
+                        &mut cursor,
+                        turn_id,
+                        &mut parser_state,
+                        &mut saw_terminal_answer,
+                        &mut model,
+                        &tx,
+                    );
+                }
+                if let Some(uuid) = conversation_id
+                    && maybe_upgrade_transcript_path(
+                        &mut transcript_path,
+                        &home_dir,
+                        uuid,
+                        cursor,
+                    )
+                    && let Some(path) = &transcript_path
+                {
+                    // The full file may already have records beyond the compact
+                    // cursor. Drain them immediately rather than waiting for the
+                    // next poll after the one-way handoff.
                     drain_transcript(
                         path,
                         &mut cursor,
@@ -631,7 +656,7 @@ async fn run_producer(ctx: ProducerCtx) {
                 // the dispatcher heals the registry locator; the next turn then
                 // resumes the new conversation instead of re-forking the stale
                 // one every turn.
-                transcript_path = Some(paths::transcript_path(&home_dir, uuid));
+                transcript_path = Some(paths::preferred_transcript_path(&home_dir, uuid));
                 cursor = 0;
                 emit_locator_captured(&tx, uuid);
             }
@@ -662,20 +687,37 @@ async fn run_producer(ctx: ProducerCtx) {
     // a bounded number of times to cover the window where `agy` flushes the
     // terminal record just after exiting. Stop as soon as the answer lands, or
     // if no output appeared at all (nothing to wait for).
-    if let Some(path) = &transcript_path {
+    if transcript_path.is_some() {
         for attempt in 0..FINAL_DRAIN_ATTEMPTS {
             if attempt > 0 {
                 tokio::time::sleep(POLL_INTERVAL).await;
             }
-            drain_transcript(
-                path,
-                &mut cursor,
-                turn_id,
-                &mut parser_state,
-                &mut saw_terminal_answer,
-                &mut model,
-                &tx,
-            );
+            if let Some(path) = &transcript_path {
+                drain_transcript(
+                    path,
+                    &mut cursor,
+                    turn_id,
+                    &mut parser_state,
+                    &mut saw_terminal_answer,
+                    &mut model,
+                    &tx,
+                );
+            }
+            if let Some(uuid) = conversation_id
+                && !resume_forked
+                && maybe_upgrade_transcript_path(&mut transcript_path, &home_dir, uuid, cursor)
+                && let Some(path) = &transcript_path
+            {
+                drain_transcript(
+                    path,
+                    &mut cursor,
+                    turn_id,
+                    &mut parser_state,
+                    &mut saw_terminal_answer,
+                    &mut model,
+                    &tx,
+                );
+            }
             if saw_terminal_answer || !saw_stdout_content {
                 break;
             }
@@ -766,6 +808,7 @@ fn drain_transcript(
     model: &mut Option<String>,
     tx: &tokio::sync::mpsc::UnboundedSender<AdapterEvent>,
 ) {
+    let full_transcript = paths::is_full_transcript_path(path);
     let (records, new_cursor) = read_records_past_cursor(path, *cursor);
     *cursor = new_cursor;
     for rec in &records {
@@ -777,10 +820,44 @@ fn drain_transcript(
         if let Some(m) = extract_model_from_record(rec) {
             *model = Some(m);
         }
-        for event in record_to_live_events(rec, turn_id, parser_state) {
+        let events = if full_transcript {
+            record_to_live_events_with_encoding(
+                rec,
+                turn_id,
+                parser_state,
+                facets::ArgumentEncoding::Native,
+            )
+        } else {
+            record_to_live_events(rec, turn_id, parser_state)
+        };
+        for event in events {
             let _ = tx.send(event);
         }
     }
+}
+
+/// Upgrade a compact live tail only after the full transcript has reached the
+/// current cursor. The files share an observed record order, so preserving the
+/// cursor then emits neither duplicates nor gaps. The handoff is one-way: once
+/// full is active, temporary write lag never flips the parser's arg encoding.
+fn maybe_upgrade_transcript_path(
+    current: &mut Option<PathBuf>,
+    home_dir: &Path,
+    conversation_id: Uuid,
+    cursor: usize,
+) -> bool {
+    let Some(path) = current.as_ref() else {
+        return false;
+    };
+    if paths::is_full_transcript_path(path) {
+        return false;
+    }
+    let Some(full) = paths::caught_up_full_transcript_path(home_dir, conversation_id, cursor)
+    else {
+        return false;
+    };
+    *current = Some(full);
+    true
 }
 
 /// Emit the captured conversation UUID as a normalized capture event. The
@@ -916,7 +993,7 @@ fn correlate_conversation_dir(home_dir: &Path, since: SystemTime, prompt: &str) 
         if mtime + Duration::from_millis(500) < since {
             continue;
         }
-        if transcript_echoes_prompt(&paths::transcript_path(home_dir, uuid), prompt) {
+        if transcript_echoes_prompt(&paths::preferred_transcript_path(home_dir, uuid), prompt) {
             matches.push(uuid);
         }
     }
@@ -1351,17 +1428,85 @@ fn classify_outcome(
     }
 }
 
-fn count_complete_lines(path: &Path) -> usize {
-    std::fs::read_to_string(path).map_or(0, |c| match c.rfind('\n') {
-        Some(idx) => c[..=idx].lines().count(),
-        None => 0,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    struct DrainTestState {
+        cursor: usize,
+        turn_id: TurnId,
+        parser_state: AntigravityParserState,
+        saw_terminal_answer: bool,
+        model: Option<String>,
+        tx: tokio::sync::mpsc::UnboundedSender<AdapterEvent>,
+        rx: tokio::sync::mpsc::UnboundedReceiver<AdapterEvent>,
+    }
+
+    impl DrainTestState {
+        fn new() -> Self {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            Self {
+                cursor: 0,
+                turn_id: Uuid::now_v7(),
+                parser_state: AntigravityParserState::default(),
+                saw_terminal_answer: false,
+                model: None,
+                tx,
+                rx,
+            }
+        }
+
+        fn drain(&mut self, path: &Path) {
+            drain_transcript(
+                path,
+                &mut self.cursor,
+                self.turn_id,
+                &mut self.parser_state,
+                &mut self.saw_terminal_answer,
+                &mut self.model,
+                &self.tx,
+            );
+        }
+
+        fn take_events(&mut self) -> Vec<AdapterEvent> {
+            let mut events = Vec::new();
+            while let Ok(event) = self.rx.try_recv() {
+                events.push(event);
+            }
+            events
+        }
+    }
+
+    fn handoff_transcript_records() -> [String; 5] {
+        [
+            serde_json::json!({
+                "step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE",
+                "tool_calls": [{"name": "run_command", "args": {"CommandLine": "\"pwd\""}}]
+            })
+            .to_string(),
+            serde_json::json!({
+                "step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE",
+                "tool_calls": [{"name": "run_command", "args": {"CommandLine": "pwd"}}]
+            })
+            .to_string(),
+            serde_json::json!({
+                "step_index": 2, "source": "MODEL", "type": "RUN_COMMAND", "status": "DONE",
+                "content": "ok"
+            })
+            .to_string(),
+            serde_json::json!({
+                "step_index": 3, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE",
+                "thinking": "checking"
+            })
+            .to_string(),
+            serde_json::json!({
+                "step_index": 4, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE",
+                "content": "done"
+            })
+            .to_string(),
+        ]
+    }
 
     #[test]
     fn probe_binary_returns_binary_not_found_for_nonexistent_name() {
@@ -1385,7 +1530,7 @@ mod tests {
         ]
         .join("\n");
         std::fs::write(&path, &content).unwrap();
-        let cursor = count_complete_lines(&path);
+        let cursor = paths::complete_line_count(&path);
         assert_eq!(
             seed_carry_forward_model(&path, cursor),
             Some("Gemini 3.1 Pro".to_owned())
@@ -1401,7 +1546,7 @@ mod tests {
             "\n",
         );
         std::fs::write(&path, content).unwrap();
-        let cursor = count_complete_lines(&path);
+        let cursor = paths::complete_line_count(&path);
         assert_eq!(seed_carry_forward_model(&path, cursor), None);
     }
 
@@ -1796,6 +1941,117 @@ mod tests {
         let (records, cursor) = read_records_past_cursor(&tmp.path().join("absent.jsonl"), 7);
         assert!(records.is_empty());
         assert_eq!(cursor, 7);
+    }
+
+    #[test]
+    fn drain_full_transcript_uses_native_tool_arguments() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("transcript_full.jsonl");
+        let record = serde_json::json!({
+            "step_index": 1,
+            "source": "MODEL",
+            "type": "PLANNER_RESPONSE",
+            "status": "DONE",
+            "tool_calls": [{
+                "name": "replace_file_content",
+                "args": {
+                    "TargetFile": "/tmp/quoted.txt",
+                    "TargetContent": "before",
+                    "ReplacementContent": "\"literal quotes\""
+                }
+            }]
+        });
+        std::fs::write(&path, record.to_string() + "\n").unwrap();
+
+        let mut state = DrainTestState::new();
+        state.drain(&path);
+
+        let AdapterEvent::ToolStarted { facet, .. } = state.rx.try_recv().unwrap() else {
+            panic!("expected tool start");
+        };
+        let crate::facets::ToolFacet::Edit { files } = facet else {
+            panic!("expected edit facet");
+        };
+        assert_eq!(files[0].edits[0].new, "\"literal quotes\"");
+    }
+
+    #[test]
+    fn compact_tail_switches_once_after_full_catches_up_without_event_drift() {
+        let home = TempDir::new().unwrap();
+        let conversation_id = Uuid::now_v7();
+        let compact = paths::transcript_path(home.path(), conversation_id);
+        let full = paths::full_transcript_path(home.path(), conversation_id);
+        std::fs::create_dir_all(compact.parent().unwrap()).unwrap();
+
+        let [compact_start, full_start, result, thinking, answer] = handoff_transcript_records();
+
+        std::fs::write(&compact, format!("{compact_start}\n{result}\n")).unwrap();
+        let mut active_path = Some(compact.clone());
+        let mut state = DrainTestState::new();
+        state.drain(&compact);
+        assert_eq!(state.cursor, 2);
+
+        std::fs::write(&full, format!("{full_start}\n")).unwrap();
+        assert!(!maybe_upgrade_transcript_path(
+            &mut active_path,
+            home.path(),
+            conversation_id,
+            state.cursor
+        ));
+        assert_eq!(active_path.as_deref(), Some(compact.as_path()));
+
+        std::fs::write(&compact, format!("{compact_start}\n{result}\n{thinking}\n")).unwrap();
+        state.drain(active_path.as_deref().unwrap());
+        assert_eq!(state.cursor, 3);
+        assert!(!maybe_upgrade_transcript_path(
+            &mut active_path,
+            home.path(),
+            conversation_id,
+            state.cursor
+        ));
+
+        std::fs::write(
+            &full,
+            format!("{full_start}\n{result}\n{thinking}\n{answer}\n"),
+        )
+        .unwrap();
+        assert!(maybe_upgrade_transcript_path(
+            &mut active_path,
+            home.path(),
+            conversation_id,
+            state.cursor
+        ));
+        assert_eq!(active_path.as_deref(), Some(full.as_path()));
+        state.drain(active_path.as_deref().unwrap());
+        assert!(!maybe_upgrade_transcript_path(
+            &mut active_path,
+            home.path(),
+            conversation_id,
+            state.cursor
+        ));
+
+        let events = state.take_events();
+        assert_eq!(events.len(), 4);
+        assert!(matches!(events[0], AdapterEvent::ToolStarted { .. }));
+        assert!(matches!(events[1], AdapterEvent::ToolCompleted { .. }));
+        assert!(matches!(
+            &events[2],
+            AdapterEvent::ContentChunk {
+                kind: crate::events::ContentKind::Thinking,
+                text,
+                ..
+            } if text == "checking"
+        ));
+        assert!(matches!(
+            &events[3],
+            AdapterEvent::ContentChunk {
+                kind: crate::events::ContentKind::Text,
+                text,
+                ..
+            } if text == "done"
+        ));
+        assert!(state.saw_terminal_answer);
+        assert_eq!(state.cursor, 4);
     }
 
     #[test]

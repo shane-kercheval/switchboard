@@ -1,7 +1,7 @@
 # First-class MCP content mutation displays
 
 **Status:** Implemented; final manual visual/reopen verification pending. M7 live validation found
-two unrelated harness-environment drift items recorded below.
+one external Antigravity/MCP-schema incompatibility recorded below.
 **Branch:** `tiddly-mcp-diffs`, based on `main` at `3de604a` (PR #64)
 
 ## Problem statement
@@ -794,11 +794,10 @@ a persistent test dependency.
 
 - `make check` passed, including Rust, frontend jsdom, lint/type/format, and WebKit browser coverage.
 - The Codex live suite passed in full.
-- Claude's adapter/tool/full-stack live checks passed, but two context-window assertions exposed
-  Claude Code 2.1.210 drift: assistant events report `claude-opus-4-8` while `modelUsage` keys the
-  same model as `claude-opus-4-8[1m]`. The existing exact-key attribution therefore omits the
-  context window. This is unrelated to MCP mutation classification and remains a separate harness
-  follow-up.
+- Claude Code 2.1.210 initially exposed a context-window key drift: assistant events report
+  `claude-opus-4-8` while `modelUsage` keys the same model as `claude-opus-4-8[1m]`. The parser now
+  prefers an exact key and accepts only that observed qualifier as a fallback while preserving the
+  assistant model for reopen provenance. The complete Claude live suite passed 28/28 after the fix.
 - Antigravity's auth, adapter, full-stack, resume, shell-facet, and invalid-tool live checks passed.
   Its successful file-read smoke test was blocked before invocation by the locally configured MCP
   schema: Antigravity rejected an empty value in `tag_match`'s enum. This is external server/config

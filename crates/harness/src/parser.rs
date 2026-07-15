@@ -616,10 +616,12 @@ struct SelectedContextWindow {
 ///
 /// The final parent assistant model is authoritative. The result-level model
 /// is used only when no assistant model was observed, and a sole-entry fallback
-/// is allowed only when neither identifier exists. An identifier that fails to
-/// match does not fall through: guessing would risk binding an auxiliary
-/// model's window to the parent turn. A numerically impossible window is also
-/// rejected before it can reach persistence or the UI.
+/// is allowed only when neither identifier exists. Claude may qualify the
+/// corresponding usage-map key with `[1m]`; that exact transport suffix is the
+/// only non-exact lookup allowed. Other mismatches do not fall through because
+/// guessing would risk binding an auxiliary model's window to the parent turn.
+/// A numerically impossible window is also rejected before it can reach
+/// persistence or the UI.
 fn select_context_window(
     result: &Value,
     final_assistant_model: Option<&str>,
@@ -630,16 +632,18 @@ fn select_context_window(
         return None;
     }
 
-    let model = if let Some(model) = final_assistant_model {
-        model
+    let (model, sole_entry_fallback) = if let Some(model) = final_assistant_model {
+        (model, false)
     } else if let Some(model) = result.get("model").and_then(Value::as_str) {
-        model
+        (model, false)
     } else if model_usage.len() == 1 {
-        model_usage.keys().next()?.as_str()
+        (model_usage.keys().next()?.as_str(), true)
     } else {
         return None;
     };
-    let entry = model_usage.get(model)?;
+    let entry = model_usage
+        .get(model)
+        .or_else(|| model_usage.get(&format!("{model}[1m]")))?;
     let context_window = u32::try_from(entry.get("contextWindow")?.as_u64()?).ok()?;
     if context_window == 0
         || context_tokens_after_turn.is_some_and(|occupancy| occupancy > u64::from(context_window))
@@ -647,7 +651,11 @@ fn select_context_window(
         return None;
     }
     Some(SelectedContextWindow {
-        model: model.to_owned(),
+        model: if sole_entry_fallback {
+            model.strip_suffix("[1m]").unwrap_or(model).to_owned()
+        } else {
+            model.to_owned()
+        },
         context_window,
     })
 }
@@ -1211,6 +1219,33 @@ mod tests {
     }
 
     #[test]
+    fn qualified_usage_key_keeps_assistant_model_as_context_provenance() {
+        let mut state = ParserState::default();
+        let turn_id = tid();
+        let agent_id = aid();
+        let assistant = r#"{"type":"assistant","message":{"id":"m1","model":"claude-opus-4-8","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":100,"output_tokens":25}}}"#;
+        let result = r#"{"type":"result","is_error":false,"result":"ok","usage":{"input_tokens":100,"output_tokens":25},"modelUsage":{"claude-opus-4-8[1m]":{"inputTokens":100,"outputTokens":25,"contextWindow":1000000}}}"#;
+
+        let _ = parse_line(assistant, turn_id, agent_id, &mut state);
+        let _ = parse_line(result, turn_id, agent_id, &mut state);
+
+        match state.take_final_turn_end(turn_id, TurnOutcome::Completed) {
+            Some(AdapterEvent::TurnEnd {
+                usage: Some(usage),
+                context_window_source:
+                    Some(crate::events::ContextWindowSource::StreamOnly { model }),
+                model: turn_model,
+                ..
+            }) => {
+                assert_eq!(usage.context_window, Some(1_000_000));
+                assert_eq!(model, "claude-opus-4-8");
+                assert_eq!(turn_model.as_deref(), Some("claude-opus-4-8"));
+            }
+            other => panic!("expected qualified context window on completed turn, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn parent_context_overflow_hides_derived_occupancy_without_losing_raw_usage() {
         let assistant = r#"{"type":"assistant","message":{"id":"m1","model":"claude-sonnet-5","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":18446744073709551615,"cache_read_input_tokens":1,"output_tokens":1}}}"#;
         let result = r#"{"type":"result","is_error":false,"result":"ok","usage":{"input_tokens":7,"output_tokens":8},"modelUsage":{"claude-sonnet-5":{"inputTokens":7,"outputTokens":8,"contextWindow":200000}}}"#;
@@ -1380,6 +1415,62 @@ mod tests {
     }
 
     #[test]
+    fn select_context_window_accepts_one_million_usage_key_qualifier() {
+        let result = json!({
+            "modelUsage": {
+                "claude-opus-4-8[1m]": {
+                    "inputTokens": 50,
+                    "contextWindow": 1_000_000
+                },
+                "claude-haiku-4-5": {
+                    "inputTokens": 10_000,
+                    "contextWindow": 200_000
+                }
+            }
+        });
+        assert_eq!(
+            select_context_window(&result, Some("claude-opus-4-8"), Some(600_000)),
+            Some(SelectedContextWindow {
+                model: "claude-opus-4-8".to_owned(),
+                context_window: 1_000_000,
+            })
+        );
+    }
+
+    #[test]
+    fn select_context_window_prefers_exact_key_over_qualified_key() {
+        let result = json!({
+            "modelUsage": {
+                "claude-opus-4-8": {"inputTokens": 50, "contextWindow": 200_000},
+                "claude-opus-4-8[1m]": {"inputTokens": 50, "contextWindow": 1_000_000}
+            }
+        });
+        assert_eq!(
+            select_context_window(&result, Some("claude-opus-4-8"), Some(100_000)),
+            Some(SelectedContextWindow {
+                model: "claude-opus-4-8".to_owned(),
+                context_window: 200_000,
+            })
+        );
+    }
+
+    #[test]
+    fn select_context_window_does_not_accept_other_key_qualifiers() {
+        let result = json!({
+            "modelUsage": {
+                "claude-opus-4-8[beta]": {
+                    "inputTokens": 50,
+                    "contextWindow": 1_000_000
+                }
+            }
+        });
+        assert_eq!(
+            select_context_window(&result, Some("claude-opus-4-8"), Some(100_000)),
+            None
+        );
+    }
+
+    #[test]
     fn select_context_window_does_not_guess_across_multiple_entries() {
         let result = json!({
             "modelUsage": {
@@ -1402,6 +1493,41 @@ mod tests {
             Some(SelectedContextWindow {
                 model: "claude-sonnet-5".to_owned(),
                 context_window: 1_000_000,
+            })
+        );
+    }
+
+    #[test]
+    fn select_context_window_normalizes_only_one_million_qualified_sole_entry() {
+        let qualified = json!({
+            "modelUsage": {
+                "claude-opus-4-8[1m]": {
+                    "inputTokens": 5,
+                    "contextWindow": 1_000_000
+                }
+            }
+        });
+        assert_eq!(
+            select_context_window(&qualified, None, Some(600_000)),
+            Some(SelectedContextWindow {
+                model: "claude-opus-4-8".to_owned(),
+                context_window: 1_000_000,
+            })
+        );
+
+        let unrelated = json!({
+            "modelUsage": {
+                "claude-opus-4-8[beta]": {
+                    "inputTokens": 5,
+                    "contextWindow": 200_000
+                }
+            }
+        });
+        assert_eq!(
+            select_context_window(&unrelated, None, Some(100_000)),
+            Some(SelectedContextWindow {
+                model: "claude-opus-4-8[beta]".to_owned(),
+                context_window: 200_000,
             })
         );
     }

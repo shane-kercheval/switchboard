@@ -71,8 +71,11 @@ pub struct RateLimitSnapshot {
 pub struct ContextWindowSnapshot {
     /// The model's total context-window size in tokens.
     pub context_window: u32,
-    /// Exact resolved `modelUsage` key that supplied the window. Legacy
-    /// snapshots have no provenance and are deliberately not overlaid.
+    /// Exact resolved parent-assistant model whose `modelUsage` entry supplied
+    /// the window. The usage-map key may carry a transport-only qualifier such
+    /// as `[1m]`; persisting the assistant identity keeps the reopen join
+    /// aligned with the transcript model. Legacy snapshots have no provenance
+    /// and are deliberately not overlaid.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     /// Final non-subagent assistant message id for the turn that reported this

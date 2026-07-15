@@ -1,11 +1,11 @@
 //! Hydration: reconstruct an Antigravity conversation's prior turns from its
-//! `transcript.jsonl` into the normalized [`LoadedTranscript`] the UI consumes
-//! for every harness.
+//! preferred full transcript (or compact fallback) into the normalized
+//! [`LoadedTranscript`] the UI consumes for every harness.
 //!
 //! Antigravity is **single-file-per-conversation**: a resume appends to the
-//! same `transcript.jsonl` (the conversation UUID lives in the directory
-//! name), so hydration reads one file — there is no Gemini-style per-resume
-//! file fan-out to merge. The conversation UUID comes from the per-agent
+//! same transcript pair (the conversation UUID lives in the directory name),
+//! so hydration reads one representation — there is no Gemini-style
+//! per-resume file fan-out to merge. The conversation UUID comes from the per-agent
 //! sidecar (server-assigned, never `AgentRecord.session_id`, which is always
 //! `None` for Antigravity).
 //!
@@ -67,7 +67,7 @@ pub fn load_antigravity_transcript(
         });
     };
 
-    let path = paths::transcript_path(home_dir, conversation_id);
+    let path = paths::preferred_transcript_path(home_dir, conversation_id);
     let content = match std::fs::read_to_string(&path) {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -84,7 +84,15 @@ pub fn load_antigravity_transcript(
         Err(e) => return Err(LoadTranscriptError::Io { path, source: e }),
     };
 
-    let mut transcript = parse_antigravity_transcript_content(&content, agent_id);
+    let mut transcript = if paths::is_full_transcript_path(&path) {
+        parse_antigravity_transcript_content_with_encoding(
+            &content,
+            agent_id,
+            super::facets::ArgumentEncoding::Native,
+        )
+    } else {
+        parse_antigravity_transcript_content(&content, agent_id)
+    };
     // Layer the registries onto the parsed model — the same two-source merge
     // the other loaders use.
     transcript.meta = Some(merge_meta_with_loaders(
@@ -95,14 +103,26 @@ pub fn load_antigravity_transcript(
     Ok(transcript)
 }
 
-/// Parse `transcript.jsonl` content into a [`LoadedTranscript`] (no FS access).
+/// Parse compact `transcript.jsonl` content into a [`LoadedTranscript`] (no FS access).
 /// Exposed `pub(crate)` so unit tests drive the reconstructor without staging a
 /// temp file.
 pub(crate) fn parse_antigravity_transcript_content(
     content: &str,
     agent_id: AgentId,
 ) -> LoadedTranscript {
-    let mut recon = Reconstruction::new(agent_id);
+    parse_antigravity_transcript_content_with_encoding(
+        content,
+        agent_id,
+        super::facets::ArgumentEncoding::CompactJsonStrings,
+    )
+}
+
+fn parse_antigravity_transcript_content_with_encoding(
+    content: &str,
+    agent_id: AgentId,
+    encoding: super::facets::ArgumentEncoding,
+) -> LoadedTranscript {
+    let mut recon = Reconstruction::new(agent_id, encoding);
     // Parse only complete (newline-terminated) lines. A trailing line with no
     // newline is an incomplete final write (a truncated file); it is dropped
     // without a warning, mirroring the live tail's partial-line handling.
@@ -128,6 +148,7 @@ pub(crate) fn parse_antigravity_transcript_content(
 /// on the next `USER_INPUT` (or at EOF).
 struct Reconstruction {
     agent_id: AgentId,
+    argument_encoding: super::facets::ArgumentEncoding,
     turns: Vec<Turn>,
     model: Option<String>,
     /// Running carry-forward model for per-turn stamping. Antigravity announces
@@ -196,9 +217,10 @@ impl AgentBuilder {
 }
 
 impl Reconstruction {
-    fn new(agent_id: AgentId) -> Self {
+    fn new(agent_id: AgentId, argument_encoding: super::facets::ArgumentEncoding) -> Self {
         Self {
             agent_id,
+            argument_encoding,
             turns: Vec::new(),
             current: None,
             model: None,
@@ -301,8 +323,11 @@ impl Reconstruction {
                     let idx = builder.items.len();
                     let result =
                         pop_plausible_result(&mut builder.pending_tool_results, rec.step_index);
-                    let (kind, facet) =
-                        super::facets::classify_antigravity_tool(&call.name, &call.args);
+                    let (kind, facet) = super::facets::classify_antigravity_tool_with_encoding(
+                        &call.name,
+                        &call.args,
+                        self.argument_encoding,
+                    );
                     builder.items.push(TurnItem::Tool {
                         tool_use_id,
                         kind,
@@ -452,6 +477,7 @@ fn pop_plausible_result(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn agent_id() -> AgentId {
         Uuid::now_v7()
@@ -483,6 +509,110 @@ mod tests {
             Turn::Agent { model, .. } => model.clone(),
             other => panic!("expected agent turn, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn loader_prefers_full_transcript_and_native_tool_arguments() {
+        let home = tempfile::tempdir().unwrap();
+        let conversation_id = Uuid::now_v7();
+        let user = json!({
+            "step_index": 0,
+            "source": "USER_EXPLICIT",
+            "type": "USER_INPUT",
+            "status": "DONE",
+            "created_at": "2026-07-14T19:00:00Z",
+            "content": "<USER_REQUEST>\nedit\n</USER_REQUEST>"
+        });
+        let full_call = json!({
+            "step_index": 1,
+            "source": "MODEL",
+            "type": "PLANNER_RESPONSE",
+            "status": "DONE",
+            "created_at": "2026-07-14T19:00:01Z",
+            "tool_calls": [{
+                "name": "replace_file_content",
+                "args": {
+                    "TargetFile": "/tmp/quoted.txt",
+                    "TargetContent": "before",
+                    "ReplacementContent": "\"literal quotes\"\nsecond"
+                }
+            }]
+        });
+        let compact_call = json!({
+            "step_index": 1,
+            "source": "MODEL",
+            "type": "PLANNER_RESPONSE",
+            "status": "DONE",
+            "created_at": "2026-07-14T19:00:01Z",
+            "tool_calls": [{
+                "name": "replace_file_content",
+                "args": {
+                    "TargetFile": "\"/tmp/quoted.txt\"",
+                    "TargetContent": "\"before\"",
+                    "ReplacementContent": "\"wrong compact value\""
+                }
+            }]
+        });
+        let result = json!({
+            "step_index": 2,
+            "source": "MODEL",
+            "type": "CortexStepFileEdit",
+            "status": "DONE",
+            "created_at": "2026-07-14T19:00:02Z",
+            "content": "edited"
+        });
+        let answer = json!({
+            "step_index": 3,
+            "source": "MODEL",
+            "type": "PLANNER_RESPONSE",
+            "status": "DONE",
+            "created_at": "2026-07-14T19:00:03Z",
+            "content": "done"
+        });
+        let transcript = |call: serde_json::Value| {
+            [user.clone(), call, result.clone(), answer.clone()]
+                .into_iter()
+                .map(|record| record.to_string())
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n"
+        };
+        let compact_content = transcript(compact_call);
+        let full_content = transcript(full_call);
+        let edit_new = |loaded: &LoadedTranscript| {
+            let TurnItem::Tool { facet, .. } = &agent_items(&loaded.turns[1])[0] else {
+                panic!("expected tool item");
+            };
+            let crate::facets::ToolFacet::Edit { files } = facet else {
+                panic!("expected edit facet");
+            };
+            files[0].edits[0].new.clone()
+        };
+
+        let compact_path = paths::transcript_path(home.path(), conversation_id);
+        let full_path = paths::full_transcript_path(home.path(), conversation_id);
+        std::fs::create_dir_all(compact_path.parent().unwrap()).unwrap();
+        std::fs::write(&compact_path, compact_content).unwrap();
+        std::fs::write(&full_path, user.to_string() + "\n").unwrap();
+
+        let compact_loaded = load_antigravity_transcript(
+            home.path(),
+            home.path(),
+            Some(conversation_id),
+            agent_id(),
+        )
+        .unwrap();
+        assert_eq!(edit_new(&compact_loaded), "wrong compact value");
+
+        std::fs::write(full_path, full_content).unwrap();
+        let full_loaded = load_antigravity_transcript(
+            home.path(),
+            home.path(),
+            Some(conversation_id),
+            agent_id(),
+        )
+        .unwrap();
+        assert_eq!(edit_new(&full_loaded), "\"literal quotes\"\nsecond");
     }
 
     #[test]

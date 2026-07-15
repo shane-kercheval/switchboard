@@ -8,12 +8,13 @@
 //!   "drip"), plus `Error:` / `Warning:` / `Authentication required` lines
 //!   on failure. `agy` exits 0 on essentially every condition, so stdout
 //!   text — not the exit code — is the failure signal.
-//! - **`transcript.jsonl`** carries one record per "step": user input,
+//! - **the conversation transcript** carries one record per "step": user input,
 //!   model planner responses (with `thinking` + `tool_calls`), and tool
 //!   results (`RUN_COMMAND`, `VIEW_FILE`, other `CortexStep*` types). It
 //!   has no top-level metadata record and no terminal "turn complete"
 //!   record — the conversation UUID lives in the directory name, and the
-//!   turn terminates when the `agy` process exits.
+//!   turn terminates when the `agy` process exits. Current versions write a
+//!   lossless `transcript_full.jsonl` plus a compact `transcript.jsonl` fallback.
 //!
 //! See `docs/research/archive/antigravity-cli-observed.md` for the ground-truth
 //! shapes these types mirror.
@@ -25,7 +26,7 @@ use serde_json::Value;
 
 use crate::events::{AdapterEvent, ContentKind, TurnId};
 
-/// One record (line) of `transcript.jsonl`. The fields below are the subset
+/// One record (line) of an Antigravity transcript. The fields below are the subset
 /// Switchboard consumes; `#[serde]` ignores any additional fields, so the type
 /// tolerates the large, growing `type` vocabulary and future field additions.
 #[derive(Debug, Clone, Deserialize)]
@@ -58,10 +59,9 @@ pub struct TranscriptRecord {
     pub tool_calls: Option<Vec<ToolCall>>,
 }
 
-/// A tool invocation inside a `PLANNER_RESPONSE.tool_calls[]`. `args` values
-/// are pre-stringified (each is a JSON string containing a JSON literal);
-/// we surface the object verbatim as the tool `input` rather than trying to
-/// unwrap, since the shape varies per tool and the UI renders it opaquely.
+/// A tool invocation inside a `PLANNER_RESPONSE.tool_calls[]`. Compact
+/// transcript args are pre-stringified; full-transcript args retain native
+/// JSON types. The raw object remains the tool `input` for provenance.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ToolCall {
     #[serde(default)]
@@ -195,6 +195,20 @@ pub fn record_to_live_events(
     turn_id: TurnId,
     state: &mut AntigravityParserState,
 ) -> Vec<AdapterEvent> {
+    record_to_live_events_with_encoding(
+        rec,
+        turn_id,
+        state,
+        super::facets::ArgumentEncoding::CompactJsonStrings,
+    )
+}
+
+pub(crate) fn record_to_live_events_with_encoding(
+    rec: &TranscriptRecord,
+    turn_id: TurnId,
+    state: &mut AntigravityParserState,
+    encoding: super::facets::ArgumentEncoding,
+) -> Vec<AdapterEvent> {
     let mut out = Vec::new();
 
     if let Some(thinking) = &rec.thinking
@@ -231,7 +245,16 @@ pub fn record_to_live_events(
             // bare `{step}:{name}` would collide and make UI/tool pairing
             // ambiguous.
             let tool_use_id = format!("{}:{}:{}", rec.step_index, call_index, call.name);
-            let (kind, facet) = super::facets::classify_antigravity_tool(&call.name, &call.args);
+            let (kind, facet) = match encoding {
+                super::facets::ArgumentEncoding::CompactJsonStrings => {
+                    super::facets::classify_antigravity_tool(&call.name, &call.args)
+                }
+                super::facets::ArgumentEncoding::Native => {
+                    super::facets::classify_antigravity_tool_with_encoding(
+                        &call.name, &call.args, encoding,
+                    )
+                }
+            };
             out.push(AdapterEvent::ToolStarted {
                 turn_id,
                 tool_use_id: tool_use_id.clone(),

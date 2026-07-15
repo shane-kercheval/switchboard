@@ -601,9 +601,14 @@ describe("ToolCallWidget facet bodies", () => {
         },
       ],
     };
-    const { getByTestId } = render(ToolCallWidget, { tool: withFacet(facet) });
+    const { getByTestId, queryByTestId, container } = render(ToolCallWidget, {
+      tool: withFacet(facet),
+    });
     expect(getByTestId("tool-verb")).toHaveTextContent("Delete");
     expect(getByTestId("tool-body")).not.toHaveTextContent("(deleted)");
+    expect(queryByTestId("tool-edit-pending")).toBeNull();
+    expect(container.querySelector('[data-origin="removed"]')).toHaveTextContent("bye");
+    expect(container.querySelector('[data-origin="added"]')).toBeNull();
   });
 
   it("caps a large edit diff to a preview and reveals the rest on expand", async () => {

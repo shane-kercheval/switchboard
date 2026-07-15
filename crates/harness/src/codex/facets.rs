@@ -231,12 +231,29 @@ fn patch_apply_end_file(path: &str, change: &Value) -> EditedFile {
                 truncated,
             }
         }
-        "delete" | "remove" => EditedFile {
-            path: path.to_owned(),
-            change: EditChange::Deleted,
-            edits: Vec::new(),
-            truncated: false,
-        },
+        "delete" | "remove" => {
+            let content = change.get("content").and_then(Value::as_str);
+            let (edits, truncated) = content.map_or_else(
+                || (Vec::new(), false),
+                |content| {
+                    let content = content.strip_suffix('\n').unwrap_or(content);
+                    let (old, truncated) = cap_content(content);
+                    (
+                        vec![EditPair {
+                            old,
+                            new: String::new(),
+                        }],
+                        truncated,
+                    )
+                },
+            );
+            EditedFile {
+                path: path.to_owned(),
+                change: EditChange::Deleted,
+                edits,
+                truncated,
+            }
+        }
         _ => {
             let (edits, truncated) = change
                 .get("unified_diff")
@@ -443,7 +460,7 @@ mod tests {
                     "unified_diff": "@@ -1 +1 @@\n-foo\n+bar\n"
                 },
                 "/tmp/new.txt": {"type": "add", "content": "hello\n"},
-                "/tmp/gone.txt": {"type": "delete"}
+                "/tmp/gone.txt": {"type": "delete", "content": "old one\nold two\n"}
             }
         }));
         let ToolFacet::Edit { files } = facet else {
@@ -465,7 +482,41 @@ mod tests {
             .find(|file| file.path == "/tmp/gone.txt")
             .unwrap();
         assert_eq!(deleted.change, EditChange::Deleted);
-        assert!(deleted.edits.is_empty());
+        assert_eq!(
+            deleted.edits,
+            vec![EditPair {
+                old: "old one\nold two".to_owned(),
+                new: String::new()
+            }]
+        );
+    }
+
+    #[test]
+    fn patch_apply_end_delete_without_content_remains_content_unavailable() {
+        let facet = patch_apply_end_facet(&json!({
+            "changes": {"/tmp/gone.txt": {"type": "delete"}}
+        }));
+        let ToolFacet::Edit { files } = facet else {
+            panic!("expected Edit");
+        };
+        assert_eq!(files[0].change, EditChange::Deleted);
+        assert!(files[0].edits.is_empty());
+    }
+
+    #[test]
+    fn patch_apply_end_delete_content_uses_the_facet_cap() {
+        let content = "x".repeat(crate::facets::FACET_CONTENT_CAP + 1);
+        let facet = patch_apply_end_facet(&json!({
+            "changes": {"/tmp/gone.txt": {"type": "delete", "content": content}}
+        }));
+        let ToolFacet::Edit { files } = facet else {
+            panic!("expected Edit");
+        };
+        assert_eq!(
+            files[0].edits[0].old.len(),
+            crate::facets::FACET_CONTENT_CAP
+        );
+        assert!(files[0].truncated);
     }
 
     #[test]

@@ -675,6 +675,56 @@ and must remain documented beside the helper.
 
 ---
 
+## Milestone 6.7 — Provider edit-content fidelity
+
+### Goal & Outcome
+
+Use the complete edit content each provider already persists so deletion and large-edit rows render
+truthfully instead of degrading to unavailable or escaped, clipped input.
+
+- Codex deletions render their captured prior content as an all-removed diff and use the Delete verb.
+- Antigravity prefers its complete transcript for live and reopened turns, preserving native tool
+  arguments and full edit content.
+- Older or incomplete Antigravity conversations still load from the compact transcript; clipped
+  encoded strings render only their valid decoded prefix and carry an honest truncation marker.
+
+### Implementation Outline
+
+For Codex, consume the observed `patch_apply_end` delete shape's `content` field through the same
+content cap as additions and modifications. Preserve the existing content-unavailable fallback when
+an older record omits that field.
+
+For Antigravity, prefer `transcript_full.jsonl` after it catches up and retain `transcript.jsonl` as
+the compatibility fallback. The files are written independently but carry the same observed record
+order: live tailing may switch compact → full only when full has at least reached the emitted cursor,
+must preserve that cursor, and must never switch back. Hydration may choose full only when it has at
+least as many complete records as compact. Keep their argument
+encodings explicit: the full transcript stores native strings/objects, while the compact transcript
+stores JSON literals inside strings. This distinction is load-bearing because native source content
+may itself be valid JSON and must not be decoded twice. Compact values clipped with Antigravity's
+`<truncated N bytes>` suffix may recover only a valid JSON-decodable prefix and must set the existing
+facet truncation flag; never render escaped source or the vendor suffix as file content.
+
+Do not infer deleted content from the filesystem, add provider-specific frontend behavior, or change
+the normalized facet wire contract.
+
+### Definition of Done
+
+- Codex facet tests cover a delete with captured content and the older content-absent fallback.
+- The tool widget test proves a one-file deletion renders Delete with removed rows and no pending or
+  added rows.
+- Antigravity tests cover a lagging full transcript, the one-way caught-up live handoff without
+  missing or duplicate events, hydration preference by completeness, native arguments that look JSON-encoded,
+  native MCP argument objects, compact clipped-string recovery, UTF-8/escape-boundary recovery, and
+  facet truncation.
+- Live and hydration paths select the same Antigravity transcript representation and classifier
+  encoding.
+- `docs/harness-behavior.md` records the observed provider shapes and removes Codex deletion from the
+  unverified gap list.
+- Targeted Rust/frontend tests pass, followed by `make check`.
+
+---
+
 ## Milestone 7 — Operational documentation and final validation
 
 ### Goal & Outcome
@@ -738,7 +788,10 @@ a persistent test dependency.
    none may invent a harness-local mutation shape.
 3. M6 consumes the stable wire contract after the harness paths are covered.
 4. M6.5 makes the shared filesystem/MCP edit preview lazy before final visual verification.
-5. M7 documents the behavior actually implemented and runs final cross-cutting validation.
+5. M6.6 replaces size heuristics with row-bounded complexity measurement and asynchronous expansion.
+6. M6.7 preserves provider-native deletion and complete Antigravity edit content before final visual
+   verification.
+7. M7 documents the behavior actually implemented and runs final cross-cutting validation.
 
 If implementation evidence contradicts a reviewed schema or envelope, stop at that milestone and
 ask for direction. Do not broaden the classifier, fetch remote state, or add a new presentation type

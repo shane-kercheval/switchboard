@@ -19,12 +19,11 @@
 //! The sanitized wrapper record, with synthetic surrounding result/answer
 //! records, is `tests/fixtures/antigravity/mcp-tool-wrapper.transcript.jsonl`.
 //!
-//! **Arg encoding.** In `transcript.jsonl` every arg value is a *string
-//! containing a JSON literal* (`"StartLine": "1"`, `"TargetContent":
-//! "\"foo\""`). [`arg_str`] decodes one level when the inner literal is a
-//! string and falls back to the raw value otherwise, which also transparently
-//! handles the raw-typed args of `transcript_full.jsonl` should the source
-//! ever switch.
+//! **Arg encoding.** In compact `transcript.jsonl`, every arg value is a
+//! string containing a JSON literal (`"StartLine": "1"`,
+//! `"TargetContent": "\"foo\""`). `transcript_full.jsonl` carries native
+//! strings instead. Callers identify the source explicitly so source content
+//! that happens to be valid JSON is never decoded twice.
 
 use serde_json::Value;
 
@@ -33,33 +32,53 @@ use crate::facets::{
     EditChange, EditPair, EditedFile, ToolFacet, cap_content, classify_mcp_tool_facet,
 };
 
+#[derive(Clone, Copy)]
+pub(crate) enum ArgumentEncoding {
+    CompactJsonStrings,
+    Native,
+}
+
 /// Classify one raw Antigravity tool call. A valid `call_mcp_tool` wrapper is
 /// normalized to MCP identity and semantic arguments; malformed wrappers and
 /// native tools retain the existing builtin/generic behavior.
 pub(crate) fn classify_antigravity_tool(name: &str, args: &Value) -> (ToolKind, ToolFacet) {
+    classify_antigravity_tool_with_encoding(name, args, ArgumentEncoding::CompactJsonStrings)
+}
+
+pub(crate) fn classify_antigravity_tool_with_encoding(
+    name: &str,
+    args: &Value,
+    encoding: ArgumentEncoding,
+) -> (ToolKind, ToolFacet) {
     if let Some((server, tool, arguments)) = decode_mcp_wrapper(name, args) {
         return (
             ToolKind::Mcp,
             classify_mcp_tool_facet(&server, &tool, &arguments),
         );
     }
-    (
-        ToolKind::Builtin,
-        classify_antigravity_tool_facet(name, args),
-    )
+    let facet = match encoding {
+        ArgumentEncoding::CompactJsonStrings => classify_antigravity_tool_facet(name, args),
+        ArgumentEncoding::Native => {
+            classify_antigravity_tool_facet_with_encoding(name, args, encoding)
+        }
+    };
+    (ToolKind::Builtin, facet)
 }
 
 fn decode_mcp_wrapper(name: &str, args: &Value) -> Option<(String, String, Value)> {
     if name != "call_mcp_tool" {
         return None;
     }
-    let server = arg_str(args, "ServerName")?;
-    let tool = arg_str(args, "ToolName")?;
+    let server = arg_str(args, "ServerName", ArgumentEncoding::CompactJsonStrings)?;
+    let tool = arg_str(args, "ToolName", ArgumentEncoding::CompactJsonStrings)?;
     if server.trim().is_empty() || tool.trim().is_empty() {
         return None;
     }
-    let raw_arguments = args.get("Arguments").and_then(Value::as_str)?;
-    let arguments = serde_json::from_str::<Value>(raw_arguments).ok()?;
+    let arguments = match args.get("Arguments")? {
+        Value::String(raw) => serde_json::from_str::<Value>(raw).ok()?,
+        Value::Object(object) => Value::Object(object.clone()),
+        _ => return None,
+    };
     if !arguments.is_object() {
         return None;
     }
@@ -71,54 +90,64 @@ fn decode_mcp_wrapper(name: &str, args: &Value) -> Option<(String, String, Value
 /// observed args are absolute, and the transcript offers no cwd to resolve
 /// against beyond `run_command`'s own `Cwd` argument.
 pub(crate) fn classify_antigravity_tool_facet(name: &str, args: &Value) -> ToolFacet {
+    classify_antigravity_tool_facet_with_encoding(name, args, ArgumentEncoding::CompactJsonStrings)
+}
+
+fn classify_antigravity_tool_facet_with_encoding(
+    name: &str,
+    args: &Value,
+    encoding: ArgumentEncoding,
+) -> ToolFacet {
     match name {
-        "run_command" => match arg_str(args, "CommandLine") {
+        "run_command" => match arg_str(args, "CommandLine", encoding) {
             Some(command) => ToolFacet::Shell {
                 command,
-                cwd: arg_str(args, "Cwd"),
+                cwd: arg_str(args, "Cwd", encoding),
             },
             None => ToolFacet::Other,
         },
-        "view_file" => match arg_str(args, "AbsolutePath") {
+        "view_file" => match arg_str(args, "AbsolutePath", encoding) {
             Some(path) => ToolFacet::Read { path },
             None => ToolFacet::Other,
         },
         "replace_file_content" => {
             let (Some(path), Some(old), Some(new)) = (
-                arg_str(args, "TargetFile"),
-                arg_str(args, "TargetContent"),
-                arg_str(args, "ReplacementContent"),
+                arg_str(args, "TargetFile", encoding),
+                content_arg(args, "TargetContent", encoding),
+                content_arg(args, "ReplacementContent", encoding),
             ) else {
                 return ToolFacet::Other;
             };
-            let (old, t1) = cap_content(&old);
-            let (new, t2) = cap_content(&new);
+            let source_truncated = old.source_truncated || new.source_truncated;
+            let (old, t1) = cap_content(&old.value);
+            let (new, t2) = cap_content(&new.value);
             ToolFacet::Edit {
                 files: vec![EditedFile {
                     path,
                     change: EditChange::Modified,
                     edits: vec![EditPair { old, new }],
-                    truncated: t1 || t2,
+                    truncated: source_truncated || t1 || t2,
                 }],
             }
         }
         "write_to_file" => {
-            let (Some(path), Some(content)) =
-                (arg_str(args, "TargetFile"), arg_str(args, "CodeContent"))
-            else {
+            let (Some(path), Some(content)) = (
+                arg_str(args, "TargetFile", encoding),
+                content_arg(args, "CodeContent", encoding),
+            ) else {
                 return ToolFacet::Other;
             };
-            let (content, truncated) = cap_content(&content);
+            let (content_value, truncated) = cap_content(&content.value);
             ToolFacet::Write {
                 path,
-                content,
-                truncated,
+                content: content_value,
+                truncated: content.source_truncated || truncated,
             }
         }
-        "grep_search" => match arg_str(args, "Query") {
+        "grep_search" => match arg_str(args, "Query", encoding) {
             Some(pattern) => ToolFacet::Search {
                 pattern,
-                path: arg_str(args, "SearchPath"),
+                path: arg_str(args, "SearchPath", encoding),
             },
             None => ToolFacet::Other,
         },
@@ -131,12 +160,65 @@ pub(crate) fn classify_antigravity_tool_facet(name: &str, args: &Value) -> ToolF
 /// string-encoding (`"\"foo\"" → foo`); a value that isn't an encoded string
 /// is returned verbatim (`"pwd" → pwd`, and raw-typed `transcript_full`
 /// strings pass through unchanged).
-fn arg_str(args: &Value, key: &str) -> Option<String> {
+fn arg_str(args: &Value, key: &str, encoding: ArgumentEncoding) -> Option<String> {
+    content_arg(args, key, encoding).map(|arg| arg.value)
+}
+
+struct ContentArg {
+    value: String,
+    source_truncated: bool,
+}
+
+fn content_arg(args: &Value, key: &str, encoding: ArgumentEncoding) -> Option<ContentArg> {
     let raw = args.get(key).and_then(Value::as_str)?;
-    match serde_json::from_str::<Value>(raw) {
-        Ok(Value::String(inner)) => Some(inner),
-        _ => Some(raw.to_owned()),
+    if matches!(encoding, ArgumentEncoding::Native) {
+        return Some(ContentArg {
+            value: raw.to_owned(),
+            source_truncated: false,
+        });
     }
+    match serde_json::from_str::<Value>(raw) {
+        Ok(Value::String(inner)) => Some(ContentArg {
+            value: inner,
+            source_truncated: false,
+        }),
+        _ => decode_compact_truncated_string(raw).or_else(|| {
+            Some(ContentArg {
+                value: raw.to_owned(),
+                source_truncated: false,
+            })
+        }),
+    }
+}
+
+/// `transcript.jsonl` clips large encoded values before their closing quote,
+/// then appends a literal newline plus `<truncated N bytes>`. Recover the
+/// complete JSON-decodable prefix so fallback reads show real line breaks and
+/// an honest truncated diff rather than escaped source plus the vendor marker.
+fn decode_compact_truncated_string(raw: &str) -> Option<ContentArg> {
+    if !raw.starts_with('"') {
+        return None;
+    }
+    let (encoded_prefix, marker) = raw.rsplit_once("\n<truncated ")?;
+    let omitted = marker.strip_suffix(" bytes>")?;
+    omitted.parse::<usize>().ok()?;
+
+    let mut end = encoded_prefix.len();
+    // A clipped JSON escape needs at most six characters removed; a clipped
+    // low-surrogate escape may also require removing its preceding high
+    // surrogate before serde accepts the recovered string.
+    for _ in 0..=12 {
+        let candidate = format!("{}\"", &encoded_prefix[..end]);
+        if let Ok(value) = serde_json::from_str::<String>(&candidate) {
+            return Some(ContentArg {
+                value,
+                source_truncated: true,
+            });
+        }
+        let (previous, _) = encoded_prefix[..end].char_indices().next_back()?;
+        end = previous;
+    }
+    None
 }
 
 #[cfg(test)]
@@ -198,6 +280,31 @@ mod tests {
                 mutation: None,
             }
         );
+    }
+
+    #[test]
+    fn mcp_wrapper_accepts_full_transcript_typed_arguments() {
+        let (kind, facet) = classify_antigravity_tool(
+            "call_mcp_tool",
+            &json!({
+                "ServerName": "notes_alias",
+                "ToolName": "edit_content",
+                "Arguments": {
+                    "id": "note-example",
+                    "type": "note",
+                    "old_str": "before",
+                    "new_str": "after"
+                }
+            }),
+        );
+        assert_eq!(kind, ToolKind::Mcp);
+        assert!(matches!(
+            facet,
+            ToolFacet::Mcp {
+                mutation: Some(mutation),
+                ..
+            } if matches!(mutation.as_ref(), crate::facets::McpMutation::TextEdit { .. })
+        ));
     }
 
     #[test]
@@ -320,6 +427,57 @@ mod tests {
                 new: "bar".to_owned()
             }]
         );
+    }
+
+    #[test]
+    fn compact_truncated_edit_decodes_prefix_and_marks_facet_truncated() {
+        let facet = classify_antigravity_tool_facet(
+            "replace_file_content",
+            &json!({
+                "TargetFile": "\"/tmp/large.txt\"",
+                "TargetContent": "\"before\"",
+                "ReplacementContent": "\"Line 1\\nLine 2\\nLine 3\n<truncated 4154 bytes>"
+            }),
+        );
+        let ToolFacet::Edit { files } = facet else {
+            panic!("expected Edit");
+        };
+        assert_eq!(files[0].edits[0].new, "Line 1\nLine 2\nLine 3");
+        assert!(files[0].truncated);
+    }
+
+    #[test]
+    fn full_transcript_native_content_that_looks_encoded_is_preserved() {
+        let (_, facet) = classify_antigravity_tool_with_encoding(
+            "replace_file_content",
+            &json!({
+                "TargetFile": "/tmp/quoted.txt",
+                "TargetContent": "before",
+                "ReplacementContent": "\"literal quotes\""
+            }),
+            ArgumentEncoding::Native,
+        );
+        let ToolFacet::Edit { files } = facet else {
+            panic!("expected Edit");
+        };
+        assert_eq!(files[0].edits[0].new, "\"literal quotes\"");
+    }
+
+    #[test]
+    fn compact_truncation_inside_an_escape_keeps_only_valid_decoded_content() {
+        let decoded =
+            decode_compact_truncated_string("\"Line 1\\nLine 2\\u00\n<truncated 2 bytes>").unwrap();
+        assert_eq!(decoded.value, "Line 1\nLine 2");
+        assert!(decoded.source_truncated);
+    }
+
+    #[test]
+    fn compact_truncation_inside_a_surrogate_pair_drops_the_incomplete_pair() {
+        let decoded =
+            decode_compact_truncated_string("\"Line 1\\nLine 2\\ud83d\\ud8\n<truncated 4 bytes>")
+                .unwrap();
+        assert_eq!(decoded.value, "Line 1\nLine 2");
+        assert!(decoded.source_truncated);
     }
 
     #[test]

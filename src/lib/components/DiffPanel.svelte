@@ -23,7 +23,7 @@
   import DiffView from "$lib/components/DiffView.svelte";
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
   import AsyncIconButton from "$lib/components/ui/AsyncIconButton.svelte";
-  import { ICON_BUTTON_CLASS, SELECTED_ROW_ICON_HOVER } from "$lib/components/ui/iconButton";
+  import { ICON_BUTTON_CLASS, ROW_ACTION_ICON_CLASS } from "$lib/components/ui/iconButton";
   import {
     SEGMENTED_MAIN_CONTAINER_CLASS,
     SEGMENTED_MAIN_ITEM_CLASS,
@@ -230,12 +230,15 @@
   const iconsHoverReveal = $derived(
     hoverableClass("group-hover:pointer-events-auto group-hover:opacity-100"),
   );
+  const countsHoverHide = $derived(hoverableClass("group-hover:hidden"));
   const padFocus = $derived(
-    target.kind === "uncommitted" ? "group-focus-within:pr-[5.75rem]" : "group-focus-within:pr-10",
+    target.kind === "uncommitted"
+      ? "group-focus-within:pr-[5.75rem]"
+      : "group-focus-within:pr-[3.75rem]",
   );
   const padHoverReveal = $derived(
     hoverableClass(
-      target.kind === "uncommitted" ? "group-hover:pr-[5.75rem]" : "group-hover:pr-10",
+      target.kind === "uncommitted" ? "group-hover:pr-[5.75rem]" : "group-hover:pr-[3.75rem]",
     ),
   );
 
@@ -293,9 +296,9 @@
   }
 
   function copyFilePath(file: ChangedFile): Promise<void> {
-    if (target.kind !== "uncommitted") return Promise.resolve();
     externalActionError = null;
-    return copyText(worktreeFilePath(target.worktreePath, file.path));
+    const root = target.kind === "uncommitted" ? target.worktreePath : target.repoRoot;
+    return copyText(worktreeFilePath(root, file.path));
   }
 
   function openFileInEditor(file: ChangedFile): Promise<void> {
@@ -364,7 +367,7 @@
               <button
                 {...props}
                 type="button"
-                class={cn(ICON_BUTTON_CLASS, "hover:bg-hover h-5 w-5 shrink-0")}
+                class={cn(ICON_BUTTON_CLASS, "h-5 w-5 shrink-0")}
                 aria-label="Show commit message"
                 data-testid="commit-message-open"
                 onclick={() => {
@@ -432,7 +435,7 @@
           <button
             {...props}
             type="button"
-            class={cn(ICON_BUTTON_CLASS, "hover:bg-hover shrink-0")}
+            class={cn(ICON_BUTTON_CLASS, "shrink-0")}
             aria-label={detailExpanded ? "Restore Git details panel" : "Expand Git details panel"}
             data-testid="detail-expand-toggle"
             onclick={onToggleDetailExpanded}
@@ -449,7 +452,7 @@
 
     <button
       type="button"
-      class={cn(ICON_BUTTON_CLASS, "hover:bg-hover shrink-0")}
+      class={cn(ICON_BUTTON_CLASS, "shrink-0")}
       aria-label="Close diff panel"
       data-testid="detail-close"
       onclick={onClose}
@@ -547,8 +550,8 @@
             {@const isSelected = file.path === selectedFile}
             <li>
               <!-- `data-selected` drives the action-icons' hover color via the
-                   shared `SELECTED_ROW_ICON_HOVER` `group-data-` variant: the
-                   icons hover gray by default and white (`bg-raised`) on a
+                   shared `ROW_ACTION_ICON_CLASS` `group-data-` variant: the
+                   icons hover a stronger gray by default and white (`bg-raised`) on a
                    selected (blue) row so they read against the blue. CSS (not a
                    JS class) because the buttons live inside Tooltip `{#snippet}`s,
                    which don't re-render when `selectedFile` changes. -->
@@ -591,12 +594,14 @@
                   <!-- +n/−n magnitude, quiet mono like the commit timestamps.
                        Absent for binary/oversized content (counts are null, not
                        0) and for a pure rename (0/0 — the R badge already says
-                       everything). Lives inside the button, so the hover
-                       padding shift slides it left to make room for the
-                       revealed action icons. -->
+                       everything). Hover/focus replaces it with the row actions
+                       instead of shifting it left beside them. -->
                   {#if file.additions !== null && file.deletions !== null && file.additions + file.deletions > 0}
                     <span
-                      class="mt-0.5 ml-auto shrink-0 pl-2 font-mono text-[10px] leading-4"
+                      class={cn(
+                        "mt-0.5 ml-auto shrink-0 pl-2 font-mono text-[10px] leading-4 group-focus-within:hidden",
+                        countsHoverHide,
+                      )}
                       data-testid="changed-file-counts"
                     >
                       <span class="text-diff-added">+{file.additions}</span>
@@ -610,64 +615,47 @@
                     iconsHoverReveal,
                   )}
                 >
-                  {#if target.kind === "uncommitted"}
-                    <Tooltip label="Copy path" side="top">
+                  <Tooltip label="Copy path" side="top">
+                    {#snippet trigger(props)}
+                      <AsyncIconButton
+                        {...props}
+                        class={cn(ROW_ACTION_ICON_CLASS, "h-6 w-6 shrink-0")}
+                        label={`Copy path for ${file.path}`}
+                        testid="changed-file-copy-path"
+                        action={() => copyFilePath(file)}
+                        onError={(error) =>
+                          onExternalActionError("[switchboard] copy file path failed", error)}
+                      >
+                        <Copy size={14} strokeWidth={1.8} aria-hidden="true" />
+                      </AsyncIconButton>
+                    {/snippet}
+                  </Tooltip>
+                  {#if target.kind === "uncommitted" && canOpenFileInEditor(file)}
+                    <Tooltip label="Open in editor" side="top">
                       {#snippet trigger(props)}
                         <AsyncIconButton
                           {...props}
-                          class={cn(
-                            ICON_BUTTON_CLASS,
-                            "h-6 w-6 shrink-0",
-                            "hover:bg-hover",
-                            SELECTED_ROW_ICON_HOVER,
-                          )}
-                          label={`Copy path for ${file.path}`}
-                          testid="changed-file-copy-path"
-                          action={() => copyFilePath(file)}
+                          class={cn(ROW_ACTION_ICON_CLASS, "h-6 w-6 shrink-0")}
+                          label={`Open ${file.path} in editor`}
+                          testid="changed-file-editor"
+                          completeAfterMs={700}
+                          action={() => openFileInEditor(file)}
                           onError={(error) =>
-                            onExternalActionError("[switchboard] copy file path failed", error)}
+                            onExternalActionError(
+                              "[switchboard] open file in editor failed",
+                              error,
+                            )}
                         >
-                          <Copy size={14} strokeWidth={1.8} aria-hidden="true" />
+                          <Code2 size={14} strokeWidth={1.8} aria-hidden="true" />
                         </AsyncIconButton>
                       {/snippet}
                     </Tooltip>
-                    {#if canOpenFileInEditor(file)}
-                      <Tooltip label="Open in editor" side="top">
-                        {#snippet trigger(props)}
-                          <AsyncIconButton
-                            {...props}
-                            class={cn(
-                              ICON_BUTTON_CLASS,
-                              "h-6 w-6 shrink-0",
-                              "hover:bg-hover",
-                              SELECTED_ROW_ICON_HOVER,
-                            )}
-                            label={`Open ${file.path} in editor`}
-                            testid="changed-file-editor"
-                            completeAfterMs={700}
-                            action={() => openFileInEditor(file)}
-                            onError={(error) =>
-                              onExternalActionError(
-                                "[switchboard] open file in editor failed",
-                                error,
-                              )}
-                          >
-                            <Code2 size={14} strokeWidth={1.8} aria-hidden="true" />
-                          </AsyncIconButton>
-                        {/snippet}
-                      </Tooltip>
-                    {/if}
                   {/if}
                   <Tooltip label="Open in difftool" side="top">
                     {#snippet trigger(props)}
                       <AsyncIconButton
                         {...props}
-                        class={cn(
-                          ICON_BUTTON_CLASS,
-                          "h-6 w-6 shrink-0",
-                          "hover:bg-hover",
-                          SELECTED_ROW_ICON_HOVER,
-                        )}
+                        class={cn(ROW_ACTION_ICON_CLASS, "h-6 w-6 shrink-0")}
                         label={`Open ${file.path} in difftool`}
                         testid="changed-file-difftool"
                         completeAfterMs={700}

@@ -51,6 +51,8 @@ pub struct TranscriptRecord {
     #[serde(default)]
     pub content: Option<String>,
     #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
     pub thinking: Option<String>,
     #[serde(default)]
     pub tool_calls: Option<Vec<ToolCall>>,
@@ -76,19 +78,41 @@ impl TranscriptRecord {
         self.source == "MODEL" && self.record_type == "PLANNER_RESPONSE"
     }
 
-    /// A `MODEL` record that is not a planner response is a tool result
-    /// (`RUN_COMMAND`, `VIEW_FILE`, `CortexStep*`...). Its `content` is a
-    /// pre-rendered text blob.
+    /// A `MODEL` record that is not a planner response is a normal tool result
+    /// (`RUN_COMMAND`, `VIEW_FILE`, `CortexStep*`...). Antigravity instead
+    /// writes invalid tool invocations as `SYSTEM` / `ERROR_MESSAGE` records;
+    /// those are tool results only when their payload explicitly identifies an
+    /// invalid tool call. Other system errors, such as quota exhaustion, are
+    /// turn-level and must not consume a pending tool id.
     pub(crate) fn is_tool_result(&self) -> bool {
-        self.source == "MODEL" && !self.is_planner_response()
+        (self.source == "MODEL" && !self.is_planner_response()) || self.is_invalid_tool_call_error()
     }
 
     pub(crate) fn tool_result_is_error(&self) -> bool {
-        self.status.as_deref() == Some("FAILED")
+        self.is_invalid_tool_call_error()
+            || self.status.as_deref() == Some("FAILED")
             || self
                 .content
                 .as_deref()
                 .is_some_and(tool_result_content_is_error)
+    }
+
+    pub(crate) fn tool_result_output(&self) -> String {
+        self.error
+            .as_deref()
+            .filter(|error| !error.trim().is_empty())
+            .or(self.content.as_deref())
+            .unwrap_or_default()
+            .to_owned()
+    }
+
+    fn is_invalid_tool_call_error(&self) -> bool {
+        self.source == "SYSTEM"
+            && self.record_type == "ERROR_MESSAGE"
+            && [self.error.as_deref(), self.content.as_deref()]
+                .into_iter()
+                .flatten()
+                .any(|text| text.to_ascii_lowercase().contains("invalid tool call"))
     }
 
     /// A planner response with non-empty `content` and no tool calls is the
@@ -235,7 +259,7 @@ pub fn record_to_live_events(
 
     if rec.is_tool_result() {
         let is_error = rec.tool_result_is_error();
-        let output = rec.content.clone().unwrap_or_default();
+        let output = rec.tool_result_output();
         if let Some(pending) = state.pending_tool_ids.front()
             && rec.step_index > pending.planner_step
         {
@@ -426,6 +450,63 @@ mod tests {
             other => panic!("expected ToolCompleted, got {other:?}"),
         }
         assert!(state.pending_tool_ids.is_empty(), "pending id consumed");
+    }
+
+    #[test]
+    fn invalid_tool_call_errors_complete_the_correct_pending_tools() {
+        let records = [
+            r#"{"step_index":8,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"view_file","args":{"AbsolutePath":"\"/tmp/missing-read\""}}]}"#,
+            r#"{"step_index":9,"source":"SYSTEM","type":"ERROR_MESSAGE","status":"DONE","error":"There was a problem parsing the tool call. Error Message: model output error: invalid tool call error (invalid_args) failed to read file: no such file","content":"Created At: now\nError invalid tool call: timestamped read failure"}"#,
+            r#"{"step_index":10,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"replace_file_content","args":{"TargetFile":"\"/tmp/missing-edit\""}}]}"#,
+            r#"{"step_index":11,"source":"SYSTEM","type":"ERROR_MESSAGE","status":"DONE","error":"There was a problem parsing the tool call. Error Message: model output error: invalid tool call error (invalid_args) target file does not exist","content":"Created At: now\nError invalid tool call: timestamped edit failure"}"#,
+            r#"{"step_index":12,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"run_command","args":{"CommandLine":"\"missing-command\""}}]}"#,
+            r#"{"step_index":13,"source":"MODEL","type":"RUN_COMMAND","status":"DONE","content":"The command failed with exit code: 127\nOutput:\nzsh: command not found: missing-command"}"#,
+        ];
+        let mut state = AntigravityParserState::default();
+        let turn = tid();
+        let events: Vec<AdapterEvent> = records
+            .iter()
+            .flat_map(|line| record_to_live_events(&parse(line), turn, &mut state))
+            .collect();
+
+        let completions: Vec<(&str, &str, bool)> = events
+            .iter()
+            .filter_map(|event| match event {
+                AdapterEvent::ToolCompleted {
+                    tool_use_id,
+                    output,
+                    is_error,
+                    ..
+                } => Some((tool_use_id.as_str(), output.as_str(), *is_error)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(completions.len(), 3);
+        assert_eq!(completions[0].0, "8:0:view_file");
+        assert!(completions[0].1.contains("failed to read file"));
+        assert_eq!(completions[1].0, "10:0:replace_file_content");
+        assert!(completions[1].1.contains("target file does not exist"));
+        assert_eq!(completions[2].0, "12:0:run_command");
+        assert!(completions[2].1.contains("command not found"));
+        assert!(completions.iter().all(|(_, _, is_error)| *is_error));
+        assert!(state.pending_tool_ids.is_empty());
+    }
+
+    #[test]
+    fn turn_level_system_error_does_not_complete_a_pending_tool() {
+        let started = parse(
+            r#"{"step_index":2,"source":"MODEL","type":"PLANNER_RESPONSE","tool_calls":[{"name":"run_command","args":{}}]}"#,
+        );
+        let quota = parse(
+            r#"{"step_index":3,"source":"SYSTEM","type":"ERROR_MESSAGE","status":"DONE","error":"RESOURCE_EXHAUSTED (code 429): Individual quota reached."}"#,
+        );
+        let mut state = AntigravityParserState::default();
+        let turn = tid();
+
+        let _ = record_to_live_events(&started, turn, &mut state);
+        assert!(record_to_live_events(&quota, turn, &mut state).is_empty());
+        assert_eq!(state.pending_tool_ids.len(), 1);
+        assert!(state.pending_tool_results.is_empty());
     }
 
     #[test]

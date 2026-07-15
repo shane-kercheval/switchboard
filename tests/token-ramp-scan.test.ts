@@ -10,7 +10,8 @@ import { describe, expect, it } from "vitest";
 //      differently over every parent and yields a shade nobody named — exactly
 //      the muddiness the ramp collapse removed.
 //   2. `border` is a line, never a fill. `bg-border` (in any form) is banned;
-//      hovers use `bg-hover`, control/track fills use `bg-active`.
+//      rows use `bg-hover`, compact controls use `bg-control-hover`, and
+//      pressed/track fills use `bg-active`.
 //
 // The two-nested-treatments rule (a bordered container's child gets a fill or
 // nothing, not both) is deliberately NOT scanned — it needs a human eye and
@@ -87,11 +88,13 @@ describe("neutral-ramp scan", () => {
   it("permits the sanctioned ramp tokens", () => {
     for (const ok of [
       "bg-hover",
+      "bg-control-hover",
       "bg-active",
       "bg-panel",
       "bg-focus-soft",
       "border-border",
       "hover:bg-hover",
+      "hover:bg-control-hover",
     ]) {
       expect(SURFACE_OPACITY.test(`class="${ok}"`)).toBe(false);
       expect(BORDER_FILL.test(`class="${ok}"`)).toBe(false);

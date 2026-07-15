@@ -151,6 +151,19 @@ export const DEFAULT_EFFORT: Record<HarnessKind, string | undefined> = {
   antigravity: undefined,
 };
 
+/// Presets for agents automatically created with a new project. Kept separate
+/// from the Add Agent form defaults so onboarding can choose a stronger initial
+/// Codex configuration without silently changing the manual creation workflow.
+export const NEW_PROJECT_DEFAULT_MODEL: Record<HarnessKind, string | undefined> = {
+  ...DEFAULT_MODEL,
+  codex: "gpt-5.6-sol",
+};
+
+export const NEW_PROJECT_DEFAULT_EFFORT: Record<HarnessKind, string | undefined> = {
+  ...DEFAULT_EFFORT,
+  codex: "high",
+};
+
 /// The auto-derived agent name for a create: named after the model it'll run,
 /// with effort appended where the harness has that axis — so a roster of
 /// auto-created agents reads as `opus-high`, `gpt-5-5-medium`, … at a glance.

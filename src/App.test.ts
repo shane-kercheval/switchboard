@@ -638,7 +638,7 @@ describe("App", () => {
     await waitFor(() => expect(createAgentCalls()).toHaveLength(3));
     expect(createAgentCalls()).toEqual([
       { name: "opus-high", harness: "claude_code" },
-      { name: "gpt-5-6-terra-medium", harness: "codex" },
+      { name: "gpt-5-6-sol-high", harness: "codex" },
       { name: "antigravity", harness: "antigravity" },
     ]);
     // Auto-seeded → the roster is populated, not the empty first-agent prompt.
@@ -652,7 +652,7 @@ describe("App", () => {
       .map(([, a]) => a as { name: string; harness: string; model?: string; effort?: string });
     expect(seededArgs).toEqual([
       { name: "opus-high", harness: "claude_code", model: "opus", effort: "high" },
-      { name: "gpt-5-6-terra-medium", harness: "codex", model: "gpt-5.6-terra", effort: "medium" },
+      { name: "gpt-5-6-sol-high", harness: "codex", model: "gpt-5.6-sol", effort: "high" },
       { name: "antigravity", harness: "antigravity", model: undefined, effort: undefined },
     ]);
   });
@@ -679,7 +679,7 @@ describe("App", () => {
     await waitFor(() => expect(createAgentCalls()).toHaveLength(2));
     expect(createAgentCalls()).toEqual([
       { name: "opus-high", harness: "claude_code" },
-      { name: "gpt-5-6-terra-medium", harness: "codex" },
+      { name: "gpt-5-6-sol-high", harness: "codex" },
     ]);
   });
 
@@ -2359,7 +2359,7 @@ describe("App", () => {
     expect(selection.selectionFor("p-a")).toEqual(["ag-1"]);
 
     // Split, then ⌘⌥2 targets the new pane and ⌘⌥1 the leftmost — full
-    // replace semantics, same meaning as clicking the pane header.
+    // replace semantics, same meaning as Cmd+clicking the pane.
     panes.moveAgentToNewPane("p-a", roster, "ag-2");
     await fireEvent.keyDown(window, { key: "2", code: "Digit2", metaKey: true, altKey: true });
     expect(selection.selectionFor("p-a")).toEqual(["ag-2"]);
@@ -2405,9 +2405,13 @@ describe("App", () => {
     const roster = ["ag-1", "ag-2"];
     panes.moveAgentToNewPane("p-a", roster, "ag-2"); // pane 1: alice, pane 2: bob
     selection.setRecipients("p-a", ["ag-1"]);
+    flushSync();
+    const setItemSpy = vi.spyOn(Storage.prototype, "setItem");
 
     // ⌘⇧] → next pane (bob); again wraps back to alice. `code`, not `key`
-    // (Shift+bracket produces "{"/"}").
+    // (Shift+bracket produces "{"/"}"). Both panes are already visible, so
+    // cycling must not rewrite the pane-layout store and invalidate the long
+    // transcript trees beneath it.
     await fireEvent.keyDown(window, {
       key: "}",
       code: "BracketRight",
@@ -2415,6 +2419,9 @@ describe("App", () => {
       shiftKey: true,
     });
     expect(selection.selectionFor("p-a")).toEqual(["ag-2"]);
+    expect(setItemSpy.mock.calls.some(([key]) => key === "switchboard-transcript-panes")).toBe(
+      false,
+    );
     await fireEvent.keyDown(window, {
       key: "}",
       code: "BracketRight",
@@ -2431,6 +2438,50 @@ describe("App", () => {
       shiftKey: true,
     });
     expect(selection.selectionFor("p-a")).toEqual(["ag-2"]);
+
+    setItemSpy.mockRestore();
+    panes._testing.reset();
+    selection._testing.reset();
+  });
+
+  it("cycles panes from the command palette", async () => {
+    const panes = await import("$lib/state/transcriptPanes.svelte");
+    const selection = await import("$lib/state/recipientSelection.svelte");
+    panes._testing.reset();
+    selection._testing.reset();
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [
+        agent({ id: "ag-1", project_id: "p-a", name: "alice" }),
+        agent({ id: "ag-2", project_id: "p-a", name: "bob" }),
+      ],
+    });
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument());
+    await fireEvent.click(screen.getByText("alpha"));
+    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
+
+    const roster = ["ag-1", "ag-2"];
+    panes.moveAgentToNewPane("p-a", roster, "ag-2");
+    selection.setRecipients("p-a", ["ag-1"]);
+
+    await fireEvent.keyDown(window, { key: "P", code: "KeyP", metaKey: true, shiftKey: true });
+    await waitFor(() => expect(screen.getByTestId("command-palette")).toBeInTheDocument());
+    await fireEvent.input(screen.getByTestId("command-palette-search"), {
+      target: { value: "next pane" },
+    });
+    await fireEvent.click(screen.getByTestId("command-option-project.next-pane"));
+    expect(selection.selectionFor("p-a")).toEqual(["ag-2"]);
+
+    await fireEvent.keyDown(window, { key: "P", code: "KeyP", metaKey: true, shiftKey: true });
+    await waitFor(() => expect(screen.getByTestId("command-palette")).toBeInTheDocument());
+    await fireEvent.input(screen.getByTestId("command-palette-search"), {
+      target: { value: "previous pane" },
+    });
+    await fireEvent.click(screen.getByTestId("command-option-project.previous-pane"));
+    expect(selection.selectionFor("p-a")).toEqual(["ag-1"]);
 
     panes._testing.reset();
     selection._testing.reset();

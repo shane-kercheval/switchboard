@@ -9,6 +9,8 @@ import {
   DEFAULT_MODEL,
   EFFORT_OPTIONS,
   MODEL_OPTIONS,
+  NEW_PROJECT_DEFAULT_EFFORT,
+  NEW_PROJECT_DEFAULT_MODEL,
   defaultAgentName,
   effortOptionsFor,
 } from "./agentSelection";
@@ -87,6 +89,26 @@ describe("effortOptionsFor", () => {
   });
 });
 
+describe("new-project agent presets", () => {
+  for (const harness of ALL_HARNESSES) {
+    it(`${harness}: uses supported model and effort values`, () => {
+      const model = NEW_PROJECT_DEFAULT_MODEL[harness];
+      const effort = NEW_PROJECT_DEFAULT_EFFORT[harness];
+      if (model !== undefined) {
+        expect(MODEL_OPTIONS[harness].map((option) => option.value)).toContain(model);
+      }
+      if (effort !== undefined) {
+        expect(effortOptionsFor(harness, model).map((option) => option.value)).toContain(effort);
+      }
+    });
+  }
+
+  it("seeds Codex with Sol and high effort", () => {
+    expect(NEW_PROJECT_DEFAULT_MODEL.codex).toBe("gpt-5.6-sol");
+    expect(NEW_PROJECT_DEFAULT_EFFORT.codex).toBe("high");
+  });
+});
+
 describe("defaultAgentName", () => {
   it("derives model-effort for a fully-capable harness", () => {
     expect(defaultAgentName("claude_code", "opus", "high")).toBe("opus-high");
@@ -135,10 +157,14 @@ describe("defaultAgentName", () => {
   // defaults, so a clash would fail one harness's creation. The only point a
   // clash can be introduced is a code edit to the default tables — guard it
   // here under the same canonicalization the backend uses for uniqueness.
-  it("seed defaults are pairwise-distinct across harnesses", () => {
+  it("new-project seed defaults are pairwise-distinct across harnesses", () => {
     const canonical = ALL_HARNESSES.map((harness) =>
       canonicalizeForUniqueness(
-        defaultAgentName(harness, DEFAULT_MODEL[harness], DEFAULT_EFFORT[harness]),
+        defaultAgentName(
+          harness,
+          NEW_PROJECT_DEFAULT_MODEL[harness],
+          NEW_PROJECT_DEFAULT_EFFORT[harness],
+        ),
       ),
     );
     expect(new Set(canonical).size).toBe(canonical.length);

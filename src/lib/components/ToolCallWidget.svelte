@@ -15,14 +15,16 @@
   /// stringified every tool call's full raw input whether or not it was ever
   /// expanded — a 500 KB write built a 500 KB string and DOM node nobody asked
   /// for. Formatting raw JSON and output must stay gated behind `open`. The
-  /// deliberate exception: Edit and Write facets render their diff inline —
-  /// watching file changes stream by is the point of the row. This is safe to
-  /// do eagerly because facet content is capped and off-window rows aren't
-  /// mounted at all (transcript render-windowing). Inline content is further capped to a preview length
-  /// (both while streaming and once settled — flipping full→capped when a turn
-  /// ends would be jarring); expanding the row un-caps it and reveals output +
-  /// raw input. Its detail line is suppressed in both states: the inline
-  /// per-file headers already carry the paths.
+  /// deliberate exception: successful/running Edit and Write facets render
+  /// their diff inline — watching file changes stream by is the point of the
+  /// row. A failed/cancelled file operation suppresses that attempted content
+  /// and shows its status output instead; the Git view is authoritative for
+  /// what actually changed. Facet content is capped and off-window rows aren't
+  /// mounted at all (transcript render-windowing). Inline content is further
+  /// capped to a preview length (both while streaming and once settled —
+  /// flipping full→capped when a turn ends would be jarring); expanding the row
+  /// un-caps it and reveals output + raw input. Its detail line is suppressed in
+  /// both states: the inline per-file headers already carry the paths.
   import type { ToolCall } from "$lib/state/index.svelte";
   import type { EditedFile } from "$lib/types";
   import DiffView from "$lib/components/DiffView.svelte";
@@ -36,6 +38,10 @@
 
   let { tool, turnSettled = true }: { tool: ToolCall; turnSettled?: boolean } = $props();
 
+  // Start collapsed; the row itself carries the common case, and avoiding
+  // automatic expansion keeps concurrent/fast tool calls from moving the page.
+  let open = $state(false);
+
   const facet = $derived(tool.facet);
   const rowState = $derived(toolRowState(tool));
   const verb = $derived(toolVerb(facet, tool.name));
@@ -45,11 +51,25 @@
       : toolDetail(facet, tool.input),
   );
   const FacetIcon = $derived(toolIcon(facet));
-  const hasOutput = $derived(tool.output !== undefined && tool.output !== "");
+  const failed = $derived(rowState === "failed");
+  const cancelled = $derived(rowState === "cancelled");
+  const interrupted = $derived(failed || cancelled);
+  const fileContentFacet = $derived(facet.facet_kind === "edit" || facet.facet_kind === "write");
+  const outputPreview = $derived(boundedOutputPreview(tool.output));
+  // Collapsed rows use only the bounded preview result. Once the user expands
+  // the row, scanning the retained full value is intentional: it determines
+  // whether the complete output or the no-details fallback should render.
+  const hasOutput = $derived(
+    open ? tool.output !== undefined && /\S/.test(tool.output) : outputPreview.hasContent,
+  );
+  const statusPreview = $derived(
+    failed
+      ? outputPreview.hasContent
+        ? outputPreview.text
+        : "Tool failed without error details."
+      : "Tool cancelled before completion.",
+  );
 
-  // Start collapsed; the row itself carries the common case, and avoiding
-  // automatic expansion keeps concurrent/fast tool calls from moving the page.
-  let open = $state(false);
   // Raw provenance for specialized facets sits behind its own reveal — the
   // facet body already shows the same information in readable form, so the
   // JSON envelope is one click further. Generic facets (`other` and any
@@ -70,6 +90,26 @@
   /// is expanded — a large change shouldn't dominate the transcript, but you
   /// can still watch the first chunk stream in and expand for the rest.
   const INLINE_DIFF_PREVIEW_LINES = 25;
+
+  /// Failed output is visible while collapsed, unlike ordinary tool output.
+  /// Bound both the source inspected and the text mounted in the DOM so the
+  /// preview does not defeat the row's lazy-rendering contract.
+  const OUTPUT_PREVIEW_SOURCE_CAP = 2_048;
+  const OUTPUT_PREVIEW_TEXT_CAP = 240;
+
+  function boundedOutputPreview(value: string | undefined): {
+    text: string;
+    hasContent: boolean;
+  } {
+    if (value === undefined || value === "") return { text: "", hasContent: false };
+    const source = value.slice(0, OUTPUT_PREVIEW_SOURCE_CAP);
+    const normalized = source.replace(/\s+/g, " ").trim();
+    if (normalized === "") return { text: "", hasContent: false };
+    const text = normalized.slice(0, OUTPUT_PREVIEW_TEXT_CAP).trimEnd();
+    const truncated =
+      normalized.length > OUTPUT_PREVIEW_TEXT_CAP || value.length > OUTPUT_PREVIEW_SOURCE_CAP;
+    return { text: truncated ? `${text}…` : text, hasContent: true };
+  }
 
   function cappedRawInput(input: unknown): { text: string; truncated: boolean } {
     const formatted = formatToolInput(input) ?? "";
@@ -202,12 +242,12 @@
     {/if}
   </button>
 
-  {#if open || facet.facet_kind === "edit" || facet.facet_kind === "write"}
+  {#if open || fileContentFacet || interrupted}
     <div
       class="border-border/70 mt-1 ml-[13px] space-y-2 border-l py-0.5 pl-4"
       data-testid="tool-body"
     >
-      {#if facet.facet_kind === "shell"}
+      {#if open && facet.facet_kind === "shell"}
         <section class="space-y-1" aria-label="Command">
           <pre
             class="text-fg max-h-44 overflow-y-auto font-mono whitespace-pre-wrap"
@@ -216,7 +256,7 @@
             <div class="text-muted font-mono text-[11px]">in {facet.cwd}</div>
           {/if}
         </section>
-      {:else if facet.facet_kind === "edit"}
+      {:else if !interrupted && facet.facet_kind === "edit"}
         {#each facet.files as file (file.path)}
           <section class="space-y-1" aria-label="File edit" data-testid="tool-edit-file">
             <div class="text-muted flex items-center gap-2 font-mono text-[11px]">
@@ -239,7 +279,7 @@
             {/if}
           </section>
         {/each}
-      {:else if facet.facet_kind === "write"}
+      {:else if !interrupted && facet.facet_kind === "write"}
         {@const rendered = synthesizeWriteDiff(
           facet.path,
           facet.content,
@@ -280,18 +320,18 @@
             </button>
           {/if}
         </section>
-      {:else if facet.facet_kind === "read"}
+      {:else if open && facet.facet_kind === "read"}
         <div class="text-muted font-mono text-[11px]" data-testid="tool-read-path">
           {facet.path}
         </div>
-      {:else if facet.facet_kind === "search"}
+      {:else if open && facet.facet_kind === "search"}
         <div class="text-muted font-mono text-[11px]" data-testid="tool-search-detail">
           <span class="text-fg">{facet.pattern}</span>
           {#if facet.path}
             <span> in {facet.path}</span>
           {/if}
         </div>
-      {:else if facet.facet_kind === "todo"}
+      {:else if open && facet.facet_kind === "todo"}
         <ul class="space-y-0.5" data-testid="tool-todo">
           {#each facet.items as item, i (i)}
             {@const StatusIcon = todoStatusIcon(item.status)}
@@ -305,13 +345,27 @@
         </ul>
       {/if}
 
+      {#if interrupted && (!open || !hasOutput)}
+        <p
+          class={cn(
+            "truncate font-mono text-[11px]",
+            failed ? "text-status-failed" : "text-status-cancelled",
+          )}
+          data-testid="tool-status-preview"
+        >
+          {statusPreview}
+        </p>
+      {/if}
+
       {#if open && hasOutput}
-        <section class="space-y-1" aria-label="Tool output">
-          <div class="text-muted text-[10px] font-semibold tracking-wide uppercase">Output</div>
+        <section class="space-y-1" aria-label={failed ? "Tool error" : "Tool output"}>
+          <div class="text-muted text-[10px] font-semibold tracking-wide uppercase">
+            {failed ? "Error" : "Output"}
+          </div>
           <pre
             class={cn(
               "bg-panel max-h-44 overflow-y-auto rounded px-2 py-1.5 font-mono whitespace-pre-wrap",
-              tool.is_error ? "text-status-failed" : "text-muted",
+              failed ? "text-status-failed" : "text-muted",
             )}
             data-testid="tool-output">{tool.output}</pre>
         </section>

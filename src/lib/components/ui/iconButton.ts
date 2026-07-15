@@ -5,20 +5,14 @@
 const ICON_BUTTON_BASE =
   "text-muted hover:text-fg inline-flex h-[26px] w-[26px] items-center justify-center rounded-full";
 
-export const ICON_BUTTON_CLASS = `${ICON_BUTTON_BASE} hover:bg-raised`;
+export const ICON_BUTTON_CLASS = `${ICON_BUTTON_BASE} hover:bg-control-hover`;
 
-// Same footprint as `ICON_BUTTON_CLASS`, but for buttons sitting *on* a
-// `bg-raised` surface (the compose card and its menus), where `hover:bg-raised`
-// would be invisible (white-on-white in light mode). Steps the hover fill down
-// to `panel` so the round hover affordance still reads.
-export const ICON_BUTTON_ON_RAISED_CLASS = `${ICON_BUTTON_BASE} hover:bg-panel`;
+/// Compact controls that rest directly on a recessed `panel` surface brighten
+/// to `raised`, producing a clearer hover than another nearby gray.
+export const ICON_BUTTON_ON_PANEL_CLASS = `${ICON_BUTTON_BASE} hover:bg-raised`;
 
 export const ICON_SIZE = 18;
 
-/// Hover treatment for an action icon on a *selected* row — a list/tree row that
-/// sets `data-selected` on its `group` element. The row's selected fill makes the
-/// icons' default gray hover muddy, so this overrides it to the white `bg-raised`
-/// fill. Apply the gray default explicitly alongside it (`hover:bg-hover`):
-/// this handles only the selected case, deliberately, so both states are named at
-/// the call site. Generic affordance; the Git view is its only consumer today.
-export const SELECTED_ROW_ICON_HOVER = "group-data-[selected=true]:hover:bg-raised";
+/// Actions nested in a row need one stronger step than the row's own hover.
+/// Selected blue rows instead use the light `raised` fill for contrast.
+export const ROW_ACTION_ICON_CLASS = `${ICON_BUTTON_BASE} hover:bg-active group-data-[selected=true]:hover:bg-raised`;

@@ -26,7 +26,7 @@
   import ForwardSourcePicker from "$lib/components/ui/ForwardSourcePicker.svelte";
   import ClearIcon from "$lib/components/ui/ClearIcon.svelte";
   import { cn } from "$lib/utils";
-  import { ICON_BUTTON_ON_RAISED_CLASS } from "$lib/components/ui/iconButton";
+  import { ICON_BUTTON_CLASS } from "$lib/components/ui/iconButton";
 
   /// Prompt mode: the chosen prompt, its argument inputs, an appended-text field,
   /// and a Preview overlay of the combined message. The parent (`ComposeBar`)
@@ -295,7 +295,7 @@
           triggerTestid={testid}
           triggerLabel={label}
           tooltipLabel="Forward an agent's output"
-          triggerClass={cn(ICON_BUTTON_ON_RAISED_CLASS, "shrink-0 self-center")}
+          triggerClass={cn(ICON_BUTTON_CLASS, "shrink-0 self-center")}
         />
       {/snippet}
 
@@ -321,7 +321,7 @@
                    to drop at once. -->
               <button
                 type="button"
-                class={cn(ICON_BUTTON_ON_RAISED_CLASS, "ml-0.5 shrink-0 disabled:opacity-50")}
+                class={cn(ICON_BUTTON_CLASS, "ml-0.5 shrink-0 disabled:opacity-50")}
                 data-testid={`${testid}-clear`}
                 aria-label="Clear forward sources"
                 title="Clear forward sources"

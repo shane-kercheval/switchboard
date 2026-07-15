@@ -2165,7 +2165,7 @@ describe("ComposeBar pane targeting", () => {
     const composeStore = await loadComposeStore();
     await renderTwoAgents();
 
-    // Simulates a pane header click / Cmd+Alt+N from outside this component.
+    // Simulates a pane Cmd+click / Cmd+Alt+N from outside this component.
     selection.setRecipients(PROJECT_ID, [AGENT_B.id]);
     await waitFor(() => {
       expect(chip(AGENT_B.id)).toHaveAttribute("data-selected", "true");

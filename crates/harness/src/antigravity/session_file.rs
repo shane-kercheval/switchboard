@@ -270,9 +270,10 @@ impl Reconstruction {
             return;
         }
 
-        // Non-MODEL internal steps (e.g. SYSTEM / CONVERSATION_HISTORY) carry
-        // no user-visible content.
-        if rec.source != "MODEL" {
+        // Most non-MODEL internal steps carry no user-visible content. Invalid
+        // tool calls are the exception: Antigravity records their completion
+        // as SYSTEM / ERROR_MESSAGE rather than a MODEL tool-result record.
+        if rec.source != "MODEL" && !rec.is_tool_result() {
             return;
         }
 
@@ -337,7 +338,7 @@ impl Reconstruction {
             }
         } else if rec.is_tool_result() {
             let is_error = rec.tool_result_is_error();
-            let output = rec.content.clone().unwrap_or_default();
+            let output = rec.tool_result_output();
             if let Some(pending) = builder.pending_tools.front()
                 && rec.step_index > pending.planner_step
             {
@@ -629,6 +630,53 @@ mod tests {
             other => panic!("expected tool item, got {other:?}"),
         }
         assert_eq!(agent_status(&t.turns[1]), TurnStatus::Complete);
+    }
+
+    #[test]
+    fn invalid_tool_call_errors_pair_correctly_on_reload() {
+        let content = concat!(
+            r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-07-14T23:38:49Z","content":"<USER_REQUEST>\ntest failures\n</USER_REQUEST>"}"#,
+            "\n",
+            r#"{"step_index":8,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-07-14T23:38:58Z","tool_calls":[{"name":"view_file","args":{"AbsolutePath":"\"/tmp/missing-read\""}}]}"#,
+            "\n",
+            r#"{"step_index":9,"source":"SYSTEM","type":"ERROR_MESSAGE","status":"DONE","created_at":"2026-07-14T23:38:59Z","error":"There was a problem parsing the tool call. Error Message: model output error: invalid tool call error (invalid_args) failed to read file: no such file","content":"Created At: now\nError invalid tool call: timestamped read failure"}"#,
+            "\n",
+            r#"{"step_index":10,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-07-14T23:39:02Z","tool_calls":[{"name":"replace_file_content","args":{"TargetFile":"\"/tmp/missing-edit\""}}]}"#,
+            "\n",
+            r#"{"step_index":11,"source":"SYSTEM","type":"ERROR_MESSAGE","status":"DONE","created_at":"2026-07-14T23:39:03Z","error":"There was a problem parsing the tool call. Error Message: model output error: invalid tool call error (invalid_args) target file does not exist","content":"Created At: now\nError invalid tool call: timestamped edit failure"}"#,
+            "\n",
+            r#"{"step_index":12,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-07-14T23:39:05Z","tool_calls":[{"name":"run_command","args":{"CommandLine":"\"missing-command\""}}]}"#,
+            "\n",
+            r#"{"step_index":13,"source":"MODEL","type":"RUN_COMMAND","status":"DONE","created_at":"2026-07-14T23:39:06Z","content":"The command failed with exit code: 127\nOutput:\nzsh: command not found: missing-command"}"#,
+            "\n",
+            r#"{"step_index":15,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-07-14T23:39:08Z","content":"all failed as expected"}"#,
+            "\n",
+        );
+        let transcript = parse_antigravity_transcript_content(content, agent_id());
+        let items = agent_items(&transcript.turns[1]);
+        let tools: Vec<(&str, &str, bool)> = items
+            .iter()
+            .filter_map(|item| match item {
+                TurnItem::Tool {
+                    name,
+                    output: Some(output),
+                    is_error: Some(is_error),
+                    completed_at: Some(_),
+                    ..
+                } => Some((name.as_str(), output.as_str(), *is_error)),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(tools.len(), 3);
+        assert_eq!(tools[0].0, "view_file");
+        assert!(tools[0].1.contains("failed to read file"));
+        assert_eq!(tools[1].0, "replace_file_content");
+        assert!(tools[1].1.contains("target file does not exist"));
+        assert_eq!(tools[2].0, "run_command");
+        assert!(tools[2].1.contains("command not found"));
+        assert!(tools.iter().all(|(_, _, is_error)| *is_error));
+        assert!(transcript.warnings.is_empty());
     }
 
     #[test]

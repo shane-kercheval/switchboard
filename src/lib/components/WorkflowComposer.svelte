@@ -14,7 +14,7 @@
     type ForwardSource,
   } from "$lib/state/heldForwards.svelte";
   import { cn } from "$lib/utils";
-  import { ICON_BUTTON_ON_RAISED_CLASS } from "$lib/components/ui/iconButton";
+  import { ICON_BUTTON_CLASS } from "$lib/components/ui/iconButton";
   import Textarea from "$lib/components/ui/Textarea.svelte";
   import ClearIcon from "$lib/components/ui/ClearIcon.svelte";
   import HarnessIcon from "$lib/components/ui/HarnessIcon.svelte";
@@ -404,7 +404,7 @@
         triggerTestid={`workflow-forward-picker-${name}`}
         triggerLabel={`Forward an agent's output into ${name}`}
         tooltipLabel="Forward an agent's output"
-        triggerClass={cn(ICON_BUTTON_ON_RAISED_CLASS, "shrink-0 self-center")}
+        triggerClass={cn(ICON_BUTTON_CLASS, "shrink-0 self-center")}
       />
     {/if}
   {/snippet}
@@ -429,7 +429,7 @@
                drop at once. -->
           <button
             type="button"
-            class={cn(ICON_BUTTON_ON_RAISED_CLASS, "ml-0.5 shrink-0")}
+            class={cn(ICON_BUTTON_CLASS, "ml-0.5 shrink-0")}
             data-testid={`workflow-forward-sources-${name}-clear`}
             aria-label="Clear forward sources"
             title="Clear forward sources"

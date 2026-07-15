@@ -8,7 +8,14 @@ import { page } from "vitest/browser";
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(async (cmd: string) => {
     if (cmd === "changed_files")
-      return [{ path: "src/components/really-long-file-name-for-actions.ts", change: "modified" }];
+      return [
+        {
+          path: "src/components/really-long-file-name-for-actions.ts",
+          change: "modified",
+          additions: 12,
+          deletions: 3,
+        },
+      ];
     return null;
   }),
   convertFileSrc: (p: string) => p,
@@ -58,11 +65,13 @@ test("a changed-file row's click target fills the full row height", async () => 
     .toBe(true);
 });
 
-test("changed-file actions do not reserve row text width until hover", async () => {
+test("changed-file actions replace counts and reserve row text width only on hover", async () => {
   mountDiffPanel({ target: TARGET });
 
   const button = page.getByTestId("changed-file");
+  const counts = page.getByTestId("changed-file-counts");
   await expect.element(button).toBeInTheDocument();
+  await expect.element(counts).toBeVisible();
 
   await expect
     .poll(() => {
@@ -75,6 +84,8 @@ test("changed-file actions do not reserve row text width until hover", async () 
     .toBe(true);
 
   await button.hover();
+
+  await expect.element(counts).not.toBeVisible();
 
   await expect
     .poll(() => {

@@ -37,15 +37,21 @@
   --fg: #18181b;
   --muted: #71717a;
 
-  /* neutral interaction — the fill under a hovered/pressed row or icon button.
+  /* neutral interaction — the fill under hovered/pressed rows and controls.
      Named for the interaction so no component reaches for `border` (a line) as
      a fill. `hover` is deliberately a *subtle* wash (barely off white) — it sits
      on white content rows and light menus, so a heavier gray reads as jarring.
-     `active` is one clear step stronger: pressed state, a toggle's off-track, a
-     progress groove, a resize seam, and an icon button that must stand out
-     against a row that is itself already hovered. */
+     `control-hover` gives compact controls a stronger circular/pill affordance.
+     `active` is the strongest neutral interaction fill: pressed state,
+     tracks/grooves, and compact actions nested inside an already-hovered row. */
   --hover: #f6f6f7;
+  --control-hover: #ececef;
   --active: #e2e2e5;
+
+  /* segmented controls use their own selected role so their neutral selection
+     is consistent without coupling it to text-muted or the primary action. */
+  --segment-selected: #71717a;
+  --segment-selected-fg: #ffffff;
 
   /* focus — blue, the app's one blue. A ring uses `--focus`; `--focus-soft` is
      the pale tint for user-authored input surfaces (the compose focus wash, the
@@ -130,7 +136,11 @@
   --muted: #a1a1aa;
 
   --hover: #26262a;
+  --control-hover: #2b2b30;
   --active: #303036;
+
+  --segment-selected: #a1a1aa;
+  --segment-selected-fg: #18181b;
 
   --focus: #6398dd;
   --focus-soft: #393c43;
@@ -189,7 +199,10 @@
   --color-muted: var(--muted);
 
   --color-hover: var(--hover);
+  --color-control-hover: var(--control-hover);
   --color-active: var(--active);
+  --color-segment-selected: var(--segment-selected);
+  --color-segment-selected-fg: var(--segment-selected-fg);
 
   --color-focus: var(--focus);
   --color-focus-soft: var(--focus-soft);

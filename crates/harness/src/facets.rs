@@ -188,14 +188,6 @@ pub struct McpMutationField {
 /// Build an MCP facet and enrich the five recognized content-mutation schemas.
 /// Unknown or malformed inputs retain MCP provenance with no mutation rather
 /// than degrading to [`ToolFacet::Other`].
-// The shared classifier contract intentionally precedes its per-harness callers.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "shared classifier is consumed by harness adapters"
-    )
-)]
 pub(crate) fn classify_mcp_tool_facet(
     server: &str,
     tool: &str,

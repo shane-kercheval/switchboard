@@ -15,21 +15,21 @@
 
 use serde_json::Value;
 
-use crate::facets::{EditChange, EditPair, EditedFile, ToolFacet, cap_content, split_mcp_name};
+use crate::facets::{
+    EditChange, EditPair, EditedFile, ToolFacet, cap_content, classify_mcp_tool_facet,
+    split_mcp_name,
+};
 
-/// Classify one Claude tool call. Missing or malformed required fields fall
-/// to `Other` — the classifier never fabricates a facet from a partial shape.
+/// Classify one Claude tool call. Missing or malformed required fields on
+/// built-in tools fall to `Other`. MCP names retain their server/tool identity;
+/// malformed mutation arguments only suppress semantic enrichment.
 ///
 /// Paths are passed through as-is: Claude requires absolute paths in its
 /// file tools (probe-verified), and the classifier has no cwd to resolve
 /// against if that ever changes.
 pub(crate) fn classify_claude_tool_facet(name: &str, input: &Value) -> ToolFacet {
     if let Some((server, tool)) = split_mcp_name(name) {
-        return ToolFacet::Mcp {
-            server,
-            tool,
-            mutation: None,
-        };
+        return classify_mcp_tool_facet(&server, &tool, input);
     }
     match name {
         "Bash" => match str_field(input, "command") {
@@ -327,6 +327,98 @@ mod tests {
     }
 
     #[test]
+    fn mcp_text_edit_uses_the_shared_mutation_classifier() {
+        let facet = classify_claude_tool_facet(
+            "mcp__notes_alias__edit_content",
+            &json!({
+                "id": "note-example",
+                "type": "note",
+                "old_str": "before text",
+                "new_str": "after text"
+            }),
+        );
+
+        let ToolFacet::Mcp {
+            server,
+            tool,
+            mutation: Some(mutation),
+        } = facet
+        else {
+            panic!("expected enriched MCP facet, got {facet:?}");
+        };
+        assert_eq!(server, "notes_alias");
+        assert_eq!(tool, "edit_content");
+        assert!(matches!(
+            *mutation,
+            crate::facets::McpMutation::TextEdit {
+                ref target,
+                ref before,
+                ref after,
+                content_truncated: false,
+                ..
+            } if target == "note · note-example"
+                && before == "before text"
+                && after == "after text"
+        ));
+    }
+
+    #[test]
+    fn mcp_creation_enrichment_is_independent_of_the_server_alias() {
+        let input = json!({"name": "sample-prompt", "content": "Prompt body"});
+        let first = classify_claude_tool_facet("mcp__prompts_one__create_prompt", &input);
+        let second = classify_claude_tool_facet("mcp__renamed_server__create_prompt", &input);
+
+        let (
+            ToolFacet::Mcp {
+                server: first_server,
+                tool: first_tool,
+                mutation: first_mutation,
+            },
+            ToolFacet::Mcp {
+                server: second_server,
+                tool: second_tool,
+                mutation: second_mutation,
+            },
+        ) = (first, second)
+        else {
+            panic!("expected MCP facets");
+        };
+        assert_eq!(first_server, "prompts_one");
+        assert_eq!(second_server, "renamed_server");
+        assert_eq!(first_tool, "create_prompt");
+        assert_eq!(second_tool, "create_prompt");
+        assert_eq!(first_mutation, second_mutation);
+        assert!(matches!(
+            first_mutation.as_deref(),
+            Some(crate::facets::McpMutation::TextCreation {
+                target,
+                content,
+                content_truncated: false,
+                ..
+            }) if target == "prompt · sample-prompt" && content == "Prompt body"
+        ));
+    }
+
+    #[test]
+    fn malformed_known_mcp_tool_remains_a_basic_mcp_facet() {
+        assert_eq!(
+            classify_claude_tool_facet(
+                "mcp__notes_alias__edit_content",
+                &json!({
+                    "id": "note-example",
+                    "type": "note",
+                    "old_str": "before text"
+                }),
+            ),
+            ToolFacet::Mcp {
+                server: "notes_alias".to_owned(),
+                tool: "edit_content".to_owned(),
+                mutation: None,
+            }
+        );
+    }
+
+    #[test]
     fn unknown_and_subagent_tools_map_to_other() {
         assert_eq!(
             classify_claude_tool_facet("Task", &json!({"prompt": "go"})),
@@ -355,10 +447,10 @@ mod tests {
             .join(name)
     }
 
-    /// `(tool_use_id, name, facet)` for every `ToolStarted` the live stream
-    /// parser emits from the recorded stream fixture.
-    fn stream_tool_facets() -> Vec<(String, String, ToolFacet)> {
-        let content = std::fs::read_to_string(fixture_path("tool-vocabulary.jsonl")).unwrap();
+    /// `(tool_use_id, name, input, facet)` for every `ToolStarted` the live
+    /// stream parser emits from a fixture.
+    fn stream_tools(fixture: &str) -> Vec<(String, String, Value, ToolFacet)> {
+        let content = std::fs::read_to_string(fixture_path(fixture)).unwrap();
         let turn_id = Uuid::now_v7();
         let agent_id = AgentId::now_v7();
         let mut state = ParserState::default();
@@ -373,27 +465,28 @@ mod tests {
                 if let AdapterEvent::ToolStarted {
                     tool_use_id,
                     name,
+                    input,
                     facet,
                     ..
                 } = e
                 {
-                    out.push((tool_use_id, name, facet));
+                    out.push((tool_use_id, name, input, facet));
                 }
             }
         }
         out
     }
 
-    /// Same triple, reconstructed by the session-file parser from the
-    /// recorded on-disk fixture.
-    fn session_tool_facets() -> Vec<(String, String, ToolFacet)> {
+    /// Same tuple, reconstructed by the session-file parser from an on-disk
+    /// fixture.
+    fn session_tools(fixture: &str) -> Vec<(String, String, Value, ToolFacet)> {
         let home = tempfile::TempDir::new().unwrap();
         let cwd = tempfile::TempDir::new().unwrap();
         let session_id = Uuid::now_v7();
         let canonical = cwd.path().canonicalize().unwrap();
         let path = crate::claude_session_file_path(home.path(), &canonical, &session_id);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::copy(fixture_path("tool-vocabulary.session.jsonl"), &path).unwrap();
+        std::fs::copy(fixture_path(fixture), &path).unwrap();
         let loaded =
             load_claude_transcript(home.path(), cwd.path(), session_id, AgentId::now_v7()).unwrap();
         let mut out = Vec::new();
@@ -403,16 +496,31 @@ mod tests {
                     if let TurnItem::Tool {
                         tool_use_id,
                         name,
+                        input,
                         facet,
                         ..
                     } = item
                     {
-                        out.push((tool_use_id, name, facet));
+                        out.push((tool_use_id, name, input, facet));
                     }
                 }
             }
         }
         out
+    }
+
+    fn stream_tool_facets() -> Vec<(String, String, ToolFacet)> {
+        stream_tools("tool-vocabulary.jsonl")
+            .into_iter()
+            .map(|(id, name, _, facet)| (id, name, facet))
+            .collect()
+    }
+
+    fn session_tool_facets() -> Vec<(String, String, ToolFacet)> {
+        session_tools("tool-vocabulary.session.jsonl")
+            .into_iter()
+            .map(|(id, name, _, facet)| (id, name, facet))
+            .collect()
     }
 
     #[test]
@@ -460,6 +568,35 @@ mod tests {
             compared >= 7,
             "expected the fixtures to share at least 7 tool calls, compared {compared}"
         );
+    }
+
+    #[test]
+    fn mcp_mutation_fixture_agrees_live_and_after_reopen() {
+        let stream = stream_tools("mcp-content-mutation.jsonl");
+        let session = session_tools("mcp-content-mutation.session.jsonl");
+
+        assert_eq!(stream.len(), 1);
+        assert_eq!(session.len(), 1);
+        assert_eq!(stream, session);
+
+        let (_, name, input, facet) = &stream[0];
+        assert_eq!(name, "mcp__notes_alias__edit_content");
+        assert_eq!(
+            input,
+            &json!({
+                "id": "note-example",
+                "type": "note",
+                "old_str": "before text",
+                "new_str": "after text"
+            })
+        );
+        assert!(matches!(
+            facet,
+            ToolFacet::Mcp {
+                mutation: Some(_),
+                ..
+            }
+        ));
     }
 
     #[test]

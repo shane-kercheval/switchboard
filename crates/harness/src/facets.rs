@@ -185,9 +185,23 @@ pub struct McpMutationField {
     pub value: String,
 }
 
-/// Build an MCP facet and enrich the five recognized content-mutation schemas.
-/// Unknown or malformed inputs retain MCP provenance with no mutation rather
-/// than degrading to [`ToolFacet::Other`].
+/// Build an MCP facet and enrich the shared content-mutation schemas.
+///
+/// Recognition is deliberately independent of the user-configured server
+/// alias (see [`McpMutation`]) and requires these exact tool/input contracts:
+///
+/// - `edit_content`: string `id`, `type` (`note` or `bookmark`), `old_str`,
+///   and `new_str`;
+/// - `edit_prompt_content`: string `name`, `old_str`, and `new_str`;
+/// - `create_note`: string `title` and optional string/null `content`;
+/// - `create_prompt`: string `name` and `content`;
+/// - `create_bookmark`: string `url`, with independently optional string
+///   `title`/`description` and string-array `tags` summary fields.
+///
+/// Unknown tools and malformed recognized inputs retain MCP provenance with no
+/// mutation rather than degrading to [`ToolFacet::Other`]. Full-replacement
+/// tools are intentionally not inferred as edits because their input carries
+/// no honest before-state.
 pub(crate) fn classify_mcp_tool_facet(
     server: &str,
     tool: &str,

@@ -1,6 +1,7 @@
 # First-class MCP content mutation displays
 
-**Status:** planned
+**Status:** Implemented; final manual visual/reopen verification pending. M7 live validation found
+two unrelated harness-environment drift items recorded below.
 **Branch:** `tiddly-mcp-diffs`, based on `main` at `3de604a` (PR #64)
 
 ## Problem statement
@@ -711,8 +712,9 @@ the normalized facet wire contract.
 ### Definition of Done
 
 - Codex facet tests cover a delete with captured content and the older content-absent fallback.
-- The tool widget test proves a one-file deletion renders Delete with removed rows and no pending or
-  added rows.
+- Tool-widget tests prove one-file and homogeneous multi-file deletions render Delete with paths
+  only while collapsed (and no collapsed diff work); expansion renders removed rows with no pending,
+  added, or redundant `(deleted)` markers.
 - Antigravity tests cover a lagging full transcript, the one-way caught-up live handoff without
   missing or duplicate events, hydration preference by completeness, native arguments that look JSON-encoded,
   native MCP argument objects, compact clipped-string recovery, UTF-8/escape-boundary recovery, and
@@ -732,22 +734,26 @@ the normalized facet wire contract.
 Make the new behavior reviewable and durable without turning any private MCP configuration into a
 project dependency.
 
-- Developers can see exactly which semantic tool schemas are recognized, that recognition is not
-  provider identity, and how each harness carries them.
-- The documented limitations match the UI: input-derived requested changes, no full-replacement
-  diffs, no automatic record fetch.
+- Developers can see exactly how each harness carries MCP identity and arguments through its live
+  and persisted transcript representations.
+- The shared classifier documents its five semantic input contracts and limitations beside the
+  implementation, without presenting Switchboard policy as vendor harness behavior.
 - The complete offline suite and relevant live harness checks pass without requiring a Tiddly account
   in CI.
 
 ### Implementation Outline
 
-Update `docs/harness-behavior.md` §3.6 with:
+Update `docs/harness-behavior.md` §3.6 only with harness-owned behavior: the direct
+Claude/Codex/Gemini MCP envelopes, Antigravity's `call_mcp_tool` wrapper, the live-versus-persisted
+identity/argument shapes, and Gemini's fixture-only status. Do not put the five semantic mappings,
+server-alias-independent matching policy, Tiddly matching behavior, or frontend presentation in
+that document; none is a property of a harness.
 
-- the five structurally recognized MCP mutation tools and the server-alias-independent rule;
-- the input-derived requested-change limitation and Tiddly whitespace-normalized matching caveat;
-- direct Claude/Codex/Gemini MCP envelopes and Antigravity's `call_mcp_tool` wrapper;
-- the explicit generic treatment of `update_item` and `update_prompt` because no prior content exists;
-- Gemini's fixture-only status.
+Keep the shared semantic contract beside `classify_mcp_tool_facet` in `crates/harness/src/facets.rs`:
+the five exact tool/input schemas, provider-neutral rationale, input-derived limitation, malformed
+fallback, and exclusion of full-replacement tools that carry no before-state. The implementation
+plan remains the chronological design record; the classifier documentation is the durable contract
+that changes with the code.
 
 Do not add this to the README: it is an enhanced rendering capability, not a user-facing harness
 limitation or setup requirement. Do not add Tiddly endpoints, aliases, tokens, real IDs, or private
@@ -763,7 +769,10 @@ a persistent test dependency.
 
 ### Definition of Done
 
-- `docs/harness-behavior.md` reflects the implemented mappings and limitations exactly.
+- `docs/harness-behavior.md` reflects each harness's MCP envelope and live/hydration behavior without
+  documenting shared semantic or frontend policy as vendor behavior.
+- `classify_mcp_tool_facet` documents the five recognized input contracts, provider-neutral scope,
+  malformed fallback, and the no-before-state boundary for full replacements.
 - All new fixtures are synthetic and a repository search confirms no bearer tokens or authorization
   headers were introduced.
 - Targeted Rust classifier/parser/session tests pass while iterating.
@@ -780,6 +789,23 @@ a persistent test dependency.
   mutation renders equivalently live and after project reload for every locally available harness;
   do not create persistent test notes/bookmarks/prompts solely for this check.
 - No dependency manifests or lockfiles change.
+
+### Validation record (2026-07-15)
+
+- `make check` passed, including Rust, frontend jsdom, lint/type/format, and WebKit browser coverage.
+- The Codex live suite passed in full.
+- Claude's adapter/tool/full-stack live checks passed, but two context-window assertions exposed
+  Claude Code 2.1.210 drift: assistant events report `claude-opus-4-8` while `modelUsage` keys the
+  same model as `claude-opus-4-8[1m]`. The existing exact-key attribution therefore omits the
+  context window. This is unrelated to MCP mutation classification and remains a separate harness
+  follow-up.
+- Antigravity's auth, adapter, full-stack, resume, shell-facet, and invalid-tool live checks passed.
+  Its successful file-read smoke test was blocked before invocation by the locally configured MCP
+  schema: Antigravity rejected an empty value in `tag_match`'s enum. This is external server/config
+  validation rather than an adapter parsing failure.
+- Gemini remained unavailable under the documented individual-account authentication gap.
+- Manual visual and reopen equivalence remain pending; they must be checked against the final dev
+  build without creating persistent MCP records solely for validation.
 
 ## Milestone dependency order
 

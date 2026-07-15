@@ -518,6 +518,10 @@ inline-rendering exception and to state that they are capped and input-derived.
 
 ## Milestone 6.5 — Lazy previews for large text edits
 
+> Superseded by Milestone 6.6 after performance calibration and automated behavior testing showed
+> that source-size and line-count gates hid useful previews for large but computationally simple
+> edits. This section remains as the implementation record for the earlier decision.
+
 ### Goal & Outcome
 
 Prevent collapsed transcript rows from computing a complete structured diff when they will render
@@ -592,6 +596,82 @@ hidden-line count.
 - Targeted `toolDiff` and `ToolCallWidget` tests pass, followed by `make check`.
 - Milestone 6's outstanding manual light/dark verification is performed after this change so it
   covers the final collapsed and expanded edit behavior.
+
+---
+
+## Milestone 6.6 — Complexity-based edit previews
+
+### Goal & Outcome
+
+Preserve previews for large edits that are cheap to compare while protecting the transcript from
+the smaller, high-edit-distance inputs that actually make structured diff synthesis expensive.
+
+- An exact diff that completes promptly renders normally: up to 25 rows in full, otherwise the
+  existing 25-row preview with an exact hidden-line count.
+- Only a comparison that exceeds the collapsed computation deadline shows "Complex edit — expand
+  to prepare diff."
+- Expanding that exceptional edit prepares the exact diff asynchronously so agent streams and user
+  interaction remain responsive.
+- File writes and MCP text creations retain their bounded all-added previews and never enter the
+  structured comparison path.
+
+### Implementation Outline
+
+Remove the source-unit and combined-line gates introduced in Milestone 6.5. They are not reliable
+proxies for Myers-diff cost: calibration with the installed `diff` package showed a 100K-character
+creation completing in under 1 ms, a 5,000-line append in roughly 5 ms, 500 unrelated lines per
+side in roughly 23–29 ms, 1,000 unrelated lines per side in roughly 114 ms, and 2,000 unrelated
+lines per side in roughly 480 ms.
+
+Attempt exact collapsed synthesis under one absolute 25 ms deadline per tool row, passing only the
+remaining time to each jsdiff comparison and including hunk conversion in the same boundary. The
+transcript is a chunked agent-output surface rather than a continuously animated canvas, so an
+occasional one-to-two-frame task is an acceptable trade for retaining substantially more useful
+previews. Files that complete before the deadline keep their exact full/25-row preview; once a file
+times out or exhausts the row deadline, that file and all later files use the deferred state without
+starting more synchronous comparisons. This row scope prevents a multi-file tool call from
+multiplying an individually acceptable delay. MCP text edits contain one comparison and follow the
+same deadline contract.
+
+Expansion must not retry exceptional comparisons as unbounded synchronous tasks. Use jsdiff's
+callback mode, which yields to the event loop, and show a compact preparation state until each exact
+diff is ready. Queue a row's deferred files sequentially behind one absolute five-second deadline,
+passing only the remaining time into each file and its edit pairs. Completed files render as they
+finish; a file that reaches the ceiling and work that has not yet started use the explicit
+unavailable state. This prevents expanding one multi-file row from launching many long-running
+comparisons on the main thread at once. Give each queued job a cancellation signal so a streaming
+prop update can remove a superseded version before it starts; an already-running comparison remains
+bounded by the row deadline and its result guard. Do not add a worker, caching layer, new backend
+fields, or an approximate prefix diff. A prefix could omit the actual changed region and would be
+more misleading than the explicit deferred state.
+
+Keep truncation semantics unchanged: only backend content truncation drives DiffView's "Diff
+truncated" notice. A timed-out comparison is a presentation state, not missing source content. The
+25 ms deadline and the reason for selecting actual computation over size heuristics are load-bearing
+and must remain documented beside the helper.
+
+### Definition of Done
+
+- Unit tests prove abortable synthesis passes only the remaining portion of one 25 ms row deadline
+  through to jsdiff, includes hunk conversion in that deadline, and does not start later file work
+  after exhaustion.
+- A 100K-character simple addition still renders an inline diff, proving source size alone no
+  longer suppresses previews.
+- Component tests cover all three states: a complete diff of at most 25 rows, a successful exact
+  diff capped to a 25-row preview, and a timed-out comparison with the deferred affordance.
+- Expanding deferred filesystem or MCP edits shows preparation, then exact asynchronously computed
+  diffs; multi-file work starts sequentially, shares one five-second row deadline, and has an
+  explicit unavailable state for timed-out and unstarted work.
+- A multi-file tool call preserves previews completed before its collapsed deadline while deferring
+  the difficult and subsequent files rather than multiplying synchronous render time.
+- Component tests prove stale asynchronous results cannot replace newer props or update an
+  unmounted component, and a superseded queued version never invokes jsdiff before the current
+  version starts.
+- Failed and cancelled edits continue to suppress requested-change content, and creation rendering
+  remains unchanged.
+- Targeted `toolDiff` and `ToolCallWidget` tests pass, followed by `make check`.
+- Manual light/dark verification covers ordinary previews, a large simple addition, a deferred
+  complex edit, its preparation state, and its expanded result.
 
 ---
 

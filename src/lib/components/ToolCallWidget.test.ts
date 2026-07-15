@@ -1,8 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
-import { render, fireEvent } from "@testing-library/svelte";
+import { render, fireEvent, waitFor } from "@testing-library/svelte";
+import type { StructuredPatch } from "diff";
 import type { ToolCall } from "$lib/state/types";
 import type { ToolFacet } from "$lib/types";
+import { createExpandedDiffCoordinator } from "$lib/toolDiff";
+import AsyncToolDiff from "./AsyncToolDiff.svelte";
 import ToolCallWidget from "./ToolCallWidget.svelte";
 
 // Wrap the real formatter in a spy so the eager-stringify regression test can
@@ -143,6 +146,41 @@ function withMcpFacet(facet: ToolFacet, overrides: Partial<ToolCall> = {}): Tool
 
 function unrelatedLines(count: number, prefix: string): string {
   return Array.from({ length: count }, (_, index) => `${prefix}${index}`).join("\n");
+}
+
+function mockAsyncPatchResult(
+  result: "success" | "unavailable" = "success",
+  removed = "before",
+  added = "after",
+): () => void {
+  let deliver = (): void => {
+    throw new Error("Async patch computation did not start");
+  };
+  structuredPatchSpy.mockImplementationOnce((...args: unknown[]) => {
+    const options = args[6] as { callback: (patch: StructuredPatch | undefined) => void };
+    deliver = () =>
+      options.callback(
+        result === "unavailable"
+          ? undefined
+          : {
+              oldFileName: "",
+              newFileName: "",
+              oldHeader: "",
+              newHeader: "",
+              hunks: [
+                {
+                  oldStart: 1,
+                  oldLines: 1,
+                  newStart: 1,
+                  newLines: 1,
+                  lines: [`-${removed}`, `+${added}`],
+                },
+              ],
+            },
+      );
+    return undefined;
+  });
+  return () => deliver();
 }
 
 describe("ToolCallWidget collapsed row", () => {
@@ -638,7 +676,7 @@ describe("ToolCallWidget facet bodies", () => {
     expect(getByTestId("tool-verb")).toHaveTextContent("Edit");
   });
 
-  it("defers every diff in an oversized multi-file row until expansion", async () => {
+  it("prepares only timed-out file diffs asynchronously on expansion", async () => {
     const facet: ToolFacet = {
       facet_kind: "edit",
       files: [
@@ -657,7 +695,8 @@ describe("ToolCallWidget facet bodies", () => {
       ],
     };
     structuredPatchSpy.mockClear();
-    const { getByTestId, getAllByTestId, queryByTestId } = render(ToolCallWidget, {
+    structuredPatchSpy.mockReturnValueOnce(undefined);
+    const { getAllByTestId, queryByTestId } = render(ToolCallWidget, {
       tool: withFacet(facet),
     });
 
@@ -666,12 +705,20 @@ describe("ToolCallWidget facet bodies", () => {
     expect(sections[0]).toHaveTextContent("/repo/a.ts");
     expect(sections[1]).toHaveTextContent("/repo/b.ts");
     expect(queryByTestId("diff-view")).toBeNull();
-    expect(structuredPatchSpy).not.toHaveBeenCalled();
+    expect(getAllByTestId("tool-edit-deferred")).toHaveLength(2);
+    expect(structuredPatchSpy).toHaveBeenCalledTimes(1);
 
-    await fireEvent.click(getByTestId("tool-edit-deferred"));
+    const finishFirst = mockAsyncPatchResult();
+    const finishSecond = mockAsyncPatchResult();
+    await fireEvent.click(getAllByTestId("tool-edit-deferred")[0]!);
     expect(queryByTestId("tool-edit-deferred")).toBeNull();
-    expect(getAllByTestId("diff-view")).toHaveLength(2);
+    expect(getAllByTestId("tool-edit-async-loading")).toHaveLength(2);
     expect(structuredPatchSpy).toHaveBeenCalledTimes(2);
+    finishFirst();
+    await waitFor(() => expect(structuredPatchSpy).toHaveBeenCalledTimes(3));
+    finishSecond();
+    await waitFor(() => expect(getAllByTestId("diff-view")).toHaveLength(2));
+    expect(structuredPatchSpy).toHaveBeenCalledTimes(3);
   });
 
   it("shows a pending placeholder for a content-less edit on a live turn", async () => {
@@ -812,39 +859,64 @@ describe("ToolCallWidget MCP mutation bodies", () => {
     expect(getByTestId("tool-body")).not.toHaveTextContent("snippet-relative");
   });
 
-  it("defers a many-short-line MCP edit before synthesis and renders it on expansion", async () => {
+  it("prepares a timed-out MCP edit asynchronously on expansion", async () => {
     const before = unrelatedLines(251, "before-");
     const after = unrelatedLines(250, "after-");
     structuredPatchSpy.mockClear();
+    structuredPatchSpy.mockReturnValueOnce(undefined);
     const { getByTestId, queryByTestId, container } = render(ToolCallWidget, {
       tool: withMcpFacet(mcpTextEdit("note · large", { before, after })),
     });
 
     expect(getByTestId("tool-mcp-edit-deferred")).toHaveTextContent(
-      "Large edit — expand to view full diff",
+      "Complex edit — expand to prepare diff",
     );
     expect(queryByTestId("diff-view")).toBeNull();
-    expect(structuredPatchSpy).not.toHaveBeenCalled();
+    expect(structuredPatchSpy).toHaveBeenCalledTimes(1);
 
+    const finish = mockAsyncPatchResult();
     await fireEvent.click(getByTestId("tool-mcp-edit-deferred"));
     expect(queryByTestId("tool-mcp-edit-deferred")).toBeNull();
-    expect(getByTestId("diff-view")).toBeInTheDocument();
+    expect(getByTestId("tool-mcp-edit-async-loading")).toHaveTextContent("Preparing full diff…");
+    finish();
+    await waitFor(() => expect(getByTestId("diff-view")).toBeInTheDocument());
     expect(container.querySelector('[data-origin="removed"]')).not.toBeNull();
     expect(container.querySelector('[data-origin="added"]')).not.toBeNull();
-    expect(structuredPatchSpy).toHaveBeenCalledTimes(1);
+    expect(structuredPatchSpy).toHaveBeenCalledTimes(2);
   });
 
-  it("defers a source-large MCP edit before synthesis", () => {
+  it("keeps a 100K-character simple addition as an inline preview", () => {
     structuredPatchSpy.mockClear();
     const { getByTestId, queryByTestId } = render(ToolCallWidget, {
       tool: withMcpFacet(
-        mcpTextEdit("note · large source", { before: "x".repeat(40_000), after: "updated" }),
+        mcpTextEdit("note · large source", { before: "", after: "x".repeat(100_000) }),
       ),
     });
 
-    expect(getByTestId("tool-mcp-edit-deferred")).toBeInTheDocument();
-    expect(queryByTestId("diff-view")).toBeNull();
-    expect(structuredPatchSpy).not.toHaveBeenCalled();
+    expect(queryByTestId("tool-mcp-edit-deferred")).toBeNull();
+    expect(getByTestId("diff-view")).toBeInTheDocument();
+    expect(structuredPatchSpy).toHaveBeenCalledTimes(1);
+    const timeout = (structuredPatchSpy.mock.calls[0]?.[6] as { timeout: number }).timeout;
+    expect(timeout).toBeGreaterThan(0);
+    expect(timeout).toBeLessThanOrEqual(25);
+  });
+
+  it("reports when an expanded complex edit exceeds the asynchronous safety ceiling", async () => {
+    structuredPatchSpy.mockClear();
+    structuredPatchSpy.mockReturnValueOnce(undefined);
+    const { getByTestId } = render(ToolCallWidget, {
+      tool: withMcpFacet(mcpTextEdit("note · pathological")),
+    });
+
+    const finish = mockAsyncPatchResult("unavailable");
+    await fireEvent.click(getByTestId("tool-mcp-edit-deferred"));
+    expect(getByTestId("tool-mcp-edit-async-loading")).toBeInTheDocument();
+    finish();
+    await waitFor(() =>
+      expect(getByTestId("tool-mcp-edit-async-unavailable")).toHaveTextContent(
+        "too complex to render inline",
+      ),
+    );
   });
 
   it.each([
@@ -1052,5 +1124,78 @@ describe("ToolCallWidget MCP mutation bodies", () => {
       expect(view.queryByTestId("tool-mcp-record-creation")).toBeNull();
       view.unmount();
     }
+  });
+});
+
+describe("AsyncToolDiff lifecycle", () => {
+  it("skips a superseded queued version and renders only the newest result", async () => {
+    structuredPatchSpy.mockClear();
+    const finishStale = mockAsyncPatchResult("success", "stale-before", "stale-after");
+    const coordinator = createExpandedDiffCoordinator();
+    const view = render(AsyncToolDiff, {
+      sourceKind: "mcp",
+      before: "old source",
+      after: "old result",
+      contentTruncated: false,
+      coordinator,
+      language: "markdown",
+      testid: "async-race",
+    });
+    await waitFor(() => expect(structuredPatchSpy).toHaveBeenCalledTimes(1));
+
+    await view.rerender({
+      sourceKind: "mcp",
+      before: "superseded source",
+      after: "superseded result",
+      contentTruncated: false,
+      coordinator,
+      language: "markdown",
+      testid: "async-race",
+    });
+    await view.rerender({
+      sourceKind: "mcp",
+      before: "current source",
+      after: "current result",
+      contentTruncated: false,
+      coordinator,
+      language: "markdown",
+      testid: "async-race",
+    });
+    const finishCurrent = mockAsyncPatchResult("success", "current-before", "current-after");
+    finishStale();
+    await waitFor(() => expect(structuredPatchSpy).toHaveBeenCalledTimes(2));
+
+    expect(structuredPatchSpy.mock.calls[1]?.[2]).toBe("current source");
+    expect(structuredPatchSpy.mock.calls[1]?.[3]).toBe("current result");
+    expect(view.container).not.toHaveTextContent("stale-before");
+    expect(view.container).not.toHaveTextContent("stale-after");
+    expect(view.container).not.toHaveTextContent("superseded source");
+    expect(view.container).not.toHaveTextContent("superseded result");
+    finishCurrent();
+    await waitFor(() => expect(view.getByTestId("async-race")).toBeInTheDocument());
+    expect(view.container).toHaveTextContent("current-before");
+    expect(view.container).toHaveTextContent("current-after");
+  });
+
+  it("ignores a pending result after unmount", async () => {
+    structuredPatchSpy.mockClear();
+    const finish = mockAsyncPatchResult();
+    const coordinator = createExpandedDiffCoordinator();
+    const view = render(AsyncToolDiff, {
+      sourceKind: "mcp",
+      before: "before",
+      after: "after",
+      contentTruncated: false,
+      coordinator,
+      language: "markdown",
+      testid: "async-unmount",
+    });
+    await waitFor(() => expect(structuredPatchSpy).toHaveBeenCalledTimes(1));
+
+    view.unmount();
+    finish();
+    await Promise.resolve();
+
+    expect(view.container).toBeEmptyDOMElement();
   });
 });

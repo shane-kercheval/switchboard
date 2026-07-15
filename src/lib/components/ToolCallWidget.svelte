@@ -24,23 +24,25 @@
   /// (transcript render-windowing). Inline content is further capped to a
   /// preview length (both while streaming and once settled — flipping
   /// full→capped when a turn ends would be jarring); expanding the row un-caps
-  /// it and reveals output + raw input. Oversized edit rows also defer complete
-  /// structured-diff synthesis until expansion; computing the full diff merely
-  /// to recover an exact hidden-line count would defeat the collapsed budget.
+  /// it and reveals output + raw input. Collapsed edits get a short exact-diff
+  /// attempt: ordinary and large-but-simple changes keep their preview, while
+  /// a genuinely complex comparison is prepared asynchronously on expansion.
   /// File-facet detail is suppressed in both states because the inline per-file
   /// headers already carry the paths.
   import type { ToolCall } from "$lib/state/index.svelte";
   import type { FileDiff } from "$lib/types";
+  import { onDestroy } from "svelte";
+  import AsyncToolDiff from "$lib/components/AsyncToolDiff.svelte";
   import DiffView from "$lib/components/DiffView.svelte";
   import Spinner from "$lib/components/ui/Spinner.svelte";
   import { languageForPath } from "$lib/diff";
   import {
-    synthesizeEditDiff,
+    COLLAPSED_EDIT_DIFF_TIMEOUT_MS,
+    createExpandedDiffCoordinator,
+    synthesizeCollapsedEditDiffs,
     synthesizeMcpTextCreationDiff,
     synthesizeMcpTextEditDiff,
     synthesizeWriteDiff,
-    shouldDeferFileEditPreview,
-    shouldDeferMcpTextEditPreview,
     truncateDiff,
   } from "$lib/toolDiff";
   import { formatToolInput, redactDisplay } from "$lib/toolInput";
@@ -60,6 +62,7 @@
   // Start collapsed; the row itself carries the common case, and avoiding
   // automatic expansion keeps concurrent/fast tool calls from moving the page.
   let open = $state(false);
+  let expandedDiffCoordinator = $state(createExpandedDiffCoordinator());
 
   const facet = $derived(tool.facet);
   const mutation = $derived(knownMcpMutation(facet));
@@ -89,6 +92,21 @@
         ? outputPreview.text
         : "Tool failed without error details."
       : "Tool cancelled before completion.",
+  );
+  const collapsedFileDiffs = $derived.by(() =>
+    facet.facet_kind === "edit"
+      ? synthesizeCollapsedEditDiffs(facet.files, COLLAPSED_EDIT_DIFF_TIMEOUT_MS)
+      : [],
+  );
+  const collapsedMcpEditDiff = $derived.by(() =>
+    mutation?.mutation_kind === "text_edit"
+      ? synthesizeMcpTextEditDiff(
+          mutation.before,
+          mutation.after,
+          mutation.content_truncated,
+          COLLAPSED_EDIT_DIFF_TIMEOUT_MS,
+        )
+      : undefined,
   );
 
   // Raw provenance for specialized facets sits behind its own reveal — the
@@ -164,6 +182,18 @@
     if (status === "in_progress") return CircleDotDashed;
     return Circle;
   }
+
+  function setOpen(next: boolean): void {
+    if (next === open) return;
+    if (next) {
+      expandedDiffCoordinator = createExpandedDiffCoordinator();
+    } else {
+      expandedDiffCoordinator.cancel();
+    }
+    open = next;
+  }
+
+  onDestroy(() => expandedDiffCoordinator.cancel());
 </script>
 
 {#snippet inlineDiff(fullDiff: FileDiff, language: string, expandTestid: string)}
@@ -187,7 +217,7 @@
       type="button"
       class="text-muted hover:text-fg text-[11px] transition-colors"
       data-testid={expandTestid}
-      onclick={() => (open = true)}
+      onclick={() => setOpen(true)}
     >
       Show {preview.hiddenLines} more {preview.hiddenLines === 1 ? "line" : "lines"}
     </button>
@@ -199,9 +229,9 @@
     type="button"
     class="text-muted hover:text-fg text-[11px] transition-colors"
     data-testid={testid}
-    onclick={() => (open = true)}
+    onclick={() => setOpen(true)}
   >
-    Large edit — expand to view full diff
+    Complex edit — expand to prepare diff
   </button>
 {/snippet}
 
@@ -226,7 +256,7 @@
       type="button"
       class="text-muted hover:text-fg text-[11px] transition-colors"
       data-testid={expandTestid}
-      onclick={() => (open = true)}
+      onclick={() => setOpen(true)}
     >
       Show {rendered.hiddenLines} more {rendered.hiddenLines === 1 ? "line" : "lines"}
     </button>
@@ -239,7 +269,7 @@
     class="hover:bg-hover flex min-h-7 w-full items-center gap-2 rounded-md px-1.5 py-1 text-left"
     aria-expanded={open}
     data-testid="tool-row"
-    onclick={() => (open = !open)}
+    onclick={() => setOpen(!open)}
   >
     <FacetIcon class="text-muted h-3.5 w-3.5 shrink-0" aria-hidden="true" />
     <span class="text-fg shrink-0 font-medium" data-testid="tool-verb">{verb}</span>
@@ -332,8 +362,8 @@
           {/if}
         </section>
       {:else if !interrupted && facet.facet_kind === "edit"}
-        {@const deferred = !open && shouldDeferFileEditPreview(facet.files)}
-        {#each facet.files as file (file.path)}
+        {#each facet.files as file, index (file.path)}
+          {@const diff = collapsedFileDiffs[index]}
           <section class="space-y-1" aria-label="File edit" data-testid="tool-edit-file">
             <div class="text-muted flex items-center gap-2 font-mono text-[11px]">
               <span class="min-w-0 truncate" title={file.path}>{file.path}</span>
@@ -350,18 +380,21 @@
                   ? "Diff content unavailable for this edit."
                   : "Diff will appear when the turn completes."}
               </p>
-            {:else if !deferred}
-              {@render inlineDiff(
-                synthesizeEditDiff(file),
-                languageForPath(file.path),
-                "tool-edit-expand",
-              )}
+            {:else if diff !== undefined}
+              {@render inlineDiff(diff, languageForPath(file.path), "tool-edit-expand")}
+            {:else if open}
+              <AsyncToolDiff
+                sourceKind="file"
+                {file}
+                coordinator={expandedDiffCoordinator}
+                language={languageForPath(file.path)}
+                testid="tool-edit-async"
+              />
+            {:else}
+              {@render deferredEditPreview("tool-edit-deferred")}
             {/if}
           </section>
         {/each}
-        {#if deferred}
-          {@render deferredEditPreview("tool-edit-deferred")}
-        {/if}
       {:else if !interrupted && facet.facet_kind === "write"}
         {@const rendered = synthesizeWriteDiff(
           facet.path,
@@ -381,25 +414,26 @@
           )}
         </section>
       {:else if !interrupted && mutation?.mutation_kind === "text_edit"}
-        {@const deferred = !open && shouldDeferMcpTextEditPreview(mutation.before, mutation.after)}
         <section class="space-y-1" aria-label="Requested content edit" data-testid="tool-mcp-edit">
           {#if open}
             <div class="text-muted truncate font-mono text-[11px]" data-testid="tool-mcp-target">
               {mutationTarget()}
             </div>
           {/if}
-          {#if deferred}
-            {@render deferredEditPreview("tool-mcp-edit-deferred")}
+          {#if collapsedMcpEditDiff !== undefined}
+            {@render inlineDiff(collapsedMcpEditDiff, "markdown", "tool-mcp-edit-expand")}
+          {:else if open}
+            <AsyncToolDiff
+              sourceKind="mcp"
+              before={mutation.before}
+              after={mutation.after}
+              contentTruncated={mutation.content_truncated}
+              coordinator={expandedDiffCoordinator}
+              language="markdown"
+              testid="tool-mcp-edit-async"
+            />
           {:else}
-            {@render inlineDiff(
-              synthesizeMcpTextEditDiff(
-                mutation.before,
-                mutation.after,
-                mutation.content_truncated,
-              ),
-              "markdown",
-              "tool-mcp-edit-expand",
-            )}
+            {@render deferredEditPreview("tool-mcp-edit-deferred")}
           {/if}
         </section>
       {:else if !interrupted && mutation?.mutation_kind === "text_creation"}

@@ -68,6 +68,22 @@ test("filesystem paths below tool headers wrap without horizontal clipping", asy
 
   mountTranscript({ projectId: PROJECT_ID, agents: [ALICE], width: 280 });
 
+  const pathRows = page.getByTestId("tool-path-row");
+  const copyButtons = page.getByTestId("tool-path-copy");
+  await expect.poll(() => pathRows.elements().length).toBe(2);
+  await expect.poll(() => copyButtons.elements().length).toBe(2);
+
+  const firstCopyContainer = copyButtons.nth(0).element().parentElement as HTMLElement;
+  expect(getComputedStyle(firstCopyContainer).opacity).toBe("0");
+  await pathRows.nth(0).hover();
+  await expect.poll(() => getComputedStyle(firstCopyContainer).opacity).toBe("1");
+
+  const copyRect = copyButtons.nth(0).element().getBoundingClientRect();
+  const statusRect = page.getByTestId("tool-done").nth(0).element().getBoundingClientRect();
+  expect(
+    Math.abs(copyRect.x + copyRect.width / 2 - (statusRect.x + statusRect.width / 2)),
+  ).toBeLessThan(1);
+
   for (const testid of ["tool-read-path", "tool-edit-path"]) {
     await expect.poll(() => pathMetrics(testid).height).toBeGreaterThan(20);
     await expect

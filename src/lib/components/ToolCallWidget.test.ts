@@ -25,6 +25,11 @@ vi.mock("diff", async (importOriginal) => {
   return { ...mod, structuredPatch: structuredPatchSpy };
 });
 
+const copyTextMock = vi.hoisted(() => vi.fn(async (_text: string): Promise<void> => undefined));
+vi.mock("$lib/native", () => ({
+  copyText: (text: string) => copyTextMock(text),
+}));
+
 const running: ToolCall = {
   item_kind: "tool",
   facet: { facet_kind: "other" },
@@ -587,6 +592,7 @@ describe("ToolCallWidget facet bodies", () => {
     const { getByTestId } = render(ToolCallWidget, { tool: withFacet(facet) });
     expect(getByTestId("tool-verb")).toHaveTextContent("Write");
     expect(getByTestId("tool-body")).not.toHaveTextContent("(added)");
+    expect(getByTestId("tool-path-copy")).toBeInTheDocument();
   });
 
   it("keeps a single-file deletion quiet until expanded", async () => {
@@ -637,6 +643,7 @@ describe("ToolCallWidget facet bodies", () => {
       ],
     };
     structuredPatchSpy.mockClear();
+    copyTextMock.mockClear();
     const { getByTestId, getAllByTestId, queryByTestId, container } = render(ToolCallWidget, {
       tool: withFacet(facet),
     });
@@ -648,6 +655,11 @@ describe("ToolCallWidget facet bodies", () => {
       "/repo/old-b.txt",
     ]);
     expect(container.querySelector('[data-origin="removed"]')).toBeNull();
+    expect(structuredPatchSpy).not.toHaveBeenCalled();
+
+    await fireEvent.click(getAllByTestId("tool-path-copy")[1]!);
+    expect(copyTextMock).toHaveBeenCalledWith("/repo/old-b.txt");
+    expect(getByTestId("tool-row")).toHaveAttribute("aria-expanded", "false");
     expect(structuredPatchSpy).not.toHaveBeenCalled();
 
     await fireEvent.click(getByTestId("tool-row"));
@@ -726,6 +738,7 @@ describe("ToolCallWidget facet bodies", () => {
 
     const sections = getAllByTestId("tool-edit-file");
     expect(sections).toHaveLength(2);
+    expect(getAllByTestId("tool-path-copy")).toHaveLength(2);
     expect(sections[1]).toHaveTextContent("(added)");
     expect(getByTestId("tool-verb")).toHaveTextContent("Edit");
   });
@@ -864,12 +877,16 @@ describe("ToolCallWidget facet bodies", () => {
   });
 
   it("renders read and search facet details", async () => {
+    copyTextMock.mockClear();
     const read = render(ToolCallWidget, {
       tool: withFacet({ facet_kind: "read", path: "/repo/src/main.rs" }),
     });
     expect(read.queryByTestId("tool-detail")).toBeNull();
     expect(read.getByTestId("tool-read-path")).toHaveTextContent("/repo/src/main.rs");
     expect(read.queryByTestId("tool-output")).toBeNull();
+    await fireEvent.click(read.getByTestId("tool-path-copy"));
+    expect(copyTextMock).toHaveBeenCalledWith("/repo/src/main.rs");
+    expect(read.getByTestId("tool-row")).toHaveAttribute("aria-expanded", "false");
     await fireEvent.click(read.getByTestId("tool-row"));
     expect(read.getByTestId("tool-read-path")).toHaveTextContent("/repo/src/main.rs");
     expect(read.getByTestId("tool-output")).toHaveTextContent("hi");

@@ -34,7 +34,10 @@
   import { onDestroy } from "svelte";
   import AsyncToolDiff from "$lib/components/AsyncToolDiff.svelte";
   import DiffView from "$lib/components/DiffView.svelte";
+  import AsyncIconButton from "$lib/components/ui/AsyncIconButton.svelte";
   import Spinner from "$lib/components/ui/Spinner.svelte";
+  import Tooltip from "$lib/components/ui/Tooltip.svelte";
+  import { ROW_ACTION_ICON_CLASS } from "$lib/components/ui/iconButton";
   import { languageForPath } from "$lib/diff";
   import {
     COLLAPSED_EDIT_DIFF_TIMEOUT_MS,
@@ -46,6 +49,7 @@
     truncateDiff,
   } from "$lib/toolDiff";
   import { formatToolInput, redactDisplay } from "$lib/toolInput";
+  import { copyText } from "$lib/native";
   import {
     isGenericFacet,
     knownMcpMutation,
@@ -55,7 +59,7 @@
     toolVerb,
   } from "$lib/toolRow";
   import { cn } from "$lib/utils";
-  import { CircleCheck, CircleDotDashed, Circle } from "@lucide/svelte";
+  import { CircleCheck, CircleDotDashed, Circle, Copy } from "@lucide/svelte";
 
   let { tool, turnSettled = true }: { tool: ToolCall; turnSettled?: boolean } = $props();
 
@@ -270,6 +274,27 @@
   {/if}
 {/snippet}
 
+{#snippet copyPathAction(path: string)}
+  <div
+    class="pointer-events-none mr-0.5 shrink-0 opacity-0 transition-opacity group-focus-within/path:pointer-events-auto group-focus-within/path:opacity-100 group-hover/path:pointer-events-auto group-hover/path:opacity-100"
+  >
+    <Tooltip label="Copy path" side="top">
+      {#snippet trigger(props)}
+        <AsyncIconButton
+          {...props}
+          class={cn(ROW_ACTION_ICON_CLASS, "h-6 w-6")}
+          label={`Copy path for ${path}`}
+          testid="tool-path-copy"
+          action={() => copyText(path)}
+          onError={(error) => console.error("[switchboard] copy tool path failed", error)}
+        >
+          <Copy size={14} strokeWidth={1.8} aria-hidden="true" />
+        </AsyncIconButton>
+      {/snippet}
+    </Tooltip>
+  </div>
+{/snippet}
+
 <div class="text-xs" data-testid="turn-tool" data-tool-use-id={tool.tool_use_id}>
   <button
     type="button"
@@ -371,13 +396,17 @@
       {:else if !interrupted && facet.facet_kind === "edit"}
         {#each facet.files as file, index (file.path)}
           <section class="space-y-1" aria-label="File edit" data-testid="tool-edit-file">
-            <div class="text-muted flex items-start gap-2 font-mono text-[11px]">
+            <div
+              class="group/path text-muted flex items-start gap-2 font-mono text-[11px]"
+              data-testid="tool-path-row"
+            >
               <span class={cn(FILE_PATH_CLASS, "flex-1")} data-testid="tool-edit-path">
                 {file.path}
               </span>
               {#if verb === "Edit" && facet.files.length > 1 && file.change !== "modified"}
                 <span class="shrink-0">({file.change})</span>
               {/if}
+              {@render copyPathAction(file.path)}
             </div>
             {#if !deleteFacet || open}
               {@const diff = collapsedFileDiffs[index]}
@@ -415,10 +444,13 @@
         )}
         <section class="space-y-1" aria-label="File write" data-testid="tool-write-file">
           <div
-            class={cn("text-muted font-mono text-[11px]", FILE_PATH_CLASS)}
-            data-testid="tool-write-path"
+            class="group/path text-muted flex items-start gap-2 font-mono text-[11px]"
+            data-testid="tool-path-row"
           >
-            {facet.path}
+            <span class={cn(FILE_PATH_CLASS, "flex-1")} data-testid="tool-write-path">
+              {facet.path}
+            </span>
+            {@render copyPathAction(facet.path)}
           </div>
           {@render inlineAddedContent(
             rendered,
@@ -515,10 +547,13 @@
         </section>
       {:else if !interrupted && facet.facet_kind === "read"}
         <div
-          class={cn("text-muted font-mono text-[11px]", FILE_PATH_CLASS)}
-          data-testid="tool-read-path"
+          class="group/path text-muted flex items-start gap-2 font-mono text-[11px]"
+          data-testid="tool-path-row"
         >
-          {facet.path}
+          <span class={cn(FILE_PATH_CLASS, "flex-1")} data-testid="tool-read-path">
+            {facet.path}
+          </span>
+          {@render copyPathAction(facet.path)}
         </div>
       {:else if open && facet.facet_kind === "search"}
         <div class="text-muted font-mono text-[11px]" data-testid="tool-search-detail">

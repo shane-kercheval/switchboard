@@ -516,6 +516,85 @@ inline-rendering exception and to state that they are capped and input-derived.
 
 ---
 
+## Milestone 6.5 — Lazy previews for large text edits
+
+### Goal & Outcome
+
+Prevent collapsed transcript rows from computing a complete structured diff when they will render
+only a short preview. This applies consistently to existing filesystem edits and the MCP text edits
+that reuse the same synthesis path.
+
+- Ordinary edits retain the current 25-line preview, fade, and exact "Show N more lines" affordance.
+- Oversized edits mount without running full diff synthesis while collapsed.
+- Expanding an oversized edit computes and renders all captured before/after content.
+- File writes and MCP text creations keep their existing bounded all-added path; this milestone does
+  not redesign creation rendering.
+
+### Implementation Outline
+
+Before synthesizing any collapsed diff, evaluate the complete tool row against two shared budgets:
+32,768 JavaScript string code units and 500 combined logical lines across all before and after
+strings. Count both dimensions without allocating normalized strings or line arrays and stop as soon
+as either budget is exceeded. A filesystem edit contributes every edit pair from every file in the
+row; an MCP text edit contributes its single before/after pair.
+
+Both limits are load-bearing. The source-size limit is intentionally below the backend's 256
+KiB-per-content cap, while the line limit protects against thousands of short, unrelated lines that
+are small in bytes but expensive for the line-oriented diff algorithm. Local worst-case calibration
+with the installed `diff` package showed unrelated 1,000-line inputs on each side taking roughly 98
+ms and 2,000-line inputs on each side taking roughly 363 ms despite using only about 9.8K and 21.8K
+combined characters, respectively. The 500-combined-line limit keeps that synchronous collapsed
+work in the lower-cost range without timing-dependent production logic or tests.
+
+When a collapsed edit is within budget, preserve the existing behavior exactly: synthesize the full
+diff, trim its mounted representation to 25 lines, and report the exact number of hidden diff lines.
+When either row budget is exceeded, defer every diff in the row. Do not call `structuredPatch`, do
+not build an approximate prefix diff, and do not claim an exact hidden-line count. Preserve the
+filesystem path headings so the affected files remain visible, but show one compact row-level button
+such as "Large edit — expand to view full diff" in place of all collapsed diff canvases. Spending a
+shared budget on only the first files would make the preview depend on file order and could imply
+that omitted files had no requested changes; the all-or-nothing deferred state is explicit and
+consistent. An MCP text edit uses the same deferred affordance beneath its existing target detail.
+
+Expansion remains the explicit boundary for full work: after the user expands the row, synthesize
+the complete diff from the already-capped facet content and render it through the current compact
+unified `DiffView`. Do not add workers, asynchronous loading state, caching, new backend fields, or a
+second diff representation. The backend cap bounds expanded work, and keeping the existing
+synthesis path avoids broadening this milestone into a diff-engine redesign.
+
+Apply the behavior at the shared inline-edit presentation boundary so filesystem and MCP edits
+cannot drift. The row-level decision must occur before entering the filesystem facet's per-file
+synthesis loop. Keep content-truncation semantics unchanged: only the facet's content truncation
+flag drives DiffView's truncation notice, and deferring a collapsed preview must not be described as
+content truncation.
+
+The row-scoped source and line budgets and the reason for the deferred state are load-bearing
+performance decisions. Preserve that rationale in the nearby helper or component comment so a
+future refactor does not restore full collapsed diff synthesis merely to recover the exact
+hidden-line count.
+
+### Definition of Done
+
+- Unit tests cover the source and combined-line budgets immediately below, at, and above each
+  boundary, including allocation-free early exit and a filesystem edit containing multiple pairs.
+- A multi-file filesystem row whose individual files are each under budget but whose aggregate
+  source exceeds a row budget defers every diff while retaining all file headings.
+- A many-short-line fixture fits under the source-size budget, exceeds the combined-line budget, and
+  takes the deferred path.
+- A normal collapsed filesystem edit and MCP text edit retain their current diff preview and exact
+  "Show N more lines" behavior.
+- An oversized collapsed filesystem edit and MCP text edit render the deferred affordance without a
+  diff canvas; expanding each renders the complete captured diff.
+- Tests pin the performance contract that either over-budget condition is selected before any full
+  structured-diff synthesis, rather than computing one or more diffs and discarding them afterward.
+- Failed and cancelled edits continue to suppress both inline and deferred requested-change bodies.
+- File write and MCP text-creation behavior and tests remain unchanged.
+- Targeted `toolDiff` and `ToolCallWidget` tests pass, followed by `make check`.
+- Milestone 6's outstanding manual light/dark verification is performed after this change so it
+  covers the final collapsed and expanded edit behavior.
+
+---
+
 ## Milestone 7 — Operational documentation and final validation
 
 ### Goal & Outcome
@@ -578,7 +657,8 @@ a persistent test dependency.
 2. M2–M5 integrate each harness independently against M1. They may be implemented sequentially, but
    none may invent a harness-local mutation shape.
 3. M6 consumes the stable wire contract after the harness paths are covered.
-4. M7 documents the behavior actually implemented and runs final cross-cutting validation.
+4. M6.5 makes the shared filesystem/MCP edit preview lazy before final visual verification.
+5. M7 documents the behavior actually implemented and runs final cross-cutting validation.
 
 If implementation evidence contradicts a reviewed schema or envelope, stop at that milestone and
 ask for direction. Do not broaden the classifier, fetch remote state, or add a new presentation type

@@ -354,6 +354,71 @@ async fn live_antigravity_emits_tool_started_and_tool_completed_for_file_read() 
 }
 
 #[tokio::test]
+#[ignore = "requires agy authenticated (run `agy`) — run with: make test-live"]
+async fn live_antigravity_invalid_file_read_completes_as_tool_error() {
+    let tmp = tempfile::Builder::new()
+        .prefix("agy-tool-error-test")
+        .tempdir()
+        .expect("tempdir");
+    let missing_path = tmp.path().join("SWITCHBOARD_MISSING_FILE.txt");
+    let missing_path_text = missing_path.display().to_string();
+
+    let adapter = AntigravityAdapter::new();
+    let agent = antigravity_agent();
+    let turn_id = Uuid::now_v7();
+    let prompt = format!(
+        "Use the view_file tool exactly once to read the absolute path {missing_path_text}. The file intentionally does not exist. After the tool fails, reply with only the word ack."
+    );
+    let stream = adapter
+        .dispatch(
+            &agent,
+            tmp.path(),
+            &prompt,
+            turn_id,
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("dispatch should succeed with real agy");
+    let events: Vec<AdapterEvent> = stream.collect().await;
+
+    let started = events.iter().find(|event| match event {
+        AdapterEvent::ToolStarted { input, .. } => serde_json::to_string(input)
+            .is_ok_and(|text| text.contains("SWITCHBOARD_MISSING_FILE.txt")),
+        _ => false,
+    });
+    let AdapterEvent::ToolStarted {
+        tool_use_id: started_id,
+        ..
+    } = started.unwrap_or_else(|| panic!("expected missing-file tool start; got: {events:?}"))
+    else {
+        unreachable!();
+    };
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AdapterEvent::ToolCompleted {
+                tool_use_id,
+                output,
+                is_error: true,
+                ..
+            } if tool_use_id == started_id
+                && output.to_ascii_lowercase().contains("invalid tool call")
+        )),
+        "expected the invalid file read to complete as an error; got: {events:?}"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AdapterEvent::TurnEnd {
+                outcome: TurnOutcome::Completed,
+                ..
+            }
+        )),
+        "expected the agent to recover and complete the turn; got: {events:?}"
+    );
+}
+
+#[tokio::test]
 #[ignore = "requires codex installed — run with: make test-live"]
 async fn live_codex_emits_tool_started_and_tool_completed_for_shell_command() {
     let tmp = tempfile::TempDir::new().expect("tempdir");

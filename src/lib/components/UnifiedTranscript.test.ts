@@ -433,7 +433,7 @@ describe("UnifiedTranscript", () => {
     expect(tool.querySelector('[data-testid="tool-error"]')).toBeNull();
   });
 
-  it("keeps completed tool errors collapsed while showing error in the header", async () => {
+  it("keeps completed tool errors collapsed while showing an inline preview", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
     state.transcripts[CLAUDE_AGENT.id] = [
@@ -463,7 +463,11 @@ describe("UnifiedTranscript", () => {
     render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     const tool = screen.getByTestId("turn-tool");
-    expect(tool.querySelector('[data-testid="tool-body"]')).toBeNull();
+    expect(tool.querySelector('[data-testid="tool-body"]')).not.toBeNull();
+    expect(within(tool).getByTestId("tool-status-preview")).toHaveTextContent(
+      "File does not exist",
+    );
+    expect(tool.querySelector('[data-testid="tool-output"]')).toBeNull();
     expect(tool.querySelector('[data-testid="tool-error"]')).not.toBeNull();
   });
 

@@ -170,6 +170,130 @@ describe("ToolCallWidget status glyphs", () => {
   });
 });
 
+describe("ToolCallWidget failed and cancelled output", () => {
+  it("shows a one-line failed-output preview and reveals the full error on expand", async () => {
+    const { getByTestId, queryByTestId, getByLabelText } = render(ToolCallWidget, {
+      tool: {
+        ...done,
+        is_error: true,
+        output: "first failure line\n  second detail line",
+      },
+    });
+
+    const preview = getByTestId("tool-status-preview");
+    expect(preview).toHaveTextContent("first failure line second detail line");
+    expect(preview.className).toContain("truncate");
+    expect(queryByTestId("tool-output")).toBeNull();
+
+    await fireEvent.click(getByTestId("tool-row"));
+    expect(queryByTestId("tool-status-preview")).toBeNull();
+    expect(getByLabelText("Tool error")).toHaveTextContent("Error");
+    expect(getByTestId("tool-output")).toHaveTextContent("first failure line");
+    expect(getByTestId("tool-output")).toHaveTextContent("second detail line");
+  });
+
+  it("shows a fallback when a failed tool has no error output", async () => {
+    const { getByTestId } = render(ToolCallWidget, { tool: stoppedFailed });
+
+    expect(getByTestId("tool-status-preview")).toHaveTextContent(
+      "Tool failed without error details.",
+    );
+
+    await fireEvent.click(getByTestId("tool-row"));
+    expect(getByTestId("tool-status-preview")).toHaveTextContent(
+      "Tool failed without error details.",
+    );
+  });
+
+  it("bounds a large failed-output preview while collapsed", () => {
+    const output = `first failure line\n${"x".repeat(2_000_000)}`;
+    const { getByTestId, queryByTestId } = render(ToolCallWidget, {
+      tool: { ...done, is_error: true, output },
+    });
+
+    const preview = getByTestId("tool-status-preview").textContent ?? "";
+    expect(preview).toContain("first failure line");
+    expect(preview).toHaveLength(241);
+    expect(preview.endsWith("…")).toBe(true);
+    expect(queryByTestId("tool-output")).toBeNull();
+  });
+
+  it("treats whitespace-only failed output as missing when collapsed and expanded", async () => {
+    const { getByTestId, queryByTestId } = render(ToolCallWidget, {
+      tool: { ...done, is_error: true, output: " \n\t ".repeat(500_000) },
+    });
+
+    expect(getByTestId("tool-status-preview")).toHaveTextContent(
+      "Tool failed without error details.",
+    );
+    expect(queryByTestId("tool-output")).toBeNull();
+
+    await fireEvent.click(getByTestId("tool-row"));
+    expect(getByTestId("tool-status-preview")).toHaveTextContent(
+      "Tool failed without error details.",
+    );
+    expect(queryByTestId("tool-output")).toBeNull();
+  });
+
+  it("reveals meaningful output beyond the collapsed inspection cap when expanded", async () => {
+    const { getByTestId, queryByTestId } = render(ToolCallWidget, {
+      tool: { ...done, is_error: true, output: `${" ".repeat(3_000)}late failure detail` },
+    });
+
+    expect(getByTestId("tool-status-preview")).toHaveTextContent(
+      "Tool failed without error details.",
+    );
+
+    await fireEvent.click(getByTestId("tool-row"));
+    expect(queryByTestId("tool-status-preview")).toBeNull();
+    expect(getByTestId("tool-output")).toHaveTextContent("late failure detail");
+  });
+
+  for (const facet of [
+    EDIT_FACET,
+    {
+      facet_kind: "write",
+      path: "/repo/new.txt",
+      content: "content that was not written",
+      truncated: false,
+    } satisfies ToolFacet,
+  ]) {
+    it(`suppresses a failed ${facet.facet_kind} diff while retaining error and raw input`, async () => {
+      const { getByTestId, queryByTestId } = render(ToolCallWidget, {
+        tool: withFacet(facet, {
+          is_error: true,
+          output: "permission denied",
+          input: { attempted: true },
+        }),
+      });
+
+      expect(getByTestId("tool-status-preview")).toHaveTextContent("permission denied");
+      expect(queryByTestId("tool-edit-file")).toBeNull();
+      expect(queryByTestId("tool-write-file")).toBeNull();
+
+      await fireEvent.click(getByTestId("tool-row"));
+      expect(getByTestId("tool-output")).toHaveTextContent("permission denied");
+      expect(getByTestId("tool-raw-toggle")).toBeInTheDocument();
+      expect(queryByTestId("tool-edit-file")).toBeNull();
+      expect(queryByTestId("tool-write-file")).toBeNull();
+
+      await fireEvent.click(getByTestId("tool-raw-toggle"));
+      expect(getByTestId("tool-input")).toHaveTextContent('"attempted": true');
+    });
+  }
+
+  it("suppresses a cancelled edit diff and shows a cancelled message", () => {
+    const { getByTestId, queryByTestId } = render(ToolCallWidget, {
+      tool: { ...cancelled, facet: EDIT_FACET },
+    });
+
+    expect(getByTestId("tool-status-preview")).toHaveTextContent(
+      "Tool cancelled before completion.",
+    );
+    expect(queryByTestId("tool-edit-file")).toBeNull();
+  });
+});
+
 describe("ToolCallWidget expansion", () => {
   it("starts collapsed with no body and stays collapsed across completion", async () => {
     const { getByTestId, queryByTestId, rerender } = render(ToolCallWidget, { tool: running });

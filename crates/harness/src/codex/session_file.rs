@@ -1084,6 +1084,7 @@ impl CodexReconstruction {
                         Some((server, tool)) => crate::facets::ToolFacet::Mcp {
                             server: server.to_owned(),
                             tool: tool.to_owned(),
+                            mutation: None,
                         },
                         None => crate::facets::ToolFacet::Other,
                     },
@@ -1513,6 +1514,7 @@ fn apply_mcp_result(items: &mut [TurnItem], call_id: &str, result: &McpResult) -
                 *facet = crate::facets::ToolFacet::Mcp {
                     server: result.server.clone(),
                     tool: result.tool.clone(),
+                    mutation: None,
                 };
             }
             *output = Some(result.output.clone());

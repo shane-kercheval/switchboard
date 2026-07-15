@@ -147,6 +147,7 @@ fn parse_item_started(obj: &Value, turn_id: TurnId) -> ParseOutcome {
                 facet: ToolFacet::Mcp {
                     server: server.to_owned(),
                     tool: tool.to_owned(),
+                    mutation: None,
                 },
                 name: format!("{server}.{tool}"),
                 input: item.get("arguments").cloned().unwrap_or(Value::Null),

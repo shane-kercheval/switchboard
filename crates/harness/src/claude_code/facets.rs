@@ -25,7 +25,11 @@ use crate::facets::{EditChange, EditPair, EditedFile, ToolFacet, cap_content, sp
 /// against if that ever changes.
 pub(crate) fn classify_claude_tool_facet(name: &str, input: &Value) -> ToolFacet {
     if let Some((server, tool)) = split_mcp_name(name) {
-        return ToolFacet::Mcp { server, tool };
+        return ToolFacet::Mcp {
+            server,
+            tool,
+            mutation: None,
+        };
     }
     match name {
         "Bash" => match str_field(input, "command") {
@@ -316,7 +320,8 @@ mod tests {
             classify_claude_tool_facet("mcp__tiddly__search_items", &json!({"query": "x"})),
             ToolFacet::Mcp {
                 server: "tiddly".to_owned(),
-                tool: "search_items".to_owned()
+                tool: "search_items".to_owned(),
+                mutation: None,
             }
         );
     }

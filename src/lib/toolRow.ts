@@ -20,7 +20,7 @@ import {
   Wrench,
 } from "@lucide/svelte";
 import type { ToolCall } from "$lib/state/types";
-import type { ToolFacet } from "$lib/types";
+import type { McpMutation, ToolFacet } from "$lib/types";
 import { redactDisplay, toolInputPreview } from "$lib/toolInput";
 
 /// All lucide icons share one component shape; alias it off a concrete icon
@@ -95,10 +95,34 @@ export function toolDetail(facet: ToolFacet, input: unknown): string | undefined
       return facet.path ? `${facet.pattern} in ${facet.path}` : nonEmpty(facet.pattern);
     case "todo":
       return todoSummary(facet.items);
+    case "mcp": {
+      const mutation = knownMcpMutation(facet);
+      return mutation
+        ? `${mutation.target}${mutation.target_truncated ? "…" : ""}`
+        : toolInputPreview(input);
+    }
     default:
-      // mcp, other, and unknown discriminants: the input preview (already
-      // redacted) is the only substance available.
+      // Other and unknown discriminants: the input preview (already redacted)
+      // is the only substance available.
       return toolInputPreview(input);
+  }
+}
+
+/// Return only mutation variants this frontend understands. The backend enum
+/// is non-exhaustive, so a newer mutation discriminant may arrive at runtime;
+/// treating it as absent preserves the complete basic-MCP fallback instead of
+/// mounting an empty specialized body.
+export function knownMcpMutation(facet: ToolFacet): McpMutation | undefined {
+  if (facet.facet_kind !== "mcp") return undefined;
+  const candidate: unknown = facet.mutation;
+  if (typeof candidate !== "object" || candidate === null) return undefined;
+  switch ((candidate as { mutation_kind?: unknown }).mutation_kind) {
+    case "text_edit":
+    case "text_creation":
+    case "record_creation":
+      return candidate as McpMutation;
+    default:
+      return undefined;
   }
 }
 

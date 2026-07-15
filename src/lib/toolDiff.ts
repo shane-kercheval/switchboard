@@ -27,15 +27,34 @@ import type { DiffHunk, DiffLine, EditPair, EditedFile, FileDiff } from "$lib/ty
 const CONTEXT_LINES = 3;
 
 export function synthesizeEditDiff(file: EditedFile): FileDiff {
+  return synthesizeTextEditDiff(file.path, file.edits, file.truncated);
+}
+
+/// MCP edits are remote snippet changes, not filesystem edits. Keep the
+/// required `FileDiff.path` empty so this adapter cannot accidentally confer
+/// file actions if the shared diff renderer gains them later.
+export function synthesizeMcpTextEditDiff(
+  before: string,
+  after: string,
+  contentTruncated: boolean,
+): FileDiff {
+  return synthesizeTextEditDiff("", [{ old: before, new: after }], contentTruncated);
+}
+
+function synthesizeTextEditDiff(
+  path: string,
+  edits: EditPair[],
+  contentTruncated: boolean,
+): FileDiff {
   return {
-    path: file.path,
+    path,
     binary: false,
     // The facet cap truncated the before/after content, so the hunks below
     // are computed from a prefix — surface DiffView's existing notice.
-    truncated: file.truncated,
+    truncated: contentTruncated,
     too_large: false,
     too_large_bytes: null,
-    hunks: file.edits.flatMap((pair) => pairHunks(pair)),
+    hunks: edits.flatMap((pair) => pairHunks(pair)),
   };
 }
 
@@ -78,6 +97,16 @@ export function synthesizeWriteDiff(
     },
     hiddenLines: lines.length - visibleLines.length,
   };
+}
+
+/// MCP text creation uses the same all-added representation as a file write,
+/// but deliberately carries no path because the target names a remote record.
+export function synthesizeMcpTextCreationDiff(
+  content: string,
+  contentTruncated: boolean,
+  maxLines?: number,
+): { diff: FileDiff; hiddenLines: number } {
+  return synthesizeWriteDiff("", content, contentTruncated, maxLines);
 }
 
 function pairHunks(pair: EditPair): DiffHunk[] {

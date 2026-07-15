@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
 import type { DiffLine, EditedFile, FileDiff } from "$lib/types";
-import { synthesizeEditDiff, synthesizeWriteDiff, truncateDiff } from "$lib/toolDiff";
+import {
+  synthesizeEditDiff,
+  synthesizeMcpTextCreationDiff,
+  synthesizeMcpTextEditDiff,
+  synthesizeWriteDiff,
+  truncateDiff,
+} from "$lib/toolDiff";
 
 function file(edits: { old: string; new: string }[], truncated = false): EditedFile {
   return { path: "/repo/src/a.ts", change: "modified", edits, truncated };
@@ -144,5 +150,41 @@ describe("synthesizeWriteDiff", () => {
     expect(diff.hunks[0]!.lines[24]!.content).toBe("line 24");
     expect(diff.truncated).toBe(true);
     expect(hiddenLines).toBe(35);
+  });
+});
+
+describe("MCP text mutation diffs", () => {
+  it("renders snippet-relative removals and additions without a filesystem path", () => {
+    const diff = synthesizeMcpTextEditDiff(
+      "# Template\nHello {{ name }}\nNo trailing newline",
+      "# Template\nHello {{ user }}\nNo trailing newline",
+      false,
+    );
+
+    expect(diff.path).toBe("");
+    expect(diff.truncated).toBe(false);
+    expect(diff.hunks[0]!.header).toContain("snippet-relative");
+    expect(diff.hunks.flatMap((hunk) => hunk.lines)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ origin: "removed", content: "Hello {{ name }}" }),
+        expect.objectContaining({ origin: "added", content: "Hello {{ user }}" }),
+      ]),
+    );
+  });
+
+  it("forwards only content truncation and creates all-added Markdown content", () => {
+    const edit = synthesizeMcpTextEditDiff("before", "after", true);
+    expect(edit.truncated).toBe(true);
+
+    const { diff, hiddenLines } = synthesizeMcpTextCreationDiff(
+      "# Prompt\n\nUse {{ context }}\n",
+      false,
+    );
+    expect(diff.path).toBe("");
+    expect(diff.truncated).toBe(false);
+    expect(hiddenLines).toBe(0);
+    expect(diff.hunks.flatMap((hunk) => hunk.lines).every((line) => line.origin === "added")).toBe(
+      true,
+    );
   });
 });

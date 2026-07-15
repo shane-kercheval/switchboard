@@ -15,24 +15,38 @@
   /// stringified every tool call's full raw input whether or not it was ever
   /// expanded — a 500 KB write built a 500 KB string and DOM node nobody asked
   /// for. Formatting raw JSON and output must stay gated behind `open`. The
-  /// deliberate exception: successful/running Edit and Write facets render
-  /// their diff inline — watching file changes stream by is the point of the
-  /// row. A failed/cancelled file operation suppresses that attempted content
-  /// and shows its status output instead; the Git view is authoritative for
-  /// what actually changed. Facet content is capped and off-window rows aren't
-  /// mounted at all (transcript render-windowing). Inline content is further
-  /// capped to a preview length (both while streaming and once settled —
-  /// flipping full→capped when a turn ends would be jarring); expanding the row
-  /// un-caps it and reveals output + raw input. Its detail line is suppressed in
-  /// both states: the inline per-file headers already carry the paths.
+  /// deliberate exception: successful/running Edit and Write facets and
+  /// input-derived MCP mutation previews render inline — watching requested
+  /// changes stream by is the point of the row. A failed/cancelled operation
+  /// suppresses that attempted content and shows its status output instead;
+  /// the Git view or remote service is authoritative for what actually changed.
+  /// Facet content is capped and off-window rows aren't mounted at all
+  /// (transcript render-windowing). Inline content is further capped to a
+  /// preview length (both while streaming and once settled — flipping
+  /// full→capped when a turn ends would be jarring); expanding the row un-caps
+  /// it and reveals output + raw input. File-facet detail is suppressed in both
+  /// states because the inline per-file headers already carry the paths.
   import type { ToolCall } from "$lib/state/index.svelte";
-  import type { EditedFile } from "$lib/types";
+  import type { FileDiff } from "$lib/types";
   import DiffView from "$lib/components/DiffView.svelte";
   import Spinner from "$lib/components/ui/Spinner.svelte";
   import { languageForPath } from "$lib/diff";
-  import { synthesizeEditDiff, synthesizeWriteDiff, truncateDiff } from "$lib/toolDiff";
+  import {
+    synthesizeEditDiff,
+    synthesizeMcpTextCreationDiff,
+    synthesizeMcpTextEditDiff,
+    synthesizeWriteDiff,
+    truncateDiff,
+  } from "$lib/toolDiff";
   import { formatToolInput, redactDisplay } from "$lib/toolInput";
-  import { isGenericFacet, toolDetail, toolIcon, toolRowState, toolVerb } from "$lib/toolRow";
+  import {
+    isGenericFacet,
+    knownMcpMutation,
+    toolDetail,
+    toolIcon,
+    toolRowState,
+    toolVerb,
+  } from "$lib/toolRow";
   import { cn } from "$lib/utils";
   import { CircleCheck, CircleDotDashed, Circle } from "@lucide/svelte";
 
@@ -43,6 +57,7 @@
   let open = $state(false);
 
   const facet = $derived(tool.facet);
+  const mutation = $derived(knownMcpMutation(facet));
   const rowState = $derived(toolRowState(tool));
   const verb = $derived(toolVerb(facet, tool.name));
   const detail = $derived(
@@ -55,6 +70,7 @@
   const cancelled = $derived(rowState === "cancelled");
   const interrupted = $derived(failed || cancelled);
   const fileContentFacet = $derived(facet.facet_kind === "edit" || facet.facet_kind === "write");
+  const inlineContentFacet = $derived(fileContentFacet || mutation !== undefined);
   const outputPreview = $derived(boundedOutputPreview(tool.output));
   // Collapsed rows use only the bounded preview result. Once the user expands
   // the row, scanning the retained full value is intentional: it determines
@@ -97,6 +113,12 @@
   const OUTPUT_PREVIEW_SOURCE_CAP = 2_048;
   const OUTPUT_PREVIEW_TEXT_CAP = 240;
 
+  /// Bookmark fields are inline too, so their collapsed representation must
+  /// not mount a complete backend-capped value. Expansion intentionally
+  /// reveals the full captured field, matching diff previews.
+  const RECORD_FIELD_PREVIEW_SOURCE_CAP = 2_048;
+  const RECORD_FIELD_PREVIEW_TEXT_CAP = 500;
+
   function boundedOutputPreview(value: string | undefined): {
     text: string;
     hasContent: boolean;
@@ -117,6 +139,21 @@
     return { text: formatted.slice(0, RAW_DISPLAY_CAP), truncated: true };
   }
 
+  function mutationTarget(): string {
+    if (mutation === undefined) return "";
+    return `${mutation.target}${mutation.target_truncated ? "…" : ""}`;
+  }
+
+  function boundedRecordFieldPreview(value: string): { text: string; truncated: boolean } {
+    const source = value.slice(0, RECORD_FIELD_PREVIEW_SOURCE_CAP);
+    const normalized = source.replace(/\s+/g, " ").trim();
+    const text = normalized.slice(0, RECORD_FIELD_PREVIEW_TEXT_CAP).trimEnd();
+    const truncated =
+      normalized.length > RECORD_FIELD_PREVIEW_TEXT_CAP ||
+      value.length > RECORD_FIELD_PREVIEW_SOURCE_CAP;
+    return { text: truncated ? `${text}…` : text, truncated };
+  }
+
   function todoStatusIcon(status: string): typeof Circle {
     if (status === "completed") return CircleCheck;
     if (status === "in_progress") return CircleDotDashed;
@@ -124,8 +161,7 @@
   }
 </script>
 
-{#snippet inlineDiff(file: EditedFile, expandTestid: string)}
-  {@const fullDiff = synthesizeEditDiff(file)}
+{#snippet inlineDiff(fullDiff: FileDiff, language: string, expandTestid: string)}
   {@const preview = truncateDiff(fullDiff, INLINE_DIFF_PREVIEW_LINES)}
   {@const capped = !open && preview.hiddenLines > 0}
   <!-- Cap the inline diff in both live and settled states — flipping full to
@@ -138,12 +174,7 @@
         capped && "[mask-image:linear-gradient(to_bottom,black_calc(100%_-_3rem),transparent)]",
       )}
     >
-      <DiffView
-        diff={capped ? preview.diff : fullDiff}
-        style="unified"
-        language={languageForPath(file.path)}
-        compact
-      />
+      <DiffView diff={capped ? preview.diff : fullDiff} style="unified" {language} compact />
     </div>
   </div>
   {#if capped}
@@ -154,6 +185,34 @@
       onclick={() => (open = true)}
     >
       Show {preview.hiddenLines} more {preview.hiddenLines === 1 ? "line" : "lines"}
+    </button>
+  {/if}
+{/snippet}
+
+{#snippet inlineAddedContent(
+  rendered: { diff: FileDiff; hiddenLines: number },
+  language: string,
+  contentTestid: string,
+  expandTestid: string,
+)}
+  {@const capped = rendered.hiddenLines > 0}
+  <div class="border-border/60 overflow-hidden rounded border" data-testid={contentTestid}>
+    <div
+      class={cn(
+        capped && "[mask-image:linear-gradient(to_bottom,black_calc(100%_-_3rem),transparent)]",
+      )}
+    >
+      <DiffView diff={rendered.diff} style="unified" {language} compact />
+    </div>
+  </div>
+  {#if capped}
+    <button
+      type="button"
+      class="text-muted hover:text-fg text-[11px] transition-colors"
+      data-testid={expandTestid}
+      onclick={() => (open = true)}
+    >
+      Show {rendered.hiddenLines} more {rendered.hiddenLines === 1 ? "line" : "lines"}
     </button>
   {/if}
 {/snippet}
@@ -242,7 +301,7 @@
     {/if}
   </button>
 
-  {#if open || fileContentFacet || interrupted}
+  {#if open || inlineContentFacet || interrupted}
     <div
       class="border-border/70 mt-1 ml-[13px] space-y-2 border-l py-0.5 pl-4"
       data-testid="tool-body"
@@ -275,7 +334,11 @@
                   : "Diff will appear when the turn completes."}
               </p>
             {:else}
-              {@render inlineDiff(file, "tool-edit-expand")}
+              {@render inlineDiff(
+                synthesizeEditDiff(file),
+                languageForPath(file.path),
+                "tool-edit-expand",
+              )}
             {/if}
           </section>
         {/each}
@@ -286,38 +349,91 @@
           facet.truncated,
           open ? undefined : INLINE_DIFF_PREVIEW_LINES,
         )}
-        {@const capped = rendered.hiddenLines > 0}
         <section class="space-y-1" aria-label="File write" data-testid="tool-write-file">
           <div class="text-muted truncate font-mono text-[11px]" title={facet.path}>
             {facet.path}
           </div>
-          <div
-            class="border-border/60 overflow-hidden rounded border"
-            data-testid="tool-write-content"
-          >
-            <div
-              class={cn(
-                capped &&
-                  "[mask-image:linear-gradient(to_bottom,black_calc(100%_-_3rem),transparent)]",
-              )}
-            >
-              <DiffView
-                diff={rendered.diff}
-                style="unified"
-                language={languageForPath(facet.path)}
-                compact
-              />
+          {@render inlineAddedContent(
+            rendered,
+            languageForPath(facet.path),
+            "tool-write-content",
+            "tool-write-expand",
+          )}
+        </section>
+      {:else if !interrupted && mutation?.mutation_kind === "text_edit"}
+        <section class="space-y-1" aria-label="Requested content edit" data-testid="tool-mcp-edit">
+          {#if open}
+            <div class="text-muted truncate font-mono text-[11px]" data-testid="tool-mcp-target">
+              {mutationTarget()}
             </div>
-          </div>
-          {#if capped}
-            <button
-              type="button"
-              class="text-muted hover:text-fg text-[11px] transition-colors"
-              data-testid="tool-write-expand"
-              onclick={() => (open = true)}
-            >
-              Show {rendered.hiddenLines} more {rendered.hiddenLines === 1 ? "line" : "lines"}
-            </button>
+          {/if}
+          {@render inlineDiff(
+            synthesizeMcpTextEditDiff(mutation.before, mutation.after, mutation.content_truncated),
+            "markdown",
+            "tool-mcp-edit-expand",
+          )}
+        </section>
+      {:else if !interrupted && mutation?.mutation_kind === "text_creation"}
+        <section
+          class="space-y-1"
+          aria-label="Requested content creation"
+          data-testid="tool-mcp-creation"
+        >
+          {#if open}
+            <div class="text-muted truncate font-mono text-[11px]" data-testid="tool-mcp-target">
+              {mutationTarget()}
+            </div>
+          {/if}
+          {#if mutation.content === ""}
+            <p class="text-muted" data-testid="tool-mcp-empty-creation">
+              Created without body content.
+            </p>
+          {:else}
+            {@const rendered = synthesizeMcpTextCreationDiff(
+              mutation.content,
+              mutation.content_truncated,
+              open ? undefined : INLINE_DIFF_PREVIEW_LINES,
+            )}
+            {@render inlineAddedContent(
+              rendered,
+              "markdown",
+              "tool-mcp-creation-content",
+              "tool-mcp-creation-expand",
+            )}
+          {/if}
+        </section>
+      {:else if !interrupted && mutation?.mutation_kind === "record_creation"}
+        <section
+          class="space-y-1"
+          aria-label="Requested record creation"
+          data-testid="tool-mcp-record-creation"
+        >
+          {#if open}
+            <div class="text-muted truncate font-mono text-[11px]" data-testid="tool-mcp-target">
+              {mutationTarget()}
+            </div>
+          {/if}
+          <dl class="border-border/60 divide-border/40 divide-y overflow-hidden rounded border">
+            {#each mutation.fields as field, index (`${field.label}:${index}`)}
+              {@const preview = boundedRecordFieldPreview(field.value)}
+              <div class="bg-diff-added-soft flex min-w-0 gap-3 px-2 py-1">
+                <dt class="text-muted w-20 shrink-0 font-medium">{field.label}</dt>
+                <dd
+                  class={cn(
+                    "text-fg min-w-0 flex-1 break-words",
+                    open ? "whitespace-pre-wrap" : "truncate",
+                  )}
+                  data-testid="tool-mcp-record-field"
+                >
+                  {open ? field.value : preview.text}
+                </dd>
+              </div>
+            {/each}
+          </dl>
+          {#if mutation.fields_truncated}
+            <p class="text-muted text-[11px]" data-testid="tool-mcp-record-truncated">
+              Bookmark details truncated.
+            </p>
           {/if}
         </section>
       {:else if open && facet.facet_kind === "read"}

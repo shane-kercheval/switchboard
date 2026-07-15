@@ -57,6 +57,83 @@ const EDIT_FACET: ToolFacet = {
   ],
 };
 
+function mcpTextEdit(
+  target = "note · note-example",
+  overrides: Partial<{
+    target_truncated: boolean;
+    before: string;
+    after: string;
+    content_truncated: boolean;
+  }> = {},
+): ToolFacet {
+  return {
+    facet_kind: "mcp",
+    server: "notes_alias",
+    tool: "edit_content",
+    mutation: {
+      mutation_kind: "text_edit",
+      target,
+      target_truncated: false,
+      before: "old line\n",
+      after: "new line\n",
+      content_truncated: false,
+      ...overrides,
+    },
+  };
+}
+
+function mcpTextCreation(
+  target = "note · New note",
+  content = "# Heading\n\nCreated body\n",
+  contentTruncated = false,
+): ToolFacet {
+  return {
+    facet_kind: "mcp",
+    server: "notes_alias",
+    tool: "create_note",
+    mutation: {
+      mutation_kind: "text_creation",
+      target,
+      target_truncated: false,
+      content,
+      content_truncated: contentTruncated,
+    },
+  };
+}
+
+function mcpRecordCreation(
+  fieldsTruncated = false,
+  fields = [
+    { label: "Title", value: "Example" },
+    { label: "URL", value: "https://example.com" },
+    { label: "Description", value: "Useful reference" },
+    { label: "Tags", value: "research, example" },
+  ],
+): ToolFacet {
+  return {
+    facet_kind: "mcp",
+    server: "notes_alias",
+    tool: "create_bookmark",
+    mutation: {
+      mutation_kind: "record_creation",
+      target: "bookmark · Example",
+      target_truncated: false,
+      fields,
+      fields_truncated: fieldsTruncated,
+    },
+  };
+}
+
+function withMcpFacet(facet: ToolFacet, overrides: Partial<ToolCall> = {}): ToolCall {
+  return withFacet(facet, {
+    kind: "mcp",
+    name: "mcp__notes_alias__mutation",
+    input: { marker: "raw MCP input" },
+    output: "minimal server output",
+    ...overrides,
+  });
+}
+
 describe("ToolCallWidget collapsed row", () => {
   // Detail is facet-derived and never repeats the verb or the raw tool name —
   // the raw name lives in the expanded raw-input label instead.
@@ -651,5 +728,247 @@ describe("ToolCallWidget facet bodies", () => {
     });
     await fireEvent.click(search.getByTestId("tool-row"));
     expect(search.getByTestId("tool-search-detail")).toHaveTextContent("TODO in /repo/src");
+  });
+});
+
+describe("ToolCallWidget MCP mutation bodies", () => {
+  it.each([
+    ["note", mcpTextEdit("note · note-example"), "note · note-example"],
+    ["bookmark", mcpTextEdit("bookmark · bookmark-example"), "bookmark · bookmark-example"],
+    [
+      "prompt",
+      {
+        facet_kind: "mcp",
+        server: "prompts_alias",
+        tool: "edit_prompt_content",
+        mutation: {
+          mutation_kind: "text_edit",
+          target: "prompt · review-code",
+          target_truncated: false,
+          before: "Review {{ old }}\n",
+          after: "Review {{ changes }}\n",
+          content_truncated: false,
+        },
+      } satisfies ToolFacet,
+      "prompt · review-code",
+    ],
+  ])("renders a %s text edit as an inline compact diff", (_kind, facet, target) => {
+    const { getByTestId, queryByTestId, container } = render(ToolCallWidget, {
+      tool: withMcpFacet(facet),
+    });
+
+    expect(getByTestId("tool-mcp-edit")).toBeInTheDocument();
+    expect(getByTestId("tool-detail")).toHaveTextContent(target);
+    expect(queryByTestId("tool-output")).toBeNull();
+    expect(container.querySelector('[data-origin="removed"]')).not.toBeNull();
+    expect(container.querySelector('[data-origin="added"]')).not.toBeNull();
+    expect(getByTestId("tool-body")).not.toHaveTextContent("snippet-relative");
+  });
+
+  it.each([
+    ["note", mcpTextCreation("note · Release notes", "# Release\n\nReady.\n")],
+    [
+      "prompt",
+      {
+        facet_kind: "mcp",
+        server: "prompts_alias",
+        tool: "create_prompt",
+        mutation: {
+          mutation_kind: "text_creation",
+          target: "prompt · summarize",
+          target_truncated: false,
+          content: "Summarize {{ context }}\n",
+          content_truncated: false,
+        },
+      } satisfies ToolFacet,
+    ],
+  ])("renders a %s creation as all-added Markdown content", (kind, facet) => {
+    const { getByTestId, container } = render(ToolCallWidget, {
+      tool: withMcpFacet(facet),
+    });
+
+    expect(getByTestId("tool-mcp-creation-content")).toBeInTheDocument();
+    expect(container.querySelectorAll('[data-origin="added"]')).not.toHaveLength(0);
+    expect(container.querySelector('[data-origin="removed"]')).toBeNull();
+    if (kind === "note") {
+      expect(container.querySelector(".token")).not.toBeNull();
+    } else {
+      expect(getByTestId("tool-mcp-creation-content")).toHaveTextContent("{{ context }}");
+    }
+  });
+
+  it("renders bookmark creation as structured added fields, not a diff", () => {
+    const { getByTestId, getAllByTestId, queryByTestId } = render(ToolCallWidget, {
+      tool: withMcpFacet(mcpRecordCreation()),
+    });
+
+    const record = getByTestId("tool-mcp-record-creation");
+    expect(record).toHaveTextContent("Title");
+    expect(record).toHaveTextContent("https://example.com");
+    expect(getAllByTestId("tool-mcp-record-field")).toHaveLength(4);
+    expect(queryByTestId("diff-view")).toBeNull();
+  });
+
+  it("keeps an empty text creation legible without mounting an empty diff", () => {
+    const { getByTestId, queryByTestId } = render(ToolCallWidget, {
+      tool: withMcpFacet(mcpTextCreation("note · Empty note", "")),
+    });
+
+    expect(getByTestId("tool-detail")).toHaveTextContent("note · Empty note");
+    expect(getByTestId("tool-mcp-empty-creation")).toHaveTextContent(
+      "Created without body content.",
+    );
+    expect(queryByTestId("diff-view")).toBeNull();
+  });
+
+  it("mounts only the bounded target plus an ellipsis and never puts it in a title", async () => {
+    const boundedTarget = `note · ${"é".repeat(233)}`;
+    const fullTarget = `${boundedTarget}${"é".repeat(2000)}`;
+    const facet = mcpTextEdit(boundedTarget, { target_truncated: true });
+    const { getByTestId, queryByTestId, container } = render(ToolCallWidget, {
+      tool: withMcpFacet(facet, { input: { title: fullTarget } }),
+    });
+
+    const detail = getByTestId("tool-detail");
+    expect(detail).toHaveTextContent(`${boundedTarget}…`);
+    expect(detail).not.toHaveAttribute("title");
+    expect(container.textContent).not.toContain(fullTarget);
+    expect(queryByTestId("diff-truncated")).toBeNull();
+
+    await fireEvent.click(getByTestId("tool-row"));
+    expect(getByTestId("tool-mcp-target")).toHaveTextContent(`${boundedTarget}…`);
+    expect(getByTestId("tool-mcp-target")).not.toHaveAttribute("title");
+    expect(container.textContent).not.toContain(fullTarget);
+  });
+
+  it("uses content truncation, but not target truncation, for the diff warning", () => {
+    const targetOnly = render(ToolCallWidget, {
+      tool: withMcpFacet(mcpTextEdit("note · bounded", { target_truncated: true })),
+    });
+    expect(targetOnly.queryByTestId("diff-truncated")).toBeNull();
+    targetOnly.unmount();
+
+    const content = render(ToolCallWidget, {
+      tool: withMcpFacet(mcpTextEdit("note · normal", { content_truncated: true })),
+    });
+    expect(content.getByTestId("diff-truncated")).toHaveTextContent("Diff truncated");
+  });
+
+  it("uses record-specific copy for capped bookmark fields", () => {
+    const { getByTestId, queryByTestId } = render(ToolCallWidget, {
+      tool: withMcpFacet(mcpRecordCreation(true)),
+    });
+    expect(getByTestId("tool-mcp-record-truncated")).toHaveTextContent(
+      "Bookmark details truncated.",
+    );
+    expect(queryByTestId("diff-truncated")).toBeNull();
+  });
+
+  it("bounds bookmark field text while collapsed and reveals captured text on expansion", async () => {
+    const longValue = `begin ${"x".repeat(20_000)} end`;
+    const { getByTestId } = render(ToolCallWidget, {
+      tool: withMcpFacet(mcpRecordCreation(false, [{ label: "Description", value: longValue }])),
+    });
+    const collapsed = getByTestId("tool-mcp-record-field").textContent ?? "";
+    expect(collapsed.length).toBeLessThan(600);
+    expect(collapsed.endsWith("…")).toBe(true);
+
+    await fireEvent.click(getByTestId("tool-row"));
+    expect(getByTestId("tool-mcp-record-field").textContent).toBe(longValue);
+  });
+
+  it("caps a long text mutation at 25 lines and reveals captured content on expansion", async () => {
+    const content = Array.from({ length: 60 }, (_, index) => `line ${index}`).join("\n") + "\n";
+    const { getByTestId, queryByTestId, container } = render(ToolCallWidget, {
+      tool: withMcpFacet(mcpTextCreation("prompt · long", content)),
+    });
+
+    expect(getByTestId("tool-mcp-creation-expand")).toHaveTextContent("Show 35 more lines");
+    expect(container.querySelectorAll('[data-origin="added"]')).toHaveLength(25);
+    await fireEvent.click(getByTestId("tool-mcp-creation-expand"));
+    expect(queryByTestId("tool-mcp-creation-expand")).toBeNull();
+    expect(container.querySelectorAll('[data-origin="added"]')).toHaveLength(60);
+  });
+
+  for (const [mutationKind, facet] of [
+    ["edit", mcpTextEdit()],
+    ["creation", mcpTextCreation()],
+  ] as const) {
+    for (const [status, overrides] of [
+      ["failed", { is_error: true, output: "mutation failed" }],
+      [
+        "cancelled",
+        {
+          completed_at: undefined,
+          is_error: undefined,
+          output: undefined,
+          stopped_at: "2026-05-16T00:00:02Z",
+          stop_reason: "cancelled" as const,
+        },
+      ],
+    ] as const) {
+      it(`suppresses a ${status} MCP ${mutationKind} body and retains raw input`, async () => {
+        const { getByTestId, queryByTestId } = render(ToolCallWidget, {
+          tool: withMcpFacet(facet, overrides),
+        });
+        expect(queryByTestId("tool-mcp-edit")).toBeNull();
+        expect(queryByTestId("tool-mcp-creation")).toBeNull();
+        expect(getByTestId("tool-status-preview")).toBeInTheDocument();
+
+        await fireEvent.click(getByTestId("tool-row"));
+        expect(getByTestId("tool-raw-toggle")).toBeInTheDocument();
+        await fireEvent.click(getByTestId("tool-raw-toggle"));
+        expect(getByTestId("tool-input")).toHaveTextContent("raw MCP input");
+      });
+    }
+  }
+
+  it("keeps successful output collapsed and reveals output plus provenance on expansion", async () => {
+    const { getByTestId, queryByTestId } = render(ToolCallWidget, {
+      tool: withMcpFacet(mcpTextEdit()),
+    });
+    expect(queryByTestId("tool-output")).toBeNull();
+    expect(getByTestId("tool-mcp-edit")).toBeInTheDocument();
+
+    await fireEvent.click(getByTestId("tool-row"));
+    expect(getByTestId("tool-output")).toHaveTextContent("minimal server output");
+    expect(getByTestId("tool-mcp-edit")).toBeInTheDocument();
+    expect(getByTestId("tool-mcp-target")).toHaveTextContent("note · note-example");
+    await fireEvent.click(getByTestId("tool-raw-toggle"));
+    expect(getByTestId("tool-input")).toHaveTextContent("raw MCP input");
+  });
+
+  it("does not eagerly format a large raw input for an inline mutation", () => {
+    formatToolInputSpy.mockClear();
+    const { queryByTestId } = render(ToolCallWidget, {
+      tool: withMcpFacet(mcpTextEdit(), { input: { blob: "x".repeat(2_000_000) } }),
+    });
+    expect(queryByTestId("tool-input")).toBeNull();
+    expect(formatToolInputSpy).not.toHaveBeenCalled();
+  });
+
+  it("degrades basic and unknown mutation facets to the existing MCP body", async () => {
+    const facets = [
+      { facet_kind: "mcp", server: "notes_alias", tool: "get_context" } satisfies ToolFacet,
+      {
+        facet_kind: "mcp",
+        server: "notes_alias",
+        tool: "future_mutation",
+        mutation: { mutation_kind: "future_shape", target: "future" },
+      } as unknown as ToolFacet,
+    ];
+    for (const facet of facets) {
+      const view = render(ToolCallWidget, {
+        tool: withMcpFacet(facet, { input: { query: "generic preview" } }),
+      });
+      expect(view.getByTestId("tool-detail")).toHaveTextContent("generic preview");
+      expect(view.queryByTestId("tool-body")).toBeNull();
+      await fireEvent.click(view.getByTestId("tool-row"));
+      expect(view.getByTestId("tool-raw-toggle")).toBeInTheDocument();
+      expect(view.queryByTestId("tool-mcp-edit")).toBeNull();
+      expect(view.queryByTestId("tool-mcp-creation")).toBeNull();
+      expect(view.queryByTestId("tool-mcp-record-creation")).toBeNull();
+      view.unmount();
+    }
   });
 });

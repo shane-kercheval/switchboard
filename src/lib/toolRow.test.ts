@@ -1,8 +1,15 @@
 import { describe, expect, it } from "vitest";
-import { FilePen, FilePlus, FileX, Wrench } from "@lucide/svelte";
+import { FilePen, FilePlus, FileX, Plug, Wrench } from "@lucide/svelte";
 import type { ToolCall } from "$lib/state/types";
 import type { ToolFacet } from "$lib/types";
-import { isGenericFacet, toolDetail, toolIcon, toolRowState, toolVerb } from "$lib/toolRow";
+import {
+  isGenericFacet,
+  knownMcpMutation,
+  toolDetail,
+  toolIcon,
+  toolRowState,
+  toolVerb,
+} from "$lib/toolRow";
 
 const BASE: ToolCall = {
   item_kind: "tool",
@@ -13,6 +20,47 @@ const BASE: ToolCall = {
   input: { command: "ls" },
   started_at: "2026-05-16T00:00:01Z",
 };
+
+const MCP_FACETS = [
+  {
+    facet_kind: "mcp",
+    server: "notes_alias",
+    tool: "edit_content",
+    mutation: {
+      mutation_kind: "text_edit",
+      target: "note · example",
+      target_truncated: false,
+      before: "before",
+      after: "after",
+      content_truncated: false,
+    },
+  },
+  {
+    facet_kind: "mcp",
+    server: "prompts_alias",
+    tool: "create_prompt",
+    mutation: {
+      mutation_kind: "text_creation",
+      target: "prompt · example",
+      target_truncated: false,
+      content: "body",
+      content_truncated: false,
+    },
+  },
+  {
+    facet_kind: "mcp",
+    server: "notes_alias",
+    tool: "create_bookmark",
+    mutation: {
+      mutation_kind: "record_creation",
+      target: "bookmark · Example",
+      target_truncated: true,
+      fields: [{ label: "URL", value: "https://example.com" }],
+      fields_truncated: false,
+    },
+  },
+  { facet_kind: "mcp", server: "notes_alias", tool: "get_context" },
+] satisfies ToolFacet[];
 
 describe("toolRowState", () => {
   it("is running with neither completed_at nor stopped_at", () => {
@@ -89,6 +137,13 @@ describe("toolVerb", () => {
     expect(toolVerb({ facet_kind: "mcp", server: "linear", tool: "create_issue" }, "x")).toBe(
       "linear · create_issue",
     );
+  });
+
+  it("preserves the MCP heading and plug icon for every mutation shape and the absent case", () => {
+    for (const facet of MCP_FACETS) {
+      expect(toolVerb(facet, "raw_name")).toBe(`${facet.server} · ${facet.tool}`);
+      expect(toolIcon(facet)).toBe(Plug);
+    }
   });
 
   it("uses the raw tool name for the generic facet", () => {
@@ -174,6 +229,23 @@ describe("toolDetail", () => {
     ).toBe("find things");
     const unknown = { facet_kind: "hologram" } as unknown as ToolFacet;
     expect(toolDetail(unknown, { command: "echo hi" })).toBe("echo hi");
+  });
+
+  it("uses the bounded mutation target as MCP detail and marks target truncation", () => {
+    expect(toolDetail(MCP_FACETS[0]!, { secret: "raw input" })).toBe("note · example");
+    expect(toolDetail(MCP_FACETS[2]!, { secret: "raw input" })).toBe("bookmark · Example…");
+    expect(toolDetail(MCP_FACETS[3]!, { query: "context" })).toBe("context");
+  });
+
+  it("degrades an unknown MCP mutation discriminant to the basic MCP detail", () => {
+    const facet = {
+      facet_kind: "mcp",
+      server: "notes_alias",
+      tool: "future_mutation",
+      mutation: { mutation_kind: "future_shape", target: "hidden target" },
+    } as unknown as ToolFacet;
+    expect(knownMcpMutation(facet)).toBeUndefined();
+    expect(toolDetail(facet, { query: "raw fallback" })).toBe("raw fallback");
   });
 });
 

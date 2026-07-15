@@ -1,0 +1,4 @@
+{"type":"tool_use","timestamp":"2026-07-14T20:00:01Z","tool_name":"mcp__notes_alias__edit_content","tool_id":"mcp_edit_1","parameters":{"id":"note-example","type":"note","old_str":"before text","new_str":"after text"}}
+{"type":"tool_result","timestamp":"2026-07-14T20:00:02Z","tool_id":"mcp_edit_1","status":"success","output":"updated"}
+{"type":"tool_use","timestamp":"2026-07-14T20:00:03Z","tool_name":"mcp__notes_alias__get_context","tool_id":"mcp_context_1","parameters":{}}
+{"type":"tool_result","timestamp":"2026-07-14T20:00:04Z","tool_id":"mcp_context_1","status":"success","output":"context"}

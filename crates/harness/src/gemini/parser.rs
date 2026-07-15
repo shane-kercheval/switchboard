@@ -25,6 +25,7 @@ use crate::events::{
     AdapterEvent, ContentKind, FailureKind, McpServerStatus, ToolKind, TurnId, TurnOutcome,
     TurnUsage,
 };
+use crate::facets::{ToolFacet, classify_mcp_tool_facet, split_mcp_name};
 use crate::parser::ParseOutcome;
 
 /// Tool names that the Gemini CLI auto-fires for internal book-keeping.
@@ -241,23 +242,30 @@ fn parse_tool_use(obj: &Value, turn_id: TurnId, state: &mut GeminiParserState) -
         state.filtered_tool_ids.insert(id.to_owned());
         return ParseOutcome::Skip;
     }
-    let kind = if name.starts_with("mcp__") {
-        ToolKind::Mcp
-    } else {
-        ToolKind::Builtin
-    };
-    // Facet classification is deliberately not built for Gemini — the CLI is
-    // auth-dead for individual accounts, so its tool vocabulary can't be
-    // probed or live-tested (harness-behavior G26). `Other` renders via the
-    // generic path, exactly the pre-facet behavior; mapping later is additive.
+    let input = obj.get("parameters").cloned().unwrap_or(Value::Null);
+    let (kind, facet) = classify_gemini_tool(name, &input);
     ParseOutcome::Event(AdapterEvent::ToolStarted {
         turn_id,
         tool_use_id: id.to_owned(),
         kind,
-        facet: crate::facets::ToolFacet::Other,
+        facet,
         name: name.to_owned(),
-        input: obj.get("parameters").cloned().unwrap_or(Value::Null),
+        input,
     })
+}
+
+/// Classify only Gemini's provider-neutral MCP envelope. Builtin facets remain
+/// unmapped because the CLI cannot currently be live-probed with an individual
+/// account; recognizing the shared MCP name and argument schema does not imply
+/// that Gemini's builtin vocabulary has been verified.
+pub(crate) fn classify_gemini_tool(name: &str, arguments: &Value) -> (ToolKind, ToolFacet) {
+    if !name.starts_with("mcp__") {
+        return (ToolKind::Builtin, ToolFacet::Other);
+    }
+    let facet = split_mcp_name(name).map_or(ToolFacet::Other, |(server, tool)| {
+        classify_mcp_tool_facet(&server, &tool, arguments)
+    });
+    (ToolKind::Mcp, facet)
 }
 
 fn parse_tool_result(obj: &Value, turn_id: TurnId, state: &mut GeminiParserState) -> ParseOutcome {
@@ -394,8 +402,12 @@ fn extract_usage(stats: Option<&Value>) -> TurnUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::facets::McpMutation;
     use serde_json::json;
     use uuid::Uuid;
+
+    const MCP_MUTATION_STREAM_FIXTURE: &str =
+        include_str!("../../tests/fixtures/gemini/mcp-content-mutations.stream.jsonl");
 
     fn turn_id() -> TurnId {
         Uuid::now_v7()
@@ -550,15 +562,124 @@ mod tests {
     }
 
     #[test]
-    fn parse_mcp_prefixed_tool_use_emits_mcp_kind() {
-        let line = r#"{"type":"tool_use","tool_name":"mcp__server__action","tool_id":"m_1","parameters":{}}"#;
+    fn mcp_fixture_enriches_mutations_and_preserves_generic_calls_and_results() {
         let mut s = GeminiParserState::default();
-        match parse_line(line, turn_id(), agent_id(), &mut s) {
-            ParseOutcome::Event(AdapterEvent::ToolStarted { kind, .. }) => {
-                assert_eq!(kind, ToolKind::Mcp);
+        let turn_id = turn_id();
+        let agent_id = agent_id();
+        let mut starts = Vec::new();
+        let mut completions = Vec::new();
+        for line in MCP_MUTATION_STREAM_FIXTURE.lines() {
+            match parse_line(line, turn_id, agent_id, &mut s) {
+                ParseOutcome::Event(AdapterEvent::ToolStarted {
+                    tool_use_id,
+                    kind,
+                    facet,
+                    name,
+                    input,
+                    ..
+                }) => starts.push((tool_use_id, kind, facet, name, input)),
+                ParseOutcome::Event(AdapterEvent::ToolCompleted {
+                    tool_use_id,
+                    output,
+                    is_error,
+                    ..
+                }) => completions.push((tool_use_id, output, is_error)),
+                other => panic!("expected tool event, got {other:?}"),
             }
-            other => panic!("expected ToolStarted, got {other:?}"),
         }
+
+        assert_eq!(starts.len(), 2);
+        let (edit_id, edit_kind, edit_facet, edit_name, edit_input) = &starts[0];
+        assert_eq!(edit_id, "mcp_edit_1");
+        assert_eq!(*edit_kind, ToolKind::Mcp);
+        assert_eq!(edit_name, "mcp__notes_alias__edit_content");
+        assert_eq!(
+            edit_input,
+            &json!({
+                "id": "note-example",
+                "type": "note",
+                "old_str": "before text",
+                "new_str": "after text"
+            })
+        );
+        let ToolFacet::Mcp {
+            server,
+            tool,
+            mutation: Some(mutation),
+        } = edit_facet
+        else {
+            panic!("expected enriched MCP facet, got {edit_facet:?}");
+        };
+        assert_eq!(server, "notes_alias");
+        assert_eq!(tool, "edit_content");
+        assert!(matches!(
+            mutation.as_ref(),
+            McpMutation::TextEdit {
+                target,
+                before,
+                after,
+                content_truncated: false,
+                ..
+            } if target == "note · note-example"
+                && before == "before text"
+                && after == "after text"
+        ));
+
+        let (context_id, context_kind, context_facet, context_name, context_input) = &starts[1];
+        assert_eq!(context_id, "mcp_context_1");
+        assert_eq!(*context_kind, ToolKind::Mcp);
+        assert_eq!(context_name, "mcp__notes_alias__get_context");
+        assert_eq!(context_input, &json!({}));
+        assert_eq!(
+            context_facet,
+            &ToolFacet::Mcp {
+                server: "notes_alias".to_owned(),
+                tool: "get_context".to_owned(),
+                mutation: None,
+            }
+        );
+        assert_eq!(
+            completions,
+            vec![
+                ("mcp_edit_1".to_owned(), "updated".to_owned(), false),
+                ("mcp_context_1".to_owned(), "context".to_owned(), false),
+            ]
+        );
+    }
+
+    #[test]
+    fn malformed_mcp_names_and_arguments_keep_existing_generic_behavior() {
+        let malformed_name = classify_gemini_tool("mcp__notes_alias", &json!({}));
+        assert_eq!(malformed_name, (ToolKind::Mcp, ToolFacet::Other));
+
+        let malformed_arguments = classify_gemini_tool(
+            "mcp__notes_alias__edit_content",
+            &json!({"id": "note-example", "type": "note"}),
+        );
+        assert_eq!(
+            malformed_arguments,
+            (
+                ToolKind::Mcp,
+                ToolFacet::Mcp {
+                    server: "notes_alias".to_owned(),
+                    tool: "edit_content".to_owned(),
+                    mutation: None,
+                }
+            )
+        );
+
+        assert_eq!(
+            classify_gemini_tool(
+                "edit_content",
+                &json!({
+                    "id": "note-example",
+                    "type": "note",
+                    "old_str": "before",
+                    "new_str": "after"
+                })
+            ),
+            (ToolKind::Builtin, ToolFacet::Other)
+        );
     }
 
     #[test]

@@ -26,9 +26,9 @@ use serde_json::Value;
 use switchboard_core::AgentId;
 use uuid::Uuid;
 
-use crate::events::{ContentKind, ToolKind, TurnId, TurnUsage};
+use crate::events::{ContentKind, TurnId, TurnUsage};
 use crate::gemini::config::load_mcp_servers;
-use crate::gemini::parser::GEMINI_INTERNAL_TOOL_NAMES;
+use crate::gemini::parser::{GEMINI_INTERNAL_TOOL_NAMES, classify_gemini_tool};
 use crate::gemini::skills::load_skills;
 use crate::transcript::{
     LoadTranscriptError, LoadedTranscript, ParseWarning, SessionMetaInfo, Turn, TurnItem,
@@ -525,18 +525,12 @@ impl GeminiReconstruction {
                 if GEMINI_INTERNAL_TOOL_NAMES.contains(&tc.name.as_str()) {
                     continue;
                 }
-                let kind = if tc.name.starts_with("mcp__") {
-                    ToolKind::Mcp
-                } else {
-                    ToolKind::Builtin
-                };
+                let (kind, facet) = classify_gemini_tool(&tc.name, &tc.args);
                 let tc_ts = tc.timestamp.unwrap_or(builder.last_seen_at);
-                // Gemini facets are deliberately unmapped (auth-dead CLI —
-                // harness-behavior G26); `Other` = generic rendering.
                 items.push(TurnItem::Tool {
                     tool_use_id: tc.id.clone(),
                     kind,
-                    facet: crate::facets::ToolFacet::Other,
+                    facet,
                     name: tc.name.clone(),
                     input: tc.args.clone(),
                     output: tc.output.clone(),
@@ -692,6 +686,8 @@ fn parse_tokens(value: &Value) -> TurnUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::events::ToolKind;
+    use crate::facets::{McpMutation, ToolFacet};
     use tempfile::TempDir;
 
     #[test]
@@ -855,6 +851,8 @@ mod tests {
         include_str!("../../tests/fixtures/gemini/happy-path.session.jsonl");
     const TOOL_USE_FIXTURE: &str =
         include_str!("../../tests/fixtures/gemini/tool-use.session.jsonl");
+    const MCP_MUTATION_FIXTURE: &str =
+        include_str!("../../tests/fixtures/gemini/mcp-content-mutations.session.jsonl");
     const INTERLEAVED_FIXTURE: &str =
         include_str!("../../tests/fixtures/gemini/interleaved-collision.session.jsonl");
 
@@ -1011,6 +1009,145 @@ mod tests {
             Some("SWITCHBOARD_GEMINI_PROBE_TOOL_5F8A21"),
             "final assistant text item must be the sentinel"
         );
+    }
+
+    #[test]
+    fn mcp_fixture_enriches_mutations_and_preserves_generic_calls_and_results() {
+        let transcript = parse_gemini_transcript_content(MCP_MUTATION_FIXTURE, agent_id());
+        assert!(transcript.warnings.is_empty());
+        let Turn::Agent { items, .. } = transcript
+            .turns
+            .iter()
+            .find(|turn| matches!(turn, Turn::Agent { .. }))
+            .expect("agent turn present")
+        else {
+            unreachable!();
+        };
+        let tools: Vec<_> = items
+            .iter()
+            .filter_map(|item| match item {
+                TurnItem::Tool {
+                    tool_use_id,
+                    kind,
+                    facet,
+                    name,
+                    input,
+                    output,
+                    is_error,
+                    ..
+                } => Some((tool_use_id, kind, facet, name, input, output, is_error)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tools.len(), 2);
+
+        let (edit_id, edit_kind, edit_facet, edit_name, edit_input, edit_output, edit_error) =
+            tools[0];
+        assert_eq!(edit_id, "mcp_edit_1");
+        assert_eq!(*edit_kind, ToolKind::Mcp);
+        assert_eq!(edit_name, "mcp__notes_alias__edit_content");
+        assert_eq!(
+            edit_input,
+            &serde_json::json!({
+                "id": "note-example",
+                "type": "note",
+                "old_str": "before text",
+                "new_str": "after text"
+            })
+        );
+        assert_eq!(edit_output.as_deref(), Some("updated"));
+        assert_eq!(*edit_error, Some(false));
+        let ToolFacet::Mcp {
+            server,
+            tool,
+            mutation: Some(mutation),
+        } = edit_facet
+        else {
+            panic!("expected enriched MCP facet, got {edit_facet:?}");
+        };
+        assert_eq!(server, "notes_alias");
+        assert_eq!(tool, "edit_content");
+        assert!(matches!(
+            mutation.as_ref(),
+            McpMutation::TextEdit {
+                target,
+                before,
+                after,
+                content_truncated: false,
+                ..
+            } if target == "note · note-example"
+                && before == "before text"
+                && after == "after text"
+        ));
+
+        let (
+            context_id,
+            context_kind,
+            context_facet,
+            context_name,
+            context_input,
+            context_output,
+            context_error,
+        ) = tools[1];
+        assert_eq!(context_id, "mcp_context_1");
+        assert_eq!(*context_kind, ToolKind::Mcp);
+        assert_eq!(context_name, "mcp__notes_alias__get_context");
+        assert_eq!(context_input, &serde_json::json!({}));
+        assert_eq!(context_output.as_deref(), Some("context"));
+        assert_eq!(*context_error, Some(false));
+        assert_eq!(
+            context_facet,
+            &ToolFacet::Mcp {
+                server: "notes_alias".to_owned(),
+                tool: "get_context".to_owned(),
+                mutation: None,
+            }
+        );
+    }
+
+    #[test]
+    fn malformed_mcp_names_and_arguments_do_not_disturb_hydrated_results() {
+        const FIXTURE: &str = concat!(
+            r#"{"id":"user-malformed","timestamp":"2026-07-14T20:00:00Z","type":"user","content":[{"text":"test malformed calls"}]}"#,
+            "\n",
+            r#"{"id":"gemini-malformed","timestamp":"2026-07-14T20:00:03Z","type":"gemini","content":"Done.","thoughts":[],"tokens":{"input":1,"output":1,"cached":0},"model":"gemini-example","toolCalls":[{"id":"bad-name","name":"mcp__notes_alias","args":{},"status":"success","result":[{"functionResponse":{"response":{"output":"first"}}}]},{"id":"bad-args","name":"mcp__notes_alias__edit_content","args":{"id":"note-example","type":"note"},"status":"failed","result":[{"functionResponse":{"response":{"output":"second"}}}]}]}"#,
+        );
+        let transcript = parse_gemini_transcript_content(FIXTURE, agent_id());
+        let Turn::Agent { items, .. } = &transcript.turns[1] else {
+            panic!("expected agent turn");
+        };
+        let tools: Vec<_> = items
+            .iter()
+            .filter_map(|item| match item {
+                TurnItem::Tool {
+                    tool_use_id,
+                    kind,
+                    facet,
+                    output,
+                    is_error,
+                    ..
+                } => Some((tool_use_id, kind, facet, output, is_error)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].0, "bad-name");
+        assert_eq!(*tools[0].1, ToolKind::Mcp);
+        assert_eq!(tools[0].2, &ToolFacet::Other);
+        assert_eq!(tools[0].3.as_deref(), Some("first"));
+        assert_eq!(*tools[0].4, Some(false));
+        assert_eq!(tools[1].0, "bad-args");
+        assert_eq!(*tools[1].1, ToolKind::Mcp);
+        assert_eq!(
+            tools[1].2,
+            &ToolFacet::Mcp {
+                server: "notes_alias".to_owned(),
+                tool: "edit_content".to_owned(),
+                mutation: None,
+            }
+        );
+        assert_eq!(tools[1].3.as_deref(), Some("second"));
+        assert_eq!(*tools[1].4, Some(true));
     }
 
     /// Real Gemini sessions echo each tool result back as a standalone

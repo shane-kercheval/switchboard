@@ -18,7 +18,11 @@
 
 <div style="height: 700px; width: {width}px; display: flex; flex-direction: column;">
   <div style="flex: 1 1 0%; min-height: 0; display: flex; flex-direction: column;">
-    <TranscriptPanes {projectId} {agents} onRequestComposeFocus={() => (composeFocusRequest += 1)} />
+    <TranscriptPanes
+      {projectId}
+      {agents}
+      onRequestComposeFocus={() => (composeFocusRequest += 1)}
+    />
   </div>
   <ComposeBar {projectId} {agents} focusRequest={composeFocusRequest} />
 </div>

@@ -17,10 +17,7 @@ vi.mock("@tauri-apps/api/webview", () => ({
 import { mountPanesWithComposer } from "./composeMount";
 import { registerAgent, seedTurns, resetState } from "./harness";
 import { ALICE, PROJECT_ID, agentTurn, longText, textItem, userTurn } from "./fixtures";
-import {
-  moveAgentToNewPane,
-  _testing as panesState,
-} from "$lib/state/transcriptPanes.svelte";
+import { moveAgentToNewPane, _testing as panesState } from "$lib/state/transcriptPanes.svelte";
 import {
   selectionFor,
   setRecipients,
@@ -87,7 +84,10 @@ test("Cmd+click a pane while the composer is focused re-targets without a focus-
   box.addEventListener("focusout", onFocusOut);
 
   // Real WebKit modifier-click on alice's pane body: re-targets to alice.
-  await page.getByTestId("transcript-pane").nth(0).click({ modifiers: ["Meta"] });
+  await page
+    .getByTestId("transcript-pane")
+    .nth(0)
+    .click({ modifiers: ["Meta"] });
 
   await expect.poll(() => selectionFor(PROJECT_ID)).toEqual([ALICE.id]);
   // The gesture never blurred the composer, so the ring never flickered, and

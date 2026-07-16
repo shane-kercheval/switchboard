@@ -120,9 +120,11 @@ async function seedTwoAgentTranscripts(): Promise<void> {
   ];
 }
 
+const focusSpy = vi.fn();
+
 function renderPanes(overlay: ConversationItem[] = []) {
   return render(TranscriptPanes, {
-    props: { projectId: PROJECT_ID, agents: ROSTER, overlay },
+    props: { projectId: PROJECT_ID, agents: ROSTER, overlay, onRequestComposeFocus: focusSpy },
   });
 }
 
@@ -138,6 +140,7 @@ beforeEach(() => {
   panesState.reset();
   selectionState.reset();
   workflowState.reset();
+  focusSpy.mockReset();
   listeners.clear();
   invokeMock.mockReset();
   setProjectCompact(PROJECT_ID, false);
@@ -625,6 +628,9 @@ describe("visibility", () => {
     // Cmd+click targeting an empty pane would only clear the recipient set.
     await fireEvent.click(paneB, { metaKey: true });
     expect(selectionFor(PROJECT_ID)).toEqual([ALICE.id]);
+    // And because it changed nothing, it must not pull focus into the composer —
+    // otherwise focus moves while the old recipients stay selected (mis-send).
+    expect(focusSpy).not.toHaveBeenCalled();
   });
 });
 
@@ -654,6 +660,37 @@ describe("targeting", () => {
 
     await fireEvent.click(paneEls()[0]!, { metaKey: true, shiftKey: true });
     expect(selectionFor(PROJECT_ID)).toEqual([BOB.id]);
+  });
+
+  it("Cmd+click's mousedown is prevented so an already-focused composer keeps focus", async () => {
+    await seedTwoAgentTranscripts();
+    moveAgentToNewPane(PROJECT_ID, ROSTER_IDS, BOB.id);
+    renderPanes();
+
+    // A prevented mousedown keeps focus put (no blur → no ring flicker). A plain
+    // or modified mousedown is left alone so reading/selection is unaffected.
+    // `fireEvent` resolves to false when the event was cancelled (preventDefault).
+    expect(await fireEvent.mouseDown(paneEls()[0]!, { metaKey: true })).toBe(false);
+    expect(await fireEvent.mouseDown(paneEls()[0]!)).toBe(true);
+    expect(await fireEvent.mouseDown(paneEls()[0]!, { metaKey: true, altKey: true })).toBe(true);
+  });
+
+  it("Cmd+click a populated pane requests compose focus so the user can type immediately", async () => {
+    await seedTwoAgentTranscripts();
+    moveAgentToNewPane(PROJECT_ID, ROSTER_IDS, BOB.id);
+    renderPanes();
+
+    // Plain click reads — it must not pull focus into the composer.
+    await fireEvent.click(paneEls()[0]!);
+    expect(focusSpy).not.toHaveBeenCalled();
+
+    // Cmd+click targets the pane AND asks the composer to take focus.
+    await fireEvent.click(paneEls()[0]!, { metaKey: true });
+    expect(focusSpy).toHaveBeenCalledTimes(1);
+
+    // A modified Cmd-click (not a targeting gesture) leaves focus alone.
+    await fireEvent.click(paneEls()[0]!, { metaKey: true, altKey: true });
+    expect(focusSpy).toHaveBeenCalledTimes(1);
   });
 
   it("coverage border derives from the recipient set and cannot lie", async () => {

@@ -89,7 +89,16 @@
     projectId,
     agents,
     focusOnMount = false,
-  }: { projectId: ProjectId; agents: AgentRecord[]; focusOnMount?: boolean } = $props();
+    focusRequest = 0,
+  }: {
+    projectId: ProjectId;
+    agents: AgentRecord[];
+    focusOnMount?: boolean;
+    /// A monotonic counter the parent bumps to pull focus into the composer
+    /// (a pane Cmd+click). Not project state — a transient one-shot signal
+    /// owned by `App` and delivered as a prop; see the watching effect.
+    focusRequest?: number;
+  } = $props();
 
   // The compose bar is remounted per project (App.svelte's `{#key}`), and the
   // parent only mounts it once the roster is loaded and non-empty — so the
@@ -469,6 +478,25 @@
     } else {
       focusPromptFieldOnMount = true;
     }
+  });
+
+  // A pane Cmd+click (see TranscriptPanes.onPaneClick) targets the pane and
+  // then bumps `focusRequest` to take focus so the user can type immediately.
+  // The effect's first run only records the baseline — so mount, and a remount
+  // that inherits a prior count, never steal focus; only a later bump does.
+  // Focused directly (not via rAF): the textarea already exists post-mount,
+  // same as the Mod+K path — the rAF deferral is only for the mount/restore
+  // paths where the element is freshly inserted. Prompt/workflow modes have no
+  // textarea, so this no-ops there by design (focus assist is plain-mode only).
+  let lastFocusRequest: number | null = null;
+  $effect(() => {
+    const requested = focusRequest;
+    if (lastFocusRequest === null || requested === lastFocusRequest) {
+      lastFocusRequest = requested;
+      return;
+    }
+    lastFocusRequest = requested;
+    textareaEl?.focus();
   });
 
   /// Resolve a saved prompt-mode draft against the loaded cache. If the prompt

@@ -641,6 +641,12 @@
   /// `animate-spin` is a compositable transform animation.
   let transcriptBusy = $state(false);
 
+  // A monotonic counter bumped when a pane Cmd+click asks the composer to take
+  // focus (see TranscriptPanes.onRequestComposeFocus). Owned here rather than in
+  // a module store because it's a transient one-shot signal between two children
+  // App already renders, not per-project state anything derives from.
+  let composeFocusRequest = $state(0);
+
   async function withTranscriptBusy(action: () => void): Promise<void> {
     transcriptBusy = true;
     await new Promise(requestAnimationFrame);
@@ -1288,6 +1294,7 @@
                     void retryProjectHydration(selection.activeProjectId);
                 }}
                 onAddAgent={openAddAgent}
+                onRequestComposeFocus={() => (composeFocusRequest += 1)}
               />
               <!-- Remount per project: besides re-seeding the per-project
                    draft/recipient state, this resets sendError, the @-menu, and
@@ -1297,6 +1304,7 @@
                   projectId={selection.activeProjectId!}
                   agents={activeAgents}
                   focusOnMount={true}
+                  focusRequest={composeFocusRequest}
                 />
               {/key}
             </div>

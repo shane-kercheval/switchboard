@@ -870,6 +870,46 @@ describe("ComposeBar", () => {
     alertDialog.remove();
   });
 
+  it("takes focus when the parent bumps focusRequest (pane Cmd+click)", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+
+    // Default mount (focusOnMount unset) does not grab focus, so park it
+    // elsewhere first to prove the bump — not the mount — pulls it in.
+    const { rerender } = render(ComposeBar, {
+      props: { projectId: PROJECT_ID, agents: [AGENT_A], focusRequest: 0 },
+    });
+    const outside = document.createElement("button");
+    document.body.appendChild(outside);
+    outside.focus();
+    expect(document.activeElement).toBe(outside);
+
+    await rerender({ projectId: PROJECT_ID, agents: [AGENT_A], focusRequest: 1 });
+    await tick();
+
+    expect(screen.getByTestId("compose-textarea")).toHaveFocus();
+    outside.remove();
+  });
+
+  it("does not steal focus for the initial focusRequest value (remount baseline)", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+
+    // A remount inherits the parent's running count; the effect's first run only
+    // records that baseline, so a nonzero starting value must not pull focus.
+    render(ComposeBar, {
+      props: { projectId: PROJECT_ID, agents: [AGENT_A], focusRequest: 5 },
+    });
+    const outside = document.createElement("button");
+    document.body.appendChild(outside);
+    outside.focus();
+    await tick();
+
+    expect(document.activeElement).toBe(outside);
+    expect(screen.getByTestId("compose-textarea")).not.toHaveFocus();
+    outside.remove();
+  });
+
   it("fans one message out to all selected recipients sharing one send_id", async () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);
@@ -1406,6 +1446,29 @@ describe("ComposeBar prompt mode", () => {
     expect((screen.getByTestId("prompt-appended") as HTMLTextAreaElement).value).toBe(
       "carried text",
     );
+  });
+
+  it("a focus request in prompt mode is a safe no-op (focus assist is plain-mode only)", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    mockPromptBackend({ prompts: [REVIEW] });
+    const { rerender } = render(ComposeBar, {
+      props: { projectId: PROJECT_ID, agents: [AGENT_A], focusRequest: 0 },
+    });
+
+    await enterPromptMode("prompt-option-local:review");
+    const focusArg = screen.getByTestId("prompt-arg-focus");
+    expect(focusArg).toHaveFocus();
+    // No plain textarea exists in prompt mode — the focus consumer must degrade
+    // gracefully rather than reach for a missing element.
+    expect(screen.queryByTestId("compose-textarea")).toBeNull();
+
+    // A pane Cmd+click bumps focusRequest; with no textarea it must no-op and
+    // leave the prompt field's focus untouched (not throw, not steal focus).
+    await rerender({ projectId: PROJECT_ID, agents: [AGENT_A], focusRequest: 1 });
+    await tick();
+
+    expect(focusArg).toHaveFocus();
   });
 
   it("blocks send until required arguments are filled", async () => {

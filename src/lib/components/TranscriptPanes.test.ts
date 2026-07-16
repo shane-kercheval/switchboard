@@ -19,10 +19,6 @@ import {
   setRecipients,
   _testing as selectionState,
 } from "$lib/state/recipientSelection.svelte";
-import {
-  composeFocusNonce,
-  _testing as composeFocusState,
-} from "$lib/state/composeFocus.svelte";
 import { setProjectCompact, _testing as previewState } from "$lib/state/transcriptPreview.svelte";
 import { workflowRuns, _testing as workflowState } from "$lib/state/workflows.svelte";
 import { tick } from "svelte";
@@ -124,9 +120,11 @@ async function seedTwoAgentTranscripts(): Promise<void> {
   ];
 }
 
+const focusSpy = vi.fn();
+
 function renderPanes(overlay: ConversationItem[] = []) {
   return render(TranscriptPanes, {
-    props: { projectId: PROJECT_ID, agents: ROSTER, overlay },
+    props: { projectId: PROJECT_ID, agents: ROSTER, overlay, onRequestComposeFocus: focusSpy },
   });
 }
 
@@ -141,8 +139,8 @@ beforeEach(() => {
   // lets its effects observe (and react to) the wipe.
   panesState.reset();
   selectionState.reset();
-  composeFocusState.reset();
   workflowState.reset();
+  focusSpy.mockReset();
   listeners.clear();
   invokeMock.mockReset();
   setProjectCompact(PROJECT_ID, false);
@@ -630,6 +628,9 @@ describe("visibility", () => {
     // Cmd+click targeting an empty pane would only clear the recipient set.
     await fireEvent.click(paneB, { metaKey: true });
     expect(selectionFor(PROJECT_ID)).toEqual([ALICE.id]);
+    // And because it changed nothing, it must not pull focus into the composer —
+    // otherwise focus moves while the old recipients stay selected (mis-send).
+    expect(focusSpy).not.toHaveBeenCalled();
   });
 });
 
@@ -674,24 +675,22 @@ describe("targeting", () => {
     expect(await fireEvent.mouseDown(paneEls()[0]!, { metaKey: true, altKey: true })).toBe(true);
   });
 
-  it("Cmd+click a pane requests compose focus so the user can type immediately", async () => {
+  it("Cmd+click a populated pane requests compose focus so the user can type immediately", async () => {
     await seedTwoAgentTranscripts();
     moveAgentToNewPane(PROJECT_ID, ROSTER_IDS, BOB.id);
     renderPanes();
 
-    const before = composeFocusNonce(PROJECT_ID);
     // Plain click reads — it must not pull focus into the composer.
     await fireEvent.click(paneEls()[0]!);
-    expect(composeFocusNonce(PROJECT_ID)).toBe(before);
+    expect(focusSpy).not.toHaveBeenCalled();
 
     // Cmd+click targets the pane AND asks the composer to take focus.
     await fireEvent.click(paneEls()[0]!, { metaKey: true });
-    expect(composeFocusNonce(PROJECT_ID)).toBeGreaterThan(before);
+    expect(focusSpy).toHaveBeenCalledTimes(1);
 
     // A modified Cmd-click (not a targeting gesture) leaves focus alone.
-    const afterTarget = composeFocusNonce(PROJECT_ID);
     await fireEvent.click(paneEls()[0]!, { metaKey: true, altKey: true });
-    expect(composeFocusNonce(PROJECT_ID)).toBe(afterTarget);
+    expect(focusSpy).toHaveBeenCalledTimes(1);
   });
 
   it("coverage border derives from the recipient set and cannot lie", async () => {

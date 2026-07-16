@@ -50,7 +50,6 @@
     selectionFor,
     targetRecipients,
   } from "$lib/state/recipientSelection.svelte";
-  import { requestComposeFocus } from "$lib/state/composeFocus.svelte";
   import { workflowRuns } from "$lib/state/workflows.svelte";
 
   let {
@@ -62,6 +61,7 @@
     onRetryLoad,
     runWithBusy = (action: () => void) => action(),
     onAddAgent,
+    onRequestComposeFocus,
   }: {
     projectId: ProjectId;
     agents: AgentRecord[];
@@ -77,6 +77,10 @@
     /// CTA on the zero-agent empty state; absent → the state renders without
     /// a button (standalone/test mounts).
     onAddAgent?: () => void;
+    /// Ask the composer to take keyboard focus — fired after a pane Cmd+click
+    /// that actually re-targets, so the user can type immediately. Wired by
+    /// `App` to the sibling `ComposeBar`; absent on standalone/test mounts.
+    onRequestComposeFocus?: () => void;
   } = $props();
 
   const rosterIds = $derived(agents.map((a) => a.id));
@@ -136,13 +140,13 @@
   }
 
   /// Replace the recipient set with the pane's members — the meaning of every
-  /// targeting gesture (Cmd+click, `@panename`, Cmd+Alt+N).
-  /// An empty pane is not a send target anywhere: targeting it could only
-  /// clear the recipient set, silently. Goes through `targetRecipients` so the
-  /// prompt-render targeting freeze applies (see recipientSelection).
-  function targetPane(pane: TranscriptPane): void {
-    if (pane.members.length === 0) return;
-    targetRecipients(projectId, [...pane.members]);
+  /// targeting gesture (Cmd+click, `@panename`, Cmd+Alt+N). Returns whether the
+  /// recipient set actually changed: false for an empty pane (not a send target
+  /// anywhere — targeting it could only clear the set, silently) and false while
+  /// targeting is locked mid-render (`targetRecipients` refuses). Callers use
+  /// the result so focus doesn't move on a gesture that changed nothing.
+  function targetPane(pane: TranscriptPane): boolean {
+    return pane.members.length > 0 && targetRecipients(projectId, [...pane.members]);
   }
 
   /// Minimize/maximize remount or re-lay-out the transcript in one synchronous
@@ -207,11 +211,11 @@
     if (!hasOnlyMeta(event)) return;
     event.preventDefault();
     event.stopPropagation();
-    targetPane(pane);
-    // Cmd+click a pane to target it *and* land in the composer — the gesture
-    // means "I'm about to write to these agents," so pull focus so the user can
-    // type immediately without a second click on the box.
-    requestComposeFocus(projectId);
+    // Land in the composer *only* when the click re-targeted — the gesture means
+    // "I'm about to write to these agents." Focusing after an inert click (empty
+    // pane, or locked mid-render) would move focus while the old recipients stay
+    // selected, inviting a mis-send.
+    if (targetPane(pane)) onRequestComposeFocus?.();
   }
 
   /// Suppress the default focus shift on a Cmd+click's mousedown so an

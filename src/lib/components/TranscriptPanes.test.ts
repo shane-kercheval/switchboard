@@ -19,6 +19,10 @@ import {
   setRecipients,
   _testing as selectionState,
 } from "$lib/state/recipientSelection.svelte";
+import {
+  composeFocusNonce,
+  _testing as composeFocusState,
+} from "$lib/state/composeFocus.svelte";
 import { setProjectCompact, _testing as previewState } from "$lib/state/transcriptPreview.svelte";
 import { workflowRuns, _testing as workflowState } from "$lib/state/workflows.svelte";
 import { tick } from "svelte";
@@ -137,6 +141,7 @@ beforeEach(() => {
   // lets its effects observe (and react to) the wipe.
   panesState.reset();
   selectionState.reset();
+  composeFocusState.reset();
   workflowState.reset();
   listeners.clear();
   invokeMock.mockReset();
@@ -654,6 +659,39 @@ describe("targeting", () => {
 
     await fireEvent.click(paneEls()[0]!, { metaKey: true, shiftKey: true });
     expect(selectionFor(PROJECT_ID)).toEqual([BOB.id]);
+  });
+
+  it("Cmd+click's mousedown is prevented so an already-focused composer keeps focus", async () => {
+    await seedTwoAgentTranscripts();
+    moveAgentToNewPane(PROJECT_ID, ROSTER_IDS, BOB.id);
+    renderPanes();
+
+    // A prevented mousedown keeps focus put (no blur → no ring flicker). A plain
+    // or modified mousedown is left alone so reading/selection is unaffected.
+    // `fireEvent` resolves to false when the event was cancelled (preventDefault).
+    expect(await fireEvent.mouseDown(paneEls()[0]!, { metaKey: true })).toBe(false);
+    expect(await fireEvent.mouseDown(paneEls()[0]!)).toBe(true);
+    expect(await fireEvent.mouseDown(paneEls()[0]!, { metaKey: true, altKey: true })).toBe(true);
+  });
+
+  it("Cmd+click a pane requests compose focus so the user can type immediately", async () => {
+    await seedTwoAgentTranscripts();
+    moveAgentToNewPane(PROJECT_ID, ROSTER_IDS, BOB.id);
+    renderPanes();
+
+    const before = composeFocusNonce(PROJECT_ID);
+    // Plain click reads — it must not pull focus into the composer.
+    await fireEvent.click(paneEls()[0]!);
+    expect(composeFocusNonce(PROJECT_ID)).toBe(before);
+
+    // Cmd+click targets the pane AND asks the composer to take focus.
+    await fireEvent.click(paneEls()[0]!, { metaKey: true });
+    expect(composeFocusNonce(PROJECT_ID)).toBeGreaterThan(before);
+
+    // A modified Cmd-click (not a targeting gesture) leaves focus alone.
+    const afterTarget = composeFocusNonce(PROJECT_ID);
+    await fireEvent.click(paneEls()[0]!, { metaKey: true, altKey: true });
+    expect(composeFocusNonce(PROJECT_ID)).toBe(afterTarget);
   });
 
   it("coverage border derives from the recipient set and cannot lie", async () => {

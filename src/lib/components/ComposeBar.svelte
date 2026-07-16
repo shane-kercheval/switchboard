@@ -42,6 +42,7 @@
     setTargetingLocked,
     targetRecipients,
   } from "$lib/state/recipientSelection.svelte";
+  import { composeFocusNonce } from "$lib/state/composeFocus.svelte";
   import {
     isAgentHidden,
     layoutFor,
@@ -469,6 +470,24 @@
     } else {
       focusPromptFieldOnMount = true;
     }
+  });
+
+  // A pane Cmd+click (see TranscriptPanes.onPaneClick) targets the pane and
+  // then asks the composer to take focus so the user can type immediately. The
+  // effect's first run only records the baseline — so mount, and a remount that
+  // inherits a prior nonce, never steal focus; only a later bump does.
+  // Focused directly (not via rAF): the textarea already exists post-mount,
+  // same as the Mod+K path — the rAF deferral is only for the mount/restore
+  // paths where the element is freshly inserted.
+  let lastFocusNonce: number | null = null;
+  $effect(() => {
+    const requested = composeFocusNonce(projectId);
+    if (lastFocusNonce === null || requested === lastFocusNonce) {
+      lastFocusNonce = requested;
+      return;
+    }
+    lastFocusNonce = requested;
+    textareaEl?.focus();
   });
 
   /// Resolve a saved prompt-mode draft against the loaded cache. If the prompt

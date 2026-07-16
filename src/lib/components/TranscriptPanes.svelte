@@ -50,6 +50,7 @@
     selectionFor,
     targetRecipients,
   } from "$lib/state/recipientSelection.svelte";
+  import { requestComposeFocus } from "$lib/state/composeFocus.svelte";
   import { workflowRuns } from "$lib/state/workflows.svelte";
 
   let {
@@ -207,6 +208,22 @@
     event.preventDefault();
     event.stopPropagation();
     targetPane(pane);
+    // Cmd+click a pane to target it *and* land in the composer — the gesture
+    // means "I'm about to write to these agents," so pull focus so the user can
+    // type immediately without a second click on the box.
+    requestComposeFocus(projectId);
+  }
+
+  /// Suppress the default focus shift on a Cmd+click's mousedown so an
+  /// already-focused composer keeps focus — otherwise the textarea blurs on
+  /// mousedown (clearing the compose focus ring) a beat before `onPaneClick`
+  /// refocuses it, flickering the ring off and back on. Cmd+click is never a
+  /// text-selection gesture, so preventing its default costs nothing; plain
+  /// mousedown (reading, selecting, copying) is untouched.
+  function onPaneMousedown(event: MouseEvent): void {
+    if (!multiPane) return;
+    if (!hasOnlyMeta(event)) return;
+    event.preventDefault();
   }
 
   // ── Cmd-held target overlay ─────────────────────────────────────────────────
@@ -457,6 +474,7 @@
           data-pane-id={pane.id}
           data-coverage={multiPane && maximizedPane === null ? cov : undefined}
           data-maximized={maximizedPane?.id === pane.id}
+          onmousedown={(event) => onPaneMousedown(event)}
           onclick={(event) => onPaneClick(pane, event)}
           onpointerenter={() => {
             hoveredPaneId = pane.id;

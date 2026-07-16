@@ -104,6 +104,7 @@ beforeEach(async () => {
   // spurious deselect-all into composeStore after composeStore's own reset.
   (await import("$lib/state/transcriptPanes.svelte"))._testing.reset();
   (await import("$lib/state/recipientSelection.svelte"))._testing.reset();
+  (await import("$lib/state/composeFocus.svelte"))._testing.reset();
   listeners.clear();
   dragDropCb = undefined;
   resolveDropSub = undefined;
@@ -868,6 +869,44 @@ describe("ComposeBar", () => {
     expect(dialogButton).toHaveFocus();
     expect(screen.getByTestId("compose-textarea")).not.toHaveFocus();
     alertDialog.remove();
+  });
+
+  it("takes focus when a pane Cmd+click requests it (composeFocus signal)", async () => {
+    const { requestComposeFocus } = await import("$lib/state/composeFocus.svelte");
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+
+    // Default mount (focusOnMount unset) does not grab focus, so park it
+    // elsewhere first to prove the signal — not the mount — pulls it in.
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    const outside = document.createElement("button");
+    document.body.appendChild(outside);
+    outside.focus();
+    expect(document.activeElement).toBe(outside);
+
+    requestComposeFocus(PROJECT_ID);
+    await tick();
+
+    expect(screen.getByTestId("compose-textarea")).toHaveFocus();
+    outside.remove();
+  });
+
+  it("ignores a focus request aimed at a different project", async () => {
+    const { requestComposeFocus } = await import("$lib/state/composeFocus.svelte");
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    const outside = document.createElement("button");
+    document.body.appendChild(outside);
+    outside.focus();
+
+    requestComposeFocus("00000000-0000-7000-8000-0000000000ee");
+    await tick();
+
+    expect(document.activeElement).toBe(outside);
+    expect(screen.getByTestId("compose-textarea")).not.toHaveFocus();
+    outside.remove();
   });
 
   it("fans one message out to all selected recipients sharing one send_id", async () => {

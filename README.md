@@ -8,6 +8,14 @@ Spawn multiple agent sessions in a single project, route messages between them, 
 
 It's built for anyone who wants explicit, human-in-the-loop control over multi-agent workflows — not an opinionated SDLC engine, not a full agent replacement, just the coordination layer between agents you're already using.
 
+![Project view](docs/images/project-view.png)
+
+**Projects** are where the work happens. A project holds any number of agents — here one agent implementing while three review its work — and you split the transcript into side-by-side panes to keep each group's conversation readable. The compose bar sends to whichever agents you target, so fanning a message out to every reviewer is one send rather than four copy-pastes. The sidebar tracks each agent's model, context usage, and remaining rate limit, so you can see which agent is running out of room before it does.
+
+![Git view](docs/images/git-view.png)
+
+**Git view** shows what your agents have actually changed: every repository you track, its local and remote branches, recent commits, and the uncommitted changes in each one as a split or unified diff. Because agents often work in separate worktrees, this is how you review their work across all of them without switching terminals. It only ever reads — it fetches to show how far ahead or behind a branch is, and opens a file in your editor, terminal, or Finder. It never commits, pushes, or changes a branch; that stays your call, in your terminal.
+
 ## Install
 
 macOS only (v1, early development). Switchboard is currently installed by building from source — a one-time setup, after which it lives in `/Applications` and updates with a single command. A signed Homebrew install is planned.

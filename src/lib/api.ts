@@ -2,6 +2,7 @@
 // 1:1 onto a `#[tauri::command]` in `crates/app/src/lib.rs`.
 
 import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   AgentSessionFingerprint,
   AgentId,
@@ -25,6 +26,7 @@ import type {
   Preferences,
   ProjectListing,
   ProjectSummary,
+  PathSource,
   Prompt,
   PromptSource,
   RenderedPrompt,
@@ -71,6 +73,28 @@ export async function checkClaudeAuth(): Promise<void> {
 /// reported as `{ installed: false, version: null }`.
 export async function getHarnessInstallStatus(harness: HarnessKind): Promise<HarnessInstallStatus> {
   return await invoke<HarnessInstallStatus>("get_harness_install_status", { harness });
+}
+
+/// Discard the backend's cached PATH, re-read it from the user's login shell,
+/// and report where the new value came from. Install probes search a PATH
+/// captured once per app launch; if that capture failed (a slow login-restore),
+/// every harness reads as "not installed" until something forces a re-read.
+/// Waits for the shell, so this can take seconds.
+export async function recheckHarnessInstalls(): Promise<PathSource> {
+  return await invoke<PathSource>("recheck_harness_installs");
+}
+
+/// Wait (bounded) for the login-shell PATH to be resolved, then report where it
+/// came from. For callers that need a definitive answer — auto-create runs once
+/// per project creation and cannot retroactively add agents it skipped.
+export async function awaitHarnessPath(): Promise<PathSource> {
+  return await invoke<PathSource>("await_harness_path");
+}
+
+/// Fires when the backend finishes resolving the login-shell PATH. Detection
+/// results taken before then are provisional, so listeners re-probe on receipt.
+export async function listenHarnessPathResolved(handler: () => void): Promise<UnlistenFn> {
+  return await listen("harness_path_resolved", () => handler());
 }
 
 export async function pickDirectory(path: string): Promise<DirectoryInfo> {

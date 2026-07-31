@@ -28,13 +28,15 @@ toml = { workspace = true }
 tokio-util = { workspace = true }
 
 # `nix` is unix-only and used by:
+# - `subprocess.rs`: process-group signalling (`signal`) and switching a child's
+#   stdout pipe to non-blocking so the reader thread can honor a deadline (`fs`).
 # - the `fake_claude` test binary (`src/bin/fake_claude.rs`) to write its own
 #   pgid to a file so the integration test can verify process-group spawn
 #   actually flows through ClaudeCodeAdapter::dispatch.
 # - the process-group integration test itself (`tests/claude_adapter.rs`).
 # Listed as a regular dep (not dev-dep) so the bin target can link it.
 [target."cfg(unix)".dependencies]
-nix = { version = "0.31.3", default-features = false, features = ["process", "signal"] }
+nix = { version = "0.31.3", default-features = false, features = ["fs", "process", "signal"] }
 
 [dev-dependencies]
 tokio = { workspace = true }

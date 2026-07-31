@@ -434,7 +434,11 @@ export type HarnessKind = "claude_code" | "codex" | "gemini" | "antigravity";
 ///   the result lands. Fail-closed by type, not by polite hope.
 /// - `"available"`: probe completed positively.
 /// - `"missing"`: probe completed negatively.
-export type BinaryState = "available" | "missing" | "checking";
+/// `probe_failed` is deliberately distinct from `missing`: the check errored, so
+/// we don't know whether the CLI is there. Collapsing the two is what tells a
+/// user to install software they already have. Gating treats both as
+/// unselectable; only the rendered *reason* differs.
+export type BinaryState = "available" | "missing" | "checking" | "probe_failed";
 
 /// Frontend availability surface. Tracks binary presence only — auth is
 /// **not** a frontend concern in v1: a logged-out harness is discovered
@@ -451,11 +455,34 @@ export type HarnessAvailability = {
 };
 
 /// Install status of a harness CLI for the getting-started surface.
+/// Where the PATH used for a detection probe came from. `capturing` means the
+/// login-shell read is still in flight and the result is provisional;
+/// `fallback` means that read failed and detection is running against a
+/// best-guess PATH, so a negative result may be wrong.
+export type PathSource = "capturing" | "login_shell" | "fallback";
+
+/// A probe that could not run at all — an IPC failure, not an answer about the
+/// CLI. Distinct from `{ installed: false }`, which asserts the CLI is absent.
+/// Conflating them is what makes a transient hiccup render as "Not installed"
+/// with a Setup guide for software the user already has.
+export type HarnessProbeError = "probe_failed";
+
+/// Result of a user-initiated recheck (the UI's "Refresh" button, which
+/// discards the cached PATH and re-reads it — stronger than an ordinary
+/// refresh, which re-probes against the PATH already held). Discriminated
+/// rather than a bare
+/// `PathSource` because "the re-read reported a degraded PATH" and "the re-read
+/// couldn't run at all" are different things to tell the user — only the first
+/// is about their shell, and collapsing them is what made the old message blame
+/// the wrong subsystem.
+export type RecheckOutcome = { kind: "path"; source: PathSource } | { kind: "failed" };
+
 /// Mirrors the Rust `HarnessInstallStatus`. A missing binary is
 /// `installed: false` with `version: null` — data, not an error.
 export type HarnessInstallStatus = {
   installed: boolean;
   version: string | null;
+  path_source: PathSource;
 };
 
 /// Mirror of the Rust `SessionLocator` (externally tagged enum) — the identity

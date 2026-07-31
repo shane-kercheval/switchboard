@@ -20,7 +20,7 @@ use switchboard_dispatcher::{
 };
 use switchboard_harness::{
     CancelSource, ForwardedBlock, HarnessAdapter, MessageId, TurnOutcome,
-    compose_forwarded_message, latest_completed_agent_text,
+    compose_forwarded_message, latest_completed_agent_text, subprocess::PathSource,
 };
 use switchboard_prompts::PromptService;
 use tokio_util::sync::CancellationToken;
@@ -5012,6 +5012,13 @@ pub fn check_gemini_auth_impl(home_dir: &Path) -> Result<(), AppError> {
 pub struct HarnessInstallStatus {
     pub installed: bool,
     pub version: Option<String>,
+    /// Which PATH this result was derived from. Detection is only as good as
+    /// the PATH behind it, so the frontend needs to know whether this is a
+    /// final answer (`login_shell`), a provisional one taken while the PATH is
+    /// still being resolved (`capturing`), or a degraded one from a failed
+    /// resolution (`fallback`). Without it, a probe that races startup renders
+    /// as a confident "Not installed".
+    pub path_source: PathSource,
 }
 
 /// Derive install status from an adapter: present-on-PATH plus its
@@ -5019,33 +5026,127 @@ pub struct HarnessInstallStatus {
 /// (a missing binary has no version to report). Free of harness identity —
 /// works for any adapter, which keeps it trivially unit-testable.
 fn install_status_for(adapter: &dyn HarnessAdapter) -> HarnessInstallStatus {
-    let installed = adapter.probe().is_ok();
-    HarnessInstallStatus {
-        installed,
-        version: if installed { adapter.version() } else { None },
+    install_status_with(adapter, &GlobalPathState)
+}
+
+/// The PATH state a status probe reads. Injected rather than read straight from
+/// the global so the ordering below is testable: the defect this guards against
+/// is *when* the snapshot is taken, and a test that can't observe call order
+/// relative to `probe()` can only pin the arithmetic, not the ordering.
+pub trait PathState {
+    /// The current source, paired with the revision it was read at.
+    fn snapshot(&self) -> (PathSource, u64);
+    /// The current revision alone.
+    fn revision(&self) -> u64;
+}
+
+struct GlobalPathState;
+
+impl PathState for GlobalPathState {
+    fn snapshot(&self) -> (PathSource, u64) {
+        switchboard_harness::subprocess::path_source_at()
+    }
+
+    fn revision(&self) -> u64 {
+        switchboard_harness::subprocess::path_revision()
     }
 }
 
-/// Install status for a given harness. The `match harness` here is adapter
-/// *routing* (the same pattern as `send_message_impl`), not failure
-/// classification — it selects which CLI to inspect.
-pub fn get_harness_install_status_impl(
+/// Derive install status, reading the PATH state through `path`.
+///
+/// **The snapshot is taken before the probe, and re-checked after.** `probe()`
+/// and `version()` each consult the PATH independently, so there is no single
+/// value to pin; what can be established is whether the PATH moved while they
+/// ran. A result that straddles a change describes a PATH that is no longer
+/// current, and labelling it final is what lets a CLI the old PATH couldn't see
+/// render as a confident "Not installed" — the symptom this whole mechanism
+/// exists to stop producing. Marking it provisional instead shows "Checking…"
+/// and the completion event supplies the real answer.
+fn install_status_with(adapter: &dyn HarnessAdapter, path: &dyn PathState) -> HarnessInstallStatus {
+    let (source, before) = path.snapshot();
+    let installed = adapter.probe().is_ok();
+    let version = if installed { adapter.version() } else { None };
+    HarnessInstallStatus {
+        installed,
+        version,
+        path_source: if path.revision() == before {
+            source
+        } else {
+            PathSource::Capturing
+        },
+    }
+}
+
+/// How long an explicit Recheck waits for the login-shell PATH before answering.
+/// Unlike a routine probe — which takes whatever snapshot is current and lets
+/// the completion event correct it — the user is watching a spinner here, so
+/// reporting a provisional answer as final is the one thing this must not do.
+///
+/// Derived from the capture timeout rather than written as a literal, because it
+/// has to cover the worst case: a capture already in flight burns its full
+/// timeout being superseded, then the replacement runs. A hand-picked number
+/// silently stops covering that the moment the capture timeout is bumped.
+pub const RECHECK_CAPTURE_WAIT: std::time::Duration =
+    switchboard_harness::subprocess::capture_attempt_budget().saturating_mul(2);
+
+/// How long auto-create waits for the PATH before seeding from whatever it
+/// knows. Deliberately *not* [`RECHECK_CAPTURE_WAIT`]: the two callers have
+/// opposite urgency. An explicit Recheck is the user asking us to go read their
+/// shell and waiting for the answer; project creation is not, and the New
+/// Project dialog is non-dismissible while seeding runs — so inheriting the
+/// Recheck budget could freeze that modal for the better part of a minute.
+///
+/// Captures normally settle in well under a second, so this covers essentially
+/// every real case and only declines to wait out the pathological one. When it
+/// does expire the caller seeds from the provisional answer and *tells the
+/// user*, because an agent silently missing is worse than an agent visibly
+/// missing.
+pub const AUTOCREATE_PATH_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Discard the cached harness PATH and re-resolve it from the user's login
+/// shell, waiting for the result. Backs the "Recheck" action: a capture that
+/// failed once (a slow login-restore) makes every harness read as "not
+/// installed", and the user needs a retry that isn't "quit and relaunch".
+///
+/// **Blocking — call from `spawn_blocking`.** Returns the resulting PATH source
+/// so the caller can tell the user when the re-read didn't work, rather than
+/// showing them the same list again with no explanation.
+pub fn recheck_harness_installs_impl() -> PathSource {
+    switchboard_harness::subprocess::invalidate_path_cache();
+    switchboard_harness::subprocess::await_capture(RECHECK_CAPTURE_WAIT)
+}
+
+/// The adapter that owns `harness`, or `None` for a kind this build doesn't
+/// serve. The `match` is adapter *routing* (the same pattern as
+/// `send_message_impl`), not failure classification. Returns an owned handle so
+/// the probe (which shells out) can be moved onto a blocking thread instead of
+/// borrowing managed state.
+#[must_use]
+pub fn harness_adapter_for(
     state: &AppState,
     harness: HarnessKind,
-) -> HarnessInstallStatus {
-    let adapter: &dyn HarnessAdapter = match harness {
-        HarnessKind::ClaudeCode => state.claude_adapter.as_ref(),
-        HarnessKind::Codex => state.codex_adapter.as_ref(),
-        HarnessKind::Gemini => state.gemini_adapter.as_ref(),
-        HarnessKind::Antigravity => state.antigravity_adapter.as_ref(),
-        _ => {
-            return HarnessInstallStatus {
-                installed: false,
-                version: None,
-            };
-        }
-    };
-    install_status_for(adapter)
+) -> Option<Arc<dyn HarnessAdapter>> {
+    match harness {
+        HarnessKind::ClaudeCode => Some(Arc::clone(&state.claude_adapter)),
+        HarnessKind::Codex => Some(Arc::clone(&state.codex_adapter)),
+        HarnessKind::Gemini => Some(Arc::clone(&state.gemini_adapter)),
+        HarnessKind::Antigravity => Some(Arc::clone(&state.antigravity_adapter)),
+        _ => None,
+    }
+}
+
+/// Install status for a resolved adapter; an unserved harness reports
+/// not-installed rather than erroring.
+#[must_use]
+pub fn install_status_for_adapter(adapter: Option<&dyn HarnessAdapter>) -> HarnessInstallStatus {
+    adapter.map_or_else(
+        || HarnessInstallStatus {
+            installed: false,
+            version: None,
+            path_source: switchboard_harness::subprocess::path_source(),
+        },
+        install_status_for,
+    )
 }
 
 /// Find a not-yet-loaded project's owning directory by searching every loaded
@@ -5219,6 +5320,7 @@ pub(crate) fn parse_uuid(value: &str) -> Result<Uuid, AppError> {
 mod tests {
     use super::*;
 
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
@@ -7099,26 +7201,134 @@ mod tests {
         // Mock adapter probes Ok and reports no version — the "installed but
         // version unknown" composition.
         let status = install_status_for(&MockHarnessAdapter::new());
-        assert_eq!(
-            status,
-            HarnessInstallStatus {
-                installed: true,
-                version: None,
+        assert!(status.installed);
+        assert_eq!(status.version, None);
+    }
+
+    /// A `PathState` whose revision advances the first time it is read *after*
+    /// the probe, and which records the order of every interaction. Deterministic
+    /// — no shell, no global state — which is what lets it pin the *ordering*
+    /// rather than just the arithmetic.
+    struct RecordingPathState {
+        log: Mutex<Vec<&'static str>>,
+        probed: AtomicBool,
+    }
+
+    impl RecordingPathState {
+        fn new() -> Self {
+            Self {
+                log: Mutex::new(Vec::new()),
+                probed: AtomicBool::new(false),
             }
+        }
+
+        fn note(&self, what: &'static str) {
+            self.log.lock().unwrap().push(what);
+        }
+
+        fn calls(&self) -> Vec<&'static str> {
+            self.log.lock().unwrap().clone()
+        }
+    }
+
+    impl PathState for RecordingPathState {
+        fn snapshot(&self) -> (PathSource, u64) {
+            self.note("snapshot");
+            // A settled source both before and after, so the *only* thing that
+            // distinguishes a correct read-before from a buggy read-after is the
+            // revision comparison.
+            (PathSource::LoginShell, self.revision_value())
+        }
+
+        fn revision(&self) -> u64 {
+            self.note("revision");
+            self.revision_value()
+        }
+    }
+
+    impl RecordingPathState {
+        /// Revision 1 until the probe has run, 2 afterwards — a capture landing
+        /// mid-probe.
+        fn revision_value(&self) -> u64 {
+            if self.probed.load(Ordering::SeqCst) {
+                2
+            } else {
+                1
+            }
+        }
+    }
+
+    /// Adapter that marks the PATH as having moved, mid-probe.
+    struct ProbeMovesPath<'a>(&'a RecordingPathState);
+
+    #[async_trait::async_trait]
+    impl HarnessAdapter for ProbeMovesPath<'_> {
+        fn probe(&self) -> Result<(), switchboard_harness::DispatchError> {
+            self.0.note("probe");
+            self.0.probed.store(true, Ordering::SeqCst);
+            Err(switchboard_harness::DispatchError::BinaryNotFound)
+        }
+
+        fn version(&self) -> Option<String> {
+            None
+        }
+
+        async fn dispatch(
+            &self,
+            _agent: &AgentRecord,
+            _cwd: &std::path::Path,
+            _prompt: &str,
+            _turn_id: switchboard_harness::TurnId,
+            _options: switchboard_harness::DispatchOptions,
+        ) -> Result<switchboard_harness::EventStream, switchboard_harness::DispatchError> {
+            unreachable!("status probing never dispatches")
+        }
+    }
+
+    #[test]
+    fn a_probe_that_straddles_a_path_change_is_reported_as_provisional() {
+        // The defect this guards is *when* the snapshot is taken. Reading it
+        // after the probe would compare the post-move revision against itself,
+        // pass, and label a result derived from the old PATH as final — so a CLI
+        // the old PATH couldn't see renders as a confident "Not installed" with
+        // a Setup guide. Only an ordering-aware test catches that; one that
+        // exercises the comparison alone stays green through the regression.
+        let path = RecordingPathState::new();
+        let adapter = ProbeMovesPath(&path);
+
+        let status = install_status_with(&adapter, &path);
+
+        assert_eq!(
+            status.path_source,
+            PathSource::Capturing,
+            "a result straddling a PATH change must be reported as provisional"
         );
+        assert!(!status.installed);
+        // The ordering itself, pinned directly: snapshot, then probe, then the
+        // re-read. Any other order is the bug.
+        assert_eq!(path.calls(), vec!["snapshot", "probe", "revision"]);
+    }
+
+    #[test]
+    fn a_probe_with_a_stable_path_keeps_the_source_it_observed() {
+        // The other half: without this, "always report Capturing" would pass the
+        // test above and every status would render as an eternal "Checking…".
+        let path = RecordingPathState::new();
+        // Never marks the PATH as moved.
+        let adapter = MockHarnessAdapter::new();
+
+        let status = install_status_with(&adapter, &path);
+
+        assert_eq!(status.path_source, PathSource::LoginShell);
+        assert!(status.installed);
     }
 
     #[test]
     fn install_status_for_missing_binary_reports_not_installed() {
         let adapter = ClaudeCodeAdapter::with_binary_path("/nonexistent/claude-xyz123");
         let status = install_status_for(&adapter);
-        assert_eq!(
-            status,
-            HarnessInstallStatus {
-                installed: false,
-                version: None,
-            }
-        );
+        assert!(!status.installed);
+        assert_eq!(status.version, None);
     }
 
     #[test]
@@ -7152,8 +7362,12 @@ mod tests {
         let emitter = Arc::new(RecordingEmitter::new());
         let state = AppState::new(claude, codex, gemini, antigravity, emitter);
 
-        assert!(!get_harness_install_status_impl(&state, HarnessKind::ClaudeCode).installed);
-        assert!(get_harness_install_status_impl(&state, HarnessKind::Codex).installed);
+        // Exercised the way the Tauri command composes them, so the routing
+        // under test is the routing that ships.
+        let status_of =
+            |harness| install_status_for_adapter(harness_adapter_for(&state, harness).as_deref());
+        assert!(!status_of(HarnessKind::ClaudeCode).installed);
+        assert!(status_of(HarnessKind::Codex).installed);
     }
 
     /// Drift-detection live test: if `agy` is renamed or moved off PATH,

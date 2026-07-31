@@ -71,3 +71,25 @@ describe("isHarnessSelectable", () => {
     expect(isHarnessSelectable(ANTIGRAVITY_BINARY_MISSING)).toBe(false);
   });
 });
+
+describe("probe_failed", () => {
+  const a = { harness: "claude_code" as const, binary: "probe_failed" as const };
+
+  it("blocks selection like any other non-available state", () => {
+    // Fail closed: we don't know the CLI is there, so we don't offer it.
+    expect(isHarnessSelectable(a)).toBe(false);
+  });
+
+  it("does not tell the user to install a CLI we failed to check for", () => {
+    // The `missing` copy asserts absence and points at an install URL. Showing
+    // it here would be confidently wrong advice about software that may already
+    // be installed — the whole reason this state is distinct.
+    const reason = harnessUnavailableReason(a);
+    expect(reason).not.toBeNull();
+    expect(reason).not.toMatch(/not found on PATH/i);
+    expect(reason).not.toMatch(/https?:\/\//);
+    expect(reason).toMatch(/couldn't check/i);
+    // And it is genuinely different from the absent-CLI copy.
+    expect(reason).not.toBe(harnessUnavailableReason({ ...a, binary: "missing" }));
+  });
+});

@@ -123,6 +123,78 @@ use tokio::sync::{Notify, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+/// How long a dispatch waits for the login-shell PATH before proceeding on the
+/// best-guess one.
+///
+/// **Accepted residual:** on a machine whose shell startup is slower than this —
+/// the login-restore case the PATH capture exists for — the turn runs against
+/// the fallback PATH anyway, and an agent shelling out to something outside the
+/// well-known install directories can fail mid-turn. The alternative is blocking
+/// Send for the full capture timeout, which is the behavior the non-blocking
+/// PATH redesign removed. Captures normally complete in under a second, so this
+/// costs nothing outside that window.
+const DISPATCH_PATH_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// How a dispatch learns the harness PATH has settled.
+///
+/// Injectable because the alternative is untestable in practice: the real
+/// implementation reads a process-global resolver and blocks on the developer's
+/// login shell, so a test of the *call site* would depend on ambient shell speed
+/// and would perturb every sibling test through the shared global. With this,
+/// a test holds readiness at `Capturing`, observes that no dispatch has begun,
+/// publishes a settled value, and observes that it proceeds — deterministically.
+type PathReadiness = Arc<
+    dyn Fn() -> futures::future::BoxFuture<'static, switchboard_harness::subprocess::PathSource>
+        + Send
+        + Sync,
+>;
+
+/// Process-wide readiness source. A test swaps it for a controllable one via
+/// [`set_path_readiness_for_test`] and restores it on drop.
+static PATH_READINESS: Mutex<Option<PathReadiness>> = Mutex::new(None);
+
+async fn path_readiness() -> switchboard_harness::subprocess::PathSource {
+    let injected = PATH_READINESS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    match injected {
+        Some(readiness) => readiness().await,
+        None => switchboard_harness::subprocess::ensure_path_settled(DISPATCH_PATH_WAIT).await,
+    }
+}
+
+/// Install a readiness source for the duration of the returned guard.
+///
+/// Test-only in practice, but `pub` so integration tests (a separate crate) can
+/// reach it. The source is process-global: while the guard lives, *every* turn
+/// in the process reads it — including turns run by concurrently-executing
+/// sibling tests in the same binary. An injected source must therefore tolerate
+/// foreign callers (hand out shared, non-consuming readiness — a watch channel,
+/// never a one-shot), and only one guard may be live at a time: dropping
+/// restores the default source, not a previously-injected one.
+#[must_use]
+pub fn set_path_readiness_for_test(readiness: PathReadiness) -> PathReadinessGuard {
+    *PATH_READINESS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(readiness);
+    PathReadinessGuard
+}
+
+/// Restores the real readiness source on drop, including on an unwind — a test
+/// that panicked while holding an injected source would otherwise leave every
+/// later test dispatching against it.
+#[derive(Debug)]
+pub struct PathReadinessGuard;
+
+impl Drop for PathReadinessGuard {
+    fn drop(&mut self) {
+        *PATH_READINESS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+}
+
 /// A message accepted into an agent's queue (or run immediately). Carries only
 /// what cannot be recomputed when the turn finally starts — the adapter, cwd,
 /// emitter, options, and journal are rebuilt by the actor's
@@ -1388,6 +1460,20 @@ async fn run_turn(
     // boundary, so adapters stay attachment-unaware. Empty attachments → the
     // prompt is returned unchanged.
     let dispatch_prompt = render_prompt_with_attachments(&item.prompt, &item.attachments);
+    // Wait, briefly, for the harness PATH to be resolved from the user's login
+    // shell. A GUI launch inherits a PATH too minimal to find the CLIs, and the
+    // real one is captured asynchronously — so an agent spawned inside that
+    // window would run its *entire* turn against a best-guess PATH. Detection
+    // gets a corrective re-probe; a running child does not. Awaited, not
+    // blocked on, so this never occupies a runtime worker.
+    if path_readiness().await == switchboard_harness::subprocess::PathSource::Capturing {
+        tracing::warn!(
+            %agent_id,
+            %turn_id,
+            "dispatching before the login-shell PATH resolved; the agent will use the \
+             fallback PATH for this turn"
+        );
+    }
     let stream = match adapter
         .dispatch(&agent, &cwd, &dispatch_prompt, turn_id, options)
         .await

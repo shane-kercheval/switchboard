@@ -44,6 +44,12 @@ function binaryMissingCopy(harness: HarnessKind): string {
 /// would force the message-rendering site to filter out non-message
 /// states.
 export function harnessUnavailableReason(a: HarnessAvailability): string | null {
+  if (a.binary === "probe_failed") {
+    // Never `BINARY_COPY` here: that copy says "not found on PATH — install
+    // from <url>", which is confidently wrong advice when the check itself
+    // failed and the CLI may well be installed.
+    return "Couldn't check whether this CLI is installed. Try again in a moment.";
+  }
   return a.binary === "missing" ? BINARY_COPY[a.harness] : null;
 }
 

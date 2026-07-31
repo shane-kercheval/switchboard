@@ -33,22 +33,23 @@ use crate::wake_lock::WakeLockEmitter;
 
 use crate::commands::ProjectConversation;
 use crate::commands::{
-    AgentSessionFingerprint, AgentSessionInfo, DirectoryInfo, ForwardArg, ForwardOutcome,
-    HarnessInstallStatus, ProjectListing, RepoListing, StagedAttachment, WorkspaceDirectories,
-    add_mcp_provider_impl, add_tracked_repo_impl, agent_session_info_impl, attach_agent_impl,
-    cancel_agent_impl, cancel_forward_impl, cancel_send_impl, cancel_turn_impl, changed_files_impl,
-    check_antigravity_auth_impl, check_antigravity_binary_impl, check_claude_auth_impl,
-    check_claude_binary_impl, check_codex_auth_impl, check_codex_binary_impl,
-    check_gemini_auth_impl, check_gemini_binary_impl, commit_changed_files_impl,
-    commit_file_diff_impl, commit_ranges_impl, copy_builtin_prompt_impl, create_agent_impl,
-    create_project_impl, delete_project_impl, editor_open_argv, existing_attachment_paths_impl,
-    fetch_repo_impl, file_diff_impl, forward_message_impl, forward_prompt_impl,
-    get_harness_install_status_impl, get_preferences_impl, get_prompt_source_impl,
-    init_directory_impl, list_agents_impl, list_mcp_providers_impl, list_projects_impl,
-    list_prompts_impl, list_tracked_repos_from_inputs, list_workspace_directories_impl,
-    load_project_conversation_impl, load_transcript_impl, open_commit_file_difftool_impl,
-    open_project_impl, open_worktree_file_difftool_impl, parse_uuid, pick_directory_impl,
-    project_session_fingerprints_impl, read_tracked_repo_from_inputs, remove_agent_impl,
+    AUTOCREATE_PATH_WAIT, AgentSessionFingerprint, AgentSessionInfo, DirectoryInfo, ForwardArg,
+    ForwardOutcome, HarnessInstallStatus, ProjectListing, RepoListing, StagedAttachment,
+    WorkspaceDirectories, add_mcp_provider_impl, add_tracked_repo_impl, agent_session_info_impl,
+    attach_agent_impl, cancel_agent_impl, cancel_forward_impl, cancel_send_impl, cancel_turn_impl,
+    changed_files_impl, check_antigravity_auth_impl, check_antigravity_binary_impl,
+    check_claude_auth_impl, check_claude_binary_impl, check_codex_auth_impl,
+    check_codex_binary_impl, check_gemini_auth_impl, check_gemini_binary_impl,
+    commit_changed_files_impl, commit_file_diff_impl, commit_ranges_impl, copy_builtin_prompt_impl,
+    create_agent_impl, create_project_impl, delete_project_impl, editor_open_argv,
+    existing_attachment_paths_impl, fetch_repo_impl, file_diff_impl, forward_message_impl,
+    forward_prompt_impl, get_preferences_impl, get_prompt_source_impl, harness_adapter_for,
+    init_directory_impl, install_status_for_adapter, list_agents_impl, list_mcp_providers_impl,
+    list_projects_impl, list_prompts_impl, list_tracked_repos_from_inputs,
+    list_workspace_directories_impl, load_project_conversation_impl, load_transcript_impl,
+    open_commit_file_difftool_impl, open_project_impl, open_worktree_file_difftool_impl,
+    parse_uuid, pick_directory_impl, project_session_fingerprints_impl,
+    read_tracked_repo_from_inputs, recheck_harness_installs_impl, remove_agent_impl,
     remove_directory_impl, remove_mcp_provider_impl, remove_queued_message_impl,
     remove_tracked_repo_impl, rename_agent_impl, rename_project_impl, render_prompt_impl,
     reorder_agents_impl, reveal_in_finder_argv, search_project_files_in_root,
@@ -70,9 +71,49 @@ use switchboard_core::{AgentRecord, Attachment, HarnessKind, ProjectId, ProjectS
 use switchboard_git::{
     BranchKind, ChangeKind, ChangedFile, CommitChanges, FileDiff, GitCommitRange,
 };
+use switchboard_harness::subprocess::PathSource;
 use switchboard_prompts::{McpProviderInfo, Prompt, PromptSource, RenderedPrompt};
 use switchboard_workflow::InputValue;
 use uuid::Uuid;
+
+/// Emitted once the login-shell PATH capture settles. The frontend re-probes
+/// install status on receipt — detection is only as good as the PATH behind it,
+/// and that PATH arrives asynchronously.
+const HARNESS_PATH_RESOLVED_EVENT: &str = "harness_path_resolved";
+
+/// Bridge the harness crate's PATH-revision stream to the frontend event.
+///
+/// Subscribing here rather than registering a callback in the harness crate
+/// keeps the Tauri concern in the Tauri layer, and means the resolver has a
+/// single publication point instead of notifying three audiences from two
+/// places. Only *terminal* transitions are emitted: an invalidation or a capture
+/// starting also advances the revision, and telling the frontend to re-probe
+/// then would just cost it a round-trip to learn nothing has settled yet.
+#[cfg(target_os = "macos")]
+fn spawn_path_resolved_emitter(app: tauri::AppHandle) {
+    use switchboard_harness::subprocess::PathSource;
+
+    let mut revisions = switchboard_harness::subprocess::subscribe_revisions();
+    tauri::async_runtime::spawn(async move {
+        loop {
+            // Checked before waiting, not only after: if the PATH settled before
+            // this task got scheduled, `changed()` would never fire for that
+            // publish and the frontend would sit on its provisional answer until
+            // the backstop. Emitting is idempotent — the frontend re-probe is
+            // generation-guarded — so a redundant emit costs one round-trip and
+            // a missed one costs 30 seconds of spinner.
+            if switchboard_harness::subprocess::path_source() != PathSource::Capturing {
+                let _ = app.emit(HARNESS_PATH_RESOLVED_EVENT, ());
+            }
+            if revisions.changed().await.is_err() {
+                break;
+            }
+        }
+    });
+}
+
+#[cfg(not(target_os = "macos"))]
+fn spawn_path_resolved_emitter(_app: tauri::AppHandle) {}
 
 #[tauri::command]
 async fn check_claude_binary(state: State<'_, AppState>) -> Result<(), String> {
@@ -123,12 +164,38 @@ async fn check_claude_auth() -> Result<(), String> {
     check_claude_auth_impl().map_err(|e| e.to_string())
 }
 
+/// Probing shells out (`which`, then `<binary> --version`), so it runs on the
+/// blocking pool rather than occupying an async worker — the frontend fires one
+/// of these per harness concurrently.
 #[tauri::command]
 async fn get_harness_install_status(
     state: State<'_, AppState>,
     harness: HarnessKind,
 ) -> Result<HarnessInstallStatus, String> {
-    Ok(get_harness_install_status_impl(state.inner(), harness))
+    let adapter = harness_adapter_for(state.inner(), harness);
+    tauri::async_runtime::spawn_blocking(move || install_status_for_adapter(adapter.as_deref()))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Wait (bounded) for the login-shell PATH to resolve, then report where it came
+/// from. Used by auto-create, which gets one shot: it runs once per project
+/// creation and cannot retroactively add agents it skipped. Returns
+/// [`PathSource::Capturing`] if the wait expires, which the caller surfaces
+/// rather than swallowing.
+#[tauri::command]
+async fn await_harness_path() -> Result<PathSource, String> {
+    Ok(switchboard_harness::subprocess::ensure_path_settled(AUTOCREATE_PATH_WAIT).await)
+}
+
+/// Re-read the login-shell PATH and report where the result came from, so the
+/// UI can say "couldn't read your shell's PATH" instead of silently showing the
+/// same list again. Blocking (it waits for the shell), hence `spawn_blocking`.
+#[tauri::command]
+async fn recheck_harness_installs() -> Result<PathSource, String> {
+    tauri::async_runtime::spawn_blocking(recheck_harness_installs_impl)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1325,6 +1392,21 @@ pub fn run() {
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_notification::init())
         .setup(move |app| {
+            // Resolve the login-shell PATH in the background, and tell the
+            // frontend to re-probe once it lands. Both halves matter: a GUI
+            // launch inherits a PATH too minimal to find any harness CLI, and
+            // nothing waits for the capture — so without the event, a probe
+            // that raced startup would keep its provisional answer until the
+            // user happened to focus the window.
+            // Subscriber first, then the warm-up that starts the capture: a
+            // `watch` receiver only observes changes made after it subscribes,
+            // so warming first races the capture completing before anyone is
+            // listening. (`spawn_path_resolved_emitter` is also written to be
+            // order-independent — belt as well as braces, because this is the
+            // second time this exact race has appeared in this change.)
+            spawn_path_resolved_emitter(app.handle().clone());
+            switchboard_harness::subprocess::warm_path_cache();
+
             // Wrap the base emitter so any in-flight agent turn holds an OS
             // wake lock; the decorator counts `turn_start`/`turn_end` across
             // all agents and releases once the last turn ends.
@@ -1381,6 +1463,8 @@ pub fn run() {
             check_antigravity_auth,
             check_claude_auth,
             get_harness_install_status,
+            recheck_harness_installs,
+            await_harness_path,
             pick_directory,
             init_directory,
             remove_directory,

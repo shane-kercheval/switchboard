@@ -30,16 +30,27 @@ import App from "./App.svelte";
 // naturally (add directory → create project → activate → send) without
 // asserting brittle call orders.
 
-const listenCallbacks = new Map<string, (e: { payload: NormalizedEvent }) => void>();
+// A *set* of handlers per channel: the real `listen` is multi-subscriber (the
+// availability store and the status list both subscribe to
+// `harness_path_resolved`), so a single-slot map would let the second
+// registration silently displace the first — hiding real behavior and failing
+// tests that fire the shared event.
+const listenCallbacks = new Map<string, Set<(e: { payload: NormalizedEvent }) => void>>();
 function fireTo(channel: string, event: NormalizedEvent): void {
-  const cb = listenCallbacks.get(channel);
-  if (cb === undefined) throw new Error(`no listener registered for ${channel}`);
-  cb({ payload: event });
+  const cbs = listenCallbacks.get(channel);
+  if (cbs === undefined || cbs.size === 0) {
+    throw new Error(`no listener registered for ${channel}`);
+  }
+  for (const cb of cbs) cb({ payload: event });
 }
 const listenMock = vi.fn(async (event: string, handler: unknown): Promise<() => void> => {
-  listenCallbacks.set(event, handler as (e: { payload: NormalizedEvent }) => void);
+  const cb = handler as (e: { payload: NormalizedEvent }) => void;
+  const cbs = listenCallbacks.get(event) ?? new Set();
+  cbs.add(cb);
+  listenCallbacks.set(event, cbs);
   return () => {
-    listenCallbacks.delete(event);
+    cbs.delete(cb);
+    if (cbs.size === 0) listenCallbacks.delete(event);
   };
 });
 const openDialogMock = vi.fn(async (_options: unknown): Promise<string | null> => null);
@@ -59,10 +70,17 @@ type Backend = {
   // Harnesses whose `create_agent` should reject (keyed by HarnessKind).
   // Drives the partial-auto-create-failure test.
   createAgentFailFor: Set<string>;
+  // Which PATH the fake backend claims its install answers came from.
+  // `capturing` models a probe answered before the login-shell PATH resolved.
+  pathSource: "capturing" | "login_shell" | "fallback";
   // When set, `get_harness_install_status` waits on this gate before
   // resolving — lets a test hold the probe "pending" to exercise the
   // auto-create race guard (await a fresh probe before reading installed()).
   installGate: Promise<void> | null;
+  // When set, `await_harness_path` waits on this gate — models a PATH capture
+  // that settles during seeding. Unset means the wait returns immediately with
+  // whatever `pathSource` says, modelling an expired budget.
+  awaitPathGate: Promise<void> | null;
   // When set, `create_agent` waits on this gate before resolving — lets a
   // test park the seeding loop after its first create (call is recorded on
   // invoke) to exercise the captured-project-id bail.
@@ -96,7 +114,9 @@ function freshBackend(): Backend {
     probeFailures: new Set(),
     notInstalled: new Set(),
     createAgentFailFor: new Set(),
+    pathSource: "login_shell",
     installGate: null,
+    awaitPathGate: null,
     createAgentGate: null,
     openProjectGates: new Map(),
     agentQueue: [],
@@ -237,8 +257,17 @@ const invokeMock = vi.fn(async (cmd: string, args?: Record<string, unknown>): Pr
     case "get_harness_install_status": {
       if (backend.installGate) await backend.installGate;
       const installed = !backend.notInstalled.has(args?.harness as string);
-      return { installed, version: installed ? "1.0.0" : null };
+      return {
+        installed,
+        version: installed ? "1.0.0" : null,
+        path_source: backend.pathSource,
+      };
     }
+    case "await_harness_path":
+      // Models the bounded wait: resolving the gate stands in for the capture
+      // landing within budget; leaving it unset stands in for the wait expiring.
+      if (backend.awaitPathGate) await backend.awaitPathGate;
+      return backend.pathSource;
     case "get_preferences":
       return {
         editor_command: null,
@@ -490,6 +519,35 @@ describe("App", () => {
     expect(screen.queryByTestId(/^banner-auth_missing-/)).not.toBeInTheDocument();
   });
 
+  it("re-probes when the backend reports the login-shell PATH resolved", async () => {
+    // The linchpin of the non-blocking PATH design: nothing waits for the shell,
+    // so the first probes can be answered from an interim PATH. This event is
+    // what replaces them. An event-name typo or a listener that never attached
+    // would silently restore "Not installed for no reason" on every launch, with
+    // every other test still green.
+    backend.pathSource = "capturing";
+    backend.notInstalled.add("claude_code");
+    await mountApp();
+
+    // A negative answer taken mid-capture is provisional — it must not render as
+    // a confident absence with a Setup guide.
+    await waitFor(() =>
+      expect(screen.getByTestId("harness-install-claude_code")).toHaveTextContent("Checking…"),
+    );
+    expect(screen.queryByTestId("harness-setup-claude_code")).not.toBeInTheDocument();
+
+    // The real PATH lands and finds the CLI after all.
+    backend.pathSource = "login_shell";
+    backend.notInstalled.delete("claude_code");
+    // The store owns this listener and attaches it before its first probe.
+    await waitFor(() => expect(listenCallbacks.has("harness_path_resolved")).toBe(true));
+    fireTo("harness_path_resolved", undefined as unknown as NormalizedEvent);
+
+    await waitFor(() =>
+      expect(screen.getByTestId("harness-install-claude_code")).toHaveTextContent("Installed"),
+    );
+  });
+
   it("keeps missing CLI status out of global banners", async () => {
     backend.notInstalled.add("claude_code");
     backend.notInstalled.add("codex");
@@ -711,6 +769,57 @@ describe("App", () => {
 
     release();
     await waitFor(() => expect(createAgentCalls()).toHaveLength(3));
+  });
+
+  it("auto-create waits for the login-shell PATH — a CLI absent from the interim PATH still seeds", async () => {
+    // Distinct from the probe-pending gate above. Here the *probe* answers
+    // promptly, but from a PATH that is still being read — and on that interim
+    // PATH the CLI is not found. Seeding from that answer would permanently omit
+    // the agent, since nothing re-runs auto-create when the real PATH lands.
+    // `settledHarnessAvailability` exists precisely to close this window.
+    backend.pathSource = "capturing";
+    backend.notInstalled.add("codex");
+    let resolvePath: () => void = () => {};
+    backend.awaitPathGate = new Promise<void>((r) => (resolvePath = r));
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("welcome-add-project")).toBeInTheDocument());
+
+    await createNewProjectViaDialog("brand-new");
+    await waitFor(() => expect(screen.getByText("brand-new")).toBeInTheDocument());
+    // Anchor on seeding having *reached* the wait before asserting it hasn't
+    // created anything — otherwise "no agents yet" passes trivially against a
+    // version that skips the wait entirely and simply hasn't got there yet.
+    await waitFor(() =>
+      expect(invokeMock.mock.calls.some(([cmd]) => cmd === "await_harness_path")).toBe(true),
+    );
+    expect(createAgentCalls()).toHaveLength(0);
+
+    // The capture lands and finds codex after all.
+    backend.pathSource = "login_shell";
+    backend.notInstalled.delete("codex");
+    resolvePath();
+
+    await waitFor(() => expect(createAgentCalls()).toHaveLength(3));
+    expect(screen.queryByTestId("banner-seed-path-unresolved")).not.toBeInTheDocument();
+  });
+
+  it("auto-create tells the user when it had to seed before the PATH resolved", async () => {
+    // The other half of the same contract: the wait is bounded, so when it
+    // expires seeding proceeds from the provisional answer — a frozen
+    // non-dismissible dialog would be worse. But it must not be silent: a
+    // project quietly missing an agent gives the user nothing to act on.
+    backend.pathSource = "capturing";
+    backend.notInstalled.add("codex");
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("welcome-add-project")).toBeInTheDocument());
+
+    await createNewProjectViaDialog("brand-new");
+
+    await waitFor(() =>
+      expect(screen.getByTestId("banner-seed-path-unresolved")).toBeInTheDocument(),
+    );
+    // Seeding still happened for what *was* found — a partial project beats none.
+    expect(createAgentCalls().length).toBeGreaterThan(0);
   });
 
   it("new project: a failed agent create surfaces a dismissible banner and the rest still seed", async () => {

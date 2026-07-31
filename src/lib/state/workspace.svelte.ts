@@ -41,7 +41,7 @@ import type {
   WorkspaceDirectoryInfo,
 } from "$lib/types";
 import { tick, untrack } from "svelte";
-import { harnessAvailability, refreshHarnessAvailability } from "$lib/harnessAvailability.svelte";
+import { harnessAvailability, settledHarnessAvailability } from "$lib/harnessAvailability.svelte";
 import { AUTO_SEED_ON_NEW_PROJECT } from "$lib/harnessDisplay";
 import {
   NEW_PROJECT_DEFAULT_EFFORT,
@@ -118,6 +118,18 @@ export const agentsByProject = $state<Record<ProjectId, AgentRecord[]>>({});
 /// silent. Transient and event-scoped: cleared on every project (re)activation,
 /// repopulated only by `createProjectAndActivate`.
 export const agentCreationFailures = $state<{ harness: HarnessKind; error: string }[]>([]);
+
+/// Set when auto-create had to seed before the login-shell PATH resolved, so the
+/// agent set may be incomplete. Surfaced as a dismissible banner rather than
+/// logged: a project quietly missing an agent is worse than one visibly missing
+/// it, because the user has no way to know which agent should have been there.
+/// Same lifecycle as `agentCreationFailures` — cleared on every (re)activation.
+export const seedPathUnresolved = $state<{ value: boolean }>({ value: false });
+
+/// Dismiss the incomplete-seeding banner.
+export function dismissSeedPathUnresolved(): void {
+  seedPathUnresolved.value = false;
+}
 
 /// Per-project hydrated conversation overlays, keyed by project id.
 export const conversations = $state<Record<ProjectId, ProjectConversationState>>({});
@@ -396,10 +408,12 @@ export async function createProjectAndActivate(name: string, directory: string):
 /// like Gemini stay dialog-only. New projects only — called solely from
 /// `createProjectAndActivate`, never on activation of an existing project.
 ///
-/// Awaits a fresh availability probe before reading `installed()`: the store's
-/// startup probe is fired un-awaited and reports `[]` until it resolves, so a
-/// project created inside that window would otherwise seed zero agents. The
-/// probe is idempotent and cheap, so awaiting it here closes the race.
+/// Awaits a *settled* availability probe before reading `installed()`. Two races
+/// converge here: the store's startup probe is fired un-awaited and reports `[]`
+/// until it resolves, and the PATH those probes search is itself resolved
+/// asynchronously — a probe answered from the interim PATH can miss a CLI
+/// entirely. Seeding is one-shot, so either race silently produces a project
+/// with fewer agents than the user has CLIs, permanently.
 ///
 /// Mirrors the canonical create path (`createAgent` → `registerAgent` →
 /// `addAgentToActiveProject`) per agent — a plain roster re-fetch would skip
@@ -418,7 +432,12 @@ export async function createProjectAndActivate(name: string, directory: string):
 /// same coupling affects project remove/rename.
 async function seedAgentsForInstalledHarnesses(projectId: ProjectId): Promise<void> {
   if (selection.activeProjectId !== projectId) return;
-  await refreshHarnessAvailability();
+  // A `capturing` result means the wait expired with the PATH still unresolved,
+  // so `installed()` may be short. Seeding proceeds anyway — a wedged
+  // non-dismissible dialog is worse than a missing agent — but the user is told.
+  if ((await settledHarnessAvailability()) === "capturing") {
+    seedPathUnresolved.value = selection.activeProjectId === projectId;
+  }
   for (const harness of harnessAvailability.installed()) {
     if (selection.activeProjectId !== projectId) break;
     // Installed but auto-seed-excluded harnesses (e.g. Gemini) are still
@@ -638,6 +657,7 @@ export async function activateProject(projectId: ProjectId): Promise<ActivationR
   // re-activating) clears the banner. `createProjectAndActivate` seeds *after*
   // this, so its failures survive.
   agentCreationFailures.length = 0;
+  seedPathUnresolved.value = false;
   // A re-activation is a switch back to a project whose load already ran — the
   // only time a staleness refresh applies (first activation hydrates fresh).
   const isReactivation = loadStarted.has(projectId);
@@ -938,5 +958,6 @@ export const _testing = {
       delete backgroundCompletedProjectIds[key];
     for (const key of Object.keys(projectActivityOverrides)) delete projectActivityOverrides[key];
     agentCreationFailures.length = 0;
+    seedPathUnresolved.value = false;
   },
 };

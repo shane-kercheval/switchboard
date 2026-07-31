@@ -25,4 +25,5 @@ futures = { workspace = true }
 tokio-util = { workspace = true }
 
 [dev-dependencies]
+async-trait.workspace = true
 tempfile = { workspace = true }

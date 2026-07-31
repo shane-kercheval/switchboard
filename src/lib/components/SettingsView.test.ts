@@ -12,7 +12,8 @@ import { _testing as prefsTesting } from "$lib/preferences.svelte";
 // McpServersSettings (loads providers on mount). Tests that override the mock
 // must keep these baseline stubs, so it's a named default restored per test.
 const defaultInvoke = async (cmd: string, _args?: Record<string, unknown>): Promise<unknown> => {
-  if (cmd === "get_harness_install_status") return { installed: true, version: "1.0.0" };
+  if (cmd === "get_harness_install_status")
+    return { installed: true, version: "1.0.0", path_source: "login_shell" };
   if (cmd === "list_mcp_providers") return []; // embedded McpServersSettings loads on mount
   if (cmd === "local_prompts_dir")
     return "/Users/test/Library/Application Support/switchboard/prompts";
@@ -200,7 +201,8 @@ describe("SettingsView", () => {
     // A failed config.yaml write must not be silent: the user sees an error and
     // the typed value stays (surface-and-keep, not revert).
     invokeMock.mockImplementation(async (cmd: string) => {
-      if (cmd === "get_harness_install_status") return { installed: true, version: "1.0.0" };
+      if (cmd === "get_harness_install_status")
+        return { installed: true, version: "1.0.0", path_source: "login_shell" };
       if (cmd === "list_mcp_providers") return [];
       if (cmd === "set_preferences") throw new Error("disk full");
       return null;

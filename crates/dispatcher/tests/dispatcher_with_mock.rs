@@ -128,6 +128,29 @@ impl TestFactory {
         )
     }
 
+    /// As [`Self::sequence`], but with pre-built adapters instead of scenarios,
+    /// so a test can inject an adapter that observes dispatcher state at the
+    /// moment `dispatch` is called.
+    fn with_adapters(
+        adapters: impl IntoIterator<Item = Arc<dyn HarnessAdapter>>,
+        agent: AgentRecord,
+        emitter: Arc<RecordingEmitter>,
+        journal: Arc<dyn ConversationJournal>,
+    ) -> Arc<Self> {
+        let queue: std::collections::VecDeque<Arc<dyn HarnessAdapter>> =
+            adapters.into_iter().collect();
+        let last = Arc::clone(queue.back().expect("at least one adapter"));
+        Arc::new(Self {
+            adapters: Mutex::new(queue),
+            last,
+            agent,
+            emitter: emitter as Arc<dyn EventEmitter>,
+            journal,
+            metadata: Arc::new(NoopMetadataCache),
+            locator_sink: Arc::new(NoopSessionLocatorSink),
+        })
+    }
+
     /// As [`Self::sequence_with_metadata`], but with an injected
     /// [`SessionLocatorSink`] so the runtime-capture tests can capture what the
     /// dispatcher persists (or assert a persist failure fails the turn).
@@ -396,6 +419,126 @@ fn accepted(outcome: SendOutcome) -> MessageId {
 /// Count emitted events of a given wire `type`.
 fn count_type(events: &[(String, serde_json::Value)], ty: &str) -> usize {
     events.iter().filter(|(_, v)| event_type(v) == ty).count()
+}
+
+/// Wraps a mock adapter and records that `dispatch` was reached — the only
+/// observable that answers "did the dispatcher wait before spawning?", since the
+/// wait happens immediately before this call.
+struct DispatchRecordingAdapter {
+    inner: MockHarnessAdapter,
+    dispatched: Arc<Mutex<bool>>,
+}
+
+#[async_trait::async_trait]
+impl HarnessAdapter for DispatchRecordingAdapter {
+    fn probe(&self) -> Result<(), switchboard_harness::DispatchError> {
+        self.inner.probe()
+    }
+
+    fn version(&self) -> Option<String> {
+        self.inner.version()
+    }
+
+    async fn dispatch(
+        &self,
+        agent: &AgentRecord,
+        cwd: &std::path::Path,
+        prompt: &str,
+        turn_id: TurnId,
+        options: DispatchOptions,
+    ) -> Result<switchboard_harness::EventStream, switchboard_harness::DispatchError> {
+        *self.dispatched.lock().unwrap() = true;
+        self.inner
+            .dispatch(agent, cwd, prompt, turn_id, options)
+            .await
+    }
+}
+
+/// A turn must not be spawned while the harness PATH is still being read.
+///
+/// Detection recovers from a provisional answer — a completion event re-probes
+/// every surface. A *running agent* cannot: it inherits the PATH it was spawned
+/// with for the whole turn, so an agent that shells out to something outside the
+/// fallback directories fails partway through with no explanation. The
+/// dispatcher's bounded wait is the only thing preventing that, and its absence
+/// is silent.
+///
+/// Readiness is injected rather than driven through the real resolver: doing the
+/// latter would make this assert how fast the developer's login shell starts —
+/// failing on exactly the slow-shell machines the feature exists for — and would
+/// perturb every sibling test in this binary through the shared global.
+#[tokio::test]
+async fn dispatch_waits_for_the_path_to_settle_before_spawning() {
+    let spawned = Arc::new(Mutex::new(false));
+    let adapter: Arc<dyn HarnessAdapter> = Arc::new(DispatchRecordingAdapter {
+        inner: MockHarnessAdapter::with_scenario(MockScenario::Streaming),
+        dispatched: Arc::clone(&spawned),
+    });
+
+    // Readiness that reports settled only once released — the cold-launch
+    // sequence, under the test's control. A watch channel rather than a
+    // one-shot: the injected source is process-global, so a turn from a
+    // concurrently-running sibling test can call it too, and a consumable
+    // signal would let that caller steal the release — this test's own turn
+    // would then dispatch immediately and the parked assertion below would
+    // flake. Every caller of a watch waits for the same release.
+    let (settle_tx, settle_rx) = tokio::sync::watch::channel(false);
+    let _readiness = switchboard_dispatcher::set_path_readiness_for_test(Arc::new(move || {
+        let mut rx = settle_rx.clone();
+        Box::pin(async move {
+            while !*rx.borrow_and_update() {
+                if rx.changed().await.is_err() {
+                    break;
+                }
+            }
+            switchboard_harness::subprocess::PathSource::LoginShell
+        })
+    }));
+
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+    let factory = TestFactory::with_adapters(
+        [adapter],
+        agent.clone(),
+        Arc::clone(&emitter),
+        noop_journal(),
+    );
+
+    accepted(
+        dispatcher
+            .send_message(
+                agent.id,
+                "hello",
+                vec![],
+                Uuid::now_v7(),
+                factory,
+                OnBusy::Enqueue,
+            )
+            .await,
+    );
+
+    // Parked on readiness: the adapter must not have been reached.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !*spawned.lock().unwrap(),
+        "the agent was spawned before the PATH settled; it would run the whole \
+         turn against a best-guess PATH with no way to correct it"
+    );
+
+    settle_tx
+        .send(true)
+        .expect("readiness receiver still alive");
+    within(
+        &emitter,
+        "agent_idle",
+        emitter.wait_for_type("agent_idle", 1),
+    )
+    .await;
+
+    // And once released it proceeds — a wait that never completed would be just
+    // as broken as one that never happened.
+    assert!(*spawned.lock().unwrap(), "dispatch never ran");
 }
 
 #[tokio::test]

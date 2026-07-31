@@ -54,10 +54,12 @@
     agentsByProject,
     conversations,
     dismissAgentCreationFailure,
+    dismissSeedPathUnresolved,
     loadWorkspace,
     nextUnreadCompletedProjectId,
     projects,
     retryProjectHydration,
+    seedPathUnresolved,
     selection,
     setProjectArchived,
     startProjectActivityObserver,
@@ -379,6 +381,9 @@
   // `harnessAvailability` comment above.
   onMount(() => {
     const stopProjectActivityObserver = startProjectActivityObserver();
+    // The startup probe races the backend's PATH capture, so its answer can be
+    // provisional; the store awaits its own completion-listener registration
+    // before issuing any probe, and arms its own backstop for a lost event.
     void refreshHarnessAvailability();
     void loadPreferences();
     void loadWorkspace().catch((err) => {
@@ -1149,6 +1154,13 @@
         {/if}
       </div>
 
+      {#if seedPathUnresolved.value}
+        <Banner
+          message="Couldn't finish detecting your installed CLIs, so this project may be missing an agent. Use + to add one, or open Settings → Supported CLIs and press Refresh."
+          testid="banner-seed-path-unresolved"
+          onDismiss={dismissSeedPathUnresolved}
+        />
+      {/if}
       {#each agentCreationFailures as failure (failure.harness)}
         <Banner
           message={`Couldn't create the ${HARNESS_LABEL[failure.harness]} agent: ${failure.error}`}

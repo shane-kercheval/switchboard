@@ -10,7 +10,12 @@
   import Button from "$lib/components/ui/Button.svelte";
   import EmptyState from "$lib/components/ui/EmptyState.svelte";
   import ResizeHandle from "$lib/components/ui/ResizeHandle.svelte";
-  import { GIT_DETAIL_MIN_WIDTH, layout } from "$lib/layout.svelte";
+  import {
+    GIT_REPO_DEFAULT_WIDTH,
+    GIT_REPO_MAX_WIDTH,
+    GIT_REPO_MIN_WIDTH,
+    layout,
+  } from "$lib/layout.svelte";
   import Spinner from "$lib/components/ui/Spinner.svelte";
   import GitRepoNode from "$lib/components/GitRepoNode.svelte";
   import DiffPanel from "$lib/components/DiffPanel.svelte";
@@ -57,24 +62,10 @@
   // The open diff target (a commit or a worktree's uncommitted changes), or null.
   // Drives the right inspector.
   const panel = $derived(diffTarget.current);
-  let splitEl = $state<HTMLDivElement | null>(null);
-  let detailEl = $state<HTMLElement | null>(null);
   /// Live width during a resize drag; the layout store commits on pointer-up.
-  /// `layout.gitDetailWidth` stays null until the first drag, keeping the CSS
-  /// default (2/3 of the split) — double-click reset returns to it.
-  let draftDetailWidth = $state<number | null>(null);
-  const detailWidth = $derived(draftDetailWidth ?? layout.gitDetailWidth);
+  let draftRepoWidth = $state<number | null>(null);
+  const repoWidth = $derived(draftRepoWidth ?? layout.gitRepoWidth);
   let detailExpanded = $state(false);
-
-  function detailStartWidth(): number {
-    return detailWidth ?? detailEl?.getBoundingClientRect().width ?? GIT_DETAIL_MIN_WIDTH;
-  }
-
-  function detailMaxWidth(): number {
-    return splitEl === null
-      ? Number.POSITIVE_INFINITY
-      : splitEl.getBoundingClientRect().width * 0.85;
-  }
 
   function onWindowPointerMove(): void {
     if (hoverSuppressed.value) hoverSuppressed.value = false;
@@ -106,7 +97,7 @@
   function toggleDetailExpanded(): void {
     // Expanding mid-drag unmounts the resize handle (ending the drag); drop
     // any uncommitted draft so it can't pin the width after un-expanding.
-    draftDetailWidth = null;
+    draftRepoWidth = null;
     detailExpanded = !detailExpanded;
   }
 
@@ -390,10 +381,11 @@
     </div>
   {/if}
 
-  <div class="flex min-h-0 flex-1 overflow-hidden" bind:this={splitEl} data-testid="git-split">
+  <div class="flex min-h-0 flex-1 overflow-hidden" data-testid="git-split">
     {#if !detailExpanded}
       <div
-        class="git-scrollbar bg-raised flex min-h-0 min-w-0 flex-1 [scrollbar-gutter:stable] flex-col gap-1 overflow-y-scroll p-2"
+        class="git-scrollbar bg-raised flex min-h-0 shrink-0 [scrollbar-gutter:stable] flex-col gap-1 overflow-y-scroll p-2"
+        style={`width: ${repoWidth}px`}
         data-testid="git-repo-list"
       >
         {#if gitView.status === "loading" && gitView.repos.length === 0}
@@ -434,37 +426,28 @@
       </div>
 
       <ResizeHandle
-        value={detailStartWidth}
-        min={GIT_DETAIL_MIN_WIDTH}
-        max={detailMaxWidth}
-        edge="start"
-        label="Resize diff panel"
-        testid="git-detail-resizer"
+        value={() => repoWidth}
+        min={GIT_REPO_MIN_WIDTH}
+        max={() => GIT_REPO_MAX_WIDTH}
+        label="Resize repository pane"
+        testid="git-repo-resizer"
         class="border-border/60 bg-panel hover:bg-focus w-1.5 border-x transition-colors"
-        onDraft={(px) => (draftDetailWidth = px)}
+        onDraft={(px) => (draftRepoWidth = px)}
         onCommit={(px) => {
-          layout.gitDetailWidth = px;
-          draftDetailWidth = null;
+          layout.gitRepoWidth = px;
+          draftRepoWidth = null;
         }}
         onReset={() => {
-          layout.gitDetailWidth = null;
-          draftDetailWidth = null;
+          layout.gitRepoWidth = GIT_REPO_DEFAULT_WIDTH;
+          draftRepoWidth = null;
         }}
       />
     {/if}
     <aside
-      bind:this={detailEl}
       class={cn(
-        "border-border/60 bg-raised flex min-h-0 flex-col border-l",
-        // The live max-width mirrors detailMaxWidth() in CSS (85% of the split
-        // container — the *actual* container, tighter than the store's
-        // viewport-based read clamp), so a persisted width is capped the
-        // moment the container shrinks. Never applied while expanded: that
-        // state is flex-1 and must fill the row.
-        detailExpanded ? "min-w-0 flex-1 border-l-0" : "max-w-[85%] shrink-0",
-        !detailExpanded && detailWidth === null && "w-2/3",
+        "border-border/60 bg-raised flex min-h-0 min-w-0 flex-1 flex-col border-l",
+        detailExpanded && "border-l-0",
       )}
-      style={!detailExpanded && detailWidth !== null ? `width: ${detailWidth}px` : undefined}
       data-testid="git-detail-sidebar"
       data-expanded={detailExpanded}
     >

@@ -4,7 +4,13 @@ import { page } from "vitest/browser";
 import { createRawSnippet } from "svelte";
 import SidebarPanel from "$lib/components/ui/SidebarPanel.svelte";
 import ResizableSidebarHost from "./ResizableSidebarHost.svelte";
-import { _testing, GIT_DETAIL_MIN_WIDTH, layout, sidebarMaxWidth } from "$lib/layout.svelte";
+import {
+  GIT_REPO_MAX_WIDTH,
+  SIDEBAR_MAX_WIDTH,
+  _testing,
+  layout,
+  sidebarMaxWidth,
+} from "$lib/layout.svelte";
 
 // The persisted-layout viewport clamp is geometry-coupled: it reads the real
 // window size and must produce a rendered rail that fits it. jsdom has no real
@@ -29,6 +35,7 @@ afterEach(() => {
 });
 
 test("a sidebar width saved on a larger monitor clamps to the live viewport on restore", async () => {
+  await page.viewport(700, 800);
   localStorage.setItem(
     STORAGE_KEY,
     JSON.stringify({
@@ -43,7 +50,7 @@ test("a sidebar width saved on a larger monitor clamps to the live viewport on r
   // expectation mirrors that: the live max, never the saved 5000.
   const expected = sidebarMaxWidth();
   expect(expected).toBeLessThan(5000);
-  expect(layout.projectsSidebarWidth).toBe(expected);
+  expect(layout.projectsSidebarWidth).toBe(SIDEBAR_MAX_WIDTH);
 
   render(SidebarPanel, {
     width: layout.projectsSidebarWidth,
@@ -54,15 +61,13 @@ test("a sidebar width saved on a larger monitor clamps to the live viewport on r
   await expect.poll(() => panel?.getBoundingClientRect().width).toBe(expected);
 });
 
-test("a stored git detail width clamps proportionally to the live viewport", () => {
+test("a stored git repo preference is independent of the live viewport", () => {
   localStorage.setItem(
     STORAGE_KEY,
-    JSON.stringify({ version: 1, layout: { gitDetailWidth: 12_000 } }),
+    JSON.stringify({ version: 1, layout: { gitRepoWidth: 12_000 } }),
   );
   _testing.reloadFromStorage();
-  expect(layout.gitDetailWidth).toBe(
-    Math.max(GIT_DETAIL_MIN_WIDTH, Math.round(window.innerWidth * 0.85)),
-  );
+  expect(layout.gitRepoWidth).toBe(GIT_REPO_MAX_WIDTH);
 });
 
 function hostSidebarWidth(): number {

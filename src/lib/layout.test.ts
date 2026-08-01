@@ -3,7 +3,11 @@ import {
   AGENTS_SIDEBAR_DEFAULT_WIDTH,
   DIFF_FILE_LIST_DEFAULT_WIDTH,
   DIFF_FILE_LIST_MAX_WIDTH,
+  GIT_REPO_DEFAULT_WIDTH,
+  GIT_REPO_MAX_WIDTH,
+  GIT_REPO_MIN_WIDTH,
   PROJECTS_SIDEBAR_DEFAULT_WIDTH,
+  SIDEBAR_MAX_WIDTH,
   SIDEBAR_MIN_WIDTH,
   _testing,
   layout,
@@ -38,7 +42,7 @@ describe("layout store", () => {
     expect(layout.agentsSidebarWidth).toBe(AGENTS_SIDEBAR_DEFAULT_WIDTH);
     expect(layout.projectsSidebarOpen).toBe(true);
     expect(layout.agentsSidebarOpen).toBe(true);
-    expect(layout.gitDetailWidth).toBeNull();
+    expect(layout.gitRepoWidth).toBe(GIT_REPO_DEFAULT_WIDTH);
     expect(layout.diffFileListWidth).toBe(DIFF_FILE_LIST_DEFAULT_WIDTH);
   });
 
@@ -47,24 +51,23 @@ describe("layout store", () => {
     layout.agentsSidebarWidth = 300;
     layout.projectsSidebarOpen = false;
     layout.agentsSidebarOpen = false;
-    layout.gitDetailWidth = 500;
+    layout.gitRepoWidth = 380;
     layout.diffFileListWidth = 300;
     _testing.reloadFromStorage();
     expect(layout.projectsSidebarWidth).toBe(320);
     expect(layout.agentsSidebarWidth).toBe(300);
     expect(layout.projectsSidebarOpen).toBe(false);
     expect(layout.agentsSidebarOpen).toBe(false);
-    expect(layout.gitDetailWidth).toBe(500);
+    expect(layout.gitRepoWidth).toBe(380);
     expect(layout.diffFileListWidth).toBe(300);
   });
 
-  it("clamps a sidebar width saved on a larger monitor against the current viewport", () => {
+  it("validates a stored sidebar preference without replacing it with the live viewport cap", () => {
     seed({
       version: 1,
       layout: { projectsSidebar: { width: 5000, open: true } },
     });
-    expect(layout.projectsSidebarWidth).toBe(sidebarMaxWidth());
-    expect(layout.projectsSidebarWidth).toBeLessThanOrEqual(Math.round(1024 * 0.4));
+    expect(layout.projectsSidebarWidth).toBe(SIDEBAR_MAX_WIDTH);
   });
 
   it("sidebarMaxWidth follows the viewport but never exceeds 480", () => {
@@ -74,11 +77,32 @@ describe("layout store", () => {
     expect(sidebarMaxWidth()).toBe(480);
   });
 
-  it("clamps a stored git detail width against the viewport and floors it at its minimum", () => {
-    seed({ version: 1, layout: { gitDetailWidth: 10_000 } });
-    expect(layout.gitDetailWidth).toBe(Math.round(1024 * 0.85));
-    seed({ version: 1, layout: { gitDetailWidth: 10 } });
-    expect(layout.gitDetailWidth).toBe(360);
+  it("clamps a stored git repo preference to its absolute bounds", () => {
+    seed({ version: 1, layout: { gitRepoWidth: 10_000 } });
+    expect(layout.gitRepoWidth).toBe(GIT_REPO_MAX_WIDTH);
+    seed({ version: 1, layout: { gitRepoWidth: 10 } });
+    expect(layout.gitRepoWidth).toBe(GIT_REPO_MIN_WIDTH);
+  });
+
+  it("preserves preferred widths when an unrelated change persists after a narrow launch", () => {
+    setViewportWidth(700);
+    seed({
+      version: 1,
+      layout: {
+        projectsSidebar: { width: SIDEBAR_MAX_WIDTH, open: true },
+        agentsSidebar: { width: SIDEBAR_MAX_WIDTH, open: true },
+        gitRepoWidth: GIT_REPO_MAX_WIDTH,
+      },
+    });
+
+    layout.projectsSidebarOpen = false;
+    setViewportWidth(1400);
+    _testing.reloadFromStorage();
+
+    expect(layout.projectsSidebarWidth).toBe(SIDEBAR_MAX_WIDTH);
+    expect(layout.agentsSidebarWidth).toBe(SIDEBAR_MAX_WIDTH);
+    expect(layout.gitRepoWidth).toBe(GIT_REPO_MAX_WIDTH);
+    expect(layout.projectsSidebarOpen).toBe(false);
   });
 
   it("clamps widths on write, not only on read", () => {
@@ -88,11 +112,18 @@ describe("layout store", () => {
     expect(layout.diffFileListWidth).toBe(DIFF_FILE_LIST_MAX_WIDTH);
   });
 
-  it("setting gitDetailWidth back to null persists the unset state", () => {
-    layout.gitDetailWidth = 500;
-    layout.gitDetailWidth = null;
+  it("ignores the retired detail width without resetting other stored layout", () => {
+    seed({
+      version: 1,
+      layout: {
+        projectsSidebar: { width: 320, open: false },
+        gitDetailWidth: 500,
+      },
+    });
     _testing.reloadFromStorage();
-    expect(layout.gitDetailWidth).toBeNull();
+    expect(layout.projectsSidebarWidth).toBe(320);
+    expect(layout.projectsSidebarOpen).toBe(false);
+    expect(layout.gitRepoWidth).toBe(GIT_REPO_DEFAULT_WIDTH);
   });
 
   it("degrades a corrupt blob to defaults", () => {
@@ -109,13 +140,13 @@ describe("layout store", () => {
       version: 1,
       layout: {
         projectsSidebar: { width: "wide", open: "yes" },
-        gitDetailWidth: "big",
+        gitRepoWidth: "big",
         diffFileListWidth: Number.NaN,
       },
     });
     expect(layout.projectsSidebarWidth).toBe(PROJECTS_SIDEBAR_DEFAULT_WIDTH);
     expect(layout.projectsSidebarOpen).toBe(true);
-    expect(layout.gitDetailWidth).toBeNull();
+    expect(layout.gitRepoWidth).toBe(GIT_REPO_DEFAULT_WIDTH);
     expect(layout.diffFileListWidth).toBe(DIFF_FILE_LIST_DEFAULT_WIDTH);
   });
 

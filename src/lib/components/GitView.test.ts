@@ -551,7 +551,7 @@ describe("GitView", () => {
     // diff panel renders until a branch/commit/worktree is selected.
     expect(screen.queryByTestId("diff-panel")).not.toBeInTheDocument();
     expect(screen.getByTestId("git-detail-sidebar")).toBeInTheDocument();
-    expect(screen.getByTestId("git-detail-resizer")).toBeInTheDocument();
+    expect(screen.getByTestId("git-repo-resizer")).toBeInTheDocument();
     expect(screen.getByTestId("git-detail-empty")).toHaveTextContent("Select a commit");
 
     // Click the `main` branch row (dirty worktree → defaults to its uncommitted
@@ -563,7 +563,7 @@ describe("GitView", () => {
 
     await waitFor(() => expect(screen.getByTestId("diff-panel")).toBeInTheDocument());
     expect(screen.getByTestId("git-detail-sidebar")).toBeInTheDocument();
-    expect(screen.getByTestId("git-detail-resizer")).toBeInTheDocument();
+    expect(screen.getByTestId("git-repo-resizer")).toBeInTheDocument();
     // Dirty branch → the panel opens on uncommitted changes…
     expect(screen.getByTestId("detail-title")).toHaveTextContent("Uncommitted changes");
     // …and the branch's commits load into the tree.
@@ -595,12 +595,12 @@ describe("GitView", () => {
     await fireEvent.click(screen.getByTestId("detail-expand-toggle"));
     expect(screen.getByTestId("git-detail-sidebar")).toHaveAttribute("data-expanded", "true");
     expect(screen.queryByTestId("git-repo-list")).not.toBeInTheDocument();
-    expect(screen.queryByTestId("git-detail-resizer")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("git-repo-resizer")).not.toBeInTheDocument();
 
     await fireEvent.keyDown(window, { key: "D", metaKey: true, shiftKey: true });
     expect(screen.getByTestId("git-detail-sidebar")).toHaveAttribute("data-expanded", "false");
     expect(screen.getByTestId("git-repo-list")).toBeInTheDocument();
-    expect(screen.getByTestId("git-detail-resizer")).toBeInTheDocument();
+    expect(screen.getByTestId("git-repo-resizer")).toBeInTheDocument();
 
     await fireEvent.keyDown(window, { key: "d", ctrlKey: true, shiftKey: true });
     expect(screen.getByTestId("git-detail-sidebar")).toHaveAttribute("data-expanded", "true");

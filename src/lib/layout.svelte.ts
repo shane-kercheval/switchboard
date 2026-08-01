@@ -1,5 +1,5 @@
 /// Persisted app-layout preferences: sidebar widths + collapse state, the Git
-/// view's detail-pane width, and the diff panel's file-list width.
+/// view's repository-pane width, and the diff panel's file-list width.
 ///
 /// **Global per device, not per project.** A sidebar's width expresses a fact
 /// about your monitor and reading preference — it means the same thing in every
@@ -14,16 +14,11 @@
 /// defaults — layout is ergonomic, not load-bearing.
 ///
 /// Widths are pixels, deliberately: a 280px rail should stay 280px on a bigger
-/// monitor (the content area is what should grow). The pixel representation is
-/// kept honest in two layers. This store sanitizes on read and write — a value
-/// from a bigger monitor (or a hand-edited blob) is clamped against the current
-/// viewport before it's ever returned. The *live* bound is CSS: each consumer
-/// mirrors its clamp as a `max-width` (SidebarPanel, the Git detail aside, the
-/// diff file list), so a mid-session window shrink caps the rendered width
-/// immediately — and because the stored preference is never rewritten by that
-/// shrink, the panel re-expands when the window grows back. `ResizeHandle`
-/// clamps its start value to the same live bound, so a drag begins from the
-/// width on screen, not the invisible stored one.
+/// monitor (the content area is what should grow). The store retains the user's
+/// preferred width within each pane's absolute bounds. Sidebars additionally
+/// apply a viewport-relative live cap in CSS, but that temporary rendered width
+/// never replaces the stored preference. The Git repository and changed-files
+/// panes do not have live caps: the diff canvas alone absorbs window resizing.
 
 const STORAGE_KEY = "switchboard-layout";
 const STORAGE_VERSION = 1;
@@ -32,11 +27,13 @@ const STORAGE_VERSION = 1;
 /// untouched install looks identical.
 export const PROJECTS_SIDEBAR_DEFAULT_WIDTH = 288;
 export const AGENTS_SIDEBAR_DEFAULT_WIDTH = 240;
+export const GIT_REPO_DEFAULT_WIDTH = 360;
 export const DIFF_FILE_LIST_DEFAULT_WIDTH = 256;
 
 export const SIDEBAR_MIN_WIDTH = 200;
-/// The Git detail pane's minimum, shared by its drag clamp and the read clamp.
-export const GIT_DETAIL_MIN_WIDTH = 360;
+export const SIDEBAR_MAX_WIDTH = 480;
+export const GIT_REPO_MIN_WIDTH = 240;
+export const GIT_REPO_MAX_WIDTH = 480;
 export const DIFF_FILE_LIST_MIN_WIDTH = 176;
 export const DIFF_FILE_LIST_MAX_WIDTH = 440;
 
@@ -47,19 +44,18 @@ function viewportWidth(): number {
 /// Live upper bound for a sidebar: never wider than 480px or 40% of the
 /// viewport — a rail, not a split view.
 export function sidebarMaxWidth(): number {
-  return Math.max(SIDEBAR_MIN_WIDTH, Math.min(480, Math.round(viewportWidth() * 0.4)));
+  return Math.max(
+    SIDEBAR_MIN_WIDTH,
+    Math.min(SIDEBAR_MAX_WIDTH, Math.round(viewportWidth() * 0.4)),
+  );
 }
 
 function clampSidebarWidth(px: number): number {
-  return Math.min(sidebarMaxWidth(), Math.max(SIDEBAR_MIN_WIDTH, Math.round(px)));
+  return Math.min(SIDEBAR_MAX_WIDTH, Math.max(SIDEBAR_MIN_WIDTH, Math.round(px)));
 }
 
-/// The detail pane's drag clamp is 85% of its live split container; on read the
-/// viewport is the best available stand-in for that container.
-function clampGitDetailWidth(px: number | null): number | null {
-  if (px === null) return null;
-  const max = Math.max(GIT_DETAIL_MIN_WIDTH, Math.round(viewportWidth() * 0.85));
-  return Math.min(max, Math.max(GIT_DETAIL_MIN_WIDTH, Math.round(px)));
+function clampGitRepoWidth(px: number): number {
+  return Math.min(GIT_REPO_MAX_WIDTH, Math.max(GIT_REPO_MIN_WIDTH, Math.round(px)));
 }
 
 function clampDiffFileListWidth(px: number): number {
@@ -71,8 +67,7 @@ type SidebarLayout = { width: number; open: boolean };
 type LayoutState = {
   projectsSidebar: SidebarLayout;
   agentsSidebar: SidebarLayout;
-  /// null = never dragged: the Git view keeps its CSS default (2/3 of the split).
-  gitDetailWidth: number | null;
+  gitRepoWidth: number;
   diffFileListWidth: number;
 };
 
@@ -80,7 +75,7 @@ function defaults(): LayoutState {
   return {
     projectsSidebar: { width: PROJECTS_SIDEBAR_DEFAULT_WIDTH, open: true },
     agentsSidebar: { width: AGENTS_SIDEBAR_DEFAULT_WIDTH, open: true },
-    gitDetailWidth: null,
+    gitRepoWidth: GIT_REPO_DEFAULT_WIDTH,
     diffFileListWidth: DIFF_FILE_LIST_DEFAULT_WIDTH,
   };
 }
@@ -111,16 +106,16 @@ function readStored(): LayoutState {
     const v = envelope.layout as {
       projectsSidebar?: unknown;
       agentsSidebar?: unknown;
-      gitDetailWidth?: unknown;
+      gitRepoWidth?: unknown;
       diffFileListWidth?: unknown;
     };
     return {
       projectsSidebar: parseSidebar(v.projectsSidebar, base.projectsSidebar),
       agentsSidebar: parseSidebar(v.agentsSidebar, base.agentsSidebar),
-      gitDetailWidth:
-        typeof v.gitDetailWidth === "number" && Number.isFinite(v.gitDetailWidth)
-          ? clampGitDetailWidth(v.gitDetailWidth)
-          : null,
+      gitRepoWidth:
+        typeof v.gitRepoWidth === "number" && Number.isFinite(v.gitRepoWidth)
+          ? clampGitRepoWidth(v.gitRepoWidth)
+          : base.gitRepoWidth,
       diffFileListWidth:
         typeof v.diffFileListWidth === "number" && Number.isFinite(v.diffFileListWidth)
           ? clampDiffFileListWidth(v.diffFileListWidth)
@@ -171,11 +166,11 @@ export const layout = {
     state.agentsSidebar.open = open;
     persist();
   },
-  get gitDetailWidth(): number | null {
-    return state.gitDetailWidth;
+  get gitRepoWidth(): number {
+    return state.gitRepoWidth;
   },
-  set gitDetailWidth(px: number | null) {
-    state.gitDetailWidth = clampGitDetailWidth(px);
+  set gitRepoWidth(px: number) {
+    state.gitRepoWidth = clampGitRepoWidth(px);
     persist();
   },
   get diffFileListWidth(): number {

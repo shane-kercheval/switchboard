@@ -91,16 +91,9 @@
   let diffToken = 0;
   let filesKey: string | null = null;
   let diffKey: string | null = null;
-  let bodyEl = $state<HTMLDivElement | null>(null);
   /// Live width during a resize drag; the layout store commits on pointer-up.
   let draftFileListWidth = $state<number | null>(null);
   const fileListWidth = $derived(draftFileListWidth ?? layout.diffFileListWidth);
-
-  function fileListMaxWidth(): number {
-    return bodyEl === null
-      ? DIFF_FILE_LIST_MAX_WIDTH
-      : Math.min(DIFF_FILE_LIST_MAX_WIDTH, bodyEl.getBoundingClientRect().width * 0.55);
-  }
 
   // Stable identity for the selected target — changes when the user picks a
   // different commit or worktree, the signal the load effects key on.
@@ -522,16 +515,14 @@
       <EmptyState testid="detail-no-changes" title="This commit changed no files." />
     {/if}
   {:else}
-    <div class="flex min-h-0 flex-1 overflow-hidden" bind:this={bodyEl}>
+    <div class="flex min-h-0 flex-1 overflow-hidden">
       <!-- Changed-files list. Raised like the diff it belongs to — the border
            carries the column boundary, so the pane isn't a gray column with a
-           grayer header inside a white drawer. The max-width mirrors
-           fileListMaxWidth() in CSS (55% of the body, capped at 440px) so a
-           persisted width is bounded live as the panel shrinks; keep the two
-           formulas in sync. -->
+           grayer header inside a white drawer. -->
       <div
-        class="border-border/60 bg-raised max-w-[clamp(176px,55%,440px)] shrink-0 overflow-hidden border-r"
+        class="border-border/60 bg-raised shrink-0 overflow-hidden border-r"
         style={`width: ${fileListWidth}px`}
+        data-testid="changed-files-list"
       >
         <div class="border-border/60 flex h-8 items-center justify-between border-b px-2">
           <span class="text-muted text-[11px] font-semibold tracking-wide uppercase">
@@ -677,7 +668,7 @@
       <ResizeHandle
         value={() => fileListWidth}
         min={DIFF_FILE_LIST_MIN_WIDTH}
-        max={fileListMaxWidth}
+        max={() => DIFF_FILE_LIST_MAX_WIDTH}
         label="Resize changed files list"
         testid="changed-files-resizer"
         class="border-border/60 bg-panel hover:bg-focus w-1.5 border-r transition-colors"

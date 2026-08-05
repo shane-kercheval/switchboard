@@ -67,6 +67,53 @@ test("concurrent fan-out responses retain independent live caps", async () => {
   }
 });
 
+test("a small scroll up inside a live cap releases its pin; other columns keep following", async () => {
+  // Each capped fan-out column pins to its own bottom independently. The same
+  // streaming-escape contract as the outer transcript applies inside a cap: one
+  // small upward scroll (well inside the 32px re-pin threshold) must release
+  // that column's pin immediately — under the old distance rule every streamed
+  // token re-pinned the cap and a gentle scroll could never escape. The sibling
+  // column must keep following its own stream, untouched.
+  await registerAgent(ALICE);
+  await registerAgent(BOB);
+  const column = (agentId: string, turnId: string, lines: number) => [
+    userTurn({ id: `user-${turnId}`, agentId, text: "compare", sendId: "send-fanout" }),
+    agentTurn({
+      id: turnId,
+      agentId,
+      status: "streaming" as const,
+      sendId: "send-fanout",
+      items: [textItem(longText(lines))],
+    }),
+  ];
+  seedTurns(ALICE.id, column(ALICE.id, "alice-streaming", 60));
+  seedTurns(BOB.id, column(BOB.id, "bob-streaming", 60));
+
+  mountTranscript({ projectId: PROJECT_ID, agents: [ALICE, BOB] });
+
+  const caps = page.getByTestId("turn-live-scroll");
+  await expect.poll(() => caps.elements().length).toBe(2);
+  const capGap = (el: Element): number => el.scrollHeight - el.scrollTop - el.clientHeight;
+  // Both caps overflow and start pinned to their own bottoms.
+  for (const cap of caps.elements()) {
+    await expect.poll(() => cap.scrollHeight - cap.clientHeight).toBeGreaterThan(1);
+    await expect.poll(() => capGap(cap)).toBeLessThan(32);
+  }
+
+  // One small wheel tick inside the first column's cap.
+  const first = caps.elements()[0] as HTMLElement;
+  first.scrollTop = first.scrollTop - 5;
+  first.dispatchEvent(new Event("scroll"));
+
+  // Both streams grow. The scrolled column must hold its place (its gap widens
+  // by the growth); the sibling must stay pinned to its bottom.
+  seedTurns(ALICE.id, column(ALICE.id, "alice-streaming", 90));
+  seedTurns(BOB.id, column(BOB.id, "bob-streaming", 90));
+
+  await expect.poll(() => capGap(caps.elements()[0] as HTMLElement)).toBeGreaterThan(50);
+  await expect.poll(() => capGap(caps.elements()[1] as HTMLElement)).toBeLessThan(32);
+});
+
 test("the stop control stays fixed when elapsed seconds gain a digit", async () => {
   await registerAgent(ALICE);
   seedTurns(ALICE.id, [

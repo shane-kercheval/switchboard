@@ -30,6 +30,7 @@
 <div class="text-xs" data-testid="turn-thinking">
   <button
     type="button"
+    data-layout-toggle
     class="hover:bg-hover flex min-h-7 w-full items-center gap-2 rounded-md px-1.5 py-1 text-left"
     aria-expanded={open}
     data-testid="thinking-row"

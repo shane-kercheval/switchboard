@@ -226,6 +226,7 @@
   {#if capped}
     <button
       type="button"
+      data-layout-toggle
       class="text-muted hover:text-fg text-[11px] transition-colors"
       data-testid={expandTestid}
       onclick={() => setOpen(true)}
@@ -238,6 +239,7 @@
 {#snippet deferredEditPreview(testid: string)}
   <button
     type="button"
+    data-layout-toggle
     class="text-muted hover:text-fg text-[11px] transition-colors"
     data-testid={testid}
     onclick={() => setOpen(true)}
@@ -265,6 +267,7 @@
   {#if capped}
     <button
       type="button"
+      data-layout-toggle
       class="text-muted hover:text-fg text-[11px] transition-colors"
       data-testid={expandTestid}
       onclick={() => setOpen(true)}
@@ -298,6 +301,7 @@
 <div class="text-xs" data-testid="turn-tool" data-tool-use-id={tool.tool_use_id}>
   <button
     type="button"
+    data-layout-toggle
     class="hover:bg-hover flex min-h-7 w-full items-center gap-2 rounded-md px-1.5 py-1 text-left"
     aria-expanded={open}
     data-testid="tool-row"
@@ -605,6 +609,7 @@
       {#if open && !generic}
         <button
           type="button"
+          data-layout-toggle
           class="text-muted hover:text-fg text-[11px] transition-colors"
           data-testid="tool-raw-toggle"
           onclick={() => (rawOpen = !rawOpen)}

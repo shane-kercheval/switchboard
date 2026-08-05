@@ -1625,8 +1625,9 @@ describe("UnifiedTranscript — markdown rendering", () => {
     await waitFor(() => expect(container.scrollTop).toBe(1000));
 
     // User scrolls up: 200px from the bottom (1000 - 300 - 500), so not pinned.
-    // A bare scroll event with UNCHANGED height is user-initiated — this is the
-    // scrollbar-drag / keyboard case (no wheel or touch involved).
+    // A bare scroll event whose scrollTop DECREASED while the scrollable extent
+    // held is user-initiated — this is the scrollbar-drag / keyboard case (no
+    // wheel or touch involved).
     container.scrollTop = 300;
     await fireEvent.scroll(container);
 
@@ -1645,11 +1646,57 @@ describe("UnifiedTranscript — markdown rendering", () => {
     });
   });
 
-  it("does not unpin on a layout-induced scroll (content height changed)", async () => {
-    // The browser clamps scrollTop (and fires `scroll`) when content shrinks on
-    // collapse — that must NOT be read as the user scrolling away, or the next
-    // re-anchor jumps to a stale position. A `scroll` whose height differs from
-    // the last anchor is layout-induced and leaves `pinned` alone.
+  it("does not unpin when a collapse clamps scrollTop (extent shrank)", async () => {
+    // The browser clamps scrollTop down (and fires `scroll`) when content
+    // shrinks on collapse — that must NOT be read as the user scrolling away,
+    // or the next re-anchor jumps to a stale position. A downward-scrollTop
+    // event whose scrollable extent SHRANK is a clamp, not the user.
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    const container = screen.getByTestId("unified-transcript");
+    Object.defineProperty(container, "scrollHeight", { configurable: true, value: 2000 });
+    Object.defineProperty(container, "clientHeight", { configurable: true, value: 500 });
+
+    fireTo(`agent:${CLAUDE_AGENT.id}`, {
+      type: "turn_start",
+      turn_id: "turn-1",
+      message_id: "msg-1",
+      send_id: "msg-1",
+      started_at: "2026-05-16T00:00:00Z",
+    });
+    fireTo(`agent:${CLAUDE_AGENT.id}`, {
+      type: "content_chunk",
+      turn_id: "turn-1",
+      kind: "text",
+      text: "x",
+    });
+    await waitFor(() => expect(container.scrollTop).toBe(2000)); // pinned
+
+    // Content collapses: the extent shrinks (2000 → 1000) and the browser clamps
+    // scrollTop to the new bottom (maxScroll = 1000 - 500), firing `scroll`.
+    Object.defineProperty(container, "scrollHeight", { configurable: true, value: 1000 });
+    container.scrollTop = 500;
+    await fireEvent.scroll(container); // scrollTop dropped BUT extent shrank → clamp, not user
+
+    // Still pinned: the next content change re-pins to the bottom.
+    fireTo(`agent:${CLAUDE_AGENT.id}`, {
+      type: "content_chunk",
+      turn_id: "turn-1",
+      kind: "text",
+      text: "y",
+    });
+    await waitFor(() => expect(container.scrollTop).toBe(1000));
+  });
+
+  it("does not unpin when a viewport-growth resize clamps scrollTop", async () => {
+    // Growing the viewport (window resize, pane divider) shrinks the scrollable
+    // extent with scrollHeight UNCHANGED; the browser clamps scrollTop down and
+    // fires `scroll`. Attribution must compare the extent (scrollHeight −
+    // clientHeight), not scrollHeight — a height-only comparison would misread
+    // this clamp as the user scrolling up and break auto-follow on resize.
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
 
@@ -1672,23 +1719,193 @@ describe("UnifiedTranscript — markdown rendering", () => {
       kind: "text",
       text: "x",
     });
-    await waitFor(() => expect(container.scrollTop).toBe(1000)); // pinned, lastScrollHeight=1000
+    await waitFor(() => expect(container.scrollTop).toBe(1000)); // pinned
 
-    // A content change leaves scrollTop far from the bottom AND fires `scroll`
-    // with a different height — the collapse-clamp shape.
-    Object.defineProperty(container, "scrollHeight", { configurable: true, value: 2000 });
-    container.scrollTop = 100; // gap of 2000 - 100 - 500 = 1400, well past the 32px threshold
-    await fireEvent.scroll(container); // height (2000) !== lastScrollHeight (1000) → must not unpin
+    // Viewport grows 500 → 800: extent shrinks to 200, scrollTop clamps to it.
+    Object.defineProperty(container, "clientHeight", { configurable: true, value: 800 });
+    container.scrollTop = 200;
+    await fireEvent.scroll(container); // scrollTop dropped BUT extent shrank → clamp, not user
 
-    // Still pinned: the next content change re-pins to the bottom (2000), not the
-    // preserve-distance position (2000 - 500 - 1400 = 100) it would land on if unpinned.
+    // Still pinned: the next content change re-pins to the bottom.
     fireTo(`agent:${CLAUDE_AGENT.id}`, {
       type: "content_chunk",
       turn_id: "turn-1",
       kind: "text",
       text: "y",
     });
-    await waitFor(() => expect(container.scrollTop).toBe(2000));
+    await waitFor(() => expect(container.scrollTop).toBe(1000));
+  });
+
+  it("a small scroll up unpins immediately, and the gap-hold's own write can't re-pin", async () => {
+    // The core streaming-escape contract: unpinning keys on scroll DIRECTION,
+    // not on distance from the bottom, so a single small wheel tick — still
+    // within the 32px re-pin threshold — stops auto-follow even while chunks
+    // are re-pinning the view many times a second. The second act guards the
+    // snapshot discipline: the gap-hold's own downward scrollTop write echoes a
+    // `scroll` event, and because the write refreshed the snapshots that echo
+    // computes a zero delta — without that, a just-unpinned view sitting <32px
+    // from the bottom would be re-pinned by its own hold and slammed down on
+    // the next chunk.
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    const container = screen.getByTestId("unified-transcript");
+    Object.defineProperty(container, "scrollHeight", { configurable: true, value: 1000 });
+    Object.defineProperty(container, "clientHeight", { configurable: true, value: 500 });
+
+    fireTo(`agent:${CLAUDE_AGENT.id}`, {
+      type: "turn_start",
+      turn_id: "turn-1",
+      message_id: "msg-1",
+      send_id: "msg-1",
+      started_at: "2026-05-16T00:00:00Z",
+    });
+    fireTo(`agent:${CLAUDE_AGENT.id}`, {
+      type: "content_chunk",
+      turn_id: "turn-1",
+      kind: "text",
+      text: "streaming",
+    });
+    await waitFor(() => expect(container.scrollTop).toBe(1000));
+
+    // jsdom doesn't clamp our pin write (scrollTop = scrollHeight); emulate the
+    // browser settling it onto the real bottom (maxScroll = 500) and echoing a
+    // `scroll` — at the bottom this is inert either way.
+    container.scrollTop = 500;
+    await fireEvent.scroll(container);
+
+    // One small wheel tick: 5px up — well inside the 32px threshold. Direction
+    // says user; must unpin NOW.
+    container.scrollTop = 495;
+    await fireEvent.scroll(container);
+
+    // A chunk grows the content: the view must hold the 5px gap (gap-hold →
+    // (1200-500) - 5 = 695), not follow to the bottom.
+    Object.defineProperty(container, "scrollHeight", { configurable: true, value: 1200 });
+    fireTo(`agent:${CLAUDE_AGENT.id}`, {
+      type: "content_chunk",
+      turn_id: "turn-1",
+      kind: "text",
+      text: " grows",
+    });
+    await waitFor(() => expect(container.scrollTop).toBe(695));
+
+    // The browser echoes the gap-hold's own write as a `scroll` event. Zero
+    // delta against the refreshed snapshots → still unpinned.
+    await fireEvent.scroll(container);
+
+    // Next chunk: the gap must STILL hold ((1400-500) - 5 = 895, not 1400).
+    Object.defineProperty(container, "scrollHeight", { configurable: true, value: 1400 });
+    fireTo(`agent:${CLAUDE_AGENT.id}`, {
+      type: "content_chunk",
+      turn_id: "turn-1",
+      kind: "text",
+      text: " and grows again",
+    });
+    await waitFor(() => expect(container.scrollTop).toBe(895));
+  });
+
+  it("a sub-pixel downward drift is honored by the next gap-hold, not undone", async () => {
+    // Downward intent accumulates just like upward intent: a slow drift of
+    // sub-epsilon events classifies once the total crosses the epsilon, which
+    // refreshes the stored gap. Without that, the next streamed chunk would
+    // gap-hold to the stale pre-drift position and silently undo the user's
+    // movement.
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    const container = screen.getByTestId("unified-transcript");
+    Object.defineProperty(container, "scrollHeight", { configurable: true, value: 1000 });
+    Object.defineProperty(container, "clientHeight", { configurable: true, value: 500 });
+
+    fireTo(`agent:${CLAUDE_AGENT.id}`, {
+      type: "turn_start",
+      turn_id: "turn-1",
+      message_id: "msg-1",
+      send_id: "msg-1",
+      started_at: "2026-05-16T00:00:00Z",
+    });
+    fireTo(`agent:${CLAUDE_AGENT.id}`, {
+      type: "content_chunk",
+      turn_id: "turn-1",
+      kind: "text",
+      text: "streaming",
+    });
+    await waitFor(() => expect(container.scrollTop).toBe(1000));
+
+    // Unpin 200px above the bottom.
+    container.scrollTop = 300;
+    await fireEvent.scroll(container);
+
+    // Drift 7.5px down through ten 0.75px events — every one below the
+    // per-event epsilon; the signed total classifies on alternating events.
+    for (let i = 1; i <= 10; i++) {
+      container.scrollTop = 300 + i * 0.75;
+      await fireEvent.scroll(container);
+    }
+
+    // The next chunk must hold the drifted gap (500 - 307.5 = 192.5), landing
+    // at (1200-500) - 192.5 = 507.5 — not the stale pre-drift 500.
+    Object.defineProperty(container, "scrollHeight", { configurable: true, value: 1200 });
+    fireTo(`agent:${CLAUDE_AGENT.id}`, {
+      type: "content_chunk",
+      turn_id: "turn-1",
+      kind: "text",
+      text: " grows",
+    });
+    await waitFor(() => expect(container.scrollTop).toBe(507.5));
+  });
+
+  it("a genuine downward scroll to the bottom re-pins", async () => {
+    // Re-pinning is the one place the 32px threshold still applies, and it
+    // requires genuine downward movement — programmatic writes are excluded by
+    // the snapshot discipline, so only the user returning to the bottom
+    // re-engages auto-follow.
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    const container = screen.getByTestId("unified-transcript");
+    Object.defineProperty(container, "scrollHeight", { configurable: true, value: 1000 });
+    Object.defineProperty(container, "clientHeight", { configurable: true, value: 500 });
+
+    fireTo(`agent:${CLAUDE_AGENT.id}`, {
+      type: "turn_start",
+      turn_id: "turn-1",
+      message_id: "msg-1",
+      send_id: "msg-1",
+      started_at: "2026-05-16T00:00:00Z",
+    });
+    fireTo(`agent:${CLAUDE_AGENT.id}`, {
+      type: "content_chunk",
+      turn_id: "turn-1",
+      kind: "text",
+      text: "first",
+    });
+    await waitFor(() => expect(container.scrollTop).toBe(1000));
+
+    // Scroll far up: unpinned.
+    container.scrollTop = 100;
+    await fireEvent.scroll(container);
+
+    // Scroll back down to 20px from the bottom: downward + within 32px → re-pin.
+    container.scrollTop = 480;
+    await fireEvent.scroll(container);
+
+    // New content follows to the bottom again.
+    Object.defineProperty(container, "scrollHeight", { configurable: true, value: 1200 });
+    fireTo(`agent:${CLAUDE_AGENT.id}`, {
+      type: "content_chunk",
+      turn_id: "turn-1",
+      kind: "text",
+      text: " more",
+    });
+    await waitFor(() => expect(container.scrollTop).toBe(1200));
   });
 
   it("intercepts a link click, routes it to open_external_url, and prevents navigation", async () => {

@@ -3,6 +3,7 @@
   import type { AgentRecord, Attachment, ConversationItem, ProjectId } from "$lib/types";
   import { HEARTBEAT_TIMEOUT_MS } from "$lib/types";
   import { cn, formatDuration } from "$lib/utils";
+  import { createPinTracker, type ScrollGeometry } from "$lib/scrollPin";
   import { convertFileSrc } from "@tauri-apps/api/core";
   import {
     ChevronRight,
@@ -632,23 +633,30 @@
   // its position on *any* height change — a message collapsing/expanding, a
   // fan-out toggling, the live cap being removed when a turn completes — so
   // nothing jerks and whatever the user clicked stays put. We measure height
-  // changes with a ResizeObserver and re-anchor ourselves because WebKit (the
-  // Tauri webview) has no native CSS scroll-anchoring.
+  // changes with a ResizeObserver and re-anchor ourselves: WebKit (the Tauri
+  // webview) exposes no CSS `overflow-anchor` control, and while the engine
+  // does self-adjust for growth above the viewport (see the "anchor"
+  // attribution in $lib/scrollPin.ts), that built-in behavior covers neither
+  // the follow-the-bottom nor the gap-hold contracts.
   let container = $state<HTMLDivElement | null>(null);
   let content = $state<HTMLDivElement | null>(null);
-  let pinned = $state<boolean>(true);
+  // Pin attribution (user-up unpins, user-down near the bottom re-pins,
+  // clamps and our own writes are inert) lives in the shared tracker — see
+  // $lib/scrollPin.ts for the state machine. The inner live caps run their own
+  // instances in `liveScroll`, so outer and inner cannot drift apart.
+  const outerPin = createPinTracker();
   // The user's saved gap from the bottom, updated only by real scrolls. Holding
   // it constant across a resize keeps every element whose content-below is
   // unchanged (e.g. the toggle you just clicked) at the same place on screen.
   let distanceFromBottom = 0;
-  // Content height at the last (re)anchor or scroll. A `scroll` event whose
-  // height matches this is genuinely user-initiated (the content didn't change),
-  // so it may unpin; one with a *different* height is the browser clamping
-  // `scrollTop` as content changed (a message collapsing, the live cap dropping
-  // on completion) and must NOT flip us off the bottom — otherwise the re-anchor
-  // jumps to a stale position. Discriminating by content-change rather than by
-  // input device is what lets scrollbar-drag and keyboard scrolling work too.
-  let lastScrollHeight = 0;
+
+  function geometryOf(el: Element): ScrollGeometry {
+    return {
+      scrollTop: el.scrollTop,
+      scrollHeight: el.scrollHeight,
+      clientHeight: el.clientHeight,
+    };
+  }
 
   // The block at the top of the viewport (re-captured on every user scroll and
   // after every re-anchor pass), its offset from the viewport top, and its
@@ -659,19 +667,32 @@
   // the viewport (a streaming response growing, a new turn arriving — the
   // read-while-streaming bug), and an upward reveal prepends a batch ABOVE it.
   // The gap is kept for two cases only:
-  // - the change happened INSIDE the anchor block (its own height moved): the
-  //   user expanded/collapsed the thing they're looking at, and the contract
-  //   there is "the toggle I clicked stays put" — which gap-hold provides,
-  //   since the toggle sits below the growth (footer-anchor test);
+  // - the change happened INSIDE the anchor block (its own height moved) and
+  //   the block is settled: the user expanded/collapsed the thing they're
+  //   looking at, and the contract there is "the toggle I clicked stays put" —
+  //   which gap-hold provides, since the toggle sits below the growth
+  //   (footer-anchor test). In-block growth attributed to STREAM APPEND (see
+  //   the `streamAppend` provenance test in `reanchor`) is the opposite: it
+  //   lands at the block's bottom, below what the user is reading, so the
+  //   anchor restore applies despite the height change — otherwise an
+  //   unpinned view inside a viewport-spanning streaming message would keep
+  //   following the stream at a held gap;
   // - the anchor target is unreachable: content below shrank past the clamp (a
   //   real collapse), where the contract is "hold the gap, don't slam into the
   //   bottom" (scroll-hold tests).
   let anchorEl: Element | null = null;
   let anchorOffset = 0;
   let anchorHeight = 0;
+  // Whether the anchor block hosted a live streaming region at capture time.
+  // Lets `reanchor` recognize the live→settled completion transition, where
+  // the region unmounts before the pass runs. ASSIGNED on every capture, never
+  // OR-accumulated — a stale `true` would waive the anchor-height check for
+  // every future toggle in a block that once streamed.
+  let anchorHadLiveRegion = false;
 
   function captureAnchor(): void {
     anchorEl = null;
+    anchorHadLiveRegion = false;
     if (!container || content === null) return;
     const viewportTop = container.getBoundingClientRect().top;
     // Blocks are in document order, so the first one whose bottom edge crosses
@@ -696,16 +717,24 @@
     const rect = anchorEl.getBoundingClientRect();
     anchorOffset = rect.top - viewportTop;
     anchorHeight = rect.height;
+    anchorHadLiveRegion = anchorEl.querySelector("[data-live-region]") !== null;
   }
 
   function onScroll(): void {
     if (!container) return;
-    distanceFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
-    if (container.scrollHeight === lastScrollHeight) {
-      pinned = distanceFromBottom < 32;
+    const attribution = outerPin.onScrollEvent(geometryOf(container));
+    // Genuine user movement relocates the reading position; clamps and noise
+    // must not overwrite a still-valid anchor OR the stored gap. A collapse's
+    // clamp event can fire BEFORE the ResizeObserver pass that corrects it —
+    // stomping the gap with the clamped value (zero) there would make the
+    // pass's gap-hold reproduce the slammed-to-bottom position instead of
+    // restoring the user's place (the scroll-hold contract). A real scroll
+    // also cancels any pending clicked-control hold: the user moved on.
+    if (attribution === "up" || attribution === "down") {
+      clearClickIntent();
+      distanceFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
       captureAnchor();
     }
-    lastScrollHeight = container.scrollHeight;
   }
 
   // Whether the previous reanchor pass saw conversation rows. Drives the
@@ -713,15 +742,67 @@
   // reads/writes it).
   let hadRows = false;
 
+  // Provenance for in-anchor height changes (see the anchor comment above):
+  // `lastReanchorRevision` tells a pass whether transcript CONTENT changed
+  // since the previous pass — stream chunks bump the revision; user
+  // expand/collapse toggles never do (preview state lives outside the store).
+  let lastReanchorRevision = -1;
+
+  // Clicked-control hold. When the user clicks a control that reshapes
+  // settled content (every such control carries `data-layout-toggle`), the
+  // contract is "the control I clicked stays put" — stronger than any gap or
+  // block-top correction, and it must win even when a streamed chunk lands in
+  // the same pass. The capture-phase listener records the control and its
+  // viewport position BEFORE the control's own handler mutates anything; the
+  // next re-anchor passes (at most two — the content-signal pass and the
+  // ResizeObserver pass) restore the control to that position instead of
+  // running the anchor/gap machinery. ONLY marked controls arm this: a copy
+  // button or link must not divert the correction of an unrelated streaming
+  // block, and a control whose click resizes nothing produces a zero-drift
+  // no-op for its held passes. A genuine user scroll cancels the hold (the
+  // user moved on), and pass-count expiry — not wall-clock — keeps it
+  // deterministic under test.
+  let intentEl: Element | null = null;
+  let intentTop = 0;
+  let intentPasses = 0;
+
+  function clearClickIntent(): void {
+    intentEl = null;
+    intentPasses = 0;
+  }
+
+  $effect(() => {
+    const el = container;
+    if (el === null) return;
+    const arm = (event: MouseEvent): void => {
+      const target = event.target instanceof Element ? event.target : null;
+      const control = target?.closest("[data-layout-toggle]") ?? null;
+      if (control === null) return;
+      intentEl = control;
+      intentTop = control.getBoundingClientRect().top;
+      intentPasses = 2;
+    };
+    el.addEventListener("click", arm, { capture: true });
+    return () => el.removeEventListener("click", arm, { capture: true });
+  });
+
   /// Pin to the bottom when the user is already there; otherwise keep what the
   /// user is reading still: anchor-restore when the change landed elsewhere,
   /// gap-hold when it landed inside the anchor block or past the clamp (see
-  /// the anchor comment above). Advancing `lastScrollHeight` here means the
-  /// `scroll` event our own `scrollTop` write triggers compares equal and is
-  /// treated as user-initiated (it recomputes `pinned`/anchor from the
-  /// position we just set — benign).
+  /// the anchor comment above). `notifyProgrammaticWrite` after every write
+  /// here is load-bearing, not hygiene: it makes the `scroll` event our own
+  /// write triggers compute a zero delta and change nothing. Without it, a
+  /// gap-hold write (a downward `scrollTop` move) would read as the user
+  /// scrolling down and re-pin anyone who had just unpinned within the
+  /// threshold of the bottom.
   function reanchor(): void {
     if (!container) return;
+    // Consume this pass's provenance inputs up front so every exit path
+    // advances them. `untrack` keeps the callers' dependency sets unchanged
+    // (the scrollSignal effect already depends on the revision via the signal).
+    const revision = untrack(() => getTranscriptRevision());
+    const revisionChanged = revision !== lastReanchorRevision;
+    lastReanchorRevision = revision;
     // The empty state — the one-line placeholder or the onboarding block — is
     // a document, not a conversation: it reads top-down and has no "newest
     // content" to follow, so auto-scroll never touches it. Without this, a
@@ -736,20 +817,54 @@
     // newest message and follows streaming, per the chat contract.
     if (!hadRows) {
       hadRows = true;
-      pinned = true;
+      outerPin.setPinned(true, geometryOf(container));
     }
-    if (pinned) {
+    if (outerPin.pinned) {
+      // Auto-follow owns the view; any pending clicked-control hold is moot.
+      clearClickIntent();
       container.scrollTop = container.scrollHeight;
-      lastScrollHeight = container.scrollHeight;
+      outerPin.notifyProgrammaticWrite(geometryOf(container));
       return;
     }
     const maxScroll = container.scrollHeight - container.clientHeight;
+    // Clicked-control hold (see `intentEl` above): restore the clicked
+    // control's viewport position and skip the anchor/gap machinery for this
+    // pass. Falls through when the target is out of range (the resize pushed
+    // it past the scroll limits — the ordinary contracts take over).
+    if (intentPasses > 0) {
+      intentPasses -= 1;
+      if (intentEl?.isConnected === true) {
+        const drift = intentEl.getBoundingClientRect().top - intentTop;
+        const target = container.scrollTop + drift;
+        if (target >= 0 && target <= maxScroll) {
+          if (drift !== 0) container.scrollTop = target;
+          distanceFromBottom =
+            container.scrollHeight - container.scrollTop - container.clientHeight;
+          outerPin.notifyProgrammaticWrite(geometryOf(container));
+          captureAnchor();
+          return;
+        }
+      } else {
+        clearClickIntent();
+      }
+    }
     let anchored = false;
     if (anchorEl?.isConnected === true) {
       const rect = anchorEl.getBoundingClientRect();
       const drift = rect.top - container.getBoundingClientRect().top - anchorOffset;
       const target = container.scrollTop + drift;
-      if (rect.height === anchorHeight && target >= 0 && target <= maxScroll) {
+      // Waive the height-equality check only for stream append: the anchor
+      // block hosts (or hosted, for the completion transition) a live region,
+      // and transcript content actually changed since the last pass.
+      // Membership alone is NOT provenance — a fan-out block holds settled
+      // columns alongside a streaming sibling, and a toggle there must keep
+      // the strict gap-hold contract. A toggle CLICK that collides with a
+      // same-pass chunk never reaches here at all: the clicked-control hold
+      // above wins outright.
+      const streamAppend =
+        revisionChanged &&
+        (anchorHadLiveRegion || anchorEl.querySelector("[data-live-region]") !== null);
+      if ((rect.height === anchorHeight || streamAppend) && target >= 0 && target <= maxScroll) {
         if (drift !== 0) container.scrollTop = target;
         // The gap genuinely changed (the height change landed elsewhere);
         // keep the stored gap honest so a later gap-hold corrects from
@@ -761,7 +876,7 @@
     if (!anchored) {
       container.scrollTop = maxScroll - distanceFromBottom;
     }
-    lastScrollHeight = container.scrollHeight;
+    outerPin.notifyProgrammaticWrite(geometryOf(container));
     // The just-settled position is the new reference: an expand that fell back
     // to gap-hold must not keep suppressing anchor-restore for the unrelated
     // changes that follow it (e.g. streaming resuming below).
@@ -910,8 +1025,8 @@
       if (!(el instanceof HTMLElement)) return;
       const delta = el.getBoundingClientRect().top - container.getBoundingClientRect().top;
       container.scrollTop += delta;
-      pinned = false;
-      lastScrollHeight = container.scrollHeight;
+      outerPin.setPinned(false, geometryOf(container));
+      clearClickIntent();
       distanceFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
       captureAnchor();
     });
@@ -926,25 +1041,31 @@
     "[mask-image:linear-gradient(to_bottom,transparent_0,black_2.5rem)] [-webkit-mask-image:linear-gradient(to_bottom,transparent_0,black_2.5rem)]";
 
   /// Inner bottom-pin for a capped live region. Each streaming unit's scroll
-  /// element gets its own instance (its own `pinned` closure), so columns pin
-  /// independently. Starts pinned; stays pinned while the user is near the
-  /// bottom (within the same 32px threshold as the outer transcript); releases
-  /// when the user scrolls up and re-engages when they return. `args.signal` is
-  /// the unit's streamed-content length — Svelte re-runs `update` when it
-  /// changes, re-pinning to the newest activity if still pinned. `args.key`
-  /// scopes the top-fade flag.
+  /// element gets its own `PinTracker` instance, so columns pin independently
+  /// while sharing the outer transcript's exact attribution rules (see
+  /// $lib/scrollPin.ts): any genuine upward scroll releases immediately — one
+  /// wheel tick over a streaming column freezes it — the re-pin threshold
+  /// applies only on the way back down, and the region's own re-pin writes
+  /// report themselves so they read as zero-delta. `args.signal` is the unit's
+  /// streamed-content length — Svelte re-runs `update` when it changes,
+  /// re-pinning to the newest activity if still pinned. `args.key` scopes the
+  /// top-fade flag.
   function liveScroll(node: HTMLElement, args: { key: string; signal: number }) {
-    let pinnedHere = true;
+    const pin = createPinTracker();
     const sync = (): void => {
-      pinnedHere = node.scrollHeight - node.scrollTop - node.clientHeight < 32;
+      pin.onScrollEvent(geometryOf(node));
       liveTopFade[args.key] = node.scrollTop > 8;
     };
     node.addEventListener("scroll", sync);
     node.scrollTop = node.scrollHeight;
+    pin.notifyProgrammaticWrite(geometryOf(node));
     liveTopFade[args.key] = node.scrollTop > 8;
     return {
       update(next: { key: string; signal: number }): void {
-        if (pinnedHere) node.scrollTop = node.scrollHeight;
+        if (pin.pinned) {
+          node.scrollTop = node.scrollHeight;
+          pin.notifyProgrammaticWrite(geometryOf(node));
+        }
         liveTopFade[next.key] = node.scrollTop > 8;
       },
       destroy(): void {
@@ -1067,6 +1188,7 @@
         liveCap && (liveTopFade[liveKey] ?? false) && LIVE_TOP_FADE,
       )}
       data-testid="turn-live-scroll"
+      data-live-region
       use:liveScroll={{ key: liveKey, signal: liveSignalOf(turn) }}
     >
       {@render turnItems(turn, false)}
@@ -1088,6 +1210,7 @@
 {#snippet hiddenItemsIndicator(key: string, label: string)}
   <button
     type="button"
+    data-layout-toggle
     class="text-muted hover:text-fg inline-flex items-center gap-1 text-xs transition-colors"
     data-testid="hidden-items-indicator"
     aria-label={`Show ${label}`}
@@ -1203,6 +1326,7 @@
        so an always-on control would just be noise. -->
   <button
     type="button"
+    data-layout-toggle
     class="text-muted hover:text-fg hover:bg-control-hover inline-flex items-center gap-1 rounded-full border border-transparent px-2 py-0.5 text-xs opacity-0 transition-colors group-focus-within:opacity-100 group-hover:opacity-100"
     data-testid="turn-preview-toggle"
     aria-label={label}
@@ -1231,6 +1355,7 @@
       <button
         {...props}
         type="button"
+        data-layout-toggle
         class={cn(
           META_ICON_BUTTON,
           "shrink-0 opacity-0 group-focus-within/responses:opacity-100 group-hover/responses:opacity-100",

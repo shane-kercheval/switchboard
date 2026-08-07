@@ -402,6 +402,14 @@ function projectRowByName(name: string): HTMLElement {
   return row;
 }
 
+function paneChipById(paneId: string): HTMLElement {
+  const chip = screen
+    .getAllByTestId("app-pane-tab")
+    .find((candidate) => candidate.getAttribute("data-pane-id") === paneId);
+  if (chip === undefined) throw new Error(`missing pane chip ${paneId}`);
+  return chip;
+}
+
 async function expectComposeFocused(): Promise<void> {
   await waitFor(() => expect(document.activeElement).toBe(screen.getByTestId("compose-textarea")));
 }
@@ -1321,13 +1329,22 @@ describe("App", () => {
 
   // --- first agent + add agent ---
 
-  it("a project with no agents shows the create-agent form; creating one renders the transcript", async () => {
+  it("assigns the first agent to a pane created while the project was empty", async () => {
+    const panes = await import("$lib/state/transcriptPanes.svelte");
+    const recipients = await import("$lib/state/recipientSelection.svelte");
     seedProject({ projectId: "p-a", directory: DIR_A, name: "alpha", agents: [] });
+    backend.agentQueue.push(
+      agent({ id: "ag-first", project_id: "p-a", name: "opus-high", session_locator: null }),
+    );
     await mountApp();
     await waitFor(() => expect(screen.getByTestId("project-row")).toBeInTheDocument());
 
     await fireEvent.click(screen.getByText("alpha"));
     await waitFor(() => expect(screen.getByTestId("confirm-create-agent")).toBeInTheDocument());
+    await fireEvent.click(await screen.findByTestId("app-pane-add"));
+    const emptyLayout = panes.layoutFor("p-a", []);
+    expect(emptyLayout.panes).toHaveLength(2);
+    expect(emptyLayout.panes.every((pane) => pane.members.length === 0)).toBe(true);
 
     await fireEvent.click(screen.getByTestId("confirm-create-agent"));
     await waitFor(() => {
@@ -1335,6 +1352,10 @@ describe("App", () => {
       expect(screen.getByTestId("compose-textarea")).toBeInTheDocument();
       expect(screen.getByTestId("sidebar")).toBeInTheDocument();
     });
+    const populatedLayout = panes.layoutFor("p-a", ["ag-first"]);
+    expect(populatedLayout.panes[0]!.members).toEqual(["ag-first"]);
+    expect(populatedLayout.panes[1]!.members).toEqual([]);
+    expect(recipients.selectionFor("p-a")).toEqual(["ag-first"]);
     const createCalls = invokeMock.mock.calls.filter(([c]) => c === "create_agent");
     expect(createCalls).toHaveLength(1);
     // The form preselects and submits Claude's defaults.
@@ -1346,7 +1367,33 @@ describe("App", () => {
     });
   });
 
-  it("add agent via the sidebar modal registers a listener and appends to the roster", async () => {
+  it("assigns the first agent to the pane already visible in a retained maximized layout", async () => {
+    const panes = await import("$lib/state/transcriptPanes.svelte");
+    const recipients = await import("$lib/state/recipientSelection.svelte");
+    seedProject({ projectId: "p-a", directory: DIR_A, name: "alpha", agents: [] });
+    backend.agentQueue.push(
+      agent({ id: "ag-first", project_id: "p-a", name: "opus-high", session_locator: null }),
+    );
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("project-row")).toBeInTheDocument());
+    await fireEvent.click(screen.getByText("alpha"));
+    await waitFor(() => expect(screen.getByTestId("confirm-create-agent")).toBeInTheDocument());
+
+    const pane2 = panes.createEmptyPane("p-a", []);
+    panes.maximizePane("p-a", [], pane2);
+    await fireEvent.click(screen.getByTestId("confirm-create-agent"));
+
+    await waitFor(() => expect(screen.getByTestId("unified-transcript")).toBeInTheDocument());
+    const populatedLayout = panes.layoutFor("p-a", ["ag-first"]);
+    expect(populatedLayout.maximized).toBe(pane2);
+    expect(populatedLayout.panes[0]!.members).toEqual([]);
+    expect(populatedLayout.panes[1]!.members).toEqual(["ag-first"]);
+    expect(recipients.selectionFor("p-a")).toEqual(["ag-first"]);
+  });
+
+  it("add agent via the sidebar fills the oldest visible empty pane", async () => {
+    const panes = await import("$lib/state/transcriptPanes.svelte");
+    const recipients = await import("$lib/state/recipientSelection.svelte");
     seedProject({
       projectId: "p-a",
       directory: DIR_A,
@@ -1366,6 +1413,8 @@ describe("App", () => {
     await waitFor(() => expect(screen.getByTestId("project-row")).toBeInTheDocument());
     await fireEvent.click(screen.getByText("alpha"));
     await waitFor(() => expect(screen.getByTestId("sidebar")).toBeInTheDocument());
+    const pane2 = panes.createEmptyPane("p-a", ["ag-1"]);
+    recipients.setRecipients("p-a", ["ag-1"]);
 
     const listenBefore = listenMock.mock.calls.length;
     await fireEvent.click(screen.getByTestId("sidebar-add-agent"));
@@ -1382,6 +1431,10 @@ describe("App", () => {
     });
     expect(listenMock.mock.calls.length).toBe(listenBefore + 1);
     expect(listenMock.mock.calls.at(-1)?.[0]).toBe("agent:ag-2");
+    expect(
+      panes.layoutFor("p-a", ["ag-1", "ag-2"]).panes.find((pane) => pane.id === pane2)?.members,
+    ).toEqual(["ag-2"]);
+    expect(recipients.selectionFor("p-a")).toEqual(["ag-1"]);
   });
 
   // --- post-restart merged conversation ---
@@ -1830,6 +1883,7 @@ describe("App", () => {
     const compact = screen.getByTestId("transcript-compact-toggle");
     const projectsToggle = screen.getByTestId("view-toggle-projects");
     const tabStrip = screen.getByTestId("app-pane-tab-strip");
+    expect(screen.queryByTestId("app-pane-tab")).not.toBeInTheDocument();
     expect(tabStrip).not.toContainElement(paneAdd);
     expect(tabStrip).not.toContainElement(compact);
     expect(paneAdd.compareDocumentPosition(compact) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
@@ -1844,13 +1898,15 @@ describe("App", () => {
     );
   });
 
-  it("does not show the compact toggle for a project with no agents", async () => {
+  it("does not show transcript controls or a redundant pane chip for a project with no agents", async () => {
     seedProject({ projectId: "p-a", name: "alpha", agents: [] });
     await mountApp();
     await waitFor(() => expect(screen.getByTestId("project-row")).toBeInTheDocument());
     await fireEvent.click(screen.getByText("alpha"));
     await waitFor(() => expect(screen.getByTestId("breadcrumb")).toHaveTextContent("alpha"));
     expect(screen.queryByTestId("transcript-compact-toggle")).not.toBeInTheDocument();
+    await screen.findByTestId("app-pane-add");
+    expect(screen.queryByTestId("app-pane-tab")).not.toBeInTheDocument();
   });
 
   it("inverts compact mode from the header (default compact → expand)", async () => {
@@ -2232,6 +2288,75 @@ describe("App", () => {
     expect(selection.selectionFor("p-a")).toEqual(["ag-1", "ag-3"]);
   });
 
+  it("shows every pane in the header regardless of pane membership or eye-hidden agents", async () => {
+    const panes = await import("$lib/state/transcriptPanes.svelte");
+    const selection = await import("$lib/state/recipientSelection.svelte");
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [
+        agent({ id: "ag-1", project_id: "p-a", name: "alice" }),
+        agent({ id: "ag-2", project_id: "p-a", name: "bob" }),
+      ],
+    });
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument());
+    await fireEvent.click(screen.getByText("alpha"));
+    await waitFor(() => expect(screen.getByTestId("app-pane-add")).toBeInTheDocument());
+
+    const roster = ["ag-1", "ag-2"];
+    const pane1 = panes.layoutFor("p-a", roster).panes[0]!.id;
+    const pane2 = panes.createEmptyPane("p-a", roster);
+    panes.toggleAgentHidden("p-a", roster, "ag-1");
+    panes.toggleAgentHidden("p-a", roster, "ag-2");
+
+    await waitFor(() => expect(screen.getAllByTestId("app-pane-tab")).toHaveLength(2));
+    expect(panes.layoutFor("p-a", roster).panes.find((pane) => pane.id === pane2)?.members).toEqual(
+      [],
+    );
+    expect(paneChipById(pane1)).toHaveAttribute("data-pane-state", "visible");
+    expect(paneChipById(pane2)).toHaveAttribute("data-pane-state", "visible");
+    expect(paneChipById(pane1)).toHaveAttribute("aria-label", "Pane 1 — visible. Click to select.");
+    expect(paneChipById(pane2)).toHaveAttribute(
+      "aria-label",
+      "Pane 2 — visible. No agents assigned; selection unavailable.",
+    );
+    expect(paneChipById(pane1)).not.toHaveClass("bg-focus-soft", "hover:bg-focus");
+    expect(paneChipById(pane2)).toHaveAttribute("aria-disabled", "true");
+    selection.setRecipients("p-a", ["ag-1"]);
+    await fireEvent.click(paneChipById(pane2));
+    expect(selection.selectionFor("p-a")).toEqual(["ag-1"]);
+  });
+
+  it("shows a formerly minimized pane as visible after maximizing it", async () => {
+    const panes = await import("$lib/state/transcriptPanes.svelte");
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [
+        agent({ id: "ag-1", project_id: "p-a", name: "alice" }),
+        agent({ id: "ag-2", project_id: "p-a", name: "bob" }),
+      ],
+    });
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument());
+    await fireEvent.click(screen.getByText("alpha"));
+    await waitFor(() => expect(screen.getByTestId("app-pane-add")).toBeInTheDocument());
+
+    const roster = ["ag-1", "ag-2"];
+    const pane1 = panes.layoutFor("p-a", roster).panes[0]!.id;
+    const pane2 = panes.moveAgentToNewPane("p-a", roster, "ag-2");
+    panes.minimizePane("p-a", roster, pane2);
+    panes.maximizePane("p-a", roster, pane2);
+
+    await waitFor(() => expect(paneChipById(pane2)).toHaveAttribute("data-pane-state", "visible"));
+    expect(panes.layoutFor("p-a", roster).minimized).not.toContain(pane2);
+    expect(paneChipById(pane1)).toHaveAttribute("data-pane-state", "behind_maximized");
+    expect(screen.queryByTestId("app-pane-restore-all")).not.toBeInTheDocument();
+  });
+
   it("restores and switches minimized panes from the app header", async () => {
     const panes = await import("$lib/state/transcriptPanes.svelte");
     const state = await import("$lib/state/index.svelte");
@@ -2263,10 +2388,17 @@ describe("App", () => {
       pending_sends: [{ send_id: "send-bob", user_turn_id: "user-bob" }],
     };
     panes.minimizePane("p-a", roster, pane2);
-    await waitFor(() => expect(screen.getByTestId("app-pane-minimized-tab")).toBeInTheDocument());
-    expect(screen.getByTestId("app-pane-minimized-tab")).toHaveTextContent(/^Pane 2$/);
+    await waitFor(() => expect(screen.getAllByTestId("app-pane-tab")).toHaveLength(2));
+    const pane1 = panes.layoutFor("p-a", roster).panes[0]!.id;
+    expect(paneChipById(pane1)).toHaveAttribute("data-pane-state", "visible");
+    expect(paneChipById(pane2)).toHaveAttribute("data-pane-state", "minimized");
+    expect(paneChipById(pane2)).toHaveTextContent(/^Pane 2$/);
+    expect(paneChipById(pane2)).toHaveAttribute(
+      "aria-label",
+      "Pane 2 — minimized. Agents are working. Click to open.",
+    );
     expect(
-      within(screen.getByTestId("app-pane-minimized-tab")).getByRole("status", {
+      within(paneChipById(pane2)).getByRole("status", {
         name: "Pane 2 has running agents",
       }),
     ).toBeInTheDocument();
@@ -2278,38 +2410,49 @@ describe("App", () => {
     };
     await waitFor(() =>
       expect(
-        within(screen.getByTestId("app-pane-minimized-tab")).getByRole("status", {
+        within(paneChipById(pane2)).getByRole("status", {
           name: "Pane 2 activity ended",
         }),
       ).toBeInTheDocument(),
     );
+    expect(paneChipById(pane2)).toHaveAttribute(
+      "aria-label",
+      "Pane 2 — minimized. Agents finished while hidden. Click to open.",
+    );
 
-    await fireEvent.click(screen.getByTestId("app-pane-minimized-tab"));
+    await fireEvent.click(paneChipById(pane2));
     // Revealing a pane is deferred behind the transcript-busy spinner (two
     // animation frames), so poll for the layout change rather than asserting
     // synchronously right after the click.
     await waitFor(() => expect(panes.layoutFor("p-a", roster).minimized).toEqual([]));
+    expect(paneChipById(pane1)).toHaveAttribute("data-pane-state", "visible");
+    expect(paneChipById(pane2)).toHaveAttribute("data-pane-state", "visible");
 
-    panes.maximizePane("p-a", roster, panes.layoutFor("p-a", roster).panes[0]!.id);
-    await waitFor(() =>
-      expect(screen.getByTestId("app-pane-minimized-tab")).toHaveTextContent(/^Pane 2$/),
-    );
+    recipients.setRecipients("p-a", ["ag-2"]);
+    await fireEvent.click(paneChipById(pane1));
+    expect(recipients.selectionFor("p-a")).toEqual(["ag-1"]);
+    await expectComposeFocused();
+
+    panes.maximizePane("p-a", roster, pane1);
+    await waitFor(() => expect(paneChipById(pane2)).toHaveTextContent(/^Pane 2$/));
+    expect(paneChipById(pane1)).toHaveAttribute("data-pane-state", "visible");
+    expect(paneChipById(pane2)).toHaveAttribute("data-pane-state", "behind_maximized");
     expect(
-      within(screen.getByTestId("app-pane-minimized-tab")).queryByRole("status", {
+      within(paneChipById(pane2)).queryByRole("status", {
         name: "Pane 2 activity ended",
       }),
     ).not.toBeInTheDocument();
-    await fireEvent.click(screen.getByTestId("app-pane-minimized-tab"));
+    await fireEvent.click(paneChipById(pane2));
     await waitFor(() => {
       expect(panes.layoutFor("p-a", roster).maximized).toBe(pane2);
       expect(recipients.selectionFor("p-a")).toEqual(["ag-2"]);
     });
+    expect(paneChipById(pane1)).toHaveAttribute("data-pane-state", "behind_maximized");
+    expect(paneChipById(pane2)).toHaveAttribute("data-pane-state", "visible");
 
     panes.maximizePane("p-a", roster, pane2);
-    await waitFor(() =>
-      expect(screen.getByTestId("app-pane-minimized-tab")).toHaveTextContent("Pane 1"),
-    );
-    await fireEvent.click(screen.getByTestId("app-pane-minimized-tab"));
+    await waitFor(() => expect(paneChipById(pane1)).toHaveTextContent("Pane 1"));
+    await fireEvent.click(paneChipById(pane1));
     await waitFor(() => {
       expect(panes.layoutFor("p-a", roster).maximized).toBe(
         panes.layoutFor("p-a", roster).panes[0]!.id,
@@ -2354,7 +2497,9 @@ describe("App", () => {
     const rosterA = ["ag-1", "ag-2"];
     const pane2 = panes.moveAgentToNewPane("p-a", rosterA, "ag-2");
     panes.minimizePane("p-a", rosterA, pane2);
-    await waitFor(() => expect(screen.getByTestId("app-pane-minimized-tab")).toBeInTheDocument());
+    await waitFor(() =>
+      expect(paneChipById(pane2)).toHaveAttribute("data-pane-state", "minimized"),
+    );
 
     // Clicking the tab schedules the reveal behind the spinner's two animation
     // frames. Synchronously switch to project B before those frames fire (no
@@ -2362,7 +2507,7 @@ describe("App", () => {
     // active project id synchronously. When the deferred action lands, B is
     // active. Under the bug, the closure read the live roster (B's) and
     // `reconcileLayout` would prune ag-2 from A's pane and persist the loss.
-    fireEvent.click(screen.getByTestId("app-pane-minimized-tab"));
+    fireEvent.click(paneChipById(pane2));
     void ws.activateProject("p-b");
     expect(ws.selection.activeProjectId).toBe("p-b");
 
@@ -2416,14 +2561,20 @@ describe("App", () => {
     panes.minimizePane("p-a", roster, pane2);
     await waitFor(() =>
       expect(
-        within(screen.getByTestId("app-pane-minimized-tab")).getByRole("status", {
+        within(paneChipById(pane2)).getByRole("status", {
           name: "Pane 2 has running agents",
         }),
       ).toBeInTheDocument(),
     );
 
     await fireEvent.click(within(projectRowByName("beta")).getByText("beta"));
-    await waitFor(() => expect(screen.queryByTestId("app-pane-minimized-tab")).toBeNull());
+    await waitFor(() =>
+      expect(
+        screen
+          .queryAllByTestId("app-pane-tab")
+          .some((chip) => chip.getAttribute("data-pane-id") === pane2),
+      ).toBe(false),
+    );
     state.runtimes["ag-2"] = {
       ...state.runtimes["ag-2"]!,
       run_status: "idle",
@@ -2433,7 +2584,7 @@ describe("App", () => {
     await fireEvent.click(within(projectRowByName("alpha")).getByText("alpha"));
     await waitFor(() =>
       expect(
-        within(screen.getByTestId("app-pane-minimized-tab")).getByRole("status", {
+        within(paneChipById(pane2)).getByRole("status", {
           name: "Pane 2 activity ended",
         }),
       ).toBeInTheDocument(),

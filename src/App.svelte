@@ -12,6 +12,8 @@
   import SettingsView from "$lib/components/SettingsView.svelte";
   import Sidebar from "$lib/components/Sidebar.svelte";
   import TranscriptNavigator from "$lib/components/TranscriptNavigator.svelte";
+  import PaneTabStrip from "$lib/components/PaneTabStrip.svelte";
+  import type { HeaderPaneState } from "$lib/components/PaneTabStrip.types";
   import TranscriptPanes from "$lib/components/TranscriptPanes.svelte";
   import WelcomeScreen from "$lib/components/WelcomeScreen.svelte";
   import Dialog from "$lib/components/ui/Dialog.svelte";
@@ -26,13 +28,14 @@
   import SidebarToggleButton from "$lib/components/ui/SidebarToggleButton.svelte";
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
   import { ICON_BUTTON_CLASS, ICON_SIZE } from "$lib/components/ui/iconButton";
-  import { ChevronsDownUp, ChevronsUpDown, CircleCheck, Plus } from "@lucide/svelte";
+  import { ChevronsDownUp, ChevronsUpDown, Plus } from "@lucide/svelte";
   import {
     hasOverrides,
     normalizeProjectCompact,
     stateFor,
   } from "$lib/state/transcriptPreview.svelte";
   import {
+    assignAgentToFirstVisibleEmptyPane,
     createEmptyPane,
     expandAllPanes,
     layoutFor,
@@ -49,7 +52,7 @@
   import { agentIsWorking, hydrateAgent, registerAgent, runtimes } from "$lib/state/index.svelte";
   import {
     activateProject,
-    addAgentToActiveProject,
+    addAgentToProjectRoster,
     agentCreationFailures,
     agentsByProject,
     conversations,
@@ -418,19 +421,22 @@
   const canCyclePanes = $derived(
     (activePaneLayout?.panes.filter((pane) => pane.members.length > 0).length ?? 0) > 1,
   );
-  const activeMaximizedPane = $derived(
-    activePaneLayout?.maximized === null || activePaneLayout === null
-      ? null
-      : (activePaneLayout.panes.find((pane) => pane.id === activePaneLayout.maximized) ?? null),
-  );
-  const headerTabPanes = $derived(
-    activePaneLayout === null
-      ? []
-      : activePaneLayout.panes.filter((pane) =>
-          activeMaximizedPane !== null
-            ? pane.id !== activeMaximizedPane.id
-            : activePaneLayout.minimized.includes(pane.id),
-        ),
+  const headerPaneEntries = $derived.by(() => {
+    if (activePaneLayout === null || activePaneLayout.panes.length < 2) return [];
+    return activePaneLayout.panes.map((pane) => {
+      let state: HeaderPaneState = "visible";
+      if (activePaneLayout.maximized === pane.id) {
+        state = "visible";
+      } else if (activePaneLayout.maximized !== null) {
+        state = activePaneLayout.minimized.includes(pane.id) ? "minimized" : "behind_maximized";
+      } else if (activePaneLayout.minimized.includes(pane.id)) {
+        state = "minimized";
+      }
+      return { pane, state };
+    });
+  });
+  const hiddenHeaderPaneEntries = $derived(
+    headerPaneEntries.filter((entry) => entry.state !== "visible"),
   );
   const activeConvo = $derived(
     selection.activeProjectId !== null ? conversations[selection.activeProjectId] : undefined,
@@ -460,15 +466,11 @@
     layout.projectsSidebarOpen && projectsSidebarHasContent && view.mode !== "git",
   );
   const showPaneHeaderControls = $derived(
-    !settingsOpen &&
-      view.mode !== "git" &&
-      selection.activeProjectId !== null &&
-      rosterLoaded &&
-      activeAgents.length > 0,
+    !settingsOpen && view.mode !== "git" && selection.activeProjectId !== null && rosterLoaded,
   );
   // The navigator needs a project transcript with messages to navigate — the
   // same condition as its header button being shown.
-  const canOpenNavigator = $derived(showPaneHeaderControls);
+  const canOpenNavigator = $derived(showPaneHeaderControls && activeAgents.length > 0);
 
   // The navigator's open flag is global (so ⌘F and the palette can drive it),
   // but the component that can close it only mounts while a project transcript
@@ -518,7 +520,7 @@
     if (projectId === null || paneLayout === null) return;
     const projectPrefix = `${projectId}:`;
     const paneKeys = paneLayout.panes.map((pane) => paneTabKey(projectId, pane.id));
-    const tabEntries = headerTabPanes.map((pane) => ({
+    const tabEntries = hiddenHeaderPaneEntries.map(({ pane }) => ({
       key: paneTabKey(projectId, pane.id),
       active: paneIsActive(pane),
     }));
@@ -582,6 +584,12 @@
         targetRecipients(projectId, [...pane.members]);
       }
     });
+  }
+
+  function targetVisibleHeaderPane(pane: TranscriptPane): void {
+    const projectId = selection.activeProjectId;
+    if (projectId === null || pane.members.length === 0) return;
+    if (targetRecipients(projectId, [...pane.members])) composeFocusRequest += 1;
   }
 
   /// Cycle the targeted pane by position (⌘⇧[ = -1, ⌘⇧] = +1). A visible pane
@@ -689,10 +697,10 @@
     projectDialogOpen = true;
   }
 
-  /// Create or attach an agent into the active project, register its listeners,
-  /// and add it to the active roster. Attach kicks off per-agent hydration so
-  /// the brought-in harness session's history appears.
-  async function createOrAttachAndRegister(submission: AgentFormSubmit): Promise<void> {
+  /// Create or attach an agent, register its listeners, and add it to the
+  /// roster named by the returned record. Attach kicks off per-agent hydration
+  /// so the brought-in harness session's history appears.
+  async function createOrAttachAndRegister(submission: AgentFormSubmit): Promise<AgentRecord> {
     const agent =
       submission.mode === "create"
         ? await api.createAgent(
@@ -703,10 +711,13 @@
           )
         : await api.attachAgent(submission.name, submission.harness, submission.existingSessionId);
     await registerAgent(agent);
-    addAgentToActiveProject(agent);
+    addAgentToProjectRoster(agent);
+    const rosterIds = (agentsByProject[agent.project_id] ?? []).map((item) => item.id);
+    assignAgentToFirstVisibleEmptyPane(agent.project_id, rosterIds, agent.id);
     if (submission.mode === "attach") {
       void hydrateAgent(agent.id);
     }
+    return agent;
   }
 
   // First-agent form (center, when the active project has no agents).
@@ -717,7 +728,8 @@
     firstAgentError = null;
     firstAgentBusy = true;
     try {
-      await createOrAttachAndRegister(submission);
+      const agent = await createOrAttachAndRegister(submission);
+      targetRecipients(agent.project_id, [agent.id]);
     } catch (err) {
       firstAgentError = err instanceof Error ? err.message : String(err);
     } finally {
@@ -992,62 +1004,16 @@
 
         {#if showPaneHeaderControls}
           <div class="flex min-w-0 shrink items-center gap-1" data-tauri-no-drag>
-            <div
-              class="flex min-w-0 shrink items-center gap-1 overflow-hidden"
-              data-testid="app-pane-tab-strip"
-            >
-              {#each headerTabPanes as pane (pane.id)}
-                {@const active = paneIsActive(pane)}
-                {@const completed = paneTabIsCompleted(pane)}
-                <!-- The tooltip is where the spinner/✓ semantics are taught:
-                     the indicator is seen far more often than any empty-state
-                     prose, so the explanation lives on the indicator itself. -->
-                <Tooltip
-                  label={active
-                    ? `${pane.name} — agents are working. Click to open.`
-                    : completed
-                      ? `${pane.name} — agents finished since you last looked. Click to open.`
-                      : `Open ${pane.name}`}
-                  side="bottom"
-                >
-                  {#snippet trigger(props)}
-                    <button
-                      {...props}
-                      type="button"
-                      class="border-border bg-panel text-fg hover:bg-raised inline-flex h-6.5 max-w-36 min-w-0 shrink items-center gap-1.5 rounded-full border px-2 text-xs"
-                      data-testid="app-pane-minimized-tab"
-                      data-pane-id={pane.id}
-                      onclick={() => selectHeaderPane(pane)}
-                    >
-                      {#if active}
-                        <span
-                          class="inline-flex shrink-0 items-center justify-center"
-                          role="status"
-                          aria-label={`${pane.name} has running agents`}
-                          data-testid="app-pane-tab-activity"
-                        >
-                          <Spinner class="h-3.5 w-3.5" />
-                        </span>
-                      {:else if completed}
-                        <span
-                          class="text-accent inline-flex shrink-0 items-center justify-center"
-                          role="status"
-                          aria-label={`${pane.name} activity ended`}
-                          data-testid="app-pane-tab-completed"
-                        >
-                          <CircleCheck size={14} strokeWidth={1.8} aria-hidden="true" />
-                        </span>
-                      {/if}
-                      <span class="truncate font-medium">{pane.name}</span>
-                    </button>
-                  {/snippet}
-                </Tooltip>
-              {/each}
-            </div>
+            <PaneTabStrip
+              entries={headerPaneEntries}
+              {paneIsActive}
+              paneIsCompleted={paneTabIsCompleted}
+              onSelectVisible={targetVisibleHeaderPane}
+              onOpenHidden={selectHeaderPane}
+            />
             <!-- Shown whenever more than one pane is hidden — minimized into the
-                 tab strip, or hidden behind a maximized pane. `headerTabPanes`
-                 already captures both cases. -->
-            {#if headerTabPanes.length > 1}
+                 tab strip, or hidden behind a maximized pane. -->
+            {#if hiddenHeaderPaneEntries.length > 1}
               <button
                 type="button"
                 class="text-muted hover:text-fg hover:bg-hover inline-flex h-6.5 shrink-0 items-center rounded-full px-2 text-xs"
@@ -1071,30 +1037,32 @@
                 </button>
               {/snippet}
             </Tooltip>
-            <Tooltip label={compactLabel} side="bottom">
-              {#snippet trigger(props)}
-                <button
-                  {...props}
-                  type="button"
-                  onclick={toggleCompactTranscript}
-                  aria-label={compactLabel}
-                  data-testid="transcript-compact-toggle"
-                  data-tauri-no-drag
-                  class={cn(ICON_BUTTON_CLASS, "shrink-0")}
-                >
-                  {#if compactEnabled}
-                    <ChevronsUpDown size={ICON_SIZE} aria-hidden="true" />
-                  {:else}
-                    <ChevronsDownUp size={ICON_SIZE} aria-hidden="true" />
-                  {/if}
-                </button>
-              {/snippet}
-            </Tooltip>
-            <TranscriptNavigator
-              projectId={selection.activeProjectId!}
-              agents={activeAgents}
-              overlay={activeConvo?.items ?? []}
-            />
+            {#if activeAgents.length > 0}
+              <Tooltip label={compactLabel} side="bottom">
+                {#snippet trigger(props)}
+                  <button
+                    {...props}
+                    type="button"
+                    onclick={toggleCompactTranscript}
+                    aria-label={compactLabel}
+                    data-testid="transcript-compact-toggle"
+                    data-tauri-no-drag
+                    class={cn(ICON_BUTTON_CLASS, "shrink-0")}
+                  >
+                    {#if compactEnabled}
+                      <ChevronsUpDown size={ICON_SIZE} aria-hidden="true" />
+                    {:else}
+                      <ChevronsDownUp size={ICON_SIZE} aria-hidden="true" />
+                    {/if}
+                  </button>
+                {/snippet}
+              </Tooltip>
+              <TranscriptNavigator
+                projectId={selection.activeProjectId!}
+                agents={activeAgents}
+                overlay={activeConvo?.items ?? []}
+              />
+            {/if}
           </div>
           <!-- Hairline between the project-transcript controls (panes,
                navigator, compact) and the app-level view switcher. A border,

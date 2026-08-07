@@ -541,6 +541,16 @@ body {
   }
 }
 
+/* Every pane stays reachable in the title-bar map. Keep horizontal overflow
+   scrollable without spending the title bar's fixed height on scrollbar chrome. */
+.pane-tab-strip {
+  scrollbar-width: none;
+}
+
+.pane-tab-strip::-webkit-scrollbar {
+  display: none;
+}
+
 /* Prism token classes → semantic syntax roles. Shared by the Markdown body and
    the Git diff view (both highlight through the same Prism path), so the mapping
    lives once here scoped to either ancestor. Same class names in both themes;

@@ -17,8 +17,18 @@ import {
   _testing as panesState,
 } from "$lib/state/transcriptPanes.svelte";
 import { jumpToRow, _testing as jumpState } from "$lib/state/transcriptJump.svelte";
+import { hasOverrides } from "$lib/state/transcriptPreview.svelte";
 import { INITIAL_WINDOW } from "$lib/state/unified";
-import { ALICE, BOB, PROJECT_ID, agentTurn, textItem, userTurn } from "./fixtures";
+import {
+  ALICE,
+  BOB,
+  PROJECT_ID,
+  agentTurn,
+  longText,
+  textItem,
+  toolItem,
+  userTurn,
+} from "./fixtures";
 import type { Turn } from "$lib/state/index.svelte";
 
 // The navigator jump is geometry: the target block must land with its top at
@@ -28,8 +38,9 @@ import type { Turn } from "$lib/state/index.svelte";
 // bottom. jsdom has no layout, so all of that is asserted here in WebKit.
 
 const OVER = INITIAL_WINDOW * 3;
+type AgentItems = Extract<Turn, { role: "agent" }>["items"];
 
-function turnsFor(agent: typeof ALICE, n: number): Turn[] {
+function turnsFor(agent: typeof ALICE, n: number, firstItems?: AgentItems): Turn[] {
   const turns: Turn[] = [];
   for (let k = 0; k < n; k++) {
     const mm = String(Math.floor(k / 60)).padStart(2, "0");
@@ -39,7 +50,13 @@ function turnsFor(agent: typeof ALICE, n: number): Turn[] {
         id: `turn-${k}`,
         agentId: agent.id,
         at: `2026-05-16T00:${mm}:${ss}Z`,
-        items: [textItem(`message ${k}\n\nsome body content for height`)],
+        items:
+          k === 0 && firstItems !== undefined
+            ? firstItems
+            : [
+                ...(k === 0 ? [toolItem({ id: "target-tool", command: "echo target" })] : []),
+                textItem(`message ${k}\n\nsome body content for height`),
+              ],
       }),
     );
   }
@@ -78,6 +95,11 @@ test("jumping to an off-window block grows the window and lands it at the contai
   await expect
     .poll(() => document.querySelectorAll('[data-testid="transcript-block"]').length)
     .toBe(OVER);
+  // Selection expands the exact response before alignment, revealing detail
+  // that compact mode hid while preserving the block's final top position.
+  await expect
+    .poll(() => blockEl("a:turn-0")?.querySelector('[data-testid="tool-row"]') !== null)
+    .toBe(true);
   // …and the target's top sits at the scroll container's top (± a px).
   await expect
     .poll(() => {
@@ -92,6 +114,64 @@ test("jumping to an off-window block grows the window and lands it at the contai
   // The anchoring machinery defends the position (no snap back to bottom).
   const c = scrollContainer();
   expect(c.scrollHeight - c.scrollTop - c.clientHeight).toBeGreaterThan(100);
+});
+
+test("jumping to an off-window short response does not create an invisible override", async () => {
+  await registerAgent(ALICE);
+  seedTurns(ALICE.id, turnsFor(ALICE, OVER, [textItem("short target response")]));
+  mountPanes({ projectId: PROJECT_ID, agents: [ALICE] });
+
+  await expect
+    .poll(() => document.querySelectorAll('[data-testid="transcript-block"]').length)
+    .toBe(INITIAL_WINDOW);
+  expect(blockEl("a:turn-0")).toBeNull();
+  expect(hasOverrides(PROJECT_ID)).toBe(false);
+
+  expect(jumpToRow(PROJECT_ID, [ALICE.id], [ALICE.id], "a:turn-0")).toBe(true);
+
+  await expect.poll(() => blockEl("a:turn-0") !== null).toBe(true);
+  await expect
+    .poll(() => {
+      const el = blockEl("a:turn-0");
+      if (el === null) return Number.NaN;
+      return Math.abs(
+        el.getBoundingClientRect().top - scrollContainer().getBoundingClientRect().top,
+      );
+    })
+    .toBeLessThan(2);
+  expect(hasOverrides(PROJECT_ID)).toBe(false);
+});
+
+test("jumping to off-window overflowing prose expands before final alignment", async () => {
+  await registerAgent(ALICE);
+  seedTurns(ALICE.id, turnsFor(ALICE, OVER, [textItem(longText(80, "Target"))]));
+  mountPanes({ projectId: PROJECT_ID, agents: [ALICE] });
+
+  await expect
+    .poll(() => document.querySelectorAll('[data-testid="transcript-block"]').length)
+    .toBe(INITIAL_WINDOW);
+  expect(blockEl("a:turn-0")).toBeNull();
+
+  expect(jumpToRow(PROJECT_ID, [ALICE.id], [ALICE.id], "a:turn-0")).toBe(true);
+
+  await expect.poll(() => hasOverrides(PROJECT_ID)).toBe(true);
+  await expect
+    .poll(
+      () =>
+        blockEl("a:turn-0")
+          ?.querySelector('[data-preview-key="agent:turn-0"]')
+          ?.querySelector('[data-testid="preview-clip"]') === null,
+    )
+    .toBe(true);
+  await expect
+    .poll(() => {
+      const el = blockEl("a:turn-0");
+      if (el === null) return Number.NaN;
+      return Math.abs(
+        el.getBoundingClientRect().top - scrollContainer().getBoundingClientRect().top,
+      );
+    })
+    .toBeLessThan(2);
 });
 
 test("jumping into a minimized pane restores it; the fresh mount picks up the pending request", async () => {

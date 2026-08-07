@@ -328,17 +328,31 @@
     return colRows.some((r) => r.kind === "agent" && r.turn.items.length > 0);
   }
 
+  function userPreviewKey(rowKey: string): string {
+    return `user:${rowKey}`;
+  }
+
+  function agentPreviewKey(turnId: string): string {
+    return `agent:${turnId}`;
+  }
+
+  function fanoutPreviewKey(sendId: string, agentId: string): string {
+    return `fanout:${sendId}:${agentId}`;
+  }
+
   /// The render key for a turn — matches the key its render site uses, so
   /// `latestResponseKeys` membership lines up there. A turn whose send fans out
-  /// renders as a column (`fanout:…`); otherwise a standalone row.
+  /// renders as a column (`fanout:…`); otherwise a standalone row. The render
+  /// sites rely on the grouping invariant that a standalone row cannot also
+  /// belong to a fan-out block for the same send.
   function previewKeyForTurn(turn: AgentTurn): string {
     if (
       turn.send_id !== undefined &&
       blocks.some((b) => b.kind === "fanout" && b.send_id === turn.send_id)
     ) {
-      return `fanout:${turn.send_id}:${turn.agent_id}`;
+      return fanoutPreviewKey(turn.send_id, turn.agent_id);
     }
-    return `agent:${turn.turn_id}`;
+    return agentPreviewKey(turn.turn_id);
   }
 
   /// Preview keys of each agent's most-recent collapsible response. When compact,
@@ -363,6 +377,10 @@
     for (const v of latestPerAgent.values()) keys.add(v.key);
     return keys;
   });
+
+  function responseDefaultCompact(key: string): boolean {
+    return compactEnabled && !latestResponseKeys.has(key);
+  }
 
   // No `content-visibility` containment on transcript blocks: render-windowing
   // (above) bounds the mounted set, so the off-screen-layout cost containment
@@ -417,15 +435,21 @@
     );
   }
 
+  function responseHasDataHidden(turn: AgentTurn, isLatestResponse: boolean): boolean {
+    return (
+      turnHasHiddenDetail(turn) ||
+      (isLatestResponse && answerTextOf(turn) !== lastAnswerTextOf(turn))
+    );
+  }
+
   /// Whether expanding a response would reveal more than its collapsed view, so a
   /// toggle is meaningful. A clipped preview hides tool calls / reasoning (and
   /// clips overflowing text — the `clipOverflow` half); the latest-response view
   /// is expanded by default, so its toggle means "collapse to the final answer
   /// block."
   function responseHasMore(turn: AgentTurn, key: string, isLatestResponse: boolean): boolean {
-    if (isLatestResponse)
-      return turnHasHiddenDetail(turn) || answerTextOf(turn) !== lastAnswerTextOf(turn);
-    if (turnHasHiddenDetail(turn)) return true;
+    if (responseHasDataHidden(turn, isLatestResponse)) return true;
+    if (isLatestResponse) return false;
     return clipOverflow[key] ?? false;
   }
 
@@ -978,7 +1002,7 @@
 
   /// Navigator jump: bring one block to the top of this pane's view
   /// (`transcriptJump.svelte.ts` requests, addressed by pane). Execution lives
-  /// here because all three phases touch this component's private state:
+  /// here because all four phases touch this component's private state:
   /// (1) re-pin the window cursor so the target mounts — a *tail* window, so
   /// everything from the target down mounts, paying its markdown parse. The
   /// cursor only ever lowers (monotonic, floored at 0), so a jump costs
@@ -986,8 +1010,11 @@
   /// something OLDER than the current top grows the window again — the cost is
   /// per-deeper-jump, not once per conversation. Accepted: the user explicitly
   /// asked to go there;
-  /// (2) after the flush, align the target block's top with the container top;
-  /// (3) adopt that position as the new anchor reference exactly the way
+  /// (2) after the flush, measure the compact unit and expand it only when the
+  /// compact rendering hides content;
+  /// (3) after any expansion flush, align the target block's top with the
+  /// container top;
+  /// (4) adopt that position as the new anchor reference exactly the way
   /// `reanchor` ends a pass — unpinned, gap captured — so the anchoring
   /// machinery defends the jumped-to position instead of snapping back.
   /// A consumed request can't linger: without consumption, a later remount of
@@ -1003,6 +1030,56 @@
     );
   }
 
+  /// Resolve a navigator row to the exact compact unit that owns it. Fan-out
+  /// responses share one scroll block, but each agent column keeps its own
+  /// expansion state, so selecting Bob's result must not open Alice's too.
+  function expansionTargetForRow(
+    block: RenderBlock,
+    key: string,
+  ): { key: string; defaultCompact: boolean; dataHidden: boolean } | null {
+    if (block.kind === "row") {
+      if (block.row.key !== key) return null;
+      if (block.row.kind === "user") {
+        return {
+          key: userPreviewKey(block.row.key),
+          defaultCompact: compactEnabled,
+          dataHidden: false,
+        };
+      }
+      if (block.row.kind === "agent" && isCollapsibleResponse(block.row.turn)) {
+        const previewKey = agentPreviewKey(block.row.turn.turn_id);
+        const latestResponse = latestResponseKeys.has(previewKey);
+        return {
+          key: previewKey,
+          defaultCompact: responseDefaultCompact(previewKey),
+          dataHidden: responseHasDataHidden(block.row.turn, latestResponse),
+        };
+      }
+      return null;
+    }
+    if (block.user.key === key) {
+      return {
+        key: userPreviewKey(block.user.key),
+        defaultCompact: compactEnabled,
+        dataHidden: false,
+      };
+    }
+    for (const col of block.columns) {
+      if (!col.rows.some((row) => row.kind === "agent" && row.key === key)) continue;
+      if (!isCollapsibleColumn(col.rows)) return null;
+      const previewKey = fanoutPreviewKey(block.send_id, col.agent_id);
+      const latestResponse = latestResponseKeys.has(previewKey);
+      return {
+        key: previewKey,
+        defaultCompact: responseDefaultCompact(previewKey),
+        dataHidden: col.rows.some(
+          (row) => row.kind === "agent" && responseHasDataHidden(row.turn, latestResponse),
+        ),
+      };
+    }
+    return null;
+  }
+
   let lastHandledJumpSeq = 0;
   $effect(() => {
     const seq = jumpRequest.seq;
@@ -1014,13 +1091,31 @@
     consumeJump(seq);
     const index = untrack(() => blocks.findIndex((block) => blockContainsRow(block, key)));
     if (index === -1) return; // stale key — the row was pruned since indexing
-    const targetKey = untrack(() => blockKey(blocks[index]!));
+    const targetBlock = untrack(() => blocks[index]!);
+    const targetKey = blockKey(targetBlock);
+    const expansionTarget = untrack(() => expansionTargetForRow(targetBlock, key));
     if (index < untrack(() => firstVisibleIndex)) {
       cursor = index;
       frozenIdentity = untrack(() => windowIdentity);
     }
-    void tick().then(() => {
-      if (!container) return;
+    void tick().then(async () => {
+      if (!container || lastHandledJumpSeq !== seq || jumpRequest.seq !== seq) return;
+      if (
+        expansionTarget !== null &&
+        untrack(() => isCompact(projectId, expansionTarget.key, expansionTarget.defaultCompact))
+      ) {
+        const unit = container.querySelector(
+          `[data-preview-key="${CSS.escape(expansionTarget.key)}"]`,
+        );
+        const clip = unit?.querySelector('[data-testid="preview-clip"]');
+        const proseOverflows =
+          clip instanceof HTMLElement && clip.scrollHeight - clip.clientHeight > 1;
+        if (expansionTarget.dataHidden || proseOverflows) {
+          setManyOverrides(projectId, [expansionTarget.key], false);
+          await tick();
+          if (!container || lastHandledJumpSeq !== seq || jumpRequest.seq !== seq) return;
+        }
+      }
       const el = container.querySelector(`[data-block-key="${CSS.escape(targetKey)}"]`);
       if (!(el instanceof HTMLElement)) return;
       const delta = el.getBoundingClientRect().top - container.getBoundingClientRect().top;
@@ -1541,7 +1636,7 @@
 {/snippet}
 
 {#snippet userMessage(row: Extract<UnifiedRow, { kind: "user" }>)}
-  {@const key = `user:${row.key}`}
+  {@const key = userPreviewKey(row.key)}
   {@const defaultCompact = compactEnabled}
   {@const compact = isCompact(projectId, key, defaultCompact)}
   <!-- A user message has nothing hidden behind a collapse — only height — so it
@@ -1558,7 +1653,13 @@
   {@const forwarded = FORWARD_SENTINEL.test(row.text)}
   {@const caption =
     row.send_id !== undefined ? forwardCaptionFor(projectId, row.send_id) : undefined}
-  <div class="group min-w-0 flex-1" data-testid="turn" data-role="user" data-forwarded={forwarded}>
+  <div
+    class="group min-w-0 flex-1"
+    data-testid="turn"
+    data-role="user"
+    data-forwarded={forwarded}
+    data-preview-key={key}
+  >
     <div class="bg-focus-soft w-full max-w-full overflow-hidden rounded-xl px-4 py-2">
       <!-- Clip wraps the content inside the bubble (not the bubble itself). The
            clip + `measureClip` mount ONLY while compact (mirroring agent rows): on
@@ -1669,12 +1770,12 @@
        failed, cancelled, or dangling streaming-on-disk closed by a marker). Only
        a genuinely-live streaming turn is excluded — it uses the live-streaming cap. -->
   {@const previewEligible = isCollapsibleResponse(turn)}
-  {@const key = `agent:${turn.turn_id}`}
+  {@const key = agentPreviewKey(turn.turn_id)}
   {@const latestResponse = latestResponseKeys.has(key)}
-  {@const defaultCompact = compactEnabled && !latestResponse}
+  {@const defaultCompact = responseDefaultCompact(key)}
   {@const compact = previewEligible && isCompact(projectId, key, defaultCompact)}
   {@const showToggle = previewEligible && responseHasMore(turn, key, latestResponse)}
-  <div class="group space-y-1.5" data-testid="turn" data-role="agent">
+  <div class="group space-y-1.5" data-testid="turn" data-role="agent" data-preview-key={key}>
     <div class="flex items-center gap-2 text-xs font-semibold tracking-wide uppercase">
       <span class="text-fg" data-testid="turn-agent-name">{agentName(turn.agent_id)}</span>
       {#if harness}<HarnessIcon {harness} testid="turn-harness-icon" />{:else}<Badge>?</Badge>{/if}
@@ -2055,8 +2156,8 @@
           {@const fanoutEntries = block.columns
             .filter((col) => isCollapsibleColumn(col.rows))
             .map((col) => {
-              const key = `fanout:${block.send_id}:${col.agent_id}`;
-              return { key, defaultCompact: compactEnabled && !latestResponseKeys.has(key) };
+              const key = fanoutPreviewKey(block.send_id, col.agent_id);
+              return { key, defaultCompact: responseDefaultCompact(key) };
             })}
           {@const fanoutCopyable = fanoutText(block.columns)}
           {@const fanoutLiveCap = !block.columns.some((col) => {
@@ -2087,10 +2188,10 @@
                    doubled `failed`). Safe per the single-(send_id, agent_id)
                    column invariant. -->
                   {@const colHasOutcome = col.rows.some((r) => r.kind === "outcome")}
-                  {@const colKey = `fanout:${block.send_id}:${col.agent_id}`}
+                  {@const colKey = fanoutPreviewKey(block.send_id, col.agent_id)}
                   {@const colEligible = isCollapsibleColumn(col.rows)}
                   {@const colLatestResponse = latestResponseKeys.has(colKey)}
-                  {@const colDefaultCompact = compactEnabled && !colLatestResponse}
+                  {@const colDefaultCompact = responseDefaultCompact(colKey)}
                   {@const colCompact =
                     colEligible && isCompact(projectId, colKey, colDefaultCompact)}
                   {@const colShowToggle =
@@ -2104,6 +2205,7 @@
                     data-testid="fanout-column"
                     data-role="agent"
                     data-agent-id={col.agent_id}
+                    data-preview-key={colKey}
                     data-state={state}
                   >
                     <div

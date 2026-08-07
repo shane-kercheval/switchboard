@@ -10,6 +10,7 @@ import { agentCopy } from "$lib/agentCopy.svelte";
 // `vi.mock` is hoisted above imports, so the mocks below still apply.
 import UnifiedTranscript from "./UnifiedTranscript.svelte";
 import {
+  hasOverrides,
   setProjectCompact,
   toggleKey,
   _testing as previewState,
@@ -2931,6 +2932,165 @@ describe("UnifiedTranscript compact mode", () => {
     expect(toggleLabel(a!)).toBe("Collapse"); // now expanded
     expect(toggleLabel(b!)).toBe("Expand"); // unchanged
     expect(toggleLabel(c!)).toBe("Collapse"); // unchanged
+  });
+
+  it("expands only the standalone response selected by a navigator jump", async () => {
+    const state = await loadState();
+    const jump = await import("$lib/state/transcriptJump.svelte");
+    await state.registerAgent(CLAUDE_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [
+      user(CLAUDE_AGENT, "send-a", "u-a", "2026-05-16T00:00:00Z"),
+      done(CLAUDE_AGENT, "send-a", "a-a", "2026-05-16T00:00:01Z", "2026-05-16T00:00:02Z", [
+        TOOL("ta"),
+        ANSWER("A"),
+      ]),
+      user(CLAUDE_AGENT, "send-b", "u-b", "2026-05-16T00:00:10Z"),
+      done(CLAUDE_AGENT, "send-b", "a-b", "2026-05-16T00:00:11Z", "2026-05-16T00:00:12Z", [
+        TOOL("tb"),
+        ANSWER("B"),
+      ]),
+      user(CLAUDE_AGENT, "send-c", "u-c", "2026-05-16T00:00:20Z"),
+      done(CLAUDE_AGENT, "send-c", "a-c", "2026-05-16T00:00:21Z", "2026-05-16T00:00:22Z", [
+        TOOL("tc"),
+        ANSWER("C"),
+      ]),
+    ];
+    setProjectCompact(PROJECT_ID, true);
+
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT], paneId: "pane-x" },
+    });
+
+    const [a, b] = agentTurns();
+    expect(within(a!).queryByTestId("tool-row")).toBeNull();
+    expect(within(b!).queryByTestId("tool-row")).toBeNull();
+
+    jump.requestJump(PROJECT_ID, "pane-x", "a:a-a");
+    await tick();
+    await tick();
+
+    expect(within(a!).getByTestId("tool-row")).toBeInTheDocument();
+    expect(within(b!).queryByTestId("tool-row")).toBeNull();
+  });
+
+  it("expands a user message selected by a navigator jump", async () => {
+    const state = await loadState();
+    const jump = await import("$lib/state/transcriptJump.svelte");
+    await state.registerAgent(CLAUDE_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [
+      {
+        role: "user",
+        turn_id: "u-a",
+        agent_id: CLAUDE_AGENT.id,
+        send_id: "send-a",
+        started_at: "2026-05-16T00:00:00Z",
+        text: "long prompt\n".repeat(40),
+      },
+    ];
+    setProjectCompact(PROJECT_ID, true);
+
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT], paneId: "pane-x" },
+    });
+
+    const userTurn = screen.getByTestId("turn");
+    const clip = within(userTurn).getByTestId("preview-clip");
+    Object.defineProperties(clip, {
+      scrollHeight: { configurable: true, value: 400 },
+      clientHeight: { configurable: true, value: 100 },
+    });
+
+    jump.requestJump(PROJECT_ID, "pane-x", "u:send-a");
+    await tick();
+    await tick();
+
+    expect(within(userTurn).queryByTestId("preview-clip")).toBeNull();
+  });
+
+  it("expands only the selected agent column in a fan-out", async () => {
+    const state = await loadState();
+    const jump = await import("$lib/state/transcriptJump.svelte");
+    await state.registerAgent(CLAUDE_AGENT);
+    await state.registerAgent(CODEX_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [
+      user(CLAUDE_AGENT, "send-f", "u-fa", "2026-05-16T00:00:00Z"),
+      done(CLAUDE_AGENT, "send-f", "a-fa", "2026-05-16T00:00:01Z", "2026-05-16T00:00:02Z", [
+        TOOL("ta"),
+        ANSWER("Alice"),
+      ]),
+    ];
+    state.transcripts[CODEX_AGENT.id] = [
+      user(CODEX_AGENT, "send-f", "u-fb", "2026-05-16T00:00:00Z"),
+      done(CODEX_AGENT, "send-f", "a-fb", "2026-05-16T00:00:01Z", "2026-05-16T00:00:02Z", [
+        TOOL("tb"),
+        ANSWER("Bob"),
+      ]),
+    ];
+    setProjectCompact(PROJECT_ID, true);
+    toggleKey(PROJECT_ID, `fanout:send-f:${CLAUDE_AGENT.id}`, false);
+    toggleKey(PROJECT_ID, `fanout:send-f:${CODEX_AGENT.id}`, false);
+
+    render(UnifiedTranscript, {
+      props: {
+        projectId: PROJECT_ID,
+        agents: [CLAUDE_AGENT, CODEX_AGENT],
+        paneId: "pane-x",
+      },
+    });
+
+    const [alice, bob] = screen.getAllByTestId("fanout-column");
+    expect(within(alice!).queryByTestId("tool-row")).toBeNull();
+    expect(within(bob!).queryByTestId("tool-row")).toBeNull();
+
+    jump.requestJump(PROJECT_ID, "pane-x", "a:a-fb");
+    await tick();
+    await tick();
+
+    expect(within(alice!).queryByTestId("tool-row")).toBeNull();
+    expect(within(bob!).getByTestId("tool-row")).toBeInTheDocument();
+  });
+
+  it("does not pin an expanded-by-default latest response open after a jump", async () => {
+    const state = await loadState();
+    const jump = await import("$lib/state/transcriptJump.svelte");
+    await state.registerAgent(CLAUDE_AGENT);
+    const latest = done(
+      CLAUDE_AGENT,
+      "send-a",
+      "a-a",
+      "2026-05-16T00:00:01Z",
+      "2026-05-16T00:00:02Z",
+      [TOOL("ta"), ANSWER("A")],
+    );
+    state.transcripts[CLAUDE_AGENT.id] = [
+      user(CLAUDE_AGENT, "send-a", "u-a", "2026-05-16T00:00:00Z"),
+      latest,
+    ];
+    setProjectCompact(PROJECT_ID, true);
+
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT], paneId: "pane-x" },
+    });
+
+    const response = agentTurns()[0]!;
+    expect(within(response).getByTestId("tool-row")).toBeInTheDocument();
+    expect(hasOverrides(PROJECT_ID)).toBe(false);
+
+    jump.requestJump(PROJECT_ID, "pane-x", "a:a-a");
+    await tick();
+    await tick();
+    expect(hasOverrides(PROJECT_ID)).toBe(false);
+
+    state.transcripts[CLAUDE_AGENT.id] = [
+      ...state.transcripts[CLAUDE_AGENT.id]!,
+      done(CLAUDE_AGENT, "send-b", "a-b", "2026-05-16T00:00:11Z", "2026-05-16T00:00:12Z", [
+        TOOL("tb"),
+        ANSWER("B"),
+      ]),
+    ];
+    await tick();
+
+    expect(within(response).queryByTestId("tool-row")).toBeNull();
   });
 
   it("renders no compact toggle on a queued row", async () => {

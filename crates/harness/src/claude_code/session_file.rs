@@ -30,6 +30,12 @@
 //!   - `type: "tool_use"` → append `TurnItem::Tool` (`output`/`completed_at`
 //!     filled in by the later paired user/`tool_result` record).
 //!   - any other block type → silently skipped; reserved for future expansion.
+//! - A structurally linked `sdk-cli` `system/subtype: "local_command"`
+//!   input/output pair → a completed harness response. This compatibility and
+//!   recovery path covers pre-escape Switchboard history, attached SDK-created
+//!   sessions, and unexpected future command interception. New ordinary
+//!   Switchboard sends bypass Claude's local-command parser. The output record's
+//!   UUID provides disk re-parse stability; it is not a live-matched join key.
 //!
 //! ## Lifecycle
 //!
@@ -320,6 +326,21 @@ fn is_bare_slash_command_record(record: &Value, text: &str) -> bool {
         && KNOWN_BOOKKEEPING_SLASH_COMMANDS.contains(&text.trim())
 }
 
+fn extract_local_command_output(content: &str) -> Option<&str> {
+    for (open, close) in [
+        ("<local-command-stdout>", "</local-command-stdout>"),
+        ("<local-command-stderr>", "</local-command-stderr>"),
+    ] {
+        if let Some(output) = content
+            .strip_prefix(open)
+            .and_then(|text| text.strip_suffix(close))
+        {
+            return Some(output);
+        }
+    }
+    None
+}
+
 /// In-progress reconstruction state. Walks records in order, opening a
 /// fresh `Turn::User` on each prompt and accumulating `assistant` records
 /// into the corresponding `Turn::Agent`.
@@ -357,6 +378,17 @@ struct ReconstructionState {
     /// **expected and benign** for genuine prompts that start with a path/slash;
     /// investigate only alongside an observed duplication.
     commandish_not_reclassified: usize,
+    pending_local_command: Option<PendingLocalCommand>,
+}
+
+struct PendingLocalCommand {
+    input_uuid: String,
+    started_at: DateTime<Utc>,
+    outputs: Vec<String>,
+    output_ids: Vec<String>,
+    matched_output_count: usize,
+    ended_at: DateTime<Utc>,
+    last_line_number: usize,
 }
 
 struct AgentTurnBuilder {
@@ -417,6 +449,7 @@ impl ReconstructionState {
             pending_tool_results: Vec::new(),
             housekeeping_skipped: 0,
             commandish_not_reclassified: 0,
+            pending_local_command: None,
         }
     }
 
@@ -432,16 +465,129 @@ impl ReconstructionState {
             return;
         };
         match record_type {
-            "user" => self.handle_user(line_number, record),
-            "assistant" => self.handle_assistant(line_number, record),
+            "user" => {
+                self.finish_pending_local_command();
+                self.handle_user(line_number, record);
+            }
+            "assistant" => {
+                self.finish_pending_local_command();
+                self.handle_assistant(line_number, record);
+            }
+            "system" => self.handle_system(line_number, record),
             _ => {
                 // Other record types (`attachment`, `queue-operation`,
-                // `system`, `agent-name`, `ai-title`, `last-prompt`,
+                // `agent-name`, `ai-title`, `last-prompt`,
                 // `file-history-snapshot`, `permission-mode`) carry session
                 // metadata that doesn't affect the user/agent transcript
                 // shape. Silently skipped — not a warning condition.
             }
         }
+    }
+
+    fn handle_system(&mut self, line_number: usize, record: &Value) {
+        if record.get("subtype").and_then(Value::as_str) != Some("local_command") {
+            return;
+        }
+        let Some(content) = record.get("content").and_then(Value::as_str) else {
+            self.warn(
+                line_number,
+                "Claude local_command record has no string content",
+            );
+            return;
+        };
+        let entrypoint = record.get("entrypoint").and_then(Value::as_str);
+        if entrypoint != Some("sdk-cli") {
+            return;
+        }
+        let timestamp = parse_timestamp(record).unwrap_or_else(Utc::now);
+
+        if let Some(output) = extract_local_command_output(content) {
+            let parent_uuid = record.get("parentUuid").and_then(Value::as_str);
+            let output_uuid = record.get("uuid").and_then(Value::as_str);
+            if output_uuid.is_none() {
+                self.warn(line_number, "sdk-cli local-command output has no uuid");
+            }
+            let Some(pending) = self.pending_local_command.as_mut() else {
+                self.warn(
+                    line_number,
+                    "orphaned sdk-cli local-command output without a pending input",
+                );
+                return;
+            };
+            if parent_uuid != Some(pending.input_uuid.as_str()) {
+                self.warn(
+                    line_number,
+                    "sdk-cli local-command output parentUuid does not match its pending input",
+                );
+                return;
+            }
+            pending.matched_output_count += 1;
+            if !output.is_empty() {
+                pending.outputs.push(output.to_owned());
+            }
+            if let Some(uuid) = output_uuid {
+                pending.output_ids.push(uuid.to_owned());
+            }
+            pending.ended_at = timestamp;
+            pending.last_line_number = line_number;
+        } else if content.trim_start().starts_with('/') {
+            self.finish_pending_local_command();
+            self.close_current_agent(TurnStatus::Complete);
+            self.flush_deferred_as_warnings();
+            let Some(input_uuid) = record.get("uuid").and_then(Value::as_str) else {
+                self.warn(line_number, "sdk-cli local-command input has no uuid");
+                return;
+            };
+            self.pending_local_command = Some(PendingLocalCommand {
+                input_uuid: input_uuid.to_owned(),
+                started_at: timestamp,
+                outputs: Vec::new(),
+                output_ids: Vec::new(),
+                matched_output_count: 0,
+                ended_at: timestamp,
+                last_line_number: line_number,
+            });
+        }
+    }
+
+    fn finish_pending_local_command(&mut self) {
+        let Some(pending) = self.pending_local_command.take() else {
+            return;
+        };
+        if pending.outputs.is_empty() {
+            return;
+        }
+        let hydration_key = if pending.matched_output_count == 1 {
+            pending.output_ids.first().cloned()
+        } else {
+            self.warn(
+                pending.last_line_number,
+                "sdk-cli local command produced multiple output records; hydration key omitted",
+            );
+            None
+        };
+        self.turns.push(Turn::Agent {
+            turn_id: Uuid::now_v7(),
+            agent_id: self.agent_id,
+            started_at: pending.started_at,
+            ended_at: Some(pending.ended_at),
+            status: TurnStatus::Complete,
+            items: pending
+                .outputs
+                .into_iter()
+                .map(|text| TurnItem::Text {
+                    kind: ContentKind::Text,
+                    text,
+                })
+                .collect(),
+            usage: None,
+            model: None,
+            effort: None,
+            spend: None,
+            hydration_key,
+            continuation_of: None,
+            stable_message_id: None,
+        });
     }
 
     /// Drain `pending_tool_results` into warnings. Called at each turn
@@ -868,6 +1014,7 @@ impl ReconstructionState {
         // `close_current_agent`, so by this point any remaining deferreds
         // are genuinely unmatched (the matching `tool_use` never appeared
         // in the final turn's records).
+        self.finish_pending_local_command();
         let status = self
             .current_agent
             .as_ref()
@@ -1064,6 +1211,24 @@ mod tests {
                     "cache_creation_input_tokens": 3,
                 }
             },
+            "timestamp": timestamp,
+        })
+    }
+
+    fn local_command_record(
+        content: &str,
+        uuid: &str,
+        parent_uuid: Option<&str>,
+        entrypoint: &str,
+        timestamp: &str,
+    ) -> Value {
+        json!({
+            "type": "system",
+            "subtype": "local_command",
+            "content": content,
+            "uuid": uuid,
+            "parentUuid": parent_uuid,
+            "entrypoint": entrypoint,
             "timestamp": timestamp,
         })
     }
@@ -2668,6 +2833,281 @@ mod tests {
         let result = load_claude_transcript(home.path(), cwd.path(), session_id, agent_id).unwrap();
         assert!(result.turns.is_empty());
         assert!(result.warnings.is_empty());
+    }
+
+    #[test]
+    fn local_command_stdout_reconstructs_a_keyed_harness_response() {
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        let session_id = Uuid::now_v7();
+        let agent_id = Uuid::now_v7();
+        stage_session_file(
+            home.path(),
+            cwd.path(),
+            session_id,
+            include_str!("../../tests/fixtures/claude/local-command.session.jsonl"),
+        );
+        let turns = load_claude_transcript(home.path(), cwd.path(), session_id, agent_id)
+            .unwrap()
+            .turns;
+
+        assert!(matches!(
+            turns.as_slice(),
+            [Turn::Agent {
+                status: TurnStatus::Complete,
+                items,
+                model: None,
+                hydration_key: Some(hydration_key),
+                ..
+            }] if hydration_key == "disk-output-id"
+                && matches!(items.as_slice(), [TurnItem::Text { kind: ContentKind::Text, text }]
+                    if text == "/plugin isn't available in this environment.")
+        ));
+    }
+
+    #[test]
+    fn interactive_local_command_output_is_not_fabricated_as_an_agent_turn() {
+        let turns = load_turns(&[
+            local_command_record(
+                "<command-name>/context</command-name>",
+                "interactive-input",
+                None,
+                "cli",
+                "2026-08-06T19:00:00Z",
+            ),
+            local_command_record(
+                "<local-command-stdout>Context table</local-command-stdout>",
+                "interactive-output",
+                Some("interactive-input"),
+                "cli",
+                "2026-08-06T19:00:01Z",
+            ),
+        ]);
+
+        assert!(turns.is_empty());
+    }
+
+    #[test]
+    fn mismatched_local_command_parent_does_not_discard_the_expected_input() {
+        let mut state = ReconstructionState::new(Uuid::now_v7());
+        state.ingest_record(
+            1,
+            &local_command_record(
+                "/plugin",
+                "input-id",
+                None,
+                "sdk-cli",
+                "2026-08-06T19:00:00Z",
+            ),
+        );
+        state.ingest_record(
+            2,
+            &local_command_record(
+                "<local-command-stdout>wrong parent</local-command-stdout>",
+                "output-id",
+                Some("different-input"),
+                "sdk-cli",
+                "2026-08-06T19:00:01Z",
+            ),
+        );
+        state.ingest_record(
+            3,
+            &local_command_record(
+                "<local-command-stdout>correct parent</local-command-stdout>",
+                "output-id",
+                Some("input-id"),
+                "sdk-cli",
+                "2026-08-06T19:00:02Z",
+            ),
+        );
+        let transcript = state.finalize();
+
+        assert!(matches!(
+            transcript.turns.as_slice(),
+            [Turn::Agent { items, hydration_key: Some(key), .. }]
+                if key == "output-id"
+                    && matches!(items.as_slice(), [TurnItem::Text { text, .. }]
+                        if text == "correct parent")
+        ));
+        assert!(
+            transcript.warnings.iter().any(|warning| {
+                warning.line_number == 2 && warning.reason.contains("parentUuid")
+            })
+        );
+    }
+
+    #[test]
+    fn metadata_between_local_command_input_and_output_preserves_linkage() {
+        let mut state = ReconstructionState::new(Uuid::now_v7());
+        for (line, record) in [
+            local_command_record(
+                "/plugin",
+                "input-id",
+                None,
+                "sdk-cli",
+                "2026-08-06T19:00:00Z",
+            ),
+            json!({"type": "queue-operation", "operation": "enqueue"}),
+            json!({"type": "file-history-snapshot", "snapshot": {}}),
+            local_command_record(
+                "<local-command-stdout>response</local-command-stdout>",
+                "output-id",
+                Some("input-id"),
+                "sdk-cli",
+                "2026-08-06T19:00:01Z",
+            ),
+        ]
+        .iter()
+        .enumerate()
+        {
+            state.ingest_record(line + 1, record);
+        }
+        let transcript = state.finalize();
+
+        assert!(matches!(
+            transcript.turns.as_slice(),
+            [Turn::Agent { hydration_key: Some(key), .. }] if key == "output-id"
+        ));
+        assert!(transcript.warnings.is_empty());
+    }
+
+    #[test]
+    fn matching_multiple_local_command_outputs_are_preserved_without_a_guessed_key() {
+        let mut state = ReconstructionState::new(Uuid::now_v7());
+        let mut output_without_uuid = local_command_record(
+            "<local-command-stderr>second</local-command-stderr>",
+            "removed-id",
+            Some("input-id"),
+            "sdk-cli",
+            "2026-08-06T19:00:02Z",
+        );
+        output_without_uuid
+            .as_object_mut()
+            .expect("record object")
+            .remove("uuid");
+        for (line, record) in [
+            local_command_record(
+                "/context",
+                "input-id",
+                None,
+                "sdk-cli",
+                "2026-08-06T19:00:00Z",
+            ),
+            local_command_record(
+                "<local-command-stdout>first</local-command-stdout>",
+                "output-1",
+                Some("input-id"),
+                "sdk-cli",
+                "2026-08-06T19:00:01Z",
+            ),
+            output_without_uuid,
+        ]
+        .iter()
+        .enumerate()
+        {
+            state.ingest_record(line + 1, record);
+        }
+        let transcript = state.finalize();
+
+        assert!(matches!(
+            transcript.turns.as_slice(),
+            [Turn::Agent { items, hydration_key: None, .. }]
+                if matches!(items.as_slice(), [
+                    TurnItem::Text { text: first, .. },
+                    TurnItem::Text { text: second, .. },
+                ] if first == "first" && second == "second")
+        ));
+        assert!(
+            transcript
+                .warnings
+                .iter()
+                .any(|warning| { warning.reason.contains("multiple output records") })
+        );
+        assert!(
+            transcript
+                .warnings
+                .iter()
+                .any(|warning| { warning.reason.contains("output has no uuid") })
+        );
+    }
+
+    #[test]
+    fn conversation_boundaries_clear_stale_local_command_input() {
+        for boundary in [
+            user_record("next prompt", "2026-08-06T19:00:01Z"),
+            assistant_text_record("next response", "claude-sonnet-5", "2026-08-06T19:00:01Z"),
+        ] {
+            let mut state = ReconstructionState::new(Uuid::now_v7());
+            state.ingest_record(
+                1,
+                &local_command_record(
+                    "/plugin",
+                    "input-id",
+                    None,
+                    "sdk-cli",
+                    "2026-08-06T19:00:00Z",
+                ),
+            );
+            state.ingest_record(2, &boundary);
+            state.ingest_record(
+                3,
+                &local_command_record(
+                    "<local-command-stdout>late output</local-command-stdout>",
+                    "output-id",
+                    Some("input-id"),
+                    "sdk-cli",
+                    "2026-08-06T19:00:02Z",
+                ),
+            );
+            let transcript = state.finalize();
+
+            assert_eq!(transcript.turns.len(), 1);
+            assert!(transcript.warnings.iter().any(|warning| {
+                warning.line_number == 3 && warning.reason.contains("orphaned")
+            }));
+        }
+    }
+
+    #[test]
+    fn replacement_sdk_command_discards_an_unanswered_pending_input() {
+        let mut state = ReconstructionState::new(Uuid::now_v7());
+        for (line, record) in [
+            local_command_record(
+                "/first",
+                "first-input",
+                None,
+                "sdk-cli",
+                "2026-08-06T19:00:00Z",
+            ),
+            local_command_record(
+                "/second",
+                "second-input",
+                None,
+                "sdk-cli",
+                "2026-08-06T19:00:01Z",
+            ),
+            local_command_record(
+                "<local-command-stdout>second response</local-command-stdout>",
+                "second-output",
+                Some("second-input"),
+                "sdk-cli",
+                "2026-08-06T19:00:02Z",
+            ),
+        ]
+        .iter()
+        .enumerate()
+        {
+            state.ingest_record(line + 1, record);
+        }
+        let transcript = state.finalize();
+
+        assert!(matches!(
+            transcript.turns.as_slice(),
+            [Turn::Agent { items, hydration_key: Some(key), .. }]
+                if key == "second-output"
+                    && matches!(items.as_slice(), [TurnItem::Text { text, .. }]
+                        if text == "second response")
+        ));
     }
 
     #[test]

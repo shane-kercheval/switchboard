@@ -13706,6 +13706,33 @@ mod tests {
     }
 
     #[test]
+    fn merge_local_command_compatibility_response_falls_back_to_position() {
+        // Claude persists a headless local-command response as system records,
+        // not a user/assistant pair. Pre-escape Switchboard journals linked the
+        // live synthetic message.id, while the only stable disk identity is the
+        // output record's different uuid. The incompatible link is ignored and
+        // the promptless response pairs positionally with the journaled send.
+        let agent = Uuid::now_v7();
+        let send = Uuid::now_v7();
+        let journal = vec![
+            send_record(send, Uuid::now_v7(), agent, "/plugin", 1),
+            link_record(send, agent, "synthetic-message-id", 3),
+        ];
+        let turns = vec![agent_turn_keyed(
+            Uuid::now_v7(),
+            agent,
+            "/plugin isn't available in this environment.",
+            3,
+            "disk-output-id",
+        )];
+
+        let merged = merge_project_conversation(journal, vec![(agent, transcript_of(turns), None)]);
+
+        assert_eq!(user_texts(&merged), vec!["/plugin"]);
+        assert_eq!(agent_send_ids(&merged), vec![Some(send)]);
+    }
+
+    #[test]
     fn merge_without_links_falls_back_to_positional_unchanged() {
         // The same transcript with NO link records must classify exactly by the
         // positional path — proving the key-join is purely additive and legacy

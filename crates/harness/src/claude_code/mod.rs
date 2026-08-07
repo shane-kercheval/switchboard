@@ -191,7 +191,19 @@ fn build_args(
     // Any flag added later must be pushed BEFORE this `--`, or it lands as a
     // positional alongside the prompt.
     args.push("--".to_owned());
-    args.push(prompt.to_owned());
+    // Claude's headless CLI still routes a bare slash-leading positional through
+    // its interactive command parser (`/plugin`, `/context`, unknown commands),
+    // so the model may never see a plain Switchboard message. A single leading
+    // ASCII space bypasses that parser without changing the message's meaning.
+    // Keep this at the adapter boundary: the journal and frontend retain the
+    // user's exact text, and every dispatch source (compose, prompt, workflow,
+    // forward) gets the same literal-message contract.
+    let transport_prompt = if prompt.starts_with('/') {
+        format!(" {prompt}")
+    } else {
+        prompt.to_owned()
+    };
+    args.push(transport_prompt);
     args
 }
 
@@ -586,6 +598,38 @@ mod tests {
                 "--",
                 "prompt is the last positional, preceded by `--`; got {args:?}"
             );
+        }
+    }
+
+    #[test]
+    fn build_args_prefixes_slash_leading_prompt_for_literal_model_dispatch() {
+        let home = tempfile::TempDir::new().unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        let agent = agent_with_session(Uuid::now_v7());
+
+        for (prompt, transported) in [
+            ("/plugin", " /plugin"),
+            ("/code-review", " /code-review"),
+            (
+                "/shanekercheval/path/to/something is missing",
+                " /shanekercheval/path/to/something is missing",
+            ),
+        ] {
+            let args = build_args(&agent, prompt, project.path(), Some(home.path()));
+            assert_eq!(args.last().map(String::as_str), Some(transported));
+            assert_eq!(args[args.len() - 2], "--");
+        }
+    }
+
+    #[test]
+    fn build_args_preserves_non_slash_and_already_spaced_prompts() {
+        let home = tempfile::TempDir::new().unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        let agent = agent_with_session(Uuid::now_v7());
+
+        for prompt in ["plain message", " /plugin"] {
+            let args = build_args(&agent, prompt, project.path(), Some(home.path()));
+            assert_eq!(args.last().map(String::as_str), Some(prompt));
         }
     }
 

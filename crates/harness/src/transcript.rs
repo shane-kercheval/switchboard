@@ -136,8 +136,10 @@ pub enum Turn {
         /// onto the IPC wire** (the merge on the other side dedups by it), and it
         /// carries a deliberately broader contract.
         ///
-        /// Per harness: Claude the **first** non-subagent assistant `message.id`
-        /// (matches the live `TurnEnd`); Codex the `turn_context.turn_id` (**not**
+        /// Per harness: Claude normally uses the **first** non-subagent assistant
+        /// `message.id`; SDK local-command compatibility records use their output
+        /// UUID for re-parse stability but have no live-matched key. Codex uses the
+        /// `turn_context.turn_id` (**not**
         /// `task_started.turn_id`, whose per-turn uniqueness is unconfirmed — see
         /// `codex/session_file.rs`); Gemini the turn's first `gemini` record `id`.
         /// `None` for Antigravity (no native per-turn id) — the merge falls back to

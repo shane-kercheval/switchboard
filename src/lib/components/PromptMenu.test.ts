@@ -43,11 +43,14 @@ const BUILTIN: Prompt = {
 
 function setup(prompts: Prompt[] = PROMPTS, loading = false) {
   const onpick = vi.fn();
+  const oninsert = vi.fn();
   const oncopy = vi.fn();
   const onopenfolder = vi.fn();
   const onclose = vi.fn();
-  render(PromptMenu, { props: { prompts, loading, onpick, oncopy, onopenfolder, onclose } });
-  return { onpick, oncopy, onopenfolder, onclose };
+  render(PromptMenu, {
+    props: { prompts, loading, onpick, oninsert, oncopy, onopenfolder, onclose },
+  });
+  return { onpick, oninsert, oncopy, onopenfolder, onclose };
 }
 
 describe("PromptMenu", () => {
@@ -90,6 +93,31 @@ describe("PromptMenu", () => {
       target: { value: "zzz" },
     });
     expect(screen.getByTestId("prompt-menu-empty")).toHaveTextContent("No matching prompts");
+    expect(screen.getByTestId("prompt-menu-insert-message")).toHaveTextContent(
+      "Insert “/zzz” into the message",
+    );
+  });
+
+  it("inserts an unmatched slash query instead of swallowing it", async () => {
+    const { oninsert } = setup();
+    const search = screen.getByTestId("prompt-menu-search");
+    await fireEvent.input(search, { target: { value: "plugin" } });
+    await fireEvent.keyDown(search, { key: "Enter" });
+
+    expect(oninsert).toHaveBeenCalledOnce();
+    expect(oninsert).toHaveBeenCalledWith("/plugin");
+  });
+
+  it("keeps literal-message insertion available alongside matching prompts", async () => {
+    const { oninsert } = setup();
+    await fireEvent.input(screen.getByTestId("prompt-menu-search"), {
+      target: { value: "summ" },
+    });
+
+    const insert = screen.getByTestId("prompt-menu-insert-message");
+    expect(insert).toHaveTextContent("Insert “/summ” into the message");
+    await fireEvent.click(insert);
+    expect(oninsert).toHaveBeenCalledWith("/summ");
   });
 
   it("shows a distinct empty state when there are no prompts at all", () => {

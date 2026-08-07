@@ -583,7 +583,7 @@ pub trait ConversationJournal: Send + Sync {
 
     /// Written at a turn's terminal when the adapter reports a stable per-turn
     /// `hydration_key` — for a **`Completed` or `Failed`** turn (a failed turn can
-    /// carry partial content on disk keyed by its first assistant `message.id`).
+    /// carry partial content on disk keyed by its harness hydration identity).
     /// Records the durable send↔turn join so the transcript merge matches this
     /// turn to its send by key instead of by counting.
     ///
@@ -1584,6 +1584,11 @@ async fn drain_turn(
     // it removes the disk-flush race the manual path would otherwise hit.
     // `Thinking` text and tool output are deliberately excluded.
     let mut captured_text = String::new();
+    // Diagnostic-only record of whether the adapter produced anything the
+    // transcript can render. A completed turn without content or tool activity
+    // may be valid for a future harness shape, so it remains Completed; the
+    // warning simply turns a silent parser regression into an actionable log.
+    let mut visible_output_seen = false;
     // Set when the dispatcher itself synthesizes a `Failed` terminal (a
     // load-bearing locator-persist failure). Distinct from the cancel latch:
     // cancellation deliberately still forwards buffered content (system-design
@@ -1642,6 +1647,14 @@ async fn drain_turn(
                 // `Thinking`; tool output never arrives as a `ContentChunk`.
                 if let AdapterEvent::ContentChunk { kind: ContentKind::Text, text, .. } = &event {
                     captured_text.push_str(text);
+                }
+                if matches!(
+                    &event,
+                    AdapterEvent::ContentChunk { .. }
+                        | AdapterEvent::ToolStarted { .. }
+                        | AdapterEvent::ToolCompleted { .. }
+                ) {
+                    visible_output_seen = true;
                 }
                 // Internal adapter→dispatcher event: persist the runtime-captured
                 // session locator to the **running turn's** agent (never an
@@ -1703,12 +1716,19 @@ async fn drain_turn(
                     if token.is_cancelled() {
                         continue;
                     }
+                    if matches!(outcome, TurnOutcome::Completed) && !visible_output_seen {
+                        tracing::warn!(
+                            agent_id = %agent_id,
+                            %turn_id,
+                            "adapter completed a turn without visible content or tool activity"
+                        );
+                    }
                     terminal_seen = true;
                     if !matches!(outcome, TurnOutcome::Completed) {
                         journal.record_outcome(turn_id, agent_id, outcome, started_at, *ended_at);
                     }
                     // Durable send↔turn key-join: whenever the terminal carries a
-                    // stable per-turn id (Claude's first assistant `message.id`),
+                    // stable per-turn hydration identity,
                     // record the link so the merge matches this turn to its send by
                     // key, not by counting. Written for `Completed` AND `Failed`
                     // (a failed-with-content turn's partial output is on disk and

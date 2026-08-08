@@ -6,6 +6,12 @@ import Harness from "./_TooltipHarness.svelte";
 /// each `pointerEnter` resolve in microseconds instead of waiting 700ms
 /// of wall time per test — without them the suite gets visibly slow as
 /// tooltip coverage grows.
+///
+/// `shouldAdvanceTime` also moves the clock forward with real time, so never
+/// assert on the exact edge of a delay: a single auto-advance tick under load
+/// carries virtual time past the threshold and opens a tooltip a test expects
+/// to still be closed. Straddle a boundary with a comfortable margin on each
+/// side (e.g. 500ms then 200ms), not 699ms then 1ms.
 beforeEach(() => {
   vi.useFakeTimers({ shouldAdvanceTime: true });
 });
@@ -65,9 +71,9 @@ describe("Tooltip", () => {
 
     await fireEvent.pointerLeave(trigger);
     await fireEvent.pointerEnter(trigger);
-    await vi.advanceTimersByTimeAsync(699);
+    await vi.advanceTimersByTimeAsync(500);
     expect(screen.queryByTestId("tooltip-content")).not.toBeInTheDocument();
-    await vi.advanceTimersByTimeAsync(1);
+    await vi.advanceTimersByTimeAsync(200);
     expect(await waitFor(() => screen.getByTestId("tooltip-content"))).toHaveTextContent(
       "toggle 1",
     );
@@ -155,9 +161,9 @@ describe("Tooltip", () => {
 
     await fireEvent.pointerLeave(first);
     await fireEvent.pointerEnter(second);
-    await vi.advanceTimersByTimeAsync(699);
+    await vi.advanceTimersByTimeAsync(500);
     expect(screen.queryByTestId("tooltip-content")).not.toBeInTheDocument();
-    await vi.advanceTimersByTimeAsync(1);
+    await vi.advanceTimersByTimeAsync(200);
     expect(await waitFor(() => screen.getByTestId("tooltip-content"))).toHaveTextContent(
       "second tooltip",
     );
@@ -195,9 +201,9 @@ describe("Tooltip", () => {
     await vi.advanceTimersByTimeAsync(300);
     await fireEvent.pointerLeave(trigger);
     await fireEvent.pointerEnter(trigger);
-    await vi.advanceTimersByTimeAsync(699);
+    await vi.advanceTimersByTimeAsync(500);
     expect(screen.queryByTestId("tooltip-content")).not.toBeInTheDocument();
-    await vi.advanceTimersByTimeAsync(1);
+    await vi.advanceTimersByTimeAsync(200);
     expect(await waitFor(() => screen.getByTestId("tooltip-content"))).toBeInTheDocument();
   });
 

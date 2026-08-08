@@ -20,7 +20,11 @@
     setStoredPinPinned,
     togglePinCollapsed,
   } from "$lib/state/messagePins.svelte";
-  import { jumpToRow, resolveJumpPane } from "$lib/state/transcriptJump.svelte";
+  import {
+    buildJumpPaneIndex,
+    canResolveJumpFromIndex,
+    jumpToRow,
+  } from "$lib/state/transcriptJump.svelte";
   import {
     layout,
     PINS_SIDEBAR_DEFAULT_WIDTH,
@@ -57,6 +61,7 @@
   let draftWidth = $state<number | null>(null);
   const pinsSortMode = $derived(layout.pinsSortModeFor(projectId));
   const rosterIds = $derived(agents.map((agent) => agent.id));
+  const jumpPaneIndex = $derived(buildJumpPaneIndex(projectId, rosterIds));
   const agentById = $derived(new Map(agents.map((agent) => [agent.id, agent])));
   const agentNames = $derived(new Map(agents.map((agent) => [agent.id, agent.name])));
   const agentHarnesses = $derived(new Map(agents.map((agent) => [agent.id, agent.harness])));
@@ -181,7 +186,7 @@
   });
 
   function canJump(entry: NavigatorEntry): boolean {
-    return resolveJumpPane(projectId, rosterIds, entry.agentIds) !== null;
+    return canResolveJumpFromIndex(jumpPaneIndex, entry.agentIds);
   }
 
   function jump(entry: NavigatorEntry): void {

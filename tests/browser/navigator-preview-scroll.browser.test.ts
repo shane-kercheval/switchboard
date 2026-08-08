@@ -36,6 +36,7 @@ test("selecting another long message resets its preview to the top", async () =>
   ]);
   mountNavigator({ projectId: PROJECT_ID, agents: [ALICE] });
   await page.getByTestId("transcript-navigator-toggle").click();
+  await expect.element(page.getByTestId("navigator-ready")).toBeVisible();
 
   const search = page.getByTestId("navigator-search").element() as HTMLInputElement;
   search.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true }));

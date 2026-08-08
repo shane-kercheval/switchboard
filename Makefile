@@ -1,4 +1,4 @@
-.PHONY: dev build open run install-app uninstall-app deploy test test-browser lint fmt check clean install test-live test-live-claude test-live-codex test-live-gemini test-live-antigravity
+.PHONY: dev build open run install-app uninstall-app deploy test test-browser lint fmt check check-rust check-frontend clean install test-live test-live-claude test-live-codex test-live-gemini test-live-antigravity
 
 # Crates that carry live (`#[ignore]`-gated) harness tests.
 LIVE_PKGS := -p switchboard-harness -p switchboard-dispatcher -p switchboard-app
@@ -77,17 +77,21 @@ fmt:
 	cargo fmt --all
 	pnpm format
 
-check:
-	pnpm install --frozen-lockfile
+check-rust:
 	cargo fmt --all -- --check
 	cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 	cargo test --workspace --all-features --locked
+
+check-frontend:
+	pnpm install --frozen-lockfile
 	pnpm lint
 	pnpm check
 	pnpm format:check
 	pnpm test
 	pnpm exec playwright install webkit
 	pnpm test:browser
+
+check: check-rust check-frontend
 
 test-live:
 	cargo test --locked $(LIVE_PKGS) -- --ignored

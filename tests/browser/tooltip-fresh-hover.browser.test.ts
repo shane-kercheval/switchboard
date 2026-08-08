@@ -23,7 +23,7 @@ test("an activated state-control tooltip waits for a fresh hover", async () => {
 
     await page.getByTestId("tooltip-parking").hover();
     await trigger.hover();
-    await vi.advanceTimersByTimeAsync(499);
+    await vi.advanceTimersByTimeAsync(699);
     await tick();
     expect(document.querySelector('[data-testid="tooltip-content"]')).toBeNull();
 

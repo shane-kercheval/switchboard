@@ -144,7 +144,7 @@ describe("PinsSidebar", () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     try {
       await fireEvent.pointerEnter(toggle);
-      await vi.advanceTimersByTimeAsync(500);
+      await vi.advanceTimersByTimeAsync(700);
       expect(screen.getByTestId("tooltip-content")).toHaveTextContent("Collapse message");
 
       await fireEvent.click(toggle);

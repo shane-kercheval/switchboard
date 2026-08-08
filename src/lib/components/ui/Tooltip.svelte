@@ -106,7 +106,7 @@
 
   let {
     side = "top",
-    delayDuration = 500,
+    delayDuration = 700,
     skipDelayDuration = 300,
     disableHoverableContent = false,
     disabled = false,

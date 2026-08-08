@@ -565,7 +565,7 @@ describe("pane chrome (headers, rename, close)", () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     try {
       await fireEvent.pointerEnter(maximize);
-      await vi.advanceTimersByTimeAsync(500);
+      await vi.advanceTimersByTimeAsync(700);
       expect(screen.getByTestId("tooltip-content")).toHaveTextContent("Maximize Pane 2");
 
       await fireEvent.click(maximize);

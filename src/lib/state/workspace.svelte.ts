@@ -56,6 +56,7 @@ import {
 } from "$lib/utils";
 import { buildLiveSendsMap } from "$lib/state/liveSends";
 import { draftAttachmentPaths } from "$lib/state/composeStore";
+import { layout } from "$lib/layout.svelte";
 import {
   applyAgentHydrate,
   markHydrationAttempted,
@@ -597,16 +598,18 @@ export async function renameProject(projectId: ProjectId, newName: string): Prom
 /// Permanently delete one project's Switchboard state. The backend drains its
 /// agents and removes its on-disk state (never the working directory or harness
 /// session files); on success we perform the matching **frontend lifecycle
-/// teardown** for that single project — the same set `removeDirectory` clears,
-/// scoped to one id — so a project id reused later (ids persist on disk) starts
-/// clean and no listeners/state leak. Errors propagate to the caller (the menu's
-/// inline confirm surfaces them and keeps the row).
+/// teardown** for that single project and remove its persisted layout
+/// preferences. Reversible directory removal keeps those preferences, but a
+/// permanently deleted project id must start clean if it is ever reused. Errors
+/// propagate to the caller (the menu's inline confirm surfaces them and keeps
+/// the row).
 export async function deleteProject(projectId: ProjectId): Promise<void> {
   // Snapshot the agent ids before the await — the roster is dropped below.
   const removedAgentIds = (agentsByProject[projectId] ?? []).map((a) => a.id);
 
   await api.deleteProject(projectId);
 
+  layout.removeProjectPreferences(projectId);
   unregisterAgents(removedAgentIds);
   unsubscribeProjectWorkflows([projectId]);
   projects.list = projects.list.filter((p) => p.id !== projectId);

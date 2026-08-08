@@ -67,6 +67,8 @@ afterEach(async () => {
   state._testing.reset();
   const ws = await loadWorkspaceState();
   ws._testing.reset();
+  const layoutStore = await import("$lib/layout.svelte");
+  layoutStore._testing.reset();
 });
 
 describe("workspace project activity", () => {
@@ -352,10 +354,13 @@ describe("workspace project activity", () => {
   it("removing a busy project clears activity observer memory and local markers", async () => {
     const state = await loadAgentState();
     const ws = await loadWorkspaceState();
+    const layoutStore = await import("$lib/layout.svelte");
     const busyProject = project(PROJECT_1, "2026-05-16T00:00:00Z");
     ws.projects.list = [busyProject];
     const a = agent(AGENT_1, PROJECT_1);
     ws.agentsByProject[PROJECT_1] = [a];
+    layoutStore.layout.setRightSidebarMode(PROJECT_1, "pins");
+    layoutStore.layout.setPinsSortMode(PROJECT_1, "message_at");
     await state.registerAgent(a);
     state.dispatchUserTurn(AGENT_1, "user-1", "go", [], "send-1", busyProject.last_activity);
     observerStops.push(ws.startProjectActivityObserver(() => "2026-05-25T12:00:00.000Z"));
@@ -376,6 +381,24 @@ describe("workspace project activity", () => {
     expect(ws.backgroundCompletedProjectIds[PROJECT_1]).toBeUndefined();
     expect(ws.projectActivityOverrides[PROJECT_1]).toBeUndefined();
     expect(ws.projects.list).toEqual([]);
+    expect(layoutStore.layout.rightSidebarModeFor(PROJECT_1)).toBe("pins");
+    expect(layoutStore.layout.pinsSortModeFor(PROJECT_1)).toBe("message_at");
+  });
+});
+
+describe("project preference lifecycle", () => {
+  it("clears project layout preferences after permanent deletion", async () => {
+    const ws = await loadWorkspaceState();
+    const layoutStore = await import("$lib/layout.svelte");
+    ws.projects.list = [project(PROJECT_1, "2026-05-16T00:00:00Z")];
+    layoutStore.layout.setRightSidebarMode(PROJECT_1, "pins");
+    layoutStore.layout.setPinsSortMode(PROJECT_1, "message_at");
+    invokeMock.mockResolvedValue(undefined);
+
+    await ws.deleteProject(PROJECT_1);
+
+    expect(layoutStore.layout.rightSidebarModeFor(PROJECT_1)).toBe("agents");
+    expect(layoutStore.layout.pinsSortModeFor(PROJECT_1)).toBe("pinned_at");
   });
 });
 

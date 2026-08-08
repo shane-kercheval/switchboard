@@ -1969,6 +1969,39 @@ describe("App", () => {
     ).not.toBe(0);
   });
 
+  it("restores the selected right-sidebar content for each project", async () => {
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [agent({ id: "ag-1", project_id: "p-a", name: "alice" })],
+    });
+    seedProject({
+      projectId: "p-b",
+      directory: DIR_B,
+      name: "beta",
+      agents: [agent({ id: "ag-2", project_id: "p-b", name: "bob" })],
+    });
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument());
+
+    await fireEvent.click(within(projectRowByName("alpha")).getByText("alpha"));
+    await waitFor(() => expect(screen.getByTestId("sidebar")).toBeInTheDocument());
+    await fireEvent.click(screen.getByTestId("right-sidebar-mode-pins"));
+    await waitFor(() => expect(screen.getByTestId("pins-sidebar")).toBeInTheDocument());
+
+    await fireEvent.click(within(projectRowByName("beta")).getByText("beta"));
+    await waitFor(() => expect(screen.getByTestId("sidebar")).toBeInTheDocument());
+    expect(screen.getByTestId("right-sidebar-mode-agents")).toHaveAttribute("aria-checked", "true");
+
+    await fireEvent.click(within(projectRowByName("alpha")).getByText("alpha"));
+    await waitFor(() => expect(screen.getByTestId("pins-sidebar")).toBeInTheDocument());
+    expect(screen.getByTestId("right-sidebar-mode-pins")).toHaveAttribute("aria-checked", "true");
+
+    await fireEvent.click(within(projectRowByName("beta")).getByText("beta"));
+    await waitFor(() => expect(screen.getByTestId("sidebar")).toBeInTheDocument());
+  });
+
   it("toggles Agents and Pins with ⌘⌥P and reopens the right sidebar", async () => {
     seedProject({
       projectId: "p-a",

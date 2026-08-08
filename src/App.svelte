@@ -53,7 +53,7 @@
     type TranscriptPane,
   } from "$lib/state/transcriptPanes.svelte";
   import { selectionFor, targetRecipients } from "$lib/state/recipientSelection.svelte";
-  import { layout, type RightSidebarMode } from "$lib/layout.svelte";
+  import { layout, RIGHT_SIDEBAR_DEFAULT_MODE, type RightSidebarMode } from "$lib/layout.svelte";
   import { navigatorState, toggleNavigator, openNavigator } from "$lib/state/transcriptJump.svelte";
   import {
     dismissPinMutationError,
@@ -143,6 +143,11 @@
   let projectViewResumeSeq = 0;
   let gitViewResumePending = $state<boolean>(false);
   let gitViewResumeSeq = 0;
+  const activeRightSidebarMode = $derived.by<RightSidebarMode>(() => {
+    const projectId = selection.activeProjectId;
+    return projectId === null ? RIGHT_SIDEBAR_DEFAULT_MODE : layout.rightSidebarModeFor(projectId);
+  });
+
   function isComposerShortcutTarget(target: EventTarget | null): boolean {
     return (
       target instanceof HTMLElement && target.closest('[data-shortcut-scope="composer"]') !== null
@@ -151,12 +156,14 @@
 
   function selectRightSidebarMode(mode: RightSidebarMode): void {
     if (mode === "agents" && activeAgents.length === 0) return;
-    layout.rightSidebarMode = mode;
+    const projectId = selection.activeProjectId;
+    if (projectId === null) return;
+    layout.setRightSidebarMode(projectId, mode);
     layout.rightSidebarOpen = true;
   }
 
   function toggleRightSidebarMode(): void {
-    selectRightSidebarMode(layout.rightSidebarMode === "agents" ? "pins" : "agents");
+    selectRightSidebarMode(activeRightSidebarMode === "agents" ? "pins" : "agents");
   }
 
   function handleGlobalKeydown(event: KeyboardEvent): void {
@@ -901,9 +908,7 @@
     cmds.push({
       id: "nav.toggle-right-sidebar-mode",
       title:
-        layout.rightSidebarMode === "agents"
-          ? "Switch to Pins sidebar"
-          : "Switch to Agents sidebar",
+        activeRightSidebarMode === "agents" ? "Switch to Pins sidebar" : "Switch to Agents sidebar",
       group: "Navigation",
       shortcut: ["mod", "alt", "P"],
       keywords: "agents pins right sidebar toggle switch",
@@ -1181,12 +1186,12 @@
                   role="radio"
                   class={cn(
                     SEGMENTED_MAIN_ITEM_CLASS,
-                    layout.rightSidebarMode === "agents"
+                    activeRightSidebarMode === "agents"
                       ? SEGMENTED_MAIN_ITEM_ACTIVE_CLASS
                       : SEGMENTED_MAIN_ITEM_INACTIVE_CLASS,
                   )}
                   aria-label="Show agents sidebar"
-                  aria-checked={layout.rightSidebarMode === "agents"}
+                  aria-checked={activeRightSidebarMode === "agents"}
                   aria-disabled={activeAgents.length === 0}
                   data-testid="right-sidebar-mode-agents"
                   class:opacity-40={activeAgents.length === 0}
@@ -1209,18 +1214,18 @@
                   role="radio"
                   class={cn(
                     SEGMENTED_MAIN_ITEM_CLASS,
-                    layout.rightSidebarMode === "pins"
+                    activeRightSidebarMode === "pins"
                       ? SEGMENTED_MAIN_ITEM_ACTIVE_CLASS
                       : SEGMENTED_MAIN_ITEM_INACTIVE_CLASS,
                   )}
                   aria-label="Show pins sidebar"
-                  aria-checked={layout.rightSidebarMode === "pins"}
+                  aria-checked={activeRightSidebarMode === "pins"}
                   data-testid="right-sidebar-mode-pins"
                   onclick={() => selectRightSidebarMode("pins")}
                 >
                   <Pin
                     size={14}
-                    fill={layout.rightSidebarMode === "pins" ? "currentColor" : "none"}
+                    fill={activeRightSidebarMode === "pins" ? "currentColor" : "none"}
                     aria-hidden="true"
                   />
                 </button>
@@ -1231,8 +1236,8 @@
             side="right"
             expanded={layout.rightSidebarOpen}
             label={layout.rightSidebarOpen
-              ? `Hide ${layout.rightSidebarMode} sidebar`
-              : `Show ${layout.rightSidebarMode} sidebar`}
+              ? `Hide ${activeRightSidebarMode} sidebar`
+              : `Show ${activeRightSidebarMode} sidebar`}
             testid="agents-sidebar-toggle"
             onclick={() => (layout.rightSidebarOpen = !layout.rightSidebarOpen)}
           />
@@ -1433,8 +1438,8 @@
             {#if layout.rightSidebarOpen}
               <SidebarPanel
                 side="right"
-                widthProfile={layout.rightSidebarMode === "pins" ? "reading" : "rail"}
-                width={layout.rightSidebarMode === "pins"
+                widthProfile={activeRightSidebarMode === "pins" ? "reading" : "rail"}
+                width={activeRightSidebarMode === "pins"
                   ? layout.pinsSidebarWidth
                   : layout.agentsSidebarWidth}
                 testid="project-loading-sidebar-shell"
@@ -1454,7 +1459,7 @@
                 {availability}
               />
             </div>
-            {#if layout.rightSidebarOpen && layout.rightSidebarMode === "pins"}
+            {#if layout.rightSidebarOpen && activeRightSidebarMode === "pins"}
               <PinsSidebar
                 projectId={selection.activeProjectId!}
                 agents={activeAgents}
@@ -1500,7 +1505,7 @@
               {/key}
             </div>
             {#if layout.rightSidebarOpen}
-              {#if layout.rightSidebarMode === "pins"}
+              {#if activeRightSidebarMode === "pins"}
                 <PinsSidebar
                   projectId={selection.activeProjectId!}
                   agents={activeAgents}

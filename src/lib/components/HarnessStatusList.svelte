@@ -181,7 +181,7 @@
 <div class="flex flex-col gap-2">
   <ul
     data-testid="harness-status"
-    class="border-border divide-border/60 flex flex-col divide-y rounded-lg border"
+    class="harness-status-container border-border divide-border/60 flex flex-col divide-y rounded-lg border"
   >
     {#each DISPLAY_ORDER as harness (harness)}
       {@const install = harnessAvailability.status(harness)}
@@ -195,31 +195,56 @@
       {@const installed = binary === "available"}
       <li
         data-testid={`harness-row-${harness}`}
-        class="grid grid-cols-[1.5rem_5.5rem_minmax(0,1fr)_minmax(0,1.2fr)] items-center gap-x-3 px-3 py-2.5"
+        class="harness-status-row grid items-center gap-x-3 px-3 py-2.5"
       >
         <HarnessIcon {harness} size="md" />
-        <span class="text-fg text-sm font-medium">{HARNESS_LABEL[harness]}</span>
+        <span class="text-fg text-sm font-medium" data-testid={`harness-label-${harness}`}
+          >{HARNESS_LABEL[harness]}</span
+        >
 
         <!-- Install column -->
-        <span class="text-xs" data-testid={`harness-install-${harness}`}>
+        <span
+          class="harness-install-cell flex min-w-0 items-baseline gap-1 text-xs"
+          data-testid={`harness-install-${harness}`}
+        >
           {#if installing}
-            <span class="text-muted">Checking…</span>
+            <span class="text-muted whitespace-nowrap">Checking…</span>
           {:else if probeFailed}
             <!-- The check itself failed, so we don't know. Offering a Setup guide
                  here would tell the user to install what they may already have. -->
-            <span class="text-warning">Couldn't check</span>
+            <span class="text-warning whitespace-nowrap">Couldn't check</span>
           {:else if installed}
-            <span class="text-fg">Installed</span>
+            <span class="text-fg shrink-0">Installed</span>
             {#if install?.version != null}
-              <span class="text-muted">v{install.version}</span>
+              <span class="text-muted min-w-0 truncate" data-testid={`harness-version-${harness}`}
+                >v{install.version}</span
+              >
             {/if}
           {:else}
-            <span class="inline-flex items-center gap-2">
-              <span class="text-warning">Not installed</span>
+            <span class="text-warning whitespace-nowrap">Not installed</span>
+          {/if}
+        </span>
+
+        <!-- Auth/action column. Setup belongs here rather than beside the
+             install status so every row keeps the same column alignment. -->
+        <span class="harness-auth-cell flex min-w-0 items-center text-xs">
+          <span data-testid={`harness-auth-${harness}`}>
+            {#if installing || !installed}
+              <!-- nothing: still checking, or install is the blocking step -->
+            {:else if authed[harness] === null}
+              <span class="text-muted">Checking…</span>
+            {:else if authed[harness]}
+              <span class="text-fg">Authenticated</span>
+            {:else}
+              <span class="text-warning">{HARNESS_LOGIN_HINT[harness]}</span>
+            {/if}
+          </span>
+          {#if !installing && !probeFailed && !installed}
+            <span class="shrink-0">
               <button
                 type="button"
                 data-testid={`harness-setup-${harness}`}
-                class="text-fg border-border hover:bg-panel inline-flex items-center gap-1 rounded-md border px-2 py-0.5 font-medium"
+                class="text-fg border-border hover:bg-panel inline-flex items-center gap-1 rounded-md border px-2 py-0.5 font-medium whitespace-nowrap"
                 onclick={() => openSetup(harness)}
               >
                 Setup guide
@@ -240,24 +265,14 @@
           {/if}
         </span>
 
-        <!-- Auth column (absent when not installed — auth is moot) -->
-        <span class="text-xs" data-testid={`harness-auth-${harness}`}>
-          {#if installing || !installed}
-            <!-- nothing: still checking, or install is the blocking step -->
-          {:else if authed[harness] === null}
-            <span class="text-muted">Checking…</span>
-          {:else if authed[harness]}
-            <span class="text-fg">Authenticated</span>
-          {:else}
-            <span class="text-warning">{HARNESS_LOGIN_HINT[harness]}</span>
-          {/if}
-        </span>
-
         {#if harness === "gemini"}
-          <!-- Full-row availability note (spans all four grid columns).
+          <!-- Full-row availability note (spans every grid column).
              Individual-tier Gemini access moved to Antigravity on 2026-06-18;
              see docs/harness-update-review.md for the tier terminology. -->
-          <p class="text-muted col-span-4 pt-1 text-xs leading-5" data-testid="harness-note-gemini">
+          <p
+            class="harness-note text-muted pt-1 text-xs leading-5"
+            data-testid="harness-note-gemini"
+          >
             Gemini is no longer available on individual Google accounts — replaced by Antigravity.
             It still works if you have an organization plan (Gemini Code Assist Standard or
             Enterprise).
@@ -297,3 +312,35 @@
     </Button>
   </div>
 </div>
+
+<style>
+  .harness-status-container {
+    container-type: inline-size;
+  }
+
+  .harness-status-row {
+    grid-template-columns: 1.5rem minmax(0, 1fr);
+    row-gap: 0.25rem;
+  }
+
+  .harness-install-cell,
+  .harness-auth-cell {
+    grid-column: 2;
+  }
+
+  .harness-note {
+    grid-column: 1 / -1;
+  }
+
+  @container (min-width: 24rem) {
+    .harness-status-row {
+      grid-template-columns: 1.5rem 5.5rem minmax(0, 1fr) minmax(0, 1.2fr);
+      row-gap: 0;
+    }
+
+    .harness-install-cell,
+    .harness-auth-cell {
+      grid-column: auto;
+    }
+  }
+</style>

@@ -1429,6 +1429,8 @@ pub fn migrate_message_pin_impl(
         return Ok(pins);
     }
 
+    // A migration changes identity only; preserving the original pin time keeps
+    // the user's recently-pinned ordering stable across live-to-disk hydration.
     if pins.iter().any(|pin| pin.key == to_key) {
         pins.retain(|pin| pin.key != from_key);
     } else if let Some(pin) = pins.iter_mut().find(|pin| pin.key == from_key) {

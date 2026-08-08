@@ -76,12 +76,14 @@ function clampDiffFileListWidth(px: number): number {
 
 type SidebarLayout = { width: number; open: boolean };
 export type RightSidebarMode = "agents" | "pins";
+export type PinsSortMode = "pinned_at" | "message_at";
 
 type LayoutState = {
   projectsSidebar: SidebarLayout;
   agentsSidebar: SidebarLayout;
   pinsSidebarWidth: number;
   rightSidebarMode: RightSidebarMode;
+  pinsSortMode: PinsSortMode;
   gitRepoWidth: number;
   diffFileListWidth: number;
 };
@@ -92,6 +94,7 @@ function defaults(): LayoutState {
     agentsSidebar: { width: AGENTS_SIDEBAR_DEFAULT_WIDTH, open: true },
     pinsSidebarWidth: PINS_SIDEBAR_DEFAULT_WIDTH,
     rightSidebarMode: "agents",
+    pinsSortMode: "pinned_at",
     gitRepoWidth: GIT_REPO_DEFAULT_WIDTH,
     diffFileListWidth: DIFF_FILE_LIST_DEFAULT_WIDTH,
   };
@@ -125,6 +128,7 @@ function readStored(): LayoutState {
       agentsSidebar?: unknown;
       pinsSidebarWidth?: unknown;
       rightSidebarMode?: unknown;
+      pinsSortMode?: unknown;
       gitRepoWidth?: unknown;
       diffFileListWidth?: unknown;
     };
@@ -136,6 +140,7 @@ function readStored(): LayoutState {
           ? clampSidebarWidth(v.pinsSidebarWidth, RIGHT_SIDEBAR_MAX_WIDTH)
           : base.pinsSidebarWidth,
       rightSidebarMode: v.rightSidebarMode === "pins" ? "pins" : "agents",
+      pinsSortMode: v.pinsSortMode === "message_at" ? "message_at" : "pinned_at",
       gitRepoWidth:
         typeof v.gitRepoWidth === "number" && Number.isFinite(v.gitRepoWidth)
           ? clampGitRepoWidth(v.gitRepoWidth)
@@ -202,6 +207,13 @@ export const layout = {
   },
   set rightSidebarMode(mode: RightSidebarMode) {
     state.rightSidebarMode = mode;
+    persist();
+  },
+  get pinsSortMode(): PinsSortMode {
+    return state.pinsSortMode;
+  },
+  set pinsSortMode(mode: PinsSortMode) {
+    state.pinsSortMode = mode;
     persist();
   },
   get gitRepoWidth(): number {

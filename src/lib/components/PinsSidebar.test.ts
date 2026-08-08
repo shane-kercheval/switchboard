@@ -53,6 +53,7 @@ const transcript = await import("$lib/state/index.svelte");
 const jump = await import("$lib/state/transcriptJump.svelte");
 const panes = await import("$lib/state/transcriptPanes.svelte");
 const pins = await import("$lib/state/messagePins.svelte");
+const layoutStore = await import("$lib/layout.svelte");
 
 afterEach(() => {
   cleanup();
@@ -60,6 +61,7 @@ afterEach(() => {
   jump._testing.reset();
   panes._testing.reset();
   pins._testing.reset();
+  layoutStore._testing.reset();
   persistedPins = [{ key: PIN_KEY, pinned_at: "2026-08-07T12:01:00Z" }];
   invokeMock.mockClear();
 });
@@ -73,7 +75,7 @@ describe("PinsSidebar", () => {
         turn_id: "turn-1",
         agent_id: AGENT.id,
         send_id: "send-1",
-        started_at: "2026-08-07T12:00:01Z",
+        started_at: "2026-08-07T12:00:00Z",
         status: "complete",
         hydration_key: "message-1",
         items: [
@@ -92,6 +94,7 @@ describe("PinsSidebar", () => {
     expect(screen.getByTestId("pinned-message-card")).toHaveClass("bg-raised");
     expect(screen.getByTestId("pinned-message-header")).toHaveClass("bg-surface");
     expect(screen.getByTestId("pinned-message-header")).not.toHaveClass("bg-panel");
+    expect(screen.queryByTestId("pins-sort")).not.toBeInTheDocument();
 
     await fireEvent.click(screen.getByTestId("pinned-message"));
     expect(screen.queryByTestId("pinned-message-body")).not.toBeInTheDocument();
@@ -135,7 +138,7 @@ describe("PinsSidebar", () => {
         role: "agent",
         turn_id: "turn-1",
         agent_id: AGENT.id,
-        started_at: "2026-08-07T12:00:01Z",
+        started_at: "2026-08-07T12:00:00Z",
         status: "complete",
         hydration_key: "message-1",
         items: [{ item_kind: "text", kind: "text", text: "first answer" }],
@@ -144,7 +147,7 @@ describe("PinsSidebar", () => {
         role: "agent",
         turn_id: "turn-2",
         agent_id: AGENT.id,
-        started_at: "2026-08-07T12:00:02Z",
+        started_at: "2026-08-07T12:00:00.500Z",
         status: "complete",
         hydration_key: "message-2",
         items: [{ item_kind: "text", kind: "text", text: "second answer" }],
@@ -164,6 +167,151 @@ describe("PinsSidebar", () => {
 
     await fireEvent.click(toggleAll);
     expect(screen.getAllByTestId("pinned-message-body")).toHaveLength(2);
+  });
+
+  it("sorts by pin time or message time and places unavailable messages last", async () => {
+    const secondKey = `agent:hydration:${AGENT.id}:message-2`;
+    const unavailableKey = `agent:hydration:${AGENT.id}:missing`;
+    persistedPins = [
+      { key: unavailableKey, pinned_at: "2026-08-07T12:04:00Z" },
+      { key: PIN_KEY, pinned_at: "2026-08-07T12:03:00Z" },
+      { key: secondKey, pinned_at: "2026-08-07T12:02:00Z" },
+    ];
+    await transcript.registerAgent(AGENT);
+    transcript.transcripts[AGENT.id] = [
+      {
+        role: "agent",
+        turn_id: "turn-1",
+        agent_id: AGENT.id,
+        started_at: "2026-08-07T12:00:00Z",
+        status: "complete",
+        hydration_key: "message-1",
+        items: [{ item_kind: "text", kind: "text", text: "older message" }],
+      },
+      {
+        role: "agent",
+        turn_id: "turn-2",
+        agent_id: AGENT.id,
+        started_at: "2026-08-07T12:00:00.500Z",
+        status: "complete",
+        hydration_key: "message-2",
+        items: [{ item_kind: "text", kind: "text", text: "newer message" }],
+      },
+    ];
+
+    render(PinsSidebar, { props: { projectId: PROJECT, agents: [AGENT] } });
+
+    await screen.findByTestId("pins-sort");
+    const cardKeys = (): (string | null)[] =>
+      screen
+        .getAllByTestId("pinned-message-card")
+        .map((card) => card.getAttribute("data-message-key"));
+    expect(screen.getByTestId("pins-sort-pinned")).toHaveAttribute("aria-checked", "true");
+    expect(cardKeys()).toEqual([unavailableKey, PIN_KEY, secondKey]);
+
+    await fireEvent.click(screen.getByTestId("pins-sort-message"));
+
+    expect(screen.getByTestId("pins-sort-message")).toHaveAttribute("aria-checked", "true");
+    expect(cardKeys()).toEqual([secondKey, PIN_KEY, unavailableKey]);
+  });
+
+  it("uses pin time and key to break ties between equivalent message instants", async () => {
+    const secondKey = `agent:hydration:${AGENT.id}:message-2`;
+    const thirdKey = `agent:hydration:${AGENT.id}:message-3`;
+    persistedPins = [
+      { key: thirdKey, pinned_at: "2026-08-07T12:01:00.500Z" },
+      { key: secondKey, pinned_at: "2026-08-07T12:01:00Z" },
+      { key: PIN_KEY, pinned_at: "2026-08-07T12:01:00.500Z" },
+    ];
+    await transcript.registerAgent(AGENT);
+    transcript.transcripts[AGENT.id] = [
+      {
+        role: "agent",
+        turn_id: "turn-1",
+        agent_id: AGENT.id,
+        started_at: "2026-08-07T12:00:00Z",
+        status: "complete",
+        hydration_key: "message-1",
+        items: [{ item_kind: "text", kind: "text", text: "first" }],
+      },
+      {
+        role: "agent",
+        turn_id: "turn-2",
+        agent_id: AGENT.id,
+        started_at: "2026-08-07T12:00:00.000Z",
+        status: "complete",
+        hydration_key: "message-2",
+        items: [{ item_kind: "text", kind: "text", text: "second" }],
+      },
+      {
+        role: "agent",
+        turn_id: "turn-3",
+        agent_id: AGENT.id,
+        started_at: "2026-08-07T13:00:00+01:00",
+        status: "complete",
+        hydration_key: "message-3",
+        items: [{ item_kind: "text", kind: "text", text: "third" }],
+      },
+    ];
+
+    render(PinsSidebar, { props: { projectId: PROJECT, agents: [AGENT] } });
+    await fireEvent.click(await screen.findByTestId("pins-sort-message"));
+
+    expect(
+      screen
+        .getAllByTestId("pinned-message-card")
+        .map((card) => card.getAttribute("data-message-key")),
+    ).toEqual([PIN_KEY, thirdKey, secondKey]);
+  });
+
+  it("hides message-time sorting when every pinned message is unavailable", async () => {
+    persistedPins = [
+      { key: `agent:hydration:${AGENT.id}:missing-1`, pinned_at: "2026-08-07T12:01:00Z" },
+      { key: `agent:hydration:${AGENT.id}:missing-2`, pinned_at: "2026-08-07T12:02:00Z" },
+    ];
+
+    render(PinsSidebar, { props: { projectId: PROJECT, agents: [AGENT] } });
+
+    await screen.findAllByTestId("pinned-missing");
+    expect(screen.queryByTestId("pins-sort")).not.toBeInTheDocument();
+  });
+
+  it("keeps a valid message ahead of an invalid timestamp in newest-message mode", async () => {
+    const invalidKey = `agent:hydration:${AGENT.id}:message-invalid`;
+    persistedPins = [
+      { key: invalidKey, pinned_at: "2026-08-07T12:02:00Z" },
+      { key: PIN_KEY, pinned_at: "2026-08-07T12:01:00Z" },
+    ];
+    await transcript.registerAgent(AGENT);
+    transcript.transcripts[AGENT.id] = [
+      {
+        role: "agent",
+        turn_id: "turn-valid",
+        agent_id: AGENT.id,
+        started_at: "2026-08-07T12:00:00Z",
+        status: "complete",
+        hydration_key: "message-1",
+        items: [{ item_kind: "text", kind: "text", text: "valid" }],
+      },
+      {
+        role: "agent",
+        turn_id: "turn-invalid",
+        agent_id: AGENT.id,
+        started_at: "invalid",
+        status: "complete",
+        hydration_key: "message-invalid",
+        items: [{ item_kind: "text", kind: "text", text: "invalid" }],
+      },
+    ];
+
+    render(PinsSidebar, { props: { projectId: PROJECT, agents: [AGENT] } });
+    await fireEvent.click(await screen.findByTestId("pins-sort-message"));
+
+    expect(
+      screen
+        .getAllByTestId("pinned-message-card")
+        .map((card) => card.getAttribute("data-message-key")),
+    ).toEqual([PIN_KEY, invalidKey]);
   });
 
   it("keeps a live pin's full response together after Claude splits it at compaction", async () => {

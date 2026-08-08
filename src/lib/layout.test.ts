@@ -45,6 +45,7 @@ describe("layout store", () => {
     expect(layout.agentsSidebarWidth).toBe(AGENTS_SIDEBAR_DEFAULT_WIDTH);
     expect(layout.pinsSidebarWidth).toBe(PINS_SIDEBAR_DEFAULT_WIDTH);
     expect(layout.rightSidebarMode).toBe("agents");
+    expect(layout.pinsSortMode).toBe("pinned_at");
     expect(layout.projectsSidebarOpen).toBe(true);
     expect(layout.rightSidebarOpen).toBe(true);
     expect(layout.gitRepoWidth).toBe(GIT_REPO_DEFAULT_WIDTH);
@@ -56,6 +57,7 @@ describe("layout store", () => {
     layout.agentsSidebarWidth = 300;
     layout.pinsSidebarWidth = 380;
     layout.rightSidebarMode = "pins";
+    layout.pinsSortMode = "message_at";
     layout.projectsSidebarOpen = false;
     layout.rightSidebarOpen = false;
     layout.gitRepoWidth = 380;
@@ -65,6 +67,7 @@ describe("layout store", () => {
     expect(layout.agentsSidebarWidth).toBe(300);
     expect(layout.pinsSidebarWidth).toBe(380);
     expect(layout.rightSidebarMode).toBe("pins");
+    expect(layout.pinsSortMode).toBe("message_at");
     expect(layout.projectsSidebarOpen).toBe(false);
     expect(layout.rightSidebarOpen).toBe(false);
     expect(layout.gitRepoWidth).toBe(380);
@@ -164,12 +167,14 @@ describe("layout store", () => {
         projectsSidebar: { width: "wide", open: "yes" },
         gitRepoWidth: "big",
         diffFileListWidth: Number.NaN,
+        pinsSortMode: "random",
       },
     });
     expect(layout.projectsSidebarWidth).toBe(PROJECTS_SIDEBAR_DEFAULT_WIDTH);
     expect(layout.projectsSidebarOpen).toBe(true);
     expect(layout.gitRepoWidth).toBe(GIT_REPO_DEFAULT_WIDTH);
     expect(layout.diffFileListWidth).toBe(DIFF_FILE_LIST_DEFAULT_WIDTH);
+    expect(layout.pinsSortMode).toBe("pinned_at");
   });
 
   it("survives a persist failure with the in-memory value intact", () => {

@@ -2,7 +2,7 @@
   import { tick, untrack } from "svelte";
   import type { AgentRecord, ConversationItem, ProjectId } from "$lib/types";
   import { HEARTBEAT_TIMEOUT_MS } from "$lib/types";
-  import { cn, formatDuration } from "$lib/utils";
+  import { cn, formatDuration, isIsoTimestampAfter } from "$lib/utils";
   import { createPinTracker, type ScrollGeometry } from "$lib/scrollPin";
   import {
     ChevronRight,
@@ -330,7 +330,7 @@
       const turn = row.turn;
       const at = turn.ended_at ?? turn.started_at;
       const prev = latestPerAgent.get(turn.agent_id);
-      if (prev === undefined || at.localeCompare(prev.at) > 0) {
+      if (prev === undefined || isIsoTimestampAfter(at, prev.at)) {
         latestPerAgent.set(turn.agent_id, { at, key: previewKeyForTurn(turn) });
       }
     }

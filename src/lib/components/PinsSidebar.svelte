@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { ChevronsDownUp, ChevronsUpDown, LocateFixed, Pin } from "@lucide/svelte";
+  import { ChevronsDownUp, ChevronsUpDown, Clock3, LocateFixed, Pin } from "@lucide/svelte";
   import { SvelteMap, SvelteSet } from "svelte/reactivity";
   import type { AgentRecord, ConversationItem, ProjectId } from "$lib/types";
   import { transcripts, type Turn } from "$lib/state/index.svelte";
@@ -27,7 +27,7 @@
     rightSidebarMaxWidth,
     SIDEBAR_MIN_WIDTH,
   } from "$lib/layout.svelte";
-  import { cn, relativeTime } from "$lib/utils";
+  import { cn, compareIsoTimestampsDescending, relativeTime } from "$lib/utils";
   import { HARNESS_COLOR } from "$lib/harnessDisplay";
   import { agentCopy } from "$lib/agentCopy.svelte";
   import AgentMessageBody from "$lib/components/AgentMessageBody.svelte";
@@ -37,6 +37,12 @@
   import SidebarPanel from "$lib/components/ui/SidebarPanel.svelte";
   import SidebarSection from "$lib/components/ui/SidebarSection.svelte";
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
+  import {
+    SEGMENTED_MAIN_CONTAINER_CLASS,
+    SEGMENTED_MAIN_ITEM_ACTIVE_CLASS,
+    SEGMENTED_MAIN_ITEM_CLASS,
+    SEGMENTED_MAIN_ITEM_INACTIVE_CLASS,
+  } from "$lib/components/ui/segmentedControl";
 
   let {
     projectId,
@@ -117,7 +123,8 @@
   }
 
   const pinnedItems = $derived.by(() => {
-    const pins = [...pinsFor(projectId)].sort((a, b) => b.pinned_at.localeCompare(a.pinned_at));
+    const pins = [...pinsFor(projectId)];
+    const sortMode = layout.pinsSortMode;
     const wanted = new Set(pins.map((pin) => pin.key));
     const resolved = new SvelteMap<
       string,
@@ -134,7 +141,7 @@
         resolved.set(key, resolved.has(key) ? null : { row: displayRow, identity: item.identity });
       }
     }
-    return pins.map((pin) => {
+    const items = pins.map((pin) => {
       const match = resolved.get(pin.key);
       if (match == null) return { pin, entry: undefined, row: undefined };
       return {
@@ -143,11 +150,26 @@
         entry: navigatorEntryForRow(match.row, agentNames, agentHarnesses),
       };
     });
+    return items.sort((a, b) => {
+      if (sortMode === "message_at") {
+        if (a.entry === undefined && b.entry !== undefined) return 1;
+        if (a.entry !== undefined && b.entry === undefined) return -1;
+        if (a.entry !== undefined && b.entry !== undefined) {
+          const byMessageTime = compareIsoTimestampsDescending(a.entry.at, b.entry.at);
+          if (byMessageTime !== 0) return byMessageTime;
+        }
+      }
+      const byPinnedTime = compareIsoTimestampsDescending(a.pin.pinned_at, b.pin.pinned_at);
+      return byPinnedTime !== 0 ? byPinnedTime : a.pin.key.localeCompare(b.pin.key);
+    });
   });
   const collapsiblePinKeys = $derived(
     pinnedItems
       .filter((item) => item.row?.kind === "user" || item.row?.kind === "agent")
       .map((item) => item.pin.key),
+  );
+  const showPinsSort = $derived(
+    pinnedItems.length > 1 && pinnedItems.some((item) => item.entry !== undefined),
   );
   const allPinsCollapsed = $derived(
     collapsiblePinKeys.length > 0 &&
@@ -204,31 +226,88 @@
   />
   <SidebarSection title="Pins">
     {#snippet action()}
-      {#if collapsiblePinKeys.length > 1}
-        <Tooltip
-          label={allPinsCollapsed ? "Expand all pinned messages" : "Collapse all pinned messages"}
-          side="bottom"
-        >
-          {#snippet trigger(props)}
-            <button
-              {...props}
-              type="button"
-              class="text-muted hover:text-fg hover:bg-control-hover flex h-6 w-6 items-center justify-center rounded-full"
-              aria-label={allPinsCollapsed
-                ? "Expand all pinned messages"
-                : "Collapse all pinned messages"}
-              data-testid="pins-toggle-all"
-              onclick={() => setPinsCollapsed(projectId, collapsiblePinKeys, !allPinsCollapsed)}
-            >
-              {#if allPinsCollapsed}
-                <ChevronsUpDown size={14} aria-hidden="true" />
-              {:else}
-                <ChevronsDownUp size={14} aria-hidden="true" />
-              {/if}
-            </button>
-          {/snippet}
-        </Tooltip>
-      {/if}
+      <div class="flex items-center gap-1">
+        {#if showPinsSort}
+          <div
+            class={cn(SEGMENTED_MAIN_CONTAINER_CLASS, "flex")}
+            role="radiogroup"
+            aria-label="Sort pinned messages"
+            data-testid="pins-sort"
+          >
+            <Tooltip label="Recently pinned" side="bottom">
+              {#snippet trigger(props)}
+                <button
+                  {...props}
+                  type="button"
+                  role="radio"
+                  class={cn(
+                    SEGMENTED_MAIN_ITEM_CLASS,
+                    layout.pinsSortMode === "pinned_at"
+                      ? SEGMENTED_MAIN_ITEM_ACTIVE_CLASS
+                      : SEGMENTED_MAIN_ITEM_INACTIVE_CLASS,
+                  )}
+                  aria-label="Sort by recently pinned"
+                  aria-checked={layout.pinsSortMode === "pinned_at"}
+                  data-testid="pins-sort-pinned"
+                  onclick={() => (layout.pinsSortMode = "pinned_at")}
+                >
+                  <Pin
+                    size={13}
+                    fill={layout.pinsSortMode === "pinned_at" ? "currentColor" : "none"}
+                    aria-hidden="true"
+                  />
+                </button>
+              {/snippet}
+            </Tooltip>
+            <Tooltip label="Newest messages" side="bottom">
+              {#snippet trigger(props)}
+                <button
+                  {...props}
+                  type="button"
+                  role="radio"
+                  class={cn(
+                    SEGMENTED_MAIN_ITEM_CLASS,
+                    layout.pinsSortMode === "message_at"
+                      ? SEGMENTED_MAIN_ITEM_ACTIVE_CLASS
+                      : SEGMENTED_MAIN_ITEM_INACTIVE_CLASS,
+                  )}
+                  aria-label="Sort by newest messages"
+                  aria-checked={layout.pinsSortMode === "message_at"}
+                  data-testid="pins-sort-message"
+                  onclick={() => (layout.pinsSortMode = "message_at")}
+                >
+                  <Clock3 size={13} aria-hidden="true" />
+                </button>
+              {/snippet}
+            </Tooltip>
+          </div>
+        {/if}
+        {#if collapsiblePinKeys.length > 1}
+          <Tooltip
+            label={allPinsCollapsed ? "Expand all pinned messages" : "Collapse all pinned messages"}
+            side="bottom"
+          >
+            {#snippet trigger(props)}
+              <button
+                {...props}
+                type="button"
+                class="text-muted hover:text-fg hover:bg-control-hover flex h-6 w-6 items-center justify-center rounded-full"
+                aria-label={allPinsCollapsed
+                  ? "Expand all pinned messages"
+                  : "Collapse all pinned messages"}
+                data-testid="pins-toggle-all"
+                onclick={() => setPinsCollapsed(projectId, collapsiblePinKeys, !allPinsCollapsed)}
+              >
+                {#if allPinsCollapsed}
+                  <ChevronsUpDown size={14} aria-hidden="true" />
+                {:else}
+                  <ChevronsDownUp size={14} aria-hidden="true" />
+                {/if}
+              </button>
+            {/snippet}
+          </Tooltip>
+        {/if}
+      </div>
     {/snippet}
     {#if !pinsLoaded(projectId)}
       <div class="text-muted px-3 py-4 text-sm" data-testid="pins-loading">

@@ -48,7 +48,12 @@ import {
   NEW_PROJECT_DEFAULT_MODEL,
   defaultAgentName,
 } from "$lib/agentSelection";
-import { currentIsoTimestamp } from "$lib/utils";
+import {
+  compareIsoTimestampsDescending,
+  currentIsoTimestamp,
+  isIsoTimestampAfter,
+  isIsoTimestampBefore,
+} from "$lib/utils";
 import { buildLiveSendsMap } from "$lib/state/liveSends";
 import { draftAttachmentPaths } from "$lib/state/composeStore";
 import {
@@ -215,14 +220,14 @@ function fingerprintChanged(
 }
 
 function sortByActivity(list: ProjectListing[]): ProjectListing[] {
-  return [...list].sort((a, b) => b.last_activity.localeCompare(a.last_activity));
+  return [...list].sort((a, b) => compareIsoTimestampsDescending(a.last_activity, b.last_activity));
 }
 
 function applyActivityOverrides(list: ProjectListing[]): ProjectListing[] {
   return sortByActivity(
     list.map((project) => {
       const override = projectActivityOverrides[project.id];
-      return override !== undefined && override > project.last_activity
+      return override !== undefined && isIsoTimestampAfter(override, project.last_activity)
         ? { ...project, last_activity: override }
         : project;
     }),
@@ -247,7 +252,7 @@ export function nextUnreadCompletedProjectId(): ProjectId | null {
   );
   if (unread.length === 0) return null;
   return unread.reduce((oldest, project) =>
-    project.last_activity < oldest.last_activity ? project : oldest,
+    isIsoTimestampBefore(project.last_activity, oldest.last_activity) ? project : oldest,
   ).id;
 }
 

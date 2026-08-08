@@ -2890,30 +2890,41 @@ describe("UnifiedTranscript compact mode", () => {
   it("picks each agent's latest response by completion recency, not rendered order", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
-    // send-a is anchored earlier (renders first) but finishes LAST (ended t5).
+    // send-a is anchored earlier (renders first) but finishes last within the
+    // same second, using a different fractional precision than send-b.
     state.transcripts[CLAUDE_AGENT.id] = [
       user(CLAUDE_AGENT, "send-a", "u-a", "2026-05-16T00:00:00Z"),
-      done(CLAUDE_AGENT, "send-a", "a-a", "2026-05-16T00:00:01Z", "2026-05-16T00:00:05Z", [
+      done(CLAUDE_AGENT, "send-a", "a-a", "2026-05-16T00:00:01Z", "2026-05-16T00:00:05.500Z", [
         ANSWER("a first"),
         ANSWER("a last"),
       ]),
       user(CLAUDE_AGENT, "send-b", "u-b", "2026-05-16T00:00:02Z"),
-      done(CLAUDE_AGENT, "send-b", "a-b", "2026-05-16T00:00:03Z", "2026-05-16T00:00:04Z", [
+      done(CLAUDE_AGENT, "send-b", "a-b", "2026-05-16T00:00:03Z", "2026-05-16T00:00:05Z", [
         ANSWER("b first"),
+        TOOL("t-b"),
         ANSWER("b last"),
+      ]),
+      user(CLAUDE_AGENT, "send-c", "u-c", "2026-05-16T00:00:06Z"),
+      done(CLAUDE_AGENT, "send-c", "a-c", "2026-05-16T00:00:07Z", "invalid", [
+        ANSWER("invalid first"),
+        TOOL("t-invalid"),
+        ANSWER("invalid last"),
       ]),
     ];
     setProjectCompact(PROJECT_ID, true);
 
     render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
-    const [first, second] = agentTurns();
+    const [first, second, invalid] = agentTurns();
     // send-a is the latest by recency → full answer prose.
     expect(within(first!).getByText("a first")).toBeInTheDocument();
     expect(within(first!).getByText("a last")).toBeInTheDocument();
     // send-b is older → clipped preview (all its answer text).
     expect(within(second!).getByText("b first")).toBeInTheDocument();
     expect(within(second!).getByText("b last")).toBeInTheDocument();
+    expect(toggleLabel(first!)).toBe("Collapse");
+    expect(toggleLabel(second!)).toBe("Expand");
+    expect(toggleLabel(invalid!)).toBe("Expand");
   });
 
   it("renders each latest fan-out column as full answer prose", async () => {

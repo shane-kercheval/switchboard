@@ -70,6 +70,41 @@ afterEach(async () => {
 });
 
 describe("workspace project activity", () => {
+  it("sorts mixed-precision project activity chronologically", async () => {
+    const ws = await loadWorkspaceState();
+    ws.projects.list = [
+      project(PROJECT_1, "2026-05-25T12:00:00Z"),
+      project(PROJECT_2, "2026-05-25T12:00:00.500Z"),
+    ];
+
+    ws.recordProjectsActivityLocally([PROJECT_1], "2026-05-25T12:00:00Z");
+
+    expect(ws.projects.list.map((item) => item.id)).toEqual([PROJECT_2, PROJECT_1]);
+  });
+
+  it("accepts a valid activity override but rejects an invalid one", async () => {
+    const ws = await loadWorkspaceState();
+    ws.projects.list = [project(PROJECT_1, "invalid")];
+
+    ws.recordProjectsActivityLocally([PROJECT_1], "2026-05-25T12:00:00Z");
+    expect(ws.projects.list[0]?.last_activity).toBe("2026-05-25T12:00:00Z");
+
+    ws.recordProjectsActivityLocally([PROJECT_1], "still-invalid");
+    expect(ws.projects.list[0]?.last_activity).toBe("2026-05-25T12:00:00Z");
+  });
+
+  it("selects the chronologically oldest unread project across mixed precision", async () => {
+    const ws = await loadWorkspaceState();
+    ws.projects.list = [
+      project(PROJECT_2, "2026-05-25T12:00:00.500Z"),
+      project(PROJECT_1, "2026-05-25T12:00:00Z"),
+    ];
+    ws.backgroundCompletedProjectIds[PROJECT_1] = true;
+    ws.backgroundCompletedProjectIds[PROJECT_2] = true;
+
+    expect(ws.nextUnreadCompletedProjectId()).toBe(PROJECT_1);
+  });
+
   it("records a shared local activity timestamp and preserves stable order within the batch", async () => {
     const ws = await loadWorkspaceState();
     ws.projects.list = [

@@ -124,6 +124,39 @@ describe("PinsSidebar", () => {
     );
   });
 
+  it("keeps the message-toggle tooltip quiet until a full-delay re-entry", async () => {
+    await transcript.registerAgent(AGENT);
+    transcript.transcripts[AGENT.id] = [
+      {
+        role: "agent",
+        turn_id: "turn-1",
+        agent_id: AGENT.id,
+        send_id: "send-1",
+        started_at: "2026-08-07T12:00:00Z",
+        status: "complete",
+        hydration_key: "message-1",
+        items: [{ item_kind: "text", kind: "text", text: "important answer" }],
+      },
+    ];
+    render(PinsSidebar, { props: { projectId: PROJECT, agents: [AGENT] } });
+    const toggle = await screen.findByTestId("pinned-message-toggle");
+
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      await fireEvent.pointerEnter(toggle);
+      await vi.advanceTimersByTimeAsync(500);
+      expect(screen.getByTestId("tooltip-content")).toHaveTextContent("Collapse message");
+
+      await fireEvent.click(toggle);
+      await fireEvent.pointerLeave(toggle);
+      await fireEvent.pointerEnter(screen.getByTestId("pinned-message-toggle"));
+      await vi.advanceTimersByTimeAsync(300);
+      expect(screen.queryByTestId("tooltip-content")).not.toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("shows one control for multiple cards and collapses or expands them together", async () => {
     persistedPins = [
       { key: PIN_KEY, pinned_at: "2026-08-07T12:01:00Z" },

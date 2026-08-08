@@ -300,7 +300,11 @@
           class="h-[26px] py-0"
         />
       </div>
-      <Tooltip label={descending ? "Newest first" : "Oldest first"} side="bottom">
+      <Tooltip
+        label={descending ? "Newest first" : "Oldest first"}
+        side="bottom"
+        reopen="fresh-hover"
+      >
         {#snippet trigger(props)}
           <button
             {...props}
@@ -318,7 +322,11 @@
           </button>
         {/snippet}
       </Tooltip>
-      <Tooltip label={pinnedOnly ? "Show all messages" : "Show pinned only"} side="bottom">
+      <Tooltip
+        label={pinnedOnly ? "Show all messages" : "Show pinned only"}
+        side="bottom"
+        reopen="fresh-hover"
+      >
         {#snippet trigger(props)}
           <button
             {...props}
@@ -398,7 +406,11 @@
               {@render entryButton()}
             {/if}
             {#if pinnableIdentity !== undefined && pinReady}
-              <Tooltip label={pinned ? "Unpin message" : "Pin message"} side="left">
+              <Tooltip
+                label={pinned ? "Unpin message" : "Pin message"}
+                side="left"
+                reopen="fresh-hover"
+              >
                 {#snippet trigger(props)}
                   <button
                     {...props}

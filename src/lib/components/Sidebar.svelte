@@ -1058,6 +1058,7 @@
                 <Tooltip
                   label={agentHidden ? `Show ${agent.name}` : `Hide ${agent.name} (⌥-click: solo)`}
                   delayDuration={800}
+                  reopen="fresh-hover"
                 >
                   {#snippet trigger(props)}
                     <button

@@ -234,7 +234,7 @@
             aria-label="Sort pinned messages"
             data-testid="pins-sort"
           >
-            <Tooltip label="Recently pinned" side="bottom">
+            <Tooltip label="Recently pinned" side="bottom" reopen="fresh-hover">
               {#snippet trigger(props)}
                 <button
                   {...props}
@@ -259,7 +259,7 @@
                 </button>
               {/snippet}
             </Tooltip>
-            <Tooltip label="Newest messages" side="bottom">
+            <Tooltip label="Newest messages" side="bottom" reopen="fresh-hover">
               {#snippet trigger(props)}
                 <button
                   {...props}
@@ -286,6 +286,7 @@
           <Tooltip
             label={allPinsCollapsed ? "Expand all pinned messages" : "Collapse all pinned messages"}
             side="bottom"
+            reopen="fresh-hover"
           >
             {#snippet trigger(props)}
               <button
@@ -405,6 +406,7 @@
                     ? "Expand message"
                     : "Collapse message"}
                   side="bottom"
+                  reopen="fresh-hover"
                 >
                   {#snippet trigger(props)}
                     <button

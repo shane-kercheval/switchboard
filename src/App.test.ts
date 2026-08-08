@@ -1927,17 +1927,22 @@ describe("App", () => {
     await waitFor(() => expect(screen.getByTestId("sidebar")).toBeInTheDocument());
     expect(screen.getByTestId("sidebar")).toHaveStyle({ width: "275px" });
 
-    await fireEvent.click(screen.getByTestId("right-sidebar-mode-pins"));
+    const pinsMode = screen.getByTestId("right-sidebar-mode-pins");
+    await fireEvent.click(pinsMode);
     await waitFor(() => expect(screen.getByTestId("pins-sidebar")).toBeInTheDocument());
     expect(screen.queryByTestId("sidebar")).not.toBeInTheDocument();
     expect(screen.getByTestId("pins-sidebar")).toHaveStyle({ width: "390px" });
-    const pinsMode = screen.getByTestId("right-sidebar-mode-pins");
     expect(pinsMode).toHaveAttribute("aria-checked", "true");
+    expect(screen.queryByTestId("tooltip-content")).not.toBeInTheDocument();
 
+    await fireEvent.pointerLeave(pinsMode);
     await fireEvent.pointerEnter(pinsMode);
     await waitFor(() => expect(screen.getByTestId("tooltip-content")).toHaveTextContent("Pins"));
     window.dispatchEvent(new Event("blur"));
     await waitFor(() => expect(screen.queryByTestId("tooltip-content")).not.toBeInTheDocument());
+    window.dispatchEvent(new Event("focus"));
+    await fireEvent.focus(pinsMode);
+    expect(screen.queryByTestId("tooltip-content")).not.toBeInTheDocument();
 
     await fireEvent.click(screen.getByTestId("agents-sidebar-toggle"));
     expect(screen.queryByTestId("pins-sidebar")).not.toBeInTheDocument();

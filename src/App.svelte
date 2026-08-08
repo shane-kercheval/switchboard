@@ -143,14 +143,6 @@
   let projectViewResumeSeq = 0;
   let gitViewResumePending = $state<boolean>(false);
   let gitViewResumeSeq = 0;
-  let agentsModeTooltipOpen = $state<boolean>(false);
-  let pinsModeTooltipOpen = $state<boolean>(false);
-
-  function closeRightSidebarModeTooltips(): void {
-    agentsModeTooltipOpen = false;
-    pinsModeTooltipOpen = false;
-  }
-
   function isComposerShortcutTarget(target: EventTarget | null): boolean {
     return (
       target instanceof HTMLElement && target.closest('[data-shortcut-scope="composer"]') !== null
@@ -441,12 +433,10 @@
     });
 
     window.addEventListener("keydown", handleGlobalKeydown);
-    window.addEventListener("blur", closeRightSidebarModeTooltips);
     const removeDevSeed = installDevTranscriptSeed(() => activeAgents);
     return () => {
       stopProjectActivityObserver();
       window.removeEventListener("keydown", handleGlobalKeydown);
-      window.removeEventListener("blur", closeRightSidebarModeTooltips);
       removeDevSeed();
     };
   });
@@ -1140,7 +1130,7 @@
               {/snippet}
             </Tooltip>
             {#if activeAgents.length > 0}
-              <Tooltip label={compactLabel} side="bottom">
+              <Tooltip label={compactLabel} side="bottom" reopen="fresh-hover">
                 {#snippet trigger(props)}
                   <button
                     {...props}
@@ -1179,11 +1169,10 @@
             aria-label="Right sidebar"
           >
             <Tooltip
-              bind:open={agentsModeTooltipOpen}
               label={activeAgents.length === 0 ? "No agents in this project" : "Agents"}
               shortcut={shortcut("mod", "alt", "P")}
               side="bottom"
-              ignoreNonKeyboardFocus
+              reopen="fresh-hover"
             >
               {#snippet trigger(props)}
                 <button
@@ -1208,11 +1197,10 @@
               {/snippet}
             </Tooltip>
             <Tooltip
-              bind:open={pinsModeTooltipOpen}
               label="Pins"
               shortcut={shortcut("mod", "alt", "P")}
               side="bottom"
-              ignoreNonKeyboardFocus
+              reopen="fresh-hover"
             >
               {#snippet trigger(props)}
                 <button
@@ -1263,7 +1251,12 @@
           role="radiogroup"
           aria-label="View"
         >
-          <Tooltip label="Projects" shortcut={shortcut("mod", "shift", "G")} side="bottom">
+          <Tooltip
+            label="Projects"
+            shortcut={shortcut("mod", "shift", "G")}
+            side="bottom"
+            reopen="fresh-hover"
+          >
             {#snippet trigger(props)}
               <button
                 {...props}
@@ -1284,7 +1277,12 @@
               </button>
             {/snippet}
           </Tooltip>
-          <Tooltip label="Git" shortcut={shortcut("mod", "shift", "G")} side="bottom">
+          <Tooltip
+            label="Git"
+            shortcut={shortcut("mod", "shift", "G")}
+            side="bottom"
+            reopen="fresh-hover"
+          >
             {#snippet trigger(props)}
               <button
                 {...props}

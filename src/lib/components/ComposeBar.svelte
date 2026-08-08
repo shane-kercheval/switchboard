@@ -2479,6 +2479,7 @@
                     : `Add ${agent.name}`}
                 shortcut={i < 9 ? shortcut("mod", String(i + 1)) : undefined}
                 delayDuration={chipHidden ? 300 : 1000}
+                reopen="fresh-hover"
               >
                 {#snippet trigger(props)}
                   <button

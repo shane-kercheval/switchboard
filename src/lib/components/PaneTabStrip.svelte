@@ -68,7 +68,11 @@
     {@const presentation = presentationFor(pane, state, active, completed)}
     <!-- The tooltip is where the spinner/✓ semantics are taught: the
          indicator is seen far more often than any empty-state prose. -->
-    <Tooltip label={presentation.label} side="bottom">
+    <Tooltip
+      label={presentation.label}
+      side="bottom"
+      reopen={presentation.selectable || !presentation.visible ? "fresh-hover" : "default"}
+    >
       {#snippet trigger(props)}
         {#snippet contents()}
           {#if active}

@@ -596,6 +596,7 @@
                     label={maximizedPane?.id === pane.id
                       ? "Restore panes"
                       : `Maximize ${pane.name}`}
+                    reopen="fresh-hover"
                   >
                     {#snippet trigger(props)}
                       <button

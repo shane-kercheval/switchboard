@@ -1404,7 +1404,7 @@
   {@const anyExpanded = entries.some((e) => !isCompact(projectId, e.key, e.defaultCompact))}
   {@const keys = entries.map((e) => e.key)}
   {@const label = anyExpanded ? "Collapse all responses above" : "Expand all responses above"}
-  <Tooltip {label} side="bottom">
+  <Tooltip {label} side="bottom" reopen="fresh-hover">
     {#snippet trigger(props)}
       <button
         {...props}
@@ -1520,7 +1520,11 @@
         {#if messageIdentity?.kind === "pinnable" && pinsLoaded(projectId)}
           {@const pinnableIdentity = messageIdentity as PinnableMessageIdentity}
           {@const pinned = isMessagePinned(projectId, pinnableIdentity)}
-          <Tooltip label={pinned ? "Unpin message" : "Pin message"} side="bottom">
+          <Tooltip
+            label={pinned ? "Unpin message" : "Pin message"}
+            side="bottom"
+            reopen="fresh-hover"
+          >
             {#snippet trigger(props)}
               <button
                 {...props}

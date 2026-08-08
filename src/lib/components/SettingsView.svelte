@@ -58,6 +58,7 @@
     { action: "Expand or restore Git details panel", keys: ["⌘", "⇧", "D"] },
     { action: "Toggle projects sidebar", keys: ["⌘", "B"] },
     { action: "Toggle agents sidebar", keys: ["⌘", "⇧", "B"] },
+    { action: "Toggle Agents / Pins sidebar", keys: ["⌘", "⌥", "P"] },
     { action: "Toggle both sidebars", keys: ["⌘", "⌥", "B"] },
     { action: "Toggle settings", keys: ["⌘", ","] },
     {

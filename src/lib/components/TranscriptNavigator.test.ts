@@ -5,7 +5,9 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/svelte";
 import TranscriptNavigator from "./TranscriptNavigator.svelte";
 import type { AgentRecord } from "$lib/types";
 
-const invokeMock = vi.fn(async (_cmd: string, _args?: Record<string, unknown>) => null);
+const invokeMock = vi.fn<(_cmd: string, _args?: Record<string, unknown>) => Promise<unknown>>(
+  async () => null,
+);
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: (cmd: string, args?: Record<string, unknown>) => invokeMock(cmd, args),
   convertFileSrc: (p: string) => `asset://localhost/${p}`,
@@ -16,6 +18,7 @@ vi.mock("$lib/native", () => ({ copyText: vi.fn(async () => undefined) }));
 const state = await import("$lib/state/index.svelte");
 const jump = await import("$lib/state/transcriptJump.svelte");
 const panes = await import("$lib/state/transcriptPanes.svelte");
+const pins = await import("$lib/state/messagePins.svelte");
 
 const PROJECT_ID = "00000000-0000-7000-8000-0000000000ff";
 const ALICE: AgentRecord = {
@@ -38,6 +41,9 @@ afterEach(() => {
   state._testing.reset();
   jump._testing.reset();
   panes._testing.reset();
+  pins._testing.reset();
+  invokeMock.mockReset();
+  invokeMock.mockResolvedValue(null);
 });
 
 async function seed(): Promise<void> {
@@ -58,6 +64,7 @@ async function seed(): Promise<void> {
       agent_id: ALICE.id,
       started_at: "2026-05-16T00:00:01Z",
       status: "complete",
+      hydration_key: "message-a",
       items: [{ item_kind: "text", kind: "text", text: "deployed the fix" }],
     },
   ];
@@ -68,6 +75,7 @@ async function seed(): Promise<void> {
       agent_id: BOB.id,
       started_at: "2026-05-16T00:00:02Z",
       status: "complete",
+      hydration_key: "message-b",
       items: [{ item_kind: "text", kind: "text", text: "reviewing the change" }],
     },
   ];
@@ -222,6 +230,29 @@ describe("TranscriptNavigator", () => {
     expect(jump.navigatorState.open).toBe(false);
     await tick();
     expect(screen.queryByTestId("transcript-navigator")).toBeNull();
+  });
+
+  it("pins from a result without navigating and filters to pinned messages", async () => {
+    invokeMock.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "list_message_pins") return [];
+      if (cmd === "set_message_pin") {
+        return args?.pinned ? [{ key: args.key, pinned_at: "2026-08-07T12:00:00Z" }] : [];
+      }
+      return null;
+    });
+    await seed();
+    render(TranscriptNavigator, { props: props() });
+    await openNavigator();
+
+    const firstPin = screen.getAllByTestId("navigator-entry-pin")[0]!;
+    await fireEvent.click(firstPin);
+    expect(jump.jumpRequest.rowKey).toBeNull();
+    expect(jump.navigatorState.open).toBe(true);
+    await waitFor(() => expect(firstPin).toHaveAttribute("aria-pressed", "true"));
+
+    await fireEvent.click(screen.getByTestId("navigator-pinned-filter"));
+    expect(screen.getAllByTestId("navigator-entry")).toHaveLength(1);
+    expect(screen.getByTestId("navigator-entry")).toHaveTextContent("bob");
   });
 
   it("disables entries whose agent is hidden in its pane; clicking one is a no-op", async () => {

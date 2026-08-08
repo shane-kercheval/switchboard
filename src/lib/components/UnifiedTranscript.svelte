@@ -1,10 +1,9 @@
 <script lang="ts">
   import { tick, untrack } from "svelte";
-  import type { AgentRecord, Attachment, ConversationItem, ProjectId } from "$lib/types";
+  import type { AgentRecord, ConversationItem, ProjectId } from "$lib/types";
   import { HEARTBEAT_TIMEOUT_MS } from "$lib/types";
   import { cn, formatDuration } from "$lib/utils";
   import { createPinTracker, type ScrollGeometry } from "$lib/scrollPin";
-  import { convertFileSrc } from "@tauri-apps/api/core";
   import {
     ChevronRight,
     ChevronsDownUp,
@@ -12,6 +11,7 @@
     Columns2,
     CornerUpRight,
     MessagesSquare,
+    Pin,
     Send,
     SquareSlash,
     Workflow,
@@ -46,6 +46,7 @@
   import { shortcut } from "$lib/platform";
   import { HARNESS_COLOR } from "$lib/harnessDisplay";
   import Badge from "$lib/components/ui/Badge.svelte";
+  import AgentMessageBody from "$lib/components/AgentMessageBody.svelte";
   import CompactionMarker from "$lib/components/CompactionMarker.svelte";
   import HarnessIcon from "$lib/components/ui/HarnessIcon.svelte";
   import Markdown from "$lib/components/ui/Markdown.svelte";
@@ -54,9 +55,8 @@
   import Spinner from "$lib/components/ui/Spinner.svelte";
   import StatusChip from "$lib/components/ui/StatusChip.svelte";
   import StopIcon from "$lib/components/ui/StopIcon.svelte";
-  import ToolCallWidget from "$lib/components/ToolCallWidget.svelte";
+  import UserMessageBody from "$lib/components/UserMessageBody.svelte";
   import { consumeJump, jumpRequest } from "$lib/state/transcriptJump.svelte";
-  import ThinkingWidget from "$lib/components/ThinkingWidget.svelte";
   import ErrorDetailsDialog from "$lib/components/ui/ErrorDetailsDialog.svelte";
   import Button from "$lib/components/ui/Button.svelte";
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
@@ -66,6 +66,18 @@
     stateFor,
     toggleKey,
   } from "$lib/state/transcriptPreview.svelte";
+  import {
+    messageIdentityForRow,
+    type MessageIdentity,
+    type PinnableMessageIdentity,
+  } from "$lib/messageIdentity";
+  import {
+    isMessagePinned,
+    loadMessagePins,
+    pinsLoaded,
+    pinsUnavailableReason,
+    toggleMessagePin,
+  } from "$lib/state/messagePins.svelte";
 
   type AgentTurn = Extract<Turn, { role: "agent" }>;
   type NonUserRow = Exclude<UnifiedRow, { kind: "user" }>;
@@ -108,6 +120,10 @@
     /// (`transcriptJump.svelte.ts`). Absent → this instance ignores jumps.
     paneId?: string;
   } = $props();
+
+  $effect(() => {
+    void loadMessagePins(projectId);
+  });
 
   /// Roster agents whose *own* history failed to load (the per-agent
   /// `hydration_error`), independent of the whole-project load. Surfaced as
@@ -246,60 +262,6 @@
       .map((held) => ({ held, recipients: held.recipients.filter((r) => ids.has(r)) }))
       .filter((entry) => entry.recipients.length > 0);
   });
-
-  /// The transcript recognizes a quoted block by matching the **canonical backend
-  /// wire shape** — a synchronized cross-language contract with the Rust emitters
-  /// (`crates/harness/src/forward.rs` `compose_forwarded_message` → `forwarded
-  /// from`; `crates/workflow/src/template.rs` `aggregated_responses` → `response
-  /// from`). Change a sentinel's wording on either side and both must change; these
-  /// comments are a signpost, **not enforcement**. (Follow-up for durable
-  /// enforcement: a shared fixture asserted by a Rust *and* a TS test, or structured
-  /// provenance replacing string-sniffing — deferred; string-matching is the
-  /// root-cause class of the B1 bug this fix addresses.)
-
-  /// Fast single-line gate: does the body contain any quoted block? Anchored (`/m`),
-  /// so no `/g` `lastIndex` state — used only to decide whether to take the banding
-  /// path. Broader than `FORWARD_SENTINEL` (the manual-forward marker, in
-  /// `heldForwards`): it also matches the `response from` aggregation shape.
-  const QUOTED_BLOCK_SENTINEL = /^=== START (?:forwarded|response) from .+ ===$/m;
-
-  /// One quoted block — `=== START (forwarded|response) from <agent> === … === END
-  /// … ===` — covering both a forwarded block (manual or workflow `forward_from`)
-  /// and a fan-in aggregation block (`aggregated_responses`). Captures the START
-  /// sentinel, the keyword, the agent, the inner content, and the END sentinel
-  /// separately so the sentinels can be styled while the content renders as
-  /// Markdown. Matched non-greedily so adjacent blocks don't merge; blocks don't
-  /// nest, so this is unambiguous. The END keyword and agent are backreferences to
-  /// the START (`\2`, `\3`), so a block only bands when its sentinels pair on both
-  /// — the canonical backend shapes always do; stray/pasted sentinel-looking text
-  /// won't mis-band (the backreferences match the captured text literally, so no
-  /// regex injection from agent names).
-  const QUOTED_BLOCK =
-    /(=== START (forwarded|response) from (.+?) ===)\n([\s\S]*?)\n(=== END \2 from \3 ===)/g;
-
-  type QuotedSegment =
-    | { kind: "text"; text: string }
-    | { kind: "quote"; start: string; inner: string; end: string };
-
-  /// Split a message body into ordered segments — the user's typed text (or a
-  /// rendered prompt) as `text`, each quoted block (forwarded or aggregated) as
-  /// `quote` — so the transcript can give *only the quoted portions* a style-only
-  /// band, leaving the user's own text plain. Text is kept verbatim (sentinels
-  /// included); only the blank-line separators between segments are trimmed.
-  function splitQuotedSegments(text: string): QuotedSegment[] {
-    const segments: QuotedSegment[] = [];
-    let last = 0;
-    for (const m of text.matchAll(QUOTED_BLOCK)) {
-      const idx = m.index ?? 0;
-      const between = text.slice(last, idx).replace(/^\n+|\n+$/g, "");
-      if (between !== "") segments.push({ kind: "text", text: between });
-      segments.push({ kind: "quote", start: m[1]!, inner: m[4]!, end: m[5]! });
-      last = idx + m[0].length;
-    }
-    const tail = text.slice(last).replace(/^\n+|\n+$/g, "");
-    if (tail !== "") segments.push({ kind: "text", text: tail });
-    return segments;
-  }
 
   /// Whether compact mode is on for the active project.
   const compactEnabled = $derived(stateFor(projectId).enabled);
@@ -586,6 +548,16 @@
     for (let i = colRows.length - 1; i >= 0; i--) {
       const r = colRows[i]!;
       if (r.kind === "agent") return r.turn.effort;
+    }
+    return undefined;
+  }
+
+  function columnMessageIdentity(colRows: NonUserRow[]): MessageIdentity | undefined {
+    for (let i = colRows.length - 1; i >= 0; i--) {
+      const row = colRows[i]!;
+      if (row.kind === "agent") {
+        return messageIdentityForRow(row, agentById[row.turn.agent_id]?.harness);
+      }
     }
     return undefined;
   }
@@ -1218,17 +1190,7 @@
      closed is terminal — callers encode that via `live`, so they pass the
      effective value rather than the widget re-deriving a naive one. -->
 {#snippet turnItems(turn: AgentTurn, settled: boolean)}
-  {#each turn.items as item, i (i)}
-    {#if item.item_kind === "text"}
-      {#if item.kind === "thinking"}
-        <ThinkingWidget text={item.text} />
-      {:else}
-        <Markdown text={item.text} />
-      {/if}
-    {:else}
-      <ToolCallWidget tool={item} turnSettled={settled} />
-    {/if}
-  {/each}
+  <AgentMessageBody {turn} {settled} />
 {/snippet}
 
 <!-- `mode` selects how a response renders:
@@ -1293,9 +1255,6 @@
     <!-- This branch means the turn is not (streaming && live): it either ended
          or an outcome marker closed a streaming-on-disk turn — settled both ways. -->
     {@render turnItems(turn, true)}
-    {#if turn.status === "failed" && turn.error}
-      <div class="text-status-failed text-xs" data-testid="turn-error">{turn.error}</div>
-    {/if}
   {/if}
 {/snippet}
 
@@ -1422,7 +1381,7 @@
   <button
     type="button"
     data-layout-toggle
-    class="text-muted hover:text-fg hover:bg-control-hover inline-flex items-center gap-1 rounded-full border border-transparent px-2 py-0.5 text-xs opacity-0 transition-colors group-focus-within:opacity-100 group-hover:opacity-100"
+    class="text-muted hover:text-fg hover:bg-control-hover inline-flex items-center gap-1 rounded-full border border-transparent px-2 py-0.5 text-xs opacity-0 transition-colors group-hover:opacity-100 group-has-[:focus-visible]:opacity-100"
     data-testid="turn-preview-toggle"
     aria-label={label}
     onclick={() => toggleKey(projectId, key, defaultCompact)}
@@ -1480,6 +1439,7 @@
   effort = undefined,
   previewKey = undefined,
   previewDefaultCompact = false,
+  messageIdentity = undefined,
 }: {
   at: string;
   copyable?: string;
@@ -1491,9 +1451,10 @@
   effort?: string;
   previewKey?: string;
   previewDefaultCompact?: boolean;
+  messageIdentity?: MessageIdentity;
 })}
   <!-- Two zones on a flex row: cost/overage + expand/collapse toggle pinned LEFT, and
-       the hover-revealed model/timestamp/copy pinned RIGHT (`ml-auto`). The gap
+       the hover-revealed model/timestamp/pin/copy pinned RIGHT (`ml-auto`). The gap
        between them collapses first as the row narrows; then the right cluster's
        text wraps (model over timestamp) and truncates with `…`. The toggle and
        copy button are `shrink-0` — never squished. -->
@@ -1525,114 +1486,88 @@
       {/if}
     </div>
     <!-- Right: per-turn model/effort (history — what this turn actually ran on),
-         timestamp, and copy. Hover/focus-revealed. The text group wraps so a
+         timestamp, pin, and copy. Hover/keyboard-focus-revealed. The text group wraps so a
          narrow column stacks model over timestamp, and each line truncates with
-         `…` rather than squishing to more lines; the copy button sits OUTSIDE the
-         wrap (`shrink-0`) so it is never squished. -->
+         `…` rather than squishing to more lines; Pin and Copy form a tight,
+         non-shrinking action cluster separated from the text metadata. -->
     <div
-      class="ml-auto flex min-w-0 items-center gap-2 opacity-0 group-focus-within:opacity-100 group-hover:opacity-100"
+      class="ml-auto flex min-w-0 items-center gap-2 opacity-0 group-hover:opacity-100 group-has-[:focus-visible]:opacity-100"
+      data-testid="message-meta-details"
     >
-      <div class="flex min-w-0 flex-wrap items-center justify-end gap-x-2">
-        {#if model}
-          <span class="text-muted max-w-full truncate text-xs" data-testid="message-model"
-            >{model}</span
-          >
+      <div class="flex min-w-0 items-center gap-2">
+        <div class="flex min-w-0 flex-wrap items-center justify-end gap-x-2">
+          {#if model}
+            <span class="text-muted max-w-full truncate text-xs" data-testid="message-model"
+              >{model}</span
+            >
+          {/if}
+          {#if effort}
+            <span class="text-muted max-w-full truncate text-xs" data-testid="message-effort"
+              >{effort}</span
+            >
+          {/if}
+          {#if at}
+            <time
+              class="text-muted max-w-full truncate text-xs"
+              datetime={at}
+              title={at}
+              data-testid="message-time">{formatTime(at)}</time
+            >
+          {/if}
+        </div>
+      </div>
+      <div class="flex shrink-0 items-center gap-0" data-testid="message-meta-actions">
+        {#if messageIdentity?.kind === "pinnable" && pinsLoaded(projectId)}
+          {@const pinnableIdentity = messageIdentity as PinnableMessageIdentity}
+          {@const pinned = isMessagePinned(projectId, pinnableIdentity)}
+          <Tooltip label={pinned ? "Unpin message" : "Pin message"} side="bottom">
+            {#snippet trigger(props)}
+              <button
+                {...props}
+                type="button"
+                class={cn(META_ICON_BUTTON, "shrink-0", pinned && "text-accent")}
+                aria-label={pinned ? "Unpin message" : "Pin message"}
+                aria-pressed={pinned}
+                data-testid="message-pin"
+                onclick={() => toggleMessagePin(projectId, pinnableIdentity)}
+              >
+                <Pin size={15} fill={pinned ? "currentColor" : "none"} aria-hidden="true" />
+              </button>
+            {/snippet}
+          </Tooltip>
+        {:else if messageIdentity !== undefined}
+          {@const unavailableReason =
+            messageIdentity.kind === "unsupported"
+              ? messageIdentity.reason
+              : pinsUnavailableReason(projectId)}
+          <Tooltip label={unavailableReason} side="bottom">
+            {#snippet trigger(props)}
+              <span
+                {...props}
+                class={cn(META_ICON_BUTTON, "text-muted/50 shrink-0")}
+                role="button"
+                aria-label={unavailableReason}
+                aria-disabled="true"
+                tabindex="0"
+                data-testid="message-pin-unavailable"
+              >
+                <Pin size={15} aria-hidden="true" />
+              </span>
+            {/snippet}
+          </Tooltip>
         {/if}
-        {#if effort}
-          <span class="text-muted max-w-full truncate text-xs" data-testid="message-effort"
-            >{effort}</span
-          >
-        {/if}
-        {#if at}
-          <time
-            class="text-muted max-w-full truncate text-xs"
-            datetime={at}
-            title={at}
-            data-testid="message-time">{formatTime(at)}</time
-          >
+        {#if copyable}
+          <span class="shrink-0">
+            <CopyButton text={copyable} {label} testid="message-copy" />
+          </span>
         {/if}
       </div>
-      {#if copyable}
-        <span class="shrink-0">
-          <CopyButton text={copyable} {label} testid="message-copy" />
-        </span>
-      {/if}
     </div>
   </div>
 {/snippet}
 
-{#snippet attachmentList(attachments: Attachment[])}
-  <div class="mt-1.5 flex flex-wrap gap-1.5" data-testid="user-attachments">
-    {#each attachments as attachment (attachment.path)}
-      {#if attachment.kind === "image"}
-        <!-- `convertFileSrc` turns the absolute staged path into an `asset://`
-             URL the webview can load (a raw filesystem path can't be an <img
-             src>); the asset protocol is enabled + scoped in tauri.conf.json. -->
-        <img
-          src={convertFileSrc(attachment.path)}
-          alt={attachment.original_name}
-          title={attachment.original_name}
-          data-testid={`attachment-thumb-${attachment.label}`}
-          class="border-border h-16 w-16 rounded-md border object-cover"
-        />
-      {:else}
-        <span
-          class="border-border bg-panel text-fg inline-flex max-w-[14rem] items-center gap-1.5 rounded-full border px-2 py-px text-xs"
-          data-testid={`attachment-file-${attachment.label}`}
-          data-kind={attachment.kind}
-        >
-          <svg
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="1.8"
-            stroke-linecap="round"
-            stroke-linejoin="round"
-            class="text-muted h-3.5 w-3.5 shrink-0"
-            aria-hidden="true"
-          >
-            <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z" />
-            <path d="M14 3v5h5" />
-          </svg>
-          <span class="truncate" title={attachment.original_name}>{attachment.original_name}</span>
-        </span>
-      {/if}
-    {/each}
-  </div>
-{/snippet}
-
 {#snippet userBody(row: Extract<UnifiedRow, { kind: "user" }>)}
-  {#if QUOTED_BLOCK_SENTINEL.test(row.text)}
-    <!-- Quoted blocks: give each forwarded (`forwarded from`) or aggregated
-         (`response from`) block — and only it — a style-only band so the quoted
-         agent output stands apart from the user's own typed text, which stays
-         plain. Text is verbatim — the `=== … ===` sentinels are kept. The turn's
-         `data-forwarded` marker stays forward-only (below); the band is purely
-         presentational and covers both shapes. -->
-    {#each splitQuotedSegments(row.text) as seg, i (i)}
-      {#if seg.kind === "quote"}
-        <!-- Border-only band: a neutral dark-gray left rule (the `muted` token —
-             not the harness-colored agent rules, not the accent green). Extra
-             `py` makes the rule extend past the text top/bottom, and `my` adds
-             separation between adjacent forwarded blocks. The `=== … ===`
-             sentinels render bold + monospace (verbatim, as plain text so the
-             `===` isn't parsed as Markdown); the content between renders as
-             Markdown. -->
-        <div class="border-muted my-3 border-l-2 pl-3" data-testid="quoted-block">
-          <div class="font-mono text-xs font-bold">{seg.start}</div>
-          <Markdown text={seg.inner} />
-          <div class="font-mono text-xs font-bold">{seg.end}</div>
-        </div>
-      {:else}
-        <Markdown text={seg.text} />
-      {/if}
-    {/each}
-  {:else}
-    <Markdown text={row.text} />
-  {/if}
-  {#if row.attachments.length > 0}
-    {@render attachmentList(row.attachments)}
-  {/if}
+  <UserMessageBody {row} />
 {/snippet}
 
 {#snippet userMessage(row: Extract<UnifiedRow, { kind: "user" }>)}
@@ -1680,6 +1615,7 @@
       label: "Copy message",
       previewKey: showToggle ? key : undefined,
       previewDefaultCompact: defaultCompact,
+      messageIdentity: messageIdentityForRow(row),
     })}
     {#if caption !== undefined}
       <div class="text-muted mt-0.5 text-xs" data-testid="forward-caption">
@@ -1757,7 +1693,8 @@
   </div>
 {/snippet}
 
-{#snippet agentRow(turn: AgentTurn)}
+{#snippet agentRow(row: Extract<UnifiedRow, { kind: "agent" }>)}
+  {@const turn = row.turn}
   {@const harness = agentById[turn.agent_id]?.harness}
   {@const copyable = copyTextOf(turn, agentCopy.mode)}
   <!-- A non-completed Outcome marker (rendered as a sibling `outcomeRow`) is
@@ -1816,6 +1753,7 @@
       effort: turn.effort,
       previewKey: showToggle ? key : undefined,
       previewDefaultCompact: defaultCompact,
+      messageIdentity: messageIdentityForRow(row, agentById[turn.agent_id]?.harness),
     })}
   </div>
 {/snippet}
@@ -2150,7 +2088,7 @@
           {:else if block.row.kind === "system_marker"}
             {@render systemMarkerRow(block.row)}
           {:else}
-            {@render agentRow(block.row.turn)}
+            {@render agentRow(block.row)}
           {/if}
         {:else}
           {@const fanoutEntries = block.columns
@@ -2276,6 +2214,7 @@
                       effort: columnEffort(col.rows),
                       previewKey: colShowToggle ? colKey : undefined,
                       previewDefaultCompact: colDefaultCompact,
+                      messageIdentity: columnMessageIdentity(col.rows),
                     })}
                   </div>
                 {/each}

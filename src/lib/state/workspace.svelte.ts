@@ -777,6 +777,7 @@ export async function hydrateProject(
           turn_id: item.turn_id,
           agent_id: item.agent_id,
           send_id: item.send_id ?? null,
+          send_correlation: item.send_correlation ?? null,
           started_at: item.started_at,
           ended_at: item.ended_at ?? null,
           status: item.status,

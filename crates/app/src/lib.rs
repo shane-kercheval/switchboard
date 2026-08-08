@@ -45,18 +45,19 @@ use crate::commands::{
     existing_attachment_paths_impl, fetch_repo_impl, file_diff_impl, forward_message_impl,
     forward_prompt_impl, get_preferences_impl, get_prompt_source_impl, harness_adapter_for,
     init_directory_impl, install_status_for_adapter, list_agents_impl, list_mcp_providers_impl,
-    list_projects_impl, list_prompts_impl, list_tracked_repos_from_inputs,
+    list_message_pins_impl, list_projects_impl, list_prompts_impl, list_tracked_repos_from_inputs,
     list_workspace_directories_impl, load_project_conversation_impl, load_transcript_impl,
-    open_commit_file_difftool_impl, open_project_impl, open_worktree_file_difftool_impl,
-    parse_uuid, pick_directory_impl, project_session_fingerprints_impl,
-    read_tracked_repo_from_inputs, recheck_harness_installs_impl, remove_agent_impl,
-    remove_directory_impl, remove_mcp_provider_impl, remove_queued_message_impl,
+    migrate_message_pin_impl, open_commit_file_difftool_impl, open_project_impl,
+    open_worktree_file_difftool_impl, parse_uuid, pick_directory_impl,
+    project_session_fingerprints_impl, read_tracked_repo_from_inputs,
+    recheck_harness_installs_impl, remove_agent_impl, remove_directory_impl,
+    remove_mcp_provider_impl, remove_message_pins_impl, remove_queued_message_impl,
     remove_tracked_repo_impl, rename_agent_impl, rename_project_impl, render_prompt_impl,
     reorder_agents_impl, reveal_in_finder_argv, search_project_files_in_root,
     search_project_files_root_impl, send_message_impl, set_active_project_impl,
-    set_agent_effort_impl, set_agent_model_impl, set_preferences_impl, set_project_archived_impl,
-    stage_attachment_impl, sync_prompts_and_notify, terminal_open_argv, test_mcp_connection_impl,
-    tracked_repos_inputs, tracked_roots, validate_external_url,
+    set_agent_effort_impl, set_agent_model_impl, set_message_pin_impl, set_preferences_impl,
+    set_project_archived_impl, stage_attachment_impl, sync_prompts_and_notify, terminal_open_argv,
+    test_mcp_connection_impl, tracked_repos_inputs, tracked_roots, validate_external_url,
 };
 use crate::preferences::Preferences;
 use crate::state::AppState;
@@ -67,7 +68,9 @@ use crate::workflow_commands::{
     validate_workflow_invocation_impl,
 };
 
-use switchboard_core::{AgentRecord, Attachment, HarnessKind, ProjectId, ProjectSummary};
+use switchboard_core::{
+    AgentRecord, Attachment, HarnessKind, MessagePin, ProjectId, ProjectSummary,
+};
 use switchboard_git::{
     BranchKind, ChangeKind, ChangedFile, CommitChanges, FileDiff, GitCommitRange,
 };
@@ -220,6 +223,44 @@ async fn remove_directory(state: State<'_, AppState>, path: String) -> Result<()
 #[tauri::command]
 async fn list_projects(state: State<'_, AppState>) -> Result<Vec<ProjectListing>, String> {
     list_projects_impl(state.inner()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn list_message_pins(
+    state: State<'_, AppState>,
+    project_id: ProjectId,
+) -> Result<Vec<MessagePin>, String> {
+    list_message_pins_impl(state.inner(), project_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn set_message_pin(
+    state: State<'_, AppState>,
+    project_id: ProjectId,
+    key: String,
+    pinned: bool,
+) -> Result<Vec<MessagePin>, String> {
+    set_message_pin_impl(state.inner(), project_id, &key, pinned).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn remove_message_pins(
+    state: State<'_, AppState>,
+    project_id: ProjectId,
+    keys: Vec<String>,
+) -> Result<Vec<MessagePin>, String> {
+    remove_message_pins_impl(state.inner(), project_id, &keys).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn migrate_message_pin(
+    state: State<'_, AppState>,
+    project_id: ProjectId,
+    from_key: String,
+    to_key: String,
+) -> Result<Vec<MessagePin>, String> {
+    migrate_message_pin_impl(state.inner(), project_id, &from_key, &to_key)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1469,6 +1510,10 @@ pub fn run() {
             init_directory,
             remove_directory,
             list_projects,
+            list_message_pins,
+            set_message_pin,
+            remove_message_pins,
+            migrate_message_pin,
             list_workspace_directories,
             add_tracked_repo,
             remove_tracked_repo,

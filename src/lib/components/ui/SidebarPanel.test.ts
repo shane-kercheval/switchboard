@@ -12,12 +12,26 @@ describe("SidebarPanel", () => {
     expect(panel).toHaveTextContent("contents");
     expect(panel).toHaveStyle({ width: "288px" });
     expect(panel).toHaveClass("border-r");
+    expect(panel).toHaveClass("max-w-[clamp(200px,40vw,480px)]");
   });
 
-  it("puts the border on the right edge when side=right", () => {
+  it("puts the border on the right edge without widening a navigation rail", () => {
     render(SidebarPanel, {
       props: { side: "right", width: 240, testid: "panel", children: body },
     });
-    expect(screen.getByTestId("panel")).toHaveClass("border-l");
+    expect(screen.getByTestId("panel")).toHaveClass("border-l", "max-w-[clamp(200px,40vw,480px)]");
+  });
+
+  it("allows a wider reading profile", () => {
+    render(SidebarPanel, {
+      props: {
+        side: "right",
+        widthProfile: "reading",
+        width: 520,
+        testid: "panel",
+        children: body,
+      },
+    });
+    expect(screen.getByTestId("panel")).toHaveClass("border-l", "max-w-[clamp(200px,60vw,720px)]");
   });
 });

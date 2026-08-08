@@ -233,6 +233,7 @@ describe("SettingsView", () => {
     expect(screen.getByText("Expand or restore Git details panel")).toBeInTheDocument();
     expect(screen.getByText("Toggle projects sidebar")).toBeInTheDocument();
     expect(screen.getByText("Toggle agents sidebar")).toBeInTheDocument();
+    expect(screen.getByText("Toggle Agents / Pins sidebar")).toBeInTheDocument();
     expect(screen.getByText("Toggle settings")).toBeInTheDocument();
     expect(screen.getByText("Cycle to previous / next pane")).toBeInTheDocument();
   });

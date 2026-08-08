@@ -13,6 +13,7 @@ mod io;
 pub mod journal;
 pub mod name;
 mod paths;
+pub mod pins;
 pub mod project;
 
 pub use agent::{AgentId, AgentRecord, SessionLocator, normalize_selection};
@@ -22,4 +23,5 @@ pub use error::{CoreError, Result};
 pub use harness::{HarnessKind, SelectionAxis};
 pub use io::{append_jsonl, edit_yaml_mapping, read_jsonl, read_yaml, write_yaml};
 pub use journal::{JournalRecord, SendId};
+pub use pins::MessagePin;
 pub use project::{Project, ProjectConfig, ProjectId, ProjectSummary};

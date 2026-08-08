@@ -100,11 +100,8 @@ pub struct ParserState {
     /// durable join key that re-attaches cost/overage to the right message on
     /// reopen (the same id appears in the on-disk session file; verified).
     last_assistant_message_id: Option<String>,
-    /// The **first** assistant message's Anthropic `message.id`, kept-first
-    /// (set once per turn, never overwritten). Emitted as the turn's
-    /// `first_message_id` → the frontend `hydration_key`. Unlike the last id,
-    /// this is stable from the turn's first assistant message, so a live turn and a
-    /// mid-flight or completed disk re-read of it all dedup to the same key.
+    /// The turn's **first** assistant `message.id`, kept-first. It is emitted as
+    /// `first_message_id` → the frontend `hydration_key`.
     /// See `AdapterEvent::TurnEnd::first_message_id`.
     first_assistant_message_id: Option<String>,
     /// The most recent assistant message's `message.model`, kept-last the same
@@ -733,9 +730,12 @@ fn parse_mcp_server_status(v: &Value) -> Option<McpServerStatus> {
 }
 
 /// Parse an `assistant` envelope: emit `ToolStarted` for each `tool_use`
-/// content block. Text content is handled at the delta layer in
-/// `parse_stream_event` (the envelope arrives after all the deltas), so we
-/// don't emit `ContentChunk`s from here — that would double-emit.
+/// content block. Normal model text is handled at the delta layer in
+/// `parse_stream_event` (the envelope arrives after all the deltas), so replaying
+/// it here would double-emit. Claude's harness-authored responses are different:
+/// they use `message.model: "<synthetic>"` and may emit no deltas, so their
+/// non-error text blocks are surfaced directly from the envelope as a defensive
+/// fallback. Ordinary Switchboard sends bypass Claude's local-command parser.
 ///
 /// **Auth-failure detection (state-flag pattern).** If the envelope carries
 /// top-level `"error": "authentication_failed"`, stash the displayable
@@ -745,44 +745,8 @@ fn parse_mcp_server_status(v: &Value) -> Option<McpServerStatus> {
 /// the folded result; the stash just refines the failure's `FailureKind`
 /// from `HarnessError` to `AuthFailure`.
 fn parse_assistant_envelope(obj: &Value, turn_id: TurnId, state: &mut ParserState) -> ParseOutcome {
-    // Track this model call's prompt size for context-occupancy. Done before
-    // the content/early-return below so the final *text-only* answer message
-    // (which produces no tool event) still updates the occupancy — its usage
-    // reflects the largest, most-recent context. Overwrite → keep last.
-    if let Some(usage) = obj
-        .get("message")
-        .and_then(|m| m.get("usage"))
-        .and_then(Value::as_object)
-    {
-        let input = usage
-            .get("input_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        let cache_read = usage
-            .get("cache_read_input_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        let cache_creation = usage
-            .get("cache_creation_input_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        let output = usage.get("output_tokens").and_then(Value::as_u64);
-        let context_input = input
-            .checked_add(cache_read)
-            .and_then(|tokens| tokens.checked_add(cache_creation));
-        let context_after_turn = context_input
-            .zip(output)
-            .and_then(|(tokens, output)| tokens.checked_add(output));
-        if context_input.is_none()
-            || (context_input.is_some() && output.is_some() && context_after_turn.is_none())
-        {
-            tracing::warn!(
-                "Claude parent context-token arithmetic overflow — context utilization unavailable"
-            );
-        }
-        state.last_assistant_context_input_tokens = context_input;
-        state.last_assistant_context_tokens_after_turn = context_after_turn;
-    }
+    let mut events = Vec::new();
+    track_assistant_context_usage(obj, state);
 
     // Track this message's Anthropic id as the turn's durable join key (keep
     // last → the final assistant message's id). Same envelope, same "keep last"
@@ -791,35 +755,41 @@ fn parse_assistant_envelope(obj: &Value, turn_id: TurnId, state: &mut ParserStat
     // message by construction.
     // Announce the turn's dedup identity the first time we see an assistant
     // message id, so a live turn carries its `hydration_key` while streaming.
-    let mut identity_event: Option<AdapterEvent> = None;
-    if let Some(id) = obj
+    let message_id = obj
         .get("message")
         .and_then(|m| m.get("id"))
-        .and_then(Value::as_str)
-    {
+        .and_then(Value::as_str);
+    if let Some(id) = message_id {
         state.last_assistant_message_id = Some(id.to_owned());
-        // Keep-*first* (set once): the dedup identity must be the turn's first
-        // assistant message, which is invariant across partial vs complete
-        // parses — see the field doc.
-        if state.first_assistant_message_id.is_none() {
-            state.first_assistant_message_id = Some(id.to_owned());
-            identity_event = Some(AdapterEvent::TurnIdentity {
-                turn_id,
-                message_id: id.to_owned(),
-            });
-        }
     }
-    // Keep-last the assistant model the same way (final non-subagent model is
-    // the turn's model). Stamped on `TurnEnd.model`.
-    if let Some(model) = obj
+    let assistant_model = obj
         .get("message")
         .and_then(|m| m.get("model"))
-        .and_then(Value::as_str)
-    {
+        .and_then(Value::as_str);
+    let is_synthetic = assistant_model == Some("<synthetic>");
+    let content = obj
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(Value::as_array);
+
+    // Keep-last the real assistant model the same way (final non-subagent model
+    // is the turn's model). `<synthetic>` identifies harness-authored local
+    // output, not a model selection, so never stamp it onto turn metadata.
+    if let Some(model) = assistant_model.filter(|model| *model != "<synthetic>") {
         state.last_assistant_model = Some(model.to_owned());
     }
 
-    if obj.get("error").and_then(Value::as_str) == Some("authentication_failed") {
+    let envelope_error = obj.get("error").and_then(Value::as_str);
+    if state.first_assistant_message_id.is_none()
+        && let Some(id) = message_id
+    {
+        state.first_assistant_message_id = Some(id.to_owned());
+        events.push(AdapterEvent::TurnIdentity {
+            turn_id,
+            message_id: id.to_owned(),
+        });
+    }
+    if envelope_error == Some("authentication_failed") {
         // Stash the authored Switchboard auth message rather than Claude's
         // own `Please run /login` (which is the interactive-session slash
         // command, not the CLI command). Authoring keeps the user-facing
@@ -836,13 +806,10 @@ fn parse_assistant_envelope(obj: &Value, turn_id: TurnId, state: &mut ParserStat
     // The identity event leads; tool_use blocks follow. A first assistant
     // envelope with no content array still emits the identity (it's decoupled
     // from content) rather than being dropped by an early `Skip`.
-    let mut events = Vec::new();
-    events.extend(identity_event);
-    if let Some(content) = obj
-        .get("message")
-        .and_then(|m| m.get("content"))
-        .and_then(Value::as_array)
-    {
+    if let Some(content) = content {
+        if is_synthetic && envelope_error.is_none() {
+            append_synthetic_text_events(content, turn_id, state, &mut events);
+        }
         for block in content {
             if block.get("type").and_then(Value::as_str) == Some("tool_use") {
                 let Some(id) = block.get("id").and_then(Value::as_str) else {
@@ -866,6 +833,75 @@ fn parse_assistant_envelope(obj: &Value, turn_id: TurnId, state: &mut ParserStat
         0 => ParseOutcome::Skip,
         1 => ParseOutcome::Event(events.into_iter().next().expect("len==1")),
         _ => ParseOutcome::Events(events),
+    }
+}
+
+fn track_assistant_context_usage(obj: &Value, state: &mut ParserState) {
+    let Some(usage) = obj
+        .get("message")
+        .and_then(|message| message.get("usage"))
+        .and_then(Value::as_object)
+    else {
+        return;
+    };
+    let input = usage
+        .get("input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let cache_read = usage
+        .get("cache_read_input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let cache_creation = usage
+        .get("cache_creation_input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let output = usage.get("output_tokens").and_then(Value::as_u64);
+    let context_input = input
+        .checked_add(cache_read)
+        .and_then(|tokens| tokens.checked_add(cache_creation));
+    let context_after_turn = context_input
+        .zip(output)
+        .and_then(|(tokens, output)| tokens.checked_add(output));
+    if context_input.is_none()
+        || (context_input.is_some() && output.is_some() && context_after_turn.is_none())
+    {
+        tracing::warn!(
+            "Claude parent context-token arithmetic overflow — context utilization unavailable"
+        );
+    }
+    state.last_assistant_context_input_tokens = context_input;
+    state.last_assistant_context_tokens_after_turn = context_after_turn;
+}
+
+fn append_synthetic_text_events(
+    content: &[Value],
+    turn_id: TurnId,
+    state: &mut ParserState,
+    events: &mut Vec<AdapterEvent>,
+) {
+    let mut emitted_text = false;
+    for block in content {
+        if block.get("type").and_then(Value::as_str) != Some("text") {
+            continue;
+        }
+        let Some(text) = block.get("text").and_then(Value::as_str) else {
+            continue;
+        };
+        if text.is_empty() {
+            continue;
+        }
+        events.push(AdapterEvent::ContentChunk {
+            turn_id,
+            kind: ContentKind::Text,
+            text: if emitted_text {
+                format!("\n\n{text}")
+            } else {
+                text.to_owned()
+            },
+        });
+        emitted_text = true;
+        state.text_chunk_emitted_in_turn = true;
     }
 }
 
@@ -1015,8 +1051,8 @@ mod tests {
 
     /// The accessor the adapter reads to stamp the dedup identity onto a
     /// synthesized **failure** `TurnEnd`: `None` before any assistant message,
-    /// then the *first* assistant `message.id` (keep-first, not overwritten by
-    /// later messages). This is what lets a crashed multi-message turn's
+    /// then the adapter-selected hydration identity (normally the first assistant
+    /// `message.id`, keep-first). This is what lets a crashed multi-message turn's
     /// `Failed` row dedup against its on-disk copy.
     #[test]
     fn first_assistant_message_id_accessor_is_keep_first() {
@@ -1665,6 +1701,70 @@ mod tests {
     }
 
     #[test]
+    fn synthetic_assistant_text_yields_content_without_model_metadata() {
+        let fixture = include_str!("../tests/fixtures/claude/local-command.stream.jsonl");
+        let mut lines = fixture.lines();
+        let line = lines.next().expect("assistant line");
+        let turn_id = tid();
+        let mut state = ParserState::default();
+
+        let events = match parse_line(line, turn_id, aid(), &mut state) {
+            ParseOutcome::Events(events) => events,
+            other => panic!("expected identity + synthetic content events, got {other:?}"),
+        };
+        assert!(matches!(
+            &events[0],
+            AdapterEvent::TurnIdentity { message_id, .. }
+                if message_id == "synthetic-message-id"
+        ));
+        assert!(matches!(
+            &events[1],
+            AdapterEvent::ContentChunk { kind: ContentKind::Text, text, .. }
+                if text == "/plugin isn't available in this environment."
+        ));
+        assert_eq!(
+            state.first_assistant_message_id(),
+            Some("synthetic-message-id")
+        );
+
+        let result = lines.next().expect("result line");
+        assert!(matches!(
+            parse_line(result, turn_id, aid(), &mut state),
+            ParseOutcome::Event(AdapterEvent::Liveness { .. })
+        ));
+        assert_eq!(
+            state.first_assistant_message_id(),
+            Some("synthetic-message-id")
+        );
+        assert_eq!(state.last_assistant_model, None);
+    }
+
+    #[test]
+    fn synthetic_error_text_is_not_emitted_as_content() {
+        let line = r#"{"type":"assistant","error":"authentication_failed","message":{"id":"synthetic-auth","model":"<synthetic>","content":[{"type":"text","text":"Not logged in"}]}}"#;
+        let turn_id = tid();
+        let mut state = ParserState::default();
+
+        let events = match parse_line(line, turn_id, aid(), &mut state) {
+            ParseOutcome::Event(event) => vec![event],
+            ParseOutcome::Events(events) => events,
+            ParseOutcome::Skip => Vec::new(),
+            ParseOutcome::Error(error) => panic!("unexpected parse error: {error}"),
+        };
+
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, AdapterEvent::ContentChunk { .. }))
+        );
+        assert_eq!(
+            state.pending_auth_failure.as_deref(),
+            Some(CLAUDE_AUTH_MESSAGE)
+        );
+        assert_eq!(state.last_assistant_model, None);
+    }
+
+    #[test]
     fn assistant_with_multiple_tool_use_blocks_yields_events_vec() {
         let line = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{}},{"type":"tool_use","id":"t2","name":"Read","input":{}}]}}"#;
         match parse_one(line, tid()) {
@@ -2225,10 +2325,9 @@ mod tests {
         })?
     }
 
-    /// `TurnIdentity` is emitted **once**, at the first assistant message,
-    /// carrying the first non-subagent `message.id` — the same value `TurnEnd`
-    /// carries — and it precedes the terminal `TurnEnd`. This is what lets the
-    /// frontend stamp a live turn's `hydration_key` while it is still streaming.
+    /// An ordinary model turn emits `TurnIdentity` **once**, at the first
+    /// assistant message, carrying the first non-subagent `message.id` — the same
+    /// value `TurnEnd` carries — before the terminal `TurnEnd`.
     #[test]
     fn emits_turn_identity_once_before_turn_end() {
         let events = replay_fixture(include_str!("../tests/fixtures/claude/tool-use.jsonl"));
@@ -2318,6 +2417,11 @@ mod tests {
             turn_end_stable_id(&events),
             Some("msg_00000000000000000000a001".to_owned()),
             "the subagent envelope's id must not win the join key; keep-last skips it"
+        );
+        assert_eq!(
+            turn_end_first_id(&events),
+            Some("msg_00000000000000000000a001".to_owned()),
+            "synthetic tool-use envelopes must retain message.id as their hydration identity"
         );
     }
 

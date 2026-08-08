@@ -11,7 +11,10 @@
   import ProjectsSidebar from "$lib/components/ProjectsSidebar.svelte";
   import SettingsView from "$lib/components/SettingsView.svelte";
   import Sidebar from "$lib/components/Sidebar.svelte";
+  import PinsSidebar from "$lib/components/PinsSidebar.svelte";
   import TranscriptNavigator from "$lib/components/TranscriptNavigator.svelte";
+  import PaneTabStrip from "$lib/components/PaneTabStrip.svelte";
+  import type { HeaderPaneState } from "$lib/components/PaneTabStrip.types";
   import TranscriptPanes from "$lib/components/TranscriptPanes.svelte";
   import WelcomeScreen from "$lib/components/WelcomeScreen.svelte";
   import Dialog from "$lib/components/ui/Dialog.svelte";
@@ -26,13 +29,22 @@
   import SidebarToggleButton from "$lib/components/ui/SidebarToggleButton.svelte";
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
   import { ICON_BUTTON_CLASS, ICON_SIZE } from "$lib/components/ui/iconButton";
-  import { ChevronsDownUp, ChevronsUpDown, CircleCheck, Plus } from "@lucide/svelte";
+  import {
+    ChevronsDownUp,
+    ChevronsUpDown,
+    FolderOpen,
+    GitBranch,
+    Pin,
+    Plus,
+    UsersRound,
+  } from "@lucide/svelte";
   import {
     hasOverrides,
     normalizeProjectCompact,
     stateFor,
   } from "$lib/state/transcriptPreview.svelte";
   import {
+    assignAgentToFirstVisibleEmptyPane,
     createEmptyPane,
     expandAllPanes,
     layoutFor,
@@ -41,15 +53,32 @@
     type TranscriptPane,
   } from "$lib/state/transcriptPanes.svelte";
   import { selectionFor, targetRecipients } from "$lib/state/recipientSelection.svelte";
-  import { layout } from "$lib/layout.svelte";
+  import { layout, type RightSidebarMode } from "$lib/layout.svelte";
   import { navigatorState, toggleNavigator, openNavigator } from "$lib/state/transcriptJump.svelte";
+  import {
+    dismissPinMutationError,
+    loadMessagePins,
+    pinLoadError,
+    pinMutationError,
+    pinsLoaded,
+    pinsFor,
+    reconcileMessagePinIdentities,
+  } from "$lib/state/messagePins.svelte";
   import DevIndicator from "$lib/components/ui/DevIndicator.svelte";
   import { installDevTranscriptSeed } from "$lib/dev/seedTranscript";
   import { windowDragRegion } from "$lib/windowDrag";
-  import { agentIsWorking, hydrateAgent, registerAgent, runtimes } from "$lib/state/index.svelte";
+  import {
+    agentIsWorking,
+    hydrateAgent,
+    registerAgent,
+    runtimes,
+    transcripts,
+  } from "$lib/state/index.svelte";
+  import { buildUnifiedRows } from "$lib/state/unified";
+  import { messageIdentityForRow, type PinnableMessageIdentity } from "$lib/messageIdentity";
   import {
     activateProject,
-    addAgentToActiveProject,
+    addAgentToProjectRoster,
     agentCreationFailures,
     agentsByProject,
     conversations,
@@ -91,6 +120,7 @@
   } from "$lib/components/ui/segmentedControl";
   import { cn } from "$lib/utils";
   import { isEditableShortcutTarget } from "$lib/keyboard";
+  import { shortcut } from "$lib/platform";
 
   // One availability map keyed by harness, derived from the shared
   // `harnessAvailability` store (one probe also feeding the Supported-CLIs
@@ -113,11 +143,20 @@
   let projectViewResumeSeq = 0;
   let gitViewResumePending = $state<boolean>(false);
   let gitViewResumeSeq = 0;
-
   function isComposerShortcutTarget(target: EventTarget | null): boolean {
     return (
       target instanceof HTMLElement && target.closest('[data-shortcut-scope="composer"]') !== null
     );
+  }
+
+  function selectRightSidebarMode(mode: RightSidebarMode): void {
+    if (mode === "agents" && activeAgents.length === 0) return;
+    layout.rightSidebarMode = mode;
+    layout.rightSidebarOpen = true;
+  }
+
+  function toggleRightSidebarMode(): void {
+    selectRightSidebarMode(layout.rightSidebarMode === "agents" ? "pins" : "agents");
   }
 
   function handleGlobalKeydown(event: KeyboardEvent): void {
@@ -165,10 +204,13 @@
 
     const key = event.key.toLowerCase();
     if (event.altKey) {
-      if (event.code === "KeyB") {
+      if (!event.shiftKey && event.code === "KeyP" && showRightSidebarControls) {
+        event.preventDefault();
+        toggleRightSidebarMode();
+      } else if (event.code === "KeyB") {
         event.preventDefault();
         layout.projectsSidebarOpen = !layout.projectsSidebarOpen;
-        layout.agentsSidebarOpen = !layout.agentsSidebarOpen;
+        layout.rightSidebarOpen = !layout.rightSidebarOpen;
       } else if (/^Digit[1-9]$/.test(event.code)) {
         // ⌘⌥1..N targets pane N (leftmost = 1): replace the compose recipient
         // set with that pane's members. `event.code`, not `event.key` — Option
@@ -223,7 +265,7 @@
       void openSelectionInEditor();
     } else if (key === "b" && event.shiftKey) {
       event.preventDefault();
-      layout.agentsSidebarOpen = !layout.agentsSidebarOpen;
+      layout.rightSidebarOpen = !layout.rightSidebarOpen;
     } else if (key === "b") {
       event.preventDefault();
       layout.projectsSidebarOpen = !layout.projectsSidebarOpen;
@@ -410,6 +452,20 @@
   const rosterLoaded = $derived(
     selection.activeProjectId !== null && selection.activeProjectId in agentsByProject,
   );
+  $effect(() => {
+    const projectId = selection.activeProjectId;
+    if (projectId === null || !rosterLoaded) return;
+    void loadMessagePins(projectId);
+  });
+  const activePins = $derived(
+    selection.activeProjectId === null ? [] : pinsFor(selection.activeProjectId),
+  );
+  const activePinLoadError = $derived(
+    selection.activeProjectId === null ? null : pinLoadError(selection.activeProjectId),
+  );
+  const activePinMutationError = $derived(
+    selection.activeProjectId === null ? null : pinMutationError(selection.activeProjectId),
+  );
   const activePaneLayout = $derived(
     selection.activeProjectId !== null
       ? layoutFor(selection.activeProjectId, activeRosterIds)
@@ -418,23 +474,55 @@
   const canCyclePanes = $derived(
     (activePaneLayout?.panes.filter((pane) => pane.members.length > 0).length ?? 0) > 1,
   );
-  const activeMaximizedPane = $derived(
-    activePaneLayout?.maximized === null || activePaneLayout === null
-      ? null
-      : (activePaneLayout.panes.find((pane) => pane.id === activePaneLayout.maximized) ?? null),
-  );
-  const headerTabPanes = $derived(
-    activePaneLayout === null
-      ? []
-      : activePaneLayout.panes.filter((pane) =>
-          activeMaximizedPane !== null
-            ? pane.id !== activeMaximizedPane.id
-            : activePaneLayout.minimized.includes(pane.id),
-        ),
+  const headerPaneEntries = $derived.by(() => {
+    if (activePaneLayout === null || activePaneLayout.panes.length < 2) return [];
+    return activePaneLayout.panes.map((pane) => {
+      let state: HeaderPaneState = "visible";
+      if (activePaneLayout.maximized === pane.id) {
+        state = "visible";
+      } else if (activePaneLayout.maximized !== null) {
+        state = activePaneLayout.minimized.includes(pane.id) ? "minimized" : "behind_maximized";
+      } else if (activePaneLayout.minimized.includes(pane.id)) {
+        state = "minimized";
+      }
+      return { pane, state };
+    });
+  });
+  const hiddenHeaderPaneEntries = $derived(
+    headerPaneEntries.filter((entry) => entry.state !== "visible"),
   );
   const activeConvo = $derived(
     selection.activeProjectId !== null ? conversations[selection.activeProjectId] : undefined,
   );
+  const activePinIdentities = $derived.by(() => {
+    const turns = activeAgents.flatMap((agent) => transcripts[agent.id] ?? []);
+    const rows = buildUnifiedRows(
+      turns,
+      activeConvo?.items ?? [],
+      new Set(activeAgents.map((agent) => agent.id)),
+    );
+    const harnesses = new Map(activeAgents.map((agent) => [agent.id, agent.harness]));
+    const identities: PinnableMessageIdentity[] = [];
+    for (const row of rows) {
+      if (row.kind !== "user" && row.kind !== "agent") continue;
+      const identity = messageIdentityForRow(
+        row,
+        row.kind === "agent" ? harnesses.get(row.turn.agent_id) : undefined,
+      );
+      if (identity.kind === "pinnable") identities.push(identity);
+    }
+    return identities;
+  });
+  $effect(() => {
+    const projectId = selection.activeProjectId;
+    if (
+      projectId === null ||
+      !pinsLoaded(projectId) ||
+      !activePins.some((pin) => pin.key.startsWith("agent:send:"))
+    )
+      return;
+    reconcileMessagePinIdentities(projectId, activePinIdentities);
+  });
   const activeProject = $derived(
     projects.list.find((p) => p.id === selection.activeProjectId) ?? null,
   );
@@ -460,15 +548,15 @@
     layout.projectsSidebarOpen && projectsSidebarHasContent && view.mode !== "git",
   );
   const showPaneHeaderControls = $derived(
-    !settingsOpen &&
-      view.mode !== "git" &&
-      selection.activeProjectId !== null &&
-      rosterLoaded &&
-      activeAgents.length > 0,
+    !settingsOpen && view.mode !== "git" && selection.activeProjectId !== null && rosterLoaded,
+  );
+  const showRightSidebarControls = $derived(
+    showPaneHeaderControls &&
+      (activeAgents.length > 0 || activePins.length > 0 || layout.rightSidebarOpen),
   );
   // The navigator needs a project transcript with messages to navigate — the
   // same condition as its header button being shown.
-  const canOpenNavigator = $derived(showPaneHeaderControls);
+  const canOpenNavigator = $derived(showPaneHeaderControls && activeAgents.length > 0);
 
   // The navigator's open flag is global (so ⌘F and the palette can drive it),
   // but the component that can close it only mounts while a project transcript
@@ -518,7 +606,7 @@
     if (projectId === null || paneLayout === null) return;
     const projectPrefix = `${projectId}:`;
     const paneKeys = paneLayout.panes.map((pane) => paneTabKey(projectId, pane.id));
-    const tabEntries = headerTabPanes.map((pane) => ({
+    const tabEntries = hiddenHeaderPaneEntries.map(({ pane }) => ({
       key: paneTabKey(projectId, pane.id),
       active: paneIsActive(pane),
     }));
@@ -582,6 +670,12 @@
         targetRecipients(projectId, [...pane.members]);
       }
     });
+  }
+
+  function targetVisibleHeaderPane(pane: TranscriptPane): void {
+    const projectId = selection.activeProjectId;
+    if (projectId === null || pane.members.length === 0) return;
+    if (targetRecipients(projectId, [...pane.members])) composeFocusRequest += 1;
   }
 
   /// Cycle the targeted pane by position (⌘⇧[ = -1, ⌘⇧] = +1). A visible pane
@@ -689,10 +783,10 @@
     projectDialogOpen = true;
   }
 
-  /// Create or attach an agent into the active project, register its listeners,
-  /// and add it to the active roster. Attach kicks off per-agent hydration so
-  /// the brought-in harness session's history appears.
-  async function createOrAttachAndRegister(submission: AgentFormSubmit): Promise<void> {
+  /// Create or attach an agent, register its listeners, and add it to the
+  /// roster named by the returned record. Attach kicks off per-agent hydration
+  /// so the brought-in harness session's history appears.
+  async function createOrAttachAndRegister(submission: AgentFormSubmit): Promise<AgentRecord> {
     const agent =
       submission.mode === "create"
         ? await api.createAgent(
@@ -703,10 +797,13 @@
           )
         : await api.attachAgent(submission.name, submission.harness, submission.existingSessionId);
     await registerAgent(agent);
-    addAgentToActiveProject(agent);
+    addAgentToProjectRoster(agent);
+    const rosterIds = (agentsByProject[agent.project_id] ?? []).map((item) => item.id);
+    assignAgentToFirstVisibleEmptyPane(agent.project_id, rosterIds, agent.id);
     if (submission.mode === "attach") {
       void hydrateAgent(agent.id);
     }
+    return agent;
   }
 
   // First-agent form (center, when the active project has no agents).
@@ -717,7 +814,8 @@
     firstAgentError = null;
     firstAgentBusy = true;
     try {
-      await createOrAttachAndRegister(submission);
+      const agent = await createOrAttachAndRegister(submission);
+      targetRecipients(agent.project_id, [agent.id]);
     } catch (err) {
       firstAgentError = err instanceof Error ? err.message : String(err);
     } finally {
@@ -793,12 +891,24 @@
     });
     cmds.push({
       id: "nav.toggle-agents-sidebar",
-      title: layout.agentsSidebarOpen ? "Hide agents sidebar" : "Show agents sidebar",
+      title: layout.rightSidebarOpen ? "Hide right sidebar" : "Show right sidebar",
       group: "Navigation",
       shortcut: ["mod", "shift", "B"],
       run: () => {
-        layout.agentsSidebarOpen = !layout.agentsSidebarOpen;
+        layout.rightSidebarOpen = !layout.rightSidebarOpen;
       },
+    });
+    cmds.push({
+      id: "nav.toggle-right-sidebar-mode",
+      title:
+        layout.rightSidebarMode === "agents"
+          ? "Switch to Pins sidebar"
+          : "Switch to Agents sidebar",
+      group: "Navigation",
+      shortcut: ["mod", "alt", "P"],
+      keywords: "agents pins right sidebar toggle switch",
+      disabled: !showRightSidebarControls,
+      run: () => toggleRightSidebarMode(),
     });
     cmds.push({
       id: "nav.add-project",
@@ -927,12 +1037,6 @@
     {/snippet}
 
     {#snippet center()}
-      {@const showAgentsToggle =
-        !settingsOpen &&
-        view.mode !== "git" &&
-        selection.activeProjectId !== null &&
-        rosterLoaded &&
-        activeAgents.length > 0}
       <!--
         One title bar spanning the center pane, draggable. When the projects
         sidebar is collapsed there is no left column, so this bar absorbs the
@@ -992,62 +1096,16 @@
 
         {#if showPaneHeaderControls}
           <div class="flex min-w-0 shrink items-center gap-1" data-tauri-no-drag>
-            <div
-              class="flex min-w-0 shrink items-center gap-1 overflow-hidden"
-              data-testid="app-pane-tab-strip"
-            >
-              {#each headerTabPanes as pane (pane.id)}
-                {@const active = paneIsActive(pane)}
-                {@const completed = paneTabIsCompleted(pane)}
-                <!-- The tooltip is where the spinner/✓ semantics are taught:
-                     the indicator is seen far more often than any empty-state
-                     prose, so the explanation lives on the indicator itself. -->
-                <Tooltip
-                  label={active
-                    ? `${pane.name} — agents are working. Click to open.`
-                    : completed
-                      ? `${pane.name} — agents finished since you last looked. Click to open.`
-                      : `Open ${pane.name}`}
-                  side="bottom"
-                >
-                  {#snippet trigger(props)}
-                    <button
-                      {...props}
-                      type="button"
-                      class="border-border bg-panel text-fg hover:bg-raised inline-flex h-6.5 max-w-36 min-w-0 shrink items-center gap-1.5 rounded-full border px-2 text-xs"
-                      data-testid="app-pane-minimized-tab"
-                      data-pane-id={pane.id}
-                      onclick={() => selectHeaderPane(pane)}
-                    >
-                      {#if active}
-                        <span
-                          class="inline-flex shrink-0 items-center justify-center"
-                          role="status"
-                          aria-label={`${pane.name} has running agents`}
-                          data-testid="app-pane-tab-activity"
-                        >
-                          <Spinner class="h-3.5 w-3.5" />
-                        </span>
-                      {:else if completed}
-                        <span
-                          class="text-accent inline-flex shrink-0 items-center justify-center"
-                          role="status"
-                          aria-label={`${pane.name} activity ended`}
-                          data-testid="app-pane-tab-completed"
-                        >
-                          <CircleCheck size={14} strokeWidth={1.8} aria-hidden="true" />
-                        </span>
-                      {/if}
-                      <span class="truncate font-medium">{pane.name}</span>
-                    </button>
-                  {/snippet}
-                </Tooltip>
-              {/each}
-            </div>
+            <PaneTabStrip
+              entries={headerPaneEntries}
+              {paneIsActive}
+              paneIsCompleted={paneTabIsCompleted}
+              onSelectVisible={targetVisibleHeaderPane}
+              onOpenHidden={selectHeaderPane}
+            />
             <!-- Shown whenever more than one pane is hidden — minimized into the
-                 tab strip, or hidden behind a maximized pane. `headerTabPanes`
-                 already captures both cases. -->
-            {#if headerTabPanes.length > 1}
+                 tab strip, or hidden behind a maximized pane. -->
+            {#if hiddenHeaderPaneEntries.length > 1}
               <button
                 type="button"
                 class="text-muted hover:text-fg hover:bg-hover inline-flex h-6.5 shrink-0 items-center rounded-full px-2 text-xs"
@@ -1071,30 +1129,32 @@
                 </button>
               {/snippet}
             </Tooltip>
-            <Tooltip label={compactLabel} side="bottom">
-              {#snippet trigger(props)}
-                <button
-                  {...props}
-                  type="button"
-                  onclick={toggleCompactTranscript}
-                  aria-label={compactLabel}
-                  data-testid="transcript-compact-toggle"
-                  data-tauri-no-drag
-                  class={cn(ICON_BUTTON_CLASS, "shrink-0")}
-                >
-                  {#if compactEnabled}
-                    <ChevronsUpDown size={ICON_SIZE} aria-hidden="true" />
-                  {:else}
-                    <ChevronsDownUp size={ICON_SIZE} aria-hidden="true" />
-                  {/if}
-                </button>
-              {/snippet}
-            </Tooltip>
-            <TranscriptNavigator
-              projectId={selection.activeProjectId!}
-              agents={activeAgents}
-              overlay={activeConvo?.items ?? []}
-            />
+            {#if activeAgents.length > 0}
+              <Tooltip label={compactLabel} side="bottom" reopen="fresh-hover">
+                {#snippet trigger(props)}
+                  <button
+                    {...props}
+                    type="button"
+                    onclick={toggleCompactTranscript}
+                    aria-label={compactLabel}
+                    data-testid="transcript-compact-toggle"
+                    data-tauri-no-drag
+                    class={cn(ICON_BUTTON_CLASS, "shrink-0")}
+                  >
+                    {#if compactEnabled}
+                      <ChevronsUpDown size={ICON_SIZE} aria-hidden="true" />
+                    {:else}
+                      <ChevronsDownUp size={ICON_SIZE} aria-hidden="true" />
+                    {/if}
+                  </button>
+                {/snippet}
+              </Tooltip>
+              <TranscriptNavigator
+                projectId={selection.activeProjectId!}
+                agents={activeAgents}
+                overlay={activeConvo?.items ?? []}
+              />
+            {/if}
           </div>
           <!-- Hairline between the project-transcript controls (panes,
                navigator, compact) and the app-level view switcher. A border,
@@ -1102,56 +1162,148 @@
           <div class="border-border h-4 shrink-0 border-l" aria-hidden="true"></div>
         {/if}
 
-        <!-- Top-level view toggle: Projects | Git (⌘⇧G). Session-only; settings
-             is a modal-over, so its toggle press lands on the chosen view. -->
+        {#if showRightSidebarControls}
+          <div
+            class={cn(SEGMENTED_MAIN_CONTAINER_CLASS, "flex shrink-0")}
+            role="radiogroup"
+            aria-label="Right sidebar"
+          >
+            <Tooltip
+              label={activeAgents.length === 0 ? "No agents in this project" : "Agents"}
+              shortcut={shortcut("mod", "alt", "P")}
+              side="bottom"
+              reopen="fresh-hover"
+            >
+              {#snippet trigger(props)}
+                <button
+                  {...props}
+                  type="button"
+                  role="radio"
+                  class={cn(
+                    SEGMENTED_MAIN_ITEM_CLASS,
+                    layout.rightSidebarMode === "agents"
+                      ? SEGMENTED_MAIN_ITEM_ACTIVE_CLASS
+                      : SEGMENTED_MAIN_ITEM_INACTIVE_CLASS,
+                  )}
+                  aria-label="Show agents sidebar"
+                  aria-checked={layout.rightSidebarMode === "agents"}
+                  aria-disabled={activeAgents.length === 0}
+                  data-testid="right-sidebar-mode-agents"
+                  class:opacity-40={activeAgents.length === 0}
+                  onclick={() => selectRightSidebarMode("agents")}
+                >
+                  <UsersRound size={14} aria-hidden="true" />
+                </button>
+              {/snippet}
+            </Tooltip>
+            <Tooltip
+              label="Pins"
+              shortcut={shortcut("mod", "alt", "P")}
+              side="bottom"
+              reopen="fresh-hover"
+            >
+              {#snippet trigger(props)}
+                <button
+                  {...props}
+                  type="button"
+                  role="radio"
+                  class={cn(
+                    SEGMENTED_MAIN_ITEM_CLASS,
+                    layout.rightSidebarMode === "pins"
+                      ? SEGMENTED_MAIN_ITEM_ACTIVE_CLASS
+                      : SEGMENTED_MAIN_ITEM_INACTIVE_CLASS,
+                  )}
+                  aria-label="Show pins sidebar"
+                  aria-checked={layout.rightSidebarMode === "pins"}
+                  data-testid="right-sidebar-mode-pins"
+                  onclick={() => selectRightSidebarMode("pins")}
+                >
+                  <Pin
+                    size={14}
+                    fill={layout.rightSidebarMode === "pins" ? "currentColor" : "none"}
+                    aria-hidden="true"
+                  />
+                </button>
+              {/snippet}
+            </Tooltip>
+          </div>
+          <SidebarToggleButton
+            side="right"
+            expanded={layout.rightSidebarOpen}
+            label={layout.rightSidebarOpen
+              ? `Hide ${layout.rightSidebarMode} sidebar`
+              : `Show ${layout.rightSidebarMode} sidebar`}
+            testid="agents-sidebar-toggle"
+            onclick={() => (layout.rightSidebarOpen = !layout.rightSidebarOpen)}
+          />
+          <div
+            class="border-border h-4 shrink-0 border-l"
+            aria-hidden="true"
+            data-testid="right-sidebar-command-divider"
+          ></div>
+        {/if}
+        <CommandPaletteButton testid="command-palette-button" onclick={() => togglePalette()} />
+        <!-- Top-level Projects / Git view switch. Icon-only is an intentional
+             compact-header trial; tooltips and accessible names keep both
+             destinations explicit. -->
         <div
           class={cn(SEGMENTED_MAIN_CONTAINER_CLASS, "flex shrink-0")}
           role="radiogroup"
           aria-label="View"
         >
-          <button
-            type="button"
-            role="radio"
-            class={cn(
-              SEGMENTED_MAIN_ITEM_CLASS,
-              !settingsOpen && view.mode === "projects"
-                ? SEGMENTED_MAIN_ITEM_ACTIVE_CLASS
-                : SEGMENTED_MAIN_ITEM_INACTIVE_CLASS,
-            )}
-            aria-checked={!settingsOpen && view.mode === "projects"}
-            data-testid="view-toggle-projects"
-            title="Projects (⌘⇧G)"
-            onclick={() => selectView("projects")}
+          <Tooltip
+            label="Projects"
+            shortcut={shortcut("mod", "shift", "G")}
+            side="bottom"
+            reopen="fresh-hover"
           >
-            Projects
-          </button>
-          <button
-            type="button"
-            role="radio"
-            class={cn(
-              SEGMENTED_MAIN_ITEM_CLASS,
-              !settingsOpen && view.mode === "git"
-                ? SEGMENTED_MAIN_ITEM_ACTIVE_CLASS
-                : SEGMENTED_MAIN_ITEM_INACTIVE_CLASS,
-            )}
-            aria-checked={!settingsOpen && view.mode === "git"}
-            data-testid="view-toggle-git"
-            title="Git (⌘⇧G)"
-            onclick={() => selectView("git")}
+            {#snippet trigger(props)}
+              <button
+                {...props}
+                type="button"
+                role="radio"
+                class={cn(
+                  SEGMENTED_MAIN_ITEM_CLASS,
+                  !settingsOpen && view.mode === "projects"
+                    ? SEGMENTED_MAIN_ITEM_ACTIVE_CLASS
+                    : SEGMENTED_MAIN_ITEM_INACTIVE_CLASS,
+                )}
+                aria-label="Projects"
+                aria-checked={!settingsOpen && view.mode === "projects"}
+                data-testid="view-toggle-projects"
+                onclick={() => selectView("projects")}
+              >
+                <FolderOpen size={14} aria-hidden="true" />
+              </button>
+            {/snippet}
+          </Tooltip>
+          <Tooltip
+            label="Git"
+            shortcut={shortcut("mod", "shift", "G")}
+            side="bottom"
+            reopen="fresh-hover"
           >
-            Git
-          </button>
+            {#snippet trigger(props)}
+              <button
+                {...props}
+                type="button"
+                role="radio"
+                class={cn(
+                  SEGMENTED_MAIN_ITEM_CLASS,
+                  !settingsOpen && view.mode === "git"
+                    ? SEGMENTED_MAIN_ITEM_ACTIVE_CLASS
+                    : SEGMENTED_MAIN_ITEM_INACTIVE_CLASS,
+                )}
+                aria-label="Git"
+                aria-checked={!settingsOpen && view.mode === "git"}
+                data-testid="view-toggle-git"
+                onclick={() => selectView("git")}
+              >
+                <GitBranch size={14} aria-hidden="true" />
+              </button>
+            {/snippet}
+          </Tooltip>
         </div>
-        <CommandPaletteButton testid="command-palette-button" onclick={() => togglePalette()} />
-        {#if showAgentsToggle}
-          <SidebarToggleButton
-            side="right"
-            expanded={layout.agentsSidebarOpen}
-            label={layout.agentsSidebarOpen ? "Hide agents sidebar" : "Show agents sidebar"}
-            testid="agents-sidebar-toggle"
-            onclick={() => (layout.agentsSidebarOpen = !layout.agentsSidebarOpen)}
-          />
-        {/if}
       </div>
 
       {#if seedPathUnresolved.value}
@@ -1180,6 +1332,21 @@
           message={commandError}
           testid="banner-command-failed"
           onDismiss={() => (commandError = null)}
+        />
+      {/if}
+      {#if selection.activeProjectId !== null && activePinLoadError !== null}
+        <Banner
+          message={`Couldn't load pins: ${activePinLoadError}`}
+          testid="banner-pins-load-failed"
+          actionLabel="Retry"
+          onAction={() => void loadMessagePins(selection.activeProjectId!, true)}
+        />
+      {/if}
+      {#if selection.activeProjectId !== null && activePinMutationError !== null}
+        <Banner
+          message={`Pin change wasn't saved: ${activePinMutationError}`}
+          testid="banner-pins-save-failed"
+          onDismiss={() => dismissPinMutationError(selection.activeProjectId!)}
         />
       {/if}
 
@@ -1263,10 +1430,13 @@
                 </div>
               </div>
             </div>
-            {#if layout.agentsSidebarOpen}
+            {#if layout.rightSidebarOpen}
               <SidebarPanel
                 side="right"
-                width={layout.agentsSidebarWidth}
+                widthProfile={layout.rightSidebarMode === "pins" ? "reading" : "rail"}
+                width={layout.rightSidebarMode === "pins"
+                  ? layout.pinsSidebarWidth
+                  : layout.agentsSidebarWidth}
                 testid="project-loading-sidebar-shell"
               >
                 <div></div>
@@ -1274,14 +1444,23 @@
             {/if}
           </div>
         {:else if activeAgents.length === 0}
-          <div class="flex flex-1 flex-col overflow-y-auto">
-            <CreateAgentForm
-              busy={firstAgentBusy}
-              error={firstAgentError}
-              onSubmit={handleCreateFirstAgent}
-              roster={activeAgents}
-              {availability}
-            />
+          <div class="flex min-h-0 flex-1 overflow-hidden">
+            <div class="flex min-w-0 flex-1 flex-col overflow-y-auto">
+              <CreateAgentForm
+                busy={firstAgentBusy}
+                error={firstAgentError}
+                onSubmit={handleCreateFirstAgent}
+                roster={activeAgents}
+                {availability}
+              />
+            </div>
+            {#if layout.rightSidebarOpen && layout.rightSidebarMode === "pins"}
+              <PinsSidebar
+                projectId={selection.activeProjectId!}
+                agents={activeAgents}
+                overlay={activeConvo?.items ?? []}
+              />
+            {/if}
           </div>
         {:else}
           <div class="flex min-h-0 flex-1 overflow-hidden">
@@ -1320,12 +1499,20 @@
                 />
               {/key}
             </div>
-            {#if layout.agentsSidebarOpen}
-              <Sidebar
-                projectId={selection.activeProjectId!}
-                agents={activeAgents}
-                onAddAgent={openAddAgent}
-              />
+            {#if layout.rightSidebarOpen}
+              {#if layout.rightSidebarMode === "pins"}
+                <PinsSidebar
+                  projectId={selection.activeProjectId!}
+                  agents={activeAgents}
+                  overlay={activeConvo?.items ?? []}
+                />
+              {:else}
+                <Sidebar
+                  projectId={selection.activeProjectId!}
+                  agents={activeAgents}
+                  onAddAgent={openAddAgent}
+                />
+              {/if}
             {/if}
           </div>
         {/if}

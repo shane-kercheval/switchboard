@@ -556,6 +556,29 @@ describe("pane chrome (headers, rename, close)", () => {
     expect(screen.getByText("hello from bob")).toBeInTheDocument();
   });
 
+  it("keeps the maximize tooltip quiet until a full-delay re-entry", async () => {
+    await seedTwoAgentTranscripts();
+    moveAgentToNewPane(PROJECT_ID, ROSTER_IDS, BOB.id);
+    renderPanes();
+    const maximize = screen.getAllByTestId("pane-maximize")[1]!;
+
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      await fireEvent.pointerEnter(maximize);
+      await vi.advanceTimersByTimeAsync(700);
+      expect(screen.getByTestId("tooltip-content")).toHaveTextContent("Maximize Pane 2");
+
+      await fireEvent.click(maximize);
+      const restore = screen.getByTestId("pane-maximize");
+      await fireEvent.pointerLeave(restore);
+      await fireEvent.pointerEnter(restore);
+      await vi.advanceTimersByTimeAsync(300);
+      expect(screen.queryByTestId("tooltip-content")).not.toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("shows pane activity in headers", async () => {
     await seedTwoAgentTranscripts();
     const state = await loadState();

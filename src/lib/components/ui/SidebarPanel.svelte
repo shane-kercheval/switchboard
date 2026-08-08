@@ -12,21 +12,25 @@
 
   type Props = {
     side?: "left" | "right";
+    widthProfile?: "rail" | "reading";
     width: number;
     testid?: string;
     children: Snippet;
   };
 
-  let { side = "left", width, testid, children }: Props = $props();
+  let { side = "left", widthProfile = "rail", width, testid, children }: Props = $props();
 </script>
 
-<!-- The max-width mirrors `sidebarMaxWidth()` (layout.svelte.ts) in CSS so the
-     bound holds *live*: a width persisted on a large monitor is capped the
-     moment the window shrinks, and re-expands when it grows — the stored
-     preference is never rewritten. Keep the two formulas in sync. -->
+<!-- These max-widths mirror `sidebarMaxWidth()` / `rightSidebarMaxWidth()` in
+     layout.svelte.ts so the bound holds live as the window changes without
+     rewriting the stored preference. Side controls the divider; width profile
+     distinguishes a narrow navigation rail from the Pins reading surface. -->
 <aside
   class={cn(
-    "bg-panel relative flex max-w-[clamp(200px,40vw,480px)] shrink-0 flex-col",
+    "bg-panel relative flex shrink-0 flex-col",
+    widthProfile === "reading"
+      ? "max-w-[clamp(200px,60vw,720px)]"
+      : "max-w-[clamp(200px,40vw,480px)]",
     side === "left" ? "border-border/80 border-r" : "border-border/80 border-l",
   )}
   style={`width: ${width}px`}

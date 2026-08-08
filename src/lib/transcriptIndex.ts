@@ -10,9 +10,10 @@
 
 import type { UnifiedRow } from "$lib/state/unified";
 import type { Turn } from "$lib/state/types";
-import type { AgentId } from "$lib/types";
+import type { AgentId, HarnessKind } from "$lib/types";
 import { toolDetail, toolVerb } from "$lib/toolRow";
 import { previewLine } from "$lib/markdown";
+import { messageIdentityForRow, type MessageIdentity } from "$lib/messageIdentity";
 
 type AgentTurn = Extract<Turn, { role: "agent" }>;
 
@@ -22,6 +23,7 @@ export type NavigatorRoleFilter = "all" | NavigatorRole;
 export type NavigatorEntry = {
   /// UnifiedRow key — the jump target.
   rowKey: string;
+  messageIdentity: MessageIdentity;
   role: NavigatorRole;
   /// Pane-resolution anchors: the recipients for a user send, the author for
   /// an agent turn.
@@ -73,6 +75,7 @@ function agentFallbackPreview(turn: AgentTurn): string {
 
 function entry(
   rowKey: string,
+  messageIdentity: MessageIdentity,
   role: NavigatorRole,
   agentIds: AgentId[],
   attribution: string,
@@ -82,6 +85,7 @@ function entry(
 ): NavigatorEntry {
   return {
     rowKey,
+    messageIdentity,
     role,
     agentIds,
     attribution,
@@ -92,6 +96,41 @@ function entry(
   };
 }
 
+export function navigatorEntryForRow(
+  row: Extract<UnifiedRow, { kind: "user" | "agent" }>,
+  agentNames: ReadonlyMap<AgentId, string>,
+  agentHarnesses: ReadonlyMap<AgentId, HarnessKind> = new Map(),
+): NavigatorEntry {
+  if (row.kind === "user") {
+    const attachmentOnly = row.text.trim() === "" && row.attachments.length > 0;
+    const preview = attachmentOnly ? row.attachments[0]!.label : previewLine(row.text);
+    return entry(
+      row.key,
+      messageIdentityForRow(row),
+      "user",
+      row.agent_ids,
+      "You",
+      row.at,
+      preview,
+      row.text,
+    );
+  }
+
+  const prose = agentProse(row.turn);
+  const preview = prose.trim() === "" ? agentFallbackPreview(row.turn) : previewLine(prose);
+  const name = agentNames.get(row.turn.agent_id) ?? row.turn.agent_id;
+  return entry(
+    row.key,
+    messageIdentityForRow(row, agentHarnesses.get(row.turn.agent_id)),
+    "agent",
+    [row.turn.agent_id],
+    name,
+    row.at,
+    preview,
+    prose,
+  );
+}
+
 /// Flatten the unified rows into navigator entries, in transcript order: one
 /// entry per user send (the row model already collapses a fan-out's per-agent
 /// user copies) and one attributed entry per agent turn. Outcome markers and
@@ -99,18 +138,12 @@ function entry(
 export function buildNavigatorEntries(
   rows: UnifiedRow[],
   agentNames: ReadonlyMap<AgentId, string>,
+  agentHarnesses: ReadonlyMap<AgentId, HarnessKind> = new Map(),
 ): NavigatorEntry[] {
   const entries: NavigatorEntry[] = [];
   for (const row of rows) {
-    if (row.kind === "user") {
-      const attachmentOnly = row.text.trim() === "" && row.attachments.length > 0;
-      const preview = attachmentOnly ? row.attachments[0]!.label : previewLine(row.text);
-      entries.push(entry(row.key, "user", row.agent_ids, "You", row.at, preview, row.text));
-    } else if (row.kind === "agent") {
-      const prose = agentProse(row.turn);
-      const preview = prose.trim() === "" ? agentFallbackPreview(row.turn) : previewLine(prose);
-      const name = agentNames.get(row.turn.agent_id) ?? row.turn.agent_id;
-      entries.push(entry(row.key, "agent", [row.turn.agent_id], name, row.at, preview, prose));
+    if (row.kind === "user" || row.kind === "agent") {
+      entries.push(navigatorEntryForRow(row, agentNames, agentHarnesses));
     }
   }
   return entries;

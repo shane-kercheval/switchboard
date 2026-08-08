@@ -33,6 +33,7 @@ import type {
   TurnId,
 } from "$lib/types";
 import type { AgentCopyMode } from "$lib/agentCopyMode";
+import { compareIsoTimestampsAscending, isIsoTimestampBefore } from "$lib/utils";
 import type { Turn } from "./types";
 
 type AgentTurn = Extract<Turn, { role: "agent" }>;
@@ -225,7 +226,7 @@ export function buildUnifiedRows(
         groupOrder.push(groupKey);
       } else {
         if (!g.agent_ids.includes(turn.agent_id)) g.agent_ids.push(turn.agent_id);
-        if (turn.started_at < g.at) g.at = turn.started_at;
+        if (isIsoTimestampBefore(turn.started_at, g.at)) g.at = turn.started_at;
       }
     } else {
       rows.push({
@@ -343,16 +344,18 @@ export function buildUnifiedRows(
   for (const row of visibleRows) {
     if (row.kind === "user" && row.send_id !== undefined) {
       const prior = sendAnchor.get(row.send_id);
-      if (prior === undefined || row.at < prior) sendAnchor.set(row.send_id, row.at);
+      if (prior === undefined || isIsoTimestampBefore(row.at, prior)) {
+        sendAnchor.set(row.send_id, row.at);
+      }
     }
   }
   const anchorOf = (row: UnifiedRow): string =>
     (row.send_id !== undefined ? sendAnchor.get(row.send_id) : undefined) ?? row.at;
   visibleRows.sort((a, b) => {
-    const t = anchorOf(a).localeCompare(anchorOf(b));
+    const t = compareIsoTimestampsAscending(anchorOf(a), anchorOf(b));
     if (t !== 0) return t;
     if (a.rank !== b.rank) return a.rank - b.rank;
-    return a.at.localeCompare(b.at);
+    return compareIsoTimestampsAscending(a.at, b.at);
   });
   return visibleRows;
 }

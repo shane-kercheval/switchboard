@@ -1,11 +1,68 @@
 import { describe, it, expect } from "vitest";
 import {
   basename,
+  compareIsoTimestampsAscending,
+  compareIsoTimestampsDescending,
   currentIsoTimestamp,
   formatDuration,
   formatHomePath,
+  isIsoTimestampAfter,
+  isIsoTimestampBefore,
   relativeTime,
 } from "./utils";
+
+describe("RFC 3339 timestamp ordering", () => {
+  it("orders whole-second and variable-precision fractions chronologically", () => {
+    expect(
+      compareIsoTimestampsAscending("2026-08-07T12:00:00Z", "2026-08-07T12:00:00.500Z"),
+    ).toBeLessThan(0);
+    expect(
+      compareIsoTimestampsAscending("2026-08-07T12:00:00.123Z", "2026-08-07T12:00:00.123456Z"),
+    ).toBeLessThan(0);
+    expect(
+      compareIsoTimestampsAscending(
+        "2026-08-07T12:00:00.123456Z",
+        "2026-08-07T12:00:00.123456789Z",
+      ),
+    ).toBeLessThan(0);
+  });
+
+  it("treats equivalent instants with different offsets and precision as equal", () => {
+    expect(
+      compareIsoTimestampsAscending("2026-08-07T12:00:00Z", "2026-08-07T13:00:00.000+01:00"),
+    ).toBe(0);
+  });
+
+  it("preserves sub-millisecond ordering", () => {
+    expect(
+      compareIsoTimestampsAscending("2026-08-07T12:00:00.123456Z", "2026-08-07T12:00:00.123457Z"),
+    ).toBeLessThan(0);
+  });
+
+  it("sorts valid instants before invalid values in either direction", () => {
+    expect(compareIsoTimestampsAscending("2026-08-07T12:00:00Z", "invalid-b")).toBeLessThan(0);
+    expect(compareIsoTimestampsDescending("2026-08-07T12:00:00Z", "invalid-b")).toBeLessThan(0);
+    expect(compareIsoTimestampsDescending("invalid-a", "invalid-b")).toBeLessThan(0);
+  });
+
+  it("orders valid instants newest-first with the descending comparator", () => {
+    expect(
+      compareIsoTimestampsDescending("2026-08-07T12:00:00.500Z", "2026-08-07T12:00:00Z"),
+    ).toBeLessThan(0);
+  });
+
+  it("selects valid earlier and later candidates without promoting invalid values", () => {
+    const earlier = "2026-08-07T12:00:00Z";
+    const later = "2026-08-07T12:00:00.500Z";
+    expect(isIsoTimestampAfter(later, earlier)).toBe(true);
+    expect(isIsoTimestampBefore(earlier, later)).toBe(true);
+    expect(isIsoTimestampAfter("invalid", earlier)).toBe(false);
+    expect(isIsoTimestampBefore("invalid", later)).toBe(false);
+    expect(isIsoTimestampAfter(later, "invalid")).toBe(true);
+    expect(isIsoTimestampBefore(earlier, "invalid")).toBe(true);
+    expect(isIsoTimestampAfter("invalid-a", "invalid-b")).toBe(false);
+  });
+});
 
 describe("formatDuration", () => {
   it("formats bare seconds under a minute", () => {

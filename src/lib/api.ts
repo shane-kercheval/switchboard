@@ -21,6 +21,7 @@ import type {
   LoadedTranscript,
   McpProviderInfo,
   MessageId,
+  MessagePin,
   ProjectConversation,
   ProjectId,
   Preferences,
@@ -262,6 +263,33 @@ export async function deleteProject(projectId: ProjectId): Promise<void> {
 /// when the project's directory is offline.
 export async function setProjectArchived(projectId: ProjectId, archived: boolean): Promise<void> {
   await invoke("set_project_archived", { projectId, archived });
+}
+
+export async function listMessagePins(projectId: ProjectId): Promise<MessagePin[]> {
+  return await invoke<MessagePin[]>("list_message_pins", { projectId });
+}
+
+export async function setMessagePin(
+  projectId: ProjectId,
+  key: string,
+  pinned: boolean,
+): Promise<MessagePin[]> {
+  return await invoke<MessagePin[]>("set_message_pin", { projectId, key, pinned });
+}
+
+export async function removeMessagePins(
+  projectId: ProjectId,
+  keys: string[],
+): Promise<MessagePin[]> {
+  return await invoke<MessagePin[]>("remove_message_pins", { projectId, keys });
+}
+
+export async function migrateMessagePin(
+  projectId: ProjectId,
+  fromKey: string,
+  toKey: string,
+): Promise<MessagePin[]> {
+  return await invoke<MessagePin[]>("migrate_message_pin", { projectId, fromKey, toKey });
 }
 
 // Removes a directory from the workspace: drains its projects' in-flight turns,

@@ -7,6 +7,7 @@ const {
   hiddenCount,
   isAgentHidden,
   paneOfAgent,
+  assignAgentToFirstVisibleEmptyPane,
   unassignedAgentIds,
   paneToCycleTo,
   toggleAgentHidden,
@@ -400,6 +401,15 @@ describe("pane display state", () => {
     expect(layoutFor(P, ROSTER).maximized).toBeNull();
   });
 
+  it("makes a minimized pane visible when maximizing it", () => {
+    const p2 = moveAgentToNewPane(P, ROSTER, "b");
+    minimizePane(P, ROSTER, p2);
+    maximizePane(P, ROSTER, p2);
+    const layout = layoutFor(P, ROSTER);
+    expect(layout.maximized).toBe(p2);
+    expect(layout.minimized).not.toContain(p2);
+  });
+
   it("reveal restores a minimized pane when nothing is maximized", () => {
     const p2 = moveAgentToNewPane(P, ROSTER, "b");
     minimizePane(P, ROSTER, p2);
@@ -453,7 +463,7 @@ describe("pane display state", () => {
       },
       ROSTER,
     );
-    expect(layout.minimized).toEqual(["p1", "p2"]);
+    expect(layout.minimized).toEqual(["p2"]);
     const restored = reconcileLayout({ ...layout, maximized: null }, ROSTER);
     expect(restored.minimized).toHaveLength(1);
   });
@@ -509,7 +519,24 @@ describe("roster reconciliation", () => {
       ROSTER,
     );
     expect(layout.fractions).toEqual([0.5, 0.5]);
-    expect(layout.minimized).toEqual(["p2"]);
+    expect(layout.minimized).toEqual([]);
+    expect(layout.maximized).toBe("p2");
+  });
+
+  it("removes the maximized pane from a retained minimized set", () => {
+    const layout = reconcileLayout(
+      {
+        panes: [
+          { id: "p1", name: "Pane 1", members: ["a"], hidden: [] },
+          { id: "p2", name: "Pane 2", members: ["b"], hidden: [] },
+        ],
+        fractions: [0.5, 0.5],
+        minimized: ["p1", "p2"],
+        maximized: "p2",
+      },
+      ROSTER,
+    );
+    expect(layout.minimized).toEqual(["p1"]);
     expect(layout.maximized).toBe("p2");
   });
 
@@ -528,6 +555,37 @@ describe("roster reconciliation", () => {
     );
     expect(layout.minimized).toEqual(["p2"]);
     expect(layout.maximized).toBeNull();
+  });
+});
+
+describe("automatic empty-pane assignment", () => {
+  it("fills visible empty panes in creation order", () => {
+    const p2 = createEmptyPane(P, ["a"]);
+    const p3 = createEmptyPane(P, ["a"]);
+
+    expect(assignAgentToFirstVisibleEmptyPane(P, ["a", "x"], "x")).toBe(p2);
+    expect(assignAgentToFirstVisibleEmptyPane(P, ["a", "x", "y"], "y")).toBe(p3);
+    const layout = layoutFor(P, ["a", "x", "y"]);
+    expect(layout.panes.find((pane) => pane.id === p2)?.members).toEqual(["x"]);
+    expect(layout.panes.find((pane) => pane.id === p3)?.members).toEqual(["y"]);
+  });
+
+  it("skips minimized empty panes", () => {
+    const p2 = createEmptyPane(P, ["a"]);
+    const p3 = createEmptyPane(P, ["a"]);
+    minimizePane(P, ["a"], p2);
+
+    expect(assignAgentToFirstVisibleEmptyPane(P, ["a", "x"], "x")).toBe(p3);
+    expect(layoutFor(P, ["a", "x"]).panes.find((pane) => pane.id === p2)?.members).toEqual([]);
+  });
+
+  it("only fills the maximized pane while focus mode is active", () => {
+    const p2 = createEmptyPane(P, ["a"]);
+    const p3 = createEmptyPane(P, ["a"]);
+    maximizePane(P, ["a"], p3);
+
+    expect(assignAgentToFirstVisibleEmptyPane(P, ["a", "x"], "x")).toBe(p3);
+    expect(layoutFor(P, ["a", "x"]).panes.find((pane) => pane.id === p2)?.members).toEqual([]);
   });
 });
 

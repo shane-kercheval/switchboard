@@ -16,6 +16,7 @@
     prompts,
     loading = false,
     onpick,
+    oninsert,
     oncopy,
     onopenfolder,
     onclose,
@@ -25,6 +26,8 @@
     /// "no prompts" empty state, which would otherwise flash on first open.
     loading?: boolean;
     onpick: (prompt: Prompt) => void;
+    /// Insert an unmatched slash query into the plain message composer.
+    oninsert?: (message: string) => void;
     /// Copy a read-only built-in into the user's own prompts. Only built-in rows
     /// surface the affordance; omitting the handler hides it everywhere.
     oncopy?: (prompt: Prompt) => void;
@@ -45,10 +48,14 @@
       `${p.title ?? ""} ${p.provider}:${p.name} ${p.description ?? ""}`.toLowerCase().includes(q),
     );
   });
+  const messageToInsert = $derived(
+    query.length === 0 ? null : query.startsWith("/") ? query : `/${query}`,
+  );
+  const optionCount = $derived(filtered.length + (oninsert && messageToInsert ? 1 : 0));
 
   // Keep the highlight in range as the filtered set shrinks/grows.
   $effect(() => {
-    if (highlighted > filtered.length - 1) highlighted = Math.max(0, filtered.length - 1);
+    if (highlighted > optionCount - 1) highlighted = Math.max(0, optionCount - 1);
   });
 
   // Autofocus the search field on open so the user can type to filter immediately.
@@ -63,14 +70,18 @@
   function onKeydown(event: KeyboardEvent): void {
     if (event.key === "ArrowDown") {
       event.preventDefault();
-      if (filtered.length > 0) highlighted = (highlighted + 1) % filtered.length;
+      if (optionCount > 0) highlighted = (highlighted + 1) % optionCount;
     } else if (event.key === "ArrowUp") {
       event.preventDefault();
-      if (filtered.length > 0) highlighted = (highlighted - 1 + filtered.length) % filtered.length;
+      if (optionCount > 0) highlighted = (highlighted - 1 + optionCount) % optionCount;
     } else if (event.key === "Enter") {
       event.preventDefault();
       const pick = filtered[highlighted];
-      if (pick !== undefined) onpick(pick);
+      if (pick !== undefined) {
+        onpick(pick);
+      } else if (oninsert && messageToInsert) {
+        oninsert(messageToInsert);
+      }
     } else if (event.key === "Escape") {
       event.preventDefault();
       onclose();
@@ -153,6 +164,22 @@
         {/if}
       </div>
     {/each}
+    {#if oninsert && messageToInsert}
+      <button
+        type="button"
+        class={cn(
+          "text-fg flex w-full cursor-pointer rounded-md px-2.5 py-2 text-left text-sm outline-none select-none",
+          highlighted === filtered.length ? "bg-hover" : "",
+        )}
+        data-testid="prompt-menu-insert-message"
+        role="option"
+        aria-selected={highlighted === filtered.length}
+        onmousemove={() => (highlighted = filtered.length)}
+        onclick={() => oninsert(messageToInsert)}
+      >
+        Insert “<span class="font-mono">{messageToInsert}</span>” into the message
+      </button>
+    {/if}
     {#if filtered.length === 0}
       {#if loading && prompts.length === 0}
         <div class="text-muted px-2.5 py-2 text-sm select-none" data-testid="prompt-menu-loading">

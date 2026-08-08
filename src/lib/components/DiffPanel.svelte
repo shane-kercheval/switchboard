@@ -423,6 +423,7 @@
         label={detailExpanded ? "Restore Git details panel" : "Expand Git details panel"}
         shortcut={shortcut("mod", "shift", "D")}
         side="bottom"
+        reopen="fresh-hover"
       >
         {#snippet trigger(props)}
           <button

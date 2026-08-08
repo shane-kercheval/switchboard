@@ -5,6 +5,7 @@
 export type TurnId = string;
 export type AgentId = string;
 export type ProjectId = string;
+export type MessagePin = { key: string; pinned_at: string };
 
 export type FailureKind = "harness_error" | "adapter_failure" | "auth_failure";
 // Future: "timeout" — added if/when an active per-turn timeout lands.
@@ -357,6 +358,7 @@ export type LoadedTurn =
       turn_id: TurnId;
       agent_id: AgentId;
       send_id?: SendId | null;
+      send_correlation?: "durable_link" | "positional" | null;
       started_at: string;
       ended_at?: string | null;
       status: "streaming" | "complete" | "failed";
@@ -737,8 +739,9 @@ export type OutcomeStatus = "cancelled" | "failed";
 export type ConversationItem =
   | {
       kind: "user_message";
-      // Stable render identity: the journal `send_id` for a dispatched send, the
-      // harness `turn_id` for an imported prompt. Keys the row; not a join key.
+      // Render identity: the journal `send_id` for a dispatched send, or a
+      // parser-generated harness `turn_id` for an imported prompt. The imported
+      // form changes on reparse and must not back persistent annotations.
       id: string;
       // Grouping key for a fan-out. Null for an imported prompt that predates
       // journaling (an attached session's history) — it has no journal Send.
@@ -762,6 +765,9 @@ export type ConversationItem =
       // Null when neither resolves a send (pre-journal history, keyless with no
       // positional match, or a declined anomalous link).
       send_id?: SendId | null;
+      // Authority behind `send_id`. Persistent message annotations may trust a
+      // durable link, but positional grouping is display-only best effort.
+      send_correlation?: "durable_link" | "positional" | null;
       started_at: string;
       ended_at?: string | null;
       status: "streaming" | "complete" | "failed";

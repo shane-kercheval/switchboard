@@ -48,7 +48,12 @@ import {
   NEW_PROJECT_DEFAULT_MODEL,
   defaultAgentName,
 } from "$lib/agentSelection";
-import { currentIsoTimestamp } from "$lib/utils";
+import {
+  compareIsoTimestampsDescending,
+  currentIsoTimestamp,
+  isIsoTimestampAfter,
+  isIsoTimestampBefore,
+} from "$lib/utils";
 import { buildLiveSendsMap } from "$lib/state/liveSends";
 import { draftAttachmentPaths } from "$lib/state/composeStore";
 import {
@@ -215,14 +220,14 @@ function fingerprintChanged(
 }
 
 function sortByActivity(list: ProjectListing[]): ProjectListing[] {
-  return [...list].sort((a, b) => b.last_activity.localeCompare(a.last_activity));
+  return [...list].sort((a, b) => compareIsoTimestampsDescending(a.last_activity, b.last_activity));
 }
 
 function applyActivityOverrides(list: ProjectListing[]): ProjectListing[] {
   return sortByActivity(
     list.map((project) => {
       const override = projectActivityOverrides[project.id];
-      return override !== undefined && override > project.last_activity
+      return override !== undefined && isIsoTimestampAfter(override, project.last_activity)
         ? { ...project, last_activity: override }
         : project;
     }),
@@ -247,7 +252,7 @@ export function nextUnreadCompletedProjectId(): ProjectId | null {
   );
   if (unread.length === 0) return null;
   return unread.reduce((oldest, project) =>
-    project.last_activity < oldest.last_activity ? project : oldest,
+    isIsoTimestampBefore(project.last_activity, oldest.last_activity) ? project : oldest,
   ).id;
 }
 
@@ -416,18 +421,18 @@ export async function createProjectAndActivate(name: string, directory: string):
 /// with fewer agents than the user has CLIs, permanently.
 ///
 /// Mirrors the canonical create path (`createAgent` → `registerAgent` →
-/// `addAgentToActiveProject`) per agent — a plain roster re-fetch would skip
+/// `addAgentToProjectRoster`) per agent — a plain roster re-fetch would skip
 /// `registerAgent` and leave the agents without live transcript/dispatch state.
 /// Each create is independent: one failure is recorded in `agentCreationFailures`
 /// (surfaced as a dismissible banner) and never aborts the rest or the open.
 ///
 /// **Targets a captured project, not live active state.** Both `create_agent`
-/// (backend active project) and `addAgentToActiveProject` (frontend
-/// `selection.activeProjectId`) bind to whatever is active *at call time*. If
-/// the user navigated to another project mid-seed, continuing would scatter
-/// agents into the wrong project — so we capture the id up front and bail if it
-/// changes. The new-project dialog also stays non-dismissible while this runs
-/// (belt). The durable fix is `create_agent`/`attach_agent` taking an explicit
+/// (backend active project) binds to whatever is active *at call time*. If the
+/// user navigated to another project mid-seed, continuing could create agents
+/// in the wrong project — so we capture the id up front and bail if it changes.
+/// Frontend roster insertion uses the returned agent's authoritative project id.
+/// The new-project dialog also stays non-dismissible while this runs (belt).
+/// The durable backend fix is `create_agent`/`attach_agent` taking an explicit
 /// `project_id` instead of reading active state — out of scope here, but the
 /// same coupling affects project remove/rename.
 async function seedAgentsForInstalledHarnesses(projectId: ProjectId): Promise<void> {
@@ -458,7 +463,7 @@ async function seedAgentsForInstalledHarnesses(projectId: ProjectId): Promise<vo
       if (selection.activeProjectId !== projectId) break;
       await registerAgent(agent);
       if (selection.activeProjectId !== projectId) break;
-      addAgentToActiveProject(agent);
+      addAgentToProjectRoster(agent);
     } catch (err) {
       // Don't strand a banner on a project the user already left.
       if (selection.activeProjectId !== projectId) break;
@@ -777,6 +782,7 @@ export async function hydrateProject(
           turn_id: item.turn_id,
           agent_id: item.agent_id,
           send_id: item.send_id ?? null,
+          send_correlation: item.send_correlation ?? null,
           started_at: item.started_at,
           ended_at: item.ended_at ?? null,
           status: item.status,
@@ -924,16 +930,11 @@ export async function retryProjectHydration(projectId: ProjectId): Promise<void>
   await hydrateProject(projectId);
 }
 
-/// Append a freshly created/attached agent to the active project's roster so
-/// the sidebar and transcript pick it up without a full reload.
-export function addAgentToActiveProject(agent: AgentRecord): void {
-  const projectId = selection.activeProjectId;
-  if (projectId === null) {
-    console.error("[switchboard] addAgentToActiveProject with no active project");
-    return;
-  }
-  const existing = agentsByProject[projectId] ?? [];
-  agentsByProject[projectId] = [...existing, agent];
+/// Append a freshly created/attached agent to its owning project's roster so
+/// an async completion cannot place it in whichever project is active later.
+export function addAgentToProjectRoster(agent: AgentRecord): void {
+  const existing = agentsByProject[agent.project_id] ?? [];
+  agentsByProject[agent.project_id] = [...existing, agent];
 }
 
 /// Test-only reset. Production never calls this; the module is a singleton, so

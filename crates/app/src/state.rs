@@ -105,8 +105,8 @@ pub struct RunSnapshot {
 /// unserialized writes would corrupt it). Because it's a leaf taken alone, no
 /// other lock may be acquired while holding it — keep it that way.
 ///
-/// `registry_write` serializes append-only-log mutations
-/// (`create_project`, `register_agent`, `init_directory`).
+/// `registry_write` serializes project-registry mutations and small mutable
+/// project sidecars such as message pins.
 /// `Directory::create_project` and `Project::register_agent` have a TOCTOU
 /// window between their internal "is this name unique?" read and the
 /// subsequent append; two concurrent IPC calls could otherwise both pass

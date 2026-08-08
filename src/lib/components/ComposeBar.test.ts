@@ -476,6 +476,86 @@ describe("ComposeBar", () => {
     expect(screen.queryByTestId("workflow-menu")).toBeNull();
   });
 
+  it("inserts an unmatched slash query into the message without dispatching", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "list_prompts" || cmd === "search_project_files") return [];
+      return null;
+    });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    await fireEvent.keyDown(textarea, { key: "/" });
+    const search = await screen.findByTestId("prompt-menu-search");
+    await fireEvent.input(search, { target: { value: "plugin" } });
+    await fireEvent.click(screen.getByTestId("prompt-menu-insert-message"));
+
+    expect(textarea.value).toBe("/plugin");
+    await waitFor(() => expect(textarea).toHaveFocus());
+    expect(screen.queryByTestId("prompt-menu")).toBeNull();
+    expect(invokeMock.mock.calls.some(([cmd]) => cmd === "send_message")).toBe(false);
+  });
+
+  it("does not invent a slash insertion when the toolbar opens the prompt menu", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "list_prompts" || cmd === "search_project_files") return [];
+      return null;
+    });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+
+    await fireEvent.click(screen.getByTestId("compose-prompt-button"));
+    const search = await screen.findByTestId("prompt-menu-search");
+    await fireEvent.input(search, { target: { value: "plugin" } });
+    await fireEvent.keyDown(search, { key: "Enter" });
+
+    expect(screen.queryByTestId("prompt-menu-insert-message")).toBeNull();
+    expect(screen.getByTestId("prompt-menu")).toBeInTheDocument();
+    expect((screen.getByTestId("compose-textarea") as HTMLTextAreaElement).value).toBe("");
+    expect(invokeMock.mock.calls.some(([cmd]) => cmd === "send_message")).toBe(false);
+  });
+
+  it("dispatches the original slash-leading message after prompt-menu insertion", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "list_prompts" || cmd === "search_project_files") return [];
+      if (cmd === "send_message") return "msg-slash";
+      return null;
+    });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    await fireEvent.keyDown(textarea, { key: "/" });
+    const search = await screen.findByTestId("prompt-menu-search");
+    await fireEvent.input(search, { target: { value: "plugin" } });
+    await fireEvent.keyDown(search, { key: "Enter" });
+    await fireEvent.keyDown(textarea, { key: "Enter", metaKey: true });
+
+    await waitFor(() => {
+      expect(invokeMock.mock.calls.filter(([cmd]) => cmd === "send_message")).toHaveLength(1);
+    });
+    const send = invokeMock.mock.calls.find(([cmd]) => cmd === "send_message");
+    expect(send?.[1]).toMatchObject({ prompt: "/plugin" });
+  });
+
+  it("preserves a pasted slash-leading message without opening the prompt menu", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    await fireEvent.input(textarea, { target: { value: "/message whatever" } });
+
+    expect(textarea.value).toBe("/message whatever");
+    expect(screen.queryByTestId("prompt-menu")).toBeNull();
+  });
+
   it("dismisses the prompt menu on a click outside it, but not inside", async () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);

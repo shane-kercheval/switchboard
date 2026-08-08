@@ -20,7 +20,7 @@
   );
 </script>
 
-<Tooltip {label} shortcut={tooltipShortcut} side="bottom">
+<Tooltip {label} shortcut={tooltipShortcut} side="bottom" reopen="fresh-hover">
   {#snippet trigger(props)}
     <button
       {...props}

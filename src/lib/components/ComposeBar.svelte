@@ -367,6 +367,7 @@
   );
   let appendedText = $state<string>("");
   let promptMenuOpen = $state(false);
+  let promptMenuAllowsLiteralInsert = $state(false);
   let prompts = $state<Prompt[]>([]);
   let focusPromptFieldOnMount = $state(false);
   // Whether the cache has been read at least once, so the picker can show a
@@ -1340,7 +1341,7 @@
     // `/` on an empty textarea opens the prompt picker (instead of typing a slash).
     if (event.key === "/" && draft === "" && !promptMenuOpen) {
       event.preventDefault();
-      openPromptMenu();
+      openPromptMenu(true);
       return;
     }
     // Escape (menu dismiss / clear recipients) is handled by the window-level
@@ -1351,11 +1352,21 @@
     }
   }
 
-  function openPromptMenu(): void {
+  function openPromptMenu(allowsLiteralInsert = false): void {
     closeMentionMenu();
     workflowMenuOpen = false;
+    promptMenuAllowsLiteralInsert = allowsLiteralInsert;
     void loadPrompts();
     promptMenuOpen = true;
+  }
+
+  function setEmptyDraftFromPromptSearch(message: string): void {
+    draft = message;
+    promptMenuOpen = false;
+    void tick().then(() => {
+      textareaEl?.focus();
+      textareaEl?.setSelectionRange(message.length, message.length);
+    });
   }
 
   /// Enter prompt mode (or swap the chosen prompt). Carries any text the user
@@ -2153,6 +2164,7 @@
           {prompts}
           loading={!promptsLoaded}
           onpick={pickPrompt}
+          oninsert={promptMenuAllowsLiteralInsert ? setEmptyDraftFromPromptSearch : undefined}
           oncopy={copyPrompt}
           onopenfolder={openPromptsFolder}
           onclose={() => (promptMenuOpen = false)}
@@ -2467,6 +2479,7 @@
                     : `Add ${agent.name}`}
                 shortcut={i < 9 ? shortcut("mod", String(i + 1)) : undefined}
                 delayDuration={chipHidden ? 300 : 1000}
+                reopen="fresh-hover"
               >
                 {#snippet trigger(props)}
                   <button

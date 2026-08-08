@@ -17,7 +17,7 @@
   const resolvedLabel = $derived(label ?? (pressed ? "Close settings" : "Open settings"));
 </script>
 
-<Tooltip label="Settings" shortcut={shortcut("mod", ",")} side="bottom">
+<Tooltip label="Settings" shortcut={shortcut("mod", ",")} side="bottom" reopen="fresh-hover">
   {#snippet trigger(props)}
     <button
       {...props}

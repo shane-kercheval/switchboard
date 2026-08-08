@@ -225,14 +225,10 @@ pub enum AdapterEvent {
     /// timer so a long silent-but-thinking turn is not falsely declared dead.
     /// Never becomes a transcript item.
     Liveness { turn_id: TurnId },
-    /// The turn's dedup identity, announced **early** — at the first non-subagent
-    /// assistant message, not at turn end. Carries the first assistant
-    /// `message.id`, the same value `TurnEnd.first_message_id` carries, so the
-    /// frontend can stamp a live turn's `hydration_key` *while it is still
-    /// streaming*. That lets a concurrent disk re-read (switch-back refresh)
-    /// recognize the live turn as the same turn and collapse against it, instead
-    /// of rendering a second copy. Emitted once per turn (Claude only); keyless
-    /// harnesses never emit it. Content-free.
+    /// The turn's dedup identity, announced immediately from the first assistant
+    /// `message.id`. The value matches `TurnEnd.first_message_id`, so ordinary
+    /// live and disk copies collapse into one turn. Emitted once per turn (Claude
+    /// only); keyless harnesses never emit it. Content-free.
     TurnIdentity { turn_id: TurnId, message_id: String },
     ToolStarted {
         turn_id: TurnId,
@@ -303,10 +299,9 @@ pub enum AdapterEvent {
         /// frontend dedups a live turn against its on-disk copy. Named
         /// `first_message_id` for historical reasons (Claude's source), but it is
         /// harness-generic; routed to `NormalizedEvent::TurnEnd.hydration_key`.
-        /// Per harness: **Claude** the **first** non-subagent assistant `message.id`
-        /// (distinct from `stable_message_id`, the *final* id — the first id is
-        /// parse-invariant, so a mid-flight re-read mints the same key as the
-        /// completed turn); **Codex** the current turn's `turn_context.turn_id`,
+        /// Per harness: **Claude** the **first** non-subagent assistant
+        /// `message.id` (distinct from `stable_message_id`, the *final* id);
+        /// **Codex** the current turn's `turn_context.turn_id`,
         /// read from the post-terminal enrichment re-read of the session file so it
         /// equals the parsed key by construction (probe-verified live↔disk). `None`
         /// for keyless harnesses (Antigravity), Gemini (live↔disk parity unprobed),
@@ -402,8 +397,8 @@ pub enum NormalizedEvent {
     /// Early dedup identity for the live turn (see [`AdapterEvent::TurnIdentity`]).
     /// The frontend stamps `hydration_key` onto the in-flight turn so a
     /// concurrent disk re-read collapses against it instead of duplicating. The
-    /// internal first `message.id` is surfaced here as `hydration_key` — the same
-    /// frontend-facing key `TurnEnd` carries.
+    /// adapter-selected durable identity is surfaced here as `hydration_key` —
+    /// the same frontend-facing key `TurnEnd` carries.
     TurnIdentity {
         turn_id: TurnId,
         hydration_key: String,
@@ -452,8 +447,7 @@ pub enum NormalizedEvent {
         /// carry on disk, so a turn that streamed live *and* is later re-read from
         /// the session file is recognized as one turn (the merge dedups on it, and
         /// the durable `TurnLink` correlates it to its send). Per harness: **Claude**
-        /// the first non-subagent assistant `message.id` (parse-invariant, so a
-        /// mid-flight re-read mints the same key); **Codex** the current turn's
+        /// the first non-subagent assistant `message.id`; **Codex** the current turn's
         /// `turn_context.turn_id` via the post-terminal enrichment re-read, so it
         /// equals the parsed key by construction (probe-verified). `None` for
         /// Antigravity (no per-turn id) and Gemini (live↔disk parity unprobed) —

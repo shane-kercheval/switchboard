@@ -64,6 +64,9 @@ export type Turn =
       /// recovered by the backend's journal join — `undefined` when no Send
       /// matched (pre-journal history).
       send_id?: SendId;
+      /// `live` is the dispatch-owned association from this app session;
+      /// hydrated values describe the backend merge's authority.
+      send_correlation?: "live" | "durable_link" | "positional";
       started_at: string;
       ended_at?: string;
       /// `"cancelled"` is a terminal state distinct from `"failed"`: the user

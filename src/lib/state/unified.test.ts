@@ -348,6 +348,31 @@ describe("buildUnifiedRows", () => {
     ]);
   });
 
+  it("orders same-second timestamps with different fractional precision chronologically", () => {
+    const overlay: ConversationItem[] = [
+      {
+        kind: "user_message",
+        id: "later",
+        send_id: "later",
+        agent_ids: [AGENT_A],
+        text: "later",
+        at: "2026-05-16T00:00:00.500Z",
+      },
+      {
+        kind: "user_message",
+        id: "earlier",
+        send_id: "earlier",
+        agent_ids: [AGENT_A],
+        text: "earlier",
+        at: "2026-05-16T00:00:00Z",
+      },
+    ];
+
+    const rows = buildUnifiedRows([], overlay);
+
+    expect(rows.map((row) => row.at)).toEqual(["2026-05-16T00:00:00Z", "2026-05-16T00:00:00.500Z"]);
+  });
+
   it("anchors a queued send's response under its own prompt, not by run-time", () => {
     // Two sequential single-recipient sends: prompts stamped near submit
     // (00, 01), but send-2 is queued so its response only runs at 20 — after
@@ -406,6 +431,26 @@ describe("buildUnifiedRows", () => {
     expect((users[0] as Extract<UnifiedRow, { kind: "user" }>).agent_ids).toEqual([
       AGENT_A,
       AGENT_B,
+    ]);
+  });
+
+  it("anchors a same-second live fan-out at its earliest fractional timestamp", () => {
+    const rows = buildUnifiedRows(
+      [
+        userTurn(TURN_1, AGENT_A, "2026-05-16T00:00:00.500Z", "fan out", SEND_1),
+        userTurn(
+          "00000000-0000-7000-8000-000000000002",
+          AGENT_B,
+          "2026-05-16T00:00:00Z",
+          "fan out",
+          SEND_1,
+        ),
+      ],
+      [],
+    );
+
+    expect(rows.filter((row) => row.kind === "user")).toMatchObject([
+      { at: "2026-05-16T00:00:00Z" },
     ]);
   });
 });

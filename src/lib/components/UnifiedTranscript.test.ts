@@ -10,6 +10,7 @@ import { agentCopy } from "$lib/agentCopy.svelte";
 // `vi.mock` is hoisted above imports, so the mocks below still apply.
 import UnifiedTranscript from "./UnifiedTranscript.svelte";
 import {
+  hasOverrides,
   setProjectCompact,
   toggleKey,
   _testing as previewState,
@@ -122,6 +123,7 @@ afterEach(async () => {
   _testing.reset();
   previewState.reset();
   (await import("$lib/state/transcriptJump.svelte"))._testing.reset();
+  (await import("$lib/state/messagePins.svelte"))._testing.reset();
 });
 
 describe("UnifiedTranscript", () => {
@@ -1937,6 +1939,55 @@ describe("UnifiedTranscript — markdown rendering", () => {
 });
 
 describe("UnifiedTranscript — per-message copy", () => {
+  it("pins one user message immediately left of its copy action", async () => {
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "list_message_pins") return [];
+      if (cmd === "set_message_pin") {
+        return [{ key: `user:send:${SEND_1}`, pinned_at: "2026-08-07T12:00:00Z" }];
+      }
+      return null;
+    });
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [
+      {
+        role: "user",
+        turn_id: "user-1",
+        agent_id: CLAUDE_AGENT.id,
+        send_id: SEND_1,
+        started_at: "2026-05-16T00:00:00Z",
+        text: "keep this",
+      },
+    ];
+
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+    const turn = screen.getByTestId("turn");
+    const pin = turn.querySelector('[data-testid="message-pin"]');
+    const copy = turn.querySelector('[data-testid="message-copy"]');
+    if (!(pin instanceof HTMLButtonElement) || copy === null) {
+      throw new Error("expected adjacent pin and copy actions");
+    }
+    expect(pin.compareDocumentPosition(copy) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+    expect(turn.querySelector('[data-testid="message-meta-actions"]')).toHaveClass("gap-0");
+    expect(turn.querySelector('[data-testid="message-meta-details"]')).toHaveClass(
+      "gap-2",
+      "opacity-0",
+      "group-has-[:focus-visible]:opacity-100",
+      "group-hover:opacity-100",
+    );
+    expect(pin).not.toHaveClass("opacity-0");
+
+    await fireEvent.click(pin);
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("set_message_pin", {
+        projectId: PROJECT_ID,
+        key: `user:send:${SEND_1}`,
+        pinned: true,
+      }),
+    );
+    expect(pin).toHaveAttribute("aria-pressed", "true");
+  });
+
   it("copies a user message's text", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
@@ -2185,6 +2236,7 @@ describe("UnifiedTranscript — per-message copy", () => {
         send_id: SEND_1,
         started_at: "2026-05-16T00:00:01Z",
         status: "complete",
+        hydration_key: "fanout-message-claude",
         items: [
           { item_kind: "text", kind: "text", text: "first block" },
           { item_kind: "text", kind: "text", text: "final block" },
@@ -2244,6 +2296,7 @@ describe("UnifiedTranscript — per-message copy", () => {
         send_id: SEND_1,
         started_at: "2026-05-16T00:00:01Z",
         status: "complete",
+        hydration_key: "copy-all-message-claude",
         items: [
           { item_kind: "text", kind: "text", text: "first block" },
           { item_kind: "text", kind: "text", text: "alice final" },
@@ -2266,6 +2319,7 @@ describe("UnifiedTranscript — per-message copy", () => {
         send_id: SEND_1,
         started_at: "2026-05-16T00:00:02Z",
         status: "complete",
+        hydration_key: "fanout-message-codex",
         items: [
           { item_kind: "text", kind: "thinking", text: "private reasoning" },
           { item_kind: "text", kind: "text", text: "bob final" },
@@ -2277,6 +2331,12 @@ describe("UnifiedTranscript — per-message copy", () => {
       props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT, CODEX_AGENT] },
     });
     copyTextMock.mockClear();
+
+    const group = screen.getByTestId("fanout-group");
+    expect(within(group).getAllByTestId("message-pin")).toHaveLength(3);
+    expect(
+      within(screen.getByTestId("fanout-actions-footer")).queryByTestId("message-pin"),
+    ).toBeNull();
 
     await fireEvent.click(screen.getByTestId("fanout-copy"));
 
@@ -2830,30 +2890,41 @@ describe("UnifiedTranscript compact mode", () => {
   it("picks each agent's latest response by completion recency, not rendered order", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
-    // send-a is anchored earlier (renders first) but finishes LAST (ended t5).
+    // send-a is anchored earlier (renders first) but finishes last within the
+    // same second, using a different fractional precision than send-b.
     state.transcripts[CLAUDE_AGENT.id] = [
       user(CLAUDE_AGENT, "send-a", "u-a", "2026-05-16T00:00:00Z"),
-      done(CLAUDE_AGENT, "send-a", "a-a", "2026-05-16T00:00:01Z", "2026-05-16T00:00:05Z", [
+      done(CLAUDE_AGENT, "send-a", "a-a", "2026-05-16T00:00:01Z", "2026-05-16T00:00:05.500Z", [
         ANSWER("a first"),
         ANSWER("a last"),
       ]),
       user(CLAUDE_AGENT, "send-b", "u-b", "2026-05-16T00:00:02Z"),
-      done(CLAUDE_AGENT, "send-b", "a-b", "2026-05-16T00:00:03Z", "2026-05-16T00:00:04Z", [
+      done(CLAUDE_AGENT, "send-b", "a-b", "2026-05-16T00:00:03Z", "2026-05-16T00:00:05Z", [
         ANSWER("b first"),
+        TOOL("t-b"),
         ANSWER("b last"),
+      ]),
+      user(CLAUDE_AGENT, "send-c", "u-c", "2026-05-16T00:00:06Z"),
+      done(CLAUDE_AGENT, "send-c", "a-c", "2026-05-16T00:00:07Z", "invalid", [
+        ANSWER("invalid first"),
+        TOOL("t-invalid"),
+        ANSWER("invalid last"),
       ]),
     ];
     setProjectCompact(PROJECT_ID, true);
 
     render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
-    const [first, second] = agentTurns();
+    const [first, second, invalid] = agentTurns();
     // send-a is the latest by recency → full answer prose.
     expect(within(first!).getByText("a first")).toBeInTheDocument();
     expect(within(first!).getByText("a last")).toBeInTheDocument();
     // send-b is older → clipped preview (all its answer text).
     expect(within(second!).getByText("b first")).toBeInTheDocument();
     expect(within(second!).getByText("b last")).toBeInTheDocument();
+    expect(toggleLabel(first!)).toBe("Collapse");
+    expect(toggleLabel(second!)).toBe("Expand");
+    expect(toggleLabel(invalid!)).toBe("Expand");
   });
 
   it("renders each latest fan-out column as full answer prose", async () => {
@@ -2931,6 +3002,165 @@ describe("UnifiedTranscript compact mode", () => {
     expect(toggleLabel(a!)).toBe("Collapse"); // now expanded
     expect(toggleLabel(b!)).toBe("Expand"); // unchanged
     expect(toggleLabel(c!)).toBe("Collapse"); // unchanged
+  });
+
+  it("expands only the standalone response selected by a navigator jump", async () => {
+    const state = await loadState();
+    const jump = await import("$lib/state/transcriptJump.svelte");
+    await state.registerAgent(CLAUDE_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [
+      user(CLAUDE_AGENT, "send-a", "u-a", "2026-05-16T00:00:00Z"),
+      done(CLAUDE_AGENT, "send-a", "a-a", "2026-05-16T00:00:01Z", "2026-05-16T00:00:02Z", [
+        TOOL("ta"),
+        ANSWER("A"),
+      ]),
+      user(CLAUDE_AGENT, "send-b", "u-b", "2026-05-16T00:00:10Z"),
+      done(CLAUDE_AGENT, "send-b", "a-b", "2026-05-16T00:00:11Z", "2026-05-16T00:00:12Z", [
+        TOOL("tb"),
+        ANSWER("B"),
+      ]),
+      user(CLAUDE_AGENT, "send-c", "u-c", "2026-05-16T00:00:20Z"),
+      done(CLAUDE_AGENT, "send-c", "a-c", "2026-05-16T00:00:21Z", "2026-05-16T00:00:22Z", [
+        TOOL("tc"),
+        ANSWER("C"),
+      ]),
+    ];
+    setProjectCompact(PROJECT_ID, true);
+
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT], paneId: "pane-x" },
+    });
+
+    const [a, b] = agentTurns();
+    expect(within(a!).queryByTestId("tool-row")).toBeNull();
+    expect(within(b!).queryByTestId("tool-row")).toBeNull();
+
+    jump.requestJump(PROJECT_ID, "pane-x", "a:a-a");
+    await tick();
+    await tick();
+
+    expect(within(a!).getByTestId("tool-row")).toBeInTheDocument();
+    expect(within(b!).queryByTestId("tool-row")).toBeNull();
+  });
+
+  it("expands a user message selected by a navigator jump", async () => {
+    const state = await loadState();
+    const jump = await import("$lib/state/transcriptJump.svelte");
+    await state.registerAgent(CLAUDE_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [
+      {
+        role: "user",
+        turn_id: "u-a",
+        agent_id: CLAUDE_AGENT.id,
+        send_id: "send-a",
+        started_at: "2026-05-16T00:00:00Z",
+        text: "long prompt\n".repeat(40),
+      },
+    ];
+    setProjectCompact(PROJECT_ID, true);
+
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT], paneId: "pane-x" },
+    });
+
+    const userTurn = screen.getByTestId("turn");
+    const clip = within(userTurn).getByTestId("preview-clip");
+    Object.defineProperties(clip, {
+      scrollHeight: { configurable: true, value: 400 },
+      clientHeight: { configurable: true, value: 100 },
+    });
+
+    jump.requestJump(PROJECT_ID, "pane-x", "u:send-a");
+    await tick();
+    await tick();
+
+    expect(within(userTurn).queryByTestId("preview-clip")).toBeNull();
+  });
+
+  it("expands only the selected agent column in a fan-out", async () => {
+    const state = await loadState();
+    const jump = await import("$lib/state/transcriptJump.svelte");
+    await state.registerAgent(CLAUDE_AGENT);
+    await state.registerAgent(CODEX_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [
+      user(CLAUDE_AGENT, "send-f", "u-fa", "2026-05-16T00:00:00Z"),
+      done(CLAUDE_AGENT, "send-f", "a-fa", "2026-05-16T00:00:01Z", "2026-05-16T00:00:02Z", [
+        TOOL("ta"),
+        ANSWER("Alice"),
+      ]),
+    ];
+    state.transcripts[CODEX_AGENT.id] = [
+      user(CODEX_AGENT, "send-f", "u-fb", "2026-05-16T00:00:00Z"),
+      done(CODEX_AGENT, "send-f", "a-fb", "2026-05-16T00:00:01Z", "2026-05-16T00:00:02Z", [
+        TOOL("tb"),
+        ANSWER("Bob"),
+      ]),
+    ];
+    setProjectCompact(PROJECT_ID, true);
+    toggleKey(PROJECT_ID, `fanout:send-f:${CLAUDE_AGENT.id}`, false);
+    toggleKey(PROJECT_ID, `fanout:send-f:${CODEX_AGENT.id}`, false);
+
+    render(UnifiedTranscript, {
+      props: {
+        projectId: PROJECT_ID,
+        agents: [CLAUDE_AGENT, CODEX_AGENT],
+        paneId: "pane-x",
+      },
+    });
+
+    const [alice, bob] = screen.getAllByTestId("fanout-column");
+    expect(within(alice!).queryByTestId("tool-row")).toBeNull();
+    expect(within(bob!).queryByTestId("tool-row")).toBeNull();
+
+    jump.requestJump(PROJECT_ID, "pane-x", "a:a-fb");
+    await tick();
+    await tick();
+
+    expect(within(alice!).queryByTestId("tool-row")).toBeNull();
+    expect(within(bob!).getByTestId("tool-row")).toBeInTheDocument();
+  });
+
+  it("does not pin an expanded-by-default latest response open after a jump", async () => {
+    const state = await loadState();
+    const jump = await import("$lib/state/transcriptJump.svelte");
+    await state.registerAgent(CLAUDE_AGENT);
+    const latest = done(
+      CLAUDE_AGENT,
+      "send-a",
+      "a-a",
+      "2026-05-16T00:00:01Z",
+      "2026-05-16T00:00:02Z",
+      [TOOL("ta"), ANSWER("A")],
+    );
+    state.transcripts[CLAUDE_AGENT.id] = [
+      user(CLAUDE_AGENT, "send-a", "u-a", "2026-05-16T00:00:00Z"),
+      latest,
+    ];
+    setProjectCompact(PROJECT_ID, true);
+
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT], paneId: "pane-x" },
+    });
+
+    const response = agentTurns()[0]!;
+    expect(within(response).getByTestId("tool-row")).toBeInTheDocument();
+    expect(hasOverrides(PROJECT_ID)).toBe(false);
+
+    jump.requestJump(PROJECT_ID, "pane-x", "a:a-a");
+    await tick();
+    await tick();
+    expect(hasOverrides(PROJECT_ID)).toBe(false);
+
+    state.transcripts[CLAUDE_AGENT.id] = [
+      ...state.transcripts[CLAUDE_AGENT.id]!,
+      done(CLAUDE_AGENT, "send-b", "a-b", "2026-05-16T00:00:11Z", "2026-05-16T00:00:12Z", [
+        TOOL("tb"),
+        ANSWER("B"),
+      ]),
+    ];
+    await tick();
+
+    expect(within(response).queryByTestId("tool-row")).toBeNull();
   });
 
   it("renders no compact toggle on a queued row", async () => {

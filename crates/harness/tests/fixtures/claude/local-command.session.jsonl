@@ -1,0 +1,2 @@
+{"parentUuid":null,"type":"system","subtype":"local_command","content":"/plugin","timestamp":"2026-08-06T19:00:00Z","uuid":"input-id","entrypoint":"sdk-cli"}
+{"parentUuid":"input-id","type":"system","subtype":"local_command","content":"<local-command-stdout>/plugin isn't available in this environment.</local-command-stdout>","timestamp":"2026-08-06T19:00:01Z","uuid":"disk-output-id","entrypoint":"sdk-cli"}

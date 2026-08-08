@@ -27,11 +27,13 @@ const STORAGE_VERSION = 1;
 /// untouched install looks identical.
 export const PROJECTS_SIDEBAR_DEFAULT_WIDTH = 288;
 export const AGENTS_SIDEBAR_DEFAULT_WIDTH = 240;
+export const PINS_SIDEBAR_DEFAULT_WIDTH = 360;
 export const GIT_REPO_DEFAULT_WIDTH = 360;
 export const DIFF_FILE_LIST_DEFAULT_WIDTH = 256;
 
 export const SIDEBAR_MIN_WIDTH = 200;
 export const SIDEBAR_MAX_WIDTH = 480;
+export const RIGHT_SIDEBAR_MAX_WIDTH = 720;
 export const GIT_REPO_MIN_WIDTH = 240;
 export const GIT_REPO_MAX_WIDTH = 480;
 export const DIFF_FILE_LIST_MIN_WIDTH = 176;
@@ -50,8 +52,18 @@ export function sidebarMaxWidth(): number {
   );
 }
 
-function clampSidebarWidth(px: number): number {
-  return Math.min(SIDEBAR_MAX_WIDTH, Math.max(SIDEBAR_MIN_WIDTH, Math.round(px)));
+/// The right sidebar doubles as a reading surface in Pins mode, so it may grow
+/// beyond the narrower project-picker rail while still leaving room for the
+/// transcript beside it.
+export function rightSidebarMaxWidth(): number {
+  return Math.max(
+    SIDEBAR_MIN_WIDTH,
+    Math.min(RIGHT_SIDEBAR_MAX_WIDTH, Math.round(viewportWidth() * 0.6)),
+  );
+}
+
+function clampSidebarWidth(px: number, maxWidth: number): number {
+  return Math.min(maxWidth, Math.max(SIDEBAR_MIN_WIDTH, Math.round(px)));
 }
 
 function clampGitRepoWidth(px: number): number {
@@ -63,10 +75,15 @@ function clampDiffFileListWidth(px: number): number {
 }
 
 type SidebarLayout = { width: number; open: boolean };
+export type RightSidebarMode = "agents" | "pins";
+export type PinsSortMode = "pinned_at" | "message_at";
 
 type LayoutState = {
   projectsSidebar: SidebarLayout;
   agentsSidebar: SidebarLayout;
+  pinsSidebarWidth: number;
+  rightSidebarMode: RightSidebarMode;
+  pinsSortMode: PinsSortMode;
   gitRepoWidth: number;
   diffFileListWidth: number;
 };
@@ -75,18 +92,21 @@ function defaults(): LayoutState {
   return {
     projectsSidebar: { width: PROJECTS_SIDEBAR_DEFAULT_WIDTH, open: true },
     agentsSidebar: { width: AGENTS_SIDEBAR_DEFAULT_WIDTH, open: true },
+    pinsSidebarWidth: PINS_SIDEBAR_DEFAULT_WIDTH,
+    rightSidebarMode: "agents",
+    pinsSortMode: "pinned_at",
     gitRepoWidth: GIT_REPO_DEFAULT_WIDTH,
     diffFileListWidth: DIFF_FILE_LIST_DEFAULT_WIDTH,
   };
 }
 
-function parseSidebar(value: unknown, fallback: SidebarLayout): SidebarLayout {
+function parseSidebar(value: unknown, fallback: SidebarLayout, maxWidth: number): SidebarLayout {
   if (value === null || typeof value !== "object") return fallback;
   const v = value as { width?: unknown; open?: unknown };
   return {
     width:
       typeof v.width === "number" && Number.isFinite(v.width)
-        ? clampSidebarWidth(v.width)
+        ? clampSidebarWidth(v.width, maxWidth)
         : fallback.width,
     open: typeof v.open === "boolean" ? v.open : fallback.open,
   };
@@ -106,12 +126,21 @@ function readStored(): LayoutState {
     const v = envelope.layout as {
       projectsSidebar?: unknown;
       agentsSidebar?: unknown;
+      pinsSidebarWidth?: unknown;
+      rightSidebarMode?: unknown;
+      pinsSortMode?: unknown;
       gitRepoWidth?: unknown;
       diffFileListWidth?: unknown;
     };
     return {
-      projectsSidebar: parseSidebar(v.projectsSidebar, base.projectsSidebar),
-      agentsSidebar: parseSidebar(v.agentsSidebar, base.agentsSidebar),
+      projectsSidebar: parseSidebar(v.projectsSidebar, base.projectsSidebar, SIDEBAR_MAX_WIDTH),
+      agentsSidebar: parseSidebar(v.agentsSidebar, base.agentsSidebar, SIDEBAR_MAX_WIDTH),
+      pinsSidebarWidth:
+        typeof v.pinsSidebarWidth === "number" && Number.isFinite(v.pinsSidebarWidth)
+          ? clampSidebarWidth(v.pinsSidebarWidth, RIGHT_SIDEBAR_MAX_WIDTH)
+          : base.pinsSidebarWidth,
+      rightSidebarMode: v.rightSidebarMode === "pins" ? "pins" : "agents",
+      pinsSortMode: v.pinsSortMode === "message_at" ? "message_at" : "pinned_at",
       gitRepoWidth:
         typeof v.gitRepoWidth === "number" && Number.isFinite(v.gitRepoWidth)
           ? clampGitRepoWidth(v.gitRepoWidth)
@@ -142,7 +171,7 @@ export const layout = {
     return state.projectsSidebar.width;
   },
   set projectsSidebarWidth(px: number) {
-    state.projectsSidebar.width = clampSidebarWidth(px);
+    state.projectsSidebar.width = clampSidebarWidth(px, SIDEBAR_MAX_WIDTH);
     persist();
   },
   get projectsSidebarOpen(): boolean {
@@ -156,14 +185,35 @@ export const layout = {
     return state.agentsSidebar.width;
   },
   set agentsSidebarWidth(px: number) {
-    state.agentsSidebar.width = clampSidebarWidth(px);
+    state.agentsSidebar.width = clampSidebarWidth(px, SIDEBAR_MAX_WIDTH);
     persist();
   },
-  get agentsSidebarOpen(): boolean {
+  get rightSidebarOpen(): boolean {
     return state.agentsSidebar.open;
   },
-  set agentsSidebarOpen(open: boolean) {
+  set rightSidebarOpen(open: boolean) {
     state.agentsSidebar.open = open;
+    persist();
+  },
+  get pinsSidebarWidth(): number {
+    return state.pinsSidebarWidth;
+  },
+  set pinsSidebarWidth(px: number) {
+    state.pinsSidebarWidth = clampSidebarWidth(px, RIGHT_SIDEBAR_MAX_WIDTH);
+    persist();
+  },
+  get rightSidebarMode(): RightSidebarMode {
+    return state.rightSidebarMode;
+  },
+  set rightSidebarMode(mode: RightSidebarMode) {
+    state.rightSidebarMode = mode;
+    persist();
+  },
+  get pinsSortMode(): PinsSortMode {
+    return state.pinsSortMode;
+  },
+  set pinsSortMode(mode: PinsSortMode) {
+    state.pinsSortMode = mode;
     persist();
   },
   get gitRepoWidth(): number {

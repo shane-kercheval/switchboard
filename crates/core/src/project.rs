@@ -10,7 +10,9 @@ use crate::error::{CoreError, Result};
 use crate::harness::{HarnessKind, SelectionAxis};
 use crate::io::{append_jsonl, read_jsonl, read_yaml, write_jsonl, write_yaml};
 use crate::name::{canonicalize_for_uniqueness, validate_name};
-use crate::paths::{ATTACHMENTS_DIR, CONFIG_FILE, JOURNAL_FILE, REGISTRY_FILE, RUNS_DIR};
+use crate::paths::{
+    ATTACHMENTS_DIR, CONFIG_FILE, JOURNAL_FILE, PINS_FILE, REGISTRY_FILE, RUNS_DIR,
+};
 
 pub type ProjectId = Uuid;
 
@@ -63,6 +65,12 @@ impl Project {
     /// `projects/`.
     pub fn journal_path(&self) -> PathBuf {
         self.root.join(JOURNAL_FILE)
+    }
+
+    /// Path to this project's mutable message-pin list. Pins contain only
+    /// stable message identifiers and timestamps, never message content.
+    pub fn pins_path(&self) -> PathBuf {
+        self.root.join(PINS_FILE)
     }
 
     /// Directory holding this project's staged attachment files

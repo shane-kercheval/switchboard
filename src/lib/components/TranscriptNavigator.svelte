@@ -8,7 +8,7 @@
   /// — the transcript is render-windowed. Opened by the header button, ⌘F, or
   /// the command palette (all via `navigatorState`).
   import { tick } from "svelte";
-  import { ArrowDownWideNarrow, ArrowUpWideNarrow, TableOfContents } from "@lucide/svelte";
+  import { ArrowDownWideNarrow, ArrowUpWideNarrow, Pin, TableOfContents } from "@lucide/svelte";
   import { cn, relativeTime } from "$lib/utils";
   import { ICON_BUTTON_CLASS } from "$lib/components/ui/iconButton";
   import Dialog from "$lib/components/ui/Dialog.svelte";
@@ -24,6 +24,13 @@
     type NavigatorRoleFilter,
   } from "$lib/transcriptIndex";
   import { jumpToRow, navigatorState, resolveJumpPane } from "$lib/state/transcriptJump.svelte";
+  import {
+    isMessagePinned,
+    loadMessagePins,
+    pinsLoaded,
+    pinsUnavailableReason,
+    toggleMessagePin,
+  } from "$lib/state/messagePins.svelte";
   import type { AgentRecord, ConversationItem, ProjectId } from "$lib/types";
 
   let {
@@ -41,6 +48,7 @@
   /// Newest-first by default: the common use is "jump to something recent," so
   /// the most recent message should be at the top rather than after a scroll.
   let descending = $state(true);
+  let pinnedOnly = $state(false);
   let highlighted = $state(0);
   let findTooltipOpen = $state(false);
   let findTooltipSuppressed = $state(false);
@@ -71,10 +79,19 @@
       for (const turn of transcripts[agent.id] ?? []) turns.push(turn);
     }
     const rows = buildUnifiedRows(turns, overlay, new Set(rosterIds));
-    return buildNavigatorEntries(rows, new Map(agents.map((a) => [a.id, a.name])));
+    return buildNavigatorEntries(
+      rows,
+      new Map(agents.map((a) => [a.id, a.name])),
+      new Map(agents.map((a) => [a.id, a.harness])),
+    );
   });
   const filtered = $derived.by(() => {
-    const matched = filterEntries(entries, query, role as NavigatorRoleFilter);
+    const matched = filterEntries(entries, query, role as NavigatorRoleFilter).filter(
+      (entry) =>
+        !pinnedOnly ||
+        (entry.messageIdentity.kind === "pinnable" &&
+          isMessagePinned(projectId, entry.messageIdentity)),
+    );
     // The index is chronological (oldest first); descending shows newest first.
     return descending ? [...matched].reverse() : matched;
   });
@@ -108,9 +125,11 @@
     query = "";
     role = "all";
     descending = true;
+    pinnedOnly = false;
     highlighted = 0;
     previewKey = null;
     void tick().then(() => searchEl?.focus());
+    void loadMessagePins(projectId);
   }
 
   function close(): void {
@@ -181,6 +200,7 @@
     void query;
     void role;
     void descending;
+    void pinnedOnly;
     highlighted = 0;
   });
 
@@ -280,7 +300,11 @@
           class="h-[26px] py-0"
         />
       </div>
-      <Tooltip label={descending ? "Newest first" : "Oldest first"} side="bottom">
+      <Tooltip
+        label={descending ? "Newest first" : "Oldest first"}
+        side="bottom"
+        reopen="fresh-hover"
+      >
         {#snippet trigger(props)}
           <button
             {...props}
@@ -295,6 +319,25 @@
             {:else}
               <ArrowUpWideNarrow size={16} aria-hidden="true" />
             {/if}
+          </button>
+        {/snippet}
+      </Tooltip>
+      <Tooltip
+        label={pinnedOnly ? "Show all messages" : "Show pinned only"}
+        side="bottom"
+        reopen="fresh-hover"
+      >
+        {#snippet trigger(props)}
+          <button
+            {...props}
+            type="button"
+            class={cn(ICON_BUTTON_CLASS, "shrink-0", pinnedOnly && "text-accent bg-hover")}
+            aria-label={pinnedOnly ? "Showing pinned messages" : "Show pinned messages only"}
+            aria-pressed={pinnedOnly}
+            data-testid="navigator-pinned-filter"
+            onclick={() => (pinnedOnly = !pinnedOnly)}
+          >
+            <Pin size={15} fill={pinnedOnly ? "currentColor" : "none"} aria-hidden="true" />
           </button>
         {/snippet}
       </Tooltip>
@@ -315,12 +358,19 @@
       >
         {#each filtered as entry, index (entry.rowKey)}
           {@const disabled = jumpTarget(entry) === null}
+          {@const pinReady = pinsLoaded(projectId)}
+          {@const pinnableIdentity =
+            entry.messageIdentity.kind === "pinnable" ? entry.messageIdentity : undefined}
+          {@const pinned =
+            pinnableIdentity !== undefined &&
+            pinReady &&
+            isMessagePinned(projectId, pinnableIdentity)}
           {#snippet entryButton(extraProps: Record<string, unknown> = {})}
             <button
               {...extraProps}
               type="button"
               class={cn(
-                "block w-full rounded-md px-2.5 py-1.5 text-left outline-none select-none",
+                "block min-w-0 flex-1 rounded-md px-2.5 py-1.5 text-left outline-none select-none",
                 disabled ? "cursor-default opacity-40" : "cursor-pointer",
                 index === highlighted && "bg-hover",
               )}
@@ -345,15 +395,63 @@
               </span>
             </button>
           {/snippet}
-          {#if disabled}
-            <Tooltip label={`${entry.attribution} isn't visible in any pane`} side="right">
-              {#snippet trigger(props)}
-                {@render entryButton(props)}
-              {/snippet}
-            </Tooltip>
-          {:else}
-            {@render entryButton()}
-          {/if}
+          <div class={cn("flex items-center rounded-md", index === highlighted && "bg-hover")}>
+            {#if disabled}
+              <Tooltip label={`${entry.attribution} isn't visible in any pane`} side="right">
+                {#snippet trigger(props)}
+                  {@render entryButton(props)}
+                {/snippet}
+              </Tooltip>
+            {:else}
+              {@render entryButton()}
+            {/if}
+            {#if pinnableIdentity !== undefined && pinReady}
+              <Tooltip
+                label={pinned ? "Unpin message" : "Pin message"}
+                side="left"
+                reopen="fresh-hover"
+              >
+                {#snippet trigger(props)}
+                  <button
+                    {...props}
+                    type="button"
+                    class={cn(
+                      "hover:bg-control-hover mr-1 flex h-7 w-7 shrink-0 items-center justify-center rounded-full",
+                      pinned ? "text-accent" : "text-muted hover:text-fg",
+                    )}
+                    aria-label={pinned ? "Unpin message" : "Pin message"}
+                    aria-pressed={pinned}
+                    data-testid="navigator-entry-pin"
+                    onclick={() => toggleMessagePin(projectId, pinnableIdentity)}
+                  >
+                    <Pin size={14} fill={pinned ? "currentColor" : "none"} aria-hidden="true" />
+                  </button>
+                {/snippet}
+              </Tooltip>
+            {:else}
+              {@const unavailableReason =
+                pinnableIdentity !== undefined
+                  ? pinsUnavailableReason(projectId)
+                  : entry.messageIdentity.kind === "unsupported"
+                    ? entry.messageIdentity.reason
+                    : "Pin unavailable"}
+              <Tooltip label={unavailableReason} side="left">
+                {#snippet trigger(props)}
+                  <span
+                    {...props}
+                    class="text-muted/50 mr-1 flex h-7 w-7 shrink-0 items-center justify-center rounded-full"
+                    role="button"
+                    aria-label={unavailableReason}
+                    aria-disabled="true"
+                    tabindex="0"
+                    data-testid="navigator-entry-pin-unavailable"
+                  >
+                    <Pin size={14} aria-hidden="true" />
+                  </span>
+                {/snippet}
+              </Tooltip>
+            {/if}
+          </div>
         {/each}
         {#if filtered.length === 0}
           <div class="text-muted px-2.5 py-3 text-sm select-none" data-testid="navigator-empty">

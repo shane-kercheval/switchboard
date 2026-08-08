@@ -44,8 +44,8 @@
   import {
     AGENTS_SIDEBAR_DEFAULT_WIDTH,
     layout,
-    SIDEBAR_MIN_WIDTH,
     sidebarMaxWidth,
+    SIDEBAR_MIN_WIDTH,
   } from "$lib/layout.svelte";
   import DropdownMenu from "$lib/components/ui/DropdownMenu.svelte";
   import DropdownMenuItem from "$lib/components/ui/DropdownMenuItem.svelte";
@@ -1058,6 +1058,7 @@
                 <Tooltip
                   label={agentHidden ? `Show ${agent.name}` : `Hide ${agent.name} (⌥-click: solo)`}
                   delayDuration={800}
+                  reopen="fresh-hover"
                 >
                   {#snippet trigger(props)}
                     <button

@@ -11,8 +11,8 @@ use std::sync::{Arc, Mutex};
 use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
 use switchboard_core::{
-    AgentId, AgentRecord, Attachment, CoreError, Directory, HarnessKind, Project, ProjectId,
-    ProjectSummary, SelectionAxis, SendId, SessionLocator, normalize_selection,
+    AgentId, AgentRecord, Attachment, CoreError, Directory, HarnessKind, MessagePin, Project,
+    ProjectId, ProjectSummary, SelectionAxis, SendId, SessionLocator, normalize_selection,
 };
 use switchboard_dispatcher::{
     CancelOutcome, CurrentTurnWait, DispatchContextFactory, EventEmitter, OnBusy,
@@ -1345,6 +1345,99 @@ pub fn set_project_archived_impl(
         persist_workspace(state);
     }
     Ok(())
+}
+
+pub fn list_message_pins_impl(
+    state: &AppState,
+    project_id: ProjectId,
+) -> Result<Vec<MessagePin>, AppError> {
+    let project = lock(&state.projects)
+        .get(&project_id)
+        .cloned()
+        .ok_or(AppError::ProjectNotLoaded(project_id))?;
+    Ok(switchboard_core::pins::read_pins(&project.pins_path())?)
+}
+
+pub fn set_message_pin_impl(
+    state: &AppState,
+    project_id: ProjectId,
+    key: &str,
+    pinned: bool,
+) -> Result<Vec<MessagePin>, AppError> {
+    let _write = lock(&state.registry_write);
+    let project = lock(&state.projects)
+        .get(&project_id)
+        .cloned()
+        .ok_or(AppError::ProjectNotLoaded(project_id))?;
+    let path = project.pins_path();
+    let mut pins = switchboard_core::pins::read_pins(&path)?;
+    let changed = if pinned {
+        if pins.iter().any(|pin| pin.key == key) {
+            false
+        } else {
+            pins.push(MessagePin {
+                key: key.to_owned(),
+                pinned_at: chrono::Utc::now(),
+            });
+            true
+        }
+    } else {
+        let before = pins.len();
+        pins.retain(|pin| pin.key != key);
+        pins.len() != before
+    };
+    if changed {
+        switchboard_core::pins::write_pins(&path, &pins)?;
+    }
+    Ok(pins)
+}
+
+pub fn remove_message_pins_impl(
+    state: &AppState,
+    project_id: ProjectId,
+    keys: &[String],
+) -> Result<Vec<MessagePin>, AppError> {
+    let _write = lock(&state.registry_write);
+    let project = lock(&state.projects)
+        .get(&project_id)
+        .cloned()
+        .ok_or(AppError::ProjectNotLoaded(project_id))?;
+    let path = project.pins_path();
+    let mut pins = switchboard_core::pins::read_pins(&path)?;
+    let before = pins.len();
+    pins.retain(|pin| !keys.contains(&pin.key));
+    if pins.len() != before {
+        switchboard_core::pins::write_pins(&path, &pins)?;
+    }
+    Ok(pins)
+}
+
+pub fn migrate_message_pin_impl(
+    state: &AppState,
+    project_id: ProjectId,
+    from_key: &str,
+    to_key: &str,
+) -> Result<Vec<MessagePin>, AppError> {
+    let _write = lock(&state.registry_write);
+    let project = lock(&state.projects)
+        .get(&project_id)
+        .cloned()
+        .ok_or(AppError::ProjectNotLoaded(project_id))?;
+    let path = project.pins_path();
+    let mut pins = switchboard_core::pins::read_pins(&path)?;
+    if from_key == to_key || !pins.iter().any(|pin| pin.key == from_key) {
+        return Ok(pins);
+    }
+
+    // A migration changes identity only; preserving the original pin time keeps
+    // the user's recently-pinned ordering stable across live-to-disk hydration.
+    if pins.iter().any(|pin| pin.key == to_key) {
+        pins.retain(|pin| pin.key != from_key);
+    } else if let Some(pin) = pins.iter_mut().find(|pin| pin.key == from_key) {
+        to_key.clone_into(&mut pin.key);
+    }
+    switchboard_core::pins::write_pins(&path, &pins)?;
+    Ok(pins)
 }
 
 /// Permanently delete one project's Switchboard state. Mirrors
@@ -3805,12 +3898,12 @@ pub enum ConversationItem {
     ///   journaling (an attached session's history that the journal never saw):
     ///   `send_id` is `None` and there is a single recipient.
     ///
-    /// `id` is the stable render identity in both cases — the journal `send_id`
-    /// for a dispatched send, the harness `turn_id` for an imported prompt. It
-    /// keys the rendered row and is never a join key to a `Send` (so grouping
-    /// must key off `send_id`, not `id`). `agent_ids` are the recipients in
-    /// first-seen order; `text` is the prompt (identical across a fan-out); `at`
-    /// is the earliest `at` in the group.
+    /// `id` is a render identity: the journal `send_id` for a dispatched send,
+    /// or the parser-generated harness `turn_id` for an imported prompt. The
+    /// imported form is intentionally **not** a durable annotation key — session
+    /// parsers regenerate it on each read. Grouping must key off `send_id`, not
+    /// `id`. `agent_ids` are the recipients in first-seen order; `text` is the
+    /// prompt (identical across a fan-out); `at` is the earliest `at` in the group.
     UserMessage {
         id: Uuid,
         send_id: Option<SendId>,
@@ -3837,6 +3930,11 @@ pub enum ConversationItem {
         turn_id: switchboard_harness::TurnId,
         agent_id: AgentId,
         send_id: Option<SendId>,
+        /// Whether `send_id` came from an authoritative `TurnLink` or the
+        /// best-effort positional fallback. Persistent annotations may use a
+        /// durable link as an alias, but must never trust positional grouping.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        send_correlation: Option<SendCorrelation>,
         started_at: chrono::DateTime<chrono::Utc>,
         ended_at: Option<chrono::DateTime<chrono::Utc>>,
         status: switchboard_harness::TurnStatus,
@@ -3892,6 +3990,14 @@ pub enum ConversationItem {
     },
 }
 
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum SendCorrelation {
+    DurableLink,
+    Positional,
+}
+
 /// The non-completed terminal kinds the journal records. This is where
 /// `cancelled` enters the rendered model — `TurnStatus` (harness-sourced) has
 /// no `Cancelled` because the harness never persists a cancelled turn.
@@ -3942,7 +4048,10 @@ type UserMessageGroup = (
 /// journaled prompt the journal already renders).
 #[derive(Clone, Copy)]
 enum TurnRender {
-    Agent(Option<SendId>),
+    Agent {
+        send_id: Option<SendId>,
+        correlation: Option<SendCorrelation>,
+    },
     UserImported,
     /// A `Turn::System` (e.g. compaction): rendered as a marker, but invisible to
     /// prompt↔send correlation — it consumes no send slot and advances no counter
@@ -3983,7 +4092,13 @@ fn classify_turns_by_provenance(
         .iter()
         .copied()
         .map(|turn| match turn {
-            switchboard_harness::Turn::Agent { .. } => TurnRender::Agent(pending_send.take()),
+            switchboard_harness::Turn::Agent { .. } => {
+                let send_id = pending_send.take();
+                TurnRender::Agent {
+                    correlation: send_id.map(|_| SendCorrelation::Positional),
+                    send_id,
+                }
+            }
             switchboard_harness::Turn::System { .. } => TurnRender::SystemMarker,
             switchboard_harness::Turn::User {
                 started_at, source, ..
@@ -4049,7 +4164,10 @@ fn classify_turns_by_count(
                     None
                 };
                 agent_seen += 1;
-                TurnRender::Agent(send_id)
+                TurnRender::Agent {
+                    correlation: send_id.map(|_| SendCorrelation::Positional),
+                    send_id,
+                }
             }
             switchboard_harness::Turn::User { .. } => {
                 let imported = if agent_seen < agent_turn_count {
@@ -4194,7 +4312,10 @@ fn classify_agent_turns(
                     });
                     let already_claimed = claimed.contains(&send_id);
                     if window_ok && !already_claimed {
-                        renders[i] = TurnRender::Agent(Some(send_id));
+                        renders[i] = TurnRender::Agent {
+                            send_id: Some(send_id),
+                            correlation: Some(SendCorrelation::DurableLink),
+                        };
                         resolved[i] = true;
                         claimed.insert(send_id);
                         if let Some(pi) = paired_prompt {
@@ -4552,12 +4673,16 @@ fn merge_project_conversation(
                         continuation_of,
                         ..
                     },
-                    TurnRender::Agent(send_id),
+                    TurnRender::Agent {
+                        send_id,
+                        correlation: send_correlation,
+                    },
                 ) => {
                     items.push(ConversationItem::AgentTurn {
                         turn_id,
                         agent_id: a_id,
                         send_id,
+                        send_correlation,
                         started_at,
                         ended_at,
                         status,
@@ -5405,6 +5530,106 @@ mod tests {
             emitter.clone() as Arc<dyn EventEmitter>,
         );
         (tmp, state, emitter)
+    }
+
+    #[tokio::test]
+    async fn message_pins_persist_idempotently_without_message_content() {
+        let (tmp, state, _) = fresh_state_with_mock();
+        init_directory_impl(&state, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let project = create_project_in_only_dir(&state, "alpha");
+
+        assert!(
+            list_message_pins_impl(&state, project.id)
+                .unwrap()
+                .is_empty()
+        );
+        let first = set_message_pin_impl(&state, project.id, "user:send:one", true).unwrap();
+        assert_eq!(first.len(), 1);
+        let duplicate = set_message_pin_impl(&state, project.id, "user:send:one", true).unwrap();
+        assert_eq!(duplicate, first);
+
+        let two = set_message_pin_impl(&state, project.id, "agent:send:one:alice", true).unwrap();
+        assert_eq!(two.len(), 2);
+        let remaining = set_message_pin_impl(&state, project.id, "user:send:one", false).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].key, "agent:send:one:alice");
+        assert_eq!(
+            list_message_pins_impl(&state, project.id).unwrap(),
+            remaining
+        );
+
+        let stored =
+            std::fs::read_to_string(lock(&state.projects).get(&project.id).unwrap().pins_path())
+                .unwrap();
+        let record: serde_json::Value = serde_json::from_str(stored.trim()).unwrap();
+        assert_eq!(record.as_object().unwrap().len(), 2);
+        assert_eq!(record["key"], "agent:send:one:alice");
+        assert!(record["pinned_at"].is_string());
+    }
+
+    #[tokio::test]
+    async fn message_pin_identity_migrates_atomically_and_preserves_timestamp() {
+        let (tmp, state, _) = fresh_state_with_mock();
+        init_directory_impl(&state, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let project = create_project_in_only_dir(&state, "alpha");
+
+        let original = set_message_pin_impl(&state, project.id, "agent:send:one:alice", true)
+            .unwrap()
+            .remove(0);
+        let migrated = migrate_message_pin_impl(
+            &state,
+            project.id,
+            "agent:send:one:alice",
+            "agent:hydration:alice:message-one",
+        )
+        .unwrap();
+
+        assert_eq!(migrated.len(), 1);
+        assert_eq!(migrated[0].key, "agent:hydration:alice:message-one");
+        assert_eq!(migrated[0].pinned_at, original.pinned_at);
+        assert_eq!(
+            list_message_pins_impl(&state, project.id).unwrap(),
+            migrated
+        );
+    }
+
+    #[tokio::test]
+    async fn message_pin_removal_deletes_all_identity_keys_atomically() {
+        let (tmp, state, _) = fresh_state_with_mock();
+        init_directory_impl(&state, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let project = create_project_in_only_dir(&state, "alpha");
+        set_message_pin_impl(&state, project.id, "agent:send:one:alice", true).unwrap();
+        set_message_pin_impl(
+            &state,
+            project.id,
+            "agent:hydration:alice:message-one",
+            true,
+        )
+        .unwrap();
+        set_message_pin_impl(&state, project.id, "user:send:keep", true).unwrap();
+
+        let remaining = remove_message_pins_impl(
+            &state,
+            project.id,
+            &[
+                "agent:send:one:alice".to_owned(),
+                "agent:hydration:alice:message-one".to_owned(),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].key, "user:send:keep");
+        assert_eq!(
+            list_message_pins_impl(&state, project.id).unwrap(),
+            remaining
+        );
     }
 
     /// Like `fresh_state_with_mock` but every harness adapter runs the given
@@ -13703,6 +13928,61 @@ mod tests {
         );
         // reply1→s1, spurious→None, reply2→s2 — by KEY, not shifted by the spurious.
         assert_eq!(agent_send_ids(&merged), vec![Some(s1), None, Some(s2)]);
+        let correlations: Vec<Option<SendCorrelation>> = merged
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                ConversationItem::AgentTurn {
+                    send_correlation, ..
+                } => Some(*send_correlation),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            correlations,
+            vec![
+                Some(SendCorrelation::DurableLink),
+                None,
+                Some(SendCorrelation::DurableLink)
+            ]
+        );
+    }
+
+    #[test]
+    fn merge_local_command_compatibility_response_falls_back_to_position() {
+        // Claude persists a headless local-command response as system records,
+        // not a user/assistant pair. Pre-escape Switchboard journals linked the
+        // live synthetic message.id, while the only stable disk identity is the
+        // output record's different uuid. The incompatible link is ignored and
+        // the promptless response pairs positionally with the journaled send.
+        let agent = Uuid::now_v7();
+        let send = Uuid::now_v7();
+        let journal = vec![
+            send_record(send, Uuid::now_v7(), agent, "/plugin", 1),
+            link_record(send, agent, "synthetic-message-id", 3),
+        ];
+        let turns = vec![agent_turn_keyed(
+            Uuid::now_v7(),
+            agent,
+            "/plugin isn't available in this environment.",
+            3,
+            "disk-output-id",
+        )];
+
+        let merged = merge_project_conversation(journal, vec![(agent, transcript_of(turns), None)]);
+
+        assert_eq!(user_texts(&merged), vec!["/plugin"]);
+        assert_eq!(agent_send_ids(&merged), vec![Some(send)]);
+        assert!(matches!(
+            merged.items.as_slice(),
+            [
+                ConversationItem::UserMessage { .. },
+                ConversationItem::AgentTurn {
+                    send_correlation: Some(SendCorrelation::Positional),
+                    ..
+                }
+            ]
+        ));
     }
 
     #[test]

@@ -9,5 +9,6 @@ pub(crate) const REGISTRY_FILE: &str = "registry.jsonl";
 pub(crate) const PROJECTS_INDEX: &str = "projects.jsonl";
 pub(crate) const PROJECTS_DIR: &str = "projects";
 pub(crate) const JOURNAL_FILE: &str = "journal.jsonl";
+pub(crate) const PINS_FILE: &str = "pins.jsonl";
 pub(crate) const ATTACHMENTS_DIR: &str = "attachments";
 pub(crate) const RUNS_DIR: &str = "runs";

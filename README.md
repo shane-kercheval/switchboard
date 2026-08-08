@@ -14,7 +14,18 @@ It's built for anyone who wants explicit, human-in-the-loop control over multi-a
 
 ![Git view](docs/images/git-view.png)
 
-Switchboard also has a **Git view** which is a simple read-only view of your Git repositories.
+Switchboard also has a **Git view** for reviewing repositories, changed files, diffs, and commit history without leaving the app. It is deliberately read-only: Switchboard does not stage files, create commits, or replace a full Git client.
+
+## Features
+
+- **Work with multiple CLI agents in one project.** Run any combination of the supported Claude Code, Codex, Gemini, and Antigravity sessions while keeping each agent's conversation and status visible.
+- **Fan-out and fan-in.** Send one request to several agents in parallel, then forward one or more responses into the next message — or let a workflow wait for them, combine them, and send the result onward — without copying and pasting between terminals.
+- **Group agents into transcript panes.** Keep implementers, reviewers, or other roles together, target the group as one recipient, and hide or solo agents when you need a quieter view.
+- **Use one prompt library across your agent CLIs.** Choose parameterized prompts from the built-in library, local files, or HTTP MCP prompt servers; Switchboard centrally resolves and renders them for whichever agents you select.
+- **Run reusable multi-agent workflows.** Built-in and user-authored workflows can route prompts, run agents in parallel, wait for their responses, combine the results, and pass them to the next agent.
+- **Keep important messages beside the transcript.** Pin complete messages in the sidebar so you can refer to them while working elsewhere, then jump back to their original location when needed.
+- **Search and navigate long conversations.** Search message text across agents, filter by role or pinned status, preview results, and jump back to a result when its agent is visible in a pane.
+- **Keep track of work across projects.** The project list shows which projects are still running, marks background work when it finishes, and lets you jump directly to newly completed work you haven't viewed.
 
 ## Install
 
@@ -58,22 +69,37 @@ Switchboard removes the coordination overhead while keeping the human in the loo
 
 The goal isn't to give the AI a task and review what it produced. It's to stay in the decisions that matter — is this plan good enough to implement? which review feedback is worth acting on? — while automating the mechanical routing in between. Switchboard is the coordination layer; you're still the one making the calls.
 
-There is also a quieter benefit: because Switchboard resolves prompts itself and sends agents plain text, your prompt library lives in one place and works identically across all your agents — without configuring the prompt source in each harness. Especially useful for CLIs with limited MCP prompt support, like Codex.
+## Coordinating agents
 
-## Core ideas
+A fan-out sends one instruction to several agents so they can work independently — for example, asking multiple reviewers to assess the same plan or diff. A fan-in brings their work back together: select one or more agent responses as sources for a new message, or use a workflow to wait for every reviewer, combine their responses, and pass the result to another agent.
 
-- **Project**: a workspace containing related agents working toward a shared goal (a feature, a refactor, a document).
-- **Agent**: a named agent session within a project, backed by one of the supported CLIs.
-- **Workflow**: a reusable, parameterized routing template — for example "fan-out review and aggregate" — defined as a YAML file and invoked by name.
-- **Routing**: message passing between agents, optionally wrapped in a prompt template, with support for fan-out (one to many) and fan-in (many to one).
+Forwarding uses the agents' actual responses and clearly labels each source for the recipient. If a selected agent is still working, Switchboard holds the dependent message until the response is ready. You can add your own instructions or apply a prompt while forwarding, so the handoff can say what the next agent should do with the supplied material rather than merely pasting it into a new terminal.
+
+Panes make that routing easy to see. You can keep agents with related roles together and address the pane as a group, while every agent remains an independent session that can also be targeted directly.
+
+## Prompts and workflows
+
+Prompts are reusable, optionally parameterized text templates. They can come from Switchboard's built-in library, local files, or an HTTP MCP prompt server. The compose bar presents the prompt's arguments as fields, lets you preview the rendered result, and centrally resolves the same template for every supported agent CLI. Your prompt library therefore needs to be configured only once, including for CLIs with limited native MCP prompt support.
+
+Add an HTTP MCP prompt server under Settings → **Add MCP server**. For example, you can add [Tiddly](https://tiddly.me) by pasting a Tiddly access token as the bearer; tokens are stored in your OS keychain. Stdio MCP servers and a one-click Tiddly login are planned but not currently supported.
+
+Workflows record routing patterns you otherwise repeat by hand: send a prompt to several agents, wait for them, aggregate their responses, and hand the result to the next agent. Switchboard includes built-in workflows, and you can copy or write personal YAML workflows that are available in every project on this Mac. The invocation form shows what a workflow will do and lets you bind its agent roles; while it runs, the compose area shows the current step and what remains.
+
+## Transcripts, search, and pins
+
+Switchboard combines each project's agent sessions into one chronological transcript while preserving agent attribution, tool calls, reasoning, failures, cancellations, and context-compaction boundaries. Compact mode keeps routine detail out of the way without removing it from the history.
+
+Press ⌘F to search message text across the project, filter by role or pinned status, and preview a result before jumping to it. Selecting a result whose agent is visible in a pane reveals that pane, scrolls to the message, and expands it when necessary. Messages from eye-hidden or unassigned agents remain searchable but cannot be jumped to until the agent is visible in a pane.
+
+Pins are for messages you need to keep reading, not just bookmarks. A pinned message appears in full in the sidebar, where it can remain visible while you work elsewhere in the transcript. Jumping from a pin scrolls the transcript to the original message. Pins can also be added or filtered from search.
 
 ## Transcript panes
 
 By default a project shows one unified transcript of all its agents. You can split it into side-by-side panes — for example reviewers on the left, the implementer on the right — where each pane shows only its agents' conversation.
 
-- **Create a pane** (the part that isn't obvious): hover over an agent in the agents sidebar, open its **⋯ actions menu**, and choose **"Move to new pane."** There's no standalone split button — a pane is created by moving an agent into it. The same menu moves agents between existing panes. Needs at least two agents and enough window width (each pane has a minimum width).
+- **Create and populate a pane**: click the **+** button in the project header to add an empty pane, then use an agent's **⋯ actions menu** to move it into that pane. **Move to new pane** creates and populates one in a single action. On the first split from the default unified view, if the compose bar targets only a subset of agents, the original pane keeps that subset and the other agents become unassigned; otherwise its membership stays unchanged.
 - **Send to a pane**: click a pane's header (or ⌘-click anywhere in it, type `@panename` in the composer, or press ⌘⌥1–9) to make that pane's agents the message recipients. The targeted pane shows a green ring — your draft goes exactly to the agents inside it. Hold ⌘ to preview which pane a click would target.
-- **Rename / resize / close**: panes rename from the pencil icon in their header, resize by dragging the divider between them, and close from the ✕ — closing merges its agents into the neighboring pane, and moving everyone back into one pane restores the unified view.
+- **Rename / resize / close**: panes rename from the pencil icon in their header and resize by dragging the divider between them. Closing a pane leaves its agents unassigned and stops targeting them, but the agents keep working. Choose **Return to unified view** from a pane's menu to show every agent together again.
 - **Hide agents**: the eye icon on an agent's sidebar card hides its messages without removing it (⌥-click to solo it — show only that agent in its pane). Hidden agents still receive messages you send them; the recipient chip shows a warning when you're about to message a hidden agent.
 
 The layout (panes, names, widths, hidden agents) is remembered per project on this machine.
@@ -86,9 +112,9 @@ The layout (panes, names, widths, hidden agents) is remembered per project on th
 - Cross-session persistent agent memory. Possibly a future addition; not in scope for v1.
 - A hosted / SaaS service. Switchboard runs locally on your machine. A future hosted service may exist for cross-machine sync of workflows and prompts; that is not v1.
 
-## Harness support and limitations
+## Agent CLI support and limitations
 
-Switchboard drives each agent through its own CLI, so it inherits that CLI's capabilities — and a few per-harness limitations are worth knowing up front:
+Switchboard drives each agent through its own CLI, so it inherits that CLI's capabilities — and a few CLI-specific limitations are worth knowing up front:
 
 - **Model selection.** Claude Code, Codex, and Gemini let Switchboard choose the model per agent — pick it when you create the agent, or change it later from the agent's actions menu; the transcript records the model each past turn actually ran on. **Antigravity does not** — its CLI exposes no model option, so Antigravity agents run on whatever model you've selected inside Antigravity itself, and Switchboard can't change it per agent (the sidebar shows the model it observes Antigravity using).
 - **Reasoning effort.** Claude Code and Codex let Switchboard set the reasoning-effort level per agent (alongside the model). **Gemini does not** — Gemini exposes reasoning effort only through its own config, not a per-run option, so Switchboard can't set it; Gemini agents use whatever Gemini's config specifies. For **Antigravity**, effort is part of the model name you pick inside Antigravity, so it follows the same limitation as model selection above.
@@ -96,8 +122,9 @@ Switchboard drives each agent through its own CLI, so it inherits that CLI's cap
 - **The highest Codex effort levels need a GPT-5.6 model.** The `Max` and `Ultra` reasoning-effort levels work on the GPT-5.6 family (Sol, Terra, Luna); older models such as GPT-5.5 top out at `XHigh`. Selecting a higher level on an older model fails the turn with Codex's own message listing the levels that model supports — switch the model or lower the effort and resend.
 - **Gemini isn't added to new projects by default.** Gemini is no longer available on individual plans, so a new project starts with a Claude Code, Codex, and Antigravity agent but not a Gemini one. Gemini is still fully supported — if you have access, add a Gemini agent yourself from the "Add agent" dialog.
 - **Antigravity and hidden folders.** Antigravity can't work in a project whose path contains a hidden (dot-prefixed) folder — for example anything under `~/.config/…`. The agent still runs but can't see your files. Keep projects under normal paths like `~/repos/…`.
-- **Picking up terminal-continued sessions.** If you continue a session in the harness's own terminal (outside Switchboard) and then switch back to that project, **Claude Code** agents pick up the new turns automatically. **Codex, Gemini, and Antigravity don't yet** — their history updates only on the next full reload. (This refresh happens on project switch-back, not while you stay inside a project.)
-- **Prompts work across every harness.** Switchboard resolves prompts itself and sends each agent plain text, so a prompt library — local files or any MCP prompt server you add in Settings — works identically with Claude Code, Codex, Gemini, and Antigravity, with no per-CLI setup. This is especially useful for Codex and Gemini, whose native MCP-prompt support is limited. Add an MCP prompt server (e.g. [Tiddly](https://tiddly.me) — paste a Tiddly access token as the bearer) under Settings → "Add MCP server"; tokens are stored in your OS keychain. (HTTP MCP servers only for now; stdio servers and a one-click Tiddly login are planned.)
+- **Some messages can't be pinned.** Switchboard disables Pin when a message has no identity that survives reopening rather than risk attaching the pin to a different message. This includes some imported history and every Antigravity reply. A newly completed Gemini reply becomes pinnable after you reopen Switchboard and its session history is loaded. User messages sent through Switchboard can still be pinned.
+- **Picking up terminal-continued sessions.** If you continue a session in the agent CLI's own terminal, **Claude Code** picks up the new turns when you switch back to the project. **Codex, Gemini, and Antigravity don't yet** — reopen Switchboard to load their updated history.
+- **Slash-leading prompts can retain CLI command behavior.** Switchboard centrally resolves and renders the same prompt for each selected agent, but Gemini still processes recognized slash-leading text as native commands. Avoid slash-leading prompt bodies when they must behave the same across agent CLIs.
 
 ## Design and discussion
 

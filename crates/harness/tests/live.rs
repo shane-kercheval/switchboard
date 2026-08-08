@@ -1080,6 +1080,125 @@ async fn live_claude_dash_leading_prompt_completes() {
     );
 }
 
+#[tokio::test]
+#[ignore = "requires claude installed — run with: make test-live-claude"]
+async fn live_claude_unescaped_plugin_is_still_a_zero_turn_synthetic_command() {
+    // Negative control for the adapter workaround below. If Claude stops
+    // intercepting a bare slash-leading positional, this test fails and tells us
+    // the transport-only space may no longer be necessary.
+    let mut command = tokio::process::Command::new("claude");
+    command
+        .args([
+            "-p",
+            "--output-format",
+            "stream-json",
+            "--include-partial-messages",
+            "--verbose",
+            "--dangerously-skip-permissions",
+            "--session-id",
+            &Uuid::now_v7().to_string(),
+            "--",
+            "/plugin",
+        ])
+        .current_dir("/tmp")
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(std::time::Duration::from_secs(30), command.output())
+        .await
+        .expect("bare /plugin probe timed out")
+        .expect("claude should run");
+    assert!(
+        output.status.success(),
+        "bare /plugin probe failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let records: Vec<serde_json::Value> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    assert!(records.iter().any(|record| {
+        record.get("type").and_then(serde_json::Value::as_str) == Some("assistant")
+            && record
+                .pointer("/message/model")
+                .and_then(serde_json::Value::as_str)
+                == Some("<synthetic>")
+            && record
+                .pointer("/message/content")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|blocks| {
+                    blocks.iter().any(|block| {
+                        block.get("type").and_then(serde_json::Value::as_str) == Some("text")
+                            && block
+                                .get("text")
+                                .and_then(serde_json::Value::as_str)
+                                .is_some_and(|text| !text.is_empty())
+                    })
+                })
+    }));
+    assert!(records.iter().any(|record| {
+        record.get("type").and_then(serde_json::Value::as_str) == Some("result")
+            && record.get("num_turns").and_then(serde_json::Value::as_u64) == Some(0)
+            && record.get("is_error").and_then(serde_json::Value::as_bool) == Some(false)
+            && record
+                .get("modelUsage")
+                .and_then(serde_json::Value::as_object)
+                .is_some_and(serde_json::Map::is_empty)
+    }));
+    assert!(!records.iter().any(|record| {
+        record.get("type").and_then(serde_json::Value::as_str) == Some("assistant")
+            && record
+                .pointer("/message/model")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|model| model != "<synthetic>")
+    }));
+}
+
+#[tokio::test]
+#[ignore = "requires claude installed — run with: make test-live-claude"]
+async fn live_claude_slash_leading_prompt_reaches_model() {
+    // Claude 2.1.223 routes a bare `/plugin` positional through its local command
+    // parser and emits a zero-token `<synthetic>` response. The adapter's single
+    // transport-only leading space must keep an ordinary Switchboard message on
+    // the model path. This is a real-CLI drift guard because fixture tests can
+    // prove our argv shape but not Anthropic's parsing behavior.
+    let adapter = ClaudeCodeAdapter::new();
+    let agent = live_agent();
+    let events: Vec<AdapterEvent> = adapter
+        .dispatch(
+            &agent,
+            Path::new("/tmp"),
+            "/plugin",
+            Uuid::now_v7(),
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("dispatch should succeed with a slash-leading prompt")
+        .collect()
+        .await;
+
+    let text: String = events
+        .iter()
+        .filter_map(|event| match event {
+            AdapterEvent::ContentChunk { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !text.trim().is_empty(),
+        "bare slash-leading prompt must produce a model response"
+    );
+    assert!(matches!(
+        events
+            .iter()
+            .find(|event| matches!(event, AdapterEvent::TurnEnd { .. })),
+        Some(AdapterEvent::TurnEnd {
+            outcome: TurnOutcome::Completed,
+            model: Some(_),
+            ..
+        })
+    ));
+}
+
 // --- Codex live tests ---
 
 fn live_codex_agent() -> AgentRecord {

@@ -76,6 +76,7 @@ export function transcriptReducer(
           turn_id: input.turn_id,
           agent_id: agentId,
           send_id: sendId,
+          send_correlation: sendId === undefined ? undefined : "live",
           started_at: input.started_at,
           status: "streaming",
           items: [],
@@ -505,6 +506,10 @@ function resolveTurnCollision(
   return {
     ...winner,
     send_id: winner.send_id ?? loser.send_id,
+    send_correlation:
+      winner.send_correlation === "live" || loser.send_correlation === "live"
+        ? "live"
+        : (winner.send_correlation ?? loser.send_correlation),
     ended_at: winner.ended_at ?? loser.ended_at,
     usage: winner.usage ?? loser.usage,
     spend: winner.spend ?? loser.spend,
@@ -531,6 +536,7 @@ function loadedTurnToTurn(t: LoadedTurn): Turn {
     turn_id: t.turn_id,
     agent_id: t.agent_id,
     send_id: t.send_id ?? undefined,
+    send_correlation: t.send_correlation ?? undefined,
     started_at: t.started_at,
     ended_at: t.ended_at ?? undefined,
     status: t.status,

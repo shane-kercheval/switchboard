@@ -1,10 +1,9 @@
 <script lang="ts">
   import { tick, untrack } from "svelte";
-  import type { AgentRecord, Attachment, ConversationItem, ProjectId } from "$lib/types";
+  import type { AgentRecord, ConversationItem, ProjectId } from "$lib/types";
   import { HEARTBEAT_TIMEOUT_MS } from "$lib/types";
-  import { cn, formatDuration } from "$lib/utils";
+  import { cn, formatDuration, isIsoTimestampAfter } from "$lib/utils";
   import { createPinTracker, type ScrollGeometry } from "$lib/scrollPin";
-  import { convertFileSrc } from "@tauri-apps/api/core";
   import {
     ChevronRight,
     ChevronsDownUp,
@@ -12,6 +11,7 @@
     Columns2,
     CornerUpRight,
     MessagesSquare,
+    Pin,
     Send,
     SquareSlash,
     Workflow,
@@ -46,6 +46,7 @@
   import { shortcut } from "$lib/platform";
   import { HARNESS_COLOR } from "$lib/harnessDisplay";
   import Badge from "$lib/components/ui/Badge.svelte";
+  import AgentMessageBody from "$lib/components/AgentMessageBody.svelte";
   import CompactionMarker from "$lib/components/CompactionMarker.svelte";
   import HarnessIcon from "$lib/components/ui/HarnessIcon.svelte";
   import Markdown from "$lib/components/ui/Markdown.svelte";
@@ -54,9 +55,8 @@
   import Spinner from "$lib/components/ui/Spinner.svelte";
   import StatusChip from "$lib/components/ui/StatusChip.svelte";
   import StopIcon from "$lib/components/ui/StopIcon.svelte";
-  import ToolCallWidget from "$lib/components/ToolCallWidget.svelte";
+  import UserMessageBody from "$lib/components/UserMessageBody.svelte";
   import { consumeJump, jumpRequest } from "$lib/state/transcriptJump.svelte";
-  import ThinkingWidget from "$lib/components/ThinkingWidget.svelte";
   import ErrorDetailsDialog from "$lib/components/ui/ErrorDetailsDialog.svelte";
   import Button from "$lib/components/ui/Button.svelte";
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
@@ -66,6 +66,18 @@
     stateFor,
     toggleKey,
   } from "$lib/state/transcriptPreview.svelte";
+  import {
+    messageIdentityForRow,
+    type MessageIdentity,
+    type PinnableMessageIdentity,
+  } from "$lib/messageIdentity";
+  import {
+    isMessagePinned,
+    loadMessagePins,
+    pinsLoaded,
+    pinsUnavailableReason,
+    toggleMessagePin,
+  } from "$lib/state/messagePins.svelte";
 
   type AgentTurn = Extract<Turn, { role: "agent" }>;
   type NonUserRow = Exclude<UnifiedRow, { kind: "user" }>;
@@ -108,6 +120,10 @@
     /// (`transcriptJump.svelte.ts`). Absent → this instance ignores jumps.
     paneId?: string;
   } = $props();
+
+  $effect(() => {
+    void loadMessagePins(projectId);
+  });
 
   /// Roster agents whose *own* history failed to load (the per-agent
   /// `hydration_error`), independent of the whole-project load. Surfaced as
@@ -247,60 +263,6 @@
       .filter((entry) => entry.recipients.length > 0);
   });
 
-  /// The transcript recognizes a quoted block by matching the **canonical backend
-  /// wire shape** — a synchronized cross-language contract with the Rust emitters
-  /// (`crates/harness/src/forward.rs` `compose_forwarded_message` → `forwarded
-  /// from`; `crates/workflow/src/template.rs` `aggregated_responses` → `response
-  /// from`). Change a sentinel's wording on either side and both must change; these
-  /// comments are a signpost, **not enforcement**. (Follow-up for durable
-  /// enforcement: a shared fixture asserted by a Rust *and* a TS test, or structured
-  /// provenance replacing string-sniffing — deferred; string-matching is the
-  /// root-cause class of the B1 bug this fix addresses.)
-
-  /// Fast single-line gate: does the body contain any quoted block? Anchored (`/m`),
-  /// so no `/g` `lastIndex` state — used only to decide whether to take the banding
-  /// path. Broader than `FORWARD_SENTINEL` (the manual-forward marker, in
-  /// `heldForwards`): it also matches the `response from` aggregation shape.
-  const QUOTED_BLOCK_SENTINEL = /^=== START (?:forwarded|response) from .+ ===$/m;
-
-  /// One quoted block — `=== START (forwarded|response) from <agent> === … === END
-  /// … ===` — covering both a forwarded block (manual or workflow `forward_from`)
-  /// and a fan-in aggregation block (`aggregated_responses`). Captures the START
-  /// sentinel, the keyword, the agent, the inner content, and the END sentinel
-  /// separately so the sentinels can be styled while the content renders as
-  /// Markdown. Matched non-greedily so adjacent blocks don't merge; blocks don't
-  /// nest, so this is unambiguous. The END keyword and agent are backreferences to
-  /// the START (`\2`, `\3`), so a block only bands when its sentinels pair on both
-  /// — the canonical backend shapes always do; stray/pasted sentinel-looking text
-  /// won't mis-band (the backreferences match the captured text literally, so no
-  /// regex injection from agent names).
-  const QUOTED_BLOCK =
-    /(=== START (forwarded|response) from (.+?) ===)\n([\s\S]*?)\n(=== END \2 from \3 ===)/g;
-
-  type QuotedSegment =
-    | { kind: "text"; text: string }
-    | { kind: "quote"; start: string; inner: string; end: string };
-
-  /// Split a message body into ordered segments — the user's typed text (or a
-  /// rendered prompt) as `text`, each quoted block (forwarded or aggregated) as
-  /// `quote` — so the transcript can give *only the quoted portions* a style-only
-  /// band, leaving the user's own text plain. Text is kept verbatim (sentinels
-  /// included); only the blank-line separators between segments are trimmed.
-  function splitQuotedSegments(text: string): QuotedSegment[] {
-    const segments: QuotedSegment[] = [];
-    let last = 0;
-    for (const m of text.matchAll(QUOTED_BLOCK)) {
-      const idx = m.index ?? 0;
-      const between = text.slice(last, idx).replace(/^\n+|\n+$/g, "");
-      if (between !== "") segments.push({ kind: "text", text: between });
-      segments.push({ kind: "quote", start: m[1]!, inner: m[4]!, end: m[5]! });
-      last = idx + m[0].length;
-    }
-    const tail = text.slice(last).replace(/^\n+|\n+$/g, "");
-    if (tail !== "") segments.push({ kind: "text", text: tail });
-    return segments;
-  }
-
   /// Whether compact mode is on for the active project.
   const compactEnabled = $derived(stateFor(projectId).enabled);
 
@@ -328,17 +290,31 @@
     return colRows.some((r) => r.kind === "agent" && r.turn.items.length > 0);
   }
 
+  function userPreviewKey(rowKey: string): string {
+    return `user:${rowKey}`;
+  }
+
+  function agentPreviewKey(turnId: string): string {
+    return `agent:${turnId}`;
+  }
+
+  function fanoutPreviewKey(sendId: string, agentId: string): string {
+    return `fanout:${sendId}:${agentId}`;
+  }
+
   /// The render key for a turn — matches the key its render site uses, so
   /// `latestResponseKeys` membership lines up there. A turn whose send fans out
-  /// renders as a column (`fanout:…`); otherwise a standalone row.
+  /// renders as a column (`fanout:…`); otherwise a standalone row. The render
+  /// sites rely on the grouping invariant that a standalone row cannot also
+  /// belong to a fan-out block for the same send.
   function previewKeyForTurn(turn: AgentTurn): string {
     if (
       turn.send_id !== undefined &&
       blocks.some((b) => b.kind === "fanout" && b.send_id === turn.send_id)
     ) {
-      return `fanout:${turn.send_id}:${turn.agent_id}`;
+      return fanoutPreviewKey(turn.send_id, turn.agent_id);
     }
-    return `agent:${turn.turn_id}`;
+    return agentPreviewKey(turn.turn_id);
   }
 
   /// Preview keys of each agent's most-recent collapsible response. When compact,
@@ -354,7 +330,7 @@
       const turn = row.turn;
       const at = turn.ended_at ?? turn.started_at;
       const prev = latestPerAgent.get(turn.agent_id);
-      if (prev === undefined || at.localeCompare(prev.at) > 0) {
+      if (prev === undefined || isIsoTimestampAfter(at, prev.at)) {
         latestPerAgent.set(turn.agent_id, { at, key: previewKeyForTurn(turn) });
       }
     }
@@ -363,6 +339,10 @@
     for (const v of latestPerAgent.values()) keys.add(v.key);
     return keys;
   });
+
+  function responseDefaultCompact(key: string): boolean {
+    return compactEnabled && !latestResponseKeys.has(key);
+  }
 
   // No `content-visibility` containment on transcript blocks: render-windowing
   // (above) bounds the mounted set, so the off-screen-layout cost containment
@@ -417,15 +397,21 @@
     );
   }
 
+  function responseHasDataHidden(turn: AgentTurn, isLatestResponse: boolean): boolean {
+    return (
+      turnHasHiddenDetail(turn) ||
+      (isLatestResponse && answerTextOf(turn) !== lastAnswerTextOf(turn))
+    );
+  }
+
   /// Whether expanding a response would reveal more than its collapsed view, so a
   /// toggle is meaningful. A clipped preview hides tool calls / reasoning (and
   /// clips overflowing text — the `clipOverflow` half); the latest-response view
   /// is expanded by default, so its toggle means "collapse to the final answer
   /// block."
   function responseHasMore(turn: AgentTurn, key: string, isLatestResponse: boolean): boolean {
-    if (isLatestResponse)
-      return turnHasHiddenDetail(turn) || answerTextOf(turn) !== lastAnswerTextOf(turn);
-    if (turnHasHiddenDetail(turn)) return true;
+    if (responseHasDataHidden(turn, isLatestResponse)) return true;
+    if (isLatestResponse) return false;
     return clipOverflow[key] ?? false;
   }
 
@@ -562,6 +548,16 @@
     for (let i = colRows.length - 1; i >= 0; i--) {
       const r = colRows[i]!;
       if (r.kind === "agent") return r.turn.effort;
+    }
+    return undefined;
+  }
+
+  function columnMessageIdentity(colRows: NonUserRow[]): MessageIdentity | undefined {
+    for (let i = colRows.length - 1; i >= 0; i--) {
+      const row = colRows[i]!;
+      if (row.kind === "agent") {
+        return messageIdentityForRow(row, agentById[row.turn.agent_id]?.harness);
+      }
     }
     return undefined;
   }
@@ -978,7 +974,7 @@
 
   /// Navigator jump: bring one block to the top of this pane's view
   /// (`transcriptJump.svelte.ts` requests, addressed by pane). Execution lives
-  /// here because all three phases touch this component's private state:
+  /// here because all four phases touch this component's private state:
   /// (1) re-pin the window cursor so the target mounts — a *tail* window, so
   /// everything from the target down mounts, paying its markdown parse. The
   /// cursor only ever lowers (monotonic, floored at 0), so a jump costs
@@ -986,8 +982,11 @@
   /// something OLDER than the current top grows the window again — the cost is
   /// per-deeper-jump, not once per conversation. Accepted: the user explicitly
   /// asked to go there;
-  /// (2) after the flush, align the target block's top with the container top;
-  /// (3) adopt that position as the new anchor reference exactly the way
+  /// (2) after the flush, measure the compact unit and expand it only when the
+  /// compact rendering hides content;
+  /// (3) after any expansion flush, align the target block's top with the
+  /// container top;
+  /// (4) adopt that position as the new anchor reference exactly the way
   /// `reanchor` ends a pass — unpinned, gap captured — so the anchoring
   /// machinery defends the jumped-to position instead of snapping back.
   /// A consumed request can't linger: without consumption, a later remount of
@@ -1003,6 +1002,56 @@
     );
   }
 
+  /// Resolve a navigator row to the exact compact unit that owns it. Fan-out
+  /// responses share one scroll block, but each agent column keeps its own
+  /// expansion state, so selecting Bob's result must not open Alice's too.
+  function expansionTargetForRow(
+    block: RenderBlock,
+    key: string,
+  ): { key: string; defaultCompact: boolean; dataHidden: boolean } | null {
+    if (block.kind === "row") {
+      if (block.row.key !== key) return null;
+      if (block.row.kind === "user") {
+        return {
+          key: userPreviewKey(block.row.key),
+          defaultCompact: compactEnabled,
+          dataHidden: false,
+        };
+      }
+      if (block.row.kind === "agent" && isCollapsibleResponse(block.row.turn)) {
+        const previewKey = agentPreviewKey(block.row.turn.turn_id);
+        const latestResponse = latestResponseKeys.has(previewKey);
+        return {
+          key: previewKey,
+          defaultCompact: responseDefaultCompact(previewKey),
+          dataHidden: responseHasDataHidden(block.row.turn, latestResponse),
+        };
+      }
+      return null;
+    }
+    if (block.user.key === key) {
+      return {
+        key: userPreviewKey(block.user.key),
+        defaultCompact: compactEnabled,
+        dataHidden: false,
+      };
+    }
+    for (const col of block.columns) {
+      if (!col.rows.some((row) => row.kind === "agent" && row.key === key)) continue;
+      if (!isCollapsibleColumn(col.rows)) return null;
+      const previewKey = fanoutPreviewKey(block.send_id, col.agent_id);
+      const latestResponse = latestResponseKeys.has(previewKey);
+      return {
+        key: previewKey,
+        defaultCompact: responseDefaultCompact(previewKey),
+        dataHidden: col.rows.some(
+          (row) => row.kind === "agent" && responseHasDataHidden(row.turn, latestResponse),
+        ),
+      };
+    }
+    return null;
+  }
+
   let lastHandledJumpSeq = 0;
   $effect(() => {
     const seq = jumpRequest.seq;
@@ -1014,13 +1063,31 @@
     consumeJump(seq);
     const index = untrack(() => blocks.findIndex((block) => blockContainsRow(block, key)));
     if (index === -1) return; // stale key — the row was pruned since indexing
-    const targetKey = untrack(() => blockKey(blocks[index]!));
+    const targetBlock = untrack(() => blocks[index]!);
+    const targetKey = blockKey(targetBlock);
+    const expansionTarget = untrack(() => expansionTargetForRow(targetBlock, key));
     if (index < untrack(() => firstVisibleIndex)) {
       cursor = index;
       frozenIdentity = untrack(() => windowIdentity);
     }
-    void tick().then(() => {
-      if (!container) return;
+    void tick().then(async () => {
+      if (!container || lastHandledJumpSeq !== seq || jumpRequest.seq !== seq) return;
+      if (
+        expansionTarget !== null &&
+        untrack(() => isCompact(projectId, expansionTarget.key, expansionTarget.defaultCompact))
+      ) {
+        const unit = container.querySelector(
+          `[data-preview-key="${CSS.escape(expansionTarget.key)}"]`,
+        );
+        const clip = unit?.querySelector('[data-testid="preview-clip"]');
+        const proseOverflows =
+          clip instanceof HTMLElement && clip.scrollHeight - clip.clientHeight > 1;
+        if (expansionTarget.dataHidden || proseOverflows) {
+          setManyOverrides(projectId, [expansionTarget.key], false);
+          await tick();
+          if (!container || lastHandledJumpSeq !== seq || jumpRequest.seq !== seq) return;
+        }
+      }
       const el = container.querySelector(`[data-block-key="${CSS.escape(targetKey)}"]`);
       if (!(el instanceof HTMLElement)) return;
       const delta = el.getBoundingClientRect().top - container.getBoundingClientRect().top;
@@ -1123,17 +1190,7 @@
      closed is terminal — callers encode that via `live`, so they pass the
      effective value rather than the widget re-deriving a naive one. -->
 {#snippet turnItems(turn: AgentTurn, settled: boolean)}
-  {#each turn.items as item, i (i)}
-    {#if item.item_kind === "text"}
-      {#if item.kind === "thinking"}
-        <ThinkingWidget text={item.text} />
-      {:else}
-        <Markdown text={item.text} />
-      {/if}
-    {:else}
-      <ToolCallWidget tool={item} turnSettled={settled} />
-    {/if}
-  {/each}
+  <AgentMessageBody {turn} {settled} />
 {/snippet}
 
 <!-- `mode` selects how a response renders:
@@ -1198,9 +1255,6 @@
     <!-- This branch means the turn is not (streaming && live): it either ended
          or an outcome marker closed a streaming-on-disk turn — settled both ways. -->
     {@render turnItems(turn, true)}
-    {#if turn.status === "failed" && turn.error}
-      <div class="text-status-failed text-xs" data-testid="turn-error">{turn.error}</div>
-    {/if}
   {/if}
 {/snippet}
 
@@ -1327,7 +1381,7 @@
   <button
     type="button"
     data-layout-toggle
-    class="text-muted hover:text-fg hover:bg-control-hover inline-flex items-center gap-1 rounded-full border border-transparent px-2 py-0.5 text-xs opacity-0 transition-colors group-focus-within:opacity-100 group-hover:opacity-100"
+    class="text-muted hover:text-fg hover:bg-control-hover inline-flex items-center gap-1 rounded-full border border-transparent px-2 py-0.5 text-xs opacity-0 transition-colors group-hover:opacity-100 group-has-[:focus-visible]:opacity-100"
     data-testid="turn-preview-toggle"
     aria-label={label}
     onclick={() => toggleKey(projectId, key, defaultCompact)}
@@ -1350,7 +1404,7 @@
   {@const anyExpanded = entries.some((e) => !isCompact(projectId, e.key, e.defaultCompact))}
   {@const keys = entries.map((e) => e.key)}
   {@const label = anyExpanded ? "Collapse all responses above" : "Expand all responses above"}
-  <Tooltip {label} side="bottom">
+  <Tooltip {label} side="bottom" reopen="fresh-hover">
     {#snippet trigger(props)}
       <button
         {...props}
@@ -1385,6 +1439,7 @@
   effort = undefined,
   previewKey = undefined,
   previewDefaultCompact = false,
+  messageIdentity = undefined,
 }: {
   at: string;
   copyable?: string;
@@ -1396,9 +1451,10 @@
   effort?: string;
   previewKey?: string;
   previewDefaultCompact?: boolean;
+  messageIdentity?: MessageIdentity;
 })}
   <!-- Two zones on a flex row: cost/overage + expand/collapse toggle pinned LEFT, and
-       the hover-revealed model/timestamp/copy pinned RIGHT (`ml-auto`). The gap
+       the hover-revealed model/timestamp/pin/copy pinned RIGHT (`ml-auto`). The gap
        between them collapses first as the row narrows; then the right cluster's
        text wraps (model over timestamp) and truncates with `…`. The toggle and
        copy button are `shrink-0` — never squished. -->
@@ -1430,118 +1486,96 @@
       {/if}
     </div>
     <!-- Right: per-turn model/effort (history — what this turn actually ran on),
-         timestamp, and copy. Hover/focus-revealed. The text group wraps so a
+         timestamp, pin, and copy. Hover/keyboard-focus-revealed. The text group wraps so a
          narrow column stacks model over timestamp, and each line truncates with
-         `…` rather than squishing to more lines; the copy button sits OUTSIDE the
-         wrap (`shrink-0`) so it is never squished. -->
+         `…` rather than squishing to more lines; Pin and Copy form a tight,
+         non-shrinking action cluster separated from the text metadata. -->
     <div
-      class="ml-auto flex min-w-0 items-center gap-2 opacity-0 group-focus-within:opacity-100 group-hover:opacity-100"
+      class="ml-auto flex min-w-0 items-center gap-2 opacity-0 group-hover:opacity-100 group-has-[:focus-visible]:opacity-100"
+      data-testid="message-meta-details"
     >
-      <div class="flex min-w-0 flex-wrap items-center justify-end gap-x-2">
-        {#if model}
-          <span class="text-muted max-w-full truncate text-xs" data-testid="message-model"
-            >{model}</span
+      <div class="flex min-w-0 items-center gap-2">
+        <div class="flex min-w-0 flex-wrap items-center justify-end gap-x-2">
+          {#if model}
+            <span class="text-muted max-w-full truncate text-xs" data-testid="message-model"
+              >{model}</span
+            >
+          {/if}
+          {#if effort}
+            <span class="text-muted max-w-full truncate text-xs" data-testid="message-effort"
+              >{effort}</span
+            >
+          {/if}
+          {#if at}
+            <time
+              class="text-muted max-w-full truncate text-xs"
+              datetime={at}
+              title={at}
+              data-testid="message-time">{formatTime(at)}</time
+            >
+          {/if}
+        </div>
+      </div>
+      <div class="flex shrink-0 items-center gap-0" data-testid="message-meta-actions">
+        {#if messageIdentity?.kind === "pinnable" && pinsLoaded(projectId)}
+          {@const pinnableIdentity = messageIdentity as PinnableMessageIdentity}
+          {@const pinned = isMessagePinned(projectId, pinnableIdentity)}
+          <Tooltip
+            label={pinned ? "Unpin message" : "Pin message"}
+            side="bottom"
+            reopen="fresh-hover"
           >
+            {#snippet trigger(props)}
+              <button
+                {...props}
+                type="button"
+                class={cn(META_ICON_BUTTON, "shrink-0", pinned && "text-accent")}
+                aria-label={pinned ? "Unpin message" : "Pin message"}
+                aria-pressed={pinned}
+                data-testid="message-pin"
+                onclick={() => toggleMessagePin(projectId, pinnableIdentity)}
+              >
+                <Pin size={15} fill={pinned ? "currentColor" : "none"} aria-hidden="true" />
+              </button>
+            {/snippet}
+          </Tooltip>
+        {:else if messageIdentity !== undefined}
+          {@const unavailableReason =
+            messageIdentity.kind === "unsupported"
+              ? messageIdentity.reason
+              : pinsUnavailableReason(projectId)}
+          <Tooltip label={unavailableReason} side="bottom">
+            {#snippet trigger(props)}
+              <span
+                {...props}
+                class={cn(META_ICON_BUTTON, "text-muted/50 shrink-0")}
+                role="button"
+                aria-label={unavailableReason}
+                aria-disabled="true"
+                tabindex="0"
+                data-testid="message-pin-unavailable"
+              >
+                <Pin size={15} aria-hidden="true" />
+              </span>
+            {/snippet}
+          </Tooltip>
         {/if}
-        {#if effort}
-          <span class="text-muted max-w-full truncate text-xs" data-testid="message-effort"
-            >{effort}</span
-          >
-        {/if}
-        {#if at}
-          <time
-            class="text-muted max-w-full truncate text-xs"
-            datetime={at}
-            title={at}
-            data-testid="message-time">{formatTime(at)}</time
-          >
+        {#if copyable}
+          <span class="shrink-0">
+            <CopyButton text={copyable} {label} testid="message-copy" />
+          </span>
         {/if}
       </div>
-      {#if copyable}
-        <span class="shrink-0">
-          <CopyButton text={copyable} {label} testid="message-copy" />
-        </span>
-      {/if}
     </div>
   </div>
 {/snippet}
 
-{#snippet attachmentList(attachments: Attachment[])}
-  <div class="mt-1.5 flex flex-wrap gap-1.5" data-testid="user-attachments">
-    {#each attachments as attachment (attachment.path)}
-      {#if attachment.kind === "image"}
-        <!-- `convertFileSrc` turns the absolute staged path into an `asset://`
-             URL the webview can load (a raw filesystem path can't be an <img
-             src>); the asset protocol is enabled + scoped in tauri.conf.json. -->
-        <img
-          src={convertFileSrc(attachment.path)}
-          alt={attachment.original_name}
-          title={attachment.original_name}
-          data-testid={`attachment-thumb-${attachment.label}`}
-          class="border-border h-16 w-16 rounded-md border object-cover"
-        />
-      {:else}
-        <span
-          class="border-border bg-panel text-fg inline-flex max-w-[14rem] items-center gap-1.5 rounded-full border px-2 py-px text-xs"
-          data-testid={`attachment-file-${attachment.label}`}
-          data-kind={attachment.kind}
-        >
-          <svg
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="1.8"
-            stroke-linecap="round"
-            stroke-linejoin="round"
-            class="text-muted h-3.5 w-3.5 shrink-0"
-            aria-hidden="true"
-          >
-            <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z" />
-            <path d="M14 3v5h5" />
-          </svg>
-          <span class="truncate" title={attachment.original_name}>{attachment.original_name}</span>
-        </span>
-      {/if}
-    {/each}
-  </div>
-{/snippet}
-
 {#snippet userBody(row: Extract<UnifiedRow, { kind: "user" }>)}
-  {#if QUOTED_BLOCK_SENTINEL.test(row.text)}
-    <!-- Quoted blocks: give each forwarded (`forwarded from`) or aggregated
-         (`response from`) block — and only it — a style-only band so the quoted
-         agent output stands apart from the user's own typed text, which stays
-         plain. Text is verbatim — the `=== … ===` sentinels are kept. The turn's
-         `data-forwarded` marker stays forward-only (below); the band is purely
-         presentational and covers both shapes. -->
-    {#each splitQuotedSegments(row.text) as seg, i (i)}
-      {#if seg.kind === "quote"}
-        <!-- Border-only band: a neutral dark-gray left rule (the `muted` token —
-             not the harness-colored agent rules, not the accent green). Extra
-             `py` makes the rule extend past the text top/bottom, and `my` adds
-             separation between adjacent forwarded blocks. The `=== … ===`
-             sentinels render bold + monospace (verbatim, as plain text so the
-             `===` isn't parsed as Markdown); the content between renders as
-             Markdown. -->
-        <div class="border-muted my-3 border-l-2 pl-3" data-testid="quoted-block">
-          <div class="font-mono text-xs font-bold">{seg.start}</div>
-          <Markdown text={seg.inner} />
-          <div class="font-mono text-xs font-bold">{seg.end}</div>
-        </div>
-      {:else}
-        <Markdown text={seg.text} />
-      {/if}
-    {/each}
-  {:else}
-    <Markdown text={row.text} />
-  {/if}
-  {#if row.attachments.length > 0}
-    {@render attachmentList(row.attachments)}
-  {/if}
+  <UserMessageBody {row} />
 {/snippet}
 
 {#snippet userMessage(row: Extract<UnifiedRow, { kind: "user" }>)}
-  {@const key = `user:${row.key}`}
+  {@const key = userPreviewKey(row.key)}
   {@const defaultCompact = compactEnabled}
   {@const compact = isCompact(projectId, key, defaultCompact)}
   <!-- A user message has nothing hidden behind a collapse — only height — so it
@@ -1558,7 +1592,13 @@
   {@const forwarded = FORWARD_SENTINEL.test(row.text)}
   {@const caption =
     row.send_id !== undefined ? forwardCaptionFor(projectId, row.send_id) : undefined}
-  <div class="group min-w-0 flex-1" data-testid="turn" data-role="user" data-forwarded={forwarded}>
+  <div
+    class="group min-w-0 flex-1"
+    data-testid="turn"
+    data-role="user"
+    data-forwarded={forwarded}
+    data-preview-key={key}
+  >
     <div class="bg-focus-soft w-full max-w-full overflow-hidden rounded-xl px-4 py-2">
       <!-- Clip wraps the content inside the bubble (not the bubble itself). The
            clip + `measureClip` mount ONLY while compact (mirroring agent rows): on
@@ -1579,6 +1619,7 @@
       label: "Copy message",
       previewKey: showToggle ? key : undefined,
       previewDefaultCompact: defaultCompact,
+      messageIdentity: messageIdentityForRow(row),
     })}
     {#if caption !== undefined}
       <div class="text-muted mt-0.5 text-xs" data-testid="forward-caption">
@@ -1656,7 +1697,8 @@
   </div>
 {/snippet}
 
-{#snippet agentRow(turn: AgentTurn)}
+{#snippet agentRow(row: Extract<UnifiedRow, { kind: "agent" }>)}
+  {@const turn = row.turn}
   {@const harness = agentById[turn.agent_id]?.harness}
   {@const copyable = copyTextOf(turn, agentCopy.mode)}
   <!-- A non-completed Outcome marker (rendered as a sibling `outcomeRow`) is
@@ -1669,12 +1711,12 @@
        failed, cancelled, or dangling streaming-on-disk closed by a marker). Only
        a genuinely-live streaming turn is excluded — it uses the live-streaming cap. -->
   {@const previewEligible = isCollapsibleResponse(turn)}
-  {@const key = `agent:${turn.turn_id}`}
+  {@const key = agentPreviewKey(turn.turn_id)}
   {@const latestResponse = latestResponseKeys.has(key)}
-  {@const defaultCompact = compactEnabled && !latestResponse}
+  {@const defaultCompact = responseDefaultCompact(key)}
   {@const compact = previewEligible && isCompact(projectId, key, defaultCompact)}
   {@const showToggle = previewEligible && responseHasMore(turn, key, latestResponse)}
-  <div class="group space-y-1.5" data-testid="turn" data-role="agent">
+  <div class="group space-y-1.5" data-testid="turn" data-role="agent" data-preview-key={key}>
     <div class="flex items-center gap-2 text-xs font-semibold tracking-wide uppercase">
       <span class="text-fg" data-testid="turn-agent-name">{agentName(turn.agent_id)}</span>
       {#if harness}<HarnessIcon {harness} testid="turn-harness-icon" />{:else}<Badge>?</Badge>{/if}
@@ -1715,6 +1757,7 @@
       effort: turn.effort,
       previewKey: showToggle ? key : undefined,
       previewDefaultCompact: defaultCompact,
+      messageIdentity: messageIdentityForRow(row, agentById[turn.agent_id]?.harness),
     })}
   </div>
 {/snippet}
@@ -2049,14 +2092,14 @@
           {:else if block.row.kind === "system_marker"}
             {@render systemMarkerRow(block.row)}
           {:else}
-            {@render agentRow(block.row.turn)}
+            {@render agentRow(block.row)}
           {/if}
         {:else}
           {@const fanoutEntries = block.columns
             .filter((col) => isCollapsibleColumn(col.rows))
             .map((col) => {
-              const key = `fanout:${block.send_id}:${col.agent_id}`;
-              return { key, defaultCompact: compactEnabled && !latestResponseKeys.has(key) };
+              const key = fanoutPreviewKey(block.send_id, col.agent_id);
+              return { key, defaultCompact: responseDefaultCompact(key) };
             })}
           {@const fanoutCopyable = fanoutText(block.columns)}
           {@const fanoutLiveCap = !block.columns.some((col) => {
@@ -2087,10 +2130,10 @@
                    doubled `failed`). Safe per the single-(send_id, agent_id)
                    column invariant. -->
                   {@const colHasOutcome = col.rows.some((r) => r.kind === "outcome")}
-                  {@const colKey = `fanout:${block.send_id}:${col.agent_id}`}
+                  {@const colKey = fanoutPreviewKey(block.send_id, col.agent_id)}
                   {@const colEligible = isCollapsibleColumn(col.rows)}
                   {@const colLatestResponse = latestResponseKeys.has(colKey)}
-                  {@const colDefaultCompact = compactEnabled && !colLatestResponse}
+                  {@const colDefaultCompact = responseDefaultCompact(colKey)}
                   {@const colCompact =
                     colEligible && isCompact(projectId, colKey, colDefaultCompact)}
                   {@const colShowToggle =
@@ -2104,6 +2147,7 @@
                     data-testid="fanout-column"
                     data-role="agent"
                     data-agent-id={col.agent_id}
+                    data-preview-key={colKey}
                     data-state={state}
                   >
                     <div
@@ -2174,6 +2218,7 @@
                       effort: columnEffort(col.rows),
                       previewKey: colShowToggle ? colKey : undefined,
                       previewDefaultCompact: colDefaultCompact,
+                      messageIdentity: columnMessageIdentity(col.rows),
                     })}
                   </div>
                 {/each}

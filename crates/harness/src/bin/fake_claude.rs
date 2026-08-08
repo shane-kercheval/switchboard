@@ -7,7 +7,10 @@
 //! The adapter passes the prompt as the LAST argv entry (a positional after the
 //! `--` end-of-options separator, so a leading-dash prompt isn't misparsed). The
 //! fake binary mirrors that by treating the last arg as a path to a JSONL
-//! fixture file. Each non-empty, non-comment line is written to stdout verbatim.
+//! fixture file. The production adapter prefixes slash-leading model input with
+//! one transport-only space, so the fake strips that exact prefix before opening
+//! its absolute fixture path. Each non-empty, non-comment line is written to
+//! stdout verbatim.
 //!
 //! Special comment lines in the fixture (processed, never forwarded to stdout):
 //!   `// exit:<N>` — exit with code N instead of 0; stops line processing.
@@ -36,7 +39,9 @@ fn main() {
     // The adapter passes the prompt (here, the fixture path) as the LAST argv
     // entry, after a `--` separator. Mirror that by reading the last arg.
     let fixture_path = match args.last() {
-        Some(p) if args.len() >= 2 => p.clone(),
+        Some(p) if args.len() >= 2 => p
+            .strip_prefix(" /")
+            .map_or_else(|| p.to_owned(), |path| format!("/{path}")),
         _ => {
             eprintln!("fake_claude: expected fixture path as the last argument");
             process::exit(1);

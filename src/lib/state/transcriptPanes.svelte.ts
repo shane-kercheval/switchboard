@@ -106,6 +106,10 @@ function normalizeViewState(
     }
   }
   const max = typeof maximized === "string" && valid.has(maximized) ? maximized : null;
+  if (max !== null) {
+    const index = out.indexOf(max);
+    if (index !== -1) out.splice(index, 1);
+  }
   if (max === null && out.length >= panes.length && out.length > 0) out.pop();
   return { minimized: out, maximized: max };
 }
@@ -267,6 +271,28 @@ export function paneOfAgent(
 export function unassignedAgentIds(projectId: ProjectId, rosterIds: AgentId[]): AgentId[] {
   const assigned = layoutFor(projectId, rosterIds).panes.flatMap((p) => p.members);
   return rosterIds.filter((id) => !assigned.includes(id));
+}
+
+/// Place an unassigned agent into the oldest visible empty pane, if one exists.
+/// Pane order is creation order, so repeated additions fill waiting panes from
+/// left to right. A maximized pane is the only visible candidate while focus
+/// mode is active; minimized panes are never filled behind the user's back.
+export function assignAgentToFirstVisibleEmptyPane(
+  projectId: ProjectId,
+  rosterIds: AgentId[],
+  agentId: AgentId,
+): PaneId | null {
+  const layout = layoutFor(projectId, rosterIds);
+  if (layout.panes.some((pane) => pane.members.includes(agentId))) return null;
+  const destination =
+    layout.maximized === null
+      ? layout.panes.find(
+          (pane) => pane.members.length === 0 && !layout.minimized.includes(pane.id),
+        )
+      : layout.panes.find((pane) => pane.id === layout.maximized && pane.members.length === 0);
+  if (destination === undefined) return null;
+  moveAgentToPane(projectId, rosterIds, agentId, destination.id);
+  return destination.id;
 }
 
 function sameMembers(a: AgentId[], b: AgentId[]): boolean {
@@ -580,7 +606,13 @@ export function restorePane(projectId: ProjectId, rosterIds: AgentId[], paneId: 
 
 export function maximizePane(projectId: ProjectId, rosterIds: AgentId[], paneId: PaneId): void {
   update(projectId, rosterIds, (layout) =>
-    layout.panes.some((pane) => pane.id === paneId) ? { ...layout, maximized: paneId } : layout,
+    layout.panes.some((pane) => pane.id === paneId)
+      ? {
+          ...layout,
+          minimized: layout.minimized.filter((id) => id !== paneId),
+          maximized: paneId,
+        }
+      : layout,
   );
 }
 

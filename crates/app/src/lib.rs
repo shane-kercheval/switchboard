@@ -59,6 +59,7 @@ use crate::commands::{
     set_project_archived_impl, stage_attachment_impl, sync_prompts_and_notify, terminal_open_argv,
     test_mcp_connection_impl, tracked_repos_inputs, tracked_roots, validate_external_url,
 };
+use crate::error::AppError;
 use crate::preferences::Preferences;
 use crate::state::AppState;
 use crate::workflow_commands::{
@@ -83,6 +84,30 @@ use uuid::Uuid;
 /// install status on receipt — detection is only as good as the PATH behind it,
 /// and that PATH arrives asynchronously.
 const HARNESS_PATH_RESOLVED_EVENT: &str = "harness_path_resolved";
+
+/// Structured activation-command failure. The diagnostic remains separate
+/// from the discriminant so the frontend never infers recovery actions from
+/// user-facing prose. Unknown future variants must degrade to `other` on an
+/// older frontend, where destructive recovery stays unavailable.
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[non_exhaustive]
+enum ActivationCommandError {
+    ProjectNotLoaded { message: String },
+    ProjectLocked { message: String },
+    Other { message: String },
+}
+
+impl From<AppError> for ActivationCommandError {
+    fn from(error: AppError) -> Self {
+        let message = error.to_string();
+        match error {
+            AppError::ProjectNotLoaded(_) => Self::ProjectNotLoaded { message },
+            AppError::ProjectLocked(_) => Self::ProjectLocked { message },
+            _ => Self::Other { message },
+        }
+    }
+}
 
 /// Bridge the harness crate's PATH-revision stream to the frontend event.
 ///
@@ -521,15 +546,18 @@ async fn set_project_archived(
 async fn open_project(
     state: State<'_, AppState>,
     project_id: String,
-) -> Result<ProjectSummary, String> {
-    let id = parse_uuid(&project_id).map_err(|e| e.to_string())?;
-    open_project_impl(state.inner(), id).map_err(|e| e.to_string())
+) -> Result<ProjectSummary, ActivationCommandError> {
+    let id = parse_uuid(&project_id).map_err(ActivationCommandError::from)?;
+    open_project_impl(state.inner(), id).map_err(ActivationCommandError::from)
 }
 
 #[tauri::command]
-async fn set_active_project(state: State<'_, AppState>, project_id: String) -> Result<(), String> {
-    let id = parse_uuid(&project_id).map_err(|e| e.to_string())?;
-    set_active_project_impl(state.inner(), id).map_err(|e| e.to_string())
+async fn set_active_project(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<(), ActivationCommandError> {
+    let id = parse_uuid(&project_id).map_err(ActivationCommandError::from)?;
+    set_active_project_impl(state.inner(), id).map_err(ActivationCommandError::from)
 }
 
 #[tauri::command]
@@ -624,12 +652,12 @@ async fn reorder_agents(
 async fn list_agents(
     state: State<'_, AppState>,
     project_id: Option<String>,
-) -> Result<Vec<AgentRecord>, String> {
+) -> Result<Vec<AgentRecord>, ActivationCommandError> {
     let pid = match project_id {
-        Some(s) => Some(parse_uuid(&s).map_err(|e| e.to_string())?),
+        Some(s) => Some(parse_uuid(&s).map_err(ActivationCommandError::from)?),
         None => None,
     };
-    list_agents_impl(state.inner(), pid).map_err(|e| e.to_string())
+    list_agents_impl(state.inner(), pid).map_err(ActivationCommandError::from)
 }
 
 #[tauri::command]
@@ -1593,8 +1621,22 @@ pub fn run() {
 // builds; `cargo test --release` turns those off and the symbol away.
 #[cfg(all(test, debug_assertions))]
 mod tests {
-    use super::{debug_config_dir, run_open_argv};
+    use super::{ActivationCommandError, debug_config_dir, run_open_argv};
+    use crate::error::AppError;
     use std::path::PathBuf;
+    use uuid::Uuid;
+
+    #[test]
+    fn activation_command_errors_serialize_kind_separately_from_message() {
+        let error = ActivationCommandError::from(AppError::ProjectNotLoaded(Uuid::nil()));
+        let wire = serde_json::to_value(error).expect("activation error serializes");
+
+        assert_eq!(wire["type"], "project_not_loaded");
+        assert_eq!(
+            wire["message"],
+            format!("project {} is not loaded", Uuid::nil())
+        );
+    }
 
     #[test]
     fn override_dir_is_used_verbatim() {

@@ -9,6 +9,7 @@ import type { AgentRecord, ProjectListing } from "$lib/types";
 import ProjectsSidebar from "./ProjectsSidebar.svelte";
 import { workflowRuns, _testing as workflowsTesting } from "$lib/state/workflows.svelte";
 import type { WorkflowRunInfo } from "$lib/types";
+import { PROJECT_DELETE_TOOLTIP } from "$lib/projectDeletion";
 
 const invokeMock = vi.fn<(cmd: string, args?: Record<string, unknown>) => Promise<unknown>>(
   async () => undefined,
@@ -538,10 +539,10 @@ describe("ProjectsSidebar — delete", () => {
     expect(invokeMock).not.toHaveBeenCalledWith("delete_project", expect.anything());
   });
 
-  it("keeps hover-only project actions out of the tab order", async () => {
+  it("keeps project actions in the tab order", async () => {
     await renderWith([projectIn(A1, "alpha", "/work/a")]);
 
-    expect(screen.getByTestId("project-actions-trigger")).toHaveAttribute("tabindex", "-1");
+    expect(screen.getByTestId("project-actions-trigger")).not.toHaveAttribute("tabindex", "-1");
   });
 
   it("keeps the card highlighted and actions open while the menu is open", async () => {
@@ -656,8 +657,8 @@ describe("ProjectsSidebar — delete", () => {
     await fireEvent.click(screen.getByTestId("project-action-delete"));
     await fireEvent.click(screen.getByTestId("project-delete-confirm"));
 
-    const err = await screen.findByTestId("project-delete-error");
-    expect(err).toHaveTextContent("disk busy");
+    const ws = await loadWorkspace();
+    await waitFor(() => expect(ws.projectDeletions.errors[A1]).toBe("disk busy"));
     expect(screen.getByTestId("project-row")).toBeInTheDocument();
     await openProjectActions();
     expect(screen.getByTestId("project-action-delete")).toBeInTheDocument();
@@ -669,7 +670,7 @@ describe("ProjectsSidebar — delete", () => {
 
     expect(screen.getByTestId("project-action-delete")).toHaveAttribute(
       "title",
-      "Removes Switchboard's files for this project; your code and agent session files are kept. Works even if the project's folder no longer exists.",
+      `${PROJECT_DELETE_TOOLTIP} Works even if the project's folder no longer exists.`,
     );
   });
 
@@ -688,6 +689,26 @@ describe("ProjectsSidebar — delete", () => {
     await waitFor(() =>
       expect(invokeMock.mock.calls.some((c) => c[0] === "delete_project")).toBe(true),
     );
+  });
+
+  it("quick-deletes archived projects with pointer-leave reset and inline confirmation", async () => {
+    await renderWith([projectIn(A1, "alpha", "/work/a", true)]);
+    await fireEvent.click(screen.getByTestId("project-view-archived"));
+    const row = screen.getByTestId("project-row");
+
+    await fireEvent.click(screen.getByTestId("project-quick-delete"));
+    expect(screen.getByTestId("project-quick-delete-cancel")).toBeInTheDocument();
+    expect(screen.getByTestId("project-quick-delete-confirm")).toBeInTheDocument();
+    expect(invokeMock).not.toHaveBeenCalledWith("delete_project", expect.anything());
+
+    await fireEvent.pointerLeave(row);
+    expect(screen.getByTestId("project-quick-delete")).toBeInTheDocument();
+    expect(screen.queryByTestId("project-quick-delete-confirm")).not.toBeInTheDocument();
+
+    await fireEvent.click(screen.getByTestId("project-quick-delete"));
+    await fireEvent.click(screen.getByTestId("project-quick-delete-confirm"));
+    expect(invokeMock).toHaveBeenCalledWith("delete_project", { projectId: A1 });
+    await waitFor(() => expect(screen.queryByTestId("project-row")).not.toBeInTheDocument());
   });
 });
 

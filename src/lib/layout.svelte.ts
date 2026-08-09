@@ -1,11 +1,14 @@
+import type { ProjectId } from "$lib/types";
+
 /// Persisted app-layout preferences: sidebar widths + collapse state, the Git
 /// view's repository-pane width, and the diff panel's file-list width.
 ///
-/// **Global per device, not per project.** A sidebar's width expresses a fact
-/// about your monitor and reading preference — it means the same thing in every
-/// project, and making it per-project would reflow the whole app on every
-/// project switch. (Transcript pane *fractions* are per-project because pane
-/// membership is; see `state/transcriptPanes.svelte.ts`.)
+/// **Device-local, with explicit project-scoped preferences.** Sidebar widths
+/// and open state express facts about the device and mean the same thing in
+/// every project. The selected right-sidebar content and Pins ordering are
+/// keyed by project, however: switching projects restores how that project's
+/// right sidebar was last used. (Transcript pane *fractions* are also
+/// per-project because pane membership is; see `state/transcriptPanes.svelte.ts`.)
 ///
 /// Like the theme (`theme.svelte.ts`), this lives in `localStorage` rather than
 /// the git-trackable `config.yaml`: layout is a device-local appearance
@@ -30,6 +33,8 @@ export const AGENTS_SIDEBAR_DEFAULT_WIDTH = 240;
 export const PINS_SIDEBAR_DEFAULT_WIDTH = 360;
 export const GIT_REPO_DEFAULT_WIDTH = 360;
 export const DIFF_FILE_LIST_DEFAULT_WIDTH = 256;
+export const RIGHT_SIDEBAR_DEFAULT_MODE: RightSidebarMode = "agents";
+export const PINS_SORT_DEFAULT_MODE: PinsSortMode = "pinned_at";
 
 export const SIDEBAR_MIN_WIDTH = 200;
 export const SIDEBAR_MAX_WIDTH = 480;
@@ -77,13 +82,16 @@ function clampDiffFileListWidth(px: number): number {
 type SidebarLayout = { width: number; open: boolean };
 export type RightSidebarMode = "agents" | "pins";
 export type PinsSortMode = "pinned_at" | "message_at";
+type ProjectLayoutPreferences = {
+  rightSidebarMode?: RightSidebarMode;
+  pinsSortMode?: PinsSortMode;
+};
 
 type LayoutState = {
   projectsSidebar: SidebarLayout;
   agentsSidebar: SidebarLayout;
   pinsSidebarWidth: number;
-  rightSidebarMode: RightSidebarMode;
-  pinsSortMode: PinsSortMode;
+  projectPreferences: Record<ProjectId, ProjectLayoutPreferences>;
   gitRepoWidth: number;
   diffFileListWidth: number;
 };
@@ -93,11 +101,34 @@ function defaults(): LayoutState {
     projectsSidebar: { width: PROJECTS_SIDEBAR_DEFAULT_WIDTH, open: true },
     agentsSidebar: { width: AGENTS_SIDEBAR_DEFAULT_WIDTH, open: true },
     pinsSidebarWidth: PINS_SIDEBAR_DEFAULT_WIDTH,
-    rightSidebarMode: "agents",
-    pinsSortMode: "pinned_at",
+    projectPreferences: {},
     gitRepoWidth: GIT_REPO_DEFAULT_WIDTH,
     diffFileListWidth: DIFF_FILE_LIST_DEFAULT_WIDTH,
   };
+}
+
+function parseRightSidebarMode(value: unknown): RightSidebarMode | undefined {
+  if (value === "agents" || value === "pins") return value;
+  return undefined;
+}
+
+function parsePinsSortMode(value: unknown): PinsSortMode | undefined {
+  if (value === "pinned_at" || value === "message_at") return value;
+  return undefined;
+}
+
+function parseProjectPreferences(value: unknown): Record<ProjectId, ProjectLayoutPreferences> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return {};
+  return Object.fromEntries(
+    Object.entries(value).flatMap(([projectId, stored]) => {
+      if (projectId.length === 0 || stored === null || typeof stored !== "object") return [];
+      const raw = stored as { rightSidebarMode?: unknown; pinsSortMode?: unknown };
+      const rightSidebarMode = parseRightSidebarMode(raw.rightSidebarMode);
+      const pinsSortMode = parsePinsSortMode(raw.pinsSortMode);
+      if (rightSidebarMode === undefined && pinsSortMode === undefined) return [];
+      return [[projectId, { rightSidebarMode, pinsSortMode }]];
+    }),
+  );
 }
 
 function parseSidebar(value: unknown, fallback: SidebarLayout, maxWidth: number): SidebarLayout {
@@ -127,8 +158,7 @@ function readStored(): LayoutState {
       projectsSidebar?: unknown;
       agentsSidebar?: unknown;
       pinsSidebarWidth?: unknown;
-      rightSidebarMode?: unknown;
-      pinsSortMode?: unknown;
+      projectPreferences?: unknown;
       gitRepoWidth?: unknown;
       diffFileListWidth?: unknown;
     };
@@ -139,8 +169,7 @@ function readStored(): LayoutState {
         typeof v.pinsSidebarWidth === "number" && Number.isFinite(v.pinsSidebarWidth)
           ? clampSidebarWidth(v.pinsSidebarWidth, RIGHT_SIDEBAR_MAX_WIDTH)
           : base.pinsSidebarWidth,
-      rightSidebarMode: v.rightSidebarMode === "pins" ? "pins" : "agents",
-      pinsSortMode: v.pinsSortMode === "message_at" ? "message_at" : "pinned_at",
+      projectPreferences: parseProjectPreferences(v.projectPreferences),
       gitRepoWidth:
         typeof v.gitRepoWidth === "number" && Number.isFinite(v.gitRepoWidth)
           ? clampGitRepoWidth(v.gitRepoWidth)
@@ -202,18 +231,31 @@ export const layout = {
     state.pinsSidebarWidth = clampSidebarWidth(px, RIGHT_SIDEBAR_MAX_WIDTH);
     persist();
   },
-  get rightSidebarMode(): RightSidebarMode {
-    return state.rightSidebarMode;
+  rightSidebarModeFor(projectId: ProjectId): RightSidebarMode {
+    // The direct indexed read subscribes Svelte to an absent project key so
+    // the first project-specific write repaints its mounted consumers.
+    return state.projectPreferences[projectId]?.rightSidebarMode ?? RIGHT_SIDEBAR_DEFAULT_MODE;
   },
-  set rightSidebarMode(mode: RightSidebarMode) {
-    state.rightSidebarMode = mode;
+  setRightSidebarMode(projectId: ProjectId, mode: RightSidebarMode): void {
+    state.projectPreferences[projectId] = {
+      ...state.projectPreferences[projectId],
+      rightSidebarMode: mode,
+    };
     persist();
   },
-  get pinsSortMode(): PinsSortMode {
-    return state.pinsSortMode;
+  pinsSortModeFor(projectId: ProjectId): PinsSortMode {
+    return state.projectPreferences[projectId]?.pinsSortMode ?? PINS_SORT_DEFAULT_MODE;
   },
-  set pinsSortMode(mode: PinsSortMode) {
-    state.pinsSortMode = mode;
+  setPinsSortMode(projectId: ProjectId, mode: PinsSortMode): void {
+    state.projectPreferences[projectId] = {
+      ...state.projectPreferences[projectId],
+      pinsSortMode: mode,
+    };
+    persist();
+  },
+  removeProjectPreferences(projectId: ProjectId): void {
+    if (state.projectPreferences[projectId] === undefined) return;
+    delete state.projectPreferences[projectId];
     persist();
   },
   get gitRepoWidth(): number {

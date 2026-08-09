@@ -3,6 +3,7 @@
   import type { AgentRecord, ConversationItem, ProjectId } from "$lib/types";
   import { HEARTBEAT_TIMEOUT_MS } from "$lib/types";
   import { cn, formatDuration, isIsoTimestampAfter } from "$lib/utils";
+  import { WORKFLOW_AUTHORING_GUIDE_URL } from "$lib/workflowAuthoring";
   import { createPinTracker, type ScrollGeometry } from "$lib/scrollPin";
   import {
     ChevronRight,
@@ -2049,9 +2050,7 @@
                 your projects — open it with "Open local workflows folder…" in the Workflow menu.
                 The best way to create one is to have an agent write it for you; point it at the
                 authoring guide:
-                {@render guideLink(
-                  "https://github.com/shane-kercheval/switchboard/blob/main/docs/agent-instructions/workflows.md",
-                )}
+                {@render guideLink(WORKFLOW_AUTHORING_GUIDE_URL)}
               </p>
             </div>
           </li>

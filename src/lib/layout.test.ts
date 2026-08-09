@@ -7,7 +7,9 @@ import {
   GIT_REPO_MAX_WIDTH,
   GIT_REPO_MIN_WIDTH,
   PINS_SIDEBAR_DEFAULT_WIDTH,
+  PINS_SORT_DEFAULT_MODE,
   PROJECTS_SIDEBAR_DEFAULT_WIDTH,
+  RIGHT_SIDEBAR_DEFAULT_MODE,
   RIGHT_SIDEBAR_MAX_WIDTH,
   SIDEBAR_MAX_WIDTH,
   SIDEBAR_MIN_WIDTH,
@@ -44,20 +46,20 @@ describe("layout store", () => {
     expect(layout.projectsSidebarWidth).toBe(PROJECTS_SIDEBAR_DEFAULT_WIDTH);
     expect(layout.agentsSidebarWidth).toBe(AGENTS_SIDEBAR_DEFAULT_WIDTH);
     expect(layout.pinsSidebarWidth).toBe(PINS_SIDEBAR_DEFAULT_WIDTH);
-    expect(layout.rightSidebarMode).toBe("agents");
-    expect(layout.pinsSortMode).toBe("pinned_at");
+    expect(layout.rightSidebarModeFor("p-a")).toBe(RIGHT_SIDEBAR_DEFAULT_MODE);
+    expect(layout.pinsSortModeFor("p-a")).toBe(PINS_SORT_DEFAULT_MODE);
     expect(layout.projectsSidebarOpen).toBe(true);
     expect(layout.rightSidebarOpen).toBe(true);
     expect(layout.gitRepoWidth).toBe(GIT_REPO_DEFAULT_WIDTH);
     expect(layout.diffFileListWidth).toBe(DIFF_FILE_LIST_DEFAULT_WIDTH);
   });
 
-  it("round-trips widths and collapse state through storage", () => {
+  it("round-trips global dimensions and project-scoped sidebar preferences", () => {
     layout.projectsSidebarWidth = 320;
     layout.agentsSidebarWidth = 300;
     layout.pinsSidebarWidth = 380;
-    layout.rightSidebarMode = "pins";
-    layout.pinsSortMode = "message_at";
+    layout.setRightSidebarMode("p-a", "pins");
+    layout.setPinsSortMode("p-a", "message_at");
     layout.projectsSidebarOpen = false;
     layout.rightSidebarOpen = false;
     layout.gitRepoWidth = 380;
@@ -66,8 +68,10 @@ describe("layout store", () => {
     expect(layout.projectsSidebarWidth).toBe(320);
     expect(layout.agentsSidebarWidth).toBe(300);
     expect(layout.pinsSidebarWidth).toBe(380);
-    expect(layout.rightSidebarMode).toBe("pins");
-    expect(layout.pinsSortMode).toBe("message_at");
+    expect(layout.rightSidebarModeFor("p-a")).toBe("pins");
+    expect(layout.pinsSortModeFor("p-a")).toBe("message_at");
+    expect(layout.rightSidebarModeFor("p-b")).toBe("agents");
+    expect(layout.pinsSortModeFor("p-b")).toBe("pinned_at");
     expect(layout.projectsSidebarOpen).toBe(false);
     expect(layout.rightSidebarOpen).toBe(false);
     expect(layout.gitRepoWidth).toBe(380);
@@ -151,6 +155,43 @@ describe("layout store", () => {
     expect(layout.gitRepoWidth).toBe(GIT_REPO_DEFAULT_WIDTH);
   });
 
+  it("ignores retired global preferences for projects without explicit choices", () => {
+    seed({
+      version: 1,
+      layout: { rightSidebarMode: "pins", pinsSortMode: "message_at" },
+    });
+    expect(layout.rightSidebarModeFor("p-a")).toBe("agents");
+    expect(layout.pinsSortModeFor("p-a")).toBe("pinned_at");
+  });
+
+  it("defaults each missing project preference independently", () => {
+    seed({
+      version: 1,
+      layout: {
+        projectPreferences: {
+          "p-a": { pinsSortMode: "message_at" },
+          "p-b": { rightSidebarMode: "pins" },
+        },
+      },
+    });
+
+    expect(layout.rightSidebarModeFor("p-a")).toBe("agents");
+    expect(layout.pinsSortModeFor("p-a")).toBe("message_at");
+    expect(layout.rightSidebarModeFor("p-b")).toBe("pins");
+    expect(layout.pinsSortModeFor("p-b")).toBe("pinned_at");
+  });
+
+  it("removes persisted preferences for a permanently deleted project", () => {
+    layout.setRightSidebarMode("p-a", "pins");
+    layout.setPinsSortMode("p-a", "message_at");
+
+    layout.removeProjectPreferences("p-a");
+    _testing.reloadFromStorage();
+
+    expect(layout.rightSidebarModeFor("p-a")).toBe("agents");
+    expect(layout.pinsSortModeFor("p-a")).toBe("pinned_at");
+  });
+
   it("degrades a corrupt blob to defaults", () => {
     localStorage.setItem(STORAGE_KEY, "{not json");
     _testing.reloadFromStorage();
@@ -167,14 +208,21 @@ describe("layout store", () => {
         projectsSidebar: { width: "wide", open: "yes" },
         gitRepoWidth: "big",
         diffFileListWidth: Number.NaN,
-        pinsSortMode: "random",
+        projectPreferences: {
+          "p-a": { rightSidebarMode: "unknown", pinsSortMode: "random" },
+          "p-b": { rightSidebarMode: "pins", pinsSortMode: "message_at" },
+          "p-c": "invalid",
+        },
       },
     });
     expect(layout.projectsSidebarWidth).toBe(PROJECTS_SIDEBAR_DEFAULT_WIDTH);
     expect(layout.projectsSidebarOpen).toBe(true);
     expect(layout.gitRepoWidth).toBe(GIT_REPO_DEFAULT_WIDTH);
     expect(layout.diffFileListWidth).toBe(DIFF_FILE_LIST_DEFAULT_WIDTH);
-    expect(layout.pinsSortMode).toBe("pinned_at");
+    expect(layout.rightSidebarModeFor("p-a")).toBe("agents");
+    expect(layout.pinsSortModeFor("p-a")).toBe("pinned_at");
+    expect(layout.rightSidebarModeFor("p-b")).toBe("pins");
+    expect(layout.pinsSortModeFor("p-b")).toBe("message_at");
   });
 
   it("survives a persist failure with the in-memory value intact", () => {

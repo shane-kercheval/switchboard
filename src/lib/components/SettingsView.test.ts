@@ -7,6 +7,7 @@ import { theme } from "$lib/theme.svelte";
 import { agentCopy } from "$lib/agentCopy.svelte";
 import { _testing as availabilityTesting } from "$lib/harnessAvailability.svelte";
 import { _testing as prefsTesting } from "$lib/preferences.svelte";
+import { WORKFLOW_AUTHORING_GUIDE_URL } from "$lib/workflowAuthoring";
 
 // SettingsView embeds HarnessStatusList (probes install/auth on mount) and
 // McpServersSettings (loads providers on mount). Tests that override the mock
@@ -22,8 +23,12 @@ const defaultInvoke = async (cmd: string, _args?: Record<string, unknown>): Prom
   return null; // auth probes resolve = authenticated
 };
 const invokeMock = vi.fn(defaultInvoke);
+const copyTextMock = vi.fn(async (_text: string): Promise<void> => undefined);
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: (cmd: string, args?: Record<string, unknown>) => invokeMock(cmd, args),
+}));
+vi.mock("$lib/native", () => ({
+  copyText: (text: string) => copyTextMock(text),
 }));
 // Embedded McpServersSettings subscribes to `prompts:synced` on mount.
 vi.mock("@tauri-apps/api/event", () => ({
@@ -37,6 +42,7 @@ beforeEach(() => {
   // (the embedded McpServersSettings loads on every mount).
   invokeMock.mockReset();
   invokeMock.mockImplementation(defaultInvoke);
+  copyTextMock.mockClear();
   // The embedded HarnessStatusList reads the shared singleton store; reset it
   // so probed values don't leak across tests.
   availabilityTesting.reset();
@@ -264,5 +270,25 @@ describe("SettingsView", () => {
     await fireEvent.click(screen.getByTestId("workflows-open"));
 
     expect(invokeMock).toHaveBeenCalledWith("open_workflows_dir", undefined);
+  });
+
+  it("previews and copies the workflow authoring prompt", async () => {
+    render(SettingsView, { props: { onClose: vi.fn() } });
+
+    const toggle = screen.getByTestId("workflow-authoring-toggle");
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByTestId("workflow-authoring-prompt")).not.toBeInTheDocument();
+
+    await waitFor(() => expect(screen.getByTestId("workflows-dir")).toBeInTheDocument());
+    await fireEvent.click(screen.getByTestId("workflow-authoring-copy"));
+    await waitFor(() => expect(copyTextMock).toHaveBeenCalledOnce());
+
+    const copied = copyTextMock.mock.calls[0]![0];
+    expect(copied).toContain(WORKFLOW_AUTHORING_GUIDE_URL);
+    expect(copied).toContain("/Users/test/Library/Application Support/switchboard/workflows");
+
+    await fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByTestId("workflow-authoring-prompt").textContent).toBe(copied);
   });
 });

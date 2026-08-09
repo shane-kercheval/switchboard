@@ -53,7 +53,7 @@
     type TranscriptPane,
   } from "$lib/state/transcriptPanes.svelte";
   import { selectionFor, targetRecipients } from "$lib/state/recipientSelection.svelte";
-  import { layout, type RightSidebarMode } from "$lib/layout.svelte";
+  import { layout, RIGHT_SIDEBAR_DEFAULT_MODE, type RightSidebarMode } from "$lib/layout.svelte";
   import { navigatorState, toggleNavigator, openNavigator } from "$lib/state/transcriptJump.svelte";
   import {
     dismissPinMutationError,
@@ -82,11 +82,14 @@
     agentCreationFailures,
     agentsByProject,
     conversations,
+    deleteProject,
+    dismissProjectDeletionError,
     dismissAgentCreationFailure,
     dismissSeedPathUnresolved,
     loadWorkspace,
     nextUnreadCompletedProjectId,
     projects,
+    projectDeletions,
     retryProjectHydration,
     seedPathUnresolved,
     selection,
@@ -94,6 +97,7 @@
     startProjectActivityObserver,
     workspace,
   } from "$lib/state/workspace.svelte";
+  import { PROJECT_DELETE_TOOLTIP } from "$lib/projectDeletion";
   import {
     contributedCommands,
     palette,
@@ -143,6 +147,11 @@
   let projectViewResumeSeq = 0;
   let gitViewResumePending = $state<boolean>(false);
   let gitViewResumeSeq = 0;
+  const activeRightSidebarMode = $derived.by<RightSidebarMode>(() => {
+    const projectId = selection.activeProjectId;
+    return projectId === null ? RIGHT_SIDEBAR_DEFAULT_MODE : layout.rightSidebarModeFor(projectId);
+  });
+
   function isComposerShortcutTarget(target: EventTarget | null): boolean {
     return (
       target instanceof HTMLElement && target.closest('[data-shortcut-scope="composer"]') !== null
@@ -151,12 +160,14 @@
 
   function selectRightSidebarMode(mode: RightSidebarMode): void {
     if (mode === "agents" && activeAgents.length === 0) return;
-    layout.rightSidebarMode = mode;
+    const projectId = selection.activeProjectId;
+    if (projectId === null) return;
+    layout.setRightSidebarMode(projectId, mode);
     layout.rightSidebarOpen = true;
   }
 
   function toggleRightSidebarMode(): void {
-    selectRightSidebarMode(layout.rightSidebarMode === "agents" ? "pins" : "agents");
+    selectRightSidebarMode(activeRightSidebarMode === "agents" ? "pins" : "agents");
   }
 
   function handleGlobalKeydown(event: KeyboardEvent): void {
@@ -762,6 +773,7 @@
   }
 
   function retryActivation(): void {
+    activationDeleteProjectId = null;
     if (selection.activeProjectId !== null) void activateProject(selection.activeProjectId);
   }
 
@@ -770,6 +782,39 @@
   // user can copy the exact error into a bug report regardless of which
   // failure surface they hit.
   let activationDetailsOpen = $state<boolean>(false);
+  let activationDeleteProjectId = $state<ProjectId | null>(null);
+  let activationDeleteContextId: ProjectId | null = null;
+  let activationCanDelete = $derived.by(() => {
+    const projectId = selection.activeProjectId;
+    const failure = selection.activationFailure;
+    if (projectId === null || failure === null) return false;
+    if (failure.type === "project_locked") return false;
+    const project = projects.list.find((candidate) => candidate.id === projectId);
+    return project?.available === false || failure.type === "project_not_loaded";
+  });
+  let activationDeleting = $derived(
+    selection.activeProjectId !== null && selection.activeProjectId in projectDeletions.pending,
+  );
+
+  $effect(() => {
+    const failedProjectId = selection.activationFailure === null ? null : selection.activeProjectId;
+    untrack(() => {
+      if (activationDeleteContextId === failedProjectId) return;
+      activationDeleteContextId = failedProjectId;
+      activationDeleteProjectId = null;
+    });
+  });
+
+  async function confirmActivationDelete(): Promise<void> {
+    const projectId = selection.activeProjectId;
+    if (projectId === null || activationDeleteProjectId !== projectId) return;
+    try {
+      await deleteProject(projectId);
+      activationDeleteProjectId = null;
+    } catch {
+      activationDeleteProjectId = null;
+    }
+  }
 
   // "Add project" dialog. The form (`CreateProjectForm`) owns both modes' state
   // and commits; App only tracks open/close and a `busy` flag the form drives so
@@ -901,9 +946,7 @@
     cmds.push({
       id: "nav.toggle-right-sidebar-mode",
       title:
-        layout.rightSidebarMode === "agents"
-          ? "Switch to Pins sidebar"
-          : "Switch to Agents sidebar",
+        activeRightSidebarMode === "agents" ? "Switch to Pins sidebar" : "Switch to Agents sidebar",
       group: "Navigation",
       shortcut: ["mod", "alt", "P"],
       keywords: "agents pins right sidebar toggle switch",
@@ -1181,12 +1224,12 @@
                   role="radio"
                   class={cn(
                     SEGMENTED_MAIN_ITEM_CLASS,
-                    layout.rightSidebarMode === "agents"
+                    activeRightSidebarMode === "agents"
                       ? SEGMENTED_MAIN_ITEM_ACTIVE_CLASS
                       : SEGMENTED_MAIN_ITEM_INACTIVE_CLASS,
                   )}
                   aria-label="Show agents sidebar"
-                  aria-checked={layout.rightSidebarMode === "agents"}
+                  aria-checked={activeRightSidebarMode === "agents"}
                   aria-disabled={activeAgents.length === 0}
                   data-testid="right-sidebar-mode-agents"
                   class:opacity-40={activeAgents.length === 0}
@@ -1209,18 +1252,18 @@
                   role="radio"
                   class={cn(
                     SEGMENTED_MAIN_ITEM_CLASS,
-                    layout.rightSidebarMode === "pins"
+                    activeRightSidebarMode === "pins"
                       ? SEGMENTED_MAIN_ITEM_ACTIVE_CLASS
                       : SEGMENTED_MAIN_ITEM_INACTIVE_CLASS,
                   )}
                   aria-label="Show pins sidebar"
-                  aria-checked={layout.rightSidebarMode === "pins"}
+                  aria-checked={activeRightSidebarMode === "pins"}
                   data-testid="right-sidebar-mode-pins"
                   onclick={() => selectRightSidebarMode("pins")}
                 >
                   <Pin
                     size={14}
-                    fill={layout.rightSidebarMode === "pins" ? "currentColor" : "none"}
+                    fill={activeRightSidebarMode === "pins" ? "currentColor" : "none"}
                     aria-hidden="true"
                   />
                 </button>
@@ -1231,8 +1274,8 @@
             side="right"
             expanded={layout.rightSidebarOpen}
             label={layout.rightSidebarOpen
-              ? `Hide ${layout.rightSidebarMode} sidebar`
-              : `Show ${layout.rightSidebarMode} sidebar`}
+              ? `Hide ${activeRightSidebarMode} sidebar`
+              : `Show ${activeRightSidebarMode} sidebar`}
             testid="agents-sidebar-toggle"
             onclick={() => (layout.rightSidebarOpen = !layout.rightSidebarOpen)}
           />
@@ -1327,6 +1370,13 @@
           onDismiss={() => (editorShortcutError = null)}
         />
       {/if}
+      {#each Object.entries(projectDeletions.errors) as [projectId, error] (projectId)}
+        <Banner
+          message={`Couldn't delete ${projects.list.find((project) => project.id === projectId)?.name ?? "project"}: ${error}`}
+          testid={`banner-project-delete-failed-${projectId}`}
+          onDismiss={() => dismissProjectDeletionError(projectId)}
+        />
+      {/each}
       {#if commandError !== null}
         <Banner
           message={commandError}
@@ -1371,12 +1421,12 @@
               <WelcomeScreen onAddProject={openProjectDialog} />
             </div>
           </div>
-        {:else if selection.activationError !== null}
+        {:else if selection.activationFailure !== null}
           <EmptyState
             testid="activation-error"
             tone="error"
             title="Couldn't open this project."
-            description={selection.activationError}
+            description={selection.activationFailure.message}
           >
             {#snippet action()}
               <div class="flex items-center gap-2">
@@ -1384,6 +1434,7 @@
                   variant="secondary"
                   size="sm"
                   data-testid="activation-retry"
+                  disabled={activationDeleting}
                   onclick={retryActivation}
                 >
                   Retry
@@ -1392,10 +1443,52 @@
                   variant="ghost"
                   size="sm"
                   data-testid="activation-details"
+                  disabled={activationDeleting}
                   onclick={() => (activationDetailsOpen = true)}
                 >
                   Details
                 </Button>
+                {#if activationDeleteProjectId === selection.activeProjectId}
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    data-testid="activation-delete-cancel"
+                    disabled={activationDeleting}
+                    onclick={() => (activationDeleteProjectId = null)}
+                  >
+                    Cancel
+                  </Button>
+                  <Tooltip label="Confirm delete" side="bottom" reopen="fresh-hover">
+                    {#snippet trigger(props)}
+                      <Button
+                        {...props}
+                        variant="danger"
+                        size="sm"
+                        data-testid="activation-delete-confirm"
+                        disabled={activationDeleting}
+                        onclick={() => void confirmActivationDelete()}
+                      >
+                        {activationDeleting ? "Deleting…" : "Confirm delete"}
+                      </Button>
+                    {/snippet}
+                  </Tooltip>
+                {:else if activationCanDelete}
+                  <Tooltip label={PROJECT_DELETE_TOOLTIP} side="bottom" reopen="fresh-hover">
+                    {#snippet trigger(props)}
+                      <Button
+                        {...props}
+                        variant="danger"
+                        size="sm"
+                        data-testid="activation-delete"
+                        onclick={() => {
+                          activationDeleteProjectId = selection.activeProjectId;
+                        }}
+                      >
+                        Delete project
+                      </Button>
+                    {/snippet}
+                  </Tooltip>
+                {/if}
               </div>
             {/snippet}
           </EmptyState>
@@ -1433,8 +1526,8 @@
             {#if layout.rightSidebarOpen}
               <SidebarPanel
                 side="right"
-                widthProfile={layout.rightSidebarMode === "pins" ? "reading" : "rail"}
-                width={layout.rightSidebarMode === "pins"
+                widthProfile={activeRightSidebarMode === "pins" ? "reading" : "rail"}
+                width={activeRightSidebarMode === "pins"
                   ? layout.pinsSidebarWidth
                   : layout.agentsSidebarWidth}
                 testid="project-loading-sidebar-shell"
@@ -1454,7 +1547,7 @@
                 {availability}
               />
             </div>
-            {#if layout.rightSidebarOpen && layout.rightSidebarMode === "pins"}
+            {#if layout.rightSidebarOpen && activeRightSidebarMode === "pins"}
               <PinsSidebar
                 projectId={selection.activeProjectId!}
                 agents={activeAgents}
@@ -1500,7 +1593,7 @@
               {/key}
             </div>
             {#if layout.rightSidebarOpen}
-              {#if layout.rightSidebarMode === "pins"}
+              {#if activeRightSidebarMode === "pins"}
                 <PinsSidebar
                   projectId={selection.activeProjectId!}
                   agents={activeAgents}
@@ -1553,7 +1646,7 @@
     bind:open={activationDetailsOpen}
     title="Couldn't open this project"
     message="Opening this project failed. The exact error is below — copy it into a bug report."
-    details={selection.activationError ?? "No error detail was reported."}
+    details={selection.activationFailure?.message ?? "No error detail was reported."}
   />
 
   <CommandPalette bind:open={palette.open} commands={paletteCommands} />

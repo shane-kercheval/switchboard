@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { FolderOpen } from "@lucide/svelte";
+  import { ChevronRight, FolderOpen } from "@lucide/svelte";
   import { theme, type ThemeMode } from "$lib/theme.svelte";
   import { agentCopy } from "$lib/agentCopy.svelte";
   import type { AgentCopyMode } from "$lib/agentCopyMode";
@@ -14,6 +14,7 @@
   } from "$lib/components/ui/segmentedControl";
   import HarnessStatusList from "$lib/components/HarnessStatusList.svelte";
   import Input from "$lib/components/ui/Input.svelte";
+  import CopyButton from "$lib/components/ui/CopyButton.svelte";
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
   import { preferences, saveStatus, updatePreferences } from "$lib/preferences.svelte";
   import McpServersSettings from "$lib/components/McpServersSettings.svelte";
@@ -23,12 +24,15 @@
     workflowsDir as workflowsDirApi,
     openWorkflowsDir,
   } from "$lib/api";
+  import { workflowAuthoringPrompt } from "$lib/workflowAuthoring";
 
   let { onClose }: { onClose: () => void } = $props();
   let promptsDir = $state<string | null>(null);
   let promptsDirError = $state<string | null>(null);
   let workflowsDir = $state<string | null>(null);
   let workflowsDirError = $state<string | null>(null);
+  let workflowPromptOpen = $state(false);
+  const workflowPrompt = $derived(workflowAuthoringPrompt(workflowsDir));
 
   const themeOptions: { mode: ThemeMode; label: string }[] = [
     { mode: "system", label: "System" },
@@ -387,6 +391,56 @@
             </button>
           {/snippet}
         </Tooltip>
+      </div>
+
+      <div
+        class="border-border bg-panel overflow-hidden rounded-md border"
+        data-testid="workflow-authoring"
+      >
+        <div class="flex items-start gap-2 p-2.5">
+          <button
+            type="button"
+            class="focus-visible:ring-focus flex min-w-0 flex-1 items-start gap-2 rounded-sm text-left outline-none focus-visible:ring-1"
+            aria-expanded={workflowPromptOpen}
+            aria-controls="workflow-authoring-prompt"
+            data-testid="workflow-authoring-toggle"
+            onclick={() => (workflowPromptOpen = !workflowPromptOpen)}
+          >
+            <ChevronRight
+              size={15}
+              strokeWidth={1.8}
+              aria-hidden="true"
+              class={cn(
+                "text-muted mt-0.5 shrink-0 transition-transform",
+                workflowPromptOpen && "rotate-90",
+              )}
+            />
+            <span class="min-w-0">
+              <span class="text-fg block text-sm font-medium">Create with an AI agent</span>
+              <span class="text-muted mt-0.5 block text-xs leading-relaxed">
+                Copy this prompt into a coding agent to create a custom workflow.
+              </span>
+            </span>
+          </button>
+          <Tooltip label="Copy Prompt" side="top">
+            {#snippet trigger(props)}
+              <span {...props} class="shrink-0">
+                <CopyButton
+                  text={workflowPrompt}
+                  label="Copy workflow authoring prompt"
+                  testid="workflow-authoring-copy"
+                />
+              </span>
+            {/snippet}
+          </Tooltip>
+        </div>
+
+        {#if workflowPromptOpen}
+          <pre
+            id="workflow-authoring-prompt"
+            data-testid="workflow-authoring-prompt"
+            class="border-border bg-surface text-fg max-h-80 overflow-auto border-t px-3 py-2.5 font-mono text-[11px] leading-relaxed break-words whitespace-pre-wrap">{workflowPrompt}</pre>
+        {/if}
       </div>
     </section>
 

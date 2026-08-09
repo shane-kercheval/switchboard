@@ -82,11 +82,14 @@
     agentCreationFailures,
     agentsByProject,
     conversations,
+    deleteProject,
+    dismissProjectDeletionError,
     dismissAgentCreationFailure,
     dismissSeedPathUnresolved,
     loadWorkspace,
     nextUnreadCompletedProjectId,
     projects,
+    projectDeletions,
     retryProjectHydration,
     seedPathUnresolved,
     selection,
@@ -94,6 +97,7 @@
     startProjectActivityObserver,
     workspace,
   } from "$lib/state/workspace.svelte";
+  import { PROJECT_DELETE_TOOLTIP } from "$lib/projectDeletion";
   import {
     contributedCommands,
     palette,
@@ -769,6 +773,7 @@
   }
 
   function retryActivation(): void {
+    activationDeleteProjectId = null;
     if (selection.activeProjectId !== null) void activateProject(selection.activeProjectId);
   }
 
@@ -777,6 +782,39 @@
   // user can copy the exact error into a bug report regardless of which
   // failure surface they hit.
   let activationDetailsOpen = $state<boolean>(false);
+  let activationDeleteProjectId = $state<ProjectId | null>(null);
+  let activationDeleteContextId: ProjectId | null = null;
+  let activationCanDelete = $derived.by(() => {
+    const projectId = selection.activeProjectId;
+    const failure = selection.activationFailure;
+    if (projectId === null || failure === null) return false;
+    if (failure.type === "project_locked") return false;
+    const project = projects.list.find((candidate) => candidate.id === projectId);
+    return project?.available === false || failure.type === "project_not_loaded";
+  });
+  let activationDeleting = $derived(
+    selection.activeProjectId !== null && selection.activeProjectId in projectDeletions.pending,
+  );
+
+  $effect(() => {
+    const failedProjectId = selection.activationFailure === null ? null : selection.activeProjectId;
+    untrack(() => {
+      if (activationDeleteContextId === failedProjectId) return;
+      activationDeleteContextId = failedProjectId;
+      activationDeleteProjectId = null;
+    });
+  });
+
+  async function confirmActivationDelete(): Promise<void> {
+    const projectId = selection.activeProjectId;
+    if (projectId === null || activationDeleteProjectId !== projectId) return;
+    try {
+      await deleteProject(projectId);
+      activationDeleteProjectId = null;
+    } catch {
+      activationDeleteProjectId = null;
+    }
+  }
 
   // "Add project" dialog. The form (`CreateProjectForm`) owns both modes' state
   // and commits; App only tracks open/close and a `busy` flag the form drives so
@@ -1332,6 +1370,13 @@
           onDismiss={() => (editorShortcutError = null)}
         />
       {/if}
+      {#each Object.entries(projectDeletions.errors) as [projectId, error] (projectId)}
+        <Banner
+          message={`Couldn't delete ${projects.list.find((project) => project.id === projectId)?.name ?? "project"}: ${error}`}
+          testid={`banner-project-delete-failed-${projectId}`}
+          onDismiss={() => dismissProjectDeletionError(projectId)}
+        />
+      {/each}
       {#if commandError !== null}
         <Banner
           message={commandError}
@@ -1376,12 +1421,12 @@
               <WelcomeScreen onAddProject={openProjectDialog} />
             </div>
           </div>
-        {:else if selection.activationError !== null}
+        {:else if selection.activationFailure !== null}
           <EmptyState
             testid="activation-error"
             tone="error"
             title="Couldn't open this project."
-            description={selection.activationError}
+            description={selection.activationFailure.message}
           >
             {#snippet action()}
               <div class="flex items-center gap-2">
@@ -1389,6 +1434,7 @@
                   variant="secondary"
                   size="sm"
                   data-testid="activation-retry"
+                  disabled={activationDeleting}
                   onclick={retryActivation}
                 >
                   Retry
@@ -1397,10 +1443,52 @@
                   variant="ghost"
                   size="sm"
                   data-testid="activation-details"
+                  disabled={activationDeleting}
                   onclick={() => (activationDetailsOpen = true)}
                 >
                   Details
                 </Button>
+                {#if activationDeleteProjectId === selection.activeProjectId}
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    data-testid="activation-delete-cancel"
+                    disabled={activationDeleting}
+                    onclick={() => (activationDeleteProjectId = null)}
+                  >
+                    Cancel
+                  </Button>
+                  <Tooltip label="Confirm delete" side="bottom" reopen="fresh-hover">
+                    {#snippet trigger(props)}
+                      <Button
+                        {...props}
+                        variant="danger"
+                        size="sm"
+                        data-testid="activation-delete-confirm"
+                        disabled={activationDeleting}
+                        onclick={() => void confirmActivationDelete()}
+                      >
+                        {activationDeleting ? "Deleting…" : "Confirm delete"}
+                      </Button>
+                    {/snippet}
+                  </Tooltip>
+                {:else if activationCanDelete}
+                  <Tooltip label={PROJECT_DELETE_TOOLTIP} side="bottom" reopen="fresh-hover">
+                    {#snippet trigger(props)}
+                      <Button
+                        {...props}
+                        variant="danger"
+                        size="sm"
+                        data-testid="activation-delete"
+                        onclick={() => {
+                          activationDeleteProjectId = selection.activeProjectId;
+                        }}
+                      >
+                        Delete project
+                      </Button>
+                    {/snippet}
+                  </Tooltip>
+                {/if}
               </div>
             {/snippet}
           </EmptyState>
@@ -1558,7 +1646,7 @@
     bind:open={activationDetailsOpen}
     title="Couldn't open this project"
     message="Opening this project failed. The exact error is below — copy it into a bug report."
-    details={selection.activationError ?? "No error detail was reported."}
+    details={selection.activationFailure?.message ?? "No error detail was reported."}
   />
 
   <CommandPalette bind:open={palette.open} commands={paletteCommands} />

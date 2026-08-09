@@ -7,6 +7,10 @@ export type AgentId = string;
 export type ProjectId = string;
 export type MessagePin = { key: string; pinned_at: string };
 
+export type ActivationFailureKind = "project_not_loaded" | "project_locked" | "other";
+export type ActivationCommandError = { type: ActivationFailureKind | string; message: string };
+export type ActivationFailure = { type: ActivationFailureKind; message: string };
+
 export type FailureKind = "harness_error" | "adapter_failure" | "auth_failure";
 // Future: "timeout" — added if/when an active per-turn timeout lands.
 // `auth_failure` is detected via stream events: Claude's

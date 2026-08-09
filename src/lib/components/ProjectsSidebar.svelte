@@ -16,6 +16,7 @@
     backgroundCompletedProjectIds,
     liveProjectSends,
     projects,
+    projectDeletions,
     deleteProject,
     renameProject,
     selection,
@@ -45,6 +46,7 @@
   import StopIcon from "$lib/components/ui/StopIcon.svelte";
   import Spinner from "$lib/components/ui/Spinner.svelte";
   import StatusDot from "$lib/components/ui/StatusDot.svelte";
+  import Tooltip from "$lib/components/ui/Tooltip.svelte";
   import { workflowRuns, cancelRun } from "$lib/state/workflows.svelte";
   import DropdownMenu from "$lib/components/ui/DropdownMenu.svelte";
   import DropdownMenuItem from "$lib/components/ui/DropdownMenuItem.svelte";
@@ -57,6 +59,7 @@
     SEGMENTED_MAIN_ITEM_INACTIVE_CLASS,
   } from "$lib/components/ui/segmentedControl";
   import { windowDragRegion } from "$lib/windowDrag";
+  import { PROJECT_DELETE_TOOLTIP } from "$lib/projectDeletion";
 
   let {
     onAddProject,
@@ -90,10 +93,8 @@
   /// Live width during a resize drag; the store commits on pointer-up.
   let draftWidth = $state<number | null>(null);
 
-  let deleteConfirmProjectId = $state<ProjectId | null>(null);
-  let deletingProjectId = $state<ProjectId | null>(null);
+  let pendingDelete = $state<{ projectId: ProjectId; via: "menu" | "quick" } | null>(null);
   let archiveError = $state<{ projectId: ProjectId; message: string } | null>(null);
-  let deleteError = $state<{ projectId: ProjectId; message: string } | null>(null);
   let gitRevealError = $state<{ projectId: ProjectId; message: string } | null>(null);
   let openActionError = $state<{ projectId: ProjectId; message: string } | null>(null);
   let openProjectActionsId = $state<ProjectId | null>(null);
@@ -171,7 +172,7 @@
   const canSave = $derived(renameValidation.ok && !renaming);
 
   function startEdit(project: ProjectListing): void {
-    deleteConfirmProjectId = null;
+    pendingDelete = null;
     editingProjectId = project.id;
     draftName = project.name;
     renameError = null;
@@ -247,16 +248,22 @@
         openProject !== undefined &&
         liveProjectSends(openProject.id).size === 0 &&
         openProject.id in backgroundCompletedProjectIds;
-      if (openProject === undefined || openProjectCompleted) {
+      if (openProject === undefined || (openProjectCompleted && archivedView !== "archived")) {
         openProjectActionsId = null;
       }
     }
     if (
-      deleteConfirmProjectId !== null &&
-      (!visibleProjects.some((project) => project.id === deleteConfirmProjectId) ||
-        openProjectActionsId !== deleteConfirmProjectId)
+      pendingDelete?.via === "menu" &&
+      (!visibleProjects.some((project) => project.id === pendingDelete?.projectId) ||
+        openProjectActionsId !== pendingDelete.projectId)
     ) {
-      deleteConfirmProjectId = null;
+      pendingDelete = null;
+    }
+    if (
+      pendingDelete?.via === "quick" &&
+      !visibleProjects.some((project) => project.id === pendingDelete?.projectId)
+    ) {
+      pendingDelete = null;
     }
     if (
       gitRevealError !== null &&
@@ -283,11 +290,10 @@
 
   async function toggleArchive(project: ProjectListing): Promise<void> {
     archiveError = null;
-    deleteError = null;
     gitRevealError = null;
     try {
       await setProjectArchived(project.id, !project.archived);
-      if (deleteConfirmProjectId === project.id) deleteConfirmProjectId = null;
+      if (pendingDelete?.projectId === project.id) pendingDelete = null;
     } catch (err) {
       archiveError = {
         projectId: project.id,
@@ -298,35 +304,55 @@
 
   function startDelete(project: ProjectListing): void {
     archiveError = null;
-    deleteError = null;
     gitRevealError = null;
-    deleteConfirmProjectId = project.id;
+    pendingDelete = { projectId: project.id, via: "menu" };
+  }
+
+  function startQuickDelete(project: ProjectListing): void {
+    archiveError = null;
+    gitRevealError = null;
+    pendingDelete = { projectId: project.id, via: "quick" };
+    focusProjectControl(project.id, "project-quick-delete-cancel");
   }
 
   function cancelDelete(projectId: ProjectId): void {
-    if (deleteConfirmProjectId === projectId) deleteConfirmProjectId = null;
+    if (pendingDelete?.projectId === projectId) pendingDelete = null;
   }
 
   async function confirmDelete(project: ProjectListing): Promise<void> {
-    deletingProjectId = project.id;
-    deleteError = null;
+    const via = pendingDelete?.projectId === project.id ? pendingDelete.via : null;
+    let failed = false;
     try {
       await deleteProject(project.id);
-      if (deleteConfirmProjectId === project.id) deleteConfirmProjectId = null;
-    } catch (err) {
-      deleteConfirmProjectId = null;
-      deleteError = {
-        projectId: project.id,
-        message: err instanceof Error ? err.message : String(err),
-      };
+    } catch {
+      // The shared deletion store retains the visible failure.
+      failed = true;
     } finally {
-      deletingProjectId = null;
+      if (pendingDelete?.projectId === project.id) pendingDelete = null;
+      if (failed && via !== null) {
+        focusProjectControl(
+          project.id,
+          via === "quick" ? "project-quick-delete" : "project-actions-trigger",
+        );
+      }
     }
+  }
+
+  function cancelQuickDelete(projectId: ProjectId): void {
+    if (pendingDelete?.projectId !== projectId || pendingDelete.via !== "quick") return;
+    pendingDelete = null;
+    focusProjectControl(projectId, "project-quick-delete");
+  }
+
+  function focusProjectControl(projectId: ProjectId, testid: string): void {
+    requestAnimationFrame(() => {
+      const row = document.querySelector<HTMLElement>(`[data-project-id="${projectId}"]`);
+      row?.querySelector<HTMLElement>(`[data-testid="${testid}"]`)?.focus();
+    });
   }
 
   async function showProjectInGit(project: ProjectListing): Promise<void> {
     archiveError = null;
-    deleteError = null;
     gitRevealError = null;
     openActionError = null;
     const result = await revealProjectBranch(project.id, project.directory);
@@ -345,7 +371,6 @@
 
   function runProjectOpenAction(project: ProjectListing, action: () => Promise<void>): void {
     archiveError = null;
-    deleteError = null;
     gitRevealError = null;
     openActionError = null;
     const seq = ++openActionSeq;
@@ -523,6 +548,9 @@
         {@const highlighted =
           project.id === (selection.loadingProjectId ?? selection.activeProjectId)}
         {@const actionsOpen = openProjectActionsId === project.id}
+        {@const quickDeleteArmed =
+          pendingDelete?.projectId === project.id && pendingDelete.via === "quick"}
+        {@const projectDeleting = project.id in projectDeletions.pending}
         <div
           class={cn(
             // Documented exception to the panel-context hover idiom (elsewhere a
@@ -540,6 +568,12 @@
           data-project-id={project.id}
           data-active={highlighted}
           data-actions-open={actionsOpen}
+          role="group"
+          aria-label={project.name}
+          onpointerleave={() => {
+            if (projectDeleting || !quickDeleteArmed) return;
+            pendingDelete = null;
+          }}
         >
           <div class="flex w-full items-center">
             {#if editing}
@@ -643,16 +677,28 @@
                 </div>
               </button>
               <div class="flex shrink-0 items-center gap-0.5 pr-1.5">
-                {#if !completed}
+                {#if !completed || archivedView === "archived"}
                   <div
+                    data-testid="project-row-actions"
                     class={cn(
-                      "pointer-events-none flex max-w-0 items-center gap-0.5 overflow-hidden opacity-0 transition-[max-width,opacity] group-focus-within:pointer-events-auto group-focus-within:max-w-[28px] group-focus-within:opacity-100 group-hover:pointer-events-auto group-hover:max-w-[28px] group-hover:opacity-100",
-                      actionsOpen && "pointer-events-auto max-w-[28px] opacity-100",
+                      // One, two, or three 28px action slots: menu alone;
+                      // menu + quick delete; menu + cancel + confirm.
+                      "pointer-events-none flex max-w-0 items-center justify-end gap-0.5 overflow-hidden opacity-0 transition-[max-width,opacity]",
+                      quickDeleteArmed
+                        ? "pointer-events-auto max-w-[84px] opacity-100"
+                        : archivedView === "archived"
+                          ? "group-focus-within:pointer-events-auto group-focus-within:max-w-[56px] group-focus-within:opacity-100 group-hover:pointer-events-auto group-hover:max-w-[56px] group-hover:opacity-100"
+                          : "group-focus-within:pointer-events-auto group-focus-within:max-w-[28px] group-focus-within:opacity-100 group-hover:pointer-events-auto group-hover:max-w-[28px] group-hover:opacity-100",
+                      actionsOpen &&
+                        (archivedView === "archived"
+                          ? "pointer-events-auto max-w-[56px] opacity-100"
+                          : "pointer-events-auto max-w-[28px] opacity-100"),
                     )}
                   >
                     <DropdownMenu
                       open={actionsOpen}
                       onOpenChange={(open) => {
+                        if (open && pendingDelete?.via === "quick") pendingDelete = null;
                         openProjectActionsId = open
                           ? project.id
                           : openProjectActionsId === project.id
@@ -661,14 +707,14 @@
                       }}
                       triggerLabel={`Actions for ${project.name}`}
                       triggerTestid="project-actions-trigger"
-                      triggerTabindex={-1}
+                      triggerTabindex={0}
                       triggerClass={cn(projectRowActionClass, "shrink-0")}
                       contentTestid="project-actions-menu"
                     >
                       {#snippet trigger()}
                         <MoreHorizontal size={14} strokeWidth={1.8} aria-hidden="true" />
                       {/snippet}
-                      {#if deleteConfirmProjectId === project.id}
+                      {#if pendingDelete?.projectId === project.id && pendingDelete.via === "menu"}
                         <DropdownMenuItem
                           onSelect={() => cancelDelete(project.id)}
                           closeOnSelect={false}
@@ -685,7 +731,7 @@
                         </DropdownMenuItem>
                         <DropdownMenuItem
                           onSelect={() => void confirmDelete(project)}
-                          disabled={deletingProjectId === project.id}
+                          disabled={projectDeleting}
                           class="text-status-failed gap-2"
                           data-testid="project-delete-confirm"
                         >
@@ -775,16 +821,76 @@
                         <DropdownMenuItem
                           onSelect={() => startDelete(project)}
                           closeOnSelect={false}
-                          disabled={busy}
+                          disabled={busy || projectDeleting}
                           class="text-status-failed gap-2"
                           data-testid="project-action-delete"
-                          title="Removes Switchboard's files for this project; your code and agent session files are kept. Works even if the project's folder no longer exists."
+                          title={`${PROJECT_DELETE_TOOLTIP} Works even if the project's folder no longer exists.`}
                         >
                           <Trash2 size={14} strokeWidth={1.8} class="shrink-0" aria-hidden="true" />
                           Delete project
                         </DropdownMenuItem>
                       {/if}
                     </DropdownMenu>
+                    {#if archivedView === "archived"}
+                      {#if quickDeleteArmed}
+                        <Tooltip label="Cancel delete" side="bottom" reopen="fresh-hover">
+                          {#snippet trigger(props)}
+                            <button
+                              {...props}
+                              type="button"
+                              class={cn(projectRowActionClass, "text-muted shrink-0")}
+                              aria-label={`Cancel deleting ${project.name}`}
+                              data-testid="project-quick-delete-cancel"
+                              disabled={projectDeleting}
+                              onclick={() => cancelQuickDelete(project.id)}
+                            >
+                              <X size={14} strokeWidth={1.8} aria-hidden="true" />
+                            </button>
+                          {/snippet}
+                        </Tooltip>
+                        <Tooltip label="Confirm delete" side="bottom" reopen="fresh-hover">
+                          {#snippet trigger(props)}
+                            <button
+                              {...props}
+                              type="button"
+                              class={cn(
+                                projectRowActionClass,
+                                "text-status-failed shrink-0 disabled:cursor-not-allowed disabled:opacity-50",
+                              )}
+                              aria-label={`Confirm deleting ${project.name}`}
+                              data-testid="project-quick-delete-confirm"
+                              disabled={projectDeleting}
+                              onclick={() => void confirmDelete(project)}
+                            >
+                              {#if projectDeleting}
+                                <Spinner class="h-4 w-4" />
+                              {:else}
+                                <Check size={14} strokeWidth={1.8} aria-hidden="true" />
+                              {/if}
+                            </button>
+                          {/snippet}
+                        </Tooltip>
+                      {:else}
+                        <Tooltip label={PROJECT_DELETE_TOOLTIP} side="bottom" reopen="fresh-hover">
+                          {#snippet trigger(props)}
+                            <button
+                              {...props}
+                              type="button"
+                              class={cn(
+                                projectRowActionClass,
+                                "text-muted hover:text-status-failed shrink-0 disabled:cursor-not-allowed disabled:opacity-50",
+                              )}
+                              aria-label={`Delete ${project.name}`}
+                              data-testid="project-quick-delete"
+                              disabled={busy || workflowRunning || projectDeleting}
+                              onclick={() => startQuickDelete(project)}
+                            >
+                              <Trash2 size={14} strokeWidth={1.8} aria-hidden="true" />
+                            </button>
+                          {/snippet}
+                        </Tooltip>
+                      {/if}
+                    {/if}
                   </div>
                 {/if}
                 {#if workflowFailedOrInterrupted}
@@ -843,11 +949,6 @@
           {#if archiveError?.projectId === project.id}
             <div class="text-status-failed px-2.5 pb-2 text-xs" data-testid="project-archive-error">
               Couldn't update project: {archiveError.message}
-            </div>
-          {/if}
-          {#if deleteError?.projectId === project.id}
-            <div class="text-status-failed px-2.5 pb-2 text-xs" data-testid="project-delete-error">
-              Couldn't delete project: {deleteError.message}
             </div>
           {/if}
           {#if gitRevealError?.projectId === project.id}

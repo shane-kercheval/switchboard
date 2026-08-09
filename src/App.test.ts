@@ -90,10 +90,12 @@ type Backend = {
   // When set, `open_project` waits on this project's gate before resolving — lets a test
   // observe the immediate UI state while project activation is still pending.
   openProjectGates: Map<string, Promise<void>>;
+  deleteProjectGates: Map<string, Promise<void>>;
   agentQueue: AgentRecord[];
   sendMessageId: string;
   loadConvoCalls: string[];
-  failOpenFor: Set<string>;
+  failOpenFor: Map<string, unknown>;
+  failDeleteFor: Map<string, string>;
   failConvoFor: Set<string>;
   failPickFor: Set<string>;
   // Git-view tracked repos returned by `list_tracked_repos` / `read_tracked_repo`.
@@ -124,10 +126,12 @@ function freshBackend(): Backend {
     awaitPathGate: null,
     createAgentGate: null,
     openProjectGates: new Map(),
+    deleteProjectGates: new Map(),
     agentQueue: [],
     sendMessageId: "77777777-7777-7000-8000-777777777777",
     loadConvoCalls: [],
-    failOpenFor: new Set(),
+    failOpenFor: new Map(),
+    failDeleteFor: new Map(),
     failConvoFor: new Set(),
     failPickFor: new Set(),
     trackedRepos: [],
@@ -190,6 +194,18 @@ const invokeMock = vi.fn(async (cmd: string, args?: Record<string, unknown>): Pr
       backend.projects = backend.projects.filter((p) => p.directory !== path);
       return null;
     }
+    case "delete_project": {
+      const projectId = args?.projectId as string;
+      const gate = backend.deleteProjectGates.get(projectId);
+      if (gate !== undefined) await gate;
+      const deleteError = backend.failDeleteFor.get(projectId);
+      if (deleteError !== undefined) throw new Error(deleteError);
+      backend.projects = backend.projects.filter((project) => project.id !== projectId);
+      backend.rosters.delete(projectId);
+      backend.conversations.delete(projectId);
+      if (backend.activeProjectId === projectId) backend.activeProjectId = null;
+      return null;
+    }
     case "create_project": {
       const id = `00000000-0000-7000-8000-0000000c${(backend.projects.length + 1)
         .toString()
@@ -211,7 +227,8 @@ const invokeMock = vi.fn(async (cmd: string, args?: Record<string, unknown>): Pr
       const pid = args?.projectId as string;
       const gate = backend.openProjectGates.get(pid);
       if (gate !== undefined) await gate;
-      if (backend.failOpenFor.has(pid)) throw new Error("project is locked by another process");
+      const openError = backend.failOpenFor.get(pid);
+      if (openError !== undefined) throw openError;
       return summaryFor(pid);
     }
     case "set_active_project":
@@ -954,7 +971,10 @@ describe("App", () => {
   });
 
   it("new project: failed activation does not auto-seed agents", async () => {
-    backend.failOpenFor.add("00000000-0000-7000-8000-0000000c0001");
+    backend.failOpenFor.set("00000000-0000-7000-8000-0000000c0001", {
+      type: "project_locked",
+      message: "project is locked by another process",
+    });
     await mountApp();
     await waitFor(() => expect(screen.getByTestId("welcome-add-project")).toBeInTheDocument());
 
@@ -1763,19 +1783,132 @@ describe("App", () => {
       name: "alpha",
       agents: [agent({ id: "ag-1", project_id: "p-a", name: "assistant" })],
     });
-    backend.failOpenFor.add("p-a");
+    backend.failOpenFor.set("p-a", {
+      type: "project_locked",
+      message: "project p-a is already open in another Switchboard process",
+    });
+    const lockedRow = backend.projects.find((project) => project.id === "p-a");
+    if (lockedRow === undefined) throw new Error("expected seeded project");
+    lockedRow.available = false;
     await mountApp();
     await waitFor(() => expect(screen.getByTestId("project-row")).toBeInTheDocument());
 
     await fireEvent.click(screen.getByText("alpha"));
     await waitFor(() => expect(screen.getByTestId("activation-error")).toBeInTheDocument());
     expect(screen.queryByTestId("project-loading")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("activation-delete")).not.toBeInTheDocument();
 
     // Recover and retry — the project opens.
     backend.failOpenFor.delete("p-a");
     await fireEvent.click(screen.getByTestId("activation-retry"));
     await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
     expect(screen.queryByTestId("activation-error")).not.toBeInTheDocument();
+  });
+
+  it("does not offer deletion for an unknown activation failure on an available project", async () => {
+    seedProject({ projectId: "p-a", directory: DIR_A, name: "alpha", agents: [] });
+    backend.failOpenFor.set("p-a", {
+      type: "future_failure",
+      message: "a newer backend failure",
+    });
+    await mountApp();
+
+    await fireEvent.click(await screen.findByText("alpha"));
+    await waitFor(() => expect(screen.getByTestId("activation-error")).toBeInTheDocument());
+    expect(screen.queryByTestId("activation-delete")).not.toBeInTheDocument();
+  });
+
+  it("offers deletion when an unavailable project reports an unclassified failure", async () => {
+    seedProject({ projectId: "p-a", directory: DIR_A, name: "alpha", agents: [] });
+    const row = backend.projects.find((project) => project.id === "p-a");
+    if (row === undefined) throw new Error("expected seeded project");
+    row.available = false;
+    backend.failOpenFor.set("p-a", { type: "other", message: "directory disappeared" });
+    await mountApp();
+
+    await fireEvent.click(await screen.findByText("alpha"));
+    await waitFor(() => expect(screen.getByTestId("activation-delete")).toBeInTheDocument());
+  });
+
+  it("deletes a project from the activation-error state after inline confirmation", async () => {
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [agent({ id: "ag-1", project_id: "p-a", name: "assistant" })],
+    });
+    backend.failOpenFor.set("p-a", {
+      type: "project_not_loaded",
+      message: "project p-a is not loaded",
+    });
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("project-row")).toBeInTheDocument());
+
+    await fireEvent.click(screen.getByText("alpha"));
+    await waitFor(() => expect(screen.getByTestId("activation-error")).toBeInTheDocument());
+    await fireEvent.click(screen.getByTestId("activation-delete"));
+
+    expect(screen.getByTestId("activation-delete-cancel")).toBeInTheDocument();
+    expect(screen.getByTestId("activation-delete-confirm")).toBeInTheDocument();
+    expect(invokeMock).not.toHaveBeenCalledWith("delete_project", expect.anything());
+
+    await fireEvent.click(screen.getByTestId("activation-delete-confirm"));
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("delete_project", { projectId: "p-a" }),
+    );
+    await waitFor(() => expect(screen.queryByTestId("activation-error")).not.toBeInTheDocument());
+    expect(screen.getByTestId("welcome-add-project")).toBeInTheDocument();
+  });
+
+  it("shares pending deletion across the activation error and project row", async () => {
+    seedProject({ projectId: "p-a", directory: DIR_A, name: "alpha", agents: [] });
+    backend.failOpenFor.set("p-a", {
+      type: "project_not_loaded",
+      message: "project p-a is not loaded",
+    });
+    let releaseDelete!: () => void;
+    backend.deleteProjectGates.set(
+      "p-a",
+      new Promise<void>((resolve) => {
+        releaseDelete = resolve;
+      }),
+    );
+    await mountApp();
+    await fireEvent.click(await screen.findByText("alpha"));
+    await waitFor(() => expect(screen.getByTestId("activation-delete")).toBeInTheDocument());
+    await fireEvent.click(screen.getByTestId("activation-delete"));
+    await fireEvent.click(screen.getByTestId("activation-delete-confirm"));
+    await waitFor(() => expect(screen.getByTestId("activation-delete-confirm")).toBeDisabled());
+
+    await fireEvent.click(screen.getByTestId("project-actions-trigger"));
+    expect(await screen.findByTestId("project-action-delete")).toHaveAttribute(
+      "aria-disabled",
+      "true",
+    );
+
+    const ws = await import("$lib/state/workspace.svelte");
+    const shared = ws.deleteProject("p-a");
+    expect(invokeMock.mock.calls.filter(([cmd]) => cmd === "delete_project")).toHaveLength(1);
+    releaseDelete();
+    await shared;
+  });
+
+  it("keeps a deletion failure visible in the shared app banner", async () => {
+    seedProject({ projectId: "p-a", directory: DIR_A, name: "alpha", agents: [] });
+    backend.failOpenFor.set("p-a", {
+      type: "project_not_loaded",
+      message: "project p-a is not loaded",
+    });
+    backend.failDeleteFor.set("p-a", "disk busy");
+    await mountApp();
+    await fireEvent.click(await screen.findByText("alpha"));
+    await waitFor(() => expect(screen.getByTestId("activation-delete")).toBeInTheDocument());
+    await fireEvent.click(screen.getByTestId("activation-delete"));
+    await fireEvent.click(screen.getByTestId("activation-delete-confirm"));
+
+    const banner = await screen.findByTestId("banner-project-delete-failed-p-a");
+    expect(banner).toHaveTextContent("Couldn't delete alpha: disk busy");
+    expect(screen.getByTestId("project-row")).toBeInTheDocument();
   });
 
   it("an unreadable workspace with no recovered directories shows the not-persistable banner, not welcome", async () => {

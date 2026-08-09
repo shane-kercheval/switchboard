@@ -29,6 +29,7 @@
 import * as api from "$lib/api";
 import type {
   AgentId,
+  ActivationFailure,
   AgentRecord,
   AgentSessionFingerprint,
   ConversationItem,
@@ -97,13 +98,32 @@ export const workspace = $state<{ directories: WorkspaceDirectoryInfo[]; persist
 /// The flat cross-directory project list, sorted desc by `last_activity`.
 export const projects = $state<{ list: ProjectListing[] }>({ list: [] });
 
+/// Project-scoped deletion lifecycle shared by every deletion surface. Pending
+/// is reactive UI state; the private promise registry below provides the
+/// single-flight guarantee. Errors persist until dismissed or retried so a
+/// failure remains visible even if the user navigates while deletion is in
+/// flight.
+export const projectDeletions = $state<{
+  pending: Record<ProjectId, true>;
+  errors: Record<ProjectId, string>;
+}>({ pending: {}, errors: {} });
+// Promise identity is non-rendering bookkeeping; `projectDeletions.pending`
+// is the reactive projection consumed by components.
+// eslint-disable-next-line svelte/prefer-svelte-reactivity
+const projectDeletionPromises = new Map<ProjectId, Promise<void>>();
+
+export function dismissProjectDeletionError(projectId: ProjectId): void {
+  delete projectDeletions.errors[projectId];
+}
+
 /// The displayed project. Display-only — switching does not stop other
 /// projects' agents or tear down their event subscriptions.
 ///
-/// `activationError` holds the message when opening the displayed project
-/// failed (locked by another process, directory went unavailable, removed
-/// concurrently). It always pertains to the current `activeProjectId`: cleared
-/// on every (re)activation and switch, set only on the current one's failure.
+/// `activationFailure` holds a typed kind plus diagnostic message when opening
+/// the displayed project failed (locked by another process, directory went
+/// unavailable, removed concurrently). It always pertains to the current
+/// `activeProjectId`: cleared on every (re)activation and switch, set only on
+/// the current one's failure.
 /// The center pane renders a retry affordance instead of an endless loading
 /// state when it's set.
 ///
@@ -111,9 +131,9 @@ export const projects = $state<{ list: ProjectListing[] }>({ list: [] });
 /// paint the new selection before a large transcript is derived and rendered.
 export const selection = $state<{
   activeProjectId: ProjectId | null;
-  activationError: string | null;
+  activationFailure: ActivationFailure | null;
   loadingProjectId: ProjectId | null;
-}>({ activeProjectId: null, activationError: null, loadingProjectId: null });
+}>({ activeProjectId: null, activationFailure: null, loadingProjectId: null });
 
 /// Per-project agent rosters, populated lazily on first activation.
 export const agentsByProject = $state<Record<ProjectId, AgentRecord[]>>({});
@@ -387,7 +407,7 @@ export async function removeDirectory(path: string): Promise<void> {
   );
   if (activeRemoved) {
     selection.activeProjectId = null;
-    selection.activationError = null;
+    selection.activationFailure = null;
     selection.loadingProjectId = null;
   }
   await loadWorkspace();
@@ -603,7 +623,26 @@ export async function renameProject(projectId: ProjectId, newName: string): Prom
 /// permanently deleted project id must start clean if it is ever reused. Errors
 /// propagate to the caller (the menu's inline confirm surfaces them and keeps
 /// the row).
-export async function deleteProject(projectId: ProjectId): Promise<void> {
+export function deleteProject(projectId: ProjectId): Promise<void> {
+  const existing = projectDeletionPromises.get(projectId);
+  if (existing !== undefined) return existing;
+
+  delete projectDeletions.errors[projectId];
+  projectDeletions.pending[projectId] = true;
+  const operation = deleteProjectOnce(projectId)
+    .catch((error: unknown) => {
+      projectDeletions.errors[projectId] = error instanceof Error ? error.message : String(error);
+      throw error;
+    })
+    .finally(() => {
+      projectDeletionPromises.delete(projectId);
+      delete projectDeletions.pending[projectId];
+    });
+  projectDeletionPromises.set(projectId, operation);
+  return operation;
+}
+
+async function deleteProjectOnce(projectId: ProjectId): Promise<void> {
   // Snapshot the agent ids before the await — the roster is dropped below.
   const removedAgentIds = (agentsByProject[projectId] ?? []).map((a) => a.id);
 
@@ -626,7 +665,7 @@ export async function deleteProject(projectId: ProjectId): Promise<void> {
   );
   if (selection.activeProjectId === projectId) {
     selection.activeProjectId = null;
-    selection.activationError = null;
+    selection.activationFailure = null;
     selection.loadingProjectId = null;
   }
 }
@@ -651,14 +690,14 @@ export function dismissAgentCreationFailure(harness: HarnessKind): void {
 /// work happens behind it. Loads the roster + hydrates the conversation on
 /// first activation (once), then issues `set_active_project` — but only after
 /// open/list/register succeed, so the backend's active project never points at
-/// one that failed to load. On failure, records `activationError` (the center
+/// one that failed to load. On failure, records `activationFailure` (the center
 /// pane shows a retry affordance instead of an endless loading state); the
 /// error is cleared here on every (re)activation, so switching away or retrying
 /// clears a stale failure.
 export async function activateProject(projectId: ProjectId): Promise<ActivationResult> {
   const seq = ++activationSeq;
   selection.activeProjectId = projectId;
-  selection.activationError = null;
+  selection.activationFailure = null;
   selection.loadingProjectId = projectId;
   delete backgroundCompletedProjectIds[projectId];
   // Auto-create failures pertain to a just-created project; switching away (or
@@ -688,7 +727,10 @@ export async function activateProject(projectId: ProjectId): Promise<ActivationR
     return "activated";
   } catch (err) {
     if (seq !== activationSeq || selection.activeProjectId !== projectId) return "superseded";
-    selection.activationError = err instanceof Error ? err.message : String(err);
+    selection.activationFailure =
+      err instanceof api.ActivationFailureError
+        ? { type: err.type, message: err.message }
+        : { type: "other", message: err instanceof Error ? err.message : String(err) };
     selection.loadingProjectId = null;
     return "failed";
   }
@@ -947,8 +989,11 @@ export const _testing = {
     workspace.directories = [];
     workspace.persistable = true;
     projects.list = [];
+    for (const key of Object.keys(projectDeletions.pending)) delete projectDeletions.pending[key];
+    for (const key of Object.keys(projectDeletions.errors)) delete projectDeletions.errors[key];
+    projectDeletionPromises.clear();
     selection.activeProjectId = null;
-    selection.activationError = null;
+    selection.activationFailure = null;
     selection.loadingProjectId = null;
     previousLiveProjectSendPairs = [];
     activationSeq = 0;

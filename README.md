@@ -127,6 +127,16 @@ Switchboard drives each agent through its own CLI, so it inherits that CLI's cap
 - **Picking up terminal-continued sessions.** If you continue a session in the agent CLI's own terminal, **Claude Code** picks up the new turns when you switch back to the project. **Codex, Gemini, and Antigravity don't yet** — reopen Switchboard to load their updated history.
 - **Slash-leading prompts can retain CLI command behavior.** Switchboard centrally resolves and renders the same prompt for each selected agent, but Gemini still processes recognized slash-leading text as native commands. Avoid slash-leading prompt bodies when they must behave the same across agent CLIs.
 
+## Notifications
+
+Switchboard posts a macOS notification when every recipient of a send has responded, and when a workflow run reaches its end. Turn them on or off in Settings → Notifications.
+
+The first time it needs to notify you, macOS asks for permission. **The Allow button is behind the "Options" dropdown** — the prompt is easy to dismiss without noticing it:
+
+![macOS notification permission prompt, with Allow under the Options dropdown](docs/images/notification-permission.png)
+
+If you miss it, Settings → Notifications tells you macOS is blocking notifications and where to turn them back on (System Settings → Notifications → Applications → Switchboard).
+
 ## Design and discussion
 
 The architectural decisions, functional requirements, and open questions are being worked through in [`docs/`](./docs), starting with [`docs/system-design.md`](./docs/system-design.md). Comments and pushback welcome via issues.

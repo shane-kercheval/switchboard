@@ -26,7 +26,7 @@ Switchboard also has a **Git view** for reviewing repositories, changed files, d
 - **Keep important messages beside the transcript.** Pin complete messages in the sidebar so you can refer to them while working elsewhere, then jump back to their original location when needed.
 - **Search and navigate long conversations.** Search message text across agents, filter by role or pinned status, preview results, and jump back to a result when its agent is visible in a pane.
 - **Keep track of work across projects.** The project list shows which projects are still running, marks background work when it finishes, and lets you jump directly to newly completed work you haven't viewed.
-- **macOS notifications.** A notification once every recipient of a send has responded, and once a workflow run reaches its end. Clicking it brings Switchboard forward. Optional, and by default it stays quiet while you're working in the app.
+- **macOS notifications.** Switchboard notifies you when your agents finish and when a workflow run ends, while you're working in another app. Clicking the notification brings Switchboard forward. An optional setting extends this to your other projects while you're still in Switchboard, so a project finishing in the background reaches you while you're reading a different one.
 
 ## Install
 
@@ -129,7 +129,9 @@ Switchboard drives each agent through its own CLI, so it inherits that CLI's cap
 
 ## Notifications
 
-Switchboard posts a macOS notification when every recipient of a send has responded, and when a workflow run reaches its end. Turn them on or off in Settings → Notifications.
+A turn can run for a long time, and the point of running several agents at once is that you go and do something else while they work. Switchboard posts a macOS notification when a message you sent has been answered by every agent it went to, and when a workflow run reaches its end. The notification names the project and the agents involved, so it tells you where to go back to. Clicking it brings Switchboard forward.
+
+Which notifications reach you depends on where you are. When Switchboard isn't the app you're using, everything notifies. When it is, the project on screen stays quiet, because its transcript is already telling you. Your other projects stay quiet too by default; the projects sidebar marks them as finished instead. Turn on the second setting in Settings → Notifications if you'd rather be interrupted than notice the marker later.
 
 The first time it needs to notify you, macOS asks for permission. **The Allow button is behind the "Options" dropdown** — the prompt is easy to dismiss without noticing it:
 

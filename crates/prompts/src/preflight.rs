@@ -52,13 +52,6 @@ pub(crate) struct PreflightOutcome {
     /// *authorization server's* `scopes_supported`) would over-ask (e.g.
     /// requesting Clerk's `private_metadata` to fetch prompt templates), so
     /// that path never runs.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "consumed by the sign-in flow, the only caller that registers"
-        )
-    )]
     pub scopes: Option<Vec<String>>,
 }
 
@@ -247,7 +240,13 @@ fn validate_advertised_resource(
 /// an explicit default port, parser-level dot-segment normalization, and a
 /// trailing slash — exactly the spellings that still name the same authority
 /// the well-known request was sent to.
-fn as_identifier(url: &url::Url) -> String {
+///
+/// Crate-visible: the sign-in flow's registration-reuse check compares stored
+/// vs. current issuer through this same derivation, so a spelling-level
+/// difference costs nothing there either (a phantom mismatch would merely
+/// trigger one harmless re-registration, but reuse exists to avoid exactly
+/// that churn).
+pub(crate) fn as_identifier(url: &url::Url) -> String {
     format!("{}{}", origin_of(url), url.path().trim_end_matches('/'))
 }
 

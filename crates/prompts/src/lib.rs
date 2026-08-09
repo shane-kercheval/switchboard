@@ -23,12 +23,14 @@ mod preflight;
 mod provider;
 mod secret;
 mod service;
+mod signin;
 
 pub use builtin::builtin_prompt_content;
 pub use config::{McpAuth, McpProviderConfig, McpTransport, PromptConfig, resolve_local_dirs};
 pub use model::{BUILTIN_PROVIDER, LOCAL_PROVIDER, Prompt, PromptArgument, PromptId};
 pub use secret::{InMemorySecretStore, SecretStore, SecretStoreError};
 pub use service::{McpProviderInfo, PromptService, PromptSource, ProviderStatus, RenderedPrompt};
+pub use signin::BrowserOpener;
 
 pub use error::PromptError;
 
@@ -152,5 +154,12 @@ mod error {
         /// typed `needs_auth` *provider status*, not this variant.
         #[error("MCP provider {provider:?} needs sign-in before its prompts can be used")]
         McpNeedsAuth { provider: String },
+
+        /// A browser sign-in or sign-out flow failed: consent was denied, the
+        /// callback never arrived, registration or the token exchange failed,
+        /// or the provider isn't configured for OAuth. `message` is readable
+        /// and never contains an authorization code or token.
+        #[error("OAuth flow failed for MCP provider {provider:?}: {message}")]
+        OAuthFlow { provider: String, message: String },
     }
 }

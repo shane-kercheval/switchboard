@@ -56,8 +56,9 @@ use crate::commands::{
     reorder_agents_impl, reveal_in_finder_argv, search_project_files_in_root,
     search_project_files_root_impl, send_message_impl, set_active_project_impl,
     set_agent_effort_impl, set_agent_model_impl, set_message_pin_impl, set_preferences_impl,
-    set_project_archived_impl, stage_attachment_impl, sync_prompts_and_notify, terminal_open_argv,
-    test_mcp_connection_impl, tracked_repos_inputs, tracked_roots, validate_external_url,
+    set_project_archived_impl, sign_in_mcp_provider_impl, sign_out_mcp_provider_impl,
+    stage_attachment_impl, sync_prompts_and_notify, terminal_open_argv, test_mcp_connection_impl,
+    tracked_repos_inputs, tracked_roots, validate_external_url,
 };
 use crate::error::AppError;
 use crate::preferences::Preferences;
@@ -344,21 +345,49 @@ async fn list_mcp_providers(state: State<'_, AppState>) -> Result<Vec<McpProvide
     Ok(list_mcp_providers_impl(state.inner()))
 }
 
-/// Add a generic MCP server (name + URL + optional bearer token).
+/// Add a generic MCP server (name + URL + auth mode). `auth` is optional on
+/// the wire and defaults to bearer, so existing callers are unaffected; the
+/// bearer token applies only to bearer mode (OAuth providers are added
+/// credential-less and then signed in).
 #[tauri::command]
 async fn add_mcp_provider(
     state: State<'_, AppState>,
     name: String,
     url: String,
+    auth: Option<switchboard_prompts::McpAuth>,
     bearer: Option<String>,
 ) -> Result<(), String> {
-    add_mcp_provider_impl(state.inner(), &name, &url, bearer.as_deref()).map_err(|e| e.to_string())
+    add_mcp_provider_impl(
+        state.inner(),
+        &name,
+        &url,
+        auth.unwrap_or_default(),
+        bearer.as_deref(),
+    )
+    .map_err(|e| e.to_string())
 }
 
 /// Remove a configured MCP server (deletes its config entry and stored token).
 #[tauri::command]
 async fn remove_mcp_provider(state: State<'_, AppState>, name: String) -> Result<(), String> {
     remove_mcp_provider_impl(state.inner(), &name).map_err(|e| e.to_string())
+}
+
+/// Run the browser sign-in flow for a saved OAuth provider. Long-running: it
+/// resolves only when the user completes (or abandons) the browser flow.
+#[tauri::command]
+async fn sign_in_mcp_provider(state: State<'_, AppState>, name: String) -> Result<(), String> {
+    sign_in_mcp_provider_impl(state.inner(), &name)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Sign out an OAuth provider: clears its tokens, keeps its registration.
+#[tauri::command]
+async fn sign_out_mcp_provider(state: State<'_, AppState>, name: String) -> Result<(), String> {
+    sign_out_mcp_provider_impl(state.inner(), &name)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Probe a candidate MCP server (connect + list) before saving; returns the
@@ -916,9 +945,16 @@ async fn open_session_file(state: State<'_, AppState>, agent_id: String) -> Resu
 
 #[tauri::command]
 async fn open_external_url(url: String) -> Result<(), String> {
-    validate_external_url(&url)?;
+    open_validated_external_url(&url).await
+}
+
+/// Open `url` with macOS `open` after gating it through
+/// [`validate_external_url`]. Shared by the `open_external_url` command
+/// (markdown links) and the OAuth sign-in browser opener.
+async fn open_validated_external_url(url: &str) -> Result<(), String> {
+    validate_external_url(url)?;
     let status = tokio::process::Command::new("open")
-        .arg(&url)
+        .arg(url)
         .status()
         .await
         .map_err(|e| e.to_string())?;
@@ -926,6 +962,19 @@ async fn open_external_url(url: String) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!("`open` failed for {url} (exit {status})"))
+    }
+}
+
+/// The injected side effect for `switchboard_prompts`' OAuth sign-in flow:
+/// opens the authorization URL in the user's default browser through the same
+/// validated opener as clicked links (`crates/prompts` stays Tauri-free and
+/// never shells out itself).
+struct SystemBrowserOpener;
+
+#[async_trait::async_trait]
+impl switchboard_prompts::BrowserOpener for SystemBrowserOpener {
+    async fn open(&self, url: &str) -> Result<(), String> {
+        open_validated_external_url(url).await
     }
 }
 
@@ -1325,6 +1374,7 @@ fn build_prompt_service() -> switchboard_prompts::PromptService {
         let prompts_dir = dir.join("prompts");
         let secrets = build_secret_store(&dir);
         switchboard_prompts::PromptService::new(dir.join("config.yaml"), prompts_dir, home, secrets)
+            .with_browser_opener(Arc::new(SystemBrowserOpener))
     } else {
         tracing::warn!("no home directory resolved — prompt providers disabled");
         switchboard_prompts::PromptService::disabled()
@@ -1424,17 +1474,114 @@ impl crate::workflow_commands::Notifier for TauriNotifier {
     }
 }
 
+/// Whether a log event may be emitted, given its target and level — the
+/// deterministic guard that keeps `rmcp`'s auth module from writing credential
+/// material into logs. rmcp 1.7.0 debug-logs the **raw authorization code**
+/// during the token exchange (`transport/auth.rs`, `exchange_code_for_token`),
+/// which would violate this project's never-log-credentials invariant the
+/// moment a user runs with debug logging to file a bug report. Applied as a
+/// layer filter AND-composed with the `EnvFilter`, so it holds regardless of
+/// `RUST_LOG` (an `EnvFilter` directive could be out-precedenced by a user's
+/// own `rmcp=debug`). Scoped to the auth module only: rmcp's transport and
+/// protocol debug output stays available for diagnosing MCP connections.
+/// Re-check the upstream module on any rmcp version bump.
+fn rmcp_auth_log_allowed(target: &str, level: tracing::Level) -> bool {
+    !(target.starts_with("rmcp::transport::auth") && level > tracing::Level::INFO)
+}
+
+#[cfg(test)]
+mod logging_tests {
+    use tracing_subscriber::Layer as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    /// A `MakeWriter` capturing everything the fmt layer emits.
+    #[derive(Clone, Default)]
+    struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+        type Writer = Capture;
+        fn make_writer(&'a self) -> Capture {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn rmcp_auth_debug_is_denied_even_when_the_env_requests_it() {
+        // The bug-report scenario the redaction exists for: the user has
+        // explicitly enabled rmcp debug logging. The layer filter must still
+        // drop the auth module's debug output (rmcp logs the raw
+        // authorization code there) while letting auth INFO and other rmcp
+        // modules' debug output through — this composes the same
+        // env-filter + deny-filter stack as `run()`.
+        let capture = Capture::default();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(capture.clone())
+                .with_ansi(false)
+                .with_filter(tracing_subscriber::EnvFilter::new("rmcp=debug"))
+                .with_filter(tracing_subscriber::filter::filter_fn(|meta| {
+                    super::rmcp_auth_log_allowed(meta.target(), *meta.level())
+                })),
+        );
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::debug!(target: "rmcp::transport::auth", "start exchange code for token: SECRET-AUTH-CODE");
+            tracing::info!(target: "rmcp::transport::auth", "auth info line");
+            tracing::debug!(target: "rmcp::transport::streamable_http_client", "transport debug line");
+        });
+
+        let logs = String::from_utf8(
+            capture
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+        )
+        .unwrap();
+        assert!(
+            !logs.contains("SECRET-AUTH-CODE"),
+            "auth-module debug output leaked: {logs}"
+        );
+        assert!(logs.contains("auth info line"), "{logs}");
+        assert!(logs.contains("transport debug line"), "{logs}");
+    }
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "length is dominated by the flat `generate_handler!` command registry, which reads better as one list than split across helpers"
 )]
 pub fn run() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .try_init();
+    {
+        use tracing_subscriber::Layer as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+        use tracing_subscriber::util::SubscriberInitExt as _;
+        let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+        let _ = tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_filter(env_filter)
+                    // AND-composed with the env filter, so the credential
+                    // redaction below holds no matter what RUST_LOG says.
+                    .with_filter(tracing_subscriber::filter::filter_fn(|meta| {
+                        rmcp_auth_log_allowed(meta.target(), *meta.level())
+                    })),
+            )
+            .try_init();
+    }
 
     let (claude_adapter, codex_adapter, gemini_adapter, antigravity_adapter) = build_adapters();
 
@@ -1564,6 +1711,8 @@ pub fn run() {
             list_mcp_providers,
             add_mcp_provider,
             remove_mcp_provider,
+            sign_in_mcp_provider,
+            sign_out_mcp_provider,
             test_mcp_connection,
             local_prompts_dir,
             open_local_prompts_dir,

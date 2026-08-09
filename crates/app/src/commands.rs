@@ -1180,16 +1180,35 @@ pub fn list_mcp_providers_impl(state: &AppState) -> Vec<switchboard_prompts::Mcp
     state.prompts.list_mcp_providers()
 }
 
-/// Add a generic MCP provider (name + URL + optional bearer): writes its config
-/// entry, stores the bearer in the keychain, and kicks off a background cache
-/// rebuild so its prompts appear without blocking the command on a slow server.
+/// Add a generic MCP provider (name + URL + auth mode + optional bearer):
+/// writes its config entry, stores the bearer in the keychain (bearer mode
+/// only — an OAuth provider is added credential-less and then signed in), and
+/// kicks off a background cache rebuild so its prompts appear without blocking
+/// the command on a slow server.
 pub fn add_mcp_provider_impl(
     state: &AppState,
     name: &str,
     url: &str,
+    auth: switchboard_prompts::McpAuth,
     bearer: Option<&str>,
 ) -> Result<(), AppError> {
-    state.prompts.add_mcp_provider(name, url, bearer)?;
+    state.prompts.add_mcp_provider(name, url, auth, bearer)?;
+    spawn_prompt_sync(state);
+    Ok(())
+}
+
+/// Run the browser sign-in flow for a saved OAuth provider, then rebuild the
+/// prompt cache in the background so its prompts appear once signed in.
+pub async fn sign_in_mcp_provider_impl(state: &AppState, name: &str) -> Result<(), AppError> {
+    state.prompts.sign_in_mcp_provider(name).await?;
+    spawn_prompt_sync(state);
+    Ok(())
+}
+
+/// Sign out an OAuth provider (clear its tokens, keep its registration) and
+/// rebuild the cache so its prompts drop out and its status reads needs-auth.
+pub async fn sign_out_mcp_provider_impl(state: &AppState, name: &str) -> Result<(), AppError> {
+    state.prompts.sign_out_mcp_provider(name).await?;
     spawn_prompt_sync(state);
     Ok(())
 }
@@ -17562,7 +17581,14 @@ mod tests {
         // prompts crate). Uses the state's in-memory secret store.
         let (_tmp, state) = state_with_prompts();
 
-        add_mcp_provider_impl(&state, "team", "https://mcp.example.com", Some("tok")).unwrap();
+        add_mcp_provider_impl(
+            &state,
+            "team",
+            "https://mcp.example.com",
+            switchboard_prompts::McpAuth::Bearer,
+            Some("tok"),
+        )
+        .unwrap();
         let providers = list_mcp_providers_impl(&state);
         assert_eq!(providers.len(), 1);
         assert_eq!(providers[0].name, "team");
@@ -17570,7 +17596,13 @@ mod tests {
 
         // Duplicate names are rejected at the command boundary.
         assert!(matches!(
-            add_mcp_provider_impl(&state, "team", "https://other", None),
+            add_mcp_provider_impl(
+                &state,
+                "team",
+                "https://other",
+                switchboard_prompts::McpAuth::Bearer,
+                None
+            ),
             Err(AppError::Prompt(_))
         ));
 

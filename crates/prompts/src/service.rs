@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use rmcp::transport::auth::{AuthClient, AuthError, AuthorizationManager};
+use rmcp::transport::auth::{AuthClient, AuthError, AuthorizationManager, CredentialStore as _};
 use serde::Serialize;
 
 use crate::builtin::{BuiltinProvider, builtin_prompt_source};
@@ -40,11 +40,17 @@ use crate::oauth::{
 use crate::preflight::preflight;
 use crate::provider::PromptProvider;
 use crate::secret::{InMemorySecretStore, SecretStore};
+use crate::signin::{BrowserOpener, NoBrowserOpener, SignInRequest, run_sign_in};
 
 /// Per-provider budget for the whole connect + request round-trip during a cache
 /// build — and, for OAuth providers, the client-acquisition + token-probe +
 /// connect + request sequence — so one slow/cold MCP server can't stall startup.
 const PROVIDER_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a sign-in waits for the user to complete the browser flow before
+/// tearing down the callback listener. Generous — the user may be signing in
+/// to the identity provider and completing MFA.
+const SIGN_IN_TIMEOUT: Duration = Duration::from_mins(5);
 
 /// One provider's lazily-built OAuth client. `tokio::sync::OnceCell` gives
 /// single-flight construction: concurrent first users (a `sync` racing a
@@ -188,6 +194,14 @@ pub struct PromptService {
     /// it via [`with_provider_timeout`](Self::with_provider_timeout) so
     /// timeout-path assertions don't wait out ten real seconds.
     provider_timeout: Duration,
+    /// Opens the browser for OAuth sign-in. Defaults to a fail-fast stub;
+    /// production injects the OS opener via
+    /// [`with_browser_opener`](Self::with_browser_opener).
+    browser: Arc<dyn BrowserOpener>,
+    /// How long a sign-in waits for the browser callback. `SIGN_IN_TIMEOUT` in
+    /// production; tests shrink it via
+    /// [`with_sign_in_timeout`](Self::with_sign_in_timeout).
+    sign_in_timeout: Duration,
 }
 
 impl PromptService {
@@ -212,7 +226,27 @@ impl PromptService {
             credential_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             http: Arc::new(tokio::sync::OnceCell::new()),
             provider_timeout: PROVIDER_TIMEOUT,
+            browser: Arc::new(NoBrowserOpener),
+            sign_in_timeout: SIGN_IN_TIMEOUT,
         }
+    }
+
+    /// Inject the browser opener the OAuth sign-in flow uses. The app supplies
+    /// its validated OS opener; without this, sign-in fails fast with a
+    /// readable "no browser opener" error (tests, the disabled service).
+    #[must_use]
+    pub fn with_browser_opener(mut self, opener: Arc<dyn BrowserOpener>) -> Self {
+        self.browser = opener;
+        self
+    }
+
+    /// Test hook: shrink the sign-in callback wait so abandoned-flow tests
+    /// don't wait out the production five minutes. Hidden — not product API.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_sign_in_timeout(mut self, timeout: Duration) -> Self {
+        self.sign_in_timeout = timeout;
+        self
     }
 
     /// Test hook: shrink the per-provider budget so timeout-path tests don't
@@ -269,6 +303,8 @@ impl PromptService {
             credential_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             http: Arc::new(tokio::sync::OnceCell::new()),
             provider_timeout: PROVIDER_TIMEOUT,
+            browser: Arc::new(NoBrowserOpener),
+            sign_in_timeout: SIGN_IN_TIMEOUT,
         }
     }
 
@@ -606,12 +642,163 @@ impl PromptService {
     }
 
     /// Drop any cached OAuth client for `name` (all URLs). Called on provider
-    /// removal; sign-out and sign-in will invalidate through here too.
+    /// removal, on sign-out, and by sign-in when the registration changed.
+    ///
+    /// Safe against a build racing this call: `oauth_client` clones the
+    /// entry's `Arc<OnceCell>` before releasing the map lock, so the `retain`
+    /// here unlinks the cell from the map *before* a racing builder populates
+    /// it — the populated client is visible only to callers already holding
+    /// the cell and never re-enters the cache. It is also inert: it re-reads
+    /// the credential store on every call, and its saves are refused after a
+    /// sign-out (the sign-out epoch) or a re-registration (the client-id
+    /// check). No generation counter on the cache is needed.
     fn invalidate_oauth_clients(&self, name: &str) {
         self.oauth_clients
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .retain(|(cached_name, _), _| cached_name != name);
+    }
+
+    /// The provider's already-built cached client, if any — without
+    /// constructing one (sign-out must not run a preflight just to lock a
+    /// client that doesn't exist).
+    fn cached_oauth_client(
+        &self,
+        name: &str,
+        canonical_url: &str,
+    ) -> Option<AuthClient<reqwest::Client>> {
+        self.oauth_clients
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&(name.to_owned(), canonical_url.to_owned()))
+            .and_then(|cell| cell.get().cloned())
+    }
+
+    /// The URL and scopes override of provider `name`, which must be an OAuth
+    /// provider — the shared precondition of sign-in and sign-out.
+    fn oauth_provider_config(
+        &self,
+        name: &str,
+    ) -> Result<(String, Option<Vec<String>>), PromptError> {
+        let config = self
+            .mcp_provider_configs()
+            .into_iter()
+            .find(|c| c.name == name)
+            .ok_or_else(|| PromptError::ProviderNotFound {
+                provider: name.to_owned(),
+            })?;
+        let McpTransport::Http { url } = config.transport;
+        match config.auth {
+            McpAuth::Oauth { scopes } => Ok((url, scopes)),
+            McpAuth::Bearer => Err(PromptError::OAuthFlow {
+                provider: name.to_owned(),
+                message: "this provider uses a pasted bearer token, not browser sign-in".to_owned(),
+            }),
+        }
+    }
+
+    /// Browser sign-in for an OAuth provider: preflight, register (or reuse)
+    /// the client registration, open the browser via the injected opener,
+    /// await the loopback callback, exchange the code, and durably commit the
+    /// tokens. Serialized per provider against sign-out (and other sign-ins)
+    /// by the flow gate — which refuses a busy provider rather than queueing
+    /// (a queued second sign-in would open a surprise browser tab minutes
+    /// later; a queued sign-out would wait out the flow and then destroy the
+    /// tokens the user just obtained). The gate is deliberately **not** the
+    /// credential transaction lock — the flow's own registration persistence
+    /// and token save take that lock internally (see [`CredentialLifecycle`]).
+    pub async fn sign_in_mcp_provider(&self, name: &str) -> Result<(), PromptError> {
+        let (url, scopes_override) = self.oauth_provider_config(name)?;
+        let canonical =
+            canonicalize_resource_url(&url).map_err(|e| PromptError::OAuthValidation {
+                provider: name.to_owned(),
+                message: format!("invalid provider URL {url:?}: {e}"),
+            })?;
+        let lifecycle = self.credential_lifecycle(name);
+        let Ok(_flow) = lifecycle.flow_gate.try_lock() else {
+            return Err(Self::flow_in_progress(name));
+        };
+        let http = self.http_client(name).await?;
+        let store = self.credential_store(name, &canonical);
+        let cached_client = self.cached_oauth_client(name, &canonical);
+        let (registration_changed, result) = run_sign_in(SignInRequest {
+            http,
+            opener: self.browser.as_ref(),
+            store: &store,
+            cached_client,
+            provider: name,
+            canonical_url: &canonical,
+            scopes_override: scopes_override.as_deref(),
+            exchange_timeout: self.provider_timeout,
+            callback_timeout: self.sign_in_timeout,
+        })
+        .await;
+        // Invalidate only when the flow re-registered (reported even when a
+        // later step failed — the new registration is already persisted): a
+        // cached client configured with the previous client id would refresh
+        // against the wrong registration from then on. When the registration
+        // is unchanged the cached client deliberately stays: it re-reads the
+        // store on every call so it picks up the new tokens, while retiring
+        // it would let a later rebuild coexist with its still-running
+        // operations — two live managers refreshing one rotating
+        // refresh-token family.
+        if registration_changed {
+            self.invalidate_oauth_clients(name);
+        }
+        result
+    }
+
+    /// The refusal both flows return when the provider's flow gate is held.
+    fn flow_in_progress(name: &str) -> PromptError {
+        PromptError::OAuthFlow {
+            provider: name.to_owned(),
+            message: "a sign-in or sign-out for this provider is already in progress".to_owned(),
+        }
+    }
+
+    /// Sign out an OAuth provider: clear its stored tokens (the registration
+    /// survives for the next sign-in) and drop its cached client.
+    ///
+    /// Serializes against in-flight token use by holding the cached client's
+    /// auth-manager mutex across the clear *and* the cache invalidation: an
+    /// in-flight refresh either completes first (its just-persisted tokens are
+    /// then cleared) or starts after and finds nothing to refresh —
+    /// `get_access_token` re-loads from the credential store on every call, so
+    /// there is no in-memory copy a late refresh could resurrect from. Without
+    /// this, a refresh racing sign-out could re-persist tokens *after* the
+    /// user was told they were removed.
+    pub async fn sign_out_mcp_provider(&self, name: &str) -> Result<(), PromptError> {
+        let (url, _scopes) = self.oauth_provider_config(name)?;
+        let canonical =
+            canonicalize_resource_url(&url).map_err(|e| PromptError::OAuthValidation {
+                provider: name.to_owned(),
+                message: format!("invalid provider URL {url:?}: {e}"),
+            })?;
+        let lifecycle = self.credential_lifecycle(name);
+        let Ok(_flow) = lifecycle.flow_gate.try_lock() else {
+            return Err(Self::flow_in_progress(name));
+        };
+        let cached = self.cached_oauth_client(name, &canonical);
+        let _refresh_exclusion = match &cached {
+            Some(client) => Some(client.auth_manager.lock().await),
+            None => None,
+        };
+        // Retire every credential store created before this instant: a client
+        // the mutex above cannot see (mid-construction, or orphaned by an
+        // earlier invalidation) may already have loaded the tokens and be
+        // refreshing them; bumping the epoch before the clear makes its
+        // eventual save refuse instead of resurrecting credentials (see
+        // `CredentialLifecycle::sign_out_epoch`).
+        lifecycle
+            .sign_out_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let cleared = self.credential_store(name, &canonical).clear().await;
+        self.invalidate_oauth_clients(name);
+        cleared.map_err(|e| {
+            PromptError::Secret(crate::secret::SecretStoreError::Backend(format!(
+                "could not clear stored credentials: {e}"
+            )))
+        })
     }
 
     fn publish(&self, prompts: Vec<Prompt>) {
@@ -885,18 +1072,28 @@ impl PromptService {
     }
 
     /// Add a generic HTTP MCP provider: validate the name, write its non-secret
-    /// config entry (preserving every other config key), and store its bearer in
-    /// the secret store. Does **not** rebuild the cache — the caller triggers a
-    /// background sync so a slow server can't block the command.
+    /// config entry (preserving every other config key), and — for a bearer
+    /// provider — store its pasted token in the secret store. An OAuth
+    /// provider is added credential-less; its honest next step is
+    /// [`sign_in_mcp_provider`](Self::sign_in_mcp_provider). Does **not**
+    /// rebuild the cache — the caller triggers a background sync so a slow
+    /// server can't block the command.
     pub fn add_mcp_provider(
         &self,
         name: &str,
         url: &str,
+        auth: McpAuth,
         bearer: Option<&str>,
     ) -> Result<(), PromptError> {
         if !is_valid_provider_name(name) {
             return Err(PromptError::InvalidProviderName {
                 name: name.to_owned(),
+            });
+        }
+        if bearer.is_some() && !matches!(auth, McpAuth::Bearer) {
+            return Err(PromptError::OAuthFlow {
+                provider: name.to_owned(),
+                message: "a pasted bearer token does not apply to an OAuth provider".to_owned(),
             });
         }
         let _guard = self
@@ -914,7 +1111,7 @@ impl PromptService {
             transport: McpTransport::Http {
                 url: url.to_owned(),
             },
-            auth: McpAuth::default(),
+            auth,
         });
         // Store the secret *before* writing the config entry. A stored secret with
         // no config entry is benign (never read, overwritten on retry); a config
@@ -1403,7 +1600,12 @@ mod tests {
         );
 
         service
-            .add_mcp_provider("team", "https://mcp.example.com", Some("secret-tok"))
+            .add_mcp_provider(
+                "team",
+                "https://mcp.example.com",
+                McpAuth::Bearer,
+                Some("secret-tok"),
+            )
             .unwrap();
 
         // The MCP entry was added; the local dir and the unknown `theme` key survive.
@@ -1435,25 +1637,103 @@ mod tests {
             None,
             Arc::new(InMemorySecretStore::new()),
         );
-        service.add_mcp_provider("team", "https://a", None).unwrap();
+        service
+            .add_mcp_provider("team", "https://a", McpAuth::Bearer, None)
+            .unwrap();
         assert!(matches!(
-            service.add_mcp_provider("team", "https://b", None),
+            service.add_mcp_provider("team", "https://b", McpAuth::Bearer, None),
             Err(PromptError::DuplicateProvider { .. })
         ));
         assert!(matches!(
-            service.add_mcp_provider("local", "https://b", None),
+            service.add_mcp_provider("local", "https://b", McpAuth::Bearer, None),
             Err(PromptError::InvalidProviderName { .. })
         ));
         // The built-in library's namespace is reserved at the boundary a user
         // hits — an MCP provider named `builtin` can't shadow the read-only
         // built-ins. This is the milestone's no-collision keystone.
         assert!(matches!(
-            service.add_mcp_provider("builtin", "https://b", None),
+            service.add_mcp_provider("builtin", "https://b", McpAuth::Bearer, None),
             Err(PromptError::InvalidProviderName { .. })
         ));
         assert!(matches!(
-            service.add_mcp_provider("a:b", "https://b", None),
+            service.add_mcp_provider("a:b", "https://b", McpAuth::Bearer, None),
             Err(PromptError::InvalidProviderName { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn add_oauth_provider_writes_auth_mode_and_stores_no_secret() {
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join("config.yaml");
+        let store = Arc::new(InMemorySecretStore::new());
+        let service = PromptService::new(
+            config_path.clone(),
+            dir.path().join("prompts"),
+            None,
+            store.clone(),
+        );
+
+        service
+            .add_mcp_provider(
+                "tiddly",
+                "https://prompts-mcp.tiddly.me/mcp",
+                McpAuth::Oauth { scopes: None },
+                None,
+            )
+            .unwrap();
+
+        let raw = std::fs::read_to_string(&config_path).unwrap();
+        assert!(raw.contains("type: oauth"), "{raw}");
+        let providers = service.list_mcp_providers();
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].auth, McpAuth::Oauth { scopes: None });
+        // Credential-less until sign-in.
+        assert!(!providers[0].has_token);
+        assert!(store.get("oauth:tiddly").unwrap().is_none());
+
+        // A pasted token combined with OAuth mode is an API misuse, refused
+        // before anything is written.
+        let err = service
+            .add_mcp_provider(
+                "other",
+                "https://a/mcp",
+                McpAuth::Oauth { scopes: None },
+                Some("tok"),
+            )
+            .unwrap_err();
+        assert!(matches!(err, PromptError::OAuthFlow { .. }));
+        assert_eq!(service.list_mcp_providers().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn sign_in_and_sign_out_require_an_oauth_provider() {
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join("config.yaml");
+        std::fs::write(&config_path, http_provider_yaml("team", "https://a")).unwrap();
+        let service = PromptService::new(
+            config_path,
+            dir.path().join("prompts"),
+            None,
+            Arc::new(InMemorySecretStore::new()),
+        );
+
+        // A bearer provider has no browser flow in either direction.
+        let err = service.sign_in_mcp_provider("team").await.unwrap_err();
+        assert!(
+            matches!(err, PromptError::OAuthFlow { ref provider, .. } if provider == "team"),
+            "{err:?}"
+        );
+        let err = service.sign_out_mcp_provider("team").await.unwrap_err();
+        assert!(matches!(err, PromptError::OAuthFlow { .. }));
+
+        // An unconfigured name is "no such provider", not a flow failure.
+        assert!(matches!(
+            service.sign_in_mcp_provider("nope").await.unwrap_err(),
+            PromptError::ProviderNotFound { .. }
+        ));
+        assert!(matches!(
+            service.sign_out_mcp_provider("nope").await.unwrap_err(),
+            PromptError::ProviderNotFound { .. }
         ));
     }
 
@@ -1500,7 +1780,9 @@ mod tests {
             Arc::new(InMemorySecretStore::new()),
         );
 
-        service.add_mcp_provider("team", "https://a", None).unwrap();
+        service
+            .add_mcp_provider("team", "https://a", McpAuth::Bearer, None)
+            .unwrap();
 
         let raw = std::fs::read_to_string(&config_path).unwrap();
         let section: McpSection = serde_norway::from_str(&raw).unwrap();
@@ -1598,7 +1880,7 @@ mod tests {
         // Secret is stored before the config entry, so a failed `set` aborts the
         // add before anything is written — no half-added, retry-blocking provider.
         let err = service
-            .add_mcp_provider("team", "https://a", Some("tok"))
+            .add_mcp_provider("team", "https://a", McpAuth::Bearer, Some("tok"))
             .unwrap_err();
         assert!(matches!(err, PromptError::Secret(_)));
         assert!(service.list_mcp_providers().is_empty());
@@ -1744,7 +2026,7 @@ mod tests {
             Arc::new(InMemorySecretStore::new()),
         );
         assert!(matches!(
-            service.add_mcp_provider("team", "https://a", None),
+            service.add_mcp_provider("team", "https://a", McpAuth::Bearer, None),
             Err(PromptError::ConfigWrite { .. })
         ));
     }

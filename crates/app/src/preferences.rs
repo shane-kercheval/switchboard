@@ -280,7 +280,12 @@ mod tests {
         });
         let adder = std::thread::spawn(move || {
             prompts
-                .add_mcp_provider("team", "https://example.test", None)
+                .add_mcp_provider(
+                    "team",
+                    "https://example.test",
+                    switchboard_prompts::McpAuth::Bearer,
+                    None,
+                )
                 .unwrap();
         });
         saver.join().unwrap();

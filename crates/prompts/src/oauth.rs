@@ -78,6 +78,15 @@ pub(crate) struct OAuthEnvelope {
 
 /// The non-secret client registration a provider holds with its authorization
 /// server. Survives sign-out; deleted only with the provider.
+///
+/// Beyond the client id, this records the **compatibility fingerprint** the
+/// sign-in flow checks before reusing a registration: the redirect form, the
+/// scopes it was registered with, and the authorization server it belongs to.
+/// Reusing a registration whose fingerprint no longer matches what the current
+/// sign-in would request fails *at the authorization server, in the browser* —
+/// where we can never see or handle it — and reuse would then hand back the
+/// same stale client id on every retry, making the failure permanent. A
+/// mismatch instead re-registers (see `signin::resolve_client_id`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct OAuthRegistration {
     pub client_id: String,
@@ -86,6 +95,19 @@ pub(crate) struct OAuthRegistration {
     pub redirect_uri: String,
     /// Canonical URL of the MCP endpoint these credentials belong to.
     pub resource: String,
+    /// The normalized (sorted, deduplicated) scopes sent at registration.
+    /// Serde-defaulted so a pre-fingerprint envelope reads as "registered with
+    /// no scopes" — which re-registers as soon as the server advertises any,
+    /// the safe direction.
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    /// The authorization server's validated issuer identifier at registration
+    /// time. Compared via the preflight's `as_identifier` derivation, so
+    /// spelling-level differences (trailing slash, host case) don't churn
+    /// re-registrations. Serde-defaulted (empty) for pre-fingerprint
+    /// envelopes, which therefore re-register once.
+    #[serde(default)]
+    pub issuer: String,
 }
 
 /// A provider's local credential situation, determined without any network
@@ -105,26 +127,46 @@ pub(crate) enum CredentialState {
     SignedIn,
 }
 
-/// One provider's credential concurrency state — two locks with distinct jobs
-/// and a strict acquisition order (`io_gate` before `txn`; removal takes `txn`
-/// only, so no cycle):
+/// One provider's credential concurrency state — three locks and a
+/// generation counter, each with a distinct job, and a strict lock
+/// acquisition order (`flow_gate`, then `io_gate`, then `txn`; removal takes
+/// `txn` only, so no cycle):
 ///
 /// - **`txn`** — the transaction lock: held across a whole envelope
 ///   read → check → write (and removal's deletes). Synchronous, held only
 ///   inside blocking-pool closures or brief sync sections — **never across an
 ///   `.await`**, and never across an operation that itself persists
-///   credentials (that self-deadlocks; the sign-in flow's gate is a *separate*
-///   async mutex — see the plan's M3 notes).
+///   credentials (that self-deadlocks; the flows hold `flow_gate` instead).
 /// - **`io_gate`** — bounds abandoned blocking work. Each blocking task takes
 ///   an **owned** guard *into its closure*, so the gate is released only when
 ///   the store call actually finishes — not when a timed-out caller gives up.
 ///   Against a wedged keychain, one thread parks per provider and every later
 ///   attempt waits on the (cancellable) gate without spawning anything.
 ///   Caller-held guards would drop on timeout and re-open the pile-up.
+/// - **`flow_gate`** — serializes whole sign-in/sign-out *orchestrations* so
+///   the two flows cannot interleave with each other. Async, held across the
+///   flow's awaits — which is exactly why it must be a separate lock from
+///   `txn`: `persist_registration` and every credential save/clear a flow
+///   performs take `txn` internally, so a flow holding `txn` would
+///   self-deadlock at its own registration persistence, before the browser
+///   even opens. Store operations never touch this gate.
+/// - **`sign_out_epoch`** — the in-memory generation that makes clients
+///   predating a sign-out unable to persist credentials. Every
+///   [`ProviderCredentialStore`] captures the epoch at construction;
+///   `save_sync` refuses when it has since moved. This is what covers the
+///   clients the sign-out serialization cannot see: one mid-construction (not
+///   yet in the session cache when sign-out samples it) or one orphaned by an
+///   earlier invalidation — either could otherwise load tokens before the
+///   clear, refresh, and re-persist them *after* the user was told they were
+///   signed out. Deliberately in-memory only (a persisted generation counter
+///   was considered and rejected earlier in this plan): restarts rebuild every
+///   client anyway.
 #[derive(Default)]
 pub(crate) struct CredentialLifecycle {
     pub(crate) txn: std::sync::Mutex<()>,
     pub(crate) io_gate: Arc<tokio::sync::Mutex<()>>,
+    pub(crate) flow_gate: tokio::sync::Mutex<()>,
+    pub(crate) sign_out_epoch: std::sync::atomic::AtomicU64,
 }
 
 /// Bridges one provider's envelope onto `rmcp`'s [`CredentialStore`]. rmcp only
@@ -150,6 +192,11 @@ pub(crate) struct ProviderCredentialStore {
     resource: String,
     /// Shared with `PromptService`'s removal path via `credential_lifecycle`.
     lifecycle: Arc<CredentialLifecycle>,
+    /// The provider's sign-out epoch when this store was created. Clones share
+    /// it (they belong to the same client generation); `save_sync` refuses
+    /// once the lifecycle's epoch has moved past it — see
+    /// [`CredentialLifecycle`].
+    epoch_at_creation: u64,
 }
 
 impl Clone for ProviderCredentialStore {
@@ -159,6 +206,7 @@ impl Clone for ProviderCredentialStore {
             key: self.key.clone(),
             resource: self.resource.clone(),
             lifecycle: self.lifecycle.clone(),
+            epoch_at_creation: self.epoch_at_creation,
         }
     }
 }
@@ -170,11 +218,15 @@ impl ProviderCredentialStore {
         resource: &str,
         lifecycle: Arc<CredentialLifecycle>,
     ) -> Self {
+        let epoch_at_creation = lifecycle
+            .sign_out_epoch
+            .load(std::sync::atomic::Ordering::SeqCst);
         Self {
             secrets,
             key: oauth_secret_key(provider),
             resource: resource.to_owned(),
             lifecycle,
+            epoch_at_creation,
         }
     }
 
@@ -188,7 +240,9 @@ impl ProviderCredentialStore {
     /// Run a store operation on the blocking pool, with the closure **owning**
     /// the provider's I/O gate for its full duration (see
     /// [`CredentialLifecycle`] for why ownership must live in the closure).
-    async fn with_io_gate<T, F>(&self, op: F) -> Result<T, AuthError>
+    /// Crate-visible so the sign-in flow's registration read/persist go through
+    /// the same gate as every other store operation.
+    pub(crate) async fn with_io_gate<T, F>(&self, op: F) -> Result<T, AuthError>
     where
         F: FnOnce(&ProviderCredentialStore) -> T + Send + 'static,
         T: Send + 'static,
@@ -209,14 +263,12 @@ impl ProviderCredentialStore {
     /// never orphans a server-side registration. The `resource` is stamped from
     /// this store's own binding rather than accepted from the caller, so the
     /// invariant cannot arrive as two independently-supplied strings.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "consumed by the sign-in flow, its only caller")
-    )]
     pub(crate) fn persist_registration(
         &self,
         client_id: String,
         redirect_uri: String,
+        scopes: Vec<String>,
+        issuer: String,
     ) -> Result<(), AuthError> {
         let _guard = self.locked();
         self.write_envelope_locked(&OAuthEnvelope {
@@ -224,6 +276,8 @@ impl ProviderCredentialStore {
                 client_id,
                 redirect_uri,
                 resource: self.resource.clone(),
+                scopes,
+                issuer,
             },
             tokens: None,
         })
@@ -235,10 +289,6 @@ impl ProviderCredentialStore {
     /// through the guarded read means a registration bound to a since-changed
     /// URL reads as absent, so the flow re-registers instead of reusing a
     /// client id the resource check would reject forever after.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "consumed by the sign-in flow, its only caller")
-    )]
     pub(crate) fn registration(&self) -> Result<Option<OAuthRegistration>, AuthError> {
         let _guard = self.locked();
         self.read_envelope_locked()
@@ -380,6 +430,20 @@ impl ProviderCredentialStore {
         // which case the read below sees no envelope and the save errors —
         // never a resurrected credential.
         let _guard = self.locked();
+        // A store created before the last sign-out belongs to a client the
+        // user has since signed out from; its save must not re-persist tokens
+        // (see `CredentialLifecycle::sign_out_epoch`). Checked under the
+        // transaction lock so it orders strictly against the bump-then-clear.
+        if self
+            .lifecycle
+            .sign_out_epoch
+            .load(std::sync::atomic::Ordering::SeqCst)
+            != self.epoch_at_creation
+        {
+            return Err(AuthError::InternalError(
+                "refusing to persist tokens for a client superseded by sign-out".to_owned(),
+            ));
+        }
         // rmcp calls this on every token exchange/refresh with only a
         // `StoredCredentials`; the registration block must survive. A missing
         // (or, via the guarded read, mismatched-resource) envelope is an
@@ -523,6 +587,8 @@ mod tests {
             .persist_registration(
                 "client-1".to_owned(),
                 "http://127.0.0.1/callback".to_owned(),
+                vec!["openid".to_owned()],
+                "https://auth.example.com".to_owned(),
             )
             .unwrap();
         store
@@ -563,6 +629,8 @@ mod tests {
         assert_eq!(registration.client_id, "client-1");
         assert_eq!(registration.redirect_uri, "http://127.0.0.1/callback");
         assert_eq!(registration.resource, RESOURCE);
+        assert_eq!(registration.scopes, vec!["openid".to_owned()]);
+        assert_eq!(registration.issuer, "https://auth.example.com");
 
         // Through a store bound to a different URL the registration is absent —
         // the sign-in flow re-registers rather than reusing a client id that
@@ -586,6 +654,8 @@ mod tests {
                 client_id: "client-1".to_owned(),
                 redirect_uri: "http://127.0.0.1/callback".to_owned(),
                 resource: RESOURCE.to_owned(),
+                scopes: vec!["openid".to_owned()],
+                issuer: "https://auth.example.com".to_owned(),
             }
         );
         assert!(envelope.tokens.is_some());
@@ -865,6 +935,8 @@ mod tests {
             .persist_registration(
                 "client-1".to_owned(),
                 "http://127.0.0.1/callback".to_owned(),
+                vec![],
+                String::new(),
             )
             .unwrap();
         store.save(credentials("client-1", "tok-1")).await.unwrap();
@@ -891,5 +963,56 @@ mod tests {
         let result = racing_save.await.unwrap();
         assert!(matches!(result, Err(AuthError::InternalError(_))));
         assert!(secrets.get("oauth:team").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn save_from_a_store_predating_a_sign_out_is_refused() {
+        // The cold-build / orphaned-client variant of the resurrection race:
+        // a client whose store was created before the sign-out (and so was
+        // never visible to sign-out's cached-client serialization) must not be
+        // able to persist a refresh afterwards. A store created *after* the
+        // bump belongs to the next generation and saves normally.
+        let secrets = Arc::new(InMemorySecretStore::new());
+        let lifecycle = Arc::new(CredentialLifecycle::default());
+        let stale = ProviderCredentialStore::new(
+            secrets.clone() as Arc<dyn SecretStore>,
+            "team",
+            RESOURCE,
+            lifecycle.clone(),
+        );
+        stale
+            .persist_registration(
+                "client-1".to_owned(),
+                "http://127.0.0.1/callback".to_owned(),
+                vec![],
+                String::new(),
+            )
+            .unwrap();
+
+        // Sign-out bumps the epoch (the service does this under the flow
+        // gate, before clearing).
+        lifecycle
+            .sign_out_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+        let err = stale
+            .save(credentials("client-1", "tok-late"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AuthError::InternalError(_)));
+        let raw = secrets.get("oauth:team").unwrap().unwrap();
+        assert!(!raw.contains("tok-late"), "stale save must not persist");
+
+        // The next generation's store (created after the bump) is unaffected.
+        let fresh = ProviderCredentialStore::new(
+            secrets.clone() as Arc<dyn SecretStore>,
+            "team",
+            RESOURCE,
+            lifecycle.clone(),
+        );
+        fresh
+            .save(credentials("client-1", "tok-next"))
+            .await
+            .unwrap();
     }
 }

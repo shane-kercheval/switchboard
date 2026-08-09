@@ -133,7 +133,9 @@ Switchboard posts a macOS notification when every recipient of a send has respon
 
 The first time it needs to notify you, macOS asks for permission. **The Allow button is behind the "Options" dropdown** — the prompt is easy to dismiss without noticing it:
 
-![macOS notification permission prompt, with Allow under the Options dropdown](docs/images/notification-permission.png)
+<!-- Sized in HTML, not scaled down on disk: the capture is 2x, so rendering it at
+     half its pixel width keeps it crisp on a Retina display. -->
+<img src="docs/images/notification-permission.png" width="368" alt="macOS notification permission prompt, with Allow under the Options dropdown" />
 
 If you miss it, Settings → Notifications tells you macOS is blocking notifications and where to turn them back on (System Settings → Notifications → Applications → Switchboard).
 

@@ -151,11 +151,13 @@ fn bundled() -> bool {
 /// notification activates the owning app through macOS itself, with no
 /// participation from us, so there is nothing to observe.
 ///
-/// Activation is verified: a probe that posted a notification, dropped the
-/// handle and exited was relaunched by macOS on click. **Whether activation also
-/// restores a *minimized* window is not** — that is a separate `AppKit` behavior,
-/// and if it turns out not to hold, the fix belongs in the app's activation
-/// handling, not here.
+/// Verified end to end from an installed build: clicking a notification brings
+/// Switchboard forward **and restores a minimized window**, with no window code
+/// of ours involved. That second half was the open question — activating a
+/// process and deminiaturizing its window are separate `AppKit` behaviors — so it
+/// is recorded here rather than left to be re-derived. If a future macOS release
+/// breaks it, the fix belongs in the app's activation handling
+/// (`tauri::RunEvent::Reopen`), not in this module.
 pub struct UserNotificationDelivery;
 
 impl NotificationDelivery for UserNotificationDelivery {

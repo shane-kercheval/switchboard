@@ -1,4 +1,4 @@
-.PHONY: dev build open run install-app uninstall-app deploy test test-browser lint fmt check clean install test-live test-live-claude test-live-codex test-live-gemini test-live-antigravity
+.PHONY: dev build open run install-app uninstall-app debug-app uninstall-debug-app deploy test test-browser lint fmt check clean install test-live test-live-claude test-live-codex test-live-gemini test-live-antigravity
 
 # Crates that carry live (`#[ignore]`-gated) harness tests.
 LIVE_PKGS := -p switchboard-harness -p switchboard-dispatcher -p switchboard-app
@@ -32,6 +32,11 @@ dev:
 # target/release/bundle/macos/Switchboard.app
 build:
 	pnpm tauri build --bundles app
+	# Guards a *runtime* precondition, not a distribution one: UNUserNotificationCenter
+	# silently refuses to deliver from a bundle without a real signature, so losing
+	# the ad-hoc signingIdentity would ship an app whose notifications just stop with
+	# no error anywhere. Failing the build is the only place that regression is loud.
+	codesign --verify --deep --strict target/release/bundle/macos/Switchboard.app
 
 open:
 	open target/release/bundle/macos/Switchboard.app
@@ -49,6 +54,42 @@ install-app:
 
 uninstall-app:
 	rm -rf /Applications/Switchboard.app
+
+# Debug build, installed and launched as a real app — the only way to exercise OS
+# notifications. `UNUserNotificationCenter` refuses to deliver unless the process
+# runs from a code-signed bundle installed under an Applications directory and
+# registered with Launch Services; a bundle sitting in `target/` fails even when
+# its signature is valid, and `make dev` (a bare binary) fails outright. Installs
+# under a separate name so the real /Applications/Switchboard.app keeps its own
+# notification authorization and is not replaced. Remove with `uninstall-debug-app`.
+# Both are overridable on the command line. The identifier override is
+# load-bearing, not cosmetic: macOS keys notification authorization on the bundle
+# identifier, so without it the debug build would inherit — and could revoke —
+# the installed app's permission.
+#
+# A *fresh* identifier is also the only reliable way to see the notification
+# permission prompt again; macOS asks once per identifier and never re-asks. To
+# capture the prompt for documentation, pair a throwaway identifier with the real
+# display name so the dialog reads "Switchboard":
+#
+#   make debug-app DEBUG_APP_NAME=Switchboard DEBUG_APP_ID=com.switchboard.desktop.shot
+#   make uninstall-debug-app DEBUG_APP_NAME=Switchboard
+DEBUG_APP_NAME ?= Switchboard (debug)
+DEBUG_APP_ID ?= com.switchboard.desktop.debug
+DEBUG_APP := $(HOME)/Applications/$(DEBUG_APP_NAME).app
+DEBUG_APP_CONFIG := {"productName":"$(DEBUG_APP_NAME)","identifier":"$(DEBUG_APP_ID)"}
+
+debug-app:
+	pnpm tauri build --debug --bundles app --config '$(DEBUG_APP_CONFIG)'
+	codesign --verify --deep --strict "target/debug/bundle/macos/$(DEBUG_APP_NAME).app"
+	rm -rf "$(DEBUG_APP)"
+	mkdir -p "$(HOME)/Applications"
+	cp -R "target/debug/bundle/macos/$(DEBUG_APP_NAME).app" "$(DEBUG_APP)"
+	/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$(DEBUG_APP)"
+	open "$(DEBUG_APP)"
+
+uninstall-debug-app:
+	rm -rf "$(DEBUG_APP)"
 
 deploy: build install-app
 	open /Applications/Switchboard.app

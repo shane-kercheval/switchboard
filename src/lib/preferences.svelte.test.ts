@@ -21,6 +21,8 @@ const PREFS = (editor: string | null, terminal: string): Preferences => ({
   terminal_app: terminal,
   diff_style: "side_by_side",
   show_builtins: true,
+  notify_on_completion: true,
+  notify_while_focused: false,
 });
 
 describe("preferences store", () => {

@@ -11,6 +11,7 @@ mod git_registry;
 mod journal;
 mod locator_sink;
 mod metadata;
+mod notification;
 mod preferences;
 mod secret_store;
 mod state;
@@ -56,8 +57,9 @@ use crate::commands::{
     reorder_agents_impl, reveal_in_finder_argv, search_project_files_in_root,
     search_project_files_root_impl, send_message_impl, set_active_project_impl,
     set_agent_effort_impl, set_agent_model_impl, set_message_pin_impl, set_preferences_impl,
-    set_project_archived_impl, stage_attachment_impl, sync_prompts_and_notify, terminal_open_argv,
-    test_mcp_connection_impl, tracked_repos_inputs, tracked_roots, validate_external_url,
+    set_project_archived_impl, set_visible_project_impl, stage_attachment_impl,
+    sync_prompts_and_notify, terminal_open_argv, test_mcp_connection_impl, tracked_repos_inputs,
+    tracked_roots, validate_external_url,
 };
 use crate::preferences::Preferences;
 use crate::state::AppState;
@@ -467,6 +469,33 @@ async fn commit_file_diff(
     .map_err(|e| e.to_string())
 }
 
+/// Whether macOS will actually show a notification right now. Exists because the
+/// failure modes are silent and mutually indistinguishable from inside the app:
+/// a denied permission, every presentation channel switched off in System
+/// Settings, and an unsigned or unbundled build all produce exactly the same
+/// nothing. Without this, "I never see notifications" has no diagnosis.
+#[tauri::command]
+async fn notification_availability() -> crate::notification::NotificationAvailability {
+    crate::notification::availability().await
+}
+
+/// Ask for notification permission if the user's preference wants notifications.
+/// Idempotent per process; a disabled preference leaves the once-flag unclaimed
+/// so enabling it later still prompts.
+fn request_notification_authorization(state: &AppState) {
+    crate::notification::ensure_authorization(get_preferences_impl(state).notify_on_completion);
+}
+
+#[tauri::command]
+async fn set_visible_project(
+    state: State<'_, AppState>,
+    project_id: Option<ProjectId>,
+    seq: u64,
+) -> Result<(), String> {
+    set_visible_project_impl(state.inner(), project_id, seq);
+    Ok(())
+}
+
 #[tauri::command]
 async fn get_preferences(state: State<'_, AppState>) -> Result<Preferences, String> {
     Ok(get_preferences_impl(state.inner()))
@@ -477,7 +506,13 @@ async fn set_preferences(
     state: State<'_, AppState>,
     preferences: Preferences,
 ) -> Result<(), String> {
-    set_preferences_impl(state.inner(), &preferences).map_err(|e| e.to_string())
+    set_preferences_impl(state.inner(), &preferences).map_err(|e| e.to_string())?;
+    // Switching notifications on is itself a request for them, and Settings is
+    // good context for the permission prompt. Without this, a user who enables
+    // the setting *during* a long-running turn would never be asked — no further
+    // dispatch would occur — and the completion would silently never arrive.
+    request_notification_authorization(state.inner());
+    Ok(())
 }
 
 #[tauri::command]
@@ -669,6 +704,9 @@ async fn send_message(
     let message_id = send_message_impl(state.inner(), id, &prompt, attachments, sid)
         .await
         .map_err(|e| e.to_string())?;
+    // Only after the send is *accepted*: asking permission for a dispatch that
+    // was rejected would be asking about work that isn't happening.
+    request_notification_authorization(state.inner());
     Ok(message_id.to_string())
 }
 
@@ -1041,9 +1079,10 @@ async fn invoke_workflow(
     forward_sources: std::collections::BTreeMap<String, Vec<switchboard_core::AgentId>>,
 ) -> Result<String, String> {
     let effective = merge_workflow_forwards(state.inner(), &inputs, &forward_sources).await?;
-    invoke_workflow_impl(state.inner(), project_id, &name, is_builtin, &effective)
-        .map(|id| id.to_string())
-        .map_err(|e| e.to_string())
+    let run_id = invoke_workflow_impl(state.inner(), project_id, &name, is_builtin, &effective)
+        .map_err(|e| e.to_string())?;
+    request_notification_authorization(state.inner());
+    Ok(run_id.to_string())
 }
 
 /// Fire a running workflow's cancel token (no-op if it already finished).
@@ -1363,39 +1402,6 @@ fn with_persistence_paths(state: AppState) -> AppState {
     }
 }
 
-/// Production [`Notifier`](crate::workflow_commands::Notifier): fires an OS
-/// notification via the notification plugin, **suppressed when the main window is
-/// focused** (the OS notification is for when the user has walked away — when
-/// they're watching, the run indicator carries it). A focus-query failure is
-/// treated as "not focused" so a terminal still surfaces.
-struct TauriNotifier {
-    app: tauri::AppHandle,
-}
-
-impl crate::workflow_commands::Notifier for TauriNotifier {
-    fn notify(&self, title: &str, body: &str) {
-        use tauri_plugin_notification::NotificationExt;
-        let focused = self
-            .app
-            .get_webview_window("main")
-            .and_then(|w| w.is_focused().ok())
-            .unwrap_or(false);
-        if focused {
-            return;
-        }
-        if let Err(e) = self
-            .app
-            .notification()
-            .builder()
-            .title(title)
-            .body(body)
-            .show()
-        {
-            tracing::warn!(error = %e, "failed to show workflow notification");
-        }
-    }
-}
-
 #[expect(
     clippy::too_many_lines,
     reason = "length is dominated by the flat `generate_handler!` command registry, which reads better as one list than split across helpers"
@@ -1431,7 +1437,6 @@ pub fn run() {
     builder
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
-        .plugin(tauri_plugin_notification::init())
         .setup(move |app| {
             // Resolve the login-shell PATH in the background, and tell the
             // frontend to re-probe once it lands. Both halves matter: a GUI
@@ -1481,11 +1486,52 @@ pub fn run() {
                 Arc::clone(&state.emitter),
             ));
             let state = state.with_prompts(prompts);
-            // Fire OS notifications for workflow run terminals (suppressed when the
-            // window is focused).
-            let state = state.with_notifier(Arc::new(TauriNotifier {
-                app: app.handle().clone(),
-            }));
+            // Fire OS notifications for run/send terminals. The notifier owns the
+            // whole suppression policy — window focus today, the user preference
+            // once one exists — so no caller has to reason about it. The closure
+            // is `true` because there is no preference to consult yet; it stays a
+            // closure so the value is read per call rather than captured, which is
+            // what lets a future toggle take effect without a restart.
+            let focus_handle = app.handle().clone();
+            let viewed_handle = app.handle().clone();
+            let prefs_handle = app.handle().clone();
+            let state = state.with_notifier(Arc::new(crate::notification::GatedNotifier::new(
+                Arc::new(crate::notification::UserNotificationDelivery),
+                // `None` means "couldn't read the window state"; the notifier
+                // decides what that implies, not this call site.
+                Arc::new(move || {
+                    focus_handle
+                        .get_webview_window("main")
+                        .and_then(|w| w.is_focused().ok())
+                }),
+                // What is actually rendered — not `active_project_id`, which
+                // stays set while the user is in Settings or the Git view and
+                // would wrongly suppress the last-selected project's completion.
+                Arc::new(move || {
+                    viewed_handle
+                        .try_state::<AppState>()
+                        .and_then(|state| crate::state::lock(&state.visible_project).project_id)
+                }),
+                // Read per call, not captured: a toggle in Settings takes effect on
+                // the next notification rather than the next launch. Resolved
+                // through the handle because the notifier is built before the
+                // state is managed; the closure only ever runs after startup.
+                Arc::new(move || {
+                    prefs_handle.try_state::<AppState>().map_or(
+                        crate::notification::NotifyPrefs {
+                            enabled: true,
+                            while_focused: false,
+                        },
+                        |state| {
+                            let p = crate::commands::get_preferences_impl(&state);
+                            crate::notification::NotifyPrefs {
+                                enabled: p.notify_on_completion,
+                                while_focused: p.notify_while_focused,
+                            }
+                        },
+                    )
+                }),
+            )));
             // Cold start: open a `Directory` handle for every workspace entry so
             // restored directories report `available: true` and participate in
             // the cross-harness session-id collision scan. Unopenable
@@ -1529,6 +1575,8 @@ pub fn run() {
             open_commit_file_difftool,
             get_preferences,
             set_preferences,
+            notification_availability,
+            set_visible_project,
             list_prompts,
             render_prompt,
             get_prompt_source,

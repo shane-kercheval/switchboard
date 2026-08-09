@@ -24,6 +24,7 @@ import type {
   MessagePin,
   ProjectConversation,
   ProjectId,
+  NotificationAvailability,
   Preferences,
   ProjectListing,
   ProjectSummary,
@@ -237,6 +238,18 @@ export async function getPreferences(): Promise<Preferences> {
 
 export async function setPreferences(preferences: Preferences): Promise<void> {
   await invoke("set_preferences", { preferences });
+}
+
+/// Tell the backend which project's transcript is on screen, or `null` when none
+/// is (Settings, the Git view, a project still loading). The notification gate
+/// reads it to stay quiet about the one outcome the user can already see.
+/// `seq` is a monotonic navigation counter; the backend drops stale writes.
+export async function setVisibleProject(projectId: ProjectId | null, seq: number): Promise<void> {
+  await invoke("set_visible_project", { projectId, seq });
+}
+
+export async function notificationAvailability(): Promise<NotificationAvailability> {
+  return await invoke<NotificationAvailability>("notification_availability");
 }
 
 /// Rename a project. The backend re-validates format + per-directory uniqueness

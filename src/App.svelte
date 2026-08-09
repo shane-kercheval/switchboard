@@ -550,6 +550,28 @@
   const showPaneHeaderControls = $derived(
     !settingsOpen && view.mode !== "git" && selection.activeProjectId !== null && rosterLoaded,
   );
+  // What the notification gate treats as "already on screen". Derived, not
+  // mirrored: any future navigation path that changes one of these inputs flows
+  // through automatically, whereas pushing from each navigation handler would be
+  // a second copy of this state that every new path has to remember to update.
+  //
+  // `rosterLoaded` matters — a project mid-activation is not yet readable, so its
+  // completion should still notify.
+  const visibleProjectId = $derived(
+    settingsOpen || view.mode === "git" || !rosterLoaded ? null : selection.activeProjectId,
+  );
+  // Monotonic so a slow IPC write can't land after a newer view and overwrite it.
+  let visibleProjectSeq = 0;
+  $effect(() => {
+    const id = visibleProjectId;
+    const seq = ++visibleProjectSeq;
+    void api.setVisibleProject(id, seq).catch((e: unknown) => {
+      // Display-only state; a failed write costs at most one mis-gated
+      // notification, never a dropped turn.
+      console.error("[switchboard] set visible project failed", e);
+    });
+  });
+
   const showRightSidebarControls = $derived(
     showPaneHeaderControls &&
       (activeAgents.length > 0 || activePins.length > 0 || layout.rightSidebarOpen),

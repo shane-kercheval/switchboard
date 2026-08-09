@@ -58,6 +58,28 @@ pub struct Preferences {
     /// Diff panel layout. Defaults to unified.
     pub diff_style: DiffStyle,
 
+    /// Whether an OS notification fires when agents finish — a send's recipients
+    /// all settling, or a workflow run reaching its terminal.
+    ///
+    /// One switch, not two, because Switchboard cannot express "sound but no
+    /// banner" itself: whether a delivered notification is shown as a banner is
+    /// the user's macOS per-app alert style, invisible to us. So this is the
+    /// on/off switch and macOS owns the presentation — including the sound, which
+    /// rides on the notification rather than being played separately.
+    pub notify_on_completion: bool,
+
+    /// Whether a project finishing should still notify while the user is working
+    /// in Switchboard. Only ever applies to a project *other* than the one on
+    /// screen — the project you are looking at never notifies while you are
+    /// looking at it.
+    ///
+    /// Defaults off. The projects sidebar already marks a background project as
+    /// finished, so for someone working in the app the information is on screen,
+    /// just quietly; an OS banner on top of that is a real intrusion for some
+    /// people and the missing signal for others. Off is the less startling
+    /// default, and the Settings copy tells anyone who wants it where to find it.
+    pub notify_while_focused: bool,
+
     /// Whether the app-owned read-only built-in prompts and workflows appear in
     /// the pickers. Default `true` (show examples); a user who wants only their
     /// own content turns it off. Visibility only — a workflow wired to a built-in
@@ -72,6 +94,8 @@ impl Default for Preferences {
             terminal_app: default_terminal_app(),
             diff_style: DiffStyle::default(),
             show_builtins: true,
+            notify_on_completion: true,
+            notify_while_focused: false,
         }
     }
 }
@@ -102,6 +126,8 @@ impl Preferences {
             terminal_app,
             diff_style: self.diff_style,
             show_builtins: self.show_builtins,
+            notify_on_completion: self.notify_on_completion,
+            notify_while_focused: self.notify_while_focused,
         }
     }
 }
@@ -181,6 +207,32 @@ mod tests {
         assert_eq!(p.terminal_app, "Terminal");
         assert_eq!(p.diff_style, DiffStyle::Unified);
         assert!(p.show_builtins, "built-ins are shown by default");
+        assert!(p.notify_on_completion, "notifications are on by default");
+    }
+
+    #[test]
+    fn missing_notify_key_defaults_on() {
+        // Forward/backward compat: a config.yaml written before notifications
+        // existed must load with them on, not silently off — an upgrade that
+        // turned the feature off by default would look exactly like it being
+        // broken.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(&path, "terminal_app: iTerm\n").unwrap();
+        assert!(load(&path).notify_on_completion);
+    }
+
+    #[test]
+    fn notify_preference_round_trips_when_off() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        let prefs = Preferences {
+            notify_on_completion: false,
+            notify_while_focused: false,
+            ..Preferences::default()
+        };
+        save(&path, &prefs).unwrap();
+        assert!(!load(&path).notify_on_completion);
     }
 
     #[test]
@@ -204,6 +256,8 @@ mod tests {
             diff_style: DiffStyle::Unified,
             // Non-default so the round-trip exercises an explicitly-off toggle.
             show_builtins: false,
+            notify_on_completion: true,
+            notify_while_focused: false,
         };
         save(&path, &prefs).unwrap();
         assert_eq!(load(&path), prefs);
@@ -228,6 +282,8 @@ mod tests {
                 terminal_app: "iTerm".to_owned(),
                 diff_style: DiffStyle::Unified,
                 show_builtins: true,
+                notify_on_completion: true,
+                notify_while_focused: false,
             },
         )
         .unwrap();
@@ -274,6 +330,8 @@ mod tests {
                     terminal_app: "iTerm".to_owned(),
                     diff_style: DiffStyle::Unified,
                     show_builtins: true,
+                    notify_on_completion: true,
+                    notify_while_focused: false,
                 },
             )
             .unwrap();
@@ -347,6 +405,8 @@ mod tests {
             terminal_app: "  iTerm  ".to_owned(),
             diff_style: DiffStyle::Unified,
             show_builtins: true,
+            notify_on_completion: true,
+            notify_while_focused: false,
         }
         .normalized();
         assert_eq!(p.editor_command.as_deref(), Some("cursor"));
@@ -362,6 +422,8 @@ mod tests {
             terminal_app: "   ".to_owned(),
             diff_style: DiffStyle::default(),
             show_builtins: true,
+            notify_on_completion: true,
+            notify_while_focused: false,
         }
         .normalized();
         assert_eq!(blank.editor_command, None);

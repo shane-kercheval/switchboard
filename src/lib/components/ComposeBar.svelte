@@ -61,7 +61,6 @@
   } from "$lib/types";
   import { classifyKind, nextLabel } from "$lib/attachments";
   import { getCurrentWebview } from "@tauri-apps/api/webview";
-  import { isPermissionGranted, requestPermission } from "@tauri-apps/plugin-notification";
   import { buildRenderArgs, combinePromptMessage, missingRequiredArgs } from "$lib/prompt";
   import Textarea from "$lib/components/ui/Textarea.svelte";
   import StopIcon from "$lib/components/ui/StopIcon.svelte";
@@ -1543,17 +1542,6 @@
     return !inputMissing && !argMissing;
   });
 
-  /// Request OS-notification permission once, contextually at first invoke.
-  async function ensureNotificationPermission(): Promise<void> {
-    try {
-      if (!(await isPermissionGranted())) {
-        await requestPermission();
-      }
-    } catch (err) {
-      console.warn("[switchboard] notification permission request failed", err);
-    }
-  }
-
   // The viewed project's single workflow run. The `[0]` relies on the
   // one-run-per-project invariant, enforced at the backend invoke guard (which
   // rejects both a second *active* run and a launch while a *held*
@@ -1591,8 +1579,6 @@
     invokingWorkflow = true;
     sendError = null;
     try {
-      // Contextual permission request at first invoke (not at cold startup).
-      void ensureNotificationPermission();
       // Pane-expand each field's sources to agent ids; omit empty fields so the
       // map carries only fields the user actually attached a forward to.
       const forwardSources: Record<string, AgentId[]> = {};

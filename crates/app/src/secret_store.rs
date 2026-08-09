@@ -18,12 +18,25 @@ use switchboard_prompts::{SecretStore, SecretStoreError};
 #[cfg(debug_assertions)]
 pub struct FileSecretStore {
     path: std::path::PathBuf,
+    /// Serializes the read-map→mutate→write-map in `set`/`delete`. The whole
+    /// file is rewritten per mutation, so two concurrent writers would read the
+    /// same snapshot and the last one would silently drop the other's key —
+    /// the same failure mode `switchboard_core::io`'s `YAML_EDIT_LOCK`
+    /// documents for `config.yaml`. OAuth token refreshes write concurrently
+    /// during a provider sync, and a dropped write there loses a *rotated*
+    /// refresh token, which is unrecoverable. `get` deliberately takes no lock:
+    /// writes land via atomic rename, so a reader sees one whole file or the
+    /// other, never a torn one.
+    write_lock: std::sync::Mutex<()>,
 }
 
 #[cfg(debug_assertions)]
 impl FileSecretStore {
     pub fn new(path: std::path::PathBuf) -> Self {
-        Self { path }
+        Self {
+            path,
+            write_lock: std::sync::Mutex::new(()),
+        }
     }
 
     fn read_map(&self) -> Result<std::collections::BTreeMap<String, String>, SecretStoreError> {
@@ -37,20 +50,28 @@ impl FileSecretStore {
         }
     }
 
+    /// Write via same-directory temp file + rename so concurrent readers never
+    /// see a truncated file. Same idiom as `switchboard_core::io::write_yaml`,
+    /// minus its fsync steps — a deliberate tradeoff: this file is dev-only,
+    /// regenerable data, so crash durability isn't worth the cost, while
+    /// rename-atomicity is what lets `get` run lock-free. The fixed temp path
+    /// is safe because `write_lock` serializes all writers.
     fn write_map(
         &self,
         map: &std::collections::BTreeMap<String, String>,
     ) -> Result<(), SecretStoreError> {
         let bytes =
             serde_json::to_vec_pretty(map).map_err(|e| SecretStoreError::Backend(e.to_string()))?;
-        std::fs::write(&self.path, bytes).map_err(|e| SecretStoreError::Backend(e.to_string()))?;
-        // Best-effort owner-only perms so the dev token isn't world-readable.
+        let tmp = self.path.with_extension("json.tmp");
+        std::fs::write(&tmp, bytes).map_err(|e| SecretStoreError::Backend(e.to_string()))?;
+        // Owner-only perms go on the temp file *before* the rename so the
+        // secrets are never world-readable, even briefly.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600));
+            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
         }
-        Ok(())
+        std::fs::rename(&tmp, &self.path).map_err(|e| SecretStoreError::Backend(e.to_string()))
     }
 }
 
@@ -61,12 +82,20 @@ impl SecretStore for FileSecretStore {
     }
 
     fn set(&self, key: &str, value: &str) -> Result<(), SecretStoreError> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut map = self.read_map()?;
         map.insert(key.to_owned(), value.to_owned());
         self.write_map(&map)
     }
 
     fn delete(&self, key: &str) -> Result<(), SecretStoreError> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut map = self.read_map()?;
         map.remove(key);
         self.write_map(&map)
@@ -174,5 +203,40 @@ mod tests {
         store.delete("team").unwrap();
         assert_eq!(store.get("team").unwrap(), None);
         store.delete("team").unwrap(); // idempotent
+    }
+
+    #[test]
+    fn file_store_concurrent_writes_do_not_lose_keys() {
+        // The whole-file read-modify-write must be serialized: without the
+        // write lock, writers racing from a barrier read the same snapshot and
+        // the last rename drops every other writer's key. Distinct keys mirror
+        // the real workload — concurrent OAuth refreshes for different
+        // providers, where a dropped write loses a rotated refresh token.
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = std::sync::Arc::new(FileSecretStore::new(dir.path().join("mcp-secrets.json")));
+        let writers = 8;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(writers));
+        let handles: Vec<_> = (0..writers)
+            .map(|i: usize| {
+                let store = store.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    store
+                        .set(&format!("provider-{i}"), &format!("tok-{i}"))
+                        .unwrap();
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        for i in 0..writers {
+            assert_eq!(
+                store.get(&format!("provider-{i}")).unwrap().as_deref(),
+                Some(format!("tok-{i}").as_str()),
+                "provider-{i}'s write was lost"
+            );
+        }
     }
 }

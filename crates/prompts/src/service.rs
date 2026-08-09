@@ -25,7 +25,7 @@ use serde::Serialize;
 
 use crate::builtin::{BuiltinProvider, builtin_prompt_source};
 use crate::config::{
-    McpProviderConfig, McpSection, McpTransport, PromptConfig, is_valid_provider_name,
+    McpAuth, McpProviderConfig, McpSection, McpTransport, PromptConfig, is_valid_provider_name,
     resolve_local_dirs,
 };
 use crate::error::PromptError;
@@ -464,6 +464,7 @@ impl PromptService {
             transport: McpTransport::Http {
                 url: url.to_owned(),
             },
+            auth: McpAuth::default(),
         });
         // Store the secret *before* writing the config entry. A stored secret with
         // no config entry is benign (never read, overwritten on retry); a config
@@ -481,12 +482,15 @@ impl PromptService {
         Ok(())
     }
 
-    /// Remove a generic MCP provider: delete its stored bearer, drop its config
-    /// entry (preserving others), and clear its status. Idempotent — removing an
-    /// unconfigured name is not an error. Deletes the secret *first* and surfaces
-    /// a deletion failure rather than swallowing it: removing the config while the
-    /// token lingers would report the server gone while its credential remains in
-    /// the keychain.
+    /// Remove a generic MCP provider: delete its stored credentials (both the
+    /// bearer key and the OAuth envelope), drop its config entry (preserving
+    /// others), and clear its status. Idempotent — removing an unconfigured name
+    /// is not an error. Deletes the secrets *first* and surfaces a deletion
+    /// failure rather than swallowing it: removing the config while a credential
+    /// lingers would report the server gone while its token (or refresh token)
+    /// remains in the keychain. Both deletes are attempted unconditionally — a
+    /// failure on one must not strand the other credential — and the first
+    /// failure is the one surfaced.
     pub fn remove_mcp_provider(&self, name: &str) -> Result<(), PromptError> {
         let _guard = self
             .config_write_lock
@@ -495,7 +499,9 @@ impl PromptService {
         let mut configs = self.mcp_provider_configs();
         let before = configs.len();
         configs.retain(|c| c.name != name);
-        self.secrets.delete(name)?;
+        let bearer_delete = self.secrets.delete(name);
+        let oauth_delete = self.secrets.delete(&crate::oauth::oauth_secret_key(name));
+        bearer_delete.and(oauth_delete)?;
         if configs.len() != before {
             self.write_mcp_providers(&configs)?;
         }
@@ -982,6 +988,109 @@ mod tests {
         assert!(!raw.contains("mcp_providers"));
         // Idempotent: removing again is fine.
         service.remove_mcp_provider("team").unwrap();
+    }
+
+    #[tokio::test]
+    async fn config_rewrite_preserves_oauth_auth_mode() {
+        // Adding a provider re-writes the whole mcp_providers section; an
+        // existing OAuth entry (with a scopes override) must survive verbatim,
+        // and the freshly-added bearer entry must not gain an `auth:` key.
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join("config.yaml");
+        std::fs::write(
+            &config_path,
+            "mcp_providers:\n  - name: tiddly\n    transport:\n      type: http\n      url: https://prompts-mcp.tiddly.me/mcp\n    auth:\n      type: oauth\n      scopes: [openid]\n",
+        )
+        .unwrap();
+        let service = PromptService::new(
+            config_path.clone(),
+            dir.path().join("prompts"),
+            None,
+            Arc::new(InMemorySecretStore::new()),
+        );
+
+        service.add_mcp_provider("team", "https://a", None).unwrap();
+
+        let raw = std::fs::read_to_string(&config_path).unwrap();
+        let section: McpSection = serde_norway::from_str(&raw).unwrap();
+        let configs = section.into_configs();
+        assert_eq!(configs.len(), 2);
+        assert_eq!(
+            configs[0].auth,
+            McpAuth::Oauth {
+                scopes: Some(vec!["openid".to_owned()]),
+            }
+        );
+        assert_eq!(configs[1].auth, McpAuth::Bearer);
+        // The bearer entry stays in the pre-OAuth on-disk shape (no auth key on
+        // it); the file's only `auth:` block belongs to the OAuth entry.
+        assert_eq!(raw.matches("auth:").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn remove_deletes_oauth_envelope_alongside_bearer() {
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join("config.yaml");
+        std::fs::write(&config_path, http_provider_yaml("team", "https://a")).unwrap();
+        let store = Arc::new(InMemorySecretStore::new());
+        store.set("team", "tok").unwrap();
+        store.set("oauth:team", "{\"envelope\":true}").unwrap();
+        let service =
+            PromptService::new(config_path, dir.path().join("prompts"), None, store.clone());
+
+        service.remove_mcp_provider("team").unwrap();
+        assert_eq!(store.get("team").unwrap(), None);
+        assert_eq!(store.get("oauth:team").unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn remove_attempts_second_delete_when_first_fails() {
+        /// Fails deleting the bearer key but records every delete attempted, to
+        /// prove a failed first delete doesn't short-circuit the second.
+        struct FirstDeleteFailsStore {
+            deleted: std::sync::Mutex<Vec<String>>,
+        }
+        impl SecretStore for FirstDeleteFailsStore {
+            fn get(&self, _: &str) -> Result<Option<String>, SecretStoreError> {
+                Ok(None)
+            }
+            fn set(&self, _: &str, _: &str) -> Result<(), SecretStoreError> {
+                Ok(())
+            }
+            fn delete(&self, key: &str) -> Result<(), SecretStoreError> {
+                self.deleted
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(key.to_owned());
+                if key == "team" {
+                    Err(SecretStoreError::Backend("store offline".to_owned()))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join("config.yaml");
+        std::fs::write(&config_path, http_provider_yaml("team", "https://a")).unwrap();
+        let store = Arc::new(FirstDeleteFailsStore {
+            deleted: std::sync::Mutex::new(Vec::new()),
+        });
+        let service =
+            PromptService::new(config_path, dir.path().join("prompts"), None, store.clone());
+
+        // The bearer delete fails, but the OAuth-envelope delete must still be
+        // attempted (a refresh token must not be stranded), and the failure
+        // still surfaces so the provider isn't reported gone.
+        let err = service.remove_mcp_provider("team").unwrap_err();
+        assert!(matches!(err, PromptError::Secret(_)));
+        let deleted = store
+            .deleted
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(deleted, vec!["team".to_owned(), "oauth:team".to_owned()]);
+        assert_eq!(service.list_mcp_providers().len(), 1);
     }
 
     #[tokio::test]

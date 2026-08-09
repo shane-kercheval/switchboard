@@ -220,6 +220,33 @@ A *separate* axis from model (§3.3), with a **different capability set**. Verif
 
 **`parent_session_id` is absent from the stream.** Switchboard has no wire signal that a session is a fork — the new session's `system/init` looks identical to any fresh session. The branch relationship lives only in the on-disk `parentUuid` chain. Switchboard does not need to read or track this chain; it is the harness's internal tree, not Switchboard's.
 
+### 3.5b Claude session-directory encoding (cwd → `~/.claude/projects/<dir>`)
+
+> **Status: read out of the CLI bundle (2.1.226) and confirmed on disk. Supersedes the archived probe, which records only the `/` and `.` cases.**
+
+Claude Code derives its session-storage directory from the agent's cwd. Switchboard must reproduce the rule exactly, because `build_args` picks `--session-id` (first turn) vs `--resume` (every later turn) purely from whether `<dir>/<session-uuid>.jsonl` exists. A mismatch makes every turn after the first look like a first turn, so the adapter passes `--session-id` for a session that already exists and the CLI rejects it with **`Session ID … is already in use`**. The check is a filesystem lookup, so it fails identically on every retry and across app restarts — the agent is stranded permanently, not transiently.
+
+The rule, verbatim from the bundle:
+
+```js
+bes = e => e.replace(/[^a-zA-Z0-9]/g, "-")
+gw  = e => { let t = bes(e); return t.length <= sQ ? t : `${t.slice(0, sQ)}-${T$g(e)}` }   // sQ = 200
+T$g = e => Math.abs(xdt(e)).toString(36)
+xdt = e => { let t = 0; for (…) t = (t << 5) - t + e.charCodeAt(r) | 0; return t }
+input = NFC(realpath(cwd))
+```
+
+Four details, each of which independently produces the permanent strand above:
+
+1. **Every** character outside `[a-zA-Z0-9]` collapses — not just `/` and `.`. `_` and spaces included: `switchboard-mcp_oauth` lives under `…-switchboard-mcp-oauth`. *(This is the one that stranded a real agent; fixed.)*
+2. The regex has **no `u` flag**, so it runs over UTF-16 code units. An astral character (emoji) becomes **two** dashes, not one. *(Fixed — `encode_utf16`, not `chars`.)*
+3. Names over **200** characters are truncated and suffixed with `-<base36 hash of the untruncated path>`. Reachable in ordinary use: the `.switchboard/projects/<uuid>` cwd shape alone adds 59 characters. *(Fixed.)*
+4. The path is **NFC-normalized** first. **Not yet implemented** — a decomposed (NFD) path, which macOS produces routinely, still resolves to the wrong directory and strands the agent. Closing this needs a Unicode-normalization dependency (e.g. `unicode-normalization`); until then an NFD cwd containing non-ASCII is a known-broken shape.
+
+Empirical corroboration: across a 161-directory sample of a real `~/.claude/projects/`, every name matches `[A-Za-z0-9-]*` — no `_`, `.`, or spaces survive.
+
+**Transcript loading is insulated; dispatch is not.** `claude_code/session_file.rs` falls back to scanning `projects/*/<uuid>.jsonl`, which is encoding-independent, so a stranded agent still renders its full history while every dispatch fails — a confusing signature worth recognizing. `build_args` has no such fallback.
+
 ### 3.6 Tool vocabularies & facet mapping
 
 > **Status: probed live 2026-07-13** (claude 2.1.206, codex 0.144.3, agy 1.0.16; gemini 0.44.0 **unprobeable** — see G26). Captures live under `crates/harness/tests/fixtures/<harness>/` (`tool-vocabulary*`, `file-change*`, `apply-patch*`, `exec-wrapper*`). Each adapter maps its raw tool vocabulary to a normalized `ToolFacet` (`crates/harness/src/facets.rs`) at both call sites (stream parser + session-file parser); the raw `name`/`input` ride alongside untouched.

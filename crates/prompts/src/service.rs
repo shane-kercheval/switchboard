@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+use rmcp::transport::auth::{AuthClient, AuthError, AuthorizationManager};
 use serde::Serialize;
 
 use crate::builtin::{BuiltinProvider, builtin_prompt_source};
@@ -32,12 +33,46 @@ use crate::error::PromptError;
 use crate::local::LocalProvider;
 use crate::mcp::McpProvider;
 use crate::model::{BUILTIN_PROVIDER, LOCAL_PROVIDER, Prompt};
+use crate::oauth::{
+    CredentialLifecycle, CredentialState, ProviderCredentialStore, canonicalize_resource_url,
+    oauth_secret_key,
+};
+use crate::preflight::preflight;
 use crate::provider::PromptProvider;
 use crate::secret::{InMemorySecretStore, SecretStore};
 
 /// Per-provider budget for the whole connect + request round-trip during a cache
-/// build, so one slow/cold MCP server can't stall startup.
+/// build — and, for OAuth providers, the client-acquisition + token-probe +
+/// connect + request sequence — so one slow/cold MCP server can't stall startup.
 const PROVIDER_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// One provider's lazily-built OAuth client. `tokio::sync::OnceCell` gives
+/// single-flight construction: concurrent first users (a `sync` racing a
+/// `render`) share one initialization instead of building two `AuthClient`s —
+/// which matters because refresh serialization lives in the client's internal
+/// mutex, and two instances would each refresh against a rotating refresh
+/// token and invalidate the other.
+type OAuthClientCell = Arc<tokio::sync::OnceCell<AuthClient<reqwest::Client>>>;
+
+/// The session cache, keyed by `(provider name, canonical URL)` — the URL in
+/// the key makes invalidation on URL change automatic. Guarded by a *sync*
+/// mutex held only for map lookups/inserts, never across I/O: holding it
+/// through discovery would serialize unrelated providers and defeat `sync`'s
+/// concurrent fan-out.
+type OAuthClientMap = std::sync::Mutex<HashMap<(String, String), OAuthClientCell>>;
+
+/// Per-provider credential lifecycle state (transaction lock + I/O gate — see
+/// [`CredentialLifecycle`]), keyed by provider name. The transaction lock is
+/// the exclusion that stops an in-flight refresh from resurrecting credentials
+/// the user just removed.
+///
+/// Entries are **deliberately never pruned** — not even on provider removal.
+/// Pruning would let a later lookup mint a *fresh* lock while an in-flight
+/// operation still holds the old one, so the two would no longer exclude each
+/// other and the resurrection guard would silently stop guarding. The cost is
+/// one tiny entry per provider name ever seen this process (historical names,
+/// not current count) — accepted.
+type CredentialLockMap = std::sync::Mutex<HashMap<String, Arc<CredentialLifecycle>>>;
 
 /// Rendered prompt text, as returned to the frontend. A struct (rather than a
 /// bare string) keeps the wire shape stable as later milestones add fields.
@@ -55,25 +90,42 @@ pub struct PromptSource {
 }
 
 /// An MCP provider as shown in Settings: its non-secret config plus whether a
-/// bearer is stored and the outcome of the last cache build.
+/// credential is stored and the outcome of the last cache build.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct McpProviderInfo {
     pub name: String,
     pub url: String,
-    /// Whether a bearer token is currently stored for this provider.
+    /// Whether a *token* is currently stored for this provider — the pasted
+    /// bearer, or (OAuth) signed-in tokens. Never registration presence: a
+    /// signed-out OAuth provider must not render as credentialed.
     pub has_token: bool,
+    /// The provider's auth mode, so the UI can pick the right affordance
+    /// ("paste a token" vs. "sign in").
+    pub auth: McpAuth,
     pub status: ProviderStatus,
 }
 
 /// Outcome of the last attempt to list a provider's prompts.
 ///
-/// Deliberately coarse: `rmcp` collapses transport failures (connection refused,
-/// HTTP 401/403) into one opaque error that can't be reliably sub-classified
-/// without coupling to its internals, so a failure is one `errored` bucket with
-/// the underlying message surfaced for detail — rather than a fragile
-/// auth-vs-unreachable split. `store_unavailable` (the keychain couldn't be read)
-/// is genuinely distinct and knowable locally; the "no credential stored" nudge
-/// is carried by [`McpProviderInfo::has_token`].
+/// Deliberately coarse for **bearer** providers: `rmcp` collapses transport
+/// failures (connection refused, HTTP 401/403) into one opaque error that can't
+/// be reliably sub-classified without coupling to its internals, so a failure
+/// is one `errored` bucket with the underlying message surfaced for detail —
+/// rather than a fragile auth-vs-unreachable split. `store_unavailable` (the
+/// keychain couldn't be read) is genuinely distinct and knowable locally; the
+/// "no credential stored" nudge is carried by [`McpProviderInfo::has_token`].
+///
+/// **OAuth changes that calculus for `needs_auth` only**: the proactive
+/// `AuthClient::get_access_token()` probe returns a *typed*
+/// `AuthorizationRequired` **before any request to the MCP server** — a local
+/// determination, and the only permitted source of this status. It is still
+/// never inferred from a transport error: a token that is inside its expiry
+/// window but revoked server-side fails mid-call as generic `errored` (the
+/// next sync's probe reports `needs_auth` once its refresh fails) — a recorded
+/// limitation, because sub-classifying mid-flight failures would mean reaching
+/// into rmcp's type-erased transport error, exactly the coupling argued
+/// against above. `store_unavailable` likewise stays a *direct* secret-store
+/// probe, never a classification of rmcp's overloaded `InternalError`.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum ProviderStatus {
@@ -83,6 +135,9 @@ pub enum ProviderStatus {
     Errored { message: String },
     /// The secret store couldn't be read (e.g. keychain locked/absent).
     StoreUnavailable,
+    /// OAuth provider with no usable credentials (never signed in, signed out,
+    /// or refresh failed) — the fix is signing in, not debugging a server.
+    NeedsAuth,
     /// No sync has recorded a status yet (e.g. just added, not yet built).
     Unknown,
 }
@@ -114,6 +169,25 @@ pub struct PromptService {
     /// app-layer visibility filter; the built-ins are always listed and
     /// resolvable here so a workflow wired to one never breaks.
     include_builtins: bool,
+    /// Per-provider OAuth clients (see [`OAuthClientMap`]). **Every** OAuth
+    /// caller — `sync`, `render`, the saved-provider probe — must go through
+    /// [`oauth_client`](Self::oauth_client); a second `AuthClient` for one
+    /// provider would defeat the refresh serialization its internal mutex
+    /// provides. Invalidated on provider removal (and by sign-out/sign-in when
+    /// those land); a URL change invalidates automatically via the cache key.
+    oauth_clients: Arc<OAuthClientMap>,
+    /// See [`CredentialLockMap`].
+    credential_locks: Arc<CredentialLockMap>,
+    /// Shared bounded HTTP client for preflight fetches and (injected via
+    /// `with_client`) rmcp's discovery/token requests — replacing rmcp's own
+    /// 30s-per-request default so those round trips respect the provider
+    /// budget. Built lazily: constructing it can fail (TLS backend), and the
+    /// bearer-only path should never pay for it.
+    http: Arc<tokio::sync::OnceCell<reqwest::Client>>,
+    /// The per-provider budget. `PROVIDER_TIMEOUT` in production; tests shrink
+    /// it via [`with_provider_timeout`](Self::with_provider_timeout) so
+    /// timeout-path assertions don't wait out ten real seconds.
+    provider_timeout: Duration,
 }
 
 impl PromptService {
@@ -134,7 +208,46 @@ impl PromptService {
             sync_lock: Arc::new(tokio::sync::Mutex::new(())),
             config_write_lock: Arc::new(std::sync::Mutex::new(())),
             include_builtins: true,
+            oauth_clients: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            credential_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            http: Arc::new(tokio::sync::OnceCell::new()),
+            provider_timeout: PROVIDER_TIMEOUT,
         }
+    }
+
+    /// Test hook: shrink the per-provider budget so timeout-path tests don't
+    /// wait out the production ten seconds. **Construction-time only**: it
+    /// resets this clone's shared HTTP client and OAuth-client cells (both
+    /// bake in the budget at first build), so it must be called before any
+    /// OAuth operation runs — and the re-budgeted clone stops sharing those
+    /// caches with its siblings. Hidden — not product API.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_provider_timeout(mut self, timeout: Duration) -> Self {
+        self.provider_timeout = timeout;
+        self.http = Arc::new(tokio::sync::OnceCell::new());
+        self.oauth_clients = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        self
+    }
+
+    /// The per-provider credential lifecycle state (see [`CredentialLockMap`]).
+    fn credential_lifecycle(&self, name: &str) -> Arc<CredentialLifecycle> {
+        self.credential_locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(name.to_owned())
+            .or_default()
+            .clone()
+    }
+
+    /// Build this provider's credential-store view (envelope + lifecycle).
+    fn credential_store(&self, name: &str, canonical_url: &str) -> ProviderCredentialStore {
+        ProviderCredentialStore::new(
+            self.secrets.clone(),
+            name,
+            canonical_url,
+            self.credential_lifecycle(name),
+        )
     }
 
     /// An inert service for contexts with no resolved prompt store. Listing is
@@ -152,6 +265,10 @@ impl PromptService {
             sync_lock: Arc::new(tokio::sync::Mutex::new(())),
             config_write_lock: Arc::new(std::sync::Mutex::new(())),
             include_builtins: false,
+            oauth_clients: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            credential_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            http: Arc::new(tokio::sync::OnceCell::new()),
+            provider_timeout: PROVIDER_TIMEOUT,
         }
     }
 
@@ -227,14 +344,6 @@ impl PromptService {
     ///   slow provider can't delay the others. A provider that errors or times
     ///   out contributes nothing (with a warning).
     pub async fn sync(&self) {
-        // One provider being prepared for the concurrent query phase; carries the
-        // secret-store read outcome for the StoreUnavailable status.
-        struct Pending {
-            name: String,
-            store_unavailable: bool,
-            provider: McpProvider,
-        }
-
         let _guard = self.sync_lock.lock().await;
 
         let mut prompts = match self.local_provider() {
@@ -248,51 +357,261 @@ impl PromptService {
         }
         self.publish(prompts.clone());
 
-        let pendings: Vec<Pending> = self
-            .mcp_provider_configs()
-            .into_iter()
-            .map(|config| {
-                let McpTransport::Http { url } = &config.transport;
-                let (bearer, store_unavailable) = self.resolve_bearer(&config.name);
-                Pending {
-                    name: config.name.clone(),
-                    store_unavailable,
-                    provider: McpProvider::new(
-                        config.name.clone(),
-                        url.clone(),
-                        bearer,
-                        PROVIDER_TIMEOUT,
-                    ),
-                }
-            })
-            .collect();
+        // Each provider's whole pipeline — including, for OAuth, the credential
+        // probe and (cold) client construction — runs inside its own concurrent
+        // branch. Hoisting any of it above the join would let one slow provider
+        // delay every sibling's start, breaking the isolation guarantee below.
+        let configs = self.mcp_provider_configs();
         let results =
-            futures::future::join_all(pendings.iter().map(|p| p.provider.list_result())).await;
+            futures::future::join_all(configs.iter().map(|config| self.query_provider(config)))
+                .await;
 
         let mut statuses: HashMap<String, ProviderStatus> = HashMap::new();
-        for (pending, result) in pendings.iter().zip(results) {
-            let status = match result {
-                Ok(provider_prompts) => {
-                    let status = ProviderStatus::Ok {
-                        prompt_count: provider_prompts.len(),
-                    };
-                    prompts.extend(provider_prompts);
-                    status
-                }
-                // A store-read failure is the more actionable root cause when the
-                // list also failed; otherwise surface the provider's own error.
-                Err(_) if pending.store_unavailable => ProviderStatus::StoreUnavailable,
-                Err(e) => ProviderStatus::Errored {
-                    message: e.to_string(),
-                },
-            };
-            statuses.insert(pending.name.clone(), status);
+        for (name, status, provider_prompts) in results {
+            prompts.extend(provider_prompts);
+            statuses.insert(name, status);
         }
         *self
             .provider_status
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = statuses;
         self.publish(prompts);
+    }
+
+    /// List one provider's prompts per its auth mode, mapping the outcome to a
+    /// status. Infallible by shape — every failure becomes a status — so a
+    /// broken provider degrades to "no prompts + a status" and never affects a
+    /// sibling in the same `sync`.
+    async fn query_provider(
+        &self,
+        config: &McpProviderConfig,
+    ) -> (String, ProviderStatus, Vec<Prompt>) {
+        let McpTransport::Http { url } = &config.transport;
+        let name = config.name.clone();
+        match &config.auth {
+            McpAuth::Bearer => {
+                // One budget over credential resolution + list: without it, a
+                // wedged keychain read would keep this future pending forever,
+                // `join_all` (and so `sync()`, and so the `sync_lock`) with it.
+                let listed = tokio::time::timeout(self.provider_timeout, async {
+                    let (bearer, store_unavailable) = self.resolve_bearer(&name).await;
+                    let provider =
+                        McpProvider::new(name.clone(), url.clone(), bearer, self.provider_timeout);
+                    (store_unavailable, provider.list_uncapped().await)
+                })
+                .await;
+                match listed {
+                    Err(_elapsed) => (
+                        name,
+                        ProviderStatus::Errored {
+                            message: format!(
+                                "timed out after {}s",
+                                self.provider_timeout.as_secs()
+                            ),
+                        },
+                        vec![],
+                    ),
+                    Ok((_, Ok(provider_prompts))) => {
+                        let status = ProviderStatus::Ok {
+                            prompt_count: provider_prompts.len(),
+                        };
+                        (name, status, provider_prompts)
+                    }
+                    // A store-read failure is the more actionable root cause
+                    // when the list also failed; otherwise the provider's own.
+                    Ok((true, Err(_))) => (name, ProviderStatus::StoreUnavailable, vec![]),
+                    Ok((false, Err(e))) => (
+                        name,
+                        ProviderStatus::Errored {
+                            message: e.to_string(),
+                        },
+                        vec![],
+                    ),
+                }
+            }
+            McpAuth::Oauth { scopes } => {
+                self.query_oauth_provider(name, url, scopes.as_deref())
+                    .await
+            }
+        }
+    }
+
+    /// The OAuth listing pipeline, the whole sequence under one provider
+    /// budget: local credential check (short-circuit) → (cached or freshly
+    /// preflighted) client → proactive token probe → list.
+    async fn query_oauth_provider(
+        &self,
+        name: String,
+        url: &str,
+        scopes_override: Option<&[String]>,
+    ) -> (String, ProviderStatus, Vec<Prompt>) {
+        /// The pipeline's outcome before status mapping — statuses that aren't
+        /// listing errors need their own arm.
+        enum Outcome {
+            StoreUnavailable,
+            NeedsAuth,
+            Listed(Vec<Prompt>),
+        }
+
+        let listed = tokio::time::timeout(self.provider_timeout, async {
+            let canonical =
+                canonicalize_resource_url(url).map_err(|e| PromptError::OAuthValidation {
+                    provider: name.clone(),
+                    message: format!("invalid provider URL {url:?}: {e}"),
+                })?;
+            // Local short-circuit: a signed-out provider is knowable from the
+            // keychain alone — report `NeedsAuth` without spending the budget
+            // on discovery, and *correctly* even when offline (a network-first
+            // path would misreport "server error" when the fix is signing in).
+            // `StoreUnavailable` comes from this direct check alone — never
+            // from classifying rmcp's `AuthError::InternalError`, which it
+            // overloads for non-store failures (see the `ProviderStatus` docs).
+            match self
+                .credential_store(&name, &canonical)
+                .credential_state()
+                .await
+            {
+                CredentialState::Unavailable(reason) => {
+                    tracing::warn!(provider = %name, %reason, "secret store unavailable for OAuth provider");
+                    return Ok(Outcome::StoreUnavailable);
+                }
+                CredentialState::SignedOut => return Ok(Outcome::NeedsAuth),
+                CredentialState::SignedIn => {}
+            }
+            let client = self
+                .oauth_client(&name, &canonical, scopes_override)
+                .await?;
+            // Proactive probe: refreshes a near-expiry token once, ahead of the
+            // listing, and turns "no usable credentials" into a typed outcome
+            // before any request reaches the MCP server.
+            match client.get_access_token().await {
+                Ok(_) => {}
+                Err(AuthError::AuthorizationRequired) => return Ok(Outcome::NeedsAuth),
+                Err(e) => {
+                    return Err(PromptError::McpConnect {
+                        provider: name.clone(),
+                        message: e.to_string(),
+                    });
+                }
+            }
+            let provider =
+                McpProvider::new_oauth(name.clone(), canonical, client, self.provider_timeout);
+            provider.list_uncapped().await.map(Outcome::Listed)
+        })
+        .await;
+
+        match listed {
+            Err(_elapsed) => (
+                name,
+                ProviderStatus::Errored {
+                    message: format!("timed out after {}s", self.provider_timeout.as_secs()),
+                },
+                vec![],
+            ),
+            Ok(Err(e)) => (
+                name,
+                ProviderStatus::Errored {
+                    message: e.to_string(),
+                },
+                vec![],
+            ),
+            Ok(Ok(Outcome::StoreUnavailable)) => (name, ProviderStatus::StoreUnavailable, vec![]),
+            Ok(Ok(Outcome::NeedsAuth)) => (name, ProviderStatus::NeedsAuth, vec![]),
+            Ok(Ok(Outcome::Listed(provider_prompts))) => {
+                let status = ProviderStatus::Ok {
+                    prompt_count: provider_prompts.len(),
+                };
+                (name, status, provider_prompts)
+            }
+        }
+    }
+
+    /// The per-provider `AuthClient`, built on first use. Single-flight via the
+    /// entry's `OnceCell`; the map mutex is held only for the lookup/insert,
+    /// never across the build's I/O. A failed build leaves the cell empty, so
+    /// the next caller retries.
+    async fn oauth_client(
+        &self,
+        name: &str,
+        canonical_url: &str,
+        scopes_override: Option<&[String]>,
+    ) -> Result<AuthClient<reqwest::Client>, PromptError> {
+        let cell = {
+            let mut map = self
+                .oauth_clients
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            map.entry((name.to_owned(), canonical_url.to_owned()))
+                .or_default()
+                .clone()
+        };
+        let client = cell
+            .get_or_try_init(|| self.build_oauth_client(name, canonical_url, scopes_override))
+            .await?;
+        Ok(client.clone())
+    }
+
+    /// Preflight (M2's validation boundary), then assemble rmcp's client around
+    /// the validated metadata and this provider's credential envelope. The
+    /// `set_metadata` install is what stops rmcp re-discovering an unvalidated
+    /// copy; `initialize_from_store` then wires the stored client id without a
+    /// network round trip.
+    async fn build_oauth_client(
+        &self,
+        name: &str,
+        canonical_url: &str,
+        scopes_override: Option<&[String]>,
+    ) -> Result<AuthClient<reqwest::Client>, PromptError> {
+        let http = self.http_client(name).await?;
+        let outcome = preflight(http, name, canonical_url, scopes_override).await?;
+        // The resolved scopes are consumed by the sign-in flow; this client
+        // only presents stored credentials, so they are not needed here.
+        let map_err = |e: AuthError| PromptError::McpConnect {
+            provider: name.to_owned(),
+            message: e.to_string(),
+        };
+        let mut manager = AuthorizationManager::new(canonical_url)
+            .await
+            .map_err(map_err)?;
+        manager.with_client(http.clone()).map_err(map_err)?;
+        manager.set_credential_store(self.credential_store(name, canonical_url));
+        manager.set_metadata(outcome.metadata);
+        manager.initialize_from_store().await.map_err(map_err)?;
+        Ok(AuthClient::new(http.clone(), manager))
+    }
+
+    /// The shared bounded HTTP client (see the field docs).
+    async fn http_client(&self, provider: &str) -> Result<&reqwest::Client, PromptError> {
+        let timeout = self.provider_timeout;
+        self.http
+            .get_or_try_init(|| async move {
+                reqwest::Client::builder()
+                    .timeout(timeout)
+                    // No redirects, anywhere this client is used: during
+                    // discovery a 3xx could launder a validated URL into an
+                    // internal or http destination, and on the token/refresh
+                    // and OAuth MCP-transport paths, silently following
+                    // redirects with credential-bearing requests is its own
+                    // hazard (the OAuth BCP position). A legitimately
+                    // redirecting server surfaces a diagnosable refusal
+                    // instead (see `preflight::fetch_json`).
+                    .redirect(reqwest::redirect::Policy::none())
+                    .build()
+                    .map_err(|e| PromptError::McpConnect {
+                        provider: provider.to_owned(),
+                        message: format!("could not build HTTP client: {e}"),
+                    })
+            })
+            .await
+    }
+
+    /// Drop any cached OAuth client for `name` (all URLs). Called on provider
+    /// removal; sign-out and sign-in will invalidate through here too.
+    fn invalidate_oauth_clients(&self, name: &str) {
+        self.oauth_clients
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|(cached_name, _), _| cached_name != name);
     }
 
     fn publish(&self, prompts: Vec<Prompt>) {
@@ -337,23 +656,145 @@ impl PromptService {
                     provider: provider.to_owned(),
                 })?;
             let McpTransport::Http { url } = &config.transport;
-            let (bearer, _) = self.resolve_bearer(&config.name);
-            McpProvider::new(config.name.clone(), url.clone(), bearer, PROVIDER_TIMEOUT)
-                .render(name, args)
-                .await?
+            match &config.auth {
+                McpAuth::Bearer => {
+                    // One budget over credential resolution + render, mirroring
+                    // the sync arm — a wedged keychain read must not hang the
+                    // render forever.
+                    let provider_name = config.name.clone();
+                    tokio::time::timeout(self.provider_timeout, async {
+                        let (bearer, _) = self.resolve_bearer(&provider_name).await;
+                        McpProvider::new(
+                            provider_name.clone(),
+                            url.clone(),
+                            bearer,
+                            self.provider_timeout,
+                        )
+                        .render_uncapped(name, args)
+                        .await
+                    })
+                    .await
+                    .map_err(|_| PromptError::McpRequest {
+                        provider: config.name.clone(),
+                        name: name.to_owned(),
+                        message: format!("timed out after {}s", self.provider_timeout.as_secs()),
+                    })??
+                }
+                McpAuth::Oauth { scopes } => tokio::time::timeout(
+                    self.provider_timeout,
+                    self.render_oauth(&config.name, url, scopes.as_deref(), name, args),
+                )
+                .await
+                .map_err(|_| PromptError::McpRequest {
+                    provider: config.name.clone(),
+                    name: name.to_owned(),
+                    message: format!("timed out after {}s", self.provider_timeout.as_secs()),
+                })??,
+            }
         };
         Ok(RenderedPrompt { text })
+    }
+
+    /// The OAuth render pipeline, run by `render` under one provider budget.
+    /// Render goes through the same cached client as sync — `render`'s "builds
+    /// fresh" framing is about the *prompt* cache, not license to construct a
+    /// second `AuthClient` (which would defeat refresh serialization). One
+    /// budget covers the local credential check + acquisition (a cold cache
+    /// runs the full preflight) + token probe + render, mirroring
+    /// `query_oauth_provider` — two stacked timers would let a cold render take
+    /// double the budget. The local check turns "signed out" into the typed
+    /// `McpNeedsAuth` with zero network traffic (correct even offline); the
+    /// later probe still catches a failed refresh.
+    async fn render_oauth(
+        &self,
+        provider_name: &str,
+        url: &str,
+        scopes_override: Option<&[String]>,
+        name: &str,
+        args: &BTreeMap<String, String>,
+    ) -> Result<String, PromptError> {
+        let canonical =
+            canonicalize_resource_url(url).map_err(|e| PromptError::OAuthValidation {
+                provider: provider_name.to_owned(),
+                message: format!("invalid provider URL {url:?}: {e}"),
+            })?;
+        match self
+            .credential_store(provider_name, &canonical)
+            .credential_state()
+            .await
+        {
+            CredentialState::Unavailable(reason) => {
+                return Err(PromptError::Secret(
+                    crate::secret::SecretStoreError::Backend(reason),
+                ));
+            }
+            CredentialState::SignedOut => {
+                return Err(PromptError::McpNeedsAuth {
+                    provider: provider_name.to_owned(),
+                });
+            }
+            CredentialState::SignedIn => {}
+        }
+        let client = self
+            .oauth_client(provider_name, &canonical, scopes_override)
+            .await?;
+        match client.get_access_token().await {
+            Ok(_) => {}
+            Err(AuthError::AuthorizationRequired) => {
+                return Err(PromptError::McpNeedsAuth {
+                    provider: provider_name.to_owned(),
+                });
+            }
+            Err(e) => {
+                return Err(PromptError::McpConnect {
+                    provider: provider_name.to_owned(),
+                    message: e.to_string(),
+                });
+            }
+        }
+        McpProvider::new_oauth(
+            provider_name.to_owned(),
+            canonical,
+            client,
+            self.provider_timeout,
+        )
+        .render_uncapped(name, args)
+        .await
     }
 
     /// Resolve a provider's bearer from the secret store, returning the bearer and
     /// whether the store read **failed** (vs. simply having no credential). Both
     /// degrade to unauthenticated, but the failure flag lets the caller record a
     /// distinct `StoreUnavailable` status.
-    fn resolve_bearer(&self, provider: &str) -> (Option<String>, bool) {
-        match self.secrets.get(provider) {
-            Ok(bearer) => (bearer, false),
-            Err(e) => {
+    ///
+    /// Async: the read runs on the blocking pool. The provider fan-out polls
+    /// every provider inside one task, so an inline blocked keychain call here
+    /// would freeze every sibling's progress, not just this provider's. The
+    /// per-provider I/O gate is owned by the closure (same construction as the
+    /// credential bridge) so repeated timed-out reads against a wedged
+    /// keychain wait on the gate instead of parking ever more threads.
+    async fn resolve_bearer(&self, provider: &str) -> (Option<String>, bool) {
+        let permit = self
+            .credential_lifecycle(provider)
+            .io_gate
+            .clone()
+            .lock_owned()
+            .await;
+        let secrets = self.secrets.clone();
+        let key = provider.to_owned();
+        let read = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            secrets.get(&key)
+        })
+        .await;
+        match read {
+            Ok(Ok(bearer)) => (bearer, false),
+            Ok(Err(e)) => {
                 tracing::warn!(provider = %provider, error = %e, "could not read secret store; treating provider as unauthenticated");
+                (None, true)
+            }
+            Err(e) => {
+                tracing::warn!(provider = %provider, error = %e, "secret store read task failed; treating provider as unauthenticated");
                 (None, true)
             }
         }
@@ -407,7 +848,7 @@ impl PromptService {
     }
 
     /// All configured MCP providers with their last-build status and whether a
-    /// bearer is stored. Status comes from the most recent [`sync`](Self::sync);
+    /// token is stored. Status comes from the most recent [`sync`](Self::sync);
     /// a just-added provider reads `Unknown` until the next build completes.
     #[must_use]
     pub fn list_mcp_providers(&self) -> Vec<McpProviderInfo> {
@@ -419,7 +860,15 @@ impl PromptService {
             .into_iter()
             .map(|config| {
                 let McpTransport::Http { url } = &config.transport;
-                let has_token = matches!(self.secrets.get(&config.name), Ok(Some(_)));
+                let has_token = match &config.auth {
+                    McpAuth::Bearer => matches!(self.secrets.get(&config.name), Ok(Some(_))),
+                    McpAuth::Oauth { .. } => {
+                        canonicalize_resource_url(url).is_ok_and(|canonical| {
+                            self.credential_store(&config.name, &canonical)
+                                .tokens_present()
+                        })
+                    }
+                };
                 let status = statuses
                     .get(&config.name)
                     .cloned()
@@ -428,6 +877,7 @@ impl PromptService {
                     name: config.name.clone(),
                     url: url.clone(),
                     has_token,
+                    auth: config.auth.clone(),
                     status,
                 }
             })
@@ -499,8 +949,27 @@ impl PromptService {
         let mut configs = self.mcp_provider_configs();
         let before = configs.len();
         configs.retain(|c| c.name != name);
-        let bearer_delete = self.secrets.delete(name);
-        let oauth_delete = self.secrets.delete(&crate::oauth::oauth_secret_key(name));
+        self.invalidate_oauth_clients(name);
+        // The deletes run under the provider's credential transaction lock: an
+        // in-flight refresh on a still-live AuthClient clone either finishes
+        // its whole read-modify-write first (and everything is then deleted),
+        // or waits and finds no envelope (its save errors). Without this lock
+        // the interleave read → delete → write would resurrect credentials
+        // under a provider the user removed — cache invalidation above cannot
+        // prevent that, because live clones outlive the cache entry. The
+        // lifecycle entry is deliberately NOT removed from the map afterwards —
+        // see `CredentialLockMap` for why pruning would reopen this race.
+        let (bearer_delete, oauth_delete) = {
+            let lifecycle = self.credential_lifecycle(name);
+            let _guard = lifecycle
+                .txn
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (
+                self.secrets.delete(name),
+                self.secrets.delete(&oauth_secret_key(name)),
+            )
+        };
         bearer_delete.and(oauth_delete)?;
         if configs.len() != before {
             self.write_mcp_providers(&configs)?;
@@ -514,7 +983,10 @@ impl PromptService {
 
     /// Probe a candidate provider before saving: connect, list, and return the
     /// prompt count, or an error. Uses the supplied bearer directly (the form's
-    /// value, not yet stored).
+    /// value, not yet stored). **Bearer-only by design**: an OAuth provider
+    /// that hasn't been saved has no registration or credentials to probe with
+    /// — the honest sequence there is add, sign in, then
+    /// [`test_saved_mcp_provider`](Self::test_saved_mcp_provider).
     pub async fn test_mcp_connection(
         &self,
         url: &str,
@@ -524,9 +996,28 @@ impl PromptService {
             "(test)".to_owned(),
             url.to_owned(),
             bearer,
-            PROVIDER_TIMEOUT,
+            self.provider_timeout,
         );
         Ok(provider.list_result().await?.len())
+    }
+
+    /// Probe a **saved** provider by name with its stored credentials — the
+    /// row-level Test action. Runs the same per-mode pipeline as `sync`
+    /// (OAuth goes through the cached client) and returns the outcome in the
+    /// status vocabulary the rows already render — `Ok { prompt_count }`,
+    /// `NeedsAuth`, `Errored`, `StoreUnavailable` — without touching the
+    /// recorded per-provider status (a probe is a peek, not a build). `Err` is
+    /// reserved for "no such provider".
+    pub async fn test_saved_mcp_provider(&self, name: &str) -> Result<ProviderStatus, PromptError> {
+        let config = self
+            .mcp_provider_configs()
+            .into_iter()
+            .find(|c| c.name == name)
+            .ok_or_else(|| PromptError::ProviderNotFound {
+                provider: name.to_owned(),
+            })?;
+        let (_, status, _) = self.query_provider(&config).await;
+        Ok(status)
     }
 
     fn config_path(&self) -> Result<&Path, PromptError> {
@@ -1116,6 +1607,102 @@ mod tests {
                 || !std::fs::read_to_string(&config_path)
                     .unwrap()
                     .contains("mcp_providers")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn removal_waits_for_in_flight_credential_write_real_path() {
+        // (multi_thread: the test thread blocks on channels while the spawned
+        // save and the blocking pool must keep making progress.)
+        use rmcp::transport::auth::StoredCredentials;
+
+        /// Envelope writes signal entry and park until released; everything
+        /// else passes through — so the test *knows* the save is inside its
+        /// locked critical section when removal is invoked, with no timing
+        /// assumption on that side.
+        struct GatedWriteStore {
+            inner: InMemorySecretStore,
+            entered: std::sync::mpsc::Sender<()>,
+            release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+        impl SecretStore for GatedWriteStore {
+            fn get(&self, key: &str) -> Result<Option<String>, SecretStoreError> {
+                self.inner.get(key)
+            }
+            fn set(&self, key: &str, value: &str) -> Result<(), SecretStoreError> {
+                if key == "oauth:team" {
+                    let _ = self.entered.send(());
+                    let _ = self
+                        .release
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .recv();
+                }
+                self.inner.set(key, value)
+            }
+            fn delete(&self, key: &str) -> Result<(), SecretStoreError> {
+                self.inner.delete(key)
+            }
+        }
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let store = Arc::new(GatedWriteStore {
+            inner: InMemorySecretStore::new(),
+            entered: entered_tx,
+            release: std::sync::Mutex::new(release_rx),
+        });
+        let resource = "https://mcp.example.com/mcp";
+        store
+            .inner
+            .set(
+                "oauth:team",
+                &format!(
+                    r#"{{"registration":{{"client_id":"client-1","redirect_uri":"http://127.0.0.1/callback","resource":"{resource}"}},"tokens":null}}"#
+                ),
+            )
+            .unwrap();
+
+        let dir = TempDir::new().unwrap();
+        let service = PromptService::new(
+            dir.path().join("config.yaml"),
+            dir.path().join("prompts"),
+            None,
+            store.clone(),
+        );
+
+        // A save through the service's own credential store — the REAL
+        // registry lifecycle, not a hand-shared mutex.
+        let cred_store = service.credential_store("team", resource);
+        let save = tokio::spawn(async move {
+            use rmcp::transport::auth::CredentialStore as _;
+            cred_store
+                .save(StoredCredentials::new(
+                    "client-1".to_owned(),
+                    None,
+                    vec![],
+                    None,
+                ))
+                .await
+        });
+        entered_rx.recv().unwrap(); // save is now inside its locked write
+
+        // The real removal path must block on the same transaction lock.
+        let service_for_removal = service.clone();
+        let removal = std::thread::spawn(move || service_for_removal.remove_mcp_provider("team"));
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !removal.is_finished(),
+            "remove_mcp_provider must wait for the in-flight credential write"
+        );
+
+        release_tx.send(()).unwrap();
+        save.await.unwrap().unwrap(); // the write completes first…
+        removal.join().unwrap().unwrap(); // …then removal deletes it
+        assert_eq!(
+            store.inner.get("oauth:team").unwrap(),
+            None,
+            "nothing may survive removal"
         );
     }
 

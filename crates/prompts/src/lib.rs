@@ -19,6 +19,7 @@ mod local;
 mod mcp;
 mod model;
 mod oauth;
+mod preflight;
 mod provider;
 mod secret;
 mod service;
@@ -136,5 +137,20 @@ mod error {
         /// The secret store could not store or delete a credential.
         #[error(transparent)]
         Secret(#[from] crate::secret::SecretStoreError),
+
+        /// An OAuth provider failed a mandatory validation gate (the preflight)
+        /// before any credential was sent: bad URL, resource-identity mismatch,
+        /// non-HTTPS endpoint, or missing PKCE support. `message` names the
+        /// specific gate and, for identity mismatches, both compared values.
+        #[error("OAuth validation failed for provider {provider:?}: {message}")]
+        OAuthValidation { provider: String, message: String },
+
+        /// An OAuth provider has no usable credentials — determined locally
+        /// from the typed `AuthorizationRequired` probe, before any request
+        /// reaches the MCP server. Internal-typed only: the app's command shim
+        /// flattens errors to strings over IPC, so UI affordances key off the
+        /// typed `needs_auth` *provider status*, not this variant.
+        #[error("MCP provider {provider:?} needs sign-in before its prompts can be used")]
+        McpNeedsAuth { provider: String },
     }
 }

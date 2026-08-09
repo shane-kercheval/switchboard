@@ -244,10 +244,12 @@ pub fn claude_session_file_path(home: &Path, cwd: &Path, session_id: &uuid::Uuid
         .join(format!("{session_id}.jsonl"))
 }
 
+/// Longest encoded directory name Claude Code emits before it truncates and
+/// appends a hash of the full path (`sQ` in the CLI bundle).
+const MAX_ENCODED_LEN: usize = 200;
+
 /// Encodes a canonical absolute path the way Claude Code does for its
-/// session-storage directory naming: every character outside `[A-Za-z0-9-]`
-/// becomes `-`. That covers `/` and `.`, but also `_` and spaces — a directory
-/// named `switchboard-mcp_oauth` is stored under `…-switchboard-mcp-oauth`.
+/// session-storage directory naming.
 ///
 /// Getting this rule exactly right is load-bearing: any mismatch causes the
 /// adapter to think a session file is missing and pass `--session-id`, which
@@ -255,15 +257,78 @@ pub fn claude_session_file_path(home: &Path, cwd: &Path, session_id: &uuid::Uuid
 /// stranding the agent permanently (the check is a filesystem lookup, so it
 /// fails identically on every retry and across app restarts).
 ///
-/// The rule is empirical, confirmed against `~/.claude/projects/` listings:
-/// across a 160-directory sample the names contain only `[A-Za-z0-9-]`, and a
-/// cwd containing `_` is stored with that `_` collapsed to `-`.
+/// The CLI's rule, read out of the 2.1.226 bundle:
+///
+/// ```js
+/// bes = e => e.replace(/[^a-zA-Z0-9]/g, "-")
+/// gw  = e => { let t = bes(e); return t.length <= sQ ? t
+///              : `${t.slice(0, sQ)}-${T$g(e)}` }          // sQ = 200
+/// T$g = e => Math.abs(xdt(e)).toString(36)
+/// xdt = e => { let t = 0; for (…) t = (t << 5) - t + e.charCodeAt(r) | 0; return t }
+/// ```
+///
+/// Three details that a "replace the separators" reading misses, each of which
+/// produces the permanent-strand failure above:
+///
+/// - **Every** non-alphanumeric collapses, not just `/` and `.` — `_` and
+///   spaces included, so `switchboard-mcp_oauth` lives under `…-mcp-oauth`.
+/// - The regex has no `u` flag, so it runs over **UTF-16 code units**: an
+///   astral character (emoji) becomes *two* dashes, not one. Hence
+///   `encode_utf16` rather than `chars`.
+/// - Names longer than 200 characters are truncated and suffixed with a
+///   base-36 Java-style string hash **of the untruncated path**.
+///
+/// Known remaining divergence: the CLI NFC-normalizes the path first, and this
+/// does not. A decomposed (NFD) path — which macOS produces routinely — still
+/// resolves to the wrong directory. Closing that needs a Unicode-normalization
+/// dependency; see the note in `docs/harness-behavior.md`.
 fn encode_cwd(canonical: &Path) -> String {
-    canonical
-        .to_string_lossy()
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect()
+    let raw = canonical.to_string_lossy();
+    let encoded: String = raw
+        .encode_utf16()
+        .map(|unit| match u8::try_from(unit) {
+            Ok(byte) if byte.is_ascii_alphanumeric() => char::from(byte),
+            _ => '-',
+        })
+        .collect();
+    if encoded.len() <= MAX_ENCODED_LEN {
+        return encoded;
+    }
+    // `encoded` is all ASCII, so byte-slicing at 200 is char-safe and matches
+    // the CLI's `slice(0, 200)` over UTF-16 units.
+    format!(
+        "{}-{}",
+        &encoded[..MAX_ENCODED_LEN],
+        java_string_hash_base36(&raw)
+    )
+}
+
+/// `Math.abs(xdt(path)).toString(36)` — the suffix Claude Code appends to a
+/// truncated directory name. `xdt` is the classic `h = h * 31 + c` string hash
+/// evaluated over UTF-16 code units with JavaScript's `| 0` int32 truncation at
+/// every step, so every operation here wraps.
+fn java_string_hash_base36(raw: &str) -> String {
+    let hash = raw.encode_utf16().fold(0i32, |acc, unit| {
+        acc.wrapping_shl(5)
+            .wrapping_sub(acc)
+            .wrapping_add(i32::from(unit))
+    });
+    // `Math.abs(-2147483648)` is 2147483648 in JS (the result is a double, not
+    // an int32), which `unsigned_abs` reproduces exactly.
+    to_base36(hash.unsigned_abs())
+}
+
+fn to_base36(mut value: u32) -> String {
+    const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    if value == 0 {
+        return "0".to_owned();
+    }
+    let mut out = Vec::new();
+    while value > 0 {
+        out.push(char::from(DIGITS[(value % 36) as usize]));
+        value /= 36;
+    }
+    out.iter().rev().collect()
 }
 
 // Parallels the Codex / Gemini producers: a single per-line control-flow loop
@@ -768,10 +833,12 @@ mod tests {
 
     #[test]
     fn encode_cwd_replaces_every_non_alphanumeric_character_with_a_dash() {
-        // All cases below are empirically verified against `claude` itself
-        // by running it in each cwd shape and inspecting where it created
-        // its session-storage directory under `~/.claude/projects/`. See
-        // `docs/research/archive/claude-code-cli-observed.md` for the probe.
+        // The dot/slash cases were verified by running `claude` in each cwd
+        // shape and inspecting the directory it created under
+        // `~/.claude/projects/` — see `docs/research/archive/claude-code-cli-observed.md`.
+        // That archived probe predates the underscore/space/astral cases below
+        // and records the rule as "`/` and `.`", which is now known to be
+        // incomplete; `docs/harness-behavior.md` carries the corrected rule.
 
         // Switchboard's actual on-disk layout: `.switchboard/` dot-prefixed
         // component must produce `--switchboard` (double dash).
@@ -806,6 +873,45 @@ mod tests {
             "-Users-x-api-copy"
         );
         assert_eq!(encode_cwd(Path::new("/a-b/c.d_e f")), "-a-b-c-d-e-f");
+        // An astral character is two UTF-16 code units, so it collapses to two
+        // dashes — `.chars()` would produce one and miss the directory.
+        assert_eq!(encode_cwd(Path::new("/Users/x/a\u{1F600}b")), "-Users-x-a--b");
+    }
+
+    /// Expected values produced by running Claude Code's own `gw`/`bes`/`xdt`
+    /// functions (lifted verbatim from the 2.1.226 bundle) in node, so this
+    /// pins against the CLI's algorithm rather than against a restatement of
+    /// our own. A path long enough to truncate is reachable in normal use: the
+    /// `.switchboard/projects/<uuid>` cwd shape alone contributes 59 characters.
+    #[test]
+    fn encode_cwd_truncates_long_names_and_appends_the_cli_hash() {
+        let long = format!("/Users/x/{}/proj_name", "verylongsegment".repeat(20));
+        let encoded = encode_cwd(Path::new(&long));
+
+        assert_eq!(
+            encoded,
+            "-Users-x-verylongsegmentverylongsegmentverylongsegmentverylongsegmentverylongsegmentverylongsegmentverylongsegmentverylongsegmentverylongsegmentverylongsegmentverylongsegmentverylongsegmentverylongseg-38h6iz"
+        );
+        assert_eq!(
+            encoded.len(),
+            MAX_ENCODED_LEN + 1 + "38h6iz".len(),
+            "200 chars, a separator dash, then the base-36 hash"
+        );
+        // Short names are returned whole — the truncation branch must not fire.
+        assert_eq!(encode_cwd(Path::new("/Users/x/repo")), "-Users-x-repo");
+    }
+
+    #[test]
+    fn java_string_hash_matches_the_cli_for_edge_values() {
+        // `Math.abs(xdt(""))` is 0, and `(0).toString(36)` is "0".
+        assert_eq!(java_string_hash_base36(""), "0");
+        assert_eq!(to_base36(0), "0");
+        assert_eq!(to_base36(35), "z");
+        assert_eq!(to_base36(36), "10");
+        // i32::MIN has no positive counterpart; JS `Math.abs` yields 2147483648
+        // because the result is a double. `unsigned_abs` must match, not panic
+        // or wrap back to a negative.
+        assert_eq!(to_base36(i32::MIN.unsigned_abs()), "zik0zk");
         // Multiple dots in one component (mixed leading + mid).
         assert_eq!(
             encode_cwd(Path::new("/private/tmp/sw-probe/foo/.bar.baz")),

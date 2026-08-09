@@ -974,10 +974,18 @@ async fn live_claude_resume_reuses_session_in_underscored_cwd() {
     let adapter = ClaudeCodeAdapter::new();
     let session_id = Uuid::now_v7();
 
-    let root = tempfile::TempDir::new().expect("temp dir");
-    let cwd = root.path().join("sw_live_probe");
+    // A *stable* path, not a fresh TempDir: claude creates a session directory
+    // under the developer's real `~/.claude/projects/`, which this test cannot
+    // clean up. A random cwd per run would leave a new directory behind every
+    // time and clutter their own `claude --resume` picker. The `/tmp`-based
+    // sibling test reuses one directory for the same reason.
+    let cwd = std::env::temp_dir().join("sw_live_probe_underscored");
     std::fs::create_dir_all(&cwd).expect("create underscored cwd");
     let cwd = cwd.canonicalize().expect("canonicalize cwd");
+    assert!(
+        cwd.to_string_lossy().contains('_'),
+        "the cwd must contain an underscore for this test to mean anything"
+    );
 
     let agent = |name: &str| AgentRecord {
         model: None,
@@ -1011,6 +1019,21 @@ async fn live_claude_resume_reuses_session_in_underscored_cwd() {
         completed(agent("underscore-1"), "Say ACK").await,
         "first turn should create the session"
     );
+
+    // Assert the encoding *directly*, not just via the second turn succeeding.
+    // Without this the test infers correctness from claude currently rejecting
+    // a reused `--session-id`; a future CLI that tolerated that would let this
+    // go green with a wrong encoder — restoring the exact false confidence the
+    // test exists to remove. This also fails with a diagnosable message.
+    let expected = claude_session_file_path(&home_dir(), &cwd, &session_id);
+    assert!(
+        expected.exists(),
+        "claude wrote its session somewhere other than {}; `encode_cwd` and the \
+         CLI disagree about how to encode {}",
+        expected.display(),
+        cwd.display()
+    );
+
     assert!(
         completed(agent("underscore-2"), "Say ACK again").await,
         "second turn must resume, not re-create: a `--session-id` here fails \

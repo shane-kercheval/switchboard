@@ -1627,6 +1627,18 @@ pub fn set_active_project_impl(state: &AppState, project_id: ProjectId) -> Resul
     Ok(())
 }
 
+/// Record what the user is looking at. Display-only, and deliberately distinct
+/// from `set_active_project`: this goes `None` for Settings, the Git view, and a
+/// project that is still loading, none of which change which project backend
+/// actions target.
+///
+/// Unvalidated on purpose — it is a rendering fact, not an assertion that the
+/// project is loaded, and a project can legitimately be on screen mid-load.
+/// Stale writes are dropped by sequence number.
+pub fn set_visible_project_impl(state: &AppState, project_id: Option<ProjectId>, seq: u64) {
+    lock(&state.visible_project).apply(project_id, seq);
+}
+
 pub fn create_agent_impl(
     state: &AppState,
     name: &str,
@@ -17030,6 +17042,8 @@ mod tests {
             terminal_app: "iTerm".to_owned(),
             diff_style: preferences::DiffStyle::Unified,
             show_builtins: false,
+            notify_on_completion: true,
+            notify_while_focused: false,
         };
         set_preferences_impl(&state, &prefs).unwrap();
 
@@ -17054,6 +17068,8 @@ mod tests {
                 terminal_app: String::new(),
                 diff_style: preferences::DiffStyle::SideBySide,
                 show_builtins: true,
+                notify_on_completion: true,
+                notify_while_focused: false,
             },
         )
         .unwrap();
@@ -17075,6 +17091,8 @@ mod tests {
             terminal_app: "Terminal".to_owned(),
             diff_style: preferences::DiffStyle::SideBySide,
             show_builtins: true,
+            notify_on_completion: true,
+            notify_while_focused: false,
         };
         set_preferences_impl(&state, &prefs).unwrap();
         assert_eq!(get_preferences_impl(&state), prefs);
@@ -17145,6 +17163,8 @@ mod tests {
             &state,
             &Preferences {
                 show_builtins: false,
+                notify_on_completion: true,
+                notify_while_focused: false,
                 ..Preferences::default()
             },
         )
@@ -17680,6 +17700,8 @@ mod tests {
             &state,
             &Preferences {
                 show_builtins: false,
+                notify_on_completion: true,
+                notify_while_focused: false,
                 ..Preferences::default()
             },
         )
@@ -18243,8 +18265,18 @@ mod tests {
     struct RecordingNotifier {
         calls: std::sync::Mutex<Vec<(String, String)>>,
     }
-    impl crate::workflow_commands::Notifier for RecordingNotifier {
-        fn notify(&self, title: &str, body: &str) {
+    impl crate::notification::Notifier for RecordingNotifier {
+        fn notify(&self, _project: switchboard_core::ProjectId, title: &str, body: &str) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((title.to_owned(), body.to_owned()));
+        }
+    }
+    /// Also usable as the OS-delivery seam, so a test can wrap it in the real
+    /// `GatedNotifier` and assert on what the gate let through.
+    impl crate::notification::NotificationDelivery for RecordingNotifier {
+        fn deliver(&self, title: &str, body: &str) {
             self.calls
                 .lock()
                 .unwrap()
@@ -18256,8 +18288,7 @@ mod tests {
     async fn notification_fires_on_completion() {
         let (tmp, state) = state_with_prompts();
         let rec = Arc::new(RecordingNotifier::default());
-        let state =
-            state.with_notifier(Arc::clone(&rec) as Arc<dyn crate::workflow_commands::Notifier>);
+        let state = state.with_notifier(Arc::clone(&rec) as Arc<dyn crate::notification::Notifier>);
         init_directory_impl(&state, tmp.path().to_str().unwrap())
             .await
             .unwrap();
@@ -18295,6 +18326,68 @@ mod tests {
         let calls = rec.calls.lock().unwrap();
         assert_eq!(calls.len(), 1, "exactly one completion notification");
         assert_eq!(calls[0].0, "Workflow complete");
+        // Every notification names its project: one can arrive while the user is
+        // working in a different project, so "which one?" must not require
+        // guessing.
+        assert_eq!(calls[0].1, "proj: review-and-recommend");
+    }
+
+    #[tokio::test]
+    async fn workflow_terminal_is_silent_when_the_preference_is_off() {
+        // The behavior change this preference introduces: the workflow notification
+        // used to be unconditional. Exercised end-to-end through a real run rather
+        // than against the gate in isolation, because the regression that matters
+        // is a notify path that bypasses the notifier — which a unit test of the
+        // gate could not see.
+        let (tmp, state) = state_with_prompts();
+        let rec = Arc::new(RecordingNotifier::default());
+        let gated = Arc::new(crate::notification::GatedNotifier::new(
+            Arc::clone(&rec) as Arc<dyn crate::notification::NotificationDelivery>,
+            Arc::new(|| Some(false)),
+            Arc::new(|| None),
+            Arc::new(|| crate::notification::NotifyPrefs {
+                enabled: false,
+                while_focused: true,
+            }),
+        ));
+        let state = state.with_notifier(gated as Arc<dyn crate::notification::Notifier>);
+        init_directory_impl(&state, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let project = create_project_in_only_dir(&state, "proj");
+        set_active_project_impl(&state, project.id).unwrap();
+        for name in ["primary", "reviewer-1"] {
+            create_agent_impl(&state, name, HarnessKind::ClaudeCode, None, None).unwrap();
+        }
+        state.prompts.sync().await;
+
+        let run_id = invoke_workflow_impl(
+            &state,
+            project.id,
+            "review-and-recommend",
+            true,
+            &inputs(vec![
+                ("worker", text("primary")),
+                ("reviewers", list(&["reviewer-1"])),
+            ]),
+        )
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if !lock(&state.workflow_runs).contains_key(&run_id) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("run did not terminalize");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert!(
+            rec.calls.lock().unwrap().is_empty(),
+            "the preference governs workflow terminals, not just send completions"
+        );
     }
 
     #[tokio::test]
@@ -18395,8 +18488,7 @@ mod tests {
         );
         let state = state.with_prompts(service);
         let rec = Arc::new(RecordingNotifier::default());
-        let state =
-            state.with_notifier(Arc::clone(&rec) as Arc<dyn crate::workflow_commands::Notifier>);
+        let state = state.with_notifier(Arc::clone(&rec) as Arc<dyn crate::notification::Notifier>);
         init_directory_impl(&state, tmp.path().to_str().unwrap())
             .await
             .unwrap();

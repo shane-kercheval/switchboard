@@ -35,7 +35,7 @@
     type PromptContent,
     type WorkflowContent,
   } from "$lib/state/composeStore";
-  import { recordProjectsActivityLocally } from "$lib/state/workspace.svelte";
+  import { projects, recordProjectsActivityLocally } from "$lib/state/workspace.svelte";
   import {
     selectionFor,
     setRecipients,
@@ -60,8 +60,8 @@
     WorkflowListing,
   } from "$lib/types";
   import { classifyKind, nextLabel } from "$lib/attachments";
+  import { registerSend } from "$lib/state/sendCompletion";
   import { getCurrentWebview } from "@tauri-apps/api/webview";
-  import { isPermissionGranted, requestPermission } from "@tauri-apps/plugin-notification";
   import { buildRenderArgs, combinePromptMessage, missingRequiredArgs } from "$lib/prompt";
   import Textarea from "$lib/components/ui/Textarea.svelte";
   import StopIcon from "$lib/components/ui/StopIcon.svelte";
@@ -1543,17 +1543,6 @@
     return !inputMissing && !argMissing;
   });
 
-  /// Request OS-notification permission once, contextually at first invoke.
-  async function ensureNotificationPermission(): Promise<void> {
-    try {
-      if (!(await isPermissionGranted())) {
-        await requestPermission();
-      }
-    } catch (err) {
-      console.warn("[switchboard] notification permission request failed", err);
-    }
-  }
-
   // The viewed project's single workflow run. The `[0]` relies on the
   // one-run-per-project invariant, enforced at the backend invoke guard (which
   // rejects both a second *active* run and a launch while a *held*
@@ -1591,8 +1580,6 @@
     invokingWorkflow = true;
     sendError = null;
     try {
-      // Contextual permission request at first invoke (not at cold startup).
-      void ensureNotificationPermission();
       // Pane-expand each field's sources to agent ids; omit empty fields so the
       // map carries only fields the user actually attached a forward to.
       const forwardSources: Record<string, AgentId[]> = {};
@@ -1890,6 +1877,17 @@
     // Bump this project's local last-activity so it sorts/reads as active right
     // away, before any turn event round-trips. Once per send action.
     recordProjectsActivityLocally([dispatchProjectId], currentIsoTimestamp());
+    // Register the whole recipient set *before* any IPC call, so one recipient's
+    // rejection can't erase an agent that was supposed to be in the send — and so
+    // the completion notification fires once, on the last recipient, rather than
+    // once per agent. Only sends dispatched here are registered, which is what
+    // keeps workflow steps from notifying individually.
+    registerSend(
+      sendId,
+      dispatchProjectId,
+      projects.list.find((p) => p.id === dispatchProjectId)?.name ?? "Switchboard",
+      targets.map((a) => ({ id: a.id, name: a.name })),
+    );
     for (const agent of targets) {
       const userTurnId = crypto.randomUUID();
       // Every recipient gets the SAME snapshotted attachment list (one shared

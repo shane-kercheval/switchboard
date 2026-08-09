@@ -20,6 +20,16 @@ const defaultInvoke = async (cmd: string, _args?: Record<string, unknown>): Prom
     return "/Users/test/Library/Application Support/switchboard/prompts";
   if (cmd === "workflows_dir")
     return "/Users/test/Library/Application Support/switchboard/workflows";
+  if (cmd === "get_preferences")
+    return {
+      editor_command: "code",
+      terminal_app: "Terminal",
+      diff_style: "unified",
+      show_builtins: true,
+      notify_on_completion: true,
+      notify_while_focused: false,
+    };
+  if (cmd === "notification_availability") return "available";
   return null; // auth probes resolve = authenticated
 };
 const invokeMock = vi.fn(defaultInvoke);
@@ -136,6 +146,8 @@ describe("SettingsView", () => {
           terminal_app: "Terminal",
           diff_style: "unified",
           show_builtins: true,
+          notify_on_completion: true,
+          notify_while_focused: false,
         },
       }),
     );
@@ -151,6 +163,8 @@ describe("SettingsView", () => {
           terminal_app: "Terminal",
           diff_style: "unified",
           show_builtins: true,
+          notify_on_completion: true,
+          notify_while_focused: false,
         },
       }),
     );
@@ -169,6 +183,8 @@ describe("SettingsView", () => {
           terminal_app: "iTerm",
           diff_style: "unified",
           show_builtins: true,
+          notify_on_completion: true,
+          notify_while_focused: false,
         },
       }),
     );
@@ -183,6 +199,8 @@ describe("SettingsView", () => {
           terminal_app: "Terminal",
           diff_style: "unified",
           show_builtins: true,
+          notify_on_completion: true,
+          notify_while_focused: false,
         },
       }),
     );
@@ -290,5 +308,156 @@ describe("SettingsView", () => {
     await fireEvent.click(toggle);
     expect(toggle).toHaveAttribute("aria-expanded", "true");
     expect(screen.getByTestId("workflow-authoring-prompt").textContent).toBe(copied);
+  });
+});
+
+describe("SettingsView — notifications", () => {
+  /// Override one command on top of the baseline stubs, which the embedded
+  /// HarnessStatusList / McpServersSettings still need.
+  const withCommand = (cmd: string, value: unknown): void => {
+    invokeMock.mockImplementation(async (c: string, args?: Record<string, unknown>) =>
+      c === cmd ? value : defaultInvoke(c, args),
+    );
+  };
+
+  it("the background-projects toggle is off by default and persists a flip", async () => {
+    render(SettingsView, { props: { onClose: vi.fn() } });
+    const toggle = await screen.findByTestId("notify-while-focused-toggle");
+    await waitFor(() => expect(toggle).toHaveAttribute("aria-checked", "false"));
+
+    await fireEvent.click(toggle);
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith(
+        "set_preferences",
+        expect.objectContaining({
+          preferences: expect.objectContaining({ notify_while_focused: true }),
+        }),
+      ),
+    );
+    expect(toggle).toHaveAttribute("aria-checked", "true");
+  });
+
+  it("disables the background-projects toggle when notifications are off entirely", async () => {
+    // It is meaningless on its own — without the master switch there is nothing
+    // to route. Leaving it live would offer a choice that does nothing.
+    render(SettingsView, { props: { onClose: vi.fn() } });
+    const master = await screen.findByTestId("notify-toggle");
+    const nested = screen.getByTestId("notify-while-focused-toggle");
+    expect(nested).not.toBeDisabled();
+
+    await fireEvent.click(master);
+    await waitFor(() => expect(nested).toBeDisabled());
+  });
+
+  it("explains the two rules a user cannot infer from the toggle", async () => {
+    // Both are load-bearing: without the first, testing the toggle while looking
+    // at the app reads as broken; without the second, "sound but no banner" looks
+    // impossible when it is actually a macOS setting.
+    render(SettingsView, { props: { onClose: vi.fn() } });
+    const section = screen.getByTestId("notification-prefs");
+    expect(within(section).getByText(/the project on screen never notifies/i)).toBeInTheDocument();
+    expect(within(section).getByText(/System Settings → Notifications/i)).toBeInTheDocument();
+  });
+
+  it("toggle reflects the stored preference and persists a flip", async () => {
+    render(SettingsView, { props: { onClose: vi.fn() } });
+    const toggle = await screen.findByTestId("notify-toggle");
+    await waitFor(() => expect(toggle).toHaveAttribute("aria-checked", "true"));
+
+    await fireEvent.click(toggle);
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith(
+        "set_preferences",
+        expect.objectContaining({
+          preferences: expect.objectContaining({ notify_on_completion: false }),
+        }),
+      ),
+    );
+    expect(toggle).toHaveAttribute("aria-checked", "false");
+  });
+
+  it("warns only when macOS is actually suppressing notifications", async () => {
+    withCommand("notification_availability", "suppressed");
+    render(SettingsView, { props: { onClose: vi.fn() } });
+    expect(await screen.findByTestId("notify-suppressed")).toBeInTheDocument();
+  });
+
+  it("stays quiet when notifications are available", async () => {
+    // The sound-only configuration (alerts off, sound on) classifies as available
+    // on the backend, so this is also the assertion that a working setup is not
+    // reported as broken.
+    render(SettingsView, { props: { onClose: vi.fn() } });
+    await screen.findByTestId("notify-toggle");
+    expect(screen.queryByTestId("notify-suppressed")).not.toBeInTheDocument();
+  });
+
+  it("stays quiet in an unbundled dev build rather than blaming the user's settings", async () => {
+    // `unavailable` is not `suppressed`: nothing is misconfigured, the build just
+    // isn't an installed app. Showing the blocking warning here would send a
+    // developer to System Settings for no reason.
+    withCommand("notification_availability", "unavailable");
+    render(SettingsView, { props: { onClose: vi.fn() } });
+    await screen.findByTestId("notify-toggle");
+    expect(screen.queryByTestId("notify-suppressed")).not.toBeInTheDocument();
+  });
+
+  it("renders no hint when the availability probe itself fails", async () => {
+    invokeMock.mockImplementation(async (c: string, args?: Record<string, unknown>) =>
+      c === "notification_availability"
+        ? Promise.reject(new Error("boom"))
+        : defaultInvoke(c, args),
+    );
+    render(SettingsView, { props: { onClose: vi.fn() } });
+    await screen.findByTestId("notify-toggle");
+    expect(screen.queryByTestId("notify-suppressed")).not.toBeInTheDocument();
+  });
+});
+
+describe("SettingsView — preference save failures", () => {
+  /// Reject only `set_preferences`, keeping the baseline stubs the embedded
+  /// components need on mount.
+  const failSaves = (): void => {
+    invokeMock.mockImplementation(async (c: string, args?: Record<string, unknown>) =>
+      c === "set_preferences" ? Promise.reject(new Error("disk full")) : defaultInvoke(c, args),
+    );
+  };
+
+  it("reports a failed notification save beside the notification toggles", async () => {
+    // Previously this surfaced under Git View — plausibly scrolled off screen —
+    // so a user would see the toggle flip with no error and assume it stuck.
+    failSaves();
+    render(SettingsView, { props: { onClose: vi.fn() } });
+    await fireEvent.click(await screen.findByTestId("notify-toggle"));
+
+    expect(await screen.findByTestId("notify-save-error")).toBeInTheDocument();
+    expect(screen.queryByTestId("git-prefs-save-error")).not.toBeInTheDocument();
+  });
+
+  it("reports a failed Git-preference save beside the Git controls", async () => {
+    failSaves();
+    render(SettingsView, { props: { onClose: vi.fn() } });
+    const editor = screen.getByTestId("git-editor-command") as HTMLInputElement;
+    await fireEvent.input(editor, { target: { value: "cursor" } });
+    await fireEvent.change(editor);
+
+    expect(await screen.findByTestId("git-prefs-save-error")).toBeInTheDocument();
+    expect(screen.queryByTestId("notify-save-error")).not.toBeInTheDocument();
+  });
+
+  it("a later successful save clears an earlier failure, including for other keys", async () => {
+    // Not sloppy attribution — accurate. Every write sends the whole merged
+    // object and memory is updated optimistically first, so the Git save below
+    // carries the failed notification value with it and does persist it.
+    failSaves();
+    render(SettingsView, { props: { onClose: vi.fn() } });
+    await fireEvent.click(await screen.findByTestId("notify-toggle"));
+    expect(await screen.findByTestId("notify-save-error")).toBeInTheDocument();
+
+    invokeMock.mockImplementation(defaultInvoke);
+    const editor = screen.getByTestId("git-editor-command") as HTMLInputElement;
+    await fireEvent.input(editor, { target: { value: "cursor" } });
+    await fireEvent.change(editor);
+
+    await waitFor(() => expect(screen.queryByTestId("notify-save-error")).not.toBeInTheDocument());
   });
 });

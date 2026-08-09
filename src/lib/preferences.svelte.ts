@@ -17,6 +17,8 @@ const DEFAULTS: Preferences = {
   terminal_app: "Terminal",
   diff_style: "unified",
   show_builtins: true,
+  notify_on_completion: true,
+  notify_while_focused: false,
 };
 
 export const preferences = $state<Preferences>({ ...DEFAULTS });
@@ -24,8 +26,20 @@ export const preferences = $state<Preferences>({ ...DEFAULTS });
 /// The last save failure, or null. Surfaced inline in Settings so a rare
 /// `config.yaml` write failure isn't silent — the setting still works this
 /// session (the in-memory value stands) but the user is told it may not survive
-/// restart, and can report it. Cleared on the next successful save.
-export const saveStatus = $state<{ error: string | null }>({ error: null });
+/// restart, and can report it.
+///
+/// `keys` records which preferences the *user touched* on the failed attempt, so
+/// Settings can render the warning next to the control they used rather than in
+/// whichever section happens to own the renderer.
+///
+/// **Any successful save clears it, even one for unrelated preferences.** That is
+/// accurate, not sloppy: every write sends the whole merged object, and memory is
+/// updated optimistically before the write — so a later successful save carries
+/// the earlier failed value with it and does persist it.
+export const saveStatus = $state<{ error: string | null; keys: string[] }>({
+  error: null,
+  keys: [],
+});
 
 let loaded = false;
 /// Set once the user changes a preference this session. Guards against a slow
@@ -43,10 +57,7 @@ export async function loadPreferences(): Promise<void> {
     // If the user already edited a field while this was in flight, their intent
     // wins — don't overwrite it with the just-loaded on-disk value.
     if (dirtied) return;
-    preferences.editor_command = fetched.editor_command;
-    preferences.terminal_app = fetched.terminal_app;
-    preferences.diff_style = fetched.diff_style;
-    preferences.show_builtins = fetched.show_builtins;
+    Object.assign(preferences, fetched);
   } catch (err) {
     // Backend unreachable / no config location — keep defaults. Allow a retry.
     loaded = false;
@@ -62,26 +73,26 @@ export async function loadPreferences(): Promise<void> {
 export async function updatePreferences(patch: Partial<Preferences>): Promise<void> {
   dirtied = true;
   const next: Preferences = { ...$state.snapshot(preferences), ...patch };
-  preferences.editor_command = next.editor_command;
-  preferences.terminal_app = next.terminal_app;
-  preferences.diff_style = next.diff_style;
-  preferences.show_builtins = next.show_builtins;
+  // Assign in bulk rather than field-by-field: a per-field copy silently drops
+  // any preference someone forgets to add here, which presents as a toggle that
+  // won't move rather than as a compile error.
+  Object.assign(preferences, next);
   try {
     await api.setPreferences(next);
     saveStatus.error = null;
+    saveStatus.keys = [];
   } catch (err) {
     saveStatus.error = err instanceof Error ? err.message : String(err);
+    saveStatus.keys = Object.keys(patch);
   }
 }
 
 /// Test-only reset.
 export const _testing = {
   reset(): void {
-    preferences.editor_command = DEFAULTS.editor_command;
-    preferences.terminal_app = DEFAULTS.terminal_app;
-    preferences.diff_style = DEFAULTS.diff_style;
-    preferences.show_builtins = DEFAULTS.show_builtins;
+    Object.assign(preferences, DEFAULTS);
     saveStatus.error = null;
+    saveStatus.keys = [];
     loaded = false;
     dirtied = false;
   },

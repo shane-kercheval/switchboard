@@ -730,7 +730,21 @@ export type Preferences = {
   terminal_app: string;
   diff_style: DiffStyle;
   show_builtins: boolean;
+  notify_on_completion: boolean;
+  notify_while_focused: boolean;
 };
+
+// Mirror of Rust `NotificationAvailability` (`crates/app/src/notification.rs`).
+// Whether macOS will actually show a notification — distinct from the in-app
+// preference, and the only way to explain the silent failures: a denied
+// permission, every presentation channel switched off in System Settings, and an
+// unsigned/unbundled build all look identical from inside the app.
+// `unavailable` is the expected state under `make dev`, not an error.
+export type NotificationAvailability =
+  | "available"
+  | "not_determined"
+  | "suppressed"
+  | "unavailable";
 
 // Mirror of Rust `ProjectConversation` / `ConversationItem` / `OutcomeStatus` /
 // `AgentConversationMeta` (`crates/app/src/commands.rs`). The post-restart

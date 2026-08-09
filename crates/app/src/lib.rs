@@ -483,7 +483,24 @@ async fn notification_availability() -> crate::notification::NotificationAvailab
 /// Idempotent per process; a disabled preference leaves the once-flag unclaimed
 /// so enabling it later still prompts.
 fn request_notification_authorization(state: &AppState) {
-    crate::notification::ensure_authorization(get_preferences_impl(state).notify_on_completion);
+    crate::notification::warm_authorization(
+        &state.notification_gate,
+        get_preferences_impl(state).notify_on_completion,
+    );
+}
+
+/// Post a notification the frontend composed. The *text* is a frontend concern
+/// (it is UI copy); the *policy* — window focus, the viewed project, the user's
+/// preferences — stays in the notifier, so this cannot be used to bypass it.
+#[tauri::command]
+async fn notify(
+    state: State<'_, AppState>,
+    project_id: ProjectId,
+    title: String,
+    body: String,
+) -> Result<(), String> {
+    state.notifier.notify(project_id, &title, &body);
+    Ok(())
 }
 
 #[tauri::command]
@@ -506,13 +523,23 @@ async fn set_preferences(
     state: State<'_, AppState>,
     preferences: Preferences,
 ) -> Result<(), String> {
-    set_preferences_impl(state.inner(), &preferences).map_err(|e| e.to_string())?;
-    // Switching notifications on is itself a request for them, and Settings is
-    // good context for the permission prompt. Without this, a user who enables
-    // the setting *during* a long-running turn would never be asked — no further
-    // dispatch would occur — and the completion would silently never arrive.
-    request_notification_authorization(state.inner());
-    Ok(())
+    // Only the *transition* warms authorization: prompting on any save while the
+    // preference happens to be on would fire it for an unrelated Git or built-ins
+    // change, which is a needless surprise.
+    let was_enabled = get_preferences_impl(state.inner()).notify_on_completion;
+    let now_enabled = preferences.notify_on_completion;
+    let result = set_preferences_impl(state.inner(), &preferences).map_err(|e| e.to_string());
+    // Warmed even when persistence failed: `set_preferences_impl` updates the
+    // in-memory value before writing, so this session *does* have notifications
+    // on and should be able to show them. The write error still reaches the UI.
+    if !was_enabled && now_enabled {
+        // Switching notifications on is itself a request for them, and Settings
+        // is good context for the prompt. Without this, a user who enables the
+        // setting *during* a long-running turn would never be asked — no further
+        // dispatch would occur — and the completion would silently never arrive.
+        request_notification_authorization(state.inner());
+    }
+    result
 }
 
 #[tauri::command]
@@ -1495,8 +1522,11 @@ pub fn run() {
             let focus_handle = app.handle().clone();
             let viewed_handle = app.handle().clone();
             let prefs_handle = app.handle().clone();
+            let delivery_gate = Arc::clone(&state.notification_gate);
             let state = state.with_notifier(Arc::new(crate::notification::GatedNotifier::new(
-                Arc::new(crate::notification::UserNotificationDelivery),
+                Arc::new(crate::notification::UserNotificationDelivery::new(
+                    delivery_gate,
+                )),
                 // `None` means "couldn't read the window state"; the notifier
                 // decides what that implies, not this call site.
                 Arc::new(move || {
@@ -1577,6 +1607,7 @@ pub fn run() {
             set_preferences,
             notification_availability,
             set_visible_project,
+            notify,
             list_prompts,
             render_prompt,
             get_prompt_source,

@@ -248,6 +248,13 @@ export async function setVisibleProject(projectId: ProjectId | null, seq: number
   await invoke("set_visible_project", { projectId, seq });
 }
 
+/// Post a notification. The backend applies the suppression policy (window
+/// focus, the visible project, the user's preferences), so a call here is a
+/// request, not a guarantee.
+export async function notify(projectId: ProjectId, title: string, body: string): Promise<void> {
+  await invoke("notify", { projectId, title, body });
+}
+
 export async function notificationAvailability(): Promise<NotificationAvailability> {
   return await invoke<NotificationAvailability>("notification_availability");
 }

@@ -1386,3 +1386,134 @@ describe("retryAgentHydration", () => {
     warnSpy.mockRestore();
   });
 });
+
+describe("send-completion notifications", () => {
+  /// Drive the real listener boundary end to end: register the send the way
+  /// `ComposeBar` does, dispatch through the state module, then fire events.
+  /// Exercises the wiring, not the tracker's rules (those are unit-tested).
+  async function setup() {
+    const state = await loadState();
+    const tracker = await import("./sendCompletion");
+    tracker._testing.reset();
+    await state.registerAgent(agentRecord(AGENT_A));
+    await state.registerAgent(agentRecord(AGENT_B));
+    return { state, tracker };
+  }
+
+  const SEND = "00000000-0000-7000-8000-0000000000e1";
+  const notified = (): string[][] =>
+    invokeMock.mock.calls.filter((c) => c[0] === "notify").map((c) => c as string[]);
+
+  it("notifies once when a fan-out's last recipient ends", async () => {
+    const { state, tracker } = await setup();
+    tracker.registerSend(SEND, "p-1", "switchboard", [
+      { id: AGENT_A, name: "claude" },
+      { id: AGENT_B, name: "codex" },
+    ]);
+    for (const [agent, turn] of [
+      [AGENT_A, TURN_1],
+      [AGENT_B, TURN_2],
+    ] as const) {
+      state.dispatchUserTurn(agent, `user-${agent}`, "hi", [], SEND);
+      fireTo(`agent:${agent}`, {
+        type: "turn_start",
+        turn_id: turn,
+        message_id: MESSAGE_1,
+        started_at: "2026-05-15T00:00:00Z",
+      } as NormalizedEvent);
+    }
+
+    fireTo(`agent:${AGENT_A}`, {
+      type: "turn_end",
+      turn_id: TURN_1,
+      outcome: { status: "completed" },
+      ended_at: "2026-05-15T00:00:01Z",
+    } as NormalizedEvent);
+    expect(notified()).toHaveLength(0);
+
+    fireTo(`agent:${AGENT_B}`, {
+      type: "turn_end",
+      turn_id: TURN_2,
+      outcome: { status: "completed" },
+      ended_at: "2026-05-15T00:00:02Z",
+    } as NormalizedEvent);
+    expect(notified()).toHaveLength(1);
+  });
+
+  it("notifies a send whose IPC was rejected, with no agent event at all", async () => {
+    // `failSendStart` is a direct call, not an event — the reason the tracker
+    // cannot be driven from the event stream alone.
+    const { state, tracker } = await setup();
+    tracker.registerSend(SEND, "p-1", "switchboard", [{ id: AGENT_A, name: "claude" }]);
+    state.dispatchUserTurn(AGENT_A, "user-1", "hi", [], SEND);
+
+    state.failSendStart(AGENT_A, "user-1", { message: "boom", kind: "adapter_failure" });
+
+    const calls = notified();
+    expect(calls).toHaveLength(1);
+    expect(calls[0][1]).toMatchObject({ title: "Agent failed" });
+  });
+
+  it("removing one recipient still lets the survivor's completion notify", async () => {
+    // Driven through `unregisterAgents` rather than the tracker directly: the
+    // settlement logic was already right, the missing lifecycle wiring was the
+    // defect. Without it the removed agent's slot never fills, so the survivor's
+    // completion is silently swallowed.
+    const { state, tracker } = await setup();
+    tracker.registerSend(SEND, "p-1", "switchboard", [
+      { id: AGENT_A, name: "claude" },
+      { id: AGENT_B, name: "codex" },
+    ]);
+    state.dispatchUserTurn(AGENT_B, "user-b", "hi", [], SEND);
+
+    state.unregisterAgents([AGENT_A]);
+    expect(notified()).toHaveLength(0);
+
+    fireTo(`agent:${AGENT_B}`, {
+      type: "turn_start",
+      turn_id: TURN_2,
+      message_id: MESSAGE_1,
+      started_at: "2026-05-15T00:00:00Z",
+    } as NormalizedEvent);
+    fireTo(`agent:${AGENT_B}`, {
+      type: "turn_end",
+      turn_id: TURN_2,
+      outcome: { status: "completed" },
+      ended_at: "2026-05-15T00:00:01Z",
+    } as NormalizedEvent);
+
+    const calls = notified();
+    expect(calls).toHaveLength(1);
+    expect(calls[0][1]).toMatchObject({ body: "switchboard: codex" });
+  });
+
+  it("stays silent for a workflow's send, which it never registered", async () => {
+    // Faithful to the backend-originated path: no `dispatchUserTurn`, so no
+    // pending entry — the turn carries its own `send_id` on the event. Workflow
+    // steps are excluded structurally, by never being registered, so nothing here
+    // has to recognize them as workflow sends.
+    const { state } = await setup();
+    fireTo(`agent:${AGENT_A}`, {
+      type: "user_message",
+      send_id: SEND,
+      text: "step 1",
+      at: "2026-05-15T00:00:00Z",
+    } as NormalizedEvent);
+    fireTo(`agent:${AGENT_A}`, {
+      type: "turn_start",
+      turn_id: TURN_1,
+      message_id: MESSAGE_1,
+      send_id: SEND,
+      started_at: "2026-05-15T00:00:00Z",
+    } as NormalizedEvent);
+    fireTo(`agent:${AGENT_A}`, {
+      type: "turn_end",
+      turn_id: TURN_1,
+      outcome: { status: "completed" },
+      ended_at: "2026-05-15T00:00:01Z",
+    } as NormalizedEvent);
+
+    expect(notified()).toHaveLength(0);
+    void state;
+  });
+});

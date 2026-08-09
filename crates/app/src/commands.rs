@@ -18326,6 +18326,10 @@ mod tests {
         let calls = rec.calls.lock().unwrap();
         assert_eq!(calls.len(), 1, "exactly one completion notification");
         assert_eq!(calls[0].0, "Workflow complete");
+        // Every notification names its project: one can arrive while the user is
+        // working in a different project, so "which one?" must not require
+        // guessing.
+        assert_eq!(calls[0].1, "proj: review-and-recommend");
     }
 
     #[tokio::test]

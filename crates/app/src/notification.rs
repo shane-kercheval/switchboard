@@ -16,12 +16,10 @@
 //! the policy — is exercised directly by tests rather than through a restatement
 //! of its rule.
 //!
-//! **One deliberate gap.** [`ensure_authorization`] calls the OS request without
-//! such a seam, so its non-blocking property is enforced structurally (the only
-//! `await` sits inside a `spawn`) and by review rather than by a test. Adding an
-//! injectable requester purely to assert a property visible in three lines costs
-//! more than it protects; the once-only half of the rule *is* tested, via
-//! `claim_first_request`.
+//! [`AuthorizationGate`] follows the same shape for the permission request, so
+//! its coordination — one request shared by concurrent callers, delivery held
+//! until it resolves, retryable after a failure — is tested against a fake
+//! requester rather than a real dialog.
 //!
 //! # macOS preconditions — both required, both silent when unmet
 //!
@@ -58,7 +56,6 @@
 //! incompatible with the ad-hoc signing this depends on.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use mac_usernotifications::{Notification, NotificationSettings};
 use serde::Serialize;
@@ -158,7 +155,15 @@ fn bundled() -> bool {
 /// is recorded here rather than left to be re-derived. If a future macOS release
 /// breaks it, the fix belongs in the app's activation handling
 /// (`tauri::RunEvent::Reopen`), not in this module.
-pub struct UserNotificationDelivery;
+pub struct UserNotificationDelivery {
+    gate: Arc<AuthorizationGate>,
+}
+
+impl UserNotificationDelivery {
+    pub fn new(gate: Arc<AuthorizationGate>) -> Self {
+        Self { gate }
+    }
+}
 
 impl NotificationDelivery for UserNotificationDelivery {
     fn deliver(&self, title: &str, body: &str) {
@@ -166,11 +171,18 @@ impl NotificationDelivery for UserNotificationDelivery {
             return;
         }
         let (title, body) = (title.to_owned(), body.to_owned());
+        let gate = Arc::clone(&self.gate);
         // Spawned rather than blocked on. The crate's blocking wrapper routes
         // through the main run loop and errors out if the main thread happens not
         // to be pumping at that instant — a needless failure mode when nothing
         // here needs an answer.
         tauri::async_runtime::spawn(async move {
+            // Wait for permission to have been *asked for* — never post into a
+            // `NotDetermined` state, which macOS drops silently. This does not
+            // decide whether to post: the attempt below is unconditional, so a
+            // user who fixes a denial in System Settings mid-session is not
+            // blocked by anything we cached.
+            gate.ensure().await;
             match Notification::new()
                 .title(title)
                 .message(body)
@@ -269,43 +281,94 @@ impl Notifier for GatedNotifier {
     }
 }
 
-/// Ask macOS for notification permission, once per process.
-///
-/// Called when the user does something that implies they want notifications: an
-/// accepted dispatch, or switching the preference on. Never at startup — a
-/// permission prompt before the user has done anything is noise — and never for
-/// a dispatch that was rejected, which would be asking about work that isn't
-/// happening.
-///
-/// **`enabled` gates the request, and a disabled call does not consume the
-/// once-flag.** Prompting someone who just turned notifications off is a
-/// credibility problem; but consuming the flag while skipping would be worse,
-/// because turning the setting back on later would then never prompt and
-/// notifications would stay silently dead forever.
-///
-/// **Never blocks the caller.** The request is spawned, and the system dialog it
-/// raises may sit unanswered indefinitely — awaiting it inline would stall a
-/// runtime worker and, with it, unrelated commands. A denial is not an error
-/// here; `availability` surfaces it in Settings instead.
-pub fn ensure_authorization(enabled: bool) {
-    static REQUESTED: AtomicBool = AtomicBool::new(false);
-    if !enabled || !bundled() || !claim_first_request(&REQUESTED) {
-        return;
-    }
-    tauri::async_runtime::spawn(async {
-        match mac_usernotifications::request_auth().await {
-            Ok(granted) => tracing::info!(granted, "notification authorization resolved"),
-            Err(e) => tracing::warn!(error = %e, "notification authorization request failed"),
-        }
-    });
+/// Requests notification permission from the OS. Injected so the gate's
+/// coordination can be tested without a real permission dialog.
+#[async_trait::async_trait]
+pub trait AuthorizationRequester: Send + Sync {
+    /// Resolve when the user has answered. The `bool` is *not* stored — see
+    /// [`AuthorizationGate`] — it exists only for logging.
+    async fn request(&self) -> Result<bool, String>;
 }
 
-/// Claim the right to make the one authorization request this process will make.
-/// `true` for the first caller, `false` for every caller after it. Split out so
-/// the once-only rule is testable against a local flag rather than the process
-/// static.
-fn claim_first_request(requested: &AtomicBool) -> bool {
-    !requested.swap(true, Ordering::SeqCst)
+/// The real request.
+pub struct OsAuthorizationRequester;
+
+#[async_trait::async_trait]
+impl AuthorizationRequester for OsAuthorizationRequester {
+    async fn request(&self) -> Result<bool, String> {
+        mac_usernotifications::request_auth()
+            .await
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// Makes sure permission has been *asked for* before anything is posted.
+///
+/// **A barrier, not a cached decision — and the distinction is the whole point.**
+/// The cell holds `()`, never the answer. macOS refuses to deliver while
+/// authorization is still `NotDetermined`, so posting before the request resolves
+/// silently drops the notification; awaiting this first closes that window. But
+/// authorization can *change* in System Settings while Switchboard runs — which
+/// the Settings copy actively tells users to do — so caching "denied" and
+/// skipping delivery on the strength of it would leave notifications dead until
+/// restart even after the user re-enabled them. Delivery therefore always
+/// attempts the post once the barrier resolves, and lets macOS apply its current
+/// settings. Storing a `bool` here would put that mistake one `if` away.
+///
+/// A failed request leaves the barrier unresolved so a later attempt can retry;
+/// only a completed request (granted *or* denied) satisfies it.
+pub struct AuthorizationGate {
+    requested: tokio::sync::OnceCell<()>,
+    requester: Arc<dyn AuthorizationRequester>,
+}
+
+impl AuthorizationGate {
+    pub fn new(requester: Arc<dyn AuthorizationRequester>) -> Self {
+        Self {
+            requested: tokio::sync::OnceCell::new(),
+            requester,
+        }
+    }
+
+    /// Resolve the barrier, requesting permission if nobody has yet. Concurrent
+    /// callers share the single in-flight request rather than stacking prompts.
+    pub async fn ensure(&self) {
+        let _ = self
+            .requested
+            .get_or_try_init(|| async {
+                match self.requester.request().await {
+                    Ok(granted) => {
+                        tracing::info!(granted, "notification authorization resolved");
+                        Ok(())
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "notification authorization request failed");
+                        Err(())
+                    }
+                }
+            })
+            .await;
+    }
+}
+
+/// Ask for permission ahead of the first notification, so the prompt arrives with
+/// context the user recognizes — their first dispatch, or switching the setting
+/// on — rather than at startup or attached to a banner they haven't seen yet.
+///
+/// Fire-and-forget: the dialog may sit unanswered indefinitely, so nothing waits
+/// on it here. Delivery awaits the same gate, so a notification that beats the
+/// answer is held rather than dropped.
+///
+/// **`enabled` gates the request.** Prompting someone who just turned
+/// notifications off is a credibility problem — and because the gate is only
+/// resolved by an actual request, skipping leaves it untouched, so enabling the
+/// setting later still prompts.
+pub fn warm_authorization(gate: &Arc<AuthorizationGate>, enabled: bool) {
+    if !enabled || !bundled() {
+        return;
+    }
+    let gate = Arc::clone(gate);
+    tauri::async_runtime::spawn(async move { gate.ensure().await });
 }
 
 /// Classify the OS settings into something a user can act on.
@@ -371,6 +434,7 @@ pub async fn availability() -> NotificationAvailability {
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use mac_usernotifications::{
         AuthorizationStatus as Auth, NotificationSettingStatus as Chan, NotificationSettings,
@@ -539,30 +603,111 @@ mod tests {
         assert_eq!(fake.calls().len(), 1);
     }
 
-    #[test]
-    fn authorization_is_requested_at_most_once() {
-        let flag = AtomicBool::new(false);
-        assert!(claim_first_request(&flag), "the first caller requests");
-        assert!(!claim_first_request(&flag), "every later caller does not");
-        assert!(!claim_first_request(&flag));
+    /// A requester the test drives: counts calls, can be held pending, and can be
+    /// made to fail.
+    struct FakeRequester {
+        calls: std::sync::atomic::AtomicUsize,
+        /// Released by the test to let the "request" resolve.
+        release: tokio::sync::Semaphore,
+        result: Mutex<Result<bool, String>>,
     }
 
-    #[test]
-    fn a_disabled_preference_leaves_the_once_flag_unclaimed() {
-        // The ordering that matters: `ensure_authorization` checks `enabled`
-        // *before* claiming. If a disabled call consumed the flag, turning
-        // notifications on later would never prompt, and they would stay
-        // silently dead for the life of the process — a worse failure than the
-        // spurious prompt this gate exists to prevent.
-        let flag = AtomicBool::new(false);
-        let enabled = false;
-        if enabled {
-            claim_first_request(&flag);
+    impl FakeRequester {
+        fn new(result: Result<bool, String>) -> Self {
+            Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                release: tokio::sync::Semaphore::new(usize::MAX >> 4),
+                result: Mutex::new(result),
+            }
         }
+
+        fn pending() -> Self {
+            let f = Self::new(Ok(true));
+            f.release.forget_permits(usize::MAX >> 4);
+            f
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AuthorizationRequester for FakeRequester {
+        async fn request(&self) -> Result<bool, String> {
+            let permit = self.release.acquire().await.expect("semaphore closed");
+            permit.forget();
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.result.lock().expect("result lock").clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn the_gate_requests_once_and_is_shared_by_concurrent_callers() {
+        // Two notifications landing together must not stack two permission
+        // prompts on the user.
+        let fake = Arc::new(FakeRequester::new(Ok(true)));
+        let gate = AuthorizationGate::new(Arc::clone(&fake) as Arc<dyn AuthorizationRequester>);
+        tokio::join!(gate.ensure(), gate.ensure());
+        gate.ensure().await;
+        assert_eq!(fake.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn delivery_waits_for_a_pending_request_rather_than_posting_early() {
+        // The bug this gate exists for: macOS silently drops a notification posted
+        // while authorization is still undetermined, so a send that finishes
+        // before the user answers must wait, not vanish.
+        let fake = Arc::new(FakeRequester::pending());
+        let gate = Arc::new(AuthorizationGate::new(
+            Arc::clone(&fake) as Arc<dyn AuthorizationRequester>
+        ));
+        let waiting = tokio::spawn({
+            let gate = Arc::clone(&gate);
+            async move { gate.ensure().await }
+        });
+
+        tokio::task::yield_now().await;
         assert!(
-            claim_first_request(&flag),
-            "the first enabled call still gets to request"
+            !waiting.is_finished(),
+            "held while the request is unanswered"
         );
+
+        fake.release.add_permits(1);
+        tokio::time::timeout(std::time::Duration::from_secs(1), waiting)
+            .await
+            .expect("gate should resolve once the request answers")
+            .expect("task panicked");
+    }
+
+    #[tokio::test]
+    async fn a_denial_resolves_the_gate_without_recording_a_verdict() {
+        // The gate holds `()`, never the answer — so a user who denies, then
+        // re-enables notifications in System Settings without restarting, is not
+        // blocked by anything cached here. Delivery attempts the post regardless
+        // and lets macOS apply its current settings.
+        let fake = Arc::new(FakeRequester::new(Ok(false)));
+        let gate = AuthorizationGate::new(Arc::clone(&fake) as Arc<dyn AuthorizationRequester>);
+        gate.ensure().await;
+        gate.ensure().await;
+        assert_eq!(fake.calls(), 1, "denial satisfies the barrier");
+    }
+
+    #[tokio::test]
+    async fn a_failed_request_leaves_the_gate_retryable() {
+        // A transient failure must not latch permanently — otherwise one bad
+        // moment costs notifications for the rest of the session.
+        let fake = Arc::new(FakeRequester::new(Err("transient".to_owned())));
+        let gate = AuthorizationGate::new(Arc::clone(&fake) as Arc<dyn AuthorizationRequester>);
+        gate.ensure().await;
+        assert_eq!(fake.calls(), 1);
+
+        *fake.result.lock().unwrap() = Ok(true);
+        gate.ensure().await;
+        assert_eq!(fake.calls(), 2, "retried after the failure");
+
+        gate.ensure().await;
+        assert_eq!(fake.calls(), 2, "settled once it succeeded");
     }
 
     /// The settings shape for a given authorization status and channel set.

@@ -1010,6 +1010,8 @@ pub fn invoke_workflow_impl(
 
     let workflow_runs = Arc::clone(&state.workflow_runs);
     let notifier = Arc::clone(&state.notifier);
+    // Resolved here rather than in the spawned task, which has no `AppState`.
+    let project_name = project.name().to_owned();
     tokio::spawn(async move {
         let status = run.execute().await;
         // The run is terminal: drop the registry entry, apply retention, then
@@ -1018,7 +1020,13 @@ pub fn invoke_workflow_impl(
         lock(&workflow_runs).remove(&run_id);
         apply_retention(&run_path, status);
         done.notify_one();
-        notify_run_terminal(notifier.as_ref(), project_id, &workflow_name, status);
+        notify_run_terminal(
+            notifier.as_ref(),
+            project_id,
+            &project_name,
+            &workflow_name,
+            status,
+        );
     });
 
     Ok(run_id)
@@ -1029,9 +1037,14 @@ pub fn invoke_workflow_impl(
 /// A user-initiated cancel is silent: it is what they just asked for. An
 /// interrupted run is silent too, because it has no live process to have been
 /// waiting on; the run indicator surfaces it on the next start instead.
+///
+/// The body leads with the project, matching send-completion notifications:
+/// every notification has to say *which* project it is about, since one can
+/// arrive while the user is working in a different one.
 fn notify_run_terminal(
     notifier: &dyn crate::notification::Notifier,
     project_id: ProjectId,
+    project_name: &str,
     workflow_name: &str,
     status: RunStatus,
 ) {
@@ -1040,14 +1053,14 @@ fn notify_run_terminal(
             notifier.notify(
                 project_id,
                 "Workflow complete",
-                &format!("{workflow_name} finished."),
+                &format!("{project_name}: {workflow_name}"),
             );
         }
         RunStatus::Failed => {
             notifier.notify(
                 project_id,
                 "Workflow failed",
-                &format!("{workflow_name} failed."),
+                &format!("{project_name}: {workflow_name}"),
             );
         }
         _ => {}

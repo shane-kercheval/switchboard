@@ -326,6 +326,10 @@ pub struct AppState {
     /// when the window is focused). Defaults to a no-op; production injects the
     /// gated notifier via [`AppState::with_notifier`].
     pub notifier: Arc<dyn Notifier>,
+    /// Shared with the notification delivery path so the permission prompt is
+    /// requested once and any pending request is awaited before a notification is
+    /// posted — see [`crate::notification::AuthorizationGate`].
+    pub notification_gate: Arc<crate::notification::AuthorizationGate>,
 
     /// The **user-global** workflows directory (`<config-dir>/workflows`) — the
     /// single store of workflow definitions, shared across every project (unlike
@@ -367,6 +371,9 @@ impl AppState {
             forwards: Mutex::new(HashMap::new()),
             workflow_runs: Arc::new(Mutex::new(HashMap::new())),
             notifier: Arc::new(NullNotifier),
+            notification_gate: Arc::new(crate::notification::AuthorizationGate::new(Arc::new(
+                crate::notification::OsAuthorizationRequester,
+            ))),
             workflows_dir: None,
         }
     }

@@ -358,9 +358,15 @@ Coordinate with the existing project-activity observer rather than running blind
 
 Note the lifetime consequence, and that it is correct: listeners are registered at project-open and never torn down, so a send in a project the user has navigated away from still notifies. That is the intent — the whole point is being told about work you are not watching.
 
+**Authorization must be coordinated with delivery, not just requested early.** macOS silently drops a notification posted while authorization is still undetermined, so the delivery path has to *await* the request rather than assume it resolved. Two cases make this load-bearing rather than theoretical: a send whose dispatch is rejected for every recipient never reaches the post-acceptance warm-up at all, and a fast turn can finish while the permission dialog is still on screen. Both are the silent failure this milestone exists to prevent.
+
+The barrier must not cache the *answer*. Authorization can change in System Settings mid-session — the Settings copy tells users to do exactly that — so a stored "denied" would keep notifications dead until restart. Hold a resolution barrier, attempt the post unconditionally once it resolves, and let macOS apply its live settings.
+
 **Delivery.** One Tauri command the frontend calls with the assembled notification text. Composing the user-facing string is a frontend concern (it is UI copy); the **policy** — focus suppression, preference gating, sound — stays in the backend notifier from M1, so the frontend cannot bypass it. Keep the command's surface to what this feature needs.
 
 **Content.** Distinguish success from failure, and name the project and the agent(s) involved. Exact phrasing is a copy decision; follow the repo's precision-over-brevity convention.
+
+**Every notification names its project — send completions and workflow terminals alike.** Since a notification can arrive while the user is working in a *different* project (D3), one that doesn't say which project it came from forces a guess. Both paths use the same body shape: `<project>: <detail>`.
 
 ### Definition of Done
 
@@ -369,7 +375,11 @@ Note the lifetime consequence, and that it is correct: listeners are registered 
 - **Frontend unit test** that a recipient cancelled via `cancel_requested` settles from its cancellation outcome rather than from disappearing out of liveness.
 - **Component-level test** with mocked `invoke`/`listen` per the AGENTS.md testing convention: capture the listener callback and drive it, including an event arriving before the send's IPC reply resolves. This is the ordering race the convention exists for, and it is the likeliest place for a real bug.
 - **Manual verification from a bundled build**, recorded in the PR: a real fan-out send notifies once with the app backgrounded; a workflow run notifies once at the end and not per step; nothing fires with the app focused.
+- **Rust tests for the authorization gate**, against an injectable requester: concurrent callers share one request; delivery is held while a request is unanswered; a denial satisfies the barrier without being cached as a verdict; a failed request stays retryable.
+- **Frontend tests for teardown**, at least one driven through `unregisterAgents` rather than the tracker directly — the settlement logic was already correct, the missing lifecycle wiring was the defect.
 - Known limitation to record: notifications only cover projects opened in the current session, because listeners register at project-open. This is inherent to how sends originate and is not a gap to fix.
+
+**A note on what the manual pass can and cannot prove.** The "totally rejected send still notifies" case cannot be staged through the UI — a harness failure is *accepted* first and fails later via `message_failed`, which requests authorization on the way and therefore exercises a different path entirely. That ordering is proven deterministically by the gate tests instead. Do not record it as manually verified unless the setup genuinely prevented every dispatch from being accepted.
 
 ---
 

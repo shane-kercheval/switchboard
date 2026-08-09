@@ -26,6 +26,7 @@ Switchboard also has a **Git view** for reviewing repositories, changed files, d
 - **Keep important messages beside the transcript.** Pin complete messages in the sidebar so you can refer to them while working elsewhere, then jump back to their original location when needed.
 - **Search and navigate long conversations.** Search message text across agents, filter by role or pinned status, preview results, and jump back to a result when its agent is visible in a pane.
 - **Keep track of work across projects.** The project list shows which projects are still running, marks background work when it finishes, and lets you jump directly to newly completed work you haven't viewed.
+- **macOS notifications.** A notification once every recipient of a send has responded, and once a workflow run reaches its end. Clicking it brings Switchboard forward. Optional, and by default it stays quiet while you're working in the app.
 
 ## Install
 

@@ -206,7 +206,7 @@ A throwaway workflow already exists at `<config-dir>/workflows/notification-test
 
 Note that this milestone exercises the **legacy** path, which has none of the modern path's signing or install-location preconditions. A pass here says nothing about whether M1's delivery will work; that is M1's own manual check.
 
-Delete `notification-test.yaml` from both config dirs when the milestone is done.
+Delete `notification-test.yaml` from both config dirs when the milestone is done. (Done — the file is not part of the repo; it lived in the user-global config dirs and has been removed.)
 
 ---
 
@@ -401,9 +401,15 @@ The barrier must not cache the *answer*. Authorization can change in System Sett
 - Notifying on anything other than send/run terminals (idle agents, rate limits, harness auth failures).
 - **Developer ID** signing and notarization — already planned in `2026-05-30-macos-release-distribution.md` and unrelated to this work. Note that **ad-hoc bundle signing is explicitly in scope and load-bearing** (D1); only the paid, distribution-facing signing is excluded. The two must not be conflated when this section is read later.
 
-## Assumptions to confirm
+## Assumptions, settled
 
-Two questions were raised during planning and not settled. They are implemented as stated in D8 and can be changed cheaply:
+Two questions were raised during planning and left open. Both shipped as stated in D8 and were confirmed in use:
 
-1. **Failure notifies.** A failed turn produces a notification, distinguished from success. The alternative — silence on failure — seems clearly wrong, since a failure is the case you most want to be pulled back for.
-2. **One notification per send, not per agent.** A four-recipient fan-out notifies once, when the last agent lands. The consequence is no signal that agents one through three are already readable. The alternative is noisier; per-send matches the stated request.
+1. **Failure notifies.** A failed turn produces a notification, distinguished from success. Silence on failure would hide the case you most want to be pulled back for.
+2. **One notification per send, not per agent.** A four-recipient fan-out notifies once, when the last agent lands. The tradeoff — no signal that agents one through three are already readable — was accepted as the quieter of the two behaviors.
+
+## Status
+
+All milestones implemented and verified against an installed build: send completions, fan-out coalescing, workflow-only run terminals, the suppression rules, the settings, and click-to-focus including a minimized window.
+
+**One known gap, deliberately not closed:** clicking a notification brings Switchboard forward but does not navigate to the project that finished. The delivery module documents what it would take and why the available route was rejected.

@@ -51,8 +51,14 @@ test("archive delete and confirm occupy the same click target", async () => {
 
   await page.getByTestId("project-view-archived").click();
   await page.getByTestId("project-row").hover();
+  const actions = page.getByTestId("project-row-actions");
   const deleteButton = page.getByTestId("project-quick-delete");
   await expect.element(deleteButton).toBeVisible();
+  // Visibility becomes true before the max-width reveal finishes. Measure only
+  // after both 26px buttons and their 2px gap have settled, or the baseline is transient.
+  await expect
+    .poll(() => (actions.element() as HTMLElement).getBoundingClientRect().width)
+    .toBeGreaterThan(53.5);
   const deleteRect = (deleteButton.element() as HTMLElement).getBoundingClientRect();
 
   await deleteButton.click();

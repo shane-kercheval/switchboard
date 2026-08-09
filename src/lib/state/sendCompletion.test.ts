@@ -1,7 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AgentId, ProjectId, SendId } from "$lib/types";
 
-const notifyMock = vi.fn(async () => {});
+// Typed to `notify`'s real signature so `mock.calls` is a tuple the assertions
+// can index — an untyped `vi.fn()` makes every call an empty tuple.
+const notifyMock = vi.fn<(projectId: ProjectId, title: string, body: string) => Promise<void>>(
+  async () => {},
+);
 vi.mock("$lib/api", () => ({
   notify: (projectId: ProjectId, title: string, body: string) => notifyMock(projectId, title, body),
 }));
@@ -23,6 +27,14 @@ const both = [
   { id: B, name: "codex" },
 ];
 
+/// The single notification the test expects, with presence asserted once rather
+/// than at every index.
+function lastCall(): [ProjectId, string, string] {
+  const call = notifyMock.mock.calls.at(-1);
+  if (call === undefined) throw new Error("expected a notification");
+  return call;
+}
+
 beforeEach(() => {
   notifyMock.mockClear();
   _testing.reset();
@@ -38,11 +50,7 @@ describe("send-completion tracker", () => {
     settleRecipient(SEND, A, "completed");
 
     expect(notifyMock).toHaveBeenCalledOnce();
-    const [projectId, title, body] = notifyMock.mock.calls[0] as unknown as [
-      ProjectId,
-      string,
-      string,
-    ];
+    const [projectId, title, body] = lastCall();
     expect(projectId).toBe(PROJECT);
     expect(title).toBe("Agent finished");
     // Names the project and the agent — with the app possibly in front, a
@@ -58,20 +66,20 @@ describe("send-completion tracker", () => {
 
     settleRecipient(SEND, B, "completed");
     expect(notifyMock).toHaveBeenCalledOnce();
-    expect(notifyMock.mock.calls[0][2]).toBe("switchboard: claude, codex");
+    expect(lastCall()[2]).toBe("switchboard: claude, codex");
   });
 
   it("says so when the send failed", async () => {
     register();
     settleRecipient(SEND, A, "failed");
-    expect(notifyMock.mock.calls[0][1]).toBe("Agent failed");
+    expect(lastCall()[1]).toBe("Agent failed");
   });
 
   it("distinguishes a partial failure from a clean run", async () => {
     register(both);
     settleRecipient(SEND, A, "completed");
     settleRecipient(SEND, B, "failed");
-    expect(notifyMock.mock.calls[0][1]).toBe("Agents finished, some failed");
+    expect(lastCall()[1]).toBe("Agents finished, some failed");
   });
 
   it("stays silent when the user cancelled the whole send", async () => {
@@ -89,7 +97,7 @@ describe("send-completion tracker", () => {
     settleRecipient(SEND, A, "cancelled");
     settleRecipient(SEND, B, "completed");
     expect(notifyMock).toHaveBeenCalledOnce();
-    expect(notifyMock.mock.calls[0][2]).toBe("switchboard: codex");
+    expect(lastCall()[2]).toBe("switchboard: codex");
   });
 
   it("notifies a send whose IPC was rejected for every recipient", async () => {
@@ -101,7 +109,7 @@ describe("send-completion tracker", () => {
     settleRecipient(SEND, A, "failed");
     settleRecipient(SEND, B, "failed");
     expect(notifyMock).toHaveBeenCalledOnce();
-    expect(notifyMock.mock.calls[0][1]).toBe("Agents failed");
+    expect(lastCall()[1]).toBe("Agents failed");
   });
 
   it("ignores a repeat signal for a recipient that already settled", async () => {
@@ -115,7 +123,7 @@ describe("send-completion tracker", () => {
     settleRecipient(SEND, B, "completed");
     expect(notifyMock).toHaveBeenCalledOnce();
     // The first outcome for a recipient wins — a later duplicate can't rewrite it.
-    expect(notifyMock.mock.calls[0][1]).toBe("Agents finished, some failed");
+    expect(lastCall()[1]).toBe("Agents finished, some failed");
   });
 
   it("never notifies again after a send has completed", async () => {
@@ -150,7 +158,7 @@ describe("send-completion tracker", () => {
 
     settleRecipient(SEND, B, "completed");
     expect(notifyMock).toHaveBeenCalledOnce();
-    expect(notifyMock.mock.calls[0][2]).toBe("switchboard: codex");
+    expect(lastCall()[2]).toBe("switchboard: codex");
   });
 
   it("stays silent and drops the send when every recipient is removed", async () => {
@@ -167,8 +175,8 @@ describe("send-completion tracker", () => {
     settleRecipient(SEND, A, "completed");
     settleAgentsRemoved([A, B]);
     expect(notifyMock).toHaveBeenCalledOnce();
-    expect(notifyMock.mock.calls[0][1]).toBe("Agent finished");
-    expect(notifyMock.mock.calls[0][2]).toBe("switchboard: claude");
+    expect(lastCall()[1]).toBe("Agent finished");
+    expect(lastCall()[2]).toBe("switchboard: claude");
   });
 
   it("ignores removal of an agent that was never a recipient", async () => {

@@ -1401,8 +1401,11 @@ describe("send-completion notifications", () => {
   }
 
   const SEND = "00000000-0000-7000-8000-0000000000e1";
-  const notified = (): string[][] =>
-    invokeMock.mock.calls.filter((c) => c[0] === "notify").map((c) => c as string[]);
+  /// The `notify` command's argument objects, in call order.
+  const notified = (): Record<string, unknown>[] =>
+    invokeMock.mock.calls
+      .filter((c) => c[0] === "notify")
+      .map((c) => c[1] as Record<string, unknown>);
 
   it("notifies once when a fan-out's last recipient ends", async () => {
     const { state, tracker } = await setup();
@@ -1451,7 +1454,7 @@ describe("send-completion notifications", () => {
 
     const calls = notified();
     expect(calls).toHaveLength(1);
-    expect(calls[0][1]).toMatchObject({ title: "Agent failed" });
+    expect(calls[0]).toMatchObject({ title: "Agent failed" });
   });
 
   it("removing one recipient still lets the survivor's completion notify", async () => {
@@ -1484,7 +1487,7 @@ describe("send-completion notifications", () => {
 
     const calls = notified();
     expect(calls).toHaveLength(1);
-    expect(calls[0][1]).toMatchObject({ body: "switchboard: codex" });
+    expect(calls[0]).toMatchObject({ body: "switchboard: codex" });
   });
 
   it("stays silent for a workflow's send, which it never registered", async () => {

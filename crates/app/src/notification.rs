@@ -155,6 +155,34 @@ fn bundled() -> bool {
 /// is recorded here rather than left to be re-derived. If a future macOS release
 /// breaks it, the fix belongs in the app's activation handling
 /// (`tauri::RunEvent::Reopen`), not in this module.
+///
+/// # Known gap: a click does not navigate to the project
+///
+/// Clicking brings the app forward but leaves the user wherever they were, not
+/// in the project that finished. Navigating would require knowing *which*
+/// notification was clicked — i.e. keeping the handle this type drops — and the
+/// cost of that is not uniform:
+///
+/// - **On a buttonless notification, observing is a trap** (the paragraph
+///   above): a 500 ms poll loop, or a timeout that deletes the notification.
+/// - **On a notification with an action button, it is fine.** `send.rs` only
+///   registers a category — and with it `CustomDismissAction` — when actions are
+///   present, so `response()` takes the plain `delegate_future.await` branch and
+///   resolves on a body click, a button press, *and* a dismissal. No polling, no
+///   deletion, no task left parked.
+///
+/// So the achievable design is: attach an action button, keep the handle, map the
+/// notification id back to its project, and emit an event the frontend turns into
+/// `activateProject`. **Not implemented** because the button would be visible on
+/// every notification while doing nothing a body click doesn't already do — a
+/// permanent UI cost paid to select a library code path. The alternative that
+/// avoids the button is installing our own `UNUserNotificationCenterDelegate`,
+/// which means replacing this crate's delivery path (the delegate is a single
+/// process-wide slot, and the crate claims it).
+///
+/// Do **not** approximate this by navigating on app activation. Activation also
+/// fires for a Dock click and ⌘-Tab, so it would pull the user out of the project
+/// they deliberately returned to.
 pub struct UserNotificationDelivery {
     gate: Arc<AuthorizationGate>,
 }

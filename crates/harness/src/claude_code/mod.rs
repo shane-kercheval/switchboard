@@ -875,7 +875,10 @@ mod tests {
         assert_eq!(encode_cwd(Path::new("/a-b/c.d_e f")), "-a-b-c-d-e-f");
         // An astral character is two UTF-16 code units, so it collapses to two
         // dashes — `.chars()` would produce one and miss the directory.
-        assert_eq!(encode_cwd(Path::new("/Users/x/a\u{1F600}b")), "-Users-x-a--b");
+        assert_eq!(
+            encode_cwd(Path::new("/Users/x/a\u{1F600}b")),
+            "-Users-x-a--b"
+        );
     }
 
     /// Expected values produced by running Claude Code's own `gw`/`bes`/`xdt`

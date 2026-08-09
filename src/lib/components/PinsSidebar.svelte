@@ -20,7 +20,11 @@
     setStoredPinPinned,
     togglePinCollapsed,
   } from "$lib/state/messagePins.svelte";
-  import { jumpToRow, resolveJumpPane } from "$lib/state/transcriptJump.svelte";
+  import {
+    buildJumpPaneIndex,
+    canResolveJumpFromIndex,
+    jumpToRow,
+  } from "$lib/state/transcriptJump.svelte";
   import {
     layout,
     PINS_SIDEBAR_DEFAULT_WIDTH,
@@ -55,7 +59,9 @@
   } = $props();
 
   let draftWidth = $state<number | null>(null);
+  const pinsSortMode = $derived(layout.pinsSortModeFor(projectId));
   const rosterIds = $derived(agents.map((agent) => agent.id));
+  const jumpPaneIndex = $derived(buildJumpPaneIndex(projectId, rosterIds));
   const agentById = $derived(new Map(agents.map((agent) => [agent.id, agent])));
   const agentNames = $derived(new Map(agents.map((agent) => [agent.id, agent.name])));
   const agentHarnesses = $derived(new Map(agents.map((agent) => [agent.id, agent.harness])));
@@ -124,7 +130,6 @@
 
   const pinnedItems = $derived.by(() => {
     const pins = [...pinsFor(projectId)];
-    const sortMode = layout.pinsSortMode;
     const wanted = new Set(pins.map((pin) => pin.key));
     const resolved = new SvelteMap<
       string,
@@ -151,7 +156,7 @@
       };
     });
     return items.sort((a, b) => {
-      if (sortMode === "message_at") {
+      if (pinsSortMode === "message_at") {
         if (a.entry === undefined && b.entry !== undefined) return 1;
         if (a.entry !== undefined && b.entry === undefined) return -1;
         if (a.entry !== undefined && b.entry !== undefined) {
@@ -181,7 +186,7 @@
   });
 
   function canJump(entry: NavigatorEntry): boolean {
-    return resolveJumpPane(projectId, rosterIds, entry.agentIds) !== null;
+    return canResolveJumpFromIndex(jumpPaneIndex, entry.agentIds);
   }
 
   function jump(entry: NavigatorEntry): void {
@@ -242,18 +247,18 @@
                   role="radio"
                   class={cn(
                     SEGMENTED_MAIN_ITEM_CLASS,
-                    layout.pinsSortMode === "pinned_at"
+                    pinsSortMode === "pinned_at"
                       ? SEGMENTED_MAIN_ITEM_ACTIVE_CLASS
                       : SEGMENTED_MAIN_ITEM_INACTIVE_CLASS,
                   )}
                   aria-label="Sort by recently pinned"
-                  aria-checked={layout.pinsSortMode === "pinned_at"}
+                  aria-checked={pinsSortMode === "pinned_at"}
                   data-testid="pins-sort-pinned"
-                  onclick={() => (layout.pinsSortMode = "pinned_at")}
+                  onclick={() => layout.setPinsSortMode(projectId, "pinned_at")}
                 >
                   <Pin
                     size={13}
-                    fill={layout.pinsSortMode === "pinned_at" ? "currentColor" : "none"}
+                    fill={pinsSortMode === "pinned_at" ? "currentColor" : "none"}
                     aria-hidden="true"
                   />
                 </button>
@@ -267,14 +272,14 @@
                   role="radio"
                   class={cn(
                     SEGMENTED_MAIN_ITEM_CLASS,
-                    layout.pinsSortMode === "message_at"
+                    pinsSortMode === "message_at"
                       ? SEGMENTED_MAIN_ITEM_ACTIVE_CLASS
                       : SEGMENTED_MAIN_ITEM_INACTIVE_CLASS,
                   )}
                   aria-label="Sort by newest messages"
-                  aria-checked={layout.pinsSortMode === "message_at"}
+                  aria-checked={pinsSortMode === "message_at"}
                   data-testid="pins-sort-message"
-                  onclick={() => (layout.pinsSortMode = "message_at")}
+                  onclick={() => layout.setPinsSortMode(projectId, "message_at")}
                 >
                   <Clock3 size={13} aria-hidden="true" />
                 </button>

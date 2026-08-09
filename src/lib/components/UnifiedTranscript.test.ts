@@ -17,6 +17,7 @@ import {
 } from "$lib/state/transcriptPreview.svelte";
 import type { Turn } from "$lib/state/index.svelte";
 import { INITIAL_WINDOW, REVEAL_BATCH } from "$lib/state/unified";
+import { WORKFLOW_AUTHORING_GUIDE_URL } from "$lib/workflowAuthoring";
 
 const listeners = new Map<string, (e: { payload: NormalizedEvent }) => void>();
 vi.mock("@tauri-apps/api/event", () => ({
@@ -158,9 +159,7 @@ describe("UnifiedTranscript", () => {
     expect(block).toHaveTextContent(/automate with workflows/i);
     // The authoring-guide URLs render verbatim — the point is that the user
     // can copy one into a message so an agent fetches the guide.
-    expect(block).toHaveTextContent(
-      "https://github.com/shane-kercheval/switchboard/blob/main/docs/agent-instructions/workflows.md",
-    );
+    expect(block).toHaveTextContent(WORKFLOW_AUTHORING_GUIDE_URL);
     expect(block).toHaveTextContent(
       "https://github.com/shane-kercheval/switchboard/blob/main/docs/agent-instructions/prompts.md",
     );

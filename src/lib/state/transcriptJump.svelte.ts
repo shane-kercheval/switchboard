@@ -67,6 +67,40 @@ export function consumeJump(seq: number): void {
   jumpRequest.rowKey = null;
 }
 
+export type JumpPaneIndex = {
+  paneOrder: PaneId[];
+  paneByAgent: ReadonlyMap<AgentId, PaneId>;
+};
+
+/// Snapshot the visible pane target for each assigned agent. Pane order is
+/// retained separately so fan-out user rows always resolve to the leftmost
+/// recipient pane rather than whichever recipient id happens to come first.
+export function buildJumpPaneIndex(projectId: ProjectId, rosterIds: AgentId[]): JumpPaneIndex {
+  const layout = layoutFor(projectId, rosterIds);
+  // This map is an immutable snapshot; no consumer observes mutations.
+  // eslint-disable-next-line svelte/prefer-svelte-reactivity
+  const paneByAgent = new Map<AgentId, PaneId>();
+  for (const pane of layout.panes) {
+    for (const agentId of pane.members) {
+      if (!pane.hidden.includes(agentId) && !paneByAgent.has(agentId)) {
+        paneByAgent.set(agentId, pane.id);
+      }
+    }
+  }
+  return { paneOrder: layout.panes.map((pane) => pane.id), paneByAgent };
+}
+
+export function canResolveJumpFromIndex(index: JumpPaneIndex, agentIds: AgentId[]): boolean {
+  return agentIds.some((agentId) => index.paneByAgent.has(agentId));
+}
+
+export function resolveJumpPaneFromIndex(index: JumpPaneIndex, agentIds: AgentId[]): PaneId | null {
+  for (const paneId of index.paneOrder) {
+    if (agentIds.some((agentId) => index.paneByAgent.get(agentId) === paneId)) return paneId;
+  }
+  return null;
+}
+
 /// Which pane a jump should land in, per the navigator rules: an agent's rows
 /// render only in its own pane (membership is exclusive), so its id resolves
 /// uniquely; a user row renders in every recipient's pane, and the leftmost
@@ -79,13 +113,7 @@ export function resolveJumpPane(
   rosterIds: AgentId[],
   agentIds: AgentId[],
 ): PaneId | null {
-  const layout = layoutFor(projectId, rosterIds);
-  for (const pane of layout.panes) {
-    if (agentIds.some((id) => pane.members.includes(id) && !pane.hidden.includes(id))) {
-      return pane.id;
-    }
-  }
-  return null;
+  return resolveJumpPaneFromIndex(buildJumpPaneIndex(projectId, rosterIds), agentIds);
 }
 
 /// The navigator's one entry point: resolve the pane, reveal it (restore a

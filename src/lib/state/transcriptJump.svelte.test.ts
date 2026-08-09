@@ -1,11 +1,14 @@
 import { afterEach, describe, expect, it } from "vitest";
 import {
   _testing,
+  buildJumpPaneIndex,
+  canResolveJumpFromIndex,
   consumeJump,
   jumpRequest,
   jumpToRow,
   requestJump,
   resolveJumpPane,
+  resolveJumpPaneFromIndex,
 } from "./transcriptJump.svelte";
 import {
   _testing as panesTesting,
@@ -59,12 +62,17 @@ describe("resolveJumpPane", () => {
     // User row fanned out to both: leftmost containing a recipient wins.
     expect(resolveJumpPane(PROJECT, ROSTER, [A, B])).toBe(paneA!.id);
     expect(resolveJumpPane(PROJECT, ROSTER, [B, A])).toBe(paneA!.id);
+
+    const index = buildJumpPaneIndex(PROJECT, ROSTER);
+    expect(canResolveJumpFromIndex(index, [B])).toBe(true);
+    expect(resolveJumpPaneFromIndex(index, [B, A])).toBe(paneA!.id);
   });
 
   it("skips eye-hidden members and returns null when no visible pane hosts the agent", () => {
     toggleAgentHidden(PROJECT, ROSTER, A);
     // A is hidden in its pane → its rows render nowhere.
     expect(resolveJumpPane(PROJECT, ROSTER, [A])).toBeNull();
+    expect(canResolveJumpFromIndex(buildJumpPaneIndex(PROJECT, ROSTER), [A])).toBe(false);
     // A user row to both recipients still lands via the visible one.
     expect(resolveJumpPane(PROJECT, ROSTER, [A, B])).not.toBeNull();
   });

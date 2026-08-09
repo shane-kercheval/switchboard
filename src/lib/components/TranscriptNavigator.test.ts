@@ -21,6 +21,7 @@ const panes = await import("$lib/state/transcriptPanes.svelte");
 const pins = await import("$lib/state/messagePins.svelte");
 
 const PROJECT_ID = "00000000-0000-7000-8000-0000000000ff";
+const OTHER_PROJECT_ID = "00000000-0000-7000-8000-0000000000ee";
 const ALICE: AgentRecord = {
   id: "00000000-0000-7000-8000-000000000aaa",
   project_id: PROJECT_ID,
@@ -35,9 +36,17 @@ const BOB: AgentRecord = {
   name: "bob",
   session_locator: { uuid: "00000000-0000-7000-8000-000000000002" },
 };
+const CAROL: AgentRecord = {
+  ...ALICE,
+  id: "00000000-0000-7000-8000-000000000ccc",
+  project_id: OTHER_PROJECT_ID,
+  name: "carol",
+  session_locator: { uuid: "00000000-0000-7000-8000-000000000003" },
+};
 
 afterEach(() => {
   vi.useRealTimers();
+  vi.restoreAllMocks();
   state._testing.reset();
   jump._testing.reset();
   panes._testing.reset();
@@ -87,10 +96,180 @@ function props() {
 
 async function openNavigator(): Promise<void> {
   await fireEvent.click(screen.getByTestId("transcript-navigator-toggle"));
-  await tick();
+  await screen.findByTestId("navigator-ready");
 }
 
 describe("TranscriptNavigator", () => {
+  it("paints a loading shell immediately and applies type-ahead after indexing", async () => {
+    await seed();
+    vi.useFakeTimers();
+    render(TranscriptNavigator, { props: props() });
+
+    await fireEvent.click(screen.getByTestId("transcript-navigator-toggle"));
+    await tick();
+
+    expect(screen.getByTestId("dialog-content")).toBeInTheDocument();
+    expect(screen.getByTestId("navigator-loading")).toHaveTextContent("Preparing messages");
+    expect(screen.getByTestId("navigator-search")).not.toBeDisabled();
+    expect(screen.queryByTestId("navigator-empty")).not.toBeInTheDocument();
+
+    await fireEvent.input(screen.getByTestId("navigator-search"), {
+      target: { value: "deployed" },
+    });
+    await vi.runAllTimersAsync();
+    await tick();
+
+    expect(screen.queryByTestId("navigator-loading")).not.toBeInTheDocument();
+    expect(screen.getAllByTestId("navigator-entry")).toHaveLength(1);
+    expect(screen.getByTestId("navigator-entry")).toHaveTextContent("deployed the fix");
+  });
+
+  it("coalesces continuous streaming into a prompt initial build and throttled refresh", async () => {
+    await seed();
+    vi.useFakeTimers();
+    vi.spyOn(globalThis, "requestAnimationFrame").mockImplementation(
+      (callback) => setTimeout(() => callback(performance.now()), 16) as unknown as number,
+    );
+    vi.spyOn(globalThis, "cancelAnimationFrame").mockImplementation((handle) => {
+      clearTimeout(handle);
+    });
+    render(TranscriptNavigator, { props: props() });
+
+    await fireEvent.click(screen.getByTestId("transcript-navigator-toggle"));
+    await tick();
+
+    const appendTurn = (index: number): void => {
+      state.setTranscript(ALICE.id, [
+        ...(state.transcripts[ALICE.id] ?? []),
+        {
+          role: "agent",
+          turn_id: `stream-${index}`,
+          agent_id: ALICE.id,
+          started_at: `2026-05-16T00:00:${String(index + 3).padStart(2, "0")}Z`,
+          status: "streaming",
+          items: [{ item_kind: "text", kind: "text", text: `stream update ${index}` }],
+        },
+      ]);
+    };
+
+    for (let index = 0; index < 2; index += 1) {
+      appendTurn(index);
+      await tick();
+      await vi.advanceTimersByTimeAsync(15);
+    }
+    await tick();
+    expect(screen.queryByTestId("navigator-loading")).not.toBeInTheDocument();
+    expect(screen.getByText("stream update 1")).toBeInTheDocument();
+
+    for (let index = 2; index < 20; index += 1) {
+      appendTurn(index);
+      await tick();
+    }
+    await vi.advanceTimersByTimeAsync(200);
+    await tick();
+    expect(screen.queryByText("stream update 19")).not.toBeInTheDocument();
+
+    await vi.advanceTimersByTimeAsync(100);
+    await tick();
+    expect(screen.getByText("stream update 19")).toBeInTheDocument();
+  });
+
+  it("discards an initial build after close and starts fresh when reopened", async () => {
+    await seed();
+    vi.useFakeTimers();
+    render(TranscriptNavigator, { props: props() });
+
+    await fireEvent.click(screen.getByTestId("transcript-navigator-toggle"));
+    await tick();
+    expect(screen.getByTestId("navigator-loading")).toBeInTheDocument();
+
+    await fireEvent.click(screen.getByTestId("dialog-close"));
+    await tick();
+    await vi.advanceTimersByTimeAsync(20);
+    expect(screen.queryByTestId("dialog-content")).not.toBeInTheDocument();
+
+    state.setTranscript(ALICE.id, [
+      ...(state.transcripts[ALICE.id] ?? []),
+      {
+        role: "agent",
+        turn_id: "after-reopen",
+        agent_id: ALICE.id,
+        started_at: "2026-05-16T00:00:03Z",
+        status: "complete",
+        items: [{ item_kind: "text", kind: "text", text: "fresh after reopen" }],
+      },
+    ]);
+    await fireEvent.click(screen.getByTestId("transcript-navigator-toggle"));
+    await tick();
+    expect(screen.getByTestId("navigator-loading")).toBeInTheDocument();
+
+    await vi.advanceTimersByTimeAsync(20);
+    await tick();
+    expect(screen.queryByTestId("navigator-loading")).not.toBeInTheDocument();
+    expect(screen.getByText("fresh after reopen")).toBeInTheDocument();
+  });
+
+  it("switches a pending index to the new project and returns to loading", async () => {
+    await seed();
+    await state.registerAgent(CAROL);
+    state.transcripts[CAROL.id] = [
+      {
+        role: "agent",
+        turn_id: "carol-turn",
+        agent_id: CAROL.id,
+        started_at: "2026-05-16T00:00:04Z",
+        status: "complete",
+        items: [{ item_kind: "text", kind: "text", text: "carol project result" }],
+      },
+    ];
+    const view = render(TranscriptNavigator, { props: props() });
+    await openNavigator();
+    state.setTranscript(ALICE.id, [
+      ...(state.transcripts[ALICE.id] ?? []),
+      {
+        role: "agent",
+        turn_id: "stale-pending-turn",
+        agent_id: ALICE.id,
+        started_at: "2026-05-16T00:00:05Z",
+        status: "complete",
+        items: [{ item_kind: "text", kind: "text", text: "stale pending result" }],
+      },
+    ]);
+    await tick();
+
+    await view.rerender({ projectId: OTHER_PROJECT_ID, agents: [CAROL] });
+    await tick();
+    expect(screen.getByTestId("navigator-loading")).toHaveTextContent("Preparing messages");
+    expect(screen.queryByText("deployed the fix")).not.toBeInTheDocument();
+
+    await screen.findByTestId("navigator-ready");
+    expect(screen.getByText("carol project result")).toBeInTheDocument();
+    expect(screen.queryByText("deployed the fix")).not.toBeInTheDocument();
+    expect(screen.queryByText("stale pending result")).not.toBeInTheDocument();
+  });
+
+  it("keeps local controls usable while indexing and waits for trusted pins", async () => {
+    await seed();
+    let resolvePins!: (pins: unknown[]) => void;
+    invokeMock.mockImplementation(async (cmd) => {
+      if (cmd !== "list_message_pins") return null;
+      return await new Promise<unknown[]>((resolve) => {
+        resolvePins = resolve;
+      });
+    });
+    render(TranscriptNavigator, { props: props() });
+
+    await fireEvent.click(screen.getByTestId("transcript-navigator-toggle"));
+    await tick();
+
+    expect(screen.getByTestId("navigator-role")).not.toHaveAttribute("aria-disabled", "true");
+    expect(screen.getByTestId("navigator-sort")).not.toBeDisabled();
+    expect(screen.getByTestId("navigator-pinned-filter")).toBeDisabled();
+
+    resolvePins([]);
+    await waitFor(() => expect(screen.getByTestId("navigator-pinned-filter")).not.toBeDisabled());
+  });
+
   it("opens to a flat list of all messages, newest-first by default; the sort toggle flips it", async () => {
     await seed();
     render(TranscriptNavigator, { props: props() });
@@ -105,6 +284,32 @@ describe("TranscriptNavigator", () => {
 
     await fireEvent.click(screen.getByTestId("navigator-sort"));
     expect(rowKeys()).toEqual(["u:send-1", "a:turn-a", "a:turn-b"]);
+  });
+
+  it("refreshes the ready index when an open transcript changes", async () => {
+    await seed();
+    render(TranscriptNavigator, { props: props() });
+    await openNavigator();
+
+    state.setTranscript(ALICE.id, [
+      ...(state.transcripts[ALICE.id] ?? []),
+      {
+        role: "agent",
+        turn_id: "turn-new",
+        agent_id: ALICE.id,
+        started_at: "2026-05-16T00:00:03Z",
+        status: "complete",
+        hydration_key: "message-new",
+        items: [{ item_kind: "text", kind: "text", text: "new streamed answer" }],
+      },
+    ]);
+
+    await waitFor(() =>
+      expect(
+        screen.getAllByTestId("navigator-entry").map((entry) => entry.getAttribute("data-row-key")),
+      ).toContain("a:turn-new"),
+    );
+    expect(screen.queryByTestId("navigator-loading")).not.toBeInTheDocument();
   });
 
   it("keeps the find tooltip closed after opening and closing the dialog", async () => {
@@ -276,5 +481,25 @@ describe("TranscriptNavigator", () => {
     render(TranscriptNavigator, { props: { projectId: PROJECT_ID, agents: [ALICE] } });
     await openNavigator();
     expect(screen.getByTestId("navigator-empty")).toHaveTextContent("No messages yet.");
+  });
+
+  it("reports the complete result count and list position metadata", async () => {
+    await state.registerAgent(ALICE);
+    state.transcripts[ALICE.id] = Array.from({ length: 120 }, (_, index) => ({
+      role: "agent" as const,
+      turn_id: `turn-${index}`,
+      agent_id: ALICE.id,
+      started_at: new Date(Date.UTC(2026, 4, 16, 0, 0, index)).toISOString(),
+      status: "complete" as const,
+      items: [{ item_kind: "text" as const, kind: "text" as const, text: `message ${index}` }],
+    }));
+    render(TranscriptNavigator, { props: { projectId: PROJECT_ID, agents: [ALICE] } });
+    await openNavigator();
+
+    expect(screen.getByTestId("navigator-count")).toHaveTextContent("120 messages");
+    const newestEntry = screen.getAllByTestId("navigator-entry")[0];
+    expect(newestEntry).toHaveAttribute("data-row-key", "a:turn-119");
+    expect(newestEntry).toHaveAttribute("aria-posinset", "1");
+    expect(newestEntry).toHaveAttribute("aria-setsize", "120");
   });
 });

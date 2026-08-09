@@ -5,6 +5,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   AgentSessionFingerprint,
+  ActivationCommandError,
+  ActivationFailureKind,
   AgentId,
   AgentRecord,
   Attachment,
@@ -41,6 +43,29 @@ import type {
   WorkflowRunInfo,
   WorkspaceDirectories,
 } from "./types";
+
+export class ActivationFailureError extends Error {
+  readonly type: ActivationFailureKind;
+
+  constructor(type: ActivationFailureKind, message: string) {
+    super(message);
+    this.name = "ActivationFailureError";
+    this.type = type;
+  }
+}
+
+function activationFailure(error: unknown): ActivationFailureError {
+  if (typeof error === "object" && error !== null) {
+    const wire = error as Partial<ActivationCommandError>;
+    if (typeof wire.message === "string") {
+      const type: ActivationFailureKind =
+        wire.type === "project_not_loaded" || wire.type === "project_locked" ? wire.type : "other";
+      return new ActivationFailureError(type, wire.message);
+    }
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  return new ActivationFailureError("other", message);
+}
 
 /// Auth probes exist for the getting-started surface (no-project state)
 /// to show ✓/✗ per harness. The working UI does **not** call these —
@@ -346,11 +371,19 @@ export async function projectSessionFingerprints(
 }
 
 export async function openProject(projectId: ProjectId): Promise<ProjectSummary> {
-  return await invoke<ProjectSummary>("open_project", { projectId });
+  try {
+    return await invoke<ProjectSummary>("open_project", { projectId });
+  } catch (error) {
+    throw activationFailure(error);
+  }
 }
 
 export async function setActiveProject(projectId: ProjectId): Promise<void> {
-  await invoke<null>("set_active_project", { projectId });
+  try {
+    await invoke<null>("set_active_project", { projectId });
+  } catch (error) {
+    throw activationFailure(error);
+  }
 }
 
 export async function createAgent(
@@ -416,7 +449,11 @@ export async function reorderAgents(
 }
 
 export async function listAgents(projectId?: ProjectId): Promise<AgentRecord[]> {
-  return await invoke<AgentRecord[]>("list_agents", { projectId });
+  try {
+    return await invoke<AgentRecord[]>("list_agents", { projectId });
+  } catch (error) {
+    throw activationFailure(error);
+  }
 }
 
 export async function searchProjectFiles(

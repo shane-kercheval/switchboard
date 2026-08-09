@@ -67,6 +67,8 @@ afterEach(async () => {
   state._testing.reset();
   const ws = await loadWorkspaceState();
   ws._testing.reset();
+  const layoutStore = await import("$lib/layout.svelte");
+  layoutStore._testing.reset();
 });
 
 describe("workspace project activity", () => {
@@ -352,10 +354,13 @@ describe("workspace project activity", () => {
   it("removing a busy project clears activity observer memory and local markers", async () => {
     const state = await loadAgentState();
     const ws = await loadWorkspaceState();
+    const layoutStore = await import("$lib/layout.svelte");
     const busyProject = project(PROJECT_1, "2026-05-16T00:00:00Z");
     ws.projects.list = [busyProject];
     const a = agent(AGENT_1, PROJECT_1);
     ws.agentsByProject[PROJECT_1] = [a];
+    layoutStore.layout.setRightSidebarMode(PROJECT_1, "pins");
+    layoutStore.layout.setPinsSortMode(PROJECT_1, "message_at");
     await state.registerAgent(a);
     state.dispatchUserTurn(AGENT_1, "user-1", "go", [], "send-1", busyProject.last_activity);
     observerStops.push(ws.startProjectActivityObserver(() => "2026-05-25T12:00:00.000Z"));
@@ -376,6 +381,84 @@ describe("workspace project activity", () => {
     expect(ws.backgroundCompletedProjectIds[PROJECT_1]).toBeUndefined();
     expect(ws.projectActivityOverrides[PROJECT_1]).toBeUndefined();
     expect(ws.projects.list).toEqual([]);
+    expect(layoutStore.layout.rightSidebarModeFor(PROJECT_1)).toBe("pins");
+    expect(layoutStore.layout.pinsSortModeFor(PROJECT_1)).toBe("message_at");
+  });
+});
+
+describe("project preference lifecycle", () => {
+  it("clears project layout preferences after permanent deletion", async () => {
+    const ws = await loadWorkspaceState();
+    const layoutStore = await import("$lib/layout.svelte");
+    ws.projects.list = [project(PROJECT_1, "2026-05-16T00:00:00Z")];
+    layoutStore.layout.setRightSidebarMode(PROJECT_1, "pins");
+    layoutStore.layout.setPinsSortMode(PROJECT_1, "message_at");
+    invokeMock.mockResolvedValue(undefined);
+
+    await ws.deleteProject(PROJECT_1);
+
+    expect(layoutStore.layout.rightSidebarModeFor(PROJECT_1)).toBe("agents");
+    expect(layoutStore.layout.pinsSortModeFor(PROJECT_1)).toBe("pinned_at");
+  });
+
+  it("shares one in-flight deletion per project", async () => {
+    const ws = await loadWorkspaceState();
+    ws.projects.list = [project(PROJECT_1, "2026-05-16T00:00:00Z")];
+    let resolveDelete!: () => void;
+    invokeMock.mockImplementation(async (cmd) =>
+      cmd === "delete_project"
+        ? new Promise<void>((resolve) => {
+            resolveDelete = resolve;
+          })
+        : undefined,
+    );
+
+    const first = ws.deleteProject(PROJECT_1);
+    const second = ws.deleteProject(PROJECT_1);
+
+    expect(second).toBe(first);
+    expect(ws.projectDeletions.pending[PROJECT_1]).toBe(true);
+    expect(invokeMock.mock.calls.filter(([cmd]) => cmd === "delete_project")).toHaveLength(1);
+
+    resolveDelete();
+    await Promise.all([first, second]);
+    expect(ws.projectDeletions.pending[PROJECT_1]).toBeUndefined();
+  });
+
+  it("retains and dismisses a project-scoped deletion failure", async () => {
+    const ws = await loadWorkspaceState();
+    ws.projects.list = [project(PROJECT_1, "2026-05-16T00:00:00Z")];
+    invokeMock.mockImplementation(async (cmd) => {
+      if (cmd === "delete_project") throw new Error("disk busy");
+      return undefined;
+    });
+
+    await expect(ws.deleteProject(PROJECT_1)).rejects.toThrow("disk busy");
+    expect(ws.projectDeletions.pending[PROJECT_1]).toBeUndefined();
+    expect(ws.projectDeletions.errors[PROJECT_1]).toBe("disk busy");
+
+    ws.dismissProjectDeletionError(PROJECT_1);
+    expect(ws.projectDeletions.errors[PROJECT_1]).toBeUndefined();
+  });
+});
+
+describe("activation failure classification", () => {
+  it.each([
+    ["project_not_loaded", "project_not_loaded"],
+    ["project_locked", "project_locked"],
+    ["future_failure", "other"],
+  ] as const)("maps %s to the safe frontend kind %s", async (wireType, expectedType) => {
+    const ws = await loadWorkspaceState();
+    invokeMock.mockImplementation(async (cmd) => {
+      if (cmd === "open_project") throw { type: wireType, message: "activation failed" };
+      return undefined;
+    });
+
+    expect(await ws.activateProject(PROJECT_1)).toBe("failed");
+    expect(ws.selection.activationFailure).toEqual({
+      type: expectedType,
+      message: "activation failed",
+    });
   });
 });
 

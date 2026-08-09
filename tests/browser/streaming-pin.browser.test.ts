@@ -1,3 +1,4 @@
+import { tick } from "svelte";
 import { beforeEach, expect, test, vi } from "vitest";
 import { page } from "vitest/browser";
 
@@ -116,36 +117,40 @@ test("a small scroll up inside a live cap releases its pin; other columns keep f
 
 test("the stop control stays fixed when elapsed seconds gain a digit", async () => {
   await registerAgent(ALICE);
-  seedTurns(ALICE.id, [
-    agentTurn({
-      id: "agent-streaming",
-      agentId: ALICE.id,
-      at: new Date(Date.now() - 7_500).toISOString(),
-      status: "streaming",
-      sendId: "send-timer",
-      items: [textItem("working")],
-    }),
-  ]);
+  vi.useFakeTimers();
+  try {
+    const now = new Date("2026-05-16T00:00:10Z");
+    vi.setSystemTime(now);
+    seedTurns(ALICE.id, [
+      agentTurn({
+        id: "agent-streaming",
+        agentId: ALICE.id,
+        at: new Date(now.getTime() - 9_000).toISOString(),
+        status: "streaming",
+        sendId: "send-timer",
+        items: [textItem("working")],
+      }),
+    ]);
 
-  mountTranscript({ projectId: PROJECT_ID, agents: [ALICE] });
+    mountTranscript({ projectId: PROJECT_ID, agents: [ALICE] });
+    await tick();
 
-  const timer = page.getByTestId("turn-elapsed");
-  const stop = page.getByTestId("turn-live-control");
-  expect(stop.element().getBoundingClientRect().x).toBeLessThan(
-    timer.element().getBoundingClientRect().x,
-  );
-  const xAtNineSeconds = await vi.waitUntil(
-    () => {
-      if (timer.element().textContent?.trim() !== "9s") return false;
-      return stop.element().getBoundingClientRect().x;
-    },
-    { timeout: 3_000, interval: 20 },
-  );
+    const timer = page.getByTestId("turn-elapsed");
+    const stop = page.getByTestId("turn-live-control");
+    expect(timer.element().textContent?.trim()).toBe("9s");
+    expect(stop.element().getBoundingClientRect().x).toBeLessThan(
+      timer.element().getBoundingClientRect().x,
+    );
+    const xAtNineSeconds = stop.element().getBoundingClientRect().x;
 
-  await expect
-    .poll(() => timer.element().textContent?.trim(), { timeout: 2_500, interval: 20 })
-    .toBe("10s");
-  expect(stop.element().getBoundingClientRect().x).toBeCloseTo(xAtNineSeconds, 1);
+    await vi.advanceTimersByTimeAsync(1_000);
+    await tick();
+
+    expect(timer.element().textContent?.trim()).toBe("10s");
+    expect(stop.element().getBoundingClientRect().x).toBeCloseTo(xAtNineSeconds, 1);
+  } finally {
+    vi.useRealTimers();
+  }
 });
 
 test("on stream completion the view stays pinned with the response end in view", async () => {

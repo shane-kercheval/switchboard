@@ -5,6 +5,7 @@ import PinsSidebar from "./PinsSidebar.svelte";
 import type { AgentRecord } from "$lib/types";
 
 const PROJECT = "00000000-0000-7000-8000-0000000000ff";
+const OTHER_PROJECT = "00000000-0000-7000-8000-0000000000fe";
 const AGENT: AgentRecord = {
   id: "00000000-0000-7000-8000-000000000aaa",
   project_id: PROJECT,
@@ -245,7 +246,62 @@ describe("PinsSidebar", () => {
     await fireEvent.click(screen.getByTestId("pins-sort-message"));
 
     expect(screen.getByTestId("pins-sort-message")).toHaveAttribute("aria-checked", "true");
+    expect(layoutStore.layout.pinsSortModeFor(PROJECT)).toBe("message_at");
+    expect(layoutStore.layout.pinsSortModeFor("another-project")).toBe("pinned_at");
     expect(cardKeys()).toEqual([secondKey, PIN_KEY, unavailableKey]);
+  });
+
+  it("restores each project's Pins ordering when one mounted sidebar changes projects", async () => {
+    const secondKey = `agent:hydration:${AGENT.id}:message-2`;
+    persistedPins = [
+      { key: PIN_KEY, pinned_at: "2026-08-07T12:03:00Z" },
+      { key: secondKey, pinned_at: "2026-08-07T12:02:00Z" },
+    ];
+    await transcript.registerAgent(AGENT);
+    transcript.transcripts[AGENT.id] = [
+      {
+        role: "agent",
+        turn_id: "turn-1",
+        agent_id: AGENT.id,
+        started_at: "2026-08-07T12:00:00Z",
+        status: "complete",
+        hydration_key: "message-1",
+        items: [{ item_kind: "text", kind: "text", text: "older message" }],
+      },
+      {
+        role: "agent",
+        turn_id: "turn-2",
+        agent_id: AGENT.id,
+        started_at: "2026-08-07T12:00:00.500Z",
+        status: "complete",
+        hydration_key: "message-2",
+        items: [{ item_kind: "text", kind: "text", text: "newer message" }],
+      },
+    ];
+    const view = render(PinsSidebar, { props: { projectId: PROJECT, agents: [AGENT] } });
+    const cardKeys = (): (string | null)[] =>
+      screen
+        .getAllByTestId("pinned-message-card")
+        .map((card) => card.getAttribute("data-message-key"));
+
+    await fireEvent.click(await screen.findByTestId("pins-sort-message"));
+    expect(cardKeys()).toEqual([secondKey, PIN_KEY]);
+
+    await view.rerender({ projectId: OTHER_PROJECT, agents: [AGENT] });
+    await waitFor(() =>
+      expect(screen.getByTestId("pins-sort-pinned")).toHaveAttribute("aria-checked", "true"),
+    );
+    expect(cardKeys()).toEqual([PIN_KEY, secondKey]);
+
+    await fireEvent.click(screen.getByTestId("pins-sort-message"));
+    await fireEvent.click(screen.getByTestId("pins-sort-pinned"));
+    expect(layoutStore.layout.pinsSortModeFor(OTHER_PROJECT)).toBe("pinned_at");
+
+    await view.rerender({ projectId: PROJECT, agents: [AGENT] });
+    await waitFor(() =>
+      expect(screen.getByTestId("pins-sort-message")).toHaveAttribute("aria-checked", "true"),
+    );
+    expect(cardKeys()).toEqual([secondKey, PIN_KEY]);
   });
 
   it("uses pin time and key to break ties between equivalent message instants", async () => {

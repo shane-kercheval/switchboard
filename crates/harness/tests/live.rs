@@ -954,6 +954,70 @@ async fn live_claude_resume_reuses_session() {
     );
 }
 
+/// The same two-turn resume, but from a cwd whose name contains `_`.
+///
+/// `live_claude_resume_reuses_session` runs in `/tmp`, so it only exercises
+/// paths made of `/` and alphanumerics — it passed for months while any agent
+/// in a directory like `switchboard-mcp_oauth` was permanently stranded.
+/// Claude Code collapses every non-alphanumeric character in the cwd (`_` and
+/// spaces included) when naming its session-storage directory; if
+/// Switchboard's `encode_cwd` disagrees, the adapter looks in a directory that
+/// does not exist, concludes "first turn," and passes `--session-id` for a
+/// session that already exists — which claude rejects with "Session ID … is
+/// already in use" on every subsequent turn.
+///
+/// Pins the encoding against the real CLI, where a unit test can only pin it
+/// against our own belief about the CLI.
+#[tokio::test]
+#[ignore = "requires claude installed — run with: make test-live"]
+async fn live_claude_resume_reuses_session_in_underscored_cwd() {
+    let adapter = ClaudeCodeAdapter::new();
+    let session_id = Uuid::now_v7();
+
+    let root = tempfile::TempDir::new().expect("temp dir");
+    let cwd = root.path().join("sw_live_probe");
+    std::fs::create_dir_all(&cwd).expect("create underscored cwd");
+    let cwd = cwd.canonicalize().expect("canonicalize cwd");
+
+    let agent = |name: &str| AgentRecord {
+        model: None,
+        effort: None,
+        id: Uuid::now_v7(),
+        project_id: Uuid::now_v7(),
+        name: name.to_owned(),
+        harness: HarnessKind::ClaudeCode,
+        session_locator: Some(SessionLocator::Uuid(session_id)),
+        created_at: chrono::Utc::now(),
+    };
+
+    let completed = async |a: AgentRecord, prompt: &str| -> bool {
+        let stream = adapter
+            .dispatch(&a, &cwd, prompt, Uuid::now_v7(), DispatchOptions::default())
+            .await
+            .expect("dispatch should succeed");
+        let events: Vec<AdapterEvent> = stream.collect().await;
+        events.iter().any(|e| {
+            matches!(
+                e,
+                AdapterEvent::TurnEnd {
+                    outcome: TurnOutcome::Completed,
+                    ..
+                }
+            )
+        })
+    };
+
+    assert!(
+        completed(agent("underscore-1"), "Say ACK").await,
+        "first turn should create the session"
+    );
+    assert!(
+        completed(agent("underscore-2"), "Say ACK again").await,
+        "second turn must resume, not re-create: a `--session-id` here fails \
+         with \"Session ID … is already in use\""
+    );
+}
+
 /// The backend contract the staleness refresh stands on: continuing a session
 /// (a second turn appended to the file, exactly as a TUI continuation does)
 /// makes a re-read return the new turn with a **new, distinct** `hydration_key`

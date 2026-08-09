@@ -225,12 +225,10 @@ fn session_exists_in(home: &Path, cwd: &Path, session_id: &uuid::Uuid) -> bool {
 
 /// Compute the canonical Claude Code session-file path. Claude Code stores
 /// sessions at `<home>/.claude/projects/<encoded-cwd>/<uuid>.jsonl` where the
-/// encoded cwd replaces both `/` and `.` with `-`. For example,
-/// `/Users/x/repo/.switchboard/projects/<id>` is encoded as
-/// `-Users-x-repo--switchboard-projects-<id>` — the leading dot of
+/// encoded cwd replaces every character outside `[A-Za-z0-9-]` with `-` (see
+/// [`encode_cwd`]). For example, `/Users/x/repo/.switchboard/projects/<id>` is
+/// encoded as `-Users-x-repo--switchboard-projects-<id>` — the leading dot of
 /// `.switchboard` becomes a dash, producing the double-dash `--switchboard`.
-/// The empirically-observed rule, confirmed against `~/.claude/projects/`
-/// listings for cwds containing dot-prefixed components.
 ///
 /// **Caller contract.** `cwd` must be a *canonical* absolute path (no
 /// symlinks, no `..`). The attach-flow caller resolves cwd via
@@ -247,13 +245,25 @@ pub fn claude_session_file_path(home: &Path, cwd: &Path, session_id: &uuid::Uuid
 }
 
 /// Encodes a canonical absolute path the way Claude Code does for its
-/// session-storage directory naming: every `/` and `.` becomes `-`. Switchboard's
-/// own working paths reliably contain `.switchboard`, so getting this rule
-/// exactly right is load-bearing — any mismatch causes the adapter to think a
-/// session file is missing and pass `--session-id`, which claude rejects with
-/// "Session ID … is already in use" on subsequent turns.
+/// session-storage directory naming: every character outside `[A-Za-z0-9-]`
+/// becomes `-`. That covers `/` and `.`, but also `_` and spaces — a directory
+/// named `switchboard-mcp_oauth` is stored under `…-switchboard-mcp-oauth`.
+///
+/// Getting this rule exactly right is load-bearing: any mismatch causes the
+/// adapter to think a session file is missing and pass `--session-id`, which
+/// claude rejects with "Session ID … is already in use" on subsequent turns,
+/// stranding the agent permanently (the check is a filesystem lookup, so it
+/// fails identically on every retry and across app restarts).
+///
+/// The rule is empirical, confirmed against `~/.claude/projects/` listings:
+/// across a 160-directory sample the names contain only `[A-Za-z0-9-]`, and a
+/// cwd containing `_` is stored with that `_` collapsed to `-`.
 fn encode_cwd(canonical: &Path) -> String {
-    canonical.to_string_lossy().replace(['/', '.'], "-")
+    canonical
+        .to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
 }
 
 // Parallels the Codex / Gemini producers: a single per-line control-flow loop
@@ -528,6 +538,41 @@ mod tests {
         }
     }
 
+    /// The exact shape that stranded a real agent: a cwd containing `_`, with
+    /// the session file where Claude Code actually writes it. Before the fix
+    /// this picked `--session-id`, which claude rejects with "Session ID … is
+    /// already in use", failing every turn forever.
+    #[test]
+    fn build_args_resumes_when_the_cwd_contains_an_underscore() {
+        let home = tempfile::TempDir::new().unwrap();
+        let root = tempfile::TempDir::new().unwrap();
+        let project = root.path().join("switchboard-mcp_oauth");
+        std::fs::create_dir_all(&project).unwrap();
+        let canonical = project.canonicalize().unwrap();
+        let session_id = Uuid::now_v7();
+
+        // Directory name spelled out the way Claude Code spells it, rather than
+        // via `encode_cwd` — otherwise this test cannot fail.
+        let encoded: String = canonical
+            .to_string_lossy()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
+        assert!(
+            encoded.contains("switchboard-mcp-oauth"),
+            "fixture must exercise the underscore case, got {encoded}"
+        );
+        let session_dir = home.path().join(".claude").join("projects").join(&encoded);
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(session_dir.join(format!("{session_id}.jsonl")), "").unwrap();
+
+        let agent = agent_with_session(session_id);
+        let args = build_args(&agent, "hi", &canonical, Some(home.path()));
+
+        assert!(args.contains(&"--resume".to_owned()));
+        assert!(!args.contains(&"--session-id".to_owned()));
+    }
+
     #[test]
     fn session_exists_in_encodes_path_and_detects_file() {
         let home = tempfile::TempDir::new().unwrap();
@@ -722,7 +767,7 @@ mod tests {
     }
 
     #[test]
-    fn encode_cwd_replaces_dots_and_slashes_with_dashes() {
+    fn encode_cwd_replaces_every_non_alphanumeric_character_with_a_dash() {
         // All cases below are empirically verified against `claude` itself
         // by running it in each cwd shape and inspecting where it created
         // its session-storage directory under `~/.claude/projects/`. See
@@ -749,6 +794,18 @@ mod tests {
             encode_cwd(Path::new("/private/tmp/sw-probe/.hidden/sub")),
             "-private-tmp-sw-probe--hidden-sub"
         );
+        // Underscore — the case that stranded `switchboard-mcp_oauth` agents.
+        // Dots and slashes are not special; every non-alphanumeric collapses.
+        assert_eq!(
+            encode_cwd(Path::new("/Users/x/switchboard-mcp_oauth")),
+            "-Users-x-switchboard-mcp-oauth"
+        );
+        // Space, and several distinct separators adjacent in one component.
+        assert_eq!(
+            encode_cwd(Path::new("/Users/x/api copy")),
+            "-Users-x-api-copy"
+        );
+        assert_eq!(encode_cwd(Path::new("/a-b/c.d_e f")), "-a-b-c-d-e-f");
         // Multiple dots in one component (mixed leading + mid).
         assert_eq!(
             encode_cwd(Path::new("/private/tmp/sw-probe/foo/.bar.baz")),

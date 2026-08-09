@@ -32,6 +32,6 @@ describe("SidebarPanel", () => {
         children: body,
       },
     });
-    expect(screen.getByTestId("panel")).toHaveClass("border-l", "max-w-[clamp(200px,60vw,720px)]");
+    expect(screen.getByTestId("panel")).toHaveClass("border-l", "max-w-[clamp(200px,60vw,960px)]");
   });
 });

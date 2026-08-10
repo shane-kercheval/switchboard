@@ -140,6 +140,26 @@ pub struct AgentRecord {
     /// where [`HarnessKind::supports_effort_selection`] holds ever carry a
     /// value. Same backward-compat rationale as `model`.
     pub effort: Option<String>,
+    /// For a forked agent: the **parent session UUID** to `--resume` from when
+    /// this agent's own session file does not exist yet. `None` for every agent
+    /// that wasn't created by forking.
+    ///
+    /// Stores the parent's *session* id, not the parent's *agent* id, so the
+    /// record is self-contained: the fork still materializes after the parent
+    /// agent is deleted (Switchboard never deletes harness session files).
+    ///
+    /// **Permanent, and inert after first use.** It is never cleared once the
+    /// fork materializes — whether a dispatch forks or plainly resumes is
+    /// derived from the agent's own session file existing, not from consuming
+    /// this field (see `claude_code::build_args`). Keeping it makes the fork's
+    /// provenance durable, and makes a first dispatch that died before creating
+    /// the file retry the fork automatically.
+    ///
+    /// Only harnesses where [`HarnessKind::supports_session_fork`] holds ever
+    /// carry `Some`. Same plain-`Option` backward-compat rationale as `model` /
+    /// `effort` above: a record written before forking existed legitimately
+    /// lacks the key and must load as `None`.
+    pub forked_from_session: Option<Uuid>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -188,6 +208,7 @@ mod tests {
             session_locator: locator,
             model: None,
             effort: None,
+            forked_from_session: None,
             created_at: Utc::now(),
         }
     }
@@ -235,6 +256,38 @@ mod tests {
         assert_eq!(parsed.model, None);
         assert_eq!(parsed.effort, None);
         assert_eq!(parsed.session_locator, None);
+    }
+
+    #[test]
+    fn agent_record_roundtrips_with_fork_provenance() {
+        let parent = Uuid::now_v7();
+        let mut record = record_with_locator(Some(SessionLocator::Uuid(Uuid::now_v7())));
+        record.forked_from_session = Some(parent);
+        let json = serde_json::to_string(&record).unwrap();
+        let parsed: AgentRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, record);
+        assert_eq!(parsed.forked_from_session, Some(parent));
+    }
+
+    #[test]
+    fn agent_record_serializes_unset_fork_provenance_as_null() {
+        // Self-describing on disk, like `model` / `effort`: a non-forked agent
+        // records "not a fork" explicitly rather than by omission.
+        let record = record_with_locator(Some(SessionLocator::Uuid(Uuid::now_v7())));
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(json.contains("\"forked_from_session\":null"), "got: {json}");
+    }
+
+    #[test]
+    fn record_missing_fork_provenance_deserializes_as_none() {
+        // Backward compat: every record written before forking existed lacks
+        // this key. Unlike `session_locator` (fail-loud on absence), a missing
+        // plain `Option` must default to `None` — "this agent is not a fork" is
+        // the correct reading of a pre-fork record, not corruption.
+        let json = r#"{"id":"019e2c5f-aaaa-7000-8000-000000000001","project_id":"019e2c5f-bbbb-7000-8000-000000000002","name":"legacy","harness":"claude_code","session_locator":null,"model":null,"effort":null,"created_at":"2026-05-15T12:30:45Z"}"#;
+        let parsed: AgentRecord =
+            serde_json::from_str(json).expect("missing forked_from_session must default to None");
+        assert_eq!(parsed.forked_from_session, None);
     }
 
     #[test]

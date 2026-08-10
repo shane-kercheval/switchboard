@@ -66,6 +66,7 @@ fn live_agent() -> AgentRecord {
     AgentRecord {
         model: None,
         effort: None,
+        forked_from_session: None,
         id: Uuid::now_v7(),
         project_id: Uuid::now_v7(),
         name: "live-test-agent".to_owned(),
@@ -883,6 +884,7 @@ async fn live_claude_resume_reuses_session() {
     let agent1 = AgentRecord {
         model: None,
         effort: None,
+        forked_from_session: None,
         id: Uuid::now_v7(),
         project_id: Uuid::now_v7(),
         name: "session-test-1".to_owned(),
@@ -919,6 +921,7 @@ async fn live_claude_resume_reuses_session() {
     let agent2 = AgentRecord {
         model: None,
         effort: None,
+        forked_from_session: None,
         id: Uuid::now_v7(),
         project_id: Uuid::now_v7(),
         name: "session-test-2".to_owned(),
@@ -990,6 +993,7 @@ async fn live_claude_resume_reuses_session_in_underscored_cwd() {
     let agent = |name: &str| AgentRecord {
         model: None,
         effort: None,
+        forked_from_session: None,
         id: Uuid::now_v7(),
         project_id: Uuid::now_v7(),
         name: name.to_owned(),
@@ -1058,6 +1062,7 @@ async fn live_claude_refresh_picks_up_appended_turn() {
     let agent = AgentRecord {
         model: None,
         effort: None,
+        forked_from_session: None,
         id: agent_id,
         project_id: Uuid::now_v7(),
         name: "refresh-test".to_owned(),
@@ -1292,6 +1297,7 @@ fn live_codex_agent() -> AgentRecord {
     AgentRecord {
         model: None,
         effort: None,
+        forked_from_session: None,
         id: Uuid::now_v7(),
         project_id: Uuid::now_v7(),
         name: "live-codex-agent".to_owned(),
@@ -1636,6 +1642,7 @@ fn live_gemini_agent() -> AgentRecord {
     AgentRecord {
         model: None,
         effort: None,
+        forked_from_session: None,
         id: Uuid::now_v7(),
         project_id: Uuid::now_v7(),
         name: "live-gemini-agent".to_owned(),
@@ -1958,6 +1965,7 @@ fn live_antigravity_agent() -> AgentRecord {
     AgentRecord {
         model: None,
         effort: None,
+        forked_from_session: None,
         id: Uuid::now_v7(),
         project_id: Uuid::now_v7(),
         name: "live-antigravity-agent".to_owned(),
@@ -2330,6 +2338,7 @@ async fn live_claude_model_and_effort_change_across_turns() {
     let mut agent = AgentRecord {
         model: Some("sonnet".to_owned()),
         effort: Some("low".to_owned()),
+        forked_from_session: None,
         id: agent_id,
         project_id: Uuid::now_v7(),
         name: "m4-claude".to_owned(),
@@ -2559,6 +2568,7 @@ async fn live_gemini_model_changes_across_turns() {
     let mut agent = AgentRecord {
         model: Some("gemini-2.5-flash".to_owned()),
         effort: None,
+        forked_from_session: None,
         id: agent_id,
         project_id: Uuid::now_v7(),
         name: "m4-gemini".to_owned(),
@@ -2720,6 +2730,7 @@ async fn live_antigravity_model_change_announced_on_resume() {
     let mut agent = AgentRecord {
         model: None,
         effort: None,
+        forked_from_session: None,
         id: agent_id,
         project_id: Uuid::now_v7(),
         name: "m4-agy".to_owned(),

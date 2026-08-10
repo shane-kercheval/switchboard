@@ -88,6 +88,21 @@ pub enum CoreError {
         axis: crate::harness::SelectionAxis,
     },
 
+    #[error(
+        "{harness} sessions cannot be branched \
+         — refusing to create a fork that could never resume its parent"
+    )]
+    SessionForkUnsupported {
+        harness: crate::harness::HarnessKind,
+    },
+
+    /// Forking needs a parent *session* id to `--resume` from, and a harness
+    /// that captures its locator at runtime has none until its first dispatch.
+    /// Distinct from [`Self::SessionForkUnsupported`]: that harness can never
+    /// fork, this agent just can't fork *yet*.
+    #[error("agent {agent_id} has no session to branch from yet")]
+    SessionForkSourceMissing { agent_id: uuid::Uuid },
+
     /// A reorder's id list must be an exact permutation of the current roster.
     /// Covers every shape failure (wrong length, unknown id, duplicate id) with
     /// one variant: the caller's list is stale or malformed either way, and the

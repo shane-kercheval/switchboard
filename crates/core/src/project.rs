@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::agent::{AgentRecord, SessionLocator, normalize_selection};
+use crate::agent::{AgentId, AgentRecord, SessionLocator, normalize_selection};
 use crate::error::{CoreError, Result};
 use crate::harness::{HarnessKind, SelectionAxis};
 use crate::io::{append_jsonl, read_jsonl, read_yaml, write_jsonl, write_yaml};
@@ -124,7 +124,7 @@ impl Project {
     /// `model` / `effort` are the user-selected per-agent settings (`None` =
     /// harness default). A selection on a harness that can't apply it (a model
     /// on Antigravity, an effort on Gemini/Antigravity) is rejected at the
-    /// persistence boundary — see `register_agent_inner_with_id`. This generic
+    /// persistence boundary — see `register_agent_inner`. This generic
     /// create path can't constrain that in its signature the way the attach
     /// variants do (Gemini takes no effort, Antigravity takes neither), so it
     /// relies on that shared chokepoint. The commands layer also validates
@@ -159,13 +159,66 @@ impl Project {
             HarnessKind::Gemini => Some(SessionLocator::Uuid(Uuid::new_v4())),
             HarnessKind::Codex | HarnessKind::Antigravity => None,
         };
-        self.register_agent_inner_with_id(
-            name,
+        self.register_agent_inner(name, harness, session_locator, model, effort, None)
+    }
+
+    /// Branch an existing agent's conversation into a new agent.
+    ///
+    /// The fork is an ordinary, equally first-class agent: it pre-generates its
+    /// own UUID v7 session locator (exactly like [`Self::register_agent`]'s
+    /// Claude arm, because Claude lets the caller choose a forked session's id)
+    /// and inherits the source's `model` / `effort` selections. What makes it a
+    /// fork is only [`AgentRecord::forked_from_session`], carrying the source's
+    /// session UUID.
+    ///
+    /// **Nothing forks here.** This method just registers the record;
+    /// materialization happens on the fork's *first dispatch*, which resumes
+    /// the parent session with `--fork-session` (see
+    /// `claude_code::build_args`). Deliberately lazy: forking eagerly would
+    /// need a synthetic prompt, costing quota and putting a throwaway turn in
+    /// both transcripts.
+    ///
+    /// Rejects a harness that can't branch, and a source with no session
+    /// locator to branch from — a fork whose `--resume` target doesn't exist
+    /// could never materialize, so it must not reach the registry.
+    ///
+    /// The derived name is `<source>-fork`, disambiguated as `-fork-2`,
+    /// `-fork-3`, … against the project's canonicalized uniqueness rule. (Not
+    /// "X (forked)": names must match `^[A-Za-z0-9_-]+$`.) Same TOCTOU
+    /// caveat as [`Self::register_agent`] — callers serialize.
+    pub fn fork_agent(&self, source_agent_id: AgentId) -> Result<AgentRecord> {
+        let agents = self.list_agents()?;
+        let source = agents
+            .iter()
+            .find(|a| a.id == source_agent_id)
+            .ok_or(CoreError::AgentNotFound(source_agent_id))?;
+
+        if !source.harness.supports_session_fork() {
+            return Err(CoreError::SessionForkUnsupported {
+                harness: source.harness,
+            });
+        }
+        // `supports_session_fork` is Claude-only, and Claude locators are always
+        // the `Uuid` shape — so `as_uuid()` failing here means no locator at all.
+        let parent_session = source
+            .session_locator
+            .as_ref()
+            .and_then(SessionLocator::as_uuid)
+            .ok_or(CoreError::SessionForkSourceMissing {
+                agent_id: source_agent_id,
+            })?;
+
+        let name = derive_fork_name(&agents, &source.name);
+        let harness = source.harness;
+        let model = source.model.clone();
+        let effort = source.effort.clone();
+        self.register_agent_inner(
+            &name,
             harness,
-            session_locator,
-            Uuid::now_v7(),
+            Some(SessionLocator::Uuid(Uuid::now_v7())),
             model,
             effort,
+            Some(parent_session),
         )
     }
 
@@ -182,13 +235,13 @@ impl Project {
         model: Option<String>,
         effort: Option<String>,
     ) -> Result<AgentRecord> {
-        self.register_agent_inner_with_id(
+        self.register_agent_inner(
             name,
             HarnessKind::ClaudeCode,
             Some(SessionLocator::Uuid(session_id)),
-            Uuid::now_v7(),
             model,
             effort,
+            None,
         )
     }
 
@@ -206,16 +259,16 @@ impl Project {
         model: Option<String>,
         effort: Option<String>,
     ) -> Result<AgentRecord> {
-        self.register_agent_inner_with_id(
+        self.register_agent_inner(
             name,
             HarnessKind::Codex,
             Some(SessionLocator::Codex {
                 thread_id,
                 partition_date,
             }),
-            Uuid::now_v7(),
             model,
             effort,
+            None,
         )
     }
 
@@ -235,12 +288,12 @@ impl Project {
         session_id: Uuid,
         model: Option<String>,
     ) -> Result<AgentRecord> {
-        self.register_agent_inner_with_id(
+        self.register_agent_inner(
             name,
             HarnessKind::Gemini,
             Some(SessionLocator::Uuid(session_id)),
-            Uuid::now_v7(),
             model,
+            None,
             None,
         )
     }
@@ -260,19 +313,20 @@ impl Project {
         name: &str,
         conversation_id: Uuid,
     ) -> Result<AgentRecord> {
-        self.register_agent_inner_with_id(
+        self.register_agent_inner(
             name,
             HarnessKind::Antigravity,
             Some(SessionLocator::Uuid(conversation_id)),
-            Uuid::now_v7(),
+            None,
             None,
             None,
         )
     }
 
     /// Shared validation + JSONL append. Caller decides the `session_locator`
-    /// strategy (create vs. attach, per-harness); every caller mints the
-    /// `agent_id` inline as `Uuid::now_v7()`. Private to enforce the public
+    /// strategy (create vs. attach, per-harness) and the fork provenance; the
+    /// `AgentId` is minted here (UUID v7) because it never varied by caller.
+    /// Private to enforce the public
     /// surface invariants: create-path uses `register_agent`, attach-path uses
     /// the harness-specific `register_attached_*` methods, so a Claude attach
     /// without a `session_locator` (or a Codex attach with one) is
@@ -285,14 +339,14 @@ impl Project {
     /// signatures; this catches the generic create path (and any future caller)
     /// so an unsupported selection can never reach `registry.jsonl`, regardless
     /// of whether a higher layer remembered to check.
-    fn register_agent_inner_with_id(
+    fn register_agent_inner(
         &self,
         name: &str,
         harness: HarnessKind,
         session_locator: Option<SessionLocator>,
-        agent_id: Uuid,
         model: Option<String>,
         effort: Option<String>,
+        forked_from_session: Option<Uuid>,
     ) -> Result<AgentRecord> {
         validate_name(name)?;
         // Normalize **before** the capability check: a blank selection means
@@ -316,13 +370,14 @@ impl Project {
         check_name_unique(&self.list_agents()?, name, None)?;
 
         let record = AgentRecord {
-            id: agent_id,
+            id: Uuid::now_v7(),
             project_id: self.id,
             name: name.to_owned(),
             harness,
             session_locator,
             model,
             effort,
+            forked_from_session,
             created_at: Utc::now(),
         };
 
@@ -529,6 +584,30 @@ fn check_name_unique(
     Ok(())
 }
 
+/// Derive an unused name for a fork of `source_name`: `<source>-fork`, then
+/// `-fork-2`, `-fork-3`, … until one is free under the project's canonicalized
+/// uniqueness rule.
+///
+/// Suffixing (rather than a parenthesized "(forked)") is forced by
+/// [`validate_name`]'s `^[A-Za-z0-9_-]+$`. Forking a fork therefore yields
+/// `x-fork-fork` — accepted as honest lineage rather than special-cased; the
+/// user can rename.
+///
+/// The search is bounded by the roster size: each candidate is distinct, so at
+/// most `agents.len()` of them can collide and one past that is always free.
+/// The final `unwrap_or` is therefore unreachable — it exists so the function
+/// stays total rather than panicking on an impossible state.
+fn derive_fork_name(agents: &[AgentRecord], source_name: &str) -> String {
+    let base = format!("{source_name}-fork");
+    if check_name_unique(agents, &base, None).is_ok() {
+        return base;
+    }
+    (2..=agents.len() + 2)
+        .map(|n| format!("{base}-{n}"))
+        .find(|candidate| check_name_unique(agents, candidate, None).is_ok())
+        .unwrap_or(base)
+}
+
 /// Load a `Project` from disk. Reads the per-project config.yaml; the caller has
 /// already located the project root (e.g., via `Directory::open_project`).
 pub(crate) fn load(directory: &Path, id: ProjectId, root: PathBuf) -> Result<Project> {
@@ -651,6 +730,161 @@ mod tests {
             "Gemini session_id must be UUID v4, got: {session_id} (version {})",
             session_id.get_version_num()
         );
+    }
+
+    #[test]
+    fn fork_agent_branches_from_the_source_session() {
+        let (_tmp, project) = fresh_project();
+        let source = project
+            .register_agent("alice", HarnessKind::ClaudeCode, None, None)
+            .unwrap();
+        let parent_session = source
+            .session_locator
+            .as_ref()
+            .and_then(SessionLocator::as_uuid)
+            .unwrap();
+
+        let fork = project.fork_agent(source.id).unwrap();
+
+        assert_eq!(fork.name, "alice-fork");
+        assert_ne!(fork.id, source.id);
+        assert_eq!(fork.harness, HarnessKind::ClaudeCode);
+        assert_eq!(fork.forked_from_session, Some(parent_session));
+        // The fork gets its OWN session to write into — sharing the parent's
+        // locator would make both agents drive one session.
+        let fork_session = fork
+            .session_locator
+            .as_ref()
+            .and_then(SessionLocator::as_uuid)
+            .expect("a fork pre-generates its own Claude locator");
+        assert_ne!(fork_session, parent_session);
+
+        // Appended after the source, and the source is untouched.
+        let listed = project.list_agents().unwrap();
+        assert_eq!(listed, vec![source, fork]);
+    }
+
+    #[test]
+    fn fork_agent_inherits_model_and_effort() {
+        let (_tmp, project) = fresh_project();
+        let source = project
+            .register_agent(
+                "alice",
+                HarnessKind::ClaudeCode,
+                Some("opus".to_owned()),
+                Some("high".to_owned()),
+            )
+            .unwrap();
+
+        let fork = project.fork_agent(source.id).unwrap();
+
+        assert_eq!(fork.model.as_deref(), Some("opus"));
+        assert_eq!(fork.effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn fork_agent_disambiguates_repeated_forks() {
+        let (_tmp, project) = fresh_project();
+        let source = project
+            .register_agent("alice", HarnessKind::ClaudeCode, None, None)
+            .unwrap();
+
+        assert_eq!(project.fork_agent(source.id).unwrap().name, "alice-fork");
+        assert_eq!(project.fork_agent(source.id).unwrap().name, "alice-fork-2");
+        assert_eq!(project.fork_agent(source.id).unwrap().name, "alice-fork-3");
+    }
+
+    #[test]
+    fn fork_agent_disambiguates_against_canonicalized_names() {
+        // Uniqueness is hyphen↔underscore + case insensitive, so a manually
+        // named `Alice_Fork` must push the derived name to `-fork-2` rather
+        // than producing a registry the roster considers duplicated.
+        let (_tmp, project) = fresh_project();
+        let source = project
+            .register_agent("alice", HarnessKind::ClaudeCode, None, None)
+            .unwrap();
+        project
+            .register_agent("Alice_Fork", HarnessKind::ClaudeCode, None, None)
+            .unwrap();
+
+        assert_eq!(project.fork_agent(source.id).unwrap().name, "alice-fork-2");
+    }
+
+    #[test]
+    fn fork_agent_rejects_a_harness_that_cannot_branch() {
+        let (_tmp, project) = fresh_project();
+        // Gemini pre-generates a locator, so this fails on the capability gate
+        // rather than on a missing session — the distinction the two error
+        // variants exist to preserve.
+        let source = project
+            .register_agent("g", HarnessKind::Gemini, None, None)
+            .unwrap();
+
+        let err = project.fork_agent(source.id).unwrap_err();
+
+        assert!(
+            matches!(err, CoreError::SessionForkUnsupported { harness } if harness == HarnessKind::Gemini),
+            "got: {err:?}"
+        );
+        assert_eq!(project.list_agents().unwrap().len(), 1, "no record written");
+    }
+
+    #[test]
+    fn fork_agent_rejects_a_source_with_no_session_yet() {
+        // A Claude agent always has a locator, so this state is only reachable
+        // through the registry directly — but the guard is what keeps a fork
+        // whose `--resume` target doesn't exist out of the registry.
+        let (_tmp, project) = fresh_project();
+        let source = project
+            .register_agent("alice", HarnessKind::ClaudeCode, None, None)
+            .unwrap();
+        let stranded = AgentRecord {
+            session_locator: None,
+            ..source
+        };
+        write_jsonl(&project.registry_path, std::slice::from_ref(&stranded)).unwrap();
+
+        let err = project.fork_agent(stranded.id).unwrap_err();
+
+        assert!(
+            matches!(err, CoreError::SessionForkSourceMissing { agent_id } if agent_id == stranded.id),
+            "got: {err:?}"
+        );
+        assert_eq!(project.list_agents().unwrap().len(), 1, "no record written");
+    }
+
+    #[test]
+    fn fork_agent_rejects_an_unknown_source() {
+        let (_tmp, project) = fresh_project();
+        let missing = Uuid::now_v7();
+
+        let err = project.fork_agent(missing).unwrap_err();
+
+        assert!(
+            matches!(err, CoreError::AgentNotFound(id) if id == missing),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn fork_of_a_fork_branches_from_the_forks_own_session() {
+        // Lineage is one hop: the grandchild resumes its *parent's* session, not
+        // the original's — otherwise it would lose the middle fork's turns.
+        let (_tmp, project) = fresh_project();
+        let source = project
+            .register_agent("alice", HarnessKind::ClaudeCode, None, None)
+            .unwrap();
+        let fork = project.fork_agent(source.id).unwrap();
+
+        let grandchild = project.fork_agent(fork.id).unwrap();
+
+        assert_eq!(
+            grandchild.forked_from_session,
+            fork.session_locator
+                .as_ref()
+                .and_then(SessionLocator::as_uuid)
+        );
+        assert_eq!(grandchild.name, "alice-fork-fork");
     }
 
     #[test]

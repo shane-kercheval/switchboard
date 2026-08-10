@@ -794,6 +794,7 @@ mod tests {
                 session_locator: Some(SessionLocator::Uuid(Uuid::now_v7())),
                 model: None,
                 effort: None,
+                forked_from_session: None,
                 created_at: Utc::now(),
             };
             let id = record.id;

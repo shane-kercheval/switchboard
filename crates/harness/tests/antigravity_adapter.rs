@@ -26,6 +26,7 @@ fn agy_agent() -> AgentRecord {
     AgentRecord {
         model: None,
         effort: None,
+        forked_from_session: None,
         id: Uuid::now_v7(),
         project_id: Uuid::now_v7(),
         name: "test-agy".to_owned(),

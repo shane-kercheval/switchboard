@@ -1637,6 +1637,7 @@ mod tests {
         let agent = AgentRecord {
             model: None,
             effort: None,
+            forked_from_session: None,
             id: Uuid::new_v4(),
             project_id: Uuid::new_v4(),
             name: "a".to_owned(),

@@ -90,6 +90,34 @@ impl HarnessKind {
             Self::Codex | Self::Gemini | Self::Antigravity => false,
         }
     }
+
+    /// Whether Switchboard can branch this harness's session into a new one —
+    /// diverging the conversation at the current tip so the branch carries the
+    /// full prior context but subsequent turns don't affect the original.
+    ///
+    /// True only for Claude, which exposes it headlessly as `--resume <parent>
+    /// --session-id <new> --fork-session` — and, decisively, lets the *caller*
+    /// choose the new session id, so a fork pre-generates its locator at
+    /// registration exactly like a fresh Claude agent. Codex has a headless
+    /// path only through the experimental app-server (`thread/fork`), a second
+    /// integration surface alongside `codex exec` that v1 deliberately does not
+    /// take on; Gemini's `--session-file` import drops tool calls and ignores
+    /// the caller's session id; Antigravity forks only server-side, on its own
+    /// initiative. Per `harness-behavior.md` §3.5.
+    ///
+    /// **Naming:** "session fork" here is Claude's `--fork-session`, which is
+    /// the headless equivalent of its TUI `/branch`. Claude's TUI `/fork` is an
+    /// unrelated operation (spawning a background agent that inherits the
+    /// conversation) — see the naming note in `harness-behavior.md` §3.5.
+    ///
+    /// Same authority + exhaustiveness role as the three siblings above.
+    #[must_use]
+    pub fn supports_session_fork(self) -> bool {
+        match self {
+            Self::ClaudeCode => true,
+            Self::Codex | Self::Gemini | Self::Antigravity => false,
+        }
+    }
 }
 
 /// The two independent per-agent selection axes. A closed, complete set — model
@@ -212,6 +240,17 @@ mod tests {
         assert!(!HarnessKind::Codex.supports_refresh());
         assert!(!HarnessKind::Gemini.supports_refresh());
         assert!(!HarnessKind::Antigravity.supports_refresh());
+    }
+
+    #[test]
+    fn supports_session_fork_is_claude_only() {
+        // Codex's app-server `thread/fork` and Gemini's lossy `--session-file`
+        // import exist but are deliberately unwired in v1 — this gate is what
+        // keeps the Fork action off those agents.
+        assert!(HarnessKind::ClaudeCode.supports_session_fork());
+        assert!(!HarnessKind::Codex.supports_session_fork());
+        assert!(!HarnessKind::Gemini.supports_session_fork());
+        assert!(!HarnessKind::Antigravity.supports_session_fork());
     }
 
     #[test]

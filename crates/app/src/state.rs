@@ -15,8 +15,8 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::git_registry::{self, GitRegistry};
+use crate::notification::{Notifier, NullNotifier};
 use crate::preferences::{self, Preferences};
-use crate::workflow_commands::{Notifier, NullNotifier};
 use crate::workspace::{self, Workspace};
 
 /// A live workflow run's in-memory handle. The on-disk `runs/<run-id>.jsonl` is
@@ -58,6 +58,30 @@ pub struct RunSnapshot {
     pub total_steps: usize,
     /// Zero-based index of the step currently in progress.
     pub current_step: usize,
+}
+
+/// What the user is looking at, as last reported by the frontend.
+///
+/// `seq` is the frontend's monotonically increasing navigation counter. Writes
+/// carrying a stale `seq` are dropped, so a slow IPC call issued before a rapid
+/// Settings → project → Git sequence cannot land after — and overwrite — a newer
+/// view.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VisibleProject {
+    pub project_id: Option<ProjectId>,
+    pub seq: u64,
+}
+
+impl VisibleProject {
+    /// Apply an update if it is newer than what we hold. Returns whether it was
+    /// applied — `false` means a newer view already won.
+    pub fn apply(&mut self, project_id: Option<ProjectId>, seq: u64) -> bool {
+        if seq < self.seq {
+            return false;
+        }
+        *self = Self { project_id, seq };
+        true
+    }
 }
 
 /// The single piece of state managed by Tauri. Multi-project and
@@ -130,6 +154,18 @@ pub struct AppState {
     pub directories: Mutex<HashMap<PathBuf, Directory>>,
     pub projects: Mutex<HashMap<ProjectId, Project>>,
     pub active_project_id: Mutex<Option<ProjectId>>,
+    /// The project whose transcript is **rendered on screen right now**, or
+    /// `None` when nothing is (Settings, the Git view, a project still loading).
+    ///
+    /// Deliberately separate from [`Self::active_project_id`], which answers a
+    /// different question — "which project would a backend action target" — and
+    /// stays set while the user is in Settings or the Git view. Only the
+    /// notification gate reads this, to stay quiet about the one outcome the user
+    /// can already see. Merging the two would silently reintroduce that bug.
+    ///
+    /// Carries the frontend's monotonic sequence number alongside the value so a
+    /// slow write cannot clobber a newer view during rapid navigation.
+    pub visible_project: Mutex<VisibleProject>,
     /// Acquired around any operation that appends to a JSONL on disk
     /// (`projects.jsonl` or a project's `registry.jsonl`). `std::sync::Mutex`
     /// because the protected work is fully synchronous — no `.await` while
@@ -288,8 +324,12 @@ pub struct AppState {
 
     /// Fires OS notifications on a workflow run's completion/failure (suppressed
     /// when the window is focused). Defaults to a no-op; production injects the
-    /// plugin-backed notifier via [`AppState::with_notifier`].
+    /// gated notifier via [`AppState::with_notifier`].
     pub notifier: Arc<dyn Notifier>,
+    /// Shared with the notification delivery path so the permission prompt is
+    /// requested once and any pending request is awaited before a notification is
+    /// posted — see [`crate::notification::AuthorizationGate`].
+    pub notification_gate: Arc<crate::notification::AuthorizationGate>,
 
     /// The **user-global** workflows directory (`<config-dir>/workflows`) — the
     /// single store of workflow definitions, shared across every project (unlike
@@ -310,6 +350,7 @@ impl AppState {
             directories: Mutex::new(HashMap::new()),
             projects: Mutex::new(HashMap::new()),
             active_project_id: Mutex::new(None),
+            visible_project: Mutex::new(VisibleProject::default()),
             registry_write: Arc::new(Mutex::new(())),
             dispatcher: Arc::new(Dispatcher::new()),
             claude_adapter,
@@ -330,6 +371,9 @@ impl AppState {
             forwards: Mutex::new(HashMap::new()),
             workflow_runs: Arc::new(Mutex::new(HashMap::new())),
             notifier: Arc::new(NullNotifier),
+            notification_gate: Arc::new(crate::notification::AuthorizationGate::new(Arc::new(
+                crate::notification::OsAuthorizationRequester,
+            ))),
             workflows_dir: None,
         }
     }
@@ -482,6 +526,39 @@ pub(crate) fn persist_git_registry(state: &AppState) {
 /// here can panic with the lock held, so this is defensive only.
 pub(crate) fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(test)]
+mod visible_project_tests {
+    use super::*;
+
+    #[test]
+    fn a_stale_sequence_number_is_dropped() {
+        // Rapid Settings → project → Git navigation issues overlapping writes.
+        // Without this guard, the slowest one wins and the gate reasons about a
+        // view the user has already left.
+        let mut v = VisibleProject::default();
+        let newer = ProjectId::from_u128(1);
+        assert!(v.apply(Some(newer), 5));
+        assert!(
+            !v.apply(Some(ProjectId::from_u128(2)), 3),
+            "older write loses"
+        );
+        assert_eq!(v.project_id, Some(newer));
+    }
+
+    #[test]
+    fn an_equal_or_newer_sequence_number_applies() {
+        let mut v = VisibleProject::default();
+        assert!(v.apply(Some(ProjectId::from_u128(1)), 1));
+        assert!(
+            v.apply(None, 1),
+            "a re-send of the current view still applies"
+        );
+        assert_eq!(v.project_id, None);
+        assert!(v.apply(Some(ProjectId::from_u128(2)), 2));
+        assert_eq!(v.project_id, Some(ProjectId::from_u128(2)));
+    }
 }
 
 #[cfg(test)]

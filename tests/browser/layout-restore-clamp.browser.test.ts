@@ -6,9 +6,11 @@ import SidebarPanel from "$lib/components/ui/SidebarPanel.svelte";
 import ResizableSidebarHost from "./ResizableSidebarHost.svelte";
 import {
   GIT_REPO_MAX_WIDTH,
+  RIGHT_SIDEBAR_MAX_WIDTH,
   SIDEBAR_MAX_WIDTH,
   _testing,
   layout,
+  rightSidebarMaxWidth,
   sidebarMaxWidth,
 } from "$lib/layout.svelte";
 
@@ -58,6 +60,34 @@ test("a sidebar width saved on a larger monitor clamps to the live viewport on r
     children: body,
   });
   const panel = document.querySelector<HTMLElement>('[data-testid="clamped-panel"]');
+  await expect.poll(() => panel?.getBoundingClientRect().width).toBe(expected);
+});
+
+// The Pins reading surface carries its own max, higher than the rail's, in two
+// places that must agree: `RIGHT_SIDEBAR_MAX_WIDTH` (which clamps the stored and
+// committed width) and a `max-w-[clamp(...)]` on the panel itself. Raising only
+// the constant leaves the drag feeling responsive — the store updates and
+// persists — while the panel silently stops widening at the stale CSS bound.
+// jsdom cannot catch that: it does not implement `clamp()` or layout, so a jsdom
+// test can only assert the class string, never its effect. Measuring the
+// rendered box in WebKit is what actually pins the two together.
+test("the pins reading profile renders as wide as its max, beyond the rail bound", async () => {
+  // Wide enough that the absolute max binds rather than the 60vw term.
+  await page.viewport(1800, 900);
+
+  const expected = rightSidebarMaxWidth();
+  expect(expected).toBe(RIGHT_SIDEBAR_MAX_WIDTH);
+  expect(expected).toBeGreaterThan(SIDEBAR_MAX_WIDTH);
+
+  render(SidebarPanel, {
+    side: "right",
+    widthProfile: "reading",
+    width: expected,
+    testid: "reading-panel",
+    children: body,
+  });
+
+  const panel = document.querySelector<HTMLElement>('[data-testid="reading-panel"]');
   await expect.poll(() => panel?.getBoundingClientRect().width).toBe(expected);
 });
 

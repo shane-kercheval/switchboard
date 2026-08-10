@@ -38,7 +38,7 @@ export const PINS_SORT_DEFAULT_MODE: PinsSortMode = "pinned_at";
 
 export const SIDEBAR_MIN_WIDTH = 200;
 export const SIDEBAR_MAX_WIDTH = 480;
-export const RIGHT_SIDEBAR_MAX_WIDTH = 720;
+export const RIGHT_SIDEBAR_MAX_WIDTH = 960;
 export const GIT_REPO_MIN_WIDTH = 240;
 export const GIT_REPO_MAX_WIDTH = 480;
 export const DIFF_FILE_LIST_MIN_WIDTH = 176;

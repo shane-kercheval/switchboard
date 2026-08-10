@@ -29,7 +29,7 @@
   class={cn(
     "bg-panel relative flex shrink-0 flex-col",
     widthProfile === "reading"
-      ? "max-w-[clamp(200px,60vw,720px)]"
+      ? "max-w-[clamp(200px,60vw,960px)]"
       : "max-w-[clamp(200px,40vw,480px)]",
     side === "left" ? "border-border/80 border-r" : "border-border/80 border-l",
   )}

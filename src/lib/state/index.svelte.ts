@@ -52,6 +52,7 @@ import type {
 } from "$lib/types";
 import { HEARTBEAT_TIMEOUT_MS } from "$lib/types";
 import { _internal, freshRuntime, runtimeReducer, transcriptReducer } from "./reducers";
+import { settleAgentsRemoved, settleRecipient } from "./sendCompletion";
 import type { AgentRuntime, PendingSend, RuntimeMap, ToolCall, TranscriptMap, Turn } from "./types";
 
 /// Per-agent turn lists, keyed by `agent_id`. The unified-view renderer
@@ -449,6 +450,10 @@ export function failSendStart(
   // genuinely processing this send. No-op (don't stomp the live turn).
   if (pending === undefined || idx < 0) return;
   const entry = pending[idx];
+  // A pre-dispatch IPC rejection never reaches the event stream, so the send
+  // tracker has to be told here or a send that failed for every recipient would
+  // silently never notify.
+  settleRecipient(entry?.send_id, agentId, "failed");
   const remaining = [...pending.slice(0, idx), ...pending.slice(idx + 1)];
   const pending_sends = remaining.length === 0 ? undefined : remaining;
   runtimes[agentId] =
@@ -551,6 +556,10 @@ export function markHydrationAttempted(agentId: AgentId): void {
 /// — ids are persisted on disk and survive removal — starts clean rather than
 /// reusing stale listeners, transcripts, or hydration guards.
 export function unregisterAgents(agentIds: AgentId[]): void {
+  // Before the listeners go: a torn-down agent will never report an outcome, and
+  // an unsettled recipient blocks its whole send — including the notification the
+  // *surviving* recipients earned.
+  settleAgentsRemoved(agentIds);
   for (const agentId of agentIds) {
     const unlisten = listenerRegistry.get(agentId);
     if (unlisten !== undefined) {
@@ -640,6 +649,25 @@ function handleEvent(agentId: AgentId, event: NormalizedEvent): void {
   // turns still group side-by-side live without waiting for a reload's journal merge.
   const eventSendId = event.type === "turn_start" ? event.send_id : undefined;
   const sendId = startEntry?.send_id ?? eventSendId ?? cancelledSendId ?? failedSendId;
+  // Settle the send tracker from the events that carry a terminal outcome. Driven
+  // from this existing boundary rather than a second `listen` per agent — that
+  // would break the one-listener-per-agent invariant this module documents.
+  if (event.type === "turn_end") {
+    const turn = priorTurns.find((t) => t.role === "agent" && t.turn_id === event.turn_id);
+    settleRecipient(
+      turn?.role === "agent" ? (turn.send_id ?? undefined) : undefined,
+      agentId,
+      event.outcome.status === "cancelled"
+        ? "cancelled"
+        : event.outcome.status === "failed"
+          ? "failed"
+          : "completed",
+    );
+  } else if (event.type === "message_failed") {
+    settleRecipient(failedSendId, agentId, "failed");
+  } else if (event.type === "message_cancelled") {
+    settleRecipient(cancelledSendId, agentId, "cancelled");
+  }
   setTranscript(
     agentId,
     transcriptReducer(

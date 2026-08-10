@@ -40,23 +40,6 @@ pub fn progress_channel(project_id: ProjectId) -> String {
     format!("workflow:{project_id}")
 }
 
-/// Fires OS notifications for a workflow run's terminal. Injected into `AppState`
-/// so the run's background task can notify without depending on Tauri internals;
-/// the production impl wraps the notification plugin and suppresses when the
-/// window is focused, while tests record calls. Called **only** for completion
-/// and failure — never cancel or interruption.
-pub trait Notifier: Send + Sync {
-    fn notify(&self, title: &str, body: &str);
-}
-
-/// A notifier that drops every call — the default until production injects a real
-/// one, and the choice for headless tests that don't assert on notifications.
-pub struct NullNotifier;
-
-impl Notifier for NullNotifier {
-    fn notify(&self, _title: &str, _body: &str) {}
-}
-
 /// Builds a per-send [`DispatchContextFactory`] for each agent a run may target.
 /// Constructed at invoke from the run's project roster. An agent on an unsupported
 /// harness is **omitted** (not a hard failure), so `factory_for` returns `None`
@@ -1027,6 +1010,8 @@ pub fn invoke_workflow_impl(
 
     let workflow_runs = Arc::clone(&state.workflow_runs);
     let notifier = Arc::clone(&state.notifier);
+    // Resolved here rather than in the spawned task, which has no `AppState`.
+    let project_name = project.name().to_owned();
     tokio::spawn(async move {
         let status = run.execute().await;
         // The run is terminal: drop the registry entry, apply retention, then
@@ -1035,20 +1020,51 @@ pub fn invoke_workflow_impl(
         lock(&workflow_runs).remove(&run_id);
         apply_retention(&run_path, status);
         done.notify_one();
-        match status {
-            RunStatus::Complete => {
-                notifier.notify("Workflow complete", &format!("{workflow_name} finished."));
-            }
-            RunStatus::Failed => {
-                notifier.notify("Workflow failed", &format!("{workflow_name} failed."));
-            }
-            // No notification on user-initiated cancel; interruption has no live
-            // process and is surfaced in the indicator on restart instead.
-            _ => {}
-        }
+        notify_run_terminal(
+            notifier.as_ref(),
+            project_id,
+            &project_name,
+            &workflow_name,
+            status,
+        );
     });
 
     Ok(run_id)
+}
+
+/// Notify the user of a run's terminal — **completion and failure only**.
+///
+/// A user-initiated cancel is silent: it is what they just asked for. An
+/// interrupted run is silent too, because it has no live process to have been
+/// waiting on; the run indicator surfaces it on the next start instead.
+///
+/// The body leads with the project, matching send-completion notifications:
+/// every notification has to say *which* project it is about, since one can
+/// arrive while the user is working in a different one.
+fn notify_run_terminal(
+    notifier: &dyn crate::notification::Notifier,
+    project_id: ProjectId,
+    project_name: &str,
+    workflow_name: &str,
+    status: RunStatus,
+) {
+    match status {
+        RunStatus::Complete => {
+            notifier.notify(
+                project_id,
+                "Workflow complete",
+                &format!("{project_name}: {workflow_name}"),
+            );
+        }
+        RunStatus::Failed => {
+            notifier.notify(
+                project_id,
+                "Workflow failed",
+                &format!("{project_name}: {workflow_name}"),
+            );
+        }
+        _ => {}
+    }
 }
 
 /// Retention keyed off the returned status: prune a `Complete`/`Cancelled` run

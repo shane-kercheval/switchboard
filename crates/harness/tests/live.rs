@@ -954,6 +954,93 @@ async fn live_claude_resume_reuses_session() {
     );
 }
 
+/// The same two-turn resume, but from a cwd whose name contains `_`.
+///
+/// `live_claude_resume_reuses_session` runs in `/tmp`, so it only exercises
+/// paths made of `/` and alphanumerics — it passed for months while any agent
+/// in a directory like `switchboard-mcp_oauth` was permanently stranded.
+/// Claude Code collapses every non-alphanumeric character in the cwd (`_` and
+/// spaces included) when naming its session-storage directory; if
+/// Switchboard's `encode_cwd` disagrees, the adapter looks in a directory that
+/// does not exist, concludes "first turn," and passes `--session-id` for a
+/// session that already exists — which claude rejects with "Session ID … is
+/// already in use" on every subsequent turn.
+///
+/// Pins the encoding against the real CLI, where a unit test can only pin it
+/// against our own belief about the CLI.
+#[tokio::test]
+#[ignore = "requires claude installed — run with: make test-live"]
+async fn live_claude_resume_reuses_session_in_underscored_cwd() {
+    let adapter = ClaudeCodeAdapter::new();
+    let session_id = Uuid::now_v7();
+
+    // A *stable* path, not a fresh TempDir: claude creates a session directory
+    // under the developer's real `~/.claude/projects/`, which this test cannot
+    // clean up. A random cwd per run would leave a new directory behind every
+    // time and clutter their own `claude --resume` picker. The `/tmp`-based
+    // sibling test reuses one directory for the same reason.
+    let cwd = std::env::temp_dir().join("sw_live_probe_underscored");
+    std::fs::create_dir_all(&cwd).expect("create underscored cwd");
+    let cwd = cwd.canonicalize().expect("canonicalize cwd");
+    assert!(
+        cwd.to_string_lossy().contains('_'),
+        "the cwd must contain an underscore for this test to mean anything"
+    );
+
+    let agent = |name: &str| AgentRecord {
+        model: None,
+        effort: None,
+        id: Uuid::now_v7(),
+        project_id: Uuid::now_v7(),
+        name: name.to_owned(),
+        harness: HarnessKind::ClaudeCode,
+        session_locator: Some(SessionLocator::Uuid(session_id)),
+        created_at: chrono::Utc::now(),
+    };
+
+    let completed = async |a: AgentRecord, prompt: &str| -> bool {
+        let stream = adapter
+            .dispatch(&a, &cwd, prompt, Uuid::now_v7(), DispatchOptions::default())
+            .await
+            .expect("dispatch should succeed");
+        let events: Vec<AdapterEvent> = stream.collect().await;
+        events.iter().any(|e| {
+            matches!(
+                e,
+                AdapterEvent::TurnEnd {
+                    outcome: TurnOutcome::Completed,
+                    ..
+                }
+            )
+        })
+    };
+
+    assert!(
+        completed(agent("underscore-1"), "Say ACK").await,
+        "first turn should create the session"
+    );
+
+    // Assert the encoding *directly*, not just via the second turn succeeding.
+    // Without this the test infers correctness from claude currently rejecting
+    // a reused `--session-id`; a future CLI that tolerated that would let this
+    // go green with a wrong encoder — restoring the exact false confidence the
+    // test exists to remove. This also fails with a diagnosable message.
+    let expected = claude_session_file_path(&home_dir(), &cwd, &session_id);
+    assert!(
+        expected.exists(),
+        "claude wrote its session somewhere other than {}; `encode_cwd` and the \
+         CLI disagree about how to encode {}",
+        expected.display(),
+        cwd.display()
+    );
+
+    assert!(
+        completed(agent("underscore-2"), "Say ACK again").await,
+        "second turn must resume, not re-create: a `--session-id` here fails \
+         with \"Session ID … is already in use\""
+    );
+}
+
 /// The backend contract the staleness refresh stands on: continuing a session
 /// (a second turn appended to the file, exactly as a TUI continuation does)
 /// makes a re-read return the new turn with a **new, distinct** `hydration_key`

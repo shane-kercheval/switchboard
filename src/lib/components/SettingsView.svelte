@@ -23,10 +23,17 @@
     openLocalPromptsDir,
     workflowsDir as workflowsDirApi,
     openWorkflowsDir,
+    notificationAvailability,
   } from "$lib/api";
+  import type { NotificationAvailability } from "$lib/types";
   import { workflowAuthoringPrompt } from "$lib/workflowAuthoring";
 
   let { onClose }: { onClose: () => void } = $props();
+  // What macOS will actually do, as opposed to what the toggle below says. Only
+  // the suppressed case is surfaced; `unavailable` (a dev build that isn't an
+  // installed app) earns its place by *not* rendering that warning, since
+  // "macOS is blocking notifications" would be wrong there.
+  let notifyAvailability = $state<NotificationAvailability | null>(null);
   let promptsDir = $state<string | null>(null);
   let promptsDirError = $state<string | null>(null);
   let workflowsDir = $state<string | null>(null);
@@ -93,6 +100,13 @@
     },
   ];
 
+  /// Whether the last failed preference save involved any of `keys` — so the
+  /// warning renders beside the control the user actually touched instead of in
+  /// whichever section happens to own the renderer.
+  function saveFailedFor(...keys: string[]): boolean {
+    return saveStatus.error !== null && keys.some((k) => saveStatus.keys.includes(k));
+  }
+
   const sectionClass = "border-border space-y-3 border-t pt-5";
   const sectionHeadingClass = "text-fg text-base font-semibold";
 
@@ -114,6 +128,16 @@
       .catch((e: unknown) => {
         workflowsDir = null;
         workflowsDirError = e instanceof Error ? e.message : String(e);
+      });
+    void notificationAvailability()
+      .then((a) => {
+        notifyAvailability = a;
+      })
+      .catch((e: unknown) => {
+        // A failed probe is not a failed feature: leave the hint unrendered
+        // rather than claiming something is wrong that we couldn't check.
+        notifyAvailability = null;
+        console.error("[switchboard] notification availability check failed", e);
       });
   });
 
@@ -264,7 +288,7 @@
         <code class="font-mono">difftool.&lt;tool&gt;</code> options.
       </p>
 
-      {#if saveStatus.error}
+      {#if saveFailedFor("editor_command", "terminal_app", "diff_style")}
         <p class="text-status-failed text-xs leading-relaxed" data-testid="git-prefs-save-error">
           Couldn't save your preferences ({saveStatus.error}). The change applies for now but may
           not survive a restart.
@@ -305,6 +329,101 @@
         </p>
       </div>
       <HarnessStatusList />
+    </section>
+
+    <section class={cn(sectionClass, "mt-7")} data-testid="notification-prefs">
+      <div>
+        <h2 class={sectionHeadingClass}>Notifications</h2>
+        <p class="text-muted mt-1 text-sm leading-relaxed">
+          Switchboard can post a macOS notification when your agents finish — when every recipient
+          of a send has responded, and when a workflow run reaches its end.
+        </p>
+        <p class="text-muted mt-2 text-sm leading-relaxed">
+          While you're working in Switchboard, the project on screen never notifies. Other projects
+          stay quiet too, unless you turn on the setting below.
+        </p>
+        <p class="text-muted mt-2 text-sm leading-relaxed">
+          Whether a notification appears as a banner, plays a sound, or both is set in System
+          Settings → Notifications → Applications → Switchboard.
+        </p>
+      </div>
+
+      <div class="flex items-start justify-between gap-4">
+        <div class="min-w-0">
+          <div class="text-fg text-sm">Notify me when agents finish</div>
+          <p class="text-muted mt-0.5 text-xs leading-relaxed">
+            Turn this off to stop all notifications, including the sound.
+          </p>
+        </div>
+        <button
+          type="button"
+          role="switch"
+          aria-checked={preferences.notify_on_completion}
+          aria-label="Notify me when agents finish"
+          data-testid="notify-toggle"
+          class={cn(
+            "relative mt-0.5 inline-flex h-5 w-9 shrink-0 cursor-pointer items-center rounded-full transition-colors outline-none",
+            preferences.notify_on_completion ? "bg-accent" : "bg-active",
+          )}
+          onclick={() =>
+            void updatePreferences({ notify_on_completion: !preferences.notify_on_completion })}
+        >
+          <span
+            class={cn(
+              "bg-raised inline-block h-4 w-4 transform rounded-full transition-transform",
+              preferences.notify_on_completion ? "translate-x-4" : "translate-x-0.5",
+            )}
+          ></span>
+        </button>
+      </div>
+
+      <div class="flex items-start justify-between gap-4">
+        <div class="min-w-0">
+          <div class={cn("text-sm", preferences.notify_on_completion ? "text-fg" : "text-muted")}>
+            Also notify me about other projects while I'm using Switchboard
+          </div>
+          <p class="text-muted mt-0.5 text-xs leading-relaxed">
+            The projects sidebar shows a checkmark when a project finishes in the background. Turn
+            this on to get a notification too.
+          </p>
+        </div>
+        <button
+          type="button"
+          role="switch"
+          disabled={!preferences.notify_on_completion}
+          aria-checked={preferences.notify_while_focused}
+          aria-label="Also notify me about other projects while I'm using Switchboard"
+          data-testid="notify-while-focused-toggle"
+          class={cn(
+            "relative mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors outline-none",
+            preferences.notify_on_completion ? "cursor-pointer" : "cursor-not-allowed opacity-50",
+            preferences.notify_while_focused ? "bg-accent" : "bg-active",
+          )}
+          onclick={() =>
+            void updatePreferences({ notify_while_focused: !preferences.notify_while_focused })}
+        >
+          <span
+            class={cn(
+              "bg-raised inline-block h-4 w-4 transform rounded-full transition-transform",
+              preferences.notify_while_focused ? "translate-x-4" : "translate-x-0.5",
+            )}
+          ></span>
+        </button>
+      </div>
+
+      {#if saveFailedFor("notify_on_completion", "notify_while_focused")}
+        <p class="text-status-failed text-xs leading-relaxed" data-testid="notify-save-error">
+          Couldn't save your preferences ({saveStatus.error}). The change applies for now but may
+          not survive a restart.
+        </p>
+      {/if}
+
+      {#if notifyAvailability === "suppressed"}
+        <p class="text-status-failed text-xs leading-relaxed" data-testid="notify-suppressed">
+          macOS is blocking notifications for Switchboard, so this setting has no effect. Turn them
+          back on in System Settings → Notifications → Applications → Switchboard.
+        </p>
+      {/if}
     </section>
 
     <section class={cn(sectionClass, "mt-7")}>

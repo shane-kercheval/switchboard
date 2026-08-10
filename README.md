@@ -26,6 +26,7 @@ Switchboard also has a **Git view** for reviewing repositories, changed files, d
 - **Keep important messages beside the transcript.** Pin complete messages in the sidebar so you can refer to them while working elsewhere, then jump back to their original location when needed.
 - **Search and navigate long conversations.** Search message text across agents, filter by role or pinned status, preview results, and jump back to a result when its agent is visible in a pane.
 - **Keep track of work across projects.** The project list shows which projects are still running, marks background work when it finishes, and lets you jump directly to newly completed work you haven't viewed.
+- **macOS notifications.** Switchboard notifies you when your agents finish and when a workflow run ends, while you're working in another app. Clicking the notification brings Switchboard forward. An optional setting extends this to your other projects while you're still in Switchboard, so a project finishing in the background reaches you while you're reading a different one.
 
 ## Install
 
@@ -125,6 +126,20 @@ Switchboard drives each agent through its own CLI, so it inherits that CLI's cap
 - **Some messages can't be pinned.** Switchboard disables Pin when a message has no identity that survives reopening rather than risk attaching the pin to a different message. This includes some imported history and every Antigravity reply. A newly completed Gemini reply becomes pinnable after you reopen Switchboard and its session history is loaded. User messages sent through Switchboard can still be pinned.
 - **Picking up terminal-continued sessions.** If you continue a session in the agent CLI's own terminal, **Claude Code** picks up the new turns when you switch back to the project. **Codex, Gemini, and Antigravity don't yet** — reopen Switchboard to load their updated history.
 - **Slash-leading prompts can retain CLI command behavior.** Switchboard centrally resolves and renders the same prompt for each selected agent, but Gemini still processes recognized slash-leading text as native commands. Avoid slash-leading prompt bodies when they must behave the same across agent CLIs.
+
+## Notifications
+
+A turn can run for a long time, and the point of running several agents at once is that you go and do something else while they work. Switchboard posts a macOS notification when a message you sent has been answered by every agent it went to, and when a workflow run reaches its end. The notification names the project and the agents involved, so it tells you where to go back to. Clicking it brings Switchboard forward.
+
+Which notifications reach you depends on where you are. When Switchboard isn't the app you're using, everything notifies. When it is, the project on screen stays quiet, because its transcript is already telling you. Your other projects stay quiet too by default; the projects sidebar marks them as finished instead. Turn on the second setting in Settings → Notifications if you'd rather be interrupted than notice the marker later.
+
+The first time it needs to notify you, macOS asks for permission. **The Allow button is behind the "Options" dropdown** — the prompt is easy to dismiss without noticing it:
+
+<!-- Sized in HTML, not scaled down on disk: the capture is 2x, so rendering it at
+     half its pixel width keeps it crisp on a Retina display. -->
+<img src="docs/images/notification-permission.png" width="368" alt="macOS notification permission prompt, with Allow under the Options dropdown" />
+
+If you miss it, Settings → Notifications tells you macOS is blocking notifications and where to turn them back on (System Settings → Notifications → Applications → Switchboard).
 
 ## Design and discussion
 

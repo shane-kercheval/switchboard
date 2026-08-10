@@ -1199,18 +1199,29 @@ pub fn add_mcp_provider_impl(
 
 /// Run the browser sign-in flow for a saved OAuth provider, then rebuild the
 /// prompt cache in the background so its prompts appear once signed in.
+///
+/// The rebuild runs on failure too: a failed sign-in can still have made a
+/// durable change (a re-registration wipes the previous tokens before the
+/// browser opens), and skipping the sync would leave the old authorization's
+/// prompts listed and selectable next to a sign-in error. Failures that
+/// changed nothing (unknown provider, wrong auth mode, flow already in
+/// progress) also trigger a sync — accepted waste: it is serialized,
+/// per-provider-budgeted, and not worth threading a changed-anything
+/// disposition through the error type to avoid.
 pub async fn sign_in_mcp_provider_impl(state: &AppState, name: &str) -> Result<(), AppError> {
-    state.prompts.sign_in_mcp_provider(name).await?;
+    let result = state.prompts.sign_in_mcp_provider(name).await;
     spawn_prompt_sync(state);
-    Ok(())
+    Ok(result?)
 }
 
 /// Sign out an OAuth provider (clear its tokens, keep its registration) and
 /// rebuild the cache so its prompts drop out and its status reads needs-auth.
+/// Syncs on failure too, mirroring sign-in (a partial failure may still have
+/// changed durable state).
 pub async fn sign_out_mcp_provider_impl(state: &AppState, name: &str) -> Result<(), AppError> {
-    state.prompts.sign_out_mcp_provider(name).await?;
+    let result = state.prompts.sign_out_mcp_provider(name).await;
     spawn_prompt_sync(state);
-    Ok(())
+    Ok(result?)
 }
 
 /// Remove a generic MCP provider: deletes its config entry + keychain token and
@@ -17608,6 +17619,37 @@ mod tests {
 
         remove_mcp_provider_impl(&state, "team").unwrap();
         assert!(list_mcp_providers_impl(&state).is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_sign_in_still_triggers_a_prompt_sync() {
+        // A failed sign-in can follow a durable change (a re-registration
+        // wipes the previous tokens before the browser opens), so the impl
+        // refreshes the prompt cache even on error — otherwise the old
+        // authorization's prompts would stay listed next to a sign-in error.
+        let (tmp, state, emitter) = fresh_state_with_mock();
+        let prompts_dir = tmp.path().join("prompts");
+        std::fs::create_dir_all(&prompts_dir).unwrap();
+        let service = switchboard_prompts::PromptService::new(
+            tmp.path().join("config.yaml"),
+            prompts_dir,
+            None,
+            Arc::new(switchboard_prompts::InMemorySecretStore::new()),
+        );
+        let state = state.with_prompts(service);
+
+        assert!(sign_in_mcp_provider_impl(&state, "nope").await.is_err());
+        for _ in 0..100 {
+            if emitter
+                .snapshot()
+                .iter()
+                .any(|(name, _)| name == PROMPTS_SYNCED_EVENT)
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("no {PROMPTS_SYNCED_EVENT} emitted after a failed sign-in");
     }
 
     #[tokio::test]

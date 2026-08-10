@@ -43,7 +43,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::error::PromptError;
-use crate::oauth::{OAuthRegistration, ProviderCredentialStore};
+use crate::oauth::{CredentialLifecycle, OAuthRegistration, ProviderCredentialStore};
 use crate::preflight::{as_identifier, preflight};
 
 /// Opens a URL in the user's browser. Injected into [`crate::PromptService`]
@@ -102,11 +102,16 @@ pub(crate) struct SignInRequest<'a> {
     pub http: &'a reqwest::Client,
     pub opener: &'a dyn BrowserOpener,
     pub store: &'a ProviderCredentialStore,
-    /// The provider's cached session client, when one exists. The commit step
-    /// takes its auth-manager mutex, so an in-flight token refresh fully
-    /// finishes (and persists) before the sign-in's tokens land — the two
-    /// writes serialize instead of interleaving.
-    pub cached_client: Option<AuthClient<reqwest::Client>>,
+    /// The provider's lifecycle state — the commit takes its `client_gate` so
+    /// no session client can finish construction while the tokens land.
+    pub lifecycle: &'a CredentialLifecycle,
+    /// Looks up the provider's *currently* cached session client. Called at
+    /// commit time (under the `client_gate`), never sampled ahead of the
+    /// browser wait: a client built during the flow must still be seen, so
+    /// its in-flight token refresh fully finishes (and persists) before the
+    /// sign-in's tokens land — the two writes serialize instead of
+    /// interleaving.
+    pub resample_cached_client: &'a (dyn Fn() -> Option<AuthClient<reqwest::Client>> + Sync),
     pub provider: &'a str,
     pub canonical_url: &'a str,
     pub scopes_override: Option<&'a [String]>,
@@ -176,7 +181,16 @@ async fn drive_sign_in(
     let mut scopes = outcome.scopes.unwrap_or_default();
     scopes.sort();
     scopes.dedup();
-    let issuer = outcome.metadata.issuer.clone().unwrap_or_default();
+    // Unreachable past the preflight's issuer gate — but if that invariant
+    // ever weakened, a defaulted empty issuer would make every stored
+    // registration look incompatible, silently re-registering (and wiping
+    // tokens) on every sign-in. Fail loudly instead.
+    let issuer = outcome.metadata.issuer.clone().ok_or_else(|| {
+        flow_err(
+            request.provider,
+            "authorization-server metadata unexpectedly lacks an issuer".to_owned(),
+        )
+    })?;
 
     let mut manager = AuthorizationManager::new(request.canonical_url)
         .await
@@ -230,7 +244,29 @@ async fn drive_sign_in(
         .await
         .map_err(|e| flow_err(request.provider, format!("could not open the browser: {e}")))?;
 
-    exchange_and_commit(request, &manager, &staging, &listener, &expected_state).await
+    exchange_and_commit(
+        request,
+        &manager,
+        &staging,
+        &listener,
+        &expected_state,
+        *registration_changed,
+    )
+    .await
+}
+
+/// The suffix for abandoned/timed-out flows, precise about what did and did
+/// not change: no tokens were stored either way, but a flow that re-registered
+/// has already (deliberately) cleared any previously stored authorization —
+/// without the condition, the common closed-the-tab case would read as though
+/// something was destroyed.
+fn no_tokens_note(registration_changed: bool) -> &'static str {
+    if registration_changed {
+        " No sign-in tokens were stored; this flow had updated the provider's client \
+         registration, so any previously stored authorization was already cleared"
+    } else {
+        " No sign-in tokens were stored and the provider's existing state is unchanged"
+    }
 }
 
 /// The post-browser half of the flow: await the state-matched callback,
@@ -242,6 +278,7 @@ async fn exchange_and_commit(
     staging: &StagingCredentialStore,
     listener: &TcpListener,
     expected_state: &str,
+    registration_changed: bool,
 ) -> Result<(), PromptError> {
     let callback = tokio::time::timeout(
         request.callback_timeout,
@@ -252,10 +289,11 @@ async fn exchange_and_commit(
         flow_err(
             request.provider,
             format!(
-                "the browser sign-in was not completed within {}s and no credentials were \
-                 stored. If the browser showed an error page, the server may have reported a \
-                 failure this app could not attribute to the pending sign-in",
-                request.callback_timeout.as_secs()
+                "the browser sign-in was not completed within {}s. If the browser showed an \
+                 error page, the server may have reported a failure this app could not \
+                 attribute to the pending sign-in.{}",
+                request.callback_timeout.as_secs(),
+                no_tokens_note(registration_changed)
             ),
         )
     })?
@@ -273,27 +311,33 @@ async fn exchange_and_commit(
         flow_err(
             request.provider,
             format!(
-                "the token exchange timed out after {}s; no credentials were stored",
-                request.exchange_timeout.as_secs()
+                "the token exchange timed out after {}s.{}",
+                request.exchange_timeout.as_secs(),
+                no_tokens_note(registration_changed)
             ),
         )
     })?
     .map_err(|e| auth_err(request.provider, "token exchange", &e))?;
 
-    // The durable commit. Serialized against an in-flight refresh on the
-    // provider's cached client (if any), and deliberately unbounded: the
-    // exchange demonstrably succeeded, so the honest report is whatever this
-    // write actually does — a timeout here would reintroduce "reported
-    // failure, stored credentials anyway". The store's registration,
-    // client-id, resource, and sign-out-epoch checks all apply.
+    // The durable commit, deliberately unbounded: the exchange demonstrably
+    // succeeded, so the honest report is whatever this write actually does —
+    // a timeout here would reintroduce "reported failure, stored credentials
+    // anyway". The store's registration, client-id, resource, and
+    // sign-out-epoch checks all apply.
     let staged = staging.take().ok_or_else(|| {
         flow_err(
             request.provider,
             "the token exchange completed but produced no credentials to store".to_owned(),
         )
     })?;
-    let _refresh_exclusion = match &request.cached_client {
-        Some(client) => Some(client.auth_manager.lock().await),
+    // Serialize against every session client, including one whose build was
+    // in flight moments ago: the `client_gate` excludes construction, and the
+    // *re-sampled* client's manager mutex excludes an in-flight refresh — so
+    // a refresh either fully persists first (its tokens are overwritten
+    // below) or starts after and loads the tokens this commit writes.
+    let _construction_exclusion = request.lifecycle.client_gate.lock().await;
+    let _refresh_exclusion = match (request.resample_cached_client)() {
+        Some(client) => Some(client.auth_manager.clone().lock_owned().await),
         None => None,
     };
     request.store.save(staged).await.map_err(|e| {
@@ -342,7 +386,6 @@ async fn resolve_client_id(
             "stored client registration no longer matches the server's advertised requirements; registering a new client"
         );
     }
-    *registration_changed = true;
     let scope_refs: Vec<&str> = scopes.iter().map(String::as_str).collect();
     let config = manager
         .register_client(CLIENT_NAME, REGISTERED_REDIRECT_URI, &scope_refs)
@@ -364,6 +407,12 @@ async fn resolve_client_id(
         .await
         .and_then(|r| r)
         .map_err(|e| auth_err(request.provider, "registration persistence", &e))?;
+    // Only now: the flag means the *persisted* registration identity changed.
+    // A failed DCR — or DCR success followed by a persistence failure (a
+    // server-side orphan, but no local identity change) — leaves the envelope
+    // untouched, so the caller's cached client is still valid and must not be
+    // retired for it.
+    *registration_changed = true;
     Ok(client_id)
 }
 

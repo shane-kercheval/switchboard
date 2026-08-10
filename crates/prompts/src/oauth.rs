@@ -127,10 +127,11 @@ pub(crate) enum CredentialState {
     SignedIn,
 }
 
-/// One provider's credential concurrency state — three locks and a
-/// generation counter, each with a distinct job, and a strict lock
-/// acquisition order (`flow_gate`, then `io_gate`, then `txn`; removal takes
-/// `txn` only, so no cycle):
+/// One provider's credential concurrency state — four locks and a generation
+/// counter, each with a distinct job, and a strict lock acquisition order
+/// (`flow_gate`, then `client_gate`, then a cached client's rmcp auth-manager
+/// mutex, then `io_gate`, then `txn`; removal takes `flow_gate` + `txn` only,
+/// so no cycle):
 ///
 /// - **`txn`** — the transaction lock: held across a whole envelope
 ///   read → check → write (and removal's deletes). Synchronous, held only
@@ -144,12 +145,24 @@ pub(crate) enum CredentialState {
 ///   attempt waits on the (cancellable) gate without spawning anything.
 ///   Caller-held guards would drop on timeout and re-open the pile-up.
 /// - **`flow_gate`** — serializes whole sign-in/sign-out *orchestrations* so
-///   the two flows cannot interleave with each other. Async, held across the
-///   flow's awaits — which is exactly why it must be a separate lock from
-///   `txn`: `persist_registration` and every credential save/clear a flow
-///   performs take `txn` internally, so a flow holding `txn` would
+///   the two flows cannot interleave with each other, and makes provider
+///   removal refuse while a flow is live (a removal mid-flow would otherwise
+///   let the flow's registration persistence *recreate* the just-deleted
+///   envelope and later store tokens for a removed provider). Async, held
+///   across the flow's awaits — which is exactly why it must be a separate
+///   lock from `txn`: `persist_registration` and every credential save/clear
+///   a flow performs take `txn` internally, so a flow holding `txn` would
 ///   self-deadlock at its own registration persistence, before the browser
 ///   even opens. Store operations never touch this gate.
+/// - **`client_gate`** — serializes session-client construction against the
+///   sign-in flow's durable token commit. Construction holds it across the
+///   cache lookup + build; the commit holds it across
+///   re-sample → manager-lock → save. Without it, a client whose build is in
+///   flight at commit time is invisible to the commit's refresh exclusion:
+///   its token probe could load the pre-commit tokens, refresh them, and
+///   persist that older family *over* the sign-in's fresh grant. Hold times
+///   are bounded (a build is capped by the provider budget; a commit is one
+///   keychain write) — this gate never spans the browser wait.
 /// - **`sign_out_epoch`** — the in-memory generation that makes clients
 ///   predating a sign-out unable to persist credentials. Every
 ///   [`ProviderCredentialStore`] captures the epoch at construction;
@@ -166,6 +179,7 @@ pub(crate) struct CredentialLifecycle {
     pub(crate) txn: std::sync::Mutex<()>,
     pub(crate) io_gate: Arc<tokio::sync::Mutex<()>>,
     pub(crate) flow_gate: tokio::sync::Mutex<()>,
+    pub(crate) client_gate: tokio::sync::Mutex<()>,
     pub(crate) sign_out_epoch: std::sync::atomic::AtomicU64,
 }
 
@@ -263,6 +277,15 @@ impl ProviderCredentialStore {
     /// never orphans a server-side registration. The `resource` is stamped from
     /// this store's own binding rather than accepted from the caller, so the
     /// invariant cannot arrive as two independently-supplied strings.
+    ///
+    /// Unlike `save_sync`, this write is *creative* — it recreates a missing
+    /// envelope — so the transaction lock alone cannot protect it from a
+    /// destructive lifecycle operation the way save's "no envelope, no write"
+    /// check protects saves. It carries no epoch check either. Both are safe
+    /// only because every caller runs inside a held `flow_gate`, which
+    /// excludes sign-out (holds the same gate) and provider removal (refuses
+    /// while the gate is held). A future caller outside the flow gate would
+    /// need both protections added here.
     pub(crate) fn persist_registration(
         &self,
         client_id: String,

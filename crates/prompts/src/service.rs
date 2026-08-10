@@ -566,12 +566,20 @@ impl PromptService {
     /// entry's `OnceCell`; the map mutex is held only for the lookup/insert,
     /// never across the build's I/O. A failed build leaves the cell empty, so
     /// the next caller retries.
+    ///
+    /// The whole lookup + build runs under the provider's `client_gate`, so a
+    /// sign-in's token commit can exclude a build that is in flight when the
+    /// commit runs (see [`CredentialLifecycle`]). This adds no contention of
+    /// its own: concurrent builders of one provider already serialize on the
+    /// cell's single-flight init.
     async fn oauth_client(
         &self,
         name: &str,
         canonical_url: &str,
         scopes_override: Option<&[String]>,
     ) -> Result<AuthClient<reqwest::Client>, PromptError> {
+        let lifecycle = self.credential_lifecycle(name);
+        let _construction_gate = lifecycle.client_gate.lock().await;
         let cell = {
             let mut map = self
                 .oauth_clients
@@ -652,6 +660,15 @@ impl PromptService {
     /// the credential store on every call, and its saves are refused after a
     /// sign-out (the sign-out epoch) or a re-registration (the client-id
     /// check). No generation counter on the cache is needed.
+    ///
+    /// Keeping a cached client across an unchanged-registration sign-in is
+    /// safe only because **no client is ever cached while signed out**: the
+    /// `CredentialState::SignedOut` short-circuits in `query_oauth_provider`
+    /// and `render_oauth` run before `oauth_client()`, and rmcp's
+    /// `initialize_from_store` configures the client only when a token
+    /// response exists. A caller that built a client without that
+    /// short-circuit would cache an unconfigured manager whose first refresh
+    /// fails as a non-recoverable internal error until restart.
     fn invalidate_oauth_clients(&self, name: &str) {
         self.oauth_clients
             .lock()
@@ -720,12 +737,13 @@ impl PromptService {
         };
         let http = self.http_client(name).await?;
         let store = self.credential_store(name, &canonical);
-        let cached_client = self.cached_oauth_client(name, &canonical);
+        let resample_cached_client = || self.cached_oauth_client(name, &canonical);
         let (registration_changed, result) = run_sign_in(SignInRequest {
             http,
             opener: self.browser.as_ref(),
             store: &store,
-            cached_client,
+            lifecycle: &lifecycle,
+            resample_cached_client: &resample_cached_client,
             provider: name,
             canonical_url: &canonical,
             scopes_override: scopes_override.as_deref(),
@@ -1143,6 +1161,18 @@ impl PromptService {
             .config_write_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Refuse while a sign-in/sign-out flow is live, and hold the gate
+        // through the deletes: the transaction lock alone cannot protect
+        // against a flow's `persist_registration`, which *recreates* a
+        // missing envelope — a removal landing between a sign-in's dynamic
+        // registration and its persistence would otherwise be resurrected
+        // (and the flow would later store tokens for a provider the user
+        // deleted). Never held for bearer providers, so this is a no-op for
+        // them; a `try_lock` on a sync path is fine (no await).
+        let lifecycle = self.credential_lifecycle(name);
+        let Ok(_flow) = lifecycle.flow_gate.try_lock() else {
+            return Err(Self::flow_in_progress(name));
+        };
         let mut configs = self.mcp_provider_configs();
         let before = configs.len();
         configs.retain(|c| c.name != name);
@@ -1157,7 +1187,6 @@ impl PromptService {
         // lifecycle entry is deliberately NOT removed from the map afterwards —
         // see `CredentialLockMap` for why pruning would reopen this race.
         let (bearer_delete, oauth_delete) = {
-            let lifecycle = self.credential_lifecycle(name);
             let _guard = lifecycle
                 .txn
                 .lock()

@@ -80,6 +80,11 @@ struct ServerState {
     auth_headers: std::sync::Mutex<Vec<String>>,
     register_hits: AtomicUsize,
     register_bodies: std::sync::Mutex<Vec<serde_json::Value>>,
+    /// Discovery fetches of the protected-resource metadata — the proxy for
+    /// "a session client was (re)built".
+    prm_fetches: AtomicUsize,
+    /// When set, `/register` answers 500 — the DCR-rejection fault.
+    register_fail: std::sync::atomic::AtomicBool,
     token_hits: AtomicUsize,
     /// Raw `application/x-www-form-urlencoded` bodies of every token request.
     token_bodies: std::sync::Mutex<Vec<String>>,
@@ -127,6 +132,7 @@ async fn mcp_middleware(
 async fn prm(
     axum::extract::State(state): axum::extract::State<Arc<ServerState>>,
 ) -> axum::Json<serde_json::Value> {
+    state.prm_fetches.fetch_add(1, Ordering::SeqCst);
     let base = state.base();
     let mut body = serde_json::json!({
         "resource": format!("{base}/mcp"),
@@ -154,14 +160,20 @@ async fn as_metadata(
 async fn register(
     axum::extract::State(state): axum::extract::State<Arc<ServerState>>,
     axum::Json(body): axum::Json<serde_json::Value>,
-) -> axum::Json<serde_json::Value> {
+) -> axum::response::Response {
+    if state.register_fail.load(Ordering::SeqCst) {
+        return axum::response::Response::builder()
+            .status(500)
+            .body(axum::body::Body::from("registration rejected"))
+            .unwrap();
+    }
     let hit = state.register_hits.fetch_add(1, Ordering::SeqCst) + 1;
     let redirect_uris = body["redirect_uris"].clone();
     state.register_bodies.lock().unwrap().push(body);
-    axum::Json(serde_json::json!({
+    axum::response::IntoResponse::into_response(axum::Json(serde_json::json!({
         "client_id": format!("dyn-client-{hit}"),
         "redirect_uris": redirect_uris,
-    }))
+    })))
 }
 
 async fn token(
@@ -237,6 +249,13 @@ enum DriveMode {
     /// First a forged `error` callback with no state (a hostile local
     /// process), then the real approval — the flow must survive the forgery.
     ForgedErrorThenApprove,
+    /// Record the authorization URL but drive nothing — the test itself
+    /// issues the callback when its interleaving is ready.
+    Capture,
+    /// First a request line far past the listener's read cap (never
+    /// newline-terminated within it), then the real approval — the oversized
+    /// request must be dropped, not parsed from its truncated prefix.
+    OversizedThenApprove,
 }
 
 /// The injected "browser": records every authorization URL it is asked to
@@ -283,7 +302,17 @@ impl BrowserOpener for DrivingOpener {
             DriveMode::WrongState => {
                 format!("{redirect_uri}?code=test-code&state=not-the-real-state")
             }
-            DriveMode::Abandon => return Ok(()),
+            DriveMode::Abandon | DriveMode::Capture => return Ok(()),
+            DriveMode::OversizedThenApprove => {
+                let real = format!("{redirect_uri}?code=test-code&state={state}");
+                let oversized_target = format!("/callback?junk={}", "a".repeat(16 * 1024));
+                let oversized_redirect = redirect_uri.clone();
+                tokio::spawn(async move {
+                    send_raw_request(&oversized_redirect, &oversized_target).await;
+                    hit_callback(real).await;
+                });
+                return Ok(());
+            }
             DriveMode::ForgedErrorThenApprove => {
                 let forged = format!("{redirect_uri}?error=access_denied");
                 let real = format!("{redirect_uri}?code=test-code&state={state}");
@@ -299,6 +328,24 @@ impl BrowserOpener for DrivingOpener {
         tokio::spawn(hit_callback(target));
         Ok(())
     }
+}
+
+/// Write one raw GET for `target` to the listener behind `redirect_uri`,
+/// ignoring errors (the listener may drop the connection without responding).
+async fn send_raw_request(redirect_uri: &str, target: &str) {
+    let url = url::Url::parse(redirect_uri).unwrap();
+    let addr = format!("{}:{}", url.host_str().unwrap(), url.port().unwrap());
+    let Ok(mut stream) = tokio::net::TcpStream::connect(addr).await else {
+        return;
+    };
+    let _ = stream
+        .write_all(
+            format!("GET {target} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .await;
+    let mut response = Vec::new();
+    let _ = stream.read_to_end(&mut response).await;
 }
 
 /// Issue a plain HTTP GET against the flow's loopback callback listener, the
@@ -687,6 +734,9 @@ async fn abandoned_sign_in_times_out_with_no_credentials_stored() {
     match &err {
         PromptError::OAuthFlow { message, .. } => {
             assert!(message.contains("was not completed"), "{message}");
+            // This flow registered fresh, so the message carries the
+            // registration-updated caveat.
+            assert!(message.contains("already cleared"), "{message}");
         }
         other => panic!("expected OAuthFlow, got {other:?}"),
     }
@@ -1222,4 +1272,294 @@ async fn sign_in_commit_waits_for_an_in_flight_refresh() {
         envelope["tokens"]["token_response"]["access_token"],
         "signin-tok-1"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_dcr_leaves_cached_client_and_tokens_intact() {
+    // A re-registration attempt whose DCR the server rejects changes nothing
+    // locally: the envelope (old client id AND its tokens) survives, and the
+    // cached session client must NOT be retired — invalidating it would let a
+    // later rebuild coexist with its in-flight operations.
+    let (base, state) = spawn_server(ServerState::default()).await;
+    let mcp_url = format!("{base}/mcp");
+    let harness = harness(&oauth_yaml("tiddly", &mcp_url), DriveMode::Approve);
+
+    harness
+        .service
+        .sign_in_mcp_provider("tiddly")
+        .await
+        .unwrap();
+    // Cache the session client (sign-in itself never caches one).
+    harness.service.sync().await;
+    assert_eq!(
+        provider_status(&harness.service, "tiddly"),
+        ProviderStatus::Ok { prompt_count: 1 }
+    );
+
+    // The server changes its advertised scopes (forcing re-registration) but
+    // rejects the new registration.
+    *state.prm_scopes.lock().unwrap() = Some(vec!["prompts.read"]);
+    state.register_fail.store(true, Ordering::SeqCst);
+    let err = harness
+        .service
+        .sign_in_mcp_provider("tiddly")
+        .await
+        .unwrap_err();
+    match &err {
+        PromptError::OAuthFlow { message, .. } => {
+            assert!(
+                message.contains("dynamic client registration failed"),
+                "{message}"
+            );
+        }
+        other => panic!("expected OAuthFlow, got {other:?}"),
+    }
+
+    // Envelope untouched: old client id, tokens still present.
+    let envelope = stored_envelope(&harness.secrets, "tiddly").unwrap();
+    assert_eq!(envelope["registration"]["client_id"], "dyn-client-1");
+    assert!(!envelope["tokens"].is_null());
+
+    // The cached client survived: a render succeeds with zero additional
+    // discovery (a retired cache would rebuild and re-fetch).
+    let discovery_before = state.prm_fetches.load(Ordering::SeqCst);
+    let rendered = harness
+        .service
+        .render("tiddly", "greet", &BTreeMap::new())
+        .await
+        .unwrap();
+    assert_eq!(rendered.text, "Hello from OAuth!");
+    assert_eq!(state.prm_fetches.load(Ordering::SeqCst), discovery_before);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_registration_persistence_leaves_cached_client_and_tokens_intact() {
+    /// Fails the third write to the OAuth envelope: the first sign-in's
+    /// registration (1) and commit (2) pass; the re-registration's
+    /// persistence (3) fails.
+    struct FailThirdOAuthWrite {
+        inner: InMemorySecretStore,
+        oauth_writes: AtomicUsize,
+    }
+    impl SecretStore for FailThirdOAuthWrite {
+        fn get(&self, key: &str) -> Result<Option<String>, SecretStoreError> {
+            self.inner.get(key)
+        }
+        fn set(&self, key: &str, value: &str) -> Result<(), SecretStoreError> {
+            if key == "oauth:tiddly" && self.oauth_writes.fetch_add(1, Ordering::SeqCst) == 2 {
+                return Err(SecretStoreError::Backend("keychain wedged".to_owned()));
+            }
+            self.inner.set(key, value)
+        }
+        fn delete(&self, key: &str) -> Result<(), SecretStoreError> {
+            self.inner.delete(key)
+        }
+    }
+
+    let (base, state) = spawn_server(ServerState::default()).await;
+    let mcp_url = format!("{base}/mcp");
+    let tmp = TempDir::new().unwrap();
+    let prompts_dir = tmp.path().join("prompts");
+    std::fs::create_dir(&prompts_dir).unwrap();
+    let config_path = tmp.path().join("config.yaml");
+    std::fs::write(&config_path, oauth_yaml("tiddly", &mcp_url)).unwrap();
+    let store = Arc::new(FailThirdOAuthWrite {
+        inner: InMemorySecretStore::new(),
+        oauth_writes: AtomicUsize::new(0),
+    });
+    let opener = DrivingOpener::new(DriveMode::Approve);
+    let service = PromptService::new(config_path, prompts_dir, None, store.clone())
+        .with_browser_opener(opener.clone());
+
+    service.sign_in_mcp_provider("tiddly").await.unwrap();
+    service.sync().await;
+
+    // Force re-registration; DCR succeeds (a server-side orphan, accepted)
+    // but persisting the replacement fails — no local identity change.
+    *state.prm_scopes.lock().unwrap() = Some(vec!["prompts.read"]);
+    let err = service.sign_in_mcp_provider("tiddly").await.unwrap_err();
+    match &err {
+        PromptError::OAuthFlow { message, .. } => {
+            assert!(
+                message.contains("registration persistence failed"),
+                "{message}"
+            );
+        }
+        other => panic!("expected OAuthFlow, got {other:?}"),
+    }
+    assert_eq!(state.register_hits.load(Ordering::SeqCst), 2);
+
+    // Envelope untouched; cached client survived (no rebuild on render).
+    let raw = store.inner.get("oauth:tiddly").unwrap().unwrap();
+    let envelope: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(envelope["registration"]["client_id"], "dyn-client-1");
+    assert!(!envelope["tokens"].is_null());
+    let discovery_before = state.prm_fetches.load(Ordering::SeqCst);
+    let rendered = service
+        .render("tiddly", "greet", &BTreeMap::new())
+        .await
+        .unwrap();
+    assert_eq!(rendered.text, "Hello from OAuth!");
+    assert_eq!(state.prm_fetches.load(Ordering::SeqCst), discovery_before);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sign_in_commit_serializes_with_a_client_built_during_the_browser_wait() {
+    // The cold-cache variant of the commit/refresh race: no client exists
+    // when sign-in starts; one is built (and starts refreshing) while the
+    // user is "in the browser". The commit re-samples under the client gate,
+    // so the mid-flow client is found and its in-flight refresh fully
+    // persists before the sign-in's tokens land last.
+    let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let (base, state) = spawn_server(ServerState {
+        token_gate: Some(TokenGate {
+            entered: entered_tx,
+            release: release.clone(),
+            refresh_only: true,
+        }),
+        ..ServerState::default()
+    })
+    .await;
+    let mcp_url = format!("{base}/mcp");
+    let harness = harness(&oauth_yaml("tiddly", &mcp_url), DriveMode::Capture);
+    harness
+        .secrets
+        .set("oauth:tiddly", &expired_envelope(&mcp_url, &base))
+        .unwrap();
+
+    // Sign-in starts against an empty cache and parks at the browser wait.
+    let sign_in_service = harness.service.clone();
+    let sign_in = tokio::spawn(async move { sign_in_service.sign_in_mcp_provider("tiddly").await });
+    while harness.opener.opened().is_empty() {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // A render builds and caches the client mid-flow, then parks inside its
+    // refresh, holding the auth-manager mutex.
+    let render_service = harness.service.clone();
+    let render = tokio::spawn(async move {
+        render_service
+            .render("tiddly", "greet", &BTreeMap::new())
+            .await
+    });
+    entered_rx.recv().await.unwrap();
+
+    // Deliver the real redirect: the exchange passes (authorization-code
+    // grants aren't gated), and the commit must block on the mid-flow
+    // client's refresh — a client the old flow-start snapshot never saw.
+    let params = query_params(&harness.opener.opened()[0]);
+    hit_callback(format!(
+        "{}?code=test-code&state={}",
+        params["redirect_uri"], params["state"]
+    ))
+    .await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert!(
+        !sign_in.is_finished(),
+        "the commit must serialize behind the mid-flow client's refresh"
+    );
+
+    // Release: refresh persists first, then the commit overwrites with the
+    // sign-in's exchange tokens (the exchange hit the endpoint first, so its
+    // tokens are signin-tok-1).
+    release.add_permits(1);
+    let _ = render.await.unwrap();
+    sign_in.await.unwrap().unwrap();
+    assert_eq!(state.register_hits.load(Ordering::SeqCst), 0, "reused");
+    let envelope = stored_envelope(&harness.secrets, "tiddly").unwrap();
+    assert_eq!(
+        envelope["tokens"]["token_response"]["access_token"],
+        "signin-tok-1"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn removal_is_refused_while_a_flow_is_in_progress() {
+    // A removal mid-sign-in would let the flow's registration persistence
+    // recreate the just-deleted envelope (and later store tokens for a
+    // removed provider) — so removal must refuse while the flow gate is held.
+    let (base, _state) = spawn_server(ServerState::default()).await;
+    let harness = harness(
+        &oauth_yaml("tiddly", &format!("{base}/mcp")),
+        DriveMode::Abandon,
+    );
+    let service = harness
+        .service
+        .clone()
+        .with_sign_in_timeout(Duration::from_secs(2));
+
+    let pending_service = service.clone();
+    let pending = tokio::spawn(async move { pending_service.sign_in_mcp_provider("tiddly").await });
+    while harness.opener.opened().is_empty() {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let err = harness.service.remove_mcp_provider("tiddly").unwrap_err();
+    match err {
+        PromptError::OAuthFlow { message, .. } => {
+            assert!(message.contains("already in progress"), "{message}");
+        }
+        other => panic!("expected OAuthFlow, got {other:?}"),
+    }
+    assert_eq!(harness.service.list_mcp_providers().len(), 1);
+
+    // Once the flow ends, removal succeeds and everything is gone.
+    assert!(pending.await.unwrap().is_err());
+    harness.service.remove_mcp_provider("tiddly").unwrap();
+    assert!(harness.service.list_mcp_providers().is_empty());
+    assert!(stored_envelope(&harness.secrets, "tiddly").is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn oversized_request_line_is_dropped_not_parsed() {
+    // A request line past the listener's read cap comes back truncated and
+    // unterminated; parsing its prefix as a complete target would be wrong.
+    // It must be dropped — and the real callback right behind it must still
+    // complete the sign-in.
+    let (base, _state) = spawn_server(ServerState::default()).await;
+    let harness = harness(
+        &oauth_yaml("tiddly", &format!("{base}/mcp")),
+        DriveMode::OversizedThenApprove,
+    );
+
+    harness
+        .service
+        .sign_in_mcp_provider("tiddly")
+        .await
+        .unwrap();
+    let envelope = stored_envelope(&harness.secrets, "tiddly").unwrap();
+    assert!(!envelope["tokens"].is_null());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn abandoned_reuse_sign_in_reports_state_unchanged() {
+    // The common closed-the-tab case on the reuse path must NOT read as
+    // though something was destroyed — the caveat about a replaced
+    // registration attaches only when the flow actually re-registered.
+    let (base, _state) = spawn_server(ServerState::default()).await;
+    let mcp_url = format!("{base}/mcp");
+    let harness = harness(&oauth_yaml("tiddly", &mcp_url), DriveMode::Approve);
+    harness
+        .service
+        .sign_in_mcp_provider("tiddly")
+        .await
+        .unwrap();
+
+    let (retry_service, _retry_opener) = harness.sibling_service(DriveMode::Abandon);
+    let retry_service = retry_service.with_sign_in_timeout(Duration::from_millis(400));
+    let err = retry_service
+        .sign_in_mcp_provider("tiddly")
+        .await
+        .unwrap_err();
+    match &err {
+        PromptError::OAuthFlow { message, .. } => {
+            assert!(message.contains("existing state is unchanged"), "{message}");
+            assert!(!message.contains("already cleared"), "{message}");
+        }
+        other => panic!("expected OAuthFlow, got {other:?}"),
+    }
+    // And the original tokens really are untouched.
+    let envelope = stored_envelope(&harness.secrets, "tiddly").unwrap();
+    assert!(!envelope["tokens"].is_null());
 }

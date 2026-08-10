@@ -1489,11 +1489,36 @@ fn rmcp_auth_log_allowed(target: &str, level: tracing::Level) -> bool {
     !(target.starts_with("rmcp::transport::auth") && level > tracing::Level::INFO)
 }
 
-#[cfg(test)]
-mod logging_tests {
+/// The app's complete log subscriber: the credential-redaction filter
+/// installed **registry-wide, ahead of every output layer**, then the
+/// env-filtered fmt layer. `run()` and the redaction test both build the
+/// subscriber through this one function (with only the writer substituted),
+/// so the test exercises the production composition rather than a copy that
+/// could drift — and any future output layer (a log file, telemetry) added
+/// here inherits the redaction structurally instead of needing its own
+/// filter.
+fn build_log_subscriber<W>(
+    env_filter: tracing_subscriber::EnvFilter,
+    writer: W,
+) -> impl tracing::Subscriber + Send + Sync
+where
+    W: for<'w> tracing_subscriber::fmt::MakeWriter<'w> + Send + Sync + 'static,
+{
     use tracing_subscriber::Layer as _;
     use tracing_subscriber::layer::SubscriberExt as _;
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::filter::filter_fn(|meta| {
+            rmcp_auth_log_allowed(meta.target(), *meta.level())
+        }))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(writer)
+                .with_filter(env_filter),
+        )
+}
 
+#[cfg(test)]
+mod logging_tests {
     /// A `MakeWriter` capturing everything the fmt layer emits.
     #[derive(Clone, Default)]
     struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
@@ -1521,20 +1546,16 @@ mod logging_tests {
     #[test]
     fn rmcp_auth_debug_is_denied_even_when_the_env_requests_it() {
         // The bug-report scenario the redaction exists for: the user has
-        // explicitly enabled rmcp debug logging. The layer filter must still
+        // explicitly enabled rmcp debug logging. The subscriber must still
         // drop the auth module's debug output (rmcp logs the raw
         // authorization code there) while letting auth INFO and other rmcp
-        // modules' debug output through — this composes the same
-        // env-filter + deny-filter stack as `run()`.
+        // modules' debug output through. Built through the SAME constructor
+        // `run()` uses — only the writer differs — so this exercises the
+        // production composition, not a copy that could drift.
         let capture = Capture::default();
-        let subscriber = tracing_subscriber::registry().with(
-            tracing_subscriber::fmt::layer()
-                .with_writer(capture.clone())
-                .with_ansi(false)
-                .with_filter(tracing_subscriber::EnvFilter::new("rmcp=debug"))
-                .with_filter(tracing_subscriber::filter::filter_fn(|meta| {
-                    super::rmcp_auth_log_allowed(meta.target(), *meta.level())
-                })),
+        let subscriber = super::build_log_subscriber(
+            tracing_subscriber::EnvFilter::new("rmcp=debug"),
+            capture.clone(),
         );
         tracing::subscriber::with_default(subscriber, || {
             tracing::debug!(target: "rmcp::transport::auth", "start exchange code for token: SECRET-AUTH-CODE");
@@ -1565,22 +1586,10 @@ mod logging_tests {
 )]
 pub fn run() {
     {
-        use tracing_subscriber::Layer as _;
-        use tracing_subscriber::layer::SubscriberExt as _;
         use tracing_subscriber::util::SubscriberInitExt as _;
         let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-        let _ = tracing_subscriber::registry()
-            .with(
-                tracing_subscriber::fmt::layer()
-                    .with_filter(env_filter)
-                    // AND-composed with the env filter, so the credential
-                    // redaction below holds no matter what RUST_LOG says.
-                    .with_filter(tracing_subscriber::filter::filter_fn(|meta| {
-                        rmcp_auth_log_allowed(meta.target(), *meta.level())
-                    })),
-            )
-            .try_init();
+        let _ = build_log_subscriber(env_filter, std::io::stdout).try_init();
     }
 
     let (claude_adapter, codex_adapter, gemini_adapter, antigravity_adapter) = build_adapters();

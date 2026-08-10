@@ -77,7 +77,7 @@ use switchboard_git::{
     BranchKind, ChangeKind, ChangedFile, CommitChanges, FileDiff, GitCommitRange,
 };
 use switchboard_harness::subprocess::PathSource;
-use switchboard_prompts::{McpProviderInfo, Prompt, PromptSource, RenderedPrompt};
+use switchboard_prompts::{McpProviderInfo, Prompt, PromptSource};
 use switchboard_workflow::InputValue;
 use uuid::Uuid;
 
@@ -303,16 +303,18 @@ async fn list_prompts(state: State<'_, AppState>) -> Result<Vec<Prompt>, String>
     Ok(list_prompts_impl(state.inner()))
 }
 
-/// Render `name` from `provider` with `args`, returning the finished text.
-/// Serves both preview and send — the caller passes the identical args map.
-/// May touch the network (MCP `prompts/get`), hence async.
+/// Render `name` from `provider` with `args`, returning a typed outcome: the
+/// finished text, or a needs-sign-in determination the composer acts on by
+/// launching the provider's browser sign-in. Serves both preview and send —
+/// the caller passes the identical args map. May touch the network (MCP
+/// `prompts/get`), hence async.
 #[tauri::command]
 async fn render_prompt(
     state: State<'_, AppState>,
     provider: String,
     name: String,
     args: std::collections::BTreeMap<String, String>,
-) -> Result<RenderedPrompt, String> {
+) -> Result<commands::RenderPromptOutcome, String> {
     render_prompt_impl(state.inner(), &provider, &name, &args)
         .await
         .map_err(|e| e.to_string())

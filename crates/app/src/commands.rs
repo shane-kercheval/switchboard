@@ -1156,8 +1156,36 @@ pub async fn render_prompt_impl(
     provider: &str,
     name: &str,
     args: &std::collections::BTreeMap<String, String>,
-) -> Result<switchboard_prompts::RenderedPrompt, AppError> {
-    Ok(state.prompts.render(provider, name, args).await?)
+) -> Result<RenderPromptOutcome, AppError> {
+    match state.prompts.render(provider, name, args).await {
+        Ok(rendered) => Ok(RenderPromptOutcome::Rendered {
+            text: rendered.text,
+        }),
+        Err(switchboard_prompts::PromptError::McpNeedsAuth { provider }) => {
+            Ok(RenderPromptOutcome::NeedsSignIn { provider })
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// The typed outcome of a prompt render over IPC. Every other render failure
+/// stays a flat error string (display-only), but needs-sign-in crosses as
+/// **data** because the composer *acts* on it — launching the provider's
+/// browser sign-in and retrying — rather than displaying it. Mirrored as a
+/// discriminated union on the TS side; `#[non_exhaustive]` so future outcome
+/// kinds land additively (the frontend degrades unknown kinds to an error).
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum RenderPromptOutcome {
+    Rendered {
+        text: String,
+    },
+    /// The prompt's OAuth provider has no usable credentials — the typed
+    /// local determination, never inferred from a transport error.
+    NeedsSignIn {
+        provider: String,
+    },
 }
 
 /// The raw, unrendered template body of a `builtin` or `local` prompt, for a
@@ -17232,7 +17260,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(rendered.text.contains("Code Review Guidelines"));
+        assert!(matches!(
+            rendered,
+            RenderPromptOutcome::Rendered { ref text } if text.contains("Code Review Guidelines")
+        ));
     }
 
     #[test]
@@ -17274,7 +17305,35 @@ mod tests {
         let rendered = render_prompt_impl(&state, "local", "greet", &args)
             .await
             .unwrap();
-        assert!(rendered.text.contains("Hi Ada"));
+        assert!(matches!(
+            rendered,
+            RenderPromptOutcome::Rendered { ref text } if text.contains("Hi Ada")
+        ));
+    }
+
+    #[tokio::test]
+    async fn render_prompt_maps_needs_sign_in_to_a_typed_outcome() {
+        // The one render failure that crosses IPC as data, not a string: the
+        // composer launches the provider's sign-in from it.
+        let (tmp, state) = state_with_prompts();
+        std::fs::write(
+            tmp.path().join("config.yaml"),
+            "mcp_providers:\n  - name: tiddly\n    transport:\n      type: http\n      url: https://prompts-mcp.tiddly.me/mcp\n    auth:\n      type: oauth\n",
+        )
+        .unwrap();
+
+        let outcome = render_prompt_impl(
+            &state,
+            "tiddly",
+            "anything",
+            &std::collections::BTreeMap::new(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            RenderPromptOutcome::NeedsSignIn { ref provider } if provider == "tiddly"
+        ));
     }
 
     #[tokio::test]

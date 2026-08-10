@@ -57,13 +57,9 @@
   type RowAction = "signing-in" | "signing-out" | "testing" | "removing";
   type Tone = "ok" | "accent" | "warning" | "error" | "muted";
   let rowAction = $state<Record<string, RowAction | undefined>>({});
-  let rowNotice = $state<Record<string, { tone: Tone; text: string } | undefined>>({});
-  // The provider (if any) whose re-sign-in awaits explicit confirmation: a
-  // sign-in on an already-signed-in row can replace the stored authorization
-  // (the flow re-registers when the server's advertised requirements changed
-  // and clears the old tokens before the browser opens), so the trade is
-  // shown before the click commits.
-  let confirmingReSignIn = $state<string | null>(null);
+  let rowNotice = $state<
+    Record<string, { tone: Tone; text: string; transient?: boolean } | undefined>
+  >({});
 
   // Mirror the backend `is_valid_provider_name` rule + uniqueness, so the user
   // gets the error inline rather than from a rejected command.
@@ -104,15 +100,16 @@
 
   // A background cache rebuild runs after add/remove/sign-in/sign-out; the
   // command returns before it finishes, so a row first reads a stale status.
-  // Re-refresh when the backend signals the rebuild is done. Success notices
-  // ("Signed in.") are dropped then — the fresh status carries the same fact —
-  // while error notices persist until the user acts on the row again.
+  // Re-refresh when the backend signals the rebuild is done. Transient flow
+  // notices ("Signed in.") are dropped then — the fresh status carries the
+  // same fact — while errors and probe results persist until the user acts on
+  // the row again.
   onMount(() => {
     refresh();
     let unlisten: (() => void) | undefined;
     void listen("prompts:synced", () => {
       for (const key of Object.keys(rowNotice)) {
-        if (rowNotice[key]?.tone === "ok") rowNotice[key] = undefined;
+        if (rowNotice[key]?.transient) rowNotice[key] = undefined;
       }
       void refresh();
     }).then((u) => {
@@ -173,20 +170,11 @@
     }
   }
 
-  function handleSignInClick(provider: McpProviderInfo): void {
-    // A signed-in row only ever *arms* the confirmation from this button —
-    // repeated clicks (a double-click is one gesture for many users) must
-    // never fall through to the destructive path; only the explicit
-    // "Replace & sign in" button proceeds.
-    if (provider.has_token) {
-      confirmingReSignIn = provider.name;
-      return;
-    }
-    void startSignIn(provider.name);
-  }
-
   async function startSignIn(providerName: string): Promise<void> {
-    confirmingReSignIn = null;
+    // Idempotence guard: the button disables while an action is pending, but
+    // a double-click's second event can race the re-render (and test drivers
+    // dispatch clicks regardless of `disabled`).
+    if (rowAction[providerName] !== undefined) return;
     rowAction[providerName] = "signing-in";
     rowNotice[providerName] = undefined;
     let ok = false;
@@ -201,12 +189,16 @@
       // must not keep asserting the old world until the background sync's
       // event happens to land. The error notice set above must survive this.
       await refresh();
-      if (ok) rowNotice[providerName] = { tone: "ok", text: "Signed in." };
+      if (ok) rowNotice[providerName] = { tone: "ok", text: "Signed in.", transient: true };
       rowAction[providerName] = undefined;
     }
   }
 
   async function handleSignOut(providerName: string): Promise<void> {
+    // Idempotence guard: the button disables while an action is pending, but
+    // a double-click's second event can race the re-render (and test drivers
+    // dispatch clicks regardless of `disabled`).
+    if (rowAction[providerName] !== undefined) return;
     rowAction[providerName] = "signing-out";
     rowNotice[providerName] = undefined;
     let ok = false;
@@ -217,12 +209,16 @@
       rowNotice[providerName] = { tone: "error", text: errorText(e) };
     } finally {
       await refresh();
-      if (ok) rowNotice[providerName] = { tone: "ok", text: "Signed out." };
+      if (ok) rowNotice[providerName] = { tone: "ok", text: "Signed out.", transient: true };
       rowAction[providerName] = undefined;
     }
   }
 
   async function handleRowTest(providerName: string): Promise<void> {
+    // Idempotence guard: the button disables while an action is pending, but
+    // a double-click's second event can race the re-render (and test drivers
+    // dispatch clicks regardless of `disabled`).
+    if (rowAction[providerName] !== undefined) return;
     rowAction[providerName] = "testing";
     rowNotice[providerName] = undefined;
     try {
@@ -239,6 +235,10 @@
   }
 
   async function handleRemove(providerName: string): Promise<void> {
+    // Idempotence guard: the button disables while an action is pending, but
+    // a double-click's second event can race the re-render (and test drivers
+    // dispatch clicks regardless of `disabled`).
+    if (rowAction[providerName] !== undefined) return;
     rowAction[providerName] = "removing";
     rowNotice[providerName] = undefined;
     let ok = false;
@@ -257,7 +257,6 @@
         // notice or an armed confirmation.
         delete rowAction[providerName];
         delete rowNotice[providerName];
-        if (confirmingReSignIn === providerName) confirmingReSignIn = null;
       } else {
         rowAction[providerName] = undefined;
       }
@@ -401,7 +400,7 @@
                   data-testid={`mcp-sign-in-${provider.name}`}
                   disabled={action !== undefined || signInBlocked(provider)}
                   title={signInBlocked(provider) ? "The OS keychain could not be read" : undefined}
-                  onclick={() => handleSignInClick(provider)}
+                  onclick={() => void startSignIn(provider.name)}
                 >
                   {action === "signing-in" ? "Waiting for browser…" : "Sign in"}
                 </Button>
@@ -437,36 +436,6 @@
               </Button>
             </div>
           </div>
-          {#if confirmingReSignIn === provider.name}
-            <div
-              class="border-border bg-surface space-y-2 rounded-md border p-2"
-              data-testid={`mcp-resignin-confirm-${provider.name}`}
-            >
-              <p class="text-fg text-xs">
-                Signing in again may replace this server's current authorization — it will if the
-                server's sign-in requirements have changed since you signed in. If the browser flow
-                is cancelled partway through, you may need to sign in again to keep using its
-                prompts.
-              </p>
-              <div class="flex justify-end gap-2">
-                <Button
-                  variant="secondary"
-                  size="sm"
-                  data-testid={`mcp-resignin-cancel-${provider.name}`}
-                  onclick={() => (confirmingReSignIn = null)}
-                >
-                  Cancel
-                </Button>
-                <Button
-                  size="sm"
-                  data-testid={`mcp-resignin-go-${provider.name}`}
-                  onclick={() => void startSignIn(provider.name)}
-                >
-                  Replace & sign in
-                </Button>
-              </div>
-            </div>
-          {/if}
           {#if notice}
             <p
               class={cn("text-xs", TONE_CLASS[notice.tone])}
@@ -575,12 +544,18 @@
           {testing ? "Testing…" : "Test connection"}
         </Button>
       {:else}
-        <span class="text-muted mr-auto text-xs" data-testid="mcp-oauth-test-hint">
+        <span class="text-muted min-w-0 flex-1 text-left text-xs" data-testid="mcp-oauth-test-hint">
           A connection test needs credentials — add the server, sign in from its row, then use its
           Test action.
         </span>
       {/if}
-      <Button size="sm" data-testid="mcp-add" disabled={!canSubmit} onclick={handleAdd}>
+      <Button
+        size="sm"
+        class="shrink-0"
+        data-testid="mcp-add"
+        disabled={!canSubmit}
+        onclick={handleAdd}
+      >
         {adding ? "Adding…" : "Add server"}
       </Button>
     </div>

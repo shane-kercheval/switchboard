@@ -34,7 +34,7 @@ import type {
   PathSource,
   Prompt,
   PromptSource,
-  RenderedPrompt,
+  RenderPromptOutcome,
   RepoListing,
   SendId,
   StagedAttachment,
@@ -660,15 +660,17 @@ export async function listPrompts(): Promise<Prompt[]> {
   return await invoke<Prompt[]>("list_prompts");
 }
 
-/// Render `name` from `provider` with `args` to its finished text. Serves both
-/// the composer's preview and its send (the same args map for both). May touch
-/// the network (MCP `prompts/get`), so callers show a pending state.
+/// Render `name` from `provider` with `args`, resolving to a typed outcome:
+/// the finished text, or a needs-sign-in determination the composer acts on by
+/// launching the provider's browser sign-in. Serves both the composer's
+/// preview and its send (the same args map for both). May touch the network
+/// (MCP `prompts/get`), so callers show a pending state.
 export async function renderPrompt(
   provider: string,
   name: string,
   args: Record<string, string>,
-): Promise<RenderedPrompt> {
-  return await invoke<RenderedPrompt>("render_prompt", { provider, name, args });
+): Promise<RenderPromptOutcome> {
+  return await invoke<RenderPromptOutcome>("render_prompt", { provider, name, args });
 }
 
 /// The raw, unrendered template body of `provider:name`, for a read-only preview.

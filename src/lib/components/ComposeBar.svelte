@@ -374,6 +374,15 @@
   // "loading" row instead of momentarily claiming there are no prompts.
   let promptsLoaded = $state(false);
   let sending = $state(false);
+  // The provider whose browser sign-in this send is currently waiting on —
+  // auto-launched when a render reports needs-sign-in (the user just tried to
+  // use that provider's prompt, so intent is unambiguous). Drives the
+  // compose-bar waiting line; `sending` stays true across the wait.
+  let signingInProvider = $state<string | null>(null);
+  // Informational (non-error) line in the send-feedback slot — used when a
+  // mid-send sign-in succeeded but the composer context changed during the
+  // browser wait, so the send was deliberately not dispatched.
+  let sendNotice = $state<string | null>(null);
 
   // Workflow invocation state (live-UI-only). The menu lists the project's
   // workflows; picking an invocable one enters workflow mode with a per-input
@@ -1914,6 +1923,7 @@
   async function handleSubmit(): Promise<void> {
     if (sendDisabled) return;
     sendError = null;
+    sendNotice = null;
     // Snapshot the whole chip set once, up front (before any await), so a
     // mid-render chip edit can't change what gets sent — same discipline as the
     // prompt/recipient snapshots below.
@@ -1980,20 +1990,60 @@
       // unmount/init releases) guarantees the lock can't outlive the render.
       setTargetingLocked(projectId, true);
       let finalText: string;
+      let signedInMidSend = false;
       try {
-        const rendered = await api.renderPrompt(prompt.provider, prompt.name, renderArgs);
-        finalText = combinePromptMessage(rendered.text, appended);
+        let outcome = await api.renderPrompt(prompt.provider, prompt.name, renderArgs);
+        if (outcome.kind === "needs_sign_in") {
+          // The provider needs a browser sign-in, and the user's intent could
+          // not be clearer — they just pressed Send on its prompt. Launch the
+          // sign-in and continue the send once they approve in the browser.
+          // The targeting freeze must not span a minutes-long wait; the
+          // post-await context check below covers what the freeze covered.
+          setTargetingLocked(projectId, false);
+          signingInProvider = outcome.provider;
+          try {
+            await api.signInMcpProvider(outcome.provider);
+          } finally {
+            signingInProvider = null;
+          }
+          signedInMidSend = true;
+          setTargetingLocked(projectId, true);
+          outcome = await api.renderPrompt(prompt.provider, prompt.name, renderArgs);
+        }
+        if (outcome.kind !== "rendered") {
+          // A second needs-sign-in, or an outcome kind this build doesn't
+          // know: stop — never loop the browser open.
+          sendError = `Send failed: MCP provider "${prompt.provider}" needs sign-in.`;
+          return;
+        }
+        finalText = combinePromptMessage(outcome.text, appended);
       } catch (err) {
-        sendError = `Send failed: ${err instanceof Error ? err.message : String(err)}`;
+        const message = err instanceof Error ? err.message : String(err);
+        // After a successful mid-send sign-in, a failure comes from the retry
+        // (typically the server) — say the sign-in itself stuck, or the user
+        // is left guessing whether their browser approval was wasted.
+        sendError = signedInMidSend
+          ? `Signed in, but the send then failed: ${message}`
+          : `Send failed: ${message}`;
         return;
       } finally {
         sending = false;
+        signingInProvider = null;
         setTargetingLocked(projectId, false);
       }
       // If the composer state changed outside the locked UI while rendering,
       // avoid dispatching text into a now-different prompt/recipient context.
       const stillSelected = new Set(selectedIds);
-      if (selectedPrompt !== prompt || targets.some((t) => !stillSelected.has(t.id))) return;
+      if (selectedPrompt !== prompt || targets.some((t) => !stillSelected.has(t.id))) {
+        if (signedInMidSend) {
+          // The UI was deliberately unfrozen during the browser wait, so a
+          // changed context is plausible rather than near-impossible — say
+          // what happened instead of dropping the send silently. The prompt
+          // and its arguments are still intact wherever they now are.
+          sendNotice = "Signed in — your prompt is ready; press Send when you are.";
+        }
+        return;
+      }
       dispatchToRecipients(finalText, attachments, targets);
       // Prompt selection is not sticky: a successful send returns to the plain
       // composer (recipients stay selected). Appended text is consumed, not
@@ -2802,6 +2852,16 @@
         </div>
       {/if}
     </div>
+    {#if signingInProvider}
+      <p class="text-muted mt-2 text-xs" data-testid="compose-signing-in">
+        Waiting for browser sign-in to {signingInProvider}…
+      </p>
+    {/if}
+    {#if sendNotice}
+      <p class="text-muted mt-2 text-xs" data-testid="compose-send-notice">
+        {sendNotice}
+      </p>
+    {/if}
     {#if sendError}
       <p class="text-status-failed mt-2 text-xs" data-testid="compose-send-error">
         {sendError}

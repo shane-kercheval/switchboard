@@ -149,9 +149,12 @@ mod error {
 
         /// An OAuth provider has no usable credentials — determined locally
         /// from the typed `AuthorizationRequired` probe, before any request
-        /// reaches the MCP server. Internal-typed only: the app's command shim
-        /// flattens errors to strings over IPC, so UI affordances key off the
-        /// typed `needs_auth` *provider status*, not this variant.
+        /// reaches the MCP server. The app's render command maps this variant
+        /// (alone — every other error crosses IPC as a flat string) into a
+        /// typed needs-sign-in outcome, which is what lets the composer launch
+        /// the provider's browser sign-in at the point of use; the service
+        /// also records it as the provider's `needs_auth` status so Settings
+        /// agrees with what the composer reported.
         #[error("MCP provider {provider:?} needs sign-in before its prompts can be used")]
         McpNeedsAuth { provider: String },
 

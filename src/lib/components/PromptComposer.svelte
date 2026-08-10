@@ -113,6 +113,7 @@
   type PreviewState =
     | { kind: "idle" }
     | { kind: "loading" }
+    | { kind: "signing_in"; provider: string }
     | { kind: "ready"; text: string }
     | { kind: "error"; message: string };
   let preview = $state<PreviewState>({ kind: "idle" });
@@ -211,11 +212,39 @@
 
   async function runPreview(): Promise<void> {
     preview = { kind: "loading" };
+    let signedInMidPreview = false;
     try {
-      const rendered = await api.renderPrompt(prompt.provider, prompt.name, previewArgs());
-      preview = { kind: "ready", text: combinePromptMessage(rendered.text, previewAppended()) };
+      let outcome = await api.renderPrompt(prompt.provider, prompt.name, previewArgs());
+      if (outcome.kind === "needs_sign_in") {
+        // Previewing is an explicit use of this provider, and rerunning a
+        // preview after sign-in dispatches nothing — so launch the browser
+        // sign-in and rerun automatically. One attempt only; a second
+        // needs-sign-in falls through to the error arm below.
+        preview = { kind: "signing_in", provider: outcome.provider };
+        await api.signInMcpProvider(outcome.provider);
+        signedInMidPreview = true;
+        preview = { kind: "loading" };
+        outcome = await api.renderPrompt(prompt.provider, prompt.name, previewArgs());
+      }
+      if (outcome.kind !== "rendered") {
+        preview = {
+          kind: "error",
+          message: `MCP provider "${prompt.provider}" needs sign-in.`,
+        };
+        return;
+      }
+      preview = { kind: "ready", text: combinePromptMessage(outcome.text, previewAppended()) };
     } catch (e) {
-      preview = { kind: "error", message: e instanceof Error ? e.message : String(e) };
+      const message = e instanceof Error ? e.message : String(e);
+      // A failure after a successful mid-preview sign-in comes from the
+      // retry, not the sign-in — say so, or the user is left guessing
+      // whether their browser approval was wasted.
+      preview = {
+        kind: "error",
+        message: signedInMidPreview
+          ? `Signed in, but the preview then failed: ${message}`
+          : message,
+      };
     }
   }
 </script>
@@ -459,6 +488,15 @@
     >
       <Spinner class="h-4 w-4" />
       Rendering preview…
+    </div>
+  {:else if preview.kind === "signing_in"}
+    <div
+      class="text-muted flex items-center gap-2 text-sm"
+      data-testid="prompt-preview-signing-in"
+      role="status"
+    >
+      <Spinner class="h-4 w-4" />
+      Waiting for browser sign-in to {preview.provider}…
     </div>
   {:else if preview.kind === "error"}
     <div class="text-status-failed text-sm" data-testid="prompt-preview-error">

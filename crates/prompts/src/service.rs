@@ -160,7 +160,9 @@ pub struct PromptService {
     secrets: Arc<dyn SecretStore>,
     cache: Arc<RwLock<Vec<Prompt>>>,
     /// Per-MCP-provider outcome of the last cache build, keyed by provider name.
-    /// Read by `list_mcp_providers` to drive the Settings status column.
+    /// Read by `list_mcp_providers` to drive the Settings status column. One
+    /// non-build writer: a render that determines needs-sign-in records it
+    /// here too (see `needs_auth`), so Settings can't contradict the composer.
     provider_status: Arc<RwLock<HashMap<String, ProviderStatus>>>,
     /// Serializes cache rebuilds so an older, slower `sync` can't finish after a
     /// newer one and overwrite the cache with stale results.
@@ -934,9 +936,7 @@ impl PromptService {
                 ));
             }
             CredentialState::SignedOut => {
-                return Err(PromptError::McpNeedsAuth {
-                    provider: provider_name.to_owned(),
-                });
+                return Err(self.needs_auth(provider_name));
             }
             CredentialState::SignedIn => {}
         }
@@ -946,9 +946,7 @@ impl PromptService {
         match client.get_access_token().await {
             Ok(_) => {}
             Err(AuthError::AuthorizationRequired) => {
-                return Err(PromptError::McpNeedsAuth {
-                    provider: provider_name.to_owned(),
-                });
+                return Err(self.needs_auth(provider_name));
             }
             Err(e) => {
                 return Err(PromptError::McpConnect {
@@ -965,6 +963,23 @@ impl PromptService {
         )
         .render_uncapped(name, args)
         .await
+    }
+
+    /// A render-path needs-sign-in: build the typed error **and** record the
+    /// status, so Settings can never contradict what the composer just told
+    /// the user (a render failure doesn't run a sync, and until the next one
+    /// the row would otherwise keep showing the last build's healthy count).
+    /// This is the one non-build status writer besides removal's cleanup; it
+    /// only ever writes `NeedsAuth`, and only from the same typed local
+    /// determination the status vocabulary already trusts.
+    fn needs_auth(&self, provider_name: &str) -> PromptError {
+        self.provider_status
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(provider_name.to_owned(), ProviderStatus::NeedsAuth);
+        PromptError::McpNeedsAuth {
+            provider: provider_name.to_owned(),
+        }
     }
 
     /// Resolve a provider's bearer from the secret store, returning the bearer and

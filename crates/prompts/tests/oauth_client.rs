@@ -653,6 +653,13 @@ async fn render_against_signed_out_provider_returns_typed_needs_auth() {
         0,
         "signed-out render must not run discovery"
     );
+    // And the determination was recorded as the provider's status, so
+    // Settings agrees with what the composer just reported (a render failure
+    // runs no sync, and the row would otherwise keep its stale status).
+    assert_eq!(
+        provider_status(&harness.service, "tiddly"),
+        ProviderStatus::NeedsAuth
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

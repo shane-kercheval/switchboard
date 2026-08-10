@@ -108,7 +108,7 @@ describe("PromptComposer", () => {
   });
 
   it("previews the combined message (rendered prompt + appended text) as markdown", async () => {
-    invokeMock.mockResolvedValue({ text: "# RENDERED BODY" });
+    invokeMock.mockResolvedValue({ kind: "rendered", text: "# RENDERED BODY" });
     setup({ focus: "tests", tone: "" }, "extra note");
 
     await fireEvent.click(screen.getByTestId("prompt-preview-button"));
@@ -296,8 +296,97 @@ describe("PromptComposer per-argument forwarding", () => {
     expect(screen.getByTestId("prompt-arg-focus")).not.toHaveClass("border-status-failed");
   });
 
+  it("a needs-sign-in preview launches the sign-in and reruns itself", async () => {
+    // Previewing is an explicit use of the provider, and a rerun dispatches
+    // nothing — so the preview signs in and completes on its own.
+    let renders = 0;
+    let releaseSignIn!: () => void;
+    const signInGate = new Promise<null>((res) => {
+      releaseSignIn = () => res(null);
+    });
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "render_prompt")
+        return ++renders === 1
+          ? { kind: "needs_sign_in", provider: "tiddly" }
+          : { kind: "rendered", text: "RENDERED AFTER SIGN-IN" };
+      if (cmd === "sign_in_mcp_provider") return signInGate;
+      return null;
+    });
+    setup({ focus: "tests", tone: "" }, "");
+
+    await fireEvent.click(screen.getByTestId("prompt-preview-button"));
+    // The waiting state names the provider while the browser is open.
+    await waitFor(() =>
+      expect(screen.getByTestId("prompt-preview-signing-in")).toHaveTextContent(
+        "Waiting for browser sign-in to tiddly",
+      ),
+    );
+
+    releaseSignIn();
+    const previewEl = await screen.findByTestId("prompt-preview");
+    expect(previewEl).toHaveTextContent("RENDERED AFTER SIGN-IN");
+    expect(invokeMock.mock.calls.filter(([c]) => c === "sign_in_mcp_provider")).toHaveLength(1);
+    expect(invokeMock.mock.calls.filter(([c]) => c === "render_prompt")).toHaveLength(2);
+  });
+
+  it("a failure after a successful mid-preview sign-in says the sign-in stuck", async () => {
+    let renders = 0;
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "render_prompt") {
+        if (++renders === 1) return { kind: "needs_sign_in", provider: "tiddly" };
+        throw new Error("timed out after 10s");
+      }
+      if (cmd === "sign_in_mcp_provider") return null;
+      return null;
+    });
+    setup({ focus: "tests", tone: "" }, "");
+
+    await fireEvent.click(screen.getByTestId("prompt-preview-button"));
+    await waitFor(() =>
+      expect(screen.getByTestId("prompt-preview-error")).toHaveTextContent(
+        "Signed in, but the preview then failed: timed out after 10s",
+      ),
+    );
+  });
+
+  it("a failure after a successful mid-preview sign-in says the sign-in stuck", async () => {
+    let renders = 0;
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "render_prompt") {
+        if (++renders === 1) return { kind: "needs_sign_in", provider: "tiddly" };
+        throw new Error("timed out after 10s");
+      }
+      return null;
+    });
+    setup({ focus: "tests", tone: "" }, "");
+
+    await fireEvent.click(screen.getByTestId("prompt-preview-button"));
+    await waitFor(() =>
+      expect(screen.getByTestId("prompt-preview-error")).toHaveTextContent(
+        "Signed in, but the preview then failed: timed out after 10s",
+      ),
+    );
+  });
+
+  it("a denied preview sign-in surfaces as the preview error", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "render_prompt") return { kind: "needs_sign_in", provider: "tiddly" };
+      if (cmd === "sign_in_mcp_provider")
+        return Promise.reject(new Error("the authorization server reported access_denied"));
+      return null;
+    });
+    setup({ focus: "tests", tone: "" }, "");
+
+    await fireEvent.click(screen.getByTestId("prompt-preview-button"));
+    await waitFor(() =>
+      expect(screen.getByTestId("prompt-preview-error")).toHaveTextContent("access_denied"),
+    );
+    // One launch, no rerun loop.
+    expect(invokeMock.mock.calls.filter(([c]) => c === "sign_in_mcp_provider")).toHaveLength(1);
+  });
+
   it("previews a forwarded argument with a placeholder for the live source", async () => {
-    invokeMock.mockResolvedValue({ text: "RENDERED" });
+    invokeMock.mockResolvedValue({ kind: "rendered", text: "RENDERED" });
     setupForward(
       { focus: "lead text", tone: "" },
       { argSources: { focus: [{ id: BOB.id, name: "bob" }] } },

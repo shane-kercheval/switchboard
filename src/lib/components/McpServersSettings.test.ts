@@ -340,31 +340,34 @@ describe("McpServersSettings — OAuth", () => {
     expect((screen.getByTestId("mcp-sign-in-tiddly") as HTMLButtonElement).disabled).toBe(false);
   });
 
-  it("re-sign-in on a signed-in row asks for confirmation first", async () => {
+  it("re-sign-in on a signed-in row launches directly and a double-click is inert", async () => {
+    // No confirmation panel (removed — see the plan's M4 supersession note:
+    // point-of-use auto-sign-in made an abandoned re-sign-in self-healing).
+    // Double-click safety comes from the pending state disabling the button.
     providers = [oauthProvider({ has_token: true, status: { state: "ok", prompt_count: 3 } })];
+    let resolveSignIn: (() => void) | undefined;
+    signInImpl = (name: string) =>
+      new Promise<unknown>((resolve) => {
+        resolveSignIn = () => {
+          markSignedIn(name);
+          resolve(null);
+        };
+      });
     render(McpServersSettings);
     await waitFor(() => expect(screen.getByTestId("mcp-sign-in-tiddly")).toBeInTheDocument());
 
-    // First click arms the confirmation — nothing is invoked yet.
     await fireEvent.click(screen.getByTestId("mcp-sign-in-tiddly"));
-    expect(screen.getByTestId("mcp-resignin-confirm-tiddly")).toHaveTextContent(
-      "may replace this server's current authorization",
-    );
-    expect(invokeMock.mock.calls.some(([c]) => c === "sign_in_mcp_provider")).toBe(false);
-
-    // A second click on the same button (a double-click is one gesture) must
-    // NOT fall through to the destructive path — it only re-arms.
-    await fireEvent.click(screen.getByTestId("mcp-sign-in-tiddly"));
-    expect(invokeMock.mock.calls.some(([c]) => c === "sign_in_mcp_provider")).toBe(false);
-    expect(screen.getByTestId("mcp-resignin-confirm-tiddly")).toBeInTheDocument();
-
-    // Cancel dismisses; confirming actually signs in.
-    await fireEvent.click(screen.getByTestId("mcp-resignin-cancel-tiddly"));
-    expect(screen.queryByTestId("mcp-resignin-confirm-tiddly")).not.toBeInTheDocument();
-    await fireEvent.click(screen.getByTestId("mcp-sign-in-tiddly"));
-    await fireEvent.click(screen.getByTestId("mcp-resignin-go-tiddly"));
     await waitFor(() =>
       expect(invokeMock).toHaveBeenCalledWith("sign_in_mcp_provider", { name: "tiddly" }),
+    );
+    // The second click of a double-click lands on a disabled, pending button.
+    expect((screen.getByTestId("mcp-sign-in-tiddly") as HTMLButtonElement).disabled).toBe(true);
+    await fireEvent.click(screen.getByTestId("mcp-sign-in-tiddly"));
+    expect(invokeMock.mock.calls.filter(([c]) => c === "sign_in_mcp_provider")).toHaveLength(1);
+
+    resolveSignIn?.();
+    await waitFor(() =>
+      expect(screen.getByTestId("mcp-notice-tiddly")).toHaveTextContent("Signed in."),
     );
   });
 
@@ -476,7 +479,6 @@ describe("McpServersSettings — OAuth delta hardening", () => {
     await waitFor(() => expect(screen.getByTestId("mcp-sign-in-tiddly")).toBeInTheDocument());
 
     await fireEvent.click(screen.getByTestId("mcp-sign-in-tiddly"));
-    await fireEvent.click(screen.getByTestId("mcp-resignin-go-tiddly"));
     await waitFor(() =>
       expect(screen.getByTestId("mcp-notice-tiddly")).toHaveTextContent("was not completed"),
     );
@@ -635,5 +637,28 @@ describe("McpServersSettings — OAuth delta hardening", () => {
     await waitFor(() => expect(screen.getByTestId("mcp-row-tiddly")).toBeInTheDocument());
     expect(screen.getByTestId("mcp-status-tiddly")).toHaveTextContent("future_state");
     expect(screen.getByTestId("mcp-status-tiddly")).toHaveClass("text-muted");
+  });
+});
+
+describe("McpServersSettings — live-run fixes", () => {
+  it("a probe result survives a background sync; only flow notices are transient", async () => {
+    // Found in the live run: the sign-in kicked off a background sync, and
+    // its prompts:synced event was wiping the Test result the user had just
+    // requested. Probe outcomes persist; "Signed in." is the transient one.
+    providers = [oauthProvider({ has_token: true, status: { state: "ok", prompt_count: 3 } })];
+    render(McpServersSettings);
+    await waitFor(() => expect(screen.getByTestId("mcp-test-tiddly")).toBeInTheDocument());
+
+    savedProbeResult = { state: "ok", prompt_count: 4 };
+    await fireEvent.click(screen.getByTestId("mcp-test-tiddly"));
+    await waitFor(() =>
+      expect(screen.getByTestId("mcp-notice-tiddly")).toHaveTextContent("Connected — 4 prompts."),
+    );
+
+    eventListeners.get("prompts:synced")?.({ payload: null });
+    // Presence must hold after the event-driven refresh settles.
+    await waitFor(() =>
+      expect(screen.getByTestId("mcp-notice-tiddly")).toHaveTextContent("Connected — 4 prompts."),
+    );
   });
 });

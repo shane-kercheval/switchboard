@@ -935,10 +935,15 @@ export type Prompt = {
   tags: string[];
 };
 
-// The finished text returned by `render_prompt` — what the agent receives.
-export type RenderedPrompt = {
-  text: string;
-};
+// The typed outcome of `render_prompt` (mirrors the Rust `RenderPromptOutcome`,
+// `#[serde(tag = "kind", rename_all = "snake_case")]`, `#[non_exhaustive]`).
+// `needs_sign_in` crosses as data rather than an error string because the
+// composer *acts* on it — launching the provider's browser sign-in and
+// retrying — instead of displaying it. Callers must degrade gracefully on
+// unknown kinds.
+export type RenderPromptOutcome =
+  | { kind: "rendered"; text: string }
+  | { kind: "needs_sign_in"; provider: string };
 
 // The raw, unrendered template body returned by `get_prompt_source` — for a
 // read-only preview. Available for `builtin`/`local` prompts; `get_prompt_source`

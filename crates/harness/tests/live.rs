@@ -1045,6 +1045,236 @@ async fn live_claude_resume_reuses_session_in_underscored_cwd() {
     );
 }
 
+/// Dispatch one live turn and return its events plus the concatenated streamed
+/// text. The fork tests each run several turns; inlining the collect-and-filter
+/// at every one of them is what pushed them past the line limit.
+async fn fork_turn(
+    adapter: &ClaudeCodeAdapter,
+    agent: &AgentRecord,
+    cwd: &Path,
+    prompt: &str,
+) -> (Vec<AdapterEvent>, String) {
+    let stream = adapter
+        .dispatch(
+            agent,
+            cwd,
+            prompt,
+            Uuid::now_v7(),
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("live dispatch should succeed");
+    let events: Vec<AdapterEvent> = stream.collect().await;
+    let text = events
+        .iter()
+        .filter_map(|e| match e {
+            AdapterEvent::ContentChunk { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    (events, text)
+}
+
+/// The whole fork contract against the real CLI: a forked agent's first
+/// dispatch inherits the parent's context, lands on the session id **we**
+/// pre-generated (not one Claude chose), leaves the parent's file untouched,
+/// and writes a child file the transcript parser reads back as full inherited
+/// history. A CLI bump that changed `--fork-session`'s interaction with
+/// `--session-id`, or stopped copying prior turns into the child, would break
+/// forking in ways no fixture test can see.
+#[tokio::test]
+#[ignore = "requires claude installed — run with: make test-live"]
+async fn live_claude_fork_inherits_context_on_the_caller_assigned_session() {
+    let adapter = ClaudeCodeAdapter::new();
+    // Stable cwd, canonicalized — same reasoning as the sibling resume tests: a
+    // fresh random directory per run would leave a new project dir behind in the
+    // developer's real `~/.claude/projects/` every time. Canonicalizing is
+    // load-bearing (macOS `temp_dir()` is a symlink): the path used for the
+    // session-file lookup must be the one claude itself resolves.
+    let cwd = std::env::temp_dir().join("sw_live_probe_fork");
+    std::fs::create_dir_all(&cwd).expect("create fork probe cwd");
+    let cwd = cwd.canonicalize().expect("canonicalize cwd");
+
+    let parent_session = Uuid::now_v7();
+    let parent = AgentRecord {
+        session_locator: Some(SessionLocator::Uuid(parent_session)),
+        ..live_agent()
+    };
+    fork_turn(
+        &adapter,
+        &parent,
+        &cwd,
+        "Remember: the secret word is BANANA. Reply with only the word ack.",
+    )
+    .await;
+
+    let parent_path = claude_session_file_path(&home_dir(), &cwd, &parent_session);
+    let parent_before = std::fs::read(&parent_path).expect("parent session file");
+
+    // The fork: its own pre-generated locator plus provenance pointing at the
+    // parent's session. `build_args` turns that into
+    // `--resume <parent> --session-id <own> --fork-session`.
+    let fork_session = Uuid::now_v7();
+    let fork = AgentRecord {
+        session_locator: Some(SessionLocator::Uuid(fork_session)),
+        forked_from_session: Some(parent_session),
+        ..live_agent()
+    };
+    let (events, text) = fork_turn(
+        &adapter,
+        &fork,
+        &cwd,
+        "What is the secret word? Reply with only that word.",
+    )
+    .await;
+    assert!(
+        text.contains("BANANA"),
+        "the fork must inherit the parent's context, got: {text:?}"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AdapterEvent::TurnEnd {
+                outcome: TurnOutcome::Completed,
+                ..
+            }
+        )),
+        "the fork's first turn must complete"
+    );
+
+    // The branch landed on OUR id — this is what lets a fork pre-generate its
+    // locator at registration instead of capturing one from the stream.
+    assert!(
+        claude_session_file_path(&home_dir(), &cwd, &fork_session).exists(),
+        "the fork must write the session file we named, not one claude chose"
+    );
+    assert_eq!(
+        std::fs::read(&parent_path).expect("parent session file"),
+        parent_before,
+        "forking must not modify the parent's session file"
+    );
+
+    // The parser reads the child back as inherited history, not just the new
+    // turn — this is what makes the forked agent's transcript render.
+    let loaded = load_claude_transcript(&home_dir(), &cwd, fork_session, fork.id)
+        .expect("the forked session file must load");
+    let prompts: Vec<String> = loaded
+        .turns
+        .iter()
+        .filter_map(|t| match t {
+            Turn::User { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        prompts.iter().any(|p| p.contains("secret word is BANANA")),
+        "the parent's prompt must be present in the fork's transcript, got: {prompts:?}"
+    );
+    assert!(
+        prompts
+            .iter()
+            .any(|p| p.contains("What is the secret word")),
+        "the fork's own prompt must be present too, got: {prompts:?}"
+    );
+
+    // Second turn: provenance is still set, but the fork's own file now exists,
+    // so this must be a plain resume — re-forking here would discard the fork's
+    // own history on every send.
+    fork_turn(&adapter, &fork, &cwd, "Reply with only the word ack2.").await;
+    let after = load_claude_transcript(&home_dir(), &cwd, fork_session, fork.id)
+        .expect("the forked session file must still load");
+    let after_prompts = after
+        .turns
+        .iter()
+        .filter(|t| matches!(t, Turn::User { .. }))
+        .count();
+    assert!(
+        after_prompts > prompts.len(),
+        "the second turn must append to the fork's own session, not re-fork it \
+         (prompts before: {}, after: {after_prompts})",
+        prompts.len()
+    );
+}
+
+/// Cancelling a fork's **first** dispatch must never strand the agent. Because
+/// fork-vs-resume is derived from whether the fork's own session file exists, a
+/// half-written child file would silently resume a shortened history forever.
+/// Probing (harness-behavior.md §3.5) showed the child file is only ever absent
+/// or content-complete — the copy lands in one write — so either outcome is
+/// recoverable, and this pins that live: after a cancel, the next send lands a
+/// fork carrying the parent's context either way.
+#[tokio::test]
+#[ignore = "requires claude installed — run with: make test-live"]
+async fn live_claude_fork_recovers_from_a_cancelled_first_dispatch() {
+    let adapter = ClaudeCodeAdapter::new();
+    // Stable, canonicalized cwd — see the sibling fork test.
+    let cwd = std::env::temp_dir().join("sw_live_probe_fork_cancel");
+    std::fs::create_dir_all(&cwd).expect("create fork-cancel probe cwd");
+    let cwd = cwd.canonicalize().expect("canonicalize cwd");
+
+    let parent_session = Uuid::now_v7();
+    let parent = AgentRecord {
+        session_locator: Some(SessionLocator::Uuid(parent_session)),
+        ..live_agent()
+    };
+    fork_turn(
+        &adapter,
+        &parent,
+        &cwd,
+        "Remember: the secret word is BANANA. Reply with only the word ack.",
+    )
+    .await;
+
+    let fork_session = Uuid::now_v7();
+    let fork = AgentRecord {
+        session_locator: Some(SessionLocator::Uuid(fork_session)),
+        forked_from_session: Some(parent_session),
+        ..live_agent()
+    };
+
+    // Cancel the fork's first dispatch mid-flight, exactly as the dispatcher's
+    // cancel path does (the token kills the subprocess group).
+    let token = tokio_util::sync::CancellationToken::new();
+    let stream = adapter
+        .dispatch(
+            &fork,
+            &cwd,
+            "Count slowly from 1 to 50, one number per line.",
+            Uuid::now_v7(),
+            DispatchOptions {
+                cancel_token: token.clone(),
+                ..DispatchOptions::default()
+            },
+        )
+        .await
+        .expect("the fork's first dispatch should spawn");
+    let canceller = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        token.cancel();
+    });
+    let _: Vec<AdapterEvent> = stream.collect().await;
+    canceller.await.expect("canceller task");
+
+    // Whichever state the cancel left behind, the next send must produce a fork
+    // that knows the parent's context — re-forking if the file never appeared,
+    // resuming the completed copy if it did.
+    let (_events, text) = fork_turn(
+        &adapter,
+        &fork,
+        &cwd,
+        "What is the secret word? Reply with only that word.",
+    )
+    .await;
+    assert!(
+        text.contains("BANANA"),
+        "a cancelled first dispatch must not cost the fork its inherited context, got: {text:?}"
+    );
+    assert!(
+        claude_session_file_path(&home_dir(), &cwd, &fork_session).exists(),
+        "the fork must end up on its own pre-generated session id"
+    );
+}
+
 /// The backend contract the staleness refresh stands on: continuing a session
 /// (a second turn appended to the file, exactly as a TUI continuation does)
 /// makes a re-read return the new turn with a **new, distinct** `hydration_key`

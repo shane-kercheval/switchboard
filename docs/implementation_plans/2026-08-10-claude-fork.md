@@ -76,18 +76,28 @@ alongside this plan).
 
 ### Prerequisite probes (run before or during M2; record results in harness-behavior §3.5)
 
-- **Probe A — read-during-write.** Fork while the parent is mid-turn (give the
-  parent a deliberately long-running prompt). Inspect both files: does the fork's
-  copy end cleanly at the last complete record, does Claude error on a torn
-  trailing line, or something else? This documents the failure mode of the
-  snapshot-boundary race that remains after the co-send rule (see Design
-  decisions) — it does not gate the design, it bounds the residual.
-- **Probe B — interrupted materialization.** Kill (`killpg`, mirroring cancel) the
-  fork's first dispatch mid-turn on a *long* parent transcript. Inspect the child
-  file: absent, complete copy, or truncated copy? This decides whether the
-  self-healing claim below needs a mitigation. If a truncated child file is
-  reachable, **stop and escalate** the mitigation choice (accept-and-document vs.
-  guard) with the probe evidence — do not pick one unilaterally.
+**Both probes are done (2026-08-10 @ 2.1.226); results recorded in
+harness-behavior.md §3.5.** Summary, because two design claims rest on them:
+
+- **Probe A — read-during-write: safe, with one visible artifact.** Forking while
+  the parent is mid-turn succeeds, inherits context correctly, and corrupts
+  neither file (no unparseable lines in either). The fork snapshots the parent's
+  on-disk records; for the parent's in-flight turn it copies the user prompt and
+  **synthesizes an assistant record reading `"No response requested."`** rather
+  than leaving a dangling prompt. So the residual isn't corruption or lost
+  context — it's a **spurious agent turn in the fork's transcript**. That is the
+  concrete harm the co-send rule prevents, and the accepted cost of the
+  rapid-fire residual.
+- **Probe B — interrupted materialization: truncation is not reachable.** Across
+  22 `killpg` runs (0.5 s–8 s) against parents of 40 records / 35 KB and 31
+  records / 160 KB, the child file was only ever **absent** or
+  **content-complete** — never partial, never a torn line; the transition is a
+  single step, so the copy is buffered and lands in one write. **No mitigation
+  needed**: the self-healing claim holds as written, and the record-count guard
+  contemplated as a fallback is not built. (Note for future re-probes: raw
+  record counts are a *false* truncation signal — a complete child legitimately
+  carries fewer records than its parent because housekeeping records aren't all
+  copied. Compare conversation content, not line counts.)
 
 ## Design decisions (settled in discussion + review — do not re-derive)
 
@@ -106,10 +116,10 @@ alongside this plan).
   plain `--resume <own>`. If Claude died before creating the new file, the next
   send retries the fork; nothing to persist or roll back. This rationale must
   survive into a code comment at the arg-building site. **Scope of the
-  self-healing claim:** it covers the file-absent case only. A *truncated* child
-  file (killed mid-copy) would be "present" and resume silently shortened — whether
-  that state is reachable is exactly Probe B; do not extend the claim until the
-  probe answers.
+  self-healing claim:** Probe B settled this — a killed first dispatch leaves the
+  child file either absent (re-forks) or content-complete (resumes with full
+  inherited history), never partial, so the claim holds for every reachable
+  state.
 - **The fork source is permanent provenance on the registry record**, never cleared
   after the first dispatch (it becomes inert once the file exists). Field semantics:
   "the parent *session* UUID to `--resume` from if this agent's own session file
@@ -308,10 +318,10 @@ a normal agent thereafter.
     the child JSONL shows inherited turns with preserved timestamps, provenance,
     and hydration keys (the parser-boundary half of the M3 fixture, against the
     live CLI).
-  - **Cancel path:** cancel a fork's first dispatch after the child file appears;
-    assert the next dispatch resumes and the inherited context survives (exact
-    assertion depends on Probe B's answer — full context if the copy is atomic,
-    the documented degraded behavior otherwise).
+  - **Cancel path:** cancel a fork's first dispatch, then assert the next send
+    still lands a fork carrying the parent's context — covering both states
+    Probe B showed are reachable (re-fork when the file never appeared, plain
+    resume when the complete copy did).
 - Probes A and B run; results written into harness-behavior §3.5.
 
 ## M3 — App command, send validation, UI, one-shot refresh, tests, docs
@@ -444,9 +454,11 @@ The feature is usable end to end and its transcript behavior is pinned.
   fork-click.
 - Fork snapshot is "parent history on disk at first send," not at fork-click. A
   parent turn completing in between is included. Forking while a parent turn is
-  in flight (or rapid-fire sends to fork then parent) snapshots only the parent's
-  completed records, with the boundary behavior documented by Probe A; the
-  fan-out case is prevented by the co-send rule until the fork materializes.
+  in flight (or rapid-fire sends to fork then parent) snapshots the parent's
+  completed records **plus** a synthesized `"No response requested."` reply
+  standing in for the in-flight turn's real answer (Probe A) — a spurious agent
+  turn in the fork's transcript. The fan-out case is prevented by the co-send
+  rule until the fork materializes; the rapid-fire case is accepted.
 - Co-paning a fork with its parent shows the shared history twice (interleaved at
   identical timestamps) — reachable only by explicit user layout choice; the
   default placement avoids it.

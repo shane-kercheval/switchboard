@@ -166,12 +166,43 @@ fn build_args(
             Some(home) => session_exists_in(home, cwd, session_id),
             None => session_file_exists(cwd, session_id),
         };
-        if exists {
-            args.push("--resume".to_owned());
-        } else {
-            args.push("--session-id".to_owned());
+        match (exists, agent.forked_from_session) {
+            // The agent's own session exists: an ordinary resume. A forked
+            // agent takes this branch for every turn after its first, so the
+            // fork flags appear exactly once in its lifetime even though the
+            // provenance field is never cleared.
+            (true, _) => {
+                args.push("--resume".to_owned());
+                args.push(session_id.to_string());
+            }
+            // An unmaterialized fork: resume the PARENT and branch, landing the
+            // branch on this agent's own pre-generated id. Claude enforces this
+            // exact trio — `--session-id` alongside `--resume`/`--continue`
+            // without `--fork-session` aborts with "--session-id can only be
+            // used with --continue or --resume if --fork-session is also
+            // specified" (2.1.226).
+            //
+            // Deriving fork-vs-resume from file existence (rather than
+            // consuming a flag) is what makes this idempotent: if this dispatch
+            // dies before Claude creates the file, the next send retries the
+            // fork; once the file exists, the arm above takes over permanently.
+            // Nothing to persist, nothing to roll back. Caveat: that reasoning
+            // treats the file as present-or-absent — a *truncated* file (killed
+            // mid-copy) reads as present. See harness-behavior.md §3.5 for
+            // whether that state is reachable.
+            (false, Some(parent_session)) => {
+                args.push("--resume".to_owned());
+                args.push(parent_session.to_string());
+                args.push("--session-id".to_owned());
+                args.push(session_id.to_string());
+                args.push("--fork-session".to_owned());
+            }
+            // First turn of an ordinary agent: create the session under our id.
+            (false, None) => {
+                args.push("--session-id".to_owned());
+                args.push(session_id.to_string());
+            }
         }
-        args.push(session_id.to_string());
     }
     // Per-agent selection (sent every turn when set; unset → harness default).
     // `--model` takes an alias (`sonnet`/`opus`) or a full id; `--effort` takes
@@ -691,6 +722,157 @@ mod tests {
 
         assert!(args.contains(&"--resume".to_owned()));
         assert!(!args.contains(&"--session-id".to_owned()));
+    }
+
+    /// Write an empty session file where Claude Code would put it, so
+    /// `build_args` sees the agent's session as materialized.
+    fn materialize_session(home: &Path, cwd: &Path, session_id: Uuid) {
+        let canonical = cwd.canonicalize().unwrap();
+        let session_dir = home
+            .join(".claude")
+            .join("projects")
+            .join(encode_cwd(&canonical));
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(session_dir.join(format!("{session_id}.jsonl")), "").unwrap();
+    }
+
+    /// Index of `flag` in `args`, asserting it appears exactly once.
+    fn flag_at(args: &[String], flag: &str) -> usize {
+        let hits: Vec<usize> = args
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| a.as_str() == flag)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(hits.len(), 1, "expected one {flag} in {args:?}");
+        hits[0]
+    }
+
+    #[test]
+    fn build_args_forks_from_the_parent_on_an_unmaterialized_forks_first_turn() {
+        // The whole contract in one assertion set: resume the PARENT, land on
+        // OUR id, and carry `--fork-session` (which claude requires whenever
+        // `--session-id` accompanies `--resume`).
+        let home = tempfile::TempDir::new().unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        let parent_session = Uuid::now_v7();
+        let own_session = Uuid::now_v7();
+        let mut agent = agent_with_session(own_session);
+        agent.forked_from_session = Some(parent_session);
+
+        let args = build_args(&agent, "hi", project.path(), Some(home.path()));
+
+        assert_eq!(
+            args[flag_at(&args, "--resume") + 1],
+            parent_session.to_string()
+        );
+        assert_eq!(
+            args[flag_at(&args, "--session-id") + 1],
+            own_session.to_string()
+        );
+        assert!(args.contains(&"--fork-session".to_owned()), "{args:?}");
+        // Every flag must precede the end-of-options separator, or it lands as
+        // a positional alongside the prompt.
+        assert!(
+            flag_at(&args, "--fork-session") < flag_at(&args, "--"),
+            "{args:?}"
+        );
+    }
+
+    #[test]
+    fn build_args_resumes_own_session_once_a_fork_has_materialized() {
+        // `forked_from_session` is never cleared, so "don't re-fork" rests
+        // entirely on the file check. If this regressed, every turn after the
+        // first would re-branch the parent — silently discarding the fork's own
+        // history on each send.
+        let home = tempfile::TempDir::new().unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        let parent_session = Uuid::now_v7();
+        let own_session = Uuid::now_v7();
+        let mut agent = agent_with_session(own_session);
+        agent.forked_from_session = Some(parent_session);
+        materialize_session(home.path(), project.path(), own_session);
+
+        let args = build_args(&agent, "hi", project.path(), Some(home.path()));
+
+        assert_eq!(
+            args[flag_at(&args, "--resume") + 1],
+            own_session.to_string()
+        );
+        assert!(!args.contains(&"--fork-session".to_owned()), "{args:?}");
+        assert!(!args.contains(&"--session-id".to_owned()), "{args:?}");
+        assert!(!args.contains(&parent_session.to_string()), "{args:?}");
+    }
+
+    #[test]
+    fn build_args_retries_the_fork_when_the_first_dispatch_left_no_file() {
+        // Self-healing: a first dispatch that died before claude created the
+        // file is indistinguishable from never having dispatched, so the next
+        // send forks again rather than resuming a session that doesn't exist.
+        let home = tempfile::TempDir::new().unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        let parent_session = Uuid::now_v7();
+        let mut agent = agent_with_session(Uuid::now_v7());
+        agent.forked_from_session = Some(parent_session);
+
+        let first = build_args(&agent, "hi", project.path(), Some(home.path()));
+        let retry = build_args(&agent, "hi", project.path(), Some(home.path()));
+
+        assert_eq!(first, retry);
+        assert!(retry.contains(&"--fork-session".to_owned()), "{retry:?}");
+    }
+
+    #[test]
+    fn build_args_omits_fork_flags_for_a_non_forked_agent() {
+        let home = tempfile::TempDir::new().unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        let session_id = Uuid::now_v7();
+        let agent = agent_with_session(session_id);
+
+        let args = build_args(&agent, "hi", project.path(), Some(home.path()));
+
+        assert!(!args.contains(&"--fork-session".to_owned()), "{args:?}");
+        assert_eq!(
+            args[flag_at(&args, "--session-id") + 1],
+            session_id.to_string()
+        );
+        assert!(!args.contains(&"--resume".to_owned()), "{args:?}");
+    }
+
+    #[test]
+    fn build_args_carries_model_and_effort_on_the_fork_dispatch() {
+        // The per-agent selection rides the fork turn like any other, and still
+        // lands before the `--` separator.
+        let home = tempfile::TempDir::new().unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        let mut agent = agent_with_session(Uuid::now_v7());
+        agent.forked_from_session = Some(Uuid::now_v7());
+        agent.model = Some("opus".to_owned());
+        agent.effort = Some("high".to_owned());
+
+        let args = build_args(&agent, "hi", project.path(), Some(home.path()));
+
+        assert_eq!(args[flag_at(&args, "--model") + 1], "opus");
+        assert_eq!(args[flag_at(&args, "--effort") + 1], "high");
+        assert!(flag_at(&args, "--model") < flag_at(&args, "--"), "{args:?}");
+    }
+
+    #[test]
+    fn build_args_ignores_fork_provenance_without_a_locator() {
+        // Unconstructible via `Project::fork_agent` (which always assigns a
+        // locator), but the arm must degrade to today's no-session-flags
+        // behavior rather than emitting a half-formed fork invocation.
+        let home = tempfile::TempDir::new().unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        let mut agent = agent_with_session(Uuid::now_v7());
+        agent.session_locator = None;
+        agent.forked_from_session = Some(Uuid::now_v7());
+
+        let args = build_args(&agent, "hi", project.path(), Some(home.path()));
+
+        assert!(!args.contains(&"--fork-session".to_owned()), "{args:?}");
+        assert!(!args.contains(&"--resume".to_owned()), "{args:?}");
+        assert!(!args.contains(&"--session-id".to_owned()), "{args:?}");
     }
 
     #[test]

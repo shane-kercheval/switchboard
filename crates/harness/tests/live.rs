@@ -1045,6 +1045,59 @@ async fn live_claude_resume_reuses_session_in_underscored_cwd() {
     );
 }
 
+/// Every keyed agent turn of `parent` must appear in `child` with identical
+/// `hydration_key` and `started_at`. This is what the imported-history
+/// rendering and the keyed merge stand on — a CLI bump that dropped inherited
+/// replies, restamped copied records at fork time, or regenerated per-turn ids
+/// would keep prompt-level assertions green while breaking hydration.
+/// (Raw-record lineage — `parentUuid` chains, `promptSource` — is asserted by
+/// M3's raw fixture; the loader normalizes those away.)
+fn assert_agent_identities_inherited(parent: &[Turn], child: &[Turn]) {
+    let identities = |turns: &[Turn]| {
+        turns
+            .iter()
+            .filter_map(|t| match t {
+                Turn::Agent {
+                    hydration_key: Some(key),
+                    started_at,
+                    ..
+                } => Some((key.clone(), *started_at)),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let parent_turns = identities(parent);
+    let child_turns = identities(child);
+    assert!(
+        !parent_turns.is_empty(),
+        "the seeded parent must have at least one keyed agent turn"
+    );
+    for parent_turn in &parent_turns {
+        assert!(
+            child_turns.contains(parent_turn),
+            "the parent's agent turn (key, started_at) = {parent_turn:?} must appear in the \
+             child with identical identity; child has: {child_turns:?}"
+        );
+    }
+}
+
+/// Assert a parent-seeding turn completed. Both fork tests seed a parent
+/// session before exercising the fork; without this, an auth/quota failure on
+/// the seed surfaces much later as `got: ""` at the BANANA assertion — the
+/// worst place to start debugging a live test months from now.
+fn assert_seed_completed(events: &[AdapterEvent]) {
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AdapterEvent::TurnEnd {
+                outcome: TurnOutcome::Completed,
+                ..
+            }
+        )),
+        "seeding the parent session did not complete (auth/quota?): {events:?}"
+    );
+}
+
 /// Dispatch one live turn and return its events plus the concatenated streamed
 /// text. The fork tests each run several turns; inlining the collect-and-filter
 /// at every one of them is what pushed them past the line limit.
@@ -1100,13 +1153,14 @@ async fn live_claude_fork_inherits_context_on_the_caller_assigned_session() {
         session_locator: Some(SessionLocator::Uuid(parent_session)),
         ..live_agent()
     };
-    fork_turn(
+    let (seed_events, _) = fork_turn(
         &adapter,
         &parent,
         &cwd,
         "Remember: the secret word is BANANA. Reply with only the word ack.",
     )
     .await;
+    assert_seed_completed(&seed_events);
 
     let parent_path = claude_session_file_path(&home_dir(), &cwd, &parent_session);
     let parent_before = std::fs::read(&parent_path).expect("parent session file");
@@ -1177,6 +1231,12 @@ async fn live_claude_fork_inherits_context_on_the_caller_assigned_session() {
         "the fork's own prompt must be present too, got: {prompts:?}"
     );
 
+    // Inherited AGENT turns must survive with identity intact — see
+    // `assert_agent_identities_inherited`.
+    let parent_loaded = load_claude_transcript(&home_dir(), &cwd, parent_session, parent.id)
+        .expect("the parent session file must load");
+    assert_agent_identities_inherited(&parent_loaded.turns, &loaded.turns);
+
     // Second turn: provenance is still set, but the fork's own file now exists,
     // so this must be a plain resume — re-forking here would discard the fork's
     // own history on every send.
@@ -1197,12 +1257,20 @@ async fn live_claude_fork_inherits_context_on_the_caller_assigned_session() {
 }
 
 /// Cancelling a fork's **first** dispatch must never strand the agent. Because
-/// fork-vs-resume is derived from whether the fork's own session file exists, a
-/// half-written child file would silently resume a shortened history forever.
-/// Probing (harness-behavior.md §3.5) showed the child file is only ever absent
-/// or content-complete — the copy lands in one write — so either outcome is
-/// recoverable, and this pins that live: after a cancel, the next send lands a
-/// fork carrying the parent's context either way.
+/// fork-vs-resume is derived from whether the fork's own session file exists,
+/// recovery must hold for whichever state the cancel leaves behind: file
+/// absent → the next send re-forks; file present → it resumes the copy.
+/// (Probing found only those two states — never a partial file — but that is a
+/// bounded observation at one CLI version, not a guarantee; see
+/// harness-behavior.md §3.5. The recovery invariant asserted here is
+/// state-independent, and the deterministic per-state arg coverage lives in
+/// the `build_args` unit tests. Which state a given run exercises depends on
+/// timing; with a tiny parent it cannot be the size-sensitive copy window the
+/// probe explored at 160 KB.)
+///
+/// The cancelled turn's prompt is deliberately long-running — an exception to
+/// AGENTS.md's tiny-response cost discipline, because the test needs a window
+/// in which the cancel can actually land.
 #[tokio::test]
 #[ignore = "requires claude installed — run with: make test-live"]
 async fn live_claude_fork_recovers_from_a_cancelled_first_dispatch() {
@@ -1217,13 +1285,14 @@ async fn live_claude_fork_recovers_from_a_cancelled_first_dispatch() {
         session_locator: Some(SessionLocator::Uuid(parent_session)),
         ..live_agent()
     };
-    fork_turn(
+    let (seed_events, _) = fork_turn(
         &adapter,
         &parent,
         &cwd,
         "Remember: the secret word is BANANA. Reply with only the word ack.",
     )
     .await;
+    assert_seed_completed(&seed_events);
 
     let fork_session = Uuid::now_v7();
     let fork = AgentRecord {
@@ -1252,8 +1321,22 @@ async fn live_claude_fork_recovers_from_a_cancelled_first_dispatch() {
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         token.cancel();
     });
-    let _: Vec<AdapterEvent> = stream.collect().await;
+    let cancelled_events: Vec<AdapterEvent> = stream.collect().await;
     canceller.await.expect("canceller task");
+
+    // The cancel must have genuinely interrupted the turn. The adapter's
+    // cancel contract is to end the stream WITHOUT a terminal event (the
+    // dispatcher synthesizes the Cancelled terminal) — so any `TurnEnd` here
+    // means claude finished inside the sleep and this run proved nothing the
+    // happy-path test doesn't. Fail loudly rather than pass vacuously; if
+    // models get fast enough to finish 50 lines in 3 s, widen the prompt.
+    assert!(
+        !cancelled_events
+            .iter()
+            .any(|e| matches!(e, AdapterEvent::TurnEnd { .. })),
+        "the first dispatch completed before the cancel landed — the test \
+         exercised nothing; widen the prompt. Events: {cancelled_events:?}"
+    );
 
     // Whichever state the cancel left behind, the next send must produce a fork
     // that knows the parent's context — re-forking if the file never appeared,

@@ -199,9 +199,12 @@ impl Project {
     /// **Nothing forks here.** This method just registers the record;
     /// materialization happens on the fork's *first dispatch*, which resumes
     /// the parent session with `--fork-session` (see
-    /// `claude_code::build_args`). Deliberately lazy: forking eagerly would
-    /// need a synthetic prompt, costing quota and putting a throwaway turn in
-    /// both transcripts.
+    /// `claude_code::build_args`). Not a design preference but a CLI
+    /// constraint: Claude has no copy-a-session operation, and a fork
+    /// invocation with an empty prompt is refused outright ("Provide a prompt
+    /// to continue…" — probed 2026-08-10 @ 2.1.226, harness-behavior §3.5).
+    /// A branch can only come into existence *as* a turn, which is why the
+    /// caller couples fork registration to a send.
     ///
     /// **This is not a complete eligibility check.** It validates two things:
     /// that the source's harness supports the deferred fork lifecycle, and that

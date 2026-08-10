@@ -168,10 +168,14 @@ pub struct AgentRecord {
     ///
     /// Only harnesses where [`HarnessKind::supports_session_fork`] holds ever
     /// carry `Some`, enforced at the registration chokepoint (see
-    /// `Project::register_agent_inner`) rather than by convention. Same
-    /// plain-`Option` backward-compat rationale as `model` / `effort` above: a
-    /// record written before forking existed legitimately lacks the key and
-    /// must load as `None`.
+    /// `Project::register_agent_inner`) rather than by convention. **That
+    /// enforcement is why the Codex/Gemini/Antigravity adapters ignore this
+    /// field entirely and are correct to** — their `build_args` never reads
+    /// it because no record of theirs can carry it. Do not add "defensive"
+    /// handling for it in those adapters: handling would imply the state is
+    /// reachable and invert the invariant. Same plain-`Option` backward-compat
+    /// rationale as `model` / `effort` above: a record written before forking
+    /// existed legitimately lacks the key and must load as `None`.
     pub forked_from_session: Option<Uuid>,
     pub created_at: DateTime<Utc>,
 }

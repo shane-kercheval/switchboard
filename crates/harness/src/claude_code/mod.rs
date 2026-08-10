@@ -86,6 +86,25 @@ impl HarnessAdapter for ClaudeCodeAdapter {
         // `options.is_first_dispatch_after_attach` has nothing to do here.
         // `options.cancel_token` IS used: it's watched in the producer's
         // `select!` to cancel the turn.
+        //
+        // Fail closed on fork provenance without a Uuid locator. `build_args`
+        // would emit no session flags at all, so claude would mint its own
+        // session id — one Switchboard never learns. The turn would look
+        // successful and every later send would silently lose continuity.
+        // A plain missing locator (no provenance) is a legitimate
+        // pre-first-turn state for other harnesses and stays permitted; the
+        // provenance is what declares an intent this record cannot honor.
+        // Unreachable via core's APIs (the registration chokepoint rejects
+        // it), so this guard only fires on a corrupted registry.
+        if agent.forked_from_session.is_some()
+            && !matches!(agent.session_locator, Some(SessionLocator::Uuid(_)))
+        {
+            return Err(DispatchError::InvalidAgentState(format!(
+                "agent {} carries fork provenance but no session locator — \
+                 refusing to dispatch a fork that cannot land on a known session",
+                agent.id
+            )));
+        }
         let binary = crate::subprocess::resolve_binary(&self.claude_binary_path)?;
         let args = build_args(agent, prompt, cwd, None);
 
@@ -859,9 +878,12 @@ mod tests {
 
     #[test]
     fn build_args_ignores_fork_provenance_without_a_locator() {
-        // Unconstructible via `Project::fork_agent` (which always assigns a
-        // locator), but the arm must degrade to today's no-session-flags
-        // behavior rather than emitting a half-formed fork invocation.
+        // Documents (not endorses) the arg-layer behavior: no session flags,
+        // like any locator-less agent. The real boundary is `dispatch`, which
+        // fails closed on this record shape before `build_args` ever runs —
+        // see `dispatch_rejects_fork_provenance_without_a_locator`. If that
+        // guard were removed, this degrade would let claude mint an untracked
+        // session id.
         let home = tempfile::TempDir::new().unwrap();
         let project = tempfile::TempDir::new().unwrap();
         let mut agent = agent_with_session(Uuid::now_v7());
@@ -873,6 +895,40 @@ mod tests {
         assert!(!args.contains(&"--fork-session".to_owned()), "{args:?}");
         assert!(!args.contains(&"--resume".to_owned()), "{args:?}");
         assert!(!args.contains(&"--session-id".to_owned()), "{args:?}");
+    }
+
+    #[tokio::test]
+    async fn dispatch_rejects_fork_provenance_without_a_locator() {
+        // Fail-closed contract for a corrupted registry record: provenance
+        // declares an intent to fork, and with no locator the fork can't land
+        // on a session Switchboard knows. Spawning anyway would *succeed* —
+        // claude mints its own session id — and continuity would silently die
+        // on the next send. The guard fires before binary resolution, so no
+        // real claude is needed.
+        let project = tempfile::TempDir::new().unwrap();
+        let mut agent = agent_with_session(Uuid::now_v7());
+        agent.session_locator = None;
+        agent.forked_from_session = Some(Uuid::now_v7());
+
+        let result = ClaudeCodeAdapter::new()
+            .dispatch(
+                &agent,
+                project.path(),
+                "hi",
+                Uuid::now_v7(),
+                crate::DispatchOptions::default(),
+            )
+            .await;
+
+        // `expect_err` needs `Debug` on the Ok side, which the event stream
+        // doesn't have — match instead.
+        match result {
+            Err(DispatchError::InvalidAgentState(msg)) => {
+                assert!(msg.contains(&agent.id.to_string()), "got: {msg}");
+            }
+            Err(other) => panic!("expected InvalidAgentState, got: {other:?}"),
+            Ok(_) => panic!("a fork with no locator must not dispatch"),
+        }
     }
 
     #[test]

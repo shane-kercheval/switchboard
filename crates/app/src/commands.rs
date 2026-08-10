@@ -1176,8 +1176,25 @@ pub fn get_prompt_source_impl(
 
 /// Configured MCP providers with their last-build status and whether a token is
 /// stored — drives the Settings provider list.
-pub fn list_mcp_providers_impl(state: &AppState) -> Vec<switchboard_prompts::McpProviderInfo> {
-    state.prompts.list_mcp_providers()
+///
+/// The listing itself is deliberately synchronous (see `tokens_present`) and
+/// does one keychain read per provider; it runs on the blocking pool here
+/// because the Settings surface now refreshes it after every row action and
+/// background sync, and a slow keychain read must not occupy an async runtime
+/// worker that unrelated work shares. A join failure (a panic in the listing)
+/// degrades to an empty list with a warning, matching the loaders'
+/// display-only contract.
+pub async fn list_mcp_providers_impl(
+    state: &AppState,
+) -> Vec<switchboard_prompts::McpProviderInfo> {
+    let prompts = state.prompts.clone();
+    match tokio::task::spawn_blocking(move || prompts.list_mcp_providers()).await {
+        Ok(providers) => providers,
+        Err(e) => {
+            tracing::warn!(error = %e, "provider listing task failed");
+            Vec::new()
+        }
+    }
 }
 
 /// Add a generic MCP provider (name + URL + auth mode + optional bearer):
@@ -1230,6 +1247,18 @@ pub fn remove_mcp_provider_impl(state: &AppState, name: &str) -> Result<(), AppE
     state.prompts.remove_mcp_provider(name)?;
     spawn_prompt_sync(state);
     Ok(())
+}
+
+/// Probe a **saved** provider by name with its stored credentials — the
+/// row-level Test action. Returns the outcome in the provider-status
+/// vocabulary the rows already render (`ok`/`needs_auth`/`errored`/
+/// `store_unavailable`) without touching the recorded status; `Err` is
+/// reserved for "no such provider".
+pub async fn test_saved_mcp_provider_impl(
+    state: &AppState,
+    name: &str,
+) -> Result<switchboard_prompts::ProviderStatus, AppError> {
+    Ok(state.prompts.test_saved_mcp_provider(name).await?)
 }
 
 /// Probe a candidate provider before saving (connect + list); returns the prompt
@@ -17600,7 +17629,7 @@ mod tests {
             Some("tok"),
         )
         .unwrap();
-        let providers = list_mcp_providers_impl(&state);
+        let providers = list_mcp_providers_impl(&state).await;
         assert_eq!(providers.len(), 1);
         assert_eq!(providers[0].name, "team");
         assert!(providers[0].has_token);
@@ -17618,7 +17647,72 @@ mod tests {
         ));
 
         remove_mcp_provider_impl(&state, "team").unwrap();
-        assert!(list_mcp_providers_impl(&state).is_empty());
+        assert!(list_mcp_providers_impl(&state).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn provider_listing_leaves_the_runtime_responsive_while_the_store_blocks() {
+        // Pins the architectural reason `list_mcp_providers_impl` goes through
+        // `spawn_blocking`: the listing does synchronous keychain reads, and
+        // this test runs on tokio's current_thread flavor — if the read ran
+        // inline on the (only) runtime worker, the select's timer below could
+        // never fire and the listing branch would win instead.
+        use switchboard_prompts::{SecretStore, SecretStoreError};
+
+        /// `get` parks until released. The park times out (returning "no
+        /// token") so a regression fails this test in seconds rather than
+        /// hanging it.
+        struct ParkedStore {
+            release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+        impl SecretStore for ParkedStore {
+            fn get(&self, _: &str) -> Result<Option<String>, SecretStoreError> {
+                let _ = self
+                    .release
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .recv_timeout(std::time::Duration::from_secs(5));
+                Ok(None)
+            }
+            fn set(&self, _: &str, _: &str) -> Result<(), SecretStoreError> {
+                Ok(())
+            }
+            fn delete(&self, _: &str) -> Result<(), SecretStoreError> {
+                Ok(())
+            }
+        }
+
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (tmp, state, _) = fresh_state_with_mock();
+        let prompts_dir = tmp.path().join("prompts");
+        std::fs::create_dir_all(&prompts_dir).unwrap();
+        let config_path = tmp.path().join("config.yaml");
+        std::fs::write(
+            &config_path,
+            "mcp_providers:\n  - name: team\n    transport:\n      type: http\n      url: https://x\n",
+        )
+        .unwrap();
+        let service = switchboard_prompts::PromptService::new(
+            config_path,
+            prompts_dir,
+            None,
+            Arc::new(ParkedStore {
+                release: std::sync::Mutex::new(release_rx),
+            }),
+        );
+        let state = state.with_prompts(service);
+
+        let mut listing = Box::pin(list_mcp_providers_impl(&state));
+        tokio::select! {
+            _ = &mut listing => {
+                panic!("the listing completed inline — it must park on the blocking pool");
+            }
+            () = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+        }
+
+        release_tx.send(()).unwrap();
+        let providers = listing.await;
+        assert_eq!(providers.len(), 1);
     }
 
     #[tokio::test]

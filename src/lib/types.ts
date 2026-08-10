@@ -895,12 +895,23 @@ export type ProviderStatus =
   | { state: "ok"; prompt_count: number }
   | { state: "errored"; message: string }
   | { state: "store_unavailable" }
+  | { state: "needs_auth" }
   | { state: "unknown" };
+
+// Mirrors the Rust `McpAuth` (`#[serde(tag = "type", rename_all =
+// "snake_case")]`, `#[non_exhaustive]`). `scopes` is the optional per-provider
+// override of the scopes requested at sign-in; absent means "resolve from the
+// server's own metadata".
+export type McpAuth = { type: "bearer" } | { type: "oauth"; scopes?: string[] | null };
 
 export type McpProviderInfo = {
   name: string;
   url: string;
+  /// Whether a *token* is stored — the pasted bearer, or (OAuth) signed-in
+  /// tokens. Never registration presence: a signed-out OAuth provider must
+  /// not render as credentialed.
   has_token: boolean;
+  auth: McpAuth;
   status: ProviderStatus;
 };
 

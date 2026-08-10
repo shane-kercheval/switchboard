@@ -58,7 +58,7 @@ use crate::commands::{
     set_agent_effort_impl, set_agent_model_impl, set_message_pin_impl, set_preferences_impl,
     set_project_archived_impl, sign_in_mcp_provider_impl, sign_out_mcp_provider_impl,
     stage_attachment_impl, sync_prompts_and_notify, terminal_open_argv, test_mcp_connection_impl,
-    tracked_repos_inputs, tracked_roots, validate_external_url,
+    test_saved_mcp_provider_impl, tracked_repos_inputs, tracked_roots, validate_external_url,
 };
 use crate::error::AppError;
 use crate::preferences::Preferences;
@@ -342,7 +342,7 @@ async fn sync_prompts(state: State<'_, AppState>) -> Result<(), String> {
 /// Configured MCP providers with status, for the Settings list.
 #[tauri::command]
 async fn list_mcp_providers(state: State<'_, AppState>) -> Result<Vec<McpProviderInfo>, String> {
-    Ok(list_mcp_providers_impl(state.inner()))
+    Ok(list_mcp_providers_impl(state.inner()).await)
 }
 
 /// Add a generic MCP server (name + URL + auth mode). `auth` is optional on
@@ -386,6 +386,19 @@ async fn sign_in_mcp_provider(state: State<'_, AppState>, name: String) -> Resul
 #[tauri::command]
 async fn sign_out_mcp_provider(state: State<'_, AppState>, name: String) -> Result<(), String> {
     sign_out_mcp_provider_impl(state.inner(), &name)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Probe a saved MCP server by name with its stored credentials — the
+/// row-level Test action. Returns a provider status, never an error (except
+/// for an unknown name).
+#[tauri::command]
+async fn test_saved_mcp_provider(
+    state: State<'_, AppState>,
+    name: String,
+) -> Result<switchboard_prompts::ProviderStatus, String> {
+    test_saved_mcp_provider_impl(state.inner(), &name)
         .await
         .map_err(|e| e.to_string())
 }
@@ -1722,6 +1735,7 @@ pub fn run() {
             remove_mcp_provider,
             sign_in_mcp_provider,
             sign_out_mcp_provider,
+            test_saved_mcp_provider,
             test_mcp_connection,
             local_prompts_dir,
             open_local_prompts_dir,

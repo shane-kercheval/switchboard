@@ -1046,37 +1046,60 @@ async fn live_claude_resume_reuses_session_in_underscored_cwd() {
 }
 
 /// Every keyed agent turn of `parent` must appear in `child` with identical
-/// `hydration_key` and `started_at`. This is what the imported-history
-/// rendering and the keyed merge stand on — a CLI bump that dropped inherited
-/// replies, restamped copied records at fork time, or regenerated per-turn ids
-/// would keep prompt-level assertions green while breaking hydration.
+/// `hydration_key`, `started_at`, **and rendered content**. This is what the
+/// imported-history rendering and the keyed merge stand on — a CLI bump that
+/// dropped inherited replies, restamped copied records at fork time, or
+/// regenerated per-turn ids would keep prompt-level assertions green while
+/// breaking hydration. Content is compared too, because identity alone would
+/// pass a fork that preserved record ids while emptying the replies.
 /// (Raw-record lineage — `parentUuid` chains, `promptSource` — is asserted by
 /// M3's raw fixture; the loader normalizes those away.)
 fn assert_agent_identities_inherited(parent: &[Turn], child: &[Turn]) {
-    let identities = |turns: &[Turn]| {
+    /// (`key`, `started_at`) → the turn's concatenated text items, so a match
+    /// asserts the reply survived rather than just its envelope.
+    fn keyed_content(turns: &[Turn]) -> Vec<((String, chrono::DateTime<chrono::Utc>), String)> {
         turns
             .iter()
             .filter_map(|t| match t {
                 Turn::Agent {
                     hydration_key: Some(key),
                     started_at,
+                    items,
                     ..
-                } => Some((key.clone(), *started_at)),
+                } => {
+                    let text: String = items
+                        .iter()
+                        .filter_map(|i| match i {
+                            TurnItem::Text { text, .. } => Some(text.clone()),
+                            _ => None,
+                        })
+                        .collect();
+                    Some(((key.clone(), *started_at), text))
+                }
                 _ => None,
             })
-            .collect::<Vec<_>>()
-    };
-    let parent_turns = identities(parent);
-    let child_turns = identities(child);
+            .collect()
+    }
+    let parent_turns = keyed_content(parent);
+    let child_turns = keyed_content(child);
     assert!(
         !parent_turns.is_empty(),
         "the seeded parent must have at least one keyed agent turn"
     );
-    for parent_turn in &parent_turns {
-        assert!(
-            child_turns.contains(parent_turn),
-            "the parent's agent turn (key, started_at) = {parent_turn:?} must appear in the \
-             child with identical identity; child has: {child_turns:?}"
+    for (identity, text) in &parent_turns {
+        let matched = child_turns
+            .iter()
+            .find(|(child_identity, _)| child_identity == identity);
+        let (_, child_text) = matched.unwrap_or_else(|| {
+            panic!(
+                "the parent's agent turn {identity:?} must appear in the child with identical \
+                 identity; child has: {:?}",
+                child_turns.iter().map(|(i, _)| i).collect::<Vec<_>>()
+            )
+        });
+        assert_eq!(
+            child_text, text,
+            "inherited agent turn {identity:?} must keep its content"
         );
     }
 }
@@ -1341,7 +1364,7 @@ async fn live_claude_fork_recovers_from_a_cancelled_first_dispatch() {
     // Whichever state the cancel left behind, the next send must produce a fork
     // that knows the parent's context — re-forking if the file never appeared,
     // resuming the completed copy if it did.
-    let (_events, text) = fork_turn(
+    let (recovery_events, text) = fork_turn(
         &adapter,
         &fork,
         &cwd,
@@ -1351,6 +1374,19 @@ async fn live_claude_fork_recovers_from_a_cancelled_first_dispatch() {
     assert!(
         text.contains("BANANA"),
         "a cancelled first dispatch must not cost the fork its inherited context, got: {text:?}"
+    );
+    // Streaming the right text isn't recovery on its own — the turn must also
+    // reach a Completed terminal, or the fork is still broken in a way the
+    // content assertion alone would miss.
+    assert!(
+        recovery_events.iter().any(|e| matches!(
+            e,
+            AdapterEvent::TurnEnd {
+                outcome: TurnOutcome::Completed,
+                ..
+            }
+        )),
+        "the recovery turn must complete: {recovery_events:?}"
     );
     assert!(
         claude_session_file_path(&home_dir(), &cwd, &fork_session).exists(),

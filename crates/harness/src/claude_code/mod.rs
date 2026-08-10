@@ -87,22 +87,29 @@ impl HarnessAdapter for ClaudeCodeAdapter {
         // `options.cancel_token` IS used: it's watched in the producer's
         // `select!` to cancel the turn.
         //
-        // Fail closed on fork provenance without a Uuid locator. `build_args`
-        // would emit no session flags at all, so claude would mint its own
-        // session id — one Switchboard never learns. The turn would look
-        // successful and every later send would silently lose continuity.
-        // A plain missing locator (no provenance) is a legitimate
-        // pre-first-turn state for other harnesses and stays permitted; the
-        // provenance is what declares an intent this record cannot honor.
-        // Unreachable via core's APIs (the registration chokepoint rejects
-        // it), so this guard only fires on a corrupted registry.
-        if agent.forked_from_session.is_some()
-            && !matches!(agent.session_locator, Some(SessionLocator::Uuid(_)))
-        {
+        // Fail closed unless this Claude agent has a Uuid session locator.
+        // Without one `build_args` emits no session flags at all, so claude
+        // mints its own session id — one Switchboard never learns. The turn
+        // looks successful and every later send silently starts a fresh
+        // session, so the agent quietly loses its memory forever.
+        //
+        // The guard covers a *missing* locator as well as a fork's, because
+        // both produce that identical silent failure. (Locator-`None` is a
+        // legitimate pre-first-turn state for Codex/Antigravity — but no other
+        // harness reaches this adapter, and `Project::register_agent` always
+        // pre-mints a locator for Claude, so here it only means a corrupted
+        // registry.) Unreachable via core's APIs; this is the boundary that
+        // keeps corruption loud instead of silent.
+        if !matches!(agent.session_locator, Some(SessionLocator::Uuid(_))) {
             return Err(DispatchError::InvalidAgentState(format!(
-                "agent {} carries fork provenance but no session locator — \
-                 refusing to dispatch a fork that cannot land on a known session",
-                agent.id
+                "Claude agent {} has no session locator{} — refusing to dispatch \
+                 a turn that would start an untracked session",
+                agent.id,
+                if agent.forked_from_session.is_some() {
+                    " (and carries fork provenance)"
+                } else {
+                    ""
+                }
             )));
         }
         let binary = crate::subprocess::resolve_binary(&self.claude_binary_path)?;
@@ -897,22 +904,17 @@ mod tests {
         assert!(!args.contains(&"--session-id".to_owned()), "{args:?}");
     }
 
-    #[tokio::test]
-    async fn dispatch_rejects_fork_provenance_without_a_locator() {
-        // Fail-closed contract for a corrupted registry record: provenance
-        // declares an intent to fork, and with no locator the fork can't land
-        // on a session Switchboard knows. Spawning anyway would *succeed* —
-        // claude mints its own session id — and continuity would silently die
-        // on the next send. The guard fires before binary resolution, so no
-        // real claude is needed.
+    /// Fail-closed contract for a corrupted registry record. Spawning without a
+    /// session locator *succeeds* — claude mints its own id — so the turn looks
+    /// fine and continuity dies silently on the next send. Both shapes (with and
+    /// without fork provenance) produce that identical failure, so both are
+    /// refused. The guard fires before binary resolution, so no real claude is
+    /// needed.
+    async fn assert_dispatch_refused(agent: &AgentRecord) {
         let project = tempfile::TempDir::new().unwrap();
-        let mut agent = agent_with_session(Uuid::now_v7());
-        agent.session_locator = None;
-        agent.forked_from_session = Some(Uuid::now_v7());
-
         let result = ClaudeCodeAdapter::new()
             .dispatch(
-                &agent,
+                agent,
                 project.path(),
                 "hi",
                 Uuid::now_v7(),
@@ -927,8 +929,25 @@ mod tests {
                 assert!(msg.contains(&agent.id.to_string()), "got: {msg}");
             }
             Err(other) => panic!("expected InvalidAgentState, got: {other:?}"),
-            Ok(_) => panic!("a fork with no locator must not dispatch"),
+            Ok(_) => panic!("a locator-less Claude agent must not dispatch"),
         }
+    }
+
+    #[tokio::test]
+    async fn dispatch_rejects_fork_provenance_without_a_locator() {
+        let mut agent = agent_with_session(Uuid::now_v7());
+        agent.session_locator = None;
+        agent.forked_from_session = Some(Uuid::now_v7());
+        assert_dispatch_refused(&agent).await;
+    }
+
+    #[tokio::test]
+    async fn dispatch_rejects_a_claude_agent_with_no_locator() {
+        // Same silent-failure class as the fork case above — provenance is not
+        // what makes it dangerous, so the guard does not require it.
+        let mut agent = agent_with_session(Uuid::now_v7());
+        agent.session_locator = None;
+        assert_dispatch_refused(&agent).await;
     }
 
     #[test]
@@ -986,7 +1005,10 @@ mod tests {
     fn build_args_omits_session_flags_when_locator_absent() {
         // Defensive: Claude agents always pre-mint a locator, but `build_args`
         // is a pure function — a `None` locator must omit both session flags
-        // rather than emit a flag with no id.
+        // rather than emit a flag with no id. Documents, not endorses: this
+        // arg shape would let claude mint an untracked session, which is why
+        // `dispatch` refuses the record outright before `build_args` runs
+        // (see `dispatch_rejects_a_claude_agent_with_no_locator`).
         let home = tempfile::TempDir::new().unwrap();
         let project = tempfile::TempDir::new().unwrap();
         let agent = AgentRecord {

@@ -20,6 +20,15 @@
 > and its disabled-tooltip primitive question. M1/M2 (core + adapter) are
 > untouched by the redesign — they were built against record state, not the
 > trigger. Superseded text below is edited in place; this note is the changelog.
+>
+> Third pass (same day, post-review of the redesign): the busy-parent check
+> moved from fork registration into the **common dispatch path** (registration
+> alone missed failure-retry sends, which never call it) and now reads the
+> dispatcher's actor via `PeekCurrentTurn` rather than a status flag that does
+> not exist; the guarantee is stated as best-effort; the refresh trigger names
+> its signal (`Completed`, re-arm on cancelled/failed); fork placement must
+> leave the new pane **visible**; the chip is always present, disabled with a
+> reason.
 
 ## What this is
 
@@ -162,10 +171,13 @@ harness-behavior.md §3.5.** Summary, because two design claims rest on them:
   plain `--resume <own>`. If Claude died before creating the new file, the next
   send retries the fork; nothing to persist or roll back. This rationale must
   survive into a code comment at the arg-building site. **Scope of the
-  self-healing claim:** Probe B settled this — a killed first dispatch leaves the
-  child file either absent (re-forks) or content-complete (resumes with full
-  inherited history), never partial, so the claim holds for every reachable
-  state.
+  self-healing claim:** it holds for the two states Probe B observed — child
+  file absent (re-forks) or content-complete (resumes with full inherited
+  history). A *partial* child file would defeat it (present ⇒ plain resume of a
+  shortened history), and Probe B never observed one — but that is a bounded
+  observation at 2.1.226, not a guarantee, so this is a documented dependency
+  on upstream behavior rather than an invariant we enforce. No partial-file
+  guard is built.
 - **The fork source is permanent provenance on the registry record**, never cleared
   after the first dispatch (it becomes inert once the file exists). Field semantics:
   "the parent *session* UUID to `--resume` from if this agent's own session file
@@ -185,22 +197,43 @@ harness-behavior.md §3.5.** Summary, because two design claims rest on them:
   actions. **Fork-on-send deletes the co-send hazard outright** — the chip
   requires a single recipient and the branch doesn't exist until the send
   resolves, so the pair can never be co-recipients. What remains:
-  - **Chip disabled while the selected parent is mid-turn**, with the tooltip
+  - **The authoritative check lives in the common dispatch path**, not in fork
+    registration. Condition: the recipient is a *materializing fork*
+    (`forked_from_session` set **and** its own session file absent) and its
+    parent agent is currently running a turn → refuse with the educational
+    error (workflow-collision posture, not queueing). Siting it here is what
+    makes it cover the fork-send flow, **failure-retry sends** (a fork whose
+    first turn failed retries through the ordinary send path and never touches
+    `fork_agent_impl`), and workflow/forward sends — one rule, one place.
+  - **Busy is read via the dispatcher's actor, not a status flag.** The
+    dispatcher deliberately has no shared per-agent status flag or idle guard —
+    "one turn in flight" is structural in the per-agent actor. The correct
+    signal is the existing **`PeekCurrentTurn`** control command (non-blocking;
+    replies `true` iff a turn is actively running), which is already used by
+    completed-only forwarding to reject a still-streaming source rather than
+    wait on it — the same shape as this gate. Do **not** invent a status map.
+  - **Chip disabled while the selected parent is mid-turn** with a tooltip
     saying why in probe-measured terms ("X is working — its current answer
-    wouldn't be included; wait or cancel first"). Re-validated at the fork-send
-    command (compose-then-send window; also covers non-compose callers), which
-    refuses with the same explanation — the workflow-collision posture, not
-    queueing.
-  - **Failure-retry sends** to a fork whose first turn failed are ordinary sends
-    to that agent and get the same treatment: the materializing dispatch is
-    refused while the parent is mid-turn, at the same command-boundary check.
+    wouldn't be included; wait or cancel first"). This is **UX only**; the
+    dispatch-path check above is what actually protects the invariant.
+  - **This is best-effort, by design.** `PeekCurrentTurn` is a peek, not a
+    lock: a parent turn can start in the window between the reply and claude's
+    file read. Closing that would need a reservation held across the fork's
+    snapshot — rejected (see the rejected-alternatives history above): no good
+    release signal, and it converts a millisecond window whose worst outcome is
+    a documented stub turn into zero at the cost of the coordination surface
+    the actor model exists to avoid. Describe the guarantee accordingly in
+    user-facing copy and Known limitations: Switchboard prevents this in every
+    UI path; it does not claim to make it impossible.
   - **Residual (accepted, documented):** the parent can start a turn from a
     non-Switchboard writer (bare CLI — already a discouraged pattern) or within
     the sub-second window between the busy check and claude's file read.
     Consequence per Probe A: no corruption; the branch inherits the in-flight
-    prompt with a synthesized `"No response requested."` stub. The three-condition
-    merge edge is pinned by a characterization test filed alongside the existing
-    positional-edge tests in `classify_turns_by_count`'s suite.
+    prompt with a synthesized `"No response requested."` stub. The
+    three-condition merge edge is covered by the mid-turn fixture in M3's DoD,
+    which asserts **desired** behavior (the stub turn never claims the fork's
+    send) rather than characterizing whatever the merge does today — if it
+    fails, that is a bug to fix in M3.
   Record this rationale at the validation site.
 - **Naming.** Agent names must match `^[A-Za-z0-9_-]+$` (`core/src/name.rs`), so
   "X (forked)" from the original discussion is invalid. Derive `<parent>-fork`,
@@ -226,13 +259,23 @@ harness-behavior.md §3.5.** Summary, because two design claims rest on them:
   pane-less and invisible. On fork-send: try
   `assignAgentToFirstVisibleEmptyPane` first (reuse a pane the user prepared),
   fall back to `moveAgentToNewPane` (which already degrades to starting
-  minimized when the row is full). **X is neither moved nor replaced** — it may
+  minimized when the row is full — see the visibility requirement below). **X
+  is neither moved nor replaced** — it may
   be mid-someone-else's-turn-of-thought; only the *compose selection* swaps (X
   deselected, `X-fork` selected, chip reset to off), so the next message goes to
   the branch. Roster position: append to the end — adjacency to the parent isn't
   worth new ordering machinery; manual reorder exists. Same-pane duplication
   remains reachable only by the user explicitly co-paning parent and fork — a
   Known limitation, not the default experience.
+  **Required outcome: the fork's pane must be visible when the flow completes.**
+  `moveAgentToNewPane` starts a new pane *minimized* when the live row can't fit
+  another at minimum width — correct for passive placement (which deliberately
+  never fills minimized panes behind the user's back), wrong here: the user's
+  message, the streaming reply, and the placeholder would all land somewhere
+  invisible while compose now addresses an unseen agent, reading as "I forked
+  and my message vanished." Stated as an outcome, not a call: forcing
+  visibility in a genuinely full row has to negotiate the min-width constraint,
+  so pick the mechanism against the real layout code and cover it with a test.
 - **First-turn placeholder.** Until the first turn terminates and the refresh
   lands, the fork's pane shows only the new message and streaming reply; then
   the inherited history fills in above. Show a small notice in the interim
@@ -254,10 +297,9 @@ it with tests rather than trust it:
   `started_at >= journal_start` window and render as `UserImported` (the existing
   "adopted an external session" path), never consuming the fork's own sends.
   (The one boundary case where a copied record can be in-window — the parent's
-  turn starting inside the busy-gate residual — is bounded by the chip gate and
-  pinned by the characterization test above. The mid-turn *synthesized* turn is
-  its own shape: in-window, keyed, link-less — covered by the dedicated fixture
-  in M3's DoD.)
+  turn starting inside the busy-gate residual — is bounded by the gate and
+  covered by the mid-turn fixture in M3's DoD, together with the synthesized
+  turn's own shape: in-window, keyed, link-less.)
 - Second, independent defense: the fork's own sends are key-joined to their turns
   via `TurnLink`s, so positional consumption never reaches them.
 - **Cross-agent hydration-key duplication is new but safe.** Copied turns carry the
@@ -419,9 +461,10 @@ The feature is usable end to end and its transcript behavior is pinned.
 - **Backend command** per the thin-shim convention: a `fork_agent_impl(agent_id)`
   free function that resolves the **agent's own project** via lookup under the
   `registry_write` lock (deliberately *not* `active_project_id`), validates
-  (`supports_session_fork`; `resolve_session_file(...).is_some()`; **parent not
-  mid-turn** — the send-time half of the busy gate, same busy signal the
-  dispatcher already tracks), calls `Project::fork_agent`, updates the
+  (`supports_session_fork`; `resolve_session_file(...).is_some()`; and, as an
+  *early friendly* check only, parent-not-mid-turn via `PeekCurrentTurn` — the
+  authoritative gate is in the dispatch path, since a retry never calls this
+  command), calls `Project::fork_agent`, updates the
   `agents_by_id` cache, and returns the record (like `create_agent_impl`: no
   event emitted — roster updates are frontend-driven). Typed errors with
   gate-accurate copy (see Design decisions); record the busy-gate rationale at
@@ -441,23 +484,38 @@ The feature is usable end to end and its transcript behavior is pinned.
   surfaced; a failed *dispatch* leaves a registered fork with no session, and
   the next send to it retries the fork through the same command-boundary busy
   check.
-- **Chip enablement** (compose): visible for a single-recipient selection;
-  enabled only when that recipient is Claude (`harness`), has
+- **Chip enablement** (compose): the chip is **always present** beside Forward
+  — never conditionally hidden — and *enabled* only when the selection is
+  exactly one recipient that is Claude (`harness`), has
   `sessionInfo?.session_file` (the existing existence-filtered signal — no new
-  IPC), and is not mid-turn (the same busy state the compose bar already knows
-  for queueing). Disabled states carry educational tooltips per the copy
-  conventions — the non-Claude tooltip is derived from
+  IPC), and is not mid-turn. Every other case is disabled **with a tooltip
+  naming the specific reason**: multiple recipients, non-Claude recipient, no
+  session to branch from yet, parent mid-turn. (Always-present is what makes
+  the multi-recipient tooltip reachable at all; hiding the chip would leave the
+  user with no explanation.) The non-Claude tooltip derives from
   `SessionForkUnsupported`'s wording (Switchboard's support, not vendor
-  capability). Tooltip-on-disabled-chip is the standard wrapper pattern; no
+  capability); the mid-turn tooltip says "wait or cancel" **in that order** —
+  cancelling trades the parent's in-flight work for the branch. Frontend busy
+  state here is **UX only**; the authoritative check is in the dispatch path
+  (below). Tooltip-on-disabled-chip is the standard wrapper pattern; no
   primitive verification task (that concern was specific to Radix menu items).
 - **TS mirror** (landed in M1 follow-up): `forked_from_session` on
   `AgentRecord` — the refresh trigger needs the provenance frontend-side.
-- **One-shot inherited-history refresh.** Contract: exactly one successful
-  inherited-history load per fork — triggered from the fork's terminal event
-  once its session file has materialized; never spent on a terminal that didn't
-  materialize the file; never generalized into refresh-on-every-terminal (the
+- **One-shot inherited-history refresh.** Contract: exactly one *successful*
+  inherited-history load per fork; never generalized into
+  refresh-on-every-terminal (the
   refresh filter in `hydrateProject`'s docs and the project's transcript-dup
-  history are why). **Seam (load-bearing):** the refresh must go through the
+  history are why). **Trigger rule (the frontend cannot stat the session
+  file, so name the signal rather than the property):** attempt the refresh on
+  the fork's first **`Completed`** terminal; **re-arm** on `Cancelled` /
+  `Failed`. Deliberately approximate in the safe direction — per Probe B a
+  cancelled first turn can leave a *complete* child file, so outcome-gating
+  skips a refresh that would have worked; that fork then picks up its inherited
+  history on its next completed turn rather than never. The alternatives are
+  worse: burning the one-shot on a failed turn leaves inherited history
+  invisible until reopen, and a file-existence IPC invents a new backend
+  surface for a cosmetic gain. **Seam (load-bearing):** the refresh must go
+  through the
   project conversation merge — re-run `load_project_conversation`, replace the
   journal overlay wholesale (dup-safe by design), and apply the fork's agent
   turns through the existing project-scoped application path
@@ -476,9 +534,15 @@ The feature is usable end to end and its transcript behavior is pinned.
 ### Definition of Done
 
 - Rust tests for `fork_agent_impl`: success; parent-file-missing rejection
-  (asserted through `resolve_session_file`); **parent-mid-turn rejection**;
-  non-Claude rejection; missing agent/project errors; project resolved from the
-  agent, not the active project.
+  (asserted through `resolve_session_file`); parent-mid-turn rejection (the
+  early friendly gate); non-Claude rejection; missing agent/project errors;
+  project resolved from the agent, not the active project.
+- Rust tests for the **dispatch-path** materializing-fork gate — the
+  authoritative one: a send to a materializing fork whose parent is mid-turn is
+  refused; the same send once the parent is idle succeeds; a send to an
+  *already-materialized* fork is never gated (its parent's state is
+  irrelevant); a **retry** send after a failed first turn hits the gate (the
+  path that never touches `fork_agent_impl`); non-fork agents unaffected.
 - **Parser-boundary fixture test**: a sanitized raw forked-session JSONL pair
   (source: the 2026-08-10 probe artifacts) driven through
   `load_claude_transcript` — asserts copied records keep original timestamps and
@@ -507,8 +571,10 @@ The feature is usable end to end and its transcript behavior is pinned.
 - **Refresh tests** (component-level, mock `invoke`/`listen` per testing
   conventions): after the fork's first terminal, inherited imported turns appear
   and the live reply renders exactly once (the hydration-key dedup pin); both
-  orderings of terminal-vs-refresh resolution; the trigger fires at most once
-  and not on a non-materializing terminal; `TurnLink`-visible-at-refresh pinned.
+  orderings of terminal-vs-refresh resolution; the trigger fires on `Completed`
+  and **re-arms** on `Cancelled`/`Failed` (a cancelled first turn followed by a
+  completed one still loads inherited history, exactly once);
+  `TurnLink`-visible-at-refresh pinned.
 - **Fork-send flow tests** (store-level, not only a mocked compose click): API →
   `registerAgent` → roster append → placement → selection swap → dispatch
   sequence, including the fast-first-event ordering; placement lands in an empty
@@ -533,15 +599,19 @@ The feature is usable end to end and its transcript behavior is pinned.
   refresh), not instantly at send — the interim shows the "Branched from X"
   notice. A CLI constraint, not a choice: a branch can only materialize as a
   turn (probe #4).
-- You cannot branch an agent while it is mid-turn (chip disabled; command
-  refuses). Escape hatch: cancel the parent, then fork — cancelling leaves a
-  clean session to branch from. Rationale: a mid-turn snapshot inherits a
-  synthesized `"No response requested."` stub in place of the parent's in-flight
-  answer (Probe A), permanently, in both transcript and model context.
-- The busy gate has a sub-second residual (non-Switchboard writers; the window
-  between the busy check and claude's file read). Consequence per Probe A: no
-  corruption; the stub turn above. The merge's behavior under the worst ordering
-  is pinned by the M3 mid-turn fixture.
+- Branching an agent while it is mid-turn is **prevented in every Switchboard
+  path** (chip disabled; the dispatch-path gate refuses) — but the protection is
+  **best-effort, not absolute**: the busy check is a peek, not a lock, so a
+  concurrent automation or a bare-CLI writer can still start a parent turn in
+  the window before claude reads the file. Escape hatch when you do want to
+  branch a working agent: cancel the parent first — cancelling leaves a clean
+  session to branch from (at the cost of the parent's in-flight work).
+  Rationale for gating at all: a mid-turn snapshot inherits a synthesized
+  `"No response requested."` stub in place of the parent's in-flight answer
+  (Probe A), permanently, in both transcript and model context. If the race is
+  lost, the outcome is that stub — no corruption, no lost parent work — and the
+  merge's behavior under the worst ordering is pinned by the M3 mid-turn
+  fixture.
 - You cannot fan-out one message to X and a not-yet-created branch of X in a
   single send (the chip takes a single recipient); send to the branch first,
   then fan-out freely.

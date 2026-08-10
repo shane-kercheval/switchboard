@@ -515,6 +515,12 @@ export type AgentRecord = {
   // neither; Gemini carries no effort) or a pre-feature agent.
   model?: string | null;
   effort?: string | null;
+  // Set on an agent created by forking: the parent session this branch resumes
+  // from until it has a session of its own. Stays set after the fork
+  // materializes (it doubles as durable lineage), so it is NOT a reliable
+  // "still unmaterialized" signal on its own — pair it with session info.
+  // `null`/absent for every agent that wasn't forked.
+  forked_from_session?: string | null;
 };
 
 export type ProjectSummary = {

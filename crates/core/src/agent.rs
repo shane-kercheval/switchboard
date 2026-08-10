@@ -151,14 +151,27 @@ pub struct AgentRecord {
     /// **Permanent, and inert after first use.** It is never cleared once the
     /// fork materializes — whether a dispatch forks or plainly resumes is
     /// derived from the agent's own session file existing, not from consuming
-    /// this field (see `claude_code::build_args`). Keeping it makes the fork's
-    /// provenance durable, and makes a first dispatch that died before creating
-    /// the file retry the fork automatically.
+    /// this field (see `claude_code::build_args`). Keeping it makes a first
+    /// dispatch that died before creating the file retry the fork
+    /// automatically.
+    ///
+    /// **This field does two jobs, and they only coincide for a deferred
+    /// fork.** (1) *Operational:* the materialization token — the session to
+    /// resume from until this agent has one of its own. (2) *Display:* durable
+    /// lineage — "this agent is a branch of that session" — which is why it
+    /// outlives job (1) rather than being cleared. Both are served by one UUID
+    /// because Claude's fork is deferred and caller-assigned (see
+    /// [`HarnessKind::supports_session_fork`]). A harness whose fork is *eager*
+    /// would need job (2) and not job (1), and its lineage identity would not
+    /// be a Claude session UUID — so it needs its own sibling field, **not** a
+    /// widening or overloading of this one.
     ///
     /// Only harnesses where [`HarnessKind::supports_session_fork`] holds ever
-    /// carry `Some`. Same plain-`Option` backward-compat rationale as `model` /
-    /// `effort` above: a record written before forking existed legitimately
-    /// lacks the key and must load as `None`.
+    /// carry `Some`, enforced at the registration chokepoint (see
+    /// `Project::register_agent_inner`) rather than by convention. Same
+    /// plain-`Option` backward-compat rationale as `model` / `effort` above: a
+    /// record written before forking existed legitimately lacks the key and
+    /// must load as `None`.
     pub forked_from_session: Option<Uuid>,
     pub created_at: DateTime<Utc>,
 }

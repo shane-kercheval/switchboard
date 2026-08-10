@@ -91,19 +91,29 @@ impl HarnessKind {
         }
     }
 
-    /// Whether Switchboard can branch this harness's session into a new one —
-    /// diverging the conversation at the current tip so the branch carries the
-    /// full prior context but subsequent turns don't affect the original.
+    /// Whether this harness supports **the fork lifecycle Switchboard
+    /// implements**: branching a session at its current tip into a new one that
+    /// carries the full prior context, *deferred* so that nothing happens until
+    /// the branch's first dispatch, which materializes it under a session id the
+    /// caller assigned in advance.
     ///
-    /// True only for Claude, which exposes it headlessly as `--resume <parent>
-    /// --session-id <new> --fork-session` — and, decisively, lets the *caller*
-    /// choose the new session id, so a fork pre-generates its locator at
-    /// registration exactly like a fresh Claude agent. Codex has a headless
-    /// path only through the experimental app-server (`thread/fork`), a second
-    /// integration surface alongside `codex exec` that v1 deliberately does not
-    /// take on; Gemini's `--session-file` import drops tool calls and ignores
-    /// the caller's session id; Antigravity forks only server-side, on its own
-    /// initiative. Per `harness-behavior.md` §3.5.
+    /// The deferral and the caller-assigned id are part of the definition, not
+    /// incidental — together they are what let a fork pre-generate its locator
+    /// at registration like any fresh agent and carry
+    /// [`crate::AgentRecord::forked_from_session`] as its materialization token.
+    /// True only for Claude (`--resume <parent> --session-id <new>
+    /// --fork-session`), the only harness offering that shape.
+    ///
+    /// **A harness whose fork is *eager* does not belong here.** Codex's
+    /// experimental app-server `thread/fork` creates the new session
+    /// immediately and hands back its id, so it has no deferred state for the
+    /// provenance field to hold and would need its own registration path —
+    /// flipping this arm to `true` is *necessary but not sufficient* for it,
+    /// and doing only that would produce records
+    /// [`crate::project::Project::fork_agent`] cannot honor. Gemini's
+    /// `--session-file` import drops tool calls and ignores the caller's
+    /// session id; Antigravity forks only server-side, on its own initiative.
+    /// Per `harness-behavior.md` §3.5.
     ///
     /// **Naming:** "session fork" here is Claude's `--fork-session`, which is
     /// the headless equivalent of its TUI `/branch`. Claude's TUI `/fork` is an

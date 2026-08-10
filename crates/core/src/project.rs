@@ -42,6 +42,24 @@ pub struct ProjectConfig {
     pub created_at: DateTime<Utc>,
 }
 
+/// The per-caller inputs to [`Project::register_agent_inner`].
+///
+/// A struct rather than a positional list because the fields it carries include
+/// two adjacent `Option<String>`s (`model`, `effort`) that a positional call
+/// could transpose silently — the compiler cannot tell them apart, and a
+/// transposed pair persists a wrong-but-valid record. Naming them at each call
+/// site makes that class of mistake unrepresentable.
+///
+/// Deliberately **not** validating: see the note on `register_agent_inner`.
+struct NewAgent<'a> {
+    name: &'a str,
+    harness: HarnessKind,
+    session_locator: Option<SessionLocator>,
+    model: Option<String>,
+    effort: Option<String>,
+    forked_from_session: Option<Uuid>,
+}
+
 /// A task-scoped project within a working directory. Holds agents in its registry.
 #[derive(Debug, Clone)]
 pub struct Project {
@@ -159,7 +177,14 @@ impl Project {
             HarnessKind::Gemini => Some(SessionLocator::Uuid(Uuid::new_v4())),
             HarnessKind::Codex | HarnessKind::Antigravity => None,
         };
-        self.register_agent_inner(name, harness, session_locator, model, effort, None)
+        self.register_agent_inner(NewAgent {
+            name,
+            harness,
+            session_locator,
+            model,
+            effort,
+            forked_from_session: None,
+        })
     }
 
     /// Branch an existing agent's conversation into a new agent.
@@ -178,9 +203,17 @@ impl Project {
     /// need a synthetic prompt, costing quota and putting a throwaway turn in
     /// both transcripts.
     ///
-    /// Rejects a harness that can't branch, and a source with no session
-    /// locator to branch from — a fork whose `--resume` target doesn't exist
-    /// could never materialize, so it must not reach the registry.
+    /// **This is not a complete eligibility check.** It validates two things:
+    /// that the source's harness supports the deferred fork lifecycle, and that
+    /// the source carries a locator of the right shape. It deliberately does
+    /// **not** check that the source's session actually exists on disk — core
+    /// has no business reading harness filesystems, exactly as the
+    /// `register_attached_*` methods leave file validation to their caller. A
+    /// never-dispatched Claude agent has a locator and no session file, and
+    /// forking it here succeeds while producing an unmaterializable fork. The
+    /// **caller owns the resumability check** (the app layer, via its
+    /// per-harness session-file resolution) and owns the friendly "no session
+    /// to branch from yet" error the user sees.
     ///
     /// The derived name is `<source>-fork`, disambiguated as `-fork-2`,
     /// `-fork-3`, … against the project's canonicalized uniqueness rule. (Not
@@ -212,14 +245,14 @@ impl Project {
         let harness = source.harness;
         let model = source.model.clone();
         let effort = source.effort.clone();
-        self.register_agent_inner(
-            &name,
+        self.register_agent_inner(NewAgent {
+            name: &name,
             harness,
-            Some(SessionLocator::Uuid(Uuid::now_v7())),
+            session_locator: Some(SessionLocator::Uuid(Uuid::now_v7())),
             model,
             effort,
-            Some(parent_session),
-        )
+            forked_from_session: Some(parent_session),
+        })
     }
 
     /// Register an attached **Claude Code** agent — one that wraps an
@@ -235,14 +268,14 @@ impl Project {
         model: Option<String>,
         effort: Option<String>,
     ) -> Result<AgentRecord> {
-        self.register_agent_inner(
+        self.register_agent_inner(NewAgent {
             name,
-            HarnessKind::ClaudeCode,
-            Some(SessionLocator::Uuid(session_id)),
+            harness: HarnessKind::ClaudeCode,
+            session_locator: Some(SessionLocator::Uuid(session_id)),
             model,
             effort,
-            None,
-        )
+            forked_from_session: None,
+        })
     }
 
     /// Register an attached **Codex** agent — one that wraps an existing Codex
@@ -259,17 +292,17 @@ impl Project {
         model: Option<String>,
         effort: Option<String>,
     ) -> Result<AgentRecord> {
-        self.register_agent_inner(
+        self.register_agent_inner(NewAgent {
             name,
-            HarnessKind::Codex,
-            Some(SessionLocator::Codex {
+            harness: HarnessKind::Codex,
+            session_locator: Some(SessionLocator::Codex {
                 thread_id,
                 partition_date,
             }),
             model,
             effort,
-            None,
-        )
+            forked_from_session: None,
+        })
     }
 
     /// Register an attached **Gemini** agent — one that wraps an
@@ -288,14 +321,14 @@ impl Project {
         session_id: Uuid,
         model: Option<String>,
     ) -> Result<AgentRecord> {
-        self.register_agent_inner(
+        self.register_agent_inner(NewAgent {
             name,
-            HarnessKind::Gemini,
-            Some(SessionLocator::Uuid(session_id)),
+            harness: HarnessKind::Gemini,
+            session_locator: Some(SessionLocator::Uuid(session_id)),
             model,
-            None,
-            None,
-        )
+            effort: None,
+            forked_from_session: None,
+        })
     }
 
     /// Register an attached **Antigravity** agent — one that wraps an existing
@@ -313,14 +346,14 @@ impl Project {
         name: &str,
         conversation_id: Uuid,
     ) -> Result<AgentRecord> {
-        self.register_agent_inner(
+        self.register_agent_inner(NewAgent {
             name,
-            HarnessKind::Antigravity,
-            Some(SessionLocator::Uuid(conversation_id)),
-            None,
-            None,
-            None,
-        )
+            harness: HarnessKind::Antigravity,
+            session_locator: Some(SessionLocator::Uuid(conversation_id)),
+            model: None,
+            effort: None,
+            forked_from_session: None,
+        })
     }
 
     /// Shared validation + JSONL append. Caller decides the `session_locator`
@@ -332,22 +365,28 @@ impl Project {
     /// without a `session_locator` (or a Codex attach with one) is
     /// unrepresentable at the API boundary.
     ///
-    /// This is also the single chokepoint that enforces the model/effort
-    /// capability invariant at the persistence boundary — mirroring
-    /// [`Self::set_session_locator`]'s `is_valid_for` guard. The attach
-    /// variants already make unsupported combinations unrepresentable in their
-    /// signatures; this catches the generic create path (and any future caller)
-    /// so an unsupported selection can never reach `registry.jsonl`, regardless
-    /// of whether a higher layer remembered to check.
-    fn register_agent_inner(
-        &self,
-        name: &str,
-        harness: HarnessKind,
-        session_locator: Option<SessionLocator>,
-        model: Option<String>,
-        effort: Option<String>,
-        forked_from_session: Option<Uuid>,
-    ) -> Result<AgentRecord> {
+    /// This is also the single chokepoint that enforces every **capability**
+    /// invariant at the persistence boundary — model, effort, and fork
+    /// provenance — mirroring [`Self::set_session_locator`]'s `is_valid_for`
+    /// guard. The attach variants already make unsupported combinations
+    /// unrepresentable in their signatures; this catches the generic create
+    /// path (and any future caller) so an unsupported selection or a fork token
+    /// on a harness that can't use it never reaches `registry.jsonl`,
+    /// regardless of whether a higher layer remembered to check.
+    ///
+    /// Validation lives **here**, not on [`NewAgent`]: the value of a single
+    /// chokepoint is that there is exactly one place an invariant can be
+    /// checked, and a validating constructor plus a validating function would
+    /// split that in two.
+    fn register_agent_inner(&self, spec: NewAgent<'_>) -> Result<AgentRecord> {
+        let NewAgent {
+            name,
+            harness,
+            session_locator,
+            model,
+            effort,
+            forked_from_session,
+        } = spec;
         validate_name(name)?;
         // Normalize **before** the capability check: a blank selection means
         // "unset," which is allowed on any harness — it must not trip the
@@ -366,6 +405,17 @@ impl Project {
                 harness,
                 axis: SelectionAxis::Effort,
             });
+        }
+        // Fork provenance is only meaningful to a harness whose fork is the
+        // deferred kind [`HarnessKind::supports_session_fork`] describes — the
+        // field *is* that harness's materialization token. On any other harness
+        // no adapter would ever read it, so the agent would silently start a
+        // fresh session while the registry claimed it was a branch: a
+        // data-level lie with no failure signal. Reject it here so the field
+        // doc's "only fork-capable harnesses carry `Some`" is enforced by the
+        // boundary rather than held by convention.
+        if forked_from_session.is_some() && !harness.supports_session_fork() {
+            return Err(CoreError::SessionForkUnsupported { harness });
         }
         check_name_unique(&self.list_agents()?, name, None)?;
 
@@ -594,18 +644,27 @@ fn check_name_unique(
 /// user can rename.
 ///
 /// The search is bounded by the roster size: each candidate is distinct, so at
-/// most `agents.len()` of them can collide and one past that is always free.
-/// The final `unwrap_or` is therefore unreachable — it exists so the function
-/// stays total rather than panicking on an impossible state.
+/// most `agents.len()` of them can collide and one past that is always free
+/// (pigeonhole). The fallback is therefore unreachable — and note it returns
+/// `base`, a name already known to collide, so it is a *fail-loud* fallback,
+/// not a usable answer: `register_agent_inner` rejects it as
+/// `DuplicateAgentName`. Preferred over panicking, and asserted in debug builds
+/// so a broken bound surfaces in tests rather than as a puzzling duplicate.
 fn derive_fork_name(agents: &[AgentRecord], source_name: &str) -> String {
     let base = format!("{source_name}-fork");
     if check_name_unique(agents, &base, None).is_ok() {
         return base;
     }
-    (2..=agents.len() + 2)
+    let candidate = (2..=agents.len() + 2)
         .map(|n| format!("{base}-{n}"))
-        .find(|candidate| check_name_unique(agents, candidate, None).is_ok())
-        .unwrap_or(base)
+        .find(|candidate| check_name_unique(agents, candidate, None).is_ok());
+    debug_assert!(
+        candidate.is_some(),
+        "pigeonhole violated: {} distinct candidates against {} agents",
+        agents.len() + 1,
+        agents.len()
+    );
+    candidate.unwrap_or(base)
 }
 
 /// Load a `Project` from disk. Reads the per-project config.yaml; the caller has
@@ -830,10 +889,13 @@ mod tests {
     }
 
     #[test]
-    fn fork_agent_rejects_a_source_with_no_session_yet() {
-        // A Claude agent always has a locator, so this state is only reachable
-        // through the registry directly — but the guard is what keeps a fork
-        // whose `--resume` target doesn't exist out of the registry.
+    fn fork_agent_rejects_a_source_carrying_no_locator() {
+        // Unreachable through any supported path *today* — every fork-capable
+        // harness pre-generates its locator, so this record shape means the
+        // registry is inconsistent. The guard still earns its keep two ways: it
+        // keeps a fork with no `--resume` target out of the registry, and if a
+        // fork-capable harness ever captures its locator at runtime, this
+        // becomes a genuine "not yet — dispatch it once first."
         let (_tmp, project) = fresh_project();
         let source = project
             .register_agent("alice", HarnessKind::ClaudeCode, None, None)
@@ -851,6 +913,58 @@ mod tests {
             "got: {err:?}"
         );
         assert_eq!(project.list_agents().unwrap().len(), 1, "no record written");
+    }
+
+    #[test]
+    fn registration_rejects_fork_provenance_on_a_harness_that_cannot_fork() {
+        // Guards the field's invariant at the persistence boundary rather than
+        // trusting `fork_agent` to be the only writer. Reaches the private
+        // chokepoint directly because every public path hard-codes `None` —
+        // the point is precisely that a *future* public path can't get this
+        // wrong silently. Without the guard the record would persist and the
+        // Codex adapter would ignore it, starting a fresh session while the
+        // registry claimed a branch.
+        let (_tmp, project) = fresh_project();
+
+        let err = project
+            .register_agent_inner(NewAgent {
+                name: "c",
+                harness: HarnessKind::Codex,
+                session_locator: None,
+                model: None,
+                effort: None,
+                forked_from_session: Some(Uuid::now_v7()),
+            })
+            .unwrap_err();
+
+        assert!(
+            matches!(err, CoreError::SessionForkUnsupported { harness } if harness == HarnessKind::Codex),
+            "got: {err:?}"
+        );
+        assert!(
+            project.list_agents().unwrap().is_empty(),
+            "a rejected registration must write no record"
+        );
+    }
+
+    #[test]
+    fn registration_allows_fork_provenance_on_a_fork_capable_harness() {
+        // The guard's other half: it must not reject the legitimate case.
+        let (_tmp, project) = fresh_project();
+        let parent = Uuid::now_v7();
+
+        let record = project
+            .register_agent_inner(NewAgent {
+                name: "a-fork",
+                harness: HarnessKind::ClaudeCode,
+                session_locator: Some(SessionLocator::Uuid(Uuid::now_v7())),
+                model: None,
+                effort: None,
+                forked_from_session: Some(parent),
+            })
+            .unwrap();
+
+        assert_eq!(record.forked_from_session, Some(parent));
     }
 
     #[test]

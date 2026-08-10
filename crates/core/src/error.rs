@@ -88,19 +88,31 @@ pub enum CoreError {
         axis: crate::harness::SelectionAxis,
     },
 
+    /// Deliberately a statement about **Switchboard's support**, not about what
+    /// the harness's CLI can do — Codex, for one, can branch a session (through
+    /// an integration Switchboard doesn't wire). Claiming otherwise would be
+    /// false, and this message is the source for the user-facing explanation on
+    /// non-forkable agents.
     #[error(
-        "{harness} sessions cannot be branched \
-         — refusing to create a fork that could never resume its parent"
+        "Switchboard does not support forking {harness} sessions \
+         — refusing to record a branch it could never materialize"
     )]
     SessionForkUnsupported {
         harness: crate::harness::HarnessKind,
     },
 
-    /// Forking needs a parent *session* id to `--resume` from, and a harness
-    /// that captures its locator at runtime has none until its first dispatch.
-    /// Distinct from [`Self::SessionForkUnsupported`]: that harness can never
-    /// fork, this agent just can't fork *yet*.
-    #[error("agent {agent_id} has no session to branch from yet")]
+    /// The source agent carries no session id to branch from. Distinct from
+    /// [`Self::SessionForkUnsupported`]: that harness can never fork; this one
+    /// could, but this record has nothing to fork *from*.
+    ///
+    /// Currently unreachable through any supported path — every fork-capable
+    /// harness pre-generates its locator at registration, so a valid record
+    /// always has one and reaching this means the registry is inconsistent.
+    /// That is a property of today's harness set, **not** of the state itself:
+    /// a fork-capable harness that captured its locator at runtime would make
+    /// this a genuine "not yet — dispatch it once first," and the message below
+    /// already reads correctly for that case.
+    #[error("agent {agent_id} has no session to branch from")]
     SessionForkSourceMissing { agent_id: uuid::Uuid },
 
     /// A reorder's id list must be an exact permutation of the current roster.

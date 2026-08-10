@@ -1479,13 +1479,16 @@ const SUMMARY: Prompt = {
 function mockPromptBackend(
   opts: {
     prompts?: Prompt[];
-    render?: () => Promise<{ text: string }>;
+    render?: () => Promise<unknown>;
+    signIn?: () => Promise<unknown>;
   } = {},
 ): void {
   invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
     if (cmd === "search_project_files") return [];
     if (cmd === "list_prompts") return opts.prompts ?? [];
-    if (cmd === "render_prompt") return opts.render ? await opts.render() : { text: "RENDERED" };
+    if (cmd === "render_prompt")
+      return opts.render ? await opts.render() : { kind: "rendered", text: "RENDERED" };
+    if (cmd === "sign_in_mcp_provider") return opts.signIn ? await opts.signIn() : null;
     if (cmd === "send_message") return "msg-id";
     return null;
   });
@@ -1638,8 +1641,8 @@ describe("ComposeBar prompt mode", () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);
     await state.registerAgent(AGENT_B);
-    let release!: (v: { text: string }) => void;
-    const gate = new Promise<{ text: string }>((res) => {
+    let release!: (v: { kind: "rendered"; text: string }) => void;
+    const gate = new Promise<{ kind: "rendered"; text: string }>((res) => {
       release = res;
     });
     mockPromptBackend({ prompts: [SUMMARY], render: () => gate });
@@ -1666,7 +1669,7 @@ describe("ComposeBar prompt mode", () => {
     expect(chip(AGENT_B.id)).toHaveAttribute("data-selected", "true");
     expect(invokeMock.mock.calls.some(([c]) => c === "send_message")).toBe(false);
 
-    release({ text: "DONE" });
+    release({ kind: "rendered", text: "DONE" });
     await waitFor(() => {
       const sends = invokeMock.mock.calls.filter(([c]) => c === "send_message");
       expect(sends).toHaveLength(2);
@@ -1675,6 +1678,153 @@ describe("ComposeBar prompt mode", () => {
     await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
     expect((state.transcripts[AGENT_A.id] ?? [])[0]).toMatchObject({ text: "DONE" });
     expect((state.transcripts[AGENT_B.id] ?? [])[0]).toMatchObject({ text: "DONE" });
+  });
+
+  it("a needs-sign-in render launches the browser sign-in and completes the send", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    let renders = 0;
+    let releaseSignIn!: () => void;
+    const signInGate = new Promise<null>((res) => {
+      releaseSignIn = () => res(null);
+    });
+    mockPromptBackend({
+      prompts: [SUMMARY],
+      // First render: the provider needs sign-in. After the sign-in resolves,
+      // the retry renders normally.
+      render: async () =>
+        ++renders === 1
+          ? { kind: "needs_sign_in", provider: "tiddly" }
+          : { kind: "rendered", text: "DONE" },
+      signIn: () => signInGate,
+    });
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+
+    await enterPromptMode("prompt-option-tiddly:summary");
+    await fireEvent.click(screen.getByTestId("compose-send"));
+
+    // The browser wait: a visible waiting line naming the provider, send held,
+    // nothing dispatched, and the sign-in invoked exactly once.
+    await waitFor(() =>
+      expect(screen.getByTestId("compose-signing-in")).toHaveTextContent(
+        "Waiting for browser sign-in to tiddly",
+      ),
+    );
+    expect((screen.getByTestId("compose-send") as HTMLButtonElement).disabled).toBe(true);
+    expect(invokeMock.mock.calls.some(([c]) => c === "send_message")).toBe(false);
+    expect(invokeMock).toHaveBeenCalledWith("sign_in_mcp_provider", { name: "tiddly" });
+
+    // The user approves in the browser: the send completes itself — no
+    // "press send again", no message.
+    releaseSignIn();
+    await waitFor(() => {
+      const sends = invokeMock.mock.calls.filter(([c]) => c === "send_message");
+      expect(sends).toHaveLength(1);
+    });
+    expect((state.transcripts[AGENT_A.id] ?? [])[0]).toMatchObject({ text: "DONE" });
+    expect(screen.queryByTestId("compose-signing-in")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("compose-send-error")).not.toBeInTheDocument();
+  });
+
+  it("a denied mid-send sign-in surfaces the failure and dispatches nothing", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    mockPromptBackend({
+      prompts: [SUMMARY],
+      render: async () => ({ kind: "needs_sign_in", provider: "tiddly" }),
+      signIn: () => Promise.reject(new Error("the authorization server reported access_denied")),
+    });
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+
+    await enterPromptMode("prompt-option-tiddly:summary");
+    await fireEvent.click(screen.getByTestId("compose-send"));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("compose-send-error")).toHaveTextContent("access_denied"),
+    );
+    expect(invokeMock.mock.calls.some(([c]) => c === "send_message")).toBe(false);
+    // The composer kept the prompt: the user can retry after fixing things.
+    expect(screen.getByTestId("prompt-composer")).toBeInTheDocument();
+    expect((state.transcripts[AGENT_A.id] ?? []).length).toBe(0);
+  });
+
+  it("a failure after a successful mid-send sign-in says the sign-in stuck", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    let renders = 0;
+    mockPromptBackend({
+      prompts: [SUMMARY],
+      // Sign-in succeeds; the retry render then fails (e.g. the server).
+      render: async () => {
+        if (++renders === 1) return { kind: "needs_sign_in", provider: "tiddly" };
+        throw new Error("timed out after 10s");
+      },
+      signIn: () => Promise.resolve(null),
+    });
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+
+    await enterPromptMode("prompt-option-tiddly:summary");
+    await fireEvent.click(screen.getByTestId("compose-send"));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("compose-send-error")).toHaveTextContent(
+        "Signed in, but the send then failed: timed out after 10s",
+      ),
+    );
+    expect(invokeMock.mock.calls.some(([c]) => c === "send_message")).toBe(false);
+    expect((state.transcripts[AGENT_A.id] ?? []).length).toBe(0);
+  });
+
+  it("a failure after a successful mid-send sign-in says the sign-in stuck", async () => {
+    // The live-run confusion this pins: the user approves in the browser,
+    // the retry then fails (e.g. a server stall) — the message must say the
+    // sign-in itself succeeded, not read as a wasted approval.
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    let renders = 0;
+    mockPromptBackend({
+      prompts: [SUMMARY],
+      render: async () => {
+        if (++renders === 1) return { kind: "needs_sign_in", provider: "tiddly" };
+        throw new Error("timed out after 10s");
+      },
+      signIn: () => Promise.resolve(null),
+    });
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+
+    await enterPromptMode("prompt-option-tiddly:summary");
+    await fireEvent.click(screen.getByTestId("compose-send"));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("compose-send-error")).toHaveTextContent(
+        "Signed in, but the send then failed: timed out after 10s",
+      ),
+    );
+    expect(invokeMock.mock.calls.some(([c]) => c === "send_message")).toBe(false);
+    expect((state.transcripts[AGENT_A.id] ?? []).length).toBe(0);
+  });
+
+  it("a second needs-sign-in after a successful sign-in stops — never a loop", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    mockPromptBackend({
+      prompts: [SUMMARY],
+      // Pathological backend: still needs sign-in after a successful flow.
+      render: async () => ({ kind: "needs_sign_in", provider: "tiddly" }),
+      signIn: () => Promise.resolve(null),
+    });
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+
+    await enterPromptMode("prompt-option-tiddly:summary");
+    await fireEvent.click(screen.getByTestId("compose-send"));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("compose-send-error")).toHaveTextContent("needs sign-in"),
+    );
+    // Exactly one browser launch, no dispatch, composer intact.
+    expect(invokeMock.mock.calls.filter(([c]) => c === "sign_in_mcp_provider")).toHaveLength(1);
+    expect(invokeMock.mock.calls.some(([c]) => c === "send_message")).toBe(false);
+    expect((state.transcripts[AGENT_A.id] ?? []).length).toBe(0);
   });
 
   it("restores a persisted prompt-mode draft (prompt, args, appended text)", async () => {
@@ -1770,8 +1920,8 @@ describe("ComposeBar prompt mode", () => {
   it("keeps prompt removal locked while the send render is in flight", async () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);
-    let release!: (v: { text: string }) => void;
-    const gate = new Promise<{ text: string }>((res) => {
+    let release!: (v: { kind: "rendered"; text: string }) => void;
+    const gate = new Promise<{ kind: "rendered"; text: string }>((res) => {
       release = res;
     });
     mockPromptBackend({ prompts: [SUMMARY], render: () => gate });
@@ -1781,7 +1931,7 @@ describe("ComposeBar prompt mode", () => {
     await fireEvent.click(screen.getByTestId("compose-send"));
     expect((screen.getByTestId("prompt-remove") as HTMLButtonElement).disabled).toBe(true);
     await fireEvent.click(screen.getByTestId("prompt-remove"));
-    release({ text: "DONE" });
+    release({ kind: "rendered", text: "DONE" });
     await waitFor(() =>
       expect(invokeMock.mock.calls.some(([c]) => c === "send_message")).toBe(true),
     );
@@ -1794,8 +1944,8 @@ describe("ComposeBar prompt mode", () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);
     await state.registerAgent(AGENT_B);
-    let release!: (v: { text: string }) => void;
-    const gate = new Promise<{ text: string }>((res) => {
+    let release!: (v: { kind: "rendered"; text: string }) => void;
+    const gate = new Promise<{ kind: "rendered"; text: string }>((res) => {
       release = res;
     });
     mockPromptBackend({ prompts: [SUMMARY], render: () => gate });
@@ -1806,7 +1956,7 @@ describe("ComposeBar prompt mode", () => {
     await fireEvent.click(screen.getByTestId("compose-send"));
     expect((chip(AGENT_A.id) as HTMLButtonElement).disabled).toBe(true);
     await fireEvent.click(chip(AGENT_A.id));
-    release({ text: "DONE" });
+    release({ kind: "rendered", text: "DONE" });
     await waitFor(() => {
       const sends = invokeMock.mock.calls.filter(([c]) => c === "send_message");
       expect(sends).toHaveLength(2);
@@ -2325,8 +2475,8 @@ describe("ComposeBar pane targeting", () => {
     await state.registerAgent(AGENT_B);
     panes.moveAgentToNewPane(PROJECT_ID, ROSTER, AGENT_B.id);
 
-    let release!: (v: { text: string }) => void;
-    const gate = new Promise<{ text: string }>((res) => {
+    let release!: (v: { kind: "rendered"; text: string }) => void;
+    const gate = new Promise<{ kind: "rendered"; text: string }>((res) => {
       release = res;
     });
     mockPromptBackend({ prompts: [SUMMARY], render: () => gate });
@@ -2341,7 +2491,7 @@ describe("ComposeBar pane targeting", () => {
     expect(selection.targetRecipients(PROJECT_ID, [AGENT_B.id])).toBe(false);
     expect(selection.selectionFor(PROJECT_ID)).toEqual([AGENT_A.id]);
 
-    release({ text: "DONE" });
+    release({ kind: "rendered", text: "DONE" });
     await waitFor(() => {
       const sends = invokeMock.mock.calls.filter(([c]) => c === "send_message");
       expect(sends).toHaveLength(1);
@@ -3133,7 +3283,7 @@ describe("ComposeBar — cross-agent forward", () => {
           return { path: `/proj/.switchboard/attachments/uuid__${name}`, original_name: name };
         }
         if (cmd === "list_prompts") return [REVIEW];
-        if (cmd === "render_prompt") return { text: "RENDERED" };
+        if (cmd === "render_prompt") return { kind: "rendered", text: "RENDERED" };
         if (cmd === "forward_prompt") {
           if (forward instanceof Error) throw forward;
           return forward;

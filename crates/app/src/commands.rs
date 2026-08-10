@@ -1156,8 +1156,36 @@ pub async fn render_prompt_impl(
     provider: &str,
     name: &str,
     args: &std::collections::BTreeMap<String, String>,
-) -> Result<switchboard_prompts::RenderedPrompt, AppError> {
-    Ok(state.prompts.render(provider, name, args).await?)
+) -> Result<RenderPromptOutcome, AppError> {
+    match state.prompts.render(provider, name, args).await {
+        Ok(rendered) => Ok(RenderPromptOutcome::Rendered {
+            text: rendered.text,
+        }),
+        Err(switchboard_prompts::PromptError::McpNeedsAuth { provider }) => {
+            Ok(RenderPromptOutcome::NeedsSignIn { provider })
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// The typed outcome of a prompt render over IPC. Every other render failure
+/// stays a flat error string (display-only), but needs-sign-in crosses as
+/// **data** because the composer *acts* on it — launching the provider's
+/// browser sign-in and retrying — rather than displaying it. Mirrored as a
+/// discriminated union on the TS side; `#[non_exhaustive]` so future outcome
+/// kinds land additively (the frontend degrades unknown kinds to an error).
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum RenderPromptOutcome {
+    Rendered {
+        text: String,
+    },
+    /// The prompt's OAuth provider has no usable credentials — the typed
+    /// local determination, never inferred from a transport error.
+    NeedsSignIn {
+        provider: String,
+    },
 }
 
 /// The raw, unrendered template body of a `builtin` or `local` prompt, for a
@@ -1176,22 +1204,69 @@ pub fn get_prompt_source_impl(
 
 /// Configured MCP providers with their last-build status and whether a token is
 /// stored — drives the Settings provider list.
-pub fn list_mcp_providers_impl(state: &AppState) -> Vec<switchboard_prompts::McpProviderInfo> {
-    state.prompts.list_mcp_providers()
+///
+/// The listing itself is deliberately synchronous (see `tokens_present`) and
+/// does one keychain read per provider; it runs on the blocking pool here
+/// because the Settings surface now refreshes it after every row action and
+/// background sync, and a slow keychain read must not occupy an async runtime
+/// worker that unrelated work shares. A join failure (a panic in the listing)
+/// degrades to an empty list with a warning, matching the loaders'
+/// display-only contract.
+pub async fn list_mcp_providers_impl(
+    state: &AppState,
+) -> Vec<switchboard_prompts::McpProviderInfo> {
+    let prompts = state.prompts.clone();
+    match tokio::task::spawn_blocking(move || prompts.list_mcp_providers()).await {
+        Ok(providers) => providers,
+        Err(e) => {
+            tracing::warn!(error = %e, "provider listing task failed");
+            Vec::new()
+        }
+    }
 }
 
-/// Add a generic MCP provider (name + URL + optional bearer): writes its config
-/// entry, stores the bearer in the keychain, and kicks off a background cache
-/// rebuild so its prompts appear without blocking the command on a slow server.
+/// Add a generic MCP provider (name + URL + auth mode + optional bearer):
+/// writes its config entry, stores the bearer in the keychain (bearer mode
+/// only — an OAuth provider is added credential-less and then signed in), and
+/// kicks off a background cache rebuild so its prompts appear without blocking
+/// the command on a slow server.
 pub fn add_mcp_provider_impl(
     state: &AppState,
     name: &str,
     url: &str,
+    auth: switchboard_prompts::McpAuth,
     bearer: Option<&str>,
 ) -> Result<(), AppError> {
-    state.prompts.add_mcp_provider(name, url, bearer)?;
+    state.prompts.add_mcp_provider(name, url, auth, bearer)?;
     spawn_prompt_sync(state);
     Ok(())
+}
+
+/// Run the browser sign-in flow for a saved OAuth provider, then rebuild the
+/// prompt cache in the background so its prompts appear once signed in.
+///
+/// The rebuild runs on failure too: a failed sign-in can still have made a
+/// durable change (a re-registration wipes the previous tokens before the
+/// browser opens), and skipping the sync would leave the old authorization's
+/// prompts listed and selectable next to a sign-in error. Failures that
+/// changed nothing (unknown provider, wrong auth mode, flow already in
+/// progress) also trigger a sync — accepted waste: it is serialized,
+/// per-provider-budgeted, and not worth threading a changed-anything
+/// disposition through the error type to avoid.
+pub async fn sign_in_mcp_provider_impl(state: &AppState, name: &str) -> Result<(), AppError> {
+    let result = state.prompts.sign_in_mcp_provider(name).await;
+    spawn_prompt_sync(state);
+    Ok(result?)
+}
+
+/// Sign out an OAuth provider (clear its tokens, keep its registration) and
+/// rebuild the cache so its prompts drop out and its status reads needs-auth.
+/// Syncs on failure too, mirroring sign-in (a partial failure may still have
+/// changed durable state).
+pub async fn sign_out_mcp_provider_impl(state: &AppState, name: &str) -> Result<(), AppError> {
+    let result = state.prompts.sign_out_mcp_provider(name).await;
+    spawn_prompt_sync(state);
+    Ok(result?)
 }
 
 /// Remove a generic MCP provider: deletes its config entry + keychain token and
@@ -1200,6 +1275,18 @@ pub fn remove_mcp_provider_impl(state: &AppState, name: &str) -> Result<(), AppE
     state.prompts.remove_mcp_provider(name)?;
     spawn_prompt_sync(state);
     Ok(())
+}
+
+/// Probe a **saved** provider by name with its stored credentials — the
+/// row-level Test action. Returns the outcome in the provider-status
+/// vocabulary the rows already render (`ok`/`needs_auth`/`errored`/
+/// `store_unavailable`) without touching the recorded status; `Err` is
+/// reserved for "no such provider".
+pub async fn test_saved_mcp_provider_impl(
+    state: &AppState,
+    name: &str,
+) -> Result<switchboard_prompts::ProviderStatus, AppError> {
+    Ok(state.prompts.test_saved_mcp_provider(name).await?)
 }
 
 /// Probe a candidate provider before saving (connect + list); returns the prompt
@@ -17193,7 +17280,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(rendered.text.contains("Code Review Guidelines"));
+        assert!(matches!(
+            rendered,
+            RenderPromptOutcome::Rendered { ref text } if text.contains("Code Review Guidelines")
+        ));
     }
 
     #[test]
@@ -17235,7 +17325,35 @@ mod tests {
         let rendered = render_prompt_impl(&state, "local", "greet", &args)
             .await
             .unwrap();
-        assert!(rendered.text.contains("Hi Ada"));
+        assert!(matches!(
+            rendered,
+            RenderPromptOutcome::Rendered { ref text } if text.contains("Hi Ada")
+        ));
+    }
+
+    #[tokio::test]
+    async fn render_prompt_maps_needs_sign_in_to_a_typed_outcome() {
+        // The one render failure that crosses IPC as data, not a string: the
+        // composer launches the provider's sign-in from it.
+        let (tmp, state) = state_with_prompts();
+        std::fs::write(
+            tmp.path().join("config.yaml"),
+            "mcp_providers:\n  - name: tiddly\n    transport:\n      type: http\n      url: https://prompts-mcp.tiddly.me/mcp\n    auth:\n      type: oauth\n",
+        )
+        .unwrap();
+
+        let outcome = render_prompt_impl(
+            &state,
+            "tiddly",
+            "anything",
+            &std::collections::BTreeMap::new(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            RenderPromptOutcome::NeedsSignIn { ref provider } if provider == "tiddly"
+        ));
     }
 
     #[tokio::test]
@@ -17582,20 +17700,129 @@ mod tests {
         // prompts crate). Uses the state's in-memory secret store.
         let (_tmp, state) = state_with_prompts();
 
-        add_mcp_provider_impl(&state, "team", "https://mcp.example.com", Some("tok")).unwrap();
-        let providers = list_mcp_providers_impl(&state);
+        add_mcp_provider_impl(
+            &state,
+            "team",
+            "https://mcp.example.com",
+            switchboard_prompts::McpAuth::Bearer,
+            Some("tok"),
+        )
+        .unwrap();
+        let providers = list_mcp_providers_impl(&state).await;
         assert_eq!(providers.len(), 1);
         assert_eq!(providers[0].name, "team");
         assert!(providers[0].has_token);
 
         // Duplicate names are rejected at the command boundary.
         assert!(matches!(
-            add_mcp_provider_impl(&state, "team", "https://other", None),
+            add_mcp_provider_impl(
+                &state,
+                "team",
+                "https://other",
+                switchboard_prompts::McpAuth::Bearer,
+                None
+            ),
             Err(AppError::Prompt(_))
         ));
 
         remove_mcp_provider_impl(&state, "team").unwrap();
-        assert!(list_mcp_providers_impl(&state).is_empty());
+        assert!(list_mcp_providers_impl(&state).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn provider_listing_leaves_the_runtime_responsive_while_the_store_blocks() {
+        // Pins the architectural reason `list_mcp_providers_impl` goes through
+        // `spawn_blocking`: the listing does synchronous keychain reads, and
+        // this test runs on tokio's current_thread flavor — if the read ran
+        // inline on the (only) runtime worker, the select's timer below could
+        // never fire and the listing branch would win instead.
+        use switchboard_prompts::{SecretStore, SecretStoreError};
+
+        /// `get` parks until released. The park times out (returning "no
+        /// token") so a regression fails this test in seconds rather than
+        /// hanging it.
+        struct ParkedStore {
+            release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+        impl SecretStore for ParkedStore {
+            fn get(&self, _: &str) -> Result<Option<String>, SecretStoreError> {
+                let _ = self
+                    .release
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .recv_timeout(std::time::Duration::from_secs(5));
+                Ok(None)
+            }
+            fn set(&self, _: &str, _: &str) -> Result<(), SecretStoreError> {
+                Ok(())
+            }
+            fn delete(&self, _: &str) -> Result<(), SecretStoreError> {
+                Ok(())
+            }
+        }
+
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (tmp, state, _) = fresh_state_with_mock();
+        let prompts_dir = tmp.path().join("prompts");
+        std::fs::create_dir_all(&prompts_dir).unwrap();
+        let config_path = tmp.path().join("config.yaml");
+        std::fs::write(
+            &config_path,
+            "mcp_providers:\n  - name: team\n    transport:\n      type: http\n      url: https://x\n",
+        )
+        .unwrap();
+        let service = switchboard_prompts::PromptService::new(
+            config_path,
+            prompts_dir,
+            None,
+            Arc::new(ParkedStore {
+                release: std::sync::Mutex::new(release_rx),
+            }),
+        );
+        let state = state.with_prompts(service);
+
+        let mut listing = Box::pin(list_mcp_providers_impl(&state));
+        tokio::select! {
+            _ = &mut listing => {
+                panic!("the listing completed inline — it must park on the blocking pool");
+            }
+            () = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+        }
+
+        release_tx.send(()).unwrap();
+        let providers = listing.await;
+        assert_eq!(providers.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_sign_in_still_triggers_a_prompt_sync() {
+        // A failed sign-in can follow a durable change (a re-registration
+        // wipes the previous tokens before the browser opens), so the impl
+        // refreshes the prompt cache even on error — otherwise the old
+        // authorization's prompts would stay listed next to a sign-in error.
+        let (tmp, state, emitter) = fresh_state_with_mock();
+        let prompts_dir = tmp.path().join("prompts");
+        std::fs::create_dir_all(&prompts_dir).unwrap();
+        let service = switchboard_prompts::PromptService::new(
+            tmp.path().join("config.yaml"),
+            prompts_dir,
+            None,
+            Arc::new(switchboard_prompts::InMemorySecretStore::new()),
+        );
+        let state = state.with_prompts(service);
+
+        assert!(sign_in_mcp_provider_impl(&state, "nope").await.is_err());
+        for _ in 0..100 {
+            if emitter
+                .snapshot()
+                .iter()
+                .any(|(name, _)| name == PROMPTS_SYNCED_EVENT)
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("no {PROMPTS_SYNCED_EVENT} emitted after a failed sign-in");
     }
 
     #[tokio::test]

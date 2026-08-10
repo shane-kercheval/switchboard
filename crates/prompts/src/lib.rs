@@ -18,15 +18,19 @@ mod config;
 mod local;
 mod mcp;
 mod model;
+mod oauth;
+mod preflight;
 mod provider;
 mod secret;
 mod service;
+mod signin;
 
 pub use builtin::builtin_prompt_content;
-pub use config::{McpProviderConfig, McpTransport, PromptConfig, resolve_local_dirs};
+pub use config::{McpAuth, McpProviderConfig, McpTransport, PromptConfig, resolve_local_dirs};
 pub use model::{BUILTIN_PROVIDER, LOCAL_PROVIDER, Prompt, PromptArgument, PromptId};
 pub use secret::{InMemorySecretStore, SecretStore, SecretStoreError};
 pub use service::{McpProviderInfo, PromptService, PromptSource, ProviderStatus, RenderedPrompt};
+pub use signin::BrowserOpener;
 
 pub use error::PromptError;
 
@@ -135,5 +139,30 @@ mod error {
         /// The secret store could not store or delete a credential.
         #[error(transparent)]
         Secret(#[from] crate::secret::SecretStoreError),
+
+        /// An OAuth provider failed a mandatory validation gate (the preflight)
+        /// before any credential was sent: bad URL, resource-identity mismatch,
+        /// non-HTTPS endpoint, or missing PKCE support. `message` names the
+        /// specific gate and, for identity mismatches, both compared values.
+        #[error("OAuth validation failed for provider {provider:?}: {message}")]
+        OAuthValidation { provider: String, message: String },
+
+        /// An OAuth provider has no usable credentials — determined locally
+        /// from the typed `AuthorizationRequired` probe, before any request
+        /// reaches the MCP server. The app's render command maps this variant
+        /// (alone — every other error crosses IPC as a flat string) into a
+        /// typed needs-sign-in outcome, which is what lets the composer launch
+        /// the provider's browser sign-in at the point of use; the service
+        /// also records it as the provider's `needs_auth` status so Settings
+        /// agrees with what the composer reported.
+        #[error("MCP provider {provider:?} needs sign-in before its prompts can be used")]
+        McpNeedsAuth { provider: String },
+
+        /// A browser sign-in or sign-out flow failed: consent was denied, the
+        /// callback never arrived, registration or the token exchange failed,
+        /// or the provider isn't configured for OAuth. `message` is readable
+        /// and never contains an authorization code or token.
+        #[error("OAuth flow failed for MCP provider {provider:?}: {message}")]
+        OAuthFlow { provider: String, message: String },
     }
 }

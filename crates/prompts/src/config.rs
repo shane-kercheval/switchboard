@@ -31,6 +31,46 @@ pub struct PromptConfig {
 pub struct McpProviderConfig {
     pub name: String,
     pub transport: McpTransport,
+    /// How the provider authenticates. Absent means bearer — the shape every
+    /// pre-OAuth config has — and a default bearer entry serializes back to
+    /// absent, so a config rewrite adds no `auth:` key to entries that never
+    /// had one. (The guarantee is schema-level: the writer normalizes YAML
+    /// formatting and drops comments regardless — see `write_mcp_providers`.)
+    #[serde(default, skip_serializing_if = "McpAuth::is_bearer")]
+    pub auth: McpAuth,
+}
+
+/// Authentication mode for an MCP provider. Same tagged-enum shape as
+/// [`McpTransport`] (`auth: { type: oauth }`); `#[non_exhaustive]` leaves room
+/// for future modes without a breaking change.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum McpAuth {
+    /// A bearer token the user pastes in Settings, stored in the keychain under
+    /// the provider's name.
+    #[default]
+    Bearer,
+    /// Browser sign-in via the MCP authorization spec (OAuth with dynamic client
+    /// registration). Credentials live in the keychain under
+    /// `oauth:<provider-name>` (see `crate::oauth`).
+    Oauth {
+        /// Optional override of the scopes requested at registration and
+        /// authorization — the escape hatch for a server whose advertised
+        /// metadata we can't otherwise satisfy. When absent, scopes are resolved
+        /// from the server's own metadata (`WWW-Authenticate` challenge, then
+        /// the protected-resource `scopes_supported`, then omitted entirely).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scopes: Option<Vec<String>>,
+    },
+}
+
+impl McpAuth {
+    /// Serialization guard: a default bearer entry is written as *no* `auth:`
+    /// key, so a rewrite introduces no `auth:` key on pre-OAuth entries.
+    fn is_bearer(&self) -> bool {
+        matches!(self, Self::Bearer)
+    }
 }
 
 /// Transport for an MCP provider. Only HTTP (Streamable HTTP) is supported in
@@ -298,6 +338,91 @@ mcp_providers:
         assert!(!is_valid_provider_name(""));
         assert!(!is_valid_provider_name("   "));
         assert!(!is_valid_provider_name("a:b"));
+    }
+
+    #[test]
+    fn absent_auth_key_means_bearer() {
+        let yaml = r"
+mcp_providers:
+  - name: team
+    transport:
+      type: http
+      url: https://mcp.example.com
+";
+        let section: McpSection = serde_norway::from_str(yaml).unwrap();
+        let configs = section.into_configs();
+        assert_eq!(configs[0].auth, McpAuth::Bearer);
+    }
+
+    #[test]
+    fn explicit_bearer_and_oauth_auth_parse() {
+        let yaml = r"
+mcp_providers:
+  - name: with-bearer
+    transport: { type: http, url: https://a.example.com }
+    auth: { type: bearer }
+  - name: with-oauth
+    transport: { type: http, url: https://b.example.com }
+    auth: { type: oauth }
+";
+        let section: McpSection = serde_norway::from_str(yaml).unwrap();
+        let configs = section.into_configs();
+        assert_eq!(configs[0].auth, McpAuth::Bearer);
+        assert_eq!(configs[1].auth, McpAuth::Oauth { scopes: None });
+    }
+
+    #[test]
+    fn oauth_scopes_override_round_trips() {
+        let yaml = r"
+mcp_providers:
+  - name: team
+    transport: { type: http, url: https://a.example.com }
+    auth:
+      type: oauth
+      scopes: [openid, offline_access]
+";
+        let section: McpSection = serde_norway::from_str(yaml).unwrap();
+        let configs = section.into_configs();
+        assert_eq!(
+            configs[0].auth,
+            McpAuth::Oauth {
+                scopes: Some(vec!["openid".to_owned(), "offline_access".to_owned()]),
+            }
+        );
+        // The override survives a serialize/deserialize round-trip.
+        let written = serde_norway::to_string(&configs).unwrap();
+        let reread: Vec<McpProviderConfig> = serde_norway::from_str(&written).unwrap();
+        assert_eq!(reread, configs);
+    }
+
+    #[test]
+    fn default_bearer_serializes_without_auth_key() {
+        // A pre-OAuth config entry must round-trip byte-compatibly: no `auth:`
+        // key appears when the mode is the default bearer.
+        let config = McpProviderConfig {
+            name: "team".to_owned(),
+            transport: McpTransport::Http {
+                url: "https://a.example.com".to_owned(),
+            },
+            auth: McpAuth::Bearer,
+        };
+        let written = serde_norway::to_string(&config).unwrap();
+        assert!(!written.contains("auth"));
+    }
+
+    #[test]
+    fn malformed_auth_skips_only_that_entry() {
+        let yaml = r"
+mcp_providers:
+  - name: bad-auth
+    transport: { type: http, url: https://a.example.com }
+    auth: { type: kerberos }
+  - name: ok
+    transport: { type: http, url: https://b.example.com }
+";
+        let section: McpSection = serde_norway::from_str(yaml).unwrap();
+        let names: Vec<String> = section.into_configs().into_iter().map(|c| c.name).collect();
+        assert_eq!(names, vec!["ok".to_owned()]);
     }
 
     #[test]

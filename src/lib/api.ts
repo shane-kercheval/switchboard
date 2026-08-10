@@ -21,6 +21,7 @@ import type {
   HarnessInstallStatus,
   HarnessKind,
   LoadedTranscript,
+  McpAuth,
   McpProviderInfo,
   MessageId,
   MessagePin,
@@ -30,10 +31,11 @@ import type {
   Preferences,
   ProjectListing,
   ProjectSummary,
+  ProviderStatus,
   PathSource,
   Prompt,
   PromptSource,
-  RenderedPrompt,
+  RenderPromptOutcome,
   RepoListing,
   SendId,
   StagedAttachment,
@@ -607,20 +609,42 @@ export async function listMcpProviders(): Promise<McpProviderInfo[]> {
   return await invoke<McpProviderInfo[]>("list_mcp_providers");
 }
 
-/// Add a generic MCP server. `bearer` is `null` for an unauthenticated server;
-/// when present it is stored in the OS keychain, never in config. Triggers a
-/// background cache rebuild.
+/// Add a generic MCP server. `bearer` applies only to bearer mode and is
+/// `null` for an unauthenticated server; when present it is stored in the OS
+/// keychain, never in config. An OAuth server is added credential-less and
+/// then signed in from its row. Triggers a background cache rebuild.
 export async function addMcpProvider(
   name: string,
   url: string,
+  auth: McpAuth,
   bearer: string | null,
 ): Promise<void> {
-  await invoke("add_mcp_provider", { name, url, bearer });
+  await invoke("add_mcp_provider", { name, url, auth, bearer });
 }
 
 /// Remove a configured MCP server (deletes its config entry and stored token).
 export async function removeMcpProvider(name: string): Promise<void> {
   await invoke("remove_mcp_provider", { name });
+}
+
+/// Run the browser sign-in flow for a saved OAuth provider. Long-running —
+/// resolves only when the user completes (or abandons) the browser round-trip,
+/// so callers need a pending state that survives minutes.
+export async function signInMcpProvider(name: string): Promise<void> {
+  await invoke("sign_in_mcp_provider", { name });
+}
+
+/// Sign out an OAuth provider: clears its tokens, keeps its registration so a
+/// later sign-in reuses it.
+export async function signOutMcpProvider(name: string): Promise<void> {
+  await invoke("sign_out_mcp_provider", { name });
+}
+
+/// Probe a saved provider by name with its stored credentials — the row-level
+/// Test action. Resolves to a provider status (`ok`/`needs_auth`/`errored`/
+/// `store_unavailable`); rejects only for an unknown name.
+export async function testSavedMcpProvider(name: string): Promise<ProviderStatus> {
+  return await invoke<ProviderStatus>("test_saved_mcp_provider", { name });
 }
 
 /// Probe a candidate server before saving; resolves to the prompt count or
@@ -656,15 +680,17 @@ export async function listPrompts(): Promise<Prompt[]> {
   return await invoke<Prompt[]>("list_prompts");
 }
 
-/// Render `name` from `provider` with `args` to its finished text. Serves both
-/// the composer's preview and its send (the same args map for both). May touch
-/// the network (MCP `prompts/get`), so callers show a pending state.
+/// Render `name` from `provider` with `args`, resolving to a typed outcome:
+/// the finished text, or a needs-sign-in determination the composer acts on by
+/// launching the provider's browser sign-in. Serves both the composer's
+/// preview and its send (the same args map for both). May touch the network
+/// (MCP `prompts/get`), so callers show a pending state.
 export async function renderPrompt(
   provider: string,
   name: string,
   args: Record<string, string>,
-): Promise<RenderedPrompt> {
-  return await invoke<RenderedPrompt>("render_prompt", { provider, name, args });
+): Promise<RenderPromptOutcome> {
+  return await invoke<RenderPromptOutcome>("render_prompt", { provider, name, args });
 }
 
 /// The raw, unrendered template body of `provider:name`, for a read-only preview.

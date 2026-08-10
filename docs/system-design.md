@@ -344,22 +344,27 @@ local_prompt_dirs:
   - ~/repos/my-prompts-library      # personal git-managed library
   - ~/.config/switchboard/prompts   # OS-conventional default; explicitly include if you want it
 
-# MCP prompt servers, added via Settings → "Add MCP server". Only the
-# non-secret name + URL live here; the bearer token (if any) is stored in
-# the OS keychain, keyed by the provider name — never in this file.
+# MCP prompt servers, added via Settings → "Add MCP server". Only non-secret
+# config lives here; credentials (a pasted bearer token, or OAuth's client
+# registration + tokens) are stored in the OS keychain, keyed by the provider
+# name — never in this file.
 mcp_providers:
-  - name: tiddly                    # the prefix (tiddly:my-prompt); a Tiddly PAT
-    transport:                      #   is pasted into the form and stored in the keychain
+  - name: tiddly                    # the prefix (tiddly:my-prompt)
+    transport:
       type: http
       url: https://prompts-mcp.tiddly.me/mcp
+    auth:
+      type: oauth                   # browser sign-in (OAuth + dynamic client
+                                    #   registration); an absent auth: key means
+                                    #   bearer — a token pasted into the form
 
-  - name: my-team-mcp
+  - name: my-team-mcp               # bearer-mode provider: no auth: key
     transport:
       type: http
       url: https://mcp.example.com/mcp
 ```
 
-**V1: all MCP servers are added through one generic form.** Settings offers an "Add MCP server" form (name + URL + optional bearer token); the non-secret `name`/`url` are written to `config.yaml` and the token is stored in the OS keychain, never in `config.yaml`. **Tiddly is configured this way in V1** — paste a Tiddly Personal Access Token (minted in Tiddly's own UI/CLI) as the bearer, with URL `https://prompts-mcp.tiddly.me/mcp`. A **first-class one-click "Connect Tiddly" preset** (browser/Auth0 login, no token handling, a `preset: tiddly` config entry) is a **deferred post-V1 follow-up** — see the implementation plan's M5. **stdio MCP providers** are likewise deferred (V1 is HTTP-only); a `transport: { type: stdio, … }` entry is not yet supported. Both can return additively without changing the config model.
+**V1: all MCP servers are added through one generic form, with two auth modes.** Settings offers an "Add MCP server" form (name + URL + an authentication mode); the non-secret config is written to `config.yaml` and credentials live in the OS keychain, never in `config.yaml`. **Bearer** is a token the user pastes (for Tiddly, a Personal Access Token minted in Tiddly's own UI/CLI) — the path for servers without OAuth support and for headless use. **OAuth** (`auth: { type: oauth }`) is browser sign-in per the MCP authorization spec: Switchboard discovers the server's authorization server (RFC 9728/8414), dynamically registers a client (RFC 7591, reused across sign-ins), and runs an Authorization Code + PKCE flow against an ephemeral loopback listener; sign-out clears tokens but keeps the registration. The integration is fully generic — no server-specific knowledge lives in Switchboard; a server advertises its own scopes via `scopes_supported`, and a per-provider `scopes:` override exists as an escape hatch. This delivers the browser-login/no-token-handling experience the earlier-planned "Connect Tiddly" preset was for, through the generic form; a named preset remains possible post-V1 sugar. **stdio MCP providers** are deferred (V1 is HTTP-only); a `transport: { type: stdio, … }` entry is not yet supported and can return additively without changing the config model.
 
 ### Addressing prompts
 

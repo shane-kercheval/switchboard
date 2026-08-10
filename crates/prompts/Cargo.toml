@@ -18,12 +18,17 @@ serde_norway = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 minijinja = "2.20.0"
-rmcp = { version = "1.7.0", default-features = false, features = ["client", "transport-streamable-http-client-reqwest", "macros", "reqwest-native-tls"] }
+rmcp = { version = "1.7.0", default-features = false, features = ["client", "transport-streamable-http-client-reqwest", "macros", "reqwest-native-tls", "auth"] }
+async-trait.workspace = true
 tokio.workspace = true
 serde_json.workspace = true
 futures.workspace = true
+reqwest = { version = "0.13.4", default-features = false, features = ["native-tls"] }
+url = "2.5.8"
 
 [dev-dependencies]
+async-trait.workspace = true
 axum = "0.8.9"
 rmcp = { version = "1.7.0", features = ["server", "transport-streamable-http-server"] }
 tempfile = { workspace = true }
+url = "2.5.8"

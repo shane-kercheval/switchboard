@@ -21,13 +21,23 @@ use crate::error::PromptError;
 use crate::model::{Prompt, PromptArgument};
 use crate::provider::PromptProvider;
 
+/// How a session authenticates: a static bearer header, or an rmcp
+/// `AuthClient` that injects (and refreshes) an OAuth access token per request.
+pub(crate) enum McpAuthMode {
+    Bearer(Option<String>),
+    OAuth(rmcp::transport::auth::AuthClient<reqwest::Client>),
+}
+
 /// A generic HTTP MCP prompt provider. One per configured `mcp_providers` entry.
 /// Connects fresh per operation (no pooling — listing happens once per cache
 /// build, render once per invocation; pooling is unwarranted complexity for v1).
+/// Note "connects fresh" is about the MCP *session*, not credentials: in OAuth
+/// mode the `AuthClient` is the caller-cached per-provider instance
+/// (`PromptService`'s session cache), never constructed here.
 pub(crate) struct McpProvider {
     name: String,
     url: String,
-    bearer: Option<String>,
+    auth: McpAuthMode,
     timeout: Duration,
 }
 
@@ -41,25 +51,51 @@ impl McpProvider {
         Self {
             name,
             url,
-            bearer,
+            auth: McpAuthMode::Bearer(bearer),
             timeout,
         }
     }
 
-    /// Open a session. The bearer (if any) is sent as the `Authorization`
-    /// header; it never appears in any error this returns.
+    pub(crate) fn new_oauth(
+        name: String,
+        url: String,
+        auth_client: rmcp::transport::auth::AuthClient<reqwest::Client>,
+        timeout: Duration,
+    ) -> Self {
+        Self {
+            name,
+            url,
+            auth: McpAuthMode::OAuth(auth_client),
+            timeout,
+        }
+    }
+
+    /// Open a session. Bearer mode sends the token (if any) as the
+    /// `Authorization` header; OAuth mode routes requests through the shared
+    /// `AuthClient`, which attaches the current access token and refreshes it
+    /// when near expiry. No credential appears in any error this returns.
     async fn connect(&self) -> Result<RunningService<RoleClient, ()>, PromptError> {
         let mut config = StreamableHttpClientTransportConfig::with_uri(self.url.clone());
-        if let Some(bearer) = &self.bearer {
-            config = config.auth_header(bearer.clone());
-        }
-        let transport = StreamableHttpClientTransport::from_config(config);
-        ().serve(transport)
-            .await
-            .map_err(|e| PromptError::McpConnect {
-                provider: self.name.clone(),
-                message: e.to_string(),
-            })
+        let result = match &self.auth {
+            McpAuthMode::Bearer(bearer) => {
+                if let Some(bearer) = bearer {
+                    config = config.auth_header(bearer.clone());
+                }
+                ().serve(StreamableHttpClientTransport::from_config(config))
+                    .await
+            }
+            McpAuthMode::OAuth(auth_client) => {
+                ().serve(StreamableHttpClientTransport::with_client(
+                    auth_client.clone(),
+                    config,
+                ))
+                .await
+            }
+        };
+        result.map_err(|e| PromptError::McpConnect {
+            provider: self.name.clone(),
+            message: e.to_string(),
+        })
     }
 
     /// Connect + `prompts/list` (paginated to completion), bounded by `timeout`,
@@ -72,7 +108,10 @@ impl McpProvider {
             .map_err(|_| self.timed_out())?
     }
 
-    async fn list_uncapped(&self) -> Result<Vec<Prompt>, PromptError> {
+    /// `list_result` without the internal timeout — for callers that already
+    /// run the whole acquisition + probe + list sequence under one outer
+    /// budget (the service's OAuth path) and must not stack a second timer.
+    pub(crate) async fn list_uncapped(&self) -> Result<Vec<Prompt>, PromptError> {
         let client = self.connect().await?;
         let result = client.list_all_prompts().await;
         let _ = client.cancel().await;
@@ -98,7 +137,10 @@ impl McpProvider {
             })?
     }
 
-    async fn render_uncapped(
+    /// `render` without the internal timeout — for callers that already run the
+    /// whole acquisition + probe + render sequence under one outer budget (the
+    /// service's OAuth path) and must not stack a second timer.
+    pub(crate) async fn render_uncapped(
         &self,
         name: &str,
         args: &BTreeMap<String, String>,

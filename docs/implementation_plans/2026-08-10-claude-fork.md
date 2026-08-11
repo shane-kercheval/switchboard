@@ -25,7 +25,9 @@
 > moved from fork registration into the **common dispatch path** (registration
 > alone missed failure-retry sends, which never call it) and now reads the
 > dispatcher's actor via `PeekCurrentTurn` rather than a status flag that does
-> not exist; the guarantee is stated as best-effort; the refresh trigger names
+> not exist; the mid-turn guarantee is stated as "blocked, but a look not a
+> lock" rather than as prevention across all paths (there is one gate at two
+> moments, not a system); the refresh trigger names
 > its signal (`Completed`, re-arm on cancelled/failed); fork placement must
 > leave the new pane **visible**; the chip is always present, disabled with a
 > reason.
@@ -214,22 +216,31 @@ harness-behavior.md §3.5.** Summary, because two design claims rest on them:
     wait on it — the same shape as this gate. Do **not** invent a status map.
   - **Chip disabled while the selected parent is mid-turn** with a tooltip
     saying why in probe-measured terms ("X is working — its current answer
-    wouldn't be included; wait or cancel first"). This is **UX only**; the
+    wouldn't be included; wait or cancel first"). This is **UX only**: the chip
+    reflects what was true when the user looked at it, and a user can enable
+    it, type for a while, and send after the parent has started working. The
     dispatch-path check above is what actually protects the invariant.
-  - **This is best-effort, by design.** `PeekCurrentTurn` is a peek, not a
-    lock: a parent turn can start in the window between the reply and claude's
-    file read. Closing that would need a reservation held across the fork's
-    snapshot — rejected (see the rejected-alternatives history above): no good
-    release signal, and it converts a millisecond window whose worst outcome is
-    a documented stub turn into zero at the cost of the coordination surface
-    the actor model exists to avoid. Describe the guarantee accordingly in
-    user-facing copy and Known limitations: Switchboard prevents this in every
-    UI path; it does not claim to make it impossible.
-  - **Residual (accepted, documented):** the parent can start a turn from a
-    non-Switchboard writer (bare CLI — already a discouraged pattern) or within
-    the sub-second window between the busy check and claude's file read.
-    Consequence per Probe A: no corruption; the branch inherits the in-flight
-    prompt with a synthesized `"No response requested."` stub. The
+  - **Scope of the guarantee — one gate, two moments, not a system.** There is
+    exactly one check ("is the parent running a turn?"), enforced at the chip
+    (advisory) and at dispatch (authoritative). Do not describe this as
+    protection across "all paths": there is only one UI path, and the
+    dispatch-path siting exists to cover the *non*-chip callers (retries,
+    workflow/forward sends), not to add a second layer of defense.
+  - **It is a look, not a lock — two ways through, both accepted.**
+    (a) A parent turn starts in the window between `PeekCurrentTurn`'s reply
+    and claude's file read (milliseconds, and only with something else
+    dispatching concurrently). (b) A `claude` process run directly against the
+    same session outside Switchboard, which we cannot observe at all (already a
+    discouraged pattern — see the same-session-parallel-invocation research).
+    Closing (a) would need a reservation held across the fork's snapshot —
+    rejected (see the rejected-alternatives history above): no good release
+    signal, and it trades a millisecond window for the permanent cross-agent
+    coordination surface the actor model exists to avoid. (b) is unclosable
+    from our side. Consequence when either happens, per Probe A: no corruption
+    and no lost parent work; the branch inherits the in-flight prompt with a
+    synthesized `"No response requested."` stub in place of the parent's real
+    answer. **User-facing copy and Known limitations must say "blocked, with a
+    check that is a look not a lock" — never "impossible."** The
     three-condition merge edge is covered by the mid-turn fixture in M3's DoD,
     which asserts **desired** behavior (the stub turn never claims the fork's
     send) rather than characterizing whatever the merge does today — if it
@@ -599,19 +610,17 @@ The feature is usable end to end and its transcript behavior is pinned.
   refresh), not instantly at send — the interim shows the "Branched from X"
   notice. A CLI constraint, not a choice: a branch can only materialize as a
   turn (probe #4).
-- Branching an agent while it is mid-turn is **prevented in every Switchboard
-  path** (chip disabled; the dispatch-path gate refuses) — but the protection is
-  **best-effort, not absolute**: the busy check is a peek, not a lock, so a
-  concurrent automation or a bare-CLI writer can still start a parent turn in
-  the window before claude reads the file. Escape hatch when you do want to
-  branch a working agent: cancel the parent first — cancelling leaves a clean
-  session to branch from (at the cost of the parent's in-flight work).
-  Rationale for gating at all: a mid-turn snapshot inherits a synthesized
-  `"No response requested."` stub in place of the parent's in-flight answer
-  (Probe A), permanently, in both transcript and model context. If the race is
-  lost, the outcome is that stub — no corruption, no lost parent work — and the
-  merge's behavior under the worst ordering is pinned by the M3 mid-turn
-  fixture.
+- **Branching a working agent is blocked** — the Fork chip is disabled and the
+  send is refused. The check is a *look, not a lock*, so a concurrent
+  automation (or a `claude` process run against the same session outside
+  Switchboard) can still slip through; if that happens the branch inherits a
+  `"No response requested."` placeholder instead of the parent's in-flight
+  answer. Nothing is corrupted and the parent loses no work — the branch is
+  just missing that one answer, permanently, in both its transcript and its
+  model context (Probe A). The merge's behavior under the worst ordering is
+  pinned by the M3 mid-turn fixture. Want to branch a working agent anyway?
+  Cancel the parent first — that leaves a clean session to branch from, at the
+  cost of its in-flight work.
 - You cannot fan-out one message to X and a not-yet-created branch of X in a
   single send (the chip takes a single recipient); send to the branch first,
   then fan-out freely.

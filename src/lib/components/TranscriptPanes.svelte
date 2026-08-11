@@ -263,8 +263,33 @@
     cmdOnlyHeld = false;
     cmdPointerMoved = false;
   }
-  function onWindowPointerMove(): void {
+  /// Reconcile the armed state against a pointer event's own modifier flags.
+  ///
+  /// **Clears but never arms.** Pointer events carry the authoritative modifier
+  /// state for their instant, so they can prove Cmd is *not* held — which is the
+  /// recovery the keydown/keyup pair lacks. That pair can desync (a keyup that
+  /// lands while something is mid-remount, an OS chord that swallows it) and the
+  /// stale `true` then survives indefinitely, because nothing else clears it: the
+  /// user sees pane targeting offered with no key down. Any mouse movement now
+  /// re-checks reality, so the overlay self-heals on the very gesture that would
+  /// otherwise reveal the bug.
+  ///
+  /// It must not arm, though. A pointer move during Cmd+C is indistinguishable
+  /// from one during a plain Cmd hold, and the chord has to stay suppressed —
+  /// only the keyboard knows a non-modifier key is down.
+  function syncCmdFromPointer(event: PointerEvent): void {
+    if (!event.metaKey || event.altKey || event.shiftKey || event.ctrlKey) {
+      cmdOnlyHeld = false;
+      cmdPointerMoved = false;
+      return;
+    }
+    // Movement while Cmd is genuinely held is the arming condition: it separates
+    // "reaching for a pane" from a cursor that happens to rest over one.
     if (cmdOnlyHeld) cmdPointerMoved = true;
+  }
+
+  function onWindowPointerMove(event: PointerEvent): void {
+    syncCmdFromPointer(event);
   }
 
   // ── Gutter resize ───────────────────────────────────────────────────────────
@@ -480,9 +505,9 @@
           data-maximized={maximizedPane?.id === pane.id}
           onmousedown={(event) => onPaneMousedown(event)}
           onclick={(event) => onPaneClick(pane, event)}
-          onpointerenter={() => {
+          onpointerenter={(event) => {
             hoveredPaneId = pane.id;
-            if (cmdOnlyHeld) cmdPointerMoved = true;
+            syncCmdFromPointer(event);
           }}
           onpointerleave={() => (hoveredPaneId = hoveredPaneId === pane.id ? null : hoveredPaneId)}
         >

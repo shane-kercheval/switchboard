@@ -94,6 +94,7 @@
     seedPathUnresolved,
     selection,
     setProjectArchived,
+    installForkHistoryRefresh,
     startProjectActivityObserver,
     workspace,
   } from "$lib/state/workspace.svelte";
@@ -434,6 +435,10 @@
   // `harnessAvailability` comment above.
   onMount(() => {
     const stopProjectActivityObserver = startProjectActivityObserver();
+    // A forked agent's branch point only materializes when its first turn runs,
+    // so its inherited history has to be read back afterwards. No-op for every
+    // non-fork agent.
+    installForkHistoryRefresh();
     // The startup probe races the backend's PATH capture, so its answer can be
     // provisional; the store awaits its own completion-listener registration
     // before issuing any probe, and arms its own backstop for a lost event.

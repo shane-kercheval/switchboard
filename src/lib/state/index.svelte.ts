@@ -109,6 +109,25 @@ export function agentIsWorking(runtime: AgentRuntime | undefined): boolean {
   );
 }
 
+/// Called when an agent's turn reaches a terminal, with the outcome.
+///
+/// A registered hook rather than a direct call because the dependency runs the
+/// other way: the workspace store imports this module, so this module cannot
+/// import it back. The one consumer is the forked-agent inherited-history
+/// refresh, which needs the *project* conversation merge (not the per-agent
+/// loader) and therefore lives in the workspace store.
+///
+/// Driven from the existing `turn_end` boundary rather than a second `listen`
+/// per agent — that would break the one-listener-per-agent invariant this
+/// module documents.
+type TurnTerminalHook = (agentId: AgentId, outcome: "completed" | "failed" | "cancelled") => void;
+
+let turnTerminalHook: TurnTerminalHook | undefined;
+
+export function setTurnTerminalHook(hook: TurnTerminalHook | undefined): void {
+  turnTerminalHook = hook;
+}
+
 /// Per-agent unlisten functions for the Tauri event channel. Keyed by
 /// `agent_id`. We hold these so the test harness can drain them via
 /// `_testing.reset()`; production callers never unregister.
@@ -654,15 +673,18 @@ function handleEvent(agentId: AgentId, event: NormalizedEvent): void {
   // would break the one-listener-per-agent invariant this module documents.
   if (event.type === "turn_end") {
     const turn = priorTurns.find((t) => t.role === "agent" && t.turn_id === event.turn_id);
-    settleRecipient(
-      turn?.role === "agent" ? (turn.send_id ?? undefined) : undefined,
-      agentId,
+    const outcome =
       event.outcome.status === "cancelled"
         ? "cancelled"
         : event.outcome.status === "failed"
           ? "failed"
-          : "completed",
+          : "completed";
+    settleRecipient(
+      turn?.role === "agent" ? (turn.send_id ?? undefined) : undefined,
+      agentId,
+      outcome,
     );
+    turnTerminalHook?.(agentId, outcome);
   } else if (event.type === "message_failed") {
     settleRecipient(failedSendId, agentId, "failed");
   } else if (event.type === "message_cancelled") {

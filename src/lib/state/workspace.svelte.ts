@@ -63,6 +63,7 @@ import {
   markHydrationAttempted,
   registerAgent,
   runtimes,
+  setTurnTerminalHook,
   transcripts,
   unregisterAgents,
 } from "./index.svelte";
@@ -1022,10 +1023,67 @@ export async function forkAgentIntoOwnPane(sourceId: AgentId): Promise<AgentReco
   return fork;
 }
 
+/// Forks whose inherited history has already been loaded. A fork's branch point
+/// only materializes when its first turn runs, so its transcript shows just that
+/// turn until the session file is re-read.
+///
+/// **Exactly one *successful* load per fork**, hence a set of the ones that
+/// succeeded rather than a set of the ones attempted.
+// Bookkeeping only — never read during render, so it needs no reactivity.
+// eslint-disable-next-line svelte/prefer-svelte-reactivity
+const forkHistoryLoaded = new Set<AgentId>();
+
+/// Load a freshly materialized fork's inherited history.
+///
+/// **Trigger is the outcome, not the file.** The frontend cannot stat a session
+/// file, so "did this turn materialize the branch?" is approximated by
+/// `Completed`, and cancelled/failed **re-arm** — a fork whose first turn was
+/// cancelled may still have a complete child file (harness-behavior §3.5), so it
+/// picks its history up on the next completed turn rather than never. The two
+/// alternatives are worse: spending the one shot on a failed turn leaves
+/// inherited history invisible until reopen, and a file-existence IPC invents a
+/// backend surface for a cosmetic gain.
+///
+/// **Goes through the project conversation merge**, not `hydrateAgent` /
+/// `retryAgentHydration`. The per-agent loader returns raw user turns, and the
+/// hydrate reducer's keyed dedup covers *agent* turns only — user turns are
+/// journal-overlay-owned. A per-agent reload would therefore duplicate both the
+/// inherited prompts and the fork's own live prompt. `hydrateProject` replaces
+/// the overlay wholesale (dup-safe) and applies agent turns for the filtered
+/// agent, where the live first reply collapses against its disk copy by
+/// `hydration_key`.
+async function loadForkInheritedHistory(agentId: AgentId): Promise<void> {
+  const agent = Object.values(agentsByProject)
+    .flat()
+    .find((candidate) => candidate.id === agentId);
+  if (agent?.forked_from_session == null) return;
+  if (forkHistoryLoaded.has(agentId)) return;
+  const projectId = agent.project_id;
+  // Only meaningful once the project's own hydration has settled — before that
+  // the open path will read this session anyway.
+  if (conversations[projectId]?.status !== "complete") return;
+  hydrationStarted.delete(projectId);
+  await hydrateProject(projectId, new Set([agentId]));
+  // Mark only on success: a failed load applied nothing, so the next completed
+  // turn should try again.
+  if (conversations[projectId]?.status === "complete") forkHistoryLoaded.add(agentId);
+}
+
+/// Wire the terminal hook that drives [`loadForkInheritedHistory`]. Called once
+/// at app start; the hook is a no-op for every non-fork agent.
+export function installForkHistoryRefresh(): void {
+  setTurnTerminalHook((agentId, outcome) => {
+    if (outcome !== "completed") return;
+    void loadForkInheritedHistory(agentId);
+  });
+}
+
 /// Test-only reset. Production never calls this; the module is a singleton, so
 /// tests reset between runs to avoid bleed.
 export const _testing = {
   reset(): void {
+    forkHistoryLoaded.clear();
+    setTurnTerminalHook(undefined);
     workspace.directories = [];
     workspace.persistable = true;
     projects.list = [];

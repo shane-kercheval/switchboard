@@ -14,9 +14,22 @@ const invokeMock = vi.fn(
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: (cmd: string, args?: Record<string, unknown>) => invokeMock(cmd, args),
 }));
+// Capture per-agent channel callbacks so a test can fire real backend events
+// (the fork-history refresh is driven from the `turn_end` boundary, so a
+// synthetic hook call would test the wiring rather than the behaviour).
+const listeners = new Map<string, (e: { payload: unknown }) => void>();
 vi.mock("@tauri-apps/api/event", () => ({
-  listen: vi.fn(async () => vi.fn()),
+  listen: vi.fn(async (name: string, cb: (e: { payload: unknown }) => void) => {
+    listeners.set(name, cb);
+    return vi.fn();
+  }),
 }));
+
+function fireTo(channel: string, payload: unknown): void {
+  const cb = listeners.get(channel);
+  if (cb === undefined) throw new Error(`no listener for ${channel}`);
+  cb({ payload });
+}
 
 const PROJECT_1 = "00000000-0000-7000-8000-0000000000f1";
 const PROJECT_2 = "00000000-0000-7000-8000-0000000000f2";
@@ -1015,5 +1028,120 @@ describe("forkAgentIntoOwnPane", () => {
     await expect(ws.forkAgentIntoOwnPane(parent.id)).rejects.toThrow("alice is working");
 
     expect(ws.agentsByProject[PROJECT_1]?.map((a) => a.id)).toEqual([parent.id]);
+  });
+});
+
+describe("forked-agent inherited-history refresh", () => {
+  /// Poll a few microtask/macrotask turns for `predicate`. This file has no
+  /// testing-library helpers, and the refresh is fired from an event handler
+  /// that awaits an IPC.
+  async function until(predicate: () => boolean): Promise<void> {
+    for (let i = 0; i < 50; i += 1) {
+      if (predicate()) return;
+      await tick();
+      await new Promise((r) => setTimeout(r, 1));
+    }
+    expect(predicate()).toBe(true);
+  }
+
+  /// Give any fire-and-forget refresh enough turns to land. A bare `tick()`
+  /// asserts before an awaited IPC could have completed, which makes a
+  /// "did NOT re-read" assertion pass whether or not the guard exists.
+  async function settle(): Promise<void> {
+    for (let i = 0; i < 20; i += 1) {
+      await tick();
+      await new Promise((r) => setTimeout(r, 1));
+    }
+  }
+
+  let turnSeq = 0;
+  function fireTurnEnd(agentId: string, status: "completed" | "failed" | "cancelled"): void {
+    turnSeq += 1;
+    fireTo(`agent:${agentId}`, {
+      type: "turn_end",
+      turn_id: `turn-${agentId}-${status}-${turnSeq}`,
+      outcome: status === "completed" ? { status: "completed" } : { status },
+      ended_at: "2026-05-16T00:00:05Z",
+    });
+  }
+
+  const FORK_ID = "00000000-0000-7000-8000-00000000000f";
+  const PARENT_SESSION = "00000000-0000-7000-8000-0000000000aa";
+
+  function forkAgent(): AgentRecord {
+    return {
+      ...agent(FORK_ID, PROJECT_1),
+      name: "agent-a-fork",
+      forked_from_session: PARENT_SESSION,
+    };
+  }
+
+  /// A hydrated project holding `records`, with `load_project_conversation`
+  /// call-counted so a test can see whether a refresh actually re-read.
+  async function hydratedProjectWith(
+    records: AgentRecord[],
+  ): Promise<{ ws: Awaited<ReturnType<typeof loadWorkspaceState>>; loads: () => number }> {
+    const ws = await loadWorkspaceState();
+    let loads = 0;
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "load_project_conversation") {
+        loads += 1;
+        return { items: [], agents: [] } satisfies ProjectConversation;
+      }
+      return undefined;
+    });
+    ws.agentsByProject[PROJECT_1] = records;
+    await ws.hydrateProject(PROJECT_1);
+    expect(ws.conversations[PROJECT_1]?.status).toBe("complete");
+    return { ws, loads: () => loads };
+  }
+
+  it("re-reads once when a fork's first turn completes, and not again", async () => {
+    // A fork's branch point only exists once its first turn has run, so the
+    // inherited history has to be read back afterwards — exactly once.
+    const state = await loadAgentState();
+    const { ws, loads } = await hydratedProjectWith([agent(AGENT_1, PROJECT_1), forkAgent()]);
+    await state.registerAgent(forkAgent());
+    ws.installForkHistoryRefresh();
+    const before = loads();
+
+    fireTurnEnd(FORK_ID, "completed");
+    await until(() => loads() === before + 1);
+
+    // Second completed turn: history is already loaded, so no re-read.
+    fireTurnEnd(FORK_ID, "completed");
+    await settle();
+    expect(loads()).toBe(before + 1);
+  });
+
+  it("re-arms after a cancelled or failed first turn", async () => {
+    // Outcome is an approximation of "did this turn materialize the branch"
+    // — a cancelled first turn can still leave a complete child file, so the
+    // shot must not be spent on it.
+    const state = await loadAgentState();
+    const { ws, loads } = await hydratedProjectWith([agent(AGENT_1, PROJECT_1), forkAgent()]);
+    await state.registerAgent(forkAgent());
+    ws.installForkHistoryRefresh();
+    const before = loads();
+
+    fireTurnEnd(FORK_ID, "cancelled");
+    fireTurnEnd(FORK_ID, "failed");
+    await settle();
+    expect(loads()).toBe(before);
+
+    fireTurnEnd(FORK_ID, "completed");
+    await until(() => loads() === before + 1);
+  });
+
+  it("never fires for a non-fork agent", async () => {
+    const state = await loadAgentState();
+    const { ws, loads } = await hydratedProjectWith([agent(AGENT_1, PROJECT_1)]);
+    await state.registerAgent(agent(AGENT_1, PROJECT_1));
+    ws.installForkHistoryRefresh();
+    const before = loads();
+
+    fireTurnEnd(AGENT_1, "completed");
+    await settle();
+    expect(loads()).toBe(before);
   });
 });

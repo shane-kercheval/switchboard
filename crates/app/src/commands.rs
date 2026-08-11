@@ -1750,6 +1750,123 @@ pub fn create_agent_impl(
     Ok(record)
 }
 
+/// Branch `source_agent_id`'s conversation into a new agent, returning the new
+/// record. Registration only — the branch materializes when the caller
+/// dispatches its first turn (Claude has no copy-a-session operation; a fork can
+/// only come into existence *as* a turn, harness-behavior §3.5). The frontend
+/// pairs this with an immediate send, which is why the Fork affordance is a
+/// compose option rather than a standalone action.
+///
+/// Resolves the **source's own project** rather than the active one: this takes
+/// an agent id, and assuming the active project would silently fork into the
+/// wrong registry for a caller acting on a non-active project.
+///
+/// The busy check here is an *early, friendly* gate so the user gets the error
+/// before an agent is created. It is **not** the authoritative one — a fork
+/// whose first turn failed retries through the ordinary send path and never
+/// calls this. See [`ensure_fork_source_free`].
+pub async fn fork_agent_impl(
+    state: &AppState,
+    source_agent_id: AgentId,
+    home_dir: &Path,
+) -> Result<AgentRecord, AppError> {
+    let (project, source) = lookup_agent(state, source_agent_id)?;
+    if !source.harness.supports_session_fork() {
+        return Err(CoreError::SessionForkUnsupported {
+            harness: source.harness,
+        }
+        .into());
+    }
+    // Eligibility is "a resumable session file exists", resolved through the
+    // one per-harness path authority so the fork gate can't drift from what
+    // transcript loading and the freshness check read.
+    if resolve_session_file(&source, &project.directory, home_dir).is_none() {
+        return Err(AppError::ForkSourceHasNoSession {
+            name: source.name.clone(),
+        });
+    }
+    ensure_fork_source_free(state, &source).await?;
+
+    // Same TOCTOU protection as `create_agent_impl` — `fork_agent` has an
+    // internal read-check-then-append window.
+    let record = {
+        let _write = lock(&state.registry_write);
+        project.fork_agent(source_agent_id)?
+    };
+    lock(&state.agents_by_id).insert(record.id, record.clone());
+    Ok(record)
+}
+
+/// Refuse if `source` is running a turn, so a branch can't be taken from a
+/// mid-turn session.
+///
+/// Why: Claude's fork copies whatever is on disk, and for a turn whose prompt is
+/// written but whose answer is still streaming it synthesizes an assistant
+/// record reading `"No response requested."` (harness-behavior §3.5, Probe A).
+/// The branch then permanently carries that stub instead of the parent's real
+/// answer — in its transcript *and* its model context. Refused rather than
+/// queued: waiting would hand the branch the answer to the very turn the user is
+/// branching away from.
+///
+/// **A look, not a lock.** `is_turn_running` is a non-blocking peek at the
+/// agent's actor (the dispatcher has no status flag by design — one turn in
+/// flight is structural), so a parent turn can still start between this reply
+/// and claude reading the file, and an external `claude` process is invisible to
+/// us entirely. Both residuals are accepted: the outcome is the stub above, not
+/// corruption. Holding a reservation across the fork's snapshot was rejected —
+/// no clean release point, and it trades a millisecond window for permanent
+/// cross-agent coupling in a dispatcher built to avoid it.
+async fn ensure_fork_source_free(state: &AppState, source: &AgentRecord) -> Result<(), AppError> {
+    if state.dispatcher.is_turn_running(source.id).await {
+        return Err(AppError::ForkSourceBusy {
+            name: source.name.clone(),
+        });
+    }
+    Ok(())
+}
+
+/// The authoritative mid-turn fork gate, applied to every send.
+///
+/// Fires only for a **materializing** fork — one carrying fork provenance whose
+/// own session file does not exist yet, so this dispatch is the one that will
+/// copy the parent's session. Once the fork has its own file, its parent's state
+/// is irrelevant and this is a no-op.
+///
+/// Sited on the common send path rather than in [`fork_agent_impl`] because the
+/// fork-send flow is not the only way a materializing dispatch happens: if a
+/// fork's first turn fails, the agent exists with no session and the *next
+/// ordinary send* re-forks. That path never touches the fork command.
+async fn ensure_materializing_fork_may_dispatch(
+    state: &AppState,
+    project: &Project,
+    agent: &AgentRecord,
+    home_dir: &Path,
+) -> Result<(), AppError> {
+    let Some(parent_session) = agent.forked_from_session else {
+        return Ok(());
+    };
+    if resolve_session_file(agent, &project.directory, home_dir).is_some() {
+        return Ok(());
+    }
+    // Find the parent by session id. The parent agent may have been deleted —
+    // then nothing of ours can be writing that session, so there is nothing to
+    // wait for and the fork proceeds.
+    let parent = lock(&state.agents_by_id)
+        .values()
+        .find(|candidate| {
+            candidate
+                .session_locator
+                .as_ref()
+                .and_then(SessionLocator::as_uuid)
+                == Some(parent_session)
+        })
+        .cloned();
+    match parent {
+        Some(parent) => ensure_fork_source_free(state, &parent).await,
+        None => Ok(()),
+    }
+}
+
 /// Reject a model on a harness without model support, or an effort on a harness
 /// without effort support — the capability invariant, checked at the command
 /// boundary so the caller gets a clear error before any registry work. `core`
@@ -2691,8 +2808,14 @@ pub async fn send_message_impl(
     prompt: &str,
     attachments: Vec<Attachment>,
     send_id: SendId,
+    home_dir: &Path,
 ) -> Result<MessageId, AppError> {
     let (project, agent) = lookup_agent(state, agent_id)?;
+    // Authoritative mid-turn fork gate. Every send funnels through here, which
+    // is the point: the fork-send flow, a retry after a failed first fork turn,
+    // and workflow/forward sends all reach it. No-op for a non-fork agent and
+    // for a fork that already has its own session.
+    ensure_materializing_fork_may_dispatch(state, &project, &agent, home_dir).await?;
     // Claude is spawned with cwd = the user's bound working directory (the
     // folder they opened), NOT the per-project metadata directory inside
     // `.switchboard/projects/<uuid>/`. The working directory is what
@@ -5808,7 +5931,26 @@ mod tests {
         agent_id: AgentId,
         prompt: &str,
     ) -> Result<MessageId, AppError> {
-        send_message_impl(state, agent_id, prompt, Vec::new(), Uuid::now_v7()).await
+        send_msg_with_home(state, agent_id, prompt, Path::new("/nonexistent-home")).await
+    }
+
+    /// `send_msg` with an explicit home, for tests that need the
+    /// materializing-fork gate to resolve real session files.
+    async fn send_msg_with_home(
+        state: &AppState,
+        agent_id: AgentId,
+        prompt: &str,
+        home_dir: &Path,
+    ) -> Result<MessageId, AppError> {
+        send_message_impl(
+            state,
+            agent_id,
+            prompt,
+            Vec::new(),
+            Uuid::now_v7(),
+            home_dir,
+        )
+        .await
     }
 
     /// Stage a Claude source agent under the active project with one completed
@@ -5909,6 +6051,250 @@ mod tests {
             .unwrap()
             .journal_path();
         switchboard_core::journal::append_record(&path, record).unwrap();
+    }
+
+    // ---- Fork: registration command + the authoritative dispatch gate ----
+
+    #[tokio::test]
+    async fn fork_agent_branches_a_claude_agent_with_a_session() {
+        let (tmp, state, _emitter) = fresh_state_with_mock();
+        let home = TempDir::new().unwrap();
+        let (_other, project_id) = project_with_agent(&state, &tmp).await;
+        let source_id = seed_source(&state, home.path(), project_id, "alice", "hello");
+        let source = lock(&state.agents_by_id).get(&source_id).cloned().unwrap();
+
+        let fork = fork_agent_impl(&state, source_id, home.path())
+            .await
+            .expect("forking an idle Claude agent with a session should succeed");
+
+        assert_eq!(fork.name, "alice-fork");
+        assert_eq!(
+            fork.forked_from_session,
+            source
+                .session_locator
+                .as_ref()
+                .and_then(SessionLocator::as_uuid)
+        );
+        // Cached for `lookup_agent`, or the immediately-following send would
+        // fail to resolve the agent it just created.
+        assert!(lock(&state.agents_by_id).contains_key(&fork.id));
+    }
+
+    #[tokio::test]
+    async fn fork_agent_rejects_a_source_with_no_session_file() {
+        // Eligibility is "a resumable session exists", resolved through
+        // `resolve_session_file` — a never-dispatched agent has a locator but
+        // no file, and forking it would produce an unmaterializable branch.
+        let (tmp, state, _emitter) = fresh_state_with_mock();
+        let home = TempDir::new().unwrap();
+        let (agent, _project_id) = project_with_agent(&state, &tmp).await;
+
+        let err = fork_agent_impl(&state, agent.id, home.path())
+            .await
+            .expect_err("an agent with no session file must not be forkable");
+
+        assert!(
+            matches!(err, AppError::ForkSourceHasNoSession { .. }),
+            "got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_agent_rejects_a_non_claude_source() {
+        let (tmp, state, _emitter) = fresh_state_with_mock();
+        let home = TempDir::new().unwrap();
+        let (_other, _project_id) = project_with_agent(&state, &tmp).await;
+        let codex = create_agent_impl(&state, "cx", HarnessKind::Codex, None, None).unwrap();
+
+        let err = fork_agent_impl(&state, codex.id, home.path())
+            .await
+            .expect_err("only Claude sessions can be branched");
+
+        assert!(
+            matches!(
+                err,
+                AppError::Core(CoreError::SessionForkUnsupported {
+                    harness: HarnessKind::Codex
+                })
+            ),
+            "got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_agent_rejects_an_unknown_agent() {
+        let (tmp, state, _emitter) = fresh_state_with_mock();
+        let home = TempDir::new().unwrap();
+        let (_other, _project_id) = project_with_agent(&state, &tmp).await;
+        let missing = Uuid::now_v7();
+
+        let err = fork_agent_impl(&state, missing, home.path())
+            .await
+            .expect_err("an unknown agent id must not fork");
+
+        assert!(
+            matches!(err, AppError::AgentNotFound(id) if id == missing),
+            "got: {err:?}"
+        );
+    }
+
+    /// State whose Claude adapter parks its first turn until `gate` fires, so a
+    /// test can hold an agent mid-turn and observe the fork gate. Mirrors
+    /// `forward_queue_fixture`'s construction (the adapter is chosen at
+    /// `AppState::new`, so it cannot be swapped in later).
+    async fn state_with_parked_claude(
+        texts: &[&str],
+    ) -> (
+        TempDir,
+        TempDir,
+        AppState,
+        Arc<tokio::sync::Notify>,
+        ProjectId,
+    ) {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let (claude, _prompts) = gated_adapter(texts, &gate, 0);
+        let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
+        let state = AppState::new(
+            claude,
+            Arc::clone(&mock),
+            Arc::clone(&mock),
+            Arc::clone(&mock),
+            Arc::new(RecordingEmitter::new()) as Arc<dyn EventEmitter>,
+        );
+        let tmp = TempDir::new().unwrap();
+        init_directory_impl(&state, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let project = create_project_in_only_dir(&state, "proj");
+        set_active_project_impl(&state, project.id).unwrap();
+        (tmp, TempDir::new().unwrap(), state, gate, project.id)
+    }
+
+    /// Poll until `agent_id`'s turn is actually running. A send is *accepted*
+    /// before its turn starts, so asserting the gate immediately after would
+    /// race the actor.
+    async fn await_turn_running(state: &AppState, agent_id: AgentId) {
+        for _ in 0..200 {
+            if state.dispatcher.is_turn_running(agent_id).await {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("agent {agent_id} never started its turn");
+    }
+
+    #[tokio::test]
+    async fn sending_to_a_materializing_fork_is_refused_while_its_parent_runs() {
+        // The authoritative gate. A branch taken mid-turn inherits a
+        // synthesized "No response requested." stub instead of the parent's
+        // real answer (harness-behavior §3.5), so the dispatch is refused —
+        // not queued, which would hand the branch the answer to the very turn
+        // the user is branching away from.
+        let (_tmp, home, state, gate, project_id) = state_with_parked_claude(&["parent"]).await;
+        let source_id = seed_source(&state, home.path(), project_id, "alice", "hello");
+        let fork = fork_agent_impl(&state, source_id, home.path())
+            .await
+            .unwrap();
+
+        send_msg_with_home(&state, source_id, "long one", home.path())
+            .await
+            .unwrap();
+        await_turn_running(&state, source_id).await;
+
+        let err = send_msg_with_home(&state, fork.id, "branch from here", home.path())
+            .await
+            .expect_err("a materializing fork must not dispatch against a busy parent");
+        assert!(
+            matches!(err, AppError::ForkSourceBusy { .. }),
+            "got: {err:?}"
+        );
+
+        gate.notify_waiters();
+    }
+
+    #[tokio::test]
+    async fn a_retry_after_a_failed_fork_turn_hits_the_same_gate() {
+        // The reason the gate lives on the send path and not in
+        // `fork_agent_impl`: a fork whose first turn failed still has no
+        // session file, so the *next ordinary send* is the one that forks —
+        // and it never calls the fork command.
+        let (_tmp, home, state, gate, project_id) = state_with_parked_claude(&["parent"]).await;
+        let source_id = seed_source(&state, home.path(), project_id, "alice", "hello");
+        let fork = fork_agent_impl(&state, source_id, home.path())
+            .await
+            .unwrap();
+
+        send_msg_with_home(&state, source_id, "long one", home.path())
+            .await
+            .unwrap();
+        await_turn_running(&state, source_id).await;
+
+        // No fork_agent_impl call here — this is the retry path.
+        let err = send_msg_with_home(&state, fork.id, "retry", home.path())
+            .await
+            .expect_err("the retry path must be gated too");
+        assert!(
+            matches!(err, AppError::ForkSourceBusy { .. }),
+            "got: {err:?}"
+        );
+
+        gate.notify_waiters();
+    }
+
+    #[tokio::test]
+    async fn sending_to_a_materialized_fork_ignores_its_parents_state() {
+        // Once the fork has its own session file its dispatch no longer reads
+        // the parent's session, so the gate is a no-op.
+        let (_tmp, home, state, gate, project_id) =
+            state_with_parked_claude(&["parent", "fork"]).await;
+        let source_id = seed_source(&state, home.path(), project_id, "alice", "hello");
+        let fork = fork_agent_impl(&state, source_id, home.path())
+            .await
+            .unwrap();
+        let directory = lock(&state.projects)
+            .get(&project_id)
+            .unwrap()
+            .directory
+            .clone();
+        let fork_session = fork
+            .session_locator
+            .as_ref()
+            .and_then(SessionLocator::as_uuid)
+            .unwrap();
+        let path =
+            switchboard_harness::claude_session_file_path(home.path(), &directory, &fork_session);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, claude_session_jsonl("inherited")).unwrap();
+
+        send_msg_with_home(&state, source_id, "long one", home.path())
+            .await
+            .unwrap();
+        await_turn_running(&state, source_id).await;
+
+        send_msg_with_home(&state, fork.id, "next", home.path())
+            .await
+            .expect("a materialized fork dispatches regardless of its parent");
+
+        gate.notify_waiters();
+    }
+
+    #[tokio::test]
+    async fn a_non_fork_agent_is_never_gated_by_another_agents_turn() {
+        let (_tmp, home, state, gate, project_id) =
+            state_with_parked_claude(&["busy", "fine"]).await;
+        let source_id = seed_source(&state, home.path(), project_id, "alice", "hello");
+        let other = create_agent_impl(&state, "bob", HarnessKind::ClaudeCode, None, None).unwrap();
+
+        send_msg_with_home(&state, source_id, "long one", home.path())
+            .await
+            .unwrap();
+        await_turn_running(&state, source_id).await;
+
+        send_msg_with_home(&state, other.id, "unrelated", home.path())
+            .await
+            .expect("an unrelated agent must stay fully concurrent");
+
+        gate.notify_waiters();
     }
 
     #[tokio::test]
@@ -11805,12 +12191,26 @@ mod tests {
 
         // One Send fanned out to both: same `send_id`, one call per recipient.
         let send_id = Uuid::now_v7();
-        send_message_impl(&state, agent_a.id, "fan-out", Vec::new(), send_id)
-            .await
-            .unwrap();
-        send_message_impl(&state, agent_b.id, "fan-out", Vec::new(), send_id)
-            .await
-            .unwrap();
+        send_message_impl(
+            &state,
+            agent_a.id,
+            "fan-out",
+            Vec::new(),
+            send_id,
+            Path::new("/nonexistent-home"),
+        )
+        .await
+        .unwrap();
+        send_message_impl(
+            &state,
+            agent_b.id,
+            "fan-out",
+            Vec::new(),
+            send_id,
+            Path::new("/nonexistent-home"),
+        )
+        .await
+        .unwrap();
         within(
             &emitter,
             "both turns in flight",
@@ -12007,6 +12407,7 @@ mod tests {
             "look at this",
             vec![attachment.clone()],
             Uuid::now_v7(),
+            Path::new("/nonexistent-home"),
         )
         .await
         .unwrap();
@@ -12075,6 +12476,7 @@ mod tests {
             "queued",
             vec![attachment.clone()],
             Uuid::now_v7(),
+            Path::new("/nonexistent-home"),
         )
         .await
         .unwrap();

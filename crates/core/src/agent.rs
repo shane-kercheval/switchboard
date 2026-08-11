@@ -167,15 +167,29 @@ pub struct AgentRecord {
     /// widening or overloading of this one.
     ///
     /// Only harnesses where [`HarnessKind::supports_session_fork`] holds ever
-    /// carry `Some`, enforced at the registration chokepoint (see
-    /// `Project::register_agent_inner`) rather than by convention. **That
-    /// enforcement is why the Codex/Gemini/Antigravity adapters ignore this
-    /// field entirely and are correct to** — their `build_args` never reads
-    /// it because no record of theirs can carry it. Do not add "defensive"
-    /// handling for it in those adapters: handling would imply the state is
-    /// reachable and invert the invariant. Same plain-`Option` backward-compat
-    /// rationale as `model` / `effort` above: a record written before forking
-    /// existed legitimately lacks the key and must load as `None`.
+    /// carry `Some` — **enforced when writing**, at the registration chokepoint
+    /// (`Project::register_agent_inner`), and not re-checked when reading. A
+    /// registry line that was hand-edited or corrupted can therefore load with
+    /// this set on a non-forkable harness; deserialization validates each field
+    /// in isolation and cannot compare this one against `harness`. Closing that
+    /// wants a record-level validation pass covering the other cross-field
+    /// claims too (locator shape vs. harness, and the `model` / `effort`
+    /// capability claims above), not a one-off hook here.
+    ///
+    /// So: the Codex/Gemini/Antigravity **adapters** ignore this field, and are
+    /// correct to — their `build_args` never reads it. Do not add "defensive"
+    /// handling there; it would imply the state is reachable through normal use
+    /// and invert the invariant. But the field is **not inert for non-Claude
+    /// agents**: the harness-agnostic materializing-fork gates in the app layer
+    /// (`ensure_materializing_fork_may_dispatch`, and the workflow preflight)
+    /// read it for every agent regardless of harness, so a corrupted record
+    /// would send a Codex agent down the unmaterialized-branch path and could
+    /// block its sends behind an unrelated "parent". That is the reachable
+    /// consequence to reason about, not adapter behavior.
+    ///
+    /// Same plain-`Option` backward-compat rationale as `model` / `effort`
+    /// above: a record written before forking existed legitimately lacks the key
+    /// and must load as `None`.
     pub forked_from_session: Option<Uuid>,
     pub created_at: DateTime<Utc>,
 }

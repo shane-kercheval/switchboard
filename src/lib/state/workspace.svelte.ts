@@ -1074,6 +1074,12 @@ const forkHistoryLoaded = new Set<AgentId>();
 /// in exactly the case it was widened to cover.
 const forkHistoryPending = new SvelteSet<AgentId>();
 
+/// Per-project in-flight fork-history read, so concurrent branch terminals
+/// serialize rather than firing overlapping project reads. Bookkeeping only —
+/// never read during render.
+// eslint-disable-next-line svelte/prefer-svelte-reactivity
+const forkHistoryLoadInFlight = new Map<ProjectId, Promise<HydrateOutcome>>();
+
 /// Whether `agentId` is a fork still waiting for its inherited history — read by
 /// the transcript to decide whether to explain the branch's empty backlog.
 export function isAwaitingForkHistory(agentId: AgentId): boolean {
@@ -1143,14 +1149,38 @@ async function loadForkInheritedHistory(agentId: AgentId): Promise<void> {
   // Only meaningful once the project's own hydration has settled — before that
   // the open path will read this session anyway.
   if (conversations[projectId]?.status !== "complete") return;
+
+  // **Serialize, don't drop.** Two branches whose first turns land together
+  // would otherwise both clear `hydrationStarted` and both read: the delete
+  // below and `hydrateProject`'s guard check are in the same synchronous slice,
+  // so neither sees the other's guard. Coalescing instead — losers returning
+  // early — is *wrong here* even though it is right for `maybeRefreshProject`:
+  // that one retries on the next project switch, which happens constantly,
+  // whereas this retries on the next completed turn of this specific fork,
+  // which may never come. A dropped load leaves that branch's inherited history
+  // permanently missing behind a banner promising it. So the loser waits and
+  // then runs its own read: sequential rather than concurrent, one extra read,
+  // nothing lost. (Its `agentTurnFilter` names a different agent, so the
+  // winner's read cannot cover it.)
+  const inFlight = forkHistoryLoadInFlight.get(projectId);
+  if (inFlight !== undefined) await inFlight.catch(() => undefined);
+
   hydrationStarted.delete(projectId);
-  const outcome = await hydrateProject(projectId, new Set([agentId]));
-  // Only an `applied` read actually produced inherited history. `failed` keeps
-  // the one-shot unset so the next completed turn retries; `skipped` means a
-  // concurrent hydration held the guard (two branches finishing together) and
-  // this fork's own read never ran, so it likewise retries. Reading
-  // `conversations[projectId].status` here instead would report success for
-  // both — a refresh preserves the prior `"complete"` view when it throws.
+  const load = hydrateProject(projectId, new Set([agentId]));
+  forkHistoryLoadInFlight.set(projectId, load);
+  let outcome: HydrateOutcome;
+  try {
+    outcome = await load;
+  } finally {
+    if (forkHistoryLoadInFlight.get(projectId) === load) {
+      forkHistoryLoadInFlight.delete(projectId);
+    }
+  }
+  // Only an `applied` read actually produced inherited history. Anything else
+  // leaves the one-shot unset so the next completed turn retries. Reading
+  // `conversations[projectId].status` here instead would report success for a
+  // failed read too — a refresh preserves the prior `"complete"` view when it
+  // throws, which is the whole reason this outcome exists.
   if (outcome === "applied") {
     forkHistoryLoaded.add(agentId);
     forkHistoryPending.delete(agentId);

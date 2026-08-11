@@ -4307,6 +4307,15 @@ enum TurnRender {
 /// Each send's dispatch window: its own instant, and the next send's where one
 /// exists. Built from the full ordered send list so the residual's view of "the
 /// next send" matches the key-join's.
+///
+/// **Assumes send instants are strictly increasing per agent**, which the
+/// dispatcher gives us — one turn in flight per agent, each `Send` journaled
+/// with its own `Utc::now()` before the subprocess spawns. The whole surplus
+/// scheme rests on it: with distinct instants the windows are disjoint and
+/// cover the timeline, so a candidate falls in at most one. Two sends sharing an
+/// instant would give the earlier one an empty `[t, t)` window that nothing can
+/// satisfy, and it would silently go uncorrelated. Violations are logged rather
+/// than assumed away — see `align_surplus_candidates`.
 type SendWindows = HashMap<
     SendId,
     (
@@ -4434,8 +4443,30 @@ fn classify_turns_by_provenance(
 /// Pre-attachments journal lines deserialize to an empty attachment list and
 /// reconstruct unchanged.
 ///
-/// Candidates must also fall inside the send's dispatch window — see the inline
-/// note; exact text alone would let an older identical prompt claim a later send.
+/// **Disjoint windows are what make assignment exclusive** — not the `floor`,
+/// and not uniqueness. Windows partition the timeline and candidates are in
+/// chronological order, so a candidate is eligible for at most one send and two
+/// sends can never contend for the same one, whatever the text says. Uniqueness
+/// then only governs two *different* candidates matching one send, and `floor`
+/// is redundant under that invariant — it is retained as the conservative
+/// fallback for the one case that breaks it, non-monotonic send instants, where
+/// windows overlap and ordering is all that keeps assignment sane.
+///
+/// Read that before "simplifying": the window looks redundant next to `floor`
+/// and is the opposite. The tests that fail if it goes are
+/// `merge_surplus_will_not_pair_a_prompt_recorded_before_its_send` and
+/// `…_after_the_following_send`, whose names do not advertise the connection.
+///
+/// **Depends on a parser invariant in another crate.** The surplus arm engages
+/// only when in-window `Sdk` candidates outnumber this agent's sends, which for
+/// a non-fork agent requires two `Sdk` user records for one dispatch —
+/// prevented by `session_file.rs`'s housekeeping classification
+/// (`is_meta_continuation` and the prefix denylist). If a CLI change breaks that
+/// contract, the two records carry identical text, so this declines on
+/// ambiguity rather than mis-pairing: the send goes uncorrelated and its echo
+/// renders imported. That is the intended conservative degradation, but it means
+/// a parser regression now shows up here as a missing send↔reply grouping, and
+/// the behavior should be re-evaluated rather than patched at this site.
 fn align_surplus_candidates(
     turns: &[&switchboard_harness::Turn],
     candidates: &[usize],
@@ -4451,6 +4482,7 @@ fn align_surplus_candidates(
     };
     let mut assignment = HashMap::new();
     let mut floor = 0usize;
+    let mut previous_send_at: Option<chrono::DateTime<chrono::Utc>> = None;
     for send_id in all_sends {
         let Some((prompt, attachments)) = send_prompts.get(send_id) else {
             continue;
@@ -4458,6 +4490,19 @@ fn align_surplus_candidates(
         let Some(&(send_at, next_send_at)) = send_windows.get(send_id) else {
             continue;
         };
+        // Breadcrumb, same posture as the declined-`TurnLink` warning above:
+        // there is no legitimate trigger in valid data, so a firing means the
+        // strictly-increasing-instants assumption the windows rest on has
+        // shifted. `floor` keeps assignment sane meanwhile; ids only, no content.
+        if previous_send_at.is_some_and(|previous| send_at <= previous) {
+            tracing::warn!(
+                %send_id,
+                ?send_at,
+                ?previous_send_at,
+                "send instants are not strictly increasing; surplus dispatch windows overlap"
+            );
+        }
+        previous_send_at = Some(send_at);
         let dispatched = switchboard_core::render_prompt_with_attachments(prompt, attachments);
         let transported = switchboard_harness::claude_transport_prompt(&dispatched);
         // Matching text is not enough: a prompt recorded *before* this send
@@ -15174,6 +15219,56 @@ mod tests {
                 ("continue working on the parent task", None),
             ],
             "the longer inherited prompt renders imported; the exact echo takes the send"
+        );
+    }
+
+    #[test]
+    fn merge_balanced_agent_pairs_positionally_and_never_consults_text() {
+        // The switch that separates "a fork edge case" from "changed behavior
+        // for every Claude conversation". The surplus arm engages only when
+        // in-window candidates OUTNUMBER sends; at parity the walk must stay
+        // purely positional. Pinned by making the recorded prompts share no text
+        // with the journaled sends at all — under text matching nothing would
+        // pair, so correct pairing here proves text is never consulted.
+        let agent = Uuid::now_v7();
+        let (first, second) = (Uuid::now_v7(), Uuid::now_v7());
+        let journal = vec![
+            send_record(first, Uuid::now_v7(), agent, "journaled one", 10),
+            send_record(second, Uuid::now_v7(), agent, "journaled two", 20),
+        ];
+        let turns = vec![
+            user_turn_src(
+                Uuid::now_v7(),
+                agent,
+                "recorded differently",
+                11,
+                UserPromptSource::Sdk,
+            ),
+            agent_turn_keyed(Uuid::now_v7(), agent, "reply one", 12, "k1"),
+            user_turn_src(
+                Uuid::now_v7(),
+                agent,
+                "also different",
+                21,
+                UserPromptSource::Sdk,
+            ),
+            agent_turn_keyed(Uuid::now_v7(), agent, "reply two", 22, "k2"),
+        ];
+
+        let merged = merge_project_conversation(journal, vec![(agent, transcript_of(turns), None)]);
+
+        assert_eq!(
+            agent_turn_grouping(&merged),
+            vec![(Some("k1"), Some(first)), (Some("k2"), Some(second))],
+            "balanced counts pair by position regardless of text"
+        );
+        assert_eq!(
+            rendered_prompts(&merged),
+            vec![
+                ("journaled one", Some(first)),
+                ("journaled two", Some(second))
+            ],
+            "both echoes are suppressed; the journal renders each prompt once"
         );
     }
 

@@ -866,6 +866,10 @@
   // carries it registers the branch and dispatches its first turn as one
   // action, which is also why a parent and its not-yet-existing branch can
   // never be co-recipients.
+  /// Shared so the shape check and the narrowing guard in `evaluateForkAttempt`
+  /// cannot drift into saying different things about the same state.
+  const NO_FORK_SOURCE = "Select an agent to branch from.";
+
   /// The one recipient a fork could branch from, or `null` when the selection
   /// isn't a single agent.
   const forkCandidate = $derived<AgentRecord | null>(
@@ -924,7 +928,7 @@
     // Fork branches one agent, so a multi-recipient send has no single source.
     if (selectedAgents.length > 1) return "Fork branches one agent — select a single recipient.";
     const candidate = forkCandidate;
-    if (candidate === null) return "Select an agent to branch from.";
+    if (candidate === null) return NO_FORK_SOURCE;
     if (forwardSources.length > 0) {
       // Both are send modifiers and the forward branch runs first, so a fork
       // would lose silently: the message would go to the parent, exactly what
@@ -970,8 +974,16 @@
 
   function evaluateForkAttempt(): ForkAttempt {
     if (forkBlock !== null) return { kind: "blocked", reason: forkBlock };
+    // Unreachable at runtime — `forkShapeBlock` already returns `NO_FORK_SOURCE`
+    // for a null candidate, so the check above returns first. Kept because it is
+    // what narrows `forkCandidate` to non-null for the `ready` variant below;
+    // deleting it does not compile.
     const source = forkCandidate;
-    if (source === null) return { kind: "blocked", reason: "Select an agent to branch from." };
+    if (source === null) return { kind: "blocked", reason: NO_FORK_SOURCE };
+    // An empty composer has nothing to fork, so it is a no-op in every state —
+    // ahead of the readiness checks below, which would otherwise explain why a
+    // message the user never typed could not be sent.
+    if (draft.trim() === "" && attachmentChips.length === 0) return { kind: "nothing-to-send" };
     if (showStop) {
       return { kind: "blocked", reason: "Wait for the send in flight to finish before branching." };
     }
@@ -982,7 +994,6 @@
         reason: `Still loading ${source.name}'s history — try again in a moment.`,
       };
     }
-    if (draft.trim() === "" && attachmentChips.length === 0) return { kind: "nothing-to-send" };
     return { kind: "ready", source };
   }
 

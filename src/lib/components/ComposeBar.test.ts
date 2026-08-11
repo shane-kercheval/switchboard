@@ -1496,6 +1496,28 @@ describe("ComposeBar", () => {
       });
     });
 
+    it("stays silent on an empty composer, whatever else is blocking", async () => {
+      // An empty composer has nothing to fork. Explaining "still loading X's
+      // history" to someone who typed nothing answers a question they did not
+      // ask, so the empty check has to sit above every readiness check.
+      const state = await loadState();
+      await state.registerAgent(AGENT_A);
+      seedTurn(state, AGENT_A.id);
+      render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+      await waitFor(() => expect(forkHalf()).not.toBeNull());
+
+      const rt = state.runtimes[AGENT_A.id];
+      if (rt === undefined) throw new Error("runtime missing");
+      state.runtimes[AGENT_A.id] = { ...rt, hydration_status: "loading" };
+
+      const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+      await fireEvent.keyDown(textarea, { key: "Enter", metaKey: true, shiftKey: true });
+      await tick();
+
+      expect(screen.queryByTestId("compose-send-error")).toBeNull();
+      expect(invokeMock).not.toHaveBeenCalledWith("fork_agent", expect.anything());
+    });
+
     it("keeps the user's text when the fork is refused", async () => {
       // The one send path that can fail before any optimistic turn exists. The
       // user must be able to wait or cancel and retry without retyping.

@@ -1287,6 +1287,48 @@ describe("forked-agent inherited-history refresh", () => {
     await until(() => loads === 2);
   });
 
+  it("serializes two branches finishing together without dropping either load", async () => {
+    // Both callers clear `hydrationStarted` synchronously before entering
+    // `hydrateProject`, so neither sees the other's guard and both used to read
+    // concurrently. Coalescing (losers return early) would be worse than the
+    // duplicate work: this retries on the fork's OWN next completed turn, which
+    // may never come, so a dropped load leaves that branch's history missing
+    // behind a banner promising it. The loser must wait and then read.
+    const state = await loadAgentState();
+    const SECOND_FORK = "00000000-0000-7000-8000-0000000000f2";
+    const secondFork: AgentRecord = { ...forkAgent(), id: SECOND_FORK, name: "agent-a-fork-2" };
+    const { ws } = await hydratedProjectWith([agent(AGENT_1, PROJECT_1), forkAgent(), secondFork]);
+    await state.registerAgent(forkAgent());
+    await state.registerAgent(secondFork);
+    ws.installForkHistoryRefresh();
+
+    let concurrent = 0;
+    let maxConcurrent = 0;
+    const filters: (string[] | undefined)[] = [];
+    invokeMock.mockImplementation(
+      async (cmd: string, args?: Record<string, unknown>): Promise<unknown> => {
+        if (cmd === "load_project_conversation") {
+          concurrent += 1;
+          maxConcurrent = Math.max(maxConcurrent, concurrent);
+          filters.push(args === undefined ? undefined : []);
+          await new Promise((r) => setTimeout(r, 5));
+          concurrent -= 1;
+          return { items: [], agents: [] } satisfies ProjectConversation;
+        }
+        return undefined;
+      },
+    );
+
+    fireTurnEnd(FORK_ID, "completed");
+    fireTurnEnd(SECOND_FORK, "completed");
+    await until(() => filters.length === 2);
+    await settle();
+
+    // Both branches read — neither was dropped — and never at the same time.
+    expect(filters.length).toBe(2);
+    expect(maxConcurrent).toBe(1);
+  });
+
   it("never fires for a non-fork agent", async () => {
     const state = await loadAgentState();
     const { ws, loads } = await hydratedProjectWith([agent(AGENT_1, PROJECT_1)]);

@@ -72,7 +72,7 @@
      darkens here; what both share is a visible step. */
   --primary: #18181b;
   --primary-fg: #fafafa;
-  --primary-hover: #3f3f46;
+  --primary-hover: #52525b;
 
   /* green accent — focus rings, links, and selected-state emphasis (e.g. the
      compose recipient chips). `-soft` is the light tint used for a selected
@@ -154,7 +154,7 @@
 
   --primary: #fafafa;
   --primary-fg: #18181b;
-  --primary-hover: #d4d4d8;
+  --primary-hover: #c0c0c7;
 
   --accent: #4ade80;
   --accent-fg: #052e16;

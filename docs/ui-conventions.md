@@ -47,7 +47,7 @@ Keep the ramp to these. It was once ~15 near-identical grays (several within a p
 
 Blue means exactly one thing: **`focus`**. Inputs, buttons, and menus show it as a thin focus **ring**; the compose box shows it as a **border-color** change (deliberately border-only, to keep that large card's highlight minimal). `focus-soft` is the pale tint for user-authored input surfaces (the user and held-forward message bubbles). It is deliberately blue, not the teal `accent` — a green highlight on a text field reads as *valid*, not *focused*. It shows on actual focus and clears when focus leaves, so it signals *where keyboard focus is* rather than sitting on permanently.
 
-Segmented controls share one color system regardless of size: a `raised` track, `panel` hover for inactive options, and the named neutral `segment-selected` fill for the active option. Standard form controls and compact page-header controls may differ in height and type size, but not in color semantics.
+Segmented controls share one color system regardless of size: a `raised` track, `control-hover` for inactive options — the same step the compact icon buttons use, since a segment is one — and the named neutral `segment-selected` fill for the active option. Standard form controls and compact page-header controls may differ in height and type size, but not in color semantics.
 
 ## Reach for a primitive before hand-rolling
 

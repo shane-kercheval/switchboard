@@ -4304,18 +4304,39 @@ enum TurnRender {
     Skip,
 }
 
+/// Each send's dispatch window: its own instant, and the next send's where one
+/// exists. Built from the full ordered send list so the residual's view of "the
+/// next send" matches the key-join's.
+type SendWindows = HashMap<
+    SendId,
+    (
+        chrono::DateTime<chrono::Utc>,
+        Option<chrono::DateTime<chrono::Utc>>,
+    ),
+>;
+
 /// Provenance-based turn classification (Claude `promptSource`). Pairs each
 /// slot-consuming `Sdk` prompt to the next journal send in order — suppressing
 /// that copy (the journal renders it) and handing the send to the prompt's reply
-/// (the following agent turn). `External`, `Unknown`, unpaired `Sdk` (more
-/// prompts than sends), and pre-journaling `Sdk` (older than the first send) all
-/// render **imported**, never dropped. Only slot-consuming prompts advance the
-/// send pointer, so interior housekeeping/bare-CLI turns can't shift the
-/// alignment — the drift that the count-based path suffers on compaction-heavy
-/// files. `journal_start` gates out pre-journaling history (same boundary the
-/// count path uses); on a single machine the harness records a prompt no earlier
-/// than Switchboard journaled its dispatch, so a genuine first send is never
-/// excluded.
+/// (the following agent turn). `External`, unpaired `Sdk`, and pre-journaling
+/// `Sdk` (older than the first send) all render **imported**, never dropped.
+/// Only slot-consuming prompts advance the send pointer, so interior
+/// housekeeping/bare-CLI turns can't shift the alignment — the drift that the
+/// count-based path suffers on compaction-heavy files. `journal_start` gates out
+/// pre-journaling history (same boundary the count path uses); on a single
+/// machine the harness records a prompt no earlier than Switchboard journaled
+/// its dispatch, so a genuine first send is never excluded.
+///
+/// **Surplus arm — order alone is not enough when candidates outnumber sends.**
+/// In-window `Sdk` prompts can exceed this agent's sends only when a prompt
+/// reached its session file that this agent never dispatched (a forked session's
+/// inherited history, or SDK history attached from outside Switchboard). Ordered
+/// consumption then hands a send to a prompt that never made it and shifts every
+/// later pairing. So when candidates outnumber sends, this classifier switches
+/// from position to identity: a candidate consumes a send only when its recorded
+/// text is *exactly* the text that send dispatched, and only when it is the
+/// **unique** such candidate ([`align_surplus_candidates`]). Ambiguous or
+/// unmatched candidates render imported and their send stays uncorrelated.
 ///
 /// **This is the positional fallback, not the primary correlation.** The durable
 /// key-join ([`classify_agent_turns`]) runs first and renders every key-linked
@@ -4328,14 +4349,34 @@ enum TurnRender {
 fn classify_turns_by_provenance(
     turns: &[&switchboard_harness::Turn],
     all_sends: &[SendId],
+    send_prompts: &HashMap<SendId, (String, Vec<Attachment>)>,
+    send_windows: &SendWindows,
     journal_start: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Vec<TurnRender> {
+    let is_candidate = |turn: &switchboard_harness::Turn| {
+        matches!(turn,
+            switchboard_harness::Turn::User { source: switchboard_harness::UserPromptSource::Sdk, started_at, .. }
+            if journal_start.is_some_and(|start| *started_at >= start))
+    };
+    let candidates: Vec<usize> = turns
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| is_candidate(t))
+        .map(|(i, _)| i)
+        .collect();
+    // Identity-based assignment replaces the ordered walk exactly when candidates
+    // outnumber sends (see the doc's surplus arm). `None` keeps the historical
+    // purely positional behavior for the balanced case, which never consults text.
+    let assignment = (candidates.len() > all_sends.len()).then(|| {
+        align_surplus_candidates(turns, &candidates, all_sends, send_prompts, send_windows)
+    });
     let mut send_idx = 0usize;
     let mut pending_send: Option<SendId> = None;
     turns
         .iter()
         .copied()
-        .map(|turn| match turn {
+        .enumerate()
+        .map(|(i, turn)| match turn {
             switchboard_harness::Turn::Agent { .. } => {
                 let send_id = pending_send.take();
                 TurnRender::Agent {
@@ -4344,15 +4385,18 @@ fn classify_turns_by_provenance(
                 }
             }
             switchboard_harness::Turn::System { .. } => TurnRender::SystemMarker,
-            switchboard_harness::Turn::User {
-                started_at, source, ..
-            } => {
-                let consume = matches!(source, switchboard_harness::UserPromptSource::Sdk)
-                    && send_idx < all_sends.len()
-                    && journal_start.is_some_and(|start| *started_at >= start);
-                if consume {
-                    pending_send = Some(all_sends[send_idx]);
-                    send_idx += 1;
+            switchboard_harness::Turn::User { .. } => {
+                let consumed = match &assignment {
+                    Some(by_candidate) => by_candidate.get(&i).copied(),
+                    None if is_candidate(turn) && send_idx < all_sends.len() => {
+                        let send_id = all_sends[send_idx];
+                        send_idx += 1;
+                        Some(send_id)
+                    }
+                    None => None,
+                };
+                if let Some(send_id) = consumed {
+                    pending_send = Some(send_id);
                     TurnRender::Skip
                 } else {
                     // A non-consuming prompt ends any pending pairing: the prior
@@ -4365,6 +4409,80 @@ fn classify_turns_by_provenance(
             _ => TurnRender::Skip,
         })
         .collect()
+}
+
+/// Assign sends to surplus-case candidates by **exact dispatched text**, keeping
+/// the assignment monotonic (a later send never takes an earlier candidate).
+///
+/// Returns `candidate turn index → send`. A send with no matching candidate, or
+/// with more than one, is left out entirely: an ambiguous match is a coin flip
+/// between two identical prompts, and rendering both imported (one visible
+/// duplicate) is strictly better than a confident mis-pair. Skipping such a send
+/// must not block the ones after it — that stranding is why this is a
+/// precomputed pass over all sends rather than a single pointer walk.
+///
+/// **What "exact" means, and the coupling it creates.** The journal stores the
+/// user's clean prompt plus its attachments; the harness receives — and records —
+/// `render_prompt_with_attachments` of the two, then the Claude adapter's
+/// transport rule ([`switchboard_harness::claude_transport_prompt`]). Both forms
+/// are accepted, so this stays correct without a harness branch here. Note this
+/// binds correlation to a *versioned rendering format*: if the attachment footer
+/// ever changes shape, historical sends stop reconstructing. That degradation is
+/// contained by design — no match means no assignment, which renders the echo
+/// imported (a visible duplicate) and never mis-pairs — but it is a real
+/// coupling, so a footer change should come with a look at this function.
+/// Pre-attachments journal lines deserialize to an empty attachment list and
+/// reconstruct unchanged.
+///
+/// Candidates must also fall inside the send's dispatch window — see the inline
+/// note; exact text alone would let an older identical prompt claim a later send.
+fn align_surplus_candidates(
+    turns: &[&switchboard_harness::Turn],
+    candidates: &[usize],
+    all_sends: &[SendId],
+    send_prompts: &HashMap<SendId, (String, Vec<Attachment>)>,
+    send_windows: &SendWindows,
+) -> HashMap<usize, SendId> {
+    let recorded = |i: usize| match turns[i] {
+        switchboard_harness::Turn::User {
+            text, started_at, ..
+        } => Some((text.as_str(), *started_at)),
+        _ => None,
+    };
+    let mut assignment = HashMap::new();
+    let mut floor = 0usize;
+    for send_id in all_sends {
+        let Some((prompt, attachments)) = send_prompts.get(send_id) else {
+            continue;
+        };
+        let Some(&(send_at, next_send_at)) = send_windows.get(send_id) else {
+            continue;
+        };
+        let dispatched = switchboard_core::render_prompt_with_attachments(prompt, attachments);
+        let transported = switchboard_harness::claude_transport_prompt(&dispatched);
+        // Matching text is not enough: a prompt recorded *before* this send
+        // cannot be its echo, and treating it as one presents an older reply as
+        // the answer to a later message. Same dispatch window the key-join arm
+        // enforces — `[send.at, next_send.at)` — so the two correlation paths
+        // agree on what "caused by this send" means instead of one silently
+        // being looser.
+        let mut matches = candidates[floor..].iter().filter(|&&i| {
+            recorded(i).is_some_and(|(text, at)| {
+                (text == dispatched || text == transported)
+                    && at >= send_at
+                    && next_send_at.is_none_or(|next| at < next)
+            })
+        });
+        let (Some(&only), None) = (matches.next(), matches.next()) else {
+            continue;
+        };
+        assignment.insert(only, *send_id);
+        floor = candidates
+            .iter()
+            .position(|&i| i == only)
+            .map_or(floor, |p| p + 1);
+    }
+    assignment
 }
 
 /// Count-based turn classification — the pre-provenance correlation, retained as
@@ -4464,10 +4582,21 @@ fn classify_turns_by_count(
 /// Claude one does (this is what lets M3 add Codex links with no merge change).
 /// `External` (bare-TUI-typed, not journaled) and pre-journaling prompts are
 /// excluded, so a genuinely-imported prompt is never suppressed.
+///
+/// **Hydration keys are unique per agent, not per project.** A forked session is
+/// a verbatim copy of its parent's file, so the child's inherited turns carry the
+/// *parent's* keys: one key legitimately names two turns owned by two agents in
+/// the same project. Two independent defenses keep that from mis-grouping, and
+/// the fork merge tests pin both by mutation — neither alone is redundant:
+/// `links` is agent-scoped (a parent's link is never even offered the child's
+/// turns), and the window guard below declines any link naming a send this agent
+/// never received. Do not "flatten" the per-agent link maps into one, and do not
+/// relax the missing-send arm into a permissive default.
 fn classify_agent_turns(
     turns: &[switchboard_harness::Turn],
     all_sends: &[(SendId, chrono::DateTime<chrono::Utc>)],
     links: &HashMap<String, SendId>,
+    send_prompts: &HashMap<SendId, (String, Vec<Attachment>)>,
     journal_start: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Vec<TurnRender> {
     let send_at: HashMap<SendId, chrono::DateTime<chrono::Utc>> =
@@ -4622,8 +4751,22 @@ fn classify_agent_turns(
         .map(|(_, at)| *at)
         .min()
         .or(journal_start);
-    let residual_renders =
-        classify_residual(&residual_turns, &residual_sends, residual_journal_start);
+    // Dispatch windows come from the **full** ordered send list, not the residual:
+    // "the next send after A" computed from unclaimed sends alone returns C when
+    // pass 1 claimed B, widening A's window across B's and making this looser than
+    // the key-join guard it mirrors.
+    let residual_windows: SendWindows = all_sends
+        .iter()
+        .enumerate()
+        .map(|(i, (send_id, at))| (*send_id, (*at, all_sends.get(i + 1).map(|(_, next)| *next))))
+        .collect();
+    let residual_renders = classify_residual(
+        &residual_turns,
+        &residual_sends,
+        send_prompts,
+        &residual_windows,
+        residual_journal_start,
+    );
     for (&oi, render) in residual_indices.iter().zip(residual_renders) {
         renders[oi] = render;
     }
@@ -4645,6 +4788,8 @@ fn classify_agent_turns(
 fn classify_residual(
     turns: &[&switchboard_harness::Turn],
     all_sends: &[SendId],
+    send_prompts: &HashMap<SendId, (String, Vec<Attachment>)>,
+    send_windows: &SendWindows,
     journal_start: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Vec<TurnRender> {
     let agent_turn_count = turns
@@ -4676,7 +4821,7 @@ fn classify_residual(
         })
     });
     if has_known_provenance && !ambiguous_unknown {
-        classify_turns_by_provenance(turns, all_sends, journal_start)
+        classify_turns_by_provenance(turns, all_sends, send_prompts, send_windows, journal_start)
     } else {
         classify_turns_by_count(
             turns,
@@ -4858,6 +5003,15 @@ fn merge_project_conversation(
             _ => {}
         }
     }
+    // Each send's journaled prompt + attachments — the two halves the surplus
+    // arm of `classify_turns_by_provenance` reconstructs the dispatched text
+    // from. Taken before the grouped messages are consumed below.
+    let send_prompts: HashMap<SendId, (String, Vec<Attachment>)> = user_messages
+        .iter()
+        .map(|(send_id, _, prompt, attachments, _)| {
+            (*send_id, (prompt.clone(), attachments.clone()))
+        })
+        .collect();
     for (send_id, agent_ids, text, attachments, at) in user_messages {
         items.push(ConversationItem::UserMessage {
             id: send_id,
@@ -4898,7 +5052,8 @@ fn merge_project_conversation(
         // rationale lives in those helpers' docs now.
         let empty_links = HashMap::new();
         let links = agent_links.get(&agent_id).unwrap_or(&empty_links);
-        let renders = classify_agent_turns(&turns, all_sends, links, journal_start_at);
+        let renders =
+            classify_agent_turns(&turns, all_sends, links, &send_prompts, journal_start_at);
         for (turn, render) in turns.into_iter().zip(renders) {
             match (turn, render) {
                 (
@@ -14418,6 +14573,758 @@ mod tests {
         assert!(
             agent_sends.contains(&Some(send_id)),
             "journaled agent turn grouped"
+        );
+    }
+
+    /// The real `--fork-session` artifacts (captured 2026-08-10, sanitized) —
+    /// see `crates/harness/tests/fixtures/claude/`. Driving the merge from the
+    /// real loader output rather than hand-built turns is what makes the
+    /// fork-merge claims falsifiable against the actual on-disk shape.
+    const FORK_FIXTURE: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../harness/tests/fixtures/claude/forked-session.jsonl"
+    ));
+    const FORK_PARENT_FIXTURE: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../harness/tests/fixtures/claude/forked-session.parent.jsonl"
+    ));
+    const FORK_SESSION: &str = "a2319443-8b29-46bd-a79d-fa1e405bf177";
+    const FORK_PARENT_SESSION: &str = "2e18d035-181f-4ba3-8845-b070ca88bffb";
+    const FORK_INHERITED_PROMPT: &str =
+        "Remember: the secret word is BANANA. Reply with only the word ack.";
+    const FORK_OWN_PROMPT: &str = "What is the secret word? Reply with only that word.";
+    /// The parent's reply key — duplicated verbatim onto the fork's copy of that
+    /// turn, so one key names two turns across two agents.
+    const FORK_PARENT_REPLY_KEY: &str = "msg_011CduTPVndhKkkb2MYENEha";
+    const FORK_OWN_REPLY_KEY: &str = "msg_011CduTQtiJPcchtQ6mQEHeZ";
+
+    fn stage_claude_session(home: &std::path::Path, cwd: &std::path::Path, session: Uuid, c: &str) {
+        let target = switchboard_harness::claude_session_file_path(home, cwd, &session);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, c).unwrap();
+    }
+
+    fn load_fork_fixture(
+        home: &TempDir,
+        cwd: &std::path::Path,
+        agent: AgentId,
+        session: &str,
+        fixture: &str,
+    ) -> LoadedTranscript {
+        let session: Uuid = session.parse().unwrap();
+        stage_claude_session(home.path(), cwd, session, fixture);
+        switchboard_harness::load_claude_transcript(home.path(), cwd, session, agent).unwrap()
+    }
+
+    fn ts(raw: &str) -> chrono::DateTime<Utc> {
+        raw.parse().unwrap()
+    }
+
+    /// `(text, send_id)` per rendered user message, in order.
+    fn rendered_prompts(merged: &ProjectConversation) -> Vec<(&str, Option<SendId>)> {
+        merged
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                ConversationItem::UserMessage { text, send_id, .. } => {
+                    Some((text.as_str(), *send_id))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `(hydration_key, send_id)` for one agent's rendered turns, in order.
+    fn turns_of(
+        merged: &ProjectConversation,
+        agent: AgentId,
+    ) -> Vec<(Option<&str>, Option<SendId>)> {
+        merged
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                ConversationItem::AgentTurn {
+                    agent_id,
+                    hydration_key,
+                    send_id,
+                    ..
+                } if *agent_id == agent => Some((hydration_key.as_deref(), *send_id)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `(hydration_key, send_id)` per rendered agent turn, in order.
+    fn agent_turn_grouping(merged: &ProjectConversation) -> Vec<(Option<&str>, Option<SendId>)> {
+        merged
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                ConversationItem::AgentTurn {
+                    hydration_key,
+                    send_id,
+                    ..
+                } => Some((hydration_key.as_deref(), *send_id)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn merge_forked_session_renders_inherited_history_as_imported() {
+        // A forked agent, end-to-end through the REAL parser on the REAL fork
+        // artifact. Its session file opens with a verbatim copy of the parent's
+        // history — same prompt text, same original timestamps, same `sdk`
+        // provenance, same hydration key. None of that may consume the send that
+        // materialized the fork: the inherited prompt renders imported, the
+        // inherited reply stays un-grouped, and the fork's own first turn
+        // key-joins to its own send.
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        let canonical_cwd = cwd.path().canonicalize().unwrap();
+        let fork = Uuid::now_v7();
+        let transcript = load_fork_fixture(&home, &canonical_cwd, fork, FORK_SESSION, FORK_FIXTURE);
+
+        // The real dispatch instants from the artifact: the send is journaled at
+        // the fork's enqueue time, the link at its reply's timestamp.
+        let send = Uuid::now_v7();
+        let journal = vec![
+            JournalRecord::Send {
+                send_id: send,
+                turn_id: Uuid::now_v7(),
+                agent_id: fork,
+                prompt: FORK_OWN_PROMPT.to_owned(),
+                attachments: Vec::new(),
+                at: ts("2026-08-10T17:23:43.775Z"),
+            },
+            JournalRecord::TurnLink {
+                send_id: send,
+                turn_id: Uuid::now_v7(),
+                agent_id: fork,
+                hydration_key: FORK_OWN_REPLY_KEY.to_owned(),
+                at: ts("2026-08-10T17:23:46.531Z"),
+            },
+        ];
+
+        let merged = merge_project_conversation(journal, vec![(fork, transcript, None)]);
+
+        assert_eq!(
+            rendered_prompts(&merged),
+            vec![(FORK_INHERITED_PROMPT, None), (FORK_OWN_PROMPT, Some(send)),],
+            "the inherited prompt renders imported exactly once; the fork's own prompt \
+             renders exactly once, from the journal"
+        );
+        assert_eq!(
+            agent_turn_grouping(&merged),
+            vec![
+                (Some(FORK_PARENT_REPLY_KEY), None),
+                (Some(FORK_OWN_REPLY_KEY), Some(send)),
+            ],
+            "the inherited reply stays un-grouped; only the fork's own reply claims the send"
+        );
+    }
+
+    #[test]
+    fn merge_fork_and_parent_together_do_not_cross_claim_the_duplicated_key() {
+        // The load-bearing axiom, exercised rather than asserted in a comment: a
+        // fork's copied turn carries the PARENT's hydration key, so one key now
+        // names two turns owned by two agents in the same project. Because the
+        // merge's link/send/journal-start maps are all per-agent, the parent's
+        // `TurnLink` can only ever reach the parent's own turn — the fork's copy
+        // of that same-keyed turn is invisible to it, and vice versa.
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        let canonical_cwd = cwd.path().canonicalize().unwrap();
+        let parent = Uuid::now_v7();
+        let fork = Uuid::now_v7();
+
+        let parent_transcript = load_fork_fixture(
+            &home,
+            &canonical_cwd,
+            parent,
+            FORK_PARENT_SESSION,
+            FORK_PARENT_FIXTURE,
+        );
+        let fork_transcript =
+            load_fork_fixture(&home, &canonical_cwd, fork, FORK_SESSION, FORK_FIXTURE);
+
+        let (parent_send, fork_send) = (Uuid::now_v7(), Uuid::now_v7());
+        let journal = vec![
+            JournalRecord::Send {
+                send_id: parent_send,
+                turn_id: Uuid::now_v7(),
+                agent_id: parent,
+                prompt: FORK_INHERITED_PROMPT.to_owned(),
+                attachments: Vec::new(),
+                at: ts("2026-08-10T17:23:24.133Z"),
+            },
+            JournalRecord::TurnLink {
+                send_id: parent_send,
+                turn_id: Uuid::now_v7(),
+                agent_id: parent,
+                hydration_key: FORK_PARENT_REPLY_KEY.to_owned(),
+                at: ts("2026-08-10T17:23:27.679Z"),
+            },
+            JournalRecord::Send {
+                send_id: fork_send,
+                turn_id: Uuid::now_v7(),
+                agent_id: fork,
+                prompt: FORK_OWN_PROMPT.to_owned(),
+                attachments: Vec::new(),
+                at: ts("2026-08-10T17:23:43.775Z"),
+            },
+            JournalRecord::TurnLink {
+                send_id: fork_send,
+                turn_id: Uuid::now_v7(),
+                agent_id: fork,
+                hydration_key: FORK_OWN_REPLY_KEY.to_owned(),
+                at: ts("2026-08-10T17:23:46.531Z"),
+            },
+        ];
+
+        let merged = merge_project_conversation(
+            journal,
+            vec![
+                (parent, parent_transcript, None),
+                (fork, fork_transcript, None),
+            ],
+        );
+
+        // The parent renders exactly as it would with no fork in the project.
+        let parent_turns = turns_of(&merged, parent);
+        assert_eq!(
+            parent_turns,
+            vec![(Some(FORK_PARENT_REPLY_KEY), Some(parent_send))],
+            "the parent's own turn key-joins to the parent's send"
+        );
+
+        let fork_turns = turns_of(&merged, fork);
+        assert_eq!(
+            fork_turns,
+            vec![
+                (Some(FORK_PARENT_REPLY_KEY), None),
+                (Some(FORK_OWN_REPLY_KEY), Some(fork_send)),
+            ],
+            "the fork's copy of the parent-keyed turn claims NOTHING — not the parent's \
+             send, not the fork's"
+        );
+
+        // The parent's prompt was journaled, so it renders once from the journal
+        // (grouped to the parent's send) and once more as the fork's imported
+        // inherited history — two different agents' views of the same text.
+        assert_eq!(
+            rendered_prompts(&merged),
+            vec![
+                (FORK_INHERITED_PROMPT, Some(parent_send)),
+                (FORK_INHERITED_PROMPT, None),
+                (FORK_OWN_PROMPT, Some(fork_send)),
+            ],
+        );
+    }
+
+    #[test]
+    fn merge_forked_agent_whose_first_turn_failed_renders_the_outcome_only() {
+        // A fork whose first dispatch failed never materialized a session file,
+        // so the agent contributes no turns at all. The user's send must still
+        // render, with its failure marker — the fork is not invisible just
+        // because the branch it was supposed to create does not exist.
+        let fork = Uuid::now_v7();
+        let send = Uuid::now_v7();
+        let turn = Uuid::now_v7();
+        let journal = vec![
+            send_record(send, turn, fork, "branch and continue", 10),
+            outcome_record(
+                send,
+                turn,
+                fork,
+                serde_json::json!({"status": "failed", "kind": "harness_error", "message": "boom"}),
+                12,
+            ),
+        ];
+
+        let merged =
+            merge_project_conversation(journal, vec![(fork, transcript_of(Vec::new()), None)]);
+
+        assert_eq!(
+            rendered_prompts(&merged),
+            vec![("branch and continue", Some(send))]
+        );
+        assert!(
+            agent_turn_grouping(&merged).is_empty(),
+            "a fork that never materialized contributes no agent turns"
+        );
+        let outcomes: Vec<(OutcomeStatus, Option<SendId>)> = merged
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                ConversationItem::Outcome {
+                    status, send_id, ..
+                } => Some((*status, Some(*send_id))),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(outcomes, vec![(OutcomeStatus::Failed, Some(send))]);
+    }
+
+    /// The hazardous mid-turn-fork ordering — **synthesized, not copied from the
+    /// probe artifact**. Forking a parent that is mid-turn copies the parent's
+    /// in-flight prompt into the child and appends a synthesized
+    /// "No response requested." assistant record stamped at COPY time, carrying a
+    /// bare-UUID hydration key that no `TurnLink` will ever name.
+    ///
+    /// The measured artifact is the *benign* arrangement: its copied prompt keeps
+    /// the parent's original (pre-send) timestamp, so it falls outside the fork's
+    /// journal window and never becomes a correlation candidate. This fixture
+    /// forces the arrangement that ordering happens to avoid — the copied prompt
+    /// landing *after* the fork's own `Send` — so the merge is tested on the case
+    /// where the copied prompt IS in-window and the synthesized turn is the first
+    /// agent turn to follow it.
+    fn mid_turn_fork_turns(fork: AgentId, include_own_reply: bool) -> Vec<Turn> {
+        let mut turns = vec![
+            // Inherited history: pre-window, so plainly imported.
+            user_turn_src(
+                Uuid::now_v7(),
+                fork,
+                "the parent's earlier prompt",
+                1,
+                UserPromptSource::Sdk,
+            ),
+            agent_turn_keyed(Uuid::now_v7(), fork, "inherited reply", 2, "msg_parent"),
+            // The hazard: the parent's in-flight prompt, copied in and stamped
+            // AFTER the fork's own send (t=10).
+            user_turn_src(
+                Uuid::now_v7(),
+                fork,
+                "the parent's in-flight prompt",
+                11,
+                UserPromptSource::Sdk,
+            ),
+            // The synthesized record: in-window, keyed, and link-less.
+            agent_turn_keyed(
+                Uuid::now_v7(),
+                fork,
+                "No response requested.",
+                12,
+                "6147d914-0ce3-434a-bb26-156b78232dba",
+            ),
+            user_turn_src(
+                Uuid::now_v7(),
+                fork,
+                "branch and continue",
+                13,
+                UserPromptSource::Sdk,
+            ),
+        ];
+        if include_own_reply {
+            turns.push(agent_turn_keyed(
+                Uuid::now_v7(),
+                fork,
+                "branched answer",
+                14,
+                "msg_fork",
+            ));
+        }
+        turns
+    }
+
+    #[test]
+    fn merge_mid_turn_fork_synthesized_turn_never_claims_the_forks_send() {
+        let fork = Uuid::now_v7();
+        let send = Uuid::now_v7();
+        let journal = vec![
+            send_record(send, Uuid::now_v7(), fork, "branch and continue", 10),
+            link_record(send, fork, "msg_fork", 15),
+        ];
+
+        let merged = merge_project_conversation(
+            journal,
+            vec![(fork, transcript_of(mid_turn_fork_turns(fork, true)), None)],
+        );
+
+        assert_eq!(
+            agent_turn_grouping(&merged),
+            vec![
+                (Some("msg_parent"), None),
+                (Some("6147d914-0ce3-434a-bb26-156b78232dba"), None),
+                (Some("msg_fork"), Some(send)),
+            ],
+            "the synthesized mid-turn record claims nothing; the fork's real reply \
+             takes its own send"
+        );
+        // Render order is chronological, and the hazard is precisely that the
+        // copied prompt is stamped *after* the fork's send — so it sorts after
+        // the user's own message. Odd-looking, but an honest rendering of an odd
+        // artifact; what matters is that all three appear exactly once with the
+        // right grouping.
+        assert_eq!(
+            rendered_prompts(&merged),
+            vec![
+                ("the parent's earlier prompt", None),
+                ("branch and continue", Some(send)),
+                ("the parent's in-flight prompt", None),
+            ],
+            "both copied prompts render imported; the user's own prompt renders once"
+        );
+    }
+
+    #[test]
+    fn merge_mid_turn_fork_failed_before_a_link_still_renders_the_users_send() {
+        // The same hazardous shape, but the fork's first turn failed before any
+        // content — so there is no `TurnLink` and no reply on disk, and the merge
+        // has only the positional fallback to work with. The synthesized turn is
+        // then the ONLY in-window agent turn, which is exactly when a naive
+        // fallback would hand it the user's send and swallow the prompt.
+        let fork = Uuid::now_v7();
+        let send = Uuid::now_v7();
+        let turn = Uuid::now_v7();
+        let journal = vec![
+            send_record(send, turn, fork, "branch and continue", 10),
+            outcome_record(
+                send,
+                turn,
+                fork,
+                serde_json::json!({"status": "failed", "kind": "harness_error", "message": "boom"}),
+                16,
+            ),
+        ];
+
+        let merged = merge_project_conversation(
+            journal,
+            vec![(fork, transcript_of(mid_turn_fork_turns(fork, false)), None)],
+        );
+
+        assert_eq!(
+            rendered_prompts(&merged),
+            vec![
+                ("the parent's earlier prompt", None),
+                ("branch and continue", Some(send)),
+                ("the parent's in-flight prompt", None),
+            ],
+            "the failed send still renders from the journal, and neither copied prompt \
+             is mistaken for it"
+        );
+        assert_eq!(
+            agent_turn_grouping(&merged),
+            vec![
+                (Some("msg_parent"), None),
+                (Some("6147d914-0ce3-434a-bb26-156b78232dba"), None),
+            ],
+            "the synthesized turn does not get handed the failed send"
+        );
+        let outcomes: Vec<OutcomeStatus> = merged
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                ConversationItem::Outcome { status, .. } => Some(*status),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(outcomes, vec![OutcomeStatus::Failed]);
+    }
+
+    /// The surplus shape with no `TurnLink`: inherited history, one copied
+    /// in-window prompt, then the fork's own prompt. Two in-window candidates
+    /// against one send, so the whole thing lands in the residual's surplus arm —
+    /// where a candidate must match its send's dispatched text exactly.
+    fn surplus_shape(fork: AgentId, copied: &str, own: &str) -> Vec<Turn> {
+        vec![
+            user_turn_src(
+                Uuid::now_v7(),
+                fork,
+                "the parent's earlier prompt",
+                1,
+                UserPromptSource::Sdk,
+            ),
+            agent_turn_keyed(Uuid::now_v7(), fork, "inherited reply", 2, "msg_parent"),
+            user_turn_src(Uuid::now_v7(), fork, copied, 11, UserPromptSource::Sdk),
+            agent_turn_keyed(Uuid::now_v7(), fork, "No response requested.", 12, "synth"),
+            user_turn_src(Uuid::now_v7(), fork, own, 13, UserPromptSource::Sdk),
+            agent_turn_keyed(Uuid::now_v7(), fork, "branched answer", 14, "msg_fork"),
+        ]
+    }
+
+    #[test]
+    fn merge_surplus_matches_the_prompt_claude_actually_recorded_not_the_journals_copy() {
+        // A `/`-leading prompt is dispatched with one leading space so Claude's
+        // headless CLI doesn't route it through its slash-command parser, and the
+        // session file records THAT text while the journal keeps the user's exact
+        // text. Comparing the two raw would never match, so the user's own prompt
+        // would fail to pair and render twice — once from the journal, once
+        // imported.
+        let fork = Uuid::now_v7();
+        let send = Uuid::now_v7();
+        let journal = vec![send_record(send, Uuid::now_v7(), fork, "/review this", 10)];
+
+        let merged = merge_project_conversation(
+            journal,
+            vec![(
+                fork,
+                transcript_of(surplus_shape(
+                    fork,
+                    "the parent's in-flight prompt",
+                    " /review this",
+                )),
+                None,
+            )],
+        );
+
+        assert_eq!(
+            rendered_prompts(&merged),
+            vec![
+                ("the parent's earlier prompt", None),
+                ("/review this", Some(send)),
+                ("the parent's in-flight prompt", None),
+            ],
+            "the transport-rewritten echo is recognized, so the user's prompt renders once"
+        );
+        assert_eq!(
+            agent_turn_grouping(&merged),
+            vec![
+                (Some("msg_parent"), None),
+                (Some("synth"), None),
+                (Some("msg_fork"), Some(send)),
+            ],
+        );
+    }
+
+    #[test]
+    fn merge_surplus_handles_an_attachments_only_send() {
+        // An attachments-only send journals an EMPTY prompt (the compose bar
+        // permits text-free sends that carry chips). Any text starts with the
+        // empty string, so a prefix test would silently pass for every candidate
+        // and hand the send to the inherited prompt. Reconstructing the dispatched
+        // text gives the attachment footer — a real string to match on.
+        let fork = Uuid::now_v7();
+        let send = Uuid::now_v7();
+        let attachment = Attachment {
+            label: "image-1".to_owned(),
+            kind: switchboard_core::AttachmentKind::Image,
+            path: "/tmp/staged/a.png".to_owned(),
+            original_name: "a.png".to_owned(),
+        };
+        let dispatched =
+            switchboard_core::render_prompt_with_attachments("", std::slice::from_ref(&attachment));
+        let journal = vec![JournalRecord::Send {
+            send_id: send,
+            turn_id: Uuid::now_v7(),
+            agent_id: fork,
+            prompt: String::new(),
+            attachments: vec![attachment],
+            at: at(10),
+        }];
+
+        let merged = merge_project_conversation(
+            journal,
+            vec![(
+                fork,
+                transcript_of(surplus_shape(
+                    fork,
+                    "the parent's in-flight prompt",
+                    &dispatched,
+                )),
+                None,
+            )],
+        );
+
+        let grouped: Vec<Option<SendId>> = rendered_prompts(&merged)
+            .into_iter()
+            .map(|(_, send_id)| send_id)
+            .collect();
+        assert_eq!(
+            grouped,
+            vec![None, Some(send), None],
+            "the inherited prompt stays imported; the attachments-only send pairs with its echo"
+        );
+        assert_eq!(
+            agent_turn_grouping(&merged),
+            vec![
+                (Some("msg_parent"), None),
+                (Some("synth"), None),
+                (Some("msg_fork"), Some(send)),
+            ],
+        );
+    }
+
+    #[test]
+    fn merge_surplus_does_not_pair_a_prompt_that_merely_starts_with_the_send() {
+        // Prefix matching is not an identity test: an inherited prompt that begins
+        // with a later send's text must not be mistaken for that send's echo.
+        let fork = Uuid::now_v7();
+        let send = Uuid::now_v7();
+        let journal = vec![send_record(send, Uuid::now_v7(), fork, "continue", 10)];
+
+        let merged = merge_project_conversation(
+            journal,
+            vec![(
+                fork,
+                transcript_of(surplus_shape(
+                    fork,
+                    "continue working on the parent task",
+                    "continue",
+                )),
+                None,
+            )],
+        );
+
+        assert_eq!(
+            rendered_prompts(&merged),
+            vec![
+                ("the parent's earlier prompt", None),
+                ("continue", Some(send)),
+                ("continue working on the parent task", None),
+            ],
+            "the longer inherited prompt renders imported; the exact echo takes the send"
+        );
+    }
+
+    #[test]
+    fn merge_surplus_will_not_pair_a_prompt_recorded_before_its_send() {
+        // Exact text is not proof of causation. An inherited prompt that predates
+        // a later send can be its unique textual match, and pairing them presents
+        // a reply recorded *before* the send as its answer while suppressing the
+        // copy the user should see imported. The key-join arm already refuses
+        // out-of-window links; the surplus arm has to agree.
+        //
+        // Shape: an earlier send anchors `journal_start` back far enough that the
+        // 11-second copy is in-window, then a later send carries the same text.
+        let fork = Uuid::now_v7();
+        let (first, second) = (Uuid::now_v7(), Uuid::now_v7());
+        let journal = vec![
+            send_record(first, Uuid::now_v7(), fork, "opening message", 10),
+            send_record(second, Uuid::now_v7(), fork, "continue", 20),
+        ];
+        let turns = vec![
+            user_turn_src(
+                Uuid::now_v7(),
+                fork,
+                "opening message",
+                11,
+                UserPromptSource::Sdk,
+            ),
+            agent_turn_keyed(Uuid::now_v7(), fork, "first reply", 12, "k1"),
+            // Inherited copy: same text as the *second* send, but recorded seven
+            // seconds before that send was journaled.
+            user_turn_src(Uuid::now_v7(), fork, "continue", 13, UserPromptSource::Sdk),
+            agent_turn_keyed(Uuid::now_v7(), fork, "stale reply", 14, "k2"),
+            // A third in-window candidate is what puts this over the sends and
+            // into the surplus arm — the balanced path is purely positional and
+            // never consults text at all.
+            user_turn_src(
+                Uuid::now_v7(),
+                fork,
+                "more inherited history",
+                15,
+                UserPromptSource::Sdk,
+            ),
+            agent_turn_keyed(Uuid::now_v7(), fork, "another stale reply", 16, "k3"),
+        ];
+
+        let merged = merge_project_conversation(journal, vec![(fork, transcript_of(turns), None)]);
+
+        assert_eq!(
+            agent_turn_grouping(&merged),
+            vec![
+                (Some("k1"), Some(first)),
+                (Some("k2"), None),
+                (Some("k3"), None)
+            ],
+            "the pre-send copy claims nothing; its reply is not offered as the answer \
+             to a message sent later"
+        );
+        assert!(
+            rendered_prompts(&merged).contains(&("continue", None)),
+            "the out-of-window copy renders imported rather than being suppressed"
+        );
+    }
+
+    #[test]
+    fn merge_surplus_will_not_pair_a_prompt_recorded_after_the_following_send() {
+        // The window's upper bound. A prompt recorded after the *next* send was
+        // journaled belongs to that send's window, not the earlier one's — the
+        // dispatcher runs one turn per agent serially, so an earlier send's echo
+        // cannot appear after a later send started. Without the bound the older
+        // send steals it and the newer send is left with nothing.
+        let fork = Uuid::now_v7();
+        let (alpha, beta) = (Uuid::now_v7(), Uuid::now_v7());
+        let journal = vec![
+            send_record(alpha, Uuid::now_v7(), fork, "alpha", 10),
+            send_record(beta, Uuid::now_v7(), fork, "beta", 20),
+        ];
+        let turns = vec![
+            user_turn_src(Uuid::now_v7(), fork, "beta", 21, UserPromptSource::Sdk),
+            agent_turn_keyed(Uuid::now_v7(), fork, "beta reply", 22, "k1"),
+            // Text of the FIRST send, but recorded after the second was sent.
+            user_turn_src(Uuid::now_v7(), fork, "alpha", 25, UserPromptSource::Sdk),
+            agent_turn_keyed(Uuid::now_v7(), fork, "late reply", 26, "k2"),
+            user_turn_src(Uuid::now_v7(), fork, "inherited", 27, UserPromptSource::Sdk),
+            agent_turn_keyed(Uuid::now_v7(), fork, "inherited reply", 28, "k3"),
+        ];
+
+        let merged = merge_project_conversation(journal, vec![(fork, transcript_of(turns), None)]);
+
+        assert_eq!(
+            agent_turn_grouping(&merged),
+            vec![
+                (Some("k1"), Some(beta)),
+                (Some("k2"), None),
+                (Some("k3"), None),
+            ],
+            "the out-of-window copy does not claim the earlier send, and the later \
+             send keeps its own reply"
+        );
+    }
+
+    #[test]
+    fn merge_surplus_ambiguity_declines_without_stranding_the_sends_behind_it() {
+        // Two candidates carrying identical text against one send: neither may
+        // claim it (a coin flip between two identical prompts is a confident
+        // mis-pair), so both render imported. The load-bearing part is what
+        // happens NEXT — a later, unambiguous send must still correlate. A
+        // single-pointer walk that declined and held its position would strand
+        // it, duplicating that prompt too.
+        let fork = Uuid::now_v7();
+        let (ambiguous, distinct) = (Uuid::now_v7(), Uuid::now_v7());
+        let journal = vec![
+            send_record(ambiguous, Uuid::now_v7(), fork, "same text", 10),
+            send_record(distinct, Uuid::now_v7(), fork, "later distinct", 14),
+        ];
+        let turns = vec![
+            user_turn_src(Uuid::now_v7(), fork, "same text", 11, UserPromptSource::Sdk),
+            agent_turn_keyed(Uuid::now_v7(), fork, "reply a", 12, "k1"),
+            user_turn_src(Uuid::now_v7(), fork, "same text", 13, UserPromptSource::Sdk),
+            agent_turn_keyed(Uuid::now_v7(), fork, "reply b", 15, "k2"),
+            user_turn_src(
+                Uuid::now_v7(),
+                fork,
+                "later distinct",
+                16,
+                UserPromptSource::Sdk,
+            ),
+            agent_turn_keyed(Uuid::now_v7(), fork, "reply c", 17, "k3"),
+        ];
+
+        let merged = merge_project_conversation(journal, vec![(fork, transcript_of(turns), None)]);
+
+        assert_eq!(
+            rendered_prompts(&merged),
+            vec![
+                ("same text", Some(ambiguous)),
+                ("same text", None),
+                ("same text", None),
+                ("later distinct", Some(distinct)),
+            ],
+            "the ambiguous send renders from the journal with both echoes imported; \
+             the later send is unaffected"
+        );
+        assert_eq!(
+            agent_turn_grouping(&merged),
+            vec![
+                (Some("k1"), None),
+                (Some("k2"), None),
+                (Some("k3"), Some(distinct)),
+            ],
+            "the unambiguous send still reaches its reply — it is not stranded behind \
+             the ambiguous one"
         );
     }
 

@@ -25,6 +25,7 @@
     transcripts,
     type Turn,
   } from "$lib/state/index.svelte";
+  import { agentsByProject, isAwaitingForkHistory } from "$lib/state/workspace.svelte";
   import {
     answerTextOf,
     buildUnifiedRows,
@@ -132,6 +133,41 @@
   /// agent contributes no turns to anchor against, and "silently missing
   /// history" is the exact trust gap this surface closes.
   const failedAgents = $derived(agents.filter((a) => runtimes[a.id]?.hydration_error != null));
+
+  /// Forked agents whose inherited history hasn't arrived yet — a branch only
+  /// materializes as a turn, so between the fork-send and that turn's terminal
+  /// the pane shows the new message and its reply with nothing above them.
+  /// Without a cue, that reads as an empty conversation — and the history
+  /// appearing later reads as a glitch rather than as designed behavior.
+  ///
+  /// **Signal is the refresh lifecycle, not the transcript's shape.** Counting
+  /// turns cannot answer this: a send appends its own user turn immediately and
+  /// `turn_start` appends the agent turn, so any "few turns yet" threshold clears
+  /// within a second of the fork-send — during the very interval this explains.
+  /// Timestamps can't either, since project hydration routes only *agent* turns
+  /// into a per-agent slice (imported prompts live in the project overlay), so a
+  /// branch inherited from a parent whose first turn was cancelled before any
+  /// reply contributes no slice turn at all and the cue would never clear.
+  /// `isAwaitingForkHistory` tracks the load itself, so it is true for exactly
+  /// as long as the history is actually missing — including across a failed
+  /// first turn, which re-arms rather than resolves.
+  const branchingAgents = $derived(agents.filter((a) => isAwaitingForkHistory(a.id)));
+
+  /// The parent an agent branched from, matched by the session it forked from.
+  ///
+  /// Scoped to the **project roster**, not the `agents` prop: that prop is this
+  /// pane's members, and forking deliberately places the branch in its own pane,
+  /// so a pane-scoped search would never find the parent and every banner would
+  /// fall to the unnamed arm. `undefined` means the parent really is gone.
+  function branchSource(agent: AgentRecord): AgentRecord | undefined {
+    return (agentsByProject[projectId] ?? []).find(
+      (candidate) =>
+        candidate.id !== agent.id &&
+        candidate.session_locator != null &&
+        "uuid" in candidate.session_locator &&
+        candidate.session_locator.uuid === agent.forked_from_session,
+    );
+  }
 
   /// Verbatim-error dialog state, shared by the project-load and per-agent
   /// failure affordances. The failure itself lives on agent/project state; this
@@ -1867,7 +1903,47 @@
     )}
   {/each}
 
-  {#if rows.length === 0 && loadStatus === "complete" && failedAgents.length === 0}
+  <!-- Pending branches: same pinned-chrome treatment as a failed load, and for
+       the same reason — the agent contributes no turns to anchor a mid-stream
+       note against, so the cue belongs where the user is already looking. -->
+  {#each branchingAgents as agent (agent.id)}
+    {@const source = branchSource(agent)}
+    <div
+      data-testid="fork-pending-history"
+      class="border-border bg-panel text-muted mb-3 flex items-center gap-2 rounded-md border px-3 py-2 text-xs"
+    >
+      <svg
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="2"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+        class="size-3.5 shrink-0"
+        aria-hidden="true"
+      >
+        <line x1="6" y1="3" x2="6" y2="15" />
+        <circle cx="18" cy="6" r="3" />
+        <circle cx="6" cy="18" r="3" />
+        <path d="M18 9a9 9 0 0 1-9 9" />
+      </svg>
+      <!-- Deliberately not "once this turn completes": the cue also persists
+           after a failed or cancelled first turn, when nothing is running and the
+           branch is waiting on the next reply that succeeds. -->
+      <span>
+        <span class="text-fg font-medium">{agent.name}</span>
+        {#if source}
+          branched from <span class="text-fg font-medium">{source.name}</span> —
+        {:else}
+          is a branch —
+        {/if}
+        it inherits that conversation's context, and the earlier messages appear here once it completes
+        a reply.
+      </span>
+    </div>
+  {/each}
+
+  {#if rows.length === 0 && loadStatus === "complete" && failedAgents.length === 0 && branchingAgents.length === 0}
     {#if showOnboarding}
       <!-- Orientation block for a blank project. Leads with the mental model
            (agents are isolated conversations; this view merges them) because

@@ -1133,6 +1133,160 @@ describe("forked-agent inherited-history refresh", () => {
     await until(() => loads() === before + 1);
   });
 
+  it("marks a new fork as awaiting history and clears it only on a successful load", async () => {
+    // The transcript's branch cue reads this. It has to arm at fork *creation*
+    // — the branch does not exist until the send that follows — and survive the
+    // whole first turn, since that is the interval it exists to explain.
+    const state = await loadAgentState();
+    const { ws } = await hydratedProjectWith([agent(AGENT_1, PROJECT_1)]);
+    await state.registerAgent(agent(AGENT_1, PROJECT_1));
+    ws.installForkHistoryRefresh();
+    expect(ws.isAwaitingForkHistory(FORK_ID)).toBe(false);
+
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "fork_agent") return forkAgent();
+      if (cmd === "load_project_conversation")
+        return { items: [], agents: [] } satisfies ProjectConversation;
+      return undefined;
+    });
+    await ws.forkAgentIntoOwnPane(AGENT_1);
+    expect(ws.isAwaitingForkHistory(FORK_ID)).toBe(true);
+
+    // A failed first turn leaves the history still missing — the cue stays.
+    fireTurnEnd(FORK_ID, "failed");
+    await settle();
+    expect(ws.isAwaitingForkHistory(FORK_ID)).toBe(true);
+
+    fireTurnEnd(FORK_ID, "completed");
+    await until(() => !ws.isAwaitingForkHistory(FORK_ID));
+  });
+
+  /// Open a project whose fingerprint probe reports `fp` for the fork agent.
+  async function openProjectWithForkFingerprint(
+    fp: { refresh_capable: boolean; fingerprint: unknown } | undefined,
+  ): Promise<Awaited<ReturnType<typeof loadWorkspaceState>>> {
+    const ws = await loadWorkspaceState();
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "load_project_conversation")
+        return { items: [], agents: [] } satisfies ProjectConversation;
+      if (cmd === "project_session_fingerprints")
+        return fp === undefined ? [] : [{ agent_id: FORK_ID, ...fp }];
+      return undefined;
+    });
+    ws.agentsByProject[PROJECT_1] = [agent(AGENT_1, PROJECT_1), forkAgent()];
+    await ws.hydrateProject(PROJECT_1);
+    return ws;
+  }
+
+  it("re-arms the cue on open for a branch whose first turn never materialized", async () => {
+    // Fork created, first turn failed, app restarted: no session file, so no
+    // inherited history — the cue is as true as it was before the restart, and
+    // the next successful turn is what resolves it.
+    await loadAgentState();
+    const ws = await openProjectWithForkFingerprint({
+      refresh_capable: true,
+      fingerprint: null,
+    });
+
+    expect(ws.isAwaitingForkHistory(FORK_ID)).toBe(true);
+  });
+
+  it("does not re-arm the cue for a materialized branch that parsed to no turns", async () => {
+    // The trap in judging this by transcript contents: a real session can load
+    // with zero agent turns (cancelled after the file was created, a parent
+    // holding only a dangling prompt). Its history HAS arrived, and a cue keyed
+    // on emptiness would sit there permanently.
+    await loadAgentState();
+    const ws = await openProjectWithForkFingerprint({
+      refresh_capable: true,
+      fingerprint: { source_path: "/s.jsonl", modified_at: "2026-05-16T00:00:00Z", byte_len: 10 },
+    });
+
+    expect(ws.isAwaitingForkHistory(FORK_ID)).toBe(false);
+  });
+
+  it("seeds nothing when the fingerprint probe says nothing", async () => {
+    // Unknown must fall to no cue: a missing one is cosmetic, a false permanent
+    // one is not.
+    await loadAgentState();
+    const ws = await openProjectWithForkFingerprint(undefined);
+
+    expect(ws.isAwaitingForkHistory(FORK_ID)).toBe(false);
+  });
+
+  it("does not mark a fork carried over from a previous session as awaiting history", async () => {
+    // A reopened fork already got its inherited history from the ordinary
+    // project load. Arming on the record's `forked_from_session` alone — which
+    // stays set forever as lineage — would brand every fork the project has
+    // ever held with a cue that never clears.
+    const state = await loadAgentState();
+    const { ws } = await hydratedProjectWith([agent(AGENT_1, PROJECT_1), forkAgent()]);
+    await state.registerAgent(forkAgent());
+    ws.installForkHistoryRefresh();
+
+    expect(ws.isAwaitingForkHistory(FORK_ID)).toBe(false);
+  });
+
+  it("retries when the refresh fails, instead of recording it as loaded", async () => {
+    // `hydrateProject` preserves the previously loaded conversation when a
+    // refresh throws — deliberately, so a transient hiccup never blanks a good
+    // view. That makes `conversations[id].status` useless as a success signal:
+    // it reads "complete" either way. Keying on it marked a fork loaded whose
+    // history never arrived, and the one-shot then blocked every retry.
+    const state = await loadAgentState();
+    const { ws } = await hydratedProjectWith([agent(AGENT_1, PROJECT_1), forkAgent()]);
+    await state.registerAgent(forkAgent());
+    ws.installForkHistoryRefresh();
+
+    let loads = 0;
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "load_project_conversation") {
+        loads += 1;
+        if (loads === 1) throw new Error("read failed");
+        return { items: [], agents: [] } satisfies ProjectConversation;
+      }
+      return undefined;
+    });
+
+    fireTurnEnd(FORK_ID, "completed");
+    await until(() => loads === 1);
+    await settle();
+    expect(ws.conversations[PROJECT_1]?.status).toBe("complete");
+
+    // The failure must not have consumed the one shot.
+    fireTurnEnd(FORK_ID, "completed");
+    await until(() => loads === 2);
+  });
+
+  it("treats a per-agent parse failure as a failed refresh", async () => {
+    // The project load succeeded, but the one agent we were waiting on
+    // contributed nothing — that is a fork with no inherited history, not a
+    // completed refresh.
+    const state = await loadAgentState();
+    const { ws } = await hydratedProjectWith([agent(AGENT_1, PROJECT_1), forkAgent()]);
+    await state.registerAgent(forkAgent());
+    ws.installForkHistoryRefresh();
+
+    let loads = 0;
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "load_project_conversation") {
+        loads += 1;
+        return {
+          items: [],
+          agents: [{ agent_id: FORK_ID, load_error: "corrupt sidecar" }],
+        } as unknown as ProjectConversation;
+      }
+      return undefined;
+    });
+
+    fireTurnEnd(FORK_ID, "completed");
+    await until(() => loads === 1);
+    await settle();
+
+    fireTurnEnd(FORK_ID, "completed");
+    await until(() => loads === 2);
+  });
+
   it("never fires for a non-fork agent", async () => {
     const state = await loadAgentState();
     const { ws, loads } = await hydratedProjectWith([agent(AGENT_1, PROJECT_1)]);

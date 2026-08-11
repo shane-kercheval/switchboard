@@ -76,6 +76,8 @@ A fan-out sends one instruction to several agents so they can work independently
 
 Forwarding uses the agents' actual responses and clearly labels each source for the recipient. If a selected agent is still working, Switchboard holds the dependent message until the response is ready. You can add your own instructions or apply a prompt while forwarding, so the handoff can say what the next agent should do with the supplied material rather than merely pasting it into a new terminal.
 
+Forking goes the other way. When a single Claude Code agent is the recipient, the send button grows a second half with a branch icon: pressing it sends your message to a _new_ agent that inherits the conversation so far, leaving the original untouched. Use it to explore an alternative approach from a shared starting point instead of overwriting a thread you might want back.
+
 Panes make that routing easy to see. You can keep agents with related roles together and address the pane as a group, while every agent remains an independent session that can also be targeted directly.
 
 ## Prompts and workflows
@@ -125,6 +127,7 @@ Switchboard drives each agent through its own CLI, so it inherits that CLI's cap
 - **Antigravity and hidden folders.** Antigravity can't work in a project whose path contains a hidden (dot-prefixed) folder — for example anything under `~/.config/…`. The agent still runs but can't see your files. Keep projects under normal paths like `~/repos/…`.
 - **Some messages can't be pinned.** Switchboard disables Pin when a message has no identity that survives reopening rather than risk attaching the pin to a different message. This includes some imported history and every Antigravity reply. A newly completed Gemini reply becomes pinnable after you reopen Switchboard and its session history is loaded. User messages sent through Switchboard can still be pinned.
 - **Picking up terminal-continued sessions.** If you continue a session in the agent CLI's own terminal, **Claude Code** picks up the new turns when you switch back to the project. **Codex, Gemini, and Antigravity don't yet** — reopen Switchboard to load their updated history.
+- **Forking a conversation is Claude Code only, and happens on send.** The branch half of the send button (⇧⌘↵) starts a new agent from everything said so far — useful for trying a second approach without losing the first. Switchboard supports Fork only for Claude Code today, so the half is absent for the other agents. It is also inseparable from a message: the branch is created _by_ the message you send, so there is no "fork now, ask later." The half is likewise absent while the selected agent is mid-turn (a branch taken then would miss the answer being written), while a send is in flight, and when more than one agent is selected. The inherited history appears in the new agent once its first reply completes.
 - **Slash-leading prompts can retain CLI command behavior.** Switchboard centrally resolves and renders the same prompt for each selected agent, but Gemini still processes recognized slash-leading text as native commands. Avoid slash-leading prompt bodies when they must behave the same across agent CLIs.
 
 ## Notifications

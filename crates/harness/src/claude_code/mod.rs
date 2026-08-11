@@ -248,20 +248,33 @@ fn build_args(
     // Any flag added later must be pushed BEFORE this `--`, or it lands as a
     // positional alongside the prompt.
     args.push("--".to_owned());
-    // Claude's headless CLI still routes a bare slash-leading positional through
-    // its interactive command parser (`/plugin`, `/context`, unknown commands),
-    // so the model may never see a plain Switchboard message. A single leading
-    // ASCII space bypasses that parser without changing the message's meaning.
-    // Keep this at the adapter boundary: the journal and frontend retain the
-    // user's exact text, and every dispatch source (compose, prompt, workflow,
-    // forward) gets the same literal-message contract.
-    let transport_prompt = if prompt.starts_with('/') {
+    args.push(claude_transport_prompt(prompt));
+    args
+}
+
+/// The exact text handed to `claude -p` for a given dispatch prompt.
+///
+/// Claude's headless CLI still routes a bare slash-leading positional through
+/// its interactive command parser (`/plugin`, `/context`, unknown commands), so
+/// the model may never see a plain Switchboard message. A single leading ASCII
+/// space bypasses that parser without changing the message's meaning. This lives
+/// at the adapter boundary: the journal and frontend retain the user's exact
+/// text, and every dispatch source (compose, prompt, workflow, forward) gets the
+/// same literal-message contract.
+///
+/// **Public because the transcript merge must reproduce it.** Correlating a
+/// journaled send against the prompt Claude recorded is an exact string
+/// comparison, and the session file holds *this* text, not the journal's. A
+/// second, drifting copy of the rule in the merge is precisely the bug that
+/// motivated exporting it — the merge calls this instead of guessing at
+/// normalization.
+#[must_use]
+pub fn claude_transport_prompt(prompt: &str) -> String {
+    if prompt.starts_with('/') {
         format!(" {prompt}")
     } else {
         prompt.to_owned()
-    };
-    args.push(transport_prompt);
-    args
+    }
 }
 
 /// Production wrapper: reads `$HOME` and delegates to `session_exists_in`.

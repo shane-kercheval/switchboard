@@ -8,8 +8,8 @@
     runtimes,
     transcripts,
   } from "$lib/state/index.svelte";
-  import { HARNESS_LABEL } from "$lib/harnessDisplay";
   import { forkAgentIntoOwnPane } from "$lib/state/workspace.svelte";
+  import { HARNESS_LABEL } from "$lib/harnessDisplay";
   import {
     addHeldForward,
     removeHeldForward,
@@ -813,7 +813,15 @@
       }
       if (e.key === "Enter") {
         if (composeEl?.contains(document.activeElement)) {
-          if (mode === "prompt") {
+          // ⇧⌘↵ asks to branch. Prompt and workflow modes have no fork, and the
+          // branches below would send *normally* — to the very agent the user
+          // was trying to branch away from, with no indication that is what
+          // happened. Intercept and explain. Plain mode never reaches here: the
+          // textarea's own handler owns the chord.
+          if (e.shiftKey && mode !== "plain") {
+            e.preventDefault();
+            handleForkSend();
+          } else if (mode === "prompt") {
             e.preventDefault();
             handlePrimaryAction();
           } else if (mode === "workflow") {
@@ -858,9 +866,6 @@
   // carries it registers the branch and dispatches its first turn as one
   // action, which is also why a parent and its not-yet-existing branch can
   // never be co-recipients.
-  const FORK_ENABLED_HINT =
-    "Send to a new branch of this agent: it inherits the conversation so far, then goes its own way.";
-  let forkEnabled = $state(false);
   /// The one recipient a fork could branch from, or `null` when the selection
   /// isn't a single agent.
   const forkCandidate = $derived<AgentRecord | null>(
@@ -893,32 +898,42 @@
     return (transcripts[agentId] ?? []).length > 0;
   }
 
-  /// Why the Fork chip is unavailable, or `null` when it can be used. The chip
-  /// is **always rendered** — hiding it would leave the multi-recipient and
-  /// wrong-harness cases with no explanation anywhere.
-  const forkUnavailableReason = $derived.by((): string | null => {
-    if (selectedAgents.length > 1) {
-      return "Fork branches one agent — select a single recipient.";
-    }
+  /// Why this send's *shape* rules out a fork, or `null` when it admits one.
+  /// Everything except whether the recipient happens to be busy right now.
+  ///
+  /// **Drives visibility as a boolean, and explanation as a string.** The fork
+  /// half is an unlabelled icon, so it is simply absent unless it applies —
+  /// dimmed, it would be unclickable noise rather than an explanation. But the
+  /// keyboard shortcut stays live in every one of these states and is then the
+  /// *only* fork surface the user can reach, so the reason has to exist as real
+  /// copy rather than as a comment. Silence there would swallow the keystroke.
+  ///
+  /// Separate from [`forkBlock`] because the two answer questions on different
+  /// clocks. Busy-ness flips the instant *this* send starts, with the pointer
+  /// still on the button; the shape only changes when the user changes the
+  /// selection. The button reserves its split footprint on the shape, so the
+  /// transition into a cancel can't narrow the control under the cursor.
+  const forkShapeBlock = $derived.by((): string | null => {
+    // Prompt and workflow modes compose their message somewhere other than
+    // `draft`, and the fork path dispatches `draft` — so a fork there would
+    // branch and then send the wrong text entirely. Plain-mode-only is the
+    // documented contract (system-design §9); prompt-mode forking is a tracked
+    // gap, not a boundary.
+    if (mode === "prompt") return "Fork isn't available while composing with a saved prompt.";
+    if (mode === "workflow") return "Fork isn't available while composing a workflow.";
+    // Fork branches one agent, so a multi-recipient send has no single source.
+    if (selectedAgents.length > 1) return "Fork branches one agent — select a single recipient.";
     const candidate = forkCandidate;
     if (candidate === null) return "Select an agent to branch from.";
     if (forwardSources.length > 0) {
-      // Both are send modifiers and the forward branch runs first, so an armed
-      // fork would lose silently: the message would go to the parent, exactly
-      // what the branch's selection swap exists to prevent. Mutual exclusion
-      // keeps the explanation where every other unavailable state lives, and
-      // the disarm effect does the rest.
+      // Both are send modifiers and the forward branch runs first, so a fork
+      // would lose silently: the message would go to the parent, exactly what
+      // the branch's selection swap exists to prevent.
       return "Fork branches from one agent's own history — clear the forward sources first.";
     }
+    // Claude is the only harness Switchboard can branch (`supports_session_fork`).
     if (candidate.harness !== "claude_code") {
       return `Switchboard can only branch Claude Code sessions, and ${candidate.name} is ${HARNESS_LABEL[candidate.harness]}.`;
-    }
-    if (agentIsWorking(runtimes[candidate.id])) {
-      // Probe-measured: a branch taken mid-turn inherits a synthesized
-      // "No response requested." placeholder instead of the parent's real
-      // answer, permanently. Wait-or-cancel, in that order — cancelling trades
-      // the parent's in-flight work for the branch.
-      return `${candidate.name} is working — a branch taken now would not include its current answer. Wait for it to finish, or cancel it first.`;
     }
     if (!looksLikeItHasASession(candidate.id)) {
       return `${candidate.name} has no session to branch from yet — send it a message first.`;
@@ -926,14 +941,50 @@
     return null;
   });
 
-  const forkAvailable = $derived(forkUnavailableReason === null);
+  const forkShapeAvailable = $derived(forkShapeBlock === null);
 
-  // Never leave the option armed once it stops being usable — the user changed
-  // the selection, or the parent started working, and a stale armed chip would
-  // silently fail at send.
-  $effect(() => {
-    if (!forkAvailable && forkEnabled) forkEnabled = false;
+  /// Why a fork can't be taken right now, or `null` when it can. Probe-measured:
+  /// a branch taken mid-turn inherits a synthesized "No response requested."
+  /// placeholder instead of the parent's real answer, permanently. The backend
+  /// re-checks this at dispatch — here it keeps the offer off the screen and
+  /// gives the shortcut something to say.
+  const forkBlock = $derived.by((): string | null => {
+    if (forkShapeBlock !== null) return forkShapeBlock;
+    const candidate = forkCandidate;
+    if (candidate !== null && agentIsWorking(runtimes[candidate.id])) {
+      return `${candidate.name} is working — a branch taken now would not include its current answer. Wait for it to finish, or cancel it first.`;
+    }
+    return null;
   });
+
+  const forkAvailable = $derived(forkBlock === null);
+
+  /// What pressing the fork shortcut should do. `nothing-to-send` is deliberate
+  /// silence: plain ⌘↵ on an empty composer already does nothing, and inventing
+  /// an error for the fork half alone would be an inconsistency the user has to
+  /// learn. Every *other* block explains itself.
+  type ForkAttempt =
+    | { kind: "ready"; source: AgentRecord }
+    | { kind: "blocked"; reason: string }
+    | { kind: "nothing-to-send" };
+
+  function evaluateForkAttempt(): ForkAttempt {
+    if (forkBlock !== null) return { kind: "blocked", reason: forkBlock };
+    const source = forkCandidate;
+    if (source === null) return { kind: "blocked", reason: "Select an agent to branch from." };
+    if (showStop) {
+      return { kind: "blocked", reason: "Wait for the send in flight to finish before branching." };
+    }
+    if (sending) return { kind: "blocked", reason: "Already sending." };
+    if (!allRecipientsHydrated) {
+      return {
+        kind: "blocked",
+        reason: `Still loading ${source.name}'s history — try again in a moment.`,
+      };
+    }
+    if (draft.trim() === "" && attachmentChips.length === 0) return { kind: "nothing-to-send" };
+    return { kind: "ready", source };
+  }
 
   /// `@` recipient picker: a trailing `@token` opens a typeahead of all agents;
   /// Enter / click picks one as the sole recipient and strips the token. This is
@@ -1446,7 +1497,8 @@
     // listener above, so it works whether the textarea or a chip has focus.
     if (event.key === "Enter" && event.metaKey) {
       event.preventDefault();
-      handlePrimaryAction();
+      if (event.shiftKey) handleForkSend();
+      else handlePrimaryAction();
     }
   }
 
@@ -1731,6 +1783,27 @@
       return;
     }
     void handleSubmit();
+  }
+
+  /// Send this message to a new branch of the recipient — the send button's
+  /// second half, and the only way a branch comes into existence.
+  ///
+  /// Guarded rather than relying on the control being hidden: the keyboard
+  /// shortcut reaches this too, and availability can change between keydown and
+  /// handling (the parent starts a turn). `showStop` is excluded because the
+  /// button is a cancel in that state and the half is not rendered.
+  function handleForkSend(): void {
+    const attempt = evaluateForkAttempt();
+    if (attempt.kind === "nothing-to-send") return;
+    if (attempt.kind === "blocked") {
+      // The shortcut is live in states where the button is hidden, so this is
+      // the only place the reason can reach the user. Never fall through to a
+      // normal send: that would message the agent they were branching away from.
+      sendError = attempt.reason;
+      return;
+    }
+    closeMentionMenu();
+    void dispatchForkSend(attempt.source, draft.trim(), snapshotAttachments());
   }
 
   /// Manual cross-agent forward (§7). Seeds the held "waiting for {agent}…" entry
@@ -2032,6 +2105,10 @@
     // synchronously, before the first await, paired with `sending` in
     // `sendDisabled`.
     sending = true;
+    // Snapshot which chips this send is carrying, before the await lets the user
+    // stage more.
+    // eslint-disable-next-line svelte/prefer-svelte-reactivity
+    const sentChipIds = new Set(attachmentChips.map((chip) => chip.id));
     let fork: AgentRecord;
     try {
       fork = await forkAgentIntoOwnPane(source.id);
@@ -2045,13 +2122,15 @@
     // leaving the parent selected would send the user's next message to the
     // agent they just branched away from.
     setSelectedIds([fork.id]);
-    forkEnabled = false;
     dispatchToRecipients(text, attachments, [fork]);
-    // Clear only what this send captured. The user can type while the fork
-    // round-trips, and blanket-clearing would silently eat the message they
-    // started composing for the branch.
+    // Clear only what this send captured. The user can type — and stage files —
+    // while the fork round-trips, and blanket-clearing would silently eat the
+    // message they started composing for the branch. Chips are removed by
+    // identity, not by emptying: dropping the whole list would take newly staged
+    // attachments with it, and keeping the whole list would re-send the ones
+    // that just went out.
     if (draft.trim() === text) draft = "";
-    commitChips([]);
+    commitChips(attachmentChips.filter((chip) => !sentChipIds.has(chip.id)));
     sendGeneration += 1;
     persistComposeNow();
   }
@@ -2215,11 +2294,6 @@
       commitChips([]);
       sendGeneration += 1;
       persistComposeNow();
-      return;
-    }
-
-    if (forkEnabled && forkCandidate !== null) {
-      await dispatchForkSend(forkCandidate, draft.trim(), attachments);
       return;
     }
 
@@ -2636,52 +2710,6 @@
           {/each}
         </div>
       {/if}
-      {#if mode === "plain"}
-        <!-- Fork: a send-time option, always rendered so its unavailable states
-             can explain themselves (a hidden control teaches nothing). Sits
-             ahead of the forward row — both are modifiers on this send.
-             `aria-disabled` rather than `disabled`: a natively-disabled button
-             cannot take keyboard focus, which would make the reason unreachable
-             without a mouse in exactly the states that most need explaining.
-             Activation is guarded in the handler instead. The reason is folded
-             into `aria-label` so it is *announced* on focus rather than only
-             revealed on hover; no `title`, which would render a second native
-             tooltip with the same text. -->
-        <div class="mb-1.5 flex flex-wrap items-center gap-1.5" data-testid="compose-options">
-          <Tooltip label={forkUnavailableReason ?? FORK_ENABLED_HINT} delayDuration={300}>
-            {#snippet trigger(props)}
-              <button
-                {...props}
-                type="button"
-                data-testid="compose-fork-toggle"
-                aria-pressed={forkEnabled}
-                aria-disabled={!forkAvailable || sending}
-                aria-label={forkUnavailableReason === null
-                  ? "Fork"
-                  : `Fork — ${forkUnavailableReason}`}
-                onclick={() => {
-                  if (forkAvailable && !sending) forkEnabled = !forkEnabled;
-                }}
-                class={cn(
-                  "flex items-center gap-1 rounded-full border px-2 py-0.5 text-xs transition-colors",
-                  forkEnabled
-                    ? "border-primary bg-primary/10 text-primary"
-                    : "border-subtle text-muted hover:text-fg",
-                  (!forkAvailable || sending) && "cursor-not-allowed opacity-50",
-                )}
-              >
-                {@render ForkIcon()}
-                Fork
-              </button>
-            {/snippet}
-          </Tooltip>
-          {#if forkEnabled && forkCandidate !== null}
-            <span class="text-muted text-xs" data-testid="compose-fork-caption">
-              Sending to a new branch of {forkCandidate.name}
-            </span>
-          {/if}
-        </div>
-      {/if}
       {#if mode === "plain" && forwardSources.length > 0}
         <!-- Plain-mode only: prompt mode forwards per-field, and workflow mode
            routes via its agent inputs, so the message-level forward set doesn't
@@ -3076,56 +3104,131 @@
   {/if}
 </div>
 
+<!-- Send, optionally split with Fork.
+     Fork is a *variant of sending*, not a compose mode — the branch comes into
+     existence as the turn this send dispatches — so it belongs on the send
+     control rather than beside the prompt/workflow selectors, which choose what
+     kind of message this is. As the second half it also costs no vertical space
+     in a bar that has little, and no horizontal space in the row the recipient
+     chips grow into.
+     The halves keep a **constant combined width** across the send→in-flight
+     transition: the button turns into a cancel the instant a send starts, which
+     happens with the pointer still on it, and a control that narrows under the
+     cursor invites cancelling a send you meant to fork. Availability changes
+     (selecting a second recipient, say) are user-initiated with the pointer
+     elsewhere, so the width may change there. -->
 {#snippet sendButton()}
-  <Tooltip
-    label={showStop ? (liveSends.size > 1 ? "Cancel all sends" : "Cancel send") : "Send"}
-    shortcut={shortcut("mod", "enter")}
+  {@const forkVisible = forkAvailable && !showStop}
+  <!-- The pill (shape + base fill) is the container; the halves are transparent
+       and round themselves, so each one's hover paints a circle inside its own
+       side rather than flooding it corner to corner. This only works because the
+       hover is its own named colour — a translucent tint over an identically
+       coloured parent composes to nothing, which is what made the first version
+       look like it had no hover at all. -->
+  <div
+    class={cn(
+      "flex h-7 shrink-0 items-center justify-center rounded-full",
+      showStop
+        ? "bg-active text-muted"
+        : sendDisabled
+          ? "bg-active text-muted/50"
+          : "bg-primary text-primary-fg",
+      // The in-flight cancel keeps the split's footprint (see above) without
+      // rendering a half that would cancel-vs-fork under a moving pointer.
+      // Keyed on the *shape*, not availability: this send is what made the
+      // recipient busy, so availability is already false by the time we get here.
+      showStop && forkShapeAvailable && "w-[3.25rem]",
+    )}
+    data-testid="compose-send-group"
   >
-    {#snippet trigger(props)}
-      <button
-        {...props}
-        type="button"
-        data-testid="compose-send"
-        onclick={handlePrimaryAction}
-        disabled={primaryDisabled}
-        aria-label={showStop ? (liveSends.size > 1 ? "Cancel all sends" : "Cancel send") : "Send"}
-        class={cn(
-          "flex h-7 w-7 shrink-0 items-center justify-center rounded-full transition-colors",
-          showStop
-            ? "bg-active text-muted hover:bg-status-failed-soft/70 hover:text-status-failed"
-            : sendDisabled
-              ? "bg-active text-muted/50 cursor-not-allowed"
-              : "bg-primary text-primary-fg hover:bg-primary/90",
-        )}
+    <Tooltip
+      label={showStop ? (liveSends.size > 1 ? "Cancel all sends" : "Cancel send") : "Send"}
+      shortcut={shortcut("mod", "enter")}
+    >
+      {#snippet trigger(props)}
+        <button
+          {...props}
+          type="button"
+          data-testid="compose-send"
+          onclick={handlePrimaryAction}
+          disabled={primaryDisabled}
+          aria-label={showStop ? (liveSends.size > 1 ? "Cancel all sends" : "Cancel send") : "Send"}
+          class={cn(
+            "flex h-7 shrink-0 items-center justify-center rounded-full",
+            // In flight the split becomes ONE cancel — same pill, same footprint,
+            // just the cancel icon and colours. The half grows to fill the pill so
+            // the whole shape stays clickable, rather than leaving dead margin
+            // around a circle.
+            showStop && forkShapeAvailable ? "w-full" : "w-7",
+            showStop
+              ? "hover:bg-status-failed-soft/70 hover:text-status-failed"
+              : sendDisabled
+                ? "cursor-not-allowed"
+                : "hover:bg-primary-hover",
+          )}
+        >
+          {#if showStop}
+            <StopIcon class="size-5" />
+          {:else if sending}
+            <svg
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2.25"
+              class="h-3.5 w-3.5 animate-spin"
+              aria-hidden="true"
+            >
+              <path d="M21 12a9 9 0 1 1-6.2-8.6" stroke-linecap="round" />
+            </svg>
+          {:else}
+            <svg
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2.25"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              class="h-3.5 w-3.5"
+              aria-hidden="true"
+            >
+              <path d="M12 19V5M5 12l7-7 7 7" />
+            </svg>
+          {/if}
+        </button>
+      {/snippet}
+    </Tooltip>
+    {#if forkVisible}
+      <!-- Divider: the two halves do different things and one of them creates an
+           agent, so the seam stays visible while either side is hovered. Its own
+           strip, so neither half's hover fill paints over it. -->
+      <span class="flex h-7 w-px shrink-0 items-center" aria-hidden="true">
+        <span class={cn("h-4 w-px", sendDisabled ? "bg-muted/30" : "bg-primary-fg/25")}></span>
+      </span>
+      <Tooltip
+        label={forkCandidate === null
+          ? "Send to a new branch"
+          : `Send to a new branch of ${forkCandidate.name} — it inherits the conversation so far, then goes its own way.`}
+        shortcut={shortcut("mod", "shift", "enter")}
       >
-        {#if showStop}
-          <StopIcon class="size-5" />
-        {:else if sending}
-          <svg
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="2.25"
-            class="h-3.5 w-3.5 animate-spin"
-            aria-hidden="true"
+        {#snippet trigger(props)}
+          <button
+            {...props}
+            type="button"
+            data-testid="compose-fork-send"
+            onclick={handleForkSend}
+            disabled={sendDisabled}
+            aria-label={forkCandidate === null
+              ? "Send to a new branch"
+              : `Send to a new branch of ${forkCandidate.name}`}
+            class={cn(
+              "flex h-7 w-7 shrink-0 items-center justify-center rounded-full",
+              sendDisabled ? "cursor-not-allowed" : "hover:bg-primary-hover",
+            )}
           >
-            <path d="M21 12a9 9 0 1 1-6.2-8.6" stroke-linecap="round" />
-          </svg>
-        {:else}
-          <svg
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="2.25"
-            stroke-linecap="round"
-            stroke-linejoin="round"
-            class="h-3.5 w-3.5"
-            aria-hidden="true"
-          >
-            <path d="M12 19V5M5 12l7-7 7 7" />
-          </svg>
-        {/if}
-      </button>
-    {/snippet}
-  </Tooltip>
+            {@render ForkIcon()}
+          </button>
+        {/snippet}
+      </Tooltip>
+    {/if}
+  </div>
 {/snippet}

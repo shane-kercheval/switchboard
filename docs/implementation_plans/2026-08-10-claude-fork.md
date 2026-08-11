@@ -149,6 +149,21 @@ harness-behavior.md §3.5.** Summary, because two design claims rest on them:
 
 ## Design decisions (settled in discussion + review — do not re-derive)
 
+> **Amendment (M3, after seeing it running).** "The Fork chip" below shipped as
+> **the second half of the send button** — an oval whose left half sends and
+> whose right half (branch icon, `⇧⌘↵`) sends to a new branch. Read every "chip"
+> in this document as that half. The reasoning that produced the chip is
+> unchanged and still correct — fork is a *modifier on this send*, so it belongs
+> with the send — but a labelled chip on its own row spent vertical space the
+> compose bar does not have, and the alternative placements all mis-file a
+> send-variant among the *mode* selectors (prompt/workflow) or crowd the row the
+> recipient chips grow into. Two consequences worth carrying: there is **no armed
+> state** any more (arming and sending collapse into one click, which deletes the
+> stale-armed-chip class of bugs), and the half is **hidden rather than disabled**
+> when unavailable — an unlabelled icon that is visible-but-dead explains nothing,
+> so the "always render it so it can explain itself" rule that applied to a
+> labelled chip does not transfer.
+
 - **Fork is a send, because a fork *is* a send (probe #4).** The Fork chip in the
   compose bar, enabled with exactly one Claude recipient selected, makes that
   send the branch point: on submit, Switchboard registers `X-fork`
@@ -311,8 +326,28 @@ harness-behavior.md §3.5.** Summary, because two design claims rest on them:
 
 ## Why the transcript side is (verifiably) safe
 
-No merge/rendering changes are needed, but this is subtle enough that M3 must pin
-it with tests rather than trust it:
+This was expected to need no merge/rendering changes — which held everywhere
+except the hazardous mid-turn ordering (see the Outcome immediately below). The
+reasoning is subtle enough that M3 must pin it with tests rather than trust it:
+
+> **Outcome (M3).** The prediction below held for every case *except* the
+> hazardous mid-turn ordering, where it was wrong: the DoD's synthesized fixture
+> found a real defect and it was fixed rather than characterized. When a fork's
+> first turn fails before a `TurnLink` is written, the merge falls to the
+> provenance walk, where an in-window copied prompt consumed the fork's own
+> send — suppressing the copy and re-importing the user's real prompt as a
+> duplicate. `classify_turns_by_provenance` now switches from position to
+> identity whenever in-window `Sdk` candidates outnumber the agent's sends: a
+> candidate consumes a send only when its recorded text is *exactly* the text
+> that send dispatched (`render_prompt_with_attachments` plus the Claude
+> adapter's transport rule, both reconstructed from the journal) and only when it
+> is the unique such candidate — ambiguity declines rather than guessing, and the
+> assignment is precomputed across all sends so a declined one cannot strand the
+> sends behind it. The balanced case — every candidate has a send — is untouched
+> and still purely positional. Mutation-verified. Separately, the cross-agent-key claim below is *understated*:
+> agent-scoped link maps are one of **two** independent defenses, the other being
+> the window guard's decline of a link naming a send this agent never received.
+> Removing either alone still renders correctly; the code comment now says so.
 
 - The copied history's records keep the **parent's timestamps** and
   `promptSource: "sdk"`. In `merge_project_conversation`, sends, links, and
@@ -537,12 +572,14 @@ The feature is usable end to end and its transcript behavior is pinned.
   Residual imprecision is all in the safe direction — a failed-first-turn agent,
   and a real session that parses to zero turns, both read as branchable — and
   the backend's `resolve_session_file` check refuses them precisely.
-  The chip uses `aria-disabled` with guarded activation, not the native
-  `disabled` attribute: a natively-disabled button cannot take keyboard focus,
-  which would make the reason unreachable without a mouse in exactly the states
-  that need explaining. The reason is folded into the accessible name so it is
-  announced on focus, not only on hover; no `title` (it would render a second
-  native tooltip with the same text).
+  **Superseded by the M3 amendment above** — this paragraph describes the
+  labelled chip. As the send button's unlabelled second half the control is
+  *hidden* when unavailable rather than rendered `aria-disabled`: a dimmed icon
+  with no label is unclickable noise, not an explanation. The reasons survive as
+  real copy, surfaced by the `⇧⌘↵` shortcut, which stays live in every
+  unavailable state and refuses with the reason rather than swallowing the
+  keystroke. Never fall through to a normal send there — it would message the
+  agent the user was branching away from.
   **The fork-send is single-flight.** It introduces the only `await` into the
   plain submit path, which had no busy term in `sendDisabled` because it had
   been synchronous; without one, two submits across that await each register a

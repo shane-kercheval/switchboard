@@ -42,6 +42,7 @@ import type {
   WorkspaceDirectoryInfo,
 } from "$lib/types";
 import { tick, untrack } from "svelte";
+import { SvelteSet } from "svelte/reactivity";
 import { harnessAvailability, settledHarnessAvailability } from "$lib/harnessAvailability.svelte";
 import { AUTO_SEED_ON_NEW_PROJECT } from "$lib/harnessDisplay";
 import {
@@ -779,11 +780,22 @@ function ensureProjectLoaded(projectId: ProjectId): Promise<void> {
 /// *duplicate* the live turn (the live-vs-disk hazard the per-harness gate
 /// exists to prevent). On first hydrate the filter is absent → all agents apply
 /// (safe: no live turns exist at project open).
+/// Outcome of a hydration attempt, for callers that must distinguish "the data
+/// arrived" from "nothing changed".
+///
+/// **`skipped` and `failed` are not interchangeable, and neither is `applied`.**
+/// A refresh deliberately preserves the previously loaded conversation when it
+/// fails (see below), so `conversations[projectId].status` reads `"complete"`
+/// whether the read succeeded or threw — it cannot be used as a success signal
+/// by anyone downstream. `skipped` means another hydration held the guard, so
+/// this caller's work may still be pending and should be retried later.
+export type HydrateOutcome = "applied" | "skipped" | "failed";
+
 export async function hydrateProject(
   projectId: ProjectId,
   agentTurnFilter?: ReadonlySet<AgentId>,
-): Promise<void> {
-  if (hydrationStarted.has(projectId)) return;
+): Promise<HydrateOutcome> {
+  if (hydrationStarted.has(projectId)) return "skipped";
   hydrationStarted.add(projectId);
   // A refresh (the only caller passing `agentTurnFilter`) re-reads over a
   // known-good loaded view, so it must be non-destructive: keep the current
@@ -908,6 +920,18 @@ export async function hydrateProject(
 
     conversations[projectId] = { items: overlay, status: "complete" };
     if (baseline !== undefined) sessionFingerprintBaseline.set(projectId, baseline);
+    if (!isRefresh) seedPendingForkHistory(projectId, baseline);
+    // A per-agent parse failure means that agent contributed no turns even
+    // though the project load succeeded — for a caller waiting on one specific
+    // agent's history that is a failure, not an application.
+    const filtered = agentTurnFilter;
+    if (filtered !== undefined) {
+      const failedAgent = convo.agents.some(
+        (meta) => filtered.has(meta.agent_id) && meta.load_error != null,
+      );
+      if (failedAgent) return "failed";
+    }
+    return "applied";
   } catch (e) {
     const message = e instanceof Error ? e.message : String(e);
     console.warn("[switchboard] hydrateProject failed", { project_id: projectId, error: e });
@@ -917,6 +941,7 @@ export async function hydrateProject(
     if (!isRefresh) {
       conversations[projectId] = { items: [], status: "failed", error: message };
     }
+    return "failed";
   }
 }
 
@@ -1020,6 +1045,9 @@ export async function forkAgentIntoOwnPane(sourceId: AgentId): Promise<AgentReco
     assignAgentToFirstVisibleEmptyPane(fork.project_id, rosterIds, fork.id) ??
     moveAgentToNewPane(fork.project_id, rosterIds, fork.id);
   revealPane(fork.project_id, rosterIds, paneId);
+  // The branch does not exist yet — the send that follows this call is what
+  // materializes it — so the transcript cue arms here, before the first turn.
+  forkHistoryPending.add(fork.id);
   return fork;
 }
 
@@ -1032,6 +1060,59 @@ export async function forkAgentIntoOwnPane(sourceId: AgentId): Promise<AgentReco
 // Bookkeeping only — never read during render, so it needs no reactivity.
 // eslint-disable-next-line svelte/prefer-svelte-reactivity
 const forkHistoryLoaded = new Set<AgentId>();
+
+/// Forks materialized **this session** whose inherited history hasn't arrived
+/// yet — the transcript's "this is a branch, its earlier conversation is still
+/// coming" cue. Reactive because it is read during render.
+///
+/// **Deliberately not the same set as [`forkHistoryLoaded`].** The two answer
+/// different questions. The refresh's one-shot guard tracks whether the history
+/// has been pulled; this tracks whether the *user needs telling* that it hasn't.
+/// Armed at fork creation, and re-armed on project open for branches that never
+/// materialized (see [`seedPendingForkHistory`]) — a branch whose first turn
+/// failed before a restart is still waiting, and the cue would otherwise vanish
+/// in exactly the case it was widened to cover.
+const forkHistoryPending = new SvelteSet<AgentId>();
+
+/// Whether `agentId` is a fork still waiting for its inherited history — read by
+/// the transcript to decide whether to explain the branch's empty backlog.
+export function isAwaitingForkHistory(agentId: AgentId): boolean {
+  return forkHistoryPending.has(agentId);
+}
+
+/// Re-arm the branch cue for forks that never materialized, on project open.
+///
+/// A branch created in an earlier session whose first turn failed has no session
+/// file and therefore no inherited history — the cue is exactly as true as it was
+/// before the restart, and the next successful turn is what resolves it. A branch
+/// that *did* materialize needs no cue: the ordinary load already brought its
+/// history in.
+///
+/// **The signal is the session file, not the transcript.** "Fork provenance plus
+/// an empty per-agent slice" looks equivalent and is not: a real session can load
+/// with no agent turns (cancelled after the file was created, a parent holding
+/// only a dangling prompt), which would pin a permanent "history is coming" cue
+/// on a branch that already has everything. The fingerprint distinguishes them —
+/// for a refresh-capable harness an absent fingerprint means the file does not
+/// exist. When fingerprints are unavailable, seed nothing: a missing cue is
+/// cosmetic, a false permanent one is not.
+function seedPendingForkHistory(
+  projectId: ProjectId,
+  fingerprints: AgentSessionFingerprint[] | undefined,
+): void {
+  // `== null` deliberately: the probe is best-effort and its failure path can
+  // yield either absence or an explicit null. Seeding must never be able to
+  // break the hydration it rides along with.
+  if (fingerprints == null) return;
+  const byAgent = new Map(fingerprints.map((f) => [f.agent_id, f]));
+  for (const agent of agentsByProject[projectId] ?? []) {
+    if (agent.forked_from_session == null) continue;
+    if (forkHistoryLoaded.has(agent.id)) continue;
+    const fingerprint = byAgent.get(agent.id);
+    if (fingerprint === undefined || !fingerprint.refresh_capable) continue;
+    if (fingerprint.fingerprint == null) forkHistoryPending.add(agent.id);
+  }
+}
 
 /// Load a freshly materialized fork's inherited history.
 ///
@@ -1063,10 +1144,17 @@ async function loadForkInheritedHistory(agentId: AgentId): Promise<void> {
   // the open path will read this session anyway.
   if (conversations[projectId]?.status !== "complete") return;
   hydrationStarted.delete(projectId);
-  await hydrateProject(projectId, new Set([agentId]));
-  // Mark only on success: a failed load applied nothing, so the next completed
-  // turn should try again.
-  if (conversations[projectId]?.status === "complete") forkHistoryLoaded.add(agentId);
+  const outcome = await hydrateProject(projectId, new Set([agentId]));
+  // Only an `applied` read actually produced inherited history. `failed` keeps
+  // the one-shot unset so the next completed turn retries; `skipped` means a
+  // concurrent hydration held the guard (two branches finishing together) and
+  // this fork's own read never ran, so it likewise retries. Reading
+  // `conversations[projectId].status` here instead would report success for
+  // both — a refresh preserves the prior `"complete"` view when it throws.
+  if (outcome === "applied") {
+    forkHistoryLoaded.add(agentId);
+    forkHistoryPending.delete(agentId);
+  }
 }
 
 /// Wire the terminal hook that drives [`loadForkInheritedHistory`]. Called once
@@ -1083,6 +1171,7 @@ export function installForkHistoryRefresh(): void {
 export const _testing = {
   reset(): void {
     forkHistoryLoaded.clear();
+    forkHistoryPending.clear();
     setTurnTerminalHook(undefined);
     workspace.directories = [];
     workspace.persistable = true;

@@ -876,12 +876,20 @@
   /// selection change would make the compose bar's request sequence depend on
   /// which agent is selected.
   ///
-  /// Imprecise in one direction, safely: an agent whose *only* turn failed
-  /// before the harness wrote a session file reads as "has a session," so the
-  /// chip is offered and the backend refuses with a precise error. The reverse
-  /// (a real session reading as absent) can't happen — hydration puts its turns
-  /// in the transcript on project open.
+  /// **Advisory, not exact.** It errs toward offering the chip; the backend
+  /// re-validates through `resolve_session_file` and returns a precise error.
+  /// Known imprecision, all in the safe direction: an agent whose only turn
+  /// failed before a session file was written reads as branchable, and so does
+  /// a real session that parses to zero turns (an empty or housekeeping-only
+  /// file). Hydration state is consulted so the *unsafe* direction — a real
+  /// session reading as absent while hydration is loading or has failed —
+  /// cannot happen.
   function looksLikeItHasASession(agentId: AgentId): boolean {
+    // An empty transcript is evidence only once hydration has *completed*.
+    // While loading, and permanently after a failure, it is empty for an agent
+    // that may have a long history — and "send it a message first" is then not
+    // merely unhelpful but false.
+    if (runtimes[agentId]?.hydration_status !== "complete") return true;
     return (transcripts[agentId] ?? []).length > 0;
   }
 
@@ -894,6 +902,14 @@
     }
     const candidate = forkCandidate;
     if (candidate === null) return "Select an agent to branch from.";
+    if (forwardSources.length > 0) {
+      // Both are send modifiers and the forward branch runs first, so an armed
+      // fork would lose silently: the message would go to the parent, exactly
+      // what the branch's selection swap exists to prevent. Mutual exclusion
+      // keeps the explanation where every other unavailable state lives, and
+      // the disarm effect does the rest.
+      return "Fork branches from one agent's own history — clear the forward sources first.";
+    }
     if (candidate.harness !== "claude_code") {
       return `Switchboard can only branch Claude Code sessions, and ${candidate.name} is ${HARNESS_LABEL[candidate.harness]}.`;
     }
@@ -1100,6 +1116,7 @@
     mode === "prompt"
       ? selectedPrompt === null || missingRequired.length > 0 || sending || !allRecipientsHydrated
       : (draft.trim() === "" && attachmentChips.length === 0 && forwardSources.length === 0) ||
+          sending ||
           !allRecipientsHydrated,
   );
 
@@ -2008,12 +2025,21 @@
     text: string,
     attachments: Attachment[],
   ): Promise<void> {
+    // **Single-flight.** This is the only `await` in the plain submit path, and
+    // that path's `sendDisabled` had no busy term before it existed. Two submits
+    // across this await would each register a branch and each dispatch the same
+    // text — two agents, the message sent twice, quota spent twice. Set
+    // synchronously, before the first await, paired with `sending` in
+    // `sendDisabled`.
+    sending = true;
     let fork: AgentRecord;
     try {
       fork = await forkAgentIntoOwnPane(source.id);
     } catch (err) {
       sendError = `Fork failed: ${err instanceof Error ? err.message : String(err)}`;
       return;
+    } finally {
+      sending = false;
     }
     // Selection follows the branch: the conversation continues there, and
     // leaving the parent selected would send the user's next message to the
@@ -2021,7 +2047,10 @@
     setSelectedIds([fork.id]);
     forkEnabled = false;
     dispatchToRecipients(text, attachments, [fork]);
-    draft = "";
+    // Clear only what this send captured. The user can type while the fork
+    // round-trips, and blanket-clearing would silently eat the message they
+    // started composing for the branch.
+    if (draft.trim() === text) draft = "";
     commitChips([]);
     sendGeneration += 1;
     persistComposeNow();
@@ -2610,7 +2639,14 @@
       {#if mode === "plain"}
         <!-- Fork: a send-time option, always rendered so its unavailable states
              can explain themselves (a hidden control teaches nothing). Sits
-             ahead of the forward row — both are modifiers on this send. -->
+             ahead of the forward row — both are modifiers on this send.
+             `aria-disabled` rather than `disabled`: a natively-disabled button
+             cannot take keyboard focus, which would make the reason unreachable
+             without a mouse in exactly the states that most need explaining.
+             Activation is guarded in the handler instead. The reason is folded
+             into `aria-label` so it is *announced* on focus rather than only
+             revealed on hover; no `title`, which would render a second native
+             tooltip with the same text. -->
         <div class="mb-1.5 flex flex-wrap items-center gap-1.5" data-testid="compose-options">
           <Tooltip label={forkUnavailableReason ?? FORK_ENABLED_HINT} delayDuration={300}>
             {#snippet trigger(props)}
@@ -2619,8 +2655,10 @@
                 type="button"
                 data-testid="compose-fork-toggle"
                 aria-pressed={forkEnabled}
-                title={forkUnavailableReason ?? FORK_ENABLED_HINT}
-                disabled={!forkAvailable || sending}
+                aria-disabled={!forkAvailable || sending}
+                aria-label={forkUnavailableReason === null
+                  ? "Fork"
+                  : `Fork — ${forkUnavailableReason}`}
                 onclick={() => {
                   if (forkAvailable && !sending) forkEnabled = !forkEnabled;
                 }}

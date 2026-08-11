@@ -1215,8 +1215,18 @@ async fn invoke_workflow(
     forward_sources: std::collections::BTreeMap<String, Vec<switchboard_core::AgentId>>,
 ) -> Result<String, String> {
     let effective = merge_workflow_forwards(state.inner(), &inputs, &forward_sources).await?;
-    let run_id = invoke_workflow_impl(state.inner(), project_id, &name, is_builtin, &effective)
-        .map_err(|e| e.to_string())?;
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default();
+    let run_id = invoke_workflow_impl(
+        state.inner(),
+        project_id,
+        &name,
+        is_builtin,
+        &effective,
+        &home,
+    )
+    .map_err(|e| e.to_string())?;
     request_notification_authorization(state.inner());
     Ok(run_id.to_string())
 }

@@ -199,14 +199,29 @@ harness-behavior.md §3.5.** Summary, because two design claims rest on them:
   actions. **Fork-on-send deletes the co-send hazard outright** — the chip
   requires a single recipient and the branch doesn't exist until the send
   resolves, so the pair can never be co-recipients. What remains:
-  - **The authoritative check lives in the common dispatch path**, not in fork
+  - **The authoritative check lives on the dispatch paths**, not in fork
     registration. Condition: the recipient is a *materializing fork*
     (`forked_from_session` set **and** its own session file absent) and its
     parent agent is currently running a turn → refuse with the educational
-    error (workflow-collision posture, not queueing). Siting it here is what
-    makes it cover the fork-send flow, **failure-retry sends** (a fork whose
-    first turn failed retries through the ordinary send path and never touches
-    `fork_agent_impl`), and workflow/forward sends — one rule, one place.
+    error (workflow-collision posture, not queueing). Siting it there is what
+    covers **failure-retry sends**: a fork whose first turn failed retries
+    through the ordinary send path and never touches `fork_agent_impl`.
+  - **Enumerate the dispatch entry points; never assert a universal invariant.**
+    There are two. `send_message_impl` covers compose *and* the manual forward
+    (which resolves a body backend-side and is re-sent through it — verified,
+    not assumed). The **workflow step dispatch** is the second and reaches the
+    harness *without* `send_message_impl`. The interpreter deliberately holds no
+    `AppState`, so its check arrives through the existing
+    `DispatchFactoryProvider` seam as a `preflight` method implemented in the app
+    layer — not by threading app state into the workflow engine, and not by
+    inventing a dispatch service. A third path must be added to this list;
+    "every send funnels through here" cannot be checked where someone adds one.
+  - **Parent lookup is scoped to the fork's own project.** A fork inherits its
+    source's `project_id`, so same-project is the exact scope — and a global scan
+    would be wrong, not merely wide: Claude session ids are cwd-namespaced and
+    uniqueness is enforced only *per directory*, so the same id can name a
+    different session in another directory. An unscoped match can consult an
+    unrelated agent, letting an unsafe fork through or blocking a valid one.
   - **Busy is read via the dispatcher's actor, not a status flag.** The
     dispatcher deliberately has no shared per-agent status flag or idle guard —
     "one turn in flight" is structural in the per-agent actor. The correct
@@ -497,19 +512,41 @@ The feature is usable end to end and its transcript behavior is pinned.
   check.
 - **Chip enablement** (compose): the chip is **always present** beside Forward
   — never conditionally hidden — and *enabled* only when the selection is
-  exactly one recipient that is Claude (`harness`), has
-  `sessionInfo?.session_file` (the existing existence-filtered signal — no new
-  IPC), and is not mid-turn. Every other case is disabled **with a tooltip
-  naming the specific reason**: multiple recipients, non-Claude recipient, no
-  session to branch from yet, parent mid-turn. (Always-present is what makes
+  exactly one recipient that is Claude (`harness`), looks like it has a session
+  to branch from, is not mid-turn, and has **no forward sources attached**.
+  Every other case is disabled **with a tooltip naming the specific reason**:
+  multiple recipients, non-Claude recipient, no session to branch from yet,
+  parent mid-turn, forward sources attached. (Fork and Forward are both send
+  modifiers and the forward branch runs first in submit, so an armed fork would
+  otherwise lose silently and message the parent — the exact outcome the
+  branch's selection swap exists to prevent.) (Always-present is what makes
   the multi-recipient tooltip reachable at all; hiding the chip would leave the
   user with no explanation.) The non-Claude tooltip derives from
   `SessionForkUnsupported`'s wording (Switchboard's support, not vendor
   capability); the mid-turn tooltip says "wait or cancel" **in that order** —
   cancelling trades the parent's in-flight work for the branch. Frontend busy
   state here is **UX only**; the authoritative check is in the dispatch path
-  (below). Tooltip-on-disabled-chip is the standard wrapper pattern; no
-  primitive verification task (that concern was specific to Radix menu items).
+  (below).
+  **Session presence is advisory and derived locally — not
+  `sessionInfo?.session_file`.** An earlier draft named that exact signal;
+  fetching it per selection change puts an IPC in the compose bar's request
+  sequence, so the chip reads the agent's transcript instead, gated on
+  hydration having *completed* (an empty transcript means nothing while
+  hydration is loading or has permanently failed — an agent with a long history
+  would otherwise be told to "send it a message first," which is false).
+  Residual imprecision is all in the safe direction — a failed-first-turn agent,
+  and a real session that parses to zero turns, both read as branchable — and
+  the backend's `resolve_session_file` check refuses them precisely.
+  The chip uses `aria-disabled` with guarded activation, not the native
+  `disabled` attribute: a natively-disabled button cannot take keyboard focus,
+  which would make the reason unreachable without a mouse in exactly the states
+  that need explaining. The reason is folded into the accessible name so it is
+  announced on focus, not only on hover; no `title` (it would render a second
+  native tooltip with the same text).
+  **The fork-send is single-flight.** It introduces the only `await` into the
+  plain submit path, which had no busy term in `sendDisabled` because it had
+  been synchronous; without one, two submits across that await each register a
+  branch and each dispatch the same text.
 - **TS mirror** (landed in M1 follow-up): `forked_from_session` on
   `AgentRecord` — the refresh trigger needs the provenance frontend-side.
 - **One-shot inherited-history refresh.** Contract: exactly one *successful*
@@ -628,6 +665,24 @@ The feature is usable end to end and its transcript behavior is pinned.
   observed absent-or-complete child-file behavior — a bounded observation at
   2.1.226, not a guarantee (falsifier documented in harness-behavior §3.5;
   re-probe on CLI bumps).
+- **Fork is available in plain compose mode only**, not while composing with a
+  saved prompt. Nothing about branching is incompatible with prompt mode — it
+  mirrors how forward sources are plain-mode-only, and the workaround (switch to
+  plain mode) is discoverable. Tracked as intended work, not a permanent
+  boundary; if it is wired later, reuse the single-flight guard from the plain
+  path.
+- **A listener-registration failure after the backend has created an agent
+  strands a durable, invisible record.** The UI reports failure and shows
+  nothing, retrying makes a second agent, and the first appears after restart.
+  **This is a shared create / attach / fork lifecycle issue, not a fork
+  limitation** — `createOrAttachAndRegister` has the identical ordering, and
+  fork deliberately mirrors it. Do not "fix" it in `forkAgentIntoOwnPane` alone
+  and delete this entry: the two older paths would keep the bug. The intended
+  fix is a shared rule — once the backend returns an `AgentRecord`, treat
+  creation as committed, reconcile it into the roster even if listener setup
+  fails, represent that failure explicitly, and allow retrying registration.
+  Until then, a reported "Fork failed" does **not** guarantee nothing was
+  persisted.
 - Co-paning a fork with its parent shows the shared history twice (interleaved at
   identical timestamps) — reachable only by explicit user layout choice; the
   default placement avoids it.

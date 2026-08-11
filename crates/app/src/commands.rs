@@ -1848,17 +1848,29 @@ async fn ensure_materializing_fork_may_dispatch(
     if resolve_session_file(agent, &project.directory, home_dir).is_some() {
         return Ok(());
     }
-    // Find the parent by session id. The parent agent may have been deleted —
-    // then nothing of ours can be writing that session, so there is nothing to
-    // wait for and the fork proceeds.
+    // Find the parent by session id, **within the fork's own project**. A fork
+    // always inherits its source's `project_id`, so same-project is the exact
+    // scope — and an unscoped scan would be wrong, not merely wide: Claude
+    // session ids are cwd-namespaced, so `check_claude_session_id_unique` only
+    // enforces uniqueness per directory and the same id may legitimately name a
+    // different session in another directory. A global match could consult an
+    // unrelated agent, letting an unsafe fork through or blocking a valid one.
+    //
+    // The parent may have been deleted — then nothing of ours is writing that
+    // session, so there is nothing to wait for and the fork proceeds.
+    //
+    // The `agents_by_id` guard is a temporary that drops at the end of this
+    // `let`, deliberately **before** the await below. Do not hoist it into a
+    // binding: that would hold a std mutex across an await point.
     let parent = lock(&state.agents_by_id)
         .values()
         .find(|candidate| {
-            candidate
-                .session_locator
-                .as_ref()
-                .and_then(SessionLocator::as_uuid)
-                == Some(parent_session)
+            candidate.project_id == agent.project_id
+                && candidate
+                    .session_locator
+                    .as_ref()
+                    .and_then(SessionLocator::as_uuid)
+                    == Some(parent_session)
         })
         .cloned();
     match parent {
@@ -2811,10 +2823,16 @@ pub async fn send_message_impl(
     home_dir: &Path,
 ) -> Result<MessageId, AppError> {
     let (project, agent) = lookup_agent(state, agent_id)?;
-    // Authoritative mid-turn fork gate. Every send funnels through here, which
-    // is the point: the fork-send flow, a retry after a failed first fork turn,
-    // and workflow/forward sends all reach it. No-op for a non-fork agent and
-    // for a fork that already has its own session.
+    // Authoritative mid-turn fork gate. **Dispatch entry points are enumerated,
+    // not assumed**: this function and the workflow step dispatch (via
+    // `DispatchFactoryProvider::preflight`) are the two places a turn starts, and
+    // both run this check. An earlier version claimed "every send funnels
+    // through here," which was false — workflow steps call the dispatcher
+    // directly — and a universal claim like that cannot be checked at the point
+    // where someone adds a third path. If you add one, add it to this list.
+    // (The manual cross-agent forward is not a third path: `forward_message`
+    // resolves a body and the frontend re-sends it through this function.)
+    // No-op for a non-fork agent and for a fork that already has its own session.
     ensure_materializing_fork_may_dispatch(state, &project, &agent, home_dir).await?;
     // Claude is spawned with cwd = the user's bound working directory (the
     // folder they opened), NOT the per-project metadata directory inside
@@ -3868,7 +3886,11 @@ pub struct AgentSessionInfo {
 /// [`project_session_fingerprints_impl`] go through here so the freshness check
 /// reads the *same* file transcript loading does, with no second copy of the
 /// resolution logic to drift.
-fn resolve_session_file(agent: &AgentRecord, directory: &Path, home_dir: &Path) -> Option<PathBuf> {
+pub(crate) fn resolve_session_file(
+    agent: &AgentRecord,
+    directory: &Path,
+    home_dir: &Path,
+) -> Option<PathBuf> {
     match agent.harness {
         HarnessKind::ClaudeCode => {
             let sid = locator_uuid(agent)?;
@@ -6184,6 +6206,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fork_agent_refuses_while_the_source_is_working() {
+        // The *early* gate. The send-path gate would catch this a moment later,
+        // but only after an agent had already been created — leaving the user a
+        // branch they didn't get to use plus an error. This check is why that
+        // doesn't happen, so it needs its own test: nothing else fails if it's
+        // deleted.
+        let (_tmp, home, state, gate, project_id) = state_with_parked_claude(&["parent"]).await;
+        let source_id = seed_source(&state, home.path(), project_id, "alice", "hello");
+        let before = lock(&state.agents_by_id).len();
+
+        send_msg_with_home(&state, source_id, "long one", home.path())
+            .await
+            .unwrap();
+        await_turn_running(&state, source_id).await;
+
+        let err = fork_agent_impl(&state, source_id, home.path())
+            .await
+            .expect_err("forking a working agent must be refused");
+        assert!(
+            matches!(err, AppError::ForkSourceBusy { .. }),
+            "got: {err:?}"
+        );
+        assert_eq!(
+            lock(&state.agents_by_id).len(),
+            before,
+            "a refused fork must not leave an agent behind"
+        );
+
+        gate.notify_waiters();
+    }
+
+    #[tokio::test]
+    async fn fork_agent_uses_the_sources_own_project_not_the_active_one() {
+        // `fork_agent_impl` takes an agent id; resolving the *active* project
+        // would fork into the wrong registry whenever the caller acts on an
+        // agent outside it.
+        let (tmp, state, _emitter) = fresh_state_with_mock();
+        let home = TempDir::new().unwrap();
+        init_directory_impl(&state, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let source_project = create_project_in_only_dir(&state, "source-proj");
+        set_active_project_impl(&state, source_project.id).unwrap();
+        let source_id = seed_source(&state, home.path(), source_project.id, "alice", "hello");
+
+        // Switch the active project *away* from the source's.
+        let other_project = create_project_in_only_dir(&state, "other-proj");
+        set_active_project_impl(&state, other_project.id).unwrap();
+
+        let fork = fork_agent_impl(&state, source_id, home.path())
+            .await
+            .expect("forking an agent outside the active project must work");
+
+        assert_eq!(
+            fork.project_id, source_project.id,
+            "the branch belongs to its source's project, not the active one"
+        );
+        let registry = lock(&state.projects)
+            .get(&source_project.id)
+            .cloned()
+            .expect("source project loaded")
+            .list_agents()
+            .unwrap();
+        assert!(
+            registry.iter().any(|a| a.id == fork.id),
+            "the record must land in the source's registry"
+        );
+    }
+
+    #[tokio::test]
     async fn sending_to_a_materializing_fork_is_refused_while_its_parent_runs() {
         // The authoritative gate. A branch taken mid-turn inherits a
         // synthesized "No response requested." stub instead of the parent's
@@ -6274,6 +6366,52 @@ mod tests {
         send_msg_with_home(&state, fork.id, "next", home.path())
             .await
             .expect("a materialized fork dispatches regardless of its parent");
+
+        gate.notify_waiters();
+    }
+
+    #[tokio::test]
+    async fn the_fork_gate_ignores_a_same_session_id_agent_in_another_project() {
+        // Claude session ids are cwd-namespaced, so `check_claude_session_id_unique`
+        // only enforces uniqueness per directory — the same id can legitimately
+        // name a different session elsewhere. An unscoped parent lookup would
+        // consult that unrelated agent and block a perfectly valid fork.
+        //
+        // Deterministic by construction: the *only* agent carrying the parent's
+        // session id lives in another project and is busy. Scoped, no parent is
+        // found in the fork's own project, so the branch proceeds (nothing of
+        // ours is writing that session). Unscoped, the foreign busy agent is
+        // found and the send is refused.
+        let (_tmp, home, state, gate, project_id) =
+            state_with_parked_claude(&["foreign", "branch"]).await;
+
+        // The soon-to-be parent, in the fork's project. Fork from it, then
+        // remove it so its session id survives only on the fork's provenance.
+        let source_id = seed_source(&state, home.path(), project_id, "alice", "hello");
+        let parent_session = lock(&state.agents_by_id)
+            .get(&source_id)
+            .and_then(|a| a.session_locator.as_ref().and_then(SessionLocator::as_uuid))
+            .unwrap();
+        let fork = fork_agent_impl(&state, source_id, home.path())
+            .await
+            .unwrap();
+        lock(&state.agents_by_id).remove(&source_id);
+
+        // A different project, holding an agent with the SAME session id, busy.
+        let other = create_project_in_only_dir(&state, "other-proj");
+        set_active_project_impl(&state, other.id).unwrap();
+        let foreign =
+            create_agent_impl(&state, "foreign", HarnessKind::ClaudeCode, None, None).unwrap();
+        set_agent_session_locator_impl(&state, foreign.id, SessionLocator::Uuid(parent_session))
+            .unwrap();
+        send_msg_with_home(&state, foreign.id, "long one", home.path())
+            .await
+            .unwrap();
+        await_turn_running(&state, foreign.id).await;
+
+        send_msg_with_home(&state, fork.id, "branch from here", home.path())
+            .await
+            .expect("a busy agent in another project must not gate this fork");
 
         gate.notify_waiters();
     }
@@ -18526,6 +18664,7 @@ mod tests {
             "solo",
             false,
             &inputs(vec![("who", text("alice"))]),
+            Path::new("/nonexistent-home"),
         )
         .unwrap_err();
         assert!(
@@ -18565,7 +18704,15 @@ mod tests {
                 },
             ],
         );
-        let err = invoke_workflow_impl(&state, pid, "solo", false, &args).unwrap_err();
+        let err = invoke_workflow_impl(
+            &state,
+            pid,
+            "solo",
+            false,
+            &args,
+            Path::new("/nonexistent-home"),
+        )
+        .unwrap_err();
         assert!(
             matches!(err, AppError::WorkflowRunRequiresDismissal { .. }),
             "got: {err:?}"
@@ -18573,7 +18720,15 @@ mod tests {
 
         // Dismissing it (abandon) frees the project; the same invoke now succeeds.
         abandon_workflow_run_impl(&state, pid, held).unwrap();
-        invoke_workflow_impl(&state, pid, "solo", false, &args).expect("invoke after dismiss");
+        invoke_workflow_impl(
+            &state,
+            pid,
+            "solo",
+            false,
+            &args,
+            Path::new("/nonexistent-home"),
+        )
+        .expect("invoke after dismiss");
     }
 
     #[tokio::test]
@@ -18604,6 +18759,7 @@ mod tests {
             "drifted",
             false,
             &inputs(vec![("a", text("a"))]),
+            Path::new("/nonexistent-home"),
         )
         .unwrap_err();
         assert!(matches!(err, AppError::Workflow(_)));
@@ -18660,6 +18816,7 @@ mod tests {
             "shadowreq",
             false,
             &inputs(vec![("a", text("a"))]),
+            Path::new("/nonexistent-home"),
         )
         .unwrap_err();
         assert!(matches!(err, AppError::Workflow(_)));
@@ -18818,6 +18975,7 @@ mod tests {
             "usesmut",
             false,
             &inputs(vec![("a", text("a"))]),
+            Path::new("/nonexistent-home"),
         )
         .unwrap_err();
         assert!(matches!(err, AppError::Workflow(_)));
@@ -18884,6 +19042,7 @@ mod tests {
             "iterate",
             false,
             &inputs(vec![("ms", list(&["x"])), ("w", text("w"))]),
+            Path::new("/nonexistent-home"),
         )
         .unwrap_err();
         assert!(matches!(err, AppError::WorkflowStepUnsupported));
@@ -18937,6 +19096,7 @@ mod tests {
                 ("worker", text("primary")),
                 ("reviewers", list(&["reviewer-1"])),
             ]),
+            Path::new("/nonexistent-home"),
         )
         .unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
@@ -18999,6 +19159,7 @@ mod tests {
                 ("worker", text("primary")),
                 ("reviewers", list(&["reviewer-1"])),
             ]),
+            Path::new("/nonexistent-home"),
         )
         .unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
@@ -19031,6 +19192,7 @@ mod tests {
                 ("worker", text("primary")),
                 ("reviewers", list(&["reviewer-1", "reviewer-2"])),
             ]),
+            Path::new("/nonexistent-home"),
         )
         .unwrap();
 
@@ -19079,6 +19241,7 @@ mod tests {
                 ("worker", text("primary")),
                 ("reviewers", list(&["reviewer-1"])),
             ]),
+            Path::new("/nonexistent-home"),
         )
         .unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
@@ -19136,6 +19299,7 @@ mod tests {
                 ("worker", text("primary")),
                 ("reviewers", list(&["reviewer-1"])),
             ]),
+            Path::new("/nonexistent-home"),
         )
         .unwrap();
 

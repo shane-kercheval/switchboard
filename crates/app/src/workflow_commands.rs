@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use serde::Serialize;
 use switchboard_core::name::canonicalize_for_uniqueness;
 use switchboard_core::{AgentId, AgentRecord, Project, ProjectId};
-use switchboard_dispatcher::{DispatchContextFactory, EventEmitter};
+use switchboard_dispatcher::{DispatchContextFactory, Dispatcher, EventEmitter};
 use switchboard_prompts::{PromptArgument, PromptId, PromptService};
 use switchboard_workflow::{
     InputType, InputValue, RecipientRef, RunRecord, RunStatus, ScopeValue, Step, TerminalStatus,
@@ -51,13 +51,27 @@ pub fn progress_channel(project_id: ProjectId) -> String {
 /// turn — this provider does not freeze that.
 pub struct ProjectDispatchFactoryProvider {
     factories: HashMap<AgentId, Arc<dyn DispatchContextFactory>>,
+    /// What `preflight` needs to run the app layer's pre-dispatch policy without
+    /// the interpreter holding `AppState`. Captured at construction: the run's
+    /// bound agents and their project don't change mid-run, and the dispatcher
+    /// is the live authority for "is a turn running".
+    dispatcher: Arc<Dispatcher>,
+    project: Project,
+    roster: Vec<AgentRecord>,
+    agents_by_id: Arc<Mutex<HashMap<AgentId, AgentRecord>>>,
+    home_dir: PathBuf,
 }
 
 impl ProjectDispatchFactoryProvider {
     /// Build a factory for every supported-harness agent in `roster` (the run's
     /// project roster, a superset of the agents the run actually targets).
     #[must_use]
-    pub fn new(state: &AppState, project: &Project, roster: &[AgentRecord]) -> Self {
+    pub fn new(
+        state: &AppState,
+        project: &Project,
+        roster: &[AgentRecord],
+        home_dir: &Path,
+    ) -> Self {
         let mut factories: HashMap<AgentId, Arc<dyn DispatchContextFactory>> = HashMap::new();
         for agent in roster {
             let Ok(adapter) = adapter_for(state, agent) else {
@@ -82,11 +96,65 @@ impl ProjectDispatchFactoryProvider {
                 Arc::new(factory) as Arc<dyn DispatchContextFactory>,
             );
         }
-        Self { factories }
+        Self {
+            factories,
+            dispatcher: Arc::clone(&state.dispatcher),
+            project: project.clone(),
+            roster: roster.to_vec(),
+            agents_by_id: Arc::clone(&state.agents_by_id),
+            home_dir: home_dir.to_path_buf(),
+        }
     }
 }
 
 impl DispatchFactoryProvider for ProjectDispatchFactoryProvider {
+    /// Refuse to materialize a fork while its parent is mid-turn — the same
+    /// policy `send_message_impl` applies to manual sends, reached here through
+    /// the seam because workflow steps dispatch without passing through that
+    /// function. Without it, a step targeting a fork whose first turn failed
+    /// could branch from a working parent and inherit a synthesized
+    /// "No response requested." placeholder instead of its real answer.
+    fn preflight(
+        &self,
+        agent_id: AgentId,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + '_>> {
+        Box::pin(async move {
+            let Some(agent) = self.roster.iter().find(|a| a.id == agent_id) else {
+                // Not a bound agent of this run; `factory_for` reports it.
+                return Ok(());
+            };
+            let Some(parent_session) = agent.forked_from_session else {
+                return Ok(());
+            };
+            if crate::commands::resolve_session_file(agent, &self.project.directory, &self.home_dir)
+                .is_some()
+            {
+                return Ok(());
+            }
+            // Same-project scope and the guard-drops-before-await discipline as
+            // the manual path — see `ensure_materializing_fork_may_dispatch`.
+            let parent = lock(&self.agents_by_id)
+                .values()
+                .find(|candidate| {
+                    candidate.project_id == agent.project_id
+                        && candidate
+                            .session_locator
+                            .as_ref()
+                            .and_then(switchboard_core::SessionLocator::as_uuid)
+                            == Some(parent_session)
+                })
+                .cloned();
+            let Some(parent) = parent else { return Ok(()) };
+            if self.dispatcher.is_turn_running(parent.id).await {
+                return Err(format!(
+                    "{} is working — a branch taken now would not include its current answer",
+                    parent.name
+                ));
+            }
+            Ok(())
+        })
+    }
+
     fn factory_for(&self, agent_id: AgentId) -> Option<Arc<dyn DispatchContextFactory>> {
         self.factories.get(&agent_id).cloned()
     }
@@ -899,6 +967,7 @@ pub fn invoke_workflow_impl(
     name: &str,
     is_builtin: bool,
     inputs: &BTreeMap<String, InputValue>,
+    home_dir: &Path,
 ) -> Result<Uuid, AppError> {
     let workflow = snapshot_workflow(state, name, is_builtin)?;
     if workflow.gated_step_kind().is_some() {
@@ -941,7 +1010,7 @@ pub fn invoke_workflow_impl(
         .collect();
 
     let provider = Arc::new(ProjectDispatchFactoryProvider::new(
-        state, &project, &roster,
+        state, &project, &roster, home_dir,
     ));
 
     let run_id = Uuid::now_v7();

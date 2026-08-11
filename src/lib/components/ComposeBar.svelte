@@ -1,5 +1,6 @@
 <script lang="ts">
   import {
+    agentIsWorking,
     cancelSend,
     dispatchUserTurn,
     failSendStart,
@@ -7,6 +8,8 @@
     runtimes,
     transcripts,
   } from "$lib/state/index.svelte";
+  import { HARNESS_LABEL } from "$lib/harnessDisplay";
+  import { forkAgentIntoOwnPane } from "$lib/state/workspace.svelte";
   import {
     addHeldForward,
     removeHeldForward,
@@ -846,6 +849,75 @@
       .map((id) => agents.find((a) => a.id === id))
       .filter((a): a is AgentRecord => a !== undefined),
   );
+
+  // ---- Fork: a send-time option, not a standalone action ----
+  //
+  // Claude has no copy-a-session operation and refuses a promptless fork, so a
+  // branch can only come into existence *as a turn* (harness-behavior §3.5).
+  // Modelling Fork as a send-modifier makes the UI match that: the send that
+  // carries it registers the branch and dispatches its first turn as one
+  // action, which is also why a parent and its not-yet-existing branch can
+  // never be co-recipients.
+  const FORK_ENABLED_HINT =
+    "Send to a new branch of this agent: it inherits the conversation so far, then goes its own way.";
+  let forkEnabled = $state(false);
+  /// The one recipient a fork could branch from, or `null` when the selection
+  /// isn't a single agent.
+  const forkCandidate = $derived<AgentRecord | null>(
+    selectedAgents.length === 1 ? (selectedAgents[0] ?? null) : null,
+  );
+
+  /// Whether `agentId` looks like it has a harness session to branch from.
+  ///
+  /// Derived from the transcript rather than fetched: an agent with any turn
+  /// has dispatched at least once, and the compose bar already holds that
+  /// state. Deliberately **not** an `agent_session_info` call — the chip is
+  /// advisory and re-validated by the backend, and putting an IPC behind every
+  /// selection change would make the compose bar's request sequence depend on
+  /// which agent is selected.
+  ///
+  /// Imprecise in one direction, safely: an agent whose *only* turn failed
+  /// before the harness wrote a session file reads as "has a session," so the
+  /// chip is offered and the backend refuses with a precise error. The reverse
+  /// (a real session reading as absent) can't happen — hydration puts its turns
+  /// in the transcript on project open.
+  function looksLikeItHasASession(agentId: AgentId): boolean {
+    return (transcripts[agentId] ?? []).length > 0;
+  }
+
+  /// Why the Fork chip is unavailable, or `null` when it can be used. The chip
+  /// is **always rendered** — hiding it would leave the multi-recipient and
+  /// wrong-harness cases with no explanation anywhere.
+  const forkUnavailableReason = $derived.by((): string | null => {
+    if (selectedAgents.length > 1) {
+      return "Fork branches one agent — select a single recipient.";
+    }
+    const candidate = forkCandidate;
+    if (candidate === null) return "Select an agent to branch from.";
+    if (candidate.harness !== "claude_code") {
+      return `Switchboard can only branch Claude Code sessions, and ${candidate.name} is ${HARNESS_LABEL[candidate.harness]}.`;
+    }
+    if (agentIsWorking(runtimes[candidate.id])) {
+      // Probe-measured: a branch taken mid-turn inherits a synthesized
+      // "No response requested." placeholder instead of the parent's real
+      // answer, permanently. Wait-or-cancel, in that order — cancelling trades
+      // the parent's in-flight work for the branch.
+      return `${candidate.name} is working — a branch taken now would not include its current answer. Wait for it to finish, or cancel it first.`;
+    }
+    if (!looksLikeItHasASession(candidate.id)) {
+      return `${candidate.name} has no session to branch from yet — send it a message first.`;
+    }
+    return null;
+  });
+
+  const forkAvailable = $derived(forkUnavailableReason === null);
+
+  // Never leave the option armed once it stops being usable — the user changed
+  // the selection, or the parent started working, and a stale armed chip would
+  // silently fail at send.
+  $effect(() => {
+    if (!forkAvailable && forkEnabled) forkEnabled = false;
+  });
 
   /// `@` recipient picker: a trailing `@token` opens a typeahead of all agents;
   /// Enter / click picks one as the sole recipient and strips the token. This is
@@ -1918,6 +1990,43 @@
     }
   }
 
+  /// Branch `source` and send this message as the branch's first turn.
+  ///
+  /// Registration must land *before* the send: the branch's session does not
+  /// exist until a turn dispatches into it, so there is no agent to send to
+  /// until `forkAgentIntoOwnPane` resolves. That await is also why this is the
+  /// one send path that can fail before any optimistic turn exists — a fork
+  /// rejection (parent busy, no session, wrong harness) leaves the compose bar
+  /// exactly as the user left it, text and all, so they can retry after
+  /// waiting or cancelling.
+  ///
+  /// Once registered, the message goes through the **normal** send path: same
+  /// journaling, same queueing, same dispatch. The branch is an ordinary agent
+  /// from that moment on.
+  async function dispatchForkSend(
+    source: AgentRecord,
+    text: string,
+    attachments: Attachment[],
+  ): Promise<void> {
+    let fork: AgentRecord;
+    try {
+      fork = await forkAgentIntoOwnPane(source.id);
+    } catch (err) {
+      sendError = `Fork failed: ${err instanceof Error ? err.message : String(err)}`;
+      return;
+    }
+    // Selection follows the branch: the conversation continues there, and
+    // leaving the parent selected would send the user's next message to the
+    // agent they just branched away from.
+    setSelectedIds([fork.id]);
+    forkEnabled = false;
+    dispatchToRecipients(text, attachments, [fork]);
+    draft = "";
+    commitChips([]);
+    sendGeneration += 1;
+    persistComposeNow();
+  }
+
   async function handleSubmit(): Promise<void> {
     if (sendDisabled) return;
     sendError = null;
@@ -2080,6 +2189,11 @@
       return;
     }
 
+    if (forkEnabled && forkCandidate !== null) {
+      await dispatchForkSend(forkCandidate, draft.trim(), attachments);
+      return;
+    }
+
     dispatchToRecipients(draft.trim(), attachments, [...selectedAgents]);
     // The optimistic user turns are now in the transcript; clear for the next
     // message (recipients stay selected — sticky). Chips clear with the text;
@@ -2108,6 +2222,25 @@
     flush();
   }
 </script>
+
+{#snippet ForkIcon()}
+  <!-- git-branch: a branch line diverging from a trunk. -->
+  <svg
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    stroke-width="2"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+    class="size-3.5 shrink-0"
+    aria-hidden="true"
+  >
+    <line x1="6" y1="3" x2="6" y2="15" />
+    <circle cx="18" cy="6" r="3" />
+    <circle cx="6" cy="18" r="3" />
+    <path d="M18 9a9 9 0 0 1-9 9" />
+  </svg>
+{/snippet}
 
 <!-- Split-rect pane glyph, shared by the @-menu's "Send to" and "Forward from"
      pane rows so both sections mark pane entries identically. -->
@@ -2472,6 +2605,43 @@
               {/if}
             </button>
           {/each}
+        </div>
+      {/if}
+      {#if mode === "plain"}
+        <!-- Fork: a send-time option, always rendered so its unavailable states
+             can explain themselves (a hidden control teaches nothing). Sits
+             ahead of the forward row — both are modifiers on this send. -->
+        <div class="mb-1.5 flex flex-wrap items-center gap-1.5" data-testid="compose-options">
+          <Tooltip label={forkUnavailableReason ?? FORK_ENABLED_HINT} delayDuration={300}>
+            {#snippet trigger(props)}
+              <button
+                {...props}
+                type="button"
+                data-testid="compose-fork-toggle"
+                aria-pressed={forkEnabled}
+                title={forkUnavailableReason ?? FORK_ENABLED_HINT}
+                disabled={!forkAvailable || sending}
+                onclick={() => {
+                  if (forkAvailable && !sending) forkEnabled = !forkEnabled;
+                }}
+                class={cn(
+                  "flex items-center gap-1 rounded-full border px-2 py-0.5 text-xs transition-colors",
+                  forkEnabled
+                    ? "border-primary bg-primary/10 text-primary"
+                    : "border-subtle text-muted hover:text-fg",
+                  (!forkAvailable || sending) && "cursor-not-allowed opacity-50",
+                )}
+              >
+                {@render ForkIcon()}
+                Fork
+              </button>
+            {/snippet}
+          </Tooltip>
+          {#if forkEnabled && forkCandidate !== null}
+            <span class="text-muted text-xs" data-testid="compose-fork-caption">
+              Sending to a new branch of {forkCandidate.name}
+            </span>
+          {/if}
         </div>
       {/if}
       {#if mode === "plain" && forwardSources.length > 0}

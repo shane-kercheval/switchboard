@@ -70,6 +70,11 @@ import {
   subscribeProjectWorkflows,
   unsubscribeProjectWorkflows,
 } from "$lib/state/workflows.svelte";
+import {
+  assignAgentToFirstVisibleEmptyPane,
+  moveAgentToNewPane,
+  revealPane,
+} from "$lib/state/transcriptPanes.svelte";
 
 /// Per-project hydrated overlay. `items` holds only `user_message` and
 /// `outcome` kinds (agent content is routed to per-agent state); `status`
@@ -980,6 +985,41 @@ export async function retryProjectHydration(projectId: ProjectId): Promise<void>
 export function addAgentToProjectRoster(agent: AgentRecord): void {
   const existing = agentsByProject[agent.project_id] ?? [];
   agentsByProject[agent.project_id] = [...existing, agent];
+}
+
+/// Branch `sourceId`'s conversation into a new agent and make it the live one.
+///
+/// Registration + placement only — the caller sends the branch's first message
+/// immediately after, and *that* send is what materializes it as a harness
+/// session (Claude cannot copy a session; a branch only exists as a turn). So
+/// this must not be called speculatively: a fork with no send is an agent whose
+/// session never comes into being until someone messages it.
+///
+/// Ordering is load-bearing and mirrors the create/attach path:
+/// `registerAgent` first (it initializes the runtime *before* subscribing, so an
+/// event arriving immediately after the command resolves finds somewhere to
+/// land), then roster, then placement.
+///
+/// **Placement:** the branch gets its own visible track. Never the parent's
+/// pane — they share history with identical timestamps, so co-paning renders
+/// every inherited message twice. Prefer a visible empty pane the user already
+/// has; otherwise a new one, which `moveAgentToNewPane` may start *minimized*
+/// when the row is full — hence `revealPane`, which also handles focus mode by
+/// making the branch the maximized pane rather than dropping the user out of
+/// focus. A fork-send is an explicit action with
+/// an immediate result: leaving the reply in a pane the user cannot see (with
+/// compose now addressed at that unseen agent) reads as "my message vanished."
+/// The parent is left exactly where it is; only the compose selection moves.
+export async function forkAgentIntoOwnPane(sourceId: AgentId): Promise<AgentRecord> {
+  const fork = await api.forkAgent(sourceId);
+  await registerAgent(fork);
+  addAgentToProjectRoster(fork);
+  const rosterIds = (agentsByProject[fork.project_id] ?? []).map((item) => item.id);
+  const paneId =
+    assignAgentToFirstVisibleEmptyPane(fork.project_id, rosterIds, fork.id) ??
+    moveAgentToNewPane(fork.project_id, rosterIds, fork.id);
+  revealPane(fork.project_id, rosterIds, paneId);
+  return fork;
 }
 
 /// Test-only reset. Production never calls this; the module is a singleton, so

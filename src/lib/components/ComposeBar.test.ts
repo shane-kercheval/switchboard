@@ -1155,6 +1155,178 @@ describe("ComposeBar", () => {
     expect(screen.getByTestId("compose-send")).toHaveAttribute("aria-label", "Send");
   });
 
+  describe("fork (send-time option)", () => {
+    const FORK_RECORD: AgentRecord = {
+      id: "00000000-0000-7000-8000-000000000f0f",
+      project_id: PROJECT_ID,
+      name: "alice-fork",
+      harness: "claude_code",
+      session_locator: { uuid: "00000000-0000-7000-8000-00000000000f" },
+      forked_from_session: "00000000-0000-7000-8000-000000000001",
+      created_at: "2026-05-16T00:00:02Z",
+    };
+
+    const forkToggle = () => screen.getByTestId("compose-fork-toggle") as HTMLButtonElement;
+
+    /// Give `agentId` hydrated history, so the chip's "has a session to branch
+    /// from" derivation is satisfied. Hydration (not a live send) is what an
+    /// agent with an existing session looks like on project open — and unlike
+    /// `dispatchUserTurn` it leaves the agent idle rather than working.
+    function seedTurn(state: Awaited<ReturnType<typeof loadState>>, agentId: string): void {
+      state.applyAgentHydrate(agentId, {
+        turns: [
+          {
+            role: "agent",
+            turn_id: `disk-${agentId}`,
+            agent_id: agentId,
+            items: [{ item_kind: "text", kind: "text", text: "earlier reply" }],
+            status: "complete",
+            started_at: "2026-05-15T00:00:00Z",
+            ended_at: "2026-05-15T00:00:01Z",
+            hydration_key: `key-${agentId}`,
+          },
+        ],
+      });
+    }
+
+    it("is disabled with an explanation when the selection is not one Claude agent", async () => {
+      const state = await loadState();
+      await state.registerAgent(AGENT_A);
+      await state.registerAgent(AGENT_B);
+      seedTurn(state, AGENT_A.id);
+      render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+
+      // Single Claude recipient with history → available.
+      await waitFor(() => expect(forkToggle().disabled).toBe(false));
+
+      // Two recipients → disabled, and the reason names the constraint.
+      await fireEvent.click(chip(AGENT_B.id));
+      await waitFor(() => expect(forkToggle().disabled).toBe(true));
+      expect(forkToggle()).toHaveAttribute(
+        "title",
+        expect.stringMatching(/select a single recipient/i),
+      );
+
+      // A single non-Claude recipient → disabled, naming the harness.
+      await fireEvent.click(chip(AGENT_A.id));
+      await waitFor(() => expect(forkToggle().disabled).toBe(true));
+      expect(forkToggle()).toHaveAttribute(
+        "title",
+        expect.stringMatching(/only branch Claude Code/i),
+      );
+    });
+
+    it("is disabled while the agent has no session to branch from", async () => {
+      const state = await loadState();
+      await state.registerAgent(AGENT_A);
+      render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+
+      await waitFor(() => expect(forkToggle().disabled).toBe(true));
+      expect(forkToggle()).toHaveAttribute(
+        "title",
+        expect.stringMatching(/no session to branch from yet/i),
+      );
+    });
+
+    it("is disabled while the agent is working", async () => {
+      // Probe-measured hazard: a branch taken mid-turn inherits a synthesized
+      // placeholder instead of the parent's in-flight answer.
+      const state = await loadState();
+      await state.registerAgent(AGENT_A);
+      seedTurn(state, AGENT_A.id);
+      render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+      await waitFor(() => expect(forkToggle().disabled).toBe(false));
+
+      fireTo(`agent:${AGENT_A.id}`, {
+        type: "turn_start",
+        turn_id: "turn-busy",
+        message_id: "msg-busy",
+        send_id: "send-busy",
+        started_at: "2026-05-16T00:00:00Z",
+      });
+
+      await waitFor(() => expect(forkToggle().disabled).toBe(true));
+      expect(forkToggle()).toHaveAttribute("title", expect.stringMatching(/is working/i));
+    });
+
+    it("disarms itself when the selection stops being forkable", async () => {
+      // A stale armed chip would silently fail at send.
+      const state = await loadState();
+      await state.registerAgent(AGENT_A);
+      await state.registerAgent(AGENT_B);
+      seedTurn(state, AGENT_A.id);
+      render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+      await waitFor(() => expect(forkToggle().disabled).toBe(false));
+
+      await fireEvent.click(forkToggle());
+      expect(forkToggle()).toHaveAttribute("aria-pressed", "true");
+
+      await fireEvent.click(chip(AGENT_B.id));
+
+      await waitFor(() => expect(forkToggle()).toHaveAttribute("aria-pressed", "false"));
+    });
+
+    it("forks, moves the selection to the branch, and sends there", async () => {
+      const state = await loadState();
+      await state.registerAgent(AGENT_A);
+      seedTurn(state, AGENT_A.id);
+      invokeMock.mockImplementation(async (cmd: string) => {
+        if (cmd === "fork_agent") return FORK_RECORD;
+        if (cmd === "send_message") return "msg-fork";
+        return null;
+      });
+      render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+      await waitFor(() => expect(forkToggle().disabled).toBe(false));
+      await fireEvent.click(forkToggle());
+
+      const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+      await fireEvent.input(textarea, { target: { value: "branch from here" } });
+      await fireEvent.click(screen.getByTestId("compose-send"));
+
+      // The branch was created, and the message went to IT — not the parent.
+      await waitFor(() => {
+        expect(invokeMock).toHaveBeenCalledWith("fork_agent", { agentId: AGENT_A.id });
+      });
+      await waitFor(() => {
+        expect(invokeMock).toHaveBeenCalledWith(
+          "send_message",
+          expect.objectContaining({ agentId: FORK_RECORD.id }),
+        );
+      });
+      expect(invokeMock).not.toHaveBeenCalledWith(
+        "send_message",
+        expect.objectContaining({ agentId: AGENT_A.id }),
+      );
+      // The option is one-shot: the next message goes to the branch normally.
+      await waitFor(() => expect(forkToggle()).toHaveAttribute("aria-pressed", "false"));
+    });
+
+    it("keeps the user's text when the fork is refused", async () => {
+      // The one send path that can fail before any optimistic turn exists. The
+      // user must be able to wait or cancel and retry without retyping.
+      const state = await loadState();
+      await state.registerAgent(AGENT_A);
+      seedTurn(state, AGENT_A.id);
+      invokeMock.mockImplementation(async (cmd: string) => {
+        if (cmd === "fork_agent") throw new Error("alice is working");
+        return null;
+      });
+      render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+      await waitFor(() => expect(forkToggle().disabled).toBe(false));
+      await fireEvent.click(forkToggle());
+
+      const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+      await fireEvent.input(textarea, { target: { value: "keep me" } });
+      await fireEvent.click(screen.getByTestId("compose-send"));
+
+      await waitFor(() => {
+        expect(screen.getByTestId("compose-send-error")).toHaveTextContent("alice is working");
+      });
+      expect((screen.getByTestId("compose-textarea") as HTMLTextAreaElement).value).toBe("keep me");
+      expect(invokeMock).not.toHaveBeenCalledWith("send_message", expect.anything());
+    });
+  });
+
   it("a per-recipient IPC failure fails only that recipient and surfaces the error", async () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);

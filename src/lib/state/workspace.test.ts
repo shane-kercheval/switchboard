@@ -935,3 +935,85 @@ describe("agent reorder", () => {
     expect(ws.agentsByProject[PROJECT_1]?.map((r) => r.id)).toEqual([a.id, b.id]);
   });
 });
+
+describe("forkAgentIntoOwnPane", () => {
+  const FORK_ID = "00000000-0000-7000-8000-00000000000f";
+
+  // The file's shared `afterEach` doesn't reset pane layout, and these cases
+  // assert on placement — without this they'd inherit the previous case's panes
+  // and silently stop testing what they claim to.
+  beforeEach(async () => {
+    const panes = await import("$lib/state/transcriptPanes.svelte");
+    panes._testing.reset();
+  });
+
+  function forkRecord(projectId: string): AgentRecord {
+    return { ...agent(FORK_ID, projectId), name: "agent-a-fork" };
+  }
+
+  it("registers, rosters, and gives the branch its own visible pane", async () => {
+    const ws = await loadWorkspaceState();
+    const panes = await import("$lib/state/transcriptPanes.svelte");
+    const parent = agent(AGENT_1, PROJECT_1);
+    ws.agentsByProject[PROJECT_1] = [parent];
+    const fork = forkRecord(PROJECT_1);
+    invokeMock.mockImplementation(async (cmd) => (cmd === "fork_agent" ? fork : undefined));
+
+    const created = await ws.forkAgentIntoOwnPane(parent.id);
+
+    expect(created.id).toBe(FORK_ID);
+    expect(invokeMock).toHaveBeenCalledWith("fork_agent", { agentId: parent.id });
+    // Rostered, so `lookup_agent` on the immediately-following send resolves it.
+    expect(ws.agentsByProject[PROJECT_1]?.map((a) => a.id)).toEqual([parent.id, FORK_ID]);
+
+    // Its own pane, not the parent's: they share history with identical
+    // timestamps, so co-paning would render every inherited message twice.
+    const rosterIds = [parent.id, FORK_ID];
+    const forkPane = panes.paneOfAgent(PROJECT_1, rosterIds, FORK_ID);
+    const parentPane = panes.paneOfAgent(PROJECT_1, rosterIds, parent.id);
+    expect(forkPane).not.toBeNull();
+    expect(forkPane?.id).not.toBe(parentPane?.id);
+    // And the parent stayed where it was.
+    expect(parentPane?.members).toContain(parent.id);
+  });
+
+  it("makes the branch visible when the user is in focus mode", async () => {
+    // A fork-send has an immediate result to show. With another pane maximized,
+    // placing the branch without revealing it would stream the reply into a
+    // pane behind the focused one, with compose now addressed at an agent the
+    // user cannot see — "I forked and my message vanished."
+    const ws = await loadWorkspaceState();
+    const panes = await import("$lib/state/transcriptPanes.svelte");
+    const parent = agent(AGENT_1, PROJECT_1);
+    ws.agentsByProject[PROJECT_1] = [parent];
+    const parentPane = panes.layoutFor(PROJECT_1, [parent.id]).panes[0];
+    panes.maximizePane(PROJECT_1, [parent.id], parentPane!.id);
+
+    const fork = forkRecord(PROJECT_1);
+    invokeMock.mockImplementation(async (cmd) => (cmd === "fork_agent" ? fork : undefined));
+    await ws.forkAgentIntoOwnPane(parent.id);
+
+    const rosterIds = [parent.id, FORK_ID];
+    const forkPane = panes.paneOfAgent(PROJECT_1, rosterIds, FORK_ID);
+    const layout = panes.layoutFor(PROJECT_1, rosterIds);
+    expect(forkPane).not.toBeNull();
+    // Focus mode is preserved — the branch *becomes* the focused pane rather
+    // than dropping the user out of focus.
+    expect(layout.maximized).toBe(forkPane?.id);
+    expect(layout.minimized).not.toContain(forkPane?.id);
+  });
+
+  it("does not roster or place anything when the fork is refused", async () => {
+    const ws = await loadWorkspaceState();
+    const parent = agent(AGENT_1, PROJECT_1);
+    ws.agentsByProject[PROJECT_1] = [parent];
+    invokeMock.mockImplementation(async (cmd) => {
+      if (cmd === "fork_agent") throw new Error("alice is working");
+      return undefined;
+    });
+
+    await expect(ws.forkAgentIntoOwnPane(parent.id)).rejects.toThrow("alice is working");
+
+    expect(ws.agentsByProject[PROJECT_1]?.map((a) => a.id)).toEqual([parent.id]);
+  });
+});

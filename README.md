@@ -79,6 +79,8 @@ Forwarding uses the agents' actual responses and clearly labels each source for 
 
 Fork creates a new Claude Code agent from an existing conversation. With one Claude agent selected, use the Fork half of the send button to send your message to `<name>-fork`, which inherits the conversation so far while leaving the original untouched. Use it to explore another approach from the same starting point.
 
+Model profiles let an agent keep a Primary model/effort setup and an optional Secondary setup you can switch to from its sidebar card. Per-agent-type defaults in Settings prefill Add Agent and are applied automatically when a new project creates its starting agents.
+
 Panes make that routing easy to see. You can keep agents with related roles together and address the pane as a group, while every agent remains an independent session that can also be targeted directly.
 
 ## Prompts and workflows
@@ -120,7 +122,7 @@ The layout (panes, names, widths, hidden agents) is remembered per project on th
 
 Switchboard drives each agent through its own CLI, so it inherits that CLI's capabilities — and a few CLI-specific limitations are worth knowing up front:
 
-- **Model selection.** Claude Code, Codex, and Gemini let Switchboard choose the model per agent — pick it when you create the agent, or change it later from the agent's actions menu; the transcript records the model each past turn actually ran on. **Antigravity does not** — its CLI exposes no model option, so Antigravity agents run on whatever model you've selected inside Antigravity itself, and Switchboard can't change it per agent (the sidebar shows the model it observes Antigravity using).
+- **Model profiles.** Claude Code, Codex, and Gemini agents can have a Primary model/effort setup plus an optional Secondary setup for quick switching. Set per-agent-type defaults in Settings; Add Agent and new projects use them automatically. The transcript records the model each past turn actually ran on. **Antigravity does not support per-agent model selection** — it uses the model selected inside Antigravity itself.
 - **Reasoning effort.** Claude Code and Codex let Switchboard set the reasoning-effort level per agent (alongside the model). **Gemini does not** — Gemini exposes reasoning effort only through its own config, not a per-run option, so Switchboard can't set it; Gemini agents use whatever Gemini's config specifies. For **Antigravity**, effort is part of the model name you pick inside Antigravity, so it follows the same limitation as model selection above.
 - **Codex models depend on your plan.** When you sign in to Codex with a ChatGPT subscription, only the models your plan includes are available; choosing one your plan doesn't cover fails the turn with Codex's own error.
 - **The highest Codex effort levels need a GPT-5.6 model.** The `Max` and `Ultra` reasoning-effort levels work on the GPT-5.6 family (Sol, Terra, Luna); older models such as GPT-5.5 top out at `XHigh`. Selecting a higher level on an older model fails the turn with Codex's own message listing the levels that model supports — switch the model or lower the effort and resend.

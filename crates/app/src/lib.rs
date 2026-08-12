@@ -42,7 +42,7 @@ use crate::commands::{
     check_claude_auth_impl, check_claude_binary_impl, check_codex_auth_impl,
     check_codex_binary_impl, check_gemini_auth_impl, check_gemini_binary_impl,
     commit_changed_files_impl, commit_file_diff_impl, commit_ranges_impl, copy_builtin_prompt_impl,
-    create_agent_impl, create_project_impl, delete_project_impl, editor_open_argv,
+    create_agent_with_profiles_impl, create_project_impl, delete_project_impl, editor_open_argv,
     existing_attachment_paths_impl, fetch_repo_impl, file_diff_impl, fork_agent_impl,
     forward_message_impl, forward_prompt_impl, get_preferences_impl, get_prompt_source_impl,
     harness_adapter_for, init_directory_impl, install_status_for_adapter, list_agents_impl,
@@ -55,8 +55,8 @@ use crate::commands::{
     remove_directory_impl, remove_mcp_provider_impl, remove_message_pins_impl,
     remove_queued_message_impl, remove_tracked_repo_impl, rename_agent_impl, rename_project_impl,
     render_prompt_impl, reorder_agents_impl, reveal_in_finder_argv, search_project_files_in_root,
-    search_project_files_root_impl, send_message_impl, set_active_project_impl,
-    set_agent_effort_impl, set_agent_model_impl, set_message_pin_impl, set_preferences_impl,
+    search_project_files_root_impl, send_message_impl, set_active_agent_profile_impl,
+    set_active_project_impl, set_agent_profiles_impl, set_message_pin_impl, set_preferences_impl,
     set_project_archived_impl, set_visible_project_impl, sign_in_mcp_provider_impl,
     sign_out_mcp_provider_impl, stage_attachment_impl, sync_prompts_and_notify, terminal_open_argv,
     test_mcp_connection_impl, test_saved_mcp_provider_impl, tracked_repos_inputs, tracked_roots,
@@ -673,8 +673,19 @@ async fn create_agent(
     harness: HarnessKind,
     model: Option<String>,
     effort: Option<String>,
+    secondary_model: Option<String>,
+    secondary_effort: Option<String>,
 ) -> Result<AgentRecord, String> {
-    create_agent_impl(state.inner(), &name, harness, model, effort).map_err(|e| e.to_string())
+    let secondary = if secondary_model.is_some() || secondary_effort.is_some() {
+        Some(switchboard_core::AgentProfile {
+            model: secondary_model,
+            effort: secondary_effort,
+        })
+    } else {
+        None
+    };
+    create_agent_with_profiles_impl(state.inner(), &name, harness, model, effort, secondary)
+        .map_err(|e| e.to_string())
 }
 
 /// Branch an agent's conversation into a new one. Registration only — the
@@ -692,23 +703,24 @@ async fn fork_agent(state: State<'_, AppState>, agent_id: String) -> Result<Agen
 }
 
 #[tauri::command]
-async fn set_agent_model(
+async fn set_agent_profiles(
     state: State<'_, AppState>,
     agent_id: String,
-    model: Option<String>,
+    primary: switchboard_core::AgentProfile,
+    secondary: Option<switchboard_core::AgentProfile>,
 ) -> Result<AgentRecord, String> {
     let id = parse_uuid(&agent_id).map_err(|e| e.to_string())?;
-    set_agent_model_impl(state.inner(), id, model).map_err(|e| e.to_string())
+    set_agent_profiles_impl(state.inner(), id, primary, secondary).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn set_agent_effort(
+async fn set_active_agent_profile(
     state: State<'_, AppState>,
     agent_id: String,
-    effort: Option<String>,
+    active: switchboard_core::AgentProfileSlot,
 ) -> Result<AgentRecord, String> {
     let id = parse_uuid(&agent_id).map_err(|e| e.to_string())?;
-    set_agent_effort_impl(state.inner(), id, effort).map_err(|e| e.to_string())
+    set_active_agent_profile_impl(state.inner(), id, active).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1868,8 +1880,8 @@ pub fn run() {
             fork_agent,
             remove_agent,
             rename_agent,
-            set_agent_model,
-            set_agent_effort,
+            set_agent_profiles,
+            set_active_agent_profile,
             reorder_agents,
             attach_agent,
             list_agents,

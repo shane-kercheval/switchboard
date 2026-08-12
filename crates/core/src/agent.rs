@@ -6,6 +6,35 @@ use crate::harness::HarnessKind;
 
 pub type AgentId = Uuid;
 
+/// One model/reasoning-effort configuration. Both axes stay optional because
+/// harness capabilities differ: Gemini has a model but no effort axis, while
+/// Antigravity exposes neither through Switchboard.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct AgentProfile {
+    pub model: Option<String>,
+    pub effort: Option<String>,
+}
+
+/// Which configured profile an agent will use for newly submitted sends.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentProfileSlot {
+    #[default]
+    Primary,
+    Secondary,
+}
+
+/// Optional secondary configuration plus the currently active slot.
+///
+/// Kept as one additive field on [`AgentRecord`] so records written before
+/// profiles existed deserialize as primary-only without a migration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct AgentProfiles {
+    pub secondary: Option<AgentProfile>,
+    pub active: AgentProfileSlot,
+}
+
 /// The identity Switchboard uses to find and resume a harness's conversation.
 ///
 /// Modeled as a harness-shaped enum because session identity is not uniform:
@@ -92,9 +121,10 @@ impl SessionLocator {
 
 /// One row in `<directory>/.switchboard/projects/<project-id>/registry.jsonl`.
 ///
-/// Records are appended on registration. Four things mutate after that, each
-/// through its own dedicated `Project` method (never a generic update API):
-/// `name` (rename), `model` / `effort` (selection changes), `session_locator`
+/// Records are appended on registration. A small set of fields mutate after
+/// that, each through its own dedicated `Project` method (never a generic
+/// update API): `name` (rename), the primary/secondary profile configuration
+/// and active slot, `session_locator`
 /// (runtime capture for Codex/Antigravity, including the Antigravity
 /// fork-and-heal case — see [`crate::project::Project::set_session_locator`]),
 /// and the records' physical order (user reordering — file order *is* the
@@ -121,8 +151,9 @@ pub struct AgentRecord {
     pub harness: HarnessKind,
     #[serde(deserialize_with = "deserialize_required_locator")]
     pub session_locator: Option<SessionLocator>,
-    /// The user-selected model this agent runs on, sent to the harness on every
-    /// dispatch when set (omitted when `None`, so the harness uses its default).
+    /// The primary profile's model. Sent when Primary is active; the secondary
+    /// profile supplies the value when Secondary is active. Omitted when
+    /// `None`, so the harness uses its default.
     /// Free-text, not validated against an enum: no harness exposes a queryable
     /// model list and some values are plan-gated, so a bad value surfaces as a
     /// failed turn rather than a registration error. Only harnesses where
@@ -134,12 +165,16 @@ pub struct AgentRecord {
     /// (Deliberately unlike `session_locator`, which adds a custom deserializer
     /// precisely to *defeat* that permissive default and fail loud on absence.)
     pub model: Option<String>,
-    /// The user-selected reasoning-effort level, sent on every dispatch when set
-    /// (omitted when `None`). A closed per-harness enum at the UI boundary, but
+    /// The primary profile's reasoning-effort level. Sent when Primary is
+    /// active and omitted when `None`. A closed per-harness enum at the UI boundary, but
     /// stored as a `String` to keep this field harness-agnostic. Only harnesses
     /// where [`HarnessKind::supports_effort_selection`] holds ever carry a
     /// value. Same backward-compat rationale as `model`.
     pub effort: Option<String>,
+    /// Secondary model/effort configuration and the active slot. The primary
+    /// configuration remains in `model` / `effort` for wire compatibility.
+    #[serde(default)]
+    pub profiles: AgentProfiles,
     /// For a forked agent: the **parent session UUID** to `--resume` from when
     /// this agent's own session file does not exist yet. `None` for every agent
     /// that wasn't created by forking.
@@ -192,6 +227,23 @@ pub struct AgentRecord {
 }
 
 impl AgentRecord {
+    /// The configuration selected for a newly submitted send.
+    #[must_use]
+    pub fn active_profile(&self) -> AgentProfile {
+        match self.profiles.active {
+            AgentProfileSlot::Primary => AgentProfile {
+                model: self.model.clone(),
+                effort: self.effort.clone(),
+            },
+            AgentProfileSlot::Secondary => {
+                self.profiles.secondary.clone().unwrap_or(AgentProfile {
+                    model: self.model.clone(),
+                    effort: self.effort.clone(),
+                })
+            }
+        }
+    }
+
     /// Re-check, on **read**, the cross-field invariants the registration
     /// chokepoint enforces on write.
     ///
@@ -234,6 +286,22 @@ impl AgentRecord {
                 harness: self.harness,
                 axis: crate::harness::SelectionAxis::Effort,
             });
+        }
+        if let Some(secondary) = &self.profiles.secondary {
+            if secondary.model.is_some() && !self.harness.supports_model_selection() {
+                return Err(CoreError::SelectionUnsupported {
+                    harness: self.harness,
+                    axis: crate::harness::SelectionAxis::Model,
+                });
+            }
+            if secondary.effort.is_some() && !self.harness.supports_effort_selection() {
+                return Err(CoreError::SelectionUnsupported {
+                    harness: self.harness,
+                    axis: crate::harness::SelectionAxis::Effort,
+                });
+            }
+        } else if self.profiles.active == AgentProfileSlot::Secondary {
+            return Err(CoreError::SecondaryProfileMissing(self.id));
         }
         Ok(())
     }
@@ -284,6 +352,7 @@ mod tests {
             session_locator: locator,
             model: None,
             effort: None,
+            profiles: AgentProfiles::default(),
             forked_from_session: None,
             created_at: Utc::now(),
         }
@@ -331,7 +400,28 @@ mod tests {
             serde_json::from_str(json).expect("missing model/effort must default to None");
         assert_eq!(parsed.model, None);
         assert_eq!(parsed.effort, None);
+        assert_eq!(parsed.profiles, AgentProfiles::default());
         assert_eq!(parsed.session_locator, None);
+    }
+
+    #[test]
+    fn agent_record_roundtrips_with_secondary_profile() {
+        let mut record = record_with_locator(Some(SessionLocator::Uuid(Uuid::now_v7())));
+        record.model = Some("opus".to_owned());
+        record.effort = Some("high".to_owned());
+        record.profiles = AgentProfiles {
+            secondary: Some(AgentProfile {
+                model: Some("sonnet".to_owned()),
+                effort: Some("medium".to_owned()),
+            }),
+            active: AgentProfileSlot::Secondary,
+        };
+
+        let json = serde_json::to_string(&record).unwrap();
+        let parsed: AgentRecord = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed, record);
+        assert_eq!(parsed.active_profile().model.as_deref(), Some("sonnet"));
     }
 
     #[test]

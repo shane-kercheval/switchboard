@@ -5,20 +5,17 @@ import {
   SUPPORTS_MODEL_SELECTION,
 } from "./harnessDisplay";
 import {
-  DEFAULT_EFFORT,
-  DEFAULT_MODEL,
+  DEFAULT_AGENT_PROFILES,
   EFFORT_OPTIONS,
   MODEL_OPTIONS,
-  NEW_PROJECT_DEFAULT_EFFORT,
-  NEW_PROJECT_DEFAULT_MODEL,
   defaultAgentName,
   effortOptionsFor,
 } from "./agentSelection";
 import { canonicalizeForUniqueness, validateAgentName } from "./agentName";
 
 /// The capability fact ("does harness H support axis A") is encoded three times
-/// — the capability map, the option list (empty ⇒ unsupported), and the default
-/// (undefined ⇒ unsupported) — across two files, intentionally mirroring
+/// — the capability map, the option list (empty ⇒ unsupported), and the built-in
+/// default (null ⇒ unsupported) — across two files, intentionally mirroring
 /// different sources. Nothing else enforces that the three agree, and the lists
 /// are designed to be hand-edited as models ship/sunset. These invariants fail
 /// closed on a desync instead of shipping a broken picker: a capability/list
@@ -29,22 +26,20 @@ describe("agentSelection capability tables stay consistent", () => {
     it(`${harness}: model capability map, list, and default agree`, () => {
       const supported = SUPPORTS_MODEL_SELECTION[harness];
       expect(MODEL_OPTIONS[harness].length > 0).toBe(supported);
-      expect(DEFAULT_MODEL[harness] !== undefined).toBe(supported);
-      if (DEFAULT_MODEL[harness] !== undefined) {
-        expect(MODEL_OPTIONS[harness].map((option) => option.value)).toContain(
-          DEFAULT_MODEL[harness],
-        );
+      const model = DEFAULT_AGENT_PROFILES[harness].primary.model;
+      expect(model !== null).toBe(supported);
+      if (model !== null) {
+        expect(MODEL_OPTIONS[harness].map((option) => option.value)).toContain(model);
       }
     });
 
     it(`${harness}: effort capability map, list, and default agree`, () => {
       const supported = SUPPORTS_EFFORT_SELECTION[harness];
       expect(EFFORT_OPTIONS[harness].length > 0).toBe(supported);
-      expect(DEFAULT_EFFORT[harness] !== undefined).toBe(supported);
-      if (DEFAULT_EFFORT[harness] !== undefined) {
-        expect(EFFORT_OPTIONS[harness].map((option) => option.value)).toContain(
-          DEFAULT_EFFORT[harness],
-        );
+      const effort = DEFAULT_AGENT_PROFILES[harness].primary.effort;
+      expect(effort !== null).toBe(supported);
+      if (effort !== null) {
+        expect(EFFORT_OPTIONS[harness].map((option) => option.value)).toContain(effort);
       }
     });
   }
@@ -80,32 +75,33 @@ describe("effortOptionsFor", () => {
     expect(effortOptionsFor("claude_code", "opus")).toEqual(EFFORT_OPTIONS.claude_code);
   });
 
-  it("keeps the Codex default effort valid for every curated Codex model (safe clamp target)", () => {
-    // The create form resets effort to DEFAULT_EFFORT when a model switch drops
-    // the current level — that fallback must be offered by every model.
+  it("keeps medium available as the safe clamp target for every curated Codex model", () => {
     for (const { value: model } of MODEL_OPTIONS.codex) {
-      expect(values("codex", model)).toContain(DEFAULT_EFFORT.codex);
+      expect(values("codex", model)).toContain("medium");
     }
   });
 });
 
-describe("new-project agent presets", () => {
+describe("built-in agent defaults", () => {
   for (const harness of ALL_HARNESSES) {
     it(`${harness}: uses supported model and effort values`, () => {
-      const model = NEW_PROJECT_DEFAULT_MODEL[harness];
-      const effort = NEW_PROJECT_DEFAULT_EFFORT[harness];
-      if (model !== undefined) {
+      const { model, effort } = DEFAULT_AGENT_PROFILES[harness].primary;
+      if (model !== null) {
         expect(MODEL_OPTIONS[harness].map((option) => option.value)).toContain(model);
       }
-      if (effort !== undefined) {
-        expect(effortOptionsFor(harness, model).map((option) => option.value)).toContain(effort);
+      if (effort !== null) {
+        expect(
+          effortOptionsFor(harness, model ?? undefined).map((option) => option.value),
+        ).toContain(effort);
       }
     });
   }
 
   it("seeds Codex with Sol and high effort", () => {
-    expect(NEW_PROJECT_DEFAULT_MODEL.codex).toBe("gpt-5.6-sol");
-    expect(NEW_PROJECT_DEFAULT_EFFORT.codex).toBe("high");
+    expect(DEFAULT_AGENT_PROFILES.codex.primary).toEqual({
+      model: "gpt-5.6-sol",
+      effort: "high",
+    });
   });
 });
 
@@ -162,8 +158,8 @@ describe("defaultAgentName", () => {
       canonicalizeForUniqueness(
         defaultAgentName(
           harness,
-          NEW_PROJECT_DEFAULT_MODEL[harness],
-          NEW_PROJECT_DEFAULT_EFFORT[harness],
+          DEFAULT_AGENT_PROFILES[harness].primary.model ?? undefined,
+          DEFAULT_AGENT_PROFILES[harness].primary.effort ?? undefined,
         ),
       ),
     );

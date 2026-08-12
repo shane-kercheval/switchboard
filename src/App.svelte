@@ -864,8 +864,9 @@
         ? await api.createAgent(
             submission.name,
             submission.harness,
-            submission.model,
-            submission.effort,
+            submission.primary.model ?? undefined,
+            submission.primary.effort ?? undefined,
+            submission.secondary,
           )
         : await api.attachAgent(submission.name, submission.harness, submission.existingSessionId);
     await registerAgent(agent);

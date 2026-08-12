@@ -16,11 +16,80 @@
 //! with that key defaulted, and an unknown future key is ignored. Later
 //! milestones add keys here (worktree base path, diff style) the same way.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::error::AppError;
+use switchboard_core::{AgentProfile, HarnessKind};
+
+/// Primary and optional secondary configuration used when creating an agent of
+/// one harness. New agents always start on Primary.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct AgentDefaults {
+    pub primary: AgentProfile,
+    pub secondary: Option<AgentProfile>,
+}
+
+fn default_agent_defaults() -> BTreeMap<HarnessKind, AgentDefaults> {
+    BTreeMap::from([
+        (
+            HarnessKind::ClaudeCode,
+            AgentDefaults {
+                primary: AgentProfile {
+                    model: Some("opus".to_owned()),
+                    effort: Some("high".to_owned()),
+                },
+                secondary: None,
+            },
+        ),
+        (
+            HarnessKind::Codex,
+            AgentDefaults {
+                primary: AgentProfile {
+                    model: Some("gpt-5.6-sol".to_owned()),
+                    effort: Some("high".to_owned()),
+                },
+                secondary: None,
+            },
+        ),
+        (
+            HarnessKind::Gemini,
+            AgentDefaults {
+                primary: AgentProfile {
+                    model: Some("auto".to_owned()),
+                    effort: None,
+                },
+                secondary: None,
+            },
+        ),
+        (HarnessKind::Antigravity, AgentDefaults::default()),
+    ])
+}
+
+fn deserialize_agent_defaults<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<HarnessKind, AgentDefaults>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw = BTreeMap::<String, AgentDefaults>::deserialize(deserializer)?;
+    Ok(raw
+        .into_iter()
+        .filter_map(|(key, value)| {
+            let harness = match key.as_str() {
+                "claude_code" => HarnessKind::ClaudeCode,
+                "codex" => HarnessKind::Codex,
+                "gemini" => HarnessKind::Gemini,
+                "antigravity" => HarnessKind::Antigravity,
+                _ => return None,
+            };
+            Some((harness, value))
+        })
+        .collect())
+}
 
 /// The default terminal application opened by the Git view's "open in terminal"
 /// action when no override is set. macOS ships Terminal.app; power users can name
@@ -85,6 +154,14 @@ pub struct Preferences {
     /// own content turns it off. Visibility only — a workflow wired to a built-in
     /// still resolves when this is off.
     pub show_builtins: bool,
+
+    /// Per-harness profiles preselected by Add Agent and used when a new
+    /// project auto-creates its roster.
+    #[serde(
+        default = "default_agent_defaults",
+        deserialize_with = "deserialize_agent_defaults"
+    )]
+    pub agent_defaults: BTreeMap<HarnessKind, AgentDefaults>,
 }
 
 impl Default for Preferences {
@@ -96,6 +173,7 @@ impl Default for Preferences {
             show_builtins: true,
             notify_on_completion: true,
             notify_while_focused: false,
+            agent_defaults: default_agent_defaults(),
         }
     }
 }
@@ -121,6 +199,38 @@ impl Preferences {
                 trimmed.to_owned()
             }
         };
+        let mut agent_defaults = default_agent_defaults();
+        for (harness, mut defaults) in self.agent_defaults {
+            let normalize = |value: Option<String>| {
+                value.map(|v| v.trim().to_owned()).filter(|v| !v.is_empty())
+            };
+            defaults.primary.model = normalize(defaults.primary.model);
+            defaults.primary.effort = normalize(defaults.primary.effort);
+            if let Some(secondary) = &mut defaults.secondary {
+                secondary.model = normalize(secondary.model.take());
+                secondary.effort = normalize(secondary.effort.take());
+            }
+            if !harness.supports_model_selection() {
+                defaults.primary.model = None;
+                if let Some(secondary) = &mut defaults.secondary {
+                    secondary.model = None;
+                }
+            }
+            if !harness.supports_effort_selection() {
+                defaults.primary.effort = None;
+                if let Some(secondary) = &mut defaults.secondary {
+                    secondary.effort = None;
+                }
+            }
+            if defaults
+                .secondary
+                .as_ref()
+                .is_some_and(|p| p.model.is_none() && p.effort.is_none())
+            {
+                defaults.secondary = None;
+            }
+            agent_defaults.insert(harness, defaults);
+        }
         Self {
             editor_command,
             terminal_app,
@@ -128,6 +238,7 @@ impl Preferences {
             show_builtins: self.show_builtins,
             notify_on_completion: self.notify_on_completion,
             notify_while_focused: self.notify_while_focused,
+            agent_defaults,
         }
     }
 }
@@ -182,11 +293,27 @@ pub fn save(path: &Path, prefs: &Preferences) -> Result<(), AppError> {
         path: path.to_owned(),
         source: std::io::Error::other(e.to_string()),
     })?;
-    let fields = match serialized {
+    let mut fields = match serialized {
         serde_norway::Value::Mapping(fields) => fields,
         _ => serde_norway::Mapping::new(),
     };
     switchboard_core::edit_yaml_mapping(path, move |root| {
+        let defaults_key = serde_norway::Value::String("agent_defaults".to_owned());
+        if let Some(new_defaults) = fields.remove(&defaults_key) {
+            match (root.get_mut(&defaults_key), new_defaults) {
+                (
+                    Some(serde_norway::Value::Mapping(existing)),
+                    serde_norway::Value::Mapping(known),
+                ) => {
+                    for (key, value) in known {
+                        existing.insert(key, value);
+                    }
+                }
+                (_, value) => {
+                    root.insert(defaults_key, value);
+                }
+            }
+        }
         for (key, value) in fields {
             root.insert(key, value);
         }
@@ -246,6 +373,90 @@ mod tests {
     }
 
     #[test]
+    fn missing_agent_defaults_gets_all_harness_defaults() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(&path, "terminal_app: iTerm\n").unwrap();
+
+        let loaded = load(&path);
+
+        assert_eq!(loaded.agent_defaults, default_agent_defaults());
+    }
+
+    #[test]
+    fn agent_defaults_normalize_profiles_and_fill_missing_harnesses() {
+        let prefs = Preferences {
+            agent_defaults: BTreeMap::from([(
+                HarnessKind::ClaudeCode,
+                AgentDefaults {
+                    primary: AgentProfile {
+                        model: Some("  sonnet  ".to_owned()),
+                        effort: Some(" medium ".to_owned()),
+                    },
+                    secondary: Some(AgentProfile {
+                        model: Some(" haiku ".to_owned()),
+                        effort: Some(" low ".to_owned()),
+                    }),
+                },
+            )]),
+            ..Preferences::default()
+        }
+        .normalized();
+
+        assert_eq!(
+            prefs.agent_defaults[&HarnessKind::ClaudeCode],
+            AgentDefaults {
+                primary: AgentProfile {
+                    model: Some("sonnet".to_owned()),
+                    effort: Some("medium".to_owned()),
+                },
+                secondary: Some(AgentProfile {
+                    model: Some("haiku".to_owned()),
+                    effort: Some("low".to_owned()),
+                }),
+            }
+        );
+        assert_eq!(
+            prefs.agent_defaults[&HarnessKind::Codex],
+            default_agent_defaults()[&HarnessKind::Codex]
+        );
+    }
+
+    #[test]
+    fn unknown_future_harness_defaults_are_ignored_on_load_and_preserved_on_save() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(
+            &path,
+            "terminal_app: iTerm\nagent_defaults:\n  claude_code:\n    primary:\n      model: sonnet\n      effort: medium\n  future_harness:\n    primary:\n      model: future-model\n      effort: extreme\n",
+        )
+        .unwrap();
+
+        let mut prefs = load(&path);
+        assert_eq!(prefs.terminal_app, "iTerm");
+        assert_eq!(
+            prefs.agent_defaults[&HarnessKind::ClaudeCode]
+                .primary
+                .model
+                .as_deref(),
+            Some("sonnet")
+        );
+        prefs.editor_command = Some("zed".to_owned());
+        save(&path, &prefs).unwrap();
+
+        let reread: serde_norway::Value = switchboard_core::read_yaml(&path).unwrap();
+        let defaults = reread
+            .get("agent_defaults")
+            .and_then(serde_norway::Value::as_mapping)
+            .unwrap();
+        let future = defaults
+            .get(serde_norway::Value::String("future_harness".to_owned()))
+            .and_then(serde_norway::Value::as_mapping)
+            .unwrap();
+        assert!(future.contains_key(serde_norway::Value::String("primary".to_owned())));
+    }
+
+    #[test]
     fn save_then_load_round_trips() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("nested").join("config.yaml");
@@ -258,6 +469,7 @@ mod tests {
             show_builtins: false,
             notify_on_completion: true,
             notify_while_focused: false,
+            agent_defaults: default_agent_defaults(),
         };
         save(&path, &prefs).unwrap();
         assert_eq!(load(&path), prefs);
@@ -284,6 +496,7 @@ mod tests {
                 show_builtins: true,
                 notify_on_completion: true,
                 notify_while_focused: false,
+                agent_defaults: default_agent_defaults(),
             },
         )
         .unwrap();
@@ -332,6 +545,7 @@ mod tests {
                     show_builtins: true,
                     notify_on_completion: true,
                     notify_while_focused: false,
+                    agent_defaults: default_agent_defaults(),
                 },
             )
             .unwrap();
@@ -412,6 +626,7 @@ mod tests {
             show_builtins: true,
             notify_on_completion: true,
             notify_while_focused: false,
+            agent_defaults: default_agent_defaults(),
         }
         .normalized();
         assert_eq!(p.editor_command.as_deref(), Some("cursor"));
@@ -429,6 +644,7 @@ mod tests {
             show_builtins: true,
             notify_on_completion: true,
             notify_while_focused: false,
+            agent_defaults: default_agent_defaults(),
         }
         .normalized();
         assert_eq!(blank.editor_command, None);

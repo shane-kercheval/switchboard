@@ -85,6 +85,8 @@ afterEach(async () => {
   ws._testing.reset();
   const layoutStore = await import("$lib/layout.svelte");
   layoutStore._testing.reset();
+  const prefs = await import("$lib/preferences.svelte");
+  prefs._testing.reset();
 });
 
 describe("workspace project activity", () => {
@@ -800,42 +802,61 @@ describe("project staleness refresh", () => {
   });
 });
 
-describe("agent model/effort selection", () => {
-  it("setAgentModel calls the backend and replaces the record in its roster", async () => {
+describe("agent model profiles", () => {
+  it("setAgentProfiles updates both profiles in one call and replaces the roster record", async () => {
     const ws = await loadWorkspaceState();
     const a = agent(AGENT_1, PROJECT_1);
     ws.agentsByProject[PROJECT_1] = [a, agent(AGENT_2, PROJECT_1)];
-    const updated: AgentRecord = { ...a, model: "sonnet" };
-    invokeMock.mockImplementation(async (cmd) => (cmd === "set_agent_model" ? updated : undefined));
+    const updated: AgentRecord = {
+      ...a,
+      model: "opus",
+      effort: "high",
+      profiles: {
+        active: "primary",
+        secondary: { model: "sonnet", effort: "medium" },
+      },
+    };
+    invokeMock.mockImplementation(async (cmd) =>
+      cmd === "set_agent_profiles" ? updated : undefined,
+    );
 
-    await ws.setAgentModel(AGENT_1, "sonnet");
+    await ws.setAgentProfiles(
+      AGENT_1,
+      { model: "opus", effort: "high" },
+      { model: "sonnet", effort: "medium" },
+    );
 
-    expect(invokeMock).toHaveBeenCalledWith("set_agent_model", {
+    expect(invokeMock).toHaveBeenCalledWith("set_agent_profiles", {
       agentId: AGENT_1,
-      model: "sonnet",
+      primary: { model: "opus", effort: "high" },
+      secondary: { model: "sonnet", effort: "medium" },
     });
-    // The record is replaced in place — the sidebar (which renders this roster)
-    // reflects the new intent immediately; the sibling agent is untouched.
-    expect(ws.agentsByProject[PROJECT_1]?.find((r) => r.id === AGENT_1)?.model).toBe("sonnet");
+    expect(ws.agentsByProject[PROJECT_1]?.find((r) => r.id === AGENT_1)).toEqual(updated);
     expect(ws.agentsByProject[PROJECT_1]?.find((r) => r.id === AGENT_2)?.model).toBeUndefined();
   });
 
-  it("setAgentEffort clears the override (passes undefined; persists the cleared record)", async () => {
+  it("setActiveAgentProfile persists the active slot and replaces the roster record", async () => {
     const ws = await loadWorkspaceState();
-    const a: AgentRecord = { ...agent(AGENT_1, PROJECT_1), effort: "high" };
+    const a: AgentRecord = {
+      ...agent(AGENT_1, PROJECT_1),
+      profiles: {
+        active: "primary",
+        secondary: { model: "sonnet", effort: "medium" },
+      },
+    };
     ws.agentsByProject[PROJECT_1] = [a];
-    const cleared: AgentRecord = { ...a, effort: null };
+    const switched: AgentRecord = { ...a, profiles: { ...a.profiles!, active: "secondary" } };
     invokeMock.mockImplementation(async (cmd) =>
-      cmd === "set_agent_effort" ? cleared : undefined,
+      cmd === "set_active_agent_profile" ? switched : undefined,
     );
 
-    await ws.setAgentEffort(AGENT_1, undefined);
+    await ws.setActiveAgentProfile(AGENT_1, "secondary");
 
-    expect(invokeMock).toHaveBeenCalledWith("set_agent_effort", {
+    expect(invokeMock).toHaveBeenCalledWith("set_active_agent_profile", {
       agentId: AGENT_1,
-      effort: undefined,
+      active: "secondary",
     });
-    expect(ws.agentsByProject[PROJECT_1]?.[0]?.effort).toBeNull();
+    expect(ws.agentsByProject[PROJECT_1]?.[0]).toEqual(switched);
   });
 });
 

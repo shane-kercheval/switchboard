@@ -8,6 +8,8 @@ import type {
   ActivationCommandError,
   ActivationFailureKind,
   AgentId,
+  AgentProfile,
+  AgentProfileSlot,
   AgentRecord,
   Attachment,
   BranchKind,
@@ -393,8 +395,16 @@ export async function createAgent(
   harness: HarnessKind,
   model?: string,
   effort?: string,
+  secondary?: AgentProfile | null,
 ): Promise<AgentRecord> {
-  return await invoke<AgentRecord>("create_agent", { name, harness, model, effort });
+  return await invoke<AgentRecord>("create_agent", {
+    name,
+    harness,
+    model,
+    effort,
+    secondaryModel: secondary?.model ?? undefined,
+    secondaryEffort: secondary?.effort ?? undefined,
+  });
 }
 
 /// Branch an agent's conversation into a new agent, returning the new record.
@@ -419,17 +429,19 @@ export async function renameAgent(agentId: AgentId, newName: string): Promise<Ag
   return await invoke<AgentRecord>("rename_agent", { agentId, newName });
 }
 
-/// Change (or clear) an agent's selected model. `model` undefined clears the
-/// override back to `None`. The backend re-validates harness capability and
-/// returns the updated record (or rejects for an unsupported harness). Takes
-/// effect on the agent's next dispatch — never an in-flight turn.
-export async function setAgentModel(agentId: AgentId, model?: string): Promise<AgentRecord> {
-  return await invoke<AgentRecord>("set_agent_model", { agentId, model });
+export async function setAgentProfiles(
+  agentId: AgentId,
+  primary: AgentProfile,
+  secondary: AgentProfile | null,
+): Promise<AgentRecord> {
+  return await invoke<AgentRecord>("set_agent_profiles", { agentId, primary, secondary });
 }
 
-/// Change (or clear) an agent's selected reasoning effort. See `setAgentModel`.
-export async function setAgentEffort(agentId: AgentId, effort?: string): Promise<AgentRecord> {
-  return await invoke<AgentRecord>("set_agent_effort", { agentId, effort });
+export async function setActiveAgentProfile(
+  agentId: AgentId,
+  active: AgentProfileSlot,
+): Promise<AgentRecord> {
+  return await invoke<AgentRecord>("set_active_agent_profile", { agentId, active });
 }
 
 export async function attachAgent(

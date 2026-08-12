@@ -88,6 +88,9 @@ pub enum CoreError {
         axis: crate::harness::SelectionAxis,
     },
 
+    #[error("agent {0} cannot activate a secondary profile because none is configured")]
+    SecondaryProfileMissing(crate::agent::AgentId),
+
     /// Deliberately a statement about **Switchboard's support**, not about what
     /// the harness's CLI can do — Codex, for one, can branch a session (through
     /// an integration Switchboard doesn't wire). Claiming otherwise would be

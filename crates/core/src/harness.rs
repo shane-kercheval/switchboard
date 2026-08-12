@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 /// of the session ID as a filename component, and UUID v7s minted in the
 /// same millisecond share their first 8 chars, causing on-disk session-file
 /// interleave under concurrent dispatch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum HarnessKind {

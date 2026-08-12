@@ -31,6 +31,8 @@ import type {
   AgentId,
   ActivationFailure,
   AgentRecord,
+  AgentProfile,
+  AgentProfileSlot,
   AgentSessionFingerprint,
   ConversationItem,
   HarnessKind,
@@ -45,11 +47,8 @@ import { tick, untrack } from "svelte";
 import { SvelteSet } from "svelte/reactivity";
 import { harnessAvailability, settledHarnessAvailability } from "$lib/harnessAvailability.svelte";
 import { AUTO_SEED_ON_NEW_PROJECT } from "$lib/harnessDisplay";
-import {
-  NEW_PROJECT_DEFAULT_EFFORT,
-  NEW_PROJECT_DEFAULT_MODEL,
-  defaultAgentName,
-} from "$lib/agentSelection";
+import { defaultAgentName } from "$lib/agentSelection";
+import { loadPreferences, preferences } from "$lib/preferences.svelte";
 import {
   compareIsoTimestampsDescending,
   currentIsoTimestamp,
@@ -465,6 +464,8 @@ export async function createProjectAndActivate(name: string, directory: string):
 /// same coupling affects project remove/rename.
 async function seedAgentsForInstalledHarnesses(projectId: ProjectId): Promise<void> {
   if (selection.activeProjectId !== projectId) return;
+  await loadPreferences();
+  if (selection.activeProjectId !== projectId) return;
   // A `capturing` result means the wait expired with the PATH still unresolved,
   // so `installed()` may be short. Seeding proceeds anyway — a wedged
   // non-dismissible dialog is worse than a missing agent — but the user is told.
@@ -480,13 +481,15 @@ async function seedAgentsForInstalledHarnesses(projectId: ProjectId): Promise<vo
     try {
       // Every auto-created agent is born with a known, displayed model/effort
       // (`undefined` for a no-capability harness → backend stores `None`).
-      const model = NEW_PROJECT_DEFAULT_MODEL[harness];
-      const effort = NEW_PROJECT_DEFAULT_EFFORT[harness];
+      const defaults = preferences.agent_defaults[harness];
+      const model = defaults.primary.model ?? undefined;
+      const effort = defaults.primary.effort ?? undefined;
       const agent = await api.createAgent(
         defaultAgentName(harness, model, effort),
         harness,
         model,
         effort,
+        defaults.secondary,
       );
       if (selection.activeProjectId !== projectId) break;
       await registerAgent(agent);
@@ -535,19 +538,20 @@ export async function renameAgent(agentId: AgentId, newName: string): Promise<vo
   replaceAgentRecord(agentId, updated);
 }
 
-/// Change (or clear) an agent's selected model. Mirrors `renameAgent`: the
-/// backend re-persists and returns the updated record, which replaces the old
-/// one in whichever project roster holds it — so the sidebar reflects the new
-/// intent immediately, before any turn runs. `model` undefined clears the
-/// override. Errors propagate to the caller (the editor surfaces them).
-export async function setAgentModel(agentId: AgentId, model?: string): Promise<void> {
-  const updated = await api.setAgentModel(agentId, model);
+export async function setAgentProfiles(
+  agentId: AgentId,
+  primary: AgentProfile,
+  secondary: AgentProfile | null,
+): Promise<void> {
+  const updated = await api.setAgentProfiles(agentId, primary, secondary);
   replaceAgentRecord(agentId, updated);
 }
 
-/// Change (or clear) an agent's selected reasoning effort. See `setAgentModel`.
-export async function setAgentEffort(agentId: AgentId, effort?: string): Promise<void> {
-  const updated = await api.setAgentEffort(agentId, effort);
+export async function setActiveAgentProfile(
+  agentId: AgentId,
+  active: AgentProfileSlot,
+): Promise<void> {
+  const updated = await api.setActiveAgentProfile(agentId, active);
   replaceAgentRecord(agentId, updated);
 }
 

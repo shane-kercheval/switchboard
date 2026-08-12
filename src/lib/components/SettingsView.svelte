@@ -13,10 +13,16 @@
     SEGMENTED_ITEM_INACTIVE_CLASS,
   } from "$lib/components/ui/segmentedControl";
   import HarnessStatusList from "$lib/components/HarnessStatusList.svelte";
+  import AgentProfileEditor from "$lib/components/AgentProfileEditor.svelte";
   import Input from "$lib/components/ui/Input.svelte";
   import CopyButton from "$lib/components/ui/CopyButton.svelte";
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
-  import { preferences, saveStatus, updatePreferences } from "$lib/preferences.svelte";
+  import {
+    loadPreferences,
+    preferences,
+    saveStatus,
+    updatePreferences,
+  } from "$lib/preferences.svelte";
   import McpServersSettings from "$lib/components/McpServersSettings.svelte";
   import {
     localPromptsDir,
@@ -25,7 +31,8 @@
     openWorkflowsDir,
     notificationAvailability,
   } from "$lib/api";
-  import type { NotificationAvailability } from "$lib/types";
+  import type { AgentProfile, HarnessKind, NotificationAvailability } from "$lib/types";
+  import { ALL_HARNESSES, HARNESS_LABEL } from "$lib/harnessDisplay";
   import { workflowAuthoringPrompt } from "$lib/workflowAuthoring";
 
   let { onClose }: { onClose: () => void } = $props();
@@ -152,6 +159,21 @@
       console.error("[switchboard] open workflows folder failed", e);
     });
   }
+
+  async function updateAgentDefault(
+    harness: HarnessKind,
+    slot: "primary" | "secondary",
+    profile: AgentProfile | null,
+  ): Promise<void> {
+    await loadPreferences();
+    const agentDefaults = structuredClone($state.snapshot(preferences.agent_defaults));
+    if (slot === "primary" && profile !== null) {
+      agentDefaults[harness].primary = profile;
+    } else if (slot === "secondary") {
+      agentDefaults[harness].secondary = profile;
+    }
+    await updatePreferences({ agent_defaults: agentDefaults });
+  }
 </script>
 
 <div class="flex flex-1 overflow-y-auto px-8 pb-7" data-testid="settings-view">
@@ -209,6 +231,51 @@
           </button>
         {/each}
       </div>
+    </section>
+
+    <section class={cn(sectionClass, "mt-7")} data-testid="agent-defaults-settings">
+      <div>
+        <h2 class={sectionHeadingClass}>Agent Defaults</h2>
+        <p class="text-muted mt-1 text-sm leading-relaxed">
+          Choose the initial model settings for new agents and projects. An optional secondary
+          configuration makes it easy to switch an agent between two setups.
+        </p>
+      </div>
+
+      <div class="space-y-2">
+        {#each ALL_HARNESSES as harness (harness)}
+          <details
+            class="border-border bg-raised rounded-md border"
+            open={harness === "claude_code"}
+          >
+            <summary
+              class="text-fg hover:bg-active cursor-pointer list-none rounded-md px-3 py-2.5 text-sm font-medium"
+            >
+              {HARNESS_LABEL[harness]}
+            </summary>
+            <div class="border-border border-t p-3">
+              <AgentProfileEditor
+                {harness}
+                bind:primary={
+                  () => preferences.agent_defaults[harness].primary,
+                  (value) => updateAgentDefault(harness, "primary", value)
+                }
+                bind:secondary={
+                  () => preferences.agent_defaults[harness].secondary,
+                  (value) => updateAgentDefault(harness, "secondary", value)
+                }
+                testidPrefix={`settings-profile-${harness}`}
+              />
+            </div>
+          </details>
+        {/each}
+      </div>
+
+      {#if saveFailedFor("agent_defaults")}
+        <p class="text-status-failed text-xs" data-testid="agent-defaults-save-error">
+          Couldn't save agent defaults. Your changes still apply for this session.
+        </p>
+      {/if}
     </section>
 
     <section class={cn(sectionClass, "mt-7")}>

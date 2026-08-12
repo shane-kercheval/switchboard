@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex, Weak};
 use switchboard_core::{AgentId, AgentRecord, Project, SendId};
 use switchboard_dispatcher::{
     ConversationJournal, DispatchContext, DispatchContextFactory, Dispatcher, EventEmitter,
-    MetadataCache, SessionLocatorSink,
+    MetadataCache, SelectionSnapshot, SessionLocatorSink,
 };
 use switchboard_harness::{DispatchOptions, HarnessAdapter};
 
@@ -104,6 +104,18 @@ impl ProjectDispatchContextFactory {
 }
 
 impl DispatchContextFactory for ProjectDispatchContextFactory {
+    fn selection_snapshot(&self) -> Option<SelectionSnapshot> {
+        let agent = lock(&self.agents_by_id)
+            .get(&self.agent_id)
+            .cloned()
+            .unwrap_or_else(|| self.fallback_agent.clone());
+        let selected = agent.active_profile();
+        Some(SelectionSnapshot {
+            model: selected.model.clone(),
+            effort: selected.effort.clone(),
+        })
+    }
+
     /// The **authoritative** materializing-fork check. `send_message_impl` runs
     /// the same policy before enqueuing so the common refusal is immediate and
     /// friendly, but a send to a busy agent queues — and a fork whose first turn

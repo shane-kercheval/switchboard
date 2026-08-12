@@ -213,6 +213,11 @@ struct WorkItem {
     /// the user's literal text.
     prompt: String,
     attachments: Vec<Attachment>,
+    /// Model/effort selected when the user submitted this send. Unlike the
+    /// locator and other agent state, these values are intent attached to the
+    /// queued work and must not change if the agent switches profiles before
+    /// the backlog reaches it.
+    selection: Option<SelectionSnapshot>,
     /// Set only for sends made via [`Dispatcher::send_message_awaiting_completion`].
     /// The actor fires it once when this send's turn reaches a terminal state.
     /// `None` for the compose-bar path — that path allocates no completion channel
@@ -231,6 +236,15 @@ struct WorkItem {
     /// user turn optimistically. Emitting at the journal boundary keeps the live
     /// user message identical to the reloaded journal view by construction.
     emit_user_message: bool,
+}
+
+/// The profile-dependent part of an agent record captured for one send.
+/// Ephemeral by design: it rides only in the in-memory queue; durable history
+/// records the harness-reported model/effort on the resulting turn.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SelectionSnapshot {
+    pub model: Option<String>,
+    pub effort: Option<String>,
 }
 
 /// Delivered once, when an awaited send's turn reaches a terminal state, over
@@ -791,6 +805,14 @@ pub struct DispatchContext {
 pub trait DispatchContextFactory: Send + Sync {
     fn build(&self, send_id: SendId) -> DispatchContext;
 
+    /// Model/effort intent captured when a send is submitted. This is called
+    /// before the work item enters the actor queue, including when the actor
+    /// already exists and ignores the newly supplied factory for context
+    /// construction. The default preserves callers with no selectable profile.
+    fn selection_snapshot(&self) -> Option<SelectionSnapshot> {
+        None
+    }
+
     /// Policy check run at the moment this turn actually **starts**, before the
     /// send is journaled or any subprocess spawns. `Err(reason)` refuses just
     /// this turn; the backlog advances and later items are checked on their own
@@ -860,11 +882,13 @@ impl Dispatcher {
         factory: Arc<dyn DispatchContextFactory>,
         on_busy: OnBusy,
     ) -> SendOutcome {
+        let selection = factory.selection_snapshot();
         let item = WorkItem {
             message_id: Uuid::now_v7(),
             send_id,
             prompt: prompt.to_owned(),
             attachments,
+            selection,
             completion: None,
             // Compose-bar sends render their user turn optimistically on the
             // frontend; no backend-emitted user message.
@@ -934,11 +958,13 @@ impl Dispatcher {
         emit_user_message: bool,
     ) -> AwaitableSendOutcome {
         let (completion_tx, completion_rx) = oneshot::channel();
+        let selection = factory.selection_snapshot();
         let item = WorkItem {
             message_id: Uuid::now_v7(),
             send_id,
             prompt: prompt.to_owned(),
             attachments,
+            selection,
             completion: Some(completion_tx),
             emit_user_message,
         };
@@ -1466,6 +1492,11 @@ async fn run_turn(
     commands: &mut mpsc::UnboundedReceiver<Command>,
     backlog: &mut VecDeque<WorkItem>,
 ) -> TurnAfter {
+    let mut context = factory.build(item.send_id);
+    if let Some(selection) = &item.selection {
+        context.agent.model.clone_from(&selection.model);
+        context.agent.effort.clone_from(&selection.effort);
+    }
     let DispatchContext {
         adapter,
         cwd,
@@ -1475,7 +1506,7 @@ async fn run_turn(
         journal,
         metadata,
         locator_sink,
-    } = factory.build(item.send_id);
+    } = context;
     // Take the completion sender out of the item so the failure paths below can
     // fire it on early return; on success it is handed to `drain_turn`, which
     // fires it at the turn's terminal. Partial move — the remaining `item`

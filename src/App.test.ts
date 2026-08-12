@@ -11,8 +11,10 @@ import type {
   ProjectListing,
   ProjectSummary,
   RepoListing,
+  Preferences,
 } from "$lib/types";
 import { ALL_HARNESSES } from "$lib/harnessDisplay";
+import { DEFAULT_AGENT_PROFILES } from "$lib/agentSelection";
 import { shortcut } from "$lib/platform";
 // Static import so App.svelte's (large) component-tree transform happens at
 // module collection, not inside the first test that calls `mountApp`. `vi.mock`
@@ -106,6 +108,8 @@ type Backend = {
   pins: Map<string, MessagePin[]>;
   failPinLoadFor: Set<string>;
   failPinSaveFor: Set<string>;
+  agentDefaults: Preferences["agent_defaults"];
+  preferencesGate: Promise<void> | null;
 };
 let backend: Backend;
 let agentSeq = 0;
@@ -141,6 +145,8 @@ function freshBackend(): Backend {
     pins: new Map(),
     failPinLoadFor: new Set(),
     failPinSaveFor: new Set(),
+    agentDefaults: structuredClone(DEFAULT_AGENT_PROFILES),
+    preferencesGate: null,
   };
 }
 
@@ -294,11 +300,13 @@ const invokeMock = vi.fn(async (cmd: string, args?: Record<string, unknown>): Pr
       if (backend.awaitPathGate) await backend.awaitPathGate;
       return backend.pathSource;
     case "get_preferences":
+      if (backend.preferencesGate) await backend.preferencesGate;
       return {
         editor_command: null,
         terminal_app: "Terminal",
         diff_style: "side_by_side",
         show_builtins: true,
+        agent_defaults: backend.agentDefaults,
       };
     case "list_message_pins": {
       const projectId = args?.projectId as string;
@@ -543,6 +551,8 @@ describe("App", () => {
     jump._testing.reset();
     const pins = await import("$lib/state/messagePins.svelte");
     pins._testing.reset();
+    const prefs = await import("$lib/preferences.svelte");
+    prefs._testing.reset();
   });
 
   // --- harness availability banners (workspace empty → welcome) ---
@@ -778,12 +788,98 @@ describe("App", () => {
     // (Antigravity carries neither).
     const seededArgs = invokeMock.mock.calls
       .filter(([c]) => c === "create_agent")
-      .map(([, a]) => a as { name: string; harness: string; model?: string; effort?: string });
+      .map(
+        ([, a]) =>
+          a as {
+            name: string;
+            harness: string;
+            model?: string;
+            effort?: string;
+            secondaryModel?: string;
+            secondaryEffort?: string;
+          },
+      );
     expect(seededArgs).toEqual([
-      { name: "opus-high", harness: "claude_code", model: "opus", effort: "high" },
-      { name: "gpt-5-6-sol-high", harness: "codex", model: "gpt-5.6-sol", effort: "high" },
-      { name: "antigravity", harness: "antigravity", model: undefined, effort: undefined },
+      {
+        name: "opus-high",
+        harness: "claude_code",
+        model: "opus",
+        effort: "high",
+        secondaryModel: undefined,
+        secondaryEffort: undefined,
+      },
+      {
+        name: "gpt-5-6-sol-high",
+        harness: "codex",
+        model: "gpt-5.6-sol",
+        effort: "high",
+        secondaryModel: undefined,
+        secondaryEffort: undefined,
+      },
+      {
+        name: "antigravity",
+        harness: "antigravity",
+        model: undefined,
+        effort: undefined,
+        secondaryModel: undefined,
+        secondaryEffort: undefined,
+      },
     ]);
+  });
+
+  it("new project: applies the saved primary and secondary defaults", async () => {
+    backend.agentDefaults.claude_code = {
+      primary: { model: "sonnet", effort: "medium" },
+      secondary: { model: "haiku", effort: "low" },
+    };
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("welcome-add-project")).toBeInTheDocument());
+
+    await createNewProjectViaDialog("custom-defaults");
+
+    await waitFor(() => expect(createAgentCalls()).toHaveLength(3));
+    const claudeArgs = invokeMock.mock.calls.find(
+      ([command, args]) => command === "create_agent" && args?.harness === "claude_code",
+    )?.[1];
+    expect(claudeArgs).toEqual({
+      name: "sonnet-medium",
+      harness: "claude_code",
+      model: "sonnet",
+      effort: "medium",
+      secondaryModel: "haiku",
+      secondaryEffort: "low",
+    });
+  });
+
+  it("new project waits for saved defaults before seeding agents", async () => {
+    backend.agentDefaults.claude_code = {
+      primary: { model: "sonnet", effort: "medium" },
+      secondary: { model: "haiku", effort: "low" },
+    };
+    const preferencesGate = deferred<void>();
+    backend.preferencesGate = preferencesGate.promise;
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("welcome-add-project")).toBeInTheDocument());
+
+    await createNewProjectViaDialog("deferred-defaults");
+    await waitFor(() =>
+      expect(invokeMock.mock.calls.some(([command]) => command === "create_project")).toBe(true),
+    );
+    expect(createAgentCalls()).toHaveLength(0);
+
+    preferencesGate.resolve();
+    await waitFor(() => expect(createAgentCalls()).toHaveLength(3));
+    const claudeArgs = invokeMock.mock.calls.find(
+      ([command, args]) => command === "create_agent" && args?.harness === "claude_code",
+    )?.[1];
+    expect(claudeArgs).toEqual({
+      name: "sonnet-medium",
+      harness: "claude_code",
+      model: "sonnet",
+      effort: "medium",
+      secondaryModel: "haiku",
+      secondaryEffort: "low",
+    });
   });
 
   it("new project: an installed but auto-seed-excluded harness (Gemini) is not seeded", async () => {
@@ -1430,6 +1526,8 @@ describe("App", () => {
       harness: "claude_code",
       model: "opus",
       effort: "high",
+      secondaryModel: undefined,
+      secondaryEffort: undefined,
     });
   });
 

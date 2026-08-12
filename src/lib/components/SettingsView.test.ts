@@ -83,6 +83,40 @@ describe("SettingsView", () => {
     );
   });
 
+  it("persists per-harness primary and optional secondary defaults", async () => {
+    render(SettingsView, { props: { onClose: vi.fn() } });
+    await fireEvent.click(screen.getByText("Codex", { selector: "summary" }));
+    await fireEvent.click(
+      screen.getByTestId("settings-profile-codex-primary-model-option-gpt-5.6-terra"),
+    );
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("set_preferences", {
+        preferences: expect.objectContaining({
+          agent_defaults: expect.objectContaining({
+            codex: expect.objectContaining({
+              primary: { model: "gpt-5.6-terra", effort: "high" },
+            }),
+          }),
+        }),
+      }),
+    );
+
+    await fireEvent.click(screen.getByTestId("settings-profile-codex-secondary-toggle"));
+    expect(screen.getByTestId("settings-profile-codex-secondary-model")).toBeInTheDocument();
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenLastCalledWith("set_preferences", {
+        preferences: expect.objectContaining({
+          agent_defaults: expect.objectContaining({
+            codex: {
+              primary: { model: "gpt-5.6-terra", effort: "high" },
+              secondary: { model: "gpt-5.6-terra", effort: "medium" },
+            },
+          }),
+        }),
+      }),
+    );
+  });
+
   it("theme picker has role=radiogroup and each option has role=radio", () => {
     render(SettingsView, { props: { onClose: vi.fn() } });
     const group = screen.getByRole("radiogroup", { name: "Theme" });
@@ -148,6 +182,7 @@ describe("SettingsView", () => {
           show_builtins: true,
           notify_on_completion: true,
           notify_while_focused: false,
+          agent_defaults: expect.any(Object),
         },
       }),
     );
@@ -165,6 +200,7 @@ describe("SettingsView", () => {
           show_builtins: true,
           notify_on_completion: true,
           notify_while_focused: false,
+          agent_defaults: expect.any(Object),
         },
       }),
     );
@@ -185,6 +221,7 @@ describe("SettingsView", () => {
           show_builtins: true,
           notify_on_completion: true,
           notify_while_focused: false,
+          agent_defaults: expect.any(Object),
         },
       }),
     );
@@ -201,6 +238,7 @@ describe("SettingsView", () => {
           show_builtins: true,
           notify_on_completion: true,
           notify_while_focused: false,
+          agent_defaults: expect.any(Object),
         },
       }),
     );

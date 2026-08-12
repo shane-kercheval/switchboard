@@ -42,16 +42,18 @@
     type WorkflowContent,
   } from "$lib/state/composeStore";
   import {
-    advancePromptFork,
-    beginPromptFork,
-    clearPromptForkOutcome,
+    abandonOperation,
+    beginOperation,
+    clearOutcome,
     composerConsumedCount,
-    endPromptFork,
+    finishOperation,
     markComposerConsumed,
-    promptForkOperation,
-    promptForkOutcome,
-    takePromptForkOutcome,
-  } from "$lib/state/promptForkOps.svelte";
+    operationFor,
+    outcomeFor,
+    ownsOperation,
+    setOperationPhase,
+    takeOutcome,
+  } from "$lib/state/composeOperations.svelte";
   import { projects, recordProjectsActivityLocally } from "$lib/state/workspace.svelte";
   import {
     selectionFor,
@@ -317,7 +319,7 @@
         addAttachmentChip(staged);
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
-        sendError = `Couldn't attach ${basename(path)}: ${message}`;
+        showError(`Couldn't attach ${basename(path)}: ${message}`);
       }
     }
   }
@@ -390,12 +392,11 @@
   // Whether the cache has been read at least once, so the picker can show a
   // "loading" row instead of momentarily claiming there are no prompts.
   let promptsLoaded = $state(false);
-  let sending = $state(false);
+
   // The provider whose browser sign-in this send is currently waiting on —
   // auto-launched when a render reports needs-sign-in (the user just tried to
   // use that provider's prompt, so intent is unambiguous). Drives the
   // compose-bar waiting line; `sending` stays true across the wait.
-  let signingInProvider = $state<string | null>(null);
   // Informational (non-error) line in the send-feedback slot — used when a
   // mid-send sign-in succeeded but the composer context changed during the
   // browser wait, so the send was deliberately not dispatched.
@@ -721,10 +722,14 @@
   /// can derive from it. This component seeds it from the persisted snapshot at
   /// mount and persists writes back (the `setSelection` effect below), wherever
   /// they originated.
-  // Defensive: a fresh composer can never start with targeting frozen (the
-  // unmount release above should make this a no-op, but a stuck lock would
-  // silently disable pane targeting forever — not a failure worth risking).
-  untrack(() => setTargetingLocked(projectId, false));
+  // Reconcile the freeze with the project's claim rather than clearing it blind:
+  // an operation still building a message keeps its recipients frozen across a
+  // remount, and one parked on a sign-in deliberately does not. Clearing
+  // unconditionally let a remount unfreeze targeting under a live operation.
+  untrack(() => {
+    const op = operationFor(projectId);
+    setTargetingLocked(projectId, op !== undefined && op.phase.name !== "awaiting_user");
+  });
   untrack(() => setRecipients(projectId, initialSelection(saved.selectedIds, agents)));
   const selectedIds = $derived(selectionFor(projectId));
   function setSelectedIds(ids: AgentId[]): void {
@@ -1205,11 +1210,21 @@
   /// per-mode content: plain needs non-empty text; prompt needs a selected prompt
   /// Busy for *this project's composer*, not just this component instance.
   ///
-  /// A prompt fork outlives the bar that started it (a project switch remounts
-  /// the bar; the send runs on), and a replacement's `sending` starts at `false`.
-  /// Without the project-scoped term, coming back mid-fork gives you a composer
-  /// that will happily submit the same prompt again — two branches, two sends.
-  const composerBusy = $derived(sending || promptForkOperation(projectId) !== undefined);
+  /// Read from the operation claim alone. Every send path that awaits claims the
+  /// slot, so a component-local flag would be a second representation of the same
+  /// fact — and the two disagreeing after a remount is the bug this feature kept
+  /// reproducing. It also makes abandonment work: releasing the claim frees the
+  /// composer everywhere, including the bar that started the operation.
+  const composerBusy = $derived(operationFor(projectId) !== undefined);
+
+  /// The operation is parked on a browser sign-in whose final step the backend
+  /// deliberately leaves un-timed. Offer a way out rather than letting one stuck
+  /// sign-in hold the project's composer until the app restarts.
+  const abandonableOperation = $derived.by(() => {
+    const op = operationFor(projectId);
+    if (op === undefined || op.phase.name !== "awaiting_user") return undefined;
+    return { id: op.id, provider: op.phase.provider };
+  });
 
   /// A finished operation's message reaches whichever bar is mounted now, which
   /// may not be the one that started it — so it is *consumed* into this bar's own
@@ -1217,12 +1232,12 @@
   /// standing fallback kept a stale "Fork failed" alive through every subsequent
   /// action and every revisit of the project.
   $effect(() => {
-    const outcome = promptForkOutcome(projectId);
+    const outcome = outcomeFor(projectId);
     if (outcome === undefined) return;
     untrack(() => {
-      takePromptForkOutcome(projectId);
-      if (outcome.tone === "error") sendError = outcome.message;
-      else sendNotice = outcome.message;
+      takeOutcome(projectId);
+      if (outcome.tone === "error") showError(outcome.message);
+      else showNotice(outcome.message);
     });
   });
 
@@ -1405,8 +1420,10 @@
     // or not this bar is still around to render the chip.
     unmounted = true;
     // A mid-render unmount (project switch via the parent's `{#key}`) must not
-    // leave the project's pane targeting frozen.
-    setTargetingLocked(projectId, false);
+    // leave the project's pane targeting frozen — unless an operation that
+    // outlives this bar still owns it, in which case releasing would unfreeze
+    // recipients underneath work that is still running.
+    if (operationFor(projectId) === undefined) setTargetingLocked(projectId, false);
     // Flush point: a project switch remounts this bar (`{#key}`), so the
     // outgoing bar's deferred draft write must land before the next one mounts.
     flush();
@@ -1611,9 +1628,9 @@
     try {
       await api.copyBuiltinPrompt(prompt.name);
       await loadPrompts();
-      sendError = null;
+      clearStatus();
     } catch (err) {
-      sendError = `Couldn't copy prompt: ${err instanceof Error ? err.message : String(err)}`;
+      showError(`Couldn't copy prompt: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
@@ -1695,7 +1712,7 @@
       workflowInputs = seeded;
     } catch (err) {
       if (gen === workflowFormGen) {
-        sendError = `Couldn't load workflow: ${err instanceof Error ? err.message : String(err)}`;
+        showError(`Couldn't load workflow: ${err instanceof Error ? err.message : String(err)}`);
       }
     } finally {
       if (gen === workflowFormGen) workflowFormLoading = false;
@@ -1717,9 +1734,9 @@
     try {
       await api.copyBuiltinWorkflow(workflow.name);
       await loadWorkflows();
-      sendError = null;
+      clearStatus();
     } catch (err) {
-      sendError = `Couldn't copy workflow: ${err instanceof Error ? err.message : String(err)}`;
+      showError(`Couldn't copy workflow: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
@@ -1796,7 +1813,7 @@
     if (selectedWorkflow === null || invokingWorkflow || !workflowRunnable) return;
     const workflow = selectedWorkflow;
     invokingWorkflow = true;
-    sendError = null;
+    clearStatus();
     try {
       // Pane-expand each field's sources to agent ids; omit empty fields so the
       // map carries only fields the user actually attached a forward to.
@@ -1839,7 +1856,7 @@
       await refreshRuns(projectId);
       removeWorkflow();
     } catch (err) {
-      sendError = `Couldn't run workflow: ${err instanceof Error ? err.message : String(err)}`;
+      showError(`Couldn't run workflow: ${err instanceof Error ? err.message : String(err)}`);
     } finally {
       invokingWorkflow = false;
     }
@@ -1867,7 +1884,7 @@
       // The shortcut is live in states where the button is hidden, so this is
       // the only place the reason can reach the user. Never fall through to a
       // normal send: that would message the agent they were branching away from.
-      sendError = attempt.reason;
+      showError(attempt.reason);
       return;
     }
     closeMentionMenu();
@@ -1927,11 +1944,11 @@
           // invalidated (a source failed/cancelled, or all sources empty) or the
           // user cancelled the hold — nothing resolved; restore the composer.
           restoreForward(body, sources, attachments);
-          if (outcome.status === "invalidated") sendError = `Forward not sent: ${outcome.reason}`;
+          if (outcome.status === "invalidated") showError(`Forward not sent: ${outcome.reason}`);
         }
       } catch (err) {
         removeHeldForward(forwardProjectId, forwardId);
-        sendError = `Forward failed: ${err instanceof Error ? err.message : String(err)}`;
+        showError(`Forward failed: ${err instanceof Error ? err.message : String(err)}`);
         restoreForward(body, sources, attachments);
       }
     })();
@@ -2056,11 +2073,11 @@
             appendedSources,
             attachments,
           );
-          if (outcome.status === "invalidated") sendError = `Forward not sent: ${outcome.reason}`;
+          if (outcome.status === "invalidated") showError(`Forward not sent: ${outcome.reason}`);
         }
       } catch (err) {
         removeHeldForward(forwardProjectId, forwardId);
-        sendError = `Forward failed: ${err instanceof Error ? err.message : String(err)}`;
+        showError(`Forward failed: ${err instanceof Error ? err.message : String(err)}`);
         restoreForwardPrompt(prompt, typedArgs, appended, argSources, appendedSources, attachments);
       }
     })();
@@ -2145,7 +2162,7 @@
           recordSendAccepted(agent.id, userTurnId, messageId);
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
-          sendError = `Send failed: ${message}`;
+          showError(`Send failed: ${message}`);
           failSendStart(agent.id, userTurnId, { message, kind: "adapter_failure" });
         }
       })();
@@ -2193,6 +2210,10 @@
       commitChips([...carried.filter((chip) => !seen.has(chip.path)), ...attachmentChips]);
     }
     flush();
+    // A bar mounted since this send started reads the store once and pushes its
+    // own locals down, so the write above is invisible to it without this — the
+    // message would come back only on the *next* mount.
+    if (unmounted) markComposerConsumed(projectId);
   }
 
   async function dispatchForkSend(
@@ -2200,16 +2221,17 @@
     text: string,
     attachments: Attachment[],
   ): Promise<void> {
-    // **Single-flight.** This is the only `await` in the plain submit path, and
-    // that path's `sendDisabled` had no busy term before it existed. Two submits
-    // across this await would each register a branch and each dispatch the same
-    // text — two agents, the message sent twice, quota spent twice. Set
-    // synchronously, before the first await, paired with `sending` in
-    // `sendDisabled`.
-    sending = true;
+    // **Single-flight, project-scoped.** Two submits across this await would each
+    // register a branch and each dispatch the same text — two agents, the message
+    // sent twice, quota spent twice. Claiming rather than setting a local flag is
+    // what makes that hold across a project switch: a replacement bar reads its
+    // busy state from the claim, so it cannot start a second operation of any
+    // kind while this one registers.
+    const opId = beginOperation(projectId, { kind: "plain_fork", sourceId: source.id });
+    if (opId === null) return;
     // Clear any error from a previous send/forward, as `handleSubmit` does —
     // otherwise a stale failure sits on screen through a successful fork.
-    sendError = null;
+    clearStatus();
     // **Clear before the await, not after.** This is the only send path with an
     // await between submit and dispatch, and everything downstream of that await
     // is a hazard: a project switch destroys this bar mid-flight, and `onDestroy`
@@ -2224,32 +2246,43 @@
     commitChips([]);
     persistComposeNow();
     const capturedRecipients = [...selectedIds];
-    let created: ReachableFork;
+    // The claim is held through the whole operation, not just the await: the
+    // selection swap, the restore, and the dispatch below are the part a second
+    // operation must not interleave with.
+    let outcome: { message: string; tone: "error" | "notice" } | undefined;
     try {
-      created = await createReachableFork(source.id);
-    } catch (err) {
-      sendError = `Fork failed: ${err instanceof Error ? err.message : String(err)}`;
-      restoreCapturedSend(text, carried);
-      return;
+      let created: ReachableFork;
+      try {
+        created = await createReachableFork(source.id);
+      } catch (err) {
+        outcome = {
+          message: `Fork failed: ${err instanceof Error ? err.message : String(err)}`,
+          tone: "error",
+        };
+        restoreCapturedSend(text, carried);
+        return;
+      }
+      selectForkIfRecipientsUnchanged(capturedRecipients, created.fork.id);
+      // **Committed is not the same as reachable.** Hand the message back — the
+      // branch stays visible with its retry, and the next send materializes it,
+      // which is the ordinary self-healing path for a fork whose first turn never
+      // ran.
+      if (created.kind === "unsubscribed") {
+        outcome = { message: created.message, tone: "error" };
+        restoreCapturedSend(text, carried);
+        return;
+      }
+      // Otherwise the send always completes, even if this bar is gone. Abandoning
+      // the first message would leave a promptless fork — the one state this
+      // design exists to make impossible, since Claude refuses a promptless fork
+      // and the branch would never materialize.
+      dispatchToRecipients(text, attachments, [created.fork]);
+      sendGeneration += 1;
     } finally {
-      sending = false;
+      // Published through the claim so a failure raised after this bar is gone
+      // still reaches whichever composer the user is looking at.
+      finishOperation(projectId, opId, outcome);
     }
-    selectForkIfRecipientsUnchanged(capturedRecipients, created.fork.id);
-    // **Committed is not the same as reachable.** Hand the message back — the
-    // branch stays visible with its retry, and the next send materializes it,
-    // which is the ordinary self-healing path for a fork whose first turn never
-    // ran.
-    if (created.kind === "unsubscribed") {
-      sendError = created.message;
-      restoreCapturedSend(text, carried);
-      return;
-    }
-    // Otherwise the send always completes, even if this bar is gone. Abandoning
-    // the first message would leave a promptless fork — the one state this design
-    // exists to make impossible, since Claude refuses a promptless fork and the
-    // branch would never materialize.
-    dispatchToRecipients(text, attachments, [created.fork]);
-    sendGeneration += 1;
   }
 
   /// Move the composer onto the branch, unless the user has moved on.
@@ -2276,8 +2309,27 @@
     flush();
   }
 
+  /// Publish a status. The two channels supersede each other: a composer showing
+  /// a stale "Already sending" above a fresh "Sent to alice-fork" is describing
+  /// two states at once. Every status write goes through these.
+  function showError(message: string | null): void {
+    sendError = message;
+    sendNotice = null;
+  }
+
+  function showNotice(message: string | null): void {
+    sendNotice = message;
+    sendError = null;
+  }
+
+  function clearStatus(): void {
+    sendError = null;
+    sendNotice = null;
+  }
+
   /// Whether both the composed content and the live recipient set still match
-  /// what a send captured — the question every post-await finalization asks.
+  /// what a send captured — asked where a fork's *precondition* must still hold
+  /// (a single, unchanged recipient), not where consumed content is retired.
   function composeUnchangedSince(snapshot: ComposeSnapshot): boolean {
     return (
       composeContentMatches(projectId, snapshot) && recipientsUnchanged(snapshot.selectedIds ?? [])
@@ -2331,7 +2383,13 @@
   /// locals *down* — so without a signal it would keep displaying, and then
   /// re-persist, a prompt that has already been sent.
   function retireConsumedCompose(snapshot: ComposeSnapshot): boolean {
-    if (!composeUnchangedSince(snapshot)) return false;
+    // **Content, not recipients.** Three different questions get asked about a
+    // snapshot and they need three different comparisons. Whether to *clear* asks
+    // only whether the composed message is still the one that was consumed —
+    // recipients are sticky across sends and are reconciled separately. Folding
+    // them in here means adding a recipient during the sign-in window leaves the
+    // just-sent prompt sitting in the composer, ready to be sent twice.
+    if (!composeContentMatches(projectId, snapshot)) return false;
     if (unmounted) {
       clearCompose(projectId);
       flush();
@@ -2374,29 +2432,19 @@
     const renderArgs = buildRenderArgs(prompt, promptArgs);
     const attachments = snapshot.attachments ?? [];
 
-    // **Single-flight is project-scoped, not component-scoped.** `sending` resets
-    // to false in a replacement bar, which would let a second submit register a
-    // second branch while the first is still rendering.
-    const opId = beginPromptFork(projectId, source.id);
+    // One claim per project, held by whichever send path awaits. A replacement bar
+    // reads its busy state from this, so coming back mid-fork cannot submit a
+    // second one.
+    const opId = beginOperation(projectId, { kind: "prompt_fork", sourceId: source.id });
     if (opId === null) return;
-    sending = true;
-    sendError = null;
-    sendNotice = null;
-    clearPromptForkOutcome(projectId);
+    clearStatus();
+    clearOutcome(projectId);
     promptMenuOpen = false;
     closeMentionMenu();
-    // **Best-effort, and known to be incomplete.** The freeze keeps a pane
-    // gesture from silently changing recipients mid-render *within this
-    // instance*. It does not survive a remount (mount and `onDestroy` both
-    // release it), and because ordinary prompt sends hold the same shared
-    // boolean without claiming an operation, a stale one of those can release it
-    // out from under a fork started by a replacement bar. The consequence is a
-    // spurious abort with an explanation, not corruption — **snapshot divergence
-    // is the authoritative policy**, and it is what the tests pin. Closing this
-    // properly means one project-scoped claim owning every async compose
-    // operation, with targeting derived from it rather than mirrored in a second
-    // boolean; that is a change to the ordinary-send path too, so it is its own
-    // piece of work.
+    // The freeze stops a pane gesture from silently changing recipients while the
+    // message is being built. Written only by the claim lifecycle (and reconciled
+    // at mount), so there is exactly one writer; a second operation cannot exist
+    // to steal it.
     setTargetingLocked(projectId, true);
     let holdsLock = true;
     const releaseLock = (): void => {
@@ -2405,25 +2453,39 @@
       setTargetingLocked(projectId, false);
     };
     let outcome: { message: string; tone: "error" | "notice" } | undefined;
+    let abandoned = false;
     try {
       let finalText: string;
       let signedInMidSend = false;
       try {
         let rendered = await api.renderPrompt(prompt.provider, prompt.name, renderArgs);
+        if (!ownsOperation(projectId, opId)) {
+          abandoned = true;
+          return;
+        }
         if (rendered.kind === "needs_sign_in") {
-          // The targeting freeze must not span a minutes-long browser wait; the
-          // snapshot comparison below covers everything the freeze covered.
+          // The wait is unbounded — the backend's credential commit is
+          // deliberately un-timed — so the composer offers a way out of it, and
+          // the freeze must not span it either.
           releaseLock();
-          signingInProvider = rendered.provider;
-          try {
-            await api.signInMcpProvider(rendered.provider);
-          } finally {
-            signingInProvider = null;
+          setOperationPhase(projectId, opId, {
+            name: "awaiting_user",
+            provider: rendered.provider,
+          });
+          await api.signInMcpProvider(rendered.provider);
+          if (!ownsOperation(projectId, opId)) {
+            abandoned = true;
+            return;
           }
+          setOperationPhase(projectId, opId, { name: "rendering" });
           signedInMidSend = true;
           setTargetingLocked(projectId, true);
           holdsLock = true;
           rendered = await api.renderPrompt(prompt.provider, prompt.name, renderArgs);
+          if (!ownsOperation(projectId, opId)) {
+            abandoned = true;
+            return;
+          }
         }
         if (rendered.kind !== "rendered") {
           outcome = {
@@ -2472,7 +2534,7 @@
         return;
       }
 
-      advancePromptFork(projectId, opId, "registering");
+      setOperationPhase(projectId, opId, { name: "registering" });
       releaseLock();
       let created: ReachableFork;
       try {
@@ -2481,6 +2543,12 @@
         // The prompt was never cleared, so there is nothing to hand back.
         const message = err instanceof Error ? err.message : String(err);
         outcome = { message: `Fork failed: ${message}`, tone: "error" };
+        return;
+      }
+      // The branch is committed; only the composer-facing half is conditional.
+      if (!ownsOperation(projectId, opId)) {
+        abandoned = true;
+        dispatchOrRetireAbandonedFork(created, finalText, attachments);
         return;
       }
       if (created.kind === "unsubscribed") {
@@ -2501,11 +2569,23 @@
         };
       }
     } finally {
-      sending = false;
-      signingInProvider = null;
       releaseLock();
-      endPromptFork(projectId, opId, outcome);
+      // An abandoned operation no longer owns the slot; publishing here would
+      // stamp a stale message over whatever now does.
+      if (!abandoned) finishOperation(projectId, opId, outcome);
     }
+  }
+
+  /// A fork whose composer was abandoned mid-registration still has to receive
+  /// its first message — the branch exists, and a promptless fork can never
+  /// materialize. It just must not touch the composer on its way out.
+  function dispatchOrRetireAbandonedFork(
+    created: ReachableFork,
+    text: string,
+    attachments: Attachment[],
+  ): void {
+    if (created.kind === "unsubscribed") return;
+    dispatchToRecipients(text, attachments, [created.fork]);
   }
 
   /// The appended free text a snapshot captured, or `""` when it wasn't prompt
@@ -2517,8 +2597,7 @@
 
   async function handleSubmit(): Promise<void> {
     if (sendDisabled) return;
-    sendError = null;
-    sendNotice = null;
+    clearStatus();
     // Snapshot the whole chip set once, up front (before any await), so a
     // mid-render chip edit can't change what gets sent — same discipline as the
     // prompt/recipient snapshots below.
@@ -2563,76 +2642,120 @@
 
       promptMenuOpen = false;
       closeMentionMenu();
-      sending = true;
-      // Freeze pane targeting for the render window: the post-render check
-      // below silently aborts the send if a captured recipient left the set,
-      // so a pane gesture landing mid-render would drop the send with no
-      // feedback. Raw selection writes (pruning a removed agent) still pass —
-      // a removed recipient SHOULD trigger that abort. `finally` (plus the
-      // unmount/init releases) guarantees the lock can't outlive the render.
+      // **The claim is project-scoped, not component-scoped.** This render can
+      // open a browser for a sign-in and wait, so the send routinely outlives the
+      // bar that started it — and a replacement bar starts with `sending` false,
+      // showing the same prompt with an enabled Send. Submitting again sent it
+      // twice; pressing Fork instead sent it to the parent *and* to a new branch,
+      // which is one action producing two sends to two agents.
+      const claim = beginOperation(projectId, { kind: "prompt_send" });
+      if (claim === null) return;
+      // What this send owns, captured before its first await so the clear at the
+      // end can tell "still mine" from "a replacement composer's".
+      const snapshot: ComposeSnapshot = {
+        content: currentContent(),
+        selectedIds: [...selectedIds],
+        attachments,
+        forwards: currentForwards(),
+      };
+      // Freeze pane targeting while the message is built: the post-render check
+      // below aborts the send if a captured recipient left the set, so a pane
+      // gesture landing mid-render would refuse it for no reason the user caused.
+      // Raw selection writes (pruning a removed agent) still pass — a removed
+      // recipient SHOULD trigger that abort.
       setTargetingLocked(projectId, true);
       let finalText: string;
       let signedInMidSend = false;
+      let outcomeForClaim: { message: string; tone: "error" | "notice" } | undefined;
+      let abandoned = false;
       try {
-        let outcome = await api.renderPrompt(prompt.provider, prompt.name, renderArgs);
-        if (outcome.kind === "needs_sign_in") {
-          // The provider needs a browser sign-in, and the user's intent could
-          // not be clearer — they just pressed Send on its prompt. Launch the
-          // sign-in and continue the send once they approve in the browser.
-          // The targeting freeze must not span a minutes-long wait; the
-          // post-await context check below covers what the freeze covered.
-          setTargetingLocked(projectId, false);
-          signingInProvider = outcome.provider;
-          try {
-            await api.signInMcpProvider(outcome.provider);
-          } finally {
-            signingInProvider = null;
+        try {
+          let outcome = await api.renderPrompt(prompt.provider, prompt.name, renderArgs);
+          if (!ownsOperation(projectId, claim)) {
+            abandoned = true;
+            return;
           }
-          signedInMidSend = true;
-          setTargetingLocked(projectId, true);
-          outcome = await api.renderPrompt(prompt.provider, prompt.name, renderArgs);
+          if (outcome.kind === "needs_sign_in") {
+            // The provider needs a browser sign-in, and the user's intent could
+            // not be clearer — they just pressed Send on its prompt. Launch the
+            // sign-in and continue the send once they approve in the browser.
+            // The wait is unbounded, so the composer offers a way out of it and
+            // the targeting freeze must not span it.
+            setTargetingLocked(projectId, false);
+            setOperationPhase(projectId, claim, {
+              name: "awaiting_user",
+              provider: outcome.provider,
+            });
+            await api.signInMcpProvider(outcome.provider);
+            if (!ownsOperation(projectId, claim)) {
+              abandoned = true;
+              return;
+            }
+            setOperationPhase(projectId, claim, { name: "rendering" });
+            signedInMidSend = true;
+            setTargetingLocked(projectId, true);
+            outcome = await api.renderPrompt(prompt.provider, prompt.name, renderArgs);
+            if (!ownsOperation(projectId, claim)) {
+              abandoned = true;
+              return;
+            }
+          }
+          if (outcome.kind !== "rendered") {
+            // A second needs-sign-in, or an outcome kind this build doesn't
+            // know: stop — never loop the browser open.
+            outcomeForClaim = {
+              message: `Send failed: MCP provider "${prompt.provider}" needs sign-in.`,
+              tone: "error",
+            };
+            return;
+          }
+          finalText = combinePromptMessage(outcome.text, appended);
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          // After a successful mid-send sign-in, a failure comes from the retry
+          // (typically the server) — say the sign-in itself stuck, or the user
+          // is left guessing whether their browser approval was wasted.
+          outcomeForClaim = {
+            message: signedInMidSend
+              ? `Signed in, but the send then failed: ${message}`
+              : `Send failed: ${message}`,
+            tone: "error",
+          };
+          return;
+        } finally {
+          setTargetingLocked(projectId, false);
         }
-        if (outcome.kind !== "rendered") {
-          // A second needs-sign-in, or an outcome kind this build doesn't
-          // know: stop — never loop the browser open.
-          sendError = `Send failed: MCP provider "${prompt.provider}" needs sign-in.`;
+        // If the composer state changed outside the locked UI while rendering,
+        // avoid dispatching text into a now-different prompt/recipient context.
+        const stillSelected = new Set(selectedIds);
+        if (selectedPrompt !== prompt || targets.some((t) => !stillSelected.has(t.id))) {
+          // **Always say something.** A send the UI accepted that then vanishes
+          // with no trace is worse than one that refuses: the user has no way to
+          // tell it from a bug. The prompt and its arguments are still intact
+          // wherever they now are.
+          outcomeForClaim = {
+            message: signedInMidSend
+              ? "Signed in — your prompt is ready; press Send when you are."
+              : "Not sent: the prompt or its recipients changed while it was being prepared.",
+            tone: "notice",
+          };
           return;
         }
-        finalText = combinePromptMessage(outcome.text, appended);
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        // After a successful mid-send sign-in, a failure comes from the retry
-        // (typically the server) — say the sign-in itself stuck, or the user
-        // is left guessing whether their browser approval was wasted.
-        sendError = signedInMidSend
-          ? `Signed in, but the send then failed: ${message}`
-          : `Send failed: ${message}`;
+        dispatchToRecipients(finalText, attachments, targets);
+        // Prompt selection is not sticky: a successful send returns to the plain
+        // composer (recipients stay selected). Appended text is consumed, not
+        // carried back. Retired under compare-and-set for the same reason the fork
+        // path is: this can run after a project switch destroyed the bar, and
+        // clearing unconditionally then wrote a dead instance's emptied locals
+        // over a replacement composer's real content.
+        if (retireConsumedCompose(snapshot)) sendGeneration += 1;
         return;
       } finally {
-        sending = false;
-        signingInProvider = null;
-        setTargetingLocked(projectId, false);
+        // Published here so a failure or notice raised after this bar is gone
+        // still reaches whichever composer the user is looking at — unless the
+        // user abandoned the wait, in which case the slot is someone else's now.
+        if (!abandoned) finishOperation(projectId, claim, outcomeForClaim);
       }
-      // If the composer state changed outside the locked UI while rendering,
-      // avoid dispatching text into a now-different prompt/recipient context.
-      const stillSelected = new Set(selectedIds);
-      if (selectedPrompt !== prompt || targets.some((t) => !stillSelected.has(t.id))) {
-        if (signedInMidSend) {
-          // The UI was deliberately unfrozen during the browser wait, so a
-          // changed context is plausible rather than near-impossible — say
-          // what happened instead of dropping the send silently. The prompt
-          // and its arguments are still intact wherever they now are.
-          sendNotice = "Signed in — your prompt is ready; press Send when you are.";
-        }
-        return;
-      }
-      dispatchToRecipients(finalText, attachments, targets);
-      // Prompt selection is not sticky: a successful send returns to the plain
-      // composer (recipients stay selected). Appended text is consumed, not
-      // carried back.
-      clearPromptComposer();
-      sendGeneration += 1;
-      return;
     }
 
     // A send with ≥1 forward source goes through the cross-agent forward path
@@ -2688,19 +2811,25 @@
     const count = composerConsumedCount(projectId);
     if (count === seenConsumed) return;
     seenConsumed = count;
-    untrack(() => resetComposerToEmpty());
+    untrack(() => reprojectFromStore());
   });
 
-  function resetComposerToEmpty(): void {
+  /// Re-read the store into this bar's locals. Covers both directions a
+  /// continuation can write: retiring content it consumed, and handing back a
+  /// send that never dispatched. Only plain content is projected — the paths that
+  /// signal are the ones that write plain content, and resolving a prompt would
+  /// need the (async) prompt cache.
+  function reprojectFromStore(): void {
+    const stored = getCompose(projectId);
     selectedPrompt = null;
     promptArgs = {};
     promptArgSources = {};
     promptAppendedSources = [];
-    forwardSources = [];
+    forwardSources = stored.forwards?.message ?? [];
     focusPromptFieldOnMount = false;
     appendedText = "";
-    draft = "";
-    attachmentChips = [];
+    draft = stored.content.kind === "plain" ? stored.content.draft : "";
+    attachmentChips = restoreChips(stored.attachments ?? []);
     mode = "plain";
   }
 
@@ -3471,9 +3600,30 @@
         </div>
       {/if}
     </div>
-    {#if signingInProvider}
-      <p class="text-muted mt-2 text-xs" data-testid="compose-signing-in">
-        Waiting for browser sign-in to {signingInProvider}…
+    {#if abandonableOperation !== undefined}
+      <p class="text-muted mt-2 flex items-center gap-2 text-xs" data-testid="compose-signing-in">
+        <span>Waiting for browser sign-in to {abandonableOperation.provider}…</span>
+        <!-- **"Stop waiting", not "Cancel".** The sign-in keeps running and may
+               still succeed — its final step is deliberately un-timed so it can
+               never report a failure it didn't have. What this stops is the
+               *composer* waiting, so one stuck sign-in can't hold the project
+               until the app restarts. -->
+        <Button
+          size="sm"
+          variant="ghost"
+          data-testid="compose-abandon-wait"
+          onclick={() => {
+            const op = abandonableOperation;
+            if (op === undefined) return;
+            abandonOperation(projectId, op.id, {
+              message:
+                "Stopped waiting for the sign-in. It may still finish in the background; your message is still here.",
+              tone: "notice",
+            });
+          }}
+        >
+          Stop waiting
+        </Button>
       </p>
     {/if}
     {#if sendNotice}

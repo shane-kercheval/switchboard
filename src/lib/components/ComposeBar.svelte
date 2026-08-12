@@ -42,7 +42,7 @@
     type WorkflowContent,
   } from "$lib/state/composeStore";
   import {
-    abandonOperation,
+    abandonAwaitingUserOperation,
     beginOperation,
     clearOutcome,
     composerConsumedCount,
@@ -58,7 +58,6 @@
   import {
     selectionFor,
     setRecipients,
-    setTargetingLocked,
     targetRecipients,
   } from "$lib/state/recipientSelection.svelte";
   import {
@@ -722,14 +721,6 @@
   /// can derive from it. This component seeds it from the persisted snapshot at
   /// mount and persists writes back (the `setSelection` effect below), wherever
   /// they originated.
-  // Reconcile the freeze with the project's claim rather than clearing it blind:
-  // an operation still building a message keeps its recipients frozen across a
-  // remount, and one parked on a sign-in deliberately does not. Clearing
-  // unconditionally let a remount unfreeze targeting under a live operation.
-  untrack(() => {
-    const op = operationFor(projectId);
-    setTargetingLocked(projectId, op !== undefined && op.phase.name !== "awaiting_user");
-  });
   untrack(() => setRecipients(projectId, initialSelection(saved.selectedIds, agents)));
   const selectedIds = $derived(selectionFor(projectId));
   function setSelectedIds(ids: AgentId[]): void {
@@ -1419,11 +1410,6 @@
     // project's draft, and `addAttachmentChip` commits it to the snapshot whether
     // or not this bar is still around to render the chip.
     unmounted = true;
-    // A mid-render unmount (project switch via the parent's `{#key}`) must not
-    // leave the project's pane targeting frozen — unless an operation that
-    // outlives this bar still owns it, in which case releasing would unfreeze
-    // recipients underneath work that is still running.
-    if (operationFor(projectId) === undefined) setTargetingLocked(projectId, false);
     // Flush point: a project switch remounts this bar (`{#key}`), so the
     // outgoing bar's deferred draft write must land before the next one mounts.
     flush();
@@ -2441,17 +2427,6 @@
     clearOutcome(projectId);
     promptMenuOpen = false;
     closeMentionMenu();
-    // The freeze stops a pane gesture from silently changing recipients while the
-    // message is being built. Written only by the claim lifecycle (and reconciled
-    // at mount), so there is exactly one writer; a second operation cannot exist
-    // to steal it.
-    setTargetingLocked(projectId, true);
-    let holdsLock = true;
-    const releaseLock = (): void => {
-      if (!holdsLock) return;
-      holdsLock = false;
-      setTargetingLocked(projectId, false);
-    };
     let outcome: { message: string; tone: "error" | "notice" } | undefined;
     let abandoned = false;
     try {
@@ -2465,9 +2440,8 @@
         }
         if (rendered.kind === "needs_sign_in") {
           // The wait is unbounded — the backend's credential commit is
-          // deliberately un-timed — so the composer offers a way out of it, and
-          // the freeze must not span it either.
-          releaseLock();
+          // deliberately un-timed — so the composer offers a way out of it. The
+          // phase change also unfreezes targeting, which must not span the wait.
           setOperationPhase(projectId, opId, {
             name: "awaiting_user",
             provider: rendered.provider,
@@ -2479,8 +2453,6 @@
           }
           setOperationPhase(projectId, opId, { name: "rendering" });
           signedInMidSend = true;
-          setTargetingLocked(projectId, true);
-          holdsLock = true;
           rendered = await api.renderPrompt(prompt.provider, prompt.name, renderArgs);
           if (!ownsOperation(projectId, opId)) {
             abandoned = true;
@@ -2535,7 +2507,6 @@
       }
 
       setOperationPhase(projectId, opId, { name: "registering" });
-      releaseLock();
       let created: ReachableFork;
       try {
         created = await createReachableFork(source.id);
@@ -2543,12 +2514,6 @@
         // The prompt was never cleared, so there is nothing to hand back.
         const message = err instanceof Error ? err.message : String(err);
         outcome = { message: `Fork failed: ${message}`, tone: "error" };
-        return;
-      }
-      // The branch is committed; only the composer-facing half is conditional.
-      if (!ownsOperation(projectId, opId)) {
-        abandoned = true;
-        dispatchOrRetireAbandonedFork(created, finalText, attachments);
         return;
       }
       if (created.kind === "unsubscribed") {
@@ -2569,23 +2534,10 @@
         };
       }
     } finally {
-      releaseLock();
       // An abandoned operation no longer owns the slot; publishing here would
       // stamp a stale message over whatever now does.
       if (!abandoned) finishOperation(projectId, opId, outcome);
     }
-  }
-
-  /// A fork whose composer was abandoned mid-registration still has to receive
-  /// its first message — the branch exists, and a promptless fork can never
-  /// materialize. It just must not touch the composer on its way out.
-  function dispatchOrRetireAbandonedFork(
-    created: ReachableFork,
-    text: string,
-    attachments: Attachment[],
-  ): void {
-    if (created.kind === "unsubscribed") return;
-    dispatchToRecipients(text, attachments, [created.fork]);
   }
 
   /// The appended free text a snapshot captured, or `""` when it wasn't prompt
@@ -2658,12 +2610,11 @@
         attachments,
         forwards: currentForwards(),
       };
-      // Freeze pane targeting while the message is built: the post-render check
-      // below aborts the send if a captured recipient left the set, so a pane
-      // gesture landing mid-render would refuse it for no reason the user caused.
-      // Raw selection writes (pruning a removed agent) still pass — a removed
-      // recipient SHOULD trigger that abort.
-      setTargetingLocked(projectId, true);
+      // Targeting is frozen for the render window by the operation's `rendering`
+      // phase: the post-render check below aborts the send if a captured
+      // recipient left the set, so a pane gesture landing mid-render would refuse
+      // it for no reason the user caused. Raw selection writes (pruning a removed
+      // agent) still pass — a removed recipient SHOULD trigger that abort.
       let finalText: string;
       let signedInMidSend = false;
       let outcomeForClaim: { message: string; tone: "error" | "notice" } | undefined;
@@ -2679,9 +2630,8 @@
             // The provider needs a browser sign-in, and the user's intent could
             // not be clearer — they just pressed Send on its prompt. Launch the
             // sign-in and continue the send once they approve in the browser.
-            // The wait is unbounded, so the composer offers a way out of it and
-            // the targeting freeze must not span it.
-            setTargetingLocked(projectId, false);
+            // The wait is unbounded, so the composer offers a way out of it. The
+            // phase change also unfreezes targeting for its duration.
             setOperationPhase(projectId, claim, {
               name: "awaiting_user",
               provider: outcome.provider,
@@ -2693,7 +2643,6 @@
             }
             setOperationPhase(projectId, claim, { name: "rendering" });
             signedInMidSend = true;
-            setTargetingLocked(projectId, true);
             outcome = await api.renderPrompt(prompt.provider, prompt.name, renderArgs);
             if (!ownsOperation(projectId, claim)) {
               abandoned = true;
@@ -2722,10 +2671,8 @@
             tone: "error",
           };
           return;
-        } finally {
-          setTargetingLocked(projectId, false);
         }
-        // If the composer state changed outside the locked UI while rendering,
+        // If the composer state changed while the message was being built,
         // avoid dispatching text into a now-different prompt/recipient context.
         const stillSelected = new Set(selectedIds);
         if (selectedPrompt !== prompt || targets.some((t) => !stillSelected.has(t.id))) {
@@ -3615,7 +3562,7 @@
           onclick={() => {
             const op = abandonableOperation;
             if (op === undefined) return;
-            abandonOperation(projectId, op.id, {
+            abandonAwaitingUserOperation(projectId, op.id, {
               message:
                 "Stopped waiting for the sign-in. It may still finish in the background; your message is still here.",
               tone: "notice",

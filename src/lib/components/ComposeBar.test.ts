@@ -3319,6 +3319,85 @@ describe("prompt-mode fork", () => {
     expect(sends()).toHaveLength(0);
   });
 
+  it("hands the project back in full when an operation outlives the bar that started it", async () => {
+    // The user-facing property: after a send that spanned a project switch
+    // finishes, the composer is usable again — not busy, and not with pane
+    // targeting silently dead. Both were separately broken here, by a leaked
+    // claim and by a freeze nothing was left to release.
+    let releaseFork!: (v: AgentRecord) => void;
+    const pending = new Promise<AgentRecord>((resolve) => {
+      releaseFork = resolve;
+    });
+    mockForkPromptBackend({ fork: () => pending });
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    seedTurn(state, AGENT_A.id);
+    const first = render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await waitFor(() => expect(forkHalf()).not.toBeNull());
+    await fireEvent.input(screen.getByTestId("compose-textarea"), { target: { value: "x" } });
+    await fireEvent.click(forkHalf()!);
+    await waitFor(() => expect(forks()).toHaveLength(1));
+
+    first.unmount();
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, FORK] } });
+    await waitFor(() => expect(screen.queryByTestId("compose-textarea")).not.toBeNull());
+
+    releaseFork(FORK);
+    await waitFor(() => expect(sends()).toHaveLength(1));
+
+    await fireEvent.input(screen.getByTestId("compose-textarea"), { target: { value: "next" } });
+    await waitFor(() =>
+      expect((screen.getByTestId("compose-send") as HTMLButtonElement).disabled).toBe(false),
+    );
+    const sel = await import("$lib/state/recipientSelection.svelte");
+    expect(sel.targetRecipients(PROJECT_ID, [AGENT_A.id])).toBe(true);
+  });
+
+  it("keeps targeting blocked for a newer send when an abandoned one settles late", async () => {
+    // Abandonment deliberately lets the old work run on beside a new claim, so
+    // "only one operation exists" was never true. With the freeze derived rather
+    // than written, a late continuation has nothing to release.
+    let releaseSignIn!: () => void;
+    const pendingSignIn = new Promise<unknown>((resolve) => {
+      releaseSignIn = () => resolve(null);
+    });
+    let holdSecond!: (v: unknown) => void;
+    let calls = 0;
+    mockForkPromptBackend({
+      render: () => {
+        calls += 1;
+        if (calls === 1) return Promise.resolve({ kind: "needs_sign_in", provider: "tiddly" });
+        return new Promise<unknown>((resolve) => {
+          holdSecond = resolve;
+        });
+      },
+      signIn: () => pendingSignIn,
+    });
+    await mountComposingSummary();
+    await fireEvent.click(screen.getByTestId("compose-send"));
+    await waitFor(() => expect(screen.queryByTestId("compose-abandon-wait")).not.toBeNull());
+    await fireEvent.click(screen.getByTestId("compose-abandon-wait"));
+
+    await waitFor(() =>
+      expect((screen.getByTestId("compose-send") as HTMLButtonElement).disabled).toBe(false),
+    );
+    await fireEvent.click(screen.getByTestId("compose-send"));
+    await waitFor(() =>
+      expect((screen.getByTestId("compose-send") as HTMLButtonElement).disabled).toBe(true),
+    );
+
+    const sel = await import("$lib/state/recipientSelection.svelte");
+    expect(sel.targetRecipients(PROJECT_ID, [AGENT_A.id])).toBe(false);
+
+    releaseSignIn();
+    await tick();
+    await tick();
+    // The abandoned operation settling must not unfreeze the live one.
+    expect(sel.targetRecipients(PROJECT_ID, [AGENT_A.id])).toBe(false);
+    holdSecond({ kind: "rendered", text: "RENDERED" });
+    await waitFor(() => expect(sends()).toHaveLength(1));
+  });
+
   it("freezes the attachment set for the whole fork, not just the render", async () => {
     // The attachment set is frozen for the duration of a send — drops ignored,
     // remove button disabled — and `sending` is what expresses that. Because it
@@ -4244,7 +4323,8 @@ describe("ComposeBar pane targeting", () => {
 
     const textarea = await renderTwoAgents();
     selection.setRecipients(PROJECT_ID, [AGENT_A.id]);
-    selection.setTargetingLocked(PROJECT_ID, true);
+    const ops = await import("$lib/state/composeOperations.svelte");
+    const blockingOp = ops.beginOperation(PROJECT_ID, { kind: "prompt_send" })!;
 
     await fireEvent.input(textarea, { target: { value: "@review" } });
     const option = await screen.findByTestId(`recipient-option-pane:${paneId}`);
@@ -4258,7 +4338,7 @@ describe("ComposeBar pane targeting", () => {
     // lock-refused gesture.
     expect(textarea.value).toBe("");
 
-    selection.setTargetingLocked(PROJECT_ID, false);
+    ops.finishOperation(PROJECT_ID, blockingOp);
   });
 
   it("pane entries list ahead of agent entries", async () => {

@@ -29,11 +29,11 @@
 //     the post-render abort check correctly cancel the send.
 
 import type { AgentId, ProjectId } from "$lib/types";
+import { operationBlocksTargeting } from "$lib/state/composeOperations.svelte";
 
 const store = $state<Record<ProjectId, AgentId[]>>({});
 
 // Not reactive: read only inside event handlers at write time, never rendered.
-const targetingLocked: Record<ProjectId, boolean> = {};
 
 /// The project's current recipient set ([] when none).
 export function selectionFor(projectId: ProjectId): AgentId[] {
@@ -51,7 +51,7 @@ export function setRecipients(projectId: ProjectId, ids: AgentId[]): void {
 /// (replace semantics — same meaning as `@agentname`). Refused (returns
 /// false) while targeting is locked for the project.
 export function targetRecipients(projectId: ProjectId, ids: AgentId[]): boolean {
-  if (targetingLocked[projectId] === true) return false;
+  if (operationBlocksTargeting(projectId)) return false;
   store[projectId] = ids;
   return true;
 }
@@ -60,7 +60,7 @@ export function targetRecipients(projectId: ProjectId, ids: AgentId[]): boolean 
 /// reflecting the new member as a selected compose chip. Lock-aware like
 /// `targetRecipients` (refused mid-render); a no-op when already selected.
 export function selectAgent(projectId: ProjectId, agentId: AgentId): boolean {
-  if (targetingLocked[projectId] === true) return false;
+  if (operationBlocksTargeting(projectId)) return false;
   const current = store[projectId] ?? [];
   if (!current.includes(agentId)) store[projectId] = [...current, agentId];
   return true;
@@ -69,28 +69,15 @@ export function selectAgent(projectId: ProjectId, agentId: AgentId): boolean {
 /// Remove one agent from the recipient set — the "removed an agent from a pane"
 /// gesture deselecting its compose chip. Lock-aware; a no-op when not selected.
 export function deselectAgent(projectId: ProjectId, agentId: AgentId): boolean {
-  if (targetingLocked[projectId] === true) return false;
+  if (operationBlocksTargeting(projectId)) return false;
   const current = store[projectId] ?? [];
   if (current.includes(agentId)) store[projectId] = current.filter((id) => id !== agentId);
   return true;
-}
-
-/// Freeze / unfreeze user targeting for a project (the prompt-render window).
-/// Callers MUST guarantee release (try/finally + unlock on unmount): a stuck
-/// lock would silently disable pane targeting for the project forever — a
-/// strictly worse failure than the silent send-drop the lock prevents.
-export function setTargetingLocked(projectId: ProjectId, locked: boolean): void {
-  if (locked) {
-    targetingLocked[projectId] = true;
-  } else {
-    delete targetingLocked[projectId];
-  }
 }
 
 /// Test-only reset.
 export const _testing = {
   reset(): void {
     for (const key of Object.keys(store)) delete store[key];
-    for (const key of Object.keys(targetingLocked)) delete targetingLocked[key];
   },
 };

@@ -140,21 +140,46 @@ export function setOperationPhase(
   }
 }
 
-/// Give up waiting on an operation without cancelling the work behind it.
+/// Whether a project's recipient-targeting gestures are refused right now.
+///
+/// The policy lives here, next to the state it reads, rather than in
+/// `recipientSelection` — that module should not have to know what a phase is.
+/// Only `rendering` blocks: `awaiting_user` is an unbounded browser wait that
+/// must not freeze the UI, and by `registering` the send is committed, so a
+/// recipient change is handled by preserving the newer composer instead.
+///
+/// **Derived, never mirrored.** This replaced a boolean written from nine places
+/// — mount, unmount, and each continuation — which is how a remounted bar could
+/// lock targeting on behalf of an operation whose only release had already fired,
+/// leaving pane clicks dead until the next project switch.
+export function operationBlocksTargeting(projectId: ProjectId): boolean {
+  return operations[projectId]?.phase.name === "rendering";
+}
+
+/// Give up waiting on a sign-in without cancelling the work behind it.
 ///
 /// Deliberately not called "cancel": the backend call keeps running and may still
 /// succeed — the credential commit behind a sign-in is unbounded precisely so it
 /// can't report a failure it didn't have. What this does is stop the *composer*
 /// waiting, so the project becomes usable again; the abandoned continuation then
 /// fails its `ownsOperation` check and acts on nothing.
-export function abandonOperation(
+///
+/// **Refused outside `awaiting_user`, and that is load-bearing.** Both prompt
+/// continuations re-check ownership immediately after the sign-in await, so an
+/// abandoned one exits before it can register anything — which makes "abandoned
+/// while registering" unrepresentable rather than merely absent from today's UI.
+/// Without this guard a future caller could release a registering fork's slot and
+/// strand a committed branch with no first message.
+export function abandonAwaitingUserOperation(
   projectId: ProjectId,
   id: string,
   outcome?: Omit<ComposeOutcome, "id">,
-): void {
-  if (operations[projectId]?.id !== id) return;
+): boolean {
+  const current = operations[projectId];
+  if (current?.id !== id || current.phase.name !== "awaiting_user") return false;
   operations[projectId] = undefined;
   outcomes[projectId] = outcome === undefined ? undefined : { id, ...outcome };
+  return true;
 }
 
 /// Release the slot and publish the outcome (if any) for the mounted composer.

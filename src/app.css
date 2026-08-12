@@ -63,9 +63,16 @@
      restyle the bubble. */
   --focus-soft: #f8fbff;
 
-  /* monochrome primary */
+  /* monochrome primary. `-hover` is a real step away from `--primary`, not an
+     opacity of it: the primary action sits on surfaces of varying lightness, so
+     a translucent hover reads as a strong tint on one surface and as nothing at
+     all on another (and as literally nothing when the element sits on a filled
+     parent of the same colour). The direction is theme-dependent — primary is
+     near-black here and near-white in dark, so "hover" lightens there and
+     darkens here; what both share is a visible step. */
   --primary: #18181b;
   --primary-fg: #fafafa;
+  --primary-hover: #52525b;
 
   /* green accent — focus rings, links, and selected-state emphasis (e.g. the
      compose recipient chips). `-soft` is the light tint used for a selected
@@ -147,6 +154,7 @@
 
   --primary: #fafafa;
   --primary-fg: #18181b;
+  --primary-hover: #c0c0c7;
 
   --accent: #4ade80;
   --accent-fg: #052e16;
@@ -209,6 +217,7 @@
 
   --color-primary: var(--primary);
   --color-primary-fg: var(--primary-fg);
+  --color-primary-hover: var(--primary-hover);
 
   --color-accent: var(--accent);
   --color-accent-fg: var(--accent-fg);

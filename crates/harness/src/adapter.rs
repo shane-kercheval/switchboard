@@ -40,6 +40,15 @@ pub enum DispatchError {
     /// subprocess crash.
     #[error("invalid prompt: {0}")]
     InvalidPrompt(String),
+    /// The agent record is internally inconsistent in a way that makes a
+    /// correct dispatch impossible — e.g., fork provenance with no session
+    /// locator, where spawning anyway would let the harness mint an untracked
+    /// session id: the turn *looks* successful, then every later send loses
+    /// continuity. Unreachable through core's registration APIs (the
+    /// persistence chokepoint enforces the invariants), so reaching it means
+    /// registry corruption; fail closed before spawning rather than degrade.
+    #[error("invalid agent state: {0}")]
+    InvalidAgentState(String),
 }
 
 /// Per-dispatch options. Plumbed through `HarnessAdapter::dispatch` so

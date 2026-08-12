@@ -140,7 +140,103 @@ pub struct AgentRecord {
     /// where [`HarnessKind::supports_effort_selection`] holds ever carry a
     /// value. Same backward-compat rationale as `model`.
     pub effort: Option<String>,
+    /// For a forked agent: the **parent session UUID** to `--resume` from when
+    /// this agent's own session file does not exist yet. `None` for every agent
+    /// that wasn't created by forking.
+    ///
+    /// Stores the parent's *session* id, not the parent's *agent* id, so the
+    /// record is self-contained: the fork still materializes after the parent
+    /// agent is deleted (Switchboard never deletes harness session files).
+    ///
+    /// **Permanent, and inert after first use.** It is never cleared once the
+    /// fork materializes — whether a dispatch forks or plainly resumes is
+    /// derived from the agent's own session file existing, not from consuming
+    /// this field (see `claude_code::build_args`). Keeping it makes a first
+    /// dispatch that died before creating the file retry the fork
+    /// automatically.
+    ///
+    /// **This field does two jobs, and they only coincide for a deferred
+    /// fork.** (1) *Operational:* the materialization token — the session to
+    /// resume from until this agent has one of its own. (2) *Display:* durable
+    /// lineage — "this agent is a branch of that session" — which is why it
+    /// outlives job (1) rather than being cleared. Both are served by one UUID
+    /// because Claude's fork is deferred and caller-assigned (see
+    /// [`HarnessKind::supports_session_fork`]). A harness whose fork is *eager*
+    /// would need job (2) and not job (1), and its lineage identity would not
+    /// be a Claude session UUID — so it needs its own sibling field, **not** a
+    /// widening or overloading of this one.
+    ///
+    /// Only harnesses where [`HarnessKind::supports_session_fork`] holds ever
+    /// carry `Some` — enforced when writing, at the registration chokepoint
+    /// (`Project::register_agent_inner`), and re-checked when reading by
+    /// [`AgentRecord::validate`], which `Project::list_agents` runs over every
+    /// record. Serde alone cannot do this: it validates each field in isolation
+    /// and cannot compare one against `harness`.
+    ///
+    /// So: the Codex/Gemini/Antigravity **adapters** ignore this field, and are
+    /// correct to — their `build_args` never reads it. Do not add "defensive"
+    /// handling there; it would imply the state is reachable through normal use
+    /// and invert the invariant. But the field is **not inert for non-Claude
+    /// agents**: the harness-agnostic materializing-fork gates in the app layer
+    /// (`ensure_materializing_fork_may_dispatch`, and the workflow preflight)
+    /// read it for every agent regardless of harness, so a corrupted record
+    /// would send a Codex agent down the unmaterialized-branch path and could
+    /// block its sends behind an unrelated "parent". That is the reachable
+    /// consequence to reason about, not adapter behavior.
+    ///
+    /// Same plain-`Option` backward-compat rationale as `model` / `effort`
+    /// above: a record written before forking existed legitimately lacks the key
+    /// and must load as `None`.
+    pub forked_from_session: Option<Uuid>,
     pub created_at: DateTime<Utc>,
+}
+
+impl AgentRecord {
+    /// Re-check, on **read**, the cross-field invariants the registration
+    /// chokepoint enforces on write.
+    ///
+    /// Serde validates one field at a time and cannot compare a field against
+    /// `harness`, so a hand-edited or corrupted `registry.jsonl` can produce
+    /// records the writer would have refused: a Codex agent carrying fork
+    /// provenance, a locator of the wrong shape for its harness, a model on a
+    /// harness with no model axis. None of those are inert — the harness-agnostic
+    /// dispatch gates read fork provenance for every agent regardless of harness,
+    /// and would treat such a record as a branch waiting to materialize.
+    ///
+    /// **Fails the whole load**, matching how this file already treats a corrupt
+    /// line (`CoreError::CorruptJsonl`) and how `session_locator`'s own
+    /// deserializer treats a missing key: a registry that contradicts itself is
+    /// not partially usable, and silently dropping the offending agent would look
+    /// to the user exactly like the data loss we are trying to make visible.
+    pub fn validate(&self) -> crate::error::Result<()> {
+        use crate::error::CoreError;
+        if let Some(locator) = &self.session_locator
+            && !locator.is_valid_for(self.harness)
+        {
+            return Err(CoreError::SessionLocatorHarnessMismatch {
+                agent_id: self.id,
+                harness: self.harness,
+            });
+        }
+        if self.forked_from_session.is_some() && !self.harness.supports_session_fork() {
+            return Err(CoreError::SessionForkUnsupported {
+                harness: self.harness,
+            });
+        }
+        if self.model.is_some() && !self.harness.supports_model_selection() {
+            return Err(CoreError::SelectionUnsupported {
+                harness: self.harness,
+                axis: crate::harness::SelectionAxis::Model,
+            });
+        }
+        if self.effort.is_some() && !self.harness.supports_effort_selection() {
+            return Err(CoreError::SelectionUnsupported {
+                harness: self.harness,
+                axis: crate::harness::SelectionAxis::Effort,
+            });
+        }
+        Ok(())
+    }
 }
 
 /// Deserialize `session_locator`, requiring the key to be present (an explicit
@@ -188,6 +284,7 @@ mod tests {
             session_locator: locator,
             model: None,
             effort: None,
+            forked_from_session: None,
             created_at: Utc::now(),
         }
     }
@@ -235,6 +332,38 @@ mod tests {
         assert_eq!(parsed.model, None);
         assert_eq!(parsed.effort, None);
         assert_eq!(parsed.session_locator, None);
+    }
+
+    #[test]
+    fn agent_record_roundtrips_with_fork_provenance() {
+        let parent = Uuid::now_v7();
+        let mut record = record_with_locator(Some(SessionLocator::Uuid(Uuid::now_v7())));
+        record.forked_from_session = Some(parent);
+        let json = serde_json::to_string(&record).unwrap();
+        let parsed: AgentRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, record);
+        assert_eq!(parsed.forked_from_session, Some(parent));
+    }
+
+    #[test]
+    fn agent_record_serializes_unset_fork_provenance_as_null() {
+        // Self-describing on disk, like `model` / `effort`: a non-forked agent
+        // records "not a fork" explicitly rather than by omission.
+        let record = record_with_locator(Some(SessionLocator::Uuid(Uuid::now_v7())));
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(json.contains("\"forked_from_session\":null"), "got: {json}");
+    }
+
+    #[test]
+    fn record_missing_fork_provenance_deserializes_as_none() {
+        // Backward compat: every record written before forking existed lacks
+        // this key. Unlike `session_locator` (fail-loud on absence), a missing
+        // plain `Option` must default to `None` — "this agent is not a fork" is
+        // the correct reading of a pre-fork record, not corruption.
+        let json = r#"{"id":"019e2c5f-aaaa-7000-8000-000000000001","project_id":"019e2c5f-bbbb-7000-8000-000000000002","name":"legacy","harness":"claude_code","session_locator":null,"model":null,"effort":null,"created_at":"2026-05-15T12:30:45Z"}"#;
+        let parsed: AgentRecord =
+            serde_json::from_str(json).expect("missing forked_from_session must default to None");
+        assert_eq!(parsed.forked_from_session, None);
     }
 
     #[test]

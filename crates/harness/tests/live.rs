@@ -66,6 +66,7 @@ fn live_agent() -> AgentRecord {
     AgentRecord {
         model: None,
         effort: None,
+        forked_from_session: None,
         id: Uuid::now_v7(),
         project_id: Uuid::now_v7(),
         name: "live-test-agent".to_owned(),
@@ -883,6 +884,7 @@ async fn live_claude_resume_reuses_session() {
     let agent1 = AgentRecord {
         model: None,
         effort: None,
+        forked_from_session: None,
         id: Uuid::now_v7(),
         project_id: Uuid::now_v7(),
         name: "session-test-1".to_owned(),
@@ -919,6 +921,7 @@ async fn live_claude_resume_reuses_session() {
     let agent2 = AgentRecord {
         model: None,
         effort: None,
+        forked_from_session: None,
         id: Uuid::now_v7(),
         project_id: Uuid::now_v7(),
         name: "session-test-2".to_owned(),
@@ -990,6 +993,7 @@ async fn live_claude_resume_reuses_session_in_underscored_cwd() {
     let agent = |name: &str| AgentRecord {
         model: None,
         effort: None,
+        forked_from_session: None,
         id: Uuid::now_v7(),
         project_id: Uuid::now_v7(),
         name: name.to_owned(),
@@ -1041,6 +1045,355 @@ async fn live_claude_resume_reuses_session_in_underscored_cwd() {
     );
 }
 
+/// Every keyed agent turn of `parent` must appear in `child` with identical
+/// `hydration_key`, `started_at`, **and rendered content**. This is what the
+/// imported-history rendering and the keyed merge stand on — a CLI bump that
+/// dropped inherited replies, restamped copied records at fork time, or
+/// regenerated per-turn ids would keep prompt-level assertions green while
+/// breaking hydration. Content is compared too, because identity alone would
+/// pass a fork that preserved record ids while emptying the replies.
+/// (Raw-record lineage — `parentUuid` chains, `promptSource` — is asserted by
+/// M3's raw fixture; the loader normalizes those away.)
+fn assert_agent_identities_inherited(parent: &[Turn], child: &[Turn]) {
+    /// (`key`, `started_at`) → the turn's concatenated text items, so a match
+    /// asserts the reply survived rather than just its envelope.
+    fn keyed_content(turns: &[Turn]) -> Vec<((String, chrono::DateTime<chrono::Utc>), String)> {
+        turns
+            .iter()
+            .filter_map(|t| match t {
+                Turn::Agent {
+                    hydration_key: Some(key),
+                    started_at,
+                    items,
+                    ..
+                } => {
+                    let text: String = items
+                        .iter()
+                        .filter_map(|i| match i {
+                            TurnItem::Text { text, .. } => Some(text.clone()),
+                            _ => None,
+                        })
+                        .collect();
+                    Some(((key.clone(), *started_at), text))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+    let parent_turns = keyed_content(parent);
+    let child_turns = keyed_content(child);
+    assert!(
+        !parent_turns.is_empty(),
+        "the seeded parent must have at least one keyed agent turn"
+    );
+    for (identity, text) in &parent_turns {
+        let matched = child_turns
+            .iter()
+            .find(|(child_identity, _)| child_identity == identity);
+        let (_, child_text) = matched.unwrap_or_else(|| {
+            panic!(
+                "the parent's agent turn {identity:?} must appear in the child with identical \
+                 identity; child has: {:?}",
+                child_turns.iter().map(|(i, _)| i).collect::<Vec<_>>()
+            )
+        });
+        assert_eq!(
+            child_text, text,
+            "inherited agent turn {identity:?} must keep its content"
+        );
+    }
+}
+
+/// Assert a parent-seeding turn completed. Both fork tests seed a parent
+/// session before exercising the fork; without this, an auth/quota failure on
+/// the seed surfaces much later as `got: ""` at the BANANA assertion — the
+/// worst place to start debugging a live test months from now.
+fn assert_seed_completed(events: &[AdapterEvent]) {
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AdapterEvent::TurnEnd {
+                outcome: TurnOutcome::Completed,
+                ..
+            }
+        )),
+        "seeding the parent session did not complete (auth/quota?): {events:?}"
+    );
+}
+
+/// Dispatch one live turn and return its events plus the concatenated streamed
+/// text. The fork tests each run several turns; inlining the collect-and-filter
+/// at every one of them is what pushed them past the line limit.
+async fn fork_turn(
+    adapter: &ClaudeCodeAdapter,
+    agent: &AgentRecord,
+    cwd: &Path,
+    prompt: &str,
+) -> (Vec<AdapterEvent>, String) {
+    let stream = adapter
+        .dispatch(
+            agent,
+            cwd,
+            prompt,
+            Uuid::now_v7(),
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("live dispatch should succeed");
+    let events: Vec<AdapterEvent> = stream.collect().await;
+    let text = events
+        .iter()
+        .filter_map(|e| match e {
+            AdapterEvent::ContentChunk { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    (events, text)
+}
+
+/// The whole fork contract against the real CLI: a forked agent's first
+/// dispatch inherits the parent's context, lands on the session id **we**
+/// pre-generated (not one Claude chose), leaves the parent's file untouched,
+/// and writes a child file the transcript parser reads back as full inherited
+/// history. A CLI bump that changed `--fork-session`'s interaction with
+/// `--session-id`, or stopped copying prior turns into the child, would break
+/// forking in ways no fixture test can see.
+#[tokio::test]
+#[ignore = "requires claude installed — run with: make test-live"]
+async fn live_claude_fork_inherits_context_on_the_caller_assigned_session() {
+    let adapter = ClaudeCodeAdapter::new();
+    // Stable cwd, canonicalized — same reasoning as the sibling resume tests: a
+    // fresh random directory per run would leave a new project dir behind in the
+    // developer's real `~/.claude/projects/` every time. Canonicalizing is
+    // load-bearing (macOS `temp_dir()` is a symlink): the path used for the
+    // session-file lookup must be the one claude itself resolves.
+    let cwd = std::env::temp_dir().join("sw_live_probe_fork");
+    std::fs::create_dir_all(&cwd).expect("create fork probe cwd");
+    let cwd = cwd.canonicalize().expect("canonicalize cwd");
+
+    let parent_session = Uuid::now_v7();
+    let parent = AgentRecord {
+        session_locator: Some(SessionLocator::Uuid(parent_session)),
+        ..live_agent()
+    };
+    let (seed_events, _) = fork_turn(
+        &adapter,
+        &parent,
+        &cwd,
+        "Remember: the secret word is BANANA. Reply with only the word ack.",
+    )
+    .await;
+    assert_seed_completed(&seed_events);
+
+    let parent_path = claude_session_file_path(&home_dir(), &cwd, &parent_session);
+    let parent_before = std::fs::read(&parent_path).expect("parent session file");
+
+    // The fork: its own pre-generated locator plus provenance pointing at the
+    // parent's session. `build_args` turns that into
+    // `--resume <parent> --session-id <own> --fork-session`.
+    let fork_session = Uuid::now_v7();
+    let fork = AgentRecord {
+        session_locator: Some(SessionLocator::Uuid(fork_session)),
+        forked_from_session: Some(parent_session),
+        ..live_agent()
+    };
+    let (events, text) = fork_turn(
+        &adapter,
+        &fork,
+        &cwd,
+        "What is the secret word? Reply with only that word.",
+    )
+    .await;
+    assert!(
+        text.contains("BANANA"),
+        "the fork must inherit the parent's context, got: {text:?}"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AdapterEvent::TurnEnd {
+                outcome: TurnOutcome::Completed,
+                ..
+            }
+        )),
+        "the fork's first turn must complete"
+    );
+
+    // The branch landed on OUR id — this is what lets a fork pre-generate its
+    // locator at registration instead of capturing one from the stream.
+    assert!(
+        claude_session_file_path(&home_dir(), &cwd, &fork_session).exists(),
+        "the fork must write the session file we named, not one claude chose"
+    );
+    assert_eq!(
+        std::fs::read(&parent_path).expect("parent session file"),
+        parent_before,
+        "forking must not modify the parent's session file"
+    );
+
+    // The parser reads the child back as inherited history, not just the new
+    // turn — this is what makes the forked agent's transcript render.
+    let loaded = load_claude_transcript(&home_dir(), &cwd, fork_session, fork.id)
+        .expect("the forked session file must load");
+    let prompts: Vec<String> = loaded
+        .turns
+        .iter()
+        .filter_map(|t| match t {
+            Turn::User { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        prompts.iter().any(|p| p.contains("secret word is BANANA")),
+        "the parent's prompt must be present in the fork's transcript, got: {prompts:?}"
+    );
+    assert!(
+        prompts
+            .iter()
+            .any(|p| p.contains("What is the secret word")),
+        "the fork's own prompt must be present too, got: {prompts:?}"
+    );
+
+    // Inherited AGENT turns must survive with identity intact — see
+    // `assert_agent_identities_inherited`.
+    let parent_loaded = load_claude_transcript(&home_dir(), &cwd, parent_session, parent.id)
+        .expect("the parent session file must load");
+    assert_agent_identities_inherited(&parent_loaded.turns, &loaded.turns);
+
+    // Second turn: provenance is still set, but the fork's own file now exists,
+    // so this must be a plain resume — re-forking here would discard the fork's
+    // own history on every send.
+    fork_turn(&adapter, &fork, &cwd, "Reply with only the word ack2.").await;
+    let after = load_claude_transcript(&home_dir(), &cwd, fork_session, fork.id)
+        .expect("the forked session file must still load");
+    let after_prompts = after
+        .turns
+        .iter()
+        .filter(|t| matches!(t, Turn::User { .. }))
+        .count();
+    assert!(
+        after_prompts > prompts.len(),
+        "the second turn must append to the fork's own session, not re-fork it \
+         (prompts before: {}, after: {after_prompts})",
+        prompts.len()
+    );
+}
+
+/// Cancelling a fork's **first** dispatch must never strand the agent. Because
+/// fork-vs-resume is derived from whether the fork's own session file exists,
+/// recovery must hold for whichever state the cancel leaves behind: file
+/// absent → the next send re-forks; file present → it resumes the copy.
+/// (Probing found only those two states — never a partial file — but that is a
+/// bounded observation at one CLI version, not a guarantee; see
+/// harness-behavior.md §3.5. The recovery invariant asserted here is
+/// state-independent, and the deterministic per-state arg coverage lives in
+/// the `build_args` unit tests. Which state a given run exercises depends on
+/// timing; with a tiny parent it cannot be the size-sensitive copy window the
+/// probe explored at 160 KB.)
+///
+/// The cancelled turn's prompt is deliberately long-running — an exception to
+/// AGENTS.md's tiny-response cost discipline, because the test needs a window
+/// in which the cancel can actually land.
+#[tokio::test]
+#[ignore = "requires claude installed — run with: make test-live"]
+async fn live_claude_fork_recovers_from_a_cancelled_first_dispatch() {
+    let adapter = ClaudeCodeAdapter::new();
+    // Stable, canonicalized cwd — see the sibling fork test.
+    let cwd = std::env::temp_dir().join("sw_live_probe_fork_cancel");
+    std::fs::create_dir_all(&cwd).expect("create fork-cancel probe cwd");
+    let cwd = cwd.canonicalize().expect("canonicalize cwd");
+
+    let parent_session = Uuid::now_v7();
+    let parent = AgentRecord {
+        session_locator: Some(SessionLocator::Uuid(parent_session)),
+        ..live_agent()
+    };
+    let (seed_events, _) = fork_turn(
+        &adapter,
+        &parent,
+        &cwd,
+        "Remember: the secret word is BANANA. Reply with only the word ack.",
+    )
+    .await;
+    assert_seed_completed(&seed_events);
+
+    let fork_session = Uuid::now_v7();
+    let fork = AgentRecord {
+        session_locator: Some(SessionLocator::Uuid(fork_session)),
+        forked_from_session: Some(parent_session),
+        ..live_agent()
+    };
+
+    // Cancel the fork's first dispatch mid-flight, exactly as the dispatcher's
+    // cancel path does (the token kills the subprocess group).
+    let token = tokio_util::sync::CancellationToken::new();
+    let stream = adapter
+        .dispatch(
+            &fork,
+            &cwd,
+            "Count slowly from 1 to 50, one number per line.",
+            Uuid::now_v7(),
+            DispatchOptions {
+                cancel_token: token.clone(),
+                ..DispatchOptions::default()
+            },
+        )
+        .await
+        .expect("the fork's first dispatch should spawn");
+    let canceller = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        token.cancel();
+    });
+    let cancelled_events: Vec<AdapterEvent> = stream.collect().await;
+    canceller.await.expect("canceller task");
+
+    // The cancel must have genuinely interrupted the turn. The adapter's
+    // cancel contract is to end the stream WITHOUT a terminal event (the
+    // dispatcher synthesizes the Cancelled terminal) — so any `TurnEnd` here
+    // means claude finished inside the sleep and this run proved nothing the
+    // happy-path test doesn't. Fail loudly rather than pass vacuously; if
+    // models get fast enough to finish 50 lines in 3 s, widen the prompt.
+    assert!(
+        !cancelled_events
+            .iter()
+            .any(|e| matches!(e, AdapterEvent::TurnEnd { .. })),
+        "the first dispatch completed before the cancel landed — the test \
+         exercised nothing; widen the prompt. Events: {cancelled_events:?}"
+    );
+
+    // Whichever state the cancel left behind, the next send must produce a fork
+    // that knows the parent's context — re-forking if the file never appeared,
+    // resuming the completed copy if it did.
+    let (recovery_events, text) = fork_turn(
+        &adapter,
+        &fork,
+        &cwd,
+        "What is the secret word? Reply with only that word.",
+    )
+    .await;
+    assert!(
+        text.contains("BANANA"),
+        "a cancelled first dispatch must not cost the fork its inherited context, got: {text:?}"
+    );
+    // Streaming the right text isn't recovery on its own — the turn must also
+    // reach a Completed terminal, or the fork is still broken in a way the
+    // content assertion alone would miss.
+    assert!(
+        recovery_events.iter().any(|e| matches!(
+            e,
+            AdapterEvent::TurnEnd {
+                outcome: TurnOutcome::Completed,
+                ..
+            }
+        )),
+        "the recovery turn must complete: {recovery_events:?}"
+    );
+    assert!(
+        claude_session_file_path(&home_dir(), &cwd, &fork_session).exists(),
+        "the fork must end up on its own pre-generated session id"
+    );
+}
+
 /// The backend contract the staleness refresh stands on: continuing a session
 /// (a second turn appended to the file, exactly as a TUI continuation does)
 /// makes a re-read return the new turn with a **new, distinct** `hydration_key`
@@ -1058,6 +1411,7 @@ async fn live_claude_refresh_picks_up_appended_turn() {
     let agent = AgentRecord {
         model: None,
         effort: None,
+        forked_from_session: None,
         id: agent_id,
         project_id: Uuid::now_v7(),
         name: "refresh-test".to_owned(),
@@ -1292,6 +1646,7 @@ fn live_codex_agent() -> AgentRecord {
     AgentRecord {
         model: None,
         effort: None,
+        forked_from_session: None,
         id: Uuid::now_v7(),
         project_id: Uuid::now_v7(),
         name: "live-codex-agent".to_owned(),
@@ -1636,6 +1991,7 @@ fn live_gemini_agent() -> AgentRecord {
     AgentRecord {
         model: None,
         effort: None,
+        forked_from_session: None,
         id: Uuid::now_v7(),
         project_id: Uuid::now_v7(),
         name: "live-gemini-agent".to_owned(),
@@ -1958,6 +2314,7 @@ fn live_antigravity_agent() -> AgentRecord {
     AgentRecord {
         model: None,
         effort: None,
+        forked_from_session: None,
         id: Uuid::now_v7(),
         project_id: Uuid::now_v7(),
         name: "live-antigravity-agent".to_owned(),
@@ -2330,6 +2687,7 @@ async fn live_claude_model_and_effort_change_across_turns() {
     let mut agent = AgentRecord {
         model: Some("sonnet".to_owned()),
         effort: Some("low".to_owned()),
+        forked_from_session: None,
         id: agent_id,
         project_id: Uuid::now_v7(),
         name: "m4-claude".to_owned(),
@@ -2559,6 +2917,7 @@ async fn live_gemini_model_changes_across_turns() {
     let mut agent = AgentRecord {
         model: Some("gemini-2.5-flash".to_owned()),
         effort: None,
+        forked_from_session: None,
         id: agent_id,
         project_id: Uuid::now_v7(),
         name: "m4-gemini".to_owned(),
@@ -2720,6 +3079,7 @@ async fn live_antigravity_model_change_announced_on_resume() {
     let mut agent = AgentRecord {
         model: None,
         effort: None,
+        forked_from_session: None,
         id: agent_id,
         project_id: Uuid::now_v7(),
         name: "m4-agy".to_owned(),

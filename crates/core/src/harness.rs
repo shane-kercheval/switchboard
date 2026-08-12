@@ -90,6 +90,44 @@ impl HarnessKind {
             Self::Codex | Self::Gemini | Self::Antigravity => false,
         }
     }
+
+    /// Whether this harness supports **the fork lifecycle Switchboard
+    /// implements**: branching a session at its current tip into a new one that
+    /// carries the full prior context, *deferred* so that nothing happens until
+    /// the branch's first dispatch, which materializes it under a session id the
+    /// caller assigned in advance.
+    ///
+    /// The deferral and the caller-assigned id are part of the definition, not
+    /// incidental — together they are what let a fork pre-generate its locator
+    /// at registration like any fresh agent and carry
+    /// [`crate::AgentRecord::forked_from_session`] as its materialization token.
+    /// True only for Claude (`--resume <parent> --session-id <new>
+    /// --fork-session`), the only harness offering that shape.
+    ///
+    /// **A harness whose fork is *eager* does not belong here.** Codex's
+    /// experimental app-server `thread/fork` creates the new session
+    /// immediately and hands back its id, so it has no deferred state for the
+    /// provenance field to hold and would need its own registration path —
+    /// flipping this arm to `true` is *necessary but not sufficient* for it,
+    /// and doing only that would produce records
+    /// [`crate::project::Project::fork_agent`] cannot honor. Gemini's
+    /// `--session-file` import drops tool calls and ignores the caller's
+    /// session id; Antigravity forks only server-side, on its own initiative.
+    /// Per `harness-behavior.md` §3.5.
+    ///
+    /// **Naming:** "session fork" here is Claude's `--fork-session`, which is
+    /// the headless equivalent of its TUI `/branch`. Claude's TUI `/fork` is an
+    /// unrelated operation (spawning a background agent that inherits the
+    /// conversation) — see the naming note in `harness-behavior.md` §3.5.
+    ///
+    /// Same authority + exhaustiveness role as the three siblings above.
+    #[must_use]
+    pub fn supports_session_fork(self) -> bool {
+        match self {
+            Self::ClaudeCode => true,
+            Self::Codex | Self::Gemini | Self::Antigravity => false,
+        }
+    }
 }
 
 /// The two independent per-agent selection axes. A closed, complete set — model
@@ -212,6 +250,17 @@ mod tests {
         assert!(!HarnessKind::Codex.supports_refresh());
         assert!(!HarnessKind::Gemini.supports_refresh());
         assert!(!HarnessKind::Antigravity.supports_refresh());
+    }
+
+    #[test]
+    fn supports_session_fork_is_claude_only() {
+        // Codex's app-server `thread/fork` and Gemini's lossy `--session-file`
+        // import exist but are deliberately unwired in v1 — this gate is what
+        // keeps the Fork action off those agents.
+        assert!(HarnessKind::ClaudeCode.supports_session_fork());
+        assert!(!HarnessKind::Codex.supports_session_fork());
+        assert!(!HarnessKind::Gemini.supports_session_fork());
+        assert!(!HarnessKind::Antigravity.supports_session_fork());
     }
 
     #[test]

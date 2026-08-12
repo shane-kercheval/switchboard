@@ -3816,4 +3816,176 @@ mod tests {
             "the whole dispatch forwards, not just the last fragment",
         );
     }
+
+    /// A real `--fork-session` pair, captured 2026-08-10 against claude 2.1.226
+    /// and sanitized (attachment payloads redacted, `cwd` neutralized). The
+    /// parent asked Claude to remember a secret word; the fork then asked for it
+    /// back, so the fork's own reply is evidence the branch actually inherited
+    /// the parent's context rather than merely copying its bytes.
+    const FORK_PARENT_FIXTURE: &str =
+        include_str!("../../tests/fixtures/claude/forked-session.parent.jsonl");
+    const FORK_FIXTURE: &str = include_str!("../../tests/fixtures/claude/forked-session.jsonl");
+    const FORK_PARENT_SESSION: &str = "2e18d035-181f-4ba3-8845-b070ca88bffb";
+    const FORK_SESSION: &str = "a2319443-8b29-46bd-a79d-fa1e405bf177";
+
+    fn load_fixture_session(fixture: &str, session_id: &str) -> LoadedTranscript {
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        let session_id: Uuid = session_id.parse().unwrap();
+        stage_session_file(home.path(), cwd.path(), session_id, fixture);
+        load_claude_transcript(home.path(), cwd.path(), session_id, Uuid::now_v7()).unwrap()
+    }
+
+    fn user_turn_facts(turn: &Turn) -> (&str, DateTime<Utc>, UserPromptSource) {
+        let Turn::User {
+            text,
+            started_at,
+            source,
+            ..
+        } = turn
+        else {
+            panic!("expected a user turn, got {turn:?}");
+        };
+        (text.as_str(), *started_at, *source)
+    }
+
+    fn agent_hydration_key(turn: &Turn) -> &str {
+        let Turn::Agent { hydration_key, .. } = turn else {
+            panic!("expected an agent turn, got {turn:?}");
+        };
+        hydration_key.as_deref().expect("agent turn must be keyed")
+    }
+
+    /// The loader's view of a forked session: the parent's history replays with
+    /// its **original** identities — same prompt text, same timestamps (all
+    /// predating the fork's own first record), same `sdk` provenance, and the
+    /// same `hydration_key` on the copied agent turn as the parent's own. That
+    /// last one is the load-bearing hazard for the merge: one key now names two
+    /// turns belonging to two different agents.
+    #[test]
+    fn forked_session_replays_the_parent_history_with_original_identities() {
+        let parent = load_fixture_session(FORK_PARENT_FIXTURE, FORK_PARENT_SESSION);
+        let fork = load_fixture_session(FORK_FIXTURE, FORK_SESSION);
+
+        assert!(parent.warnings.is_empty(), "{:?}", parent.warnings);
+        assert!(
+            fork.warnings.is_empty(),
+            "the fork's leading `mode` record is skipped silently, not warned: {:?}",
+            fork.warnings
+        );
+        assert_eq!(turn_roles(&parent.turns), vec!["user", "agent"]);
+        assert_eq!(
+            turn_roles(&fork.turns),
+            vec!["user", "agent", "user", "agent"],
+            "the fork carries the parent's turn plus its own"
+        );
+
+        let (parent_prompt, parent_prompt_at, parent_source) = user_turn_facts(&parent.turns[0]);
+        let (copied_prompt, copied_prompt_at, copied_source) = user_turn_facts(&fork.turns[0]);
+        assert_eq!(copied_prompt, parent_prompt);
+        assert_eq!(
+            copied_prompt_at, parent_prompt_at,
+            "the copy keeps the parent's original timestamp — it is NOT restamped at fork time"
+        );
+        assert_eq!(copied_source, parent_source);
+        assert_eq!(
+            copied_source,
+            UserPromptSource::Sdk,
+            "copied prompts stay `sdk`, so the merge's window guard is what keeps them imported"
+        );
+
+        assert_eq!(
+            agent_hydration_key(&fork.turns[1]),
+            agent_hydration_key(&parent.turns[1]),
+            "the copied agent turn duplicates the parent's hydration key across two agents"
+        );
+
+        let (_, own_prompt_at, own_source) = user_turn_facts(&fork.turns[2]);
+        assert!(
+            own_prompt_at > copied_prompt_at,
+            "the fork's own prompt is stamped at fork time, after the whole inherited history"
+        );
+        assert_eq!(own_source, UserPromptSource::Sdk);
+        assert_ne!(
+            agent_hydration_key(&fork.turns[3]),
+            agent_hydration_key(&fork.turns[1]),
+            "the fork's own reply is a distinct turn with its own key"
+        );
+        assert_eq!(
+            agent_text_items(&fork.turns),
+            vec![vec!["ack".to_owned()], vec!["BANANA".to_owned()]],
+            "the fork answered from inherited context — it knew the parent's secret word"
+        );
+    }
+
+    /// Raw-record assertions the loader deliberately normalizes away, so only a
+    /// raw fixture can pin them: the copy preserves record UUIDs and the
+    /// `parentUuid` chain (the fork's own prompt hangs off the *copied*
+    /// assistant record, making the branch point explicit), while `sessionId` is
+    /// rewritten to the fork's id on every record — including the copied ones.
+    #[test]
+    fn forked_session_file_preserves_raw_record_lineage() {
+        let records = |fixture: &str| -> Vec<Value> {
+            fixture
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect()
+        };
+        let field = |record: &Value, key: &str| -> Option<String> {
+            record.get(key).and_then(Value::as_str).map(str::to_owned)
+        };
+        let conversation = |recs: &[Value]| -> Vec<Value> {
+            recs.iter()
+                .filter(|r| {
+                    matches!(
+                        r.get("type").and_then(Value::as_str),
+                        Some("user" | "assistant" | "attachment")
+                    )
+                })
+                .cloned()
+                .collect()
+        };
+
+        let parent = records(FORK_PARENT_FIXTURE);
+        let fork = records(FORK_FIXTURE);
+
+        assert_eq!(
+            field(&fork[0], "type").as_deref(),
+            Some("mode"),
+            "the fixture must keep the leading `mode` record the loader skips"
+        );
+
+        let parent_chain = conversation(&parent);
+        let fork_chain = conversation(&fork);
+        let copied = &fork_chain[..parent_chain.len()];
+        assert_eq!(
+            copied
+                .iter()
+                .map(|r| (field(r, "uuid"), field(r, "parentUuid")))
+                .collect::<Vec<_>>(),
+            parent_chain
+                .iter()
+                .map(|r| (field(r, "uuid"), field(r, "parentUuid")))
+                .collect::<Vec<_>>(),
+            "copied records keep the parent's UUIDs and parent links verbatim"
+        );
+
+        let branch_point = field(parent_chain.last().unwrap(), "uuid");
+        let own_prompt = &fork_chain[parent_chain.len()];
+        assert_eq!(
+            field(own_prompt, "parentUuid"),
+            branch_point,
+            "the fork's own prompt hangs off the last inherited record — the branch point"
+        );
+
+        for record in &fork {
+            if let Some(session) = field(record, "sessionId") {
+                assert_eq!(
+                    session, FORK_SESSION,
+                    "every record — copied included — is restamped with the fork's session id"
+                );
+            }
+        }
+    }
 }

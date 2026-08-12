@@ -4889,3 +4889,143 @@ describe("UnifiedTranscript render windowing", () => {
     expect(blockCount()).toBe(WINDOW + 2 * BATCH);
   });
 });
+
+// The branch cue's whole claim is "this state is reachable and looks empty," so
+// the state is built the way the app builds it: `forkAgentIntoOwnPane` arms the
+// pending flag, `dispatchUserTurn` appends the optimistic user turn, and a real
+// `turn_start` event appends the agent turn. Assigning `transcripts[id]` here
+// would let the cue pass against a shape the dispatch path never produces —
+// which is exactly how an earlier version of this test passed while the feature
+// was broken.
+describe("pending-branch notice", () => {
+  const PARENT = CLAUDE_AGENT;
+  const FORK_ID = "00000000-0000-7000-8000-000000000f0f";
+  // The parent's own session — the lineage the fork record points back at.
+  const PARENT_SESSION = "00000000-0000-7000-8000-000000000001";
+  const FORK: AgentRecord = {
+    id: FORK_ID,
+    project_id: PROJECT_ID,
+    name: "alice-fork",
+    harness: "claude_code",
+    session_locator: { uuid: "00000000-0000-7000-8000-0000000000f1" },
+    created_at: "2026-05-16T00:00:00Z",
+    forked_from_session: PARENT_SESSION,
+  };
+
+  async function loadWorkspace() {
+    return await import("$lib/state/workspace.svelte");
+  }
+
+  /// Drive the real fork-send: create the branch through the store, then send to
+  /// it exactly as the compose bar does.
+  async function forkAndSend(): Promise<void> {
+    const state = await loadState();
+    const ws = await loadWorkspace();
+    await state.registerAgent(PARENT);
+    ws.agentsByProject[PROJECT_ID] = [PARENT];
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "fork_agent") return FORK;
+      if (cmd === "load_project_conversation") return { items: [], agents: [] };
+      return null;
+    });
+    await ws.hydrateProject(PROJECT_ID);
+    ws.installForkHistoryRefresh();
+    await ws.forkAgentIntoOwnPane(PARENT.id);
+    ws.agentsByProject[PROJECT_ID] = [PARENT, FORK];
+    await state.registerAgent(FORK);
+    state.dispatchUserTurn(
+      FORK.id,
+      "user-turn-1",
+      "branch and continue",
+      [],
+      "00000000-0000-7000-8000-000000000501",
+      "2026-05-16T00:01:00Z",
+    );
+  }
+
+  it("keeps explaining the branch through the whole first turn, naming its source", async () => {
+    await forkAndSend();
+
+    // Pane-scoped exactly as placement produces it: the fork alone, parent elsewhere.
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [FORK], loadStatus: "complete" },
+    });
+    await tick();
+
+    const notice = () => screen.queryByTestId("fork-pending-history");
+    expect(notice()).not.toBeNull();
+    // The parent lives in another pane; the cue must still name it.
+    expect(notice()).toHaveTextContent("branched from");
+    expect(notice()).toHaveTextContent("alice");
+    expect(screen.queryByText(/no messages yet/i)).toBeNull();
+
+    // The reply starts streaming — the interval the cue exists for.
+    fireTo(`agent:${FORK.id}`, {
+      type: "turn_start",
+      turn_id: "fork-turn-1",
+      message_id: "00000000-0000-7000-8000-000000000501",
+      send_id: "00000000-0000-7000-8000-000000000501",
+      started_at: "2026-05-16T00:01:01Z",
+    });
+    await tick();
+    expect(notice()).not.toBeNull();
+
+    fireTo(`agent:${FORK.id}`, {
+      type: "content_chunk",
+      turn_id: "fork-turn-1",
+      kind: "text",
+      text: "working on it",
+    });
+    await tick();
+    expect(notice()).not.toBeNull();
+  });
+
+  it("stops explaining once the inherited history has actually loaded", async () => {
+    await forkAndSend();
+
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [FORK], loadStatus: "complete" },
+    });
+    await tick();
+    expect(screen.queryByTestId("fork-pending-history")).not.toBeNull();
+
+    // Resolution goes through the real path: the first turn's terminal fires
+    // the refresh hook, which re-reads the project conversation.
+    fireTo(`agent:${FORK.id}`, {
+      type: "turn_end",
+      turn_id: "fork-turn-1",
+      outcome: { status: "completed" },
+      ended_at: "2026-05-16T00:01:05Z",
+    });
+    await waitFor(() => expect(screen.queryByTestId("fork-pending-history")).toBeNull());
+  });
+
+  it("names no source when the agent it branched from is gone", async () => {
+    await forkAndSend();
+    const ws = await loadWorkspace();
+    // Parent deleted: the fork's lineage still points at a session nothing owns.
+    ws.agentsByProject[PROJECT_ID] = [FORK];
+
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [FORK], loadStatus: "complete" },
+    });
+    await tick();
+
+    const notice = screen.getByTestId("fork-pending-history");
+    expect(notice).toHaveTextContent("is a branch");
+    expect(notice).not.toHaveTextContent("branched from");
+  });
+
+  it("leaves an ordinary empty agent alone", async () => {
+    const state = await loadState();
+    await state.registerAgent(PARENT);
+
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [PARENT], loadStatus: "complete" },
+    });
+    await tick();
+
+    expect(screen.queryByTestId("fork-pending-history")).toBeNull();
+    expect(screen.getByText(/no messages yet/i)).toBeInTheDocument();
+  });
+});

@@ -17,8 +17,12 @@ export const SEGMENTED_ITEM_CLASS = "h-6 rounded-full px-2 text-xs font-medium t
 /// The selected segment.
 export const SEGMENTED_ITEM_ACTIVE_CLASS = "bg-segment-selected text-segment-selected-fg";
 
-/// A selectable, unselected segment.
-export const SEGMENTED_ITEM_INACTIVE_CLASS = "text-muted hover:bg-panel";
+/// A selectable, unselected segment. Hovers to `control-hover`, the same step
+/// the compact icon buttons beside it use (`ICON_BUTTON_CLASS`) — a segment IS a
+/// compact control on a `raised` track, so the general ramp rule applies to it.
+/// It previously used `panel`, one step lighter, which read as a weaker hover
+/// than the icon buttons sitting inches away in the same header.
+export const SEGMENTED_ITEM_INACTIVE_CLASS = "text-muted hover:bg-control-hover";
 
 /// Compact main-view segments for persistent page chrome.
 export const SEGMENTED_MAIN_ITEM_CLASS =

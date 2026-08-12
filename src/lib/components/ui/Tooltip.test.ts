@@ -51,6 +51,19 @@ describe("Tooltip", () => {
     expect(content).toHaveTextContent("hello label");
   });
 
+  it("makes non-hoverable content pointer-transparent and closes after leaving the trigger", async () => {
+    render(Harness, { props: { mode: "non-hoverable" } });
+    const trigger = screen.getByTestId("tt-trigger");
+
+    await fireEvent.pointerEnter(trigger);
+    await vi.advanceTimersByTimeAsync(700);
+    const content = await waitFor(() => screen.getByTestId("tooltip-content"));
+    expect(content.className).toContain("pointer-events-none");
+
+    await fireEvent.pointerLeave(trigger);
+    await waitFor(() => expect(screen.queryByTestId("tooltip-content")).not.toBeInTheDocument());
+  });
+
   it("keeps an activated state control quiet until a real pointer re-entry", async () => {
     render(Harness, { props: { mode: "fresh-hover" } });
     const trigger = screen.getByTestId("tt-trigger");

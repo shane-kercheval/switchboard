@@ -7,6 +7,11 @@ const ICON_BUTTON_BASE =
 
 export const ICON_BUTTON_CLASS = `${ICON_BUTTON_BASE} hover:bg-control-hover`;
 
+/// The compose surface uses a slightly larger action column than the app's
+/// general compact controls so its icons align with the 28px Send/Fork halves.
+export const COMPOSER_ACTION_BUTTON_CLASS =
+  "text-muted hover:text-fg hover:bg-control-hover focus-visible:ring-focus flex size-7 items-center justify-center rounded-full transition-colors focus-visible:ring-1 focus-visible:outline-none";
+
 /// Compact controls that rest directly on a recessed `panel` surface brighten
 /// to `raised`, producing a clearer hover than another nearby gray.
 export const ICON_BUTTON_ON_PANEL_CLASS = `${ICON_BUTTON_BASE} hover:bg-raised`;

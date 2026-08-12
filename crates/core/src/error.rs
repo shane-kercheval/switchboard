@@ -88,6 +88,84 @@ pub enum CoreError {
         axis: crate::harness::SelectionAxis,
     },
 
+    /// Deliberately a statement about **Switchboard's support**, not about what
+    /// the harness's CLI can do — Codex, for one, can branch a session (through
+    /// an integration Switchboard doesn't wire). Claiming otherwise would be
+    /// false, and this message is the source for the user-facing explanation on
+    /// non-forkable agents.
+    #[error(
+        "Switchboard does not support forking {harness} sessions \
+         — refusing to record a branch it could never materialize"
+    )]
+    SessionForkUnsupported {
+        harness: crate::harness::HarnessKind,
+    },
+
+    /// Fork provenance forms a loop: following `forked_from_session` from this
+    /// agent leads back to it. Unreachable through any supported path — a fork's
+    /// parent always predates it — so this means the registry was edited or
+    /// corrupted.
+    ///
+    /// Rejected at **load**, not merely ignored, because a cycle is not
+    /// cosmetic: the materializing-fork gate asks each agent's own actor whether
+    /// its parent is mid-turn, so a loop makes two actors wait on each other's
+    /// reply and neither can answer. The single-agent case is caught earlier, at
+    /// the gate; longer loops can only be caught here, where the whole set is
+    /// visible at once.
+    #[error(
+        "agent {agent_id}'s fork provenance forms a cycle — the registry is \
+         inconsistent and cannot be loaded safely"
+    )]
+    ForkProvenanceCycle { agent_id: uuid::Uuid },
+
+    /// Two records in one registry share an identity that must be unique. Fatal
+    /// on read rather than tolerated: duplicate ids collapse in the app's
+    /// agent cache (two roster rows sharing one runtime and one actor), and
+    /// duplicate session locators mean two agents driving one harness
+    /// conversation — and they silently corrupt the provenance walk, whose
+    /// session-keyed map keeps only one of the pair.
+    #[error(
+        "{registry}: agents {first} and {second} share the same {field} — \
+         the registry is inconsistent and cannot be loaded safely. Remove or \
+         correct one of the two records to reopen this project."
+    )]
+    DuplicateAgentIdentity {
+        registry: std::path::PathBuf,
+        field: &'static str,
+        first: uuid::Uuid,
+        second: uuid::Uuid,
+    },
+
+    /// A record sitting in one project's registry claims to belong to another.
+    /// Fatal because it is a routing invariant, not a label: dispatch resolves an
+    /// agent's project — and therefore its working directory and journal — from
+    /// this field, so a mismatched record silently runs the agent's work against
+    /// a different project's directory whenever that project is also loaded.
+    #[error(
+        "{registry}: agent {agent_id} claims project {claimed} but is stored under \
+         {actual} — the registry is inconsistent and cannot be loaded safely"
+    )]
+    AgentProjectMismatch {
+        registry: std::path::PathBuf,
+        agent_id: uuid::Uuid,
+        claimed: uuid::Uuid,
+        actual: uuid::Uuid,
+    },
+
+    /// The source agent carries no session id to branch from. Distinct from
+    /// [`Self::SessionForkUnsupported`]: that harness can never fork; this one
+    /// could, but this record has nothing to fork *from*.
+    ///
+    /// Currently unreachable through any supported path — every fork-capable
+    /// harness pre-generates its locator at registration, so a valid record
+    /// always has one and reaching this means the registry is inconsistent.
+    /// That is a property of today's harness set, **not** of the state itself:
+    /// a fork-capable harness that captured its locator at runtime would make
+    /// this a genuine "not yet — dispatch it once first," and the message below
+    /// already reads correctly for that case.
+    #[error("agent {agent_id} has no session to branch from")]
+    SessionForkSourceMissing { agent_id: uuid::Uuid },
+
     /// A reorder's id list must be an exact permutation of the current roster.
     /// Covers every shape failure (wrong length, unknown id, duplicate id) with
     /// one variant: the caller's list is stale or malformed either way, and the

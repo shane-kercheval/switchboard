@@ -15,12 +15,13 @@
 //!   make a Codex/Antigravity agent re-create its session every turn.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, Weak};
 
 use switchboard_core::{AgentId, AgentRecord, Project, SendId};
 use switchboard_dispatcher::{
-    ConversationJournal, DispatchContext, DispatchContextFactory, EventEmitter, MetadataCache,
-    SessionLocatorSink,
+    ConversationJournal, DispatchContext, DispatchContextFactory, Dispatcher, EventEmitter,
+    MetadataCache, SessionLocatorSink,
 };
 use switchboard_harness::{DispatchOptions, HarnessAdapter};
 
@@ -45,6 +46,31 @@ pub struct ProjectDispatchContextFactory {
     needs_session_meta: Arc<Mutex<HashSet<AgentId>>>,
     agents_by_id: Arc<Mutex<HashMap<AgentId, AgentRecord>>>,
     registry_write: Arc<Mutex<()>>,
+    /// Needed by `preflight` only: the start-moment materializing-fork check
+    /// asks the dispatcher whether the parent is running a turn *now*, and
+    /// resolves the fork's own session file under this home.
+    dispatcher: Weak<Dispatcher>,
+    home_dir: PathBuf,
+}
+
+/// The app-wide handles every dispatch context needs, grouped so the factory's
+/// constructor stays readable as it accumulates them (same reason `NewAgent`
+/// exists for registration).
+pub struct DispatchDeps {
+    pub base_emitter: Arc<dyn EventEmitter>,
+    pub needs_session_meta: Arc<Mutex<HashSet<AgentId>>>,
+    pub agents_by_id: Arc<Mutex<HashMap<AgentId, AgentRecord>>>,
+    pub registry_write: Arc<Mutex<()>>,
+    /// `preflight` only: asks whether the fork's parent is running a turn *now*.
+    ///
+    /// **Weak, deliberately.** The trait contract forbids a factory holding
+    /// `Arc<Dispatcher>`: the dispatcher owns each actor's command sender, that
+    /// sender is what keeps the actor task parked rather than exiting, and the
+    /// actor owns this factory — so a strong handle here closes a cycle and the
+    /// dispatcher can never drop.
+    pub dispatcher: Weak<Dispatcher>,
+    /// `preflight` only: resolves whether the fork's own session file exists yet.
+    pub home_dir: PathBuf,
 }
 
 impl ProjectDispatchContextFactory {
@@ -52,11 +78,16 @@ impl ProjectDispatchContextFactory {
         project: Project,
         agent: AgentRecord,
         adapter: Arc<dyn HarnessAdapter>,
-        base_emitter: Arc<dyn EventEmitter>,
-        needs_session_meta: Arc<Mutex<HashSet<AgentId>>>,
-        agents_by_id: Arc<Mutex<HashMap<AgentId, AgentRecord>>>,
-        registry_write: Arc<Mutex<()>>,
+        deps: DispatchDeps,
     ) -> Self {
+        let DispatchDeps {
+            base_emitter,
+            needs_session_meta,
+            agents_by_id,
+            registry_write,
+            dispatcher,
+            home_dir,
+        } = deps;
         Self {
             project,
             agent_id: agent.id,
@@ -66,11 +97,58 @@ impl ProjectDispatchContextFactory {
             needs_session_meta,
             agents_by_id,
             registry_write,
+            dispatcher,
+            home_dir,
         }
     }
 }
 
 impl DispatchContextFactory for ProjectDispatchContextFactory {
+    /// The **authoritative** materializing-fork check. `send_message_impl` runs
+    /// the same policy before enqueuing so the common refusal is immediate and
+    /// friendly, but a send to a busy agent queues — and a fork whose first turn
+    /// failed without writing its session file is materialized by whatever
+    /// ordinary send runs next. That send may have been queued while the parent
+    /// was idle and pop long after the parent started working. This is the only
+    /// freshest judgement available: it runs immediately before the journal write
+    /// and spawn, with no unrelated await in between. It bounds the queue race —
+    /// it is not a lock, and the residual is the documented look-not-a-lock case
+    /// in system-design §9.
+    fn preflight(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + '_>> {
+        Box::pin(async move {
+            let agent = lock(&self.agents_by_id)
+                .get(&self.agent_id)
+                .cloned()
+                .unwrap_or_else(|| self.fallback_agent.clone());
+            // Fail **closed** when the dispatcher is gone. Upgrade only fails
+            // once teardown has begun, and actors can still be draining work
+            // then — so "nothing can be running" is not a safe inference.
+            // Refusing a turn during shutdown is harmless; forking a busy parent
+            // is not. (Contrast the absent-parent case inside `busy_fork_source`,
+            // which allows: no parent means nothing of ours is writing that
+            // session, which is a fact rather than an unknown.)
+            let Some(dispatcher) = self.dispatcher.upgrade() else {
+                return Err("Switchboard is shutting down".to_owned());
+            };
+            match crate::commands::busy_fork_source(
+                &self.agents_by_id,
+                &dispatcher,
+                &agent,
+                &self.project.directory,
+                &self.home_dir,
+            )
+            .await
+            {
+                Some(parent) => {
+                    Err(crate::error::AppError::ForkSourceBusy { name: parent.name }.to_string())
+                }
+                None => Ok(()),
+            }
+        })
+    }
+
     fn build(&self, send_id: SendId) -> DispatchContext {
         let agent_id = self.agent_id;
         // Live-read the current record: a locator captured on a prior turn was

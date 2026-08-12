@@ -964,6 +964,7 @@ mod tests {
             session_locator: None,
             model: None,
             effort: None,
+            forked_from_session: None,
             created_at: Utc::now(),
         }
     }

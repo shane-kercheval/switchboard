@@ -3429,13 +3429,14 @@ describe("App", () => {
     // Locked (prompt-render window): the gesture is atomic — neither the
     // recipient set nor pane visibility may change, or the revealed pane
     // would imply a target the refused write never made.
-    selection.setTargetingLocked("p-a", true);
+    const ops = await import("$lib/state/composeOperations.svelte");
+    const blockingOp = ops.beginOperation("p-a", { kind: "prompt_send" })!;
     await fireEvent.keyDown(window, { key: "2", code: "Digit2", metaKey: true, altKey: true });
     expect(selection.selectionFor("p-a")).toEqual(["ag-1"]);
     expect(panes.layoutFor("p-a", roster).minimized).toEqual([p2]);
 
     // Unlocked: the same chord retargets and reveals.
-    selection.setTargetingLocked("p-a", false);
+    ops.finishOperation("p-a", blockingOp);
     await fireEvent.keyDown(window, { key: "2", code: "Digit2", metaKey: true, altKey: true });
     expect(selection.selectionFor("p-a")).toEqual(["ag-2"]);
     expect(panes.layoutFor("p-a", roster).minimized).toEqual([]);

@@ -40,8 +40,16 @@ export function mountPromptComposer(opts: {
   prompt: Prompt;
   args: Record<string, string>;
   appendedText?: string;
+  agents?: AgentRecord[];
+  width?: number;
 }): ReturnType<typeof render> {
   return render(PromptComposerHost, {
-    props: { prompt: opts.prompt, args: opts.args, appendedText: opts.appendedText ?? "" },
+    props: {
+      prompt: opts.prompt,
+      args: opts.args,
+      appendedText: opts.appendedText ?? "",
+      agents: opts.agents ?? [],
+      ...(opts.width !== undefined ? { width: opts.width } : {}),
+    },
   });
 }

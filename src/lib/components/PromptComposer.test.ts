@@ -62,6 +62,8 @@ describe("PromptComposer", () => {
       "min-h-0",
       "overflow-y-auto",
       "pl-1",
+    );
+    expect(screen.getByTestId("prompt-fields-scroll")).not.toHaveClass(
       "pr-3",
       "[scrollbar-gutter:stable]",
     );

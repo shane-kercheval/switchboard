@@ -1,6 +1,7 @@
 <script lang="ts">
   import { ChevronsDownUp, ChevronsUpDown, Clock3, LocateFixed, Pin } from "@lucide/svelte";
   import { SvelteMap, SvelteSet } from "svelte/reactivity";
+  import { ICON_BUTTON_ON_PANEL_CLASS } from "$lib/components/ui/iconButton";
   import type { AgentRecord, ConversationItem, ProjectId } from "$lib/types";
   import { transcripts, type Turn } from "$lib/state/index.svelte";
   import { buildUnifiedRows, copyTextOf, type UnifiedRow } from "$lib/state/unified";
@@ -297,7 +298,7 @@
               <button
                 {...props}
                 type="button"
-                class="text-muted hover:text-fg hover:bg-control-hover flex h-6 w-6 items-center justify-center rounded-full"
+                class={ICON_BUTTON_ON_PANEL_CLASS}
                 aria-label={allPinsCollapsed
                   ? "Expand all pinned messages"
                   : "Collapse all pinned messages"}
@@ -387,7 +388,7 @@
                     <button
                       {...props}
                       type="button"
-                      class="text-muted hover:text-fg hover:bg-control-hover flex h-7 w-7 shrink-0 items-center justify-center rounded-full"
+                      class="text-muted hover:text-fg hover:bg-active flex h-7 w-7 shrink-0 items-center justify-center rounded-full"
                       aria-label="Go to message"
                       data-testid="pinned-message-locate"
                       onclick={() => jump(item.entry!)}
@@ -417,7 +418,7 @@
                     <button
                       {...props}
                       type="button"
-                      class="text-muted hover:text-fg hover:bg-control-hover flex h-7 w-7 shrink-0 items-center justify-center rounded-full"
+                      class="text-muted hover:text-fg hover:bg-active flex h-7 w-7 shrink-0 items-center justify-center rounded-full"
                       aria-label={isPinCollapsed(projectId, item.pin.key)
                         ? "Expand message"
                         : "Collapse message"}
@@ -439,7 +440,7 @@
                   <button
                     {...props}
                     type="button"
-                    class="text-accent hover:bg-control-hover flex h-7 w-7 shrink-0 items-center justify-center rounded-full"
+                    class="text-accent hover:bg-active flex h-7 w-7 shrink-0 items-center justify-center rounded-full"
                     aria-label="Unpin message"
                     data-testid="pinned-message-unpin"
                     onclick={() => setStoredPinPinned(projectId, item.pin.key, false)}

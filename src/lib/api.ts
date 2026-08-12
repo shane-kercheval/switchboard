@@ -397,6 +397,15 @@ export async function createAgent(
   return await invoke<AgentRecord>("create_agent", { name, harness, model, effort });
 }
 
+/// Branch an agent's conversation into a new agent, returning the new record.
+/// Registration only — the branch does not exist as a harness session until its
+/// first turn is dispatched (Claude has no copy-a-session operation), so the
+/// caller must send its first message immediately. Rejects when the source
+/// can't be branched: wrong harness, no session yet, or a turn in flight.
+export async function forkAgent(agentId: AgentId): Promise<AgentRecord> {
+  return await invoke<AgentRecord>("fork_agent", { agentId });
+}
+
 /// Remove an agent: tears down its actor (cancelling any in-flight turn) and
 /// deletes its registry record + Switchboard sidecars. Harness-native session
 /// files are left intact.

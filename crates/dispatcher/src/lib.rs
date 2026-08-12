@@ -455,6 +455,28 @@ enum Command {
 /// one-driver-per-agent invariant here rather than relying on an app-layer
 /// guard. The entry is removed only after the actor's `Shutdown` reply, so a
 /// *later* send (e.g. project re-open) creates a new actor normally.
+/// Outcome of classifying a slot for [`Dispatcher::is_safe_to_fork_from`].
+/// Extracted so the `Closing` arm is testable: teardown completes too quickly to
+/// observe reliably through the public API, and an untested guard is one someone
+/// later "simplifies" away.
+enum SlotForkSafety {
+    Decided(bool),
+    AskActor(mpsc::UnboundedSender<Command>),
+}
+
+fn fork_safety_from_slot(slot: Option<&AgentSlot>) -> SlotForkSafety {
+    match slot {
+        Some(AgentSlot::Active(tx)) => SlotForkSafety::AskActor(tx.clone()),
+        // Mid-teardown: the slot flips to `Closing` before cancellation and
+        // subprocess drain finish, so the agent may still be writing its session
+        // file. Unknowable means unsafe.
+        Some(AgentSlot::Closing) => SlotForkSafety::Decided(false),
+        // No actor ever existed, or it has fully exited — nothing of ours is
+        // writing that session.
+        None => SlotForkSafety::Decided(true),
+    }
+}
+
 enum AgentSlot {
     Active(mpsc::UnboundedSender<Command>),
     Closing,
@@ -760,10 +782,32 @@ pub struct DispatchContext {
 /// the prompt rides on the work item separately.
 ///
 /// The app impl must capture only agent-lifetime-stable data plus live `Arc`
-/// handles — never `Arc<Dispatcher>` (which it does not need) — so there is no
-/// reference cycle.
+/// handles — never `Arc<Dispatcher>` — so there is no reference cycle: the
+/// dispatcher owns each actor's command sender, that sender is what keeps the
+/// actor parked rather than exiting, and the actor owns this factory. A
+/// **`Weak<Dispatcher>`** is fine and is what `preflight` uses to ask whether
+/// another agent is mid-turn; upgrade failure means teardown, and the policy
+/// decides what to do about that.
 pub trait DispatchContextFactory: Send + Sync {
     fn build(&self, send_id: SendId) -> DispatchContext;
+
+    /// Policy check run at the moment this turn actually **starts**, before the
+    /// send is journaled or any subprocess spawns. `Err(reason)` refuses just
+    /// this turn; the backlog advances and later items are checked on their own
+    /// terms.
+    ///
+    /// **Why a start-moment hook rather than a check at the command boundary.**
+    /// Callers gate before enqueuing, but a send to a busy agent *queues* — so
+    /// by the time it runs, the world it was checked against may be gone. The
+    /// dispatcher is the only component that knows when a queued turn becomes a
+    /// real one. It stays policy-free itself: the rule lives in the injected
+    /// factory, and the default is "always allowed," so a factory with no
+    /// start-time policy is unaffected.
+    fn preflight(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + '_>> {
+        Box::pin(async { Ok(()) })
+    }
 
     /// The plain per-agent event sink, used to emit `AgentIdle` after the
     /// backlog drains — at which point no per-turn context is in hand.
@@ -1097,6 +1141,41 @@ impl Dispatcher {
     /// the actor answers immediately (never holds the reply for a running turn),
     /// so completed-only forwarding can reject a still-streaming source without
     /// waiting on it. `false` for an idle/never-dispatched/shutting-down agent.
+    /// See [`fork_safety_from_slot`] for the slot-state half of this decision.
+    ///
+    /// Whether an agent is safe to *fork from* right now — a stricter question
+    /// than [`Self::is_turn_running`], which reports a shutting-down agent as
+    /// not running.
+    ///
+    /// That answer is right for completed-only forwarding (nothing more will
+    /// arrive) and wrong here: a slot flips to `Closing` before cancellation and
+    /// subprocess drain finish, so the agent can still be writing its session
+    /// file. Copying it then produces exactly the synthesized
+    /// `"No response requested."` branch the fork gate exists to prevent. Only a
+    /// definitely-idle agent, or one with no actor at all, is safe.
+    pub async fn is_safe_to_fork_from(&self, agent_id: AgentId) -> bool {
+        let commands = {
+            let agents = lock(&self.agents);
+            match fork_safety_from_slot(agents.get(&agent_id)) {
+                SlotForkSafety::Decided(safe) => return safe,
+                SlotForkSafety::AskActor(tx) => tx,
+            }
+        };
+        let (tx, rx) = oneshot::channel();
+        if commands
+            .send(Command::PeekCurrentTurn { reply: tx })
+            .is_err()
+        {
+            // The actor is gone between the lock and the send; same as `None`.
+            return true;
+        }
+        match rx.await {
+            Ok(running) => !running,
+            // The actor dropped the reply — it is tearing down. Unsafe.
+            Err(_) => false,
+        }
+    }
+
     pub async fn is_turn_running(&self, agent_id: AgentId) -> bool {
         let commands = {
             let agents = lock(&self.agents);
@@ -1405,6 +1484,58 @@ async fn run_turn(
     let turn_id: TurnId = Uuid::now_v7();
     let started_at = Utc::now();
 
+    // Wait, briefly, for the harness PATH to be resolved from the user's login
+    // shell. A GUI launch inherits a PATH too minimal to find the CLIs, and the
+    // real one is captured asynchronously — so an agent spawned inside that
+    // window would run its *entire* turn against a best-guess PATH. Detection
+    // gets a corrective re-probe; a running child does not. Awaited, not
+    // blocked on, so this never occupies a runtime worker.
+    if path_readiness().await == switchboard_harness::subprocess::PathSource::Capturing {
+        tracing::warn!(
+            %agent_id,
+            %turn_id,
+            "dispatching before the login-shell PATH resolved; the agent will use the \
+             fallback PATH for this turn"
+        );
+    }
+
+    // Start-moment policy, ahead of the journal write: a refused turn must leave
+    // no durable trace, exactly like the journal-failure path below. This is the
+    // **freshest** judgement available — the caller's pre-enqueue check answered
+    // a question that may have gone stale while this item sat in the backlog —
+    // and it is deliberately sited after the PATH wait above so no unrelated
+    // await separates it from the dispatch it gates. It bounds that queue race;
+    // it is not a lock, and the residual is documented in system-design §9.
+    if let Err(reason) = factory.preflight().await {
+        emit_message_failed(
+            emitter.as_ref(),
+            channel,
+            item.message_id,
+            // Nothing was journaled, so reload has no send to reconstruct.
+            None,
+            agent_id,
+            &reason,
+        );
+        fire_completion(
+            &mut completion,
+            TurnOutcome::Failed {
+                // `AdapterFailure` is imprecise here — nothing reached an adapter,
+                // this is a policy refusal — and it matches the journal-failure
+                // path below, which is equally imprecise. Deliberately deferred:
+                // the frontend classifies from `MessageFailed`, which carries no
+                // kind at all and hardcodes `adapter_failure`, so fixing the
+                // signal means adding a cause to that wire event and threading it
+                // through the reducer. Worth doing before any differentiated
+                // retry UI lands; not worth a half-fix that leaves two shapes of
+                // "refused" disagreeing.
+                kind: FailureKind::AdapterFailure,
+                message: reason,
+            },
+            String::new(),
+        );
+        return TurnAfter::Continue;
+    }
+
     // Fail-closed: journal the send before spawning. On failure, no turn starts,
     // no outcome marker (the journal is what's broken — a marker would orphan),
     // and we surface MessageFailed. Advance the backlog regardless.
@@ -1460,20 +1591,6 @@ async fn run_turn(
     // boundary, so adapters stay attachment-unaware. Empty attachments → the
     // prompt is returned unchanged.
     let dispatch_prompt = render_prompt_with_attachments(&item.prompt, &item.attachments);
-    // Wait, briefly, for the harness PATH to be resolved from the user's login
-    // shell. A GUI launch inherits a PATH too minimal to find the CLIs, and the
-    // real one is captured asynchronously — so an agent spawned inside that
-    // window would run its *entire* turn against a best-guess PATH. Detection
-    // gets a corrective re-probe; a running child does not. Awaited, not
-    // blocked on, so this never occupies a runtime worker.
-    if path_readiness().await == switchboard_harness::subprocess::PathSource::Capturing {
-        tracing::warn!(
-            %agent_id,
-            %turn_id,
-            "dispatching before the login-shell PATH resolved; the agent will use the \
-             fallback PATH for this turn"
-        );
-    }
     let stream = match adapter
         .dispatch(&agent, &cwd, &dispatch_prompt, turn_id, options)
         .await
@@ -2262,3 +2379,28 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 // (a Cargo integration test compiled against this crate as an external
 // consumer) — driving the public command API and asserting on the recorded
 // event stream, the same surface the real frontend observes.
+
+#[cfg(test)]
+mod fork_safety_tests {
+    use super::{AgentSlot, SlotForkSafety, fork_safety_from_slot};
+
+    #[test]
+    fn teardown_is_unsafe_and_an_absent_actor_is_safe() {
+        // The `Closing` window is real but too short to observe through the
+        // public API, so the decision is pinned here instead. Reversing either
+        // arm reopens the mid-teardown fork hazard.
+        assert!(matches!(
+            fork_safety_from_slot(Some(&AgentSlot::Closing)),
+            SlotForkSafety::Decided(false)
+        ));
+        assert!(matches!(
+            fork_safety_from_slot(None),
+            SlotForkSafety::Decided(true)
+        ));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        assert!(matches!(
+            fork_safety_from_slot(Some(&AgentSlot::Active(tx))),
+            SlotForkSafety::AskActor(_)
+        ));
+    }
+}

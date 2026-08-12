@@ -1,5 +1,6 @@
 <script lang="ts">
   import {
+    agentIsWorking,
     cancelSend,
     dispatchUserTurn,
     failSendStart,
@@ -7,6 +8,8 @@
     runtimes,
     transcripts,
   } from "$lib/state/index.svelte";
+  import { createReachableFork, type ReachableFork } from "$lib/state/workspace.svelte";
+  import { HARNESS_LABEL } from "$lib/harnessDisplay";
   import {
     addHeldForward,
     removeHeldForward,
@@ -23,6 +26,8 @@
   } from "$lib/state/heldForwards.svelte";
   import { buildLiveSendsMap } from "$lib/state/liveSends";
   import {
+    clearCompose,
+    composeContentMatches,
     emptyForwards,
     flush,
     getCompose,
@@ -32,14 +37,27 @@
     setSelection,
     type ComposeContent,
     type ComposeForwards,
+    type ComposeSnapshot,
     type PromptContent,
     type WorkflowContent,
   } from "$lib/state/composeStore";
+  import {
+    abandonAwaitingUserOperation,
+    beginOperation,
+    clearOutcome,
+    composerConsumedCount,
+    finishOperation,
+    markComposerConsumed,
+    operationFor,
+    outcomeFor,
+    ownsOperation,
+    setOperationPhase,
+    takeOutcome,
+  } from "$lib/state/composeOperations.svelte";
   import { projects, recordProjectsActivityLocally } from "$lib/state/workspace.svelte";
   import {
     selectionFor,
     setRecipients,
-    setTargetingLocked,
     targetRecipients,
   } from "$lib/state/recipientSelection.svelte";
   import {
@@ -68,7 +86,7 @@
   import HarnessIcon from "$lib/components/ui/HarnessIcon.svelte";
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
   import ClearIcon from "$lib/components/ui/ClearIcon.svelte";
-  import { ICON_BUTTON_CLASS } from "$lib/components/ui/iconButton";
+  import { COMPOSER_ACTION_BUTTON_CLASS, ICON_BUTTON_CLASS } from "$lib/components/ui/iconButton";
   import PromptMenu from "$lib/components/PromptMenu.svelte";
   import PromptComposer from "$lib/components/PromptComposer.svelte";
   import WorkflowMenu from "$lib/components/WorkflowMenu.svelte";
@@ -300,7 +318,7 @@
         addAttachmentChip(staged);
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
-        sendError = `Couldn't attach ${basename(path)}: ${message}`;
+        showError(`Couldn't attach ${basename(path)}: ${message}`);
       }
     }
   }
@@ -331,7 +349,7 @@
           dragOver = false;
           // Ignore drops while a send is rendering: the attachment set is frozen
           // for that send (see the `sending`-gated remove button too).
-          if (!sending) void stageDroppedPaths(payload.paths);
+          if (!composerBusy) void stageDroppedPaths(payload.paths);
         }
       });
       void dropSub.catch((e) => console.error("[attachments] onDragDropEvent failed", e));
@@ -373,12 +391,11 @@
   // Whether the cache has been read at least once, so the picker can show a
   // "loading" row instead of momentarily claiming there are no prompts.
   let promptsLoaded = $state(false);
-  let sending = $state(false);
+
   // The provider whose browser sign-in this send is currently waiting on —
   // auto-launched when a render reports needs-sign-in (the user just tried to
   // use that provider's prompt, so intent is unambiguous). Drives the
   // compose-bar waiting line; `sending` stays true across the wait.
-  let signingInProvider = $state<string | null>(null);
   // Informational (non-error) line in the send-feedback slot — used when a
   // mid-send sign-in succeeded but the composer context changed during the
   // browser wait, so the send was deliberately not dispatched.
@@ -394,9 +411,11 @@
   // The resolved invocation form for the picked workflow (declared inputs +
   // auto-derived prompt-argument fields + compatibility). Fetched per-pick via
   // `describe_workflow_form`; re-fetched on `prompts:synced` so a cold MCP cache
-  // resolves. Null until the first fetch settles.
+  // resolves. Null while the initial fetch is pending or has failed; those two
+  // states render explicitly rather than falling through to plain compose.
   let workflowForm = $state<WorkflowFormDescriptor | null>(null);
   let workflowFormLoading = $state(false);
+  let workflowFormError = $state<string | null>(null);
   // Monotonic token: each pick/re-fetch bumps it; a fetch ignores its reply if a
   // newer one superseded it (name alone isn't a workflow's identity — a built-in
   // and a same-named copied user workflow share a name).
@@ -704,10 +723,6 @@
   /// can derive from it. This component seeds it from the persisted snapshot at
   /// mount and persists writes back (the `setSelection` effect below), wherever
   /// they originated.
-  // Defensive: a fresh composer can never start with targeting frozen (the
-  // unmount release above should make this a no-op, but a stuck lock would
-  // silently disable pane targeting forever — not a failure worth risking).
-  untrack(() => setTargetingLocked(projectId, false));
   untrack(() => setRecipients(projectId, initialSelection(saved.selectedIds, agents)));
   const selectedIds = $derived(selectionFor(projectId));
   function setSelectedIds(ids: AgentId[]): void {
@@ -776,7 +791,7 @@
         } else if (menuOpen) {
           menuOpen = false;
           e.preventDefault();
-        } else if (!sending && selectedIds.length > 0) {
+        } else if (!composerBusy && selectedIds.length > 0) {
           setSelectedIds([]);
           e.preventDefault();
         }
@@ -804,13 +819,21 @@
         const pane = paneLayout.panes[Number(e.key) - 1];
         if (pane !== undefined && pane.members.length > 0) {
           e.preventDefault();
-          if (!sending) addPaneForwardSources(pane);
+          if (!composerBusy) addPaneForwardSources(pane);
         }
         return;
       }
       if (e.key === "Enter") {
         if (composeEl?.contains(document.activeElement)) {
-          if (mode === "prompt") {
+          // ⇧⌘↵ asks to branch. Prompt and workflow modes have no fork, and the
+          // branches below would send *normally* — to the very agent the user
+          // was trying to branch away from, with no indication that is what
+          // happened. Intercept and explain. Plain mode never reaches here: the
+          // textarea's own handler owns the chord.
+          if (e.shiftKey && mode !== "plain") {
+            e.preventDefault();
+            handleForkSend();
+          } else if (mode === "prompt") {
             e.preventDefault();
             handlePrimaryAction();
           } else if (mode === "workflow") {
@@ -825,7 +848,7 @@
       if (e.shiftKey) {
         if (e.key.toLowerCase() === "a") {
           e.preventDefault();
-          if (sending) return;
+          if (composerBusy) return;
           setSelectedIds(agents.map((a) => a.id));
         }
         return;
@@ -834,7 +857,7 @@
       const agent = agents[Number(e.key) - 1];
       if (agent === undefined) return;
       e.preventDefault();
-      if (sending) return;
+      if (composerBusy) return;
       toggleRecipient(agent.id);
     }
     window.addEventListener("keydown", onKeydown);
@@ -846,6 +869,155 @@
       .map((id) => agents.find((a) => a.id === id))
       .filter((a): a is AgentRecord => a !== undefined),
   );
+
+  // ---- Fork: a send-time option, not a standalone action ----
+  //
+  // Claude has no copy-a-session operation and refuses a promptless fork, so a
+  // branch can only come into existence *as a turn* (harness-behavior §3.5).
+  // Modelling Fork as a send-modifier makes the UI match that: the send that
+  // carries it registers the branch and dispatches its first turn as one
+  // action, which is also why a parent and its not-yet-existing branch can
+  // never be co-recipients.
+  /// Shared so the shape check and the narrowing guard in `evaluateForkAttempt`
+  /// cannot drift into saying different things about the same state.
+  const NO_FORK_SOURCE = "Select an agent to branch from.";
+
+  /// The one recipient a fork could branch from, or `null` when the selection
+  /// isn't a single agent.
+  const forkCandidate = $derived<AgentRecord | null>(
+    selectedAgents.length === 1 ? (selectedAgents[0] ?? null) : null,
+  );
+
+  /// Whether any of the composing prompt's fields is filled from another agent —
+  /// an argument or the appended text. Either one routes the send through the
+  /// held forward-prompt path instead of an immediate render.
+  const anyPromptFieldForwarded = $derived(
+    selectedPrompt !== null &&
+      (selectedPrompt.arguments.some((a) => (promptArgSources[a.name]?.length ?? 0) > 0) ||
+        promptAppendedSources.length > 0),
+  );
+
+  /// Whether `agentId` looks like it has a harness session to branch from.
+  ///
+  /// Derived from the transcript rather than fetched: an agent with any turn
+  /// has dispatched at least once, and the compose bar already holds that
+  /// state. Deliberately **not** an `agent_session_info` call — the chip is
+  /// advisory and re-validated by the backend, and putting an IPC behind every
+  /// selection change would make the compose bar's request sequence depend on
+  /// which agent is selected.
+  ///
+  /// **Advisory, not exact.** It errs toward offering the chip; the backend
+  /// re-validates through `resolve_session_file` and returns a precise error.
+  /// Known imprecision, all in the safe direction: an agent whose only turn
+  /// failed before a session file was written reads as branchable, and so does
+  /// a real session that parses to zero turns (an empty or housekeeping-only
+  /// file). Hydration state is consulted so the *unsafe* direction — a real
+  /// session reading as absent while hydration is loading or has failed —
+  /// cannot happen.
+  function looksLikeItHasASession(agentId: AgentId): boolean {
+    // An empty transcript is evidence only once hydration has *completed*.
+    // While loading, and permanently after a failure, it is empty for an agent
+    // that may have a long history — and "send it a message first" is then not
+    // merely unhelpful but false.
+    if (runtimes[agentId]?.hydration_status !== "complete") return true;
+    return (transcripts[agentId] ?? []).length > 0;
+  }
+
+  /// Why this send's *shape* rules out a fork, or `null` when it admits one.
+  /// Everything except whether the recipient happens to be busy right now.
+  ///
+  /// **Drives visibility as a boolean, and explanation as a string.** The fork
+  /// half is an unlabelled icon, so it is simply absent unless it applies —
+  /// dimmed, it would be unclickable noise rather than an explanation. But the
+  /// keyboard shortcut stays live in every one of these states and is then the
+  /// *only* fork surface the user can reach, so the reason has to exist as real
+  /// copy rather than as a comment. Silence there would swallow the keystroke.
+  ///
+  const forkShapeBlock = $derived.by((): string | null => {
+    // A workflow is N sends; "which one branches?" has no answer.
+    if (mode === "workflow") return "Fork isn't available while composing a workflow.";
+    // A prompt with a forwarded field composes server-side and dispatches
+    // whenever its sources settle, through `dispatchForwardPrompt` — a hold with
+    // no bound. Branching into that means either a promptless agent sitting for
+    // the duration or one registered against a long-stale busy-parent gate.
+    if (mode === "prompt" && anyPromptFieldForwarded) {
+      return "Fork isn't available while a prompt field is filled from another agent — clear the forwarded fields first.";
+    }
+    // Fork branches one agent, so a multi-recipient send has no single source.
+    if (selectedAgents.length > 1) return "Fork branches one agent — select a single recipient.";
+    const candidate = forkCandidate;
+    if (candidate === null) return NO_FORK_SOURCE;
+    if (mode === "plain" && forwardSources.length > 0) {
+      // Both are send modifiers and the forward branch runs first, so a fork
+      // would lose silently: the message would go to the parent, exactly what
+      // the branch's selection swap exists to prevent.
+      return "Fork branches from one agent's own history — clear the forward sources first.";
+    }
+    // Claude is the only harness Switchboard can branch (`supports_session_fork`).
+    if (candidate.harness !== "claude_code") {
+      return `Switchboard can only branch Claude Code sessions, and ${candidate.name} is ${HARNESS_LABEL[candidate.harness]}.`;
+    }
+    if (!looksLikeItHasASession(candidate.id)) {
+      return `${candidate.name} has no session to branch from yet — send it a message first.`;
+    }
+    return null;
+  });
+
+  /// Why a fork can't be taken right now, or `null` when it can. Probe-measured:
+  /// a branch taken mid-turn inherits a synthesized "No response requested."
+  /// placeholder instead of the parent's real answer, permanently. The backend
+  /// re-checks this at dispatch — here it keeps the offer off the screen and
+  /// gives the shortcut something to say.
+  const forkBlock = $derived.by((): string | null => {
+    if (forkShapeBlock !== null) return forkShapeBlock;
+    const candidate = forkCandidate;
+    if (candidate !== null && agentIsWorking(runtimes[candidate.id])) {
+      return `${candidate.name} is working — a branch taken now would not include its current answer. Wait for it to finish, or cancel it first.`;
+    }
+    return null;
+  });
+
+  const forkAvailable = $derived(forkBlock === null);
+
+  /// What pressing the fork shortcut should do. `nothing-to-send` is deliberate
+  /// silence: plain ⌘↵ on an empty composer already does nothing, and inventing
+  /// an error for the fork half alone would be an inconsistency the user has to
+  /// learn. Every *other* block explains itself.
+  type ForkAttempt =
+    | { kind: "ready"; source: AgentRecord }
+    | { kind: "blocked"; reason: string }
+    | { kind: "nothing-to-send" };
+
+  function evaluateForkAttempt(): ForkAttempt {
+    if (forkBlock !== null) return { kind: "blocked", reason: forkBlock };
+    // Unreachable at runtime — `forkShapeBlock` already returns `NO_FORK_SOURCE`
+    // for a null candidate, so the check above returns first. Kept because it is
+    // what narrows `forkCandidate` to non-null for the `ready` variant below;
+    // deleting it does not compile.
+    const source = forkCandidate;
+    if (source === null) return { kind: "blocked", reason: NO_FORK_SOURCE };
+    // An empty composer has nothing to fork, so it is a no-op in every state —
+    // ahead of the readiness checks below, which would otherwise explain why a
+    // message the user never typed could not be sent. **Emptiness is
+    // mode-specific**: prompt mode's message lives in the prompt's fields, not
+    // `draft`, so the plain test would silently swallow every prompt fork.
+    const nothingToSend =
+      mode === "prompt"
+        ? selectedPrompt === null || missingRequired.length > 0
+        : draft.trim() === "" && attachmentChips.length === 0;
+    if (nothingToSend) return { kind: "nothing-to-send" };
+    // No `showStop` arm: it requires an empty composer and no attachments, which
+    // the check above already answers. A send in flight with text typed leaves
+    // `showStop` false and falls through to the checks below.
+    if (composerBusy) return { kind: "blocked", reason: "Already sending." };
+    if (!allRecipientsHydrated) {
+      return {
+        kind: "blocked",
+        reason: `Still loading ${source.name}'s history — try again in a moment.`,
+      };
+    }
+    return { kind: "ready", source };
+  }
 
   /// `@` recipient picker: a trailing `@token` opens a typeahead of all agents;
   /// Enter / click picks one as the sole recipient and strips the token. This is
@@ -1022,12 +1194,49 @@
 
   /// Send is gated on a recipient + every recipient's history being loaded, plus
   /// per-mode content: plain needs non-empty text; prompt needs a selected prompt
+  /// Busy for *this project's composer*, not just this component instance.
+  ///
+  /// Read from the operation claim alone. Every send path that awaits claims the
+  /// slot, so a component-local flag would be a second representation of the same
+  /// fact — and the two disagreeing after a remount is the bug this feature kept
+  /// reproducing. It also makes abandonment work: releasing the claim frees the
+  /// composer everywhere, including the bar that started the operation.
+  const composerBusy = $derived(operationFor(projectId) !== undefined);
+
+  /// The operation is parked on a browser sign-in whose final step the backend
+  /// deliberately leaves un-timed. Offer a way out rather than letting one stuck
+  /// sign-in hold the project's composer until the app restarts.
+  const abandonableOperation = $derived.by(() => {
+    const op = operationFor(projectId);
+    if (op === undefined || op.phase.name !== "awaiting_user") return undefined;
+    return { id: op.id, provider: op.phase.provider };
+  });
+
+  /// A finished operation's message reaches whichever bar is mounted now, which
+  /// may not be the one that started it — so it is *consumed* into this bar's own
+  /// error/notice state rather than rendered from shared state. Rendering it as a
+  /// standing fallback kept a stale "Fork failed" alive through every subsequent
+  /// action and every revisit of the project.
+  $effect(() => {
+    const outcome = outcomeFor(projectId);
+    if (outcome === undefined) return;
+    untrack(() => {
+      takeOutcome(projectId);
+      if (outcome.tone === "error") showError(outcome.message);
+      else showNotice(outcome.message);
+    });
+  });
+
   /// with all required arguments filled, and is blocked while a render is in
   /// flight. **Not** gated on run_status — send-while-busy queues.
   const sendDisabled = $derived(
     mode === "prompt"
-      ? selectedPrompt === null || missingRequired.length > 0 || sending || !allRecipientsHydrated
+      ? selectedPrompt === null ||
+          missingRequired.length > 0 ||
+          composerBusy ||
+          !allRecipientsHydrated
       : (draft.trim() === "" && attachmentChips.length === 0 && forwardSources.length === 0) ||
+          composerBusy ||
           !allRecipientsHydrated,
   );
 
@@ -1050,7 +1259,7 @@
   const primaryDisabled = $derived(showStop ? false : sendDisabled);
 
   function toggleRecipient(id: AgentId): void {
-    if (sending) return;
+    if (composerBusy) return;
     setSelectedIds(
       selectedIds.includes(id) ? selectedIds.filter((x) => x !== id) : [...selectedIds, id],
     );
@@ -1196,9 +1405,6 @@
     // project's draft, and `addAttachmentChip` commits it to the snapshot whether
     // or not this bar is still around to render the chip.
     unmounted = true;
-    // A mid-render unmount (project switch via the parent's `{#key}`) must not
-    // leave the project's pane targeting frozen.
-    setTargetingLocked(projectId, false);
     // Flush point: a project switch remounts this bar (`{#key}`), so the
     // outgoing bar's deferred draft write must land before the next one mounts.
     flush();
@@ -1357,7 +1563,8 @@
     // listener above, so it works whether the textarea or a chip has focus.
     if (event.key === "Enter" && event.metaKey) {
       event.preventDefault();
-      handlePrimaryAction();
+      if (event.shiftKey) handleForkSend();
+      else handlePrimaryAction();
     }
   }
 
@@ -1402,9 +1609,9 @@
     try {
       await api.copyBuiltinPrompt(prompt.name);
       await loadPrompts();
-      sendError = null;
+      clearStatus();
     } catch (err) {
-      sendError = `Couldn't copy prompt: ${err instanceof Error ? err.message : String(err)}`;
+      showError(`Couldn't copy prompt: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
@@ -1453,6 +1660,7 @@
   function pickWorkflow(workflow: WorkflowListing): void {
     selectedWorkflow = workflow;
     workflowForm = null;
+    workflowFormError = null;
     workflowInputs = {};
     workflowForwardSources = {};
     workflowSyncSettled = false;
@@ -1470,11 +1678,13 @@
   /// identity fields.
   async function loadWorkflowForm(workflow: WorkflowListing): Promise<void> {
     const gen = ++workflowFormGen;
+    if (workflowForm === null) workflowFormError = null;
     workflowFormLoading = true;
     try {
       const form = await api.describeWorkflowForm(workflow.name, workflow.is_builtin);
       if (gen !== workflowFormGen) return; // superseded by a newer pick/re-fetch
       workflowForm = form;
+      workflowFormError = null;
       const seeded: Record<string, WorkflowInputValue> = { ...workflowInputs };
       for (const input of form.inputs) {
         if (input.name in seeded) continue;
@@ -1486,7 +1696,9 @@
       workflowInputs = seeded;
     } catch (err) {
       if (gen === workflowFormGen) {
-        sendError = `Couldn't load workflow: ${err instanceof Error ? err.message : String(err)}`;
+        const message = err instanceof Error ? err.message : String(err);
+        if (workflowForm === null) workflowFormError = message;
+        else showError(`Couldn't refresh workflow: ${message}`);
       }
     } finally {
       if (gen === workflowFormGen) workflowFormLoading = false;
@@ -1498,19 +1710,25 @@
     selectedWorkflow = null;
     workflowForm = null;
     workflowFormLoading = false;
+    workflowFormError = null;
     workflowInputs = {};
     workflowForwardSources = {};
     workflowSyncSettled = false;
     workflowFormGen++; // invalidate any in-flight fetch for the removed workflow
   }
 
+  function retryWorkflowForm(): void {
+    if (selectedWorkflow === null || workflowFormLoading) return;
+    void loadWorkflowForm(selectedWorkflow);
+  }
+
   async function copyWorkflow(workflow: WorkflowListing): Promise<void> {
     try {
       await api.copyBuiltinWorkflow(workflow.name);
       await loadWorkflows();
-      sendError = null;
+      clearStatus();
     } catch (err) {
-      sendError = `Couldn't copy workflow: ${err instanceof Error ? err.message : String(err)}`;
+      showError(`Couldn't copy workflow: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
@@ -1587,7 +1805,7 @@
     if (selectedWorkflow === null || invokingWorkflow || !workflowRunnable) return;
     const workflow = selectedWorkflow;
     invokingWorkflow = true;
-    sendError = null;
+    clearStatus();
     try {
       // Pane-expand each field's sources to agent ids; omit empty fields so the
       // map carries only fields the user actually attached a forward to.
@@ -1630,7 +1848,7 @@
       await refreshRuns(projectId);
       removeWorkflow();
     } catch (err) {
-      sendError = `Couldn't run workflow: ${err instanceof Error ? err.message : String(err)}`;
+      showError(`Couldn't run workflow: ${err instanceof Error ? err.message : String(err)}`);
     } finally {
       invokingWorkflow = false;
     }
@@ -1642,6 +1860,31 @@
       return;
     }
     void handleSubmit();
+  }
+
+  /// Send this message to a new branch of the recipient — the send button's
+  /// second half, and the only way a branch comes into existence.
+  ///
+  /// Guarded rather than relying on the control being hidden: the keyboard
+  /// shortcut reaches this too, and availability can change between keydown and
+  /// handling (the parent starts a turn). `showStop` is excluded because the
+  /// button is a cancel in that state and the half is not rendered.
+  function handleForkSend(): void {
+    const attempt = evaluateForkAttempt();
+    if (attempt.kind === "nothing-to-send") return;
+    if (attempt.kind === "blocked") {
+      // The shortcut is live in states where the button is hidden, so this is
+      // the only place the reason can reach the user. Never fall through to a
+      // normal send: that would message the agent they were branching away from.
+      showError(attempt.reason);
+      return;
+    }
+    closeMentionMenu();
+    if (mode === "prompt" && selectedPrompt !== null) {
+      void dispatchPromptForkSend(attempt.source, selectedPrompt);
+      return;
+    }
+    void dispatchForkSend(attempt.source, draft.trim(), snapshotAttachments());
   }
 
   /// Manual cross-agent forward (§7). Seeds the held "waiting for {agent}…" entry
@@ -1693,11 +1936,11 @@
           // invalidated (a source failed/cancelled, or all sources empty) or the
           // user cancelled the hold — nothing resolved; restore the composer.
           restoreForward(body, sources, attachments);
-          if (outcome.status === "invalidated") sendError = `Forward not sent: ${outcome.reason}`;
+          if (outcome.status === "invalidated") showError(`Forward not sent: ${outcome.reason}`);
         }
       } catch (err) {
         removeHeldForward(forwardProjectId, forwardId);
-        sendError = `Forward failed: ${err instanceof Error ? err.message : String(err)}`;
+        showError(`Forward failed: ${err instanceof Error ? err.message : String(err)}`);
         restoreForward(body, sources, attachments);
       }
     })();
@@ -1822,11 +2065,11 @@
             appendedSources,
             attachments,
           );
-          if (outcome.status === "invalidated") sendError = `Forward not sent: ${outcome.reason}`;
+          if (outcome.status === "invalidated") showError(`Forward not sent: ${outcome.reason}`);
         }
       } catch (err) {
         removeHeldForward(forwardProjectId, forwardId);
-        sendError = `Forward failed: ${err instanceof Error ? err.message : String(err)}`;
+        showError(`Forward failed: ${err instanceof Error ? err.message : String(err)}`);
         restoreForwardPrompt(prompt, typedArgs, appended, argSources, appendedSources, attachments);
       }
     })();
@@ -1911,17 +2154,408 @@
           recordSendAccepted(agent.id, userTurnId, messageId);
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
-          sendError = `Send failed: ${message}`;
+          showError(`Send failed: ${message}`);
           failSendStart(agent.id, userTurnId, { message, kind: "adapter_failure" });
         }
       })();
     }
   }
 
-  async function handleSubmit(): Promise<void> {
-    if (sendDisabled) return;
+  /// Branch `source` and send this message as the branch's first turn.
+  ///
+  /// Registration must land *before* the send: the branch's session does not
+  /// exist until a turn dispatches into it, so there is no agent to send to
+  /// until `forkAgentIntoOwnPane` resolves. That await is also why this is the
+  /// one send path that can fail before any optimistic turn exists — a fork
+  /// rejection (parent busy, no session, wrong harness) leaves the compose bar
+  /// exactly as the user left it, text and all, so they can retry after
+  /// waiting or cancelling.
+  ///
+  /// Once registered, the message goes through the **normal** send path: same
+  /// journaling, same queueing, same dispatch. The branch is an ordinary agent
+  /// from that moment on.
+  /// Give back a send that never dispatched, without destroying anything newer.
+  ///
+  /// **Merges against the store, not this instance's locals.** Two things can
+  /// have moved on during the await: the user can type here (the textarea is not
+  /// disabled — typing while a fork registers is expected), and a project switch
+  /// can destroy this bar and mount a replacement for the same project. Assigning
+  /// `draft = text` handled neither: the first silently discarded whichever
+  /// message the user didn't get back, and the second wrote a dead instance's
+  /// state over a live one. Reading the store, merging, and writing back is
+  /// lossless in both cases regardless of which instance is running this.
+  function restoreCapturedSend(text: string, carried: AttachmentChip[]): void {
+    const stored = getCompose(projectId);
+    const current = stored.content.kind === "plain" ? stored.content.draft : "";
+    const merged = current.trim() === "" ? text : `${text}\n\n${current}`;
+    setContent(projectId, { kind: "plain", draft: merged });
+    // Union by id: the sent chips come back, anything staged since survives, and
+    // nothing is duplicated.
+    const storedAttachments = stored.attachments ?? [];
+    const seen = new Set(storedAttachments.map((a) => a.path));
+    setAttachments(projectId, [
+      ...carried.filter((chip) => !seen.has(chip.path)),
+      ...storedAttachments,
+    ]);
+    if (!unmounted) {
+      draft = merged;
+      commitChips([...carried.filter((chip) => !seen.has(chip.path)), ...attachmentChips]);
+    }
+    flush();
+    // A bar mounted since this send started reads the store once and pushes its
+    // own locals down, so the write above is invisible to it without this — the
+    // message would come back only on the *next* mount.
+    if (unmounted) markComposerConsumed(projectId);
+  }
+
+  async function dispatchForkSend(
+    source: AgentRecord,
+    text: string,
+    attachments: Attachment[],
+  ): Promise<void> {
+    // **Single-flight, project-scoped.** Two submits across this await would each
+    // register a branch and each dispatch the same text — two agents, the message
+    // sent twice, quota spent twice. Claiming rather than setting a local flag is
+    // what makes that hold across a project switch: a replacement bar reads its
+    // busy state from the claim, so it cannot start a second operation of any
+    // kind while this one registers.
+    const opId = beginOperation(projectId, { kind: "plain_fork", sourceId: source.id });
+    if (opId === null) return;
+    // Clear any error from a previous send/forward, as `handleSubmit` does —
+    // otherwise a stale failure sits on screen through a successful fork.
+    clearStatus();
+    // **Clear before the await, not after.** This is the only send path with an
+    // await between submit and dispatch, and everything downstream of that await
+    // is a hazard: a project switch destroys this bar mid-flight, and `onDestroy`
+    // flushes whatever the compose state holds at that moment. Clearing
+    // afterwards means the flush persists the message the user already sent, and
+    // they return to find it sitting in the box addressed to the parent. Guarding
+    // the post-await writes instead just makes that permanent. Clearing up front
+    // removes the window: the flush persists cleared state, and anything typed
+    // during the await is new content this send never captured.
+    const carried = attachmentChips;
+    draft = "";
+    commitChips([]);
+    persistComposeNow();
+    const capturedRecipients = [...selectedIds];
+    // The claim is held through the whole operation, not just the await: the
+    // selection swap, the restore, and the dispatch below are the part a second
+    // operation must not interleave with.
+    let outcome: { message: string; tone: "error" | "notice" } | undefined;
+    try {
+      let created: ReachableFork;
+      try {
+        created = await createReachableFork(source.id);
+      } catch (err) {
+        outcome = {
+          message: `Fork failed: ${err instanceof Error ? err.message : String(err)}`,
+          tone: "error",
+        };
+        restoreCapturedSend(text, carried);
+        return;
+      }
+      selectForkIfRecipientsUnchanged(capturedRecipients, created.fork.id);
+      // **Committed is not the same as reachable.** Hand the message back — the
+      // branch stays visible with its retry, and the next send materializes it,
+      // which is the ordinary self-healing path for a fork whose first turn never
+      // ran.
+      if (created.kind === "unsubscribed") {
+        outcome = { message: created.message, tone: "error" };
+        restoreCapturedSend(text, carried);
+        return;
+      }
+      // Otherwise the send always completes, even if this bar is gone. Abandoning
+      // the first message would leave a promptless fork — the one state this
+      // design exists to make impossible, since Claude refuses a promptless fork
+      // and the branch would never materialize.
+      dispatchToRecipients(text, attachments, [created.fork]);
+      sendGeneration += 1;
+    } finally {
+      // Published through the claim so a failure raised after this bar is gone
+      // still reaches whichever composer the user is looking at.
+      finishOperation(projectId, opId, outcome);
+    }
+  }
+
+  /// Move the composer onto the branch, unless the user has moved on.
+  ///
+  /// Selection normally follows the branch: the conversation continues there, and
+  /// leaving the parent selected would send the next message — including the
+  /// retry after an unreachable branch — to the agent they just branched away
+  /// from. But this runs after an await, so the composer it retargets may be a
+  /// *replacement* instance for the same project whose recipients the user has
+  /// since chosen deliberately. Overwriting those would silently redirect their
+  /// next message to an agent they never picked.
+  ///
+  /// **Both copies, not just the live one.** The persisted selection is normally
+  /// synced by a scheduled `$effect` that only runs while a bar is mounted — so a
+  /// fork completing while the user is in another project moved the live store
+  /// and left the saved one naming the parent. Remounting then *actively* wrote
+  /// that stale value back over the live one (`initialSelection` seeds from the
+  /// snapshot at mount), so the user returned to a composer addressed at the
+  /// agent they had just branched away from, and their next message went there.
+  function selectForkIfRecipientsUnchanged(captured: AgentId[], forkId: AgentId): void {
+    if (!recipientsUnchanged(captured)) return;
+    setSelectedIds([forkId]);
+    setSelection(projectId, [forkId]);
+    flush();
+  }
+
+  /// Publish a status. The two channels supersede each other: a composer showing
+  /// a stale "Already sending" above a fresh "Sent to alice-fork" is describing
+  /// two states at once. Every status write goes through these.
+  function showError(message: string | null): void {
+    sendError = message;
+    sendNotice = null;
+  }
+
+  function showNotice(message: string | null): void {
+    sendNotice = message;
+    sendError = null;
+  }
+
+  function clearStatus(): void {
     sendError = null;
     sendNotice = null;
+  }
+
+  /// Whether both the composed content and the live recipient set still match
+  /// what a send captured — asked where a fork's *precondition* must still hold
+  /// (a single, unchanged recipient), not where consumed content is retired.
+  function composeUnchangedSince(snapshot: ComposeSnapshot): boolean {
+    return (
+      composeContentMatches(projectId, snapshot) && recipientsUnchanged(snapshot.selectedIds ?? [])
+    );
+  }
+
+  /// Recipients come from `recipientSelection`, not the persisted copy in the
+  /// compose snapshot: that copy is written by a *scheduled* effect and lags a
+  /// selection change by a frame, which would report "unchanged" for a change
+  /// that has already happened.
+  function recipientsUnchanged(captured: AgentId[]): boolean {
+    const current = selectionFor(projectId);
+    if (current.length !== captured.length) return false;
+    return !current.some((id, i) => id !== captured[i]);
+  }
+
+  /// Return the composer to plain mode after a prompt send. Shared by the
+  /// ordinary send and the fork so the two cannot drift into clearing different
+  /// subsets — a stale forward set or a leftover argument resurfacing on the next
+  /// send is invisible until it rides a message the user didn't mean to send.
+  function clearPromptComposer(): void {
+    selectedPrompt = null;
+    promptArgs = {};
+    promptArgSources = {};
+    promptAppendedSources = [];
+    // A completed send is a fresh start: drop any plain-mode forward set that was
+    // hidden during prompt mode, so it can't silently resurface on a later send.
+    forwardSources = [];
+    focusPromptFieldOnMount = false;
+    appendedText = "";
+    draft = "";
+    // Chips clear optimistically with the text (the optimistic user turn already
+    // renders them); the staged files persist on disk for the send.
+    commitChips([]);
+    mode = "plain";
+    persistComposeNow();
+  }
+
+  /// Retire the compose state a dispatched send consumed — but only if it is
+  /// still exactly what that send captured.
+  ///
+  /// A prompt fork can outlive its own ComposeBar (a project switch remounts the
+  /// bar; the continuation runs on regardless), so "clear the composer" cannot
+  /// mean "assign my locals." It means: compare the *store* against the captured
+  /// snapshot, and clear only on an exact match. A match proves the composer on
+  /// screen is still the one that submitted; any difference means a remounted or
+  /// edited composer owns that slot and must be left alone.
+  ///
+  /// `markComposerConsumed` is the other half. Clearing the store is invisible to
+  /// an already-mounted composer — it read the store once at mount and pushes its
+  /// locals *down* — so without a signal it would keep displaying, and then
+  /// re-persist, a prompt that has already been sent.
+  function retireConsumedCompose(snapshot: ComposeSnapshot): boolean {
+    // **Content, not recipients.** Three different questions get asked about a
+    // snapshot and they need three different comparisons. Whether to *clear* asks
+    // only whether the composed message is still the one that was consumed —
+    // recipients are sticky across sends and are reconciled separately. Folding
+    // them in here means adding a recipient during the sign-in window leaves the
+    // just-sent prompt sitting in the composer, ready to be sent twice.
+    if (!composeContentMatches(projectId, snapshot)) return false;
+    if (unmounted) {
+      clearCompose(projectId);
+      flush();
+    } else {
+      clearPromptComposer();
+    }
+    markComposerConsumed(projectId);
+    return true;
+  }
+
+  /// Render `prompt`, branch `source`, and send the rendered text as the branch's
+  /// first turn.
+  ///
+  /// **Render first.** A fork is a registry append, so branching before the render
+  /// and then failing it puts a visibly empty agent in the roster that received
+  /// nothing. Rendering first means a render failure — including a refused or
+  /// abandoned MCP sign-in — leaves no durable trace at all.
+  ///
+  /// **Nothing is cleared until the send has dispatched.** The prompt stays intact
+  /// (and visibly busy) across both awaits, so every failure path preserves it by
+  /// doing nothing at all — no restore, and no window in which a rejected fork can
+  /// cost the user a filled-in prompt.
+  ///
+  /// **Divergence means different things on either side of registration.** Before
+  /// it, nothing is committed, so a composer that changed under the render aborts:
+  /// dispatching text the user has since replaced would create a branch carrying
+  /// content they abandoned. After it, the branch exists and dispatch is
+  /// mandatory — abandoning it leaves the promptless fork this whole design exists
+  /// to prevent — so the send goes and the newer composer is preserved instead.
+  async function dispatchPromptForkSend(source: AgentRecord, prompt: Prompt): Promise<void> {
+    // The whole composer, not just the prompt: an attachment staged or a forward
+    // configured since submit has to count as divergence, or finalizing would
+    // discard it.
+    const snapshot: ComposeSnapshot = {
+      content: currentContent(),
+      selectedIds: [...selectedIds],
+      attachments: snapshotAttachments(),
+      forwards: currentForwards(),
+    };
+    const renderArgs = buildRenderArgs(prompt, promptArgs);
+    const attachments = snapshot.attachments ?? [];
+
+    // One claim per project, held by whichever send path awaits. A replacement bar
+    // reads its busy state from this, so coming back mid-fork cannot submit a
+    // second one.
+    const opId = beginOperation(projectId, { kind: "prompt_fork", sourceId: source.id });
+    if (opId === null) return;
+    clearStatus();
+    clearOutcome(projectId);
+    promptMenuOpen = false;
+    closeMentionMenu();
+    let outcome: { message: string; tone: "error" | "notice" } | undefined;
+    let abandoned = false;
+    try {
+      let finalText: string;
+      let signedInMidSend = false;
+      try {
+        let rendered = await api.renderPrompt(prompt.provider, prompt.name, renderArgs);
+        if (!ownsOperation(projectId, opId)) {
+          abandoned = true;
+          return;
+        }
+        if (rendered.kind === "needs_sign_in") {
+          // The wait is unbounded — the backend's credential commit is
+          // deliberately un-timed — so the composer offers a way out of it. The
+          // phase change also unfreezes targeting, which must not span the wait.
+          setOperationPhase(projectId, opId, {
+            name: "awaiting_user",
+            provider: rendered.provider,
+          });
+          await api.signInMcpProvider(rendered.provider);
+          if (!ownsOperation(projectId, opId)) {
+            abandoned = true;
+            return;
+          }
+          setOperationPhase(projectId, opId, { name: "rendering" });
+          signedInMidSend = true;
+          rendered = await api.renderPrompt(prompt.provider, prompt.name, renderArgs);
+          if (!ownsOperation(projectId, opId)) {
+            abandoned = true;
+            return;
+          }
+        }
+        if (rendered.kind !== "rendered") {
+          outcome = {
+            message: `Fork not sent: MCP provider "${prompt.provider}" needs sign-in.`,
+            tone: "error",
+          };
+          return;
+        }
+        finalText = combinePromptMessage(rendered.text, promptAppendedOf(snapshot));
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        outcome = {
+          message: signedInMidSend
+            ? `Signed in, but the fork then failed: ${message}`
+            : `Fork failed: ${message}`,
+          tone: "error",
+        };
+        return;
+      }
+
+      // ---- Pre-registration divergence: abort. Nothing durable exists yet. ----
+      if (!composeUnchangedSince(snapshot)) {
+        outcome = {
+          message: `Fork not sent: the composer changed while "${prompt.name}" was rendering. Press Fork again when you're ready.`,
+          tone: "notice",
+        };
+        return;
+      }
+      // Re-ask the busy-parent question. It was answered at keypress, and the
+      // sign-in detour makes that answer minutes old — a branch taken mid-turn
+      // permanently inherits a placeholder instead of the parent's real answer.
+      // The backend re-checks too, so a miss here refuses rather than corrupts;
+      // this is what turns that refusal into a sentence.
+      if (!unmounted && forkBlock !== null) {
+        outcome = { message: forkBlock, tone: "error" };
+        return;
+      }
+      // Claude refuses a promptless fork, so an empty render would fail at the
+      // harness with the branch already committed. Judged on the combined
+      // transport text, not the renderer's output alone.
+      if (finalText.trim() === "" && attachments.length === 0) {
+        outcome = {
+          message: `Fork not sent: "${prompt.name}" rendered to an empty message.`,
+          tone: "error",
+        };
+        return;
+      }
+
+      setOperationPhase(projectId, opId, { name: "registering" });
+      let created: ReachableFork;
+      try {
+        created = await createReachableFork(source.id);
+      } catch (err) {
+        // The prompt was never cleared, so there is nothing to hand back.
+        const message = err instanceof Error ? err.message : String(err);
+        outcome = { message: `Fork failed: ${message}`, tone: "error" };
+        return;
+      }
+      if (created.kind === "unsubscribed") {
+        selectForkIfRecipientsUnchanged(snapshot.selectedIds ?? [], created.fork.id);
+        outcome = { message: created.message, tone: "error" };
+        return;
+      }
+      // Committed and reachable: the send is no longer optional.
+      dispatchToRecipients(finalText, attachments, [created.fork]);
+      const retired = retireConsumedCompose(snapshot);
+      if (retired) {
+        selectForkIfRecipientsUnchanged(snapshot.selectedIds ?? [], created.fork.id);
+        sendGeneration += 1;
+      } else {
+        outcome = {
+          message: `Sent to ${created.fork.name} — your newer draft and recipients were kept.`,
+          tone: "notice",
+        };
+      }
+    } finally {
+      // An abandoned operation no longer owns the slot; publishing here would
+      // stamp a stale message over whatever now does.
+      if (!abandoned) finishOperation(projectId, opId, outcome);
+    }
+  }
+
+  /// The appended free text a snapshot captured, or `""` when it wasn't prompt
+  /// content. Read from the snapshot rather than live state so a mid-render edit
+  /// cannot change what gets combined.
+  function promptAppendedOf(snapshot: ComposeSnapshot): string {
+    return snapshot.content.kind === "prompt" ? snapshot.content.appendedText : "";
+  }
+
+  async function handleSubmit(): Promise<void> {
+    if (sendDisabled) return;
+    clearStatus();
     // Snapshot the whole chip set once, up front (before any await), so a
     // mid-render chip edit can't change what gets sent — same discipline as the
     // prompt/recipient snapshots below.
@@ -1959,109 +2593,122 @@
           attachments,
           targets,
         );
-        selectedPrompt = null;
-        promptArgs = {};
-        promptArgSources = {};
-        promptAppendedSources = [];
-        // A completed send is a fresh start: drop any plain-mode forward set that
-        // was hidden during prompt mode, so it can't silently resurface and ride a
-        // later plain send. (Removing the prompt before sending still restores it.)
-        forwardSources = [];
-        focusPromptFieldOnMount = false;
-        appendedText = "";
-        draft = "";
-        commitChips([]);
+        clearPromptComposer();
         sendGeneration += 1;
-        mode = "plain";
-        persistComposeNow();
         return;
       }
 
       promptMenuOpen = false;
       closeMentionMenu();
-      sending = true;
-      // Freeze pane targeting for the render window: the post-render check
-      // below silently aborts the send if a captured recipient left the set,
-      // so a pane gesture landing mid-render would drop the send with no
-      // feedback. Raw selection writes (pruning a removed agent) still pass —
-      // a removed recipient SHOULD trigger that abort. `finally` (plus the
-      // unmount/init releases) guarantees the lock can't outlive the render.
-      setTargetingLocked(projectId, true);
+      // **The claim is project-scoped, not component-scoped.** This render can
+      // open a browser for a sign-in and wait, so the send routinely outlives the
+      // bar that started it — and a replacement bar starts with `sending` false,
+      // showing the same prompt with an enabled Send. Submitting again sent it
+      // twice; pressing Fork instead sent it to the parent *and* to a new branch,
+      // which is one action producing two sends to two agents.
+      const claim = beginOperation(projectId, { kind: "prompt_send" });
+      if (claim === null) return;
+      // What this send owns, captured before its first await so the clear at the
+      // end can tell "still mine" from "a replacement composer's".
+      const snapshot: ComposeSnapshot = {
+        content: currentContent(),
+        selectedIds: [...selectedIds],
+        attachments,
+        forwards: currentForwards(),
+      };
+      // Targeting is frozen for the render window by the operation's `rendering`
+      // phase: the post-render check below aborts the send if a captured
+      // recipient left the set, so a pane gesture landing mid-render would refuse
+      // it for no reason the user caused. Raw selection writes (pruning a removed
+      // agent) still pass — a removed recipient SHOULD trigger that abort.
       let finalText: string;
       let signedInMidSend = false;
+      let outcomeForClaim: { message: string; tone: "error" | "notice" } | undefined;
+      let abandoned = false;
       try {
-        let outcome = await api.renderPrompt(prompt.provider, prompt.name, renderArgs);
-        if (outcome.kind === "needs_sign_in") {
-          // The provider needs a browser sign-in, and the user's intent could
-          // not be clearer — they just pressed Send on its prompt. Launch the
-          // sign-in and continue the send once they approve in the browser.
-          // The targeting freeze must not span a minutes-long wait; the
-          // post-await context check below covers what the freeze covered.
-          setTargetingLocked(projectId, false);
-          signingInProvider = outcome.provider;
-          try {
-            await api.signInMcpProvider(outcome.provider);
-          } finally {
-            signingInProvider = null;
+        try {
+          let outcome = await api.renderPrompt(prompt.provider, prompt.name, renderArgs);
+          if (!ownsOperation(projectId, claim)) {
+            abandoned = true;
+            return;
           }
-          signedInMidSend = true;
-          setTargetingLocked(projectId, true);
-          outcome = await api.renderPrompt(prompt.provider, prompt.name, renderArgs);
-        }
-        if (outcome.kind !== "rendered") {
-          // A second needs-sign-in, or an outcome kind this build doesn't
-          // know: stop — never loop the browser open.
-          sendError = `Send failed: MCP provider "${prompt.provider}" needs sign-in.`;
+          if (outcome.kind === "needs_sign_in") {
+            // The provider needs a browser sign-in, and the user's intent could
+            // not be clearer — they just pressed Send on its prompt. Launch the
+            // sign-in and continue the send once they approve in the browser.
+            // The wait is unbounded, so the composer offers a way out of it. The
+            // phase change also unfreezes targeting for its duration.
+            setOperationPhase(projectId, claim, {
+              name: "awaiting_user",
+              provider: outcome.provider,
+            });
+            await api.signInMcpProvider(outcome.provider);
+            if (!ownsOperation(projectId, claim)) {
+              abandoned = true;
+              return;
+            }
+            setOperationPhase(projectId, claim, { name: "rendering" });
+            signedInMidSend = true;
+            outcome = await api.renderPrompt(prompt.provider, prompt.name, renderArgs);
+            if (!ownsOperation(projectId, claim)) {
+              abandoned = true;
+              return;
+            }
+          }
+          if (outcome.kind !== "rendered") {
+            // A second needs-sign-in, or an outcome kind this build doesn't
+            // know: stop — never loop the browser open.
+            outcomeForClaim = {
+              message: `Send failed: MCP provider "${prompt.provider}" needs sign-in.`,
+              tone: "error",
+            };
+            return;
+          }
+          finalText = combinePromptMessage(outcome.text, appended);
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          // After a successful mid-send sign-in, a failure comes from the retry
+          // (typically the server) — say the sign-in itself stuck, or the user
+          // is left guessing whether their browser approval was wasted.
+          outcomeForClaim = {
+            message: signedInMidSend
+              ? `Signed in, but the send then failed: ${message}`
+              : `Send failed: ${message}`,
+            tone: "error",
+          };
           return;
         }
-        finalText = combinePromptMessage(outcome.text, appended);
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        // After a successful mid-send sign-in, a failure comes from the retry
-        // (typically the server) — say the sign-in itself stuck, or the user
-        // is left guessing whether their browser approval was wasted.
-        sendError = signedInMidSend
-          ? `Signed in, but the send then failed: ${message}`
-          : `Send failed: ${message}`;
+        // If the composer state changed while the message was being built,
+        // avoid dispatching text into a now-different prompt/recipient context.
+        const stillSelected = new Set(selectedIds);
+        if (selectedPrompt !== prompt || targets.some((t) => !stillSelected.has(t.id))) {
+          // **Always say something.** A send the UI accepted that then vanishes
+          // with no trace is worse than one that refuses: the user has no way to
+          // tell it from a bug. The prompt and its arguments are still intact
+          // wherever they now are.
+          outcomeForClaim = {
+            message: signedInMidSend
+              ? "Signed in — your prompt is ready; press Send when you are."
+              : "Not sent: the prompt or its recipients changed while it was being prepared.",
+            tone: "notice",
+          };
+          return;
+        }
+        dispatchToRecipients(finalText, attachments, targets);
+        // Prompt selection is not sticky: a successful send returns to the plain
+        // composer (recipients stay selected). Appended text is consumed, not
+        // carried back. Retired under compare-and-set for the same reason the fork
+        // path is: this can run after a project switch destroyed the bar, and
+        // clearing unconditionally then wrote a dead instance's emptied locals
+        // over a replacement composer's real content.
+        if (retireConsumedCompose(snapshot)) sendGeneration += 1;
         return;
       } finally {
-        sending = false;
-        signingInProvider = null;
-        setTargetingLocked(projectId, false);
+        // Published here so a failure or notice raised after this bar is gone
+        // still reaches whichever composer the user is looking at — unless the
+        // user abandoned the wait, in which case the slot is someone else's now.
+        if (!abandoned) finishOperation(projectId, claim, outcomeForClaim);
       }
-      // If the composer state changed outside the locked UI while rendering,
-      // avoid dispatching text into a now-different prompt/recipient context.
-      const stillSelected = new Set(selectedIds);
-      if (selectedPrompt !== prompt || targets.some((t) => !stillSelected.has(t.id))) {
-        if (signedInMidSend) {
-          // The UI was deliberately unfrozen during the browser wait, so a
-          // changed context is plausible rather than near-impossible — say
-          // what happened instead of dropping the send silently. The prompt
-          // and its arguments are still intact wherever they now are.
-          sendNotice = "Signed in — your prompt is ready; press Send when you are.";
-        }
-        return;
-      }
-      dispatchToRecipients(finalText, attachments, targets);
-      // Prompt selection is not sticky: a successful send returns to the plain
-      // composer (recipients stay selected). Appended text is consumed, not
-      // carried back.
-      selectedPrompt = null;
-      promptArgs = {};
-      promptArgSources = {};
-      promptAppendedSources = [];
-      // A completed send is a fresh start — see the prompt-forward branch above.
-      forwardSources = [];
-      focusPromptFieldOnMount = false;
-      appendedText = "";
-      draft = "";
-      // Chips clear optimistically with the text (the optimistic user turn already
-      // renders them); the staged files persist on disk for the send.
-      commitChips([]);
-      sendGeneration += 1;
-      mode = "plain";
-      persistComposeNow();
-      return;
     }
 
     // A send with ≥1 forward source goes through the cross-agent forward path
@@ -2102,12 +2749,68 @@
   /// path the effect plus `onDestroy`'s flush already cover this, and the window is
   /// too narrow to drive from a jsdom test — so treat this as symmetry with the
   /// content path, not a test-pinned guarantee.
+  /// Re-read the store after a background send retired the content it consumed.
+  ///
+  /// A ComposeBar reads the store **once**, at mount (`untrack(getCompose)`), and
+  /// from then on pushes its locals *down* into it. So a send that clears the
+  /// store from a continuation — possibly one started by an instance that no
+  /// longer exists — is invisible to whichever bar is mounted: it keeps showing
+  /// the prompt that was already sent, and its own persist effects write that
+  /// prompt straight back over the clear. This is the signal that closes that
+  /// gap; the clear itself only happens when the store still matched, so there is
+  /// never newer work here to lose.
+  let seenConsumed = untrack(() => composerConsumedCount(projectId));
+  $effect(() => {
+    const count = composerConsumedCount(projectId);
+    if (count === seenConsumed) return;
+    seenConsumed = count;
+    untrack(() => reprojectFromStore());
+  });
+
+  /// Re-read the store into this bar's locals. Covers both directions a
+  /// continuation can write: retiring content it consumed, and handing back a
+  /// send that never dispatched. Only plain content is projected — the paths that
+  /// signal are the ones that write plain content, and resolving a prompt would
+  /// need the (async) prompt cache.
+  function reprojectFromStore(): void {
+    const stored = getCompose(projectId);
+    selectedPrompt = null;
+    promptArgs = {};
+    promptArgSources = {};
+    promptAppendedSources = [];
+    forwardSources = stored.forwards?.message ?? [];
+    focusPromptFieldOnMount = false;
+    appendedText = "";
+    draft = stored.content.kind === "plain" ? stored.content.draft : "";
+    attachmentChips = restoreChips(stored.attachments ?? []);
+    mode = "plain";
+  }
+
   function persistComposeNow(): void {
     setContent(projectId, currentContent());
     setForwards(projectId, currentForwards());
     flush();
   }
 </script>
+
+{#snippet ForkIcon()}
+  <!-- git-branch: a branch line diverging from a trunk. -->
+  <svg
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    stroke-width="2"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+    class="size-3.5 shrink-0"
+    aria-hidden="true"
+  >
+    <line x1="6" y1="3" x2="6" y2="15" />
+    <circle cx="18" cy="6" r="3" />
+    <circle cx="6" cy="18" r="3" />
+    <path d="M18 9a9 9 0 0 1-9 9" />
+  </svg>
+{/snippet}
 
 <!-- Split-rect pane glyph, shared by the @-menu's "Send to" and "Forward from"
      pane rows so both sections mark pane entries identically. -->
@@ -2474,41 +3177,46 @@
           {/each}
         </div>
       {/if}
-      {#if mode === "plain" && forwardSources.length > 0}
-        <!-- Plain-mode only: prompt mode forwards per-field, and workflow mode
-           routes via its agent inputs, so the message-level forward set doesn't
-           apply and is hidden in both (its state is preserved for restore when
-           the prompt/workflow is removed). -->
-        <div class="mb-1.5 flex flex-wrap items-center gap-1.5" data-testid="forward-source-chips">
-          <span class="text-muted text-xs">Forwarding from</span>
-          {#each forwardSources as source (forwardSourceKey(source))}
-            <ForwardSourceChip
-              {source}
-              readiness={agentReadiness(source.id)}
-              disabled={sending}
-              onRemove={() => removeForwardSource(forwardSourceKey(source))}
-            />
-          {/each}
-          {#if forwardSources.length > 1}
-            <!-- Each chip carries its own ✕; the bulk clear (same ⊘ glyph as
-                 "Clear recipients") only earns its place once there are several to
-                 drop at once. -->
-            <button
-              type="button"
-              class={cn(ICON_BUTTON_CLASS, "ml-0.5 shrink-0 disabled:opacity-50")}
-              data-testid="forward-sources-clear"
-              aria-label="Clear forward sources"
-              title="Clear forward sources"
-              disabled={sending}
-              onclick={() => {
-                if (!sending) forwardSources = [];
-              }}
-            >
-              <ClearIcon />
-            </button>
-          {/if}
-        </div>
-      {/if}
+      {#snippet forwardSourceChips()}
+        {#if forwardSources.length > 0}
+          <!-- Plain-mode only: prompt mode forwards per-field, and workflow mode
+             routes via its agent inputs, so the message-level forward set doesn't
+             apply and is hidden in both (its state is preserved for restore when
+             the prompt/workflow is removed). -->
+          <div
+            class="mb-1.5 flex flex-wrap items-center gap-1.5"
+            data-testid="forward-source-chips"
+          >
+            <span class="text-muted text-xs">Forwarding from</span>
+            {#each forwardSources as source (forwardSourceKey(source))}
+              <ForwardSourceChip
+                {source}
+                readiness={agentReadiness(source.id)}
+                disabled={composerBusy}
+                onRemove={() => removeForwardSource(forwardSourceKey(source))}
+              />
+            {/each}
+            {#if forwardSources.length > 1}
+              <!-- Each chip carries its own ✕; the bulk clear (same ⊘ glyph as
+                   "Clear recipients") only earns its place once there are several to
+                   drop at once. -->
+              <button
+                type="button"
+                class={cn(ICON_BUTTON_CLASS, "ml-0.5 shrink-0 disabled:opacity-50")}
+                data-testid="forward-sources-clear"
+                aria-label="Clear forward sources"
+                title="Clear forward sources"
+                disabled={composerBusy}
+                onclick={() => {
+                  if (!composerBusy) forwardSources = [];
+                }}
+              >
+                <ClearIcon />
+              </button>
+            {/if}
+          </div>
+        {/if}
+      {/snippet}
       {#snippet recipientChips()}
         {#if agents.length > 1}
           <div class="flex flex-wrap items-center gap-1.5 text-xs" data-testid="recipient-field">
@@ -2538,13 +3246,13 @@
                       selected
                         ? "bg-accent-soft text-fg border-transparent"
                         : "border-panel bg-panel text-muted hover:bg-raised hover:text-fg",
-                      sending ? "cursor-not-allowed opacity-60" : "",
+                      composerBusy ? "cursor-not-allowed opacity-60" : "",
                     )}
                     data-testid={`recipient-chip-${agent.id}`}
                     data-selected={selected}
                     data-hidden-recipient={chipHidden || undefined}
                     aria-pressed={selected}
-                    disabled={sending}
+                    disabled={composerBusy}
                     onclick={() => toggleRecipient(agent.id)}
                   >
                     {#if i < 9}
@@ -2594,9 +3302,9 @@
                     class={cn(ICON_BUTTON_CLASS, "ml-0.5")}
                     data-testid="recipient-clear"
                     aria-label="Clear recipients"
-                    disabled={sending}
+                    disabled={composerBusy}
                     onclick={() => {
-                      if (!sending) setSelectedIds([]);
+                      if (!composerBusy) setSelectedIds([]);
                     }}
                   >
                     <ClearIcon />
@@ -2608,143 +3316,48 @@
         {/if}
       {/snippet}
 
-      {#if mode === "plain"}
-        <!-- Plain mode owns the To row + the message-level entry points. In prompt
-           mode the To row is handed to the composer (so the prompt name titles
-           the whole thing, above the recipients); workflow mode routes via its
-           own agent inputs, so neither shows. -->
-        <div class="mb-1.5 flex items-start justify-between gap-2">
-          <div class="min-w-0">{@render recipientChips()}</div>
-          <div class="flex shrink-0 items-center gap-1">
-            <ForwardSourcePicker
-              {agents}
-              panes={paneLayout.panes}
-              onPickAgent={(agent) => addForwardSource(forwardSourceForAgent(agent))}
-              onPickPane={(pane) => addPaneForwardSources(pane)}
-              {agentReadiness}
-              disabled={sending}
-              showPaneShortcuts
-              triggerTestid="compose-forward-button"
-              triggerText="Forward"
-              triggerLabel="Forward an agent's output"
-              tooltipLabel="Forward an agent's output"
-              triggerClass={cn(
-                "text-muted hover:text-fg hover:bg-panel focus-visible:ring-focus flex h-6 items-center gap-1 rounded-full border border-transparent px-2 text-xs transition-colors focus-visible:ring-1 focus-visible:outline-none",
-                sending ? "cursor-not-allowed opacity-60" : "",
-              )}
-            />
-            <Tooltip label="Insert a prompt" shortcut={shortcut("/")}>
-              {#snippet trigger(props)}
-                <button
-                  {...props}
-                  type="button"
-                  class={cn(
-                    "text-muted hover:text-fg hover:bg-panel focus-visible:ring-focus flex h-6 items-center gap-1 rounded-full border border-transparent px-2 text-xs transition-colors focus-visible:ring-1 focus-visible:outline-none",
-                    sending ? "cursor-not-allowed opacity-60" : "",
-                  )}
-                  data-testid="compose-prompt-button"
-                  aria-label="Insert a prompt"
-                  disabled={sending}
-                  onclick={() => {
-                    if (sending) return;
-                    if (promptMenuOpen) {
-                      promptMenuOpen = false;
-                    } else {
-                      openPromptMenu();
-                    }
-                  }}
-                >
-                  <svg
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    stroke-width="2"
-                    stroke-linecap="round"
-                    class="h-4 w-4"
-                    aria-hidden="true"
-                  >
-                    <path d="M12 5v14M5 12h14" />
-                  </svg>
-                  Prompt
-                </button>
-              {/snippet}
-            </Tooltip>
-            <Tooltip label="Run a workflow">
-              {#snippet trigger(props)}
-                <button
-                  {...props}
-                  type="button"
-                  class={cn(
-                    "text-muted hover:text-fg hover:bg-panel focus-visible:ring-focus flex h-6 items-center gap-1 rounded-full border border-transparent px-2 text-xs transition-colors focus-visible:ring-1 focus-visible:outline-none",
-                    sending ? "cursor-not-allowed opacity-60" : "",
-                  )}
-                  data-testid="compose-workflow-button"
-                  aria-label="Run a workflow"
-                  disabled={sending}
-                  onclick={() => {
-                    if (sending) return;
-                    if (workflowMenuOpen) {
-                      workflowMenuOpen = false;
-                    } else {
-                      openWorkflowMenu();
-                    }
-                  }}
-                >
-                  <svg
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    stroke-width="2"
-                    stroke-linecap="round"
-                    class="h-4 w-4"
-                    aria-hidden="true"
-                  >
-                    <path d="M12 5v14M5 12h14" />
-                  </svg>
-                  Workflow
-                </button>
-              {/snippet}
-            </Tooltip>
-          </div>
-        </div>
-      {/if}
-
-      {#if attachmentChips.length > 0}
-        <div class="mb-1.5 flex flex-wrap gap-1.5" data-testid="attachment-chips">
-          {#each attachmentChips as chip (chip.id)}
-            <span
-              class="border-border bg-panel text-fg inline-flex max-w-[14rem] items-center gap-1.5 rounded-full border py-px pr-1 pl-2 text-xs"
-              data-testid={`attachment-chip-${chip.label}`}
-              data-kind={chip.kind}
-            >
+      {#snippet attachmentChipRow()}
+        {#if attachmentChips.length > 0}
+          <div class="mb-1.5 flex flex-wrap gap-1.5" data-testid="attachment-chips">
+            {#each attachmentChips as chip (chip.id)}
               <span
-                class="text-muted shrink-0 font-mono text-[10px] whitespace-nowrap"
-                aria-hidden="true">{chip.label}</span
+                class="border-border bg-panel text-fg inline-flex max-w-[14rem] items-center gap-1.5 rounded-full border py-px pr-1 pl-2 text-xs"
+                data-testid={`attachment-chip-${chip.label}`}
+                data-kind={chip.kind}
               >
-              <span class="truncate" title={chip.original_name}>{chip.original_name}</span>
-              <button
-                type="button"
-                class="text-muted hover:text-fg hover:bg-control-hover flex h-4 w-4 shrink-0 items-center justify-center rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-50"
-                data-testid={`attachment-chip-remove-${chip.label}`}
-                aria-label={`Remove ${chip.original_name}`}
-                disabled={sending}
-                onclick={() => removeAttachmentChip(chip.id)}
-              >
-                <svg
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  stroke-width="2"
-                  stroke-linecap="round"
-                  class="h-3 w-3"
-                  aria-hidden="true"
+                <span
+                  class="text-muted shrink-0 font-mono text-[10px] whitespace-nowrap"
+                  aria-hidden="true">{chip.label}</span
                 >
-                  <path d="m6 6 12 12M18 6 6 18" />
-                </svg>
-              </button>
-            </span>
-          {/each}
-        </div>
+                <span class="truncate" title={chip.original_name}>{chip.original_name}</span>
+                <button
+                  type="button"
+                  class="text-muted hover:text-fg hover:bg-control-hover flex h-4 w-4 shrink-0 items-center justify-center rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-50"
+                  data-testid={`attachment-chip-remove-${chip.label}`}
+                  aria-label={`Remove ${chip.original_name}`}
+                  disabled={composerBusy}
+                  onclick={() => removeAttachmentChip(chip.id)}
+                >
+                  <svg
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2"
+                    stroke-linecap="round"
+                    class="h-3 w-3"
+                    aria-hidden="true"
+                  >
+                    <path d="m6 6 12 12M18 6 6 18" />
+                  </svg>
+                </button>
+              </span>
+            {/each}
+          </div>
+        {/if}
+      {/snippet}
+
+      {#if mode !== "plain"}
+        {@render attachmentChipRow()}
       {/if}
 
       {#if restoring && workflowRestoreFailed}
@@ -2785,6 +3398,39 @@
         >
           <Spinner class="h-4 w-4" />
           Restoring {pendingWorkflowRestore !== null ? "workflow" : "prompt"}…
+        </div>
+      {:else if mode === "workflow" && workflowForm === null}
+        <div
+          class="flex min-h-16 items-center gap-3 px-1 text-sm"
+          data-testid={workflowFormError === null
+            ? "compose-workflow-loading"
+            : "compose-workflow-load-failed"}
+        >
+          {#if workflowFormError === null}
+            <Spinner class="h-4 w-4 shrink-0" />
+            <span class="text-muted">Loading {selectedWorkflow?.name ?? "workflow"}…</span>
+          {:else}
+            <div class="min-w-0 flex-1">
+              <p class="text-fg">Couldn't load {selectedWorkflow?.name ?? "the workflow"}.</p>
+              <p class="text-status-failed mt-0.5 truncate text-xs">{workflowFormError}</p>
+            </div>
+            <Button
+              size="sm"
+              variant="secondary"
+              data-testid="workflow-form-retry"
+              onclick={retryWorkflowForm}
+            >
+              Retry
+            </Button>
+            <Button
+              size="sm"
+              variant="ghost"
+              data-testid="workflow-form-start-over"
+              onclick={removeWorkflow}
+            >
+              Start over
+            </Button>
+          {/if}
         </div>
       {:else if mode === "workflow" && workflowForm !== null}
         <!-- Workflow mode: the invocation form spans the compose area. The compose
@@ -2829,95 +3475,304 @@
           focusFirstField={focusPromptFieldOnMount}
           onremove={removePrompt}
           recipients={recipientChips}
-          busy={sending}
+          busy={composerBusy}
           send={sendButton}
         />
-      {:else}
-        <div class="relative flex items-end gap-2">
-          <Textarea
-            autosize
-            data-testid="compose-textarea"
-            data-shortcut-scope="composer"
-            placeholder="Type a message…  (⌘+Enter to send, @ to add a recipient or forward source, / for a prompt)"
-            rows={3}
-            bind:ref={textareaEl}
-            bind:value={draft}
-            oninput={onInput}
-            onkeydown={handleKey}
-            class="max-h-48 min-h-16 border-0 bg-transparent p-1 shadow-none focus-visible:ring-0"
-          />
-          {@render sendButton()}
+      {:else if mode === "plain"}
+        <div class="relative flex items-stretch gap-2">
+          <div class="min-w-0 flex-1">
+            {@render forwardSourceChips()}
+            <!-- Plain mode owns the To row + the message-level entry points. In
+                 prompt mode the To row is handed to the composer; workflow mode
+                 routes through its own agent inputs. -->
+            <div class="mb-1.5 min-w-0">{@render recipientChips()}</div>
+            {@render attachmentChipRow()}
+            <Textarea
+              autosize
+              data-testid="compose-textarea"
+              data-shortcut-scope="composer"
+              placeholder="Type a message…  (⌘+Enter to send, @ to add a recipient or forward source, / for a prompt)"
+              rows={3}
+              bind:ref={textareaEl}
+              bind:value={draft}
+              oninput={onInput}
+              onkeydown={handleKey}
+              class="max-h-48 min-h-16 border-0 bg-transparent p-1 shadow-none focus-visible:ring-0"
+            />
+          </div>
+          <div
+            class="-mt-0.5 flex shrink-0 flex-col items-end gap-0.5"
+            data-testid="compose-action-rail"
+          >
+            <ForwardSourcePicker
+              {agents}
+              panes={paneLayout.panes}
+              onPickAgent={(agent) => addForwardSource(forwardSourceForAgent(agent))}
+              onPickPane={(pane) => addPaneForwardSources(pane)}
+              {agentReadiness}
+              disabled={composerBusy}
+              showPaneShortcuts
+              triggerTestid="compose-forward-button"
+              triggerLabel="Forward an agent's output"
+              tooltipLabel="Forward an agent's output"
+              tooltipDisableHoverableContent
+              triggerClass={cn(
+                COMPOSER_ACTION_BUTTON_CLASS,
+                composerBusy ? "cursor-not-allowed opacity-60" : "",
+              )}
+            />
+            <Tooltip label="Insert a prompt" shortcut={shortcut("/")} disableHoverableContent>
+              {#snippet trigger(props)}
+                <button
+                  {...props}
+                  type="button"
+                  class={cn(
+                    COMPOSER_ACTION_BUTTON_CLASS,
+                    composerBusy ? "cursor-not-allowed opacity-60" : "",
+                  )}
+                  data-testid="compose-prompt-button"
+                  aria-label="Insert a prompt"
+                  disabled={composerBusy}
+                  onclick={() => {
+                    if (composerBusy) return;
+                    if (promptMenuOpen) {
+                      promptMenuOpen = false;
+                    } else {
+                      openPromptMenu();
+                    }
+                  }}
+                >
+                  <svg
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="1.8"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    class="h-4 w-4"
+                    aria-hidden="true"
+                  >
+                    <path d="M6 3h9l3 3v15H6z" />
+                    <path d="M15 3v4h4" />
+                    <path d="M9 11h6M9 15h6" />
+                  </svg>
+                </button>
+              {/snippet}
+            </Tooltip>
+            <Tooltip label="Run a workflow" disableHoverableContent>
+              {#snippet trigger(props)}
+                <button
+                  {...props}
+                  type="button"
+                  class={cn(
+                    COMPOSER_ACTION_BUTTON_CLASS,
+                    composerBusy ? "cursor-not-allowed opacity-60" : "",
+                  )}
+                  data-testid="compose-workflow-button"
+                  aria-label="Run a workflow"
+                  disabled={composerBusy}
+                  onclick={() => {
+                    if (composerBusy) return;
+                    if (workflowMenuOpen) {
+                      workflowMenuOpen = false;
+                    } else {
+                      openWorkflowMenu();
+                    }
+                  }}
+                >
+                  <svg
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="1.8"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    class="h-4 w-4"
+                    aria-hidden="true"
+                  >
+                    <circle cx="6" cy="6" r="2" />
+                    <circle cx="18" cy="6" r="2" />
+                    <circle cx="18" cy="18" r="2" />
+                    <path d="M8 6h5a5 5 0 0 1 5 5v5" />
+                  </svg>
+                </button>
+              {/snippet}
+            </Tooltip>
+            <div class="mt-auto">{@render sendButton()}</div>
+          </div>
         </div>
       {/if}
     </div>
-    {#if signingInProvider}
-      <p class="text-muted mt-2 text-xs" data-testid="compose-signing-in">
-        Waiting for browser sign-in to {signingInProvider}…
+    {#if abandonableOperation !== undefined}
+      <p class="text-muted mt-2 flex items-center gap-2 text-xs" data-testid="compose-signing-in">
+        <span>Waiting for browser sign-in to {abandonableOperation.provider}…</span>
+        <!-- **"Stop waiting", not "Cancel".** The sign-in keeps running and may
+               still succeed — its final step is deliberately un-timed so it can
+               never report a failure it didn't have. What this stops is the
+               *composer* waiting, so one stuck sign-in can't hold the project
+               until the app restarts. -->
+        <Button
+          size="sm"
+          variant="ghost"
+          data-testid="compose-abandon-wait"
+          onclick={() => {
+            const op = abandonableOperation;
+            if (op === undefined) return;
+            abandonAwaitingUserOperation(projectId, op.id, {
+              message:
+                "Stopped waiting for the sign-in. It may still finish in the background; your message is still here.",
+              tone: "notice",
+            });
+          }}
+        >
+          Stop waiting
+        </Button>
       </p>
     {/if}
     {#if sendNotice}
-      <p class="text-muted mt-2 text-xs" data-testid="compose-send-notice">
+      <!-- Announced for the same reason as the error above: a fork refused
+           after the composer moved on is explained here, and a keyboard user
+           invoking the shortcut has no other signal. -->
+      <p
+        class="text-muted mt-2 text-xs"
+        data-testid="compose-send-notice"
+        role="status"
+        aria-live="polite"
+      >
         {sendNotice}
       </p>
     {/if}
     {#if sendError}
-      <p class="text-status-failed mt-2 text-xs" data-testid="compose-send-error">
+      <!-- Announced, not just shown. Hiding the fork control when unavailable
+           rests on the shortcut still explaining itself, and an explanation a
+           screen reader never speaks is no explanation. `polite` rather than
+           `alert`: this same element also carries background send failures from
+           other agents, which should not interrupt mid-utterance. -->
+      <p
+        class="text-status-failed mt-2 text-xs"
+        data-testid="compose-send-error"
+        role="status"
+        aria-live="polite"
+      >
         {sendError}
       </p>
     {/if}
   {/if}
 </div>
 
+<!-- Send, optionally split with Fork.
+     Fork is a *variant of sending*, not a compose mode — the branch comes into
+     existence as the turn this send dispatches — so it belongs on the send
+     control rather than beside the prompt/workflow selectors, which choose what
+     kind of message this is. As the second half it also costs no vertical space
+     in a bar that has little, and no horizontal space in the row the recipient
+     chips grow into.
+     In flight, the split control returns to the standard circular Stop button;
+     there is no Fork action available while a turn is running. -->
 {#snippet sendButton()}
-  <Tooltip
-    label={showStop ? (liveSends.size > 1 ? "Cancel all sends" : "Cancel send") : "Send"}
-    shortcut={shortcut("mod", "enter")}
+  {@const forkVisible = forkAvailable && !showStop}
+  <!-- The pill (shape + base fill) is the container; the halves are transparent
+       and round themselves, so each one's hover paints a circle inside its own
+       side rather than flooding it corner to corner. This only works because the
+       hover is its own named colour — a translucent tint over an identically
+       coloured parent composes to nothing, which is what made the first version
+       look like it had no hover at all. -->
+  <div
+    class={cn(
+      "flex h-7 shrink-0 items-center justify-center rounded-full",
+      showStop
+        ? "bg-active text-muted"
+        : sendDisabled
+          ? "bg-active text-muted/50"
+          : "bg-primary text-primary-fg",
+    )}
+    data-testid="compose-send-group"
   >
-    {#snippet trigger(props)}
-      <button
-        {...props}
-        type="button"
-        data-testid="compose-send"
-        onclick={handlePrimaryAction}
-        disabled={primaryDisabled}
-        aria-label={showStop ? (liveSends.size > 1 ? "Cancel all sends" : "Cancel send") : "Send"}
-        class={cn(
-          "flex h-7 w-7 shrink-0 items-center justify-center rounded-full transition-colors",
-          showStop
-            ? "bg-active text-muted hover:bg-status-failed-soft/70 hover:text-status-failed"
-            : sendDisabled
-              ? "bg-active text-muted/50 cursor-not-allowed"
-              : "bg-primary text-primary-fg hover:bg-primary/90",
-        )}
+    <Tooltip
+      label={showStop ? (liveSends.size > 1 ? "Cancel all sends" : "Cancel send") : "Send"}
+      shortcut={shortcut("mod", "enter")}
+      disableHoverableContent
+    >
+      {#snippet trigger(props)}
+        <button
+          {...props}
+          type="button"
+          data-testid="compose-send"
+          onclick={handlePrimaryAction}
+          disabled={primaryDisabled}
+          aria-label={showStop ? (liveSends.size > 1 ? "Cancel all sends" : "Cancel send") : "Send"}
+          class={cn(
+            "flex h-7 w-7 shrink-0 items-center justify-center rounded-full",
+            showStop
+              ? "hover:bg-status-failed-soft/70 hover:text-status-failed"
+              : sendDisabled
+                ? "cursor-not-allowed"
+                : "hover:bg-primary-hover",
+          )}
+        >
+          {#if showStop}
+            <StopIcon class="size-5" />
+          {:else if composerBusy}
+            <svg
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2.25"
+              class="h-3.5 w-3.5 animate-spin"
+              aria-hidden="true"
+            >
+              <path d="M21 12a9 9 0 1 1-6.2-8.6" stroke-linecap="round" />
+            </svg>
+          {:else}
+            <svg
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2.25"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              class="h-3.5 w-3.5"
+              aria-hidden="true"
+            >
+              <path d="M12 19V5M5 12l7-7 7 7" />
+            </svg>
+          {/if}
+        </button>
+      {/snippet}
+    </Tooltip>
+    {#if forkVisible}
+      <!-- Divider: the two halves do different things and one of them creates an
+           agent, so the seam stays visible while either side is hovered. Its own
+           strip, so neither half's hover fill paints over it. -->
+      <span class="flex h-7 w-px shrink-0 items-center" aria-hidden="true">
+        <span class={cn("h-4 w-px", sendDisabled ? "bg-muted/30" : "bg-primary-fg/25")}></span>
+      </span>
+      <Tooltip
+        label={forkCandidate === null
+          ? "Fork this conversation"
+          : `Fork ${forkCandidate.name} — send this message to a new agent that inherits the conversation so far.`}
+        shortcut={shortcut("mod", "shift", "enter")}
+        disableHoverableContent
       >
-        {#if showStop}
-          <StopIcon class="size-5" />
-        {:else if sending}
-          <svg
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="2.25"
-            class="h-3.5 w-3.5 animate-spin"
-            aria-hidden="true"
+        {#snippet trigger(props)}
+          <button
+            {...props}
+            type="button"
+            data-testid="compose-fork-send"
+            onclick={handleForkSend}
+            disabled={sendDisabled}
+            aria-label={forkCandidate === null
+              ? "Fork this conversation"
+              : `Fork ${forkCandidate.name}`}
+            class={cn(
+              "flex h-7 w-7 shrink-0 items-center justify-center rounded-full",
+              sendDisabled ? "cursor-not-allowed" : "hover:bg-primary-hover",
+            )}
           >
-            <path d="M21 12a9 9 0 1 1-6.2-8.6" stroke-linecap="round" />
-          </svg>
-        {:else}
-          <svg
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="2.25"
-            stroke-linecap="round"
-            stroke-linejoin="round"
-            class="h-3.5 w-3.5"
-            aria-hidden="true"
-          >
-            <path d="M12 19V5M5 12l7-7 7 7" />
-          </svg>
-        {/if}
-      </button>
-    {/snippet}
-  </Tooltip>
+            {@render ForkIcon()}
+          </button>
+        {/snippet}
+      </Tooltip>
+    {/if}
+  </div>
 {/snippet}

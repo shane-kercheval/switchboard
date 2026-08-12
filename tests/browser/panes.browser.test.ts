@@ -206,22 +206,48 @@ test("holding Cmd over a stationary pane does not show the target overlay until 
   window.dispatchEvent(new KeyboardEvent("keydown", { key: "Meta", metaKey: true }));
   await expect.poll(() => page.getByTestId("pane-target-overlay").elements().length).toBe(0);
 
-  window.dispatchEvent(new PointerEvent("pointermove", { clientX: 200, clientY: 250 }));
+  window.dispatchEvent(
+    new PointerEvent("pointermove", { clientX: 200, clientY: 250, metaKey: true }),
+  );
   await expect.poll(() => page.getByTestId("pane-target-overlay").elements().length).toBe(1);
 
   window.dispatchEvent(new KeyboardEvent("keydown", { key: "c", metaKey: true }));
   await expect.poll(() => page.getByTestId("pane-target-overlay").elements().length).toBe(0);
 
-  window.dispatchEvent(new PointerEvent("pointermove", { clientX: 210, clientY: 250 }));
+  window.dispatchEvent(
+    new PointerEvent("pointermove", { clientX: 210, clientY: 250, metaKey: true }),
+  );
   await expect.poll(() => page.getByTestId("pane-target-overlay").elements().length).toBe(0);
 
   window.dispatchEvent(new KeyboardEvent("keyup", { key: "c", metaKey: true }));
   await expect.poll(() => page.getByTestId("pane-target-overlay").elements().length).toBe(0);
 
-  window.dispatchEvent(new PointerEvent("pointermove", { clientX: 220, clientY: 250 }));
+  window.dispatchEvent(
+    new PointerEvent("pointermove", { clientX: 220, clientY: 250, metaKey: true }),
+  );
   await expect.poll(() => page.getByTestId("pane-target-overlay").elements().length).toBe(1);
 
   window.dispatchEvent(new KeyboardEvent("keyup", { key: "Meta" }));
+  await expect.poll(() => page.getByTestId("pane-target-overlay").elements().length).toBe(0);
+});
+
+test("a lost Cmd keyup is recovered by the next pointer move", async () => {
+  // The armed state's only exits were keyup and blur; miss both and the overlay
+  // stuck permanently, offering Cmd-click targeting with no key held. A pointer
+  // event carries the true modifier state, so movement without Cmd clears it.
+  await seedTwoAgents();
+  moveAgentToNewPane(PROJECT_ID, ROSTER_IDS, BOB.id);
+  mountPanes({ projectId: PROJECT_ID, agents: [ALICE, BOB], width: 1000 });
+
+  await page.getByTestId("transcript-pane").nth(0).hover();
+  window.dispatchEvent(new KeyboardEvent("keydown", { key: "Meta", metaKey: true }));
+  window.dispatchEvent(
+    new PointerEvent("pointermove", { clientX: 200, clientY: 250, metaKey: true }),
+  );
+  await expect.poll(() => page.getByTestId("pane-target-overlay").elements().length).toBe(1);
+
+  // No keyup, no blur — just the pointer moving with Cmd genuinely up.
+  window.dispatchEvent(new PointerEvent("pointermove", { clientX: 210, clientY: 250 }));
   await expect.poll(() => page.getByTestId("pane-target-overlay").elements().length).toBe(0);
 });
 

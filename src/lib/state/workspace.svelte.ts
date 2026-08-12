@@ -42,6 +42,7 @@ import type {
   WorkspaceDirectoryInfo,
 } from "$lib/types";
 import { tick, untrack } from "svelte";
+import { SvelteSet } from "svelte/reactivity";
 import { harnessAvailability, settledHarnessAvailability } from "$lib/harnessAvailability.svelte";
 import { AUTO_SEED_ON_NEW_PROJECT } from "$lib/harnessDisplay";
 import {
@@ -63,6 +64,7 @@ import {
   markHydrationAttempted,
   registerAgent,
   runtimes,
+  setTurnTerminalHook,
   transcripts,
   unregisterAgents,
 } from "./index.svelte";
@@ -70,6 +72,11 @@ import {
   subscribeProjectWorkflows,
   unsubscribeProjectWorkflows,
 } from "$lib/state/workflows.svelte";
+import {
+  assignAgentToFirstVisibleEmptyPane,
+  moveAgentToNewPane,
+  revealPane,
+} from "$lib/state/transcriptPanes.svelte";
 
 /// Per-project hydrated overlay. `items` holds only `user_message` and
 /// `outcome` kinds (agent content is routed to per-agent state); `status`
@@ -773,11 +780,22 @@ function ensureProjectLoaded(projectId: ProjectId): Promise<void> {
 /// *duplicate* the live turn (the live-vs-disk hazard the per-harness gate
 /// exists to prevent). On first hydrate the filter is absent → all agents apply
 /// (safe: no live turns exist at project open).
+/// Outcome of a hydration attempt, for callers that must distinguish "the data
+/// arrived" from "nothing changed".
+///
+/// **`skipped` and `failed` are not interchangeable, and neither is `applied`.**
+/// A refresh deliberately preserves the previously loaded conversation when it
+/// fails (see below), so `conversations[projectId].status` reads `"complete"`
+/// whether the read succeeded or threw — it cannot be used as a success signal
+/// by anyone downstream. `skipped` means another hydration held the guard, so
+/// this caller's work may still be pending and should be retried later.
+export type HydrateOutcome = "applied" | "skipped" | "failed";
+
 export async function hydrateProject(
   projectId: ProjectId,
   agentTurnFilter?: ReadonlySet<AgentId>,
-): Promise<void> {
-  if (hydrationStarted.has(projectId)) return;
+): Promise<HydrateOutcome> {
+  if (hydrationStarted.has(projectId)) return "skipped";
   hydrationStarted.add(projectId);
   // A refresh (the only caller passing `agentTurnFilter`) re-reads over a
   // known-good loaded view, so it must be non-destructive: keep the current
@@ -902,6 +920,18 @@ export async function hydrateProject(
 
     conversations[projectId] = { items: overlay, status: "complete" };
     if (baseline !== undefined) sessionFingerprintBaseline.set(projectId, baseline);
+    if (!isRefresh) seedPendingForkHistory(projectId, baseline);
+    // A per-agent parse failure means that agent contributed no turns even
+    // though the project load succeeded — for a caller waiting on one specific
+    // agent's history that is a failure, not an application.
+    const filtered = agentTurnFilter;
+    if (filtered !== undefined) {
+      const failedAgent = convo.agents.some(
+        (meta) => filtered.has(meta.agent_id) && meta.load_error != null,
+      );
+      if (failedAgent) return "failed";
+    }
+    return "applied";
   } catch (e) {
     const message = e instanceof Error ? e.message : String(e);
     console.warn("[switchboard] hydrateProject failed", { project_id: projectId, error: e });
@@ -911,6 +941,7 @@ export async function hydrateProject(
     if (!isRefresh) {
       conversations[projectId] = { items: [], status: "failed", error: message };
     }
+    return "failed";
   }
 }
 
@@ -982,10 +1013,226 @@ export function addAgentToProjectRoster(agent: AgentRecord): void {
   agentsByProject[agent.project_id] = [...existing, agent];
 }
 
+/// Branch `sourceId`'s conversation into a new agent and make it the live one.
+///
+/// Registration + placement only — the caller sends the branch's first message
+/// immediately after, and *that* send is what materializes it as a harness
+/// session (Claude cannot copy a session; a branch only exists as a turn). So
+/// this must not be called speculatively: a fork with no send is an agent whose
+/// session never comes into being until someone messages it.
+///
+/// Ordering is load-bearing and mirrors the create/attach path:
+/// `registerAgent` first (it initializes the runtime *before* subscribing, so an
+/// event arriving immediately after the command resolves finds somewhere to
+/// land), then roster, then placement.
+///
+/// **Placement:** the branch gets its own visible track. Never the parent's
+/// pane — they share history with identical timestamps, so co-paning renders
+/// every inherited message twice. Prefer a visible empty pane the user already
+/// has; otherwise a new one, which `moveAgentToNewPane` may start *minimized*
+/// when the row is full — hence `revealPane`, which also handles focus mode by
+/// making the branch the maximized pane rather than dropping the user out of
+/// focus. A fork-send is an explicit action with
+/// an immediate result: leaving the reply in a pane the user cannot see (with
+/// compose now addressed at that unseen agent) reads as "my message vanished."
+/// The parent is left exactly where it is; only the compose selection moves.
+export async function forkAgentIntoOwnPane(sourceId: AgentId): Promise<AgentRecord> {
+  const fork = await api.forkAgent(sourceId);
+  await registerAgent(fork);
+  addAgentToProjectRoster(fork);
+  const rosterIds = (agentsByProject[fork.project_id] ?? []).map((item) => item.id);
+  const paneId =
+    assignAgentToFirstVisibleEmptyPane(fork.project_id, rosterIds, fork.id) ??
+    moveAgentToNewPane(fork.project_id, rosterIds, fork.id);
+  revealPane(fork.project_id, rosterIds, paneId);
+  // The branch does not exist yet — the send that follows this call is what
+  // materializes it — so the transcript cue arms here, before the first turn.
+  forkHistoryPending.add(fork.id);
+  return fork;
+}
+
+/// A registered branch, and whether its event channel is live.
+///
+/// `unsubscribed` is **committed but unreachable**: the branch is durable and on
+/// screen, but subscribing to its channel failed, so a turn dispatched into it
+/// would spend real work on events that never arrive — and Tauri has no replay,
+/// so subscribing later cannot recover them.
+export type ReachableFork =
+  | { kind: "ready"; fork: AgentRecord }
+  | { kind: "unsubscribed"; fork: AgentRecord; message: string };
+
+/// Register a branch of `sourceId` and classify whether it can be sent to.
+///
+/// Deliberately does **not** touch recipient selection, dispatch, or compose
+/// state. Each caller finalizes its own composer on its own rules — plain mode
+/// clears before this call and hands the text back on failure, prompt mode holds
+/// everything until the send has dispatched and then retires it only if the
+/// composer still matches what it captured — and folding those into a shared
+/// helper is how an obsolete instance ends up retargeting a live one.
+export async function createReachableFork(sourceId: AgentId): Promise<ReachableFork> {
+  const fork = await forkAgentIntoOwnPane(sourceId);
+  if (runtimes[fork.id]?.listener_error != null) {
+    return {
+      kind: "unsubscribed",
+      fork,
+      message: `${fork.name} was created, but Switchboard couldn't connect to its updates — your message wasn't sent. Retry from the banner above, then send again.`,
+    };
+  }
+  return { kind: "ready", fork };
+}
+
+/// Forks whose inherited history has already been loaded. A fork's branch point
+/// only materializes when its first turn runs, so its transcript shows just that
+/// turn until the session file is re-read.
+///
+/// **Exactly one *successful* load per fork**, hence a set of the ones that
+/// succeeded rather than a set of the ones attempted.
+// Bookkeeping only — never read during render, so it needs no reactivity.
+// eslint-disable-next-line svelte/prefer-svelte-reactivity
+const forkHistoryLoaded = new Set<AgentId>();
+
+/// Forks materialized **this session** whose inherited history hasn't arrived
+/// yet — the transcript's "this is a branch, its earlier conversation is still
+/// coming" cue. Reactive because it is read during render.
+///
+/// **Deliberately not the same set as [`forkHistoryLoaded`].** The two answer
+/// different questions. The refresh's one-shot guard tracks whether the history
+/// has been pulled; this tracks whether the *user needs telling* that it hasn't.
+/// Armed at fork creation, and re-armed on project open for branches that never
+/// materialized (see [`seedPendingForkHistory`]) — a branch whose first turn
+/// failed before a restart is still waiting, and the cue would otherwise vanish
+/// in exactly the case it was widened to cover.
+const forkHistoryPending = new SvelteSet<AgentId>();
+
+/// Per-project in-flight fork-history read, so concurrent branch terminals
+/// serialize rather than firing overlapping project reads. Bookkeeping only —
+/// never read during render.
+// eslint-disable-next-line svelte/prefer-svelte-reactivity
+const forkHistoryLoadInFlight = new Map<ProjectId, Promise<HydrateOutcome>>();
+
+/// Whether `agentId` is a fork still waiting for its inherited history — read by
+/// the transcript to decide whether to explain the branch's empty backlog.
+export function isAwaitingForkHistory(agentId: AgentId): boolean {
+  return forkHistoryPending.has(agentId);
+}
+
+/// Re-arm the branch cue for forks that never materialized, on project open.
+///
+/// A branch created in an earlier session whose first turn failed has no session
+/// file and therefore no inherited history — the cue is exactly as true as it was
+/// before the restart, and the next successful turn is what resolves it. A branch
+/// that *did* materialize needs no cue: the ordinary load already brought its
+/// history in.
+///
+/// **The signal is the session file, not the transcript.** "Fork provenance plus
+/// an empty per-agent slice" looks equivalent and is not: a real session can load
+/// with no agent turns (cancelled after the file was created, a parent holding
+/// only a dangling prompt), which would pin a permanent "history is coming" cue
+/// on a branch that already has everything. The fingerprint distinguishes them —
+/// for a refresh-capable harness an absent fingerprint means the file does not
+/// exist. When fingerprints are unavailable, seed nothing: a missing cue is
+/// cosmetic, a false permanent one is not.
+function seedPendingForkHistory(
+  projectId: ProjectId,
+  fingerprints: AgentSessionFingerprint[] | undefined,
+): void {
+  // `== null` deliberately: the probe is best-effort and its failure path can
+  // yield either absence or an explicit null. Seeding must never be able to
+  // break the hydration it rides along with.
+  if (fingerprints == null) return;
+  const byAgent = new Map(fingerprints.map((f) => [f.agent_id, f]));
+  for (const agent of agentsByProject[projectId] ?? []) {
+    if (agent.forked_from_session == null) continue;
+    if (forkHistoryLoaded.has(agent.id)) continue;
+    const fingerprint = byAgent.get(agent.id);
+    if (fingerprint === undefined || !fingerprint.refresh_capable) continue;
+    if (fingerprint.fingerprint == null) forkHistoryPending.add(agent.id);
+  }
+}
+
+/// Load a freshly materialized fork's inherited history.
+///
+/// **Trigger is the outcome, not the file.** The frontend cannot stat a session
+/// file, so "did this turn materialize the branch?" is approximated by
+/// `Completed`, and cancelled/failed **re-arm** — a fork whose first turn was
+/// cancelled may still have a complete child file (harness-behavior §3.5), so it
+/// picks its history up on the next completed turn rather than never. The two
+/// alternatives are worse: spending the one shot on a failed turn leaves
+/// inherited history invisible until reopen, and a file-existence IPC invents a
+/// backend surface for a cosmetic gain.
+///
+/// **Goes through the project conversation merge**, not `hydrateAgent` /
+/// `retryAgentHydration`. The per-agent loader returns raw user turns, and the
+/// hydrate reducer's keyed dedup covers *agent* turns only — user turns are
+/// journal-overlay-owned. A per-agent reload would therefore duplicate both the
+/// inherited prompts and the fork's own live prompt. `hydrateProject` replaces
+/// the overlay wholesale (dup-safe) and applies agent turns for the filtered
+/// agent, where the live first reply collapses against its disk copy by
+/// `hydration_key`.
+async function loadForkInheritedHistory(agentId: AgentId): Promise<void> {
+  const agent = Object.values(agentsByProject)
+    .flat()
+    .find((candidate) => candidate.id === agentId);
+  if (agent?.forked_from_session == null) return;
+  if (forkHistoryLoaded.has(agentId)) return;
+  const projectId = agent.project_id;
+  // Only meaningful once the project's own hydration has settled — before that
+  // the open path will read this session anyway.
+  if (conversations[projectId]?.status !== "complete") return;
+
+  // **Serialize, don't drop.** Two branches whose first turns land together
+  // would otherwise both clear `hydrationStarted` and both read: the delete
+  // below and `hydrateProject`'s guard check are in the same synchronous slice,
+  // so neither sees the other's guard. Coalescing instead — losers returning
+  // early — is *wrong here* even though it is right for `maybeRefreshProject`:
+  // that one retries on the next project switch, which happens constantly,
+  // whereas this retries on the next completed turn of this specific fork,
+  // which may never come. A dropped load leaves that branch's inherited history
+  // permanently missing behind a banner promising it. So the loser waits and
+  // then runs its own read: sequential rather than concurrent, one extra read,
+  // nothing lost. (Its `agentTurnFilter` names a different agent, so the
+  // winner's read cannot cover it.)
+  const inFlight = forkHistoryLoadInFlight.get(projectId);
+  if (inFlight !== undefined) await inFlight.catch(() => undefined);
+
+  hydrationStarted.delete(projectId);
+  const load = hydrateProject(projectId, new Set([agentId]));
+  forkHistoryLoadInFlight.set(projectId, load);
+  let outcome: HydrateOutcome;
+  try {
+    outcome = await load;
+  } finally {
+    if (forkHistoryLoadInFlight.get(projectId) === load) {
+      forkHistoryLoadInFlight.delete(projectId);
+    }
+  }
+  // Only an `applied` read actually produced inherited history. Anything else
+  // leaves the one-shot unset so the next completed turn retries. Reading
+  // `conversations[projectId].status` here instead would report success for a
+  // failed read too — a refresh preserves the prior `"complete"` view when it
+  // throws, which is the whole reason this outcome exists.
+  if (outcome === "applied") {
+    forkHistoryLoaded.add(agentId);
+    forkHistoryPending.delete(agentId);
+  }
+}
+
+/// Wire the terminal hook that drives [`loadForkInheritedHistory`]. Called once
+/// at app start; the hook is a no-op for every non-fork agent.
+export function installForkHistoryRefresh(): void {
+  setTurnTerminalHook((agentId, outcome) => {
+    if (outcome !== "completed") return;
+    void loadForkInheritedHistory(agentId);
+  });
+}
+
 /// Test-only reset. Production never calls this; the module is a singleton, so
 /// tests reset between runs to avoid bleed.
 export const _testing = {
   reset(): void {
+    forkHistoryLoaded.clear();
+    forkHistoryPending.clear();
+    setTurnTerminalHook(undefined);
     workspace.directories = [];
     workspace.persistable = true;
     projects.list = [];

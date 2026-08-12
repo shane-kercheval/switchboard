@@ -67,6 +67,9 @@ async fn within<F: std::future::Future<Output = ()>>(
 /// streams), the factory pops a scenario per `build`, defaulting to the last
 /// once the script is exhausted.
 struct TestFactory {
+    /// When set, `preflight` refuses with this reason — the start-moment policy
+    /// hook. `None` (the default) leaves the trait's always-allow behavior.
+    refuse_at_start: Option<String>,
     /// Pre-built adapters, one popped per turn; the final one sticks for any
     /// further turns. A `MockHarnessAdapter` dispatches via `&self` (fresh
     /// channel per call), so reusing the last Arc across extra turns is safe.
@@ -141,6 +144,7 @@ impl TestFactory {
             adapters.into_iter().collect();
         let last = Arc::clone(queue.back().expect("at least one adapter"));
         Arc::new(Self {
+            refuse_at_start: None,
             adapters: Mutex::new(queue),
             last,
             agent,
@@ -168,6 +172,7 @@ impl TestFactory {
             .collect();
         let last = Arc::clone(queue.back().expect("at least one scenario"));
         Arc::new(Self {
+            refuse_at_start: None,
             adapters: Mutex::new(queue),
             last,
             agent,
@@ -180,6 +185,17 @@ impl TestFactory {
 }
 
 impl DispatchContextFactory for TestFactory {
+    fn preflight(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + '_>> {
+        Box::pin(async move {
+            match &self.refuse_at_start {
+                Some(reason) => Err(reason.clone()),
+                None => Ok(()),
+            }
+        })
+    }
+
     fn build(&self, _send_id: SendId) -> DispatchContext {
         let adapter = {
             let mut q = self.adapters.lock().unwrap();
@@ -380,6 +396,7 @@ fn agent_record() -> AgentRecord {
     AgentRecord {
         model: None,
         effort: None,
+        forked_from_session: None,
         id: Uuid::now_v7(),
         project_id: Uuid::now_v7(),
         name: "test-agent".to_owned(),
@@ -958,6 +975,126 @@ async fn manual_send_emits_no_user_message() {
         count_type(&emitter.snapshot(), "user_message"),
         0,
         "a manual send emits no UserMessage"
+    );
+}
+
+#[tokio::test]
+async fn an_agent_mid_teardown_is_not_safe_to_fork_from() {
+    // `is_turn_running` reports a shutting-down agent as not running — correct
+    // for completed-only forwarding, wrong for the fork gate. A slot flips to
+    // `Closing` before cancellation and drain finish, so the agent can still be
+    // writing its session file; copying it then yields the synthesized
+    // "No response requested." branch the gate exists to prevent.
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+    // `AwaitCancellation` holds the turn open, so "running" is a state the test
+    // can observe rather than race.
+    let factory = TestFactory::new(
+        MockScenario::AwaitCancellation,
+        agent.clone(),
+        Arc::clone(&emitter),
+        Arc::new(RecordingJournal::default()) as Arc<dyn ConversationJournal>,
+    );
+
+    // An agent with no actor at all is safe — nothing of ours writes its session.
+    assert!(dispatcher.is_safe_to_fork_from(agent.id).await);
+
+    dispatcher
+        .send_message(
+            agent.id,
+            "long one",
+            vec![],
+            Uuid::now_v7(),
+            factory,
+            OnBusy::Enqueue,
+        )
+        .await;
+    within(
+        &emitter,
+        "turn_start",
+        emitter.wait_for_type("turn_start", 1),
+    )
+    .await;
+    assert!(
+        !dispatcher.is_safe_to_fork_from(agent.id).await,
+        "a running agent is not safe to fork from"
+    );
+
+    // And the distinction that matters: the plain running-check and the fork
+    // check disagree by design once teardown starts, which is why the fork gate
+    // needs its own question rather than reusing the forwarding one.
+    assert!(
+        dispatcher.is_turn_running(agent.id).await,
+        "precondition: the turn is genuinely running"
+    );
+
+    dispatcher
+        .shutdown_agent(agent.id, CancelSource::User)
+        .await;
+}
+
+#[tokio::test]
+async fn a_start_moment_refusal_stops_the_turn_before_anything_durable() {
+    // The dispatcher is the only component that knows when a *queued* item
+    // becomes a real turn, which is why the policy hook lives here: a caller's
+    // pre-enqueue check answers a question that can go stale while the item
+    // waits. A refusal must leave no durable trace — same posture as the
+    // fail-closed journal write it sits beside — and must not wedge the agent:
+    // it goes idle rather than parking. (This drives a single fail-fast workflow
+    // item, so it proves "no durable trace, no wedge" — not backlog draining,
+    // which the app-level queued-race test covers.)
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+    let journal = Arc::new(RecordingJournal::default());
+    let mut factory = TestFactory::sequence(
+        [MockScenario::Streaming],
+        agent.clone(),
+        Arc::clone(&emitter),
+        Arc::clone(&journal) as Arc<dyn ConversationJournal>,
+    );
+    Arc::get_mut(&mut factory).unwrap().refuse_at_start = Some(
+        "alice is working — a branch taken now would not include its current answer".to_owned(),
+    );
+
+    let _ = dispatcher
+        .send_workflow_message_awaiting_completion(
+            agent.id,
+            "would fork a busy parent",
+            vec![],
+            Uuid::now_v7(),
+            factory,
+        )
+        .await;
+
+    within(
+        &emitter,
+        "message_failed",
+        emitter.wait_for_type("message_failed", 1),
+    )
+    .await;
+    within(
+        &emitter,
+        "agent_idle",
+        emitter.wait_for_type("agent_idle", 1),
+    )
+    .await;
+
+    let events = emitter.snapshot();
+    assert_eq!(
+        count_type(&events, "turn_start"),
+        0,
+        "a refused turn never starts"
+    );
+    assert_eq!(
+        count_type(&events, "user_message"),
+        0,
+        "nothing durable was written, so no live user message either"
+    );
+    assert!(
+        journal.sends.lock().unwrap().is_empty(),
+        "the refusal must precede the journal write, leaving no send to reconstruct on reload"
     );
 }
 

@@ -68,6 +68,27 @@ pub trait DispatchFactoryProvider: Send + Sync {
     /// clean step failure rather than panicking — `factory_for` is called only
     /// with the run's bound agents, so `None` is the rare removed-mid-run case.
     fn factory_for(&self, agent_id: AgentId) -> Option<Arc<dyn DispatchContextFactory>>;
+
+    /// App-layer checks that must pass **before** a step dispatches to
+    /// `agent_id`. `Err(reason)` fails the step with that reason.
+    ///
+    /// This exists because the interpreter is deliberately independent of
+    /// `AppState` — it holds a dispatcher, prompts, and this provider, nothing
+    /// more. Pre-dispatch policy that needs app state (currently: refusing to
+    /// materialize a fork while its parent is mid-turn, since the branch would
+    /// inherit a synthesized placeholder instead of the parent's real answer)
+    /// therefore arrives through this seam rather than by threading app state
+    /// into the workflow engine.
+    ///
+    /// Default: allow. A provider with no app-layer policy — the test doubles —
+    /// need not implement it.
+    fn preflight(
+        &self,
+        agent_id: AgentId,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + '_>> {
+        let _ = agent_id;
+        Box::pin(async { Ok(()) })
+    }
 }
 
 /// A live progress event emitted by the interpreter as a run advances. It carries
@@ -256,6 +277,13 @@ impl WorkflowRun {
                     "a participating agent is unavailable for dispatch (removed mid-run, or its harness is unsupported)".to_owned(),
                 )
             })?;
+            // App-layer pre-dispatch policy (see `DispatchFactoryProvider::preflight`).
+            // Workflow steps reach the harness without passing through
+            // `send_message_impl`, so a check sited only there would not cover
+            // them — a materializing fork could branch from a working parent.
+            if let Err(reason) = self.factories.preflight(agent_id).await {
+                return Err(StepError::Failed(reason));
+            }
             match self
                 .dispatcher
                 .send_workflow_message_awaiting_completion(
@@ -752,12 +780,24 @@ mod tests {
 
     struct Provider {
         factories: HashMap<AgentId, Arc<MockFactory>>,
+        /// Agents whose `preflight` refuses, with the reason. Empty in most
+        /// tests (the trait's default allows).
+        refuse: HashMap<AgentId, String>,
     }
     impl DispatchFactoryProvider for Provider {
         fn factory_for(&self, agent_id: AgentId) -> Option<Arc<dyn DispatchContextFactory>> {
             self.factories
                 .get(&agent_id)
                 .map(|f| Arc::clone(f) as Arc<dyn DispatchContextFactory>)
+        }
+
+        fn preflight(
+            &self,
+            agent_id: AgentId,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + '_>>
+        {
+            let refusal = self.refuse.get(&agent_id).cloned();
+            Box::pin(async move { refusal.map_or(Ok(()), Err) })
         }
     }
 
@@ -794,6 +834,7 @@ mod tests {
                 session_locator: Some(SessionLocator::Uuid(Uuid::now_v7())),
                 model: None,
                 effort: None,
+                forked_from_session: None,
                 created_at: Utc::now(),
             };
             let id = record.id;
@@ -812,7 +853,10 @@ mod tests {
         }
         Rig {
             dispatcher: Arc::new(Dispatcher::new()),
-            provider: Arc::new(Provider { factories }),
+            provider: Arc::new(Provider {
+                factories,
+                refuse: HashMap::new(),
+            }),
             agents: agent_map,
             names,
             ids,
@@ -1023,6 +1067,62 @@ mod tests {
             "got: {body}"
         );
         assert!(body.contains("Execute the plan above."));
+    }
+
+    #[tokio::test]
+    async fn a_refused_preflight_fails_the_step_without_dispatching() {
+        // Workflow steps reach the harness without passing through
+        // `send_message_impl`, so the app layer's pre-dispatch policy (currently:
+        // don't materialize a fork while its parent is mid-turn) arrives through
+        // `DispatchFactoryProvider::preflight`. A refusal must fail the step —
+        // and crucially must do so *before* the dispatch, or the branch would
+        // already have inherited the placeholder the check exists to prevent.
+        let mut rig = rig(vec![
+            ("planner", vec![MockScenario::Streaming]),
+            ("implementer", vec![MockScenario::Streaming]),
+        ]);
+        let implementer = rig.ids["implementer"];
+        // Keep the real factories — otherwise the step would fail on
+        // "agent unavailable" and the test would pass without exercising
+        // preflight at all.
+        rig.provider = Arc::new(Provider {
+            factories: rig.provider.factories.clone(),
+            refuse: HashMap::from([(implementer, "alice is working".to_owned())]),
+        });
+
+        let (run, _dir, path) = build_run(
+            &rig,
+            PromptService::disabled(),
+            SEQUENTIAL,
+            "seq",
+            supplied(vec![
+                ("planner", text("planner")),
+                ("implementer", text("implementer")),
+                ("goal", text("ship it")),
+            ]),
+            CancellationToken::new(),
+        );
+        assert_eq!(run.execute().await, RunStatus::Failed);
+
+        let recs = records(&path);
+        assert!(
+            matches!(
+                recs.last(),
+                Some(RunRecord::Terminal {
+                    status: TerminalStatus::Failed,
+                    ..
+                })
+            ),
+            "a refused preflight must fail the run: {recs:?}"
+        );
+        assert!(
+            !rig.sends
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(id, _)| *id == implementer),
+            "the refused agent must never be dispatched"
+        );
     }
 
     #[tokio::test]

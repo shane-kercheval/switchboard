@@ -19,11 +19,14 @@ vi.mock("@tauri-apps/api/core", () => ({
 }));
 
 const listeners = new Map<string, (e: { payload: NormalizedEvent }) => void>();
+/// Default: record the callback and succeed. A test can override this to make a
+/// specific channel's subscription fail.
+const listenMock = vi.fn(async (name: string, cb: (e: { payload: NormalizedEvent }) => void) => {
+  listeners.set(name, cb);
+  return vi.fn();
+});
 vi.mock("@tauri-apps/api/event", () => ({
-  listen: vi.fn(async (name: string, cb: (e: { payload: NormalizedEvent }) => void) => {
-    listeners.set(name, cb);
-    return vi.fn();
-  }),
+  listen: (name: string, cb: (e: { payload: NormalizedEvent }) => void) => listenMock(name, cb),
 }));
 
 type DragDropPayload =
@@ -104,7 +107,17 @@ beforeEach(async () => {
   // spurious deselect-all into composeStore after composeStore's own reset.
   (await import("$lib/state/transcriptPanes.svelte"))._testing.reset();
   (await import("$lib/state/recipientSelection.svelte"))._testing.reset();
+  // A compose operation is project-scoped and outlives its component, so a test
+  // that leaves one in flight would keep every later test's composer busy.
+  (await import("$lib/state/composeOperations.svelte"))._testing.reset();
   listeners.clear();
+  // `listenMock` is module-level so a test can make one channel fail; reset it
+  // here or that override leaks into every test after it.
+  listenMock.mockReset();
+  listenMock.mockImplementation(async (name: string, cb) => {
+    listeners.set(name, cb);
+    return vi.fn();
+  });
   dragDropCb = undefined;
   resolveDropSub = undefined;
   dropUnlisten.mockClear();
@@ -1155,6 +1168,543 @@ describe("ComposeBar", () => {
     expect(screen.getByTestId("compose-send")).toHaveAttribute("aria-label", "Send");
   });
 
+  describe("fork (the send button's second half)", () => {
+    const FORK_RECORD: AgentRecord = {
+      id: "00000000-0000-7000-8000-000000000f0f",
+      project_id: PROJECT_ID,
+      name: "alice-fork",
+      harness: "claude_code",
+      session_locator: { uuid: "00000000-0000-7000-8000-00000000000f" },
+      forked_from_session: "00000000-0000-7000-8000-000000000001",
+      created_at: "2026-05-16T00:00:02Z",
+    };
+
+    /// Fork is an action, not a mode: the half is present exactly when it can be
+    /// used. An unlabeled icon that is visible-but-dead explains nothing, so
+    /// there is no disabled state to assert — only presence.
+    const forkHalf = () => screen.queryByTestId("compose-fork-send");
+
+    /// Give `agentId` hydrated history, so the "has a session to branch from"
+    /// derivation is satisfied. Hydration (not a live send) is what an agent
+    /// with an existing session looks like on project open — and unlike
+    /// `dispatchUserTurn` it leaves the agent idle rather than working.
+    function seedTurn(state: Awaited<ReturnType<typeof loadState>>, agentId: string): void {
+      state.applyAgentHydrate(agentId, {
+        turns: [
+          {
+            role: "agent",
+            turn_id: `disk-${agentId}`,
+            agent_id: agentId,
+            items: [{ item_kind: "text", kind: "text", text: "earlier reply" }],
+            status: "complete",
+            started_at: "2026-05-15T00:00:00Z",
+            ended_at: "2026-05-15T00:00:01Z",
+            hydration_key: `key-${agentId}`,
+          },
+        ],
+      });
+    }
+
+    it("is offered only for a single Claude recipient that has something to branch", async () => {
+      const state = await loadState();
+      await state.registerAgent(AGENT_A);
+      await state.registerAgent(AGENT_B);
+      seedTurn(state, AGENT_A.id);
+      render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+
+      await waitFor(() => expect(forkHalf()).not.toBeNull());
+      expect(forkHalf()).toHaveAttribute("aria-label", expect.stringMatching(/fork alice/i));
+
+      // Two recipients — a branch has no single source.
+      await fireEvent.click(chip(AGENT_B.id));
+      await waitFor(() => expect(forkHalf()).toBeNull());
+
+      // A single non-Claude recipient — no harness support.
+      await fireEvent.click(chip(AGENT_A.id));
+      await waitFor(() => expect(forkHalf()).toBeNull());
+    });
+
+    it("is not offered while the agent has no session to branch from", async () => {
+      const state = await loadState();
+      await state.registerAgent(AGENT_A);
+      render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+
+      await waitFor(() => expect(screen.getByTestId("compose-send")).toBeInTheDocument());
+      expect(forkHalf()).toBeNull();
+    });
+
+    it("withdraws the offer while the agent is working", async () => {
+      // Probe-measured hazard: a branch taken mid-turn inherits a synthesized
+      // placeholder instead of the parent's in-flight answer.
+      const state = await loadState();
+      await state.registerAgent(AGENT_A);
+      seedTurn(state, AGENT_A.id);
+      render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+      await waitFor(() => expect(forkHalf()).not.toBeNull());
+
+      fireTo(`agent:${AGENT_A.id}`, {
+        type: "turn_start",
+        turn_id: "turn-busy",
+        message_id: "msg-busy",
+        send_id: "send-busy",
+        started_at: "2026-05-16T00:00:00Z",
+      });
+
+      await waitFor(() => expect(forkHalf()).toBeNull());
+    });
+
+    it("stays offered while hydration is loading or has failed", async () => {
+      // An empty transcript only means "no session" once hydration has
+      // *completed*. Before that — and permanently after a failure — an agent
+      // with a long history has an empty transcript, and withdrawing the offer
+      // there would hide a branch the user can legitimately take. Unknown means
+      // offer it; the backend refuses precisely if it really cannot branch.
+      const state = await loadState();
+      await state.registerAgent(AGENT_A);
+      render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+
+      state.runtimes[AGENT_A.id] = {
+        ...state.runtimes[AGENT_A.id]!,
+        hydration_status: "loading",
+      };
+      await waitFor(() => expect(forkHalf()).not.toBeNull());
+
+      state.runtimes[AGENT_A.id] = {
+        ...state.runtimes[AGENT_A.id]!,
+        hydration_status: "failed",
+      };
+      await waitFor(() => expect(forkHalf()).not.toBeNull());
+    });
+
+    it("is not offered while forward sources are attached", async () => {
+      // The forward branch runs first in submit, so a fork would lose silently
+      // and the message would go to the parent — the exact outcome the branch's
+      // selection swap exists to prevent.
+      const state = await loadState();
+      await state.registerAgent(AGENT_A);
+      await state.registerAgent(AGENT_B);
+      seedTurn(state, AGENT_A.id);
+      seedTurn(state, AGENT_B.id);
+      render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+      await waitFor(() => expect(forkHalf()).not.toBeNull());
+
+      const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+      await fireEvent.input(textarea, { target: { value: "@" } });
+      await fireEvent.click(
+        await screen.findByTestId(`forward-option-forward-agent:${AGENT_B.id}`),
+      );
+
+      await waitFor(() => expect(forkHalf()).toBeNull());
+    });
+
+    it("returns to a circular cancel button once a send is in flight", async () => {
+      const state = await loadState();
+      await state.registerAgent(AGENT_A);
+      seedTurn(state, AGENT_A.id);
+      render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+      await waitFor(() => expect(forkHalf()).not.toBeNull());
+
+      const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+      await fireEvent.input(textarea, { target: { value: "go" } });
+      await fireEvent.click(screen.getByTestId("compose-send"));
+      fireTo(`agent:${AGENT_A.id}`, {
+        type: "turn_start",
+        turn_id: "turn-live",
+        message_id: "msg-live",
+        send_id: "send-live",
+        started_at: "2026-05-16T00:00:00Z",
+      });
+
+      await waitFor(() =>
+        expect(screen.getByTestId("compose-send")).toHaveAttribute("aria-label", "Cancel send"),
+      );
+      expect(forkHalf()).toBeNull();
+      expect(screen.getByTestId("compose-send").className).toContain("w-7");
+      expect(screen.getByTestId("compose-send-group").className).not.toContain("w-[3.25rem]");
+    });
+
+    it("withdraws the offer while any send is live, not just the recipient's own", async () => {
+      // `showStop` is project-wide: another agent's live send turns this button
+      // into a cancel while the selected agent sits idle and perfectly
+      // forkable. Pairing "Cancel" with "Fork" in one control is the state the
+      // in-flight rule exists to prevent — one half would abort someone else's
+      // work, the other would start new work, a few pixels apart.
+      const state = await loadState();
+      await state.registerAgent(AGENT_A);
+      await state.registerAgent(AGENT_B);
+      seedTurn(state, AGENT_A.id);
+      render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+
+      // Send to bob alone, leaving alice idle.
+      await fireEvent.click(chip(AGENT_B.id));
+      await fireEvent.click(chip(AGENT_A.id));
+      const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+      await fireEvent.input(textarea, { target: { value: "go" } });
+      await fireEvent.click(screen.getByTestId("compose-send"));
+      fireTo(`agent:${AGENT_B.id}`, {
+        type: "turn_start",
+        turn_id: "turn-bob",
+        message_id: "msg-bob",
+        send_id: "send-bob",
+        started_at: "2026-05-16T00:00:00Z",
+      });
+      await waitFor(() =>
+        expect(screen.getByTestId("compose-send")).toHaveAttribute("aria-label", "Cancel send"),
+      );
+
+      // Re-select alice: idle, Claude, has history — forkable in every respect
+      // except that the button in front of the user is currently a cancel.
+      await fireEvent.click(chip(AGENT_A.id));
+      await fireEvent.click(chip(AGENT_B.id));
+      await waitFor(() => expect(state.runtimes[AGENT_A.id]?.run_status).toBe("idle"));
+      expect(forkHalf()).toBeNull();
+    });
+
+    it("is single-flight: a second click during the fork cannot create a second branch", async () => {
+      // Two fork-sends across the await would each register a branch and each
+      // dispatch the same text — two agents, message sent twice.
+      const state = await loadState();
+      await state.registerAgent(AGENT_A);
+      seedTurn(state, AGENT_A.id);
+      let releaseFork!: (r: AgentRecord) => void;
+      const pendingFork = new Promise<AgentRecord>((resolve) => {
+        releaseFork = resolve;
+      });
+      invokeMock.mockImplementation(async (cmd: string) => {
+        if (cmd === "fork_agent") return await pendingFork;
+        if (cmd === "send_message") return "msg-fork";
+        return null;
+      });
+      render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+      await waitFor(() => expect(forkHalf()).not.toBeNull());
+
+      const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+      await fireEvent.input(textarea, { target: { value: "branch" } });
+      await fireEvent.click(forkHalf()!);
+      await fireEvent.click(screen.getByTestId("compose-fork-send"));
+
+      releaseFork(FORK_RECORD);
+      await waitFor(() => {
+        expect(invokeMock.mock.calls.filter(([cmd]) => cmd === "send_message")).toHaveLength(1);
+      });
+      expect(invokeMock.mock.calls.filter(([cmd]) => cmd === "fork_agent")).toHaveLength(1);
+    });
+
+    it("keeps text typed while the fork is in flight", async () => {
+      const state = await loadState();
+      await state.registerAgent(AGENT_A);
+      seedTurn(state, AGENT_A.id);
+      let releaseFork!: (r: AgentRecord) => void;
+      const pendingFork = new Promise<AgentRecord>((resolve) => {
+        releaseFork = resolve;
+      });
+      invokeMock.mockImplementation(async (cmd: string) => {
+        if (cmd === "fork_agent") return await pendingFork;
+        if (cmd === "send_message") return "msg-fork";
+        return null;
+      });
+      render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+      await waitFor(() => expect(forkHalf()).not.toBeNull());
+
+      const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+      await fireEvent.input(textarea, { target: { value: "branch" } });
+      await fireEvent.click(forkHalf()!);
+      await fireEvent.input(textarea, { target: { value: "next message" } });
+
+      releaseFork(FORK_RECORD);
+      await waitFor(() => {
+        expect(invokeMock).toHaveBeenCalledWith("fork_agent", { agentId: AGENT_A.id });
+      });
+      await tick();
+      expect((screen.getByTestId("compose-textarea") as HTMLTextAreaElement).value).toBe(
+        "next message",
+      );
+    });
+
+    it("forks, moves the selection to the branch, and sends there", async () => {
+      const state = await loadState();
+      await state.registerAgent(AGENT_A);
+      seedTurn(state, AGENT_A.id);
+      invokeMock.mockImplementation(async (cmd: string) => {
+        if (cmd === "fork_agent") return FORK_RECORD;
+        if (cmd === "send_message") return "msg-fork";
+        return null;
+      });
+      render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+      await waitFor(() => expect(forkHalf()).not.toBeNull());
+
+      const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+      await fireEvent.input(textarea, { target: { value: "branch from here" } });
+      await fireEvent.click(forkHalf()!);
+
+      // The branch was created, and the message went to IT — not the parent.
+      await waitFor(() => {
+        expect(invokeMock).toHaveBeenCalledWith("fork_agent", { agentId: AGENT_A.id });
+      });
+      await waitFor(() => {
+        expect(invokeMock).toHaveBeenCalledWith(
+          "send_message",
+          expect.objectContaining({ agentId: FORK_RECORD.id }),
+        );
+      });
+      expect(invokeMock).not.toHaveBeenCalledWith(
+        "send_message",
+        expect.objectContaining({ agentId: AGENT_A.id }),
+      );
+    });
+
+    it("the plain send button never forks, even when the fork half is offered", async () => {
+      // The two halves sit against each other; pressing send must continue the
+      // existing conversation, never branch it.
+      const state = await loadState();
+      await state.registerAgent(AGENT_A);
+      seedTurn(state, AGENT_A.id);
+      invokeMock.mockImplementation(async (cmd: string) => {
+        if (cmd === "send_message") return "msg-plain";
+        return null;
+      });
+      render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+      await waitFor(() => expect(forkHalf()).not.toBeNull());
+
+      const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+      await fireEvent.input(textarea, { target: { value: "keep going" } });
+      await fireEvent.click(screen.getByTestId("compose-send"));
+
+      await waitFor(() => {
+        expect(invokeMock).toHaveBeenCalledWith(
+          "send_message",
+          expect.objectContaining({ agentId: AGENT_A.id }),
+        );
+      });
+      expect(invokeMock).not.toHaveBeenCalledWith("fork_agent", expect.anything());
+    });
+
+    it("fork-sends from the keyboard without touching the send button", async () => {
+      const state = await loadState();
+      await state.registerAgent(AGENT_A);
+      seedTurn(state, AGENT_A.id);
+      invokeMock.mockImplementation(async (cmd: string) => {
+        if (cmd === "fork_agent") return FORK_RECORD;
+        if (cmd === "send_message") return "msg-fork";
+        return null;
+      });
+      render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+      await waitFor(() => expect(forkHalf()).not.toBeNull());
+
+      const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+      await fireEvent.input(textarea, { target: { value: "branch by keyboard" } });
+      await fireEvent.keyDown(textarea, { key: "Enter", metaKey: true, shiftKey: true });
+
+      await waitFor(() => {
+        expect(invokeMock).toHaveBeenCalledWith("fork_agent", { agentId: AGENT_A.id });
+      });
+    });
+
+    it("stays silent on an empty composer, whatever else is blocking", async () => {
+      // An empty composer has nothing to fork. Explaining "still loading X's
+      // history" to someone who typed nothing answers a question they did not
+      // ask, so the empty check has to sit above every readiness check.
+      const state = await loadState();
+      await state.registerAgent(AGENT_A);
+      seedTurn(state, AGENT_A.id);
+      render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+      await waitFor(() => expect(forkHalf()).not.toBeNull());
+
+      const rt = state.runtimes[AGENT_A.id];
+      if (rt === undefined) throw new Error("runtime missing");
+      state.runtimes[AGENT_A.id] = { ...rt, hydration_status: "loading" };
+
+      const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+      await fireEvent.keyDown(textarea, { key: "Enter", metaKey: true, shiftKey: true });
+      await tick();
+
+      expect(screen.queryByTestId("compose-send-error")).toBeNull();
+      expect(invokeMock).not.toHaveBeenCalledWith("fork_agent", expect.anything());
+    });
+
+    it("leaves nothing behind in the originating project when unmounted mid-fork", async () => {
+      // Switching projects mid-fork destroys this bar, and `onDestroy` flushes
+      // whatever compose state it holds at that moment. Clearing after the await
+      // would persist the message the user already sent — they come back to find
+      // it in the box, addressed to the parent, one keystroke from a duplicate
+      // send. Clearing before the await means the flush persists cleared state.
+      const state = await loadState();
+      await state.registerAgent(AGENT_A);
+      seedTurn(state, AGENT_A.id);
+      let releaseFork!: (r: AgentRecord) => void;
+      const pendingFork = new Promise<AgentRecord>((resolve) => {
+        releaseFork = resolve;
+      });
+      invokeMock.mockImplementation(async (cmd: string) => {
+        if (cmd === "fork_agent") return await pendingFork;
+        if (cmd === "send_message") return "msg-fork";
+        return null;
+      });
+      const view = render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+      await waitFor(() => expect(forkHalf()).not.toBeNull());
+
+      const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+      await fireEvent.input(textarea, { target: { value: "branch from here" } });
+      await fireEvent.click(forkHalf()!);
+
+      view.unmount();
+      releaseFork(FORK_RECORD);
+
+      // The branch still receives its first message — abandoning it would leave
+      // a promptless fork, which cannot materialize.
+      await waitFor(() => {
+        expect(invokeMock).toHaveBeenCalledWith(
+          "send_message",
+          expect.objectContaining({ agentId: FORK_RECORD.id }),
+        );
+      });
+      // And the originating project is not holding the sent text.
+      const compose = await import("$lib/state/composeStore");
+      const content = compose.getCompose(PROJECT_ID).content;
+      expect(content.kind === "plain" ? content.draft : "unexpected mode").toBe("");
+    });
+
+    it("loses nothing when the fork is refused after the user has typed again", async () => {
+      // The textarea is not disabled during the await — typing while a fork
+      // registers is expected. Restoring only into an empty composer silently
+      // destroyed whichever message the user didn't get back.
+      const state = await loadState();
+      await state.registerAgent(AGENT_A);
+      seedTurn(state, AGENT_A.id);
+      let rejectFork!: (e: Error) => void;
+      const pendingFork = new Promise<AgentRecord>((_, reject) => {
+        rejectFork = reject;
+      });
+      invokeMock.mockImplementation(async (cmd: string) => {
+        if (cmd === "fork_agent") return await pendingFork;
+        return null;
+      });
+      render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+      await waitFor(() => expect(forkHalf()).not.toBeNull());
+
+      const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+      await fireEvent.input(textarea, { target: { value: "keep me" } });
+      await fireEvent.click(forkHalf()!);
+      await fireEvent.input(textarea, { target: { value: "also this" } });
+
+      rejectFork(new Error("alice is working"));
+      await waitFor(() => {
+        expect(screen.getByTestId("compose-send-error")).toHaveTextContent("alice is working");
+      });
+
+      const value = (screen.getByTestId("compose-textarea") as HTMLTextAreaElement).value;
+      expect(value).toContain("keep me");
+      expect(value).toContain("also this");
+    });
+
+    it("does not overwrite a replacement composer for the same project", async () => {
+      // Project scoping separates A from B, but not an obsolete A instance from
+      // a newly mounted A instance. The dead one must not write its captured
+      // state over the live one's.
+      const state = await loadState();
+      await state.registerAgent(AGENT_A);
+      seedTurn(state, AGENT_A.id);
+      let rejectFork!: (e: Error) => void;
+      const pendingFork = new Promise<AgentRecord>((_, reject) => {
+        rejectFork = reject;
+      });
+      invokeMock.mockImplementation(async (cmd: string) => {
+        if (cmd === "fork_agent") return await pendingFork;
+        return null;
+      });
+      const first = render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+      await waitFor(() => expect(forkHalf()).not.toBeNull());
+      await fireEvent.input(screen.getByTestId("compose-textarea"), {
+        target: { value: "original" },
+      });
+      await fireEvent.click(forkHalf()!);
+
+      // Leave the project and come back: a new bar for the same project.
+      first.unmount();
+      render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+      await fireEvent.input(screen.getByTestId("compose-textarea"), {
+        target: { value: "typed in the new composer" },
+      });
+
+      rejectFork(new Error("alice is working"));
+      await tick();
+
+      // The newer text survives, and the submitted one is still recoverable.
+      const compose = await import("$lib/state/composeStore");
+      const content = compose.getCompose(PROJECT_ID).content;
+      const stored = content.kind === "plain" ? content.draft : "";
+      expect(stored).toContain("typed in the new composer");
+      expect(stored).toContain("original");
+    });
+
+    it("does not send into a branch whose updates it cannot hear", async () => {
+      // The branch commits before the frontend subscribes. If subscribing fails,
+      // dispatching anyway spends real quota on a turn whose events never arrive:
+      // it sits at "starting" forever, the reply never renders, and inherited
+      // history never loads. Tauri has no event replay, so subscribing later
+      // cannot recover it. Keep the branch, keep the message, send nothing.
+      const state = await loadState();
+      await state.registerAgent(AGENT_A);
+      seedTurn(state, AGENT_A.id);
+      listenMock.mockImplementation(async (channel: string) => {
+        if (channel === `agent:${FORK_RECORD.id}`) throw new Error("channel unavailable");
+        return vi.fn();
+      });
+      invokeMock.mockImplementation(async (cmd: string) => {
+        if (cmd === "fork_agent") return FORK_RECORD;
+        if (cmd === "send_message") return "msg-fork";
+        return null;
+      });
+      render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+      await waitFor(() => expect(forkHalf()).not.toBeNull());
+
+      const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+      await fireEvent.input(textarea, { target: { value: "branch from here" } });
+      await fireEvent.click(forkHalf()!);
+
+      await waitFor(() => {
+        expect(invokeMock).toHaveBeenCalledWith("fork_agent", { agentId: AGENT_A.id });
+      });
+      // Wait for the *terminal* state before asserting what did not happen —
+      // `send_message` is several async hops past `fork_agent`, so an absence
+      // check taken any earlier passes vacuously.
+      await waitFor(() =>
+        expect(screen.getByTestId("compose-send-error")).toHaveTextContent(/created/i),
+      );
+
+      expect(invokeMock).not.toHaveBeenCalledWith("send_message", expect.anything());
+      // The message is still the user's, and the error says what actually happened.
+      expect((screen.getByTestId("compose-textarea") as HTMLTextAreaElement).value).toBe(
+        "branch from here",
+      );
+      expect(screen.getByTestId("compose-send-error")).not.toHaveTextContent(/Fork failed/i);
+    });
+
+    it("keeps the user's text when the fork is refused", async () => {
+      // The one send path that can fail before any optimistic turn exists. The
+      // user must be able to wait or cancel and retry without retyping.
+      const state = await loadState();
+      await state.registerAgent(AGENT_A);
+      seedTurn(state, AGENT_A.id);
+      invokeMock.mockImplementation(async (cmd: string) => {
+        if (cmd === "fork_agent") throw new Error("alice is working");
+        return null;
+      });
+      render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+      await waitFor(() => expect(forkHalf()).not.toBeNull());
+
+      const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+      await fireEvent.input(textarea, { target: { value: "keep me" } });
+      await fireEvent.click(forkHalf()!);
+
+      await waitFor(() => {
+        expect(screen.getByTestId("compose-send-error")).toHaveTextContent("alice is working");
+      });
+      expect((screen.getByTestId("compose-textarea") as HTMLTextAreaElement).value).toBe("keep me");
+      expect(invokeMock).not.toHaveBeenCalledWith("send_message", expect.anything());
+    });
+  });
+
   it("a per-recipient IPC failure fails only that recipient and surfaces the error", async () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);
@@ -1500,6 +2050,1398 @@ async function enterPromptMode(testId: string): Promise<void> {
   await fireEvent.click(screen.getByTestId(testId));
   await waitFor(() => expect(screen.getByTestId("prompt-composer")).toBeInTheDocument());
 }
+
+describe("fork is confined to composers whose message it can actually dispatch", () => {
+  // Every fork test used to run in plain mode and none asked whether the control
+  // leaks out of it. The control moved into the send button and lost the
+  // `{#if mode === "plain"}` wrapper the chip row had; nothing noticed, because
+  // nothing looked. Prompt mode is now supported; the two shapes below are not.
+  function seedTurn(state: Awaited<ReturnType<typeof loadState>>, agentId: string): void {
+    state.applyAgentHydrate(agentId, {
+      turns: [
+        {
+          role: "agent",
+          turn_id: `disk-${agentId}`,
+          agent_id: agentId,
+          items: [{ item_kind: "text", kind: "text", text: "earlier reply" }],
+          status: "complete",
+          started_at: "2026-05-15T00:00:00Z",
+          ended_at: "2026-05-15T00:00:01Z",
+          hydration_key: `key-${agentId}`,
+        },
+      ],
+    });
+  }
+
+  it("hides the fork half once a prompt field is filled from another agent", async () => {
+    // A forward-backed prompt composes server-side and dispatches whenever its
+    // sources settle — a different path (`dispatchForwardPrompt`) with an
+    // unbounded hold. Branching there would either leave a promptless agent for
+    // the duration or register one against a long-stale busy-parent gate.
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    seedTurn(state, AGENT_A.id);
+    mockPromptBackend({ prompts: [REVIEW] });
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+
+    await waitFor(() => expect(screen.queryByTestId("compose-fork-send")).not.toBeNull());
+    await enterPromptMode("prompt-option-local:review");
+    // Still offered: an ordinary prompt is forkable.
+    await waitFor(() => expect(screen.queryByTestId("compose-fork-send")).not.toBeNull());
+
+    await fireEvent.click(screen.getByTestId("prompt-arg-forward-focus"));
+    await fireEvent.click(await screen.findByTestId(`forward-picker-agent-${AGENT_B.id}`));
+
+    await waitFor(() => expect(screen.queryByTestId("compose-fork-send")).toBeNull());
+  });
+
+  it("refuses the fork shortcut for a forward-backed prompt instead of sending it normally", async () => {
+    // The dangerous fallback: the chord asks to branch, and the prompt-mode
+    // Enter handler would send the composed prompt to the parent — the exact
+    // agent the user was branching away from. The shortcut stays live where the
+    // control is hidden, so this is the only surface the reason can reach.
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    seedTurn(state, AGENT_A.id);
+    mockPromptBackend({ prompts: [REVIEW] });
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    await enterPromptMode("prompt-option-local:review");
+    await fireEvent.click(screen.getByTestId("prompt-arg-forward-focus"));
+    await fireEvent.click(await screen.findByTestId(`forward-picker-agent-${AGENT_B.id}`));
+
+    // The handler gates on `document.activeElement`. `prompt-composer` is a
+    // plain div with no tabindex, so calling `.focus()` on it does nothing —
+    // focus a real control inside it and assert it landed, or this test passes
+    // on whatever the previous click happened to leave focused.
+    const field = screen.getByTestId("prompt-arg-focus") as HTMLElement;
+    field.focus();
+    expect(document.activeElement).toBe(field);
+    await fireEvent.keyDown(field, { key: "Enter", metaKey: true, shiftKey: true });
+
+    await waitFor(() =>
+      expect(screen.getByTestId("compose-send-error")).toHaveTextContent(/another agent/i),
+    );
+    expect(invokeMock).not.toHaveBeenCalledWith("fork_agent", expect.anything());
+    expect(invokeMock).not.toHaveBeenCalledWith("send_message", expect.anything());
+    expect(invokeMock).not.toHaveBeenCalledWith("render_prompt", expect.anything());
+    expect(screen.getByTestId("prompt-composer")).toBeInTheDocument();
+  });
+});
+
+describe("prompt-mode fork", () => {
+  // Forking with a saved prompt is render → branch → dispatch. The render is the
+  // long, fallible step (it can open a browser for an MCP sign-in and wait
+  // minutes), so nothing durable happens until it succeeds — and nothing is
+  // cleared until the send has actually dispatched, so every failure path hands
+  // the prompt back by never having taken it.
+  const FORK: AgentRecord = {
+    id: "00000000-0000-7000-8000-000000000f0f",
+    project_id: PROJECT_ID,
+    name: "alice-fork",
+    harness: "claude_code",
+    session_locator: { uuid: "00000000-0000-7000-8000-00000000000f" },
+    forked_from_session: "00000000-0000-7000-8000-000000000001",
+    created_at: "2026-05-16T00:00:02Z",
+  };
+
+  const forkHalf = () => screen.queryByTestId("compose-fork-send");
+
+  function seedTurn(state: Awaited<ReturnType<typeof loadState>>, agentId: string): void {
+    state.applyAgentHydrate(agentId, {
+      turns: [
+        {
+          role: "agent",
+          turn_id: `disk-${agentId}`,
+          agent_id: agentId,
+          items: [{ item_kind: "text", kind: "text", text: "earlier reply" }],
+          status: "complete",
+          started_at: "2026-05-15T00:00:00Z",
+          ended_at: "2026-05-15T00:00:01Z",
+          hydration_key: `key-${agentId}`,
+        },
+      ],
+    });
+  }
+
+  /// `render` / `fork` / `signIn` let a test hold any await open or fail it.
+  function mockForkPromptBackend(
+    opts: {
+      render?: () => Promise<unknown>;
+      fork?: () => Promise<unknown>;
+      signIn?: () => Promise<unknown>;
+    } = {},
+  ): void {
+    invokeMock.mockImplementation(
+      async (cmd: string, args?: Record<string, unknown>): Promise<unknown> => {
+        if (cmd === "search_project_files") return [];
+        if (cmd === "stage_attachment") {
+          const source = String((args as { sourcePath?: unknown })?.sourcePath ?? "drop");
+          const name = source.split("/").pop() ?? source;
+          return { path: `/proj/.switchboard/attachments/uuid__${name}`, original_name: name };
+        }
+        if (cmd === "list_prompts") return [SUMMARY, REVIEW];
+        if (cmd === "render_prompt")
+          return opts.render ? await opts.render() : { kind: "rendered", text: "RENDERED" };
+        if (cmd === "sign_in_mcp_provider") return opts.signIn ? await opts.signIn() : null;
+        if (cmd === "fork_agent") return opts.fork ? await opts.fork() : FORK;
+        if (cmd === "send_message") return "msg-fork";
+        return null;
+      },
+    );
+  }
+
+  /// First render demands a browser sign-in; the second (after it) succeeds.
+  /// This is the only window in the lifecycle where pane targeting is
+  /// deliberately unfrozen, because the wait is unbounded.
+  function signInThenRender(): () => Promise<unknown> {
+    let calls = 0;
+    return () => {
+      calls += 1;
+      return Promise.resolve(
+        calls === 1
+          ? { kind: "needs_sign_in", provider: "tiddly" }
+          : { kind: "rendered", text: "RENDERED" },
+      );
+    };
+  }
+
+  /// Mount with `alice` selected, hydrated, and composing the argument-free
+  /// prompt — the shortest path to a forkable prompt-mode composer.
+  async function mountComposingSummary(): Promise<Awaited<ReturnType<typeof loadState>>> {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    seedTurn(state, AGENT_A.id);
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await enterPromptMode("prompt-option-tiddly:summary");
+    await waitFor(() => expect(forkHalf()).not.toBeNull());
+    return state;
+  }
+
+  const sends = () => invokeMock.mock.calls.filter(([c]) => c === "send_message");
+  const forks = () => invokeMock.mock.calls.filter(([c]) => c === "fork_agent");
+
+  /// Press ⇧⌘↵ the way a user does. The window-level handler only acts when focus
+  /// is *inside* the compose surface, so firing at `window` from a blurred
+  /// document silently does nothing — a shortcut test that skips the focus step
+  /// passes regardless of what the handler decides.
+  async function pressForkShortcut(): Promise<void> {
+    const field = (screen.queryByTestId("prompt-appended") ??
+      screen.getByTestId("prompt-arg-focus")) as HTMLElement;
+    field.focus();
+    await fireEvent.keyDown(field, { key: "Enter", metaKey: true, shiftKey: true });
+  }
+
+  it("renders the prompt, branches, and sends the rendered text to the branch", async () => {
+    mockForkPromptBackend();
+    await mountComposingSummary();
+    await fireEvent.input(screen.getByTestId("prompt-appended"), { target: { value: "tail" } });
+
+    await fireEvent.click(forkHalf()!);
+
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("fork_agent", { agentId: AGENT_A.id }),
+    );
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith(
+        "send_message",
+        expect.objectContaining({ agentId: FORK.id, prompt: "RENDERED\n\ntail" }),
+      ),
+    );
+    // Never the parent — that is the whole point of the branch.
+    expect(invokeMock).not.toHaveBeenCalledWith(
+      "send_message",
+      expect.objectContaining({ agentId: AGENT_A.id }),
+    );
+    // A completed send returns to the plain composer, as any prompt send does.
+    await waitFor(() => expect(screen.queryByTestId("prompt-composer")).toBeNull());
+  });
+
+  it("renders before branching, so a render failure leaves no agent behind", async () => {
+    // Fork is a registry append: branching first and failing the render would put
+    // a visibly empty agent in the roster that received nothing.
+    mockForkPromptBackend({ render: () => Promise.reject(new Error("render boom")) });
+    await mountComposingSummary();
+    await fireEvent.input(screen.getByTestId("prompt-appended"), { target: { value: "tail" } });
+
+    await fireEvent.click(forkHalf()!);
+
+    await waitFor(() =>
+      expect(screen.getByTestId("compose-send-error")).toHaveTextContent("render boom"),
+    );
+    expect(forks()).toHaveLength(0);
+    expect(sends()).toHaveLength(0);
+    // And the prompt is exactly as the user left it.
+    expect(screen.getByTestId("prompt-composer")).toBeInTheDocument();
+    expect((screen.getByTestId("prompt-appended") as HTMLTextAreaElement).value).toBe("tail");
+  });
+
+  it("is single-flight across the render await", async () => {
+    let releaseRender!: (v: unknown) => void;
+    const pending = new Promise<unknown>((resolve) => {
+      releaseRender = resolve;
+    });
+    mockForkPromptBackend({ render: () => pending });
+    await mountComposingSummary();
+
+    await fireEvent.click(forkHalf()!);
+    await fireEvent.click(screen.getByTestId("compose-fork-send"));
+    releaseRender({ kind: "rendered", text: "RENDERED" });
+
+    await waitFor(() => expect(sends()).toHaveLength(1));
+    expect(invokeMock.mock.calls.filter(([c]) => c === "render_prompt")).toHaveLength(1);
+    expect(forks()).toHaveLength(1);
+  });
+
+  it("is single-flight across the registration await", async () => {
+    // `sending` must span BOTH awaits with no gap. Released after the render, a
+    // second submit would register a second branch and dispatch twice.
+    let releaseFork!: (v: AgentRecord) => void;
+    const pending = new Promise<AgentRecord>((resolve) => {
+      releaseFork = resolve;
+    });
+    mockForkPromptBackend({ fork: () => pending });
+    await mountComposingSummary();
+
+    await fireEvent.click(forkHalf()!);
+    await waitFor(() => expect(forks()).toHaveLength(1));
+    // The prompt is still there — nothing clears until the send dispatches — and
+    // the composer is visibly busy rather than accepting another submit.
+    expect(screen.getByTestId("prompt-composer")).toHaveAttribute("aria-busy", "true");
+    await pressForkShortcut();
+    await tick();
+    expect(forks()).toHaveLength(1);
+
+    releaseFork(FORK);
+    await waitFor(() => expect(sends()).toHaveLength(1));
+    expect(forks()).toHaveLength(1);
+  });
+
+  it("stays single-flight for a bar remounted while the prompt is still rendering", async () => {
+    // `sending` is component-local, so a replacement bar starts at `false`. Only
+    // project-scoped operation state can refuse the second submit — and the
+    // prompt is still on screen there, which is exactly what invites it.
+    let releaseRender!: (v: unknown) => void;
+    const pending = new Promise<unknown>((resolve) => {
+      releaseRender = resolve;
+    });
+    mockForkPromptBackend({ render: () => pending });
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    seedTurn(state, AGENT_A.id);
+    const first = render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await enterPromptMode("prompt-option-tiddly:summary");
+    await waitFor(() => expect(forkHalf()).not.toBeNull());
+    await fireEvent.click(forkHalf()!);
+
+    first.unmount();
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await waitFor(() => expect(screen.queryByTestId("prompt-appended")).not.toBeNull());
+    // The replacement shows the operation's own busy state, not a fresh idle one.
+    expect(screen.getByTestId("prompt-composer")).toHaveAttribute("aria-busy", "true");
+    expect((screen.getByTestId("compose-send") as HTMLButtonElement).disabled).toBe(true);
+
+    await pressForkShortcut();
+    await tick();
+    releaseRender({ kind: "rendered", text: "RENDERED" });
+
+    await waitFor(() => expect(sends()).toHaveLength(1));
+    expect(forks()).toHaveLength(1);
+    expect(invokeMock.mock.calls.filter(([c]) => c === "render_prompt")).toHaveLength(1);
+  });
+
+  it("refuses when the parent starts working while the prompt is rendering", async () => {
+    // The sign-in detour makes this window minutes wide, not milliseconds. A
+    // branch taken mid-turn permanently inherits a placeholder instead of the
+    // parent's real answer.
+    let releaseRender!: (v: unknown) => void;
+    const pending = new Promise<unknown>((resolve) => {
+      releaseRender = resolve;
+    });
+    mockForkPromptBackend({ render: () => pending });
+    await mountComposingSummary();
+    await fireEvent.input(screen.getByTestId("prompt-appended"), { target: { value: "tail" } });
+
+    await fireEvent.click(forkHalf()!);
+    fireTo(`agent:${AGENT_A.id}`, {
+      type: "turn_start",
+      turn_id: "turn-busy",
+      message_id: "msg-busy",
+      send_id: "send-busy",
+      started_at: "2026-05-16T00:00:00Z",
+    });
+    releaseRender({ kind: "rendered", text: "RENDERED" });
+
+    await waitFor(() =>
+      expect(screen.getByTestId("compose-send-error")).toHaveTextContent(/alice is working/i),
+    );
+    expect(forks()).toHaveLength(0);
+    expect(sends()).toHaveLength(0);
+    expect((screen.getByTestId("prompt-appended") as HTMLTextAreaElement).value).toBe("tail");
+  });
+
+  it("refuses when a recipient is added during the sign-in wait", async () => {
+    // Fork's precondition is *one* recipient, and the ordinary prompt send only
+    // checks that its captured recipients are still selected — a subset test an
+    // added recipient passes. The sign-in wait is the window where this is
+    // reachable: pane targeting is deliberately unfrozen there, because the wait
+    // is a browser round trip with no bound.
+    let releaseSignIn!: () => void;
+    const pendingSignIn = new Promise<unknown>((resolve) => {
+      releaseSignIn = () => resolve(null);
+    });
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    seedTurn(state, AGENT_A.id);
+    mockForkPromptBackend({ render: signInThenRender(), signIn: () => pendingSignIn });
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    await enterPromptMode("prompt-option-tiddly:summary");
+    await waitFor(() => expect(forkHalf()).not.toBeNull());
+
+    await fireEvent.click(forkHalf()!);
+    const selection = await import("$lib/state/recipientSelection.svelte");
+    await waitFor(() => expect(selection.targetRecipients(PROJECT_ID, [AGENT_A.id])).toBe(true));
+    expect(selection.selectAgent(PROJECT_ID, AGENT_B.id)).toBe(true);
+    releaseSignIn();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("compose-send-notice")).toHaveTextContent(/composer changed/i),
+    );
+    expect(forks()).toHaveLength(0);
+    expect(sends()).toHaveLength(0);
+  });
+
+  it("does not branch for a prompt that renders to nothing", async () => {
+    // Claude refuses a promptless fork, so this would fail at the harness after
+    // the branch was already committed. The check is on the combined transport
+    // text, not the renderer's output alone.
+    mockForkPromptBackend({ render: () => Promise.resolve({ kind: "rendered", text: "   " }) });
+    await mountComposingSummary();
+
+    await fireEvent.click(forkHalf()!);
+
+    await waitFor(() =>
+      expect(screen.getByTestId("compose-send-error")).toHaveTextContent(/empty message/i),
+    );
+    expect(forks()).toHaveLength(0);
+    expect(screen.getByTestId("prompt-composer")).toBeInTheDocument();
+  });
+
+  it("leaves the whole prompt untouched when registration fails", async () => {
+    // Nothing was cleared, so there is nothing to restore and nothing that can
+    // be lost to a collision with whatever the user did in the meantime.
+    mockForkPromptBackend({ fork: () => Promise.reject(new Error("alice is working")) });
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    seedTurn(state, AGENT_A.id);
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await enterPromptMode("prompt-option-local:review");
+    await fireEvent.input(screen.getByTestId("prompt-arg-focus"), { target: { value: "tests" } });
+    await fireEvent.input(screen.getByTestId("prompt-appended"), { target: { value: "tail" } });
+    await waitFor(() => expect(forkHalf()).not.toBeNull());
+
+    await fireEvent.click(forkHalf()!);
+
+    await waitFor(() =>
+      expect(screen.getByTestId("compose-send-error")).toHaveTextContent("alice is working"),
+    );
+    expect(screen.getByTestId("prompt-composer")).toBeInTheDocument();
+    expect((screen.getByTestId("prompt-arg-focus") as HTMLInputElement).value).toBe("tests");
+    expect((screen.getByTestId("prompt-appended") as HTMLTextAreaElement).value).toBe("tail");
+    expect(sends()).toHaveLength(0);
+  });
+
+  it("keeps hidden plain-mode forward sources when registration fails", async () => {
+    // Message-level forwards are hidden in prompt mode but preserved for the
+    // return trip. Clearing the composer wipes them, so a failure path that
+    // cleared first would silently discard a forwarding setup the user built
+    // before ever choosing the prompt.
+    mockForkPromptBackend({ fork: () => Promise.reject(new Error("alice is working")) });
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    seedTurn(state, AGENT_A.id);
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    // ⌘⌃1 forwards pane 1 as one chip per member agent.
+    await fireEvent.keyDown(window, { key: "1", metaKey: true, ctrlKey: true });
+    await waitFor(() => expect(screen.queryByTestId("forward-source-chip-alice")).not.toBeNull());
+    await enterPromptMode("prompt-option-tiddly:summary");
+    await waitFor(() => expect(forkHalf()).not.toBeNull());
+
+    await fireEvent.click(forkHalf()!);
+
+    await waitFor(() =>
+      expect(screen.getByTestId("compose-send-error")).toHaveTextContent("alice is working"),
+    );
+    expect(screen.getByTestId("prompt-composer")).toBeInTheDocument();
+    const compose = await loadComposeStore();
+    expect(compose.getCompose(PROJECT_ID).forwards?.message ?? []).toHaveLength(1);
+  });
+
+  it("clears hidden plain-mode forward sources only after the branch is sent", async () => {
+    mockForkPromptBackend();
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    seedTurn(state, AGENT_A.id);
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await fireEvent.keyDown(window, { key: "1", metaKey: true, ctrlKey: true });
+    await waitFor(() => expect(screen.queryByTestId("forward-source-chip-alice")).not.toBeNull());
+    await enterPromptMode("prompt-option-tiddly:summary");
+    await waitFor(() => expect(forkHalf()).not.toBeNull());
+
+    await fireEvent.click(forkHalf()!);
+
+    await waitFor(() => expect(sends()).toHaveLength(1));
+    const compose = await loadComposeStore();
+    await waitFor(() =>
+      expect(compose.getCompose(PROJECT_ID).forwards?.message ?? []).toHaveLength(0),
+    );
+  });
+
+  it("keeps the prompt when the branch commits but its updates cannot be reached", async () => {
+    // Committed is not reachable: dispatching into a branch whose event channel
+    // failed spends real work on a turn that never renders, and Tauri has no
+    // replay. The branch stays visible with its retry; the prompt stays put.
+    listenMock.mockImplementation(async (name: string, cb) => {
+      if (name === `agent:${FORK.id}`) throw new Error("channel refused");
+      listeners.set(name, cb);
+      return vi.fn();
+    });
+    mockForkPromptBackend();
+    await mountComposingSummary();
+    await fireEvent.input(screen.getByTestId("prompt-appended"), { target: { value: "tail" } });
+
+    await fireEvent.click(forkHalf()!);
+
+    await waitFor(() =>
+      expect(screen.getByTestId("compose-send-error")).toHaveTextContent(/couldn't connect/i),
+    );
+    expect(forks()).toHaveLength(1);
+    expect(sends()).toHaveLength(0);
+    expect(screen.getByTestId("prompt-composer")).toBeInTheDocument();
+    expect((screen.getByTestId("prompt-appended") as HTMLTextAreaElement).value).toBe("tail");
+  });
+
+  it("leaves nothing behind in the originating project when unmounted mid-fork", async () => {
+    // `onDestroy` flushes whatever compose state the bar holds at unmount, and
+    // the continuation dispatches regardless. The dispatched prompt must not be
+    // left sitting in the project's saved state, one keystroke from a duplicate.
+    let releaseFork!: (v: AgentRecord) => void;
+    const pending = new Promise<AgentRecord>((resolve) => {
+      releaseFork = resolve;
+    });
+    mockForkPromptBackend({ fork: () => pending });
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    seedTurn(state, AGENT_A.id);
+    const view = render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await enterPromptMode("prompt-option-tiddly:summary");
+    await fireEvent.input(screen.getByTestId("prompt-appended"), { target: { value: "tail" } });
+    await waitFor(() => expect(forkHalf()).not.toBeNull());
+    await fireEvent.click(forkHalf()!);
+    await waitFor(() => expect(forks()).toHaveLength(1));
+
+    view.unmount();
+    releaseFork(FORK);
+
+    // The branch still gets its first message: abandoning it leaves a promptless
+    // fork, which can never materialize.
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith(
+        "send_message",
+        expect.objectContaining({ agentId: FORK.id }),
+      ),
+    );
+    const compose = await loadComposeStore();
+    const saved = compose.getCompose(PROJECT_ID);
+    expect(saved.content).toEqual({ kind: "plain", draft: "" });
+    expect(saved.attachments ?? []).toHaveLength(0);
+  });
+
+  it("aborts rather than branching when the store diverges under the render", async () => {
+    // The defect this round exists to fix. A ComposeBar reads the store once at
+    // mount and pushes its locals down, so an obsolete instance finishing later
+    // cannot see the replacement's edits — it would clear the store over them,
+    // dispatch text the user had already replaced, and retarget their recipients.
+    // Nothing is committed before registration, so the correct answer is to stop.
+    let releaseRender!: (v: unknown) => void;
+    const pending = new Promise<unknown>((resolve) => {
+      releaseRender = resolve;
+    });
+    mockForkPromptBackend({ render: () => pending });
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    seedTurn(state, AGENT_A.id);
+    const first = render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await enterPromptMode("prompt-option-tiddly:summary");
+    await waitFor(() => expect(forkHalf()).not.toBeNull());
+    await fireEvent.click(forkHalf()!);
+
+    // Leave and return while the render is still open. The composer is frozen —
+    // that is the point of the project-scoped busy state — so the divergence is
+    // driven through the store the way a late-resolving attachment staging or an
+    // external write would, which is what this test is actually about.
+    first.unmount();
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await waitFor(() => expect(screen.queryByTestId("prompt-appended")).not.toBeNull());
+    const store = await loadComposeStore();
+    store.setContent(PROJECT_ID, {
+      kind: "prompt",
+      provider: "tiddly",
+      name: "summary",
+      args: {},
+      appendedText: "EDITED",
+    });
+
+    releaseRender({ kind: "rendered", text: "RENDERED" });
+    await waitFor(() =>
+      expect(screen.getByTestId("compose-send-notice")).toHaveTextContent(/composer changed/i),
+    );
+
+    expect(forks()).toHaveLength(0);
+    expect(sends()).toHaveLength(0);
+    const sel = await import("$lib/state/recipientSelection.svelte");
+    expect(sel.selectionFor(PROJECT_ID)).toEqual([AGENT_A.id]);
+    const compose = await loadComposeStore();
+    expect(compose.getCompose(PROJECT_ID).content).toEqual({
+      kind: "prompt",
+      provider: "tiddly",
+      name: "summary",
+      args: {},
+      appendedText: "EDITED",
+    });
+    // The store holds the newer content; nothing overwrote it.
+    expect((compose.getCompose(PROJECT_ID).content as { appendedText: string }).appendedText).toBe(
+      "EDITED",
+    );
+  });
+
+  it("dispatches but preserves a replacement composer edited after registration began", async () => {
+    // Past registration the branch exists, so the send is no longer optional —
+    // abandoning it leaves a promptless fork. The newer composer wins instead,
+    // and the user is told the branch got the message.
+    let releaseFork!: (v: AgentRecord) => void;
+    const pending = new Promise<AgentRecord>((resolve) => {
+      releaseFork = resolve;
+    });
+    mockForkPromptBackend({ fork: () => pending });
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    seedTurn(state, AGENT_A.id);
+    const first = render(ComposeBar, {
+      props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] },
+    });
+    await enterPromptMode("prompt-option-tiddly:summary");
+    await waitFor(() => expect(forkHalf()).not.toBeNull());
+    await fireEvent.click(forkHalf()!);
+    await waitFor(() => expect(forks()).toHaveLength(1));
+
+    first.unmount();
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    await waitFor(() => expect(screen.queryByTestId("prompt-appended")).not.toBeNull());
+    const store = await loadComposeStore();
+    store.setContent(PROJECT_ID, {
+      kind: "prompt",
+      provider: "tiddly",
+      name: "summary",
+      args: {},
+      appendedText: "NEWER",
+    });
+    const sel = await import("$lib/state/recipientSelection.svelte");
+    sel.setRecipients(PROJECT_ID, [AGENT_B.id]);
+
+    releaseFork(FORK);
+
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith(
+        "send_message",
+        expect.objectContaining({ agentId: FORK.id }),
+      ),
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId("compose-send-notice")).toHaveTextContent(/newer draft/i),
+    );
+    expect((store.getCompose(PROJECT_ID).content as { appendedText?: string }).appendedText).toBe(
+      "NEWER",
+    );
+    expect(sel.selectionFor(PROJECT_ID)).toEqual([AGENT_B.id]);
+  });
+
+  it("clears a replacement composer it did consume, and selects the branch there", async () => {
+    // The mirror case: nothing changed while the operation ran, so the prompt on
+    // screen IS the one that was just sent. Clearing the store alone would leave
+    // it displayed — the replacement holds its own copy in local state — one
+    // keystroke from sending it twice.
+    let releaseFork!: (v: AgentRecord) => void;
+    const pending = new Promise<AgentRecord>((resolve) => {
+      releaseFork = resolve;
+    });
+    mockForkPromptBackend({ fork: () => pending });
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    seedTurn(state, AGENT_A.id);
+    const first = render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await enterPromptMode("prompt-option-tiddly:summary");
+    await waitFor(() => expect(forkHalf()).not.toBeNull());
+    await fireEvent.click(forkHalf()!);
+    await waitFor(() => expect(forks()).toHaveLength(1));
+
+    first.unmount();
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, FORK] } });
+    await waitFor(() => expect(screen.queryByTestId("prompt-composer")).not.toBeNull());
+
+    releaseFork(FORK);
+    await waitFor(() => expect(sends()).toHaveLength(1));
+
+    await waitFor(() => expect(screen.queryByTestId("prompt-composer")).toBeNull());
+    const compose = await loadComposeStore();
+    expect(compose.getCompose(PROJECT_ID).content).toEqual({ kind: "plain", draft: "" });
+    const sel = await import("$lib/state/recipientSelection.svelte");
+    expect(sel.selectionFor(PROJECT_ID)).toEqual([FORK.id]);
+  });
+
+  it("moves the selection to the branch even when it finishes off-screen", async () => {
+    // The persisted recipient list is synced by an effect that only runs while a
+    // bar is mounted. A fork finishing while the user is in another project used
+    // to move only the live selection; remounting then seeded from the stale
+    // saved copy and put the parent back — so the next message went to the agent
+    // they had just branched away from.
+    let releaseFork!: (v: AgentRecord) => void;
+    const pending = new Promise<AgentRecord>((resolve) => {
+      releaseFork = resolve;
+    });
+    mockForkPromptBackend({ fork: () => pending });
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    seedTurn(state, AGENT_A.id);
+    const first = render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await enterPromptMode("prompt-option-tiddly:summary");
+    await waitFor(() => expect(forkHalf()).not.toBeNull());
+    await fireEvent.click(forkHalf()!);
+    await waitFor(() => expect(forks()).toHaveLength(1));
+
+    // Leave project A entirely and let the branch finish with nothing mounted.
+    first.unmount();
+    releaseFork(FORK);
+    await waitFor(() => expect(sends()).toHaveLength(1));
+
+    const compose = await loadComposeStore();
+    const sel = await import("$lib/state/recipientSelection.svelte");
+    expect(compose.getCompose(PROJECT_ID).selectedIds).toEqual([FORK.id]);
+
+    // And coming back does not undo it.
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, FORK] } });
+    await waitFor(() => expect(screen.queryByTestId("compose-textarea")).not.toBeNull());
+    expect(sel.selectionFor(PROJECT_ID)).toEqual([FORK.id]);
+  });
+
+  it("moves the selection to an unreachable branch that finished off-screen", async () => {
+    // Same rule on the committed-but-unsubscribed path: the retry has to target
+    // the branch, so the selection must survive the round trip there too.
+    listenMock.mockImplementation(async (name: string, cb) => {
+      if (name === `agent:${FORK.id}`) throw new Error("channel refused");
+      listeners.set(name, cb);
+      return vi.fn();
+    });
+    let releaseFork!: (v: AgentRecord) => void;
+    const pending = new Promise<AgentRecord>((resolve) => {
+      releaseFork = resolve;
+    });
+    mockForkPromptBackend({ fork: () => pending });
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    seedTurn(state, AGENT_A.id);
+    const first = render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await enterPromptMode("prompt-option-tiddly:summary");
+    await waitFor(() => expect(forkHalf()).not.toBeNull());
+    await fireEvent.click(forkHalf()!);
+    await waitFor(() => expect(forks()).toHaveLength(1));
+
+    first.unmount();
+    releaseFork(FORK);
+    const compose = await loadComposeStore();
+    await waitFor(() => expect(compose.getCompose(PROJECT_ID).selectedIds).toEqual([FORK.id]));
+    expect(sends()).toHaveLength(0);
+  });
+
+  it("freezes every compose control in a bar remounted mid-operation", async () => {
+    // `sending` resets to false in a replacement bar, so gating on it left
+    // controls that look live but mutate the snapshot the in-flight operation is
+    // comparing against — recipients, staged files, and the mode buttons. The
+    // rule is one policy for every compose-mutating control.
+    let releaseRender!: (v: unknown) => void;
+    const pending = new Promise<unknown>((resolve) => {
+      releaseRender = resolve;
+    });
+    mockForkPromptBackend({ render: () => pending });
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    seedTurn(state, AGENT_A.id);
+    const first = render(ComposeBar, {
+      props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] },
+    });
+    await enterPromptMode("prompt-option-tiddly:summary");
+    await waitFor(() => expect(forkHalf()).not.toBeNull());
+    await fireEvent.click(forkHalf()!);
+
+    first.unmount();
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    await waitFor(() => expect(screen.queryByTestId("prompt-composer")).not.toBeNull());
+
+    // The mode-switch buttons live inside `{#if mode === "plain"}`, so prompt
+    // mode never renders them; what a remounted bar does still show is the
+    // recipient row, which mutates the very selection the snapshot compares.
+    const disabled = (id: string) => (screen.getByTestId(id) as HTMLButtonElement).disabled;
+    expect(disabled("recipient-clear")).toBe(true);
+    expect(disabled(`recipient-chip-${AGENT_B.id}`)).toBe(true);
+
+    // Keyboard paths too: select-all and per-agent toggle both mutate recipients.
+    const before = (await import("$lib/state/recipientSelection.svelte")).selectionFor(PROJECT_ID);
+    await fireEvent.keyDown(window, { key: "a", metaKey: true, shiftKey: true });
+    await fireEvent.keyDown(window, { key: "2", metaKey: true });
+    expect((await import("$lib/state/recipientSelection.svelte")).selectionFor(PROJECT_ID)).toEqual(
+      before,
+    );
+
+    releaseRender({ kind: "rendered", text: "RENDERED" });
+    await waitFor(() => expect(sends()).toHaveLength(1));
+  });
+
+  it("delivers a failure once, to whichever bar is mounted, and does not repeat it", async () => {
+    // The outcome is project-scoped so it can reach a replacement composer, but
+    // rendering straight from that shared state kept a stale "Fork failed" alive
+    // through every later action and every revisit of the project.
+    let rejectFork!: (e: Error) => void;
+    const pending = new Promise<AgentRecord>((_, reject) => {
+      rejectFork = reject;
+    });
+    mockForkPromptBackend({ fork: () => pending });
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    seedTurn(state, AGENT_A.id);
+    const first = render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await enterPromptMode("prompt-option-tiddly:summary");
+    await waitFor(() => expect(forkHalf()).not.toBeNull());
+    await fireEvent.click(forkHalf()!);
+    await waitFor(() => expect(forks()).toHaveLength(1));
+
+    // Fail while nothing is mounted, then come back.
+    first.unmount();
+    rejectFork(new Error("alice is working"));
+    const second = render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await waitFor(() =>
+      expect(screen.getByTestId("compose-send-error")).toHaveTextContent("alice is working"),
+    );
+
+    // Leaving and returning again must not resurrect it.
+    second.unmount();
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await waitFor(() => expect(screen.queryByTestId("prompt-composer")).not.toBeNull());
+    expect(screen.queryByTestId("compose-send-error")).toBeNull();
+  });
+
+  it("delivers a failure to a composer that was already mounted when it landed", async () => {
+    // A mount-time read would miss this — and this is the common shape, since a
+    // failure usually lands after the user has navigated back.
+    let rejectFork!: (e: Error) => void;
+    const pending = new Promise<AgentRecord>((_, reject) => {
+      rejectFork = reject;
+    });
+    mockForkPromptBackend({ fork: () => pending });
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    seedTurn(state, AGENT_A.id);
+    const first = render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await enterPromptMode("prompt-option-tiddly:summary");
+    await waitFor(() => expect(forkHalf()).not.toBeNull());
+    await fireEvent.click(forkHalf()!);
+    await waitFor(() => expect(forks()).toHaveLength(1));
+
+    first.unmount();
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await waitFor(() => expect(screen.queryByTestId("prompt-composer")).not.toBeNull());
+    rejectFork(new Error("alice is working"));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("compose-send-error")).toHaveTextContent("alice is working"),
+    );
+  });
+
+  it("holds the project against a second send or a fork while an ordinary send renders", async () => {
+    // The sequence that made this worth doing: an ordinary prompt send is still
+    // rendering, the user switches away and back, and the replacement composer
+    // shows the same prompt with an enabled Send and an available Fork. Pressing
+    // Send sent it twice; pressing Fork sent it to the parent *and* to a new
+    // branch — one action, two sends, two agents.
+    let releaseRender!: (v: unknown) => void;
+    const pending = new Promise<unknown>((resolve) => {
+      releaseRender = resolve;
+    });
+    mockForkPromptBackend({ render: () => pending });
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    seedTurn(state, AGENT_A.id);
+    const first = render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await enterPromptMode("prompt-option-tiddly:summary");
+    await fireEvent.click(screen.getByTestId("compose-send"));
+    await waitFor(() =>
+      expect(invokeMock.mock.calls.filter(([c]) => c === "render_prompt")).toHaveLength(1),
+    );
+
+    first.unmount();
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await waitFor(() => expect(screen.queryByTestId("prompt-composer")).not.toBeNull());
+
+    // Neither second operation may start. The fork half is still *rendered* —
+    // visibility tracks shape, and the shape is fine — but busy is readiness, so
+    // both halves are disabled.
+    expect((screen.getByTestId("compose-send") as HTMLButtonElement).disabled).toBe(true);
+    expect((forkHalf() as HTMLButtonElement).disabled).toBe(true);
+    await pressForkShortcut();
+    await tick();
+    expect(forks()).toHaveLength(0);
+
+    releaseRender({ kind: "rendered", text: "RENDERED" });
+
+    // Exactly one dispatch, to the captured recipient, and the composer retires.
+    await waitFor(() => expect(sends()).toHaveLength(1));
+    expect((sends()[0]![1] as { agentId: string }).agentId).toBe(AGENT_A.id);
+    expect(invokeMock.mock.calls.filter(([c]) => c === "render_prompt")).toHaveLength(1);
+    const compose = await loadComposeStore();
+    await waitFor(() =>
+      expect(compose.getCompose(PROJECT_ID).content).toEqual({ kind: "plain", draft: "" }),
+    );
+  });
+
+  it("delivers an ordinary prompt send's failure to a bar that replaced its own", async () => {
+    // Its error used to be written into a destroyed component: the replacement
+    // kept the prompt and got no explanation for why nothing happened.
+    let rejectRender!: (e: Error) => void;
+    const pending = new Promise<unknown>((_, reject) => {
+      rejectRender = reject;
+    });
+    mockForkPromptBackend({ render: () => pending });
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    seedTurn(state, AGENT_A.id);
+    const first = render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await enterPromptMode("prompt-option-tiddly:summary");
+    await fireEvent.click(screen.getByTestId("compose-send"));
+    await waitFor(() =>
+      expect(invokeMock.mock.calls.filter(([c]) => c === "render_prompt")).toHaveLength(1),
+    );
+
+    first.unmount();
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await waitFor(() => expect(screen.queryByTestId("prompt-composer")).not.toBeNull());
+    rejectRender(new Error("provider unreachable"));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("compose-send-error")).toHaveTextContent("provider unreachable"),
+    );
+    // And the prompt is still there to retry with.
+    expect(screen.getByTestId("prompt-composer")).toBeInTheDocument();
+  });
+
+  it("still retires the prompt when a recipient was added mid-send", async () => {
+    // Retiring consumed content asks about content, not recipients: the ordinary
+    // send deliberately tolerates a recipient being added during the sign-in
+    // window, and folding recipients into the clear decision left the just-sent
+    // prompt in the composer, ready to be sent again.
+    let releaseSignIn!: () => void;
+    const pendingSignIn = new Promise<unknown>((resolve) => {
+      releaseSignIn = () => resolve(null);
+    });
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    seedTurn(state, AGENT_A.id);
+    mockForkPromptBackend({ render: signInThenRender(), signIn: () => pendingSignIn });
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    await enterPromptMode("prompt-option-tiddly:summary");
+    await fireEvent.click(screen.getByTestId("compose-send"));
+
+    const selection = await import("$lib/state/recipientSelection.svelte");
+    await waitFor(() => expect(selection.targetRecipients(PROJECT_ID, [AGENT_A.id])).toBe(true));
+    expect(selection.selectAgent(PROJECT_ID, AGENT_B.id)).toBe(true);
+    releaseSignIn();
+
+    await waitFor(() => expect(sends()).toHaveLength(1));
+    // Sent to the captured recipient only, and the prompt is gone rather than
+    // left behind for an accidental second send.
+    expect((sends()[0]![1] as { agentId: string }).agentId).toBe(AGENT_A.id);
+    await waitFor(() => expect(screen.queryByTestId("prompt-composer")).toBeNull());
+  });
+
+  it("does not let an ordinary send erase a replacement composer's newer prompt", async () => {
+    // The bug this fix exists for, in the path it was overlooked in: the clear
+    // at the end of an ordinary prompt send ran unconditionally in a
+    // continuation that outlives its component, writing a dead instance's
+    // emptied locals over whatever the live composer holds.
+    let releaseRender!: (v: unknown) => void;
+    const pending = new Promise<unknown>((resolve) => {
+      releaseRender = resolve;
+    });
+    mockForkPromptBackend({ render: () => pending });
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    seedTurn(state, AGENT_A.id);
+    const first = render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await enterPromptMode("prompt-option-tiddly:summary");
+    await fireEvent.click(screen.getByTestId("compose-send"));
+    await waitFor(() =>
+      expect(invokeMock.mock.calls.filter(([c]) => c === "render_prompt")).toHaveLength(1),
+    );
+
+    first.unmount();
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await waitFor(() => expect(screen.queryByTestId("prompt-composer")).not.toBeNull());
+    // The composer is frozen while the operation owns it, so the divergence is
+    // seeded at the store — this is an algorithm-level test of the compare-and-set.
+    const compose = await loadComposeStore();
+    compose.setContent(PROJECT_ID, {
+      kind: "prompt",
+      provider: "tiddly",
+      name: "summary",
+      args: {},
+      appendedText: "NEWER",
+    });
+
+    releaseRender({ kind: "rendered", text: "RENDERED" });
+    await waitFor(() => expect(sends()).toHaveLength(1));
+
+    // Dispatched, and the newer content survived.
+    expect((compose.getCompose(PROJECT_ID).content as { appendedText?: string }).appendedText).toBe(
+      "NEWER",
+    );
+  });
+
+  it("replaces a stale status rather than stacking a notice under an error", async () => {
+    // A blocked shortcut sets "Already sending"; the operation then finishes with
+    // a notice. Rendering both leaves the composer describing two states at once.
+    let releaseFork!: (v: AgentRecord) => void;
+    const pending = new Promise<AgentRecord>((resolve) => {
+      releaseFork = resolve;
+    });
+    mockForkPromptBackend({ fork: () => pending });
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    seedTurn(state, AGENT_A.id);
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    await enterPromptMode("prompt-option-tiddly:summary");
+    await waitFor(() => expect(forkHalf()).not.toBeNull());
+    await fireEvent.click(forkHalf()!);
+    await waitFor(() => expect(forks()).toHaveLength(1));
+
+    await pressForkShortcut();
+    await waitFor(() =>
+      expect(screen.getByTestId("compose-send-error")).toHaveTextContent(/already sending/i),
+    );
+
+    // Diverge so the operation finishes with the preserve-newer-composer notice.
+    const compose = await loadComposeStore();
+    compose.setContent(PROJECT_ID, { kind: "plain", draft: "something else" });
+    releaseFork(FORK);
+
+    await waitFor(() =>
+      expect(screen.getByTestId("compose-send-notice")).toHaveTextContent(/newer draft/i),
+    );
+    expect(screen.queryByTestId("compose-send-error")).toBeNull();
+
+    // And the other direction: a fresh error retires the notice. (The composer
+    // kept prompt mode — its content diverged, so it was preserved, not retired.)
+    await fireEvent.click(chip(AGENT_B.id));
+    await pressForkShortcut();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("compose-send-error")).toHaveTextContent(/single recipient/i),
+    );
+    expect(screen.queryByTestId("compose-send-notice")).toBeNull();
+  });
+
+  it("lets the user stop waiting on a stuck sign-in, and keeps their prompt", async () => {
+    // The sign-in's final step is deliberately un-timed in the backend, so a
+    // stall there would otherwise hold this project's composer until the app
+    // restarts — the busy state is project-scoped, so switching away no longer
+    // hides it.
+    const neverSettles = new Promise<unknown>(() => {});
+    mockForkPromptBackend({ render: signInThenRender(), signIn: () => neverSettles });
+    await mountComposingSummary();
+    await fireEvent.input(screen.getByTestId("prompt-appended"), { target: { value: "tail" } });
+    await fireEvent.click(forkHalf()!);
+
+    await waitFor(() => expect(screen.queryByTestId("compose-abandon-wait")).not.toBeNull());
+    expect((screen.getByTestId("compose-send") as HTMLButtonElement).disabled).toBe(true);
+
+    await fireEvent.click(screen.getByTestId("compose-abandon-wait"));
+
+    // The composer is usable again, in the bar that started it, with the prompt
+    // still there to retry with.
+    await waitFor(() =>
+      expect((screen.getByTestId("compose-send") as HTMLButtonElement).disabled).toBe(false),
+    );
+    expect(screen.getByTestId("prompt-composer")).toBeInTheDocument();
+    expect((screen.getByTestId("prompt-appended") as HTMLTextAreaElement).value).toBe("tail");
+    expect(screen.getByTestId("compose-send-notice")).toHaveTextContent(/stopped waiting/i);
+  });
+
+  it("lets a replacement bar stop waiting on an operation it did not start", async () => {
+    const neverSettles = new Promise<unknown>(() => {});
+    mockForkPromptBackend({ render: signInThenRender(), signIn: () => neverSettles });
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    seedTurn(state, AGENT_A.id);
+    const first = render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await enterPromptMode("prompt-option-tiddly:summary");
+    await waitFor(() => expect(forkHalf()).not.toBeNull());
+    await fireEvent.click(forkHalf()!);
+    await waitFor(() => expect(screen.queryByTestId("compose-abandon-wait")).not.toBeNull());
+
+    first.unmount();
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    // The wait belongs to the project, so the replacement shows it and can end it.
+    await waitFor(() => expect(screen.queryByTestId("compose-abandon-wait")).not.toBeNull());
+    await fireEvent.click(screen.getByTestId("compose-abandon-wait"));
+
+    await waitFor(() =>
+      expect((screen.getByTestId("compose-send") as HTMLButtonElement).disabled).toBe(false),
+    );
+  });
+
+  it("ignores a sign-in that succeeds after the user stopped waiting", async () => {
+    // The abandoned continuation must not render again, register, dispatch,
+    // clear, retarget, or publish a status — it no longer owns the composer.
+    let releaseSignIn!: () => void;
+    const pendingSignIn = new Promise<unknown>((resolve) => {
+      releaseSignIn = () => resolve(null);
+    });
+    mockForkPromptBackend({ render: signInThenRender(), signIn: () => pendingSignIn });
+    await mountComposingSummary();
+    await fireEvent.click(forkHalf()!);
+    await waitFor(() => expect(screen.queryByTestId("compose-abandon-wait")).not.toBeNull());
+    await fireEvent.click(screen.getByTestId("compose-abandon-wait"));
+
+    const rendersBefore = invokeMock.mock.calls.filter(([c]) => c === "render_prompt").length;
+    releaseSignIn();
+    await tick();
+    await tick();
+
+    expect(invokeMock.mock.calls.filter(([c]) => c === "render_prompt")).toHaveLength(
+      rendersBefore,
+    );
+    expect(forks()).toHaveLength(0);
+    expect(sends()).toHaveLength(0);
+    expect(screen.getByTestId("prompt-composer")).toBeInTheDocument();
+    // The abandon notice is still the current status — nothing stamped over it.
+    expect(screen.getByTestId("compose-send-notice")).toHaveTextContent(/stopped waiting/i);
+  });
+
+  it("lets a new operation start after an abandonment, untouched by the old one", async () => {
+    let releaseSignIn!: () => void;
+    const pendingSignIn = new Promise<unknown>((resolve) => {
+      releaseSignIn = () => resolve(null);
+    });
+    let calls = 0;
+    mockForkPromptBackend({
+      render: () => {
+        calls += 1;
+        return Promise.resolve(
+          calls === 1
+            ? { kind: "needs_sign_in", provider: "tiddly" }
+            : { kind: "rendered", text: "RENDERED" },
+        );
+      },
+      signIn: () => pendingSignIn,
+    });
+    await mountComposingSummary();
+    await fireEvent.click(forkHalf()!);
+    await waitFor(() => expect(screen.queryByTestId("compose-abandon-wait")).not.toBeNull());
+    await fireEvent.click(screen.getByTestId("compose-abandon-wait"));
+
+    // Retry: a fresh operation claims the slot and completes normally.
+    await waitFor(() => expect(forkHalf()).not.toBeNull());
+    await fireEvent.click(forkHalf()!);
+    await waitFor(() => expect(sends()).toHaveLength(1));
+    expect(forks()).toHaveLength(1);
+
+    // The abandoned sign-in resolving afterwards changes nothing.
+    releaseSignIn();
+    await tick();
+    await tick();
+    expect(sends()).toHaveLength(1);
+    expect(forks()).toHaveLength(1);
+  });
+
+  it("holds the project across a remount while a plain fork registers", async () => {
+    // Plain fork is the third caller of the boundary. Outside it, a replacement
+    // bar accepted a send that the fork then invalidated by moving the recipient.
+    let releaseFork!: (v: AgentRecord) => void;
+    const pending = new Promise<AgentRecord>((resolve) => {
+      releaseFork = resolve;
+    });
+    mockForkPromptBackend({ fork: () => pending });
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    seedTurn(state, AGENT_A.id);
+    const first = render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await waitFor(() => expect(forkHalf()).not.toBeNull());
+    await fireEvent.input(screen.getByTestId("compose-textarea"), {
+      target: { value: "branch from here" },
+    });
+    await fireEvent.click(forkHalf()!);
+    await waitFor(() => expect(forks()).toHaveLength(1));
+
+    first.unmount();
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await waitFor(() => expect(screen.queryByTestId("compose-textarea")).not.toBeNull());
+
+    // Every submit path is refused while the branch is being created.
+    expect((screen.getByTestId("compose-send") as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByTestId("compose-prompt-button") as HTMLButtonElement).disabled).toBe(true);
+    await fireEvent.input(screen.getByTestId("compose-textarea"), { target: { value: "second" } });
+    await fireEvent.keyDown(screen.getByTestId("compose-textarea"), {
+      key: "Enter",
+      metaKey: true,
+    });
+    await tick();
+    expect(sends()).toHaveLength(0);
+
+    releaseFork(FORK);
+    await waitFor(() => expect(sends()).toHaveLength(1));
+    // The one dispatch went to the branch, carrying the original message.
+    expect(sends()[0]![1] as { agentId: string; prompt: string }).toMatchObject({
+      agentId: FORK.id,
+      prompt: "branch from here",
+    });
+  });
+
+  it("delivers a plain fork's failure to a bar that replaced its own", async () => {
+    let rejectFork!: (e: Error) => void;
+    const pending = new Promise<AgentRecord>((_, reject) => {
+      rejectFork = reject;
+    });
+    mockForkPromptBackend({ fork: () => pending });
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    seedTurn(state, AGENT_A.id);
+    const first = render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await waitFor(() => expect(forkHalf()).not.toBeNull());
+    await fireEvent.input(screen.getByTestId("compose-textarea"), {
+      target: { value: "branch from here" },
+    });
+    await fireEvent.click(forkHalf()!);
+    await waitFor(() => expect(forks()).toHaveLength(1));
+
+    first.unmount();
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await waitFor(() => expect(screen.queryByTestId("compose-textarea")).not.toBeNull());
+    rejectFork(new Error("alice is working"));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("compose-send-error")).toHaveTextContent("alice is working"),
+    );
+    // And the message came back rather than being lost with the old bar.
+    expect((screen.getByTestId("compose-textarea") as HTMLTextAreaElement).value).toContain(
+      "branch from here",
+    );
+  });
+
+  it("explains an ordinary prompt send refused because its context changed", async () => {
+    // A send the UI accepted that then vanishes with no trace is worse than one
+    // that refuses — the user cannot tell it from a bug.
+    let releaseSignIn!: () => void;
+    const pendingSignIn = new Promise<unknown>((resolve) => {
+      releaseSignIn = () => resolve(null);
+    });
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    seedTurn(state, AGENT_A.id);
+    mockForkPromptBackend({ render: signInThenRender(), signIn: () => pendingSignIn });
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    await enterPromptMode("prompt-option-tiddly:summary");
+    await fireEvent.click(screen.getByTestId("compose-send"));
+
+    const selection = await import("$lib/state/recipientSelection.svelte");
+    await waitFor(() => expect(selection.targetRecipients(PROJECT_ID, [AGENT_B.id])).toBe(true));
+    releaseSignIn();
+
+    // The sign-in route has its own wording; what matters is that it speaks.
+    await waitFor(() =>
+      expect(screen.getByTestId("compose-send-notice")).toHaveTextContent(/press Send/i),
+    );
+    expect(sends()).toHaveLength(0);
+  });
+
+  it("explains a send refused because a recipient disappeared, with no sign-in involved", async () => {
+    // The branch that used to return silently. A removed agent is pruned from the
+    // selection mid-render, which is exactly the case the freeze deliberately
+    // lets through — and the send then vanished with no explanation at all.
+    let releaseRender!: (v: unknown) => void;
+    const pending = new Promise<unknown>((resolve) => {
+      releaseRender = resolve;
+    });
+    mockForkPromptBackend({ render: () => pending });
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    seedTurn(state, AGENT_A.id);
+    const view = render(ComposeBar, {
+      props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] },
+    });
+    await enterPromptMode("prompt-option-tiddly:summary");
+    await fireEvent.click(screen.getByTestId("compose-send"));
+    await waitFor(() =>
+      expect(invokeMock.mock.calls.filter(([c]) => c === "render_prompt")).toHaveLength(1),
+    );
+
+    // The captured recipient leaves the roster while the message is being built.
+    await view.rerender({ projectId: PROJECT_ID, agents: [AGENT_B] });
+    await tick();
+    releaseRender({ kind: "rendered", text: "RENDERED" });
+
+    await waitFor(() =>
+      expect(screen.getByTestId("compose-send-notice")).toHaveTextContent(/changed/i),
+    );
+    expect(sends()).toHaveLength(0);
+  });
+
+  it("releases the project-scoped busy state when a fork outlives the bar that started it", async () => {
+    // After a send that spanned a project switch finishes, the composer must be
+    // usable again rather than stuck busy on a claim nobody released.
+    //
+    // Deliberately does *not* also assert that pane targeting works here: the
+    // claim is gone by this point, so `operationBlocksTargeting` returns false
+    // for any implementation and the assertion would pass whether the phase
+    // policy were right, wrong, or absent. Targeting is pinned where it can
+    // actually fail — while an operation is live (the abandonment test below)
+    // and directly against the predicate (`recipientSelection.svelte.test.ts`).
+    let releaseFork!: (v: AgentRecord) => void;
+    const pending = new Promise<AgentRecord>((resolve) => {
+      releaseFork = resolve;
+    });
+    mockForkPromptBackend({ fork: () => pending });
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    seedTurn(state, AGENT_A.id);
+    const first = render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await waitFor(() => expect(forkHalf()).not.toBeNull());
+    await fireEvent.input(screen.getByTestId("compose-textarea"), { target: { value: "x" } });
+    await fireEvent.click(forkHalf()!);
+    await waitFor(() => expect(forks()).toHaveLength(1));
+
+    first.unmount();
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, FORK] } });
+    await waitFor(() => expect(screen.queryByTestId("compose-textarea")).not.toBeNull());
+
+    releaseFork(FORK);
+    await waitFor(() => expect(sends()).toHaveLength(1));
+
+    await fireEvent.input(screen.getByTestId("compose-textarea"), { target: { value: "next" } });
+    await waitFor(() =>
+      expect((screen.getByTestId("compose-send") as HTMLButtonElement).disabled).toBe(false),
+    );
+  });
+
+  it("keeps targeting blocked for a newer send when an abandoned one settles late", async () => {
+    // Abandonment deliberately lets the old work run on beside a new claim, so
+    // "only one operation exists" was never true. With the freeze derived rather
+    // than written, a late continuation has nothing to release.
+    let releaseSignIn!: () => void;
+    const pendingSignIn = new Promise<unknown>((resolve) => {
+      releaseSignIn = () => resolve(null);
+    });
+    let holdSecond!: (v: unknown) => void;
+    let calls = 0;
+    mockForkPromptBackend({
+      render: () => {
+        calls += 1;
+        if (calls === 1) return Promise.resolve({ kind: "needs_sign_in", provider: "tiddly" });
+        return new Promise<unknown>((resolve) => {
+          holdSecond = resolve;
+        });
+      },
+      signIn: () => pendingSignIn,
+    });
+    await mountComposingSummary();
+    await fireEvent.click(screen.getByTestId("compose-send"));
+    await waitFor(() => expect(screen.queryByTestId("compose-abandon-wait")).not.toBeNull());
+    await fireEvent.click(screen.getByTestId("compose-abandon-wait"));
+
+    await waitFor(() =>
+      expect((screen.getByTestId("compose-send") as HTMLButtonElement).disabled).toBe(false),
+    );
+    await fireEvent.click(screen.getByTestId("compose-send"));
+    await waitFor(() =>
+      expect((screen.getByTestId("compose-send") as HTMLButtonElement).disabled).toBe(true),
+    );
+
+    const sel = await import("$lib/state/recipientSelection.svelte");
+    expect(sel.targetRecipients(PROJECT_ID, [AGENT_A.id])).toBe(false);
+
+    releaseSignIn();
+    await tick();
+    await tick();
+    // The abandoned operation settling must not unfreeze the live one.
+    expect(sel.targetRecipients(PROJECT_ID, [AGENT_A.id])).toBe(false);
+    holdSecond({ kind: "rendered", text: "RENDERED" });
+    await waitFor(() => expect(sends()).toHaveLength(1));
+  });
+
+  it("freezes the attachment set for the whole fork, not just the render", async () => {
+    // The attachment set is frozen for the duration of a send — drops ignored,
+    // remove button disabled — and `sending` is what expresses that. Because it
+    // now spans the registration await too, there is no window in which a file
+    // can join a fork after its attachments were captured, or be captured by a
+    // fork the user staged it after. Weakening `sending`'s span reopens both.
+    let releaseFork!: (v: AgentRecord) => void;
+    const pending = new Promise<AgentRecord>((resolve) => {
+      releaseFork = resolve;
+    });
+    mockForkPromptBackend({ fork: () => pending });
+    await mountComposingSummary();
+    fireDrop(["/tmp/before.png"]);
+    await waitFor(() => expect(screen.queryByTestId("attachment-chip-image-1")).not.toBeNull());
+    const stagedBefore = invokeMock.mock.calls.filter(([c]) => c === "stage_attachment").length;
+
+    await fireEvent.click(forkHalf()!);
+    await waitFor(() => expect(forks()).toHaveLength(1));
+    fireDrop(["/tmp/during.png"]);
+    releaseFork(FORK);
+
+    await waitFor(() => expect(sends()).toHaveLength(1));
+    expect(invokeMock.mock.calls.filter(([c]) => c === "stage_attachment")).toHaveLength(
+      stagedBefore,
+    );
+    // The fork carried exactly the file that was staged when it was submitted.
+    const carried = (sends()[0]![1] as { attachments: { original_name: string }[] }).attachments;
+    expect(carried.map((a) => a.original_name)).toEqual(["before.png"]);
+  });
+
+  it("stays silent on the shortcut while a required argument is empty", async () => {
+    // The primary send is disabled and silent in this state; inventing an error
+    // for the fork half alone is an inconsistency the user has to learn. The
+    // form's own field markers do the explaining.
+    mockForkPromptBackend();
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    seedTurn(state, AGENT_A.id);
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await enterPromptMode("prompt-option-local:review");
+    await waitFor(() => expect(forkHalf()).not.toBeNull());
+
+    await pressForkShortcut();
+    await tick();
+
+    expect(screen.queryByTestId("compose-send-error")).toBeNull();
+    expect(forks()).toHaveLength(0);
+    expect(invokeMock).not.toHaveBeenCalledWith("render_prompt", expect.anything());
+  });
+});
 
 describe("ComposeBar prompt mode", () => {
   it("opens the prompt picker from the cache without a render (network) call", async () => {
@@ -2375,7 +4317,8 @@ describe("ComposeBar pane targeting", () => {
 
     const textarea = await renderTwoAgents();
     selection.setRecipients(PROJECT_ID, [AGENT_A.id]);
-    selection.setTargetingLocked(PROJECT_ID, true);
+    const ops = await import("$lib/state/composeOperations.svelte");
+    const blockingOp = ops.beginOperation(PROJECT_ID, { kind: "prompt_send" })!;
 
     await fireEvent.input(textarea, { target: { value: "@review" } });
     const option = await screen.findByTestId(`recipient-option-pane:${paneId}`);
@@ -2389,7 +4332,7 @@ describe("ComposeBar pane targeting", () => {
     // lock-refused gesture.
     expect(textarea.value).toBe("");
 
-    selection.setTargetingLocked(PROJECT_ID, false);
+    ops.finishOperation(PROJECT_ID, blockingOp);
   });
 
   it("pane entries list ahead of agent entries", async () => {
@@ -3639,6 +5582,110 @@ describe("ComposeBar — cross-agent forward", () => {
     });
     // Chips clear once the forward has dispatched.
     await waitFor(() => expect(screen.queryByTestId("attachment-chip-image-1")).toBeNull());
+  });
+
+  it("keeps workflow loading and failure states out of the plain composer", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    await seedCompletedTurn(AGENT_B.id);
+    const WORKFLOW = {
+      name: "slow-workflow",
+      is_builtin: true,
+      description: "d",
+      inputs: [],
+      invocable: true,
+      parse_error: null,
+    };
+    let rejectDescribe: ((error: Error) => void) | undefined;
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "list_workflows") return [WORKFLOW];
+      if (cmd === "list_prompts") return [];
+      if (cmd === "stage_attachment") {
+        return {
+          path: "/proj/.switchboard/projects/p/attachments/uuid__diagram.png",
+          original_name: "diagram.png",
+        };
+      }
+      if (cmd === "describe_workflow_form") {
+        return await new Promise<never>((_resolve, reject) => {
+          rejectDescribe = reject;
+        });
+      }
+      return null;
+    });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    fireDrop(["/a/diagram.png"]);
+    await waitFor(() => expect(screen.getByTestId("attachment-chip-image-1")).toBeInTheDocument());
+    await fireEvent.click(screen.getByTestId("compose-forward-button"));
+    await fireEvent.click(await screen.findByTestId(`forward-picker-agent-${AGENT_B.id}`));
+    await waitFor(() => expect(screen.getByTestId("forward-source-chips")).toBeInTheDocument());
+
+    await fireEvent.click(screen.getByTestId("compose-workflow-button"));
+    await fireEvent.click(await screen.findByTestId("workflow-option-builtin:slow-workflow"));
+
+    await waitFor(() => expect(screen.getByTestId("compose-workflow-loading")).toBeInTheDocument());
+    expect(screen.getAllByTestId("attachment-chips")).toHaveLength(1);
+    expect(screen.queryByTestId("compose-textarea")).toBeNull();
+    expect(screen.queryByTestId("recipient-field")).toBeNull();
+    expect(screen.queryByTestId("forward-source-chips")).toBeNull();
+    expect(screen.queryByTestId("compose-action-rail")).toBeNull();
+    expect(screen.queryByTestId("compose-send")).toBeNull();
+
+    rejectDescribe?.(new Error("descriptor unavailable"));
+    await waitFor(() =>
+      expect(screen.getByTestId("compose-workflow-load-failed")).toHaveTextContent(
+        "descriptor unavailable",
+      ),
+    );
+    expect(screen.getAllByTestId("attachment-chips")).toHaveLength(1);
+    expect(screen.queryByTestId("compose-textarea")).toBeNull();
+    expect(screen.queryByTestId("compose-send")).toBeNull();
+
+    await fireEvent.click(screen.getByTestId("workflow-form-start-over"));
+    expect(screen.getByTestId("compose-textarea")).toBeInTheDocument();
+    expect(screen.getByTestId("compose-action-rail")).toBeInTheDocument();
+  });
+
+  it("retries a workflow form that initially fails to load", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    const WORKFLOW = {
+      name: "retry-workflow",
+      is_builtin: true,
+      description: "d",
+      inputs: [],
+      invocable: true,
+      parse_error: null,
+    };
+    const DESCRIPTOR = {
+      ...WORKFLOW,
+      steps: [],
+      derived_args: [],
+      compatibility: { state: "ok" },
+    };
+    let describeCalls = 0;
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "list_workflows") return [WORKFLOW];
+      if (cmd === "list_prompts") return [];
+      if (cmd === "describe_workflow_form") {
+        describeCalls += 1;
+        if (describeCalls === 1) throw new Error("temporary failure");
+        return DESCRIPTOR;
+      }
+      return null;
+    });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await fireEvent.click(screen.getByTestId("compose-workflow-button"));
+    await fireEvent.click(await screen.findByTestId("workflow-option-builtin:retry-workflow"));
+    await screen.findByTestId("compose-workflow-load-failed");
+
+    await fireEvent.click(screen.getByTestId("workflow-form-retry"));
+    await waitFor(() => expect(screen.getByTestId("workflow-composer")).toBeInTheDocument());
+    expect(describeCalls).toBe(2);
+    expect(screen.queryByTestId("compose-workflow-load-failed")).toBeNull();
   });
 
   it("enters workflow mode, resolves the form, and invokes with declared + derived values", async () => {

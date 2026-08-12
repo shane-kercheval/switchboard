@@ -20,6 +20,7 @@ Switchboard also has a **Git view** for reviewing repositories, changed files, d
 
 - **Work with multiple CLI agents in one project.** Run any combination of the supported Claude Code, Codex, Gemini, and Antigravity sessions while keeping each agent's conversation and status visible.
 - **Fan-out and fan-in.** Send one request to several agents in parallel, then forward one or more responses into the next message — or let a workflow wait for them, combine them, and send the result onward — without copying and pasting between terminals.
+- **Fork a conversation.** Create a new agent that inherits the conversation so far, letting you try another approach while leaving the original agent untouched. Available for Claude Code only for now.
 - **Group agents into transcript panes.** Keep implementers, reviewers, or other roles together, target the group as one recipient, and hide or solo agents when you need a quieter view.
 - **Use one prompt library across your agent CLIs.** Choose parameterized prompts from the built-in library, local files, or HTTP MCP prompt servers; Switchboard centrally resolves and renders them for whichever agents you select.
 - **Run reusable multi-agent workflows.** Built-in and user-authored workflows can route prompts, run agents in parallel, wait for their responses, combine the results, and pass them to the next agent.
@@ -76,6 +77,8 @@ A fan-out sends one instruction to several agents so they can work independently
 
 Forwarding uses the agents' actual responses and clearly labels each source for the recipient. If a selected agent is still working, Switchboard holds the dependent message until the response is ready. You can add your own instructions or apply a prompt while forwarding, so the handoff can say what the next agent should do with the supplied material rather than merely pasting it into a new terminal.
 
+Fork creates a new Claude Code agent from an existing conversation. With one Claude agent selected, use the Fork half of the send button to send your message to `<name>-fork`, which inherits the conversation so far while leaving the original untouched. Use it to explore another approach from the same starting point.
+
 Panes make that routing easy to see. You can keep agents with related roles together and address the pane as a group, while every agent remains an independent session that can also be targeted directly.
 
 ## Prompts and workflows
@@ -125,6 +128,7 @@ Switchboard drives each agent through its own CLI, so it inherits that CLI's cap
 - **Antigravity and hidden folders.** Antigravity can't work in a project whose path contains a hidden (dot-prefixed) folder — for example anything under `~/.config/…`. The agent still runs but can't see your files. Keep projects under normal paths like `~/repos/…`.
 - **Some messages can't be pinned.** Switchboard disables Pin when a message has no identity that survives reopening rather than risk attaching the pin to a different message. This includes some imported history and every Antigravity reply. A newly completed Gemini reply becomes pinnable after you reopen Switchboard and its session history is loaded. User messages sent through Switchboard can still be pinned.
 - **Picking up terminal-continued sessions.** If you continue a session in the agent CLI's own terminal, **Claude Code** picks up the new turns when you switch back to the project. **Codex, Gemini, and Antigravity don't yet** — reopen Switchboard to load their updated history.
+- **Fork is currently Claude Code only.** The Fork half of the send button (⇧⌘↵) appears when one idle Claude Code agent with an existing session is selected. It creates a new agent with the conversation so far and sends your message as its first turn. Claude is the only CLI path Switchboard currently uses that can create a lossless child session during a send, so Fork is unavailable for other agents and multi-agent sends.
 - **Slash-leading prompts can retain CLI command behavior.** Switchboard centrally resolves and renders the same prompt for each selected agent, but Gemini still processes recognized slash-leading text as native commands. Avoid slash-leading prompt bodies when they must behave the same across agent CLIs.
 
 ## Notifications

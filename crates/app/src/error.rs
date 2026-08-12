@@ -96,6 +96,27 @@ pub enum AppError {
     #[error("unsupported harness kind: app has no adapter wired for this variant")]
     UnsupportedHarness,
 
+    /// Fork: the source agent has no session file to branch from yet — it has
+    /// never completed (or even started) a turn, so `--resume` would target a
+    /// session that doesn't exist. Distinct from the *capability* rejection in
+    /// `CoreError::SessionForkUnsupported`: this harness can fork, this agent
+    /// just has nothing to fork from. Deliberately worded as "no session,"
+    /// not "no completed turn" — a cancelled first turn also leaves a
+    /// resumable file, and branching that is well-defined.
+    #[error("{name} has no session to branch from yet — send it a message first")]
+    ForkSourceHasNoSession { name: String },
+
+    /// Fork: the source agent is running a turn, so a branch taken now would
+    /// inherit its in-flight prompt with a synthesized "No response requested."
+    /// placeholder instead of the real answer (harness-behavior §3.5, Probe A).
+    /// Refused rather than queued — waiting would deliver the answer to the
+    /// very turn the user is branching away from.
+    #[error(
+        "{name} is working — a branch taken now would not include its current answer; \
+         wait for it to finish, or cancel it first"
+    )]
+    ForkSourceBusy { name: String },
+
     /// Attach-flow: the user supplied a `session_id` that has no
     /// corresponding session file on disk under the appropriate harness
     /// directory. Surfaces the expected path so the user can verify the

@@ -34,6 +34,7 @@ fn claude_agent() -> AgentRecord {
     AgentRecord {
         model: None,
         effort: None,
+        forked_from_session: None,
         id: Uuid::now_v7(),
         project_id: Uuid::now_v7(),
         name: "tool-use-claude".to_owned(),
@@ -47,6 +48,7 @@ fn codex_agent() -> AgentRecord {
     AgentRecord {
         model: None,
         effort: None,
+        forked_from_session: None,
         id: Uuid::now_v7(),
         project_id: Uuid::now_v7(),
         name: "tool-use-codex".to_owned(),
@@ -139,6 +141,7 @@ fn gemini_agent() -> AgentRecord {
     AgentRecord {
         model: None,
         effort: None,
+        forked_from_session: None,
         id: Uuid::now_v7(),
         project_id: Uuid::now_v7(),
         name: "tool-use-gemini".to_owned(),
@@ -265,6 +268,7 @@ fn antigravity_agent() -> AgentRecord {
     AgentRecord {
         model: None,
         effort: None,
+        forked_from_session: None,
         id: Uuid::now_v7(),
         project_id: Uuid::now_v7(),
         name: "tool-use-antigravity".to_owned(),

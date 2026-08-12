@@ -43,18 +43,18 @@ use crate::commands::{
     check_codex_binary_impl, check_gemini_auth_impl, check_gemini_binary_impl,
     commit_changed_files_impl, commit_file_diff_impl, commit_ranges_impl, copy_builtin_prompt_impl,
     create_agent_impl, create_project_impl, delete_project_impl, editor_open_argv,
-    existing_attachment_paths_impl, fetch_repo_impl, file_diff_impl, forward_message_impl,
-    forward_prompt_impl, get_preferences_impl, get_prompt_source_impl, harness_adapter_for,
-    init_directory_impl, install_status_for_adapter, list_agents_impl, list_mcp_providers_impl,
-    list_message_pins_impl, list_projects_impl, list_prompts_impl, list_tracked_repos_from_inputs,
-    list_workspace_directories_impl, load_project_conversation_impl, load_transcript_impl,
-    migrate_message_pin_impl, open_commit_file_difftool_impl, open_project_impl,
-    open_worktree_file_difftool_impl, parse_uuid, pick_directory_impl,
-    project_session_fingerprints_impl, read_tracked_repo_from_inputs,
-    recheck_harness_installs_impl, remove_agent_impl, remove_directory_impl,
-    remove_mcp_provider_impl, remove_message_pins_impl, remove_queued_message_impl,
-    remove_tracked_repo_impl, rename_agent_impl, rename_project_impl, render_prompt_impl,
-    reorder_agents_impl, reveal_in_finder_argv, search_project_files_in_root,
+    existing_attachment_paths_impl, fetch_repo_impl, file_diff_impl, fork_agent_impl,
+    forward_message_impl, forward_prompt_impl, get_preferences_impl, get_prompt_source_impl,
+    harness_adapter_for, init_directory_impl, install_status_for_adapter, list_agents_impl,
+    list_mcp_providers_impl, list_message_pins_impl, list_projects_impl, list_prompts_impl,
+    list_tracked_repos_from_inputs, list_workspace_directories_impl,
+    load_project_conversation_impl, load_transcript_impl, migrate_message_pin_impl,
+    open_commit_file_difftool_impl, open_project_impl, open_worktree_file_difftool_impl,
+    parse_uuid, pick_directory_impl, project_session_fingerprints_impl,
+    read_tracked_repo_from_inputs, recheck_harness_installs_impl, remove_agent_impl,
+    remove_directory_impl, remove_mcp_provider_impl, remove_message_pins_impl,
+    remove_queued_message_impl, remove_tracked_repo_impl, rename_agent_impl, rename_project_impl,
+    render_prompt_impl, reorder_agents_impl, reveal_in_finder_argv, search_project_files_in_root,
     search_project_files_root_impl, send_message_impl, set_active_project_impl,
     set_agent_effort_impl, set_agent_model_impl, set_message_pin_impl, set_preferences_impl,
     set_project_archived_impl, set_visible_project_impl, sign_in_mcp_provider_impl,
@@ -677,6 +677,20 @@ async fn create_agent(
     create_agent_impl(state.inner(), &name, harness, model, effort).map_err(|e| e.to_string())
 }
 
+/// Branch an agent's conversation into a new one. Registration only — the
+/// caller sends the branch's first message immediately after, which is what
+/// actually materializes it (see `fork_agent_impl`).
+#[tauri::command]
+async fn fork_agent(state: State<'_, AppState>, agent_id: String) -> Result<AgentRecord, String> {
+    let id = parse_uuid(&agent_id).map_err(|e| e.to_string())?;
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default();
+    fork_agent_impl(state.inner(), id, &home)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 async fn set_agent_model(
     state: State<'_, AppState>,
@@ -800,7 +814,10 @@ async fn send_message(
     // necessarily started). The turn's `turn_id` and lifecycle flow over the
     // per-agent event channel; the correlated `TurnStart` carries this
     // `message_id`, and a pre-`TurnStart` failure surfaces as `MessageFailed`.
-    let message_id = send_message_impl(state.inner(), id, &prompt, attachments, sid)
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default();
+    let message_id = send_message_impl(state.inner(), id, &prompt, attachments, sid, &home)
         .await
         .map_err(|e| e.to_string())?;
     // Only after the send is *accepted*: asking permission for a dispatch that
@@ -1198,8 +1215,18 @@ async fn invoke_workflow(
     forward_sources: std::collections::BTreeMap<String, Vec<switchboard_core::AgentId>>,
 ) -> Result<String, String> {
     let effective = merge_workflow_forwards(state.inner(), &inputs, &forward_sources).await?;
-    let run_id = invoke_workflow_impl(state.inner(), project_id, &name, is_builtin, &effective)
-        .map_err(|e| e.to_string())?;
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default();
+    let run_id = invoke_workflow_impl(
+        state.inner(),
+        project_id,
+        &name,
+        is_builtin,
+        &effective,
+        &home,
+    )
+    .map_err(|e| e.to_string())?;
     request_notification_authorization(state.inner());
     Ok(run_id.to_string())
 }
@@ -1838,6 +1865,7 @@ pub fn run() {
             open_project,
             set_active_project,
             create_agent,
+            fork_agent,
             remove_agent,
             rename_agent,
             set_agent_model,

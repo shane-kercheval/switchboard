@@ -12,7 +12,7 @@ Switchboard is a macOS desktop app for orchestrating multiple AI coding agents (
   - `crates/app/` — Tauri host. Owns Tauri commands, `AppState`, window, `AppHandleEmitter`. `#[tauri::command]` handlers are thin shims over free functions (`*_impl`) in `commands.rs`; tests target the free functions.
   - `crates/core/` — pure-Rust persistence: `Directory`, `Project`, `AgentRecord`, name validation, JSONL/YAML I/O. No Tauri dependency, no async.
   - `crates/harness/` — per-harness adapters (`HarnessAdapter` trait + `ClaudeCodeAdapter`, `CodexAdapter`, `MockHarnessAdapter`), event types, stream parsers, session-file parsers. No Tauri dependency.
-  - `crates/dispatcher/` — `Dispatcher`, `EventEmitter` trait, `AgentIdleGuard`. Drives adapters; owns per-agent in-memory state + `TurnId` generation. No Tauri dependency.
+  - `crates/dispatcher/` — `Dispatcher`, `EventEmitter` trait, per-agent actor tasks. Drives adapters; owns per-agent in-memory state + `TurnId` generation. "One turn in flight per agent" is structural (a single consumer per agent), not a status flag or guard. No Tauri dependency.
 - **Frontend** — Svelte 5 + Vite + TypeScript + Tailwind v4, with shadcn-svelte components. Lives at repo root (`src/`, `index.html`, `vite.config.ts`).
 - **Tauri shell** bridges frontend ↔ Rust via `#[tauri::command]` handlers and per-agent event channels.
 

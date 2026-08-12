@@ -109,6 +109,25 @@ export function agentIsWorking(runtime: AgentRuntime | undefined): boolean {
   );
 }
 
+/// Called when an agent's turn reaches a terminal, with the outcome.
+///
+/// A registered hook rather than a direct call because the dependency runs the
+/// other way: the workspace store imports this module, so this module cannot
+/// import it back. The one consumer is the forked-agent inherited-history
+/// refresh, which needs the *project* conversation merge (not the per-agent
+/// loader) and therefore lives in the workspace store.
+///
+/// Driven from the existing `turn_end` boundary rather than a second `listen`
+/// per agent — that would break the one-listener-per-agent invariant this
+/// module documents.
+type TurnTerminalHook = (agentId: AgentId, outcome: "completed" | "failed" | "cancelled") => void;
+
+let turnTerminalHook: TurnTerminalHook | undefined;
+
+export function setTurnTerminalHook(hook: TurnTerminalHook | undefined): void {
+  turnTerminalHook = hook;
+}
+
 /// Per-agent unlisten functions for the Tauri event channel. Keyed by
 /// `agent_id`. We hold these so the test harness can drain them via
 /// `_testing.reset()`; production callers never unregister.
@@ -207,6 +226,14 @@ export async function hydrateAgent(agentId: AgentId): Promise<void> {
       runtimes[agentId] = { ...after, hydration_status: "failed", hydration_error: message };
     }
   }
+}
+
+/// Re-attempt an agent's event subscription after [`registerAgent`] recorded a
+/// `listener_error`. Idempotent and safe to call repeatedly: `registerAgent`
+/// returns early once the listener is registered, and it never re-creates the
+/// agent — the record was already durable before the first attempt.
+export async function retryAgentSubscription(agent: AgentRecord): Promise<void> {
+  await registerAgent(agent);
 }
 
 /// Re-attempt an agent's hydration after a failure. Clears the sticky
@@ -313,10 +340,34 @@ export async function registerAgent(agent: AgentRecord): Promise<void> {
       }
 
       const channel = `agent:${agent.id}`;
-      const unlisten = await listen<NormalizedEvent>(channel, (event) => {
-        handleEvent(agent.id, event.payload);
-      });
-      listenerRegistry.set(agent.id, unlisten);
+      try {
+        const unlisten = await listen<NormalizedEvent>(channel, (event) => {
+          handleEvent(agent.id, event.payload);
+        });
+        listenerRegistry.set(agent.id, unlisten);
+        const settled = runtimes[agent.id];
+        if (settled?.listener_error !== undefined) {
+          runtimes[agent.id] = { ...settled, listener_error: undefined };
+        }
+      } catch (e) {
+        // **Subscribing is not creating.** By the time this runs the agent is
+        // already durable — `create_agent` / `attach_agent` / `fork_agent` all
+        // append to the registry before returning. Rejecting here would make
+        // every caller treat a committed agent as a failed one: it never reaches
+        // the roster, the user retries, and they end up with two agents while the
+        // first surfaces out of nowhere on the next restart. Record the failure
+        // on the runtime instead and resolve, so callers roster the agent that
+        // exists and the UI can say what is actually wrong.
+        const message = e instanceof Error ? e.message : String(e);
+        console.warn("[switchboard] agent event subscription failed", {
+          agent_id: agent.id,
+          error: e,
+        });
+        const after = runtimes[agent.id];
+        if (after !== undefined) {
+          runtimes[agent.id] = { ...after, listener_error: message };
+        }
+      }
     } finally {
       pendingRegistrations.delete(agent.id);
     }
@@ -654,15 +705,18 @@ function handleEvent(agentId: AgentId, event: NormalizedEvent): void {
   // would break the one-listener-per-agent invariant this module documents.
   if (event.type === "turn_end") {
     const turn = priorTurns.find((t) => t.role === "agent" && t.turn_id === event.turn_id);
-    settleRecipient(
-      turn?.role === "agent" ? (turn.send_id ?? undefined) : undefined,
-      agentId,
+    const outcome =
       event.outcome.status === "cancelled"
         ? "cancelled"
         : event.outcome.status === "failed"
           ? "failed"
-          : "completed",
+          : "completed";
+    settleRecipient(
+      turn?.role === "agent" ? (turn.send_id ?? undefined) : undefined,
+      agentId,
+      outcome,
     );
+    turnTerminalHook?.(agentId, outcome);
   } else if (event.type === "message_failed") {
     settleRecipient(failedSendId, agentId, "failed");
   } else if (event.type === "message_cancelled") {

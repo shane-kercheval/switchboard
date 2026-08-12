@@ -799,7 +799,7 @@ describe("Cmd-held target overlay", () => {
     await fireEvent.keyDown(window, { key: "Meta" });
     expect(screen.queryByTestId("pane-target-overlay")).not.toBeInTheDocument();
 
-    await fireEvent.pointerMove(window);
+    await fireEvent.pointerMove(window, { metaKey: true });
     expect(screen.getByTestId("pane-target-overlay")).toBeInTheDocument();
 
     await fireEvent.keyUp(window, { key: "Meta" });
@@ -821,7 +821,7 @@ describe("Cmd-held target overlay", () => {
     await fireEvent.keyUp(window, { key: "Alt", metaKey: true });
     expect(screen.queryByTestId("pane-target-overlay")).not.toBeInTheDocument();
 
-    await fireEvent.pointerMove(window);
+    await fireEvent.pointerMove(window, { metaKey: true });
     expect(screen.getByTestId("pane-target-overlay")).toBeInTheDocument();
 
     await fireEvent.keyDown(window, { key: "Shift", metaKey: true, shiftKey: true });
@@ -835,19 +835,21 @@ describe("Cmd-held target overlay", () => {
 
     await fireEvent.pointerEnter(paneEls()[0]!);
     await fireEvent.keyDown(window, { key: "Meta" });
-    await fireEvent.pointerMove(window);
+    await fireEvent.pointerMove(window, { metaKey: true });
     expect(screen.getByTestId("pane-target-overlay")).toBeInTheDocument();
 
     await fireEvent.keyDown(window, { key: "c", metaKey: true });
     expect(screen.queryByTestId("pane-target-overlay")).not.toBeInTheDocument();
 
-    await fireEvent.pointerMove(window);
+    // A chord key is down, so this movement must NOT re-arm — the pointer's own
+    // modifier state is what decides, and `c` is not a modifier the overlay wants.
+    await fireEvent.pointerMove(window, { metaKey: true });
     expect(screen.queryByTestId("pane-target-overlay")).not.toBeInTheDocument();
 
     await fireEvent.keyUp(window, { key: "c", metaKey: true });
     expect(screen.queryByTestId("pane-target-overlay")).not.toBeInTheDocument();
 
-    await fireEvent.pointerMove(window);
+    await fireEvent.pointerMove(window, { metaKey: true });
     expect(screen.getByTestId("pane-target-overlay")).toBeInTheDocument();
   });
 
@@ -873,11 +875,11 @@ describe("Cmd-held target overlay", () => {
     const emptyPane = paneEls().find((pane) => pane.dataset.paneId === emptyPaneId);
     if (emptyPane === undefined) throw new Error("expected empty pane");
 
-    await fireEvent.pointerEnter(emptyPane);
+    await fireEvent.pointerEnter(emptyPane, { metaKey: true });
     await fireEvent.keyDown(window, { key: "Meta" });
     expect(screen.queryByTestId("pane-target-overlay")).not.toBeInTheDocument();
 
-    await fireEvent.pointerEnter(paneEls()[0]!);
+    await fireEvent.pointerEnter(paneEls()[0]!, { metaKey: true });
     expect(screen.getByTestId("pane-target-overlay")).toBeInTheDocument();
   });
 
@@ -887,11 +889,36 @@ describe("Cmd-held target overlay", () => {
     renderPanes();
 
     await fireEvent.keyDown(window, { key: "Meta" });
-    await fireEvent.pointerEnter(paneEls()[1]!);
+    await fireEvent.pointerEnter(paneEls()[1]!, { metaKey: true });
     const overlay = screen.getByTestId("pane-target-overlay");
     expect(paneEls()[1]).toContainElement(overlay);
 
     await fireEvent.pointerLeave(paneEls()[1]!);
+    expect(screen.queryByTestId("pane-target-overlay")).not.toBeInTheDocument();
+  });
+
+  it("recovers when the Cmd keyup never arrives", async () => {
+    // Reported symptom: after forking, hovering a pane offered Cmd-click
+    // targeting with no key held, on every pane, permanently. Whatever swallows
+    // the keyup (a remount mid-chord, an OS-level shortcut), the armed state had
+    // no way back — keyup and blur were its only exits, and both had already
+    // been missed. Moving the pointer without Cmd must clear it, because that
+    // event proves Cmd is not down.
+    await seedTwoAgentTranscripts();
+    moveAgentToNewPane(PROJECT_ID, ROSTER_IDS, BOB.id);
+    renderPanes();
+
+    await fireEvent.pointerEnter(paneEls()[0]!);
+    await fireEvent.keyDown(window, { key: "Meta" });
+    await fireEvent.pointerMove(window, { metaKey: true });
+    expect(screen.getByTestId("pane-target-overlay")).toBeInTheDocument();
+
+    // The keyup is lost — no keyUp, no blur.
+    await fireEvent.pointerMove(window);
+    expect(screen.queryByTestId("pane-target-overlay")).not.toBeInTheDocument();
+
+    // And it stays cleared while hovering around, rather than flickering back.
+    await fireEvent.pointerEnter(paneEls()[1]!);
     expect(screen.queryByTestId("pane-target-overlay")).not.toBeInTheDocument();
   });
 
@@ -902,7 +929,7 @@ describe("Cmd-held target overlay", () => {
 
     await fireEvent.pointerEnter(paneEls()[0]!);
     await fireEvent.keyDown(window, { key: "Meta" });
-    await fireEvent.pointerMove(window);
+    await fireEvent.pointerMove(window, { metaKey: true });
     expect(screen.getByTestId("pane-target-overlay")).toBeInTheDocument();
 
     await fireEvent.blur(window);

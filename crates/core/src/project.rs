@@ -438,8 +438,19 @@ impl Project {
         Ok(record)
     }
 
+    /// Load every agent record, **validating cross-field invariants on the way
+    /// in**. See [`AgentRecord::validate`] for why serde alone can't, and
+    /// [`reject_fork_provenance_cycles`] for the one check no single record can
+    /// answer. A registry that contradicts itself fails the load rather than
+    /// yielding a partially-trustworthy roster — matching how a corrupt JSONL
+    /// line is already treated.
     pub fn list_agents(&self) -> Result<Vec<AgentRecord>> {
-        read_jsonl(&self.registry_path)
+        let agents: Vec<AgentRecord> = read_jsonl(&self.registry_path)?;
+        for agent in &agents {
+            agent.validate()?;
+        }
+        reject_fork_provenance_cycles(&agents)?;
+        Ok(agents)
     }
 
     /// Remove an agent from the registry by id, rewriting `registry.jsonl`
@@ -692,6 +703,42 @@ pub(crate) fn load(directory: &Path, id: ProjectId, root: PathBuf) -> Result<Pro
     })
 }
 
+/// Reject a registry whose fork provenance loops back on itself.
+///
+/// Each agent has at most one outgoing edge (`forked_from_session` names the
+/// parent's session), so the graph is a forest unless it is corrupt — walking
+/// from any node either terminates or revisits, and revisiting is the only
+/// failure. Per-record validation cannot see this: every individual record in a
+/// two-agent loop is internally consistent.
+fn reject_fork_provenance_cycles(agents: &[AgentRecord]) -> Result<()> {
+    let by_session: std::collections::HashMap<uuid::Uuid, &AgentRecord> = agents
+        .iter()
+        .filter_map(|a| {
+            a.session_locator
+                .as_ref()
+                .and_then(SessionLocator::as_uuid)
+                .map(|uuid| (uuid, a))
+        })
+        .collect();
+    for start in agents {
+        let mut seen = std::collections::HashSet::new();
+        let mut current = start;
+        while let Some(parent_session) = current.forked_from_session {
+            if !seen.insert(current.id) {
+                return Err(CoreError::ForkProvenanceCycle { agent_id: start.id });
+            }
+            match by_session.get(&parent_session) {
+                Some(parent) => current = parent,
+                // Parent not in this registry (deleted, or another directory):
+                // the chain ends, which is the normal case for an ordinary fork
+                // whose source was removed.
+                None => break,
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Create a new project's on-disk artifacts (config.yaml + empty registry.jsonl).
 /// The caller (`Directory`) is responsible for appending the `ProjectSummary` to
 /// projects.jsonl — and for rolling back the directory if that append fails.
@@ -792,6 +839,83 @@ mod tests {
             "Gemini session_id must be UUID v4, got: {session_id} (version {})",
             session_id.get_version_num()
         );
+    }
+
+    #[test]
+    fn a_registry_record_contradicting_its_harness_fails_the_load() {
+        // Serde checks fields in isolation, so a hand-edited or corrupted line
+        // can pair fork provenance with a harness that cannot fork. That is not
+        // inert: the harness-agnostic dispatch gates read the field for every
+        // agent and would treat this record as a branch waiting to materialize.
+        let (_tmp, project) = fresh_project();
+        let claude = project
+            .register_agent("alice", HarnessKind::ClaudeCode, None, None)
+            .unwrap();
+        let mut codex = project
+            .register_agent("bob", HarnessKind::Codex, None, None)
+            .unwrap();
+        codex.forked_from_session = Some(uuid::Uuid::now_v7());
+        crate::io::write_jsonl(&project.registry_path, &[claude, codex]).unwrap();
+
+        let err = project
+            .list_agents()
+            .expect_err("a record contradicting its own harness must not load");
+        assert!(
+            matches!(err, CoreError::SessionForkUnsupported { .. }),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn fork_provenance_that_loops_fails_the_load() {
+        // Two agents naming each other's sessions. Every record is individually
+        // consistent, so only a whole-set pass can see it — and it matters
+        // because the materializing-fork gate asks each agent's actor whether
+        // its parent is mid-turn, so a loop deadlocks both.
+        let (_tmp, project) = fresh_project();
+        let mut a = project
+            .register_agent("alice", HarnessKind::ClaudeCode, None, None)
+            .unwrap();
+        let mut b = project
+            .register_agent("bob", HarnessKind::ClaudeCode, None, None)
+            .unwrap();
+        let a_session = a
+            .session_locator
+            .as_ref()
+            .and_then(SessionLocator::as_uuid)
+            .unwrap();
+        let b_session = b
+            .session_locator
+            .as_ref()
+            .and_then(SessionLocator::as_uuid)
+            .unwrap();
+        a.forked_from_session = Some(b_session);
+        b.forked_from_session = Some(a_session);
+        crate::io::write_jsonl(&project.registry_path, &[a, b]).unwrap();
+
+        let err = project
+            .list_agents()
+            .expect_err("a provenance cycle must not load");
+        assert!(
+            matches!(err, CoreError::ForkProvenanceCycle { .. }),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_fork_chain_still_loads() {
+        // The check must not mistake a legitimate chain for a cycle: a fork of a
+        // fork walks two edges and terminates.
+        let (_tmp, project) = fresh_project();
+        let parent = project
+            .register_agent("alice", HarnessKind::ClaudeCode, None, None)
+            .unwrap();
+        let child = project.fork_agent(parent.id).unwrap();
+        let grandchild = project.fork_agent(child.id).unwrap();
+
+        let loaded = project.list_agents().expect("a fork chain is not a cycle");
+        assert_eq!(loaded.len(), 3);
+        assert!(loaded.iter().any(|a| a.id == grandchild.id));
     }
 
     #[test]

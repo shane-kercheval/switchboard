@@ -101,6 +101,23 @@ pub enum CoreError {
         harness: crate::harness::HarnessKind,
     },
 
+    /// Fork provenance forms a loop: following `forked_from_session` from this
+    /// agent leads back to it. Unreachable through any supported path — a fork's
+    /// parent always predates it — so this means the registry was edited or
+    /// corrupted.
+    ///
+    /// Rejected at **load**, not merely ignored, because a cycle is not
+    /// cosmetic: the materializing-fork gate asks each agent's own actor whether
+    /// its parent is mid-turn, so a loop makes two actors wait on each other's
+    /// reply and neither can answer. The single-agent case is caught earlier, at
+    /// the gate; longer loops can only be caught here, where the whole set is
+    /// visible at once.
+    #[error(
+        "agent {agent_id}'s fork provenance forms a cycle — the registry is \
+         inconsistent and cannot be loaded safely"
+    )]
+    ForkProvenanceCycle { agent_id: uuid::Uuid },
+
     /// The source agent carries no session id to branch from. Distinct from
     /// [`Self::SessionForkUnsupported`]: that harness can never fork; this one
     /// could, but this record has nothing to fork *from*.

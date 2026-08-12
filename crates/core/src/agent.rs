@@ -167,14 +167,11 @@ pub struct AgentRecord {
     /// widening or overloading of this one.
     ///
     /// Only harnesses where [`HarnessKind::supports_session_fork`] holds ever
-    /// carry `Some` — **enforced when writing**, at the registration chokepoint
-    /// (`Project::register_agent_inner`), and not re-checked when reading. A
-    /// registry line that was hand-edited or corrupted can therefore load with
-    /// this set on a non-forkable harness; deserialization validates each field
-    /// in isolation and cannot compare this one against `harness`. Closing that
-    /// wants a record-level validation pass covering the other cross-field
-    /// claims too (locator shape vs. harness, and the `model` / `effort`
-    /// capability claims above), not a one-off hook here.
+    /// carry `Some` — enforced when writing, at the registration chokepoint
+    /// (`Project::register_agent_inner`), and re-checked when reading by
+    /// [`AgentRecord::validate`], which `Project::list_agents` runs over every
+    /// record. Serde alone cannot do this: it validates each field in isolation
+    /// and cannot compare one against `harness`.
     ///
     /// So: the Codex/Gemini/Antigravity **adapters** ignore this field, and are
     /// correct to — their `build_args` never reads it. Do not add "defensive"
@@ -192,6 +189,54 @@ pub struct AgentRecord {
     /// and must load as `None`.
     pub forked_from_session: Option<Uuid>,
     pub created_at: DateTime<Utc>,
+}
+
+impl AgentRecord {
+    /// Re-check, on **read**, the cross-field invariants the registration
+    /// chokepoint enforces on write.
+    ///
+    /// Serde validates one field at a time and cannot compare a field against
+    /// `harness`, so a hand-edited or corrupted `registry.jsonl` can produce
+    /// records the writer would have refused: a Codex agent carrying fork
+    /// provenance, a locator of the wrong shape for its harness, a model on a
+    /// harness with no model axis. None of those are inert — the harness-agnostic
+    /// dispatch gates read fork provenance for every agent regardless of harness,
+    /// and would treat such a record as a branch waiting to materialize.
+    ///
+    /// **Fails the whole load**, matching how this file already treats a corrupt
+    /// line (`CoreError::CorruptJsonl`) and how `session_locator`'s own
+    /// deserializer treats a missing key: a registry that contradicts itself is
+    /// not partially usable, and silently dropping the offending agent would look
+    /// to the user exactly like the data loss we are trying to make visible.
+    pub fn validate(&self) -> crate::error::Result<()> {
+        use crate::error::CoreError;
+        if let Some(locator) = &self.session_locator
+            && !locator.is_valid_for(self.harness)
+        {
+            return Err(CoreError::SessionLocatorHarnessMismatch {
+                agent_id: self.id,
+                harness: self.harness,
+            });
+        }
+        if self.forked_from_session.is_some() && !self.harness.supports_session_fork() {
+            return Err(CoreError::SessionForkUnsupported {
+                harness: self.harness,
+            });
+        }
+        if self.model.is_some() && !self.harness.supports_model_selection() {
+            return Err(CoreError::SelectionUnsupported {
+                harness: self.harness,
+                axis: crate::harness::SelectionAxis::Model,
+            });
+        }
+        if self.effort.is_some() && !self.harness.supports_effort_selection() {
+            return Err(CoreError::SelectionUnsupported {
+                harness: self.harness,
+                axis: crate::harness::SelectionAxis::Effort,
+            });
+        }
+        Ok(())
+    }
 }
 
 /// Deserialize `session_locator`, requiring the key to be present (an explicit

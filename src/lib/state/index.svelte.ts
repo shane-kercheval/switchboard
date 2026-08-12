@@ -228,6 +228,14 @@ export async function hydrateAgent(agentId: AgentId): Promise<void> {
   }
 }
 
+/// Re-attempt an agent's event subscription after [`registerAgent`] recorded a
+/// `listener_error`. Idempotent and safe to call repeatedly: `registerAgent`
+/// returns early once the listener is registered, and it never re-creates the
+/// agent — the record was already durable before the first attempt.
+export async function retryAgentSubscription(agent: AgentRecord): Promise<void> {
+  await registerAgent(agent);
+}
+
 /// Re-attempt an agent's hydration after a failure. Clears the sticky
 /// `hydrationAttempted` guard (so `hydrateAgent` actually re-runs) and drops the
 /// prior `hydration_error` (so the UI shows the loading state, not a stale
@@ -332,10 +340,34 @@ export async function registerAgent(agent: AgentRecord): Promise<void> {
       }
 
       const channel = `agent:${agent.id}`;
-      const unlisten = await listen<NormalizedEvent>(channel, (event) => {
-        handleEvent(agent.id, event.payload);
-      });
-      listenerRegistry.set(agent.id, unlisten);
+      try {
+        const unlisten = await listen<NormalizedEvent>(channel, (event) => {
+          handleEvent(agent.id, event.payload);
+        });
+        listenerRegistry.set(agent.id, unlisten);
+        const settled = runtimes[agent.id];
+        if (settled?.listener_error !== undefined) {
+          runtimes[agent.id] = { ...settled, listener_error: undefined };
+        }
+      } catch (e) {
+        // **Subscribing is not creating.** By the time this runs the agent is
+        // already durable — `create_agent` / `attach_agent` / `fork_agent` all
+        // append to the registry before returning. Rejecting here would make
+        // every caller treat a committed agent as a failed one: it never reaches
+        // the roster, the user retries, and they end up with two agents while the
+        // first surfaces out of nowhere on the next restart. Record the failure
+        // on the runtime instead and resolve, so callers roster the agent that
+        // exists and the UI can say what is actually wrong.
+        const message = e instanceof Error ? e.message : String(e);
+        console.warn("[switchboard] agent event subscription failed", {
+          agent_id: agent.id,
+          error: e,
+        });
+        const after = runtimes[agent.id];
+        if (after !== undefined) {
+          runtimes[agent.id] = { ...after, listener_error: message };
+        }
+      }
     } finally {
       pendingRegistrations.delete(agent.id);
     }

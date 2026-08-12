@@ -316,6 +316,14 @@ export type AgentRuntime = {
   /// The rest of the project still renders; the sidebar surfaces this so the
   /// user knows which agent's history is missing and why.
   hydration_error?: string;
+  /// Set when subscribing to this agent's event channel failed. The agent is
+  /// **durably registered** — the backend committed it before the frontend ever
+  /// tried to listen — so the correct response is to show it with this failure
+  /// attached, not to claim creation failed. Distinct from `hydration_error`
+  /// ("couldn't load history") and `last_error` ("a turn errored"): this one
+  /// means the record is real but nothing it says will arrive until the
+  /// subscription is retried. Cleared by a successful re-subscription.
+  listener_error?: string;
   /// Non-blocking parser warnings surfaced by `load_transcript` — stale
   /// Codex sidecar, malformed JSONL lines, etc. Empty / undefined when no
   /// warnings landed. Display-only; never gates sendability or hydration

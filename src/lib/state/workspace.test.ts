@@ -18,11 +18,14 @@ vi.mock("@tauri-apps/api/core", () => ({
 // (the fork-history refresh is driven from the `turn_end` boundary, so a
 // synthetic hook call would test the wiring rather than the behaviour).
 const listeners = new Map<string, (e: { payload: unknown }) => void>();
+/// Default: record the callback and succeed. A test can override this to make a
+/// specific channel's subscription fail.
+const listenMock = vi.fn(async (name: string, cb: (e: { payload: unknown }) => void) => {
+  listeners.set(name, cb);
+  return vi.fn();
+});
 vi.mock("@tauri-apps/api/event", () => ({
-  listen: vi.fn(async (name: string, cb: (e: { payload: unknown }) => void) => {
-    listeners.set(name, cb);
-    return vi.fn();
-  }),
+  listen: (name: string, cb: (e: { payload: unknown }) => void) => listenMock(name, cb),
 }));
 
 function fireTo(channel: string, payload: unknown): void {
@@ -1327,6 +1330,48 @@ describe("forked-agent inherited-history refresh", () => {
     // Both branches read — neither was dropped — and never at the same time.
     expect(filters.length).toBe(2);
     expect(maxConcurrent).toBe(1);
+  });
+
+  it("keeps a fork visible when its event subscription fails, and never re-forks on retry", async () => {
+    // The backend commits the fork before returning, so a subscription failure
+    // afterwards is not a failed creation. Treating it as one hid a durable
+    // agent: the user retried, got a second fork, and the first appeared out of
+    // nowhere on the next restart.
+    const state = await loadAgentState();
+    const ws = await loadWorkspaceState();
+    const parent = agent(AGENT_1, PROJECT_1);
+    ws.agentsByProject[PROJECT_1] = [parent];
+    await state.registerAgent(parent);
+
+    let forkCalls = 0;
+    listenMock.mockImplementation(async (channel: string) => {
+      if (channel === `agent:${FORK_ID}`) throw new Error("channel unavailable");
+      return vi.fn();
+    });
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "fork_agent") {
+        forkCalls += 1;
+        return forkAgent();
+      }
+      return undefined;
+    });
+
+    const fork = await ws.forkAgentIntoOwnPane(AGENT_1);
+
+    // Committed means visible: rostered, with the failure attached rather than
+    // reported as "fork failed".
+    expect(fork.id).toBe(FORK_ID);
+    expect(ws.agentsByProject[PROJECT_1]?.map((a) => a.id)).toContain(FORK_ID);
+    expect(state.runtimes[FORK_ID]?.listener_error).toContain("channel unavailable");
+
+    // Retrying the subscription must not mint a second branch.
+    listenMock.mockImplementation(async (name: string, cb) => {
+      listeners.set(name, cb);
+      return vi.fn();
+    });
+    await state.retryAgentSubscription(fork);
+    expect(forkCalls).toBe(1);
+    expect(state.runtimes[FORK_ID]?.listener_error).toBeUndefined();
   });
 
   it("never fires for a non-fork agent", async () => {

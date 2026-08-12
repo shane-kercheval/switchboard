@@ -21,6 +21,7 @@
     cancelSend,
     getTranscriptRevision,
     retryAgentHydration,
+    retryAgentSubscription,
     runtimes,
     transcripts,
     type Turn,
@@ -133,6 +134,12 @@
   /// agent contributes no turns to anchor against, and "silently missing
   /// history" is the exact trust gap this surface closes.
   const failedAgents = $derived(agents.filter((a) => runtimes[a.id]?.hydration_error != null));
+
+  /// Agents whose event subscription failed. They exist and are durable — the
+  /// backend committed them before the frontend ever subscribed — but nothing
+  /// they say will arrive until the subscription is retried, so a silent agent
+  /// would otherwise look broken for no stated reason.
+  const unsubscribedAgents = $derived(agents.filter((a) => runtimes[a.id]?.listener_error != null));
 
   /// Forked agents whose inherited history hasn't arrived yet — a branch only
   /// materializes as a turn, so between the fork-send and that turn's terminal
@@ -1899,6 +1906,20 @@
           `Couldn't load ${agent.name}'s history`,
           "This agent's history failed to load. The exact error is below — copy it into a bug report.",
           runtimes[agent.id]?.hydration_error ?? "No error detail was reported.",
+        ),
+    )}
+  {/each}
+
+  {#each unsubscribedAgents as agent (agent.id)}
+    {@render failureBanner(
+      "agent-listener-failed",
+      `Not receiving updates from ${agent.name}.`,
+      () => void retryAgentSubscription(agent),
+      () =>
+        openDetails(
+          `Not receiving updates from ${agent.name}`,
+          "This agent exists and its history is intact, but Switchboard couldn't subscribe to its live updates — anything it says won't appear until this succeeds. The exact error is below.",
+          runtimes[agent.id]?.listener_error ?? "No error detail was reported.",
         ),
     )}
   {/each}

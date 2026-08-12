@@ -842,7 +842,7 @@ describe("App", () => {
       ([command, args]) => command === "create_agent" && args?.harness === "claude_code",
     )?.[1];
     expect(claudeArgs).toEqual({
-      name: "sonnet-medium",
+      name: "claude",
       harness: "claude_code",
       model: "sonnet",
       effort: "medium",
@@ -873,7 +873,7 @@ describe("App", () => {
       ([command, args]) => command === "create_agent" && args?.harness === "claude_code",
     )?.[1];
     expect(claudeArgs).toEqual({
-      name: "sonnet-medium",
+      name: "claude",
       harness: "claude_code",
       model: "sonnet",
       effort: "medium",

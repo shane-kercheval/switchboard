@@ -168,6 +168,17 @@ export const SUGGESTED_SECONDARY_PROFILE: Record<HarnessKind, AgentProfile> = {
   antigravity: { model: null, effort: null },
 };
 
+/// A model-derived name stops describing an agent once it can switch between
+/// two profiles. Keep that case stable and harness-shaped instead. This map is
+/// intentionally explicit rather than slugging display labels: agent names are
+/// persisted identifiers, and a future label edit must not rename the default.
+const MULTI_PROFILE_AGENT_NAME: Record<HarnessKind, string> = {
+  claude_code: "claude",
+  codex: "codex",
+  gemini: "gemini",
+  antigravity: "antigravity",
+};
+
 export function primaryProfile(agent: AgentRecord): AgentProfile {
   return { model: agent.model ?? null, effort: agent.effort ?? null };
 }
@@ -186,9 +197,8 @@ export function activeProfile(agent: AgentRecord): AgentProfile {
     : primaryProfile(agent);
 }
 
-/// The auto-derived agent name for a create: named after the model it'll run,
-/// with effort appended where the harness has that axis — so a roster of
-/// auto-created agents reads as `opus-high`, `gpt-5-5-medium`, … at a glance.
+/// The model-derived agent name for a primary-only create, with effort appended
+/// where the harness has that axis (`opus-high`, `gpt-5-5-medium`, …).
 /// Harnesses with no concrete model to name after fall back to the bare harness
 /// name: Antigravity (model is harness-owned) and Gemini left on `auto` (it
 /// picks up whatever model was last used).
@@ -209,4 +219,17 @@ export function defaultAgentName(
   const raw = effort ? `${model}-${effort}` : model;
   const slug = raw.replace(/[^A-Za-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "");
   return slug === "" ? HARNESS_DEFAULT_AGENT_NAME[harness] : slug;
+}
+
+/// The profile-aware create name shared by the dialog and new-project seeding.
+/// A secondary-capable agent uses its short harness name because neither
+/// profile alone describes it.
+export function defaultAgentNameForProfiles(
+  harness: HarnessKind,
+  primary: AgentProfile,
+  secondary: AgentProfile | null,
+): string {
+  return secondary === null
+    ? defaultAgentName(harness, primary.model ?? undefined, primary.effort ?? undefined)
+    : MULTI_PROFILE_AGENT_NAME[harness];
 }

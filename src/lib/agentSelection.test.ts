@@ -9,6 +9,7 @@ import {
   EFFORT_OPTIONS,
   MODEL_OPTIONS,
   defaultAgentName,
+  defaultAgentNameForProfiles,
   effortOptionsFor,
 } from "./agentSelection";
 import { canonicalizeForUniqueness, validateAgentName } from "./agentName";
@@ -121,6 +122,23 @@ describe("defaultAgentName", () => {
     expect(defaultAgentName("gemini", "gemini-2.5-pro", undefined)).toBe("gemini-2-5-pro");
   });
 
+  it("uses the short harness name when a secondary profile is configured", () => {
+    expect(
+      defaultAgentNameForProfiles(
+        "claude_code",
+        { model: "opus", effort: "high" },
+        { model: "sonnet", effort: "medium" },
+      ),
+    ).toBe("claude");
+    expect(
+      defaultAgentNameForProfiles(
+        "codex",
+        { model: "gpt-5.6-sol", effort: "high" },
+        { model: "gpt-5.6-terra", effort: "medium" },
+      ),
+    ).toBe("codex");
+  });
+
   it("falls back to the bare harness name when the model is auto or absent", () => {
     // Gemini left on `auto` (picks up the last-used model) and Antigravity
     // (model is harness-owned) have no concrete model to name after.
@@ -142,6 +160,16 @@ describe("defaultAgentName", () => {
         it(`${harness}: defaultAgentName(${model.value || "∅"}, ${effort.value || "∅"}) is a valid agent name`, () => {
           const name = defaultAgentName(harness, model.value, effort.value);
           expect(validateAgentName(name, [])).toEqual({ ok: true });
+          expect(
+            validateAgentName(
+              defaultAgentNameForProfiles(
+                harness,
+                { model: model.value, effort: effort.value },
+                { model: model.value, effort: effort.value },
+              ),
+              [],
+            ),
+          ).toEqual({ ok: true });
         });
       }
     }

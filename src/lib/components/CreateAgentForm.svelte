@@ -4,7 +4,7 @@
   import type { AgentFormSubmit } from "./CreateAgentForm.types";
   import { harnessUnavailableReason, isHarnessSelectable } from "$lib/harnessAvailability";
   import { ALL_HARNESSES, HARNESS_LABEL } from "$lib/harnessDisplay";
-  import { defaultAgentName } from "$lib/agentSelection";
+  import { defaultAgentName, defaultAgentNameForProfiles } from "$lib/agentSelection";
   import { loadPreferences, preferenceLoadState, preferences } from "$lib/preferences.svelte";
   import { normalizeAgentName, validateAgentName } from "$lib/agentName";
   import Button from "$lib/components/ui/Button.svelte";
@@ -51,7 +51,7 @@
   }: Props = $props();
   let name = $state<string>("");
   /// Set once the user edits the name field, which freezes it: until then the
-  /// name tracks the model/effort/harness selection (see the `$effect` below);
+  /// name tracks the profile/harness selection (see the `$effect` below);
   /// after, the user's value is theirs to keep.
   let nameTouched = $state<boolean>(false);
   let harness = $state<HarnessKind>("claude_code");
@@ -85,7 +85,7 @@
     const defaults = defaultsFor(harness);
     primary = defaults.primary;
     secondary = defaults.secondary;
-    name = defaultAgentName(harness, primary.model ?? undefined, primary.effort ?? undefined);
+    name = defaultAgentNameForProfiles(harness, primary, secondary);
     defaultsInitialized = true;
   }
 
@@ -98,16 +98,16 @@
   });
 
   /// Keep the name in lock-step with the current selection while the user
-  /// hasn't taken it over. In create mode it tracks the model/effort the new
-  /// agent will run (`opus-high`, `gpt-5-5-medium`, …); attach keeps the bare
-  /// harness name — it inherits an existing session and pins nothing, so naming
-  /// it after a picker value would mislabel it. Writing `name` here is safe — the
-  /// effect never reads it, so there's no reactive loop.
+  /// hasn't taken it over. A primary-only create tracks model/effort; enabling
+  /// Secondary switches to the harness name because either profile may run.
+  /// Attach keeps the bare harness name because it inherits an existing session
+  /// and pins nothing. Writing `name` here is safe — the effect never reads it,
+  /// so there's no reactive loop.
   $effect(() => {
     const auto =
       mode === "attach"
         ? defaultAgentName(harness, undefined, undefined)
-        : defaultAgentName(harness, primary.model ?? undefined, primary.effort ?? undefined);
+        : defaultAgentNameForProfiles(harness, primary, secondary);
     if (!nameTouched) name = auto;
   });
 

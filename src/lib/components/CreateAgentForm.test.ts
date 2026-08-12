@@ -97,7 +97,7 @@ describe("CreateAgentForm", () => {
 
     await waitFor(() => expect(pickerValue("model-select")).toBe("sonnet"));
     expect(pickerValue("effort-select")).toBe("medium");
-    expect(screen.getByTestId("agent-name")).toHaveValue("sonnet-medium");
+    expect(screen.getByTestId("agent-name")).toHaveValue("claude");
   });
 
   it("create mode + Claude default: submits {mode:create, harness:claude_code}", async () => {
@@ -127,7 +127,7 @@ describe("CreateAgentForm", () => {
 
     expect(onSubmit).toHaveBeenCalledExactlyOnceWith({
       mode: "create",
-      name: "sonnet-medium",
+      name: "claude",
       harness: "claude_code",
       primary: { model: "sonnet", effort: "medium" },
       secondary: { model: "haiku", effort: "low" },
@@ -715,6 +715,18 @@ describe("CreateAgentForm", () => {
     expect(nameInput.value).toBe("sonnet-low");
   });
 
+  it("create: Secondary switches the untouched auto-name to the harness and back", async () => {
+    renderForm();
+    const nameInput = screen.getByTestId("agent-name") as HTMLInputElement;
+    expect(nameInput.value).toBe("opus-high");
+
+    await fireEvent.click(screen.getByTestId("create-profile-secondary-toggle"));
+    expect(nameInput.value).toBe("claude");
+
+    await fireEvent.click(screen.getByTestId("create-profile-secondary-toggle"));
+    expect(nameInput.value).toBe("opus-high");
+  });
+
   it("create: switching harness re-derives the auto-name (incl. bare-name harnesses)", async () => {
     renderForm();
     const nameInput = screen.getByTestId("agent-name") as HTMLInputElement;
@@ -732,6 +744,8 @@ describe("CreateAgentForm", () => {
     await fireEvent.input(nameInput, { target: { value: "my-thing" } });
     // Neither a picker change nor a harness switch overrides the user's name.
     await choosePicker("model-select", "sonnet");
+    expect(nameInput.value).toBe("my-thing");
+    await fireEvent.click(screen.getByTestId("create-profile-secondary-toggle"));
     expect(nameInput.value).toBe("my-thing");
     await fireEvent.click(screen.getByTestId("harness-codex"));
     expect(nameInput.value).toBe("my-thing");

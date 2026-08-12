@@ -47,7 +47,7 @@ import { tick, untrack } from "svelte";
 import { SvelteSet } from "svelte/reactivity";
 import { harnessAvailability, settledHarnessAvailability } from "$lib/harnessAvailability.svelte";
 import { AUTO_SEED_ON_NEW_PROJECT } from "$lib/harnessDisplay";
-import { defaultAgentName } from "$lib/agentSelection";
+import { defaultAgentNameForProfiles } from "$lib/agentSelection";
 import { loadPreferences, preferences } from "$lib/preferences.svelte";
 import {
   compareIsoTimestampsDescending,
@@ -485,7 +485,7 @@ async function seedAgentsForInstalledHarnesses(projectId: ProjectId): Promise<vo
       const model = defaults.primary.model ?? undefined;
       const effort = defaults.primary.effort ?? undefined;
       const agent = await api.createAgent(
-        defaultAgentName(harness, model, effort),
+        defaultAgentNameForProfiles(harness, defaults.primary, defaults.secondary),
         harness,
         model,
         effort,

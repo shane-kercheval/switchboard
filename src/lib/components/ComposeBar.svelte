@@ -86,7 +86,7 @@
   import HarnessIcon from "$lib/components/ui/HarnessIcon.svelte";
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
   import ClearIcon from "$lib/components/ui/ClearIcon.svelte";
-  import { ICON_BUTTON_CLASS } from "$lib/components/ui/iconButton";
+  import { COMPOSER_ACTION_BUTTON_CLASS, ICON_BUTTON_CLASS } from "$lib/components/ui/iconButton";
   import PromptMenu from "$lib/components/PromptMenu.svelte";
   import PromptComposer from "$lib/components/PromptComposer.svelte";
   import WorkflowMenu from "$lib/components/WorkflowMenu.svelte";
@@ -411,9 +411,11 @@
   // The resolved invocation form for the picked workflow (declared inputs +
   // auto-derived prompt-argument fields + compatibility). Fetched per-pick via
   // `describe_workflow_form`; re-fetched on `prompts:synced` so a cold MCP cache
-  // resolves. Null until the first fetch settles.
+  // resolves. Null while the initial fetch is pending or has failed; those two
+  // states render explicitly rather than falling through to plain compose.
   let workflowForm = $state<WorkflowFormDescriptor | null>(null);
   let workflowFormLoading = $state(false);
+  let workflowFormError = $state<string | null>(null);
   // Monotonic token: each pick/re-fetch bumps it; a fetch ignores its reply if a
   // newer one superseded it (name alone isn't a workflow's identity — a built-in
   // and a same-named copied user workflow share a name).
@@ -931,11 +933,6 @@
   /// *only* fork surface the user can reach, so the reason has to exist as real
   /// copy rather than as a comment. Silence there would swallow the keystroke.
   ///
-  /// Separate from [`forkBlock`] because the two answer questions on different
-  /// clocks. Busy-ness flips the instant *this* send starts, with the pointer
-  /// still on the button; the shape only changes when the user changes the
-  /// selection. The button reserves its split footprint on the shape, so the
-  /// transition into a cancel can't narrow the control under the cursor.
   const forkShapeBlock = $derived.by((): string | null => {
     // A workflow is N sends; "which one branches?" has no answer.
     if (mode === "workflow") return "Fork isn't available while composing a workflow.";
@@ -965,8 +962,6 @@
     }
     return null;
   });
-
-  const forkShapeAvailable = $derived(forkShapeBlock === null);
 
   /// Why a fork can't be taken right now, or `null` when it can. Probe-measured:
   /// a branch taken mid-turn inherits a synthesized "No response requested."
@@ -1665,6 +1660,7 @@
   function pickWorkflow(workflow: WorkflowListing): void {
     selectedWorkflow = workflow;
     workflowForm = null;
+    workflowFormError = null;
     workflowInputs = {};
     workflowForwardSources = {};
     workflowSyncSettled = false;
@@ -1682,11 +1678,13 @@
   /// identity fields.
   async function loadWorkflowForm(workflow: WorkflowListing): Promise<void> {
     const gen = ++workflowFormGen;
+    if (workflowForm === null) workflowFormError = null;
     workflowFormLoading = true;
     try {
       const form = await api.describeWorkflowForm(workflow.name, workflow.is_builtin);
       if (gen !== workflowFormGen) return; // superseded by a newer pick/re-fetch
       workflowForm = form;
+      workflowFormError = null;
       const seeded: Record<string, WorkflowInputValue> = { ...workflowInputs };
       for (const input of form.inputs) {
         if (input.name in seeded) continue;
@@ -1698,7 +1696,9 @@
       workflowInputs = seeded;
     } catch (err) {
       if (gen === workflowFormGen) {
-        showError(`Couldn't load workflow: ${err instanceof Error ? err.message : String(err)}`);
+        const message = err instanceof Error ? err.message : String(err);
+        if (workflowForm === null) workflowFormError = message;
+        else showError(`Couldn't refresh workflow: ${message}`);
       }
     } finally {
       if (gen === workflowFormGen) workflowFormLoading = false;
@@ -1710,10 +1710,16 @@
     selectedWorkflow = null;
     workflowForm = null;
     workflowFormLoading = false;
+    workflowFormError = null;
     workflowInputs = {};
     workflowForwardSources = {};
     workflowSyncSettled = false;
     workflowFormGen++; // invalidate any in-flight fetch for the removed workflow
+  }
+
+  function retryWorkflowForm(): void {
+    if (selectedWorkflow === null || workflowFormLoading) return;
+    void loadWorkflowForm(selectedWorkflow);
   }
 
   async function copyWorkflow(workflow: WorkflowListing): Promise<void> {
@@ -3171,41 +3177,46 @@
           {/each}
         </div>
       {/if}
-      {#if mode === "plain" && forwardSources.length > 0}
-        <!-- Plain-mode only: prompt mode forwards per-field, and workflow mode
-           routes via its agent inputs, so the message-level forward set doesn't
-           apply and is hidden in both (its state is preserved for restore when
-           the prompt/workflow is removed). -->
-        <div class="mb-1.5 flex flex-wrap items-center gap-1.5" data-testid="forward-source-chips">
-          <span class="text-muted text-xs">Forwarding from</span>
-          {#each forwardSources as source (forwardSourceKey(source))}
-            <ForwardSourceChip
-              {source}
-              readiness={agentReadiness(source.id)}
-              disabled={composerBusy}
-              onRemove={() => removeForwardSource(forwardSourceKey(source))}
-            />
-          {/each}
-          {#if forwardSources.length > 1}
-            <!-- Each chip carries its own ✕; the bulk clear (same ⊘ glyph as
-                 "Clear recipients") only earns its place once there are several to
-                 drop at once. -->
-            <button
-              type="button"
-              class={cn(ICON_BUTTON_CLASS, "ml-0.5 shrink-0 disabled:opacity-50")}
-              data-testid="forward-sources-clear"
-              aria-label="Clear forward sources"
-              title="Clear forward sources"
-              disabled={composerBusy}
-              onclick={() => {
-                if (!composerBusy) forwardSources = [];
-              }}
-            >
-              <ClearIcon />
-            </button>
-          {/if}
-        </div>
-      {/if}
+      {#snippet forwardSourceChips()}
+        {#if forwardSources.length > 0}
+          <!-- Plain-mode only: prompt mode forwards per-field, and workflow mode
+             routes via its agent inputs, so the message-level forward set doesn't
+             apply and is hidden in both (its state is preserved for restore when
+             the prompt/workflow is removed). -->
+          <div
+            class="mb-1.5 flex flex-wrap items-center gap-1.5"
+            data-testid="forward-source-chips"
+          >
+            <span class="text-muted text-xs">Forwarding from</span>
+            {#each forwardSources as source (forwardSourceKey(source))}
+              <ForwardSourceChip
+                {source}
+                readiness={agentReadiness(source.id)}
+                disabled={composerBusy}
+                onRemove={() => removeForwardSource(forwardSourceKey(source))}
+              />
+            {/each}
+            {#if forwardSources.length > 1}
+              <!-- Each chip carries its own ✕; the bulk clear (same ⊘ glyph as
+                   "Clear recipients") only earns its place once there are several to
+                   drop at once. -->
+              <button
+                type="button"
+                class={cn(ICON_BUTTON_CLASS, "ml-0.5 shrink-0 disabled:opacity-50")}
+                data-testid="forward-sources-clear"
+                aria-label="Clear forward sources"
+                title="Clear forward sources"
+                disabled={composerBusy}
+                onclick={() => {
+                  if (!composerBusy) forwardSources = [];
+                }}
+              >
+                <ClearIcon />
+              </button>
+            {/if}
+          </div>
+        {/if}
+      {/snippet}
       {#snippet recipientChips()}
         {#if agents.length > 1}
           <div class="flex flex-wrap items-center gap-1.5 text-xs" data-testid="recipient-field">
@@ -3305,143 +3316,48 @@
         {/if}
       {/snippet}
 
-      {#if mode === "plain"}
-        <!-- Plain mode owns the To row + the message-level entry points. In prompt
-           mode the To row is handed to the composer (so the prompt name titles
-           the whole thing, above the recipients); workflow mode routes via its
-           own agent inputs, so neither shows. -->
-        <div class="mb-1.5 flex items-start justify-between gap-2">
-          <div class="min-w-0">{@render recipientChips()}</div>
-          <div class="flex shrink-0 items-center gap-1">
-            <ForwardSourcePicker
-              {agents}
-              panes={paneLayout.panes}
-              onPickAgent={(agent) => addForwardSource(forwardSourceForAgent(agent))}
-              onPickPane={(pane) => addPaneForwardSources(pane)}
-              {agentReadiness}
-              disabled={composerBusy}
-              showPaneShortcuts
-              triggerTestid="compose-forward-button"
-              triggerText="Forward"
-              triggerLabel="Forward an agent's output"
-              tooltipLabel="Forward an agent's output"
-              triggerClass={cn(
-                "text-muted hover:text-fg hover:bg-panel focus-visible:ring-focus flex h-6 items-center gap-1 rounded-full border border-transparent px-2 text-xs transition-colors focus-visible:ring-1 focus-visible:outline-none",
-                composerBusy ? "cursor-not-allowed opacity-60" : "",
-              )}
-            />
-            <Tooltip label="Insert a prompt" shortcut={shortcut("/")}>
-              {#snippet trigger(props)}
-                <button
-                  {...props}
-                  type="button"
-                  class={cn(
-                    "text-muted hover:text-fg hover:bg-panel focus-visible:ring-focus flex h-6 items-center gap-1 rounded-full border border-transparent px-2 text-xs transition-colors focus-visible:ring-1 focus-visible:outline-none",
-                    composerBusy ? "cursor-not-allowed opacity-60" : "",
-                  )}
-                  data-testid="compose-prompt-button"
-                  aria-label="Insert a prompt"
-                  disabled={composerBusy}
-                  onclick={() => {
-                    if (composerBusy) return;
-                    if (promptMenuOpen) {
-                      promptMenuOpen = false;
-                    } else {
-                      openPromptMenu();
-                    }
-                  }}
-                >
-                  <svg
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    stroke-width="2"
-                    stroke-linecap="round"
-                    class="h-4 w-4"
-                    aria-hidden="true"
-                  >
-                    <path d="M12 5v14M5 12h14" />
-                  </svg>
-                  Prompt
-                </button>
-              {/snippet}
-            </Tooltip>
-            <Tooltip label="Run a workflow">
-              {#snippet trigger(props)}
-                <button
-                  {...props}
-                  type="button"
-                  class={cn(
-                    "text-muted hover:text-fg hover:bg-panel focus-visible:ring-focus flex h-6 items-center gap-1 rounded-full border border-transparent px-2 text-xs transition-colors focus-visible:ring-1 focus-visible:outline-none",
-                    composerBusy ? "cursor-not-allowed opacity-60" : "",
-                  )}
-                  data-testid="compose-workflow-button"
-                  aria-label="Run a workflow"
-                  disabled={composerBusy}
-                  onclick={() => {
-                    if (composerBusy) return;
-                    if (workflowMenuOpen) {
-                      workflowMenuOpen = false;
-                    } else {
-                      openWorkflowMenu();
-                    }
-                  }}
-                >
-                  <svg
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    stroke-width="2"
-                    stroke-linecap="round"
-                    class="h-4 w-4"
-                    aria-hidden="true"
-                  >
-                    <path d="M12 5v14M5 12h14" />
-                  </svg>
-                  Workflow
-                </button>
-              {/snippet}
-            </Tooltip>
-          </div>
-        </div>
-      {/if}
-
-      {#if attachmentChips.length > 0}
-        <div class="mb-1.5 flex flex-wrap gap-1.5" data-testid="attachment-chips">
-          {#each attachmentChips as chip (chip.id)}
-            <span
-              class="border-border bg-panel text-fg inline-flex max-w-[14rem] items-center gap-1.5 rounded-full border py-px pr-1 pl-2 text-xs"
-              data-testid={`attachment-chip-${chip.label}`}
-              data-kind={chip.kind}
-            >
+      {#snippet attachmentChipRow()}
+        {#if attachmentChips.length > 0}
+          <div class="mb-1.5 flex flex-wrap gap-1.5" data-testid="attachment-chips">
+            {#each attachmentChips as chip (chip.id)}
               <span
-                class="text-muted shrink-0 font-mono text-[10px] whitespace-nowrap"
-                aria-hidden="true">{chip.label}</span
+                class="border-border bg-panel text-fg inline-flex max-w-[14rem] items-center gap-1.5 rounded-full border py-px pr-1 pl-2 text-xs"
+                data-testid={`attachment-chip-${chip.label}`}
+                data-kind={chip.kind}
               >
-              <span class="truncate" title={chip.original_name}>{chip.original_name}</span>
-              <button
-                type="button"
-                class="text-muted hover:text-fg hover:bg-control-hover flex h-4 w-4 shrink-0 items-center justify-center rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-50"
-                data-testid={`attachment-chip-remove-${chip.label}`}
-                aria-label={`Remove ${chip.original_name}`}
-                disabled={composerBusy}
-                onclick={() => removeAttachmentChip(chip.id)}
-              >
-                <svg
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  stroke-width="2"
-                  stroke-linecap="round"
-                  class="h-3 w-3"
-                  aria-hidden="true"
+                <span
+                  class="text-muted shrink-0 font-mono text-[10px] whitespace-nowrap"
+                  aria-hidden="true">{chip.label}</span
                 >
-                  <path d="m6 6 12 12M18 6 6 18" />
-                </svg>
-              </button>
-            </span>
-          {/each}
-        </div>
+                <span class="truncate" title={chip.original_name}>{chip.original_name}</span>
+                <button
+                  type="button"
+                  class="text-muted hover:text-fg hover:bg-control-hover flex h-4 w-4 shrink-0 items-center justify-center rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-50"
+                  data-testid={`attachment-chip-remove-${chip.label}`}
+                  aria-label={`Remove ${chip.original_name}`}
+                  disabled={composerBusy}
+                  onclick={() => removeAttachmentChip(chip.id)}
+                >
+                  <svg
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2"
+                    stroke-linecap="round"
+                    class="h-3 w-3"
+                    aria-hidden="true"
+                  >
+                    <path d="m6 6 12 12M18 6 6 18" />
+                  </svg>
+                </button>
+              </span>
+            {/each}
+          </div>
+        {/if}
+      {/snippet}
+
+      {#if mode !== "plain"}
+        {@render attachmentChipRow()}
       {/if}
 
       {#if restoring && workflowRestoreFailed}
@@ -3482,6 +3398,39 @@
         >
           <Spinner class="h-4 w-4" />
           Restoring {pendingWorkflowRestore !== null ? "workflow" : "prompt"}…
+        </div>
+      {:else if mode === "workflow" && workflowForm === null}
+        <div
+          class="flex min-h-16 items-center gap-3 px-1 text-sm"
+          data-testid={workflowFormError === null
+            ? "compose-workflow-loading"
+            : "compose-workflow-load-failed"}
+        >
+          {#if workflowFormError === null}
+            <Spinner class="h-4 w-4 shrink-0" />
+            <span class="text-muted">Loading {selectedWorkflow?.name ?? "workflow"}…</span>
+          {:else}
+            <div class="min-w-0 flex-1">
+              <p class="text-fg">Couldn't load {selectedWorkflow?.name ?? "the workflow"}.</p>
+              <p class="text-status-failed mt-0.5 truncate text-xs">{workflowFormError}</p>
+            </div>
+            <Button
+              size="sm"
+              variant="secondary"
+              data-testid="workflow-form-retry"
+              onclick={retryWorkflowForm}
+            >
+              Retry
+            </Button>
+            <Button
+              size="sm"
+              variant="ghost"
+              data-testid="workflow-form-start-over"
+              onclick={removeWorkflow}
+            >
+              Start over
+            </Button>
+          {/if}
         </div>
       {:else if mode === "workflow" && workflowForm !== null}
         <!-- Workflow mode: the invocation form spans the compose area. The compose
@@ -3529,21 +3478,128 @@
           busy={composerBusy}
           send={sendButton}
         />
-      {:else}
-        <div class="relative flex items-end gap-2">
-          <Textarea
-            autosize
-            data-testid="compose-textarea"
-            data-shortcut-scope="composer"
-            placeholder="Type a message…  (⌘+Enter to send, @ to add a recipient or forward source, / for a prompt)"
-            rows={3}
-            bind:ref={textareaEl}
-            bind:value={draft}
-            oninput={onInput}
-            onkeydown={handleKey}
-            class="max-h-48 min-h-16 border-0 bg-transparent p-1 shadow-none focus-visible:ring-0"
-          />
-          {@render sendButton()}
+      {:else if mode === "plain"}
+        <div class="relative flex items-stretch gap-2">
+          <div class="min-w-0 flex-1">
+            {@render forwardSourceChips()}
+            <!-- Plain mode owns the To row + the message-level entry points. In
+                 prompt mode the To row is handed to the composer; workflow mode
+                 routes through its own agent inputs. -->
+            <div class="mb-1.5 min-w-0">{@render recipientChips()}</div>
+            {@render attachmentChipRow()}
+            <Textarea
+              autosize
+              data-testid="compose-textarea"
+              data-shortcut-scope="composer"
+              placeholder="Type a message…  (⌘+Enter to send, @ to add a recipient or forward source, / for a prompt)"
+              rows={3}
+              bind:ref={textareaEl}
+              bind:value={draft}
+              oninput={onInput}
+              onkeydown={handleKey}
+              class="max-h-48 min-h-16 border-0 bg-transparent p-1 shadow-none focus-visible:ring-0"
+            />
+          </div>
+          <div
+            class="-mt-0.5 flex shrink-0 flex-col items-end gap-0.5"
+            data-testid="compose-action-rail"
+          >
+            <ForwardSourcePicker
+              {agents}
+              panes={paneLayout.panes}
+              onPickAgent={(agent) => addForwardSource(forwardSourceForAgent(agent))}
+              onPickPane={(pane) => addPaneForwardSources(pane)}
+              {agentReadiness}
+              disabled={composerBusy}
+              showPaneShortcuts
+              triggerTestid="compose-forward-button"
+              triggerLabel="Forward an agent's output"
+              tooltipLabel="Forward an agent's output"
+              tooltipDisableHoverableContent
+              triggerClass={cn(
+                COMPOSER_ACTION_BUTTON_CLASS,
+                composerBusy ? "cursor-not-allowed opacity-60" : "",
+              )}
+            />
+            <Tooltip label="Insert a prompt" shortcut={shortcut("/")} disableHoverableContent>
+              {#snippet trigger(props)}
+                <button
+                  {...props}
+                  type="button"
+                  class={cn(
+                    COMPOSER_ACTION_BUTTON_CLASS,
+                    composerBusy ? "cursor-not-allowed opacity-60" : "",
+                  )}
+                  data-testid="compose-prompt-button"
+                  aria-label="Insert a prompt"
+                  disabled={composerBusy}
+                  onclick={() => {
+                    if (composerBusy) return;
+                    if (promptMenuOpen) {
+                      promptMenuOpen = false;
+                    } else {
+                      openPromptMenu();
+                    }
+                  }}
+                >
+                  <svg
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="1.8"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    class="h-4 w-4"
+                    aria-hidden="true"
+                  >
+                    <path d="M6 3h9l3 3v15H6z" />
+                    <path d="M15 3v4h4" />
+                    <path d="M9 11h6M9 15h6" />
+                  </svg>
+                </button>
+              {/snippet}
+            </Tooltip>
+            <Tooltip label="Run a workflow" disableHoverableContent>
+              {#snippet trigger(props)}
+                <button
+                  {...props}
+                  type="button"
+                  class={cn(
+                    COMPOSER_ACTION_BUTTON_CLASS,
+                    composerBusy ? "cursor-not-allowed opacity-60" : "",
+                  )}
+                  data-testid="compose-workflow-button"
+                  aria-label="Run a workflow"
+                  disabled={composerBusy}
+                  onclick={() => {
+                    if (composerBusy) return;
+                    if (workflowMenuOpen) {
+                      workflowMenuOpen = false;
+                    } else {
+                      openWorkflowMenu();
+                    }
+                  }}
+                >
+                  <svg
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="1.8"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    class="h-4 w-4"
+                    aria-hidden="true"
+                  >
+                    <circle cx="6" cy="6" r="2" />
+                    <circle cx="18" cy="6" r="2" />
+                    <circle cx="18" cy="18" r="2" />
+                    <path d="M8 6h5a5 5 0 0 1 5 5v5" />
+                  </svg>
+                </button>
+              {/snippet}
+            </Tooltip>
+            <div class="mt-auto">{@render sendButton()}</div>
+          </div>
         </div>
       {/if}
     </div>
@@ -3611,12 +3667,8 @@
      kind of message this is. As the second half it also costs no vertical space
      in a bar that has little, and no horizontal space in the row the recipient
      chips grow into.
-     The halves keep a **constant combined width** across the send→in-flight
-     transition: the button turns into a cancel the instant a send starts, which
-     happens with the pointer still on it, and a control that narrows under the
-     cursor invites cancelling a send you meant to fork. Availability changes
-     (selecting a second recipient, say) are user-initiated with the pointer
-     elsewhere, so the width may change there. -->
+     In flight, the split control returns to the standard circular Stop button;
+     there is no Fork action available while a turn is running. -->
 {#snippet sendButton()}
   {@const forkVisible = forkAvailable && !showStop}
   <!-- The pill (shape + base fill) is the container; the halves are transparent
@@ -3633,17 +3685,13 @@
         : sendDisabled
           ? "bg-active text-muted/50"
           : "bg-primary text-primary-fg",
-      // The in-flight cancel keeps the split's footprint (see above) without
-      // rendering a half that would cancel-vs-fork under a moving pointer.
-      // Keyed on the *shape*, not availability: this send is what made the
-      // recipient busy, so availability is already false by the time we get here.
-      showStop && forkShapeAvailable && "w-[3.25rem]",
     )}
     data-testid="compose-send-group"
   >
     <Tooltip
       label={showStop ? (liveSends.size > 1 ? "Cancel all sends" : "Cancel send") : "Send"}
       shortcut={shortcut("mod", "enter")}
+      disableHoverableContent
     >
       {#snippet trigger(props)}
         <button
@@ -3654,12 +3702,7 @@
           disabled={primaryDisabled}
           aria-label={showStop ? (liveSends.size > 1 ? "Cancel all sends" : "Cancel send") : "Send"}
           class={cn(
-            "flex h-7 shrink-0 items-center justify-center rounded-full",
-            // In flight the split becomes ONE cancel — same pill, same footprint,
-            // just the cancel icon and colours. The half grows to fill the pill so
-            // the whole shape stays clickable, rather than leaving dead margin
-            // around a circle.
-            showStop && forkShapeAvailable ? "w-full" : "w-7",
+            "flex h-7 w-7 shrink-0 items-center justify-center rounded-full",
             showStop
               ? "hover:bg-status-failed-soft/70 hover:text-status-failed"
               : sendDisabled
@@ -3709,6 +3752,7 @@
           ? "Send to a new branch"
           : `Send to a new branch of ${forkCandidate.name} — it inherits the conversation so far, then goes its own way.`}
         shortcut={shortcut("mod", "shift", "enter")}
+        disableHoverableContent
       >
         {#snippet trigger(props)}
           <button

@@ -227,7 +227,7 @@
           {side}
           sideOffset={6}
           data-testid="tooltip-content"
-          class="bg-primary text-primary-fg z-50 rounded-lg px-2.5 py-1.5 shadow-[0_10px_28px_rgba(0,0,0,0.20)]"
+          class={`bg-primary text-primary-fg z-50 rounded-lg px-2.5 py-1.5 shadow-[0_10px_28px_rgba(0,0,0,0.20)]${disableHoverableContent ? " pointer-events-none" : ""}`}
         >
           <Bits.Arrow class="fill-primary" />
           {#if rest.children}

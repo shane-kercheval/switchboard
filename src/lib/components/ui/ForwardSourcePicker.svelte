@@ -25,6 +25,7 @@
     triggerLabel = "Forward output from an agent or pane",
     triggerText,
     tooltipLabel,
+    tooltipDisableHoverableContent = false,
     showPaneShortcuts = false,
   }: {
     agents: AgentRecord[];
@@ -43,6 +44,7 @@
     /// bar). Omitted for the per-argument icon-only trigger.
     triggerText?: string;
     tooltipLabel?: string;
+    tooltipDisableHoverableContent?: boolean;
     /// Show the `⌘⌃N` pane-forward chord on each pane row. Compose-bar only — the
     /// prompt composer's per-argument pickers have no such shortcut, so it stays
     /// off there (the index matches the pane's position in `panes`, mirroring the
@@ -68,6 +70,7 @@
   {triggerTestid}
   {triggerLabel}
   {tooltipLabel}
+  {tooltipDisableHoverableContent}
   contentTestid="forward-picker-menu"
   align="start"
 >

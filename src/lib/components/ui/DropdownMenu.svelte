@@ -21,6 +21,7 @@
     triggerTabindex?: number;
     tooltipLabel?: string;
     tooltipSide?: "top" | "bottom" | "left" | "right";
+    tooltipDisableHoverableContent?: boolean;
     contentClass?: string;
     contentTestid?: string;
     align?: "start" | "center" | "end";
@@ -37,6 +38,7 @@
     triggerTabindex,
     tooltipLabel,
     tooltipSide = "top",
+    tooltipDisableHoverableContent = false,
     contentClass,
     contentTestid,
     align = "end",
@@ -54,7 +56,11 @@
 
 <Bits.Root bind:open>
   {#if tooltipLabel}
-    <Tooltip label={tooltipLabel} side={tooltipSide}>
+    <Tooltip
+      label={tooltipLabel}
+      side={tooltipSide}
+      disableHoverableContent={tooltipDisableHoverableContent}
+    >
       {#snippet trigger(props)}
         <Bits.Trigger
           {...props}

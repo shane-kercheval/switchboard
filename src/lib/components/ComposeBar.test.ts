@@ -1300,17 +1300,12 @@ describe("ComposeBar", () => {
       await waitFor(() => expect(forkHalf()).toBeNull());
     });
 
-    it("gives way to the cancel button once a send is in flight, keeping its footprint", async () => {
-      // The button becomes a cancel with the pointer still on it. Dropping the
-      // fork half is right — there is nothing to branch mid-send — but the
-      // control must not narrow underneath the cursor, or the click aimed at
-      // fork lands on cancel.
+    it("returns to a circular cancel button once a send is in flight", async () => {
       const state = await loadState();
       await state.registerAgent(AGENT_A);
       seedTurn(state, AGENT_A.id);
       render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
       await waitFor(() => expect(forkHalf()).not.toBeNull());
-      const widthBefore = screen.getByTestId("compose-send-group").className;
 
       const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
       await fireEvent.input(textarea, { target: { value: "go" } });
@@ -1327,9 +1322,8 @@ describe("ComposeBar", () => {
         expect(screen.getByTestId("compose-send")).toHaveAttribute("aria-label", "Cancel send"),
       );
       expect(forkHalf()).toBeNull();
-      // Same reserved width as the split it replaced.
-      expect(screen.getByTestId("compose-send-group").className).not.toBe(widthBefore);
-      expect(screen.getByTestId("compose-send-group").className).toContain("w-[3.25rem]");
+      expect(screen.getByTestId("compose-send").className).toContain("w-7");
+      expect(screen.getByTestId("compose-send-group").className).not.toContain("w-[3.25rem]");
     });
 
     it("withdraws the offer while any send is live, not just the recipient's own", async () => {
@@ -5591,6 +5585,110 @@ describe("ComposeBar — cross-agent forward", () => {
     });
     // Chips clear once the forward has dispatched.
     await waitFor(() => expect(screen.queryByTestId("attachment-chip-image-1")).toBeNull());
+  });
+
+  it("keeps workflow loading and failure states out of the plain composer", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    await seedCompletedTurn(AGENT_B.id);
+    const WORKFLOW = {
+      name: "slow-workflow",
+      is_builtin: true,
+      description: "d",
+      inputs: [],
+      invocable: true,
+      parse_error: null,
+    };
+    let rejectDescribe: ((error: Error) => void) | undefined;
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "list_workflows") return [WORKFLOW];
+      if (cmd === "list_prompts") return [];
+      if (cmd === "stage_attachment") {
+        return {
+          path: "/proj/.switchboard/projects/p/attachments/uuid__diagram.png",
+          original_name: "diagram.png",
+        };
+      }
+      if (cmd === "describe_workflow_form") {
+        return await new Promise<never>((_resolve, reject) => {
+          rejectDescribe = reject;
+        });
+      }
+      return null;
+    });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    fireDrop(["/a/diagram.png"]);
+    await waitFor(() => expect(screen.getByTestId("attachment-chip-image-1")).toBeInTheDocument());
+    await fireEvent.click(screen.getByTestId("compose-forward-button"));
+    await fireEvent.click(await screen.findByTestId(`forward-picker-agent-${AGENT_B.id}`));
+    await waitFor(() => expect(screen.getByTestId("forward-source-chips")).toBeInTheDocument());
+
+    await fireEvent.click(screen.getByTestId("compose-workflow-button"));
+    await fireEvent.click(await screen.findByTestId("workflow-option-builtin:slow-workflow"));
+
+    await waitFor(() => expect(screen.getByTestId("compose-workflow-loading")).toBeInTheDocument());
+    expect(screen.getAllByTestId("attachment-chips")).toHaveLength(1);
+    expect(screen.queryByTestId("compose-textarea")).toBeNull();
+    expect(screen.queryByTestId("recipient-field")).toBeNull();
+    expect(screen.queryByTestId("forward-source-chips")).toBeNull();
+    expect(screen.queryByTestId("compose-action-rail")).toBeNull();
+    expect(screen.queryByTestId("compose-send")).toBeNull();
+
+    rejectDescribe?.(new Error("descriptor unavailable"));
+    await waitFor(() =>
+      expect(screen.getByTestId("compose-workflow-load-failed")).toHaveTextContent(
+        "descriptor unavailable",
+      ),
+    );
+    expect(screen.getAllByTestId("attachment-chips")).toHaveLength(1);
+    expect(screen.queryByTestId("compose-textarea")).toBeNull();
+    expect(screen.queryByTestId("compose-send")).toBeNull();
+
+    await fireEvent.click(screen.getByTestId("workflow-form-start-over"));
+    expect(screen.getByTestId("compose-textarea")).toBeInTheDocument();
+    expect(screen.getByTestId("compose-action-rail")).toBeInTheDocument();
+  });
+
+  it("retries a workflow form that initially fails to load", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    const WORKFLOW = {
+      name: "retry-workflow",
+      is_builtin: true,
+      description: "d",
+      inputs: [],
+      invocable: true,
+      parse_error: null,
+    };
+    const DESCRIPTOR = {
+      ...WORKFLOW,
+      steps: [],
+      derived_args: [],
+      compatibility: { state: "ok" },
+    };
+    let describeCalls = 0;
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "list_workflows") return [WORKFLOW];
+      if (cmd === "list_prompts") return [];
+      if (cmd === "describe_workflow_form") {
+        describeCalls += 1;
+        if (describeCalls === 1) throw new Error("temporary failure");
+        return DESCRIPTOR;
+      }
+      return null;
+    });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await fireEvent.click(screen.getByTestId("compose-workflow-button"));
+    await fireEvent.click(await screen.findByTestId("workflow-option-builtin:retry-workflow"));
+    await screen.findByTestId("compose-workflow-load-failed");
+
+    await fireEvent.click(screen.getByTestId("workflow-form-retry"));
+    await waitFor(() => expect(screen.getByTestId("workflow-composer")).toBeInTheDocument());
+    expect(describeCalls).toBe(2);
+    expect(screen.queryByTestId("compose-workflow-load-failed")).toBeNull();
   });
 
   it("enters workflow mode, resolves the form, and invokes with declared + derived values", async () => {

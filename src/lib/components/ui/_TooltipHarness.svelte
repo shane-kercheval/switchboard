@@ -16,6 +16,7 @@
       | "bound"
       | "bound-fresh"
       | "focus-override"
+      | "non-hoverable"
       | "dynamic",
   }: {
     mode?:
@@ -26,6 +27,7 @@
       | "bound"
       | "bound-fresh"
       | "focus-override"
+      | "non-hoverable"
       | "dynamic";
   } = $props();
   let toggleCount = $state(0);
@@ -90,6 +92,12 @@
   <output data-testid="tt-open-state">{boundOpen ? "open" : "closed"}</output>
 {:else if mode === "focus-override"}
   <Tooltip label="focus override" reopen="fresh-hover" ignoreNonKeyboardFocus={false}>
+    {#snippet trigger(props)}
+      <button {...props} type="button" data-testid="tt-trigger">trigger</button>
+    {/snippet}
+  </Tooltip>
+{:else if mode === "non-hoverable"}
+  <Tooltip label="non-hoverable tooltip" disableHoverableContent>
     {#snippet trigger(props)}
       <button {...props} type="button" data-testid="tt-trigger">trigger</button>
     {/snippet}

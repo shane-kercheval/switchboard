@@ -73,7 +73,8 @@ import {
 } from "$lib/state/workflows.svelte";
 import {
   assignAgentToFirstVisibleEmptyPane,
-  moveAgentToNewPane,
+  createEmptyPane,
+  moveAgentToPane,
   revealPane,
 } from "$lib/state/transcriptPanes.svelte";
 
@@ -1033,21 +1034,26 @@ export function addAgentToProjectRoster(agent: AgentRecord): void {
 /// **Placement:** the branch gets its own visible track. Never the parent's
 /// pane — they share history with identical timestamps, so co-paning renders
 /// every inherited message twice. Prefer a visible empty pane the user already
-/// has; otherwise a new one, which `moveAgentToNewPane` may start *minimized*
-/// when the row is full — hence `revealPane`, which also handles focus mode by
-/// making the branch the maximized pane rather than dropping the user out of
-/// focus. A fork-send is an explicit action with
-/// an immediate result: leaving the reply in a pane the user cannot see (with
-/// compose now addressed at that unseen agent) reads as "my message vanished."
-/// The parent is left exactly where it is; only the compose selection moves.
+/// has; otherwise create one while narrowing an untouched all-agent pane to the
+/// source the user actually forked. The other idle roster agents become
+/// unassigned instead of unexpectedly remaining recipients in the original
+/// pane. A new pane may start *minimized* when the row is full — hence
+/// `revealPane`, which also handles focus mode by making the branch the
+/// maximized pane rather than dropping the user out of focus. A fork-send is an
+/// explicit action with an immediate result: leaving the reply in a pane the
+/// user cannot see (with compose now addressed at that unseen agent) reads as
+/// "my message vanished." The parent is left exactly where it is; only the
+/// compose selection moves.
 export async function forkAgentIntoOwnPane(sourceId: AgentId): Promise<AgentRecord> {
   const fork = await api.forkAgent(sourceId);
   await registerAgent(fork);
   addAgentToProjectRoster(fork);
   const rosterIds = (agentsByProject[fork.project_id] ?? []).map((item) => item.id);
-  const paneId =
-    assignAgentToFirstVisibleEmptyPane(fork.project_id, rosterIds, fork.id) ??
-    moveAgentToNewPane(fork.project_id, rosterIds, fork.id);
+  let paneId = assignAgentToFirstVisibleEmptyPane(fork.project_id, rosterIds, fork.id);
+  if (paneId === null) {
+    paneId = createEmptyPane(fork.project_id, rosterIds, [sourceId]);
+    moveAgentToPane(fork.project_id, rosterIds, fork.id, paneId);
+  }
   revealPane(fork.project_id, rosterIds, paneId);
   // The branch does not exist yet — the send that follows this call is what
   // materializes it — so the transcript cue arms here, before the first turn.

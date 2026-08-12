@@ -1014,6 +1014,31 @@ describe("forkAgentIntoOwnPane", () => {
     expect(parentPane?.members).toContain(parent.id);
   });
 
+  it("keeps only the fork source in an untouched all-agent pane", async () => {
+    const ws = await loadWorkspaceState();
+    const panes = await import("$lib/state/transcriptPanes.svelte");
+    const parent = agent(AGENT_1, PROJECT_1);
+    const codex = { ...agent(AGENT_2, PROJECT_1), harness: "codex" as const };
+    const antigravity = {
+      ...agent("00000000-0000-7000-8000-00000000000c", PROJECT_1),
+      harness: "antigravity" as const,
+    };
+    ws.agentsByProject[PROJECT_1] = [parent, codex, antigravity];
+    const originalRoster = [parent.id, codex.id, antigravity.id];
+    expect(panes.layoutFor(PROJECT_1, originalRoster).panes[0]?.members).toEqual(originalRoster);
+
+    const fork = forkRecord(PROJECT_1);
+    invokeMock.mockImplementation(async (cmd) => (cmd === "fork_agent" ? fork : undefined));
+    await ws.forkAgentIntoOwnPane(parent.id);
+
+    const rosterIds = [...originalRoster, FORK_ID];
+    const parentPane = panes.paneOfAgent(PROJECT_1, rosterIds, parent.id);
+    const forkPane = panes.paneOfAgent(PROJECT_1, rosterIds, FORK_ID);
+    expect(parentPane?.members).toEqual([parent.id]);
+    expect(forkPane?.members).toEqual([FORK_ID]);
+    expect(panes.unassignedAgentIds(PROJECT_1, rosterIds)).toEqual([codex.id, antigravity.id]);
+  });
+
   it("makes the branch visible when the user is in focus mode", async () => {
     // A fork-send has an immediate result to show. With another pane maximized,
     // placing the branch without revealing it would stream the reply into a

@@ -1374,6 +1374,32 @@ describe("forked-agent inherited-history refresh", () => {
     expect(state.runtimes[FORK_ID]?.listener_error).toBeUndefined();
   });
 
+  it("opens a project when one agent's subscription fails, without taking the rest down", async () => {
+    // `ensureProjectLoaded` awaits `Promise.all(agents.map(registerAgent))`, so
+    // before the committed-vs-subscribed split a single flaky subscription
+    // rejected the whole open and the project surfaced as an activation failure
+    // — with every other agent's record having loaded fine. The all-or-nothing
+    // semantics is exactly what the split neutralises, and nothing tested it.
+    const state = await loadAgentState();
+    const ws = await loadWorkspaceState();
+    const healthy = agent(AGENT_1, PROJECT_1);
+    const broken = { ...agent(AGENT_2, PROJECT_1), name: "agent-b" };
+    listenMock.mockImplementation(async (name: string, cb) => {
+      if (name === `agent:${AGENT_2}`) throw new Error("channel unavailable");
+      listeners.set(name, cb);
+      return vi.fn();
+    });
+
+    await state.registerAgent(healthy);
+    await state.registerAgent(broken);
+    ws.agentsByProject[PROJECT_1] = [healthy, broken];
+
+    // Both rostered; only the broken one carries the failure.
+    expect(ws.agentsByProject[PROJECT_1]?.map((a) => a.id)).toEqual([AGENT_1, AGENT_2]);
+    expect(state.runtimes[AGENT_1]?.listener_error).toBeUndefined();
+    expect(state.runtimes[AGENT_2]?.listener_error).toContain("channel unavailable");
+  });
+
   it("never fires for a non-fork agent", async () => {
     const state = await loadAgentState();
     const { ws, loads } = await hydratedProjectWith([agent(AGENT_1, PROJECT_1)]);

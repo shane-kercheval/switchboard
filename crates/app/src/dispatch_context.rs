@@ -110,8 +110,10 @@ impl DispatchContextFactory for ProjectDispatchContextFactory {
     /// failed without writing its session file is materialized by whatever
     /// ordinary send runs next. That send may have been queued while the parent
     /// was idle and pop long after the parent started working. This is the only
-    /// moment the answer cannot be stale: the copy of the parent's file is taken
-    /// immediately after this returns.
+    /// freshest judgement available: it runs immediately before the journal write
+    /// and spawn, with no unrelated await in between. It bounds the queue race —
+    /// it is not a lock, and the residual is the documented look-not-a-lock case
+    /// in system-design §9.
     fn preflight(
         &self,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + '_>> {

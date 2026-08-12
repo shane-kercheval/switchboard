@@ -118,6 +118,40 @@ pub enum CoreError {
     )]
     ForkProvenanceCycle { agent_id: uuid::Uuid },
 
+    /// Two records in one registry share an identity that must be unique. Fatal
+    /// on read rather than tolerated: duplicate ids collapse in the app's
+    /// agent cache (two roster rows sharing one runtime and one actor), and
+    /// duplicate session locators mean two agents driving one harness
+    /// conversation — and they silently corrupt the provenance walk, whose
+    /// session-keyed map keeps only one of the pair.
+    #[error(
+        "{registry}: agents {first} and {second} share the same {field} — \
+         the registry is inconsistent and cannot be loaded safely. Remove or \
+         correct one of the two records to reopen this project."
+    )]
+    DuplicateAgentIdentity {
+        registry: std::path::PathBuf,
+        field: &'static str,
+        first: uuid::Uuid,
+        second: uuid::Uuid,
+    },
+
+    /// A record sitting in one project's registry claims to belong to another.
+    /// Fatal because it is a routing invariant, not a label: dispatch resolves an
+    /// agent's project — and therefore its working directory and journal — from
+    /// this field, so a mismatched record silently runs the agent's work against
+    /// a different project's directory whenever that project is also loaded.
+    #[error(
+        "{registry}: agent {agent_id} claims project {claimed} but is stored under \
+         {actual} — the registry is inconsistent and cannot be loaded safely"
+    )]
+    AgentProjectMismatch {
+        registry: std::path::PathBuf,
+        agent_id: uuid::Uuid,
+        claimed: uuid::Uuid,
+        actual: uuid::Uuid,
+    },
+
     /// The source agent carries no session id to branch from. Distinct from
     /// [`Self::SessionForkUnsupported`]: that harness can never fork; this one
     /// could, but this record has nothing to fork *from*.

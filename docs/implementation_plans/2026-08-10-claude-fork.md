@@ -708,9 +708,13 @@ The feature is usable end to end and its transcript behavior is pinned.
   plain mode) is discoverable. Tracked as intended work, not a permanent
   boundary; if it is wired later, reuse the single-flight guard from the plain
   path.
-- **A listener-registration failure after the backend has created an agent
-  strands a durable, invisible record.** The UI reports failure and shows
-  nothing, retrying makes a second agent, and the first appears after restart.
+- ~~**A listener-registration failure after the backend has created an agent
+  strands a durable, invisible record.**~~ **Fixed.** `registerAgent` now records
+  the failure on the runtime instead of rejecting, so callers roster the agent
+  that exists and the transcript explains that its updates aren't connected, with
+  a retry that re-subscribes without re-creating anything. Sends to such an agent
+  are blocked — dispatching into a channel nobody listens on spends real work on
+  a turn whose events can never arrive, and Tauri has no replay.
   **This is a shared create / attach / fork lifecycle issue, not a fork
   limitation** — `createOrAttachAndRegister` has the identical ordering, and
   fork deliberately mirrors it. Do not "fix" it in `forkAgentIntoOwnPane` alone

@@ -19,11 +19,14 @@ vi.mock("@tauri-apps/api/core", () => ({
 }));
 
 const listeners = new Map<string, (e: { payload: NormalizedEvent }) => void>();
+/// Default: record the callback and succeed. A test can override this to make a
+/// specific channel's subscription fail.
+const listenMock = vi.fn(async (name: string, cb: (e: { payload: NormalizedEvent }) => void) => {
+  listeners.set(name, cb);
+  return vi.fn();
+});
 vi.mock("@tauri-apps/api/event", () => ({
-  listen: vi.fn(async (name: string, cb: (e: { payload: NormalizedEvent }) => void) => {
-    listeners.set(name, cb);
-    return vi.fn();
-  }),
+  listen: (name: string, cb: (e: { payload: NormalizedEvent }) => void) => listenMock(name, cb),
 }));
 
 type DragDropPayload =
@@ -105,6 +108,13 @@ beforeEach(async () => {
   (await import("$lib/state/transcriptPanes.svelte"))._testing.reset();
   (await import("$lib/state/recipientSelection.svelte"))._testing.reset();
   listeners.clear();
+  // `listenMock` is module-level so a test can make one channel fail; reset it
+  // here or that override leaks into every test after it.
+  listenMock.mockReset();
+  listenMock.mockImplementation(async (name: string, cb) => {
+    listeners.set(name, cb);
+    return vi.fn();
+  });
   dragDropCb = undefined;
   resolveDropSub = undefined;
   dropUnlisten.mockClear();
@@ -1558,6 +1568,118 @@ describe("ComposeBar", () => {
       const compose = await import("$lib/state/composeStore");
       const content = compose.getCompose(PROJECT_ID).content;
       expect(content.kind === "plain" ? content.draft : "unexpected mode").toBe("");
+    });
+
+    it("loses nothing when the fork is refused after the user has typed again", async () => {
+      // The textarea is not disabled during the await — typing while a fork
+      // registers is expected. Restoring only into an empty composer silently
+      // destroyed whichever message the user didn't get back.
+      const state = await loadState();
+      await state.registerAgent(AGENT_A);
+      seedTurn(state, AGENT_A.id);
+      let rejectFork!: (e: Error) => void;
+      const pendingFork = new Promise<AgentRecord>((_, reject) => {
+        rejectFork = reject;
+      });
+      invokeMock.mockImplementation(async (cmd: string) => {
+        if (cmd === "fork_agent") return await pendingFork;
+        return null;
+      });
+      render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+      await waitFor(() => expect(forkHalf()).not.toBeNull());
+
+      const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+      await fireEvent.input(textarea, { target: { value: "keep me" } });
+      await fireEvent.click(forkHalf()!);
+      await fireEvent.input(textarea, { target: { value: "also this" } });
+
+      rejectFork(new Error("alice is working"));
+      await waitFor(() => {
+        expect(screen.getByTestId("compose-send-error")).toHaveTextContent("alice is working");
+      });
+
+      const value = (screen.getByTestId("compose-textarea") as HTMLTextAreaElement).value;
+      expect(value).toContain("keep me");
+      expect(value).toContain("also this");
+    });
+
+    it("does not overwrite a replacement composer for the same project", async () => {
+      // Project scoping separates A from B, but not an obsolete A instance from
+      // a newly mounted A instance. The dead one must not write its captured
+      // state over the live one's.
+      const state = await loadState();
+      await state.registerAgent(AGENT_A);
+      seedTurn(state, AGENT_A.id);
+      let rejectFork!: (e: Error) => void;
+      const pendingFork = new Promise<AgentRecord>((_, reject) => {
+        rejectFork = reject;
+      });
+      invokeMock.mockImplementation(async (cmd: string) => {
+        if (cmd === "fork_agent") return await pendingFork;
+        return null;
+      });
+      const first = render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+      await waitFor(() => expect(forkHalf()).not.toBeNull());
+      await fireEvent.input(screen.getByTestId("compose-textarea"), {
+        target: { value: "original" },
+      });
+      await fireEvent.click(forkHalf()!);
+
+      // Leave the project and come back: a new bar for the same project.
+      first.unmount();
+      render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+      await fireEvent.input(screen.getByTestId("compose-textarea"), {
+        target: { value: "typed in the new composer" },
+      });
+
+      rejectFork(new Error("alice is working"));
+      await tick();
+
+      // The newer text survives, and the submitted one is still recoverable.
+      const compose = await import("$lib/state/composeStore");
+      const content = compose.getCompose(PROJECT_ID).content;
+      const stored = content.kind === "plain" ? content.draft : "";
+      expect(stored).toContain("typed in the new composer");
+      expect(stored).toContain("original");
+    });
+
+    it("does not send into a branch whose updates it cannot hear", async () => {
+      // The branch commits before the frontend subscribes. If subscribing fails,
+      // dispatching anyway spends real quota on a turn whose events never arrive:
+      // it sits at "starting" forever, the reply never renders, and inherited
+      // history never loads. Tauri has no event replay, so subscribing later
+      // cannot recover it. Keep the branch, keep the message, send nothing.
+      const state = await loadState();
+      await state.registerAgent(AGENT_A);
+      seedTurn(state, AGENT_A.id);
+      listenMock.mockImplementation(async (channel: string) => {
+        if (channel === `agent:${FORK_RECORD.id}`) throw new Error("channel unavailable");
+        return vi.fn();
+      });
+      invokeMock.mockImplementation(async (cmd: string) => {
+        if (cmd === "fork_agent") return FORK_RECORD;
+        if (cmd === "send_message") return "msg-fork";
+        return null;
+      });
+      render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+      await waitFor(() => expect(forkHalf()).not.toBeNull());
+
+      const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+      await fireEvent.input(textarea, { target: { value: "branch from here" } });
+      await fireEvent.click(forkHalf()!);
+
+      await waitFor(() => {
+        expect(invokeMock).toHaveBeenCalledWith("fork_agent", { agentId: AGENT_A.id });
+      });
+      await tick();
+
+      expect(invokeMock).not.toHaveBeenCalledWith("send_message", expect.anything());
+      // The message is still the user's, and the error says what actually happened.
+      expect((screen.getByTestId("compose-textarea") as HTMLTextAreaElement).value).toBe(
+        "branch from here",
+      );
+      expect(screen.getByTestId("compose-send-error")).toHaveTextContent(/created/i);
+      expect(screen.getByTestId("compose-send-error")).not.toHaveTextContent(/Fork failed/i);
     });
 
     it("keeps the user's text when the fork is refused", async () => {

@@ -1931,10 +1931,12 @@ pub(crate) async fn busy_fork_source(
         })
         .cloned();
     let parent = parent?;
-    if dispatcher.is_turn_running(parent.id).await {
-        Some(parent)
-    } else {
+    // Stricter than `is_turn_running`: a parent mid-teardown can still be writing
+    // its session file, and that reads as "not running".
+    if dispatcher.is_safe_to_fork_from(parent.id).await {
         None
+    } else {
+        Some(parent)
     }
 }
 
@@ -6630,14 +6632,19 @@ mod tests {
         // the reason the check moved into the dispatcher at all. Every step is a
         // real dispatch through `send_message_impl`:
         //
-        //   1. `alice-fork` exists, unmaterialized (mocks write no session file,
-        //      so it stays that way — the same state a failed first turn leaves).
+        //   1. `alice-fork` exists, unmaterialized.
         //   2. Send A to the fork. It parks, so the fork's actor is busy.
         //   3. Send B to the fork. Alice is idle, so the enqueue-time gate passes
         //      and B lands in the fork's backlog.
         //   4. Send C to alice. It parks too — alice is now mid-turn.
-        //   5. Release only A. B pops, and by then the answer step 3 relied on is
-        //      stale.
+        //   5. Release A, which **fails**. The branch still has no session file,
+        //      so B inherits the job of creating it — and by then the answer step
+        //      3 relied on is stale.
+        //
+        // A must fail rather than complete: a real Claude turn that completes has
+        // written its session file, so a completed A would make B an ordinary
+        // resume and never reach this gate at all. "Completed but no file" is a
+        // mock artifact, not a reachable state.
         //
         // B must be refused before it reaches the adapter. Prior to the
         // start-moment check it would have dispatched and copied alice's session
@@ -6645,8 +6652,12 @@ mod tests {
         // stub in place of alice's real answer.
         let fork_gate = Arc::new(tokio::sync::Notify::new());
         let parent_gate = Arc::new(tokio::sync::Notify::new());
-        let adapter =
-            gated_adapter_two_parks(&["fork A", "parent C"], (&fork_gate, 0), (&parent_gate, 1));
+        let (adapter, dispatched_prompts) = gated_adapter_two_parks(
+            &["fork A", "parent C"],
+            (&fork_gate, 0),
+            (&parent_gate, 1),
+            &[0],
+        );
         let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
         let emitter = Arc::new(RecordingEmitter::new());
         let state = AppState::new(
@@ -6702,6 +6713,12 @@ mod tests {
         assert!(
             refused,
             "the queued send must be refused when it pops against a now-busy parent"
+        );
+        // Refused before the adapter: B's prompt never reached a subprocess.
+        assert!(
+            !lock(&dispatched_prompts).iter().any(|p| p == "B"),
+            "a refused turn must not reach the adapter: {:?}",
+            lock(&dispatched_prompts)
         );
 
         parent_gate.notify_waiters();
@@ -7503,6 +7520,12 @@ mod tests {
         /// can hold two turns at once and release them independently. The shared
         /// `gate`/`park_at` pair above stays as-is for the single-park tests.
         extra_parks: Vec<(usize, Arc<tokio::sync::Notify>)>,
+        /// Dispatch indices that terminate `Failed` instead of `Completed`. A
+        /// real Claude turn that completes has written its session file — the two
+        /// are the same fact, which is what `build_args` derives fork-vs-resume
+        /// from — so "completed but no file" is not a state production can reach.
+        /// A test that needs an agent to stay unmaterialized must fail the turn.
+        fail_at: Vec<usize>,
         dispatches: std::sync::atomic::AtomicUsize,
     }
 
@@ -7537,6 +7560,7 @@ mod tests {
                 }
             };
             let park = park || self.extra_parks.iter().any(|(at, _)| *at == index);
+            let fails = self.fail_at.contains(&index);
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             tokio::spawn(async move {
                 if !text.is_empty() {
@@ -7553,7 +7577,14 @@ mod tests {
                 }
                 let _ = tx.send(switchboard_harness::AdapterEvent::TurnEnd {
                     turn_id,
-                    outcome: TurnOutcome::Completed,
+                    outcome: if fails {
+                        TurnOutcome::Failed {
+                            kind: switchboard_harness::FailureKind::HarnessError,
+                            message: "scripted failure".to_owned(),
+                        }
+                    } else {
+                        TurnOutcome::Completed
+                    },
                     ended_at: chrono::Utc::now(),
                     usage: None,
                     context_window_source: None,
@@ -7608,6 +7639,7 @@ mod tests {
             gate: Arc::clone(gate),
             park_at,
             extra_parks: Vec::new(),
+            fail_at: Vec::new(),
             dispatches: std::sync::atomic::AtomicUsize::new(0),
         });
         (adapter, prompts)
@@ -7620,15 +7652,19 @@ mod tests {
         texts: &[&str],
         first: (&Arc<tokio::sync::Notify>, usize),
         second: (&Arc<tokio::sync::Notify>, usize),
-    ) -> Arc<dyn HarnessAdapter> {
-        Arc::new(GatedRecordingAdapter {
-            prompts: Arc::new(Mutex::new(Vec::new())),
+        fail_at: &[usize],
+    ) -> (Arc<dyn HarnessAdapter>, Arc<Mutex<Vec<String>>>) {
+        let prompts = Arc::new(Mutex::new(Vec::new()));
+        let adapter: Arc<dyn HarnessAdapter> = Arc::new(GatedRecordingAdapter {
+            prompts: Arc::clone(&prompts),
             texts: texts.iter().map(|t| (*t).to_owned()).collect(),
             gate: Arc::clone(first.0),
             park_at: first.1,
             extra_parks: vec![(second.1, Arc::clone(second.0))],
+            fail_at: fail_at.to_vec(),
             dispatches: std::sync::atomic::AtomicUsize::new(0),
-        })
+        });
+        (adapter, prompts)
     }
 
     /// A loaded project whose Claude adapter is a [`GatedRecordingAdapter`].

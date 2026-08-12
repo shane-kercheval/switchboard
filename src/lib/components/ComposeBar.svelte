@@ -2104,6 +2104,36 @@
   /// Once registered, the message goes through the **normal** send path: same
   /// journaling, same queueing, same dispatch. The branch is an ordinary agent
   /// from that moment on.
+  /// Give back a send that never dispatched, without destroying anything newer.
+  ///
+  /// **Merges against the store, not this instance's locals.** Two things can
+  /// have moved on during the await: the user can type here (the textarea is not
+  /// disabled — typing while a fork registers is expected), and a project switch
+  /// can destroy this bar and mount a replacement for the same project. Assigning
+  /// `draft = text` handled neither: the first silently discarded whichever
+  /// message the user didn't get back, and the second wrote a dead instance's
+  /// state over a live one. Reading the store, merging, and writing back is
+  /// lossless in both cases regardless of which instance is running this.
+  function restoreCapturedSend(text: string, carried: AttachmentChip[]): void {
+    const stored = getCompose(projectId);
+    const current = stored.content.kind === "plain" ? stored.content.draft : "";
+    const merged = current.trim() === "" ? text : `${text}\n\n${current}`;
+    setContent(projectId, { kind: "plain", draft: merged });
+    // Union by id: the sent chips come back, anything staged since survives, and
+    // nothing is duplicated.
+    const storedAttachments = stored.attachments ?? [];
+    const seen = new Set(storedAttachments.map((a) => a.path));
+    setAttachments(projectId, [
+      ...carried.filter((chip) => !seen.has(chip.path)),
+      ...storedAttachments,
+    ]);
+    if (!unmounted) {
+      draft = merged;
+      commitChips([...carried.filter((chip) => !seen.has(chip.path)), ...attachmentChips]);
+    }
+    flush();
+  }
+
   async function dispatchForkSend(
     source: AgentRecord,
     text: string,
@@ -2137,27 +2167,32 @@
       fork = await forkAgentIntoOwnPane(source.id);
     } catch (err) {
       sendError = `Fork failed: ${err instanceof Error ? err.message : String(err)}`;
-      // Nothing was dispatched, so give the message back — the user must be able
-      // to wait or cancel and retry without retyping. Only restore into a still
-      // empty composer: if they started a new message during the await, that one
-      // is newer and wins.
-      if (draft === "") draft = text;
-      if (attachmentChips.length === 0) commitChips(carried);
-      persistComposeNow();
+      restoreCapturedSend(text, carried);
       return;
     } finally {
       sending = false;
     }
-    // The send always completes, even if this bar is gone. The branch is already
-    // durable, and abandoning its first message would leave a promptless fork —
-    // the one state this whole design exists to make impossible, since Claude
-    // refuses a promptless fork and the branch would never materialize.
-    dispatchToRecipients(text, attachments, [fork]);
-    // Selection follows the branch: the conversation continues there, and
-    // leaving the parent selected would send the user's next message to the
-    // agent they just branched away from. This is the only compose write left
-    // after the await, and it is project-scoped to the originating project.
+    // Selection follows the branch either way: the conversation continues there,
+    // and leaving the parent selected would send the user's next message to the
+    // agent they just branched away from — including the retry below.
     setSelectedIds([fork.id]);
+    // **Committed is not the same as reachable.** The branch is durable, but if
+    // subscribing to its event channel failed, dispatching now spends real work
+    // on a turn whose events never arrive: it sits at "starting" forever and the
+    // reply never renders. Tauri has no replay, so subscribing later cannot
+    // recover them. Hand the message back instead — the branch stays visible with
+    // its retry, and the next send materializes it, which is the ordinary
+    // self-healing path for a fork whose first turn never ran.
+    if (runtimes[fork.id]?.listener_error != null) {
+      sendError = `${fork.name} was created, but Switchboard couldn't connect to its updates — your message wasn't sent. Retry from the banner above, then send again.`;
+      restoreCapturedSend(text, carried);
+      return;
+    }
+    // Otherwise the send always completes, even if this bar is gone. Abandoning
+    // the first message would leave a promptless fork — the one state this design
+    // exists to make impossible, since Claude refuses a promptless fork and the
+    // branch would never materialize.
+    dispatchToRecipients(text, attachments, [fork]);
     sendGeneration += 1;
   }
 

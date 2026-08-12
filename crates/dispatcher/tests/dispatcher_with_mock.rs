@@ -979,6 +979,62 @@ async fn manual_send_emits_no_user_message() {
 }
 
 #[tokio::test]
+async fn an_agent_mid_teardown_is_not_safe_to_fork_from() {
+    // `is_turn_running` reports a shutting-down agent as not running — correct
+    // for completed-only forwarding, wrong for the fork gate. A slot flips to
+    // `Closing` before cancellation and drain finish, so the agent can still be
+    // writing its session file; copying it then yields the synthesized
+    // "No response requested." branch the gate exists to prevent.
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+    // `AwaitCancellation` holds the turn open, so "running" is a state the test
+    // can observe rather than race.
+    let factory = TestFactory::new(
+        MockScenario::AwaitCancellation,
+        agent.clone(),
+        Arc::clone(&emitter),
+        Arc::new(RecordingJournal::default()) as Arc<dyn ConversationJournal>,
+    );
+
+    // An agent with no actor at all is safe — nothing of ours writes its session.
+    assert!(dispatcher.is_safe_to_fork_from(agent.id).await);
+
+    dispatcher
+        .send_message(
+            agent.id,
+            "long one",
+            vec![],
+            Uuid::now_v7(),
+            factory,
+            OnBusy::Enqueue,
+        )
+        .await;
+    within(
+        &emitter,
+        "turn_start",
+        emitter.wait_for_type("turn_start", 1),
+    )
+    .await;
+    assert!(
+        !dispatcher.is_safe_to_fork_from(agent.id).await,
+        "a running agent is not safe to fork from"
+    );
+
+    // And the distinction that matters: the plain running-check and the fork
+    // check disagree by design once teardown starts, which is why the fork gate
+    // needs its own question rather than reusing the forwarding one.
+    assert!(
+        dispatcher.is_turn_running(agent.id).await,
+        "precondition: the turn is genuinely running"
+    );
+
+    dispatcher
+        .shutdown_agent(agent.id, CancelSource::User)
+        .await;
+}
+
+#[tokio::test]
 async fn a_start_moment_refusal_stops_the_turn_before_anything_durable() {
     // The dispatcher is the only component that knows when a *queued* item
     // becomes a real turn, which is why the policy hook lives here: a caller's

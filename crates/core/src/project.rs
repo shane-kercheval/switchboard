@@ -448,7 +448,16 @@ impl Project {
         let agents: Vec<AgentRecord> = read_jsonl(&self.registry_path)?;
         for agent in &agents {
             agent.validate()?;
+            if agent.project_id != self.id {
+                return Err(CoreError::AgentProjectMismatch {
+                    registry: self.registry_path.clone(),
+                    agent_id: agent.id,
+                    claimed: agent.project_id,
+                    actual: self.id,
+                });
+            }
         }
+        reject_duplicate_identities(&agents, &self.registry_path)?;
         reject_fork_provenance_cycles(&agents)?;
         Ok(agents)
     }
@@ -703,6 +712,48 @@ pub(crate) fn load(directory: &Path, id: ProjectId, root: PathBuf) -> Result<Pro
     })
 }
 
+/// Reject a registry containing two records that share an identity.
+///
+/// Runs **before** the provenance walk, which builds a session-keyed map: with
+/// duplicate locators that map silently keeps one of the pair and the cycle
+/// result becomes insertion-order dependent, so uniqueness has to hold first.
+///
+/// Scope is this project's registry. The write-side check
+/// (`check_claude_session_id_unique`) is directory-wide, which is broader — but
+/// core cannot see sibling projects, and re-scanning every project in the
+/// directory on every open would cost O(projects × agents) for a
+/// corruption-only case. Within-registry is where the concrete harm lives.
+fn reject_duplicate_identities(agents: &[AgentRecord], registry: &Path) -> Result<()> {
+    let mut ids: std::collections::HashMap<uuid::Uuid, uuid::Uuid> =
+        std::collections::HashMap::new();
+    let mut sessions: std::collections::HashMap<uuid::Uuid, uuid::Uuid> =
+        std::collections::HashMap::new();
+    for agent in agents {
+        if let Some(first) = ids.insert(agent.id, agent.id) {
+            return Err(CoreError::DuplicateAgentIdentity {
+                registry: registry.to_owned(),
+                field: "agent id",
+                first,
+                second: agent.id,
+            });
+        }
+        if let Some(session) = agent
+            .session_locator
+            .as_ref()
+            .and_then(SessionLocator::as_uuid)
+            && let Some(first) = sessions.insert(session, agent.id)
+        {
+            return Err(CoreError::DuplicateAgentIdentity {
+                registry: registry.to_owned(),
+                field: "harness session",
+                first,
+                second: agent.id,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Reject a registry whose fork provenance loops back on itself.
 ///
 /// Each agent has at most one outgoing edge (`forked_from_session` names the
@@ -864,6 +915,68 @@ mod tests {
             matches!(err, CoreError::SessionForkUnsupported { .. }),
             "got: {err:?}"
         );
+    }
+
+    #[test]
+    fn two_agents_sharing_an_id_or_a_session_fail_the_load() {
+        // Duplicate ids collapse in the app cache — two roster rows sharing one
+        // runtime and one actor. Duplicate session locators mean two agents
+        // driving one harness conversation, and they also silently corrupt the
+        // provenance walk, whose session-keyed map keeps only one of the pair.
+        let (_tmp, project) = fresh_project();
+        let a = project
+            .register_agent("alice", HarnessKind::ClaudeCode, None, None)
+            .unwrap();
+        let b = project
+            .register_agent("bob", HarnessKind::ClaudeCode, None, None)
+            .unwrap();
+
+        let mut dup_id = b.clone();
+        dup_id.id = a.id;
+        crate::io::write_jsonl(&project.registry_path, &[a.clone(), dup_id]).unwrap();
+        assert!(matches!(
+            project
+                .list_agents()
+                .expect_err("duplicate id must not load"),
+            CoreError::DuplicateAgentIdentity {
+                field: "agent id",
+                ..
+            }
+        ),);
+
+        let mut dup_session = b.clone();
+        dup_session.session_locator = a.session_locator.clone();
+        crate::io::write_jsonl(&project.registry_path, &[a, dup_session]).unwrap();
+        assert!(matches!(
+            project
+                .list_agents()
+                .expect_err("duplicate session must not load"),
+            CoreError::DuplicateAgentIdentity {
+                field: "harness session",
+                ..
+            }
+        ),);
+    }
+
+    #[test]
+    fn a_record_claiming_another_project_fails_the_load() {
+        // Not a label: dispatch resolves an agent's project — and therefore its
+        // working directory and journal — from this field, so a mismatched record
+        // silently runs the agent's work against a different project's directory
+        // whenever that project is also loaded.
+        let (_tmp, project) = fresh_project();
+        let mut agent = project
+            .register_agent("alice", HarnessKind::ClaudeCode, None, None)
+            .unwrap();
+        agent.project_id = uuid::Uuid::now_v7();
+        crate::io::write_jsonl(&project.registry_path, &[agent]).unwrap();
+
+        assert!(matches!(
+            project
+                .list_agents()
+                .expect_err("a misfiled record must not load"),
+            CoreError::AgentProjectMismatch { .. }
+        ));
     }
 
     #[test]

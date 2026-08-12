@@ -252,7 +252,7 @@
               open={harness === "claude_code"}
             >
               <summary
-                class="text-fg hover:bg-active cursor-pointer list-none rounded-md px-3 py-2.5 text-sm font-medium"
+                class="text-fg hover:bg-hover cursor-pointer list-none rounded-md px-3 py-2.5 text-sm font-medium"
               >
                 {HARNESS_LABEL[harness]}
               </summary>

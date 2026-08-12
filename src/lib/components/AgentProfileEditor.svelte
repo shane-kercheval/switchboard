@@ -49,14 +49,14 @@
 
   function modelOptions(profile: AgentProfile): SelectionOption[] {
     const options = allowUnset
-      ? [{ label: "Use harness default", value: "" }, ...MODEL_OPTIONS[harness]]
+      ? [{ label: "Default", value: "" }, ...MODEL_OPTIONS[harness]]
       : MODEL_OPTIONS[harness];
     return withCurrent(options, profile.model);
   }
 
   function effortOptions(profile: AgentProfile): SelectionOption[] {
     const base = effortOptionsFor(harness, profile.model ?? undefined);
-    const options = allowUnset ? [{ label: "Use harness default", value: "" }, ...base] : base;
+    const options = allowUnset ? [{ label: "Default", value: "" }, ...base] : base;
     return withCurrent(options, profile.effort);
   }
 

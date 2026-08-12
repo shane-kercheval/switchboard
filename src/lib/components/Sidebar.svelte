@@ -227,12 +227,22 @@
     return label || "Harness/session default";
   }
 
-  function profileSwitchLabel(agent: AgentRecord): string {
+  function profileSwitchCopy(agent: AgentRecord): {
+    current: string;
+    target: string;
+    accessible: string;
+  } {
     const currentSlot = activeProfileSlot(agent);
     const current = currentSlot === "primary" ? primaryProfile(agent) : secondaryProfile(agent);
     const targetSlot = currentSlot === "primary" ? "Secondary" : "Primary";
     const target = currentSlot === "primary" ? secondaryProfile(agent) : primaryProfile(agent);
-    return `Using ${currentSlot === "primary" ? "Primary" : "Secondary"}: ${selectionLabel(agent, current ?? primaryProfile(agent))}. Switch to ${targetSlot}: ${selectionLabel(agent, target ?? primaryProfile(agent))}.`;
+    const currentText = `${currentSlot === "primary" ? "Primary" : "Secondary"}: ${selectionLabel(agent, current ?? primaryProfile(agent))}`;
+    const targetText = `Switch to ${targetSlot}: ${selectionLabel(agent, target ?? primaryProfile(agent))}`;
+    return {
+      current: currentText,
+      target: targetText,
+      accessible: `Using ${currentText}. ${targetText}.`,
+    };
   }
 
   const resumeAgent = $derived(
@@ -1408,16 +1418,12 @@
                 </ul>
               </Tooltip>
             {/if}
-            <!-- Selected model/effort (intent), shown first. When the user
-                 hasn't chosen a model (Antigravity, or an attached agent, which
-                 pins nothing) we fall back to the harness-observed model from
-                 `runtime.meta` so the line isn't blank when a model is known.
-                 Effort is selection-only — no observed source. The per-turn
-                 transcript footer carries the actual runtime history (which may
-                 show a resolved id even when intent is an alias). -->
+            <!-- Selected model/effort is future-send intent, never observed
+                 runtime history. The transcript footer owns the actual model
+                 used by each completed turn. -->
             {@const selectedProfile = activeProfile(agent)}
             {@const configuredSecondary = secondaryProfile(agent)}
-            {#if selectedProfile.model || runtime?.meta?.model || selectedProfile.effort || configuredSecondary !== null}
+            {#if canConfigureProfiles(agent)}
               <!-- One secondary line, `opus · high` — configuration is context,
                    not a table of key: value pairs. An observed (session-derived)
                    model keeps its explanatory tooltip instead of a label. -->
@@ -1430,15 +1436,10 @@
                     <span title={selectedProfile.model} data-testid="agent-selected-model"
                       >{selectedProfile.model}</span
                     >
-                  {:else if runtime?.meta?.model}
-                    <span
-                      title={`${runtime.meta.model} — observed from the session (no model selected)`}
-                      data-testid="agent-observed-model">{runtime.meta.model}</span
-                    >
                   {:else if !selectedProfile.effort}
                     <span data-testid="agent-selection-default">Harness/session default</span>
                   {/if}
-                  {#if (selectedProfile.model || runtime?.meta?.model) && selectedProfile.effort}
+                  {#if selectedProfile.model && selectedProfile.effort}
                     <span aria-hidden="true"> · </span>
                   {/if}
                   {#if selectedProfile.effort}
@@ -1446,13 +1447,19 @@
                   {/if}
                 </div>
                 {#if configuredSecondary !== null}
-                  <Tooltip label={profileSwitchLabel(agent)} side="left" delayDuration={500}>
+                  {@const switchCopy = profileSwitchCopy(agent)}
+                  <Tooltip
+                    side="top"
+                    delayDuration={500}
+                    disableHoverableContent
+                    reopen="fresh-hover"
+                  >
                     {#snippet trigger(props)}
                       <button
                         {...props}
                         type="button"
                         class={cn(ICON_BUTTON_CLASS, "h-5 w-5 shrink-0")}
-                        aria-label={profileSwitchLabel(agent)}
+                        aria-label={switchCopy.accessible}
                         disabled={profileSwitching === agent.id}
                         data-testid="agent-profile-switch"
                         onclick={() => void switchProfile(agent)}
@@ -1460,6 +1467,10 @@
                         <ArrowLeftRight size={12} strokeWidth={1.8} aria-hidden="true" />
                       </button>
                     {/snippet}
+                    <div class="space-y-0.5 text-[13px] leading-4">
+                      <div class="font-medium">{switchCopy.current}</div>
+                      <div class="text-primary-fg/70">{switchCopy.target}</div>
+                    </div>
                   </Tooltip>
                 {/if}
               </div>

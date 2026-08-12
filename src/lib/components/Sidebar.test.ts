@@ -734,7 +734,7 @@ describe("Sidebar", () => {
     expect(screen.queryByTestId("agent-context-bar")).toBeNull();
   });
 
-  it("renders meta info (model + mcp/skills counts) when SessionMeta has arrived", async () => {
+  it("renders MCP/skills metadata without replacing selected model intent", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
     const runtime = state.runtimes[CLAUDE_AGENT.id];
@@ -752,9 +752,10 @@ describe("Sidebar", () => {
 
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
-    // No selected model on this agent → the SessionMeta model shows as the
-    // observed fallback; mcp/skills counts stay in the meta block.
-    expect(screen.getByTestId("agent-observed-model")).toHaveTextContent("claude-sonnet-4-6");
+    expect(screen.getByTestId("agent-selection-default")).toHaveTextContent(
+      "Harness/session default",
+    );
+    expect(screen.queryByTestId("agent-observed-model")).toBeNull();
     expect(screen.getByTestId("agent-mcp-chip")).toHaveTextContent("1");
     expect(screen.getByTestId("agent-skills-chip")).toHaveTextContent("1");
   });
@@ -827,6 +828,12 @@ describe("Sidebar", () => {
     await screen.findByTestId("change-profile-primary-model");
     expect(pickerHasOption("change-profile-primary-model", "")).toBe(true);
     expect(pickerHasOption("change-profile-primary-effort", "")).toBe(true);
+    expect(screen.getByTestId("change-profile-primary-model-option-no-override")).toHaveTextContent(
+      "Default",
+    );
+    expect(
+      screen.getByTestId("change-profile-primary-effort-option-no-override"),
+    ).toHaveTextContent("Default");
     expect(pickerValue("change-profile-primary-model")).toBe("");
     expect(pickerValue("change-profile-primary-effort")).toBe("");
     await fireEvent.click(screen.getByTestId("change-profile-secondary-toggle"));
@@ -952,13 +959,50 @@ describe("Sidebar", () => {
       },
     };
     await state.registerAgent(agent);
-    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
+    const { rerender } = render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
 
     const toggle = screen.getByTestId("agent-profile-switch");
     expect(toggle).toHaveAccessibleName(/Using Primary: Opus · High.*Secondary: Sonnet · Medium/);
     await fireEvent.click(toggle);
 
     expect(setActiveAgentProfileMock).toHaveBeenCalledExactlyOnceWith(agent.id, "secondary");
+    await rerender({
+      agents: [{ ...agent, profiles: { ...agent.profiles!, active: "secondary" } }],
+    });
+    expect(screen.getByTestId("agent-selected-model")).toHaveTextContent("sonnet");
+    expect(screen.getByTestId("agent-selected-effort")).toHaveTextContent("medium");
+  });
+
+  it("shows two-line profile details above the switch and closes on pointer exit", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const state = await loadState();
+      const agent: AgentRecord = {
+        ...CLAUDE_AGENT,
+        model: "opus",
+        effort: "high",
+        profiles: {
+          active: "primary",
+          secondary: { model: "sonnet", effort: "medium" },
+        },
+      };
+      await state.registerAgent(agent);
+      render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
+
+      const toggle = screen.getByTestId("agent-profile-switch");
+      await fireEvent.pointerEnter(toggle);
+      await vi.advanceTimersByTimeAsync(500);
+      const tooltip = await waitFor(() => screen.getByTestId("tooltip-content"));
+      expect(tooltip).toHaveAttribute("data-side", "top");
+      expect(within(tooltip).getByText("Primary: Opus · High")).toBeInTheDocument();
+      expect(within(tooltip).getByText("Switch to Secondary: Sonnet · Medium")).toBeInTheDocument();
+      expect(tooltip).toHaveClass("pointer-events-none");
+
+      await fireEvent.pointerLeave(toggle);
+      await waitFor(() => expect(screen.queryByTestId("tooltip-content")).not.toBeInTheDocument());
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("quick-switches from an unpinned primary with no observed model", async () => {
@@ -1039,7 +1083,7 @@ describe("Sidebar", () => {
     expect(screen.queryByTestId("agent-observed-model")).toBeNull();
   });
 
-  it("sidebar falls back to the observed model when no model is selected, and hides when neither exists", async () => {
+  it("sidebar shows harness default rather than the last observed model when unpinned", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT); // no selected model
     const runtime = state.runtimes[CLAUDE_AGENT.id];
@@ -1055,17 +1099,14 @@ describe("Sidebar", () => {
       },
     };
 
-    const { rerender } = render(Sidebar, {
+    render(Sidebar, {
       props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] },
     });
-    expect(screen.getByTestId("agent-observed-model")).toHaveTextContent("claude-sonnet-4-6");
+    expect(screen.getByTestId("agent-selection-default")).toHaveTextContent(
+      "Harness/session default",
+    );
     expect(screen.queryByTestId("agent-selected-model")).toBeNull();
-
-    // Drop the observed model too → the whole line clean-hides.
-    state.runtimes[CLAUDE_AGENT.id] = { ...runtime, meta: undefined };
-    await rerender({ agents: [CLAUDE_AGENT] });
-    await waitFor(() => expect(screen.queryByTestId("agent-observed-model")).toBeNull());
-    expect(screen.queryByTestId("agent-selected-model")).toBeNull();
+    expect(screen.queryByTestId("agent-observed-model")).toBeNull();
   });
 
   it("sidebar shows the selected effort", async () => {
@@ -1525,10 +1566,12 @@ describe("Sidebar agent-scoped event tolerance", () => {
         skills: meta.skills,
       },
     };
-    // Component still rendered correctly with the new meta — the model shows as
-    // the observed fallback (this agent has no selected model).
+    // Runtime metadata never replaces the active profile's future-send intent.
     await waitFor(() => {
-      expect(screen.getByTestId("agent-observed-model")).toHaveTextContent("claude-sonnet-4-6");
+      expect(screen.getByTestId("agent-selection-default")).toHaveTextContent(
+        "Harness/session default",
+      );
+      expect(screen.queryByTestId("agent-observed-model")).toBeNull();
     });
   });
 });

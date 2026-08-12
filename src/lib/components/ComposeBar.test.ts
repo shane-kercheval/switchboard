@@ -1213,10 +1213,7 @@ describe("ComposeBar", () => {
       render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
 
       await waitFor(() => expect(forkHalf()).not.toBeNull());
-      expect(forkHalf()).toHaveAttribute(
-        "aria-label",
-        expect.stringMatching(/new branch of alice/i),
-      );
+      expect(forkHalf()).toHaveAttribute("aria-label", expect.stringMatching(/fork alice/i));
 
       // Two recipients — a branch has no single source.
       await fireEvent.click(chip(AGENT_B.id));

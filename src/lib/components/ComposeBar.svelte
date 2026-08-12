@@ -3749,8 +3749,8 @@
       </span>
       <Tooltip
         label={forkCandidate === null
-          ? "Send to a new branch"
-          : `Send to a new branch of ${forkCandidate.name} — it inherits the conversation so far, then goes its own way.`}
+          ? "Fork this conversation"
+          : `Fork ${forkCandidate.name} — send this message to a new agent that inherits the conversation so far.`}
         shortcut={shortcut("mod", "shift", "enter")}
         disableHoverableContent
       >
@@ -3762,8 +3762,8 @@
             onclick={handleForkSend}
             disabled={sendDisabled}
             aria-label={forkCandidate === null
-              ? "Send to a new branch"
-              : `Send to a new branch of ${forkCandidate.name}`}
+              ? "Fork this conversation"
+              : `Fork ${forkCandidate.name}`}
             class={cn(
               "flex h-7 w-7 shrink-0 items-center justify-center rounded-full",
               sendDisabled ? "cursor-not-allowed" : "hover:bg-primary-hover",

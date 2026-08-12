@@ -706,7 +706,7 @@ The feature is usable end to end and its transcript behavior is pinned.
   saved prompt. *(Amended after this plan shipped: prompt-mode fork was
   subsequently built — render → branch → dispatch, with project-scoped operation
   state so the send survives the compose bar being remounted mid-flight. Workflow
-  mode and forward-backed prompts remain excluded. See system-design §6 and
+  mode and forward-backed prompts remain excluded. See system-design §7 and
   harness-behavior §3.5; the original reasoning below is left as the record of
   what this milestone decided.)* Nothing about branching is incompatible with prompt mode — it
   mirrors how forward sources are plain-mode-only, and the workaround (switch to

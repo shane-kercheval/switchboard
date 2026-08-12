@@ -50,6 +50,7 @@
     markComposerConsumed,
     promptForkOperation,
     promptForkOutcome,
+    takePromptForkOutcome,
   } from "$lib/state/promptForkOps.svelte";
   import { projects, recordProjectsActivityLocally } from "$lib/state/workspace.svelte";
   import {
@@ -792,7 +793,7 @@
         } else if (menuOpen) {
           menuOpen = false;
           e.preventDefault();
-        } else if (!sending && selectedIds.length > 0) {
+        } else if (!composerBusy && selectedIds.length > 0) {
           setSelectedIds([]);
           e.preventDefault();
         }
@@ -820,7 +821,7 @@
         const pane = paneLayout.panes[Number(e.key) - 1];
         if (pane !== undefined && pane.members.length > 0) {
           e.preventDefault();
-          if (!sending) addPaneForwardSources(pane);
+          if (!composerBusy) addPaneForwardSources(pane);
         }
         return;
       }
@@ -849,7 +850,7 @@
       if (e.shiftKey) {
         if (e.key.toLowerCase() === "a") {
           e.preventDefault();
-          if (sending) return;
+          if (composerBusy) return;
           setSelectedIds(agents.map((a) => a.id));
         }
         return;
@@ -858,7 +859,7 @@
       const agent = agents[Number(e.key) - 1];
       if (agent === undefined) return;
       e.preventDefault();
-      if (sending) return;
+      if (composerBusy) return;
       toggleRecipient(agent.id);
     }
     window.addEventListener("keydown", onKeydown);
@@ -1211,15 +1212,19 @@
   const composerBusy = $derived(sending || promptForkOperation(projectId) !== undefined);
 
   /// A finished operation's message reaches whichever bar is mounted now, which
-  /// may not be the one that started it. Local state still wins: it belongs to
-  /// something the user did more recently.
-  const forkOutcome = $derived(promptForkOutcome(projectId));
-  const displayedError = $derived(
-    sendError ?? (forkOutcome?.tone === "error" ? forkOutcome.message : null),
-  );
-  const displayedNotice = $derived(
-    sendNotice ?? (forkOutcome?.tone === "notice" ? forkOutcome.message : null),
-  );
+  /// may not be the one that started it — so it is *consumed* into this bar's own
+  /// error/notice state rather than rendered from shared state. Rendering it as a
+  /// standing fallback kept a stale "Fork failed" alive through every subsequent
+  /// action and every revisit of the project.
+  $effect(() => {
+    const outcome = promptForkOutcome(projectId);
+    if (outcome === undefined) return;
+    untrack(() => {
+      takePromptForkOutcome(projectId);
+      if (outcome.tone === "error") sendError = outcome.message;
+      else sendNotice = outcome.message;
+    });
+  });
 
   /// with all required arguments filled, and is blocked while a render is in
   /// flight. **Not** gated on run_status — send-while-busy queues.
@@ -2256,9 +2261,19 @@
   /// *replacement* instance for the same project whose recipients the user has
   /// since chosen deliberately. Overwriting those would silently redirect their
   /// next message to an agent they never picked.
+  ///
+  /// **Both copies, not just the live one.** The persisted selection is normally
+  /// synced by a scheduled `$effect` that only runs while a bar is mounted — so a
+  /// fork completing while the user is in another project moved the live store
+  /// and left the saved one naming the parent. Remounting then *actively* wrote
+  /// that stale value back over the live one (`initialSelection` seeds from the
+  /// snapshot at mount), so the user returned to a composer addressed at the
+  /// agent they had just branched away from, and their next message went there.
   function selectForkIfRecipientsUnchanged(captured: AgentId[], forkId: AgentId): void {
     if (!recipientsUnchanged(captured)) return;
     setSelectedIds([forkId]);
+    setSelection(projectId, [forkId]);
+    flush();
   }
 
   /// Whether both the composed content and the live recipient set still match
@@ -2370,8 +2385,18 @@
     clearPromptForkOutcome(projectId);
     promptMenuOpen = false;
     closeMentionMenu();
-    // Token-scoped so a dead instance's `finally` cannot unlock a *newer*
-    // operation's render window.
+    // **Best-effort, and known to be incomplete.** The freeze keeps a pane
+    // gesture from silently changing recipients mid-render *within this
+    // instance*. It does not survive a remount (mount and `onDestroy` both
+    // release it), and because ordinary prompt sends hold the same shared
+    // boolean without claiming an operation, a stale one of those can release it
+    // out from under a fork started by a replacement bar. The consequence is a
+    // spurious abort with an explanation, not corruption — **snapshot divergence
+    // is the authoritative policy**, and it is what the tests pin. Closing this
+    // properly means one project-scoped claim owning every async compose
+    // operation, with targeting derived from it rather than mirrored in a second
+    // boolean; that is a change to the ordinary-send path too, so it is its own
+    // piece of work.
     setTargetingLocked(projectId, true);
     let holdsLock = true;
     const releaseLock = (): void => {
@@ -3081,7 +3106,7 @@
             <ForwardSourceChip
               {source}
               readiness={agentReadiness(source.id)}
-              disabled={sending}
+              disabled={composerBusy}
               onRemove={() => removeForwardSource(forwardSourceKey(source))}
             />
           {/each}
@@ -3095,9 +3120,9 @@
               data-testid="forward-sources-clear"
               aria-label="Clear forward sources"
               title="Clear forward sources"
-              disabled={sending}
+              disabled={composerBusy}
               onclick={() => {
-                if (!sending) forwardSources = [];
+                if (!composerBusy) forwardSources = [];
               }}
             >
               <ClearIcon />
@@ -3134,13 +3159,13 @@
                       selected
                         ? "bg-accent-soft text-fg border-transparent"
                         : "border-panel bg-panel text-muted hover:bg-raised hover:text-fg",
-                      sending ? "cursor-not-allowed opacity-60" : "",
+                      composerBusy ? "cursor-not-allowed opacity-60" : "",
                     )}
                     data-testid={`recipient-chip-${agent.id}`}
                     data-selected={selected}
                     data-hidden-recipient={chipHidden || undefined}
                     aria-pressed={selected}
-                    disabled={sending}
+                    disabled={composerBusy}
                     onclick={() => toggleRecipient(agent.id)}
                   >
                     {#if i < 9}
@@ -3190,9 +3215,9 @@
                     class={cn(ICON_BUTTON_CLASS, "ml-0.5")}
                     data-testid="recipient-clear"
                     aria-label="Clear recipients"
-                    disabled={sending}
+                    disabled={composerBusy}
                     onclick={() => {
-                      if (!sending) setSelectedIds([]);
+                      if (!composerBusy) setSelectedIds([]);
                     }}
                   >
                     <ClearIcon />
@@ -3218,7 +3243,7 @@
               onPickAgent={(agent) => addForwardSource(forwardSourceForAgent(agent))}
               onPickPane={(pane) => addPaneForwardSources(pane)}
               {agentReadiness}
-              disabled={sending}
+              disabled={composerBusy}
               showPaneShortcuts
               triggerTestid="compose-forward-button"
               triggerText="Forward"
@@ -3226,7 +3251,7 @@
               tooltipLabel="Forward an agent's output"
               triggerClass={cn(
                 "text-muted hover:text-fg hover:bg-panel focus-visible:ring-focus flex h-6 items-center gap-1 rounded-full border border-transparent px-2 text-xs transition-colors focus-visible:ring-1 focus-visible:outline-none",
-                sending ? "cursor-not-allowed opacity-60" : "",
+                composerBusy ? "cursor-not-allowed opacity-60" : "",
               )}
             />
             <Tooltip label="Insert a prompt" shortcut={shortcut("/")}>
@@ -3236,13 +3261,13 @@
                   type="button"
                   class={cn(
                     "text-muted hover:text-fg hover:bg-panel focus-visible:ring-focus flex h-6 items-center gap-1 rounded-full border border-transparent px-2 text-xs transition-colors focus-visible:ring-1 focus-visible:outline-none",
-                    sending ? "cursor-not-allowed opacity-60" : "",
+                    composerBusy ? "cursor-not-allowed opacity-60" : "",
                   )}
                   data-testid="compose-prompt-button"
                   aria-label="Insert a prompt"
-                  disabled={sending}
+                  disabled={composerBusy}
                   onclick={() => {
-                    if (sending) return;
+                    if (composerBusy) return;
                     if (promptMenuOpen) {
                       promptMenuOpen = false;
                     } else {
@@ -3272,13 +3297,13 @@
                   type="button"
                   class={cn(
                     "text-muted hover:text-fg hover:bg-panel focus-visible:ring-focus flex h-6 items-center gap-1 rounded-full border border-transparent px-2 text-xs transition-colors focus-visible:ring-1 focus-visible:outline-none",
-                    sending ? "cursor-not-allowed opacity-60" : "",
+                    composerBusy ? "cursor-not-allowed opacity-60" : "",
                   )}
                   data-testid="compose-workflow-button"
                   aria-label="Run a workflow"
-                  disabled={sending}
+                  disabled={composerBusy}
                   onclick={() => {
-                    if (sending) return;
+                    if (composerBusy) return;
                     if (workflowMenuOpen) {
                       workflowMenuOpen = false;
                     } else {
@@ -3323,7 +3348,7 @@
                 class="text-muted hover:text-fg hover:bg-control-hover flex h-4 w-4 shrink-0 items-center justify-center rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-50"
                 data-testid={`attachment-chip-remove-${chip.label}`}
                 aria-label={`Remove ${chip.original_name}`}
-                disabled={sending}
+                disabled={composerBusy}
                 onclick={() => removeAttachmentChip(chip.id)}
               >
                 <svg
@@ -3451,7 +3476,7 @@
         Waiting for browser sign-in to {signingInProvider}…
       </p>
     {/if}
-    {#if displayedNotice}
+    {#if sendNotice}
       <!-- Announced for the same reason as the error above: a fork refused
            after the composer moved on is explained here, and a keyboard user
            invoking the shortcut has no other signal. -->
@@ -3461,10 +3486,10 @@
         role="status"
         aria-live="polite"
       >
-        {displayedNotice}
+        {sendNotice}
       </p>
     {/if}
-    {#if displayedError}
+    {#if sendError}
       <!-- Announced, not just shown. Hiding the fork control when unavailable
            rests on the shortcut still explaining itself, and an explanation a
            screen reader never speaks is no explanation. `polite` rather than
@@ -3476,7 +3501,7 @@
         role="status"
         aria-live="polite"
       >
-        {displayedError}
+        {sendError}
       </p>
     {/if}
   {/if}
@@ -3547,7 +3572,7 @@
         >
           {#if showStop}
             <StopIcon class="size-5" />
-          {:else if sending}
+          {:else if composerBusy}
             <svg
               viewBox="0 0 24 24"
               fill="none"

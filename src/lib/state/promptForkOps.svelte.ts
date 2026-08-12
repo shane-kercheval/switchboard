@@ -91,11 +91,28 @@ export function endPromptFork(
   outcomes[projectId] = outcome === undefined ? undefined : { id, ...outcome };
 }
 
+/// The pending outcome, if any. Read reactively so a composer already on screen
+/// notices one published *after* it mounted — the common case, since a failure
+/// usually lands once the user has navigated back.
 export function promptForkOutcome(projectId: ProjectId): PromptForkOutcome | undefined {
   return outcomes[projectId];
 }
 
-/// Drop a published outcome — the user has acted again, so the message is stale.
+/// Take the outcome and clear it in one step.
+///
+/// **Deliver-once, not a persistent fallback.** Rendering straight from this map
+/// left a "Fork failed" on screen through an ordinary send, a mode switch, and
+/// every later revisit of the project — describing a state that no longer
+/// existed. Consuming it into the mounted composer's own error/notice state
+/// makes it behave like any other message: shown once, cleared by the next thing
+/// the user does.
+export function takePromptForkOutcome(projectId: ProjectId): PromptForkOutcome | undefined {
+  const outcome = outcomes[projectId];
+  if (outcome !== undefined) outcomes[projectId] = undefined;
+  return outcome;
+}
+
+/// Drop a published outcome without reading it — a new operation supersedes it.
 export function clearPromptForkOutcome(projectId: ProjectId): void {
   outcomes[projectId] = undefined;
 }

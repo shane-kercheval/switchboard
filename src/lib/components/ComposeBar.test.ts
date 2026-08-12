@@ -2120,13 +2120,13 @@ describe("fork is confined to composers whose message it can actually dispatch",
     await fireEvent.click(screen.getByTestId("prompt-arg-forward-focus"));
     await fireEvent.click(await screen.findByTestId(`forward-picker-agent-${AGENT_B.id}`));
 
-    const composer = screen.getByTestId("prompt-composer");
-    await fireEvent.keyDown(window, {
-      key: "Enter",
-      metaKey: true,
-      shiftKey: true,
-      target: composer,
-    });
+    // Focus for real: the handler gates on `document.activeElement`, which a
+    // `target` option does not move. This currently passes on incidental focus
+    // from the picker click — being explicit keeps it from silently becoming a
+    // test of nothing.
+    const composer = screen.getByTestId("prompt-composer") as HTMLElement;
+    composer.focus();
+    await fireEvent.keyDown(composer, { key: "Enter", metaKey: true, shiftKey: true });
 
     await waitFor(() =>
       expect(screen.getByTestId("compose-send-error")).toHaveTextContent(/another agent/i),
@@ -2586,13 +2586,21 @@ describe("prompt-mode fork", () => {
     await waitFor(() => expect(forkHalf()).not.toBeNull());
     await fireEvent.click(forkHalf()!);
 
-    // Leave and return while the render is still open, then edit — recipients
-    // deliberately untouched, which is what the earlier recipient-only guard
-    // could not catch.
+    // Leave and return while the render is still open. The composer is frozen —
+    // that is the point of the project-scoped busy state — so the divergence is
+    // driven through the store the way a late-resolving attachment staging or an
+    // external write would, which is what this test is actually about.
     first.unmount();
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
     await waitFor(() => expect(screen.queryByTestId("prompt-appended")).not.toBeNull());
-    await fireEvent.input(screen.getByTestId("prompt-appended"), { target: { value: "EDITED" } });
+    const store = await loadComposeStore();
+    store.setContent(PROJECT_ID, {
+      kind: "prompt",
+      provider: "tiddly",
+      name: "summary",
+      args: {},
+      appendedText: "EDITED",
+    });
 
     releaseRender({ kind: "rendered", text: "RENDERED" });
     await waitFor(() =>
@@ -2611,7 +2619,10 @@ describe("prompt-mode fork", () => {
       args: {},
       appendedText: "EDITED",
     });
-    expect((screen.getByTestId("prompt-appended") as HTMLTextAreaElement).value).toBe("EDITED");
+    // The store holds the newer content; nothing overwrote it.
+    expect((compose.getCompose(PROJECT_ID).content as { appendedText: string }).appendedText).toBe(
+      "EDITED",
+    );
   });
 
   it("dispatches but preserves a replacement composer edited after registration began", async () => {
@@ -2638,7 +2649,14 @@ describe("prompt-mode fork", () => {
     first.unmount();
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
     await waitFor(() => expect(screen.queryByTestId("prompt-appended")).not.toBeNull());
-    await fireEvent.input(screen.getByTestId("prompt-appended"), { target: { value: "NEWER" } });
+    const store = await loadComposeStore();
+    store.setContent(PROJECT_ID, {
+      kind: "prompt",
+      provider: "tiddly",
+      name: "summary",
+      args: {},
+      appendedText: "NEWER",
+    });
     const sel = await import("$lib/state/recipientSelection.svelte");
     sel.setRecipients(PROJECT_ID, [AGENT_B.id]);
 
@@ -2653,7 +2671,9 @@ describe("prompt-mode fork", () => {
     await waitFor(() =>
       expect(screen.getByTestId("compose-send-notice")).toHaveTextContent(/newer draft/i),
     );
-    expect((screen.getByTestId("prompt-appended") as HTMLTextAreaElement).value).toBe("NEWER");
+    expect((store.getCompose(PROJECT_ID).content as { appendedText?: string }).appendedText).toBe(
+      "NEWER",
+    );
     expect(sel.selectionFor(PROJECT_ID)).toEqual([AGENT_B.id]);
   });
 
@@ -2688,6 +2708,174 @@ describe("prompt-mode fork", () => {
     expect(compose.getCompose(PROJECT_ID).content).toEqual({ kind: "plain", draft: "" });
     const sel = await import("$lib/state/recipientSelection.svelte");
     expect(sel.selectionFor(PROJECT_ID)).toEqual([FORK.id]);
+  });
+
+  it("moves the selection to the branch even when it finishes off-screen", async () => {
+    // The persisted recipient list is synced by an effect that only runs while a
+    // bar is mounted. A fork finishing while the user is in another project used
+    // to move only the live selection; remounting then seeded from the stale
+    // saved copy and put the parent back — so the next message went to the agent
+    // they had just branched away from.
+    let releaseFork!: (v: AgentRecord) => void;
+    const pending = new Promise<AgentRecord>((resolve) => {
+      releaseFork = resolve;
+    });
+    mockForkPromptBackend({ fork: () => pending });
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    seedTurn(state, AGENT_A.id);
+    const first = render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await enterPromptMode("prompt-option-tiddly:summary");
+    await waitFor(() => expect(forkHalf()).not.toBeNull());
+    await fireEvent.click(forkHalf()!);
+    await waitFor(() => expect(forks()).toHaveLength(1));
+
+    // Leave project A entirely and let the branch finish with nothing mounted.
+    first.unmount();
+    releaseFork(FORK);
+    await waitFor(() => expect(sends()).toHaveLength(1));
+
+    const compose = await loadComposeStore();
+    const sel = await import("$lib/state/recipientSelection.svelte");
+    expect(compose.getCompose(PROJECT_ID).selectedIds).toEqual([FORK.id]);
+
+    // And coming back does not undo it.
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, FORK] } });
+    await waitFor(() => expect(screen.queryByTestId("compose-textarea")).not.toBeNull());
+    expect(sel.selectionFor(PROJECT_ID)).toEqual([FORK.id]);
+  });
+
+  it("moves the selection to an unreachable branch that finished off-screen", async () => {
+    // Same rule on the committed-but-unsubscribed path: the retry has to target
+    // the branch, so the selection must survive the round trip there too.
+    listenMock.mockImplementation(async (name: string, cb) => {
+      if (name === `agent:${FORK.id}`) throw new Error("channel refused");
+      listeners.set(name, cb);
+      return vi.fn();
+    });
+    let releaseFork!: (v: AgentRecord) => void;
+    const pending = new Promise<AgentRecord>((resolve) => {
+      releaseFork = resolve;
+    });
+    mockForkPromptBackend({ fork: () => pending });
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    seedTurn(state, AGENT_A.id);
+    const first = render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await enterPromptMode("prompt-option-tiddly:summary");
+    await waitFor(() => expect(forkHalf()).not.toBeNull());
+    await fireEvent.click(forkHalf()!);
+    await waitFor(() => expect(forks()).toHaveLength(1));
+
+    first.unmount();
+    releaseFork(FORK);
+    const compose = await loadComposeStore();
+    await waitFor(() => expect(compose.getCompose(PROJECT_ID).selectedIds).toEqual([FORK.id]));
+    expect(sends()).toHaveLength(0);
+  });
+
+  it("freezes every compose control in a bar remounted mid-operation", async () => {
+    // `sending` resets to false in a replacement bar, so gating on it left
+    // controls that look live but mutate the snapshot the in-flight operation is
+    // comparing against — recipients, staged files, and the mode buttons. The
+    // rule is one policy for every compose-mutating control.
+    let releaseRender!: (v: unknown) => void;
+    const pending = new Promise<unknown>((resolve) => {
+      releaseRender = resolve;
+    });
+    mockForkPromptBackend({ render: () => pending });
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    seedTurn(state, AGENT_A.id);
+    const first = render(ComposeBar, {
+      props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] },
+    });
+    await enterPromptMode("prompt-option-tiddly:summary");
+    await waitFor(() => expect(forkHalf()).not.toBeNull());
+    await fireEvent.click(forkHalf()!);
+
+    first.unmount();
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    await waitFor(() => expect(screen.queryByTestId("prompt-composer")).not.toBeNull());
+
+    // The mode-switch buttons live inside `{#if mode === "plain"}`, so prompt
+    // mode never renders them; what a remounted bar does still show is the
+    // recipient row, which mutates the very selection the snapshot compares.
+    const disabled = (id: string) => (screen.getByTestId(id) as HTMLButtonElement).disabled;
+    expect(disabled("recipient-clear")).toBe(true);
+    expect(disabled(`recipient-chip-${AGENT_B.id}`)).toBe(true);
+
+    // Keyboard paths too: select-all and per-agent toggle both mutate recipients.
+    const before = (await import("$lib/state/recipientSelection.svelte")).selectionFor(PROJECT_ID);
+    await fireEvent.keyDown(window, { key: "a", metaKey: true, shiftKey: true });
+    await fireEvent.keyDown(window, { key: "2", metaKey: true });
+    expect((await import("$lib/state/recipientSelection.svelte")).selectionFor(PROJECT_ID)).toEqual(
+      before,
+    );
+
+    releaseRender({ kind: "rendered", text: "RENDERED" });
+    await waitFor(() => expect(sends()).toHaveLength(1));
+  });
+
+  it("delivers a failure once, to whichever bar is mounted, and does not repeat it", async () => {
+    // The outcome is project-scoped so it can reach a replacement composer, but
+    // rendering straight from that shared state kept a stale "Fork failed" alive
+    // through every later action and every revisit of the project.
+    let rejectFork!: (e: Error) => void;
+    const pending = new Promise<AgentRecord>((_, reject) => {
+      rejectFork = reject;
+    });
+    mockForkPromptBackend({ fork: () => pending });
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    seedTurn(state, AGENT_A.id);
+    const first = render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await enterPromptMode("prompt-option-tiddly:summary");
+    await waitFor(() => expect(forkHalf()).not.toBeNull());
+    await fireEvent.click(forkHalf()!);
+    await waitFor(() => expect(forks()).toHaveLength(1));
+
+    // Fail while nothing is mounted, then come back.
+    first.unmount();
+    rejectFork(new Error("alice is working"));
+    const second = render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await waitFor(() =>
+      expect(screen.getByTestId("compose-send-error")).toHaveTextContent("alice is working"),
+    );
+
+    // Leaving and returning again must not resurrect it.
+    second.unmount();
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await waitFor(() => expect(screen.queryByTestId("prompt-composer")).not.toBeNull());
+    expect(screen.queryByTestId("compose-send-error")).toBeNull();
+  });
+
+  it("delivers a failure to a composer that was already mounted when it landed", async () => {
+    // A mount-time read would miss this — and this is the common shape, since a
+    // failure usually lands after the user has navigated back.
+    let rejectFork!: (e: Error) => void;
+    const pending = new Promise<AgentRecord>((_, reject) => {
+      rejectFork = reject;
+    });
+    mockForkPromptBackend({ fork: () => pending });
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    seedTurn(state, AGENT_A.id);
+    const first = render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await enterPromptMode("prompt-option-tiddly:summary");
+    await waitFor(() => expect(forkHalf()).not.toBeNull());
+    await fireEvent.click(forkHalf()!);
+    await waitFor(() => expect(forks()).toHaveLength(1));
+
+    first.unmount();
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await waitFor(() => expect(screen.queryByTestId("prompt-composer")).not.toBeNull());
+    rejectFork(new Error("alice is working"));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("compose-send-error")).toHaveTextContent("alice is working"),
+    );
   });
 
   it("freezes the attachment set for the whole fork, not just the render", async () => {

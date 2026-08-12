@@ -1065,9 +1065,10 @@ export type ReachableFork =
 ///
 /// Deliberately does **not** touch recipient selection, dispatch, or compose
 /// state. Each caller finalizes its own composer on its own rules — plain mode
-/// clears before this call and hands the text back on failure, prompt mode
-/// clears in the synchronous window just before it — and folding those into a
-/// shared helper is how an obsolete instance ends up retargeting a live one.
+/// clears before this call and hands the text back on failure, prompt mode holds
+/// everything until the send has dispatched and then retires it only if the
+/// composer still matches what it captured — and folding those into a shared
+/// helper is how an obsolete instance ends up retargeting a live one.
 export async function createReachableFork(sourceId: AgentId): Promise<ReachableFork> {
   const fork = await forkAgentIntoOwnPane(sourceId);
   if (runtimes[fork.id]?.listener_error != null) {

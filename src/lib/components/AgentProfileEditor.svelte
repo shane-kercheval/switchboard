@@ -177,10 +177,6 @@
     {#if secondary !== null}
       {@render profileFields("Secondary", "secondary", secondary)}
     {/if}
-
-    {#if harness === "claude_code"}
-      <p class="text-muted text-xs">Higher effort levels may run lower on some Claude models.</p>
-    {/if}
   {:else}
     <p class="text-muted text-xs leading-relaxed" data-testid={`${testidPrefix}-unsupported`}>
       {HARNESS_LABEL[harness]}'s model and effort are selected inside {HARNESS_LABEL[harness]} and cannot

@@ -1468,8 +1468,8 @@
                       </button>
                     {/snippet}
                     <div class="space-y-0.5 text-[13px] leading-4">
-                      <div class="font-medium">{switchCopy.current}</div>
-                      <div class="text-primary-fg/70">{switchCopy.target}</div>
+                      <div class="text-primary-fg/70">{switchCopy.current}</div>
+                      <div class="font-medium">{switchCopy.target}</div>
                     </div>
                   </Tooltip>
                 {/if}

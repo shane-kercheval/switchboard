@@ -755,6 +755,10 @@ mod tests {
         journal: Arc<dyn ConversationJournal>,
     }
     impl DispatchContextFactory for MockFactory {
+        fn selection_snapshot(&self) -> Option<switchboard_dispatcher::SelectionSnapshot> {
+            None
+        }
+
         fn build(&self, _send_id: SendId) -> DispatchContext {
             let scenario = self
                 .scenarios

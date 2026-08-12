@@ -961,6 +961,32 @@ describe("Sidebar", () => {
     expect(setActiveAgentProfileMock).toHaveBeenCalledExactlyOnceWith(agent.id, "secondary");
   });
 
+  it("quick-switches from an unpinned primary with no observed model", async () => {
+    const state = await loadState();
+    const agent: AgentRecord = {
+      ...CLAUDE_AGENT,
+      model: null,
+      effort: null,
+      profiles: {
+        active: "primary",
+        secondary: { model: "sonnet", effort: "medium" },
+      },
+    };
+    await state.registerAgent(agent);
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
+
+    expect(screen.getByTestId("agent-selection-default")).toHaveTextContent(
+      "Harness/session default",
+    );
+    const toggle = screen.getByTestId("agent-profile-switch");
+    expect(toggle).toHaveAccessibleName(
+      /Using Primary: Harness\/session default.*Secondary: Sonnet · Medium/,
+    );
+    await fireEvent.click(toggle);
+
+    expect(setActiveAgentProfileMock).toHaveBeenCalledExactlyOnceWith(agent.id, "secondary");
+  });
+
   it("keeps the quick switch usable and surfaces a persistence failure", async () => {
     const state = await loadState();
     const agent: AgentRecord = {

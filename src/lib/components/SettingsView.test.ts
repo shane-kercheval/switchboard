@@ -8,6 +8,8 @@ import { agentCopy } from "$lib/agentCopy.svelte";
 import { _testing as availabilityTesting } from "$lib/harnessAvailability.svelte";
 import { _testing as prefsTesting } from "$lib/preferences.svelte";
 import { WORKFLOW_AUTHORING_GUIDE_URL } from "$lib/workflowAuthoring";
+import { DEFAULT_AGENT_PROFILES } from "$lib/agentSelection";
+import type { Preferences } from "$lib/types";
 
 // SettingsView embeds HarnessStatusList (probes install/auth on mount) and
 // McpServersSettings (loads providers on mount). Tests that override the mock
@@ -56,7 +58,7 @@ beforeEach(() => {
   // The embedded HarnessStatusList reads the shared singleton store; reset it
   // so probed values don't leak across tests.
   availabilityTesting.reset();
-  prefsTesting.reset();
+  prefsTesting.reset({ ready: true });
 });
 
 afterEach(() => {
@@ -85,7 +87,7 @@ describe("SettingsView", () => {
 
   it("persists per-harness primary and optional secondary defaults", async () => {
     render(SettingsView, { props: { onClose: vi.fn() } });
-    await fireEvent.click(screen.getByText("Codex", { selector: "summary" }));
+    await fireEvent.click(await screen.findByText("Codex", { selector: "summary" }));
     await fireEvent.click(
       screen.getByTestId("settings-profile-codex-primary-model-option-gpt-5.6-terra"),
     );
@@ -110,6 +112,85 @@ describe("SettingsView", () => {
             codex: {
               primary: { model: "gpt-5.6-terra", effort: "high" },
               secondary: { model: "gpt-5.6-terra", effort: "medium" },
+            },
+          }),
+        }),
+      }),
+    );
+  });
+
+  it("keeps backend preference controls unavailable until saved values are authoritative", async () => {
+    prefsTesting.reset({ ready: false });
+    let resolvePreferences!: (value: Preferences) => void;
+    const delayedPreferences = new Promise<Preferences>((resolve) => {
+      resolvePreferences = resolve;
+    });
+    invokeMock.mockImplementation((cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "get_preferences") return delayedPreferences;
+      return defaultInvoke(cmd, args);
+    });
+
+    render(SettingsView, { props: { onClose: vi.fn() } });
+    expect(screen.getByTestId("agent-defaults-loading")).toBeInTheDocument();
+    expect(screen.queryByTestId("settings-profile-claude_code-primary-model")).toBeNull();
+    expect(screen.getByTestId("git-editor-command")).toBeDisabled();
+    expect(screen.getByTestId("git-terminal-app")).toBeDisabled();
+    expect(screen.getByTestId("notify-toggle")).toBeDisabled();
+    expect(screen.getByTestId("notify-while-focused-toggle")).toBeDisabled();
+    expect(screen.getByTestId("show-builtins-toggle")).toBeDisabled();
+
+    resolvePreferences({
+      editor_command: "zed",
+      terminal_app: "iTerm",
+      diff_style: "unified",
+      show_builtins: true,
+      notify_on_completion: true,
+      notify_while_focused: false,
+      agent_defaults: {
+        ...structuredClone(DEFAULT_AGENT_PROFILES),
+        claude_code: {
+          primary: { model: "sonnet", effort: "low" },
+          secondary: null,
+        },
+      },
+    });
+
+    await waitFor(() =>
+      expect(screen.getByTestId("settings-profile-claude_code-primary-model")).toHaveAttribute(
+        "data-value",
+        "sonnet",
+      ),
+    );
+    const editor = screen.getByTestId("git-editor-command") as HTMLInputElement;
+    const terminal = screen.getByTestId("git-terminal-app") as HTMLInputElement;
+    expect(editor).toBeEnabled();
+    expect(terminal).toBeEnabled();
+    expect(editor).toHaveValue("zed");
+    expect(terminal).toHaveValue("iTerm");
+    expect(screen.getByTestId("notify-toggle")).toBeEnabled();
+    expect(screen.getByTestId("show-builtins-toggle")).toBeEnabled();
+
+    await fireEvent.input(editor, { target: { value: "cursor" } });
+    await fireEvent.change(editor);
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("set_preferences", {
+        preferences: expect.objectContaining({
+          editor_command: "cursor",
+          terminal_app: "iTerm",
+        }),
+      }),
+    );
+
+    await fireEvent.click(
+      screen.getByTestId("settings-profile-claude_code-primary-effort-option-medium"),
+    );
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("set_preferences", {
+        preferences: expect.objectContaining({
+          agent_defaults: expect.objectContaining({
+            claude_code: {
+              primary: { model: "sonnet", effort: "medium" },
+              secondary: null,
             },
           }),
         }),

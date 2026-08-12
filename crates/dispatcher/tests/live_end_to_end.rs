@@ -90,6 +90,10 @@ impl LiveFactory {
 }
 
 impl DispatchContextFactory for LiveFactory {
+    fn selection_snapshot(&self) -> Option<switchboard_dispatcher::SelectionSnapshot> {
+        None
+    }
+
     fn build(&self, _send_id: SendId) -> DispatchContext {
         DispatchContext {
             adapter: Arc::clone(&self.adapter),

@@ -19,7 +19,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 
 use crate::error::AppError;
 use switchboard_core::{AgentProfile, HarnessKind};
@@ -75,20 +75,40 @@ fn deserialize_agent_defaults<'de, D>(
 where
     D: Deserializer<'de>,
 {
-    let raw = BTreeMap::<String, AgentDefaults>::deserialize(deserializer)?;
-    Ok(raw
-        .into_iter()
-        .filter_map(|(key, value)| {
-            let harness = match key.as_str() {
-                "claude_code" => HarnessKind::ClaudeCode,
-                "codex" => HarnessKind::Codex,
-                "gemini" => HarnessKind::Gemini,
-                "antigravity" => HarnessKind::Antigravity,
-                _ => return None,
-            };
-            Some((harness, value))
-        })
-        .collect())
+    let raw = BTreeMap::<String, serde_norway::Value>::deserialize(deserializer)?;
+    let mut known = BTreeMap::new();
+    for (key, value) in raw {
+        let harness = match key.as_str() {
+            "claude_code" => HarnessKind::ClaudeCode,
+            "codex" => HarnessKind::Codex,
+            "gemini" => HarnessKind::Gemini,
+            "antigravity" => HarnessKind::Antigravity,
+            _ => continue,
+        };
+        let defaults = serde_norway::from_value(value).map_err(D::Error::custom)?;
+        known.insert(harness, defaults);
+    }
+    Ok(known)
+}
+
+/// Merge a value owned by this version into an existing YAML value while
+/// preserving fields only a newer version understands. A scalar, sequence, or
+/// explicit `null` is authoritative and replaces the old value; recursion is
+/// only valid when both sides are mappings.
+fn merge_yaml_value(existing: &mut serde_norway::Value, new: serde_norway::Value) {
+    match (existing, new) {
+        (serde_norway::Value::Mapping(existing), serde_norway::Value::Mapping(new_fields)) => {
+            for (key, value) in new_fields {
+                match existing.get_mut(&key) {
+                    Some(old) => merge_yaml_value(old, value),
+                    None => {
+                        existing.insert(key, value);
+                    }
+                }
+            }
+        }
+        (existing, new) => *existing = new,
+    }
 }
 
 /// The default terminal application opened by the Git view's "open in terminal"
@@ -300,17 +320,10 @@ pub fn save(path: &Path, prefs: &Preferences) -> Result<(), AppError> {
     switchboard_core::edit_yaml_mapping(path, move |root| {
         let defaults_key = serde_norway::Value::String("agent_defaults".to_owned());
         if let Some(new_defaults) = fields.remove(&defaults_key) {
-            match (root.get_mut(&defaults_key), new_defaults) {
-                (
-                    Some(serde_norway::Value::Mapping(existing)),
-                    serde_norway::Value::Mapping(known),
-                ) => {
-                    for (key, value) in known {
-                        existing.insert(key, value);
-                    }
-                }
-                (_, value) => {
-                    root.insert(defaults_key, value);
+            match root.get_mut(&defaults_key) {
+                Some(existing) => merge_yaml_value(existing, new_defaults),
+                None => {
+                    root.insert(defaults_key, new_defaults);
                 }
             }
         }
@@ -423,12 +436,12 @@ mod tests {
     }
 
     #[test]
-    fn unknown_future_harness_defaults_are_ignored_on_load_and_preserved_on_save() {
+    fn future_agent_defaults_are_opaque_on_load_and_preserved_recursively_on_save() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("config.yaml");
         std::fs::write(
             &path,
-            "terminal_app: iTerm\nagent_defaults:\n  claude_code:\n    primary:\n      model: sonnet\n      effort: medium\n  future_harness:\n    primary:\n      model: future-model\n      effort: extreme\n",
+            "terminal_app: iTerm\nagent_defaults:\n  claude_code:\n    future_mode: adaptive\n    primary:\n      model: sonnet\n      effort: medium\n      future_axis: preserved\n    secondary:\n      model: haiku\n      effort: low\n      future_axis: removed-with-secondary\n  future_harness:\n    - a-shape\n    - this-version-cannot-parse\n",
         )
         .unwrap();
 
@@ -441,6 +454,11 @@ mod tests {
                 .as_deref(),
             Some("sonnet")
         );
+        prefs
+            .agent_defaults
+            .get_mut(&HarnessKind::ClaudeCode)
+            .unwrap()
+            .secondary = None;
         prefs.editor_command = Some("zed".to_owned());
         save(&path, &prefs).unwrap();
 
@@ -451,9 +469,31 @@ mod tests {
             .unwrap();
         let future = defaults
             .get(serde_norway::Value::String("future_harness".to_owned()))
+            .and_then(serde_norway::Value::as_sequence)
+            .unwrap();
+        assert_eq!(future.len(), 2);
+
+        let claude = defaults
+            .get(serde_norway::Value::String("claude_code".to_owned()))
             .and_then(serde_norway::Value::as_mapping)
             .unwrap();
-        assert!(future.contains_key(serde_norway::Value::String("primary".to_owned())));
+        assert_eq!(
+            claude.get(serde_norway::Value::String("future_mode".to_owned())),
+            Some(&serde_norway::Value::String("adaptive".to_owned()))
+        );
+        let primary = claude
+            .get(serde_norway::Value::String("primary".to_owned()))
+            .and_then(serde_norway::Value::as_mapping)
+            .unwrap();
+        assert_eq!(
+            primary.get(serde_norway::Value::String("future_axis".to_owned())),
+            Some(&serde_norway::Value::String("preserved".to_owned()))
+        );
+        assert_eq!(
+            claude.get(serde_norway::Value::String("secondary".to_owned())),
+            Some(&serde_norway::Value::Null),
+            "an explicit current-version null must retain deletion semantics"
+        );
     }
 
     #[test]

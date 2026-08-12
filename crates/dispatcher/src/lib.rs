@@ -808,10 +808,9 @@ pub trait DispatchContextFactory: Send + Sync {
     /// Model/effort intent captured when a send is submitted. This is called
     /// before the work item enters the actor queue, including when the actor
     /// already exists and ignores the newly supplied factory for context
-    /// construction. The default preserves callers with no selectable profile.
-    fn selection_snapshot(&self) -> Option<SelectionSnapshot> {
-        None
-    }
+    /// construction. Factories with no profile semantics return `None`
+    /// explicitly so adding a factory requires acknowledging this contract.
+    fn selection_snapshot(&self) -> Option<SelectionSnapshot>;
 
     /// Policy check run at the moment this turn actually **starts**, before the
     /// send is journaled or any subprocess spawns. `Err(reason)` refuses just

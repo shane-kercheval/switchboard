@@ -19,6 +19,7 @@
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
   import {
     loadPreferences,
+    preferenceLoadState,
     preferences,
     saveStatus,
     updatePreferences,
@@ -118,6 +119,7 @@
   const sectionHeadingClass = "text-fg text-base font-semibold";
 
   onMount(() => {
+    void loadPreferences();
     void localPromptsDir()
       .then((path) => {
         promptsDir = path;
@@ -242,34 +244,43 @@
         </p>
       </div>
 
-      <div class="space-y-2">
-        {#each ALL_HARNESSES as harness (harness)}
-          <details
-            class="border-border bg-raised rounded-md border"
-            open={harness === "claude_code"}
-          >
-            <summary
-              class="text-fg hover:bg-active cursor-pointer list-none rounded-md px-3 py-2.5 text-sm font-medium"
+      {#if preferenceLoadState.ready}
+        <div class="space-y-2">
+          {#each ALL_HARNESSES as harness (harness)}
+            <details
+              class="border-border bg-raised rounded-md border"
+              open={harness === "claude_code"}
             >
-              {HARNESS_LABEL[harness]}
-            </summary>
-            <div class="border-border border-t p-3">
-              <AgentProfileEditor
-                {harness}
-                bind:primary={
-                  () => preferences.agent_defaults[harness].primary,
-                  (value) => updateAgentDefault(harness, "primary", value)
-                }
-                bind:secondary={
-                  () => preferences.agent_defaults[harness].secondary,
-                  (value) => updateAgentDefault(harness, "secondary", value)
-                }
-                testidPrefix={`settings-profile-${harness}`}
-              />
-            </div>
-          </details>
-        {/each}
-      </div>
+              <summary
+                class="text-fg hover:bg-active cursor-pointer list-none rounded-md px-3 py-2.5 text-sm font-medium"
+              >
+                {HARNESS_LABEL[harness]}
+              </summary>
+              <div class="border-border border-t p-3">
+                <AgentProfileEditor
+                  {harness}
+                  bind:primary={
+                    () => preferences.agent_defaults[harness].primary,
+                    (value) => updateAgentDefault(harness, "primary", value)
+                  }
+                  bind:secondary={
+                    () => preferences.agent_defaults[harness].secondary,
+                    (value) => updateAgentDefault(harness, "secondary", value)
+                  }
+                  testidPrefix={`settings-profile-${harness}`}
+                />
+              </div>
+            </details>
+          {/each}
+        </div>
+      {:else}
+        <div
+          class="border-border bg-raised text-muted rounded-md border px-3 py-3 text-sm"
+          data-testid="agent-defaults-loading"
+        >
+          Loading agent defaults…
+        </div>
+      {/if}
 
       {#if saveFailedFor("agent_defaults")}
         <p class="text-status-failed text-xs" data-testid="agent-defaults-save-error">
@@ -328,6 +339,7 @@
           data-testid="git-editor-command"
           placeholder="code"
           value={preferences.editor_command ?? ""}
+          disabled={!preferenceLoadState.ready}
           onchange={(e: Event) => {
             const v = (e.currentTarget as HTMLInputElement).value.trim();
             void updatePreferences({ editor_command: v === "" ? null : v });
@@ -342,6 +354,7 @@
           data-testid="git-terminal-app"
           placeholder="Terminal"
           value={preferences.terminal_app}
+          disabled={!preferenceLoadState.ready}
           onchange={(e: Event) => {
             const v = (e.currentTarget as HTMLInputElement).value.trim();
             void updatePreferences({ terminal_app: v === "" ? "Terminal" : v });
@@ -425,11 +438,13 @@
         <button
           type="button"
           role="switch"
+          disabled={!preferenceLoadState.ready}
           aria-checked={preferences.notify_on_completion}
           aria-label="Notify me when agents finish"
           data-testid="notify-toggle"
           class={cn(
-            "relative mt-0.5 inline-flex h-5 w-9 shrink-0 cursor-pointer items-center rounded-full transition-colors outline-none",
+            "relative mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors outline-none",
+            preferenceLoadState.ready ? "cursor-pointer" : "cursor-not-allowed opacity-50",
             preferences.notify_on_completion ? "bg-accent" : "bg-active",
           )}
           onclick={() =>
@@ -457,13 +472,15 @@
         <button
           type="button"
           role="switch"
-          disabled={!preferences.notify_on_completion}
+          disabled={!preferenceLoadState.ready || !preferences.notify_on_completion}
           aria-checked={preferences.notify_while_focused}
           aria-label="Also notify me about other projects while I'm using Switchboard"
           data-testid="notify-while-focused-toggle"
           class={cn(
             "relative mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors outline-none",
-            preferences.notify_on_completion ? "cursor-pointer" : "cursor-not-allowed opacity-50",
+            preferenceLoadState.ready && preferences.notify_on_completion
+              ? "cursor-pointer"
+              : "cursor-not-allowed opacity-50",
             preferences.notify_while_focused ? "bg-accent" : "bg-active",
           )}
           onclick={() =>
@@ -513,11 +530,13 @@
         <button
           type="button"
           role="switch"
+          disabled={!preferenceLoadState.ready}
           aria-checked={preferences.show_builtins}
           aria-label="Show built-in prompts and workflows"
           data-testid="show-builtins-toggle"
           class={cn(
-            "relative mt-0.5 inline-flex h-5 w-9 shrink-0 cursor-pointer items-center rounded-full transition-colors outline-none",
+            "relative mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors outline-none",
+            preferenceLoadState.ready ? "cursor-pointer" : "cursor-not-allowed opacity-50",
             preferences.show_builtins ? "bg-accent" : "bg-active",
           )}
           onclick={() => void updatePreferences({ show_builtins: !preferences.show_builtins })}

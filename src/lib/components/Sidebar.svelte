@@ -223,7 +223,8 @@
     const effort =
       EFFORT_OPTIONS[agent.harness].find((option) => option.value === profile.effort)?.label ??
       profile.effort;
-    return [model, effort].filter((value) => value != null && value !== "").join(" · ");
+    const label = [model, effort].filter((value) => value != null && value !== "").join(" · ");
+    return label || "Harness/session default";
   }
 
   function profileSwitchLabel(agent: AgentRecord): string {
@@ -1416,7 +1417,7 @@
                  show a resolved id even when intent is an alias). -->
             {@const selectedProfile = activeProfile(agent)}
             {@const configuredSecondary = secondaryProfile(agent)}
-            {#if selectedProfile.model || runtime?.meta?.model || selectedProfile.effort}
+            {#if selectedProfile.model || runtime?.meta?.model || selectedProfile.effort || configuredSecondary !== null}
               <!-- One secondary line, `opus · high` — configuration is context,
                    not a table of key: value pairs. An observed (session-derived)
                    model keeps its explanatory tooltip instead of a label. -->
@@ -1434,6 +1435,8 @@
                       title={`${runtime.meta.model} — observed from the session (no model selected)`}
                       data-testid="agent-observed-model">{runtime.meta.model}</span
                     >
+                  {:else if !selectedProfile.effort}
+                    <span data-testid="agent-selection-default">Harness/session default</span>
                   {/if}
                   {#if (selectedProfile.model || runtime?.meta?.model) && selectedProfile.effort}
                     <span aria-hidden="true"> · </span>

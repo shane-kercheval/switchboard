@@ -760,10 +760,32 @@ pub struct DispatchContext {
 /// the prompt rides on the work item separately.
 ///
 /// The app impl must capture only agent-lifetime-stable data plus live `Arc`
-/// handles — never `Arc<Dispatcher>` (which it does not need) — so there is no
-/// reference cycle.
+/// handles — never `Arc<Dispatcher>` — so there is no reference cycle: the
+/// dispatcher owns each actor's command sender, that sender is what keeps the
+/// actor parked rather than exiting, and the actor owns this factory. A
+/// **`Weak<Dispatcher>`** is fine and is what `preflight` uses to ask whether
+/// another agent is mid-turn; upgrade failure means teardown, and the policy
+/// decides what to do about that.
 pub trait DispatchContextFactory: Send + Sync {
     fn build(&self, send_id: SendId) -> DispatchContext;
+
+    /// Policy check run at the moment this turn actually **starts**, before the
+    /// send is journaled or any subprocess spawns. `Err(reason)` refuses just
+    /// this turn; the backlog advances and later items are checked on their own
+    /// terms.
+    ///
+    /// **Why a start-moment hook rather than a check at the command boundary.**
+    /// Callers gate before enqueuing, but a send to a busy agent *queues* — so
+    /// by the time it runs, the world it was checked against may be gone. The
+    /// dispatcher is the only component that knows when a queued turn becomes a
+    /// real one. It stays policy-free itself: the rule lives in the injected
+    /// factory, and the default is "always allowed," so a factory with no
+    /// start-time policy is unaffected.
+    fn preflight(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + '_>> {
+        Box::pin(async { Ok(()) })
+    }
 
     /// The plain per-agent event sink, used to emit `AgentIdle` after the
     /// backlog drains — at which point no per-turn context is in hand.
@@ -1405,6 +1427,49 @@ async fn run_turn(
     let turn_id: TurnId = Uuid::now_v7();
     let started_at = Utc::now();
 
+    // Wait, briefly, for the harness PATH to be resolved from the user's login
+    // shell. A GUI launch inherits a PATH too minimal to find the CLIs, and the
+    // real one is captured asynchronously — so an agent spawned inside that
+    // window would run its *entire* turn against a best-guess PATH. Detection
+    // gets a corrective re-probe; a running child does not. Awaited, not
+    // blocked on, so this never occupies a runtime worker.
+    if path_readiness().await == switchboard_harness::subprocess::PathSource::Capturing {
+        tracing::warn!(
+            %agent_id,
+            %turn_id,
+            "dispatching before the login-shell PATH resolved; the agent will use the \
+             fallback PATH for this turn"
+        );
+    }
+
+    // Start-moment policy, ahead of the journal write: a refused turn must leave
+    // no durable trace, exactly like the journal-failure path below. This is the
+    // **freshest** judgement available — the caller's pre-enqueue check answered
+    // a question that may have gone stale while this item sat in the backlog —
+    // and it is deliberately sited after the PATH wait above so no unrelated
+    // await separates it from the dispatch it gates. It bounds that queue race;
+    // it is not a lock, and the residual is documented in system-design §9.
+    if let Err(reason) = factory.preflight().await {
+        emit_message_failed(
+            emitter.as_ref(),
+            channel,
+            item.message_id,
+            // Nothing was journaled, so reload has no send to reconstruct.
+            None,
+            agent_id,
+            &reason,
+        );
+        fire_completion(
+            &mut completion,
+            TurnOutcome::Failed {
+                kind: FailureKind::AdapterFailure,
+                message: reason,
+            },
+            String::new(),
+        );
+        return TurnAfter::Continue;
+    }
+
     // Fail-closed: journal the send before spawning. On failure, no turn starts,
     // no outcome marker (the journal is what's broken — a marker would orphan),
     // and we surface MessageFailed. Advance the backlog regardless.
@@ -1460,20 +1525,6 @@ async fn run_turn(
     // boundary, so adapters stay attachment-unaware. Empty attachments → the
     // prompt is returned unchanged.
     let dispatch_prompt = render_prompt_with_attachments(&item.prompt, &item.attachments);
-    // Wait, briefly, for the harness PATH to be resolved from the user's login
-    // shell. A GUI launch inherits a PATH too minimal to find the CLIs, and the
-    // real one is captured asynchronously — so an agent spawned inside that
-    // window would run its *entire* turn against a best-guess PATH. Detection
-    // gets a corrective re-probe; a running child does not. Awaited, not
-    // blocked on, so this never occupies a runtime worker.
-    if path_readiness().await == switchboard_harness::subprocess::PathSource::Capturing {
-        tracing::warn!(
-            %agent_id,
-            %turn_id,
-            "dispatching before the login-shell PATH resolved; the agent will use the \
-             fallback PATH for this turn"
-        );
-    }
     let stream = match adapter
         .dispatch(&agent, &cwd, &dispatch_prompt, turn_id, options)
         .await

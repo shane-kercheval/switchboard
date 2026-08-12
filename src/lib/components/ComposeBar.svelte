@@ -984,9 +984,9 @@
     // ahead of the readiness checks below, which would otherwise explain why a
     // message the user never typed could not be sent.
     if (draft.trim() === "" && attachmentChips.length === 0) return { kind: "nothing-to-send" };
-    if (showStop) {
-      return { kind: "blocked", reason: "Wait for the send in flight to finish before branching." };
-    }
+    // No `showStop` arm: it requires an empty composer and no attachments, which
+    // the check above already answers. A send in flight with text typed leaves
+    // `showStop` false and falls through to the checks below.
     if (sending) return { kind: "blocked", reason: "Already sending." };
     if (!allRecipientsHydrated) {
       return {
@@ -2116,34 +2116,49 @@
     // synchronously, before the first await, paired with `sending` in
     // `sendDisabled`.
     sending = true;
-    // Snapshot which chips this send is carrying, before the await lets the user
-    // stage more.
-    // eslint-disable-next-line svelte/prefer-svelte-reactivity
-    const sentChipIds = new Set(attachmentChips.map((chip) => chip.id));
+    // Clear any error from a previous send/forward, as `handleSubmit` does —
+    // otherwise a stale failure sits on screen through a successful fork.
+    sendError = null;
+    // **Clear before the await, not after.** This is the only send path with an
+    // await between submit and dispatch, and everything downstream of that await
+    // is a hazard: a project switch destroys this bar mid-flight, and `onDestroy`
+    // flushes whatever the compose state holds at that moment. Clearing
+    // afterwards means the flush persists the message the user already sent, and
+    // they return to find it sitting in the box addressed to the parent. Guarding
+    // the post-await writes instead just makes that permanent. Clearing up front
+    // removes the window: the flush persists cleared state, and anything typed
+    // during the await is new content this send never captured.
+    const carried = attachmentChips;
+    draft = "";
+    commitChips([]);
+    persistComposeNow();
     let fork: AgentRecord;
     try {
       fork = await forkAgentIntoOwnPane(source.id);
     } catch (err) {
       sendError = `Fork failed: ${err instanceof Error ? err.message : String(err)}`;
+      // Nothing was dispatched, so give the message back — the user must be able
+      // to wait or cancel and retry without retyping. Only restore into a still
+      // empty composer: if they started a new message during the await, that one
+      // is newer and wins.
+      if (draft === "") draft = text;
+      if (attachmentChips.length === 0) commitChips(carried);
+      persistComposeNow();
       return;
     } finally {
       sending = false;
     }
+    // The send always completes, even if this bar is gone. The branch is already
+    // durable, and abandoning its first message would leave a promptless fork —
+    // the one state this whole design exists to make impossible, since Claude
+    // refuses a promptless fork and the branch would never materialize.
+    dispatchToRecipients(text, attachments, [fork]);
     // Selection follows the branch: the conversation continues there, and
     // leaving the parent selected would send the user's next message to the
-    // agent they just branched away from.
+    // agent they just branched away from. This is the only compose write left
+    // after the await, and it is project-scoped to the originating project.
     setSelectedIds([fork.id]);
-    dispatchToRecipients(text, attachments, [fork]);
-    // Clear only what this send captured. The user can type — and stage files —
-    // while the fork round-trips, and blanket-clearing would silently eat the
-    // message they started composing for the branch. Chips are removed by
-    // identity, not by emptying: dropping the whole list would take newly staged
-    // attachments with it, and keeping the whole list would re-send the ones
-    // that just went out.
-    if (draft.trim() === text) draft = "";
-    commitChips(attachmentChips.filter((chip) => !sentChipIds.has(chip.id)));
     sendGeneration += 1;
-    persistComposeNow();
   }
 
   async function handleSubmit(): Promise<void> {
@@ -3108,7 +3123,17 @@
       </p>
     {/if}
     {#if sendError}
-      <p class="text-status-failed mt-2 text-xs" data-testid="compose-send-error">
+      <!-- Announced, not just shown. Hiding the fork control when unavailable
+           rests on the shortcut still explaining itself, and an explanation a
+           screen reader never speaks is no explanation. `polite` rather than
+           `alert`: this same element also carries background send failures from
+           other agents, which should not interrupt mid-utterance. -->
+      <p
+        class="text-status-failed mt-2 text-xs"
+        data-testid="compose-send-error"
+        role="status"
+        aria-live="polite"
+      >
         {sendError}
       </p>
     {/if}

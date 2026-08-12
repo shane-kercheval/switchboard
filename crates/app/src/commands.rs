@@ -15,7 +15,7 @@ use switchboard_core::{
     ProjectId, ProjectSummary, SelectionAxis, SendId, SessionLocator, normalize_selection,
 };
 use switchboard_dispatcher::{
-    CancelOutcome, CurrentTurnWait, DispatchContextFactory, EventEmitter, OnBusy,
+    CancelOutcome, CurrentTurnWait, DispatchContextFactory, Dispatcher, EventEmitter, OnBusy,
     RemovedQueuedMessage, SendOutcome,
 };
 use switchboard_harness::{
@@ -1842,11 +1842,58 @@ async fn ensure_materializing_fork_may_dispatch(
     agent: &AgentRecord,
     home_dir: &Path,
 ) -> Result<(), AppError> {
-    let Some(parent_session) = agent.forked_from_session else {
-        return Ok(());
-    };
-    if resolve_session_file(agent, &project.directory, home_dir).is_some() {
-        return Ok(());
+    match busy_fork_source(
+        &state.agents_by_id,
+        &state.dispatcher,
+        agent,
+        &project.directory,
+        home_dir,
+    )
+    .await
+    {
+        Some(parent) => Err(AppError::ForkSourceBusy { name: parent.name }),
+        None => Ok(()),
+    }
+}
+
+/// The shared policy: **the parent this dispatch would fork, if that parent is
+/// mid-turn right now** — `None` when the dispatch is safe (not a fork, already
+/// materialized, parent gone, or parent idle).
+///
+/// One function, three call sites, because the policy has three moments and had
+/// grown two independent copies that already disagreed in their error text:
+/// [`ensure_materializing_fork_may_dispatch`] at manual-send time,
+/// `ProjectDispatchFactoryProvider::preflight` at workflow-step time, and
+/// `ProjectDispatchContextFactory::preflight` at the moment a *queued* turn
+/// actually starts. The first two give a fast, friendly refusal; the third is
+/// the authoritative one, because the first two answer a question that can go
+/// stale: a send to a busy fork is queued, and the parent can start working
+/// while it waits. Only the start-moment check runs at the instant the copy of
+/// the parent's session file would actually be taken.
+/// Returning the agent *itself* is the corrupt-provenance signal — callers
+/// render it as an invalid-provenance refusal rather than a busy-parent one.
+pub(crate) async fn busy_fork_source(
+    agents_by_id: &Mutex<HashMap<AgentId, AgentRecord>>,
+    dispatcher: &Dispatcher,
+    agent: &AgentRecord,
+    directory: &Path,
+    home_dir: &Path,
+) -> Option<AgentRecord> {
+    let parent_session = agent.forked_from_session?;
+    if resolve_session_file(agent, directory, home_dir).is_some() {
+        return None;
+    }
+    // Self-referential provenance is corrupt data, not a policy question: the
+    // adapter would be handed `--resume X --session-id X --fork-session`. The
+    // caller turns this into a visible refusal; see the deadlock note below for
+    // why the lookup must not simply skip it and proceed.
+    if agent
+        .session_locator
+        .as_ref()
+        .and_then(SessionLocator::as_uuid)
+        == Some(parent_session)
+    {
+        return Some(agent.clone());
     }
     // Find the parent by session id, **within the fork's own project**. A fork
     // always inherits its source's `project_id`, so same-project is the exact
@@ -1862,10 +1909,20 @@ async fn ensure_materializing_fork_may_dispatch(
     // The `agents_by_id` guard is a temporary that drops at the end of this
     // `let`, deliberately **before** the await below. Do not hoist it into a
     // binding: that would hold a std mutex across an await point.
-    let parent = lock(&state.agents_by_id)
+    let parent = lock(agents_by_id)
         .values()
         .find(|candidate| {
-            candidate.project_id == agent.project_id
+            // Never match the agent itself. `is_turn_running` asks the target's
+            // own actor and awaits its reply, so an agent whose provenance names
+            // its own session would ask a question only it can answer, from
+            // inside the code path that is stopping it from answering —
+            // a true deadlock, unresponsive to cancel, recoverable only by
+            // restart. Reachable solely through a corrupted or hand-edited
+            // registry, which the caller then rejects as invalid provenance.
+            // (The general N-agent provenance cycle has the same shape and
+            // cannot be closed here; it belongs to registry validation.)
+            candidate.id != agent.id
+                && candidate.project_id == agent.project_id
                 && candidate
                     .session_locator
                     .as_ref()
@@ -1873,9 +1930,11 @@ async fn ensure_materializing_fork_may_dispatch(
                     == Some(parent_session)
         })
         .cloned();
-    match parent {
-        Some(parent) => ensure_fork_source_free(state, &parent).await,
-        None => Ok(()),
+    let parent = parent?;
+    if dispatcher.is_turn_running(parent.id).await {
+        Some(parent)
+    } else {
+        None
     }
 }
 
@@ -2858,10 +2917,14 @@ pub async fn send_message_impl(
         project,
         agent,
         adapter,
-        Arc::clone(&state.emitter),
-        Arc::clone(&state.needs_session_meta),
-        Arc::clone(&state.agents_by_id),
-        Arc::clone(&state.registry_write),
+        crate::dispatch_context::DispatchDeps {
+            base_emitter: Arc::clone(&state.emitter),
+            needs_session_meta: Arc::clone(&state.needs_session_meta),
+            agents_by_id: Arc::clone(&state.agents_by_id),
+            registry_write: Arc::clone(&state.registry_write),
+            dispatcher: Arc::downgrade(&state.dispatcher),
+            home_dir: home_dir.to_path_buf(),
+        },
     ));
     // `send_id` is minted by the frontend and shared across a fan-out's
     // recipients (one `send_message` call per recipient with the same id), so
@@ -6505,6 +6568,258 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn self_referential_provenance_is_refused_rather_than_asking_itself() {
+        // Corrupt data, not a policy question. `is_turn_running` asks the target
+        // agent's own actor and awaits its reply, so an agent whose provenance
+        // names its own session would ask a question only it can answer from
+        // inside the code path blocking it from answering — a deadlock that no
+        // cancel can reach. The timeout is the assertion: without the guard this
+        // hangs forever rather than failing.
+        let (_tmp, home, state, gate, project_id) = state_with_parked_claude(&["parent"]).await;
+        let agent_id = seed_source(&state, home.path(), project_id, "alice", "hello");
+        let mut agent = lock(&state.agents_by_id).get(&agent_id).cloned().unwrap();
+        // Point the agent's fork provenance at its own session.
+        agent.forked_from_session = agent
+            .session_locator
+            .as_ref()
+            .and_then(SessionLocator::as_uuid);
+        lock(&state.agents_by_id).insert(agent_id, agent.clone());
+        let directory = lock(&state.projects)
+            .get(&project_id)
+            .unwrap()
+            .directory
+            .clone();
+        // Remove its session file so the agent reads as still-materializing.
+        let uuid = agent
+            .session_locator
+            .as_ref()
+            .and_then(SessionLocator::as_uuid)
+            .unwrap();
+        std::fs::remove_file(switchboard_harness::claude_session_file_path(
+            home.path(),
+            &directory,
+            &uuid,
+        ))
+        .unwrap();
+
+        let found = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            busy_fork_source(
+                &state.agents_by_id,
+                &state.dispatcher,
+                &agent,
+                &directory,
+                home.path(),
+            ),
+        )
+        .await
+        .expect("self-referential provenance must not deadlock the actor");
+
+        assert_eq!(
+            found.map(|a| a.id),
+            Some(agent_id),
+            "the agent itself is returned, so the caller refuses it as invalid provenance"
+        );
+
+        gate.notify_waiters();
+    }
+
+    #[tokio::test]
+    async fn a_queued_send_that_would_fork_a_now_busy_parent_is_refused_when_it_pops() {
+        // The composed race — the one the layer-isolated tests do not reach, and
+        // the reason the check moved into the dispatcher at all. Every step is a
+        // real dispatch through `send_message_impl`:
+        //
+        //   1. `alice-fork` exists, unmaterialized (mocks write no session file,
+        //      so it stays that way — the same state a failed first turn leaves).
+        //   2. Send A to the fork. It parks, so the fork's actor is busy.
+        //   3. Send B to the fork. Alice is idle, so the enqueue-time gate passes
+        //      and B lands in the fork's backlog.
+        //   4. Send C to alice. It parks too — alice is now mid-turn.
+        //   5. Release only A. B pops, and by then the answer step 3 relied on is
+        //      stale.
+        //
+        // B must be refused before it reaches the adapter. Prior to the
+        // start-moment check it would have dispatched and copied alice's session
+        // file mid-write, giving the branch a permanent "No response requested."
+        // stub in place of alice's real answer.
+        let fork_gate = Arc::new(tokio::sync::Notify::new());
+        let parent_gate = Arc::new(tokio::sync::Notify::new());
+        let adapter =
+            gated_adapter_two_parks(&["fork A", "parent C"], (&fork_gate, 0), (&parent_gate, 1));
+        let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
+        let emitter = Arc::new(RecordingEmitter::new());
+        let state = AppState::new(
+            adapter,
+            Arc::clone(&mock),
+            Arc::clone(&mock),
+            Arc::clone(&mock),
+            emitter.clone() as Arc<dyn EventEmitter>,
+        );
+        let tmp = TempDir::new().unwrap();
+        init_directory_impl(&state, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let project = create_project_in_only_dir(&state, "proj");
+        set_active_project_impl(&state, project.id).unwrap();
+        let home = TempDir::new().unwrap();
+
+        let source_id = seed_source(&state, home.path(), project.id, "alice", "hello");
+        let fork = fork_agent_impl(&state, source_id, home.path())
+            .await
+            .unwrap();
+
+        send_msg_with_home(&state, fork.id, "A", home.path())
+            .await
+            .unwrap();
+        await_turn_running(&state, fork.id).await;
+
+        // Queued behind A, while alice is still idle.
+        send_msg_with_home(&state, fork.id, "B", home.path())
+            .await
+            .expect("queuing behind the fork's own turn is allowed while the parent is idle");
+
+        send_msg_with_home(&state, source_id, "C", home.path())
+            .await
+            .unwrap();
+        await_turn_running(&state, source_id).await;
+
+        // Release only the fork's turn, so B pops while alice is still parked.
+        fork_gate.notify_waiters();
+        within(
+            &emitter,
+            "message_failed",
+            emitter.wait_for_type("message_failed", 1),
+        )
+        .await;
+
+        let refused = emitter.snapshot().into_iter().any(|(_, e)| {
+            e["type"] == "message_failed"
+                && e["error"]
+                    .as_str()
+                    .is_some_and(|msg| msg.contains("is working"))
+        });
+        assert!(
+            refused,
+            "the queued send must be refused when it pops against a now-busy parent"
+        );
+
+        parent_gate.notify_waiters();
+    }
+
+    #[tokio::test]
+    async fn the_start_moment_check_refuses_a_materializing_fork_against_a_busy_parent() {
+        // The gap the command-boundary check cannot close. A send to a busy
+        // agent QUEUES, so the parent's state at enqueue time can be stale by
+        // the time the item runs — and because fork-vs-resume is derived from
+        // the fork's own session file, a queued ordinary send becomes the
+        // materializing dispatch whenever the first turn failed to create it.
+        // `ProjectDispatchContextFactory::preflight` is the only check that runs
+        // at the instant the parent's file would be copied; this pins that it
+        // refuses on the same policy as the command boundary. The dispatcher's
+        // side of the wiring — that a refusal actually stops the turn — is
+        // pinned in `switchboard-dispatcher`.
+        let (_tmp, home, state, gate, project_id) = state_with_parked_claude(&["parent"]).await;
+        let source_id = seed_source(&state, home.path(), project_id, "alice", "hello");
+        let fork = fork_agent_impl(&state, source_id, home.path())
+            .await
+            .unwrap();
+
+        // The parent starts working *after* the fork exists — exactly the state
+        // a queued send pops into.
+        send_msg_with_home(&state, source_id, "long one", home.path())
+            .await
+            .unwrap();
+        await_turn_running(&state, source_id).await;
+
+        let factory = ProjectDispatchContextFactory::new(
+            find_project_in_directories(&state, project_id).unwrap(),
+            state
+                .agents_by_id
+                .lock()
+                .unwrap()
+                .get(&fork.id)
+                .cloned()
+                .unwrap(),
+            adapter_for(&state, &fork).unwrap(),
+            crate::dispatch_context::DispatchDeps {
+                base_emitter: Arc::clone(&state.emitter),
+                needs_session_meta: Arc::clone(&state.needs_session_meta),
+                agents_by_id: Arc::clone(&state.agents_by_id),
+                registry_write: Arc::clone(&state.registry_write),
+                dispatcher: Arc::downgrade(&state.dispatcher),
+                home_dir: home.path().to_path_buf(),
+            },
+        );
+        let refusal = factory
+            .preflight()
+            .await
+            .expect_err("a turn that would fork a busy parent must be refused at its start");
+        assert!(refusal.contains("is working"), "got: {refusal}");
+
+        gate.notify_waiters();
+    }
+
+    #[tokio::test]
+    async fn the_start_moment_check_allows_an_already_materialized_fork() {
+        // Once the branch has its own session file the parent is irrelevant, so
+        // the hook must cost nothing for every ordinary turn thereafter.
+        let (_tmp, home, state, gate, project_id) = state_with_parked_claude(&["parent"]).await;
+        let source_id = seed_source(&state, home.path(), project_id, "alice", "hello");
+        let fork = fork_agent_impl(&state, source_id, home.path())
+            .await
+            .unwrap();
+        // Give the fork its own session file: it is materialized from here on.
+        {
+            let directory = lock(&state.projects)
+                .get(&project_id)
+                .unwrap()
+                .directory
+                .clone();
+            let uuid = fork
+                .session_locator
+                .as_ref()
+                .and_then(SessionLocator::as_uuid)
+                .unwrap();
+            let path =
+                switchboard_harness::claude_session_file_path(home.path(), &directory, &uuid);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, claude_session_jsonl("branched")).unwrap();
+        }
+
+        send_msg_with_home(&state, source_id, "long one", home.path())
+            .await
+            .unwrap();
+        await_turn_running(&state, source_id).await;
+
+        let factory = ProjectDispatchContextFactory::new(
+            find_project_in_directories(&state, project_id).unwrap(),
+            state
+                .agents_by_id
+                .lock()
+                .unwrap()
+                .get(&fork.id)
+                .cloned()
+                .unwrap(),
+            adapter_for(&state, &fork).unwrap(),
+            crate::dispatch_context::DispatchDeps {
+                base_emitter: Arc::clone(&state.emitter),
+                needs_session_meta: Arc::clone(&state.needs_session_meta),
+                agents_by_id: Arc::clone(&state.agents_by_id),
+                registry_write: Arc::clone(&state.registry_write),
+                dispatcher: Arc::downgrade(&state.dispatcher),
+                home_dir: home.path().to_path_buf(),
+            },
+        );
+        factory
+            .preflight()
+            .await
+            .expect("a materialized fork is not gated by its parent's state");
+
+        gate.notify_waiters();
+    }
+
+    #[tokio::test]
     async fn a_retry_after_a_failed_fork_turn_hits_the_same_gate() {
         // The reason the gate lives on the send path and not in
         // `fork_agent_impl`: a fork whose first turn failed still has no
@@ -7184,6 +7499,10 @@ mod tests {
         texts: Vec<String>,
         gate: Arc<tokio::sync::Notify>,
         park_at: usize,
+        /// Additional dispatch indices that park on their **own** gate, so a test
+        /// can hold two turns at once and release them independently. The shared
+        /// `gate`/`park_at` pair above stays as-is for the single-park tests.
+        extra_parks: Vec<(usize, Arc<tokio::sync::Notify>)>,
         dispatches: std::sync::atomic::AtomicUsize,
     }
 
@@ -7209,7 +7528,15 @@ mod tests {
             lock(&self.prompts).push(prompt.to_owned());
             let text = self.texts.get(index).cloned().unwrap_or_default();
             let park = index == self.park_at;
-            let gate = Arc::clone(&self.gate);
+            let gate = if park {
+                Arc::clone(&self.gate)
+            } else {
+                match self.extra_parks.iter().find(|(at, _)| *at == index) {
+                    Some((_, g)) => Arc::clone(g),
+                    None => Arc::clone(&self.gate),
+                }
+            };
+            let park = park || self.extra_parks.iter().any(|(at, _)| *at == index);
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             tokio::spawn(async move {
                 if !text.is_empty() {
@@ -7280,9 +7607,28 @@ mod tests {
             texts: texts.iter().map(|t| (*t).to_owned()).collect(),
             gate: Arc::clone(gate),
             park_at,
+            extra_parks: Vec::new(),
             dispatches: std::sync::atomic::AtomicUsize::new(0),
         });
         (adapter, prompts)
+    }
+
+    /// As [`gated_adapter`], but a second dispatch index parks on its own gate —
+    /// the shape needed to hold two agents' turns simultaneously and release them
+    /// in a chosen order.
+    fn gated_adapter_two_parks(
+        texts: &[&str],
+        first: (&Arc<tokio::sync::Notify>, usize),
+        second: (&Arc<tokio::sync::Notify>, usize),
+    ) -> Arc<dyn HarnessAdapter> {
+        Arc::new(GatedRecordingAdapter {
+            prompts: Arc::new(Mutex::new(Vec::new())),
+            texts: texts.iter().map(|t| (*t).to_owned()).collect(),
+            gate: Arc::clone(first.0),
+            park_at: first.1,
+            extra_parks: vec![(second.1, Arc::clone(second.0))],
+            dispatches: std::sync::atomic::AtomicUsize::new(0),
+        })
     }
 
     /// A loaded project whose Claude adapter is a [`GatedRecordingAdapter`].

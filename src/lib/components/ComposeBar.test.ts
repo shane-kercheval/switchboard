@@ -1518,6 +1518,48 @@ describe("ComposeBar", () => {
       expect(invokeMock).not.toHaveBeenCalledWith("fork_agent", expect.anything());
     });
 
+    it("leaves nothing behind in the originating project when unmounted mid-fork", async () => {
+      // Switching projects mid-fork destroys this bar, and `onDestroy` flushes
+      // whatever compose state it holds at that moment. Clearing after the await
+      // would persist the message the user already sent — they come back to find
+      // it in the box, addressed to the parent, one keystroke from a duplicate
+      // send. Clearing before the await means the flush persists cleared state.
+      const state = await loadState();
+      await state.registerAgent(AGENT_A);
+      seedTurn(state, AGENT_A.id);
+      let releaseFork!: (r: AgentRecord) => void;
+      const pendingFork = new Promise<AgentRecord>((resolve) => {
+        releaseFork = resolve;
+      });
+      invokeMock.mockImplementation(async (cmd: string) => {
+        if (cmd === "fork_agent") return await pendingFork;
+        if (cmd === "send_message") return "msg-fork";
+        return null;
+      });
+      const view = render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+      await waitFor(() => expect(forkHalf()).not.toBeNull());
+
+      const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+      await fireEvent.input(textarea, { target: { value: "branch from here" } });
+      await fireEvent.click(forkHalf()!);
+
+      view.unmount();
+      releaseFork(FORK_RECORD);
+
+      // The branch still receives its first message — abandoning it would leave
+      // a promptless fork, which cannot materialize.
+      await waitFor(() => {
+        expect(invokeMock).toHaveBeenCalledWith(
+          "send_message",
+          expect.objectContaining({ agentId: FORK_RECORD.id }),
+        );
+      });
+      // And the originating project is not holding the sent text.
+      const compose = await import("$lib/state/composeStore");
+      const content = compose.getCompose(PROJECT_ID).content;
+      expect(content.kind === "plain" ? content.draft : "unexpected mode").toBe("");
+    });
+
     it("keeps the user's text when the fork is refused", async () => {
       // The one send path that can fail before any optimistic turn exists. The
       // user must be able to wait or cancel and retry without retyping.

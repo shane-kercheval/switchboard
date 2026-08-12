@@ -86,10 +86,14 @@ impl ProjectDispatchFactoryProvider {
                 project.clone(),
                 agent.clone(),
                 adapter,
-                Arc::clone(&state.emitter),
-                Arc::clone(&state.needs_session_meta),
-                Arc::clone(&state.agents_by_id),
-                Arc::clone(&state.registry_write),
+                crate::dispatch_context::DispatchDeps {
+                    base_emitter: Arc::clone(&state.emitter),
+                    needs_session_meta: Arc::clone(&state.needs_session_meta),
+                    agents_by_id: Arc::clone(&state.agents_by_id),
+                    registry_write: Arc::clone(&state.registry_write),
+                    dispatcher: Arc::downgrade(&state.dispatcher),
+                    home_dir: home_dir.to_path_buf(),
+                },
             );
             factories.insert(
                 agent.id,
@@ -123,35 +127,20 @@ impl DispatchFactoryProvider for ProjectDispatchFactoryProvider {
                 // Not a bound agent of this run; `factory_for` reports it.
                 return Ok(());
             };
-            let Some(parent_session) = agent.forked_from_session else {
-                return Ok(());
-            };
-            if crate::commands::resolve_session_file(agent, &self.project.directory, &self.home_dir)
-                .is_some()
+            // One shared policy, not a second copy — the two used to be written
+            // independently and their refusal text had already drifted apart.
+            match crate::commands::busy_fork_source(
+                &self.agents_by_id,
+                &self.dispatcher,
+                agent,
+                &self.project.directory,
+                &self.home_dir,
+            )
+            .await
             {
-                return Ok(());
+                Some(parent) => Err(AppError::ForkSourceBusy { name: parent.name }.to_string()),
+                None => Ok(()),
             }
-            // Same-project scope and the guard-drops-before-await discipline as
-            // the manual path — see `ensure_materializing_fork_may_dispatch`.
-            let parent = lock(&self.agents_by_id)
-                .values()
-                .find(|candidate| {
-                    candidate.project_id == agent.project_id
-                        && candidate
-                            .session_locator
-                            .as_ref()
-                            .and_then(switchboard_core::SessionLocator::as_uuid)
-                            == Some(parent_session)
-                })
-                .cloned();
-            let Some(parent) = parent else { return Ok(()) };
-            if self.dispatcher.is_turn_running(parent.id).await {
-                return Err(format!(
-                    "{} is working — a branch taken now would not include its current answer",
-                    parent.name
-                ));
-            }
-            Ok(())
         })
     }
 

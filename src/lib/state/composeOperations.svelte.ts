@@ -90,12 +90,24 @@ export function operationFor(projectId: ProjectId): ComposeOperation | undefined
   return operations[projectId];
 }
 
-/// Whether `id` still owns the project's slot. **Every continuation must ask this
-/// after every await, before any side effect** — rendering again, registering a
-/// branch, dispatching, clearing or reconciling compose state, moving the
-/// recipient selection, or publishing an outcome. Abandonment releases the slot
-/// while the underlying call is still running, so a late success that skips this
-/// check acts on a composer it no longer owns.
+/// Whether `id` still owns the project's slot.
+///
+/// **A continuation must ask this immediately after any await during which
+/// abandonment is permitted** — today that is only the sign-in wait, the sole
+/// phase the abandon control is offered in. Abandonment releases the slot while
+/// the underlying call keeps running, so a late success that skips the check
+/// would render, register, dispatch, clear compose state, move the recipient
+/// selection, or publish an outcome against a composer it no longer owns.
+///
+/// **Not "after every await."** Registration deliberately dispatches without
+/// re-checking, and that is load-bearing rather than an oversight: once an
+/// operation reaches `registering`, `abandonAwaitingUserOperation` refuses it,
+/// `beginOperation` cannot replace a live claim, and `finishOperation` is
+/// id-guarded — so ownership is stable until completion. The branch is committed
+/// by then, and a promptless fork can never materialize, so the first message
+/// must go unconditionally. The wider rule would argue for restoring a
+/// "lost ownership after registration" fallback that cannot be reached and
+/// silently dropped that message when it was there.
 export function ownsOperation(projectId: ProjectId, id: string): boolean {
   return operations[projectId]?.id === id;
 }

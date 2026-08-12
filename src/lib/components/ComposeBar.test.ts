@@ -3319,11 +3319,16 @@ describe("prompt-mode fork", () => {
     expect(sends()).toHaveLength(0);
   });
 
-  it("hands the project back in full when an operation outlives the bar that started it", async () => {
-    // The user-facing property: after a send that spanned a project switch
-    // finishes, the composer is usable again — not busy, and not with pane
-    // targeting silently dead. Both were separately broken here, by a leaked
-    // claim and by a freeze nothing was left to release.
+  it("releases the project-scoped busy state when a fork outlives the bar that started it", async () => {
+    // After a send that spanned a project switch finishes, the composer must be
+    // usable again rather than stuck busy on a claim nobody released.
+    //
+    // Deliberately does *not* also assert that pane targeting works here: the
+    // claim is gone by this point, so `operationBlocksTargeting` returns false
+    // for any implementation and the assertion would pass whether the phase
+    // policy were right, wrong, or absent. Targeting is pinned where it can
+    // actually fail — while an operation is live (the abandonment test below)
+    // and directly against the predicate (`recipientSelection.svelte.test.ts`).
     let releaseFork!: (v: AgentRecord) => void;
     const pending = new Promise<AgentRecord>((resolve) => {
       releaseFork = resolve;
@@ -3349,8 +3354,6 @@ describe("prompt-mode fork", () => {
     await waitFor(() =>
       expect((screen.getByTestId("compose-send") as HTMLButtonElement).disabled).toBe(false),
     );
-    const sel = await import("$lib/state/recipientSelection.svelte");
-    expect(sel.targetRecipients(PROJECT_ID, [AGENT_A.id])).toBe(true);
   });
 
   it("keeps targeting blocked for a newer send when an abandoned one settles late", async () => {

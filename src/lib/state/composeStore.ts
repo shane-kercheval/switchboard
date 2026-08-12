@@ -413,6 +413,52 @@ export function setForwards(projectId: ProjectId, forwards: ComposeForwards): vo
   schedulePersist();
 }
 
+/// Order-insensitive structural key for a snapshot's parts. `args` / the
+/// per-field forward maps are `Record`s whose key order is an artifact of how the
+/// user filled them in, so a plain `JSON.stringify` comparison reports spurious
+/// differences; arrays keep their order because for forward sources it is
+/// meaningful.
+function canonical(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
+  if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
+  const entries = Object.entries(value as Record<string, unknown>).sort(([a], [b]) =>
+    a < b ? -1 : a > b ? 1 : 0,
+  );
+  return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonical(v)}`).join(",")}}`;
+}
+
+/// Whether a project's compose *content* is still exactly what `expected`
+/// captured — the composed message, its staged attachments, and every forward
+/// family.
+///
+/// The comparison is deliberately whole-snapshot. A send that outlives its own
+/// ComposeBar finalizes against this: matching means the composer it captured is
+/// still the composer on screen, so clearing it is safe; any difference means a
+/// remounted or edited composer owns that slot now and must not be touched.
+/// Comparing only the parts a given caller happens to care about is how a newly
+/// staged attachment or a restored forward set gets silently discarded.
+///
+/// **Recipients are not compared here.** This snapshot's `selectedIds` is written
+/// by a *scheduled* effect, so it lags the live selection by a frame; a caller
+/// deciding whether recipients moved must ask `recipientSelection` directly.
+export function composeContentMatches(projectId: ProjectId, expected: ComposeSnapshot): boolean {
+  const current = getCompose(projectId);
+  return (
+    canonical(current.content) === canonical(expected.content) &&
+    canonical(current.attachments ?? []) === canonical(expected.attachments ?? []) &&
+    canonical(current.forwards ?? emptyForwards()) ===
+      canonical(expected.forwards ?? emptyForwards())
+  );
+}
+
+/// Reset a project's compose state to an empty plain composer, in one write.
+/// Used by a send that has dispatched and must retire the content it consumed
+/// even if its own ComposeBar is long gone.
+export function clearCompose(projectId: ProjectId): void {
+  store[projectId] = { content: emptyPlain(), selectedIds: store[projectId]?.selectedIds };
+  schedulePersist();
+}
+
 /// Staged paths this project's unsent draft still references. Pass to
 /// `loadProjectConversation` — the backend GC deletes any staged attachment the
 /// journal doesn't reference, and it cannot see a draft that lives here.

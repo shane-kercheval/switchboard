@@ -1,7 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { ComposeForwards } from "./composeStore";
+import type { ComposeContent, ComposeForwards, ComposeSnapshot } from "./composeStore";
 import {
   _testing,
+  clearCompose,
+  composeContentMatches,
   draftAttachmentPaths,
   emptyForwards,
   flush,
@@ -448,5 +450,144 @@ describe("composeStore v3: attachments, forwards, workflow mode", () => {
     expect(snapshot.attachments).toEqual([ATTACHMENT]);
     expect(snapshot.forwards?.message).toEqual([SOURCE_A]);
     expect(snapshot.content).toEqual({ kind: "plain", draft: "typed after attaching" });
+  });
+});
+
+describe("composeContentMatches: whether a send's composer is still on screen", () => {
+  // A send that outlives its own ComposeBar finalizes against this. A false
+  // "matches" clears a composer the user has since edited; a false "differs"
+  // leaves a prompt that was already sent sitting on screen, one keystroke from
+  // being sent twice. Both are silent, so the comparator gets its own tests
+  // rather than being covered only through component behavior.
+  const PROMPT: ComposeSnapshot = {
+    content: {
+      kind: "prompt",
+      provider: "tiddly",
+      name: "summary",
+      args: { focus: "tests", scope: "diff" },
+      appendedText: "tail",
+    },
+    selectedIds: ["agent-a"],
+    attachments: [ATTACHMENT],
+    forwards: { ...emptyForwards(), message: [SOURCE_A] },
+  };
+
+  function seed(snapshot: ComposeSnapshot): void {
+    setContent(P, snapshot.content);
+    setAttachments(P, snapshot.attachments ?? []);
+    setForwards(P, snapshot.forwards ?? emptyForwards());
+  }
+
+  it("matches a composer that has not changed", () => {
+    seed(PROMPT);
+    expect(composeContentMatches(P, PROMPT)).toBe(true);
+  });
+
+  it("ignores the order arguments were filled in", () => {
+    // `args` key order is an artifact of which field the user typed into first,
+    // which a plain JSON comparison would report as a difference — and every
+    // such false difference silently declines to clear a sent prompt.
+    seed(PROMPT);
+    expect(
+      composeContentMatches(P, {
+        ...PROMPT,
+        content: {
+          kind: "prompt",
+          provider: "tiddly",
+          name: "summary",
+          args: { scope: "diff", focus: "tests" },
+          appendedText: "tail",
+        },
+      }),
+    ).toBe(true);
+  });
+
+  it("treats an absent optional field as its empty value", () => {
+    // The store drops `attachments`/`forwards` entirely when empty, so a capture
+    // taken from a pristine composer carries `[]` where the store carries
+    // nothing. Those are the same composer.
+    setContent(P, { kind: "plain", draft: "" });
+    expect(
+      composeContentMatches(P, {
+        content: { kind: "plain", draft: "" },
+        attachments: [],
+        forwards: emptyForwards(),
+      }),
+    ).toBe(true);
+  });
+
+  it("notices an edited argument, appended text, or a different prompt", () => {
+    seed(PROMPT);
+    const content = PROMPT.content as Extract<ComposeContent, { kind: "prompt" }>;
+    expect(
+      composeContentMatches(P, {
+        ...PROMPT,
+        content: { ...content, args: { focus: "perf", scope: "diff" } },
+      }),
+    ).toBe(false);
+    expect(
+      composeContentMatches(P, { ...PROMPT, content: { ...content, appendedText: "other" } }),
+    ).toBe(false);
+    expect(composeContentMatches(P, { ...PROMPT, content: { ...content, name: "review" } })).toBe(
+      false,
+    );
+    expect(composeContentMatches(P, { ...PROMPT, content: { kind: "plain", draft: "" } })).toBe(
+      false,
+    );
+  });
+
+  it("notices a staged or removed attachment", () => {
+    seed(PROMPT);
+    expect(composeContentMatches(P, { ...PROMPT, attachments: [] })).toBe(false);
+    setAttachments(P, []);
+    expect(composeContentMatches(P, PROMPT)).toBe(false);
+  });
+
+  it("notices a forward source added to any family", () => {
+    seed(PROMPT);
+    expect(
+      composeContentMatches(P, {
+        ...PROMPT,
+        forwards: { ...emptyForwards(), message: [SOURCE_A, SOURCE_B] },
+      }),
+    ).toBe(false);
+    expect(
+      composeContentMatches(P, {
+        ...PROMPT,
+        forwards: { ...emptyForwards(), message: [SOURCE_A], promptAppended: [SOURCE_B] },
+      }),
+    ).toBe(false);
+  });
+
+  it("keeps forward-source order significant", () => {
+    // Unlike `args`, a forward list's order is the order sources compose in, so
+    // two orderings are genuinely different composers.
+    setForwards(P, { ...emptyForwards(), message: [SOURCE_A, SOURCE_B] });
+    setContent(P, { kind: "plain", draft: "" });
+    expect(
+      composeContentMatches(P, {
+        content: { kind: "plain", draft: "" },
+        forwards: { ...emptyForwards(), message: [SOURCE_B, SOURCE_A] },
+      }),
+    ).toBe(false);
+  });
+
+  it("does not consult recipients — those lag in this snapshot", () => {
+    // `selectedIds` here is written by a scheduled effect and trails the live
+    // selection by a frame, so a caller that cares must ask recipientSelection.
+    seed(PROMPT);
+    setSelection(P, ["agent-z"]);
+    expect(composeContentMatches(P, PROMPT)).toBe(true);
+  });
+
+  it("clearCompose empties content and attachments but keeps the recipients", () => {
+    seed(PROMPT);
+    setSelection(P, ["agent-a"]);
+    clearCompose(P);
+    const snapshot = getCompose(P);
+    expect(snapshot.content).toEqual({ kind: "plain", draft: "" });
+    expect(snapshot.attachments ?? []).toEqual([]);
+    expect(snapshot.forwards ?? emptyForwards()).toEqual(emptyForwards());
+    expect(snapshot.selectedIds).toEqual(["agent-a"]);
   });
 });

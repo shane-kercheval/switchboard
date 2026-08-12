@@ -8,7 +8,7 @@
     runtimes,
     transcripts,
   } from "$lib/state/index.svelte";
-  import { forkAgentIntoOwnPane } from "$lib/state/workspace.svelte";
+  import { createReachableFork, type ReachableFork } from "$lib/state/workspace.svelte";
   import { HARNESS_LABEL } from "$lib/harnessDisplay";
   import {
     addHeldForward,
@@ -26,6 +26,8 @@
   } from "$lib/state/heldForwards.svelte";
   import { buildLiveSendsMap } from "$lib/state/liveSends";
   import {
+    clearCompose,
+    composeContentMatches,
     emptyForwards,
     flush,
     getCompose,
@@ -35,9 +37,20 @@
     setSelection,
     type ComposeContent,
     type ComposeForwards,
+    type ComposeSnapshot,
     type PromptContent,
     type WorkflowContent,
   } from "$lib/state/composeStore";
+  import {
+    advancePromptFork,
+    beginPromptFork,
+    clearPromptForkOutcome,
+    composerConsumedCount,
+    endPromptFork,
+    markComposerConsumed,
+    promptForkOperation,
+    promptForkOutcome,
+  } from "$lib/state/promptForkOps.svelte";
   import { projects, recordProjectsActivityLocally } from "$lib/state/workspace.svelte";
   import {
     selectionFor,
@@ -334,7 +347,7 @@
           dragOver = false;
           // Ignore drops while a send is rendering: the attachment set is frozen
           // for that send (see the `sending`-gated remove button too).
-          if (!sending) void stageDroppedPaths(payload.paths);
+          if (!composerBusy) void stageDroppedPaths(payload.paths);
         }
       });
       void dropSub.catch((e) => console.error("[attachments] onDragDropEvent failed", e));
@@ -876,6 +889,15 @@
     selectedAgents.length === 1 ? (selectedAgents[0] ?? null) : null,
   );
 
+  /// Whether any of the composing prompt's fields is filled from another agent —
+  /// an argument or the appended text. Either one routes the send through the
+  /// held forward-prompt path instead of an immediate render.
+  const anyPromptFieldForwarded = $derived(
+    selectedPrompt !== null &&
+      (selectedPrompt.arguments.some((a) => (promptArgSources[a.name]?.length ?? 0) > 0) ||
+        promptAppendedSources.length > 0),
+  );
+
   /// Whether `agentId` looks like it has a harness session to branch from.
   ///
   /// Derived from the transcript rather than fetched: an agent with any turn
@@ -918,18 +940,20 @@
   /// selection. The button reserves its split footprint on the shape, so the
   /// transition into a cancel can't narrow the control under the cursor.
   const forkShapeBlock = $derived.by((): string | null => {
-    // Prompt and workflow modes compose their message somewhere other than
-    // `draft`, and the fork path dispatches `draft` — so a fork there would
-    // branch and then send the wrong text entirely. Plain-mode-only is the
-    // documented contract (system-design §9); prompt-mode forking is a tracked
-    // gap, not a boundary.
-    if (mode === "prompt") return "Fork isn't available while composing with a saved prompt.";
+    // A workflow is N sends; "which one branches?" has no answer.
     if (mode === "workflow") return "Fork isn't available while composing a workflow.";
+    // A prompt with a forwarded field composes server-side and dispatches
+    // whenever its sources settle, through `dispatchForwardPrompt` — a hold with
+    // no bound. Branching into that means either a promptless agent sitting for
+    // the duration or one registered against a long-stale busy-parent gate.
+    if (mode === "prompt" && anyPromptFieldForwarded) {
+      return "Fork isn't available while a prompt field is filled from another agent — clear the forwarded fields first.";
+    }
     // Fork branches one agent, so a multi-recipient send has no single source.
     if (selectedAgents.length > 1) return "Fork branches one agent — select a single recipient.";
     const candidate = forkCandidate;
     if (candidate === null) return NO_FORK_SOURCE;
-    if (forwardSources.length > 0) {
+    if (mode === "plain" && forwardSources.length > 0) {
       // Both are send modifiers and the forward branch runs first, so a fork
       // would lose silently: the message would go to the parent, exactly what
       // the branch's selection swap exists to prevent.
@@ -982,12 +1006,18 @@
     if (source === null) return { kind: "blocked", reason: NO_FORK_SOURCE };
     // An empty composer has nothing to fork, so it is a no-op in every state —
     // ahead of the readiness checks below, which would otherwise explain why a
-    // message the user never typed could not be sent.
-    if (draft.trim() === "" && attachmentChips.length === 0) return { kind: "nothing-to-send" };
+    // message the user never typed could not be sent. **Emptiness is
+    // mode-specific**: prompt mode's message lives in the prompt's fields, not
+    // `draft`, so the plain test would silently swallow every prompt fork.
+    const nothingToSend =
+      mode === "prompt"
+        ? selectedPrompt === null || missingRequired.length > 0
+        : draft.trim() === "" && attachmentChips.length === 0;
+    if (nothingToSend) return { kind: "nothing-to-send" };
     // No `showStop` arm: it requires an empty composer and no attachments, which
     // the check above already answers. A send in flight with text typed leaves
     // `showStop` false and falls through to the checks below.
-    if (sending) return { kind: "blocked", reason: "Already sending." };
+    if (composerBusy) return { kind: "blocked", reason: "Already sending." };
     if (!allRecipientsHydrated) {
       return {
         kind: "blocked",
@@ -1172,13 +1202,35 @@
 
   /// Send is gated on a recipient + every recipient's history being loaded, plus
   /// per-mode content: plain needs non-empty text; prompt needs a selected prompt
+  /// Busy for *this project's composer*, not just this component instance.
+  ///
+  /// A prompt fork outlives the bar that started it (a project switch remounts
+  /// the bar; the send runs on), and a replacement's `sending` starts at `false`.
+  /// Without the project-scoped term, coming back mid-fork gives you a composer
+  /// that will happily submit the same prompt again — two branches, two sends.
+  const composerBusy = $derived(sending || promptForkOperation(projectId) !== undefined);
+
+  /// A finished operation's message reaches whichever bar is mounted now, which
+  /// may not be the one that started it. Local state still wins: it belongs to
+  /// something the user did more recently.
+  const forkOutcome = $derived(promptForkOutcome(projectId));
+  const displayedError = $derived(
+    sendError ?? (forkOutcome?.tone === "error" ? forkOutcome.message : null),
+  );
+  const displayedNotice = $derived(
+    sendNotice ?? (forkOutcome?.tone === "notice" ? forkOutcome.message : null),
+  );
+
   /// with all required arguments filled, and is blocked while a render is in
   /// flight. **Not** gated on run_status — send-while-busy queues.
   const sendDisabled = $derived(
     mode === "prompt"
-      ? selectedPrompt === null || missingRequired.length > 0 || sending || !allRecipientsHydrated
+      ? selectedPrompt === null ||
+          missingRequired.length > 0 ||
+          composerBusy ||
+          !allRecipientsHydrated
       : (draft.trim() === "" && attachmentChips.length === 0 && forwardSources.length === 0) ||
-          sending ||
+          composerBusy ||
           !allRecipientsHydrated,
   );
 
@@ -1201,7 +1253,7 @@
   const primaryDisabled = $derived(showStop ? false : sendDisabled);
 
   function toggleRecipient(id: AgentId): void {
-    if (sending) return;
+    if (composerBusy) return;
     setSelectedIds(
       selectedIds.includes(id) ? selectedIds.filter((x) => x !== id) : [...selectedIds, id],
     );
@@ -1814,6 +1866,10 @@
       return;
     }
     closeMentionMenu();
+    if (mode === "prompt" && selectedPrompt !== null) {
+      void dispatchPromptForkSend(attempt.source, selectedPrompt);
+      return;
+    }
     void dispatchForkSend(attempt.source, draft.trim(), snapshotAttachments());
   }
 
@@ -2162,9 +2218,10 @@
     draft = "";
     commitChips([]);
     persistComposeNow();
-    let fork: AgentRecord;
+    const capturedRecipients = [...selectedIds];
+    let created: ReachableFork;
     try {
-      fork = await forkAgentIntoOwnPane(source.id);
+      created = await createReachableFork(source.id);
     } catch (err) {
       sendError = `Fork failed: ${err instanceof Error ? err.message : String(err)}`;
       restoreCapturedSend(text, carried);
@@ -2172,19 +2229,13 @@
     } finally {
       sending = false;
     }
-    // Selection follows the branch either way: the conversation continues there,
-    // and leaving the parent selected would send the user's next message to the
-    // agent they just branched away from — including the retry below.
-    setSelectedIds([fork.id]);
-    // **Committed is not the same as reachable.** The branch is durable, but if
-    // subscribing to its event channel failed, dispatching now spends real work
-    // on a turn whose events never arrive: it sits at "starting" forever and the
-    // reply never renders. Tauri has no replay, so subscribing later cannot
-    // recover them. Hand the message back instead — the branch stays visible with
-    // its retry, and the next send materializes it, which is the ordinary
-    // self-healing path for a fork whose first turn never ran.
-    if (runtimes[fork.id]?.listener_error != null) {
-      sendError = `${fork.name} was created, but Switchboard couldn't connect to its updates — your message wasn't sent. Retry from the banner above, then send again.`;
+    selectForkIfRecipientsUnchanged(capturedRecipients, created.fork.id);
+    // **Committed is not the same as reachable.** Hand the message back — the
+    // branch stays visible with its retry, and the next send materializes it,
+    // which is the ordinary self-healing path for a fork whose first turn never
+    // ran.
+    if (created.kind === "unsubscribed") {
+      sendError = created.message;
       restoreCapturedSend(text, carried);
       return;
     }
@@ -2192,8 +2243,251 @@
     // the first message would leave a promptless fork — the one state this design
     // exists to make impossible, since Claude refuses a promptless fork and the
     // branch would never materialize.
-    dispatchToRecipients(text, attachments, [fork]);
+    dispatchToRecipients(text, attachments, [created.fork]);
     sendGeneration += 1;
+  }
+
+  /// Move the composer onto the branch, unless the user has moved on.
+  ///
+  /// Selection normally follows the branch: the conversation continues there, and
+  /// leaving the parent selected would send the next message — including the
+  /// retry after an unreachable branch — to the agent they just branched away
+  /// from. But this runs after an await, so the composer it retargets may be a
+  /// *replacement* instance for the same project whose recipients the user has
+  /// since chosen deliberately. Overwriting those would silently redirect their
+  /// next message to an agent they never picked.
+  function selectForkIfRecipientsUnchanged(captured: AgentId[], forkId: AgentId): void {
+    if (!recipientsUnchanged(captured)) return;
+    setSelectedIds([forkId]);
+  }
+
+  /// Whether both the composed content and the live recipient set still match
+  /// what a send captured — the question every post-await finalization asks.
+  function composeUnchangedSince(snapshot: ComposeSnapshot): boolean {
+    return (
+      composeContentMatches(projectId, snapshot) && recipientsUnchanged(snapshot.selectedIds ?? [])
+    );
+  }
+
+  /// Recipients come from `recipientSelection`, not the persisted copy in the
+  /// compose snapshot: that copy is written by a *scheduled* effect and lags a
+  /// selection change by a frame, which would report "unchanged" for a change
+  /// that has already happened.
+  function recipientsUnchanged(captured: AgentId[]): boolean {
+    const current = selectionFor(projectId);
+    if (current.length !== captured.length) return false;
+    return !current.some((id, i) => id !== captured[i]);
+  }
+
+  /// Return the composer to plain mode after a prompt send. Shared by the
+  /// ordinary send and the fork so the two cannot drift into clearing different
+  /// subsets — a stale forward set or a leftover argument resurfacing on the next
+  /// send is invisible until it rides a message the user didn't mean to send.
+  function clearPromptComposer(): void {
+    selectedPrompt = null;
+    promptArgs = {};
+    promptArgSources = {};
+    promptAppendedSources = [];
+    // A completed send is a fresh start: drop any plain-mode forward set that was
+    // hidden during prompt mode, so it can't silently resurface on a later send.
+    forwardSources = [];
+    focusPromptFieldOnMount = false;
+    appendedText = "";
+    draft = "";
+    // Chips clear optimistically with the text (the optimistic user turn already
+    // renders them); the staged files persist on disk for the send.
+    commitChips([]);
+    mode = "plain";
+    persistComposeNow();
+  }
+
+  /// Retire the compose state a dispatched send consumed — but only if it is
+  /// still exactly what that send captured.
+  ///
+  /// A prompt fork can outlive its own ComposeBar (a project switch remounts the
+  /// bar; the continuation runs on regardless), so "clear the composer" cannot
+  /// mean "assign my locals." It means: compare the *store* against the captured
+  /// snapshot, and clear only on an exact match. A match proves the composer on
+  /// screen is still the one that submitted; any difference means a remounted or
+  /// edited composer owns that slot and must be left alone.
+  ///
+  /// `markComposerConsumed` is the other half. Clearing the store is invisible to
+  /// an already-mounted composer — it read the store once at mount and pushes its
+  /// locals *down* — so without a signal it would keep displaying, and then
+  /// re-persist, a prompt that has already been sent.
+  function retireConsumedCompose(snapshot: ComposeSnapshot): boolean {
+    if (!composeUnchangedSince(snapshot)) return false;
+    if (unmounted) {
+      clearCompose(projectId);
+      flush();
+    } else {
+      clearPromptComposer();
+    }
+    markComposerConsumed(projectId);
+    return true;
+  }
+
+  /// Render `prompt`, branch `source`, and send the rendered text as the branch's
+  /// first turn.
+  ///
+  /// **Render first.** A fork is a registry append, so branching before the render
+  /// and then failing it puts a visibly empty agent in the roster that received
+  /// nothing. Rendering first means a render failure — including a refused or
+  /// abandoned MCP sign-in — leaves no durable trace at all.
+  ///
+  /// **Nothing is cleared until the send has dispatched.** The prompt stays intact
+  /// (and visibly busy) across both awaits, so every failure path preserves it by
+  /// doing nothing at all — no restore, and no window in which a rejected fork can
+  /// cost the user a filled-in prompt.
+  ///
+  /// **Divergence means different things on either side of registration.** Before
+  /// it, nothing is committed, so a composer that changed under the render aborts:
+  /// dispatching text the user has since replaced would create a branch carrying
+  /// content they abandoned. After it, the branch exists and dispatch is
+  /// mandatory — abandoning it leaves the promptless fork this whole design exists
+  /// to prevent — so the send goes and the newer composer is preserved instead.
+  async function dispatchPromptForkSend(source: AgentRecord, prompt: Prompt): Promise<void> {
+    // The whole composer, not just the prompt: an attachment staged or a forward
+    // configured since submit has to count as divergence, or finalizing would
+    // discard it.
+    const snapshot: ComposeSnapshot = {
+      content: currentContent(),
+      selectedIds: [...selectedIds],
+      attachments: snapshotAttachments(),
+      forwards: currentForwards(),
+    };
+    const renderArgs = buildRenderArgs(prompt, promptArgs);
+    const attachments = snapshot.attachments ?? [];
+
+    // **Single-flight is project-scoped, not component-scoped.** `sending` resets
+    // to false in a replacement bar, which would let a second submit register a
+    // second branch while the first is still rendering.
+    const opId = beginPromptFork(projectId, source.id);
+    if (opId === null) return;
+    sending = true;
+    sendError = null;
+    sendNotice = null;
+    clearPromptForkOutcome(projectId);
+    promptMenuOpen = false;
+    closeMentionMenu();
+    // Token-scoped so a dead instance's `finally` cannot unlock a *newer*
+    // operation's render window.
+    setTargetingLocked(projectId, true);
+    let holdsLock = true;
+    const releaseLock = (): void => {
+      if (!holdsLock) return;
+      holdsLock = false;
+      setTargetingLocked(projectId, false);
+    };
+    let outcome: { message: string; tone: "error" | "notice" } | undefined;
+    try {
+      let finalText: string;
+      let signedInMidSend = false;
+      try {
+        let rendered = await api.renderPrompt(prompt.provider, prompt.name, renderArgs);
+        if (rendered.kind === "needs_sign_in") {
+          // The targeting freeze must not span a minutes-long browser wait; the
+          // snapshot comparison below covers everything the freeze covered.
+          releaseLock();
+          signingInProvider = rendered.provider;
+          try {
+            await api.signInMcpProvider(rendered.provider);
+          } finally {
+            signingInProvider = null;
+          }
+          signedInMidSend = true;
+          setTargetingLocked(projectId, true);
+          holdsLock = true;
+          rendered = await api.renderPrompt(prompt.provider, prompt.name, renderArgs);
+        }
+        if (rendered.kind !== "rendered") {
+          outcome = {
+            message: `Fork not sent: MCP provider "${prompt.provider}" needs sign-in.`,
+            tone: "error",
+          };
+          return;
+        }
+        finalText = combinePromptMessage(rendered.text, promptAppendedOf(snapshot));
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        outcome = {
+          message: signedInMidSend
+            ? `Signed in, but the fork then failed: ${message}`
+            : `Fork failed: ${message}`,
+          tone: "error",
+        };
+        return;
+      }
+
+      // ---- Pre-registration divergence: abort. Nothing durable exists yet. ----
+      if (!composeUnchangedSince(snapshot)) {
+        outcome = {
+          message: `Fork not sent: the composer changed while "${prompt.name}" was rendering. Press Fork again when you're ready.`,
+          tone: "notice",
+        };
+        return;
+      }
+      // Re-ask the busy-parent question. It was answered at keypress, and the
+      // sign-in detour makes that answer minutes old — a branch taken mid-turn
+      // permanently inherits a placeholder instead of the parent's real answer.
+      // The backend re-checks too, so a miss here refuses rather than corrupts;
+      // this is what turns that refusal into a sentence.
+      if (!unmounted && forkBlock !== null) {
+        outcome = { message: forkBlock, tone: "error" };
+        return;
+      }
+      // Claude refuses a promptless fork, so an empty render would fail at the
+      // harness with the branch already committed. Judged on the combined
+      // transport text, not the renderer's output alone.
+      if (finalText.trim() === "" && attachments.length === 0) {
+        outcome = {
+          message: `Fork not sent: "${prompt.name}" rendered to an empty message.`,
+          tone: "error",
+        };
+        return;
+      }
+
+      advancePromptFork(projectId, opId, "registering");
+      releaseLock();
+      let created: ReachableFork;
+      try {
+        created = await createReachableFork(source.id);
+      } catch (err) {
+        // The prompt was never cleared, so there is nothing to hand back.
+        const message = err instanceof Error ? err.message : String(err);
+        outcome = { message: `Fork failed: ${message}`, tone: "error" };
+        return;
+      }
+      if (created.kind === "unsubscribed") {
+        selectForkIfRecipientsUnchanged(snapshot.selectedIds ?? [], created.fork.id);
+        outcome = { message: created.message, tone: "error" };
+        return;
+      }
+      // Committed and reachable: the send is no longer optional.
+      dispatchToRecipients(finalText, attachments, [created.fork]);
+      const retired = retireConsumedCompose(snapshot);
+      if (retired) {
+        selectForkIfRecipientsUnchanged(snapshot.selectedIds ?? [], created.fork.id);
+        sendGeneration += 1;
+      } else {
+        outcome = {
+          message: `Sent to ${created.fork.name} — your newer draft and recipients were kept.`,
+          tone: "notice",
+        };
+      }
+    } finally {
+      sending = false;
+      signingInProvider = null;
+      releaseLock();
+      endPromptFork(projectId, opId, outcome);
+    }
+  }
+
+  /// The appended free text a snapshot captured, or `""` when it wasn't prompt
+  /// content. Read from the snapshot rather than live state so a mid-render edit
+  /// cannot change what gets combined.
+  function promptAppendedOf(snapshot: ComposeSnapshot): string {
+    return snapshot.content.kind === "prompt" ? snapshot.content.appendedText : "";
   }
 
   async function handleSubmit(): Promise<void> {
@@ -2237,21 +2531,8 @@
           attachments,
           targets,
         );
-        selectedPrompt = null;
-        promptArgs = {};
-        promptArgSources = {};
-        promptAppendedSources = [];
-        // A completed send is a fresh start: drop any plain-mode forward set that
-        // was hidden during prompt mode, so it can't silently resurface and ride a
-        // later plain send. (Removing the prompt before sending still restores it.)
-        forwardSources = [];
-        focusPromptFieldOnMount = false;
-        appendedText = "";
-        draft = "";
-        commitChips([]);
+        clearPromptComposer();
         sendGeneration += 1;
-        mode = "plain";
-        persistComposeNow();
         return;
       }
 
@@ -2324,21 +2605,8 @@
       // Prompt selection is not sticky: a successful send returns to the plain
       // composer (recipients stay selected). Appended text is consumed, not
       // carried back.
-      selectedPrompt = null;
-      promptArgs = {};
-      promptArgSources = {};
-      promptAppendedSources = [];
-      // A completed send is a fresh start — see the prompt-forward branch above.
-      forwardSources = [];
-      focusPromptFieldOnMount = false;
-      appendedText = "";
-      draft = "";
-      // Chips clear optimistically with the text (the optimistic user turn already
-      // renders them); the staged files persist on disk for the send.
-      commitChips([]);
+      clearPromptComposer();
       sendGeneration += 1;
-      mode = "plain";
-      persistComposeNow();
       return;
     }
 
@@ -2380,6 +2648,37 @@
   /// path the effect plus `onDestroy`'s flush already cover this, and the window is
   /// too narrow to drive from a jsdom test — so treat this as symmetry with the
   /// content path, not a test-pinned guarantee.
+  /// Re-read the store after a background send retired the content it consumed.
+  ///
+  /// A ComposeBar reads the store **once**, at mount (`untrack(getCompose)`), and
+  /// from then on pushes its locals *down* into it. So a send that clears the
+  /// store from a continuation — possibly one started by an instance that no
+  /// longer exists — is invisible to whichever bar is mounted: it keeps showing
+  /// the prompt that was already sent, and its own persist effects write that
+  /// prompt straight back over the clear. This is the signal that closes that
+  /// gap; the clear itself only happens when the store still matched, so there is
+  /// never newer work here to lose.
+  let seenConsumed = untrack(() => composerConsumedCount(projectId));
+  $effect(() => {
+    const count = composerConsumedCount(projectId);
+    if (count === seenConsumed) return;
+    seenConsumed = count;
+    untrack(() => resetComposerToEmpty());
+  });
+
+  function resetComposerToEmpty(): void {
+    selectedPrompt = null;
+    promptArgs = {};
+    promptArgSources = {};
+    promptAppendedSources = [];
+    forwardSources = [];
+    focusPromptFieldOnMount = false;
+    appendedText = "";
+    draft = "";
+    attachmentChips = [];
+    mode = "plain";
+  }
+
   function persistComposeNow(): void {
     setContent(projectId, currentContent());
     setForwards(projectId, currentForwards());
@@ -3126,7 +3425,7 @@
           focusFirstField={focusPromptFieldOnMount}
           onremove={removePrompt}
           recipients={recipientChips}
-          busy={sending}
+          busy={composerBusy}
           send={sendButton}
         />
       {:else}
@@ -3152,12 +3451,20 @@
         Waiting for browser sign-in to {signingInProvider}…
       </p>
     {/if}
-    {#if sendNotice}
-      <p class="text-muted mt-2 text-xs" data-testid="compose-send-notice">
-        {sendNotice}
+    {#if displayedNotice}
+      <!-- Announced for the same reason as the error above: a fork refused
+           after the composer moved on is explained here, and a keyboard user
+           invoking the shortcut has no other signal. -->
+      <p
+        class="text-muted mt-2 text-xs"
+        data-testid="compose-send-notice"
+        role="status"
+        aria-live="polite"
+      >
+        {displayedNotice}
       </p>
     {/if}
-    {#if sendError}
+    {#if displayedError}
       <!-- Announced, not just shown. Hiding the fork control when unavailable
            rests on the shortcut still explaining itself, and an explanation a
            screen reader never speaks is no explanation. `polite` rather than
@@ -3169,7 +3476,7 @@
         role="status"
         aria-live="polite"
       >
-        {sendError}
+        {displayedError}
       </p>
     {/if}
   {/if}

@@ -703,7 +703,12 @@ The feature is usable end to end and its transcript behavior is pinned.
   2.1.226, not a guarantee (falsifier documented in harness-behavior §3.5;
   re-probe on CLI bumps).
 - **Fork is available in plain compose mode only**, not while composing with a
-  saved prompt. Nothing about branching is incompatible with prompt mode — it
+  saved prompt. *(Amended after this plan shipped: prompt-mode fork was
+  subsequently built — render → branch → dispatch, with project-scoped operation
+  state so the send survives the compose bar being remounted mid-flight. Workflow
+  mode and forward-backed prompts remain excluded. See system-design §6 and
+  harness-behavior §3.5; the original reasoning below is left as the record of
+  what this milestone decided.)* Nothing about branching is incompatible with prompt mode — it
   mirrors how forward sources are plain-mode-only, and the workaround (switch to
   plain mode) is discoverable. Tracked as intended work, not a permanent
   boundary; if it is wired later, reuse the single-flight guard from the plain

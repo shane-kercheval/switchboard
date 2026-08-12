@@ -1051,6 +1051,35 @@ export async function forkAgentIntoOwnPane(sourceId: AgentId): Promise<AgentReco
   return fork;
 }
 
+/// A registered branch, and whether its event channel is live.
+///
+/// `unsubscribed` is **committed but unreachable**: the branch is durable and on
+/// screen, but subscribing to its channel failed, so a turn dispatched into it
+/// would spend real work on events that never arrive — and Tauri has no replay,
+/// so subscribing later cannot recover them.
+export type ReachableFork =
+  | { kind: "ready"; fork: AgentRecord }
+  | { kind: "unsubscribed"; fork: AgentRecord; message: string };
+
+/// Register a branch of `sourceId` and classify whether it can be sent to.
+///
+/// Deliberately does **not** touch recipient selection, dispatch, or compose
+/// state. Each caller finalizes its own composer on its own rules — plain mode
+/// clears before this call and hands the text back on failure, prompt mode
+/// clears in the synchronous window just before it — and folding those into a
+/// shared helper is how an obsolete instance ends up retargeting a live one.
+export async function createReachableFork(sourceId: AgentId): Promise<ReachableFork> {
+  const fork = await forkAgentIntoOwnPane(sourceId);
+  if (runtimes[fork.id]?.listener_error != null) {
+    return {
+      kind: "unsubscribed",
+      fork,
+      message: `${fork.name} was created, but Switchboard couldn't connect to its updates — your message wasn't sent. Retry from the banner above, then send again.`,
+    };
+  }
+  return { kind: "ready", fork };
+}
+
 /// Forks whose inherited history has already been loaded. A fork's branch point
 /// only materializes when its first turn runs, so its transcript shows just that
 /// turn until the session file is re-read.

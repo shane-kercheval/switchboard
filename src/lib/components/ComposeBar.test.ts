@@ -5937,7 +5937,7 @@ describe("ComposeBar — cross-agent forward", () => {
     });
   });
 
-  it("resolves an unresolved workflow form on prompts:synced without a re-pick", async () => {
+  it("uses the authoritative workflow-form reply without waiting for prompts:synced", async () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);
     const WORKFLOW = {
@@ -5957,16 +5957,14 @@ describe("ComposeBar — cross-agent forward", () => {
       steps: [],
       derived_args: [] as unknown[],
     };
-    // The first describe lands while the MCP prompt is still cold (unresolved);
-    // after a sync the same call resolves to ok.
-    let synced = false;
     invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
       if (cmd === "list_workflows") return [WORKFLOW];
       if (cmd === "list_prompts") return [];
       if (cmd === "describe_workflow_form") {
-        return synced
-          ? { ...BASE, compatibility: { state: "ok" } }
-          : { ...BASE, compatibility: { state: "unresolved", prompts: ["tiddly:x"] } };
+        // The backend owns cold-cache recovery now: it conditionally syncs before
+        // returning, so this reply is settled even if the global startup event
+        // fired before the component subscribed.
+        return { ...BASE, compatibility: { state: "ok" } };
       }
       return null;
     });
@@ -5976,18 +5974,13 @@ describe("ComposeBar — cross-agent forward", () => {
     await waitFor(() => screen.getByTestId("workflow-option-dir:mcp-flow"));
     await fireEvent.click(screen.getByTestId("workflow-option-dir:mcp-flow"));
 
-    // Pending affordance shown; the agent field is withheld until resolution.
-    await waitFor(() => screen.getByTestId("workflow-resolving"));
-    expect(screen.queryByTestId("workflow-agent-worker-alice")).toBeNull();
-
-    // A completed sync re-fetches the descriptor, which now resolves → fields render.
-    synced = true;
-    listeners.get("prompts:synced")?.({ payload: null as unknown as NormalizedEvent });
+    // No prompts:synced event is fired after the pick. The command reply alone
+    // resolves the form, so a missed startup event cannot strand the spinner.
     await waitFor(() => screen.getByTestId("workflow-agent-worker-alice"));
     expect(screen.queryByTestId("workflow-resolving")).toBeNull();
   });
 
-  it("escalates a still-unresolved workflow to a not-found error after a sync settles", async () => {
+  it("treats a still-unresolved authoritative reply as settled instead of spinning", async () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);
     const WORKFLOW = {
@@ -6023,20 +6016,14 @@ describe("ComposeBar — cross-agent forward", () => {
     await waitFor(() => screen.getByTestId("workflow-option-dir:mcp-gone"));
     await fireEvent.click(screen.getByTestId("workflow-option-dir:mcp-gone"));
 
-    // Before a sync settles → pending spinner, not an error.
-    await waitFor(() => screen.getByTestId("workflow-resolving"));
-    expect(screen.queryByTestId("workflow-prompt-missing")).toBeNull();
-
-    // After a sync settles and it's still unresolved → blocking not-found error.
-    listeners.get("prompts:synced")?.({ payload: null as unknown as NormalizedEvent });
+    // This fallback protects against an older backend or an unexpected unresolved
+    // reply: a completed describe call is treated as settled, never an unbounded
+    // wait for a future global event.
     await waitFor(() => screen.getByTestId("workflow-prompt-missing"));
     expect(screen.queryByTestId("workflow-resolving")).toBeNull();
   });
 
-  it("drops a stale workflow-form reply that resolves out of order", async () => {
-    // The generation-token guard: an older describe reply that lands after a newer
-    // one must not overwrite the form. Drive two re-fetches whose replies resolve
-    // in reverse order and assert the newer (ok) wins, not the older (unresolved).
+  it("does not refresh a workflow when a sync event arrives during its fresh describe", async () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);
     const WORKFLOW = {
@@ -6056,34 +6043,108 @@ describe("ComposeBar — cross-agent forward", () => {
       steps: [],
       derived_args: [] as unknown[],
     };
-    const pending: Array<(d: unknown) => void> = [];
+    let resolveDescribe: ((descriptor: unknown) => void) | undefined;
+    let freshCalls = 0;
+    let cacheOnlyCalls = 0;
     invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
       if (cmd === "list_workflows") return [WORKFLOW];
       if (cmd === "list_prompts") return [];
       if (cmd === "describe_workflow_form") {
-        return new Promise((resolve) => pending.push(resolve));
+        freshCalls++;
+        return new Promise((resolve) => (resolveDescribe = resolve));
       }
+      if (cmd === "refresh_workflow_form_from_cache") cacheOnlyCalls++;
       return null;
     });
 
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
     await fireEvent.click(screen.getByTestId("compose-workflow-button"));
     await waitFor(() => screen.getByTestId("workflow-option-dir:race"));
-    await fireEvent.click(screen.getByTestId("workflow-option-dir:race")); // fetch #1 (gen 1)
-    // Two prompt syncs trigger two more re-fetches (gen 2, then gen 3).
-    listeners.get("prompts:synced")?.({ payload: null as unknown as NormalizedEvent });
-    listeners.get("prompts:synced")?.({ payload: null as unknown as NormalizedEvent });
-    await waitFor(() => expect(pending.length).toBe(3));
+    await fireEvent.click(screen.getByTestId("workflow-option-dir:race"));
+    await waitFor(() => expect(freshCalls).toBe(1));
 
-    // Resolve the NEWEST (gen 3) as ok, then an older (gen 1) as unresolved.
-    pending[2]?.({ ...base, compatibility: { state: "ok" } });
+    // The pending fresh request is already serialized with startup sync and will
+    // observe its result, so its completion event must not start another request.
+    listeners.get("prompts:synced")?.({ payload: null as unknown as NormalizedEvent });
+    await tick();
+    expect(freshCalls).toBe(1);
+    expect(cacheOnlyCalls).toBe(0);
+
+    resolveDescribe?.({ ...base, compatibility: { state: "ok" } });
     await waitFor(() => screen.getByTestId("workflow-agent-worker-alice"));
-    pending[0]?.({ ...base, compatibility: { state: "unresolved", prompts: ["tiddly:x"] } });
+  });
+
+  it("uses only cache reclassification after an independent sync", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    const WORKFLOW = {
+      name: "cache-refresh",
+      is_builtin: false,
+      description: "d",
+      inputs: [{ name: "worker", ty: "agent", optional: false, description: null }],
+      invocable: true,
+      parse_error: null,
+    };
+    const base = {
+      name: WORKFLOW.name,
+      description: "d",
+      is_builtin: false,
+      invocable: true,
+      inputs: WORKFLOW.inputs,
+      steps: [],
+      derived_args: [] as unknown[],
+    };
+    let freshCalls = 0;
+    let cacheOnlyCalls = 0;
+    const cacheReplies: Array<(descriptor: unknown) => void> = [];
+    const unavailable = {
+      ...base,
+      compatibility: {
+        state: "unavailable",
+        issues: [
+          {
+            prompt: "tiddly:review",
+            provider: "tiddly",
+            kind: "provider_error",
+            message: "timed out",
+          },
+        ],
+      },
+    };
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "list_workflows") return [WORKFLOW];
+      if (cmd === "list_prompts") return [];
+      if (cmd === "describe_workflow_form") {
+        freshCalls++;
+        return unavailable;
+      }
+      if (cmd === "refresh_workflow_form_from_cache") {
+        cacheOnlyCalls++;
+        return new Promise((resolve) => cacheReplies.push(resolve));
+      }
+      return null;
+    });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await fireEvent.click(screen.getByTestId("compose-workflow-button"));
+    await waitFor(() => screen.getByTestId("workflow-option-dir:cache-refresh"));
+    await fireEvent.click(screen.getByTestId("workflow-option-dir:cache-refresh"));
+    await waitFor(() => screen.getByTestId("workflow-prompt-unavailable"));
+
+    listeners.get("prompts:synced")?.({ payload: null as unknown as NormalizedEvent });
+    await waitFor(() => expect(cacheOnlyCalls).toBe(1));
+    // A newer sync must supersede an in-flight cache-only classification instead
+    // of being dropped. Neither event is allowed to call the fresh endpoint.
+    listeners.get("prompts:synced")?.({ payload: null as unknown as NormalizedEvent });
+    await waitFor(() => expect(cacheOnlyCalls).toBe(2));
+    cacheReplies[1]?.({ ...base, compatibility: { state: "ok" } });
+    await waitFor(() => screen.getByTestId("workflow-agent-worker-alice"));
+    cacheReplies[0]?.(unavailable);
     await tick();
 
-    // The stale unresolved reply is ignored — the form stays resolved.
+    expect(freshCalls).toBe(1);
+    expect(cacheOnlyCalls).toBe(2);
     expect(screen.getByTestId("workflow-agent-worker-alice")).toBeInTheDocument();
-    expect(screen.queryByTestId("workflow-resolving")).toBeNull();
   });
 });
 

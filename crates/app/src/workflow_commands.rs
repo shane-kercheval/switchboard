@@ -17,7 +17,7 @@ use serde::Serialize;
 use switchboard_core::name::canonicalize_for_uniqueness;
 use switchboard_core::{AgentId, AgentRecord, Project, ProjectId};
 use switchboard_dispatcher::{DispatchContextFactory, Dispatcher, EventEmitter};
-use switchboard_prompts::{PromptArgument, PromptId, PromptService};
+use switchboard_prompts::{PromptArgument, PromptId, PromptService, ProviderStatus};
 use switchboard_workflow::{
     InputType, InputValue, RecipientRef, RunRecord, RunStatus, ScopeValue, Step, TerminalStatus,
     Workflow, WorkflowError, WorkflowStepInfo, bind_invocation, builtin_workflow,
@@ -589,6 +589,28 @@ pub struct BindingIssue {
     pub reason: String,
 }
 
+/// Why a prompt remained unavailable after its provider cache settled.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AvailabilityIssue {
+    pub prompt: String,
+    pub provider: String,
+    pub kind: AvailabilityIssueKind,
+    /// Provider-supplied diagnostic detail, redacted by the prompt service.
+    pub message: Option<String>,
+}
+
+/// Machine-readable recovery category for an unavailable workflow prompt.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AvailabilityIssueKind {
+    NeedsAuth,
+    NotConfigured,
+    MissingPrompt,
+    StoreUnavailable,
+    ProviderError,
+    Unknown,
+}
+
 /// Whether a workflow's hardcoded prompts are runnable as picked.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(tag = "state", rename_all = "snake_case")]
@@ -598,9 +620,13 @@ pub enum FormCompatibility {
     /// A prompt drifted: an invalid binding (`template_vars` targets a missing
     /// argument), a malformed id, or a disallowed collision. Blocks Run.
     Incompatible { issues: Vec<BindingIssue> },
-    /// One or more prompts aren't resolvable yet (cold MCP cache). Pending, not an
-    /// error: the form shows a "resolving" affordance and re-fetches on sync.
+    /// One or more MCP prompts are absent from the current cache. This is an
+    /// internal pre-sync classification; the fresh IPC path always settles it.
     Unresolved { prompts: Vec<String> },
+    /// A prompt stayed unresolved after an on-demand sync settled. The issues
+    /// distinguish provider connectivity/auth/store failures from a successful
+    /// listing that simply did not contain the named prompt.
+    Unavailable { issues: Vec<AvailabilityIssue> },
 }
 
 /// The complete invocation form for a picked workflow: declared inputs plus the
@@ -851,6 +877,14 @@ fn validate_derived_args(
             ))
             .into());
         }
+        FormCompatibility::Unavailable { issues } => {
+            let detail = issues
+                .iter()
+                .map(availability_issue_message)
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(invocation_msg(format!("workflow prompt(s) unavailable: {detail}")).into());
+        }
         FormCompatibility::Ok => {}
     }
 
@@ -888,8 +922,8 @@ fn validate_derived_args(
 /// Resolve a workflow's invocation form: declared inputs + auto-derived
 /// user-fillable prompt-argument fields + a compatibility verdict. Resolves the
 /// hardcoded prompts on demand (not in `list`); needs no `project_id` because
-/// prompts are user-global. The frontend re-fetches on `prompts:synced` so a cold
-/// MCP cache resolves once sync lands.
+/// prompts are user-global. This cache-only primitive may report `Unresolved`;
+/// the fresh IPC path below owns the sync boundary and returns a terminal result.
 pub fn describe_workflow_form_impl(
     state: &AppState,
     name: &str,
@@ -916,6 +950,120 @@ pub fn describe_workflow_form_impl(
         compatibility: form.compatibility,
         steps: step_display(&workflow),
     })
+}
+
+/// Resolve a picked workflow form against a settled prompt cache. A cache miss
+/// is the only case that touches the network: capture the cache generation,
+/// classify once, then conditionally sync. The prompt service's lock-and-recheck
+/// coalesces this with startup sync when it is still running; if startup already
+/// settled without the prompt, this selection performs the retry itself.
+///
+/// The returned descriptor is authoritative and does not depend on the lossy
+/// global sync event reaching this caller. This request-owned sync deliberately
+/// does not emit that event; independently initiated sync events are handled by
+/// the cache-only reclassification path below.
+pub async fn describe_workflow_form_fresh_impl(
+    state: &AppState,
+    name: &str,
+    is_builtin: bool,
+) -> Result<WorkflowFormDescriptor, AppError> {
+    let observed_generation = state.prompts.sync_generation();
+    let initial = describe_workflow_form_impl(state, name, is_builtin)?;
+    if !matches!(initial.compatibility, FormCompatibility::Unresolved { .. }) {
+        return Ok(initial);
+    }
+
+    state.prompts.sync_if_generation(observed_generation).await;
+    describe_workflow_form_cache_only_impl(state, name, is_builtin)
+}
+
+/// Reclassify a workflow against the currently published prompt cache and
+/// provider-status snapshot. This path is used after an independent sync event
+/// and is structurally incapable of starting network or credential work.
+pub fn describe_workflow_form_cache_only_impl(
+    state: &AppState,
+    name: &str,
+    is_builtin: bool,
+) -> Result<WorkflowFormDescriptor, AppError> {
+    let mut descriptor = describe_workflow_form_impl(state, name, is_builtin)?;
+    settle_unresolved_compatibility(&mut descriptor, &state.prompts);
+    Ok(descriptor)
+}
+
+/// Turn a post-sync cache miss into an actionable terminal state. Before the
+/// sync, absence is ambiguous and remains `Unresolved`; afterwards the provider
+/// status tells us whether the user has a connection/auth/store problem or the
+/// successfully-listed provider simply lacks that prompt.
+fn settle_unresolved_compatibility(
+    descriptor: &mut WorkflowFormDescriptor,
+    prompts: &PromptService,
+) {
+    let FormCompatibility::Unresolved {
+        prompts: unresolved,
+    } = &descriptor.compatibility
+    else {
+        return;
+    };
+    let statuses = prompts.provider_status_snapshot();
+    let issues = unresolved
+        .iter()
+        .map(|id| {
+            let provider = PromptId::parse(id)
+                .map(|parsed| parsed.provider)
+                .unwrap_or_default();
+            let (kind, message) = match statuses.get(&provider) {
+                Some(ProviderStatus::Ok { .. }) => (AvailabilityIssueKind::MissingPrompt, None),
+                Some(ProviderStatus::Errored { message }) => {
+                    (AvailabilityIssueKind::ProviderError, Some(message.clone()))
+                }
+                Some(ProviderStatus::StoreUnavailable) => {
+                    (AvailabilityIssueKind::StoreUnavailable, None)
+                }
+                Some(ProviderStatus::NeedsAuth) => (AvailabilityIssueKind::NeedsAuth, None),
+                Some(ProviderStatus::Unknown) => (AvailabilityIssueKind::Unknown, None),
+                None => (AvailabilityIssueKind::NotConfigured, None),
+            };
+            AvailabilityIssue {
+                prompt: id.clone(),
+                provider,
+                kind,
+                message,
+            }
+        })
+        .collect();
+    descriptor.compatibility = FormCompatibility::Unavailable { issues };
+}
+
+fn availability_issue_message(issue: &AvailabilityIssue) -> String {
+    let AvailabilityIssue {
+        prompt,
+        provider,
+        kind,
+        message,
+    } = issue;
+    match kind {
+        AvailabilityIssueKind::NeedsAuth => {
+            format!("provider `{provider}` needs sign-in before prompt `{prompt}` can be used")
+        }
+        AvailabilityIssueKind::NotConfigured => {
+            format!(
+                "prompt `{prompt}` is unavailable because provider `{provider}` is not configured"
+            )
+        }
+        AvailabilityIssueKind::MissingPrompt => {
+            format!("prompt `{prompt}` was not returned by provider `{provider}`")
+        }
+        AvailabilityIssueKind::StoreUnavailable => format!(
+            "provider `{provider}` could not resolve prompt `{prompt}` because the credential store is unavailable"
+        ),
+        AvailabilityIssueKind::ProviderError => format!(
+            "provider `{provider}` failed to sync prompt `{prompt}`: {}",
+            message.as_deref().unwrap_or("unknown provider error")
+        ),
+        AvailabilityIssueKind::Unknown => {
+            format!("provider `{provider}` did not finish resolving prompt `{prompt}`")
+        }
+    }
 }
 
 /// Validate a workflow invocation: capability gate + partitioned invocation rules

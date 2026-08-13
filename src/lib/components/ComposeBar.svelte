@@ -415,9 +415,10 @@
   let selectedWorkflow = $state<WorkflowListing | null>(null);
   // The resolved invocation form for the picked workflow (declared inputs +
   // auto-derived prompt-argument fields + compatibility). Fetched per-pick via
-  // `describe_workflow_form`; re-fetched on `prompts:synced` so a cold MCP cache
-  // resolves. Null while the initial fetch is pending or has failed; those two
-  // states render explicitly rather than falling through to plain compose.
+  // `describe_workflow_form`; independently completed prompt syncs reclassify it
+  // through a cache-only command. Null while the initial fetch is pending or has
+  // failed; those two states render explicitly rather than falling through to
+  // plain compose.
   let workflowForm = $state<WorkflowFormDescriptor | null>(null);
   let workflowFormLoading = $state(false);
   let workflowFormError = $state<string | null>(null);
@@ -425,10 +426,10 @@
   // newer one superseded it (name alone isn't a workflow's identity — a built-in
   // and a same-named copied user workflow share a name).
   let workflowFormGen = 0;
-  // Whether a prompt sync has settled since this workflow was picked. Before that,
-  // an `unresolved` prompt is genuinely pending (cold MCP cache); after a settled
-  // sync, a still-`unresolved` prompt is a real "not found" error, not a spinner.
-  let workflowSyncSettled = $state(false);
+  // The generation of the network-owning fresh resolver, when one is in flight.
+  // Sync events must not supersede it because it already observes that sync;
+  // cache-only refreshes may supersede one another so the newest event wins.
+  let workflowFreshGen: number | null = null;
   let workflowInputs = $state<Record<string, WorkflowInputValue>>({});
   // Per-field forward sources for the workflow's fillable single-text fields,
   // keyed by field name. Persisted with the other forward families; reset whenever
@@ -474,8 +475,8 @@
   // proof the prompt is gone.
   // A single `prompts:synced` subscription drives two cache-warm re-tries: (1)
   // restoring a saved prompt-mode draft whose prompt was cold at mount, and (2)
-  // re-resolving the workflow form so a workflow hardcoding an MCP prompt leaves
-  // its "Resolving…" pending state once the cache warms — without a re-pick.
+  // cache-only workflow reclassification. The latter must never call the fresh
+  // resolver: the event was emitted by a sync that already owns the network work.
   onMount(() => {
     const hadDraft = pendingRestore !== null;
     if (hadDraft) {
@@ -485,11 +486,13 @@
       if (hadDraft) {
         void loadPrompts().then(() => tryRestorePrompt(true));
       }
-      if (mode === "workflow" && selectedWorkflow !== null) {
-        // A sync has now settled for this pick: a still-unresolved prompt after the
-        // re-fetch is a real "not found" error, not a perpetual pending state.
-        workflowSyncSettled = true;
-        void loadWorkflowForm(selectedWorkflow);
+      if (
+        mode === "workflow" &&
+        selectedWorkflow !== null &&
+        workflowForm !== null &&
+        workflowFreshGen === null
+      ) {
+        void loadWorkflowForm(selectedWorkflow, "cache_only");
       }
     });
     return () => void unlisten.then((u) => u());
@@ -606,7 +609,6 @@
     selectedWorkflow = found;
     workflowForm = null;
     workflowInputs = { ...snapshot.inputs };
-    workflowSyncSettled = false;
     mode = "workflow";
     void loadWorkflowForm(found);
   }
@@ -1668,25 +1670,29 @@
     workflowFormError = null;
     workflowInputs = {};
     workflowForwardSources = {};
-    workflowSyncSettled = false;
     mode = "workflow";
     workflowMenuOpen = false;
     void loadWorkflowForm(workflow);
   }
 
   /// Fetch (or re-fetch) the descriptor for the picked workflow and seed any
-  /// not-yet-present fields. Seeding is additive so a re-fetch (e.g. after
-  /// `prompts:synced` resolves a previously-unresolved prompt) preserves what the
-  /// user already typed. A monotonic generation token guards stale replies — name
-  /// alone is not a workflow's identity (a built-in and a same-named copied user
-  /// workflow share a name), and the token is also future-proof against further
-  /// identity fields.
-  async function loadWorkflowForm(workflow: WorkflowListing): Promise<void> {
+  /// not-yet-present fields. An initial pick/manual check uses the fresh resolver;
+  /// a `prompts:synced` event can only use the cache-only resolver. Seeding is
+  /// additive so refreshes preserve what the user already typed. A monotonic
+  /// generation token guards stale replies.
+  async function loadWorkflowForm(
+    workflow: WorkflowListing,
+    resolution: "fresh" | "cache_only" = "fresh",
+  ): Promise<void> {
     const gen = ++workflowFormGen;
+    if (resolution === "fresh") workflowFreshGen = gen;
     if (workflowForm === null) workflowFormError = null;
     workflowFormLoading = true;
     try {
-      const form = await api.describeWorkflowForm(workflow.name, workflow.is_builtin);
+      const form =
+        resolution === "fresh"
+          ? await api.describeWorkflowForm(workflow.name, workflow.is_builtin)
+          : await api.refreshWorkflowFormFromCache(workflow.name, workflow.is_builtin);
       if (gen !== workflowFormGen) return; // superseded by a newer pick/re-fetch
       workflowForm = form;
       workflowFormError = null;
@@ -1706,6 +1712,7 @@
         else showError(`Couldn't refresh workflow: ${message}`);
       }
     } finally {
+      if (resolution === "fresh" && workflowFreshGen === gen) workflowFreshGen = null;
       if (gen === workflowFormGen) workflowFormLoading = false;
     }
   }
@@ -1718,7 +1725,6 @@
     workflowFormError = null;
     workflowInputs = {};
     workflowForwardSources = {};
-    workflowSyncSettled = false;
     workflowFormGen++; // invalidate any in-flight fetch for the removed workflow
   }
 
@@ -3475,12 +3481,13 @@
           descriptor={workflowForm}
           {agents}
           loading={workflowFormLoading}
-          syncSettled={workflowSyncSettled}
           {agentReadiness}
           panes={paneLayout.panes}
           bind:inputs={workflowInputs}
           bind:forwardSources={workflowForwardSources}
           onremove={removeWorkflow}
+          onretry={retryWorkflowForm}
+          onconfigure={onConfigurePrompts ? configurePrompts : undefined}
         >
           {#snippet invoke()}
             <Button

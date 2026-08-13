@@ -18,6 +18,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -167,6 +168,11 @@ pub struct PromptService {
     /// Serializes cache rebuilds so an older, slower `sync` can't finish after a
     /// newer one and overwrite the cache with stale results.
     sync_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Monotonic count of completed cache rebuilds. Callers that observe a cache
+    /// miss use this with [`sync_if_generation`](Self::sync_if_generation) to
+    /// await a racing startup sync without immediately running a duplicate, or
+    /// to perform the retry themselves when no newer sync has completed.
+    sync_generation: Arc<AtomicU64>,
     /// Serializes the config-file read-modify-write in `add`/`remove` so two
     /// concurrent edits can't both read the old file and clobber each other's
     /// change. Synchronous (the mutators are sync fns), distinct from `sync_lock`.
@@ -222,6 +228,7 @@ impl PromptService {
             cache: Arc::new(RwLock::new(Vec::new())),
             provider_status: Arc::new(RwLock::new(HashMap::new())),
             sync_lock: Arc::new(tokio::sync::Mutex::new(())),
+            sync_generation: Arc::new(AtomicU64::new(0)),
             config_write_lock: Arc::new(std::sync::Mutex::new(())),
             include_builtins: true,
             oauth_clients: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -299,6 +306,7 @@ impl PromptService {
             cache: Arc::new(RwLock::new(Vec::new())),
             provider_status: Arc::new(RwLock::new(HashMap::new())),
             sync_lock: Arc::new(tokio::sync::Mutex::new(())),
+            sync_generation: Arc::new(AtomicU64::new(0)),
             config_write_lock: Arc::new(std::sync::Mutex::new(())),
             include_builtins: false,
             oauth_clients: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -383,7 +391,48 @@ impl PromptService {
     ///   out contributes nothing (with a warning).
     pub async fn sync(&self) {
         let _guard = self.sync_lock.lock().await;
+        self.sync_locked().await;
+    }
 
+    /// Complete a cache rebuild only if no rebuild has completed since
+    /// `observed_generation` was read. The lock-and-recheck is load-bearing: a
+    /// workflow can find an MCP prompt missing while startup sync is in flight;
+    /// it should await that work, then reuse its result instead of serially
+    /// issuing an identical second network request.
+    ///
+    /// Returns `true` when this call rebuilt the cache and `false` when a racing
+    /// sync already did. Either result means a sync newer than (or equal to) the
+    /// caller's observation has settled before this future returns.
+    pub async fn sync_if_generation(&self, observed_generation: u64) -> bool {
+        let _guard = self.sync_lock.lock().await;
+        if self.sync_generation() != observed_generation {
+            return false;
+        }
+        self.sync_locked().await;
+        true
+    }
+
+    /// The number of cache rebuilds that have fully settled in this process.
+    #[must_use]
+    pub fn sync_generation(&self) -> u64 {
+        self.sync_generation.load(Ordering::Acquire)
+    }
+
+    /// The provider outcomes published by the most recently completed sync.
+    /// Cache consumers use this instead of [`list_mcp_providers`](Self::list_mcp_providers),
+    /// whose Settings projection also performs fresh credential-store reads.
+    #[must_use]
+    pub fn provider_status_snapshot(&self) -> HashMap<String, ProviderStatus> {
+        self.provider_status
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Rebuild the cache while `sync_lock` is held, then publish the completion
+    /// generation. Keeping the increment after the final cache/status writes
+    /// makes observing a newer generation proof that all sync outputs are visible.
+    async fn sync_locked(&self) {
         let mut prompts = match self.local_provider() {
             Some(local) => local.list().await,
             None => Vec::new(),
@@ -414,6 +463,7 @@ impl PromptService {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = statuses;
         self.publish(prompts);
+        self.sync_generation.fetch_add(1, Ordering::Release);
     }
 
     /// List one provider's prompts per its auth mode, mapping the outcome to a
@@ -1502,6 +1552,37 @@ mod tests {
         let other = service.clone();
         tokio::join!(service.sync(), other.sync());
         assert_eq!(non_builtin(&service).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn conditional_sync_coalesces_callers_from_the_same_generation() {
+        let (dir, service) = service_with_prompts_dir();
+        write(
+            &dir.path().join("prompts"),
+            "p.md",
+            "---\nname: p\ndescription: d\n---\nB\n",
+        );
+        let observed = service.sync_generation();
+        let other = service.clone();
+
+        let (first, second) = tokio::join!(
+            service.sync_if_generation(observed),
+            other.sync_if_generation(observed)
+        );
+
+        assert_ne!(first, second, "exactly one caller should rebuild");
+        assert_eq!(service.sync_generation(), observed + 1);
+        assert_eq!(non_builtin(&service).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn conditional_sync_skips_after_a_newer_sync_settles() {
+        let (_dir, service) = service_with_prompts_dir();
+        let observed = service.sync_generation();
+        service.sync().await;
+
+        assert!(!service.sync_if_generation(observed).await);
+        assert_eq!(service.sync_generation(), observed + 1);
     }
 
     #[tokio::test]

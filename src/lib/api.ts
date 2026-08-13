@@ -744,13 +744,26 @@ export async function listWorkflows(): Promise<WorkflowListing[]> {
 
 /// Resolve a picked workflow's invocation form: declared inputs + auto-derived
 /// user-fillable prompt-argument fields + a compatibility verdict. No `projectId`
-/// — prompts are user-global. Resolved per-pick (not in `listWorkflows`); re-fetch
-/// on `prompts:synced` so a cold MCP cache resolves once sync lands.
+/// — prompts are user-global. Resolved per-pick (not in `listWorkflows`). An MCP
+/// cache miss conditionally awaits/runs a sync before the command replies, so the
+/// returned descriptor is settled even when the startup event was missed.
 export async function describeWorkflowForm(
   name: string,
   isBuiltin: boolean,
 ): Promise<WorkflowFormDescriptor> {
   return await invoke<WorkflowFormDescriptor>("describe_workflow_form", { name, isBuiltin });
+}
+
+/// Reclassify an open workflow after an independent prompt sync. This command is
+/// cache-only; unlike `describeWorkflowForm`, it never initiates another sync.
+export async function refreshWorkflowFormFromCache(
+  name: string,
+  isBuiltin: boolean,
+): Promise<WorkflowFormDescriptor> {
+  return await invoke<WorkflowFormDescriptor>("refresh_workflow_form_from_cache", {
+    name,
+    isBuiltin,
+  });
 }
 
 /// Validate a workflow invocation (capability gate + input/roster/prompt rules)

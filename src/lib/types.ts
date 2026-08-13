@@ -1034,16 +1034,34 @@ export type BindingIssue = {
   reason: string;
 };
 
+export type AvailabilityIssueKind =
+  | "needs_auth"
+  | "not_configured"
+  | "missing_prompt"
+  | "store_unavailable"
+  | "provider_error"
+  | "unknown";
+
+export type AvailabilityIssue = {
+  prompt: string;
+  provider: string;
+  kind: AvailabilityIssueKind;
+  message: string | null;
+};
+
 // Whether a picked workflow's hardcoded prompts are runnable as-is.
 //  - `ok`: every prompt resolved, every binding valid.
 //  - `incompatible`: a prompt drifted (invalid binding / malformed id / disallowed
 //    collision) — blocks Run with the listed issues.
-//  - `unresolved`: a prompt isn't resolvable yet (cold MCP cache) — pending, not an
-//    error; the form shows a "resolving" affordance and re-fetches on `prompts:synced`.
+//  - `unresolved`: internal pre-sync classification retained on the wire for
+//    additive compatibility; the fresh command normally settles it before reply.
+//  - `unavailable`: an on-demand sync settled without resolving the prompt; issues
+//    explain whether the provider failed, needs sign-in, or lacks the prompt.
 export type FormCompatibility =
   | { state: "ok" }
   | { state: "incompatible"; issues: BindingIssue[] }
-  | { state: "unresolved"; prompts: string[] };
+  | { state: "unresolved"; prompts: string[] }
+  | { state: "unavailable"; issues: AvailabilityIssue[] };
 
 // The complete invocation form for a picked workflow: declared inputs plus the
 // auto-derived user-fillable prompt-argument fields, plus a compatibility verdict.

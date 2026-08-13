@@ -63,7 +63,6 @@ function setup(
   panes: TranscriptPane[] = [],
   loading = false,
   forwardSources: Record<string, ForwardSource[]> = {},
-  syncSettled = false,
 ) {
   const onremove = vi.fn();
   render(WorkflowComposer, {
@@ -75,7 +74,6 @@ function setup(
       onremove,
       loading,
       forwardSources,
-      syncSettled,
     },
   });
   return { onremove, forwardSources };
@@ -229,31 +227,77 @@ describe("WorkflowComposer", () => {
     expect(screen.queryByTestId("workflow-arg-input-context")).toBeNull();
   });
 
-  it("shows a non-error resolving affordance for an unresolved prompt before a sync settles", () => {
-    setup(
-      descriptor([], [], { compatibility: { state: "unresolved", prompts: ["tiddly:x"] } }),
-      {},
-      [],
-      false,
-      {},
-      false, // no sync settled yet
-    );
-    expect(screen.getByTestId("workflow-resolving")).toBeInTheDocument();
-    expect(screen.queryByTestId("workflow-incompatible")).toBeNull();
-    expect(screen.queryByTestId("workflow-prompt-missing")).toBeNull();
-  });
-
-  it("escalates an unresolved prompt to a not-found error once a sync has settled", () => {
-    setup(
-      descriptor([], [], { compatibility: { state: "unresolved", prompts: ["tiddly:gone"] } }),
-      {},
-      [],
-      false,
-      {},
-      true, // a sync settled and it's still unresolved → genuinely missing
-    );
+  it("treats an unexpected unresolved reply as terminal instead of waiting for an event", () => {
+    setup(descriptor([], [], { compatibility: { state: "unresolved", prompts: ["tiddly:gone"] } }));
     expect(screen.getByTestId("workflow-prompt-missing")).toHaveTextContent("tiddly:gone");
     expect(screen.queryByTestId("workflow-resolving")).toBeNull();
+  });
+
+  it("shows a provider failure and checks prompt resolution again", async () => {
+    const onretry = vi.fn();
+    render(WorkflowComposer, {
+      props: {
+        descriptor: descriptor([], [], {
+          compatibility: {
+            state: "unavailable",
+            issues: [
+              {
+                prompt: "tiddly:review",
+                provider: "tiddly",
+                kind: "provider_error",
+                message: "timed out",
+              },
+            ],
+          },
+        }),
+        agents: AGENTS,
+        inputs: {},
+        onremove: vi.fn(),
+        onretry,
+      },
+    });
+
+    expect(screen.getByTestId("workflow-prompt-unavailable")).toHaveTextContent("timed out");
+    expect(screen.queryByTestId("workflow-arg-input-context")).toBeNull();
+    await fireEvent.click(screen.getByTestId("workflow-prompt-check-again"));
+    expect(onretry).toHaveBeenCalledOnce();
+  });
+
+  it("routes authentication and configuration issues to prompt settings", async () => {
+    const onconfigure = vi.fn();
+    render(WorkflowComposer, {
+      props: {
+        descriptor: descriptor([], [], {
+          compatibility: {
+            state: "unavailable",
+            issues: [
+              {
+                prompt: "tiddly:review",
+                provider: "tiddly",
+                kind: "needs_auth",
+                message: null,
+              },
+              {
+                prompt: "other:review",
+                provider: "other",
+                kind: "not_configured",
+                message: null,
+              },
+            ],
+          },
+        }),
+        agents: AGENTS,
+        inputs: {},
+        onremove: vi.fn(),
+        onconfigure,
+      },
+    });
+
+    expect(screen.getByTestId("workflow-prompt-unavailable")).toHaveTextContent("needs sign-in");
+    expect(screen.getAllByTestId("workflow-prompt-settings")).toHaveLength(1);
+    expect(screen.queryByTestId("workflow-prompt-check-again")).toBeNull();
+    await fireEvent.click(screen.getByTestId("workflow-prompt-settings"));
+    expect(onconfigure).toHaveBeenCalledOnce();
   });
 
   it("attaches and removes a forward source on a derived arg field", async () => {

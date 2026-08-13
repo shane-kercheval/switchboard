@@ -326,9 +326,9 @@ use crate::preferences::Preferences;
 use crate::state::AppState;
 use crate::workflow_commands::{
     WorkflowFormDescriptor, WorkflowListing, WorkflowRunInfo, abandon_workflow_run_impl,
-    cancel_workflow_run_impl, copy_builtin_workflow_impl, describe_workflow_form_impl,
-    invoke_workflow_impl, list_workflow_runs_impl, list_workflows_impl, user_workflows_dir,
-    validate_workflow_invocation_impl,
+    cancel_workflow_run_impl, copy_builtin_workflow_impl, describe_workflow_form_cache_only_impl,
+    describe_workflow_form_fresh_impl, invoke_workflow_impl, list_workflow_runs_impl,
+    list_workflows_impl, user_workflows_dir, validate_workflow_invocation_impl,
 };
 
 use switchboard_core::{
@@ -1438,14 +1438,29 @@ async fn list_workflows(state: State<'_, AppState>) -> Result<Vec<WorkflowListin
 
 /// Resolve a picked workflow's invocation form: declared inputs + auto-derived
 /// user-fillable prompt-argument fields + a compatibility verdict. No `project_id`
-/// — prompts are user-global. Resolved per-pick (not in `list_workflows`).
+/// — prompts are user-global. Resolved per-pick (not in `list_workflows`); an MCP
+/// cache miss awaits or performs one coalesced sync before returning.
 #[tauri::command]
 async fn describe_workflow_form(
     state: State<'_, AppState>,
     name: String,
     is_builtin: bool,
 ) -> Result<WorkflowFormDescriptor, String> {
-    describe_workflow_form_impl(state.inner(), &name, is_builtin).map_err(|e| e.to_string())
+    describe_workflow_form_fresh_impl(state.inner(), &name, is_builtin)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Reclassify an open workflow after an independently initiated prompt sync.
+/// Reads only the published cache/status snapshot and never starts another sync.
+#[tauri::command]
+async fn refresh_workflow_form_from_cache(
+    state: State<'_, AppState>,
+    name: String,
+    is_builtin: bool,
+) -> Result<WorkflowFormDescriptor, String> {
+    describe_workflow_form_cache_only_impl(state.inner(), &name, is_builtin)
+        .map_err(|e| e.to_string())
 }
 
 /// Resolve any forward-fields (completed-only) and merge the composed text into
@@ -2153,6 +2168,7 @@ pub fn run() {
             copy_builtin_prompt,
             list_workflows,
             describe_workflow_form,
+            refresh_workflow_form_from_cache,
             validate_workflow_invocation,
             invoke_workflow,
             cancel_workflow_run,

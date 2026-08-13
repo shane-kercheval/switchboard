@@ -103,7 +103,7 @@
   import { shortcut } from "$lib/platform";
   import { isEditableShortcutTarget } from "$lib/keyboard";
   import { onDestroy, onMount, tick, untrack } from "svelte";
-  import { listen } from "@tauri-apps/api/event";
+  import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
   let {
     projectId,
@@ -482,39 +482,63 @@
   // cache-only on authoritative resolution changes.
   onMount(() => {
     const hadDraft = pendingRestore !== null;
-    if (hadDraft) void resolvePendingPrompt();
-    const unlistenSynced = listen<{ generation: number }>("prompts:synced", (event) => {
-      latestPromptResolutionGeneration = Math.max(
-        latestPromptResolutionGeneration,
-        event.payload.generation,
-      );
-      if (hadDraft) {
-        promptRestoreIssue = null;
-        void resolvePendingPrompt();
+    let active = true;
+    let restoreReady = false;
+    const unlisteners: UnlistenFn[] = [];
+
+    async function register(subscription: Promise<UnlistenFn>): Promise<void> {
+      try {
+        const unlisten = await subscription;
+        if (active) unlisteners.push(unlisten);
+        else unlisten();
+      } catch {
+        // The initial snapshot read still settles restoration if native event
+        // registration is unavailable. The other subscription remains useful.
       }
-    });
-    const unlistenChanged = listen<{ generation: number }>("prompts:changed", (event) => {
-      latestPromptResolutionGeneration = Math.max(
-        latestPromptResolutionGeneration,
-        event.payload.generation,
-      );
-      promptResolutionEventGen = Math.max(promptResolutionEventGen, event.payload.generation);
-      if (hadDraft) {
-        promptRestoreIssue = null;
-        void resolvePendingPrompt();
-      }
-      if (
-        mode === "workflow" &&
-        selectedWorkflow !== null &&
-        workflowForm !== null &&
-        workflowFreshGen === null
-      ) {
-        void loadWorkflowForm(selectedWorkflow, "cache_only");
-      }
+    }
+
+    const synced = register(
+      listen<{ generation: number }>("prompts:synced", (event) => {
+        latestPromptResolutionGeneration = Math.max(
+          latestPromptResolutionGeneration,
+          event.payload.generation,
+        );
+        if (hadDraft && restoreReady) {
+          promptRestoreIssue = null;
+          void resolvePendingPrompt();
+        }
+      }),
+    );
+    const changed = register(
+      listen<{ generation: number }>("prompts:changed", (event) => {
+        latestPromptResolutionGeneration = Math.max(
+          latestPromptResolutionGeneration,
+          event.payload.generation,
+        );
+        promptResolutionEventGen = Math.max(promptResolutionEventGen, event.payload.generation);
+        if (hadDraft && restoreReady) {
+          promptRestoreIssue = null;
+          void resolvePendingPrompt();
+        }
+        if (
+          mode === "workflow" &&
+          selectedWorkflow !== null &&
+          workflowForm !== null &&
+          workflowFreshGen === null
+        ) {
+          void loadWorkflowForm(selectedWorkflow, "cache_only");
+        }
+      }),
+    );
+    void Promise.all([synced, changed]).then(() => {
+      if (!active) return;
+      restoreReady = true;
+      if (hadDraft) void resolvePendingPrompt();
     });
     return () => {
-      void unlistenSynced.then((u) => u());
-      void unlistenChanged.then((u) => u());
+      active = false;
+      for (const unlisten of unlisteners) unlisten();
+      unlisteners.length = 0;
     };
   });
 

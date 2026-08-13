@@ -492,11 +492,13 @@ impl PromptService {
         }
     }
 
-    /// Complete a cache rebuild only if no rebuild has completed since
-    /// `observed_generation` was read. The lock-and-recheck is load-bearing: a
-    /// workflow can find an MCP prompt missing while startup sync is in flight;
-    /// it should await that work, then reuse its result instead of serially
-    /// issuing an identical second network request.
+    /// Complete a cache rebuild unless another rebuild has already settled the
+    /// current provider revision since `observed_generation` was read. The
+    /// lock-and-recheck is load-bearing: a workflow can find an MCP prompt
+    /// missing while startup sync is in flight; it should await that work, then
+    /// reuse its result instead of serially issuing an identical second network
+    /// request. A generation advanced only by provider invalidation does not
+    /// satisfy the refresh request.
     ///
     /// Performs at most one rebuild attempt after acquiring the lock. Returns
     /// [`SyncOutcome::Superseded`] when a racing sync already completed or a
@@ -504,7 +506,11 @@ impl PromptService {
     /// settle within one provider budget.
     pub async fn sync_if_generation(&self, observed_generation: u64) -> SyncOutcome {
         let _guard = self.sync_lock.lock().await;
-        if self.completed_generation() != observed_generation {
+        let generation_changed = self.completed_generation() != observed_generation;
+        let current_provider_revision = self.provider_revision.load(Ordering::Acquire);
+        if generation_changed
+            && self.settled_provider_revision.load(Ordering::Acquire) == current_provider_revision
+        {
             return SyncOutcome::Superseded;
         }
         self.sync_locked().await
@@ -1881,6 +1887,34 @@ mod tests {
             SyncOutcome::Superseded
         );
         assert_eq!(service.sync_generation(), observed + 1);
+    }
+
+    #[tokio::test]
+    async fn conditional_sync_rebuilds_after_invalidation_without_a_settled_sync() {
+        let (_dir, service) = service_with_prompts_dir();
+        assert!(matches!(
+            service.sync().await,
+            SyncOutcome::Published { generation: 1 }
+        ));
+        let observed = service.sync_generation();
+        let sync_guard = service.sync_lock.lock().await;
+        let conditional_service = service.clone();
+        let conditional =
+            tokio::spawn(async move { conditional_service.sync_if_generation(observed).await });
+        tokio::task::yield_now().await;
+
+        service.invalidate_provider_resolution("unrelated", true, Some(ProviderStatus::NeedsAuth));
+        drop(sync_guard);
+
+        assert!(matches!(
+            conditional.await.unwrap(),
+            SyncOutcome::Published { generation: 3 }
+        ));
+        assert_eq!(service.sync_generation(), 3);
+        assert_eq!(
+            service.settled_provider_revision.load(Ordering::Acquire),
+            service.provider_revision.load(Ordering::Acquire)
+        );
     }
 
     #[test]

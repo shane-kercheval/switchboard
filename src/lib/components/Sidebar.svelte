@@ -1078,7 +1078,6 @@
                 <span
                   class="text-fg cursor-text truncate text-[13px] font-semibold"
                   data-testid="agent-name"
-                  title="Double-click to rename"
                 >
                   {agent.name}
                 </span>

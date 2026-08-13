@@ -1667,9 +1667,11 @@ describe("Sidebar inline rename", () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
-    await fireEvent.click(screen.getByTestId("agent-name"));
+    const name = screen.getByTestId("agent-name");
+    expect(name).not.toHaveAttribute("title");
+    await fireEvent.click(name);
     expect(screen.getByTestId("sidebar-agent")).toHaveAttribute("data-collapsed", "false");
-    await fireEvent.dblClick(screen.getByTestId("agent-name"));
+    await fireEvent.dblClick(name);
     expect(await screen.findByTestId("agent-rename-input")).toBeInTheDocument();
     await fireEvent.keyDown(screen.getByTestId("agent-rename-input"), { key: "Escape" });
     expect(screen.getByTestId("sidebar-agent")).toHaveAttribute("data-collapsed", "false");

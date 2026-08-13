@@ -40,15 +40,12 @@ const CLOSE_WINDOW_MENU_IDS: [&str; 2] = ["close-window-file", "close-window-win
 #[cfg(target_os = "macos")]
 const QUIT_MENU_ID: &str = "quit-switchboard";
 
-/// Build the standard macOS menu with normal Close and Quit items. Tauri's
-/// predefined Close hard-codes Cmd+W, while its predefined macOS Quit invokes
-/// `AppKit`'s `terminate:` selector without reaching Tauri's `ExitRequested`
-/// callback. Explicit construction gives both actions the app's lifecycle
-/// policy without depending on localized menu text or an upstream menu shape.
+/// Build the standard macOS menu with Close and Quit routed through the app's
+/// lifecycle policy. The custom Close item keeps the native Cmd+W accelerator
+/// while hiding rather than destroying the main window; the custom Quit item
+/// avoids `AppKit`'s direct `terminate:` path so active-work confirmation runs.
 #[cfg(target_os = "macos")]
-fn macos_menu_without_close_shortcut(
-    app: &tauri::AppHandle,
-) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
+fn macos_menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
     use tauri::menu::{
         AboutMetadata, HELP_SUBMENU_ID, Menu, MenuItem, PredefinedMenuItem, Submenu,
         WINDOW_SUBMENU_ID,
@@ -72,7 +69,7 @@ fn macos_menu_without_close_shortcut(
         CLOSE_WINDOW_MENU_IDS[0],
         "Close Window",
         true,
-        None::<&str>,
+        Some("CmdOrCtrl+W"),
     )?;
     let window_close = MenuItem::with_id(
         app,
@@ -1970,20 +1967,18 @@ pub fn run() {
     // since it's atomic-write dev convenience state, never the installed app's data.
     let builder = tauri::Builder::default();
     #[cfg(target_os = "macos")]
-    let builder = builder
-        .menu(macos_menu_without_close_shortcut)
-        .on_menu_event(|app, event| {
-            if CLOSE_WINDOW_MENU_IDS.contains(&event.id().as_ref())
-                && let Some(window) = app.get_webview_window("main")
-            {
-                let _ = window.hide();
-            } else if event.id() == QUIT_MENU_ID
-                && let Some(coordinator) = app.try_state::<crate::lifecycle::QuitCoordinator>()
-                && coordinator.begin()
-            {
-                start_quit_confirmation(app.clone());
-            }
-        });
+    let builder = builder.menu(macos_menu).on_menu_event(|app, event| {
+        if CLOSE_WINDOW_MENU_IDS.contains(&event.id().as_ref())
+            && let Some(window) = app.get_webview_window("main")
+        {
+            let _ = window.hide();
+        } else if event.id() == QUIT_MENU_ID
+            && let Some(coordinator) = app.try_state::<crate::lifecycle::QuitCoordinator>()
+            && coordinator.begin()
+        {
+            start_quit_confirmation(app.clone());
+        }
+    });
     #[cfg(not(debug_assertions))]
     let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
         #[cfg(target_os = "macos")]

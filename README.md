@@ -28,6 +28,7 @@ Switchboard also has a **Git view** for reviewing repositories, changed files, d
 - **Search and navigate long conversations.** Search message text across agents, filter by role or pinned status, preview results, and jump back to a result when its agent is visible in a pane.
 - **Keep track of work across projects.** The project list shows which projects are still running, marks background work when it finishes, and lets you jump directly to newly completed work you haven't viewed.
 - **macOS notifications.** Switchboard notifies you when your agents finish and when a workflow run ends, while you're working in another app. Clicking the notification brings Switchboard forward. An optional setting extends this to your other projects while you're still in Switchboard, so a project finishing in the background reaches you while you're reading a different one.
+- **Switch between model configurations.** Give an agent a Primary model/effort setup and an optional Secondary setup, then switch between them from its sidebar card without reopening its settings.
 
 ## Install
 

@@ -1347,10 +1347,9 @@ pub async fn test_mcp_connection_impl(
 /// Event emitted after a prompt-cache rebuild settles, so the frontend can
 /// refresh provider status and restore a prompt-mode compose draft that needed
 /// the cache warm. Every independent sync path — startup warm sync, the
-/// `sync_prompts` command, and add/remove — emits it via
-/// [`sync_prompts_and_notify`]. Request-owned workflow rebuilds emit it directly;
-/// workflow listeners reclassify from cache only, so notification cannot feed
-/// back into another network sync.
+/// `sync_prompts` command, and provider mutations — emits through one of the
+/// sync-and-notify helpers below. Workflow listeners reclassify from cache only,
+/// so notification cannot feed back into another network sync.
 pub const PROMPTS_SYNCED_EVENT: &str = "prompts:synced";
 
 /// Rebuild the prompt cache, then emit [`PROMPTS_SYNCED_EVENT`]. The emit is
@@ -1359,6 +1358,21 @@ pub const PROMPTS_SYNCED_EVENT: &str = "prompts:synced";
 pub async fn sync_prompts_and_notify(prompts: PromptService, emitter: Arc<dyn EventEmitter>) {
     prompts.sync().await;
     emitter.emit(PROMPTS_SYNCED_EVENT, serde_json::Value::Null);
+}
+
+/// Conditionally rebuild the prompt cache, emitting only when this caller owned
+/// the rebuild. A caller that joined a newer completed generation must not
+/// duplicate the notification owned by that sync.
+pub async fn sync_prompts_if_generation_and_notify(
+    prompts: PromptService,
+    emitter: Arc<dyn EventEmitter>,
+    observed_generation: u64,
+) -> bool {
+    let rebuilt = prompts.sync_if_generation(observed_generation).await;
+    if rebuilt {
+        emitter.emit(PROMPTS_SYNCED_EVENT, serde_json::Value::Null);
+    }
+    rebuilt
 }
 
 /// Rebuild the prompt cache off the command thread. `PromptService` is cheaply
@@ -20009,6 +20023,7 @@ mod tests {
         calls: Arc<AtomicUsize>,
         entered: Arc<tokio::sync::Semaphore>,
         release: Option<Arc<tokio::sync::Semaphore>>,
+        rendered_contexts: Arc<Mutex<Vec<Option<String>>>>,
     }
 
     impl rmcp::ServerHandler for WorkflowPromptServer {
@@ -20048,6 +20063,36 @@ mod tests {
                 ],
             })
         }
+
+        async fn get_prompt(
+            &self,
+            request: rmcp::model::GetPromptRequestParams,
+            _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+        ) -> Result<rmcp::model::GetPromptResult, rmcp::model::ErrorData> {
+            let context = request
+                .arguments
+                .as_ref()
+                .and_then(|arguments| arguments.get("context"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
+            self.rendered_contexts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(context.clone());
+            let Some(context) = context else {
+                return Err(rmcp::model::ErrorData::new(
+                    rmcp::model::ErrorCode::INVALID_PARAMS,
+                    "missing required argument: context",
+                    None,
+                ));
+            };
+            Ok(rmcp::model::GetPromptResult::new(vec![
+                rmcp::model::PromptMessage::new_text(
+                    rmcp::model::PromptMessageRole::User,
+                    format!("Review {context}"),
+                ),
+            ]))
+        }
     }
 
     struct RunningWorkflowMcpServer {
@@ -20055,6 +20100,7 @@ mod tests {
         calls: Arc<AtomicUsize>,
         entered: Arc<tokio::sync::Semaphore>,
         release: Option<Arc<tokio::sync::Semaphore>>,
+        rendered_contexts: Arc<Mutex<Vec<Option<String>>>>,
         task: tokio::task::JoinHandle<()>,
     }
 
@@ -20073,10 +20119,12 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let entered = Arc::new(tokio::sync::Semaphore::new(0));
         let release = gated.then(|| Arc::new(tokio::sync::Semaphore::new(0)));
+        let rendered_contexts = Arc::new(Mutex::new(Vec::new()));
         let handler = WorkflowPromptServer {
             calls: Arc::clone(&calls),
             entered: Arc::clone(&entered),
             release: release.clone(),
+            rendered_contexts: Arc::clone(&rendered_contexts),
         };
         let service = StreamableHttpService::new(
             move || Ok(handler.clone()),
@@ -20094,6 +20142,7 @@ mod tests {
             calls,
             entered,
             release,
+            rendered_contexts,
             task,
         }
     }
@@ -20829,7 +20878,7 @@ mod tests {
     #[tokio::test]
     async fn workflow_form_overlapping_startup_sync_reuses_its_result() {
         let server = spawn_workflow_mcp_server(true).await;
-        let (tmp, state, _) = fresh_state_with_mock();
+        let (tmp, state, emitter) = fresh_state_with_mock();
         let state = state_with_mcp_server(
             &tmp,
             state,
@@ -20865,6 +20914,13 @@ mod tests {
         assert_eq!(form.compatibility, FormCompatibility::Ok);
         assert_eq!(server.calls.load(Ordering::SeqCst), 1);
         assert_eq!(state.prompts.sync_generation(), before + 1);
+        assert!(
+            emitter
+                .snapshot()
+                .iter()
+                .all(|(name, _)| name != PROMPTS_SYNCED_EVENT),
+            "the conditional caller must not duplicate the sync owner's notification"
+        );
     }
 
     #[tokio::test]
@@ -20940,19 +20996,121 @@ mod tests {
                 .iter()
                 .any(|argument| argument.name == "context")
         );
-        validate_workflow_invocation_impl(
+        let invocation = inputs(vec![("a", text("alice")), ("context", text("review this"))]);
+        validate_workflow_invocation_impl(&state, project.id, "mcp-review", false, &invocation)
+            .unwrap();
+        assert_eq!(state.prompts.sync_generation(), 1);
+
+        let run_id = invoke_workflow_impl(
             &state,
             project.id,
             "mcp-review",
             false,
-            &inputs(vec![("a", text("alice")), ("context", text("review this"))]),
+            &invocation,
+            tmp.path(),
         )
         .unwrap();
-        assert_eq!(state.prompts.sync_generation(), 1);
+        let done = lock(&state.workflow_runs)
+            .get(&run_id)
+            .unwrap()
+            .done
+            .clone();
+        tokio::time::timeout(std::time::Duration::from_secs(2), done.notified())
+            .await
+            .expect("workflow run should settle");
+        assert_eq!(
+            *server
+                .rendered_contexts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec![Some("review this".to_owned())],
+            "execution must use the same MCP argument schema as invocation preflight"
+        );
 
         server.release.as_ref().unwrap().add_permits(1);
         second_sync.await;
         assert_eq!(state.prompts.sync_generation(), 2);
+    }
+
+    #[tokio::test]
+    async fn provider_removal_invalidates_workflows_and_stale_sync_publication_immediately() {
+        let server = spawn_workflow_mcp_server(true).await;
+        let (tmp, state, emitter) = fresh_state_with_mock();
+        let state = state_with_mcp_server(
+            &tmp,
+            state,
+            &server.url,
+            Arc::new(switchboard_prompts::InMemorySecretStore::new()),
+        )
+        .with_workflows_dir(tmp.path().join("workflows"));
+        init_directory_impl(&state, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let project = create_project_in_only_dir(&state, "proj");
+        set_active_project_impl(&state, project.id).unwrap();
+        create_agent_impl(&state, "alice", HarnessKind::ClaudeCode, None, None).unwrap();
+        seed_workflow(
+            &state,
+            "mcp-review",
+            "name: mcp-review\ndescription: d\ninputs:\n  a: agent\nsteps:\n  - label: s\n    send:\n      to: \"{{ a }}\"\n      prompt: \"tiddly:review\"\n",
+        );
+
+        server.release.as_ref().unwrap().add_permits(1);
+        state.prompts.sync().await;
+        server.entered.acquire().await.unwrap().forget();
+        assert!(state.prompts.get("tiddly", "review").is_some());
+
+        let mut stale_sync = Box::pin(state.prompts.sync());
+        tokio::select! {
+            permit = server.entered.acquire() => permit.unwrap().forget(),
+            () = &mut stale_sync => panic!("gated sync completed before provider removal"),
+        }
+
+        remove_mcp_provider_impl(&state, "tiddly").unwrap();
+        assert!(state.prompts.get("tiddly", "review").is_none());
+        let snapshot = state.prompts.resolution_snapshot();
+        assert!(!snapshot.is_provider_configured("tiddly"));
+        assert!(snapshot.get("tiddly", "review").is_none());
+        let form = describe_workflow_form_cache_only_impl(&state, "mcp-review", false).unwrap();
+        assert!(matches!(
+            form.compatibility,
+            FormCompatibility::Unavailable { ref issues }
+                if issues.iter().any(|issue| issue.kind == AvailabilityIssueKind::NotConfigured)
+        ));
+        assert!(
+            invoke_workflow_impl(
+                &state,
+                project.id,
+                "mcp-review",
+                false,
+                &inputs(vec![("a", text("alice")), ("context", text("review this"))]),
+                tmp.path(),
+            )
+            .is_err(),
+            "a removed provider must be rejected before a workflow run is registered"
+        );
+
+        server.release.as_ref().unwrap().add_permits(1);
+        stale_sync.await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if emitter
+                    .snapshot()
+                    .iter()
+                    .any(|(name, _)| name == PROMPTS_SYNCED_EVENT)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("post-removal sync should notify");
+
+        assert!(state.prompts.get("tiddly", "review").is_none());
+        let snapshot = state.prompts.resolution_snapshot();
+        assert!(!snapshot.is_provider_configured("tiddly"));
+        assert!(snapshot.get("tiddly", "review").is_none());
     }
 
     #[tokio::test(flavor = "current_thread")]

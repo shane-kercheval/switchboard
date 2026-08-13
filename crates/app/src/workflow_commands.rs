@@ -578,6 +578,32 @@ fn hardcoded_prompt_sends(workflow: &Workflow) -> Vec<(&str, Vec<&str>)> {
         .collect()
 }
 
+fn mcp_prompt_argument_names(
+    workflow: &Workflow,
+    snapshot: &PromptResolutionSnapshot,
+) -> BTreeMap<(String, String), Vec<String>> {
+    hardcoded_prompt_sends(workflow)
+        .into_iter()
+        .filter_map(|(id, _)| {
+            let id = PromptId::parse(id).ok()?;
+            if id.provider == switchboard_prompts::LOCAL_PROVIDER
+                || id.provider == switchboard_prompts::BUILTIN_PROVIDER
+            {
+                return None;
+            }
+            let prompt = snapshot.get(&id.provider, &id.name)?;
+            Some((
+                (id.provider, id.name),
+                prompt
+                    .arguments
+                    .into_iter()
+                    .map(|argument| argument.name)
+                    .collect(),
+            ))
+        })
+        .collect()
+}
+
 /// A user-fillable prompt argument surfaced in the form — the `A \ T` set (a
 /// declared prompt argument with no `template_vars` binding), merged across
 /// prompts by name.
@@ -988,9 +1014,9 @@ fn describe_workflow_form_with_snapshot(
 /// settled without the prompt, this selection performs the retry itself.
 ///
 /// The returned descriptor is authoritative and does not depend on the lossy
-/// global sync event reaching this caller. This request-owned sync deliberately
-/// does not emit that event; independently initiated sync events are handled by
-/// the cache-only reclassification path below.
+/// global sync event reaching this caller. A request-owned rebuild still notifies
+/// other cache consumers; workflow listeners use the cache-only path below, so
+/// that event cannot start another network request.
 pub async fn describe_workflow_form_fresh_impl(
     state: &AppState,
     name: &str,
@@ -1002,16 +1028,12 @@ pub async fn describe_workflow_form_fresh_impl(
         return Ok(initial);
     }
 
-    let rebuilt = state
-        .prompts
-        .sync_if_generation(observed.generation())
-        .await;
-    if rebuilt {
-        state.emitter.emit(
-            crate::commands::PROMPTS_SYNCED_EVENT,
-            serde_json::Value::Null,
-        );
-    }
+    crate::commands::sync_prompts_if_generation_and_notify(
+        state.prompts.clone(),
+        Arc::clone(&state.emitter),
+        observed.generation(),
+    )
+    .await;
     describe_workflow_form_cache_only_impl(state, name, is_builtin)
 }
 
@@ -1245,6 +1267,7 @@ pub fn invoke_workflow_impl(
     }
 
     let run = WorkflowRun {
+        mcp_prompt_arg_names: mcp_prompt_argument_names(&workflow, &snapshot),
         workflow,
         inputs: bound,
         user_args,

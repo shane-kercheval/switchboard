@@ -362,9 +362,9 @@
       dropSub = undefined;
     }
     // Await the subscription promise before unlistening, so an unmount that beats
-    // the promise still tears the listener down (matching the `prompts:synced`
-    // cleanup below). A bare `unlisten?.()` would no-op in that race and leak a
-    // global listener that keeps staging into a stale project context.
+    // the promise still tears the listener down. A bare `unlisten?.()` would
+    // no-op in that race and leak a global listener that keeps staging into a
+    // stale project context.
     return () => void dropSub?.then((u) => u()).catch(() => {});
   });
 
@@ -483,62 +483,63 @@
   onMount(() => {
     const hadDraft = pendingRestore !== null;
     let active = true;
-    let restoreReady = false;
-    const unlisteners: UnlistenFn[] = [];
+    let listenerReady = false;
+    let changedDuringRegistration = false;
+    let unlisten: UnlistenFn | null = null;
 
-    async function register(subscription: Promise<UnlistenFn>): Promise<void> {
-      try {
-        const unlisten = await subscription;
-        if (active) unlisteners.push(unlisten);
-        else unlisten();
-      } catch {
-        // The initial snapshot read still settles restoration if native event
-        // registration is unavailable. The other subscription remains useful.
+    function reclassifyFromPromptSnapshot(): void {
+      if (hadDraft) {
+        promptRestoreIssue = null;
+        void resolvePendingPrompt();
+      }
+      if (
+        mode === "workflow" &&
+        selectedWorkflow !== null &&
+        workflowForm !== null &&
+        workflowFreshGen === null
+      ) {
+        void loadWorkflowForm(selectedWorkflow, "cache_only");
       }
     }
 
-    const synced = register(
-      listen<{ generation: number }>("prompts:synced", (event) => {
-        latestPromptResolutionGeneration = Math.max(
-          latestPromptResolutionGeneration,
-          event.payload.generation,
-        );
-        if (hadDraft && restoreReady) {
-          promptRestoreIssue = null;
-          void resolvePendingPrompt();
+    function onPromptChanged(event: { payload: { generation: number } }): void {
+      latestPromptResolutionGeneration = Math.max(
+        latestPromptResolutionGeneration,
+        event.payload.generation,
+      );
+      promptResolutionEventGen = Math.max(promptResolutionEventGen, event.payload.generation);
+      if (!listenerReady) {
+        changedDuringRegistration = true;
+        return;
+      }
+      reclassifyFromPromptSnapshot();
+    }
+
+    async function register(): Promise<void> {
+      try {
+        const registered = await listen<{ generation: number }>("prompts:changed", onPromptChanged);
+        if (!active) {
+          registered();
+          return;
         }
-      }),
-    );
-    const changed = register(
-      listen<{ generation: number }>("prompts:changed", (event) => {
-        latestPromptResolutionGeneration = Math.max(
-          latestPromptResolutionGeneration,
-          event.payload.generation,
-        );
-        promptResolutionEventGen = Math.max(promptResolutionEventGen, event.payload.generation);
-        if (hadDraft && restoreReady) {
-          promptRestoreIssue = null;
-          void resolvePendingPrompt();
-        }
-        if (
-          mode === "workflow" &&
-          selectedWorkflow !== null &&
-          workflowForm !== null &&
-          workflowFreshGen === null
-        ) {
-          void loadWorkflowForm(selectedWorkflow, "cache_only");
-        }
-      }),
-    );
-    void Promise.all([synced, changed]).then(() => {
-      if (!active) return;
-      restoreReady = true;
-      if (hadDraft) void resolvePendingPrompt();
-    });
+        unlisten = registered;
+        listenerReady = true;
+        // One post-subscription read closes the read/subscribe gap. An event
+        // received while registration was pending is deliberately coalesced
+        // into this same pass rather than starting a competing request.
+        if (hadDraft || changedDuringRegistration) reclassifyFromPromptSnapshot();
+      } catch {
+        // The initial snapshot read still settles restoration if native event
+        // registration is unavailable.
+      }
+    }
+
+    if (hadDraft) void resolvePendingPrompt();
+    void register();
     return () => {
       active = false;
-      for (const unlisten of unlisteners) unlisten();
-      unlisteners.length = 0;
+      unlisten?.();
+      unlisten = null;
     };
   });
 

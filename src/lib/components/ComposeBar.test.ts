@@ -3883,17 +3883,53 @@ describe("ComposeBar prompt mode", () => {
     expect(store.getCompose(PROJECT_ID).content).toMatchObject({ kind: "prompt", name: "review" });
 
     // Sync completes with the prompt present → restore with args intact.
+    const callsBeforeEvent = invokeMock.mock.calls.filter(
+      ([cmd]) => cmd === "resolve_saved_prompt",
+    ).length;
     resolution = { state: "available", prompt: REVIEW, generation: 1 };
-    listeners.get("prompts:synced")?.({ payload: { generation: 1 } });
+    listeners.get("prompts:changed")?.({ payload: { generation: 1 } });
 
     await waitFor(() => expect(screen.getByTestId("prompt-composer")).toBeInTheDocument());
+    expect(invokeMock.mock.calls.filter(([cmd]) => cmd === "resolve_saved_prompt")).toHaveLength(
+      callsBeforeEvent + 1,
+    );
     expect((screen.getByTestId("prompt-arg-focus") as HTMLTextAreaElement).value).toBe(
       "saved focus",
     );
     expect((screen.getByTestId("prompt-appended") as HTMLTextAreaElement).value).toBe("tail");
   });
 
-  it("subscribes before the initial saved-prompt read so startup publication cannot be missed", async () => {
+  it("settles saved-prompt restoration when event registration never settles", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    const store = await loadComposeStore();
+    store.setContent(PROJECT_ID, {
+      kind: "prompt",
+      provider: "tiddly",
+      name: "summary",
+      args: {},
+      appendedText: "",
+    });
+    store.flush();
+    store._testing.reloadFromStorage();
+
+    listenMock.mockImplementation(() => new Promise<MockUnlisten>(() => undefined));
+    mockPromptBackend({
+      resolve: async () => ({ state: "temporarily_unavailable", generation: 0 }),
+    });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+
+    await waitFor(() =>
+      expect(screen.getByTestId("compose-prompt-restore-failed")).toBeInTheDocument(),
+    );
+    expect(
+      listenMock.mock.calls.map(([name]) => name).filter((name) => name.startsWith("prompts:")),
+    ).toEqual(["prompts:changed"]);
+    expect(invokeMock.mock.calls.filter(([cmd]) => cmd === "resolve_saved_prompt")).toHaveLength(1);
+  });
+
+  it("coalesces publication during registration into one post-registration read", async () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);
     const store = await loadComposeStore();
@@ -3907,29 +3943,68 @@ describe("ComposeBar prompt mode", () => {
     store.flush();
     store._testing.reloadFromStorage();
 
-    const registrations = new Map<string, (unlisten: MockUnlisten) => void>();
+    let finishRegistration: ((unlisten: MockUnlisten) => void) | undefined;
     listenMock.mockImplementation((name: string, cb) => {
       listeners.set(name, cb);
-      return new Promise<MockUnlisten>((resolve) => registrations.set(name, resolve));
+      return new Promise<MockUnlisten>((resolve) => (finishRegistration = resolve));
     });
     let resolution: unknown = { state: "temporarily_unavailable", generation: 0 };
     mockPromptBackend({ resolve: async () => resolution });
 
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
-    await waitFor(() => expect(registrations.size).toBe(2));
-    expect(invokeMock.mock.calls.some(([cmd]) => cmd === "resolve_saved_prompt")).toBe(false);
+    await waitFor(() =>
+      expect(screen.getByTestId("compose-prompt-restore-failed")).toBeInTheDocument(),
+    );
 
-    // Startup publishes while native listener registration is still pending.
-    // Even if that event is not delivered, the post-subscription read sees it.
     resolution = { state: "available", prompt: SUMMARY, generation: 1 };
-    registrations.get("prompts:synced")?.(vi.fn());
-    registrations.get("prompts:changed")?.(vi.fn());
+    listeners.get("prompts:changed")?.({ payload: { generation: 1 } });
+    finishRegistration?.(vi.fn());
 
     await waitFor(() => expect(screen.getByTestId("prompt-composer")).toBeInTheDocument());
+    expect(invokeMock.mock.calls.filter(([cmd]) => cmd === "resolve_saved_prompt")).toHaveLength(2);
+  });
+
+  it("cleans up a prompt subscription that registers after unmount", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    const store = await loadComposeStore();
+    store.setContent(PROJECT_ID, {
+      kind: "prompt",
+      provider: "tiddly",
+      name: "summary",
+      args: {},
+      appendedText: "",
+    });
+    store.flush();
+    store._testing.reloadFromStorage();
+
+    let finishRegistration: ((unlisten: MockUnlisten) => void) | undefined;
+    listenMock.mockImplementation((name: string, cb) => {
+      listeners.set(name, cb);
+      return new Promise<MockUnlisten>((resolve) => (finishRegistration = resolve));
+    });
+    mockPromptBackend({
+      resolve: async () => ({ state: "available", prompt: SUMMARY, generation: 1 }),
+    });
+    const { unmount } = render(ComposeBar, {
+      props: { projectId: PROJECT_ID, agents: [AGENT_A] },
+    });
+    await waitFor(() => expect(finishRegistration).toBeDefined());
+    await waitFor(() =>
+      expect(invokeMock.mock.calls.filter(([cmd]) => cmd === "resolve_saved_prompt")).toHaveLength(
+        1,
+      ),
+    );
+
+    unmount();
+    const unlistenChanged = vi.fn();
+    finishRegistration?.(unlistenChanged);
+
+    await waitFor(() => expect(unlistenChanged).toHaveBeenCalledOnce());
     expect(invokeMock.mock.calls.filter(([cmd]) => cmd === "resolve_saved_prompt")).toHaveLength(1);
   });
 
-  it("cleans up late prompt subscriptions without restoring after unmount", async () => {
+  it("settles restoration when prompt listener registration rejects", async () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);
     const store = await loadComposeStore();
@@ -3943,33 +4018,20 @@ describe("ComposeBar prompt mode", () => {
     store.flush();
     store._testing.reloadFromStorage();
 
-    const registrations = new Map<string, (unlisten: MockUnlisten) => void>();
-    listenMock.mockImplementation((name: string, cb) => {
-      listeners.set(name, cb);
-      return new Promise<MockUnlisten>((resolve) => registrations.set(name, resolve));
-    });
+    listenMock.mockRejectedValue(new Error("listener unavailable"));
     mockPromptBackend({
-      resolve: async () => ({ state: "available", prompt: SUMMARY, generation: 1 }),
+      resolve: async () => ({ state: "temporarily_unavailable", generation: 1 }),
     });
-    const { unmount } = render(ComposeBar, {
+
+    render(ComposeBar, {
       props: { projectId: PROJECT_ID, agents: [AGENT_A] },
     });
-    await waitFor(() => expect(registrations.size).toBe(2));
-
-    unmount();
-    const unlistenSynced = vi.fn();
-    const unlistenChanged = vi.fn();
-    registrations.get("prompts:synced")?.(unlistenSynced);
-    registrations.get("prompts:changed")?.(unlistenChanged);
-
-    await waitFor(() => {
-      expect(unlistenSynced).toHaveBeenCalledOnce();
-      expect(unlistenChanged).toHaveBeenCalledOnce();
-    });
-    expect(invokeMock.mock.calls.some(([cmd]) => cmd === "resolve_saved_prompt")).toBe(false);
+    await waitFor(() =>
+      expect(screen.getByTestId("compose-prompt-restore-failed")).toBeInTheDocument(),
+    );
   });
 
-  it("restores and cleans up when only one prompt subscription registers", async () => {
+  it("settles restoration when prompt listener creation throws synchronously", async () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);
     const store = await loadComposeStore();
@@ -3983,23 +4045,17 @@ describe("ComposeBar prompt mode", () => {
     store.flush();
     store._testing.reloadFromStorage();
 
-    const unlistenSynced = vi.fn();
-    listenMock.mockImplementation(async (name: string, cb) => {
-      if (name === "prompts:changed") throw new Error("listener unavailable");
-      listeners.set(name, cb);
-      return unlistenSynced;
+    listenMock.mockImplementation(() => {
+      throw new Error("native listen failed");
     });
     mockPromptBackend({
-      resolve: async () => ({ state: "available", prompt: SUMMARY, generation: 1 }),
+      resolve: async () => ({ state: "temporarily_unavailable", generation: 1 }),
     });
 
-    const { unmount } = render(ComposeBar, {
-      props: { projectId: PROJECT_ID, agents: [AGENT_A] },
-    });
-    await waitFor(() => expect(screen.getByTestId("prompt-composer")).toBeInTheDocument());
-    unmount();
-
-    expect(unlistenSynced).toHaveBeenCalledOnce();
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await waitFor(() =>
+      expect(screen.getByTestId("compose-prompt-restore-failed")).toBeInTheDocument(),
+    );
   });
 
   it("preserves a confirmed-missing prompt draft until the user starts over", async () => {
@@ -4030,7 +4086,7 @@ describe("ComposeBar prompt mode", () => {
     expect(store.getCompose(PROJECT_ID).content).toMatchObject({ kind: "prompt", name: "ghost" });
 
     resolution = { state: "confirmed_missing", generation: 2 };
-    listeners.get("prompts:synced")?.({ payload: { generation: 2 } });
+    listeners.get("prompts:changed")?.({ payload: { generation: 2 } });
 
     await waitFor(() =>
       expect(
@@ -4143,8 +4199,6 @@ describe("ComposeBar prompt mode", () => {
     });
 
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
-    await waitFor(() => expect(calls).toBe(1));
-    listeners.get("prompts:synced")?.({ payload: { generation: 1 } });
     await waitFor(() => expect(calls).toBe(2));
     listeners.get("prompts:changed")?.({ payload: { generation: 2 } });
     await waitFor(() => expect(calls).toBe(3));

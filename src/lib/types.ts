@@ -969,6 +969,12 @@ export type Prompt = {
   tags: string[];
 };
 
+export type SavedPromptResolution =
+  | { state: "available"; prompt: Prompt; generation: number }
+  | { state: "confirmed_missing"; generation: number }
+  | { state: "temporarily_unavailable"; generation: number }
+  | { state: "not_configured"; generation: number };
+
 // The typed outcome of `render_prompt` (mirrors the Rust `RenderPromptOutcome`,
 // `#[serde(tag = "kind", rename_all = "snake_case")]`, `#[non_exhaustive]`).
 // `needs_sign_in` crosses as data rather than an error string because the

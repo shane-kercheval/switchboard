@@ -23,15 +23,15 @@ vi.mock("$lib/native", () => ({
   copyText: (text: string) => copyTextMock(text),
 }));
 
-const listeners = new Map<string, (e: { payload: NormalizedEvent }) => void>();
+const listeners = new Map<string, (e: { payload: unknown }) => void>();
 /// Default: record the callback and succeed. A test can override this to make a
 /// specific channel's subscription fail.
-const listenMock = vi.fn(async (name: string, cb: (e: { payload: NormalizedEvent }) => void) => {
+const listenMock = vi.fn(async (name: string, cb: (e: { payload: unknown }) => void) => {
   listeners.set(name, cb);
   return vi.fn();
 });
 vi.mock("@tauri-apps/api/event", () => ({
-  listen: (name: string, cb: (e: { payload: NormalizedEvent }) => void) => listenMock(name, cb),
+  listen: (name: string, cb: (e: { payload: unknown }) => void) => listenMock(name, cb),
 }));
 
 type DragDropPayload =
@@ -2073,11 +2073,19 @@ function mockPromptBackend(
     prompts?: Prompt[];
     render?: () => Promise<unknown>;
     signIn?: () => Promise<unknown>;
+    resolve?: () => Promise<unknown>;
   } = {},
 ): void {
   invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
     if (cmd === "search_project_files") return [];
     if (cmd === "list_prompts") return opts.prompts ?? [];
+    if (cmd === "resolve_saved_prompt") {
+      if (opts.resolve) return await opts.resolve();
+      const prompt = (opts.prompts ?? [])[0];
+      return prompt
+        ? { state: "available", prompt, generation: 0 }
+        : { state: "confirmed_missing", generation: 0 };
+    }
     if (cmd === "render_prompt")
       return opts.render ? await opts.render() : { kind: "rendered", text: "RENDERED" };
     if (cmd === "sign_in_mcp_provider") return opts.signIn ? await opts.signIn() : null;
@@ -2224,6 +2232,13 @@ describe("prompt-mode fork", () => {
           return { path: `/proj/.switchboard/attachments/uuid__${name}`, original_name: name };
         }
         if (cmd === "list_prompts") return [SUMMARY, REVIEW];
+        if (cmd === "resolve_saved_prompt") {
+          return {
+            state: "available",
+            prompt: args?.name === REVIEW.name ? REVIEW : SUMMARY,
+            generation: 0,
+          };
+        }
         if (cmd === "render_prompt")
           return opts.render ? await opts.render() : { kind: "rendered", text: "RENDERED" };
         if (cmd === "sign_in_mcp_provider") return opts.signIn ? await opts.signIn() : null;
@@ -3849,24 +3864,26 @@ describe("ComposeBar prompt mode", () => {
     store.flush();
     store._testing.reloadFromStorage();
 
-    let promptList: Prompt[] = []; // cache cold at mount (MCP not synced yet)
+    let resolution: unknown = { state: "temporarily_unavailable", generation: 0 };
     invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
       if (cmd === "search_project_files") return [];
-      if (cmd === "list_prompts") return promptList;
+      if (cmd === "resolve_saved_prompt") return resolution;
       return null;
     });
 
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
 
-    // Cold: shows the restoring placeholder (not plain), and must NOT clobber the
-    // saved snapshot in storage.
-    await waitFor(() => expect(screen.getByTestId("compose-restoring")).toBeInTheDocument());
+    // Cold: shows a recoverable restore failure (not plain), and must NOT clobber
+    // the saved snapshot in storage.
+    await waitFor(() =>
+      expect(screen.getByTestId("compose-prompt-restore-failed")).toBeInTheDocument(),
+    );
     expect(screen.queryByTestId("prompt-composer")).toBeNull();
     expect(store.getCompose(PROJECT_ID).content).toMatchObject({ kind: "prompt", name: "review" });
 
     // Sync completes with the prompt present → restore with args intact.
-    promptList = [REVIEW];
-    listeners.get("prompts:synced")?.({ payload: null as unknown as NormalizedEvent });
+    resolution = { state: "available", prompt: REVIEW, generation: 1 };
+    listeners.get("prompts:synced")?.({ payload: { generation: 1 } });
 
     await waitFor(() => expect(screen.getByTestId("prompt-composer")).toBeInTheDocument());
     expect((screen.getByTestId("prompt-arg-focus") as HTMLTextAreaElement).value).toBe(
@@ -3888,22 +3905,133 @@ describe("ComposeBar prompt mode", () => {
     });
     store.flush();
     store._testing.reloadFromStorage();
-    mockPromptBackend({ prompts: [] }); // prompt never appears, even after sync
+    let resolution: unknown = { state: "temporarily_unavailable", generation: 0 };
+    mockPromptBackend({ resolve: async () => resolution });
 
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
 
-    await waitFor(() => expect(screen.getByTestId("compose-restoring")).toBeInTheDocument());
-    listeners.get("prompts:changed")?.({ payload: null as unknown as NormalizedEvent });
-    await tick();
-    expect(screen.getByTestId("compose-restoring")).toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.getByTestId("compose-prompt-restore-failed")).toBeInTheDocument(),
+    );
+    listeners.get("prompts:changed")?.({ payload: { generation: 1 } });
+    await waitFor(() =>
+      expect(screen.getByTestId("compose-prompt-restore-failed")).toBeInTheDocument(),
+    );
     expect(store.getCompose(PROJECT_ID).content).toMatchObject({ kind: "prompt", name: "ghost" });
 
-    listeners.get("prompts:synced")?.({ payload: null as unknown as NormalizedEvent });
+    resolution = { state: "confirmed_missing", generation: 2 };
+    listeners.get("prompts:synced")?.({ payload: { generation: 2 } });
 
     await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
     expect((screen.getByTestId("compose-textarea") as HTMLTextAreaElement).value).toBe(
       "leftover text",
     );
+  });
+
+  it("preserves a saved MCP prompt draft through provider failure and restores it later", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    const store = await loadComposeStore();
+    store.setContent(PROJECT_ID, {
+      kind: "prompt",
+      provider: "tiddly",
+      name: "summary",
+      args: { focus: "keep this" },
+      appendedText: "tail",
+    });
+    store.flush();
+    store._testing.reloadFromStorage();
+    let resolution: unknown = { state: "temporarily_unavailable", generation: 1 };
+    mockPromptBackend({ resolve: async () => resolution });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await waitFor(() => screen.getByTestId("compose-prompt-restore-failed"));
+    expect(store.getCompose(PROJECT_ID).content).toMatchObject({
+      kind: "prompt",
+      provider: "tiddly",
+      name: "summary",
+      args: { focus: "keep this" },
+    });
+
+    resolution = {
+      state: "available",
+      prompt: { ...SUMMARY, arguments: REVIEW.arguments },
+      generation: 2,
+    };
+    await fireEvent.click(screen.getByTestId("prompt-restore-retry"));
+    await waitFor(() => screen.getByTestId("prompt-composer"));
+    expect(screen.getByTestId("prompt-arg-focus")).toHaveValue("keep this");
+  });
+
+  it("lets the user leave an unavailable saved prompt without losing appended text", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    const store = await loadComposeStore();
+    store.setContent(PROJECT_ID, {
+      kind: "prompt",
+      provider: "tiddly",
+      name: "summary",
+      args: { focus: "structured value" },
+      appendedText: "keep this tail",
+    });
+    store.flush();
+    store._testing.reloadFromStorage();
+    mockPromptBackend({
+      resolve: async () => ({ state: "temporarily_unavailable", generation: 1 }),
+    });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await screen.findByTestId("compose-prompt-restore-failed");
+    await fireEvent.click(screen.getByTestId("prompt-restore-discard"));
+
+    expect(screen.getByTestId("compose-textarea")).toHaveValue("keep this tail");
+    await waitFor(() =>
+      expect(store.getCompose(PROJECT_ID).content).toEqual({
+        kind: "plain",
+        draft: "keep this tail",
+      }),
+    );
+  });
+
+  it("does not discard a saved draft from a restoration reply older than auth invalidation", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    const store = await loadComposeStore();
+    store.setContent(PROJECT_ID, {
+      kind: "prompt",
+      provider: "tiddly",
+      name: "summary",
+      args: { focus: "keep this" },
+      appendedText: "tail",
+    });
+    store.flush();
+    store._testing.reloadFromStorage();
+    let calls = 0;
+    let resolveOld!: (value: unknown) => void;
+    mockPromptBackend({
+      resolve: async () => {
+        calls++;
+        if (calls === 1) return { state: "temporarily_unavailable", generation: 0 };
+        if (calls === 2) return await new Promise((resolve) => (resolveOld = resolve));
+        return { state: "temporarily_unavailable", generation: 2 };
+      },
+    });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await waitFor(() => expect(calls).toBe(1));
+    listeners.get("prompts:synced")?.({ payload: { generation: 1 } });
+    await waitFor(() => expect(calls).toBe(2));
+    listeners.get("prompts:changed")?.({ payload: { generation: 2 } });
+    await waitFor(() => expect(calls).toBe(3));
+    resolveOld({ state: "confirmed_missing", generation: 1 });
+    await tick();
+
+    expect(screen.getByTestId("compose-prompt-restore-failed")).toBeInTheDocument();
+    expect(store.getCompose(PROJECT_ID).content).toMatchObject({
+      kind: "prompt",
+      name: "summary",
+      args: { focus: "keep this" },
+    });
   });
 
   it("keeps prompt removal locked while the send render is in flight", async () => {
@@ -6084,8 +6212,8 @@ describe("ComposeBar — cross-agent forward", () => {
     // Multiple events during one fresh request coalesce. The fresh cache hit may
     // represent the preceding completed generation, so one cache-only pass must
     // apply the newer schema after the authoritative response settles.
-    listeners.get("prompts:changed")?.({ payload: null as unknown as NormalizedEvent });
-    listeners.get("prompts:changed")?.({ payload: null as unknown as NormalizedEvent });
+    listeners.get("prompts:changed")?.({ payload: { generation: 1 } });
+    listeners.get("prompts:changed")?.({ payload: { generation: 2 } });
     await tick();
     expect(freshCalls).toBe(1);
     expect(cacheOnlyCalls).toBe(0);
@@ -6164,11 +6292,11 @@ describe("ComposeBar — cross-agent forward", () => {
     await fireEvent.click(screen.getByTestId("workflow-option-dir:cache-refresh"));
     await waitFor(() => screen.getByTestId("workflow-prompt-unavailable"));
 
-    listeners.get("prompts:changed")?.({ payload: null as unknown as NormalizedEvent });
+    listeners.get("prompts:changed")?.({ payload: { generation: 1 } });
     await waitFor(() => expect(cacheOnlyCalls).toBe(1));
     // A newer sync must supersede an in-flight cache-only classification instead
     // of being dropped. Neither event is allowed to call the fresh endpoint.
-    listeners.get("prompts:changed")?.({ payload: null as unknown as NormalizedEvent });
+    listeners.get("prompts:changed")?.({ payload: { generation: 2 } });
     await waitFor(() => expect(cacheOnlyCalls).toBe(2));
     cacheReplies[1]?.({ ...base, compatibility: { state: "ok" } });
     await waitFor(() => screen.getByTestId("workflow-agent-worker-alice"));
@@ -6228,7 +6356,7 @@ describe("ComposeBar — cross-agent forward", () => {
     await fireEvent.click(await screen.findByTestId(`forward-picker-agent-${AGENT_A.id}`));
     await waitFor(() => screen.getByTestId("workflow-forward-sources-old"));
 
-    listeners.get("prompts:changed")?.({ payload: null as unknown as NormalizedEvent });
+    listeners.get("prompts:changed")?.({ payload: { generation: 1 } });
     const newInput = (await screen.findByTestId("workflow-arg-input-new")) as HTMLTextAreaElement;
     expect(screen.queryByTestId("workflow-arg-input-old")).toBeNull();
     expect(screen.queryByTestId("workflow-forward-sources-old")).toBeNull();
@@ -6310,11 +6438,11 @@ describe("ComposeBar — cross-agent forward", () => {
     await fireEvent.click(screen.getByTestId("workflow-forward-picker-context"));
     await fireEvent.click(await screen.findByTestId(`forward-picker-agent-${AGENT_A.id}`));
 
-    listeners.get("prompts:changed")?.({ payload: null as unknown as NormalizedEvent });
+    listeners.get("prompts:changed")?.({ payload: { generation: 1 } });
     await waitFor(() => screen.getByTestId("workflow-prompt-unavailable"));
-    listeners.get("prompts:changed")?.({ payload: null as unknown as NormalizedEvent });
+    listeners.get("prompts:changed")?.({ payload: { generation: 2 } });
     await waitFor(() => expect(cacheCalls).toBe(2));
-    listeners.get("prompts:changed")?.({ payload: null as unknown as NormalizedEvent });
+    listeners.get("prompts:changed")?.({ payload: { generation: 3 } });
     const recovered = (await screen.findByTestId(
       "workflow-arg-input-context",
     )) as HTMLTextAreaElement;
@@ -6367,7 +6495,7 @@ describe("ComposeBar — cross-agent forward", () => {
       ),
     );
 
-    listeners.get("prompts:changed")?.({ payload: null as unknown as NormalizedEvent });
+    listeners.get("prompts:changed")?.({ payload: { generation: 1 } });
     const textInput = (await screen.findByTestId("workflow-text-target")) as HTMLTextAreaElement;
     expect(textInput).toHaveValue("");
   });

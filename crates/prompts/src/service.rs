@@ -158,6 +158,8 @@ pub struct PromptResolutionSnapshot {
     prompts: Vec<Prompt>,
     provider_status: HashMap<String, ProviderStatus>,
     configured_providers: HashSet<String>,
+    configuration_complete: bool,
+    removed_providers: HashSet<String>,
 }
 
 impl PromptResolutionSnapshot {
@@ -182,6 +184,16 @@ impl PromptResolutionSnapshot {
     #[must_use]
     pub fn is_provider_configured(&self, provider: &str) -> bool {
         self.configured_providers.contains(provider)
+    }
+
+    #[must_use]
+    pub fn configuration_complete(&self) -> bool {
+        self.configuration_complete
+    }
+
+    #[must_use]
+    pub fn was_provider_removed(&self, provider: &str) -> bool {
+        self.removed_providers.contains(provider)
     }
 }
 
@@ -440,12 +452,18 @@ impl PromptService {
     ///   slow provider can't delay the others. A provider that errors or times
     ///   out contributes nothing (with a warning).
     ///
-    /// Returns `true` when this rebuild published its MCP result. An explicit
-    /// provider mutation can invalidate work in flight, in which case the stale
-    /// result is discarded and this returns `false`.
+    /// Retries work invalidated by a concurrent provider mutation and returns
+    /// after publishing the latest revision. Each attempt retains the last
+    /// authoritative MCP projection while its bounded provider queries run; the
+    /// total duration can extend while mutations continue, but settles once they
+    /// quiesce.
     pub async fn sync(&self) -> bool {
         let _guard = self.sync_lock.lock().await;
-        self.sync_locked().await
+        loop {
+            if self.sync_locked().await {
+                return true;
+            }
+        }
     }
 
     /// Complete a cache rebuild only if no rebuild has completed since
@@ -455,15 +473,20 @@ impl PromptService {
     /// issuing an identical second network request.
     ///
     /// Returns `true` when this call published a rebuilt cache and `false` when a
-    /// racing sync already did or an explicit mutation invalidated this work.
-    /// Either result leaves the completed snapshot newer than (or equal to) the
-    /// caller's observation before this future returns.
+    /// racing sync already did. Once this caller owns the rebuild, it retries
+    /// attempts invalidated by provider mutations so the conditional path cannot
+    /// strand an initial cache fill. As with [`sync`](Self::sync), it settles once
+    /// mutations quiesce.
     pub async fn sync_if_generation(&self, observed_generation: u64) -> bool {
         let _guard = self.sync_lock.lock().await;
         if self.completed_generation() != observed_generation {
             return false;
         }
-        self.sync_locked().await
+        loop {
+            if self.sync_locked().await {
+                return true;
+            }
+        }
     }
 
     /// The current completed resolution generation. Successful rebuilds and
@@ -536,6 +559,20 @@ impl PromptService {
             .provider_publish_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let already_invalidated = {
+            let snapshot = self
+                .resolution_snapshot
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            snapshot.provider_status(name) == Some(&ProviderStatus::NeedsAuth)
+                && snapshot
+                    .prompts
+                    .iter()
+                    .all(|prompt| prompt.provider != name)
+        };
+        if already_invalidated {
+            return;
+        }
         self.publish_provider_invalidation(name, true, Some(ProviderStatus::NeedsAuth));
     }
 
@@ -575,8 +612,10 @@ impl PromptService {
         snapshot.prompts.retain(|prompt| prompt.provider != name);
         if configured {
             snapshot.configured_providers.insert(name.to_owned());
+            snapshot.removed_providers.remove(name);
         } else {
             snapshot.configured_providers.remove(name);
+            snapshot.removed_providers.insert(name.to_owned());
         }
         match status {
             Some(status) => {
@@ -596,22 +635,25 @@ impl PromptService {
     /// makes observing a newer generation proof that all sync outputs are visible.
     async fn sync_locked(&self) -> bool {
         let provider_revision = self.provider_revision.load(Ordering::Acquire);
-        let mut prompts = match self.local_provider() {
+        let prior_snapshot = self.resolution_snapshot();
+        let mut local_prompts = match self.local_provider() {
             Some(local) => local.list().await,
             None => Vec::new(),
         };
         // Built-ins are baked-in and instant, so they publish in the same fast
         // first pass as local prompts — never held behind a slow MCP server.
         if self.include_builtins {
-            prompts.extend(BuiltinProvider::new().list().await);
+            local_prompts.extend(BuiltinProvider::new().list().await);
         }
-        self.publish(prompts.clone());
+        let mut interim_prompts = local_prompts.clone();
+        interim_prompts.extend(prior_snapshot.prompts);
+        self.publish(interim_prompts);
 
         // Each provider's whole pipeline — including, for OAuth, the credential
         // probe and (cold) client construction — runs inside its own concurrent
         // branch. Hoisting any of it above the join would let one slow provider
         // delay every sibling's start, breaking the isolation guarantee below.
-        let configs = self.mcp_provider_configs();
+        let (configs, configuration_complete) = self.mcp_provider_inventory();
         let results =
             futures::future::join_all(configs.iter().map(|config| self.query_provider(config)))
                 .await;
@@ -629,13 +671,13 @@ impl PromptService {
         if self.provider_revision.load(Ordering::Acquire) != provider_revision {
             return false;
         }
-        prompts.extend(mcp_prompts.iter().cloned());
+        local_prompts.extend(mcp_prompts.iter().cloned());
         let snapshot_statuses = statuses.clone();
         *self
             .provider_status
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = statuses;
-        self.publish(prompts);
+        self.publish(local_prompts);
         let mut snapshot = self
             .resolution_snapshot
             .write()
@@ -646,6 +688,12 @@ impl PromptService {
             prompts: mcp_prompts,
             provider_status: snapshot_statuses,
             configured_providers: configs.iter().map(|config| config.name.clone()).collect(),
+            configuration_complete,
+            removed_providers: if configuration_complete {
+                HashSet::new()
+            } else {
+                snapshot.removed_providers.clone()
+            },
         };
         drop(snapshot);
         self.resolution_changes.send_replace(generation);
@@ -1293,17 +1341,24 @@ impl PromptService {
     /// (see [`PromptConfig`]) so a malformed `mcp_providers:` section can never
     /// break local prompts; individual bad entries are skipped (with a warning).
     fn mcp_provider_configs(&self) -> Vec<McpProviderConfig> {
+        self.mcp_provider_inventory().0
+    }
+
+    /// Read the usable MCP provider inventory and whether absence from it is
+    /// authoritative. A corrupt top-level config preserves uncertainty; missing
+    /// configuration is a complete empty inventory.
+    fn mcp_provider_inventory(&self) -> (Vec<McpProviderConfig>, bool) {
         let Some(path) = self.config_path.as_deref() else {
-            return Vec::new();
+            return (Vec::new(), true);
         };
         if !path.exists() {
-            return Vec::new();
+            return (Vec::new(), true);
         }
         match switchboard_core::read_yaml::<McpSection>(path) {
-            Ok(section) => section.into_configs(),
+            Ok(section) => section.into_inventory(),
             Err(e) => {
                 tracing::warn!(path = %path.display(), error = %e, "could not read mcp_providers; ignoring");
-                Vec::new()
+                (Vec::new(), false)
             }
         }
     }
@@ -2102,6 +2157,8 @@ mod tests {
                 ProviderStatus::Ok { prompt_count: 1 },
             )]),
             configured_providers: HashSet::from(["team".to_owned()]),
+            configuration_complete: true,
+            removed_providers: HashSet::new(),
         };
 
         let mut changes = service.subscribe_resolution_changes();
@@ -2164,6 +2221,8 @@ mod tests {
                 ProviderStatus::Ok { prompt_count: 1 },
             )]),
             configured_providers: HashSet::from(["team".to_owned()]),
+            configuration_complete: true,
+            removed_providers: HashSet::new(),
         };
         let mut changes = service.subscribe_resolution_changes();
 

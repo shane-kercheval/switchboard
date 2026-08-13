@@ -97,18 +97,29 @@ impl McpSection {
     /// warning) any that don't parse, carry an invalid name, or duplicate an
     /// earlier name — so one bad entry never discards the rest, and the surviving
     /// set is a clean addressing namespace.
+    #[cfg(test)]
     pub(crate) fn into_configs(self) -> Vec<McpProviderConfig> {
+        self.into_inventory().0
+    }
+
+    /// Return the usable providers plus whether the source established a
+    /// complete inventory. A skipped entry leaves provider absence uncertain,
+    /// which matters when deciding whether a persisted prompt was deleted.
+    pub(crate) fn into_inventory(self) -> (Vec<McpProviderConfig>, bool) {
         let mut seen: BTreeSet<String> = BTreeSet::new();
         let mut out = Vec::new();
+        let mut complete = true;
         for value in self.mcp_providers {
             let config = match serde_norway::from_value::<McpProviderConfig>(value) {
                 Ok(config) => config,
                 Err(e) => {
+                    complete = false;
                     tracing::warn!(error = %e, "skipping malformed mcp_providers entry");
                     continue;
                 }
             };
             if !is_valid_provider_name(&config.name) {
+                complete = false;
                 tracing::warn!(
                     name = %config.name,
                     "skipping mcp provider with invalid name (empty, reserved `local`/`builtin`, or containing `:`)"
@@ -116,6 +127,7 @@ impl McpSection {
                 continue;
             }
             if !seen.insert(config.name.clone()) {
+                complete = false;
                 // First occurrence wins; a later duplicate would otherwise share
                 // one secret-store key and shadow the first under one prefix.
                 tracing::warn!(name = %config.name, "skipping duplicate mcp provider name");
@@ -123,7 +135,7 @@ impl McpSection {
             }
             out.push(config);
         }
-        out
+        (out, complete)
     }
 }
 
@@ -276,6 +288,21 @@ mcp_providers:
                 url: "https://mcp.example.com".to_owned()
             }
         );
+    }
+
+    #[test]
+    fn malformed_entry_marks_provider_inventory_incomplete() {
+        let yaml = r"
+mcp_providers:
+  - name: team
+    transport: { type: http, url: https://mcp.example.com }
+  - name: broken
+";
+        let section: McpSection = serde_norway::from_str(yaml).unwrap();
+        let (configs, complete) = section.into_inventory();
+
+        assert_eq!(configs.len(), 1);
+        assert!(!complete);
     }
 
     #[test]

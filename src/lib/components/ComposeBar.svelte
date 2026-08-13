@@ -447,6 +447,9 @@
   let pendingRestore = $state<PromptContent | null>(
     saved.content.kind === "prompt" ? saved.content : null,
   );
+  let promptRestoreRequestGen = 0;
+  let latestPromptResolutionGeneration = 0;
+  let promptRestoreFailed = $state(false);
   // A saved workflow-mode invocation to restore once the workflow list loads.
   let pendingWorkflowRestore = $state<WorkflowContent | null>(
     saved.content.kind === "workflow" ? saved.content : null,
@@ -471,28 +474,33 @@
     }
   }
 
-  // Only touch the cache at mount when there's a saved prompt-mode draft to
-  // restore; otherwise the picker loads prompts lazily on open. (Avoids an
-  // unnecessary mount-time read in the common plain-draft case.) The cache may
-  // be cold (MCP prompts land only after the launch-time sync), so also re-try
-  // when the backend signals a completed sync — and only then is "still absent"
-  // proof the prompt is gone.
-  // A settled sync can prove a saved prompt is absent; any authoritative
-  // resolution change can reclassify an open workflow. Keep those signals
-  // separate so a temporary provider invalidation never destroys a saved prompt
-  // draft. Workflow reclassification must remain cache-only.
+  // Saved prompt restoration asks the backend for a provider-aware verdict from
+  // one coherent snapshot. A global list miss cannot distinguish deletion from
+  // auth, store, or transport failure. Workflow reclassification likewise stays
+  // cache-only on authoritative resolution changes.
   onMount(() => {
     const hadDraft = pendingRestore !== null;
-    if (hadDraft) {
-      void loadPrompts().then(() => tryRestorePrompt(false));
-    }
-    const unlistenSynced = listen("prompts:synced", () => {
+    if (hadDraft) void resolvePendingPrompt();
+    const unlistenSynced = listen<{ generation: number }>("prompts:synced", (event) => {
+      latestPromptResolutionGeneration = Math.max(
+        latestPromptResolutionGeneration,
+        event.payload.generation,
+      );
       if (hadDraft) {
-        void loadPrompts().then(() => tryRestorePrompt(true));
+        promptRestoreFailed = false;
+        void resolvePendingPrompt();
       }
     });
-    const unlistenChanged = listen("prompts:changed", () => {
-      promptResolutionEventGen++;
+    const unlistenChanged = listen<{ generation: number }>("prompts:changed", (event) => {
+      latestPromptResolutionGeneration = Math.max(
+        latestPromptResolutionGeneration,
+        event.payload.generation,
+      );
+      promptResolutionEventGen = Math.max(promptResolutionEventGen, event.payload.generation);
+      if (hadDraft) {
+        promptRestoreFailed = false;
+        void resolvePendingPrompt();
+      }
       if (
         mode === "workflow" &&
         selectedWorkflow !== null &&
@@ -546,40 +554,68 @@
     textareaEl?.focus();
   });
 
-  /// Resolve a saved prompt-mode draft against the loaded cache. If the prompt
-  /// is present, re-enter prompt mode with the saved argument values. If it's
-  /// absent, only downgrade to plain once `syncSettled` — a completed sync proves
-  /// the prompt is actually gone (renamed/removed). A cold cache (`syncSettled`
-  /// false) is left pending so a transient miss never destroys the draft.
-  function tryRestorePrompt(syncSettled: boolean): void {
+  /// Resolve a saved prompt-mode draft against one coherent backend snapshot.
+  /// Only an authoritative missing/unconfigured verdict may discard the prompt
+  /// selection; provider failures preserve every argument for a later recovery.
+  async function resolvePendingPrompt(): Promise<void> {
     if (pendingRestore === null) return;
     const snapshot = pendingRestore;
-    const found = prompts.find((p) => p.provider === snapshot.provider && p.name === snapshot.name);
-    if (found !== undefined) {
-      selectedPrompt = found;
-      promptArgs = Object.fromEntries(
-        found.arguments.map((a) => [a.name, snapshot.args[a.name] ?? ""]),
+    const request = ++promptRestoreRequestGen;
+    try {
+      const resolution = await api.resolveSavedPrompt(snapshot.provider, snapshot.name);
+      if (request !== promptRestoreRequestGen || pendingRestore !== snapshot) return;
+      if (resolution.generation < latestPromptResolutionGeneration) return;
+      latestPromptResolutionGeneration = Math.max(
+        latestPromptResolutionGeneration,
+        resolution.generation,
       );
-      appendedText = snapshot.appendedText;
-      focusPromptFieldOnMount = focusPromptFieldOnMount || focusOnMount;
-      mode = "prompt";
-      pendingRestore = null;
-      restoring = false;
-      return;
-    }
-    if (syncSettled) {
+      if (resolution.state === "available") {
+        promptRestoreFailed = false;
+        selectedPrompt = resolution.prompt;
+        promptArgs = Object.fromEntries(
+          resolution.prompt.arguments.map((a) => [a.name, snapshot.args[a.name] ?? ""]),
+        );
+        appendedText = snapshot.appendedText;
+        focusPromptFieldOnMount = focusPromptFieldOnMount || focusOnMount;
+        mode = "prompt";
+        pendingRestore = null;
+        restoring = false;
+        return;
+      }
+      if (resolution.state !== "confirmed_missing" && resolution.state !== "not_configured") {
+        promptRestoreFailed = true;
+        return;
+      }
       // Proven gone: fall back to plain, carrying the appended text so nothing
-      // the user typed is lost.
+      // the user typed outside the structured arguments is lost.
       draft = snapshot.appendedText;
       mode = "plain";
       pendingRestore = null;
+      promptRestoreFailed = false;
       restoring = false;
       if (focusOnMount) requestAnimationFrame(() => textareaEl?.focus());
+    } catch {
+      // Preserve the persisted draft. A later prompt-state event or an explicit
+      // retry can resolve it without destroying the user's arguments.
+      if (request === promptRestoreRequestGen && pendingRestore === snapshot) {
+        promptRestoreFailed = true;
+      }
     }
   }
 
-  /// Resolve a saved workflow-mode invocation against the loaded workflow list.
-  ///
+  function retryPromptRestore(): void {
+    promptRestoreFailed = false;
+    void resolvePendingPrompt();
+  }
+
+  function discardPromptRestore(): void {
+    const snapshot = pendingRestore;
+    draft = snapshot?.appendedText ?? "";
+    pendingRestore = null;
+    promptRestoreFailed = false;
+    restoring = false;
+  }
+
   /// Resolve a saved workflow-mode invocation against the loaded workflow list.
   ///
   /// `listOk` distinguishes the two outcomes that a bare `find(...) === undefined`
@@ -3489,7 +3525,30 @@
         {@render attachmentChipRow()}
       {/if}
 
-      {#if restoring && workflowRestoreFailed}
+      {#if restoring && promptRestoreFailed}
+        <div
+          class="flex h-16 items-center gap-3 px-1 text-sm"
+          data-testid="compose-prompt-restore-failed"
+        >
+          <span class="text-muted">Couldn't restore your saved prompt.</span>
+          <Button
+            size="sm"
+            variant="secondary"
+            onclick={retryPromptRestore}
+            data-testid="prompt-restore-retry"
+          >
+            Check again
+          </Button>
+          <Button
+            size="sm"
+            variant="ghost"
+            onclick={discardPromptRestore}
+            data-testid="prompt-restore-discard"
+          >
+            Start over
+          </Button>
+        </div>
+      {:else if restoring && workflowRestoreFailed}
         <!-- The workflow list failed to load, so we can't tell whether the saved
            workflow still exists. The snapshot is held (not discarded) until the
            user retries or explicitly starts over — a transient error must not

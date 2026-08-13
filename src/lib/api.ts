@@ -36,6 +36,7 @@ import type {
   ProviderStatus,
   PathSource,
   Prompt,
+  SavedPromptResolution,
   PromptSource,
   RenderPromptOutcome,
   RepoListing,
@@ -706,6 +707,14 @@ export async function syncPrompts(): Promise<void> {
 /// against it instantly.
 export async function listPrompts(): Promise<Prompt[]> {
   return await invoke<Prompt[]>("list_prompts");
+}
+
+/// Resolve one saved prompt draft from the latest coherent cache snapshot.
+export async function resolveSavedPrompt(
+  provider: string,
+  name: string,
+): Promise<SavedPromptResolution> {
+  return await invoke<SavedPromptResolution>("resolve_saved_prompt", { provider, name });
 }
 
 /// Render `name` from `provider` with `args`, resolving to a typed outcome:

@@ -1166,6 +1166,58 @@ pub fn list_prompts_impl(state: &AppState) -> Vec<switchboard_prompts::Prompt> {
         .collect()
 }
 
+/// Cache-only verdict for restoring one persisted prompt draft. Unlike a global
+/// list miss, this distinguishes confirmed deletion from provider failure.
+#[derive(Debug, Clone, serde::Serialize, PartialEq)]
+#[serde(tag = "state", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum SavedPromptResolution {
+    Available {
+        prompt: switchboard_prompts::Prompt,
+        generation: u64,
+    },
+    ConfirmedMissing {
+        generation: u64,
+    },
+    TemporarilyUnavailable {
+        generation: u64,
+    },
+    NotConfigured {
+        generation: u64,
+    },
+}
+
+pub fn resolve_saved_prompt_impl(
+    state: &AppState,
+    provider: &str,
+    name: &str,
+) -> SavedPromptResolution {
+    let snapshot = state.prompts.resolution_snapshot();
+    let generation = snapshot.generation();
+    if provider == switchboard_prompts::LOCAL_PROVIDER
+        || provider == switchboard_prompts::BUILTIN_PROVIDER
+    {
+        return match state.prompts.get(provider, name) {
+            Some(prompt) => SavedPromptResolution::Available { prompt, generation },
+            None => SavedPromptResolution::ConfirmedMissing { generation },
+        };
+    }
+    if let Some(prompt) = snapshot.get(provider, name) {
+        return SavedPromptResolution::Available { prompt, generation };
+    }
+    if snapshot.was_provider_removed(provider)
+        || (snapshot.configuration_complete() && !snapshot.is_provider_configured(provider))
+    {
+        return SavedPromptResolution::NotConfigured { generation };
+    }
+    match snapshot.provider_status(provider) {
+        Some(switchboard_prompts::ProviderStatus::Ok { .. }) => {
+            SavedPromptResolution::ConfirmedMissing { generation }
+        }
+        _ => SavedPromptResolution::TemporarilyUnavailable { generation },
+    }
+}
+
 /// Copy a built-in prompt into the user's prompts directory as `<name>.md`, so
 /// they can customize it as an owned file. Refuses to overwrite an existing file
 /// (the app never clobbers a user's prompt). After this, the copy is an ordinary
@@ -1374,12 +1426,15 @@ pub fn spawn_prompt_resolution_change_notifications(
     });
 }
 
-/// Rebuild the prompt cache, then emit [`PROMPTS_SYNCED_EVENT`] only if that work
-/// published a completed snapshot. A provider mutation may invalidate an
-/// in-flight rebuild; its queued successor owns the eventual settled event.
+/// Rebuild the prompt cache, then emit [`PROMPTS_SYNCED_EVENT`] after the latest
+/// provider revision publishes. Work invalidated by a concurrent provider
+/// mutation retries inside [`PromptService::sync`].
 pub async fn sync_prompts_and_notify(prompts: PromptService, emitter: Arc<dyn EventEmitter>) {
     if prompts.sync().await {
-        emitter.emit(PROMPTS_SYNCED_EVENT, serde_json::Value::Null);
+        emitter.emit(
+            PROMPTS_SYNCED_EVENT,
+            serde_json::json!({ "generation": prompts.sync_generation() }),
+        );
     }
 }
 
@@ -1393,20 +1448,27 @@ pub async fn sync_prompts_if_generation_and_notify(
 ) -> bool {
     let rebuilt = prompts.sync_if_generation(observed_generation).await;
     if rebuilt {
-        emitter.emit(PROMPTS_SYNCED_EVENT, serde_json::Value::Null);
+        emitter.emit(
+            PROMPTS_SYNCED_EVENT,
+            serde_json::json!({ "generation": prompts.sync_generation() }),
+        );
     }
     rebuilt
 }
 
-/// Rebuild the prompt cache off the command thread. `PromptService` is cheaply
-/// cloneable and shares its cache, so the spawned clone warms the same cache.
-/// Emits [`PROMPTS_SYNCED_EVENT`] when the rebuild finishes so Settings can
-/// refresh a just-added provider's status (the add/remove command returns before
-/// the background build completes, so the first read shows `Unknown`).
+/// Conditionally rebuild the prompt cache off the command thread. Capturing the
+/// mutation's generation lets an older in-flight rebuild own settlement without
+/// issuing a duplicate provider listing; otherwise this task publishes and
+/// notifies. `PromptService` clones share the same cache.
 fn spawn_prompt_sync(state: &AppState) {
     let prompts = state.prompts.clone();
     let emitter = Arc::clone(&state.emitter);
-    tauri::async_runtime::spawn(sync_prompts_and_notify(prompts, emitter));
+    let observed_generation = prompts.sync_generation();
+    tauri::async_runtime::spawn(sync_prompts_if_generation_and_notify(
+        prompts,
+        emitter,
+        observed_generation,
+    ));
 }
 
 pub fn create_project_impl(
@@ -20282,6 +20344,83 @@ mod tests {
         ))
     }
 
+    #[tokio::test]
+    async fn saved_prompt_resolution_only_confirms_absence_from_authoritative_state() {
+        let server = spawn_workflow_mcp_server(false).await;
+        let (tmp, state, _) = fresh_state_with_mock();
+        let state = state_with_mcp_server(
+            &tmp,
+            state,
+            &server.url,
+            Arc::new(switchboard_prompts::InMemorySecretStore::new()),
+        );
+
+        assert!(matches!(
+            resolve_saved_prompt_impl(&state, "tiddly", "review"),
+            SavedPromptResolution::TemporarilyUnavailable { generation: 0 }
+        ));
+
+        state.prompts.sync().await;
+        assert!(matches!(
+            resolve_saved_prompt_impl(&state, "tiddly", "review"),
+            SavedPromptResolution::Available { generation: 1, .. }
+        ));
+        assert_eq!(
+            resolve_saved_prompt_impl(&state, "tiddly", "ghost"),
+            SavedPromptResolution::ConfirmedMissing { generation: 1 }
+        );
+
+        state.prompts.remove_mcp_provider("tiddly").unwrap();
+        assert_eq!(
+            resolve_saved_prompt_impl(&state, "tiddly", "review"),
+            SavedPromptResolution::NotConfigured { generation: 2 }
+        );
+    }
+
+    #[tokio::test]
+    async fn saved_prompt_resolution_preserves_drafts_when_provider_listing_fails() {
+        let (tmp, state, _) = fresh_state_with_mock();
+        let state = state_with_mcp_server(
+            &tmp,
+            state,
+            "http://127.0.0.1:1/mcp",
+            Arc::new(switchboard_prompts::InMemorySecretStore::new()),
+        );
+        let prompts = state
+            .prompts
+            .clone()
+            .with_provider_timeout(std::time::Duration::from_millis(100));
+        let state = state.with_prompts(prompts);
+
+        state.prompts.sync().await;
+
+        assert_eq!(
+            resolve_saved_prompt_impl(&state, "tiddly", "review"),
+            SavedPromptResolution::TemporarilyUnavailable { generation: 1 }
+        );
+
+        let (tmp, state, _) = fresh_state_with_mock();
+        std::fs::write(
+            tmp.path().join("config.yaml"),
+            "mcp_providers:\n  - name: tiddly\n",
+        )
+        .unwrap();
+        let prompts = PromptService::new(
+            tmp.path().join("config.yaml"),
+            tmp.path().join("prompts"),
+            None,
+            Arc::new(switchboard_prompts::InMemorySecretStore::new()),
+        );
+        let state = state.with_prompts(prompts);
+        state.prompts.sync().await;
+
+        assert_eq!(
+            resolve_saved_prompt_impl(&state, "tiddly", "review"),
+            SavedPromptResolution::TemporarilyUnavailable { generation: 1 },
+            "a malformed config entry cannot prove that its provider was removed"
+        );
+    }
+
     /// A prompts-enabled state (real `PromptService`, so built-ins resolve) with a
     /// project + the named agents, the prompt cache warmed, and a temp user-global
     /// workflows dir.
@@ -21155,6 +21294,14 @@ mod tests {
             Arc::new(switchboard_prompts::InMemorySecretStore::new()),
         )
         .with_workflows_dir(tmp.path().join("workflows"));
+        std::fs::write(
+            tmp.path().join("config.yaml"),
+            format!(
+                "mcp_providers:\n  - name: tiddly\n    transport:\n      type: http\n      url: {0}\n  - name: healthy\n    transport:\n      type: http\n      url: {0}\n",
+                server.url
+            ),
+        )
+        .unwrap();
         init_directory_impl(&state, tmp.path().to_str().unwrap())
             .await
             .unwrap();
@@ -21167,19 +21314,23 @@ mod tests {
             "name: mcp-review\ndescription: d\ninputs:\n  a: agent\nsteps:\n  - label: s\n    send:\n      to: \"{{ a }}\"\n      prompt: \"tiddly:review\"\n",
         );
 
-        server.release.as_ref().unwrap().add_permits(1);
+        server.release.as_ref().unwrap().add_permits(2);
         state.prompts.sync().await;
-        server.entered.acquire().await.unwrap().forget();
+        for _ in 0..2 {
+            server.entered.acquire().await.unwrap().forget();
+        }
         assert!(state.prompts.get("tiddly", "review").is_some());
+        assert!(state.prompts.get("healthy", "review").is_some());
 
-        let stale_emitter = Arc::new(RecordingEmitter::new());
         let mut stale_sync = Box::pin(sync_prompts_and_notify(
             state.prompts.clone(),
-            Arc::clone(&stale_emitter) as Arc<dyn EventEmitter>,
+            Arc::clone(&emitter) as Arc<dyn EventEmitter>,
         ));
-        tokio::select! {
-            permit = server.entered.acquire() => permit.unwrap().forget(),
-            () = &mut stale_sync => panic!("gated sync completed before provider removal"),
+        for _ in 0..2 {
+            tokio::select! {
+                permit = server.entered.acquire() => permit.unwrap().forget(),
+                () = &mut stale_sync => panic!("gated sync completed before provider removal"),
+            }
         }
 
         remove_mcp_provider_impl(&state, "tiddly").unwrap();
@@ -21206,34 +21357,30 @@ mod tests {
             "a removed provider must be rejected before a workflow run is registered"
         );
 
+        server.release.as_ref().unwrap().add_permits(2);
+        tokio::select! {
+            permit = server.entered.acquire() => permit.unwrap().forget(),
+            () = &mut stale_sync => panic!("replacement sync completed before release"),
+        }
         server.release.as_ref().unwrap().add_permits(1);
         stale_sync.await;
-        assert!(
-            stale_emitter
-                .snapshot()
-                .iter()
-                .all(|(name, _)| name != PROMPTS_SYNCED_EVENT),
-            "a rebuild invalidated by removal must not claim synchronization settled"
-        );
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            loop {
-                if emitter
-                    .snapshot()
-                    .iter()
-                    .any(|(name, _)| name == PROMPTS_SYNCED_EVENT)
-                {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("post-removal sync should notify");
 
         assert!(state.prompts.get("tiddly", "review").is_none());
+        assert!(state.prompts.get("healthy", "review").is_some());
         let snapshot = state.prompts.resolution_snapshot();
         assert!(!snapshot.is_provider_configured("tiddly"));
         assert!(snapshot.get("tiddly", "review").is_none());
+        assert!(snapshot.get("healthy", "review").is_some());
+        assert_eq!(server.calls.load(Ordering::SeqCst), 5);
+        assert_eq!(
+            emitter
+                .snapshot()
+                .iter()
+                .filter(|(name, _)| name == PROMPTS_SYNCED_EVENT)
+                .count(),
+            1,
+            "the in-flight owner settles the latest revision; the queued mutation sync coalesces"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

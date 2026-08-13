@@ -449,7 +449,9 @@
   );
   let promptRestoreRequestGen = 0;
   let latestPromptResolutionGeneration = 0;
-  let promptRestoreFailed = $state(false);
+  let promptRestoreIssue = $state<
+    "confirmed_missing" | "not_configured" | "temporarily_unavailable" | "request_failed" | null
+  >(null);
   // A saved workflow-mode invocation to restore once the workflow list loads.
   let pendingWorkflowRestore = $state<WorkflowContent | null>(
     saved.content.kind === "workflow" ? saved.content : null,
@@ -487,7 +489,7 @@
         event.payload.generation,
       );
       if (hadDraft) {
-        promptRestoreFailed = false;
+        promptRestoreIssue = null;
         void resolvePendingPrompt();
       }
     });
@@ -498,7 +500,7 @@
       );
       promptResolutionEventGen = Math.max(promptResolutionEventGen, event.payload.generation);
       if (hadDraft) {
-        promptRestoreFailed = false;
+        promptRestoreIssue = null;
         void resolvePendingPrompt();
       }
       if (
@@ -555,14 +557,16 @@
   });
 
   /// Resolve a saved prompt-mode draft against one coherent backend snapshot.
-  /// Only an authoritative missing/unconfigured verdict may discard the prompt
-  /// selection; provider failures preserve every argument for a later recovery.
-  async function resolvePendingPrompt(): Promise<void> {
+  /// Every unavailable verdict preserves the structured draft; only the user's
+  /// explicit Start over action discards it.
+  async function resolvePendingPrompt(fresh = false): Promise<void> {
     if (pendingRestore === null) return;
     const snapshot = pendingRestore;
     const request = ++promptRestoreRequestGen;
     try {
-      const resolution = await api.resolveSavedPrompt(snapshot.provider, snapshot.name);
+      const resolution = fresh
+        ? await api.resolveSavedPromptFresh(snapshot.provider, snapshot.name)
+        : await api.resolveSavedPrompt(snapshot.provider, snapshot.name);
       if (request !== promptRestoreRequestGen || pendingRestore !== snapshot) return;
       if (resolution.generation < latestPromptResolutionGeneration) return;
       latestPromptResolutionGeneration = Math.max(
@@ -570,7 +574,7 @@
         resolution.generation,
       );
       if (resolution.state === "available") {
-        promptRestoreFailed = false;
+        promptRestoreIssue = null;
         selectedPrompt = resolution.prompt;
         promptArgs = Object.fromEntries(
           resolution.prompt.arguments.map((a) => [a.name, snapshot.args[a.name] ?? ""]),
@@ -582,38 +586,43 @@
         restoring = false;
         return;
       }
-      if (resolution.state !== "confirmed_missing" && resolution.state !== "not_configured") {
-        promptRestoreFailed = true;
-        return;
-      }
-      // Proven gone: fall back to plain, carrying the appended text so nothing
-      // the user typed outside the structured arguments is lost.
-      draft = snapshot.appendedText;
-      mode = "plain";
-      pendingRestore = null;
-      promptRestoreFailed = false;
-      restoring = false;
-      if (focusOnMount) requestAnimationFrame(() => textareaEl?.focus());
+      promptRestoreIssue =
+        resolution.state === "confirmed_missing" || resolution.state === "not_configured"
+          ? resolution.state
+          : "temporarily_unavailable";
     } catch {
       // Preserve the persisted draft. A later prompt-state event or an explicit
       // retry can resolve it without destroying the user's arguments.
       if (request === promptRestoreRequestGen && pendingRestore === snapshot) {
-        promptRestoreFailed = true;
+        promptRestoreIssue = "request_failed";
       }
     }
   }
 
   function retryPromptRestore(): void {
-    promptRestoreFailed = false;
-    void resolvePendingPrompt();
+    promptRestoreIssue = null;
+    void resolvePendingPrompt(true);
   }
 
   function discardPromptRestore(): void {
     const snapshot = pendingRestore;
     draft = snapshot?.appendedText ?? "";
     pendingRestore = null;
-    promptRestoreFailed = false;
+    promptRestoreIssue = null;
     restoring = false;
+  }
+
+  function promptRestoreMessage(): string {
+    switch (promptRestoreIssue) {
+      case "confirmed_missing":
+        return "This prompt is no longer available from its provider.";
+      case "not_configured":
+        return "This prompt's provider is no longer configured.";
+      case "temporarily_unavailable":
+        return "This prompt's provider is temporarily unavailable.";
+      default:
+        return "Couldn't restore your saved prompt.";
+    }
   }
 
   /// Resolve a saved workflow-mode invocation against the loaded workflow list.
@@ -3525,12 +3534,12 @@
         {@render attachmentChipRow()}
       {/if}
 
-      {#if restoring && promptRestoreFailed}
+      {#if restoring && promptRestoreIssue !== null}
         <div
           class="flex h-16 items-center gap-3 px-1 text-sm"
           data-testid="compose-prompt-restore-failed"
         >
-          <span class="text-muted">Couldn't restore your saved prompt.</span>
+          <span class="text-muted">{promptRestoreMessage()}</span>
           <Button
             size="sm"
             variant="secondary"

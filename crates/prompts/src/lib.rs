@@ -31,7 +31,7 @@ pub use model::{BUILTIN_PROVIDER, LOCAL_PROVIDER, Prompt, PromptArgument, Prompt
 pub use secret::{InMemorySecretStore, SecretStore, SecretStoreError};
 pub use service::{
     McpProviderInfo, PromptResolutionSnapshot, PromptService, PromptSource, ProviderStatus,
-    RenderedPrompt,
+    RenderedPrompt, SyncOutcome,
 };
 pub use signin::BrowserOpener;
 

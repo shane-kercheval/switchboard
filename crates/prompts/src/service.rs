@@ -149,6 +149,15 @@ pub enum ProviderStatus {
     Unknown,
 }
 
+/// Result of one synchronization owner. The published generation is captured
+/// while the resolution publication lock is held; `Superseded` means newer
+/// provider state won and this caller published nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncOutcome {
+    Published { generation: u64 },
+    Superseded,
+}
+
 /// One coherent MCP resolution generation. Workflow schema resolution clones
 /// this object once so prompt presence, provider status, and configuration
 /// identity can never come from different rebuilds or explicit mutations.
@@ -224,6 +233,9 @@ pub struct PromptService {
     resolution_changes: Arc<tokio::sync::watch::Sender<u64>>,
     /// Invalidates MCP work that began before an explicit provider mutation.
     provider_revision: Arc<AtomicU64>,
+    /// Provider revision most recently published by a completed synchronization.
+    /// `u64::MAX` is the pre-sync sentinel, distinct from initial revision zero.
+    settled_provider_revision: Arc<AtomicU64>,
     /// Serializes final MCP publication with immediate mutation invalidation, so
     /// an older in-flight sync cannot resurrect a removed or signed-out provider.
     provider_publish_lock: Arc<std::sync::Mutex<()>>,
@@ -286,6 +298,7 @@ impl PromptService {
             resolution_snapshot: Arc::new(RwLock::new(PromptResolutionSnapshot::default())),
             resolution_changes: Arc::new(resolution_changes),
             provider_revision: Arc::new(AtomicU64::new(0)),
+            settled_provider_revision: Arc::new(AtomicU64::new(u64::MAX)),
             provider_publish_lock: Arc::new(std::sync::Mutex::new(())),
             config_write_lock: Arc::new(std::sync::Mutex::new(())),
             include_builtins: true,
@@ -368,6 +381,7 @@ impl PromptService {
             resolution_snapshot: Arc::new(RwLock::new(PromptResolutionSnapshot::default())),
             resolution_changes: Arc::new(resolution_changes),
             provider_revision: Arc::new(AtomicU64::new(0)),
+            settled_provider_revision: Arc::new(AtomicU64::new(u64::MAX)),
             provider_publish_lock: Arc::new(std::sync::Mutex::new(())),
             config_write_lock: Arc::new(std::sync::Mutex::new(())),
             include_builtins: false,
@@ -455,13 +469,25 @@ impl PromptService {
     /// Retries work invalidated by a concurrent provider mutation and returns
     /// after publishing the latest revision. Each attempt retains the last
     /// authoritative MCP projection while its bounded provider queries run; the
-    /// total duration can extend while mutations continue, but settles once they
-    /// quiesce.
-    pub async fn sync(&self) -> bool {
-        let _guard = self.sync_lock.lock().await;
+    /// lock is released between attempts so request-owned conditional callers
+    /// cannot be starved. Total duration can extend while mutations continue,
+    /// but settles once they quiesce or another owner publishes that revision.
+    pub async fn sync(&self) -> SyncOutcome {
+        let mut retrying = false;
         loop {
-            if self.sync_locked().await {
-                return true;
+            let outcome = {
+                let _guard = self.sync_lock.lock().await;
+                if retrying
+                    && self.settled_provider_revision.load(Ordering::Acquire)
+                        == self.provider_revision.load(Ordering::Acquire)
+                {
+                    return SyncOutcome::Superseded;
+                }
+                self.sync_locked().await
+            };
+            match outcome {
+                published @ SyncOutcome::Published { .. } => return published,
+                SyncOutcome::Superseded => retrying = true,
             }
         }
     }
@@ -472,21 +498,16 @@ impl PromptService {
     /// it should await that work, then reuse its result instead of serially
     /// issuing an identical second network request.
     ///
-    /// Returns `true` when this call published a rebuilt cache and `false` when a
-    /// racing sync already did. Once this caller owns the rebuild, it retries
-    /// attempts invalidated by provider mutations so the conditional path cannot
-    /// strand an initial cache fill. As with [`sync`](Self::sync), it settles once
-    /// mutations quiesce.
-    pub async fn sync_if_generation(&self, observed_generation: u64) -> bool {
+    /// Performs at most one rebuild attempt after acquiring the lock. Returns
+    /// [`SyncOutcome::Superseded`] when a racing sync already completed or a
+    /// provider mutation invalidated the attempt, so request-owned callers always
+    /// settle within one provider budget.
+    pub async fn sync_if_generation(&self, observed_generation: u64) -> SyncOutcome {
         let _guard = self.sync_lock.lock().await;
         if self.completed_generation() != observed_generation {
-            return false;
+            return SyncOutcome::Superseded;
         }
-        loop {
-            if self.sync_locked().await {
-                return true;
-            }
-        }
+        self.sync_locked().await
     }
 
     /// The current completed resolution generation. Successful rebuilds and
@@ -633,9 +654,8 @@ impl PromptService {
     /// Rebuild the cache while `sync_lock` is held, then publish the completion
     /// generation. Keeping the increment after the final cache/status writes
     /// makes observing a newer generation proof that all sync outputs are visible.
-    async fn sync_locked(&self) -> bool {
+    async fn sync_locked(&self) -> SyncOutcome {
         let provider_revision = self.provider_revision.load(Ordering::Acquire);
-        let prior_snapshot = self.resolution_snapshot();
         let mut local_prompts = match self.local_provider() {
             Some(local) => local.list().await,
             None => Vec::new(),
@@ -645,9 +665,9 @@ impl PromptService {
         if self.include_builtins {
             local_prompts.extend(BuiltinProvider::new().list().await);
         }
-        let mut interim_prompts = local_prompts.clone();
-        interim_prompts.extend(prior_snapshot.prompts);
-        self.publish(interim_prompts);
+        if !self.publish_interim_if_current(provider_revision, &local_prompts) {
+            return SyncOutcome::Superseded;
+        }
 
         // Each provider's whole pipeline — including, for OAuth, the credential
         // probe and (cold) client construction — runs inside its own concurrent
@@ -669,7 +689,7 @@ impl PromptService {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if self.provider_revision.load(Ordering::Acquire) != provider_revision {
-            return false;
+            return SyncOutcome::Superseded;
         }
         local_prompts.extend(mcp_prompts.iter().cloned());
         let snapshot_statuses = statuses.clone();
@@ -695,8 +715,27 @@ impl PromptService {
                 snapshot.removed_providers.clone()
             },
         };
+        self.settled_provider_revision
+            .store(provider_revision, Ordering::Release);
         drop(snapshot);
         self.resolution_changes.send_replace(generation);
+        SyncOutcome::Published { generation }
+    }
+
+    /// Publish local/built-in prompts plus the latest authoritative MCP
+    /// projection only if no provider mutation has invalidated this attempt.
+    fn publish_interim_if_current(&self, provider_revision: u64, local_prompts: &[Prompt]) -> bool {
+        let _publication = self
+            .provider_publish_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.provider_revision.load(Ordering::Acquire) != provider_revision {
+            return false;
+        }
+        let snapshot = self.resolution_snapshot();
+        let mut interim_prompts = local_prompts.to_vec();
+        interim_prompts.extend(snapshot.prompts);
+        self.publish(interim_prompts);
         true
     }
 
@@ -1351,8 +1390,13 @@ impl PromptService {
         let Some(path) = self.config_path.as_deref() else {
             return (Vec::new(), true);
         };
-        if !path.exists() {
-            return (Vec::new(), true);
+        match path.try_exists() {
+            Ok(false) => return (Vec::new(), true),
+            Ok(true) => {}
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "could not inspect prompt config");
+                return (Vec::new(), false);
+            }
         }
         match switchboard_core::read_yaml::<McpSection>(path) {
             Ok(section) => section.into_inventory(),
@@ -1832,8 +1876,65 @@ mod tests {
         let observed = service.sync_generation();
         service.sync().await;
 
-        assert!(!service.sync_if_generation(observed).await);
+        assert_eq!(
+            service.sync_if_generation(observed).await,
+            SyncOutcome::Superseded
+        );
         assert_eq!(service.sync_generation(), observed + 1);
+    }
+
+    #[test]
+    fn invalidated_attempt_cannot_republish_its_interim_mcp_projection() {
+        let (_dir, service) = service_with_prompts_dir();
+        let prompt = Prompt {
+            provider: "team".to_owned(),
+            name: "review".to_owned(),
+            title: None,
+            description: None,
+            arguments: Vec::new(),
+            tags: Vec::new(),
+        };
+        service.publish(vec![prompt.clone()]);
+        *service
+            .resolution_snapshot
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = PromptResolutionSnapshot {
+            generation: 1,
+            prompts: vec![prompt],
+            provider_status: HashMap::from([(
+                "team".to_owned(),
+                ProviderStatus::Ok { prompt_count: 1 },
+            )]),
+            configured_providers: HashSet::from(["team".to_owned()]),
+            configuration_complete: true,
+            removed_providers: HashSet::new(),
+        };
+        let stale_revision = service.provider_revision.load(Ordering::Acquire);
+
+        service.invalidate_provider_resolution("team", false, None);
+
+        assert!(!service.publish_interim_if_current(stale_revision, &[]));
+        assert!(service.get("team", "review").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_metadata_error_keeps_provider_inventory_uncertain() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join("config.yaml");
+        symlink("config.yaml", &config_path).unwrap();
+        let service = PromptService::new(
+            config_path,
+            dir.path().join("prompts"),
+            None,
+            Arc::new(InMemorySecretStore::new()),
+        );
+
+        let (providers, complete) = service.mcp_provider_inventory();
+        assert!(providers.is_empty());
+        assert!(!complete);
     }
 
     #[tokio::test]

@@ -717,6 +717,14 @@ export async function resolveSavedPrompt(
   return await invoke<SavedPromptResolution>("resolve_saved_prompt", { provider, name });
 }
 
+/// Explicitly retry a saved MCP prompt with one bounded, coalesced refresh.
+export async function resolveSavedPromptFresh(
+  provider: string,
+  name: string,
+): Promise<SavedPromptResolution> {
+  return await invoke<SavedPromptResolution>("resolve_saved_prompt_fresh", { provider, name });
+}
+
 /// Render `name` from `provider` with `args`, resolving to a typed outcome:
 /// the finished text, or a needs-sign-in determination the composer acts on by
 /// launching the provider's browser sign-in. Serves both the composer's

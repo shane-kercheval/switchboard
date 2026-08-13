@@ -24,6 +24,7 @@ use rmcp::transport::streamable_http_server::session::local::LocalSessionManager
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use switchboard_prompts::{
     InMemorySecretStore, PromptError, PromptService, ProviderStatus, SecretStore, SecretStoreError,
+    SyncOutcome,
 };
 use tempfile::TempDir;
 
@@ -402,7 +403,7 @@ async fn concurrent_first_use_constructs_one_client() {
         harness.service.sync(),
         harness.service.render("tiddly", "greet", &no_args),
     );
-    assert!(published);
+    assert!(matches!(published, SyncOutcome::Published { .. }));
     rendered.unwrap();
     assert_eq!(state.prm_fetches.load(Ordering::SeqCst), 1);
     assert_eq!(state.as_fetches.load(Ordering::SeqCst), 1);
@@ -429,7 +430,7 @@ async fn near_expiry_token_refreshes_exactly_once_under_concurrency() {
         harness.service.sync(),
         harness.service.render("tiddly", "greet", &no_args),
     );
-    assert!(published);
+    assert!(matches!(published, SyncOutcome::Published { .. }));
     rendered.unwrap();
     assert_eq!(
         state.token_hits.load(Ordering::SeqCst),

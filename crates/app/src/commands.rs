@@ -1218,6 +1218,28 @@ pub fn resolve_saved_prompt_impl(
     }
 }
 
+/// Perform at most one conditional MCP refresh, then classify the saved prompt
+/// against the newest coherent snapshot. Explicit user recovery uses this path;
+/// automatic event handling remains cache-only.
+pub async fn resolve_saved_prompt_fresh_impl(
+    state: &AppState,
+    provider: &str,
+    name: &str,
+) -> SavedPromptResolution {
+    if provider != switchboard_prompts::LOCAL_PROVIDER
+        && provider != switchboard_prompts::BUILTIN_PROVIDER
+    {
+        let observed_generation = state.prompts.sync_generation();
+        sync_prompts_if_generation_and_notify(
+            state.prompts.clone(),
+            Arc::clone(&state.emitter),
+            observed_generation,
+        )
+        .await;
+    }
+    resolve_saved_prompt_impl(state, provider, name)
+}
+
 /// Copy a built-in prompt into the user's prompts directory as `<name>.md`, so
 /// they can customize it as an owned file. Refuses to overwrite an existing file
 /// (the app never clobbers a user's prompt). After this, the copy is an ordinary
@@ -1429,13 +1451,18 @@ pub fn spawn_prompt_resolution_change_notifications(
 /// Rebuild the prompt cache, then emit [`PROMPTS_SYNCED_EVENT`] after the latest
 /// provider revision publishes. Work invalidated by a concurrent provider
 /// mutation retries inside [`PromptService::sync`].
-pub async fn sync_prompts_and_notify(prompts: PromptService, emitter: Arc<dyn EventEmitter>) {
-    if prompts.sync().await {
+pub async fn sync_prompts_and_notify(
+    prompts: PromptService,
+    emitter: Arc<dyn EventEmitter>,
+) -> switchboard_prompts::SyncOutcome {
+    let outcome = prompts.sync().await;
+    if let switchboard_prompts::SyncOutcome::Published { generation } = outcome {
         emitter.emit(
             PROMPTS_SYNCED_EVENT,
-            serde_json::json!({ "generation": prompts.sync_generation() }),
+            serde_json::json!({ "generation": generation }),
         );
     }
+    outcome
 }
 
 /// Conditionally rebuild the prompt cache, emitting only when this caller owned
@@ -1445,15 +1472,15 @@ pub async fn sync_prompts_if_generation_and_notify(
     prompts: PromptService,
     emitter: Arc<dyn EventEmitter>,
     observed_generation: u64,
-) -> bool {
-    let rebuilt = prompts.sync_if_generation(observed_generation).await;
-    if rebuilt {
+) -> switchboard_prompts::SyncOutcome {
+    let outcome = prompts.sync_if_generation(observed_generation).await;
+    if let switchboard_prompts::SyncOutcome::Published { generation } = outcome {
         emitter.emit(
             PROMPTS_SYNCED_EVENT,
-            serde_json::json!({ "generation": prompts.sync_generation() }),
+            serde_json::json!({ "generation": generation }),
         );
     }
-    rebuilt
+    outcome
 }
 
 /// Conditionally rebuild the prompt cache off the command thread. Capturing the
@@ -20067,12 +20094,13 @@ mod tests {
         )
         .await;
 
-        let names: Vec<String> = emitter
-            .snapshot()
-            .into_iter()
-            .map(|(name, _)| name)
-            .collect();
-        assert_eq!(names, vec![PROMPTS_SYNCED_EVENT.to_owned()]);
+        assert_eq!(
+            emitter.snapshot(),
+            vec![(
+                PROMPTS_SYNCED_EVENT.to_owned(),
+                serde_json::json!({ "generation": 1 })
+            )]
+        );
     }
 
     #[tokio::test]
@@ -20374,6 +20402,46 @@ mod tests {
         assert_eq!(
             resolve_saved_prompt_impl(&state, "tiddly", "review"),
             SavedPromptResolution::NotConfigured { generation: 2 }
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_saved_prompt_retry_performs_one_bounded_refresh() {
+        let server = spawn_workflow_mcp_server(false).await;
+        let (tmp, state, emitter) = fresh_state_with_mock();
+        let state = state_with_mcp_server(
+            &tmp,
+            state,
+            "http://127.0.0.1:1/mcp",
+            Arc::new(switchboard_prompts::InMemorySecretStore::new()),
+        );
+        state.prompts.sync().await;
+        assert_eq!(
+            resolve_saved_prompt_impl(&state, "tiddly", "review"),
+            SavedPromptResolution::TemporarilyUnavailable { generation: 1 }
+        );
+        std::fs::write(
+            tmp.path().join("config.yaml"),
+            format!(
+                "mcp_providers:\n  - name: tiddly\n    transport:\n      type: http\n      url: {}\n",
+                server.url
+            ),
+        )
+        .unwrap();
+
+        let resolution = resolve_saved_prompt_fresh_impl(&state, "tiddly", "review").await;
+
+        assert!(matches!(
+            resolution,
+            SavedPromptResolution::Available { generation: 2, .. }
+        ));
+        assert_eq!(server.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            emitter.snapshot(),
+            vec![(
+                PROMPTS_SYNCED_EVENT.to_owned(),
+                serde_json::json!({ "generation": 2 })
+            )]
         );
     }
 
@@ -21159,7 +21227,10 @@ mod tests {
         }
         server.release.as_ref().unwrap().add_permits(1);
         let (published, form) = tokio::join!(&mut startup, &mut describe);
-        assert!(published);
+        assert!(matches!(
+            published,
+            switchboard_prompts::SyncOutcome::Published { .. }
+        ));
         let form = form.unwrap();
 
         assert_eq!(form.compatibility, FormCompatibility::Ok);
@@ -21171,6 +21242,49 @@ mod tests {
                 .iter()
                 .all(|(name, _)| name != PROMPTS_SYNCED_EVENT),
             "the conditional caller must not duplicate the sync owner's notification"
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_owned_sync_settles_after_one_invalidated_attempt() {
+        let server = spawn_workflow_mcp_server(true).await;
+        let (tmp, state, _) = fresh_state_with_mock();
+        let state = state_with_mcp_server(
+            &tmp,
+            state,
+            &server.url,
+            Arc::new(switchboard_prompts::InMemorySecretStore::new()),
+        )
+        .with_workflows_dir(tmp.path().join("workflows"));
+        seed_workflow(
+            &state,
+            "mcp-review",
+            "name: mcp-review\ndescription: d\ninputs:\n  a: agent\nsteps:\n  - label: s\n    send:\n      to: \"{{ a }}\"\n      prompt: \"tiddly:review\"\n",
+        );
+        let mut describe = Box::pin(describe_workflow_form_fresh_impl(
+            &state,
+            "mcp-review",
+            false,
+        ));
+        tokio::select! {
+            permit = server.entered.acquire() => permit.unwrap().forget(),
+            result = &mut describe => panic!("gated workflow sync completed early: {result:?}"),
+        }
+
+        state.prompts.remove_mcp_provider("tiddly").unwrap();
+        server.release.as_ref().unwrap().add_permits(1);
+        let form = describe.await.unwrap();
+
+        assert!(matches!(
+            form.compatibility,
+            FormCompatibility::Unavailable { ref issues }
+                if issues.iter().any(|issue| issue.kind == AvailabilityIssueKind::NotConfigured)
+        ));
+        assert_eq!(server.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            state.prompts.sync_generation(),
+            1,
+            "the conditional request must not retry and publish after invalidation"
         );
     }
 
@@ -21329,7 +21443,7 @@ mod tests {
         for _ in 0..2 {
             tokio::select! {
                 permit = server.entered.acquire() => permit.unwrap().forget(),
-                () = &mut stale_sync => panic!("gated sync completed before provider removal"),
+                _ = &mut stale_sync => panic!("gated sync completed before provider removal"),
             }
         }
 
@@ -21360,7 +21474,7 @@ mod tests {
         server.release.as_ref().unwrap().add_permits(2);
         tokio::select! {
             permit = server.entered.acquire() => permit.unwrap().forget(),
-            () = &mut stale_sync => panic!("replacement sync completed before release"),
+            _ = &mut stale_sync => panic!("replacement sync completed before release"),
         }
         server.release.as_ref().unwrap().add_permits(1);
         stale_sync.await;

@@ -2079,7 +2079,7 @@ function mockPromptBackend(
   invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
     if (cmd === "search_project_files") return [];
     if (cmd === "list_prompts") return opts.prompts ?? [];
-    if (cmd === "resolve_saved_prompt") {
+    if (cmd === "resolve_saved_prompt" || cmd === "resolve_saved_prompt_fresh") {
       if (opts.resolve) return await opts.resolve();
       const prompt = (opts.prompts ?? [])[0];
       return prompt
@@ -2232,7 +2232,7 @@ describe("prompt-mode fork", () => {
           return { path: `/proj/.switchboard/attachments/uuid__${name}`, original_name: name };
         }
         if (cmd === "list_prompts") return [SUMMARY, REVIEW];
-        if (cmd === "resolve_saved_prompt") {
+        if (cmd === "resolve_saved_prompt" || cmd === "resolve_saved_prompt_fresh") {
           return {
             state: "available",
             prompt: args?.name === REVIEW.name ? REVIEW : SUMMARY,
@@ -3892,7 +3892,7 @@ describe("ComposeBar prompt mode", () => {
     expect((screen.getByTestId("prompt-appended") as HTMLTextAreaElement).value).toBe("tail");
   });
 
-  it("downgrades a saved prompt draft to plain (carrying appended text) once a sync proves it gone", async () => {
+  it("preserves a confirmed-missing prompt draft until the user starts over", async () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);
     const store = await loadComposeStore();
@@ -3922,7 +3922,18 @@ describe("ComposeBar prompt mode", () => {
     resolution = { state: "confirmed_missing", generation: 2 };
     listeners.get("prompts:synced")?.({ payload: { generation: 2 } });
 
-    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
+    await waitFor(() =>
+      expect(
+        screen.getByText("This prompt is no longer available from its provider."),
+      ).toBeInTheDocument(),
+    );
+    expect(store.getCompose(PROJECT_ID).content).toMatchObject({
+      kind: "prompt",
+      name: "ghost",
+      args: { focus: "x" },
+    });
+    await fireEvent.click(screen.getByTestId("prompt-restore-discard"));
+    expect(screen.getByTestId("compose-textarea")).toBeInTheDocument();
     expect((screen.getByTestId("compose-textarea") as HTMLTextAreaElement).value).toBe(
       "leftover text",
     );
@@ -3960,6 +3971,10 @@ describe("ComposeBar prompt mode", () => {
     };
     await fireEvent.click(screen.getByTestId("prompt-restore-retry"));
     await waitFor(() => screen.getByTestId("prompt-composer"));
+    expect(invokeMock).toHaveBeenCalledWith("resolve_saved_prompt_fresh", {
+      provider: "tiddly",
+      name: "summary",
+    });
     expect(screen.getByTestId("prompt-arg-focus")).toHaveValue("keep this");
   });
 

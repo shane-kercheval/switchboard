@@ -213,6 +213,11 @@ struct WorkItem {
     /// the user's literal text.
     prompt: String,
     attachments: Vec<Attachment>,
+    /// Model/effort selected when the user submitted this send. Unlike the
+    /// locator and other agent state, these values are intent attached to the
+    /// queued work and must not change if the agent switches profiles before
+    /// the backlog reaches it.
+    selection: Option<SelectionSnapshot>,
     /// Set only for sends made via [`Dispatcher::send_message_awaiting_completion`].
     /// The actor fires it once when this send's turn reaches a terminal state.
     /// `None` for the compose-bar path — that path allocates no completion channel
@@ -231,6 +236,15 @@ struct WorkItem {
     /// user turn optimistically. Emitting at the journal boundary keeps the live
     /// user message identical to the reloaded journal view by construction.
     emit_user_message: bool,
+}
+
+/// The profile-dependent part of an agent record captured for one send.
+/// Ephemeral by design: it rides only in the in-memory queue; durable history
+/// records the harness-reported model/effort on the resulting turn.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SelectionSnapshot {
+    pub model: Option<String>,
+    pub effort: Option<String>,
 }
 
 /// Delivered once, when an awaited send's turn reaches a terminal state, over
@@ -413,6 +427,10 @@ enum Command {
     /// it never holds the reply — used by completed-only forwarding to reject a
     /// still-streaming source without waiting on it.
     PeekCurrentTurn { reply: oneshot::Sender<bool> },
+    /// Reply `true` while this actor owns running or queued work. External
+    /// session handoff uses this to avoid starting a second process against a
+    /// harness session Switchboard is still driving.
+    PeekWorkPending { reply: oneshot::Sender<bool> },
     /// Cancel the running turn (out-of-band; no-op if none is live).
     Cancel(CancelSource),
     /// Cancel a whole *send* on this agent: fire the running turn's cancel
@@ -791,6 +809,13 @@ pub struct DispatchContext {
 pub trait DispatchContextFactory: Send + Sync {
     fn build(&self, send_id: SendId) -> DispatchContext;
 
+    /// Model/effort intent captured when a send is submitted. This is called
+    /// before the work item enters the actor queue, including when the actor
+    /// already exists and ignores the newly supplied factory for context
+    /// construction. Factories with no profile semantics return `None`
+    /// explicitly so adding a factory requires acknowledging this contract.
+    fn selection_snapshot(&self) -> Option<SelectionSnapshot>;
+
     /// Policy check run at the moment this turn actually **starts**, before the
     /// send is journaled or any subprocess spawns. `Err(reason)` refuses just
     /// this turn; the backlog advances and later items are checked on their own
@@ -860,11 +885,13 @@ impl Dispatcher {
         factory: Arc<dyn DispatchContextFactory>,
         on_busy: OnBusy,
     ) -> SendOutcome {
+        let selection = factory.selection_snapshot();
         let item = WorkItem {
             message_id: Uuid::now_v7(),
             send_id,
             prompt: prompt.to_owned(),
             attachments,
+            selection,
             completion: None,
             // Compose-bar sends render their user turn optimistically on the
             // frontend; no backend-emitted user message.
@@ -934,11 +961,13 @@ impl Dispatcher {
         emit_user_message: bool,
     ) -> AwaitableSendOutcome {
         let (completion_tx, completion_rx) = oneshot::channel();
+        let selection = factory.selection_snapshot();
         let item = WorkItem {
             message_id: Uuid::now_v7(),
             send_id,
             prompt: prompt.to_owned(),
             attachments,
+            selection,
             completion: Some(completion_tx),
             emit_user_message,
         };
@@ -1194,6 +1223,31 @@ impl Dispatcher {
         rx.await.unwrap_or(false)
     }
 
+    /// Whether Switchboard still owns any running or queued work for this
+    /// agent. Unlike [`Self::is_turn_running`], this stays true through
+    /// post-terminal enrichment and a queued backlog, which are both unsafe
+    /// moments to hand the same harness session to an external terminal.
+    pub async fn has_pending_work(&self, agent_id: AgentId) -> bool {
+        let commands = {
+            let agents = lock(&self.agents);
+            match agents.get(&agent_id) {
+                Some(AgentSlot::Active(tx)) => tx.clone(),
+                Some(AgentSlot::Closing) => return true,
+                None => return false,
+            }
+        };
+        let (tx, rx) = oneshot::channel();
+        if commands
+            .send(Command::PeekWorkPending { reply: tx })
+            .is_err()
+        {
+            // The actor is disappearing between the lock and send. Treat this
+            // as busy: teardown can still be draining the harness process.
+            return true;
+        }
+        rx.await.unwrap_or(true)
+    }
+
     /// Close `agent_id`'s actor atomically: mark the slot `Closing` (so a racing
     /// send is rejected, not resurrected with a fresh actor), tell the actor to
     /// abandon its backlog + cancel any running turn + drain, await its reply,
@@ -1417,6 +1471,10 @@ fn apply_idle_command(
             let _ = reply.send(false);
             IdleAfter::Continue
         }
+        Command::PeekWorkPending { reply } => {
+            let _ = reply.send(!backlog.is_empty());
+            IdleAfter::Continue
+        }
         // No turn live ⇒ cancel is a no-op.
         Command::Cancel(_) => IdleAfter::Continue,
         // No turn live ⇒ only this send's *queued* items can exist; drop them
@@ -1466,6 +1524,11 @@ async fn run_turn(
     commands: &mut mpsc::UnboundedReceiver<Command>,
     backlog: &mut VecDeque<WorkItem>,
 ) -> TurnAfter {
+    let mut context = factory.build(item.send_id);
+    if let Some(selection) = &item.selection {
+        context.agent.model.clone_from(&selection.model);
+        context.agent.effort.clone_from(&selection.effort);
+    }
     let DispatchContext {
         adapter,
         cwd,
@@ -1475,7 +1538,7 @@ async fn run_turn(
         journal,
         metadata,
         locator_sink,
-    } = factory.build(item.send_id);
+    } = context;
     // Take the completion sender out of the item so the failure paths below can
     // fire it on early return; on success it is handed to `drain_turn`, which
     // fires it at the turn's terminal. Partial move — the remaining `item`
@@ -2011,6 +2074,11 @@ async fn drain_turn(
                     // Mid-turn peek: running iff the terminal hasn't passed yet.
                     Some(Command::PeekCurrentTurn { reply }) => {
                         let _ = reply.send(terminal.is_none());
+                    }
+                    // The actor still owns this turn while it drains
+                    // post-terminal enrichment, and may also hold a backlog.
+                    Some(Command::PeekWorkPending { reply }) => {
+                        let _ = reply.send(true);
                     }
                     Some(Command::CancelSend { send_id, source }) => {
                         // Fire the running turn's cancel token only if this turn

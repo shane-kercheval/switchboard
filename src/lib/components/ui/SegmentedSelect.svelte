@@ -5,7 +5,6 @@
     SEGMENTED_CONTAINER_CLASS,
     SEGMENTED_ITEM_ACTIVE_CLASS,
     SEGMENTED_ITEM_CLASS,
-    SEGMENTED_ITEM_INACTIVE_CLASS,
   } from "$lib/components/ui/segmentedControl";
 
   type Option = { label: string; value: string };
@@ -28,6 +27,8 @@
     ariaLabel,
     ...rest
   }: Props = $props();
+
+  let hoveredValue = $state<string | null>(null);
 
   function choose(next: string): void {
     if (disabled) return;
@@ -61,6 +62,8 @@
     disabled && "opacity-60",
     className,
   )}
+  onpointerleave={() => (hoveredValue = null)}
+  onpointercancel={() => (hoveredValue = null)}
   {...rest}
 >
   {#each options as option (option.value)}
@@ -70,15 +73,16 @@
       role="radio"
       aria-checked={selected}
       {disabled}
-      title={option.label}
       data-testid={testid ? `${testid}-option-${optionTestId(option.value)}` : undefined}
       class={cn(
         SEGMENTED_ITEM_CLASS,
         "flex min-w-0 items-center justify-center truncate text-center",
         compact && "px-1 text-[11px]",
-        selected ? SEGMENTED_ITEM_ACTIVE_CLASS : SEGMENTED_ITEM_INACTIVE_CLASS,
+        selected ? SEGMENTED_ITEM_ACTIVE_CLASS : "text-muted",
+        !selected && !disabled && hoveredValue === option.value && "bg-control-hover text-fg",
         disabled && "cursor-not-allowed",
       )}
+      onpointerenter={() => (hoveredValue = option.value)}
       onclick={() => choose(option.value)}
     >
       {option.label}

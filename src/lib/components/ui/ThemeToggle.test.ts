@@ -16,18 +16,19 @@ describe("ThemeToggle", () => {
   it("cycles system → light → dark → system on click", async () => {
     render(ThemeToggle);
     const button = screen.getByTestId("theme-toggle");
-    expect(button).toHaveAttribute("title", "Theme: system");
+    expect(button).toHaveAccessibleName("Theme: system. Click to change.");
+    expect(button).not.toHaveAttribute("title");
 
     await fireEvent.click(button);
     await tick();
-    expect(button).toHaveAttribute("title", "Theme: light");
+    expect(button).toHaveAccessibleName("Theme: light. Click to change.");
 
     await fireEvent.click(button);
     await tick();
-    expect(button).toHaveAttribute("title", "Theme: dark");
+    expect(button).toHaveAccessibleName("Theme: dark. Click to change.");
 
     await fireEvent.click(button);
     await tick();
-    expect(button).toHaveAttribute("title", "Theme: system");
+    expect(button).toHaveAccessibleName("Theme: system. Click to change.");
   });
 });

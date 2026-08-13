@@ -352,26 +352,31 @@
      rows. The box the card border drew is now drawn by hierarchy alone. -->
 <div class="min-h-0 shrink-0" data-testid="git-repo" data-repo-root={repo.root}>
   <div class="group flex min-h-10 items-center gap-2 px-1 py-1">
-    <button
-      type="button"
-      class="text-muted hover:bg-control-hover hover:text-fg flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-full transition-colors"
-      aria-label={expanded ? "Collapse repo" : "Expand repo"}
-      aria-expanded={expanded}
-      onclick={() => (expanded = !expanded)}
-    >
-      <svg
-        viewBox="0 0 24 24"
-        class={cn("h-3.5 w-3.5 transition-transform", expanded && "rotate-90")}
-        fill="none"
-        stroke="currentColor"
-        stroke-width="2"
-        stroke-linecap="round"
-        stroke-linejoin="round"
-        aria-hidden="true"
-      >
-        <path d="m9 6 6 6-6 6" />
-      </svg>
-    </button>
+    <Tooltip label={expanded ? "Collapse repository" : "Expand repository"} side="top">
+      {#snippet trigger(props)}
+        <button
+          {...props}
+          type="button"
+          class="text-muted hover:bg-control-hover hover:text-fg flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-full transition-colors"
+          aria-label={expanded ? "Collapse repo" : "Expand repo"}
+          aria-expanded={expanded}
+          onclick={() => (expanded = !expanded)}
+        >
+          <svg
+            viewBox="0 0 24 24"
+            class={cn("h-3.5 w-3.5 transition-transform", expanded && "rotate-90")}
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            aria-hidden="true"
+          >
+            <path d="m9 6 6 6-6 6" />
+          </svg>
+        </button>
+      {/snippet}
+    </Tooltip>
 
     <div class="flex min-w-0 flex-1 items-baseline gap-1.5">
       <span class="text-fg max-w-[65%] shrink-0 truncate text-sm font-semibold" title={repo.root}
@@ -423,31 +428,36 @@
             : "pointer-events-none max-w-0 opacity-0 group-focus-within:pointer-events-auto group-focus-within:max-w-[140px] group-focus-within:opacity-100 group-hover:pointer-events-auto group-hover:max-w-[140px] group-hover:opacity-100",
         )}
       >
-        <button
-          type="button"
-          class={cn(ICON_BUTTON_CLASS, "shrink-0 disabled:opacity-50")}
-          aria-label="Refresh repo"
-          data-testid="repo-refresh"
-          disabled={busy}
-          onclick={onRefresh}
-        >
-          {#if busy}
-            <Spinner class="h-4 w-4" />
-          {:else}
-            <svg
-              viewBox="0 0 24 24"
-              class="h-4 w-4"
-              fill="none"
-              stroke="currentColor"
-              stroke-width="1.5"
-              stroke-linecap="round"
-              stroke-linejoin="round"
-              aria-hidden="true"
+        <Tooltip label="Refresh repository" side="top">
+          {#snippet trigger(props)}
+            <button
+              {...props}
+              type="button"
+              class={cn(ICON_BUTTON_CLASS, "shrink-0 disabled:opacity-50")}
+              aria-label="Refresh repo"
+              data-testid="repo-refresh"
+              disabled={busy}
+              onclick={onRefresh}
             >
-              <path d="M21 12a9 9 0 1 1-2.64-6.36M21 3v6h-6" />
-            </svg>
-          {/if}
-        </button>
+              {#if busy}
+                <Spinner class="h-4 w-4" />
+              {:else}
+                <svg
+                  viewBox="0 0 24 24"
+                  class="h-4 w-4"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="1.5"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  aria-hidden="true"
+                >
+                  <path d="M21 12a9 9 0 1 1-2.64-6.36M21 3v6h-6" />
+                </svg>
+              {/if}
+            </button>
+          {/snippet}
+        </Tooltip>
 
         <Tooltip label="Reveal in Finder" side="top">
           {#snippet trigger(props)}
@@ -673,7 +683,7 @@
                     onSelect={() => runAction(openLinkedProject(project))}
                     class="gap-2"
                     data-testid="worktree-action-open-project"
-                    title={project.name}
+                    tooltip={project.name}
                   >
                     <FolderOpen
                       size={14}

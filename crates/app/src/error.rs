@@ -96,6 +96,21 @@ pub enum AppError {
     #[error("unsupported harness kind: app has no adapter wired for this variant")]
     UnsupportedHarness,
 
+    /// Interactive resume cannot start while Switchboard still owns work for
+    /// the same harness session; two writers can corrupt its transcript.
+    #[error(
+        "{name} is still active in Switchboard — wait for it to finish or stop it before resuming in a terminal"
+    )]
+    ResumeAgentBusy { name: String },
+
+    #[error("this agent has no resumable session yet")]
+    ResumeUnavailable,
+
+    #[error(
+        "unsupported terminal app {terminal_app:?} — choose Terminal or iTerm in Settings → External apps"
+    )]
+    UnsupportedTerminalApp { terminal_app: String },
+
     /// Fork: the source agent has no session file to branch from yet — it has
     /// never completed (or even started) a turn, so `--resume` would target a
     /// session that doesn't exist. Distinct from the *capability* rejection in

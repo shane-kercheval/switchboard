@@ -98,6 +98,8 @@
   import ForwardSourcePicker from "$lib/components/ui/ForwardSourcePicker.svelte";
   import Spinner from "$lib/components/ui/Spinner.svelte";
   import { basename, cn, currentIsoTimestamp } from "$lib/utils";
+  import { copyText } from "$lib/native";
+  import { workflowAuthoringPrompt } from "$lib/workflowAuthoring";
   import { shortcut } from "$lib/platform";
   import { isEditableShortcutTarget } from "$lib/keyboard";
   import { onDestroy, onMount, tick, untrack } from "svelte";
@@ -108,6 +110,7 @@
     agents,
     focusOnMount = false,
     focusRequest = 0,
+    onConfigurePrompts,
   }: {
     projectId: ProjectId;
     agents: AgentRecord[];
@@ -116,6 +119,8 @@
     /// (a pane Cmd+click). Not project state — a transient one-shot signal
     /// owned by `App` and delivered as a prop; see the watching effect.
     focusRequest?: number;
+    /// Open Settings at the prompt-source section.
+    onConfigurePrompts?: () => void;
   } = $props();
 
   // The compose bar is remounted per project (App.svelte's `{#key}`), and the
@@ -1744,6 +1749,30 @@
     });
   }
 
+  async function copyWorkflowAuthoringPrompt(): Promise<boolean> {
+    let workflowsDir: string | null = null;
+    try {
+      workflowsDir = await api.workflowsDir();
+    } catch (err) {
+      console.error("[switchboard] resolve workflows folder failed", err);
+    }
+
+    try {
+      await copyText(workflowAuthoringPrompt(workflowsDir));
+      clearStatus();
+      return true;
+    } catch (err) {
+      const message = `Couldn't copy workflow prompt: ${err instanceof Error ? err.message : String(err)}`;
+      showError(message);
+      return false;
+    }
+  }
+
+  function configurePrompts(): void {
+    promptMenuOpen = false;
+    onConfigurePrompts?.();
+  }
+
   /// Whether the picked workflow is runnable: the form is resolved, invocable,
   /// compatible (prompts resolved, no drift), and every required field (declared
   /// input or derived prompt arg) is filled. Drives the invoke button's disabled
@@ -2917,6 +2946,7 @@
           onpick={pickPrompt}
           oninsert={promptMenuAllowsLiteralInsert ? setEmptyDraftFromPromptSearch : undefined}
           oncopy={copyPrompt}
+          onconfigure={onConfigurePrompts ? configurePrompts : undefined}
           onopenfolder={openPromptsFolder}
           onclose={() => (promptMenuOpen = false)}
         />
@@ -2927,6 +2957,7 @@
           loading={!workflowsLoaded}
           onpick={pickWorkflow}
           oncopy={copyWorkflow}
+          oncopyauthoringprompt={copyWorkflowAuthoringPrompt}
           onopenfolder={openWorkflowsFolder}
           onclose={() => (workflowMenuOpen = false)}
         />
@@ -3200,19 +3231,23 @@
               <!-- Each chip carries its own ✕; the bulk clear (same ⊘ glyph as
                    "Clear recipients") only earns its place once there are several to
                    drop at once. -->
-              <button
-                type="button"
-                class={cn(ICON_BUTTON_CLASS, "ml-0.5 shrink-0 disabled:opacity-50")}
-                data-testid="forward-sources-clear"
-                aria-label="Clear forward sources"
-                title="Clear forward sources"
-                disabled={composerBusy}
-                onclick={() => {
-                  if (!composerBusy) forwardSources = [];
-                }}
-              >
-                <ClearIcon />
-              </button>
+              <Tooltip label="Clear forward sources">
+                {#snippet trigger(props)}
+                  <button
+                    {...props}
+                    type="button"
+                    class={cn(ICON_BUTTON_CLASS, "ml-0.5 shrink-0 disabled:opacity-50")}
+                    data-testid="forward-sources-clear"
+                    aria-label="Clear forward sources"
+                    disabled={composerBusy}
+                    onclick={() => {
+                      if (!composerBusy) forwardSources = [];
+                    }}
+                  >
+                    <ClearIcon />
+                  </button>
+                {/snippet}
+              </Tooltip>
             {/if}
           </div>
         {/if}

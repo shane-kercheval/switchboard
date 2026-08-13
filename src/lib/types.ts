@@ -499,6 +499,18 @@ export type SessionLocator =
   | { uuid: string }
   | { codex: { thread_id: string; partition_date: string } };
 
+export type AgentProfile = {
+  model: string | null;
+  effort: string | null;
+};
+
+export type AgentProfileSlot = "primary" | "secondary";
+
+export type AgentProfiles = {
+  secondary: AgentProfile | null;
+  active: AgentProfileSlot;
+};
+
 // Mirror of `crates/core::AgentRecord`. `session_locator` is `null` for
 // harnesses that assign their own session id at runtime (Codex and Antigravity)
 // until the first dispatch captures it; for Claude Code and Gemini it's
@@ -515,6 +527,7 @@ export type AgentRecord = {
   // neither; Gemini carries no effort) or a pre-feature agent.
   model?: string | null;
   effort?: string | null;
+  profiles?: AgentProfiles;
   // Set on an agent created by forking: the parent session this branch resumes
   // from until it has a session of its own. Stays set after the fork
   // materializes (it doubles as durable lineage), so it is NOT a reliable
@@ -738,6 +751,7 @@ export type Preferences = {
   show_builtins: boolean;
   notify_on_completion: boolean;
   notify_while_focused: boolean;
+  agent_defaults: Record<HarnessKind, { primary: AgentProfile; secondary: AgentProfile | null }>;
 };
 
 // Mirror of Rust `NotificationAvailability` (`crates/app/src/notification.rs`).

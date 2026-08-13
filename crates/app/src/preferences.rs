@@ -16,15 +16,103 @@
 //! with that key defaulted, and an unknown future key is ignored. Later
 //! milestones add keys here (worktree base path, diff style) the same way.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 
 use crate::error::AppError;
+use switchboard_core::{AgentProfile, HarnessKind};
 
-/// The default terminal application opened by the Git view's "open in terminal"
-/// action when no override is set. macOS ships Terminal.app; power users can name
-/// another (`iTerm`, `Ghostty`, …).
+/// Primary and optional secondary configuration used when creating an agent of
+/// one harness. New agents always start on Primary.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct AgentDefaults {
+    pub primary: AgentProfile,
+    pub secondary: Option<AgentProfile>,
+}
+
+fn default_agent_defaults() -> BTreeMap<HarnessKind, AgentDefaults> {
+    BTreeMap::from([
+        (
+            HarnessKind::ClaudeCode,
+            AgentDefaults {
+                primary: AgentProfile {
+                    model: Some("opus".to_owned()),
+                    effort: Some("high".to_owned()),
+                },
+                secondary: None,
+            },
+        ),
+        (
+            HarnessKind::Codex,
+            AgentDefaults {
+                primary: AgentProfile {
+                    model: Some("gpt-5.6-sol".to_owned()),
+                    effort: Some("high".to_owned()),
+                },
+                secondary: None,
+            },
+        ),
+        (
+            HarnessKind::Gemini,
+            AgentDefaults {
+                primary: AgentProfile {
+                    model: Some("auto".to_owned()),
+                    effort: None,
+                },
+                secondary: None,
+            },
+        ),
+        (HarnessKind::Antigravity, AgentDefaults::default()),
+    ])
+}
+
+fn deserialize_agent_defaults<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<HarnessKind, AgentDefaults>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw = BTreeMap::<String, serde_norway::Value>::deserialize(deserializer)?;
+    let mut known = BTreeMap::new();
+    for (key, value) in raw {
+        let harness = match key.as_str() {
+            "claude_code" => HarnessKind::ClaudeCode,
+            "codex" => HarnessKind::Codex,
+            "gemini" => HarnessKind::Gemini,
+            "antigravity" => HarnessKind::Antigravity,
+            _ => continue,
+        };
+        let defaults = serde_norway::from_value(value).map_err(D::Error::custom)?;
+        known.insert(harness, defaults);
+    }
+    Ok(known)
+}
+
+/// Merge a value owned by this version into an existing YAML value while
+/// preserving fields only a newer version understands. A scalar, sequence, or
+/// explicit `null` is authoritative and replaces the old value; recursion is
+/// only valid when both sides are mappings.
+fn merge_yaml_value(existing: &mut serde_norway::Value, new: serde_norway::Value) {
+    match (existing, new) {
+        (serde_norway::Value::Mapping(existing), serde_norway::Value::Mapping(new_fields)) => {
+            for (key, value) in new_fields {
+                match existing.get_mut(&key) {
+                    Some(old) => merge_yaml_value(old, value),
+                    None => {
+                        existing.insert(key, value);
+                    }
+                }
+            }
+        }
+        (existing, new) => *existing = new,
+    }
+}
+
+/// The default terminal application used by project/worktree open actions and
+/// interactive agent resume. macOS ships Terminal.app.
 fn default_terminal_app() -> String {
     "Terminal".to_owned()
 }
@@ -51,8 +139,8 @@ pub struct Preferences {
     /// macOS).
     pub editor_command: Option<String>,
 
-    /// Name of the terminal application the "open in terminal" action launches
-    /// (`open -a <name> <path>` on macOS). Defaults to `Terminal`.
+    /// Terminal application used by project/worktree open actions and agent
+    /// resume execution. Normalized to `Terminal` or `iTerm`.
     pub terminal_app: String,
 
     /// Diff panel layout. Defaults to unified.
@@ -85,6 +173,14 @@ pub struct Preferences {
     /// own content turns it off. Visibility only — a workflow wired to a built-in
     /// still resolves when this is off.
     pub show_builtins: bool,
+
+    /// Per-harness profiles preselected by Add Agent and used when a new
+    /// project auto-creates its roster.
+    #[serde(
+        default = "default_agent_defaults",
+        deserialize_with = "deserialize_agent_defaults"
+    )]
+    pub agent_defaults: BTreeMap<HarnessKind, AgentDefaults>,
 }
 
 impl Default for Preferences {
@@ -96,6 +192,7 @@ impl Default for Preferences {
             show_builtins: true,
             notify_on_completion: true,
             notify_while_focused: false,
+            agent_defaults: default_agent_defaults(),
         }
     }
 }
@@ -105,8 +202,8 @@ impl Preferences {
     /// arrived (deserialized from a hand-edited `config.yaml`, or sent by a
     /// client). Trims surrounding whitespace; a blank editor command becomes
     /// `None` (→ OS folder-open) and a blank terminal app becomes the default.
-    /// Applied at every boundary (`load` + `set`) so consumers — the Git-view
-    /// open-actions — never see an empty command to spawn.
+    /// Applied at every boundary (`load` + `set`) so external-app consumers
+    /// never see an empty command to spawn.
     #[must_use]
     pub fn normalized(self) -> Self {
         let editor_command = self
@@ -115,12 +212,44 @@ impl Preferences {
             .filter(|c| !c.is_empty());
         let terminal_app = {
             let trimmed = self.terminal_app.trim();
-            if trimmed.is_empty() {
-                default_terminal_app()
+            if trimmed.eq_ignore_ascii_case("iterm") || trimmed.eq_ignore_ascii_case("iterm2") {
+                "iTerm".to_owned()
             } else {
-                trimmed.to_owned()
+                default_terminal_app()
             }
         };
+        let mut agent_defaults = default_agent_defaults();
+        for (harness, mut defaults) in self.agent_defaults {
+            let normalize = |value: Option<String>| {
+                value.map(|v| v.trim().to_owned()).filter(|v| !v.is_empty())
+            };
+            defaults.primary.model = normalize(defaults.primary.model);
+            defaults.primary.effort = normalize(defaults.primary.effort);
+            if let Some(secondary) = &mut defaults.secondary {
+                secondary.model = normalize(secondary.model.take());
+                secondary.effort = normalize(secondary.effort.take());
+            }
+            if !harness.supports_model_selection() {
+                defaults.primary.model = None;
+                if let Some(secondary) = &mut defaults.secondary {
+                    secondary.model = None;
+                }
+            }
+            if !harness.supports_effort_selection() {
+                defaults.primary.effort = None;
+                if let Some(secondary) = &mut defaults.secondary {
+                    secondary.effort = None;
+                }
+            }
+            if defaults
+                .secondary
+                .as_ref()
+                .is_some_and(|p| p.model.is_none() && p.effort.is_none())
+            {
+                defaults.secondary = None;
+            }
+            agent_defaults.insert(harness, defaults);
+        }
         Self {
             editor_command,
             terminal_app,
@@ -128,6 +257,7 @@ impl Preferences {
             show_builtins: self.show_builtins,
             notify_on_completion: self.notify_on_completion,
             notify_while_focused: self.notify_while_focused,
+            agent_defaults,
         }
     }
 }
@@ -182,11 +312,20 @@ pub fn save(path: &Path, prefs: &Preferences) -> Result<(), AppError> {
         path: path.to_owned(),
         source: std::io::Error::other(e.to_string()),
     })?;
-    let fields = match serialized {
+    let mut fields = match serialized {
         serde_norway::Value::Mapping(fields) => fields,
         _ => serde_norway::Mapping::new(),
     };
     switchboard_core::edit_yaml_mapping(path, move |root| {
+        let defaults_key = serde_norway::Value::String("agent_defaults".to_owned());
+        if let Some(new_defaults) = fields.remove(&defaults_key) {
+            match root.get_mut(&defaults_key) {
+                Some(existing) => merge_yaml_value(existing, new_defaults),
+                None => {
+                    root.insert(defaults_key, new_defaults);
+                }
+            }
+        }
         for (key, value) in fields {
             root.insert(key, value);
         }
@@ -246,6 +385,117 @@ mod tests {
     }
 
     #[test]
+    fn missing_agent_defaults_gets_all_harness_defaults() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(&path, "terminal_app: iTerm\n").unwrap();
+
+        let loaded = load(&path);
+
+        assert_eq!(loaded.agent_defaults, default_agent_defaults());
+    }
+
+    #[test]
+    fn agent_defaults_normalize_profiles_and_fill_missing_harnesses() {
+        let prefs = Preferences {
+            agent_defaults: BTreeMap::from([(
+                HarnessKind::ClaudeCode,
+                AgentDefaults {
+                    primary: AgentProfile {
+                        model: Some("  sonnet  ".to_owned()),
+                        effort: Some(" medium ".to_owned()),
+                    },
+                    secondary: Some(AgentProfile {
+                        model: Some(" haiku ".to_owned()),
+                        effort: Some(" low ".to_owned()),
+                    }),
+                },
+            )]),
+            ..Preferences::default()
+        }
+        .normalized();
+
+        assert_eq!(
+            prefs.agent_defaults[&HarnessKind::ClaudeCode],
+            AgentDefaults {
+                primary: AgentProfile {
+                    model: Some("sonnet".to_owned()),
+                    effort: Some("medium".to_owned()),
+                },
+                secondary: Some(AgentProfile {
+                    model: Some("haiku".to_owned()),
+                    effort: Some("low".to_owned()),
+                }),
+            }
+        );
+        assert_eq!(
+            prefs.agent_defaults[&HarnessKind::Codex],
+            default_agent_defaults()[&HarnessKind::Codex]
+        );
+    }
+
+    #[test]
+    fn future_agent_defaults_are_opaque_on_load_and_preserved_recursively_on_save() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(
+            &path,
+            "terminal_app: iTerm\nagent_defaults:\n  claude_code:\n    future_mode: adaptive\n    primary:\n      model: sonnet\n      effort: medium\n      future_axis: preserved\n    secondary:\n      model: haiku\n      effort: low\n      future_axis: removed-with-secondary\n  future_harness:\n    - a-shape\n    - this-version-cannot-parse\n",
+        )
+        .unwrap();
+
+        let mut prefs = load(&path);
+        assert_eq!(prefs.terminal_app, "iTerm");
+        assert_eq!(
+            prefs.agent_defaults[&HarnessKind::ClaudeCode]
+                .primary
+                .model
+                .as_deref(),
+            Some("sonnet")
+        );
+        prefs
+            .agent_defaults
+            .get_mut(&HarnessKind::ClaudeCode)
+            .unwrap()
+            .secondary = None;
+        prefs.editor_command = Some("zed".to_owned());
+        save(&path, &prefs).unwrap();
+
+        let reread: serde_norway::Value = switchboard_core::read_yaml(&path).unwrap();
+        let defaults = reread
+            .get("agent_defaults")
+            .and_then(serde_norway::Value::as_mapping)
+            .unwrap();
+        let future = defaults
+            .get(serde_norway::Value::String("future_harness".to_owned()))
+            .and_then(serde_norway::Value::as_sequence)
+            .unwrap();
+        assert_eq!(future.len(), 2);
+
+        let claude = defaults
+            .get(serde_norway::Value::String("claude_code".to_owned()))
+            .and_then(serde_norway::Value::as_mapping)
+            .unwrap();
+        assert_eq!(
+            claude.get(serde_norway::Value::String("future_mode".to_owned())),
+            Some(&serde_norway::Value::String("adaptive".to_owned()))
+        );
+        let primary = claude
+            .get(serde_norway::Value::String("primary".to_owned()))
+            .and_then(serde_norway::Value::as_mapping)
+            .unwrap();
+        assert_eq!(
+            primary.get(serde_norway::Value::String("future_axis".to_owned())),
+            Some(&serde_norway::Value::String("preserved".to_owned()))
+        );
+        assert_eq!(
+            claude.get(serde_norway::Value::String("secondary".to_owned())),
+            Some(&serde_norway::Value::Null),
+            "an explicit current-version null must retain deletion semantics"
+        );
+    }
+
+    #[test]
     fn save_then_load_round_trips() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("nested").join("config.yaml");
@@ -258,6 +508,7 @@ mod tests {
             show_builtins: false,
             notify_on_completion: true,
             notify_while_focused: false,
+            agent_defaults: default_agent_defaults(),
         };
         save(&path, &prefs).unwrap();
         assert_eq!(load(&path), prefs);
@@ -284,6 +535,7 @@ mod tests {
                 show_builtins: true,
                 notify_on_completion: true,
                 notify_while_focused: false,
+                agent_defaults: default_agent_defaults(),
             },
         )
         .unwrap();
@@ -332,6 +584,7 @@ mod tests {
                     show_builtins: true,
                     notify_on_completion: true,
                     notify_while_focused: false,
+                    agent_defaults: default_agent_defaults(),
                 },
             )
             .unwrap();
@@ -404,6 +657,15 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_legacy_terminal_migrates_to_terminal_at_load() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(&path, "terminal_app: Ghostty\n").unwrap();
+
+        assert_eq!(load(&path).terminal_app, "Terminal");
+    }
+
+    #[test]
     fn normalized_trims_and_maps_blanks() {
         let p = Preferences {
             editor_command: Some("  cursor  ".to_owned()),
@@ -412,6 +674,7 @@ mod tests {
             show_builtins: true,
             notify_on_completion: true,
             notify_while_focused: false,
+            agent_defaults: default_agent_defaults(),
         }
         .normalized();
         assert_eq!(p.editor_command.as_deref(), Some("cursor"));
@@ -429,10 +692,18 @@ mod tests {
             show_builtins: true,
             notify_on_completion: true,
             notify_while_focused: false,
+            agent_defaults: default_agent_defaults(),
         }
         .normalized();
         assert_eq!(blank.editor_command, None);
         assert_eq!(blank.terminal_app, "Terminal");
+
+        let legacy = Preferences {
+            terminal_app: "Ghostty".to_owned(),
+            ..Preferences::default()
+        }
+        .normalized();
+        assert_eq!(legacy.terminal_app, "Terminal");
     }
 
     #[test]

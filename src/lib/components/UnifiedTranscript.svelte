@@ -941,14 +941,17 @@
   });
 
   /// Height changes with no data change — a message collapsing/expanding, a
-  /// fan-out toggling, the live cap dropping when a turn completes — re-anchor
-  /// too. WebKit (the Tauri webview) has no native CSS scroll-anchoring, so the
-  /// observer drives it for us.
+  /// fan-out toggling, the live cap dropping when a turn completes, or the
+  /// composer resizing the transcript viewport — re-anchor too. WebKit (the
+  /// Tauri webview) has no native CSS scroll-anchoring, so the observer drives
+  /// it for us.
   $effect(() => {
-    const el = content;
-    if (el === null) return;
+    const viewport = container;
+    const body = content;
+    if (viewport === null || body === null) return;
     const ro = new ResizeObserver(reanchor);
-    ro.observe(el);
+    ro.observe(body);
+    ro.observe(viewport);
     return () => ro.disconnect();
   });
 

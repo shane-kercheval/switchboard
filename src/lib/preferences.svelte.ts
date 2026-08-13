@@ -11,6 +11,7 @@
 
 import * as api from "$lib/api";
 import type { Preferences } from "$lib/types";
+import { DEFAULT_AGENT_PROFILES } from "$lib/agentSelection";
 
 const DEFAULTS: Preferences = {
   editor_command: "code",
@@ -19,6 +20,7 @@ const DEFAULTS: Preferences = {
   show_builtins: true,
   notify_on_completion: true,
   notify_while_focused: false,
+  agent_defaults: structuredClone(DEFAULT_AGENT_PROFILES),
 };
 
 export const preferences = $state<Preferences>({ ...DEFAULTS });
@@ -41,28 +43,30 @@ export const saveStatus = $state<{ error: string | null; keys: string[] }>({
   keys: [],
 });
 
-let loaded = false;
-/// Set once the user changes a preference this session. Guards against a slow
-/// startup `loadPreferences` resolving *after* an edit and clobbering it (the
-/// fetched value would otherwise snap the input back to the on-disk value).
-let dirtied = false;
-
-/// Fetch preferences from the backend once. Subsequent calls are no-ops. Safe to
-/// call from multiple mount points; the first wins and the rest see the result.
-export async function loadPreferences(): Promise<void> {
-  if (loaded) return;
-  loaded = true;
-  try {
-    const fetched = await api.getPreferences();
-    // If the user already edited a field while this was in flight, their intent
-    // wins — don't overwrite it with the just-loaded on-disk value.
-    if (dirtied) return;
-    Object.assign(preferences, fetched);
-  } catch (err) {
-    // Backend unreachable / no config location — keep defaults. Allow a retry.
-    loaded = false;
-    console.warn("[switchboard] loadPreferences failed", err);
-  }
+export const preferenceLoadState = $state<{ ready: boolean }>({ ready: false });
+let loadPromise: Promise<void> | null = null;
+/// Serialize whole-object writes so a slower earlier save cannot land after a
+/// newer one and restore stale defaults. This matters for profile editing,
+/// where model and effort changes can be made in quick succession.
+let saveTail: Promise<void> = Promise.resolve();
+/// Fetch preferences once and share the same readiness barrier with every
+/// caller. Failure settles to the built-in fallback rather than leaving
+/// creation paths blocked indefinitely.
+export function loadPreferences(): Promise<void> {
+  if (loadPromise !== null) return loadPromise;
+  loadPromise = (async () => {
+    try {
+      const fetched = await api.getPreferences();
+      Object.assign(preferences, fetched, {
+        agent_defaults: structuredClone(fetched.agent_defaults ?? DEFAULT_AGENT_PROFILES),
+      });
+    } catch (err) {
+      console.warn("[switchboard] loadPreferences failed", err);
+    } finally {
+      preferenceLoadState.ready = true;
+    }
+  })();
+  return loadPromise;
 }
 
 /// Apply a partial update, persisting the merged result. Updates memory first
@@ -71,29 +75,37 @@ export async function loadPreferences(): Promise<void> {
 /// set so Settings can surface it — the backend deliberately reports a failed
 /// explicit save rather than hiding it.
 export async function updatePreferences(patch: Partial<Preferences>): Promise<void> {
-  dirtied = true;
+  await loadPreferences();
   const next: Preferences = { ...$state.snapshot(preferences), ...patch };
   // Assign in bulk rather than field-by-field: a per-field copy silently drops
   // any preference someone forgets to add here, which presents as a toggle that
   // won't move rather than as a compile error.
   Object.assign(preferences, next);
-  try {
-    await api.setPreferences(next);
-    saveStatus.error = null;
-    saveStatus.keys = [];
-  } catch (err) {
-    saveStatus.error = err instanceof Error ? err.message : String(err);
-    saveStatus.keys = Object.keys(patch);
-  }
+  const keys = Object.keys(patch);
+  const save = saveTail.then(async () => {
+    try {
+      await api.setPreferences(next);
+      saveStatus.error = null;
+      saveStatus.keys = [];
+    } catch (err) {
+      saveStatus.error = err instanceof Error ? err.message : String(err);
+      saveStatus.keys = keys;
+    }
+  });
+  saveTail = save;
+  await save;
 }
 
 /// Test-only reset.
 export const _testing = {
-  reset(): void {
-    Object.assign(preferences, DEFAULTS);
+  reset(options: { ready?: boolean } = {}): void {
+    Object.assign(preferences, DEFAULTS, {
+      agent_defaults: structuredClone(DEFAULTS.agent_defaults),
+    });
     saveStatus.error = null;
     saveStatus.keys = [];
-    loaded = false;
-    dirtied = false;
+    preferenceLoadState.ready = options.ready ?? false;
+    loadPromise = preferenceLoadState.ready ? Promise.resolve() : null;
+    saveTail = Promise.resolve();
   },
 };

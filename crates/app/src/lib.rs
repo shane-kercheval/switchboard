@@ -9,6 +9,7 @@ mod emitter;
 mod error;
 mod git_registry;
 mod journal;
+mod lifecycle;
 mod locator_sink;
 mod metadata;
 mod notification;
@@ -33,6 +34,267 @@ use tauri::{Emitter, Manager, State};
 use crate::wake_lock::WakeLockEmitter;
 
 use crate::commands::ProjectConversation;
+
+#[cfg(target_os = "macos")]
+const CLOSE_WINDOW_MENU_IDS: [&str; 2] = ["close-window-file", "close-window-window"];
+#[cfg(target_os = "macos")]
+const QUIT_MENU_ID: &str = "quit-switchboard";
+
+/// Build the standard macOS menu with normal Close and Quit items. Tauri's
+/// predefined Close hard-codes Cmd+W, while its predefined macOS Quit invokes
+/// `AppKit`'s `terminate:` selector without reaching Tauri's `ExitRequested`
+/// callback. Explicit construction gives both actions the app's lifecycle
+/// policy without depending on localized menu text or an upstream menu shape.
+#[cfg(target_os = "macos")]
+fn macos_menu_without_close_shortcut(
+    app: &tauri::AppHandle,
+) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
+    use tauri::menu::{
+        AboutMetadata, HELP_SUBMENU_ID, Menu, MenuItem, PredefinedMenuItem, Submenu,
+        WINDOW_SUBMENU_ID,
+    };
+
+    let package = app.package_info();
+    let config = app.config();
+    let about = AboutMetadata {
+        name: Some(package.name.clone()),
+        version: Some(package.version.to_string()),
+        copyright: config.bundle.copyright.clone(),
+        authors: config
+            .bundle
+            .publisher
+            .clone()
+            .map(|publisher| vec![publisher]),
+        ..Default::default()
+    };
+    let file_close = MenuItem::with_id(
+        app,
+        CLOSE_WINDOW_MENU_IDS[0],
+        "Close Window",
+        true,
+        None::<&str>,
+    )?;
+    let window_close = MenuItem::with_id(
+        app,
+        CLOSE_WINDOW_MENU_IDS[1],
+        "Close Window",
+        true,
+        None::<&str>,
+    )?;
+    let quit = MenuItem::with_id(
+        app,
+        QUIT_MENU_ID,
+        format!("Quit {}", package.name),
+        true,
+        Some("CmdOrCtrl+Q"),
+    )?;
+    let window_menu = Submenu::with_id_and_items(
+        app,
+        WINDOW_SUBMENU_ID,
+        "Window",
+        true,
+        &[
+            &PredefinedMenuItem::minimize(app, None)?,
+            &PredefinedMenuItem::maximize(app, None)?,
+            &PredefinedMenuItem::separator(app)?,
+            &window_close,
+        ],
+    )?;
+    let help_menu = Submenu::with_id_and_items(app, HELP_SUBMENU_ID, "Help", true, &[])?;
+
+    Menu::with_items(
+        app,
+        &[
+            &Submenu::with_items(
+                app,
+                package.name.clone(),
+                true,
+                &[
+                    &PredefinedMenuItem::about(app, None, Some(about))?,
+                    &PredefinedMenuItem::separator(app)?,
+                    &PredefinedMenuItem::services(app, None)?,
+                    &PredefinedMenuItem::separator(app)?,
+                    &PredefinedMenuItem::hide(app, None)?,
+                    &PredefinedMenuItem::hide_others(app, None)?,
+                    &PredefinedMenuItem::separator(app)?,
+                    &quit,
+                ],
+            )?,
+            &Submenu::with_items(app, "File", true, &[&file_close])?,
+            &Submenu::with_items(
+                app,
+                "Edit",
+                true,
+                &[
+                    &PredefinedMenuItem::undo(app, None)?,
+                    &PredefinedMenuItem::redo(app, None)?,
+                    &PredefinedMenuItem::separator(app)?,
+                    &PredefinedMenuItem::cut(app, None)?,
+                    &PredefinedMenuItem::copy(app, None)?,
+                    &PredefinedMenuItem::paste(app, None)?,
+                    &PredefinedMenuItem::select_all(app, None)?,
+                ],
+            )?,
+            &Submenu::with_items(
+                app,
+                "View",
+                true,
+                &[&PredefinedMenuItem::fullscreen(app, None)?],
+            )?,
+            &window_menu,
+            &help_menu,
+        ],
+    )
+}
+
+#[cfg(target_os = "macos")]
+async fn app_has_active_work(app: &tauri::AppHandle) -> bool {
+    let Some(state) = app.try_state::<AppState>() else {
+        return false;
+    };
+    if !crate::state::lock(&state.workflow_runs).is_empty()
+        || !crate::state::lock(&state.forwards).is_empty()
+    {
+        return true;
+    }
+    let agent_ids: Vec<_> = crate::state::lock(&state.agents_by_id)
+        .keys()
+        .copied()
+        .collect();
+    for agent_id in agent_ids {
+        if state.dispatcher.has_pending_work(agent_id).await {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(target_os = "macos")]
+async fn finish_orderly_quit(app: tauri::AppHandle) {
+    let Some(state) = app.try_state::<AppState>() else {
+        return;
+    };
+    let project_ids: Vec<_> = crate::state::lock(&state.projects)
+        .keys()
+        .copied()
+        .collect();
+    let agent_ids: Vec<_> = crate::state::lock(&state.agents_by_id)
+        .keys()
+        .copied()
+        .collect();
+    let forward_tokens: Vec<_> = crate::state::lock(&state.forwards)
+        .values()
+        .cloned()
+        .collect();
+    for token in forward_tokens {
+        token.cancel();
+    }
+    crate::workflow_commands::cancel_runs_for_projects(&state, &project_ids).await;
+    crate::commands::drain_agents_then_release_locks(
+        &state,
+        &agent_ids,
+        &project_ids,
+        switchboard_harness::CancelSource::Shutdown,
+    )
+    .await;
+    if let Some(coordinator) = app.try_state::<crate::lifecycle::QuitCoordinator>() {
+        coordinator.approve_exit();
+        app.exit(0);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn start_quit_confirmation(app: tauri::AppHandle) {
+    use tauri_plugin_dialog::{DialogExt as _, MessageDialogButtons, MessageDialogKind};
+
+    tauri::async_runtime::spawn(async move {
+        if !app_has_active_work(&app).await {
+            let should_shutdown = app
+                .try_state::<crate::lifecycle::QuitCoordinator>()
+                .is_some_and(|coordinator| coordinator.begin_shutdown());
+            if should_shutdown {
+                finish_orderly_quit(app).await;
+            }
+            return;
+        }
+
+        let should_confirm = app
+            .try_state::<crate::lifecycle::QuitCoordinator>()
+            .is_some_and(|coordinator| coordinator.begin_confirmation());
+        if !should_confirm {
+            return;
+        }
+
+        let app_for_dialog = app.clone();
+        let mut dialog = app
+            .dialog()
+            .message("Agents, queued messages, or workflows are still active. Quitting will cancel that work before Switchboard closes.")
+            .title("Quit Switchboard?")
+            .kind(MessageDialogKind::Warning)
+            .buttons(MessageDialogButtons::OkCancelCustom(
+                "Quit Anyway".to_owned(),
+                "Cancel".to_owned(),
+            ));
+        if let Some(window) = app.get_webview_window("main") {
+            dialog = dialog.parent(&window);
+        }
+        dialog.show(move |quit| {
+            if quit {
+                let should_shutdown = app_for_dialog
+                    .try_state::<crate::lifecycle::QuitCoordinator>()
+                    .is_some_and(|coordinator| coordinator.begin_shutdown());
+                if should_shutdown {
+                    tauri::async_runtime::spawn(finish_orderly_quit(app_for_dialog.clone()));
+                }
+            } else if let Some(coordinator) =
+                app_for_dialog.try_state::<crate::lifecycle::QuitCoordinator>()
+            {
+                coordinator.cancel();
+            }
+        });
+    });
+}
+
+#[cfg(target_os = "macos")]
+fn handle_macos_run_event(app: &tauri::AppHandle, event: tauri::RunEvent) {
+    match event {
+        tauri::RunEvent::WindowEvent {
+            label,
+            event: tauri::WindowEvent::CloseRequested { api, .. },
+            ..
+        } if label == "main" => {
+            api.prevent_close();
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.hide();
+            }
+        }
+        tauri::RunEvent::Reopen { .. } => {
+            show_main_window(app);
+        }
+        tauri::RunEvent::ExitRequested { api, .. } => {
+            let Some(coordinator) = app.try_state::<crate::lifecycle::QuitCoordinator>() else {
+                return;
+            };
+            if coordinator.exit_is_approved() {
+                return;
+            }
+            api.prevent_exit();
+            if coordinator.begin() {
+                start_quit_confirmation(app.clone());
+            }
+        }
+        _ => {}
+    }
+}
 use crate::commands::{
     AUTOCREATE_PATH_WAIT, AgentSessionFingerprint, AgentSessionInfo, DirectoryInfo, ForwardArg,
     ForwardOutcome, HarnessInstallStatus, ProjectListing, RepoListing, StagedAttachment,
@@ -42,7 +304,7 @@ use crate::commands::{
     check_claude_auth_impl, check_claude_binary_impl, check_codex_auth_impl,
     check_codex_binary_impl, check_gemini_auth_impl, check_gemini_binary_impl,
     commit_changed_files_impl, commit_file_diff_impl, commit_ranges_impl, copy_builtin_prompt_impl,
-    create_agent_impl, create_project_impl, delete_project_impl, editor_open_argv,
+    create_agent_with_profiles_impl, create_project_impl, delete_project_impl, editor_open_argv,
     existing_attachment_paths_impl, fetch_repo_impl, file_diff_impl, fork_agent_impl,
     forward_message_impl, forward_prompt_impl, get_preferences_impl, get_prompt_source_impl,
     harness_adapter_for, init_directory_impl, install_status_for_adapter, list_agents_impl,
@@ -54,13 +316,13 @@ use crate::commands::{
     read_tracked_repo_from_inputs, recheck_harness_installs_impl, remove_agent_impl,
     remove_directory_impl, remove_mcp_provider_impl, remove_message_pins_impl,
     remove_queued_message_impl, remove_tracked_repo_impl, rename_agent_impl, rename_project_impl,
-    render_prompt_impl, reorder_agents_impl, reveal_in_finder_argv, search_project_files_in_root,
-    search_project_files_root_impl, send_message_impl, set_active_project_impl,
-    set_agent_effort_impl, set_agent_model_impl, set_message_pin_impl, set_preferences_impl,
-    set_project_archived_impl, set_visible_project_impl, sign_in_mcp_provider_impl,
-    sign_out_mcp_provider_impl, stage_attachment_impl, sync_prompts_and_notify, terminal_open_argv,
-    test_mcp_connection_impl, test_saved_mcp_provider_impl, tracked_repos_inputs, tracked_roots,
-    validate_external_url,
+    render_prompt_impl, reorder_agents_impl, resume_agent_in_terminal_impl, reveal_in_finder_argv,
+    search_project_files_in_root, search_project_files_root_impl, send_message_impl,
+    set_active_agent_profile_impl, set_active_project_impl, set_agent_profiles_impl,
+    set_message_pin_impl, set_preferences_impl, set_project_archived_impl,
+    set_visible_project_impl, sign_in_mcp_provider_impl, sign_out_mcp_provider_impl,
+    stage_attachment_impl, sync_prompts_and_notify, terminal_open_argv, test_mcp_connection_impl,
+    test_saved_mcp_provider_impl, tracked_repos_inputs, tracked_roots, validate_external_url,
 };
 use crate::error::AppError;
 use crate::preferences::Preferences;
@@ -673,8 +935,19 @@ async fn create_agent(
     harness: HarnessKind,
     model: Option<String>,
     effort: Option<String>,
+    secondary_model: Option<String>,
+    secondary_effort: Option<String>,
 ) -> Result<AgentRecord, String> {
-    create_agent_impl(state.inner(), &name, harness, model, effort).map_err(|e| e.to_string())
+    let secondary = if secondary_model.is_some() || secondary_effort.is_some() {
+        Some(switchboard_core::AgentProfile {
+            model: secondary_model,
+            effort: secondary_effort,
+        })
+    } else {
+        None
+    };
+    create_agent_with_profiles_impl(state.inner(), &name, harness, model, effort, secondary)
+        .map_err(|e| e.to_string())
 }
 
 /// Branch an agent's conversation into a new one. Registration only — the
@@ -692,23 +965,24 @@ async fn fork_agent(state: State<'_, AppState>, agent_id: String) -> Result<Agen
 }
 
 #[tauri::command]
-async fn set_agent_model(
+async fn set_agent_profiles(
     state: State<'_, AppState>,
     agent_id: String,
-    model: Option<String>,
+    primary: switchboard_core::AgentProfile,
+    secondary: Option<switchboard_core::AgentProfile>,
 ) -> Result<AgentRecord, String> {
     let id = parse_uuid(&agent_id).map_err(|e| e.to_string())?;
-    set_agent_model_impl(state.inner(), id, model).map_err(|e| e.to_string())
+    set_agent_profiles_impl(state.inner(), id, primary, secondary).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn set_agent_effort(
+async fn set_active_agent_profile(
     state: State<'_, AppState>,
     agent_id: String,
-    effort: Option<String>,
+    active: switchboard_core::AgentProfileSlot,
 ) -> Result<AgentRecord, String> {
     let id = parse_uuid(&agent_id).map_err(|e| e.to_string())?;
-    set_agent_effort_impl(state.inner(), id, effort).map_err(|e| e.to_string())
+    set_active_agent_profile_impl(state.inner(), id, active).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1038,6 +1312,21 @@ async fn open_session_file(state: State<'_, AppState>, agent_id: String) -> Resu
     } else {
         Err(format!("`open -t` failed for {path} (exit {status})"))
     }
+}
+
+#[tauri::command]
+async fn resume_agent_in_terminal(
+    state: State<'_, AppState>,
+    agent_id: String,
+) -> Result<(), String> {
+    let id = parse_uuid(&agent_id).map_err(|e| e.to_string())?;
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default();
+    let argv = resume_agent_in_terminal_impl(state.inner(), id, &home)
+        .await
+        .map_err(|e| e.to_string())?;
+    run_open_argv(argv).await
 }
 
 #[tauri::command]
@@ -1680,14 +1969,32 @@ pub fn run() {
     // registry, so two such instances can last-writer-wins each other — accepted,
     // since it's atomic-write dev convenience state, never the installed app's data.
     let builder = tauri::Builder::default();
+    #[cfg(target_os = "macos")]
+    let builder = builder
+        .menu(macos_menu_without_close_shortcut)
+        .on_menu_event(|app, event| {
+            if CLOSE_WINDOW_MENU_IDS.contains(&event.id().as_ref())
+                && let Some(window) = app.get_webview_window("main")
+            {
+                let _ = window.hide();
+            } else if event.id() == QUIT_MENU_ID
+                && let Some(coordinator) = app.try_state::<crate::lifecycle::QuitCoordinator>()
+                && coordinator.begin()
+            {
+                start_quit_confirmation(app.clone());
+            }
+        });
     #[cfg(not(debug_assertions))]
     let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+        #[cfg(target_os = "macos")]
+        show_main_window(app);
+        #[cfg(not(target_os = "macos"))]
         if let Some(window) = app.get_webview_window("main") {
             let _ = window.unminimize();
             let _ = window.set_focus();
         }
     }));
-    builder
+    let builder = builder
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .setup(move |app| {
@@ -1793,6 +2100,7 @@ pub fn run() {
             // the cross-harness session-id collision scan. Unopenable
             // directories (unmounted/moved) are skipped and stay unavailable.
             crate::state::eager_load_directories(&state);
+            app.manage(crate::lifecycle::QuitCoordinator::new());
             app.manage(state);
             Ok(())
         })
@@ -1868,8 +2176,8 @@ pub fn run() {
             fork_agent,
             remove_agent,
             rename_agent,
-            set_agent_model,
-            set_agent_effort,
+            set_agent_profiles,
+            set_active_agent_profile,
             reorder_agents,
             attach_agent,
             list_agents,
@@ -1885,6 +2193,7 @@ pub fn run() {
             forward_prompt,
             cancel_forward,
             agent_session_info,
+            resume_agent_in_terminal,
             open_session_file,
             open_external_url,
             open_in_editor,
@@ -1894,8 +2203,12 @@ pub fn run() {
             load_project_conversation,
             project_session_fingerprints,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+    #[cfg(target_os = "macos")]
+    builder.run(handle_macos_run_event);
+    #[cfg(not(target_os = "macos"))]
+    builder.run(|_, _| {});
 }
 
 // Gated on `debug_assertions` because `debug_config_dir` exists only in debug

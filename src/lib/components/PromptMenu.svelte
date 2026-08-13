@@ -18,6 +18,7 @@
     onpick,
     oninsert,
     oncopy,
+    onconfigure,
     onopenfolder,
     onclose,
   }: {
@@ -31,6 +32,8 @@
     /// Copy a read-only built-in into the user's own prompts. Only built-in rows
     /// surface the affordance; omitting the handler hides it everywhere.
     oncopy?: (prompt: Prompt) => void;
+    /// Open the Settings section that owns prompt sources.
+    onconfigure?: () => void;
     /// Open the local prompts folder (where the user adds their own). Omitting the
     /// handler hides the row.
     onopenfolder?: () => void;
@@ -204,14 +207,28 @@
     data-testid="prompt-menu-search"
     class="border-border bg-raised text-fg placeholder:text-muted focus-visible:ring-focus mt-1 w-full rounded-md border px-2.5 py-1.5 text-sm focus-visible:ring-1 focus-visible:outline-none"
   />
-  {#if onopenfolder}
-    <button
-      type="button"
-      class="text-muted hover:text-fg mt-1 w-full rounded-md px-2.5 py-1 text-left text-xs"
-      data-testid="prompt-menu-open-folder"
-      onclick={() => onopenfolder()}
-    >
-      Open local prompts folder…
-    </button>
+  {#if onconfigure || onopenfolder}
+    <div class="mt-1 flex items-center gap-1">
+      {#if onconfigure}
+        <button
+          type="button"
+          class="text-muted hover:text-fg min-w-0 flex-1 rounded-md px-2.5 py-1 text-left text-xs"
+          data-testid="prompt-menu-configure"
+          onclick={() => onconfigure()}
+        >
+          Configure in Settings…
+        </button>
+      {/if}
+      {#if onopenfolder}
+        <button
+          type="button"
+          class="text-muted hover:text-fg min-w-0 flex-1 rounded-md px-2.5 py-1 text-right text-xs"
+          data-testid="prompt-menu-open-folder"
+          onclick={() => onopenfolder()}
+        >
+          Open prompts folder…
+        </button>
+      {/if}
+    </div>
   {/if}
 </div>

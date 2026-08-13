@@ -1,4 +1,4 @@
-import type { HarnessKind } from "$lib/types";
+import type { AgentProfile, HarnessKind } from "$lib/types";
 
 /// What the create-agent form emits on submit. `model`/`effort` are a
 /// **create-only** concern: present (a curated value) when the user picked one,
@@ -9,5 +9,11 @@ import type { HarnessKind } from "$lib/types";
 /// from the agent's actions menu. This is enforced here so the rule can't be
 /// re-expressed by a caller, not just by the form's submit logic.
 export type AgentFormSubmit =
-  | { mode: "create"; name: string; harness: HarnessKind; model?: string; effort?: string }
+  | {
+      mode: "create";
+      name: string;
+      harness: HarnessKind;
+      primary: AgentProfile;
+      secondary: AgentProfile | null;
+    }
   | { mode: "attach"; name: string; harness: HarnessKind; existingSessionId: string };

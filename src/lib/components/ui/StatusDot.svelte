@@ -4,6 +4,7 @@
   /// activity" indicator on a non-active project row).
   import { cn } from "$lib/utils";
   import type { BadgeStatus } from "$lib/status";
+  import Tooltip from "$lib/components/ui/Tooltip.svelte";
 
   type Props = {
     status: BadgeStatus;
@@ -25,11 +26,19 @@
   };
 </script>
 
-<span
-  class={cn("inline-block h-1.5 w-1.5 shrink-0 rounded-full", DOT[status], className)}
-  data-testid={testid}
-  title={label}
-  aria-label={label}
-  aria-hidden={label ? undefined : "true"}
-  role={label ? "img" : undefined}
-></span>
+{#snippet dot(props: Record<string, unknown> = {})}
+  <span
+    {...props}
+    class={cn("inline-block h-1.5 w-1.5 shrink-0 rounded-full", DOT[status], className)}
+    data-testid={testid}
+    aria-label={label}
+    aria-hidden={label ? undefined : "true"}
+    role={label ? "img" : undefined}
+  ></span>
+{/snippet}
+
+{#if label}
+  <Tooltip {label}>{#snippet trigger(props)}{@render dot(props)}{/snippet}</Tooltip>
+{:else}
+  {@render dot()}
+{/if}

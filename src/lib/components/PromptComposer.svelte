@@ -25,6 +25,7 @@
   import ForwardSourceChip from "$lib/components/ui/ForwardSourceChip.svelte";
   import ForwardSourcePicker from "$lib/components/ui/ForwardSourcePicker.svelte";
   import ClearIcon from "$lib/components/ui/ClearIcon.svelte";
+  import Tooltip from "$lib/components/ui/Tooltip.svelte";
   import { cn } from "$lib/utils";
   import { COMPOSER_ACTION_BUTTON_CLASS, ICON_BUTTON_CLASS } from "$lib/components/ui/iconButton";
 
@@ -346,19 +347,23 @@
               <!-- Each chip carries its own ✕; the bulk clear (same ⊘ glyph as
                    "Clear recipients") only earns its place once there are several
                    to drop at once. -->
-              <button
-                type="button"
-                class={cn(ICON_BUTTON_CLASS, "ml-0.5 shrink-0 disabled:opacity-50")}
-                data-testid={`${testid}-clear`}
-                aria-label="Clear forward sources"
-                title="Clear forward sources"
-                disabled={busy}
-                onclick={() => {
-                  if (!busy) onClear();
-                }}
-              >
-                <ClearIcon />
-              </button>
+              <Tooltip label="Clear forward sources">
+                {#snippet trigger(props)}
+                  <button
+                    {...props}
+                    type="button"
+                    class={cn(ICON_BUTTON_CLASS, "ml-0.5 shrink-0 disabled:opacity-50")}
+                    data-testid={`${testid}-clear`}
+                    aria-label="Clear forward sources"
+                    disabled={busy}
+                    onclick={() => {
+                      if (!busy) onClear();
+                    }}
+                  >
+                    <ClearIcon />
+                  </button>
+                {/snippet}
+              </Tooltip>
             {/if}
           </div>
         {/if}

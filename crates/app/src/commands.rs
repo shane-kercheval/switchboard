@@ -11,8 +11,9 @@ use std::sync::{Arc, Mutex};
 use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
 use switchboard_core::{
-    AgentId, AgentRecord, Attachment, CoreError, Directory, HarnessKind, MessagePin, Project,
-    ProjectId, ProjectSummary, SelectionAxis, SendId, SessionLocator, normalize_selection,
+    AgentId, AgentProfile, AgentProfileSlot, AgentRecord, Attachment, CoreError, Directory,
+    HarnessKind, MessagePin, Project, ProjectId, ProjectSummary, SelectionAxis, SendId,
+    SessionLocator, normalize_selection,
 };
 use switchboard_dispatcher::{
     CancelOutcome, CurrentTurnWait, DispatchContextFactory, Dispatcher, EventEmitter, OnBusy,
@@ -1061,6 +1062,50 @@ pub fn terminal_open_argv(terminal_app: &str, path: &str) -> Vec<String> {
     ]
 }
 
+/// The macOS `AppleScript` invocation that opens a fresh window in the selected
+/// supported terminal and runs `command`. The command is passed as an argv
+/// value to `osascript`, never interpolated into `AppleScript` source, so shell
+/// quoting in the backend-generated resume command stays intact and cannot
+/// become `AppleScript` syntax.
+pub fn terminal_resume_argv(terminal_app: &str, command: &str) -> Result<Vec<String>, AppError> {
+    let app = terminal_app.trim();
+    let body = if app.eq_ignore_ascii_case("terminal") {
+        vec![
+            "set resumeCommand to item 1 of argv".to_owned(),
+            "tell application \"Terminal\"".to_owned(),
+            "activate".to_owned(),
+            "do script resumeCommand".to_owned(),
+            "end tell".to_owned(),
+        ]
+    } else if app.eq_ignore_ascii_case("iterm") || app.eq_ignore_ascii_case("iterm2") {
+        vec![
+            "set resumeCommand to item 1 of argv".to_owned(),
+            "tell application \"iTerm2\"".to_owned(),
+            "activate".to_owned(),
+            "set resumeWindow to (create window with default profile)".to_owned(),
+            "tell current session of current tab of resumeWindow to write text resumeCommand"
+                .to_owned(),
+            "end tell".to_owned(),
+        ]
+    } else {
+        return Err(AppError::UnsupportedTerminalApp {
+            terminal_app: terminal_app.to_owned(),
+        });
+    };
+
+    let mut argv = vec![
+        "/usr/bin/osascript".to_owned(),
+        "-e".to_owned(),
+        "on run argv".to_owned(),
+    ];
+    for line in body {
+        argv.push("-e".to_owned());
+        argv.push(line);
+    }
+    argv.extend(["-e".to_owned(), "end run".to_owned(), command.to_owned()]);
+    Ok(argv)
+}
+
 /// The macOS argv for revealing a path in Finder (`open -R <path>` selects the
 /// item in its containing folder rather than opening it).
 #[must_use]
@@ -1726,6 +1771,7 @@ pub fn set_visible_project_impl(state: &AppState, project_id: Option<ProjectId>,
     lock(&state.visible_project).apply(project_id, seq);
 }
 
+#[cfg(test)]
 pub fn create_agent_impl(
     state: &AppState,
     name: &str,
@@ -1733,9 +1779,32 @@ pub fn create_agent_impl(
     model: Option<String>,
     effort: Option<String>,
 ) -> Result<AgentRecord, AppError> {
+    create_agent_with_profiles_impl(state, name, harness, model, effort, None)
+}
+
+pub fn create_agent_with_profiles_impl(
+    state: &AppState,
+    name: &str,
+    harness: HarnessKind,
+    model: Option<String>,
+    effort: Option<String>,
+    secondary: Option<AgentProfile>,
+) -> Result<AgentRecord, AppError> {
     let model = normalize_selection(model);
     let effort = normalize_selection(effort);
+    let secondary = secondary.map(|mut profile| {
+        profile.model = normalize_selection(profile.model);
+        profile.effort = normalize_selection(profile.effort);
+        profile
+    });
     check_selection_supported(harness, model.as_deref(), effort.as_deref())?;
+    if let Some(secondary) = &secondary {
+        check_selection_supported(
+            harness,
+            secondary.model.as_deref(),
+            secondary.effort.as_deref(),
+        )?;
+    }
     // Same TOCTOU protection as create_project_impl — register_agent has
     // an internal read-check-then-append window that two concurrent IPC
     // calls could race through.
@@ -1745,7 +1814,7 @@ pub fn create_agent_impl(
         .get(&active)
         .cloned()
         .ok_or(AppError::ProjectNotLoaded(active))?;
-    let record = project.register_agent(name, harness, model, effort)?;
+    let record = project.register_agent_with_profiles(name, harness, model, effort, secondary)?;
     lock(&state.agents_by_id).insert(record.id, record.clone());
     Ok(record)
 }
@@ -2085,36 +2154,29 @@ pub fn set_agent_session_locator_impl(
     Ok(updated)
 }
 
-/// Change (or clear, with `None`) an agent's selected model, re-persisting the
-/// registry and refreshing the cache. Mirrors `rename_agent_impl`. Empty/
-/// whitespace normalizes to "unset"; the model-selection capability is enforced
-/// by `Project::set_agent_model` (so an unsupported harness is rejected
-/// regardless of caller). The new value applies on the agent's next dispatch —
-/// no in-flight turn is touched.
-pub fn set_agent_model_impl(
+/// Atomically replace both execution profiles for an agent.
+pub fn set_agent_profiles_impl(
     state: &AppState,
     agent_id: AgentId,
-    model: Option<String>,
+    primary: AgentProfile,
+    secondary: Option<AgentProfile>,
 ) -> Result<AgentRecord, AppError> {
-    let model = normalize_selection(model);
     let _write = lock(&state.registry_write);
     let (project, _) = lookup_agent(state, agent_id)?;
-    let updated = project.set_agent_model(agent_id, model)?;
+    let updated = project.set_agent_profiles(agent_id, primary, secondary)?;
     lock(&state.agents_by_id).insert(agent_id, updated.clone());
     Ok(updated)
 }
 
-/// Change (or clear, with `None`) an agent's selected reasoning effort. The
-/// effort-axis counterpart to [`set_agent_model_impl`].
-pub fn set_agent_effort_impl(
+/// Atomically switch the profile future sends capture.
+pub fn set_active_agent_profile_impl(
     state: &AppState,
     agent_id: AgentId,
-    effort: Option<String>,
+    active: AgentProfileSlot,
 ) -> Result<AgentRecord, AppError> {
-    let effort = normalize_selection(effort);
     let _write = lock(&state.registry_write);
     let (project, _) = lookup_agent(state, agent_id)?;
-    let updated = project.set_agent_effort(agent_id, effort)?;
+    let updated = project.set_active_agent_profile(agent_id, active)?;
     lock(&state.agents_by_id).insert(agent_id, updated.clone());
     Ok(updated)
 }
@@ -3642,12 +3704,8 @@ pub fn cancel_forward_impl(state: &AppState, forward_id: Uuid) {
 /// `project_ids`' instance locks — strictly in that order, so a project lock
 /// is never released while one of its agents' turns is still live (which would
 /// reopen the double-drive race the lock guards). The reusable
-/// cancel-and-drain lifecycle primitive: standalone and unit-tested;
-/// remove-directory wires it up (passing one directory's agents +
-/// project), and the app-quit handler is deferred.
-// Exercised by tests but not yet on a production call path — the
-// remove-working-directory lifecycle consumes it once that command exists.
-#[allow(dead_code)]
+/// cancel-and-drain lifecycle primitive: standalone and unit-tested; directory
+/// teardown and orderly application quit both use it.
 pub async fn drain_agents_then_release_locks(
     state: &AppState,
     agents: &[AgentId],
@@ -4118,6 +4176,30 @@ pub fn agent_session_info_impl(
         session_file: session_file.map(|p| p.to_string_lossy().into_owned()),
         resume_command,
     })
+}
+
+/// Validate an interactive-session handoff and build the selected terminal's
+/// launch argv. The Tauri shim performs only the subprocess spawn.
+///
+/// This is an authoritative backend check in addition to the UI's disabled
+/// state: launching while a turn or queued send exists would put two processes
+/// on one harness session. It is deliberately a check rather than a persistent
+/// lock — once the terminal owns the session, the user must not send to the same
+/// agent in Switchboard until that external session is closed.
+pub async fn resume_agent_in_terminal_impl(
+    state: &AppState,
+    agent_id: AgentId,
+    home_dir: &Path,
+) -> Result<Vec<String>, AppError> {
+    let (_, agent) = lookup_agent(state, agent_id)?;
+    if state.dispatcher.has_pending_work(agent_id).await {
+        return Err(AppError::ResumeAgentBusy { name: agent.name });
+    }
+    let command = agent_session_info_impl(state, agent_id, home_dir)?
+        .resume_command
+        .ok_or(AppError::ResumeUnavailable)?;
+    let terminal = get_preferences_impl(state).terminal_app;
+    terminal_resume_argv(&terminal, &command)
 }
 
 /// POSIX single-quote a string for safe interpolation into a shell command:
@@ -6503,6 +6585,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminal_resume_requires_switchboard_to_be_idle() {
+        let (_tmp, home, state, gate, project_id) = state_with_parked_claude(&["parent"]).await;
+        let source_id = seed_source(&state, home.path(), project_id, "alice", "hello");
+
+        let argv = resume_agent_in_terminal_impl(&state, source_id, home.path())
+            .await
+            .expect("an idle resumable agent can be handed to Terminal");
+        assert!(
+            argv.iter()
+                .any(|arg| arg == "tell application \"Terminal\"")
+        );
+
+        send_msg_with_home(&state, source_id, "long one", home.path())
+            .await
+            .unwrap();
+        await_turn_running(&state, source_id).await;
+        let err = resume_agent_in_terminal_impl(&state, source_id, home.path())
+            .await
+            .expect_err("a running agent must not be resumed externally");
+        assert!(
+            matches!(err, AppError::ResumeAgentBusy { .. }),
+            "got: {err:?}"
+        );
+
+        gate.notify_waiters();
+    }
+
+    #[tokio::test]
     async fn fork_agent_uses_the_sources_own_project_not_the_active_one() {
         // `fork_agent_impl` takes an agent id; resolving the *active* project
         // would fork into the wrong registry whenever the caller acts on an
@@ -7511,8 +7621,11 @@ mod tests {
     /// exactly one agent may dispatch through it per test. A second dispatching
     /// Claude agent would interleave into the same counter and silently draw
     /// another agent's scripted turn.
+    type RecordedProfile = (Option<String>, Option<String>);
+
     struct GatedRecordingAdapter {
         prompts: Arc<Mutex<Vec<String>>>,
+        profiles: Option<Arc<Mutex<Vec<RecordedProfile>>>>,
         texts: Vec<String>,
         gate: Arc<tokio::sync::Notify>,
         park_at: usize,
@@ -7539,7 +7652,7 @@ mod tests {
         }
         async fn dispatch(
             &self,
-            _agent: &AgentRecord,
+            agent: &AgentRecord,
             _cwd: &Path,
             prompt: &str,
             turn_id: switchboard_harness::TurnId,
@@ -7549,6 +7662,9 @@ mod tests {
                 .dispatches
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             lock(&self.prompts).push(prompt.to_owned());
+            if let Some(profiles) = &self.profiles {
+                lock(profiles).push((agent.model.clone(), agent.effort.clone()));
+            }
             let text = self.texts.get(index).cloned().unwrap_or_default();
             let park = index == self.park_at;
             let gate = if park {
@@ -7635,6 +7751,7 @@ mod tests {
         let prompts = Arc::new(Mutex::new(Vec::new()));
         let adapter: Arc<dyn HarnessAdapter> = Arc::new(GatedRecordingAdapter {
             prompts: Arc::clone(&prompts),
+            profiles: None,
             texts: texts.iter().map(|t| (*t).to_owned()).collect(),
             gate: Arc::clone(gate),
             park_at,
@@ -7657,6 +7774,7 @@ mod tests {
         let prompts = Arc::new(Mutex::new(Vec::new()));
         let adapter: Arc<dyn HarnessAdapter> = Arc::new(GatedRecordingAdapter {
             prompts: Arc::clone(&prompts),
+            profiles: None,
             texts: texts.iter().map(|t| (*t).to_owned()).collect(),
             gate: Arc::clone(first.0),
             park_at: first.1,
@@ -12129,6 +12247,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_agent_normalizes_blank_secondary_before_capability_checks() {
+        let (tmp, state, _) = fresh_state_with_mock();
+        init_directory_impl(&state, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let project = create_project_in_only_dir(&state, "alpha");
+        set_active_project_impl(&state, project.id).unwrap();
+
+        let agent = create_agent_with_profiles_impl(
+            &state,
+            "gemini",
+            HarnessKind::Gemini,
+            Some("auto".to_owned()),
+            None,
+            Some(AgentProfile {
+                model: Some("gemini-2.5-flash".to_owned()),
+                effort: Some("   ".to_owned()),
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            agent.profiles.secondary,
+            Some(AgentProfile {
+                model: Some("gemini-2.5-flash".to_owned()),
+                effort: None,
+            })
+        );
+    }
+
+    #[tokio::test]
     async fn create_agent_rejects_unsupported_selection_and_persists_nothing() {
         let (tmp, state, _) = fresh_state_with_mock();
         init_directory_impl(&state, tmp.path().to_str().unwrap())
@@ -12174,72 +12322,93 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_agent_model_and_effort_update_record_cache_and_clear() {
+    async fn profile_updates_refresh_the_registry_and_shared_cache() {
         let (tmp, state, _) = fresh_state_with_mock();
         let (agent, project_id) = project_with_agent(&state, &tmp).await;
+        let primary = AgentProfile {
+            model: Some("opus".to_owned()),
+            effort: Some("high".to_owned()),
+        };
+        let secondary = AgentProfile {
+            model: Some("sonnet".to_owned()),
+            effort: Some("medium".to_owned()),
+        };
 
-        let updated = set_agent_model_impl(&state, agent.id, Some("opus".to_owned())).unwrap();
-        assert_eq!(updated.model.as_deref(), Some("opus"));
-        set_agent_effort_impl(&state, agent.id, Some("high".to_owned())).unwrap();
+        let updated =
+            set_agent_profiles_impl(&state, agent.id, primary.clone(), Some(secondary.clone()))
+                .unwrap();
+        assert_eq!(updated.active_profile(), primary);
+        let switched =
+            set_active_agent_profile_impl(&state, agent.id, AgentProfileSlot::Secondary).unwrap();
+        assert_eq!(switched.active_profile(), secondary);
 
-        // Both registry and cache reflect the change.
         let project = lock(&state.projects).get(&project_id).cloned().unwrap();
-        let stored = &project.list_agents().unwrap()[0];
-        assert_eq!(stored.model.as_deref(), Some("opus"));
-        assert_eq!(stored.effort.as_deref(), Some("high"));
-        let cached = lock(&state.agents_by_id).get(&agent.id).cloned().unwrap();
-        assert_eq!(cached.model.as_deref(), Some("opus"));
-        assert_eq!(cached.effort.as_deref(), Some("high"));
-
-        // Clearing persists `None`.
-        let cleared = set_agent_model_impl(&state, agent.id, None).unwrap();
-        assert_eq!(cleared.model, None);
-        set_agent_effort_impl(&state, agent.id, None).unwrap();
-        let project = lock(&state.projects).get(&project_id).cloned().unwrap();
-        let stored = &project.list_agents().unwrap()[0];
-        assert_eq!(stored.model, None);
-        assert_eq!(stored.effort, None);
+        assert_eq!(project.list_agents().unwrap()[0], switched);
+        assert_eq!(lock(&state.agents_by_id).get(&agent.id), Some(&switched));
     }
 
     #[tokio::test]
-    async fn set_agent_selection_normalizes_blank_to_none() {
-        let (tmp, state, _) = fresh_state_with_mock();
-        let (agent, _pid) = project_with_agent(&state, &tmp).await;
+    async fn queued_sends_capture_the_profile_active_when_each_was_submitted() {
+        let tmp = TempDir::new().unwrap();
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let profiles = Arc::new(Mutex::new(Vec::<RecordedProfile>::new()));
+        let adapter: Arc<dyn HarnessAdapter> = Arc::new(GatedRecordingAdapter {
+            prompts: Arc::new(Mutex::new(Vec::new())),
+            profiles: Some(Arc::clone(&profiles)),
+            texts: vec![String::new(); 3],
+            gate: Arc::clone(&gate),
+            park_at: 0,
+            extra_parks: Vec::new(),
+            fail_at: Vec::new(),
+            dispatches: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let emitter = Arc::new(RecordingEmitter::new());
+        let state = AppState::new(
+            Arc::clone(&adapter),
+            Arc::clone(&adapter),
+            Arc::clone(&adapter),
+            adapter,
+            emitter.clone() as Arc<dyn EventEmitter>,
+        );
+        let (agent, _) = project_with_agent(&state, &tmp).await;
+        let primary = AgentProfile {
+            model: Some("opus".to_owned()),
+            effort: Some("high".to_owned()),
+        };
+        let secondary = AgentProfile {
+            model: Some("sonnet".to_owned()),
+            effort: Some("medium".to_owned()),
+        };
+        set_agent_profiles_impl(&state, agent.id, primary, Some(secondary)).unwrap();
 
-        let updated = set_agent_model_impl(&state, agent.id, Some("  ".to_owned())).unwrap();
-        assert_eq!(updated.model, None);
-        let updated = set_agent_effort_impl(&state, agent.id, Some(String::new())).unwrap();
-        assert_eq!(updated.effort, None);
-    }
-
-    #[tokio::test]
-    async fn set_agent_selection_rejects_unsupported_harness() {
-        let (tmp, state, _) = fresh_state_with_mock();
-        init_directory_impl(&state, tmp.path().to_str().unwrap())
+        send_msg(&state, agent.id, "park").await.unwrap();
+        within(
+            &emitter,
+            "first turn starts",
+            emitter.wait_for_type("turn_start", 1),
+        )
+        .await;
+        send_msg(&state, agent.id, "queued-primary").await.unwrap();
+        set_active_agent_profile_impl(&state, agent.id, AgentProfileSlot::Secondary).unwrap();
+        send_msg(&state, agent.id, "queued-secondary")
             .await
             .unwrap();
-        let project = create_project_in_only_dir(&state, "alpha");
-        set_active_project_impl(&state, project.id).unwrap();
-        let gemini = create_agent_impl(&state, "g", HarnessKind::Gemini, None, None).unwrap();
-        let antigravity =
-            create_agent_impl(&state, "a", HarnessKind::Antigravity, None, None).unwrap();
 
-        let err = set_agent_effort_impl(&state, gemini.id, Some("high".to_owned())).unwrap_err();
-        assert!(matches!(
-            err,
-            AppError::Core(CoreError::SelectionUnsupported {
-                harness: HarnessKind::Gemini,
-                axis: SelectionAxis::Effort
-            })
-        ));
-        let err = set_agent_model_impl(&state, antigravity.id, Some("x".to_owned())).unwrap_err();
-        assert!(matches!(
-            err,
-            AppError::Core(CoreError::SelectionUnsupported {
-                harness: HarnessKind::Antigravity,
-                axis: SelectionAxis::Model
-            })
-        ));
+        gate.notify_one();
+        within(
+            &emitter,
+            "all queued turns drain",
+            emitter.wait_for_type("agent_idle", 1),
+        )
+        .await;
+        assert_eq!(
+            *lock(&profiles),
+            vec![
+                (Some("opus".to_owned()), Some("high".to_owned())),
+                (Some("opus".to_owned()), Some("high".to_owned())),
+                (Some("sonnet".to_owned()), Some("medium".to_owned())),
+            ]
+        );
     }
 
     #[tokio::test]
@@ -18911,6 +19080,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn terminal_resume_argv_passes_the_command_as_data() {
+        let command = "cd '/repo/it'\\''s here' && claude --resume abc";
+        let terminal = terminal_resume_argv("Terminal", command).unwrap();
+        assert_eq!(
+            terminal.first().map(String::as_str),
+            Some("/usr/bin/osascript")
+        );
+        assert!(
+            terminal
+                .iter()
+                .any(|arg| arg == "tell application \"Terminal\"")
+        );
+        assert!(terminal.iter().any(|arg| arg == "do script resumeCommand"));
+        assert_eq!(terminal.last().map(String::as_str), Some(command));
+
+        let iterm = terminal_resume_argv("iTerm", command).unwrap();
+        assert!(iterm.iter().any(|arg| arg == "tell application \"iTerm2\""));
+        assert!(
+            iterm
+                .iter()
+                .any(|arg| arg == "set resumeWindow to (create window with default profile)")
+        );
+        assert!(iterm.iter().any(|arg| {
+            arg == "tell current session of current tab of resumeWindow to write text resumeCommand"
+        }));
+        assert_eq!(iterm.last().map(String::as_str), Some(command));
+
+        assert!(matches!(
+            terminal_resume_argv("Ghostty", command),
+            Err(AppError::UnsupportedTerminalApp { .. })
+        ));
+    }
+
     #[tokio::test]
     async fn aggregate_links_project_to_its_worktree_and_is_partial_on_bad_repo() {
         let (_cfg, state) = state_with_registries();
@@ -19055,6 +19258,7 @@ mod tests {
             show_builtins: false,
             notify_on_completion: true,
             notify_while_focused: false,
+            agent_defaults: Preferences::default().agent_defaults,
         };
         set_preferences_impl(&state, &prefs).unwrap();
 
@@ -19081,6 +19285,7 @@ mod tests {
                 show_builtins: true,
                 notify_on_completion: true,
                 notify_while_focused: false,
+                agent_defaults: Preferences::default().agent_defaults,
             },
         )
         .unwrap();
@@ -19104,6 +19309,7 @@ mod tests {
             show_builtins: true,
             notify_on_completion: true,
             notify_while_focused: false,
+            agent_defaults: Preferences::default().agent_defaults,
         };
         set_preferences_impl(&state, &prefs).unwrap();
         assert_eq!(get_preferences_impl(&state), prefs);

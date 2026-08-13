@@ -664,6 +664,7 @@ mod tests {
         AgentRecord {
             model: None,
             effort: None,
+            profiles: switchboard_core::AgentProfiles::default(),
             forked_from_session: None,
             id: Uuid::now_v7(),
             project_id: Uuid::now_v7(),
@@ -1027,6 +1028,7 @@ mod tests {
         let agent = AgentRecord {
             model: None,
             effort: None,
+            profiles: switchboard_core::AgentProfiles::default(),
             forked_from_session: None,
             id: Uuid::now_v7(),
             project_id: Uuid::now_v7(),

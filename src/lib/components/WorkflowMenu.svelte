@@ -16,6 +16,7 @@
     loading = false,
     onpick,
     oncopy,
+    oncopyauthoringprompt,
     onopenfolder,
     onclose,
   }: {
@@ -23,6 +24,8 @@
     loading?: boolean;
     onpick: (workflow: WorkflowListing) => void;
     oncopy?: (workflow: WorkflowListing) => void;
+    /// Copy the prompt that asks an AI coding agent to author a workflow.
+    oncopyauthoringprompt?: () => Promise<boolean>;
     /// Open the user-global workflows folder (where the user adds their own).
     onopenfolder?: () => void;
     onclose: () => void;
@@ -31,6 +34,10 @@
   let query = $state("");
   let highlighted = $state(0);
   let searchEl = $state<HTMLInputElement | undefined>(undefined);
+  let authoringPromptCopied = $state(false);
+  let copiedTimer: ReturnType<typeof setTimeout> | undefined;
+
+  $effect(() => () => clearTimeout(copiedTimer));
 
   const filtered = $derived.by(() => {
     const q = query.trim().toLowerCase();
@@ -57,6 +64,17 @@
 
   function pick(w: WorkflowListing): void {
     if (selectable(w)) onpick(w);
+  }
+
+  function copyAuthoringPrompt(): void {
+    if (!oncopyauthoringprompt) return;
+    void oncopyauthoringprompt().then((copied) => {
+      if (copied) {
+        authoringPromptCopied = true;
+        clearTimeout(copiedTimer);
+        copiedTimer = setTimeout(() => (authoringPromptCopied = false), 1000);
+      }
+    });
   }
 
   function onKeydown(event: KeyboardEvent): void {
@@ -185,14 +203,28 @@
     data-testid="workflow-menu-search"
     class="border-border bg-raised text-fg placeholder:text-muted focus-visible:ring-focus mt-1 w-full rounded-md border px-2.5 py-1.5 text-sm focus-visible:ring-1 focus-visible:outline-none"
   />
-  {#if onopenfolder}
-    <button
-      type="button"
-      class="text-muted hover:text-fg mt-1 w-full rounded-md px-2.5 py-1 text-left text-xs"
-      data-testid="workflow-menu-open-folder"
-      onclick={() => onopenfolder()}
-    >
-      Open local workflows folder…
-    </button>
+  {#if oncopyauthoringprompt || onopenfolder}
+    <div class="mt-1 flex items-center gap-1">
+      {#if oncopyauthoringprompt}
+        <button
+          type="button"
+          class="text-muted hover:text-fg min-w-0 flex-1 rounded-md px-2.5 py-1 text-left text-xs"
+          data-testid="workflow-menu-copy-authoring-prompt"
+          onclick={copyAuthoringPrompt}
+        >
+          {authoringPromptCopied ? "Copied" : "Copy workflow instructions for your AI agent"}
+        </button>
+      {/if}
+      {#if onopenfolder}
+        <button
+          type="button"
+          class="text-muted hover:text-fg min-w-0 flex-1 rounded-md px-2.5 py-1 text-right text-xs"
+          data-testid="workflow-menu-open-folder"
+          onclick={() => onopenfolder()}
+        >
+          Open workflows folder…
+        </button>
+      {/if}
+    </div>
   {/if}
 </div>

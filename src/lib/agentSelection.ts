@@ -14,7 +14,13 @@
 /// (`SUPPORTS_MODEL_SELECTION` / `SUPPORTS_EFFORT_SELECTION`); a harness with no
 /// capability has an empty list here and no default.
 
-import type { HarnessKind } from "./types";
+import type {
+  AgentProfile,
+  AgentProfileSlot,
+  AgentRecord,
+  HarnessKind,
+  Preferences,
+} from "./types";
 import { HARNESS_DEFAULT_AGENT_NAME } from "./harnessDisplay";
 
 /// One picker option: `value` is the alias/id submitted to the backend,
@@ -131,42 +137,68 @@ export function effortOptionsFor(
   return isCuratedLegacy ? base.filter((o) => !CODEX_HIGH_TIER_EFFORTS.has(o.value)) : base;
 }
 
-/// Create-form preselected model per harness. `undefined` only where the
-/// harness has no model capability (Antigravity). Attach does NOT use these —
-/// it defaults to "keep current" so attaching never silently overrides the
-/// session's existing model.
-export const DEFAULT_MODEL: Record<HarnessKind, string | undefined> = {
-  claude_code: "opus",
-  codex: "gpt-5.6-terra",
-  gemini: "auto",
-  antigravity: undefined,
+/// Built-in fallback used until persisted preferences load. This same shape is
+/// also the reset value for a missing `agent_defaults` key; once loaded, Add
+/// Agent and new-project seeding read the user's preferences directly.
+export const DEFAULT_AGENT_PROFILES: Preferences["agent_defaults"] = {
+  claude_code: {
+    primary: { model: "opus", effort: "high" },
+    secondary: null,
+  },
+  codex: {
+    primary: { model: "gpt-5.6-sol", effort: "high" },
+    secondary: null,
+  },
+  gemini: {
+    primary: { model: "auto", effort: null },
+    secondary: null,
+  },
+  antigravity: {
+    primary: { model: null, effort: null },
+    secondary: null,
+  },
 };
 
-/// Create-form preselected effort per harness. `undefined` where the harness
-/// has no effort capability (Gemini, Antigravity).
-export const DEFAULT_EFFORT: Record<HarnessKind, string | undefined> = {
-  claude_code: "high",
-  codex: "medium",
-  gemini: undefined,
-  antigravity: undefined,
+/// Useful starting values when someone enables a secondary profile for the
+/// first time and their global defaults do not already define one.
+export const SUGGESTED_SECONDARY_PROFILE: Record<HarnessKind, AgentProfile> = {
+  claude_code: { model: "sonnet", effort: "medium" },
+  codex: { model: "gpt-5.6-terra", effort: "medium" },
+  gemini: { model: "gemini-2.5-flash", effort: null },
+  antigravity: { model: null, effort: null },
 };
 
-/// Presets for agents automatically created with a new project. Kept separate
-/// from the Add Agent form defaults so onboarding can choose a stronger initial
-/// Codex configuration without silently changing the manual creation workflow.
-export const NEW_PROJECT_DEFAULT_MODEL: Record<HarnessKind, string | undefined> = {
-  ...DEFAULT_MODEL,
-  codex: "gpt-5.6-sol",
+/// A model-derived name stops describing an agent once it can switch between
+/// two profiles. Keep that case stable and harness-shaped instead. This map is
+/// intentionally explicit rather than slugging display labels: agent names are
+/// persisted identifiers, and a future label edit must not rename the default.
+const MULTI_PROFILE_AGENT_NAME: Record<HarnessKind, string> = {
+  claude_code: "claude",
+  codex: "codex",
+  gemini: "gemini",
+  antigravity: "antigravity",
 };
 
-export const NEW_PROJECT_DEFAULT_EFFORT: Record<HarnessKind, string | undefined> = {
-  ...DEFAULT_EFFORT,
-  codex: "high",
-};
+export function primaryProfile(agent: AgentRecord): AgentProfile {
+  return { model: agent.model ?? null, effort: agent.effort ?? null };
+}
 
-/// The auto-derived agent name for a create: named after the model it'll run,
-/// with effort appended where the harness has that axis — so a roster of
-/// auto-created agents reads as `opus-high`, `gpt-5-5-medium`, … at a glance.
+export function secondaryProfile(agent: AgentRecord): AgentProfile | null {
+  return agent.profiles?.secondary ?? null;
+}
+
+export function activeProfileSlot(agent: AgentRecord): AgentProfileSlot {
+  return agent.profiles?.active ?? "primary";
+}
+
+export function activeProfile(agent: AgentRecord): AgentProfile {
+  return activeProfileSlot(agent) === "secondary" && secondaryProfile(agent) !== null
+    ? secondaryProfile(agent)!
+    : primaryProfile(agent);
+}
+
+/// The model-derived agent name for a primary-only create, with effort appended
+/// where the harness has that axis (`opus-high`, `gpt-5-5-medium`, …).
 /// Harnesses with no concrete model to name after fall back to the bare harness
 /// name: Antigravity (model is harness-owned) and Gemini left on `auto` (it
 /// picks up whatever model was last used).
@@ -187,4 +219,17 @@ export function defaultAgentName(
   const raw = effort ? `${model}-${effort}` : model;
   const slug = raw.replace(/[^A-Za-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "");
   return slug === "" ? HARNESS_DEFAULT_AGENT_NAME[harness] : slug;
+}
+
+/// The profile-aware create name shared by the dialog and new-project seeding.
+/// A secondary-capable agent uses its short harness name because neither
+/// profile alone describes it.
+export function defaultAgentNameForProfiles(
+  harness: HarnessKind,
+  primary: AgentProfile,
+  secondary: AgentProfile | null,
+): string {
+  return secondary === null
+    ? defaultAgentName(harness, primary.model ?? undefined, primary.effort ?? undefined)
+    : MULTI_PROFILE_AGENT_NAME[harness];
 }

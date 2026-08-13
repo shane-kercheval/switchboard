@@ -23,6 +23,7 @@
   /// pointer-up (commit what's on screen): without that, an interrupted drag
   /// stays armed and the next bare pointer motion resizes with no button held.
   import { cn } from "$lib/utils";
+  import Tooltip from "$lib/components/ui/Tooltip.svelte";
 
   type Props = {
     /// The committed value at drag start, in the consumer's unit (px).
@@ -141,28 +142,29 @@
   onblur={onWindowBlur}
 />
 
-<!-- A focusable `role="separator"` with arrow-key handling IS the WAI-ARIA
-     window-splitter pattern; the lint doesn't model the separator's focusable
-     variant. -->
-<!-- svelte-ignore a11y_no_noninteractive_element_interactions, a11y_no_noninteractive_tabindex -->
-<div
-  role="separator"
-  aria-orientation="vertical"
-  aria-label={label}
-  aria-valuenow={ariaNow}
-  aria-valuemin={Math.round(min)}
-  aria-valuemax={ariaMax}
-  tabindex="0"
-  data-testid={testid}
-  class={cn(
-    "focus-visible:ring-focus shrink-0 cursor-col-resize touch-none focus-visible:ring-1 focus-visible:outline-none",
-    className,
-  )}
-  title="Drag to resize · double-click to reset"
-  onpointerdown={onPointerDown}
-  ondblclick={onReset}
-  onkeydown={onKeydown}
-  onkeyup={onKeyup}
-  onfocus={() => refreshAria()}
-  onblur={finalizeKeyboard}
-></div>
+<Tooltip label="Drag to resize · double-click to reset">
+  {#snippet trigger(props)}
+    <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+    <div
+      {...props}
+      role="separator"
+      aria-orientation="vertical"
+      aria-label={label}
+      aria-valuenow={ariaNow}
+      aria-valuemin={Math.round(min)}
+      aria-valuemax={ariaMax}
+      tabindex="0"
+      data-testid={testid}
+      class={cn(
+        "focus-visible:ring-focus shrink-0 cursor-col-resize touch-none focus-visible:ring-1 focus-visible:outline-none",
+        className,
+      )}
+      onpointerdown={onPointerDown}
+      ondblclick={onReset}
+      onkeydown={onKeydown}
+      onkeyup={onKeyup}
+      onfocus={() => refreshAria()}
+      onblur={finalizeKeyboard}
+    ></div>
+  {/snippet}
+</Tooltip>

@@ -351,29 +351,38 @@
             >
               {#if item.entry !== undefined}
                 {@const collapsible = item.row?.kind === "user" || item.row?.kind === "agent"}
-                <button
-                  type="button"
-                  class={cn(
-                    "min-w-0 flex-1 px-1.5 py-1 text-left",
-                    collapsible ? "cursor-pointer" : "cursor-default opacity-45",
-                  )}
-                  aria-disabled={!collapsible}
-                  aria-expanded={collapsible ? !isPinCollapsed(projectId, item.pin.key) : undefined}
-                  title={collapsible
+                <Tooltip
+                  label={collapsible
                     ? isPinCollapsed(projectId, item.pin.key)
                       ? "Expand message"
                       : "Collapse message"
                     : "Message unavailable"}
-                  data-testid="pinned-message"
-                  onclick={() => collapsible && togglePinCollapsed(projectId, item.pin.key)}
+                  side="right"
                 >
-                  <span class="text-fg block truncate text-xs font-semibold">
-                    {item.entry.attribution}
-                  </span>
-                  <span class="text-muted/70 block font-mono text-[10px]">
-                    {relativeTime(item.entry.at)}
-                  </span>
-                </button>
+                  {#snippet trigger(props)}
+                    <button
+                      {...props}
+                      type="button"
+                      class={cn(
+                        "min-w-0 flex-1 px-1.5 py-1 text-left",
+                        collapsible ? "cursor-pointer" : "cursor-default opacity-45",
+                      )}
+                      aria-disabled={!collapsible}
+                      aria-expanded={collapsible
+                        ? !isPinCollapsed(projectId, item.pin.key)
+                        : undefined}
+                      data-testid="pinned-message"
+                      onclick={() => collapsible && togglePinCollapsed(projectId, item.pin.key)}
+                    >
+                      <span class="text-fg block truncate text-xs font-semibold">
+                        {item.entry.attribution}
+                      </span>
+                      <span class="text-muted/70 block font-mono text-[10px]">
+                        {relativeTime(item.entry.at)}
+                      </span>
+                    </button>
+                  {/snippet}
+                </Tooltip>
               {:else}
                 <div
                   class="text-muted min-w-0 flex-1 px-1.5 py-2 text-xs"

@@ -9,13 +9,18 @@ import type { AgentRecord, NormalizedEvent, Prompt } from "$lib/types";
 import ComposeBar from "./ComposeBar.svelte";
 import { workflowRuns, _testing as workflowsTesting } from "$lib/state/workflows.svelte";
 import type { WorkflowRunInfo } from "$lib/types";
+import { WORKFLOW_AUTHORING_GUIDE_URL } from "$lib/workflowAuthoring";
 
 const invokeMock = vi.fn(
   async (_cmd: string, _args?: Record<string, unknown>): Promise<unknown> => null,
 );
+const copyTextMock = vi.fn(async (_text: string): Promise<void> => undefined);
 
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: (cmd: string, args?: Record<string, unknown>) => invokeMock(cmd, args),
+}));
+vi.mock("$lib/native", () => ({
+  copyText: (text: string) => copyTextMock(text),
 }));
 
 const listeners = new Map<string, (e: { payload: NormalizedEvent }) => void>();
@@ -487,6 +492,43 @@ describe("ComposeBar", () => {
     await fireEvent.keyDown(screen.getByTestId("compose-textarea"), { key: "/" });
     expect(await screen.findByTestId("prompt-menu")).toBeInTheDocument();
     expect(screen.queryByTestId("workflow-menu")).toBeNull();
+  });
+
+  it("opens prompt settings from the prompt menu", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    const onConfigurePrompts = vi.fn();
+
+    render(ComposeBar, {
+      props: { projectId: PROJECT_ID, agents: [AGENT_A], onConfigurePrompts },
+    });
+
+    await fireEvent.click(screen.getByTestId("compose-prompt-button"));
+    await fireEvent.click(await screen.findByTestId("prompt-menu-configure"));
+
+    expect(onConfigurePrompts).toHaveBeenCalledOnce();
+    expect(screen.queryByTestId("prompt-menu")).toBeNull();
+  });
+
+  it("copies the workflow-authoring prompt from the workflow menu", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "list_workflows" || cmd === "list_prompts" || cmd === "search_project_files")
+        return [];
+      if (cmd === "workflows_dir") return "/Users/test/workflows";
+      return null;
+    });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+
+    await fireEvent.click(screen.getByTestId("compose-workflow-button"));
+    await fireEvent.click(await screen.findByTestId("workflow-menu-copy-authoring-prompt"));
+
+    await waitFor(() => expect(copyTextMock).toHaveBeenCalledOnce());
+    expect(copyTextMock.mock.calls[0]?.[0]).toContain(WORKFLOW_AUTHORING_GUIDE_URL);
+    expect(copyTextMock.mock.calls[0]?.[0]).toContain("/Users/test/workflows");
+    expect(await screen.findByText("Copied")).toBeInTheDocument();
   });
 
   it("inserts an unmatched slash query into the message without dispatching", async () => {
@@ -5367,6 +5409,7 @@ describe("ComposeBar — cross-agent forward", () => {
 
     // A subsequent plain send is a normal send, not a forward of stale output.
     invokeMock.mockClear();
+    copyTextMock.mockClear();
     await fireEvent.input(screen.getByTestId("compose-textarea"), { target: { value: "next" } });
     await fireEvent.click(screen.getByTestId("compose-send"));
     await waitFor(() =>

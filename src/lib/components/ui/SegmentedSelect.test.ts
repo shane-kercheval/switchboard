@@ -67,6 +67,34 @@ describe("SegmentedSelect", () => {
     expect(screen.getByTestId("sel-option-sonnet")).toHaveAttribute("aria-checked", "true");
   });
 
+  it("shows hover on only the current option and clears it on exit", async () => {
+    render(SegmentedSelect, {
+      props: { options: OPTIONS, value: "", testid: "sel", ariaLabel: "Model" },
+    });
+    const group = screen.getByTestId("sel");
+    const opus = screen.getByTestId("sel-option-opus");
+    const sonnet = screen.getByTestId("sel-option-sonnet");
+
+    await fireEvent.pointerEnter(opus);
+    expect(opus).toHaveClass("bg-control-hover");
+    expect(sonnet).not.toHaveClass("bg-control-hover");
+
+    await fireEvent.pointerEnter(sonnet);
+    expect(opus).not.toHaveClass("bg-control-hover");
+    expect(sonnet).toHaveClass("bg-control-hover");
+
+    await fireEvent.pointerLeave(group);
+    expect(opus).not.toHaveClass("bg-control-hover");
+    expect(sonnet).not.toHaveClass("bg-control-hover");
+  });
+
+  it("does not add native tooltips to visible option labels", () => {
+    render(SegmentedSelect, {
+      props: { options: OPTIONS, value: "opus", testid: "sel", ariaLabel: "Model" },
+    });
+    expect(screen.getByTestId("sel-option-opus")).not.toHaveAttribute("title");
+  });
+
   it("honors disabled", async () => {
     render(SegmentedSelect, {
       props: { options: OPTIONS, value: "opus", disabled: true, testid: "sel", ariaLabel: "Model" },

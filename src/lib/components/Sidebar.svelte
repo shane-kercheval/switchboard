@@ -1,6 +1,7 @@
 <script lang="ts">
   import {
     ArrowDown,
+    ArrowLeftRight,
     ArrowUp,
     Check,
     ChevronsUpDown,
@@ -8,7 +9,6 @@
     Eye,
     EyeOff,
     FileText,
-    Gauge,
     GripVertical,
     MoreHorizontal,
     Pencil,
@@ -21,26 +21,27 @@
     Zap,
   } from "@lucide/svelte";
   import { flip } from "svelte/animate";
-  import type { AgentRecord, AgentId, ProjectId } from "$lib/types";
+  import type { AgentProfile, AgentRecord, AgentId, ProjectId } from "$lib/types";
   import { retryAgentHydration, runtimes, stopAgent, transcripts } from "$lib/state/index.svelte";
   import {
     removeAgent,
     renameAgent,
     reorderAgents,
-    setAgentModel,
-    setAgentEffort,
+    setActiveAgentProfile,
+    setAgentProfiles,
   } from "$lib/state/workspace.svelte";
   import { DRAG_SLOP_PX, dropIndexForPointer, movedOrder } from "$lib/agentReorder";
   import { shortcut } from "$lib/platform";
   import { SUPPORTS_EFFORT_SELECTION, SUPPORTS_MODEL_SELECTION } from "$lib/harnessDisplay";
   import {
-    DEFAULT_EFFORT,
-    DEFAULT_MODEL,
+    EFFORT_OPTIONS,
     MODEL_OPTIONS,
-    MODEL_PRESENTATION,
-    effortOptionsFor,
-    type SelectionOption,
+    activeProfile,
+    activeProfileSlot,
+    primaryProfile,
+    secondaryProfile,
   } from "$lib/agentSelection";
+  import { preferences } from "$lib/preferences.svelte";
   import {
     AGENTS_SIDEBAR_DEFAULT_WIDTH,
     layout,
@@ -49,11 +50,12 @@
   } from "$lib/layout.svelte";
   import DropdownMenu from "$lib/components/ui/DropdownMenu.svelte";
   import DropdownMenuItem from "$lib/components/ui/DropdownMenuItem.svelte";
-  import SelectionPicker from "$lib/components/ui/SelectionPicker.svelte";
+  import AgentProfileEditor from "$lib/components/AgentProfileEditor.svelte";
   import Button from "$lib/components/ui/Button.svelte";
   import {
     agentSessionInfo,
     openSessionFile as apiOpenSessionFile,
+    resumeAgentInTerminal,
     type AgentSessionInfo,
   } from "$lib/api";
   import { normalizeAgentName, validateAgentName, type NameValidation } from "$lib/agentName";
@@ -134,6 +136,10 @@
   let sessionInfoError = $state<{ agentId: AgentId; message: string } | null>(null);
   let resumeAgentId = $state<AgentId | null>(null);
   let resumeOpen = $state(false);
+  let resumeLaunchSequence = 0;
+  let resumeLaunchOperation = $state<{ id: number; agentId: AgentId } | null>(null);
+  const resumeLaunching = $derived(resumeLaunchOperation !== null);
+  let resumeLaunchError = $state<string | null>(null);
   /// Verbatim hydration-error dialog (per-agent "history failed to load"). The
   /// failure lives on `runtime.hydration_error`; this just tracks which agent's
   /// error is currently shown.
@@ -144,112 +150,104 @@
   let removingAgentId = $state<AgentId | null>(null);
   let removeError = $state<{ agentId: AgentId; message: string } | null>(null);
 
-  /// Per-agent model/effort change editor. `editing` names which agent + axis is
-  /// open; `editValue` is the picker's current (always concrete) value. Mirrors
-  /// the resume/rename editors — errors surface inline and keep the dialog open.
-  let editing = $state<{ agentId: AgentId; axis: "model" | "effort" } | null>(null);
-  let editValue = $state<string>("");
+  /// Atomic primary/secondary profile editor. Errors stay in the dialog; quick
+  /// switch errors render on the affected card.
+  let profileEditingAgentId = $state<AgentId | null>(null);
+  let editPrimary = $state<AgentProfile>({ model: null, effort: null });
+  let editSecondary = $state<AgentProfile | null>(null);
   let editBusy = $state<boolean>(false);
   let editError = $state<string | null>(null);
+  let profileSwitching = $state<AgentId | null>(null);
+  let profileSwitchError = $state<{ agentId: AgentId; message: string } | null>(null);
 
   const editingAgent = $derived(
-    editing === null ? null : (agents.find((a) => a.id === editing!.agentId) ?? null),
+    profileEditingAgentId === null
+      ? null
+      : (agents.find((a) => a.id === profileEditingAgentId) ?? null),
   );
-  function withCurrentOption(
-    options: SelectionOption[],
-    current: string | null | undefined,
-  ): SelectionOption[] {
-    if (current == null || current === "" || options.some((o) => o.value === current))
-      return options;
-    return [{ label: current, value: current }, ...options];
+  function canConfigureProfiles(agent: AgentRecord): boolean {
+    return SUPPORTS_MODEL_SELECTION[agent.harness] || SUPPORTS_EFFORT_SELECTION[agent.harness];
   }
 
-  /// The curated list for the axis being edited (concrete values only — picking
-  /// a model/effort is always a concrete choice). If the agent already carries a
-  /// value that is no longer in the curated list, keep it selectable so the
-  /// dialog honestly reflects persisted state.
-  const editOptions = $derived<SelectionOption[]>(
-    editing === null || editingAgent === null
-      ? []
-      : withCurrentOption(
-          editing.axis === "model"
-            ? MODEL_OPTIONS[editingAgent.harness]
-            : effortOptionsFor(editingAgent.harness, editingAgent.model ?? undefined),
-          editing.axis === "model" ? editingAgent.model : editingAgent.effort,
-        ),
-  );
-
-  /// True when the model dialog must show a persisted model that isn't in the
-  /// curated list (an attached session, or a since-removed id). Its label is
-  /// vendor-shaped and unbounded, so a segmented pill would truncate it — drop
-  /// to a dropdown for that case (only the model axis; effort values are always
-  /// short enum tokens).
-  const editModelOffCatalog = $derived(
-    editing?.axis === "model" &&
-      editingAgent !== null &&
-      editingAgent.model != null &&
-      editingAgent.model !== "" &&
-      !MODEL_OPTIONS[editingAgent.harness].some((o) => o.value === editingAgent.model),
-  );
-
-  /// Presentation for the change dialog: effort is always segmented; the model
-  /// axis follows the shared `MODEL_PRESENTATION` map (dropdown for Gemini),
-  /// falling back to a dropdown when an off-catalog value is injected.
-  const editPresentation = $derived<"segmented" | "dropdown">(
-    editing?.axis === "model" &&
-      editingAgent !== null &&
-      (MODEL_PRESENTATION[editingAgent.harness] === "dropdown" || editModelOffCatalog)
-      ? "dropdown"
-      : "segmented",
-  );
-
-  function canChangeModel(agent: AgentRecord): boolean {
-    return SUPPORTS_MODEL_SELECTION[agent.harness];
-  }
-  function canChangeEffort(agent: AgentRecord): boolean {
-    return SUPPORTS_EFFORT_SELECTION[agent.harness];
-  }
-
-  function openChange(agent: AgentRecord, axis: "model" | "effort"): void {
-    editing = { agentId: agent.id, axis };
-    // Seed with the agent's current value, or the harness default when it pins
-    // nothing yet (e.g. an attached agent) — the menu only opens for harnesses
-    // that have a default on this axis, so the fallback is always concrete.
-    const current = axis === "model" ? agent.model : agent.effort;
-    const fallback =
-      axis === "model" ? DEFAULT_MODEL[agent.harness] : DEFAULT_EFFORT[agent.harness];
-    editValue = current ?? fallback ?? "";
+  function openProfileSettings(agent: AgentRecord): void {
+    profileEditingAgentId = agent.id;
+    editPrimary = primaryProfile(agent);
+    editSecondary = secondaryProfile(agent);
     editError = null;
     editBusy = false;
   }
 
   function closeChange(): void {
-    editing = null;
+    profileEditingAgentId = null;
     editError = null;
     editBusy = false;
   }
 
   async function submitChange(): Promise<void> {
-    if (editing === null) return;
-    const { agentId, axis } = editing;
-    const value = editValue;
-    const stillEditingSubmittedTarget = (): boolean =>
-      editing?.agentId === agentId && editing.axis === axis;
+    if (profileEditingAgentId === null) return;
+    const agentId = profileEditingAgentId;
     editBusy = true;
     editError = null;
     try {
-      if (axis === "model") {
-        await setAgentModel(agentId, value);
-      } else {
-        await setAgentEffort(agentId, value);
-      }
-      if (stillEditingSubmittedTarget()) closeChange();
+      await setAgentProfiles(
+        agentId,
+        $state.snapshot(editPrimary),
+        editSecondary === null ? null : $state.snapshot(editSecondary),
+      );
+      if (profileSwitchError?.agentId === agentId) profileSwitchError = null;
+      if (profileEditingAgentId === agentId) closeChange();
     } catch (err) {
-      if (stillEditingSubmittedTarget()) {
+      if (profileEditingAgentId === agentId) {
         editError = err instanceof Error ? err.message : String(err);
         editBusy = false;
       }
     }
+  }
+
+  async function switchProfile(agent: AgentRecord): Promise<void> {
+    if (secondaryProfile(agent) === null || profileSwitching === agent.id) return;
+    const next = activeProfileSlot(agent) === "primary" ? "secondary" : "primary";
+    profileSwitching = agent.id;
+    profileSwitchError = null;
+    try {
+      await setActiveAgentProfile(agent.id, next);
+    } catch (err) {
+      profileSwitchError = {
+        agentId: agent.id,
+        message: err instanceof Error ? err.message : String(err),
+      };
+    } finally {
+      if (profileSwitching === agent.id) profileSwitching = null;
+    }
+  }
+
+  function selectionLabel(agent: AgentRecord, profile: AgentProfile): string {
+    const model =
+      MODEL_OPTIONS[agent.harness].find((option) => option.value === profile.model)?.label ??
+      profile.model;
+    const effort =
+      EFFORT_OPTIONS[agent.harness].find((option) => option.value === profile.effort)?.label ??
+      profile.effort;
+    const label = [model, effort].filter((value) => value != null && value !== "").join(" · ");
+    return label || "Harness/session default";
+  }
+
+  function profileSwitchCopy(agent: AgentRecord): {
+    current: string;
+    target: string;
+    accessible: string;
+  } {
+    const currentSlot = activeProfileSlot(agent);
+    const current = currentSlot === "primary" ? primaryProfile(agent) : secondaryProfile(agent);
+    const targetSlot = currentSlot === "primary" ? "Secondary" : "Primary";
+    const target = currentSlot === "primary" ? secondaryProfile(agent) : primaryProfile(agent);
+    const currentText = `${currentSlot === "primary" ? "Primary" : "Secondary"}: ${selectionLabel(agent, current ?? primaryProfile(agent))}`;
+    const targetText = `Switch to ${targetSlot}: ${selectionLabel(agent, target ?? primaryProfile(agent))}`;
+    return {
+      current: currentText,
+      target: targetText,
+      accessible: `Using ${currentText}. ${targetText}.`,
+    };
   }
 
   const resumeAgent = $derived(
@@ -258,6 +256,34 @@
   const resumeInfo = $derived(
     resumeAgentId === null ? null : (sessionInfoByAgent[resumeAgentId] ?? null),
   );
+
+  function closeResume(): void {
+    resumeAgentId = null;
+    resumeLaunchError = null;
+  }
+
+  async function launchResumeInTerminal(): Promise<void> {
+    if (resumeAgent === null || resumeLaunching || isActive(resumeAgent.id)) return;
+    const agentId = resumeAgent.id;
+    const operationId = ++resumeLaunchSequence;
+    resumeLaunchOperation = { id: operationId, agentId };
+    resumeLaunchError = null;
+    try {
+      await resumeAgentInTerminal(agentId);
+      if (resumeLaunchOperation?.id !== operationId) return;
+      resumeLaunchOperation = null;
+      if (resumeAgentId === agentId) {
+        resumeOpen = false;
+        closeResume();
+      }
+    } catch (err) {
+      if (resumeLaunchOperation?.id !== operationId) return;
+      resumeLaunchOperation = null;
+      if (resumeAgentId === agentId) {
+        resumeLaunchError = err instanceof Error ? err.message : String(err);
+      }
+    }
+  }
 
   function hasSessionActions(info: AgentSessionInfo | null | undefined): boolean {
     return Boolean(info?.session_file || info?.resume_command);
@@ -308,7 +334,10 @@
       resumeAgentId = null;
       resumeOpen = false;
     }
-    if (editing !== null && !ids.has(editing.agentId)) closeChange();
+    if (profileEditingAgentId !== null && !ids.has(profileEditingAgentId)) closeChange();
+    if (profileSwitchError !== null && !ids.has(profileSwitchError.agentId)) {
+      profileSwitchError = null;
+    }
     if (reorderError !== null && !ids.has(reorderError.agentId)) reorderError = null;
     if (dragState !== null && !ids.has(dragState.agentId)) dragState = null;
     if (hoveredAgentId !== null && !ids.has(hoveredAgentId)) hoveredAgentId = null;
@@ -895,57 +924,69 @@
     {#snippet action()}
       <div class="flex items-center gap-0.5">
         {#if hiddenAgentCount > 0}
-          <button
-            type="button"
-            class="text-muted hover:text-fg shrink-0 px-1 text-[11px] hover:underline"
-            title="Show all agents"
-            aria-label={`${hiddenAgentCount} hidden — show all agents`}
-            data-testid="sidebar-show-all-agents"
-            onclick={() => showAllAgents(projectId, rosterIds)}
-          >
-            {hiddenAgentCount} hidden
-          </button>
+          <Tooltip label="Show all agents" side="bottom">
+            {#snippet trigger(props)}
+              <button
+                {...props}
+                type="button"
+                class="text-muted hover:text-fg shrink-0 px-1 text-[11px] hover:underline"
+                aria-label={`${hiddenAgentCount} hidden — show all agents`}
+                data-testid="sidebar-show-all-agents"
+                onclick={() => showAllAgents(projectId, rosterIds)}
+              >
+                {hiddenAgentCount} hidden
+              </button>
+            {/snippet}
+          </Tooltip>
         {/if}
         {#if agents.length > 0}
-          <button
-            type="button"
-            class={ICON_BUTTON_ON_PANEL_CLASS}
-            aria-label={allExpanded ? "Collapse all agents" : "Expand all agents"}
-            title={allExpanded ? "Collapse all" : "Expand all"}
-            data-testid="sidebar-toggle-all"
-            onclick={toggleAll}
-          >
-            <svg
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              stroke-width="1.5"
-              stroke-linecap="round"
-              stroke-linejoin="round"
-              class="h-4 w-4"
-              aria-hidden="true"
-            >
-              {#if allExpanded}
-                <path d="m17 11-5-5-5 5" />
-                <path d="m17 18-5-5-5 5" />
-              {:else}
-                <path d="m7 6 5 5 5-5" />
-                <path d="m7 13 5 5 5-5" />
-              {/if}
-            </svg>
-          </button>
+          <Tooltip label={allExpanded ? "Collapse all" : "Expand all"} side="bottom">
+            {#snippet trigger(props)}
+              <button
+                {...props}
+                type="button"
+                class={ICON_BUTTON_ON_PANEL_CLASS}
+                aria-label={allExpanded ? "Collapse all agents" : "Expand all agents"}
+                data-testid="sidebar-toggle-all"
+                onclick={toggleAll}
+              >
+                <svg
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="1.5"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  class="h-4 w-4"
+                  aria-hidden="true"
+                >
+                  {#if allExpanded}
+                    <path d="m17 11-5-5-5 5" />
+                    <path d="m17 18-5-5-5 5" />
+                  {:else}
+                    <path d="m7 6 5 5 5-5" />
+                    <path d="m7 13 5 5 5-5" />
+                  {/if}
+                </svg>
+              </button>
+            {/snippet}
+          </Tooltip>
         {/if}
         {#if onAddAgent}
-          <button
-            type="button"
-            class={ICON_BUTTON_ON_PANEL_CLASS}
-            title="Add agent"
-            aria-label="Add agent"
-            data-testid="sidebar-add-agent"
-            onclick={onAddAgent}
-          >
-            <PlusIcon />
-          </button>
+          <Tooltip label="Add agent" side="bottom">
+            {#snippet trigger(props)}
+              <button
+                {...props}
+                type="button"
+                class={ICON_BUTTON_ON_PANEL_CLASS}
+                aria-label="Add agent"
+                data-testid="sidebar-add-agent"
+                onclick={onAddAgent}
+              >
+                <PlusIcon />
+              </button>
+            {/snippet}
+          </Tooltip>
         {/if}
       </div>
     {/snippet}
@@ -1012,44 +1053,46 @@
                 aria-label="Agent name"
                 aria-invalid={!renameValidation.ok}
                 aria-describedby={renameError ? `agent-rename-error-${agent.id}` : undefined}
-                title={renameMessage ?? undefined}
                 data-testid="agent-rename-input"
                 onkeydown={(event) => onRenameKeydown(event, agent)}
                 onblur={cancelEdit}
               />
-              <button
-                type="button"
-                class={cn(
-                  ICON_BUTTON_CLASS,
-                  "shrink-0 disabled:cursor-not-allowed disabled:opacity-50",
-                )}
-                disabled={!canSave}
-                aria-label="Save name"
-                title="Save"
-                data-testid="agent-rename-save"
-                onmousedown={(event) => event.preventDefault()}
-                onclick={() => void commitEdit(agent)}
-              >
-                <svg
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  stroke-width="2"
-                  stroke-linecap="round"
-                  stroke-linejoin="round"
-                  class="h-4 w-4"
-                  aria-hidden="true"
-                >
-                  <path d="M20 6 9 17l-5-5" />
-                </svg>
-              </button>
+              <Tooltip label="Save" side="bottom">
+                {#snippet trigger(props)}
+                  <button
+                    {...props}
+                    type="button"
+                    class={cn(
+                      ICON_BUTTON_CLASS,
+                      "shrink-0 disabled:cursor-not-allowed disabled:opacity-50",
+                    )}
+                    disabled={!canSave}
+                    aria-label="Save name"
+                    data-testid="agent-rename-save"
+                    onmousedown={(event) => event.preventDefault()}
+                    onclick={() => void commitEdit(agent)}
+                  >
+                    <svg
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="2"
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                      class="h-4 w-4"
+                      aria-hidden="true"
+                    >
+                      <path d="M20 6 9 17l-5-5" />
+                    </svg>
+                  </button>
+                {/snippet}
+              </Tooltip>
             {:else}
               {@const agentHidden = isAgentHidden(projectId, rosterIds, agent.id)}
               <div class="flex min-h-7 min-w-0 flex-1 items-center px-1.5 text-left">
                 <span
                   class="text-fg cursor-text truncate text-[13px] font-semibold"
                   data-testid="agent-name"
-                  title="Double-click to rename"
                 >
                   {agent.name}
                 </span>
@@ -1168,6 +1211,7 @@
                       <DropdownMenuItem
                         onSelect={() => {
                           resumeAgentId = agent.id;
+                          resumeLaunchError = null;
                           resumeOpen = true;
                         }}
                         class="gap-2"
@@ -1197,11 +1241,11 @@
                         Open session file
                       </DropdownMenuItem>
                     {/if}
-                    {#if canChangeModel(agent)}
+                    {#if canConfigureProfiles(agent)}
                       <DropdownMenuItem
-                        onSelect={() => openChange(agent, "model")}
+                        onSelect={() => openProfileSettings(agent)}
                         class="gap-2"
-                        data-testid="agent-change-model"
+                        data-testid="agent-profile-settings"
                       >
                         <SlidersHorizontal
                           size={14}
@@ -1209,22 +1253,7 @@
                           class="text-muted shrink-0"
                           aria-hidden="true"
                         />
-                        Change model
-                      </DropdownMenuItem>
-                    {/if}
-                    {#if canChangeEffort(agent)}
-                      <DropdownMenuItem
-                        onSelect={() => openChange(agent, "effort")}
-                        class="gap-2"
-                        data-testid="agent-change-effort"
-                      >
-                        <Gauge
-                          size={14}
-                          strokeWidth={1.8}
-                          class="text-muted shrink-0"
-                          aria-hidden="true"
-                        />
-                        Change effort
+                        Model settings…
                       </DropdownMenuItem>
                     {/if}
                     <!-- Roster reorder. Disabled (not hidden) at the ends so the
@@ -1318,7 +1347,7 @@
                         closeOnSelect={false}
                         class="text-status-failed gap-2"
                         data-testid="agent-action-remove"
-                        title="Deletes Switchboard's files for this agent; underlying session files are kept, and its responses are removed from the conversation."
+                        tooltip="Deletes Switchboard's files for this agent; underlying session files are kept, and its responses are removed from the conversation."
                       >
                         <Trash2 size={14} strokeWidth={1.8} class="shrink-0" aria-hidden="true" />
                         Delete agent
@@ -1437,58 +1466,101 @@
                 </ul>
               </Tooltip>
             {/if}
-            <!-- Selected model/effort (intent), shown first. When the user
-                 hasn't chosen a model (Antigravity, or an attached agent, which
-                 pins nothing) we fall back to the harness-observed model from
-                 `runtime.meta` so the line isn't blank when a model is known.
-                 Effort is selection-only — no observed source. The per-turn
-                 transcript footer carries the actual runtime history (which may
-                 show a resolved id even when intent is an alias). -->
-            {#if agent.model || runtime?.meta?.model || agent.effort}
+            <!-- Selected model/effort is future-send intent, never observed
+                 runtime history. The transcript footer owns the actual model
+                 used by each completed turn. -->
+            {@const selectedProfile = activeProfile(agent)}
+            {@const configuredSecondary = secondaryProfile(agent)}
+            {#if canConfigureProfiles(agent)}
               <!-- One secondary line, `opus · high` — configuration is context,
                    not a table of key: value pairs. An observed (session-derived)
                    model keeps its explanatory tooltip instead of a label. -->
-              <div
-                class="text-muted mt-1.5 truncate text-xs leading-4"
-                data-testid="agent-selection"
-              >
-                {#if agent.model}
-                  <span title={agent.model} data-testid="agent-selected-model">{agent.model}</span>
-                {:else if runtime?.meta?.model}
-                  <span
-                    title={`${runtime.meta.model} — observed from the session (no model selected)`}
-                    data-testid="agent-observed-model">{runtime.meta.model}</span
+              <div class="mt-1.5 flex min-w-0 items-center gap-1">
+                <div
+                  class="text-muted min-w-0 truncate text-xs leading-4"
+                  data-testid="agent-selection"
+                >
+                  {#if selectedProfile.model}
+                    <Tooltip label={selectedProfile.model} side="top">
+                      {#snippet trigger(props)}
+                        <span {...props} data-testid="agent-selected-model"
+                          >{selectedProfile.model}</span
+                        >
+                      {/snippet}
+                    </Tooltip>
+                  {:else if !selectedProfile.effort}
+                    <span data-testid="agent-selection-default">Harness/session default</span>
+                  {/if}
+                  {#if selectedProfile.model && selectedProfile.effort}
+                    <span aria-hidden="true"> · </span>
+                  {/if}
+                  {#if selectedProfile.effort}
+                    <span data-testid="agent-selected-effort">{selectedProfile.effort}</span>
+                  {/if}
+                </div>
+                {#if configuredSecondary !== null}
+                  {@const switchCopy = profileSwitchCopy(agent)}
+                  <Tooltip
+                    side="top"
+                    delayDuration={500}
+                    disableHoverableContent
+                    reopen="fresh-hover"
                   >
-                {/if}
-                {#if (agent.model || runtime?.meta?.model) && agent.effort}
-                  <span aria-hidden="true"> · </span>
-                {/if}
-                {#if agent.effort}
-                  <span data-testid="agent-selected-effort">{agent.effort}</span>
+                    {#snippet trigger(props)}
+                      <button
+                        {...props}
+                        type="button"
+                        class={cn(ICON_BUTTON_CLASS, "h-5 w-5 shrink-0")}
+                        aria-label={switchCopy.accessible}
+                        disabled={profileSwitching === agent.id}
+                        data-testid="agent-profile-switch"
+                        onclick={() => void switchProfile(agent)}
+                      >
+                        <ArrowLeftRight size={12} strokeWidth={1.8} aria-hidden="true" />
+                      </button>
+                    {/snippet}
+                    <div class="space-y-0.5 text-[13px] leading-4">
+                      <div class="text-primary-fg/70">{switchCopy.current}</div>
+                      <div class="font-medium">{switchCopy.target}</div>
+                    </div>
+                  </Tooltip>
                 {/if}
               </div>
+            {/if}
+            {#if profileSwitchError?.agentId === agent.id}
+              <p class="text-status-failed mt-1 text-xs" data-testid="agent-profile-switch-error">
+                {profileSwitchError.message}
+              </p>
             {/if}
             {#if runtime?.meta && (runtime.meta.mcp_servers.length > 0 || runtime.meta.skills.length > 0)}
               <div class="mt-1.5 flex items-center gap-1" data-testid="agent-meta">
                 {#if runtime.meta.mcp_servers.length > 0}
                   {@const mcpCount = runtime.meta.mcp_servers.length}
-                  <span
-                    class="bg-panel text-muted inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px]"
-                    title={`${mcpCount} MCP server${mcpCount === 1 ? "" : "s"}`}
-                    data-testid="agent-mcp-chip"
-                  >
-                    <Plug size={11} strokeWidth={1.8} aria-hidden="true" />{mcpCount}
-                  </span>
+                  <Tooltip label={`${mcpCount} MCP server${mcpCount === 1 ? "" : "s"}`} side="top">
+                    {#snippet trigger(props)}
+                      <span
+                        {...props}
+                        class="bg-panel text-muted inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px]"
+                        data-testid="agent-mcp-chip"
+                      >
+                        <Plug size={11} strokeWidth={1.8} aria-hidden="true" />{mcpCount}
+                      </span>
+                    {/snippet}
+                  </Tooltip>
                 {/if}
                 {#if runtime.meta.skills.length > 0}
                   {@const skillCount = runtime.meta.skills.length}
-                  <span
-                    class="bg-panel text-muted inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px]"
-                    title={`${skillCount} skill${skillCount === 1 ? "" : "s"}`}
-                    data-testid="agent-skills-chip"
-                  >
-                    <Zap size={11} strokeWidth={1.8} aria-hidden="true" />{skillCount}
-                  </span>
+                  <Tooltip label={`${skillCount} skill${skillCount === 1 ? "" : "s"}`} side="top">
+                    {#snippet trigger(props)}
+                      <span
+                        {...props}
+                        class="bg-panel text-muted inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px]"
+                        data-testid="agent-skills-chip"
+                      >
+                        <Zap size={11} strokeWidth={1.8} aria-hidden="true" />{skillCount}
+                      </span>
+                    {/snippet}
+                  </Tooltip>
                 {/if}
               </div>
             {/if}
@@ -1627,7 +1699,7 @@
 
 <Dialog
   bind:open={resumeOpen}
-  onClose={() => (resumeAgentId = null)}
+  onClose={closeResume}
   title="Resume in terminal"
   contentClass="max-w-lg"
 >
@@ -1637,7 +1709,7 @@
     </p>
     <div class="flex items-center gap-2">
       <code
-        class="bg-panel text-fg min-w-0 flex-1 overflow-x-auto rounded-md px-2.5 py-2 font-mono text-xs whitespace-pre"
+        class="bg-panel text-fg min-w-0 flex-1 rounded-md px-2.5 py-2 font-mono text-xs leading-5 break-all whitespace-pre-wrap"
         data-testid="resume-command">{resumeInfo?.resume_command ?? ""}</code
       >
       <CopyButton
@@ -1646,7 +1718,27 @@
         testid="resume-copy"
         class="shrink-0"
       />
+      <Tooltip label={`Run in ${preferences.terminal_app}`} side="top">
+        {#snippet trigger(props)}
+          <button
+            {...props}
+            type="button"
+            class={cn(ICON_BUTTON_CLASS, "shrink-0")}
+            disabled={resumeLaunching || (resumeAgent !== null && isActive(resumeAgent.id))}
+            aria-label={`Run in ${preferences.terminal_app}`}
+            data-testid="resume-run-terminal"
+            onclick={() => void launchResumeInTerminal()}
+          >
+            <Terminal size={16} strokeWidth={1.5} aria-hidden="true" />
+          </button>
+        {/snippet}
+      </Tooltip>
     </div>
+    {#if resumeLaunchError !== null}
+      <p class="text-status-failed text-xs" data-testid="resume-launch-error">
+        Couldn't open terminal: {resumeLaunchError}
+      </p>
+    {/if}
     {#if resumeAgent !== null && isActive(resumeAgent.id)}
       <p class="text-status-failed text-xs" data-testid="resume-warning-active">
         ⚠ Switchboard is currently driving this session — stop the agent before running this
@@ -1654,8 +1746,8 @@
       </p>
     {:else}
       <p class="text-muted text-xs" data-testid="resume-warning">
-        ⚠ Don't run this while the agent is active in Switchboard — two processes writing one
-        session file will corrupt it.
+        ⚠ While this terminal session is open, don't send to this agent in Switchboard — two
+        processes writing one session file can corrupt it.
       </p>
     {/if}
   </div>
@@ -1668,30 +1760,31 @@
   details={hydrationDetailsError}
 />
 
-<!-- Change model / effort. Reuses the shared selection picker (concrete values
-     only). Applies on the agent's next send. -->
+<!-- Primary and optional secondary profiles. Changes apply to future sends;
+     queued sends retain the profile they captured when submitted. -->
 <Dialog
-  open={editing !== null}
+  open={editingAgent !== null}
   onClose={closeChange}
-  title={editing?.axis === "effort" ? "Change effort" : "Change model"}
+  title="Model settings"
   contentClass="max-w-lg"
   dismissible={!editBusy}
 >
   <div class="space-y-3" data-testid="change-selection-panel">
-    <label class="block space-y-1">
-      <span class="text-muted text-xs">
-        {editing?.axis === "effort" ? "Reasoning effort" : "Model"}
-      </span>
-      <SelectionPicker
-        bind:value={editValue}
-        options={editOptions}
+    {#if editingAgent !== null}
+      <AgentProfileEditor
+        harness={editingAgent.harness}
+        bind:primary={editPrimary}
+        bind:secondary={editSecondary}
+        secondarySuggestion={preferences.agent_defaults[editingAgent.harness].secondary}
+        allowUnset
         disabled={editBusy}
-        testid="change-select"
-        ariaLabel={editing?.axis === "effort" ? "Reasoning effort" : "Model"}
-        presentation={editPresentation}
+        testidPrefix="change-profile"
       />
-    </label>
-    <p class="text-muted text-xs leading-relaxed">Takes effect on the next message.</p>
+    {/if}
+    <p class="text-muted text-xs leading-relaxed">
+      The active configuration applies to new messages. Already queued messages keep their original
+      configuration.
+    </p>
     {#if editError}
       <p class="text-status-failed text-xs" data-testid="change-error">{editError}</p>
     {/if}

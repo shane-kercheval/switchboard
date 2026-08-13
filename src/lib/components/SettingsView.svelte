@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, tick } from "svelte";
   import { ChevronRight, FolderOpen } from "@lucide/svelte";
   import { theme, type ThemeMode } from "$lib/theme.svelte";
   import { agentCopy } from "$lib/agentCopy.svelte";
@@ -13,10 +13,17 @@
     SEGMENTED_ITEM_INACTIVE_CLASS,
   } from "$lib/components/ui/segmentedControl";
   import HarnessStatusList from "$lib/components/HarnessStatusList.svelte";
+  import AgentProfileEditor from "$lib/components/AgentProfileEditor.svelte";
   import Input from "$lib/components/ui/Input.svelte";
   import CopyButton from "$lib/components/ui/CopyButton.svelte";
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
-  import { preferences, saveStatus, updatePreferences } from "$lib/preferences.svelte";
+  import {
+    loadPreferences,
+    preferenceLoadState,
+    preferences,
+    saveStatus,
+    updatePreferences,
+  } from "$lib/preferences.svelte";
   import McpServersSettings from "$lib/components/McpServersSettings.svelte";
   import {
     localPromptsDir,
@@ -25,10 +32,14 @@
     openWorkflowsDir,
     notificationAvailability,
   } from "$lib/api";
-  import type { NotificationAvailability } from "$lib/types";
+  import type { AgentProfile, HarnessKind, NotificationAvailability } from "$lib/types";
+  import { ALL_HARNESSES, HARNESS_LABEL } from "$lib/harnessDisplay";
   import { workflowAuthoringPrompt } from "$lib/workflowAuthoring";
 
-  let { onClose }: { onClose: () => void } = $props();
+  let {
+    onClose,
+    initialSection = null,
+  }: { onClose: () => void; initialSection?: "prompts" | null } = $props();
   // What macOS will actually do, as opposed to what the toggle below says. Only
   // the suppressed case is surfaced; `unavailable` (a dev build that isn't an
   // installed app) earns its place by *not* rendering that warning, since
@@ -39,6 +50,7 @@
   let workflowsDir = $state<string | null>(null);
   let workflowsDirError = $state<string | null>(null);
   let workflowPromptOpen = $state(false);
+  let promptsSection = $state<HTMLElement | undefined>(undefined);
   const workflowPrompt = $derived(workflowAuthoringPrompt(workflowsDir));
 
   const themeOptions: { mode: ThemeMode; label: string }[] = [
@@ -51,6 +63,11 @@
     { mode: "last_answer_block", label: "Final Response" },
     { mode: "full_answer", label: "Entire Response" },
   ];
+
+  const terminalOptions = [
+    { label: "Terminal", value: "Terminal" },
+    { label: "iTerm", value: "iTerm" },
+  ] as const;
 
   // `note` adds a parenthetical clarifier rendered after the action — used where
   // the key isn't literal (the compose-bar number keys map to a chip's position,
@@ -111,6 +128,7 @@
   const sectionHeadingClass = "text-fg text-base font-semibold";
 
   onMount(() => {
+    void loadPreferences();
     void localPromptsDir()
       .then((path) => {
         promptsDir = path;
@@ -139,6 +157,10 @@
         notifyAvailability = null;
         console.error("[switchboard] notification availability check failed", e);
       });
+
+    if (initialSection === "prompts") {
+      void tick().then(() => promptsSection?.scrollIntoView?.({ block: "start" }));
+    }
   });
 
   function openPromptsDir(): void {
@@ -151,6 +173,21 @@
     void openWorkflowsDir().catch((e: unknown) => {
       console.error("[switchboard] open workflows folder failed", e);
     });
+  }
+
+  async function updateAgentDefault(
+    harness: HarnessKind,
+    slot: "primary" | "secondary",
+    profile: AgentProfile | null,
+  ): Promise<void> {
+    await loadPreferences();
+    const agentDefaults = structuredClone($state.snapshot(preferences.agent_defaults));
+    if (slot === "primary" && profile !== null) {
+      agentDefaults[harness].primary = profile;
+    } else if (slot === "secondary") {
+      agentDefaults[harness].secondary = profile;
+    }
+    await updatePreferences({ agent_defaults: agentDefaults });
   }
 </script>
 
@@ -211,6 +248,60 @@
       </div>
     </section>
 
+    <section class={cn(sectionClass, "mt-7")} data-testid="agent-defaults-settings">
+      <div>
+        <h2 class={sectionHeadingClass}>Agent Defaults</h2>
+        <p class="text-muted mt-1 text-sm leading-relaxed">
+          Choose the initial model settings for new agents and projects. An optional secondary
+          configuration makes it easy to switch an agent between two setups.
+        </p>
+      </div>
+
+      {#if preferenceLoadState.ready}
+        <div class="space-y-2">
+          {#each ALL_HARNESSES as harness (harness)}
+            <details
+              class="border-border bg-raised rounded-md border"
+              open={harness === "claude_code"}
+            >
+              <summary
+                class="text-fg hover:bg-hover cursor-pointer list-none rounded-md px-3 py-2.5 text-sm font-medium"
+              >
+                {HARNESS_LABEL[harness]}
+              </summary>
+              <div class="border-border border-t p-3">
+                <AgentProfileEditor
+                  {harness}
+                  bind:primary={
+                    () => preferences.agent_defaults[harness].primary,
+                    (value) => updateAgentDefault(harness, "primary", value)
+                  }
+                  bind:secondary={
+                    () => preferences.agent_defaults[harness].secondary,
+                    (value) => updateAgentDefault(harness, "secondary", value)
+                  }
+                  testidPrefix={`settings-profile-${harness}`}
+                />
+              </div>
+            </details>
+          {/each}
+        </div>
+      {:else}
+        <div
+          class="border-border bg-raised text-muted rounded-md border px-3 py-3 text-sm"
+          data-testid="agent-defaults-loading"
+        >
+          Loading agent defaults…
+        </div>
+      {/if}
+
+      {#if saveFailedFor("agent_defaults")}
+        <p class="text-status-failed text-xs" data-testid="agent-defaults-save-error">
+          Couldn't save agent defaults. Your changes still apply for this session.
+        </p>
+      {/if}
+    </section>
+
     <section class={cn(sectionClass, "mt-7")}>
       <div>
         <h2 class={sectionHeadingClass}>Agent Message Copy Behavior</h2>
@@ -245,22 +336,22 @@
       </div>
     </section>
 
-    <section class={cn(sectionClass, "mt-7")} data-testid="git-view-prefs">
+    <section class={cn(sectionClass, "mt-7")} data-testid="external-app-prefs">
       <div>
-        <h2 class={sectionHeadingClass}>Git View</h2>
+        <h2 class={sectionHeadingClass}>External Apps</h2>
         <p class="text-muted mt-1 text-sm leading-relaxed">
-          How the Git view opens a worktree's folder. Defaults to VS Code's `code` command; leave
-          blank to use your system's default folder handler.
+          Used when opening projects and worktrees, and when resuming an agent interactively.
         </p>
       </div>
 
       <div class="space-y-1.5">
-        <label for="git-editor-command" class="text-muted block text-xs">Editor command</label>
+        <label for="external-editor-command" class="text-muted block text-xs">Editor command</label>
         <Input
-          id="git-editor-command"
-          data-testid="git-editor-command"
+          id="external-editor-command"
+          data-testid="external-editor-command"
           placeholder="code"
           value={preferences.editor_command ?? ""}
+          disabled={!preferenceLoadState.ready}
           onchange={(e: Event) => {
             const v = (e.currentTarget as HTMLInputElement).value.trim();
             void updatePreferences({ editor_command: v === "" ? null : v });
@@ -269,29 +360,44 @@
       </div>
 
       <div class="space-y-1.5">
-        <label for="git-terminal-app" class="text-muted block text-xs">Terminal app</label>
-        <Input
-          id="git-terminal-app"
-          data-testid="git-terminal-app"
-          placeholder="Terminal"
-          value={preferences.terminal_app}
-          onchange={(e: Event) => {
-            const v = (e.currentTarget as HTMLInputElement).value.trim();
-            void updatePreferences({ terminal_app: v === "" ? "Terminal" : v });
-          }}
-        />
+        <span id="external-terminal-app-label" class="text-muted block text-xs">Terminal app</span>
+        <div
+          class={cn(SEGMENTED_CONTAINER_CLASS, "inline-grid w-56 grid-cols-2")}
+          role="radiogroup"
+          aria-labelledby="external-terminal-app-label"
+          aria-disabled={!preferenceLoadState.ready}
+          data-testid="external-terminal-app"
+          data-value={preferences.terminal_app}
+        >
+          {#each terminalOptions as option (option.value)}
+            <button
+              type="button"
+              role="radio"
+              class={cn(
+                SEGMENTED_ITEM_CLASS,
+                "flex items-center justify-center",
+                preferences.terminal_app === option.value
+                  ? SEGMENTED_ITEM_ACTIVE_CLASS
+                  : SEGMENTED_ITEM_INACTIVE_CLASS,
+              )}
+              aria-checked={preferences.terminal_app === option.value}
+              disabled={!preferenceLoadState.ready}
+              data-testid={`external-terminal-app-option-${option.value.toLowerCase()}`}
+              onclick={() => void updatePreferences({ terminal_app: option.value })}
+            >
+              {option.label}
+            </button>
+          {/each}
+        </div>
       </div>
 
-      <p class="text-muted text-xs leading-relaxed">
-        File-level external diffs use your GUI Git difftool configuration. Set it with
-        <code class="font-mono">git config --global diff.tool &lt;tool&gt;</code> and the matching
-        <code class="font-mono">difftool.&lt;tool&gt;</code> options.
-      </p>
-
-      {#if saveFailedFor("editor_command", "terminal_app", "diff_style")}
-        <p class="text-status-failed text-xs leading-relaxed" data-testid="git-prefs-save-error">
-          Couldn't save your preferences ({saveStatus.error}). The change applies for now but may
-          not survive a restart.
+      {#if saveFailedFor("editor_command", "terminal_app")}
+        <p
+          class="text-status-failed text-xs leading-relaxed"
+          data-testid="external-apps-save-error"
+        >
+          Couldn't save your external app preferences ({saveStatus.error}). The change applies for
+          now but may not survive a restart.
         </p>
       {/if}
     </section>
@@ -358,11 +464,13 @@
         <button
           type="button"
           role="switch"
+          disabled={!preferenceLoadState.ready}
           aria-checked={preferences.notify_on_completion}
           aria-label="Notify me when agents finish"
           data-testid="notify-toggle"
           class={cn(
-            "relative mt-0.5 inline-flex h-5 w-9 shrink-0 cursor-pointer items-center rounded-full transition-colors outline-none",
+            "relative mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors outline-none",
+            preferenceLoadState.ready ? "cursor-pointer" : "cursor-not-allowed opacity-50",
             preferences.notify_on_completion ? "bg-accent" : "bg-active",
           )}
           onclick={() =>
@@ -390,13 +498,15 @@
         <button
           type="button"
           role="switch"
-          disabled={!preferences.notify_on_completion}
+          disabled={!preferenceLoadState.ready || !preferences.notify_on_completion}
           aria-checked={preferences.notify_while_focused}
           aria-label="Also notify me about other projects while I'm using Switchboard"
           data-testid="notify-while-focused-toggle"
           class={cn(
             "relative mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors outline-none",
-            preferences.notify_on_completion ? "cursor-pointer" : "cursor-not-allowed opacity-50",
+            preferenceLoadState.ready && preferences.notify_on_completion
+              ? "cursor-pointer"
+              : "cursor-not-allowed opacity-50",
             preferences.notify_while_focused ? "bg-accent" : "bg-active",
           )}
           onclick={() =>
@@ -446,11 +556,13 @@
         <button
           type="button"
           role="switch"
+          disabled={!preferenceLoadState.ready}
           aria-checked={preferences.show_builtins}
           aria-label="Show built-in prompts and workflows"
           data-testid="show-builtins-toggle"
           class={cn(
-            "relative mt-0.5 inline-flex h-5 w-9 shrink-0 cursor-pointer items-center rounded-full transition-colors outline-none",
+            "relative mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors outline-none",
+            preferenceLoadState.ready ? "cursor-pointer" : "cursor-not-allowed opacity-50",
             preferences.show_builtins ? "bg-accent" : "bg-active",
           )}
           onclick={() => void updatePreferences({ show_builtins: !preferences.show_builtins })}
@@ -563,7 +675,11 @@
       </div>
     </section>
 
-    <section class={cn(sectionClass, "mt-7")}>
+    <section
+      bind:this={promptsSection}
+      class={cn(sectionClass, "mt-7")}
+      data-testid="prompt-settings-section"
+    >
       <div>
         <h2 class={sectionHeadingClass}>Prompt servers (MCP)</h2>
         <p class="text-muted mt-1 text-sm leading-relaxed">

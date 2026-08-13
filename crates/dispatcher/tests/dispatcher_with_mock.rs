@@ -24,7 +24,7 @@ use switchboard_dispatcher::{
     AwaitableSendOutcome, CancelOutcome, CompletionResult, ConversationJournal, CurrentTurnWait,
     DispatchContext, DispatchContextFactory, Dispatcher, EventEmitter, JournalError, MetadataCache,
     NoopJournal, NoopMetadataCache, NoopSessionLocatorSink, NotQueued, OnBusy, RecordingEmitter,
-    SendOutcome, SessionLocatorError, SessionLocatorSink,
+    SelectionSnapshot, SendOutcome, SessionLocatorError, SessionLocatorSink,
 };
 use switchboard_harness::{
     CancelSource, ContextWindowSource, DispatchOptions, FailureKind, HarnessAdapter, MessageId,
@@ -185,6 +185,14 @@ impl TestFactory {
 }
 
 impl DispatchContextFactory for TestFactory {
+    fn selection_snapshot(&self) -> Option<SelectionSnapshot> {
+        let selected = self.agent.active_profile();
+        Some(SelectionSnapshot {
+            model: selected.model.clone(),
+            effort: selected.effort.clone(),
+        })
+    }
+
     fn preflight(
         &self,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + '_>> {
@@ -396,6 +404,7 @@ fn agent_record() -> AgentRecord {
     AgentRecord {
         model: None,
         effort: None,
+        profiles: switchboard_core::AgentProfiles::default(),
         forked_from_session: None,
         id: Uuid::now_v7(),
         project_id: Uuid::now_v7(),
@@ -444,6 +453,41 @@ fn count_type(events: &[(String, serde_json::Value)], ty: &str) -> usize {
 struct DispatchRecordingAdapter {
     inner: MockHarnessAdapter,
     dispatched: Arc<Mutex<bool>>,
+}
+
+type RecordedSelection = (Option<String>, Option<String>);
+
+struct SelectionRecordingAdapter {
+    inner: MockHarnessAdapter,
+    selections: Arc<Mutex<Vec<RecordedSelection>>>,
+}
+
+#[async_trait::async_trait]
+impl HarnessAdapter for SelectionRecordingAdapter {
+    fn probe(&self) -> Result<(), switchboard_harness::DispatchError> {
+        self.inner.probe()
+    }
+
+    fn version(&self) -> Option<String> {
+        self.inner.version()
+    }
+
+    async fn dispatch(
+        &self,
+        agent: &AgentRecord,
+        cwd: &std::path::Path,
+        prompt: &str,
+        turn_id: TurnId,
+        options: DispatchOptions,
+    ) -> Result<switchboard_harness::EventStream, switchboard_harness::DispatchError> {
+        self.selections
+            .lock()
+            .unwrap()
+            .push((agent.model.clone(), agent.effort.clone()));
+        self.inner
+            .dispatch(agent, cwd, prompt, turn_id, options)
+            .await
+    }
 }
 
 #[async_trait::async_trait]
@@ -2700,6 +2744,148 @@ async fn auto_dispatch_after_failed_first_turn() {
 #[tokio::test]
 async fn auto_dispatch_after_cancelled_first_turn() {
     auto_dispatch_after_first(MockScenario::AwaitCancellation, true).await;
+}
+
+#[tokio::test]
+async fn queued_sends_keep_the_selection_captured_at_submission() {
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let mut agent = agent_record();
+    agent.model = Some("opus".to_owned());
+    agent.effort = Some("high".to_owned());
+    let mut switched_agent = agent.clone();
+    switched_agent.model = Some("sonnet".to_owned());
+    switched_agent.effort = Some("medium".to_owned());
+    let selections = Arc::new(Mutex::new(Vec::new()));
+    let first: Arc<dyn HarnessAdapter> = Arc::new(SelectionRecordingAdapter {
+        inner: MockHarnessAdapter::with_scenario(MockScenario::AwaitCancellation),
+        selections: Arc::clone(&selections),
+    });
+    let second: Arc<dyn HarnessAdapter> = Arc::new(SelectionRecordingAdapter {
+        inner: MockHarnessAdapter::with_scenario(MockScenario::Streaming),
+        selections: Arc::clone(&selections),
+    });
+    let first_factory = TestFactory::with_adapters(
+        [first, second],
+        agent.clone(),
+        Arc::clone(&emitter),
+        noop_journal(),
+    );
+    let switched_factory = TestFactory::with_adapters(
+        [
+            Arc::new(MockHarnessAdapter::with_scenario(MockScenario::Streaming))
+                as Arc<dyn HarnessAdapter>,
+        ],
+        switched_agent,
+        Arc::clone(&emitter),
+        noop_journal(),
+    );
+
+    dispatcher
+        .send_message(
+            agent.id,
+            "first",
+            vec![],
+            Uuid::now_v7(),
+            first_factory,
+            OnBusy::Enqueue,
+        )
+        .await;
+    within(
+        &emitter,
+        "first turn_start",
+        emitter.wait_for_type("turn_start", 1),
+    )
+    .await;
+
+    dispatcher
+        .send_message(
+            agent.id,
+            "second",
+            vec![],
+            Uuid::now_v7(),
+            switched_factory,
+            OnBusy::Enqueue,
+        )
+        .await;
+    dispatcher.cancel(agent.id, CancelSource::User);
+    within(
+        &emitter,
+        "queued turn dispatched",
+        emitter.wait_for(|events| {
+            count_type(events, "turn_start") >= 2 && count_type(events, "agent_idle") >= 1
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        *selections.lock().unwrap(),
+        vec![
+            (Some("opus".to_owned()), Some("high".to_owned())),
+            (Some("sonnet".to_owned()), Some("medium".to_owned())),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn pending_work_covers_the_running_turn_and_its_queue() {
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+    let factory = TestFactory::with_adapters(
+        [
+            Arc::new(MockHarnessAdapter::with_scenario(
+                MockScenario::AwaitCancellation,
+            )) as Arc<dyn HarnessAdapter>,
+            Arc::new(MockHarnessAdapter::with_scenario(MockScenario::Streaming))
+                as Arc<dyn HarnessAdapter>,
+        ],
+        agent.clone(),
+        Arc::clone(&emitter),
+        noop_journal(),
+    );
+
+    assert!(!dispatcher.has_pending_work(agent.id).await);
+    dispatcher
+        .send_message(
+            agent.id,
+            "running",
+            vec![],
+            Uuid::now_v7(),
+            factory.clone(),
+            OnBusy::Enqueue,
+        )
+        .await;
+    within(
+        &emitter,
+        "first turn_start",
+        emitter.wait_for_type("turn_start", 1),
+    )
+    .await;
+    assert!(dispatcher.has_pending_work(agent.id).await);
+
+    dispatcher
+        .send_message(
+            agent.id,
+            "queued",
+            vec![],
+            Uuid::now_v7(),
+            factory,
+            OnBusy::Enqueue,
+        )
+        .await;
+    assert!(dispatcher.has_pending_work(agent.id).await);
+
+    dispatcher.cancel(agent.id, CancelSource::User);
+    within(
+        &emitter,
+        "queued turn dispatched and settled",
+        emitter.wait_for(|events| {
+            count_type(events, "turn_start") >= 2 && count_type(events, "agent_idle") >= 1
+        }),
+    )
+    .await;
+    assert!(!dispatcher.has_pending_work(agent.id).await);
 }
 
 #[tokio::test]

@@ -17,25 +17,40 @@ vi.mock("@tauri-apps/api/event", () => ({
 // mocks are orthogonal.
 const renameAgentMock = vi.fn<(id: string, name: string) => Promise<void>>();
 const removeAgentMock = vi.fn<(id: string) => Promise<void>>();
-const setAgentModelMock = vi.fn<(id: string, model?: string) => Promise<void>>();
-const setAgentEffortMock = vi.fn<(id: string, effort?: string) => Promise<void>>();
+const setAgentProfilesMock =
+  vi.fn<
+    (
+      id: string,
+      primary: { model: string | null; effort: string | null },
+      secondary: unknown,
+    ) => Promise<void>
+  >();
+const setActiveAgentProfileMock =
+  vi.fn<(id: string, active: "primary" | "secondary") => Promise<void>>();
 const reorderAgentsMock = vi.fn<(projectId: string, orderedIds: string[]) => Promise<void>>();
 vi.mock("$lib/state/workspace.svelte", () => ({
   renameAgent: (id: string, name: string) => renameAgentMock(id, name),
   removeAgent: (id: string) => removeAgentMock(id),
-  setAgentModel: (id: string, model?: string) => setAgentModelMock(id, model),
-  setAgentEffort: (id: string, effort?: string) => setAgentEffortMock(id, effort),
+  setAgentProfiles: (
+    id: string,
+    primary: { model: string | null; effort: string | null },
+    secondary: unknown,
+  ) => setAgentProfilesMock(id, primary, secondary),
+  setActiveAgentProfile: (id: string, active: "primary" | "secondary") =>
+    setActiveAgentProfileMock(id, active),
   reorderAgents: (projectId: string, orderedIds: string[]) =>
     reorderAgentsMock(projectId, orderedIds),
 }));
 
 const agentSessionInfoMock = vi.fn();
 const openSessionFileMock = vi.fn();
+const resumeAgentInTerminalMock = vi.fn<(id: string) => Promise<void>>();
 vi.mock("$lib/api", () => ({
   agentSessionInfo: (id: string) => agentSessionInfoMock(id),
   openSessionFile: async (id: string) => {
     openSessionFileMock(id);
   },
+  resumeAgentInTerminal: (id: string) => resumeAgentInTerminalMock(id),
   cancelAgent: vi.fn(),
 }));
 
@@ -131,11 +146,13 @@ beforeEach(() => {
   vi.clearAllMocks();
   renameAgentMock.mockResolvedValue(undefined);
   removeAgentMock.mockResolvedValue(undefined);
-  setAgentModelMock.mockResolvedValue(undefined);
-  setAgentEffortMock.mockResolvedValue(undefined);
+  setAgentProfilesMock.mockResolvedValue(undefined);
+  setActiveAgentProfileMock.mockResolvedValue(undefined);
   reorderAgentsMock.mockResolvedValue(undefined);
   agentSessionInfoMock.mockResolvedValue({ session_file: null, resume_command: null });
   openSessionFileMock.mockReset();
+  resumeAgentInTerminalMock.mockReset();
+  resumeAgentInTerminalMock.mockResolvedValue(undefined);
   copyTextMock.mockReset();
   copyTextMock.mockResolvedValue(undefined);
 });
@@ -257,8 +274,7 @@ describe("Sidebar", () => {
     const menu = await openAgentActions();
     expect(await screen.findByTestId("agent-action-resume")).toBeInTheDocument();
     expect(screen.getByTestId("agent-action-open-session")).toBeInTheDocument();
-    expect(screen.getByTestId("agent-change-model")).toBeInTheDocument();
-    expect(screen.getByTestId("agent-change-effort")).toBeInTheDocument();
+    expect(screen.getByTestId("agent-profile-settings")).toBeInTheDocument();
     expect(
       Array.from(menu.querySelectorAll('[role="menuitem"]')).map((item) =>
         item.textContent?.trim(),
@@ -268,11 +284,10 @@ describe("Sidebar", () => {
       "Collapse",
       "Resume in terminal",
       "Open session file",
-      "Change model",
-      "Change effort",
+      "Model settings…",
       "Delete agent",
     ]);
-    expect(menu.querySelectorAll('[role="menuitem"] svg')).toHaveLength(7);
+    expect(menu.querySelectorAll('[role="menuitem"] svg')).toHaveLength(6);
   });
 
   it("shows only currently available menu actions", async () => {
@@ -316,6 +331,67 @@ describe("Sidebar", () => {
     expect(copyTextMock).toHaveBeenCalledWith(
       "cd '/proj' && claude --resume abc --dangerously-skip-permissions",
     );
+
+    await fireEvent.click(screen.getByTestId("resume-run-terminal"));
+    await waitFor(() => expect(resumeAgentInTerminalMock).toHaveBeenCalledWith(CLAUDE_AGENT.id));
+    await waitFor(() => expect(screen.queryByTestId("resume-panel")).toBeNull());
+  });
+
+  it("keeps the resume dialog open and shows a terminal launch failure", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    agentSessionInfoMock.mockResolvedValue({
+      session_file: "/sessions/alice.jsonl",
+      resume_command: "cd '/proj' && claude --resume abc --dangerously-skip-permissions",
+    });
+    resumeAgentInTerminalMock.mockRejectedValue(new Error("Terminal automation was denied"));
+
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+    await openAgentActions();
+    await fireEvent.click(await screen.findByTestId("agent-action-resume"));
+    await fireEvent.click(screen.getByTestId("resume-run-terminal"));
+
+    expect(await screen.findByTestId("resume-launch-error")).toHaveTextContent(
+      "Terminal automation was denied",
+    );
+    expect(screen.getByTestId("resume-panel")).toBeInTheDocument();
+  });
+
+  it("does not let a closed dialog's pending launch affect another agent", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    await state.registerAgent(CODEX_AGENT);
+    agentSessionInfoMock.mockImplementation(async (id: string) => ({
+      session_file: `/sessions/${id}.jsonl`,
+      resume_command: id === CLAUDE_AGENT.id ? "resume alice" : "resume bob",
+    }));
+    let rejectLaunch!: (reason: unknown) => void;
+    const pendingLaunch = new Promise<void>((_resolve, reject) => {
+      rejectLaunch = reject;
+    });
+    resumeAgentInTerminalMock.mockReturnValue(pendingLaunch);
+
+    render(Sidebar, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT, CODEX_AGENT] },
+    });
+
+    await openAgentActions(0);
+    await fireEvent.click(await screen.findByTestId("agent-action-resume"));
+    await fireEvent.click(screen.getByTestId("resume-run-terminal"));
+    expect(resumeAgentInTerminalMock).toHaveBeenCalledTimes(1);
+
+    await fireEvent.click(screen.getByTestId("dialog-close"));
+    await openAgentActions(1);
+    await fireEvent.click(await screen.findByTestId("agent-action-resume"));
+    expect(screen.getByTestId("resume-command")).toHaveTextContent("resume bob");
+    expect(screen.getByTestId("resume-run-terminal")).toBeDisabled();
+
+    rejectLaunch(new Error("alice launch failed late"));
+    await waitFor(() => expect(screen.getByTestId("resume-run-terminal")).toBeEnabled());
+    expect(screen.getByTestId("resume-panel")).toBeInTheDocument();
+    expect(screen.getByTestId("resume-command")).toHaveTextContent("resume bob");
+    expect(screen.queryByTestId("resume-launch-error")).toBeNull();
+    expect(resumeAgentInTerminalMock).toHaveBeenCalledTimes(1);
   });
 
   it("omits session-backed actions when no session is bound", async () => {
@@ -382,10 +458,16 @@ describe("Sidebar", () => {
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     await openAgentActions();
-    expect(screen.getByTestId("agent-action-remove")).toHaveAttribute(
-      "title",
-      "Deletes Switchboard's files for this agent; underlying session files are kept, and its responses are removed from the conversation.",
-    );
+    const deleteItem = screen.getByTestId("agent-action-remove");
+    expect(deleteItem).not.toHaveAttribute("title");
+    await fireEvent.pointerEnter(deleteItem);
+    expect(
+      await screen.findByText(
+        "Deletes Switchboard's files for this agent; underlying session files are kept, and its responses are removed from the conversation.",
+        {},
+        { timeout: 1_500 },
+      ),
+    ).toBeInTheDocument();
   });
 
   it("confirming remove calls removeAgent and failures keep the row", async () => {
@@ -723,7 +805,7 @@ describe("Sidebar", () => {
     expect(screen.queryByTestId("agent-context-bar")).toBeNull();
   });
 
-  it("renders meta info (model + mcp/skills counts) when SessionMeta has arrived", async () => {
+  it("renders MCP/skills metadata without replacing selected model intent", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
     const runtime = state.runtimes[CLAUDE_AGENT.id];
@@ -741,33 +823,36 @@ describe("Sidebar", () => {
 
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
-    // No selected model on this agent → the SessionMeta model shows as the
-    // observed fallback; mcp/skills counts stay in the meta block.
-    expect(screen.getByTestId("agent-observed-model")).toHaveTextContent("claude-sonnet-4-6");
+    expect(screen.getByTestId("agent-selection-default")).toHaveTextContent(
+      "Harness/session default",
+    );
+    expect(screen.queryByTestId("agent-observed-model")).toBeNull();
     expect(screen.getByTestId("agent-mcp-chip")).toHaveTextContent("1");
     expect(screen.getByTestId("agent-skills-chip")).toHaveTextContent("1");
   });
 
   // --- Model / effort: change actions + intent display -----------------------
 
-  it("Claude exposes both Change model and Change effort actions", async () => {
+  it("Claude exposes one model settings action", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     await openAgentActions();
-    await waitFor(() => expect(screen.getByTestId("agent-change-model")).toBeInTheDocument());
-    expect(screen.getByTestId("agent-change-effort")).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByTestId("agent-profile-settings")).toBeInTheDocument());
+    expect(screen.getByTestId("agent-profile-settings")).toHaveTextContent("Model settings");
   });
 
-  it("Gemini exposes Change model only (no effort capability)", async () => {
+  it("Gemini exposes model settings without an effort picker", async () => {
     const state = await loadState();
     await state.registerAgent(GEMINI_AGENT);
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [GEMINI_AGENT] } });
 
     await openAgentActions();
-    await waitFor(() => expect(screen.getByTestId("agent-change-model")).toBeInTheDocument());
-    expect(screen.queryByTestId("agent-change-effort")).toBeNull();
+    await waitFor(() => expect(screen.getByTestId("agent-profile-settings")).toBeInTheDocument());
+    await fireEvent.click(screen.getByTestId("agent-profile-settings"));
+    expect(await screen.findByTestId("change-profile-primary-model")).toBeInTheDocument();
+    expect(screen.queryByTestId("change-profile-primary-effort")).toBeNull();
   });
 
   it("Antigravity exposes no change actions", async () => {
@@ -776,46 +861,79 @@ describe("Sidebar", () => {
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [ANTIGRAVITY_AGENT] } });
 
     await openAgentActions();
-    expect(screen.queryByTestId("agent-change-model")).toBeNull();
-    expect(screen.queryByTestId("agent-change-effort")).toBeNull();
+    expect(screen.queryByTestId("agent-profile-settings")).toBeNull();
   });
 
-  it("Change model opus → sonnet preselects the current value and calls setAgentModel", async () => {
+  it("model settings saves primary model and effort atomically", async () => {
     const state = await loadState();
-    const agent = { ...CLAUDE_AGENT, model: "opus" };
+    const agent = { ...CLAUDE_AGENT, model: "opus", effort: "high" };
     await state.registerAgent(agent);
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
 
     await openAgentActions();
-    await waitFor(() => expect(screen.getByTestId("agent-change-model")).toBeInTheDocument());
-    await fireEvent.click(screen.getByTestId("agent-change-model"));
+    await waitFor(() => expect(screen.getByTestId("agent-profile-settings")).toBeInTheDocument());
+    await fireEvent.click(screen.getByTestId("agent-profile-settings"));
 
-    await screen.findByTestId("change-select");
-    expect(pickerValue("change-select")).toBe("opus");
-    await choosePicker("change-select", "sonnet");
+    await screen.findByTestId("change-profile-primary-model");
+    expect(pickerValue("change-profile-primary-model")).toBe("opus");
+    await choosePicker("change-profile-primary-model", "sonnet");
     await fireEvent.click(screen.getByTestId("change-save"));
 
-    expect(setAgentModelMock).toHaveBeenCalledExactlyOnceWith(agent.id, "sonnet");
+    expect(setAgentProfilesMock).toHaveBeenCalledExactlyOnceWith(
+      agent.id,
+      { model: "sonnet", effort: "high" },
+      null,
+    );
   });
 
-  it("Change model: an agent with no pinned model seeds the harness default; no 'No override' option", async () => {
+  it("Model settings preserves an agent's unpinned primary profile", async () => {
     const state = await loadState();
-    const agent = { ...CLAUDE_AGENT, model: null };
+    const agent = { ...CLAUDE_AGENT, model: null, effort: null };
     await state.registerAgent(agent);
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
 
     await openAgentActions();
-    await waitFor(() => expect(screen.getByTestId("agent-change-model")).toBeInTheDocument());
-    await fireEvent.click(screen.getByTestId("agent-change-model"));
+    await waitFor(() => expect(screen.getByTestId("agent-profile-settings")).toBeInTheDocument());
+    await fireEvent.click(screen.getByTestId("agent-profile-settings"));
 
-    await screen.findByTestId("change-select");
-    // The picker offers concrete values only — no "No override" sentinel ("") —
-    // and preselects the harness default for an agent that pins nothing.
-    expect(pickerHasOption("change-select", "")).toBe(false);
-    expect(pickerValue("change-select")).toBe("opus");
+    await screen.findByTestId("change-profile-primary-model");
+    expect(pickerHasOption("change-profile-primary-model", "")).toBe(true);
+    expect(pickerHasOption("change-profile-primary-effort", "")).toBe(true);
+    expect(screen.getByTestId("change-profile-primary-model-option-no-override")).toHaveTextContent(
+      "Default",
+    );
+    expect(
+      screen.getByTestId("change-profile-primary-effort-option-no-override"),
+    ).toHaveTextContent("Default");
+    expect(pickerValue("change-profile-primary-model")).toBe("");
+    expect(pickerValue("change-profile-primary-effort")).toBe("");
+    await fireEvent.click(screen.getByTestId("change-profile-secondary-toggle"));
     await fireEvent.click(screen.getByTestId("change-save"));
 
-    expect(setAgentModelMock).toHaveBeenCalledExactlyOnceWith(agent.id, "opus");
+    expect(setAgentProfilesMock).toHaveBeenCalledExactlyOnceWith(
+      agent.id,
+      { model: null, effort: null },
+      { model: "sonnet", effort: "medium" },
+    );
+  });
+
+  it("changing only effort leaves an unpinned model unset", async () => {
+    const state = await loadState();
+    const agent = { ...CLAUDE_AGENT, model: null, effort: null };
+    await state.registerAgent(agent);
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
+
+    await openAgentActions();
+    await waitFor(() => expect(screen.getByTestId("agent-profile-settings")).toBeInTheDocument());
+    await fireEvent.click(screen.getByTestId("agent-profile-settings"));
+    await choosePicker("change-profile-primary-effort", "medium");
+    await fireEvent.click(screen.getByTestId("change-save"));
+
+    expect(setAgentProfilesMock).toHaveBeenCalledExactlyOnceWith(
+      agent.id,
+      { model: null, effort: "medium" },
+      null,
+    );
   });
 
   it("Change model includes an unknown persisted value so Save preserves it", async () => {
@@ -825,19 +943,23 @@ describe("Sidebar", () => {
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
 
     await openAgentActions();
-    await waitFor(() => expect(screen.getByTestId("agent-change-model")).toBeInTheDocument());
-    await fireEvent.click(screen.getByTestId("agent-change-model"));
+    await waitFor(() => expect(screen.getByTestId("agent-profile-settings")).toBeInTheDocument());
+    await fireEvent.click(screen.getByTestId("agent-profile-settings"));
 
-    await screen.findByTestId("change-select");
-    expect(pickerValue("change-select")).toBe("future-opus");
-    expect(pickerHasOption("change-select", "future-opus")).toBe(true);
+    await screen.findByTestId("change-profile-primary-model");
+    expect(pickerValue("change-profile-primary-model")).toBe("future-opus");
+    expect(pickerHasOption("change-profile-primary-model", "future-opus")).toBe(true);
     // An off-catalog value has an unbounded, vendor-shaped label that a
     // segmented pill would truncate — so the dialog drops to a native select
     // where the current model stays fully readable.
-    expect(screen.getByTestId("change-select")).toBeInstanceOf(HTMLSelectElement);
+    expect(screen.getByTestId("change-profile-primary-model")).toBeInstanceOf(HTMLSelectElement);
     await fireEvent.click(screen.getByTestId("change-save"));
 
-    expect(setAgentModelMock).toHaveBeenCalledExactlyOnceWith(agent.id, "future-opus");
+    expect(setAgentProfilesMock).toHaveBeenCalledExactlyOnceWith(
+      agent.id,
+      { model: "future-opus", effort: null },
+      null,
+    );
   });
 
   it("Change model uses the segmented toggle for an in-catalog model", async () => {
@@ -847,10 +969,10 @@ describe("Sidebar", () => {
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
 
     await openAgentActions();
-    await waitFor(() => expect(screen.getByTestId("agent-change-model")).toBeInTheDocument());
-    await fireEvent.click(screen.getByTestId("agent-change-model"));
+    await waitFor(() => expect(screen.getByTestId("agent-profile-settings")).toBeInTheDocument());
+    await fireEvent.click(screen.getByTestId("agent-profile-settings"));
 
-    const picker = await screen.findByTestId("change-select");
+    const picker = await screen.findByTestId("change-profile-primary-model");
     // A curated short list stays a toggle, not a dropdown.
     expect(picker).not.toBeInstanceOf(HTMLSelectElement);
     expect(picker).toHaveAttribute("role", "radiogroup");
@@ -861,12 +983,12 @@ describe("Sidebar", () => {
     const agent = { ...CLAUDE_AGENT, model: "opus" };
     await state.registerAgent(agent);
     const pending = deferred();
-    setAgentModelMock.mockReturnValueOnce(pending.promise);
+    setAgentProfilesMock.mockReturnValueOnce(pending.promise);
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
 
     await openAgentActions();
-    await waitFor(() => expect(screen.getByTestId("agent-change-model")).toBeInTheDocument());
-    await fireEvent.click(screen.getByTestId("agent-change-model"));
+    await waitFor(() => expect(screen.getByTestId("agent-profile-settings")).toBeInTheDocument());
+    await fireEvent.click(screen.getByTestId("agent-profile-settings"));
     await fireEvent.click(screen.getByTestId("change-save"));
 
     expect(screen.getByTestId("change-selection-panel")).toBeInTheDocument();
@@ -874,6 +996,136 @@ describe("Sidebar", () => {
 
     pending.resolve(undefined);
     await waitFor(() => expect(screen.queryByTestId("change-selection-panel")).toBeNull());
+  });
+
+  it("configures a secondary profile in the shared model settings dialog", async () => {
+    const state = await loadState();
+    const agent = { ...CLAUDE_AGENT, model: "opus", effort: "high" };
+    await state.registerAgent(agent);
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
+
+    await openAgentActions();
+    await fireEvent.click(await screen.findByTestId("agent-profile-settings"));
+    await fireEvent.click(screen.getByTestId("change-profile-secondary-toggle"));
+    expect(pickerValue("change-profile-secondary-model")).toBe("sonnet");
+    expect(pickerValue("change-profile-secondary-effort")).toBe("medium");
+    await fireEvent.click(screen.getByTestId("change-save"));
+
+    expect(setAgentProfilesMock).toHaveBeenCalledExactlyOnceWith(
+      agent.id,
+      { model: "opus", effort: "high" },
+      { model: "sonnet", effort: "medium" },
+    );
+  });
+
+  it("quick-switches an agent to its secondary profile", async () => {
+    const state = await loadState();
+    const agent: AgentRecord = {
+      ...CLAUDE_AGENT,
+      model: "opus",
+      effort: "high",
+      profiles: {
+        active: "primary",
+        secondary: { model: "sonnet", effort: "medium" },
+      },
+    };
+    await state.registerAgent(agent);
+    const { rerender } = render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
+
+    const toggle = screen.getByTestId("agent-profile-switch");
+    expect(toggle).toHaveAccessibleName(/Using Primary: Opus · High.*Secondary: Sonnet · Medium/);
+    await fireEvent.click(toggle);
+
+    expect(setActiveAgentProfileMock).toHaveBeenCalledExactlyOnceWith(agent.id, "secondary");
+    await rerender({
+      agents: [{ ...agent, profiles: { ...agent.profiles!, active: "secondary" } }],
+    });
+    expect(screen.getByTestId("agent-selected-model")).toHaveTextContent("sonnet");
+    expect(screen.getByTestId("agent-selected-effort")).toHaveTextContent("medium");
+  });
+
+  it("shows two-line profile details above the switch and closes on pointer exit", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const state = await loadState();
+      const agent: AgentRecord = {
+        ...CLAUDE_AGENT,
+        model: "opus",
+        effort: "high",
+        profiles: {
+          active: "primary",
+          secondary: { model: "sonnet", effort: "medium" },
+        },
+      };
+      await state.registerAgent(agent);
+      render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
+
+      const toggle = screen.getByTestId("agent-profile-switch");
+      await fireEvent.pointerEnter(toggle);
+      await vi.advanceTimersByTimeAsync(500);
+      const tooltip = await waitFor(() => screen.getByTestId("tooltip-content"));
+      expect(tooltip).toHaveAttribute("data-side", "top");
+      expect(within(tooltip).getByText("Primary: Opus · High")).toBeInTheDocument();
+      expect(within(tooltip).getByText("Switch to Secondary: Sonnet · Medium")).toBeInTheDocument();
+      expect(tooltip).toHaveClass("pointer-events-none");
+
+      await fireEvent.pointerLeave(toggle);
+      await waitFor(() => expect(screen.queryByTestId("tooltip-content")).not.toBeInTheDocument());
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("quick-switches from an unpinned primary with no observed model", async () => {
+    const state = await loadState();
+    const agent: AgentRecord = {
+      ...CLAUDE_AGENT,
+      model: null,
+      effort: null,
+      profiles: {
+        active: "primary",
+        secondary: { model: "sonnet", effort: "medium" },
+      },
+    };
+    await state.registerAgent(agent);
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
+
+    expect(screen.getByTestId("agent-selection-default")).toHaveTextContent(
+      "Harness/session default",
+    );
+    const toggle = screen.getByTestId("agent-profile-switch");
+    expect(toggle).toHaveAccessibleName(
+      /Using Primary: Harness\/session default.*Secondary: Sonnet · Medium/,
+    );
+    await fireEvent.click(toggle);
+
+    expect(setActiveAgentProfileMock).toHaveBeenCalledExactlyOnceWith(agent.id, "secondary");
+  });
+
+  it("keeps the quick switch usable and surfaces a persistence failure", async () => {
+    const state = await loadState();
+    const agent: AgentRecord = {
+      ...CLAUDE_AGENT,
+      model: "opus",
+      effort: "high",
+      profiles: {
+        active: "primary",
+        secondary: { model: "sonnet", effort: "medium" },
+      },
+    };
+    await state.registerAgent(agent);
+    setActiveAgentProfileMock.mockRejectedValueOnce(new Error("registry is read-only"));
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
+
+    const toggle = screen.getByTestId("agent-profile-switch");
+    await fireEvent.click(toggle);
+
+    await waitFor(() =>
+      expect(screen.getByTestId("agent-profile-switch-error")).toHaveTextContent(
+        "registry is read-only",
+      ),
+    );
+    expect(toggle).toBeEnabled();
   });
 
   it("sidebar shows the SELECTED model even when the observed model differs (post-turn state)", async () => {
@@ -902,7 +1154,7 @@ describe("Sidebar", () => {
     expect(screen.queryByTestId("agent-observed-model")).toBeNull();
   });
 
-  it("sidebar falls back to the observed model when no model is selected, and hides when neither exists", async () => {
+  it("sidebar shows harness default rather than the last observed model when unpinned", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT); // no selected model
     const runtime = state.runtimes[CLAUDE_AGENT.id];
@@ -918,17 +1170,14 @@ describe("Sidebar", () => {
       },
     };
 
-    const { rerender } = render(Sidebar, {
+    render(Sidebar, {
       props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] },
     });
-    expect(screen.getByTestId("agent-observed-model")).toHaveTextContent("claude-sonnet-4-6");
+    expect(screen.getByTestId("agent-selection-default")).toHaveTextContent(
+      "Harness/session default",
+    );
     expect(screen.queryByTestId("agent-selected-model")).toBeNull();
-
-    // Drop the observed model too → the whole line clean-hides.
-    state.runtimes[CLAUDE_AGENT.id] = { ...runtime, meta: undefined };
-    await rerender({ agents: [CLAUDE_AGENT] });
-    await waitFor(() => expect(screen.queryByTestId("agent-observed-model")).toBeNull());
-    expect(screen.queryByTestId("agent-selected-model")).toBeNull();
+    expect(screen.queryByTestId("agent-observed-model")).toBeNull();
   });
 
   it("sidebar shows the selected effort", async () => {
@@ -1388,10 +1637,12 @@ describe("Sidebar agent-scoped event tolerance", () => {
         skills: meta.skills,
       },
     };
-    // Component still rendered correctly with the new meta — the model shows as
-    // the observed fallback (this agent has no selected model).
+    // Runtime metadata never replaces the active profile's future-send intent.
     await waitFor(() => {
-      expect(screen.getByTestId("agent-observed-model")).toHaveTextContent("claude-sonnet-4-6");
+      expect(screen.getByTestId("agent-selection-default")).toHaveTextContent(
+        "Harness/session default",
+      );
+      expect(screen.queryByTestId("agent-observed-model")).toBeNull();
     });
   });
 });
@@ -1422,9 +1673,11 @@ describe("Sidebar inline rename", () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
-    await fireEvent.click(screen.getByTestId("agent-name"));
+    const name = screen.getByTestId("agent-name");
+    expect(name).not.toHaveAttribute("title");
+    await fireEvent.click(name);
     expect(screen.getByTestId("sidebar-agent")).toHaveAttribute("data-collapsed", "false");
-    await fireEvent.dblClick(screen.getByTestId("agent-name"));
+    await fireEvent.dblClick(name);
     expect(await screen.findByTestId("agent-rename-input")).toBeInTheDocument();
     await fireEvent.keyDown(screen.getByTestId("agent-rename-input"), { key: "Escape" });
     expect(screen.getByTestId("sidebar-agent")).toHaveAttribute("data-collapsed", "false");
@@ -1516,7 +1769,7 @@ describe("Sidebar inline rename", () => {
     const save = screen.getByTestId("agent-rename-save");
     expect(save).toBeDisabled();
     // The live message rides the input's title tooltip in the cramped card.
-    expect(input).toHaveAttribute("title", "An agent named 'bob' already exists");
+    expect(input).not.toHaveAttribute("title");
     expect(input).toHaveAttribute("aria-invalid", "true");
 
     // Enter is a no-op while invalid; the agent stays in edit mode.

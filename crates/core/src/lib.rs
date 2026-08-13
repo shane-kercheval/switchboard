@@ -16,7 +16,10 @@ mod paths;
 pub mod pins;
 pub mod project;
 
-pub use agent::{AgentId, AgentRecord, SessionLocator, normalize_selection};
+pub use agent::{
+    AgentId, AgentProfile, AgentProfileSlot, AgentProfiles, AgentRecord, SessionLocator,
+    normalize_selection,
+};
 pub use attachment::{Attachment, AttachmentKind, render_prompt_with_attachments};
 pub use directory::{Directory, DirectoryConfig};
 pub use error::{CoreError, Result};

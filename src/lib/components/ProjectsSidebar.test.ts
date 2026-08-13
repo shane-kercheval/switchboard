@@ -449,7 +449,7 @@ describe("ProjectsSidebar — rename", () => {
     await fireEvent.input(input, { target: { value: "BETA" } }); // canonical collision
     expect(screen.getByTestId("project-rename-save")).toBeDisabled();
     expect(input).toHaveAttribute("aria-invalid", "true");
-    expect(input).toHaveAttribute("title", "A project named 'beta' already exists");
+    expect(input).not.toHaveAttribute("title");
   });
 
   it("allows a name that only collides in a different directory", async () => {
@@ -668,10 +668,16 @@ describe("ProjectsSidebar — delete", () => {
     await renderWith([projectIn(A1, "alpha", "/work/a")]);
     await openProjectActions();
 
-    expect(screen.getByTestId("project-action-delete")).toHaveAttribute(
-      "title",
-      `${PROJECT_DELETE_TOOLTIP} Works even if the project's folder no longer exists.`,
-    );
+    const deleteItem = screen.getByTestId("project-action-delete");
+    expect(deleteItem).not.toHaveAttribute("title");
+    await fireEvent.pointerEnter(deleteItem);
+    expect(
+      await screen.findByText(
+        `${PROJECT_DELETE_TOOLTIP} Works even if the project's folder no longer exists.`,
+        {},
+        { timeout: 1_500 },
+      ),
+    ).toBeInTheDocument();
   });
 
   it("allows deleting an unavailable project (folder gone)", async () => {

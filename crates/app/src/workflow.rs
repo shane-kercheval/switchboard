@@ -755,6 +755,10 @@ mod tests {
         journal: Arc<dyn ConversationJournal>,
     }
     impl DispatchContextFactory for MockFactory {
+        fn selection_snapshot(&self) -> Option<switchboard_dispatcher::SelectionSnapshot> {
+            None
+        }
+
         fn build(&self, _send_id: SendId) -> DispatchContext {
             let scenario = self
                 .scenarios
@@ -834,6 +838,7 @@ mod tests {
                 session_locator: Some(SessionLocator::Uuid(Uuid::now_v7())),
                 model: None,
                 effort: None,
+                profiles: switchboard_core::AgentProfiles::default(),
                 forked_from_session: None,
                 created_at: Utc::now(),
             };

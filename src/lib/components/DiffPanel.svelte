@@ -375,15 +375,19 @@
         {/if}
       </div>
       {#if target.kind === "uncommitted"}
-        <button
-          type="button"
-          class="text-muted hover:text-fg block max-w-full min-w-0 truncate text-left font-mono text-[11px] leading-4"
-          title={`${target.subtitle} — reveal in Finder`}
-          data-testid="detail-subtitle"
-          onclick={revealTarget}
-        >
-          {target.subtitle}
-        </button>
+        <Tooltip label="Reveal in Finder" side="bottom">
+          {#snippet trigger(props)}
+            <button
+              {...props}
+              type="button"
+              class="text-muted hover:text-fg block max-w-full min-w-0 truncate text-left font-mono text-[11px] leading-4"
+              data-testid="detail-subtitle"
+              onclick={revealTarget}
+            >
+              {target.subtitle}
+            </button>
+          {/snippet}
+        </Tooltip>
       {:else}
         <div
           class="text-muted truncate font-mono text-[11px] leading-4"

@@ -60,6 +60,11 @@
     { mode: "full_answer", label: "Entire Response" },
   ];
 
+  const terminalOptions = [
+    { label: "Terminal", value: "Terminal" },
+    { label: "iTerm", value: "iTerm" },
+  ] as const;
+
   // `note` adds a parenthetical clarifier rendered after the action — used where
   // the key isn't literal (the compose-bar number keys map to a chip's position,
   // not a fixed digit).
@@ -323,20 +328,19 @@
       </div>
     </section>
 
-    <section class={cn(sectionClass, "mt-7")} data-testid="git-view-prefs">
+    <section class={cn(sectionClass, "mt-7")} data-testid="external-app-prefs">
       <div>
-        <h2 class={sectionHeadingClass}>Git View</h2>
+        <h2 class={sectionHeadingClass}>External Apps</h2>
         <p class="text-muted mt-1 text-sm leading-relaxed">
-          How the Git view opens a worktree's folder. Defaults to VS Code's `code` command; leave
-          blank to use your system's default folder handler.
+          Used when opening projects and worktrees, and when resuming an agent interactively.
         </p>
       </div>
 
       <div class="space-y-1.5">
-        <label for="git-editor-command" class="text-muted block text-xs">Editor command</label>
+        <label for="external-editor-command" class="text-muted block text-xs">Editor command</label>
         <Input
-          id="git-editor-command"
-          data-testid="git-editor-command"
+          id="external-editor-command"
+          data-testid="external-editor-command"
           placeholder="code"
           value={preferences.editor_command ?? ""}
           disabled={!preferenceLoadState.ready}
@@ -348,30 +352,44 @@
       </div>
 
       <div class="space-y-1.5">
-        <label for="git-terminal-app" class="text-muted block text-xs">Terminal app</label>
-        <Input
-          id="git-terminal-app"
-          data-testid="git-terminal-app"
-          placeholder="Terminal"
-          value={preferences.terminal_app}
-          disabled={!preferenceLoadState.ready}
-          onchange={(e: Event) => {
-            const v = (e.currentTarget as HTMLInputElement).value.trim();
-            void updatePreferences({ terminal_app: v === "" ? "Terminal" : v });
-          }}
-        />
+        <span id="external-terminal-app-label" class="text-muted block text-xs">Terminal app</span>
+        <div
+          class={cn(SEGMENTED_CONTAINER_CLASS, "inline-grid w-56 grid-cols-2")}
+          role="radiogroup"
+          aria-labelledby="external-terminal-app-label"
+          aria-disabled={!preferenceLoadState.ready}
+          data-testid="external-terminal-app"
+          data-value={preferences.terminal_app}
+        >
+          {#each terminalOptions as option (option.value)}
+            <button
+              type="button"
+              role="radio"
+              class={cn(
+                SEGMENTED_ITEM_CLASS,
+                "flex items-center justify-center",
+                preferences.terminal_app === option.value
+                  ? SEGMENTED_ITEM_ACTIVE_CLASS
+                  : SEGMENTED_ITEM_INACTIVE_CLASS,
+              )}
+              aria-checked={preferences.terminal_app === option.value}
+              disabled={!preferenceLoadState.ready}
+              data-testid={`external-terminal-app-option-${option.value.toLowerCase()}`}
+              onclick={() => void updatePreferences({ terminal_app: option.value })}
+            >
+              {option.label}
+            </button>
+          {/each}
+        </div>
       </div>
 
-      <p class="text-muted text-xs leading-relaxed">
-        File-level external diffs use your GUI Git difftool configuration. Set it with
-        <code class="font-mono">git config --global diff.tool &lt;tool&gt;</code> and the matching
-        <code class="font-mono">difftool.&lt;tool&gt;</code> options.
-      </p>
-
-      {#if saveFailedFor("editor_command", "terminal_app", "diff_style")}
-        <p class="text-status-failed text-xs leading-relaxed" data-testid="git-prefs-save-error">
-          Couldn't save your preferences ({saveStatus.error}). The change applies for now but may
-          not survive a restart.
+      {#if saveFailedFor("editor_command", "terminal_app")}
+        <p
+          class="text-status-failed text-xs leading-relaxed"
+          data-testid="external-apps-save-error"
+        >
+          Couldn't save your external app preferences ({saveStatus.error}). The change applies for
+          now but may not survive a restart.
         </p>
       {/if}
     </section>

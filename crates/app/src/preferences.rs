@@ -111,9 +111,8 @@ fn merge_yaml_value(existing: &mut serde_norway::Value, new: serde_norway::Value
     }
 }
 
-/// The default terminal application opened by the Git view's "open in terminal"
-/// action when no override is set. macOS ships Terminal.app; power users can name
-/// another (`iTerm`, `Ghostty`, …).
+/// The default terminal application used by project/worktree open actions and
+/// interactive agent resume. macOS ships Terminal.app.
 fn default_terminal_app() -> String {
     "Terminal".to_owned()
 }
@@ -140,8 +139,8 @@ pub struct Preferences {
     /// macOS).
     pub editor_command: Option<String>,
 
-    /// Name of the terminal application the "open in terminal" action launches
-    /// (`open -a <name> <path>` on macOS). Defaults to `Terminal`.
+    /// Terminal application used by project/worktree open actions and agent
+    /// resume execution. Normalized to `Terminal` or `iTerm`.
     pub terminal_app: String,
 
     /// Diff panel layout. Defaults to unified.
@@ -203,8 +202,8 @@ impl Preferences {
     /// arrived (deserialized from a hand-edited `config.yaml`, or sent by a
     /// client). Trims surrounding whitespace; a blank editor command becomes
     /// `None` (→ OS folder-open) and a blank terminal app becomes the default.
-    /// Applied at every boundary (`load` + `set`) so consumers — the Git-view
-    /// open-actions — never see an empty command to spawn.
+    /// Applied at every boundary (`load` + `set`) so external-app consumers
+    /// never see an empty command to spawn.
     #[must_use]
     pub fn normalized(self) -> Self {
         let editor_command = self
@@ -213,10 +212,10 @@ impl Preferences {
             .filter(|c| !c.is_empty());
         let terminal_app = {
             let trimmed = self.terminal_app.trim();
-            if trimmed.is_empty() {
-                default_terminal_app()
+            if trimmed.eq_ignore_ascii_case("iterm") || trimmed.eq_ignore_ascii_case("iterm2") {
+                "iTerm".to_owned()
             } else {
-                trimmed.to_owned()
+                default_terminal_app()
             }
         };
         let mut agent_defaults = default_agent_defaults();
@@ -658,6 +657,15 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_legacy_terminal_migrates_to_terminal_at_load() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(&path, "terminal_app: Ghostty\n").unwrap();
+
+        assert_eq!(load(&path).terminal_app, "Terminal");
+    }
+
+    #[test]
     fn normalized_trims_and_maps_blanks() {
         let p = Preferences {
             editor_command: Some("  cursor  ".to_owned()),
@@ -689,6 +697,13 @@ mod tests {
         .normalized();
         assert_eq!(blank.editor_command, None);
         assert_eq!(blank.terminal_app, "Terminal");
+
+        let legacy = Preferences {
+            terminal_app: "Ghostty".to_owned(),
+            ..Preferences::default()
+        }
+        .normalized();
+        assert_eq!(legacy.terminal_app, "Terminal");
     }
 
     #[test]

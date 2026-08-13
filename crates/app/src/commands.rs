@@ -1062,6 +1062,50 @@ pub fn terminal_open_argv(terminal_app: &str, path: &str) -> Vec<String> {
     ]
 }
 
+/// The macOS `AppleScript` invocation that opens a fresh window in the selected
+/// supported terminal and runs `command`. The command is passed as an argv
+/// value to `osascript`, never interpolated into `AppleScript` source, so shell
+/// quoting in the backend-generated resume command stays intact and cannot
+/// become `AppleScript` syntax.
+pub fn terminal_resume_argv(terminal_app: &str, command: &str) -> Result<Vec<String>, AppError> {
+    let app = terminal_app.trim();
+    let body = if app.eq_ignore_ascii_case("terminal") {
+        vec![
+            "set resumeCommand to item 1 of argv".to_owned(),
+            "tell application \"Terminal\"".to_owned(),
+            "activate".to_owned(),
+            "do script resumeCommand".to_owned(),
+            "end tell".to_owned(),
+        ]
+    } else if app.eq_ignore_ascii_case("iterm") || app.eq_ignore_ascii_case("iterm2") {
+        vec![
+            "set resumeCommand to item 1 of argv".to_owned(),
+            "tell application \"iTerm2\"".to_owned(),
+            "activate".to_owned(),
+            "set resumeWindow to (create window with default profile)".to_owned(),
+            "tell current session of current tab of resumeWindow to write text resumeCommand"
+                .to_owned(),
+            "end tell".to_owned(),
+        ]
+    } else {
+        return Err(AppError::UnsupportedTerminalApp {
+            terminal_app: terminal_app.to_owned(),
+        });
+    };
+
+    let mut argv = vec![
+        "/usr/bin/osascript".to_owned(),
+        "-e".to_owned(),
+        "on run argv".to_owned(),
+    ];
+    for line in body {
+        argv.push("-e".to_owned());
+        argv.push(line);
+    }
+    argv.extend(["-e".to_owned(), "end run".to_owned(), command.to_owned()]);
+    Ok(argv)
+}
+
 /// The macOS argv for revealing a path in Finder (`open -R <path>` selects the
 /// item in its containing folder rather than opening it).
 #[must_use]
@@ -4138,6 +4182,30 @@ pub fn agent_session_info_impl(
     })
 }
 
+/// Validate an interactive-session handoff and build the selected terminal's
+/// launch argv. The Tauri shim performs only the subprocess spawn.
+///
+/// This is an authoritative backend check in addition to the UI's disabled
+/// state: launching while a turn or queued send exists would put two processes
+/// on one harness session. It is deliberately a check rather than a persistent
+/// lock — once the terminal owns the session, the user must not send to the same
+/// agent in Switchboard until that external session is closed.
+pub async fn resume_agent_in_terminal_impl(
+    state: &AppState,
+    agent_id: AgentId,
+    home_dir: &Path,
+) -> Result<Vec<String>, AppError> {
+    let (_, agent) = lookup_agent(state, agent_id)?;
+    if state.dispatcher.has_pending_work(agent_id).await {
+        return Err(AppError::ResumeAgentBusy { name: agent.name });
+    }
+    let command = agent_session_info_impl(state, agent_id, home_dir)?
+        .resume_command
+        .ok_or(AppError::ResumeUnavailable)?;
+    let terminal = get_preferences_impl(state).terminal_app;
+    terminal_resume_argv(&terminal, &command)
+}
+
 /// POSIX single-quote a string for safe interpolation into a shell command:
 /// wrap in single quotes, and replace any embedded single quote with the
 /// `'\''` close-reopen idiom. Used only to render a copy-ready resume command.
@@ -6515,6 +6583,34 @@ mod tests {
             lock(&state.agents_by_id).len(),
             before,
             "a refused fork must not leave an agent behind"
+        );
+
+        gate.notify_waiters();
+    }
+
+    #[tokio::test]
+    async fn terminal_resume_requires_switchboard_to_be_idle() {
+        let (_tmp, home, state, gate, project_id) = state_with_parked_claude(&["parent"]).await;
+        let source_id = seed_source(&state, home.path(), project_id, "alice", "hello");
+
+        let argv = resume_agent_in_terminal_impl(&state, source_id, home.path())
+            .await
+            .expect("an idle resumable agent can be handed to Terminal");
+        assert!(
+            argv.iter()
+                .any(|arg| arg == "tell application \"Terminal\"")
+        );
+
+        send_msg_with_home(&state, source_id, "long one", home.path())
+            .await
+            .unwrap();
+        await_turn_running(&state, source_id).await;
+        let err = resume_agent_in_terminal_impl(&state, source_id, home.path())
+            .await
+            .expect_err("a running agent must not be resumed externally");
+        assert!(
+            matches!(err, AppError::ResumeAgentBusy { .. }),
+            "got: {err:?}"
         );
 
         gate.notify_waiters();
@@ -18986,6 +19082,40 @@ mod tests {
             reveal_in_finder_argv("/repo/wt"),
             vec!["open", "-R", "/repo/wt"]
         );
+    }
+
+    #[test]
+    fn terminal_resume_argv_passes_the_command_as_data() {
+        let command = "cd '/repo/it'\\''s here' && claude --resume abc";
+        let terminal = terminal_resume_argv("Terminal", command).unwrap();
+        assert_eq!(
+            terminal.first().map(String::as_str),
+            Some("/usr/bin/osascript")
+        );
+        assert!(
+            terminal
+                .iter()
+                .any(|arg| arg == "tell application \"Terminal\"")
+        );
+        assert!(terminal.iter().any(|arg| arg == "do script resumeCommand"));
+        assert_eq!(terminal.last().map(String::as_str), Some(command));
+
+        let iterm = terminal_resume_argv("iTerm", command).unwrap();
+        assert!(iterm.iter().any(|arg| arg == "tell application \"iTerm2\""));
+        assert!(
+            iterm
+                .iter()
+                .any(|arg| arg == "set resumeWindow to (create window with default profile)")
+        );
+        assert!(iterm.iter().any(|arg| {
+            arg == "tell current session of current tab of resumeWindow to write text resumeCommand"
+        }));
+        assert_eq!(iterm.last().map(String::as_str), Some(command));
+
+        assert!(matches!(
+            terminal_resume_argv("Ghostty", command),
+            Err(AppError::UnsupportedTerminalApp { .. })
+        ));
     }
 
     #[tokio::test]

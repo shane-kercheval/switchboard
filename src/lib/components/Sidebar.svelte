@@ -55,6 +55,7 @@
   import {
     agentSessionInfo,
     openSessionFile as apiOpenSessionFile,
+    resumeAgentInTerminal,
     type AgentSessionInfo,
   } from "$lib/api";
   import { normalizeAgentName, validateAgentName, type NameValidation } from "$lib/agentName";
@@ -135,6 +136,10 @@
   let sessionInfoError = $state<{ agentId: AgentId; message: string } | null>(null);
   let resumeAgentId = $state<AgentId | null>(null);
   let resumeOpen = $state(false);
+  let resumeLaunchSequence = 0;
+  let resumeLaunchOperation = $state<{ id: number; agentId: AgentId } | null>(null);
+  const resumeLaunching = $derived(resumeLaunchOperation !== null);
+  let resumeLaunchError = $state<string | null>(null);
   /// Verbatim hydration-error dialog (per-agent "history failed to load"). The
   /// failure lives on `runtime.hydration_error`; this just tracks which agent's
   /// error is currently shown.
@@ -251,6 +256,34 @@
   const resumeInfo = $derived(
     resumeAgentId === null ? null : (sessionInfoByAgent[resumeAgentId] ?? null),
   );
+
+  function closeResume(): void {
+    resumeAgentId = null;
+    resumeLaunchError = null;
+  }
+
+  async function launchResumeInTerminal(): Promise<void> {
+    if (resumeAgent === null || resumeLaunching || isActive(resumeAgent.id)) return;
+    const agentId = resumeAgent.id;
+    const operationId = ++resumeLaunchSequence;
+    resumeLaunchOperation = { id: operationId, agentId };
+    resumeLaunchError = null;
+    try {
+      await resumeAgentInTerminal(agentId);
+      if (resumeLaunchOperation?.id !== operationId) return;
+      resumeLaunchOperation = null;
+      if (resumeAgentId === agentId) {
+        resumeOpen = false;
+        closeResume();
+      }
+    } catch (err) {
+      if (resumeLaunchOperation?.id !== operationId) return;
+      resumeLaunchOperation = null;
+      if (resumeAgentId === agentId) {
+        resumeLaunchError = err instanceof Error ? err.message : String(err);
+      }
+    }
+  }
 
   function hasSessionActions(info: AgentSessionInfo | null | undefined): boolean {
     return Boolean(info?.session_file || info?.resume_command);
@@ -1164,6 +1197,7 @@
                       <DropdownMenuItem
                         onSelect={() => {
                           resumeAgentId = agent.id;
+                          resumeLaunchError = null;
                           resumeOpen = true;
                         }}
                         class="gap-2"
@@ -1639,7 +1673,7 @@
 
 <Dialog
   bind:open={resumeOpen}
-  onClose={() => (resumeAgentId = null)}
+  onClose={closeResume}
   title="Resume in terminal"
   contentClass="max-w-lg"
 >
@@ -1649,7 +1683,7 @@
     </p>
     <div class="flex items-center gap-2">
       <code
-        class="bg-panel text-fg min-w-0 flex-1 overflow-x-auto rounded-md px-2.5 py-2 font-mono text-xs whitespace-pre"
+        class="bg-panel text-fg min-w-0 flex-1 rounded-md px-2.5 py-2 font-mono text-xs leading-5 break-all whitespace-pre-wrap"
         data-testid="resume-command">{resumeInfo?.resume_command ?? ""}</code
       >
       <CopyButton
@@ -1658,7 +1692,27 @@
         testid="resume-copy"
         class="shrink-0"
       />
+      <Tooltip label={`Run in ${preferences.terminal_app}`} side="top">
+        {#snippet trigger(props)}
+          <button
+            {...props}
+            type="button"
+            class={cn(ICON_BUTTON_CLASS, "shrink-0")}
+            disabled={resumeLaunching || (resumeAgent !== null && isActive(resumeAgent.id))}
+            aria-label={`Run in ${preferences.terminal_app}`}
+            data-testid="resume-run-terminal"
+            onclick={() => void launchResumeInTerminal()}
+          >
+            <Terminal size={16} strokeWidth={1.5} aria-hidden="true" />
+          </button>
+        {/snippet}
+      </Tooltip>
     </div>
+    {#if resumeLaunchError !== null}
+      <p class="text-status-failed text-xs" data-testid="resume-launch-error">
+        Couldn't open terminal: {resumeLaunchError}
+      </p>
+    {/if}
     {#if resumeAgent !== null && isActive(resumeAgent.id)}
       <p class="text-status-failed text-xs" data-testid="resume-warning-active">
         ⚠ Switchboard is currently driving this session — stop the agent before running this
@@ -1666,8 +1720,8 @@
       </p>
     {:else}
       <p class="text-muted text-xs" data-testid="resume-warning">
-        ⚠ Don't run this while the agent is active in Switchboard — two processes writing one
-        session file will corrupt it.
+        ⚠ While this terminal session is open, don't send to this agent in Switchboard — two
+        processes writing one session file can corrupt it.
       </p>
     {/if}
   </div>

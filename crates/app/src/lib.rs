@@ -54,13 +54,13 @@ use crate::commands::{
     read_tracked_repo_from_inputs, recheck_harness_installs_impl, remove_agent_impl,
     remove_directory_impl, remove_mcp_provider_impl, remove_message_pins_impl,
     remove_queued_message_impl, remove_tracked_repo_impl, rename_agent_impl, rename_project_impl,
-    render_prompt_impl, reorder_agents_impl, reveal_in_finder_argv, search_project_files_in_root,
-    search_project_files_root_impl, send_message_impl, set_active_agent_profile_impl,
-    set_active_project_impl, set_agent_profiles_impl, set_message_pin_impl, set_preferences_impl,
-    set_project_archived_impl, set_visible_project_impl, sign_in_mcp_provider_impl,
-    sign_out_mcp_provider_impl, stage_attachment_impl, sync_prompts_and_notify, terminal_open_argv,
-    test_mcp_connection_impl, test_saved_mcp_provider_impl, tracked_repos_inputs, tracked_roots,
-    validate_external_url,
+    render_prompt_impl, reorder_agents_impl, resume_agent_in_terminal_impl, reveal_in_finder_argv,
+    search_project_files_in_root, search_project_files_root_impl, send_message_impl,
+    set_active_agent_profile_impl, set_active_project_impl, set_agent_profiles_impl,
+    set_message_pin_impl, set_preferences_impl, set_project_archived_impl,
+    set_visible_project_impl, sign_in_mcp_provider_impl, sign_out_mcp_provider_impl,
+    stage_attachment_impl, sync_prompts_and_notify, terminal_open_argv, test_mcp_connection_impl,
+    test_saved_mcp_provider_impl, tracked_repos_inputs, tracked_roots, validate_external_url,
 };
 use crate::error::AppError;
 use crate::preferences::Preferences;
@@ -1053,6 +1053,21 @@ async fn open_session_file(state: State<'_, AppState>, agent_id: String) -> Resu
 }
 
 #[tauri::command]
+async fn resume_agent_in_terminal(
+    state: State<'_, AppState>,
+    agent_id: String,
+) -> Result<(), String> {
+    let id = parse_uuid(&agent_id).map_err(|e| e.to_string())?;
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default();
+    let argv = resume_agent_in_terminal_impl(state.inner(), id, &home)
+        .await
+        .map_err(|e| e.to_string())?;
+    run_open_argv(argv).await
+}
+
+#[tauri::command]
 async fn open_external_url(url: String) -> Result<(), String> {
     open_validated_external_url(&url).await
 }
@@ -1897,6 +1912,7 @@ pub fn run() {
             forward_prompt,
             cancel_forward,
             agent_session_info,
+            resume_agent_in_terminal,
             open_session_file,
             open_external_url,
             open_in_editor,

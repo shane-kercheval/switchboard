@@ -133,8 +133,10 @@ describe("SettingsView", () => {
     render(SettingsView, { props: { onClose: vi.fn() } });
     expect(screen.getByTestId("agent-defaults-loading")).toBeInTheDocument();
     expect(screen.queryByTestId("settings-profile-claude_code-primary-model")).toBeNull();
-    expect(screen.getByTestId("git-editor-command")).toBeDisabled();
-    expect(screen.getByTestId("git-terminal-app")).toBeDisabled();
+    expect(screen.getByTestId("external-editor-command")).toBeDisabled();
+    expect(screen.getByTestId("external-terminal-app")).toHaveAttribute("aria-disabled", "true");
+    expect(screen.getByTestId("external-terminal-app-option-terminal")).toBeDisabled();
+    expect(screen.getByTestId("external-terminal-app-option-iterm")).toBeDisabled();
     expect(screen.getByTestId("notify-toggle")).toBeDisabled();
     expect(screen.getByTestId("notify-while-focused-toggle")).toBeDisabled();
     expect(screen.getByTestId("show-builtins-toggle")).toBeDisabled();
@@ -161,12 +163,12 @@ describe("SettingsView", () => {
         "sonnet",
       ),
     );
-    const editor = screen.getByTestId("git-editor-command") as HTMLInputElement;
-    const terminal = screen.getByTestId("git-terminal-app") as HTMLInputElement;
+    const editor = screen.getByTestId("external-editor-command") as HTMLInputElement;
+    const terminal = screen.getByTestId("external-terminal-app");
     expect(editor).toBeEnabled();
-    expect(terminal).toBeEnabled();
+    expect(terminal).toHaveAttribute("aria-disabled", "false");
     expect(editor).toHaveValue("zed");
-    expect(terminal).toHaveValue("iTerm");
+    expect(terminal).toHaveAttribute("data-value", "iTerm");
     expect(screen.getByTestId("notify-toggle")).toBeEnabled();
     expect(screen.getByTestId("show-builtins-toggle")).toBeEnabled();
 
@@ -246,9 +248,9 @@ describe("SettingsView", () => {
     expect(fullAnswer).toHaveAttribute("aria-checked", "true");
   });
 
-  it("git-view editor preference defaults to code and persists edits", async () => {
+  it("external editor preference defaults to code and persists edits", async () => {
     render(SettingsView, { props: { onClose: vi.fn() } });
-    const editor = screen.getByTestId("git-editor-command") as HTMLInputElement;
+    const editor = screen.getByTestId("external-editor-command") as HTMLInputElement;
 
     expect(editor.value).toBe("code");
 
@@ -287,12 +289,12 @@ describe("SettingsView", () => {
     );
   });
 
-  it("git-view terminal preference persists, defaulting a blank to Terminal", async () => {
+  it("selects Terminal or iTerm for external terminal actions", async () => {
     render(SettingsView, { props: { onClose: vi.fn() } });
-    const terminal = screen.getByTestId("git-terminal-app");
+    const terminal = screen.getByTestId("external-terminal-app");
 
-    await fireEvent.input(terminal, { target: { value: "iTerm" } });
-    await fireEvent.change(terminal);
+    expect(terminal).toHaveAttribute("data-value", "Terminal");
+    await fireEvent.click(screen.getByTestId("external-terminal-app-option-iterm"));
     await waitFor(() =>
       expect(invokeMock).toHaveBeenCalledWith("set_preferences", {
         preferences: {
@@ -308,8 +310,7 @@ describe("SettingsView", () => {
     );
 
     invokeMock.mockClear();
-    await fireEvent.input(terminal, { target: { value: "" } });
-    await fireEvent.change(terminal);
+    await fireEvent.click(screen.getByTestId("external-terminal-app-option-terminal"));
     await waitFor(() =>
       expect(invokeMock).toHaveBeenCalledWith("set_preferences", {
         preferences: {
@@ -351,12 +352,12 @@ describe("SettingsView", () => {
       return null;
     });
     render(SettingsView, { props: { onClose: vi.fn() } });
-    const editor = screen.getByTestId("git-editor-command") as HTMLInputElement;
+    const editor = screen.getByTestId("external-editor-command") as HTMLInputElement;
 
     await fireEvent.input(editor, { target: { value: "cursor" } });
     await fireEvent.change(editor);
 
-    await waitFor(() => expect(screen.getByTestId("git-prefs-save-error")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByTestId("external-apps-save-error")).toBeInTheDocument());
     // Value is kept, not reverted.
     expect(editor.value).toBe("cursor");
   });
@@ -549,17 +550,16 @@ describe("SettingsView — preference save failures", () => {
     await fireEvent.click(await screen.findByTestId("notify-toggle"));
 
     expect(await screen.findByTestId("notify-save-error")).toBeInTheDocument();
-    expect(screen.queryByTestId("git-prefs-save-error")).not.toBeInTheDocument();
   });
 
-  it("reports a failed Git-preference save beside the Git controls", async () => {
+  it("reports a failed external-app preference save beside those controls", async () => {
     failSaves();
     render(SettingsView, { props: { onClose: vi.fn() } });
-    const editor = screen.getByTestId("git-editor-command") as HTMLInputElement;
+    const editor = screen.getByTestId("external-editor-command") as HTMLInputElement;
     await fireEvent.input(editor, { target: { value: "cursor" } });
     await fireEvent.change(editor);
 
-    expect(await screen.findByTestId("git-prefs-save-error")).toBeInTheDocument();
+    expect(await screen.findByTestId("external-apps-save-error")).toBeInTheDocument();
     expect(screen.queryByTestId("notify-save-error")).not.toBeInTheDocument();
   });
 
@@ -573,7 +573,7 @@ describe("SettingsView — preference save failures", () => {
     expect(await screen.findByTestId("notify-save-error")).toBeInTheDocument();
 
     invokeMock.mockImplementation(defaultInvoke);
-    const editor = screen.getByTestId("git-editor-command") as HTMLInputElement;
+    const editor = screen.getByTestId("external-editor-command") as HTMLInputElement;
     await fireEvent.input(editor, { target: { value: "cursor" } });
     await fireEvent.change(editor);
 

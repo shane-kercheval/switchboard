@@ -44,11 +44,13 @@ vi.mock("$lib/state/workspace.svelte", () => ({
 
 const agentSessionInfoMock = vi.fn();
 const openSessionFileMock = vi.fn();
+const resumeAgentInTerminalMock = vi.fn<(id: string) => Promise<void>>();
 vi.mock("$lib/api", () => ({
   agentSessionInfo: (id: string) => agentSessionInfoMock(id),
   openSessionFile: async (id: string) => {
     openSessionFileMock(id);
   },
+  resumeAgentInTerminal: (id: string) => resumeAgentInTerminalMock(id),
   cancelAgent: vi.fn(),
 }));
 
@@ -149,6 +151,8 @@ beforeEach(() => {
   reorderAgentsMock.mockResolvedValue(undefined);
   agentSessionInfoMock.mockResolvedValue({ session_file: null, resume_command: null });
   openSessionFileMock.mockReset();
+  resumeAgentInTerminalMock.mockReset();
+  resumeAgentInTerminalMock.mockResolvedValue(undefined);
   copyTextMock.mockReset();
   copyTextMock.mockResolvedValue(undefined);
 });
@@ -327,6 +331,67 @@ describe("Sidebar", () => {
     expect(copyTextMock).toHaveBeenCalledWith(
       "cd '/proj' && claude --resume abc --dangerously-skip-permissions",
     );
+
+    await fireEvent.click(screen.getByTestId("resume-run-terminal"));
+    await waitFor(() => expect(resumeAgentInTerminalMock).toHaveBeenCalledWith(CLAUDE_AGENT.id));
+    await waitFor(() => expect(screen.queryByTestId("resume-panel")).toBeNull());
+  });
+
+  it("keeps the resume dialog open and shows a terminal launch failure", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    agentSessionInfoMock.mockResolvedValue({
+      session_file: "/sessions/alice.jsonl",
+      resume_command: "cd '/proj' && claude --resume abc --dangerously-skip-permissions",
+    });
+    resumeAgentInTerminalMock.mockRejectedValue(new Error("Terminal automation was denied"));
+
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+    await openAgentActions();
+    await fireEvent.click(await screen.findByTestId("agent-action-resume"));
+    await fireEvent.click(screen.getByTestId("resume-run-terminal"));
+
+    expect(await screen.findByTestId("resume-launch-error")).toHaveTextContent(
+      "Terminal automation was denied",
+    );
+    expect(screen.getByTestId("resume-panel")).toBeInTheDocument();
+  });
+
+  it("does not let a closed dialog's pending launch affect another agent", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    await state.registerAgent(CODEX_AGENT);
+    agentSessionInfoMock.mockImplementation(async (id: string) => ({
+      session_file: `/sessions/${id}.jsonl`,
+      resume_command: id === CLAUDE_AGENT.id ? "resume alice" : "resume bob",
+    }));
+    let rejectLaunch!: (reason: unknown) => void;
+    const pendingLaunch = new Promise<void>((_resolve, reject) => {
+      rejectLaunch = reject;
+    });
+    resumeAgentInTerminalMock.mockReturnValue(pendingLaunch);
+
+    render(Sidebar, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT, CODEX_AGENT] },
+    });
+
+    await openAgentActions(0);
+    await fireEvent.click(await screen.findByTestId("agent-action-resume"));
+    await fireEvent.click(screen.getByTestId("resume-run-terminal"));
+    expect(resumeAgentInTerminalMock).toHaveBeenCalledTimes(1);
+
+    await fireEvent.click(screen.getByTestId("dialog-close"));
+    await openAgentActions(1);
+    await fireEvent.click(await screen.findByTestId("agent-action-resume"));
+    expect(screen.getByTestId("resume-command")).toHaveTextContent("resume bob");
+    expect(screen.getByTestId("resume-run-terminal")).toBeDisabled();
+
+    rejectLaunch(new Error("alice launch failed late"));
+    await waitFor(() => expect(screen.getByTestId("resume-run-terminal")).toBeEnabled());
+    expect(screen.getByTestId("resume-panel")).toBeInTheDocument();
+    expect(screen.getByTestId("resume-command")).toHaveTextContent("resume bob");
+    expect(screen.queryByTestId("resume-launch-error")).toBeNull();
+    expect(resumeAgentInTerminalMock).toHaveBeenCalledTimes(1);
   });
 
   it("omits session-backed actions when no session is bound", async () => {

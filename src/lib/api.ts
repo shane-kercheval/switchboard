@@ -608,6 +608,13 @@ export async function agentSessionInfo(agentId: AgentId): Promise<AgentSessionIn
   return await invoke<AgentSessionInfo>("agent_session_info", { agentId });
 }
 
+/// Open a fresh window in the configured Terminal/iTerm app and run the
+/// backend-generated interactive resume command. The backend refuses while
+/// Switchboard still owns running or queued work for the agent.
+export async function resumeAgentInTerminal(agentId: AgentId): Promise<void> {
+  await invoke("resume_agent_in_terminal", { agentId });
+}
+
 /// Open the agent's harness session file in the OS default app (backend-resolved
 /// path, opened Rust-side). Rejects if the agent has no session file yet.
 export async function openSessionFile(agentId: AgentId): Promise<void> {

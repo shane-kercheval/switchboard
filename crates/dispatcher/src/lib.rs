@@ -427,6 +427,10 @@ enum Command {
     /// it never holds the reply — used by completed-only forwarding to reject a
     /// still-streaming source without waiting on it.
     PeekCurrentTurn { reply: oneshot::Sender<bool> },
+    /// Reply `true` while this actor owns running or queued work. External
+    /// session handoff uses this to avoid starting a second process against a
+    /// harness session Switchboard is still driving.
+    PeekWorkPending { reply: oneshot::Sender<bool> },
     /// Cancel the running turn (out-of-band; no-op if none is live).
     Cancel(CancelSource),
     /// Cancel a whole *send* on this agent: fire the running turn's cancel
@@ -1219,6 +1223,31 @@ impl Dispatcher {
         rx.await.unwrap_or(false)
     }
 
+    /// Whether Switchboard still owns any running or queued work for this
+    /// agent. Unlike [`Self::is_turn_running`], this stays true through
+    /// post-terminal enrichment and a queued backlog, which are both unsafe
+    /// moments to hand the same harness session to an external terminal.
+    pub async fn has_pending_work(&self, agent_id: AgentId) -> bool {
+        let commands = {
+            let agents = lock(&self.agents);
+            match agents.get(&agent_id) {
+                Some(AgentSlot::Active(tx)) => tx.clone(),
+                Some(AgentSlot::Closing) => return true,
+                None => return false,
+            }
+        };
+        let (tx, rx) = oneshot::channel();
+        if commands
+            .send(Command::PeekWorkPending { reply: tx })
+            .is_err()
+        {
+            // The actor is disappearing between the lock and send. Treat this
+            // as busy: teardown can still be draining the harness process.
+            return true;
+        }
+        rx.await.unwrap_or(true)
+    }
+
     /// Close `agent_id`'s actor atomically: mark the slot `Closing` (so a racing
     /// send is rejected, not resurrected with a fresh actor), tell the actor to
     /// abandon its backlog + cancel any running turn + drain, await its reply,
@@ -1440,6 +1469,10 @@ fn apply_idle_command(
         // No turn live ⇒ not running.
         Command::PeekCurrentTurn { reply } => {
             let _ = reply.send(false);
+            IdleAfter::Continue
+        }
+        Command::PeekWorkPending { reply } => {
+            let _ = reply.send(!backlog.is_empty());
             IdleAfter::Continue
         }
         // No turn live ⇒ cancel is a no-op.
@@ -2041,6 +2074,11 @@ async fn drain_turn(
                     // Mid-turn peek: running iff the terminal hasn't passed yet.
                     Some(Command::PeekCurrentTurn { reply }) => {
                         let _ = reply.send(terminal.is_none());
+                    }
+                    // The actor still owns this turn while it drains
+                    // post-terminal enrichment, and may also hold a backlog.
+                    Some(Command::PeekWorkPending { reply }) => {
+                        let _ = reply.send(true);
                     }
                     Some(Command::CancelSend { send_id, source }) => {
                         // Fire the running turn's cancel token only if this turn

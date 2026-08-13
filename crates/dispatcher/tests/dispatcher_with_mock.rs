@@ -2828,6 +2828,67 @@ async fn queued_sends_keep_the_selection_captured_at_submission() {
 }
 
 #[tokio::test]
+async fn pending_work_covers_the_running_turn_and_its_queue() {
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+    let factory = TestFactory::with_adapters(
+        [
+            Arc::new(MockHarnessAdapter::with_scenario(
+                MockScenario::AwaitCancellation,
+            )) as Arc<dyn HarnessAdapter>,
+            Arc::new(MockHarnessAdapter::with_scenario(MockScenario::Streaming))
+                as Arc<dyn HarnessAdapter>,
+        ],
+        agent.clone(),
+        Arc::clone(&emitter),
+        noop_journal(),
+    );
+
+    assert!(!dispatcher.has_pending_work(agent.id).await);
+    dispatcher
+        .send_message(
+            agent.id,
+            "running",
+            vec![],
+            Uuid::now_v7(),
+            factory.clone(),
+            OnBusy::Enqueue,
+        )
+        .await;
+    within(
+        &emitter,
+        "first turn_start",
+        emitter.wait_for_type("turn_start", 1),
+    )
+    .await;
+    assert!(dispatcher.has_pending_work(agent.id).await);
+
+    dispatcher
+        .send_message(
+            agent.id,
+            "queued",
+            vec![],
+            Uuid::now_v7(),
+            factory,
+            OnBusy::Enqueue,
+        )
+        .await;
+    assert!(dispatcher.has_pending_work(agent.id).await);
+
+    dispatcher.cancel(agent.id, CancelSource::User);
+    within(
+        &emitter,
+        "queued turn dispatched and settled",
+        emitter.wait_for(|events| {
+            count_type(events, "turn_start") >= 2 && count_type(events, "agent_idle") >= 1
+        }),
+    )
+    .await;
+    assert!(!dispatcher.has_pending_work(agent.id).await);
+}
+
+#[tokio::test]
 async fn remove_queued_message_prevents_dispatch_and_returns_payload() {
     // Enqueue behind a busy (AwaitCancellation) turn, remove the queued one →
     // it never dispatches; the removal returns its payload.

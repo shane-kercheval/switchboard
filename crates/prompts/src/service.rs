@@ -709,17 +709,24 @@ impl PromptService {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let generation = snapshot.generation + 1;
+        let configured_providers: HashSet<String> =
+            configs.iter().map(|config| config.name.clone()).collect();
+        let removed_providers = if configuration_complete {
+            HashSet::new()
+        } else {
+            snapshot
+                .removed_providers
+                .difference(&configured_providers)
+                .cloned()
+                .collect()
+        };
         *snapshot = PromptResolutionSnapshot {
             generation,
             prompts: mcp_prompts,
             provider_status: snapshot_statuses,
-            configured_providers: configs.iter().map(|config| config.name.clone()).collect(),
+            configured_providers,
             configuration_complete,
-            removed_providers: if configuration_complete {
-                HashSet::new()
-            } else {
-                snapshot.removed_providers.clone()
-            },
+            removed_providers,
         };
         self.settled_provider_revision
             .store(provider_revision, Ordering::Release);
@@ -1056,16 +1063,16 @@ impl PromptService {
     /// credential transaction lock — the flow's own registration persistence
     /// and token save take that lock internally (see [`CredentialLifecycle`]).
     pub async fn sign_in_mcp_provider(&self, name: &str) -> Result<(), PromptError> {
+        let lifecycle = self.credential_lifecycle(name);
+        let Ok(_flow) = lifecycle.flow_gate.try_lock() else {
+            return Err(Self::flow_in_progress(name));
+        };
         let (url, scopes_override) = self.oauth_provider_config(name)?;
         let canonical =
             canonicalize_resource_url(&url).map_err(|e| PromptError::OAuthValidation {
                 provider: name.to_owned(),
                 message: format!("invalid provider URL {url:?}: {e}"),
             })?;
-        let lifecycle = self.credential_lifecycle(name);
-        let Ok(_flow) = lifecycle.flow_gate.try_lock() else {
-            return Err(Self::flow_in_progress(name));
-        };
         let http = self.http_client(name).await?;
         let store = self.credential_store(name, &canonical);
         let resample_cached_client = || self.cached_oauth_client(name, &canonical);
@@ -1121,16 +1128,16 @@ impl PromptService {
     /// this, a refresh racing sign-out could re-persist tokens *after* the
     /// user was told they were removed.
     pub async fn sign_out_mcp_provider(&self, name: &str) -> Result<(), PromptError> {
+        let lifecycle = self.credential_lifecycle(name);
+        let Ok(_flow) = lifecycle.flow_gate.try_lock() else {
+            return Err(Self::flow_in_progress(name));
+        };
         let (url, _scopes) = self.oauth_provider_config(name)?;
         let canonical =
             canonicalize_resource_url(&url).map_err(|e| PromptError::OAuthValidation {
                 provider: name.to_owned(),
                 message: format!("invalid provider URL {url:?}: {e}"),
             })?;
-        let lifecycle = self.credential_lifecycle(name);
-        let Ok(_flow) = lifecycle.flow_gate.try_lock() else {
-            return Err(Self::flow_in_progress(name));
-        };
         let cached = self.cached_oauth_client(name, &canonical);
         let _refresh_exclusion = match &cached {
             Some(client) => Some(client.auth_manager.lock().await),
@@ -1972,6 +1979,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn incomplete_inventory_clears_tombstone_for_observed_configured_provider() {
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join("config.yaml");
+        let service = PromptService::new(
+            config_path.clone(),
+            dir.path().join("prompts"),
+            None,
+            Arc::new(InMemorySecretStore::new()),
+        );
+        service.invalidate_provider_resolution("team", false, None);
+        std::fs::write(
+            config_path,
+            "mcp_providers:\n  - name: team\n    transport:\n      type: http\n      url: https://example.com/mcp\n    auth:\n      type: oauth\n  - name: malformed\n",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            service.sync().await,
+            SyncOutcome::Published { .. }
+        ));
+
+        let snapshot = service.resolution_snapshot();
+        assert!(!snapshot.configuration_complete());
+        assert!(snapshot.is_provider_configured("team"));
+        assert!(!snapshot.was_provider_removed("team"));
+        assert_eq!(
+            snapshot.provider_status("team"),
+            Some(&ProviderStatus::NeedsAuth)
+        );
+    }
+
+    #[tokio::test]
     async fn corrupt_config_degrades_to_default_dir() {
         let dir = TempDir::new().unwrap();
         let prompts_dir = dir.path().join("prompts");
@@ -2245,6 +2284,37 @@ mod tests {
         assert!(matches!(
             service.sign_out_mcp_provider("nope").await.unwrap_err(),
             PromptError::ProviderNotFound { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn oauth_flows_claim_ownership_before_reading_provider_config() {
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join("config.yaml");
+        std::fs::write(
+            &config_path,
+            "mcp_providers:\n  - name: team\n    transport:\n      type: http\n      url: https://example.com/mcp\n    auth:\n      type: oauth\n",
+        )
+        .unwrap();
+        let service = PromptService::new(
+            config_path.clone(),
+            dir.path().join("prompts"),
+            None,
+            Arc::new(InMemorySecretStore::new()),
+        );
+        let lifecycle = service.credential_lifecycle("team");
+        let _flow = lifecycle.flow_gate.try_lock().unwrap();
+        std::fs::remove_file(config_path).unwrap();
+
+        assert!(matches!(
+            service.sign_in_mcp_provider("team").await.unwrap_err(),
+            PromptError::OAuthFlow { ref message, .. }
+                if message.contains("already in progress")
+        ));
+        assert!(matches!(
+            service.sign_out_mcp_provider("team").await.unwrap_err(),
+            PromptError::OAuthFlow { ref message, .. }
+                if message.contains("already in progress")
         ));
     }
 

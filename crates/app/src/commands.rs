@@ -1205,8 +1205,8 @@ pub fn resolve_saved_prompt_impl(
     if let Some(prompt) = snapshot.get(provider, name) {
         return SavedPromptResolution::Available { prompt, generation };
     }
-    if snapshot.was_provider_removed(provider)
-        || (snapshot.configuration_complete() && !snapshot.is_provider_configured(provider))
+    if !snapshot.is_provider_configured(provider)
+        && (snapshot.was_provider_removed(provider) || snapshot.configuration_complete())
     {
         return SavedPromptResolution::NotConfigured { generation };
     }
@@ -20489,6 +20489,38 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn observed_readded_provider_overrides_old_removal_marker() {
+        let server = spawn_workflow_mcp_server(false).await;
+        let (tmp, state, _) = fresh_state_with_mock();
+        let state = state_with_mcp_server(
+            &tmp,
+            state,
+            &server.url,
+            Arc::new(switchboard_prompts::InMemorySecretStore::new()),
+        );
+        state.prompts.remove_mcp_provider("tiddly").unwrap();
+        std::fs::write(
+            tmp.path().join("config.yaml"),
+            format!(
+                "mcp_providers:\n  - name: tiddly\n    transport:\n      type: http\n      url: {}\n  - name: malformed\n",
+                server.url
+            ),
+        )
+        .unwrap();
+
+        state.prompts.sync().await;
+
+        let snapshot = state.prompts.resolution_snapshot();
+        assert!(!snapshot.configuration_complete());
+        assert!(snapshot.is_provider_configured("tiddly"));
+        assert!(!snapshot.was_provider_removed("tiddly"));
+        assert!(matches!(
+            resolve_saved_prompt_impl(&state, "tiddly", "review"),
+            SavedPromptResolution::Available { .. }
+        ));
+    }
+
     /// A prompts-enabled state (real `PromptService`, so built-ins resolve) with a
     /// project + the named agents, the prompt cache warmed, and a temp user-global
     /// workflows dir.
@@ -21152,6 +21184,56 @@ mod tests {
             cached.compatibility,
             FormCompatibility::Unavailable { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn incomplete_provider_inventory_keeps_workflow_availability_unknown() {
+        let server = spawn_workflow_mcp_server(false).await;
+        let (tmp, state, _) = fresh_state_with_mock();
+        let prompts_dir = tmp.path().join("prompts");
+        std::fs::create_dir_all(&prompts_dir).unwrap();
+        std::fs::write(
+            tmp.path().join("config.yaml"),
+            "mcp_providers:\n  - name: tiddly\n",
+        )
+        .unwrap();
+        let prompts = switchboard_prompts::PromptService::new(
+            tmp.path().join("config.yaml"),
+            prompts_dir,
+            None,
+            Arc::new(switchboard_prompts::InMemorySecretStore::new()),
+        );
+        let state = state
+            .with_prompts(prompts)
+            .with_workflows_dir(tmp.path().join("workflows"));
+        seed_workflow(
+            &state,
+            "mcp-review",
+            "name: mcp-review\ndescription: d\ninputs:\n  a: agent\nsteps:\n  - label: s\n    send:\n      to: \"{{ a }}\"\n      prompt: \"tiddly:review\"\n",
+        );
+
+        let unavailable = describe_workflow_form_fresh_impl(&state, "mcp-review", false)
+            .await
+            .unwrap();
+        assert!(matches!(
+            unavailable.compatibility,
+            FormCompatibility::Unavailable { ref issues }
+                if issues.iter().any(|issue| issue.kind == AvailabilityIssueKind::Unknown)
+                    && issues.iter().all(|issue| issue.kind != AvailabilityIssueKind::NotConfigured)
+        ));
+
+        std::fs::write(
+            tmp.path().join("config.yaml"),
+            format!(
+                "mcp_providers:\n  - name: tiddly\n    transport:\n      type: http\n      url: {}\n",
+                server.url
+            ),
+        )
+        .unwrap();
+        state.prompts.sync().await;
+        let recovered =
+            describe_workflow_form_cache_only_impl(&state, "mcp-review", false).unwrap();
+        assert_eq!(recovered.compatibility, FormCompatibility::Ok);
     }
 
     #[tokio::test]

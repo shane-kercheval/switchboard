@@ -1076,11 +1076,13 @@ fn settle_unresolved_compatibility(
                     (AvailabilityIssueKind::StoreUnavailable, None)
                 }
                 Some(ProviderStatus::NeedsAuth) => (AvailabilityIssueKind::NeedsAuth, None),
-                Some(ProviderStatus::Unknown) => (AvailabilityIssueKind::Unknown, None),
-                None if snapshot.is_provider_configured(&provider) => {
-                    (AvailabilityIssueKind::Unknown, None)
+                None if !snapshot.is_provider_configured(&provider)
+                    && (snapshot.was_provider_removed(&provider)
+                        || snapshot.configuration_complete()) =>
+                {
+                    (AvailabilityIssueKind::NotConfigured, None)
                 }
-                None => (AvailabilityIssueKind::NotConfigured, None),
+                Some(ProviderStatus::Unknown) | None => (AvailabilityIssueKind::Unknown, None),
             };
             AvailabilityIssue {
                 prompt: id.clone(),

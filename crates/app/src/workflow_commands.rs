@@ -17,7 +17,9 @@ use serde::Serialize;
 use switchboard_core::name::canonicalize_for_uniqueness;
 use switchboard_core::{AgentId, AgentRecord, Project, ProjectId};
 use switchboard_dispatcher::{DispatchContextFactory, Dispatcher, EventEmitter};
-use switchboard_prompts::{PromptArgument, PromptId, PromptService, ProviderStatus};
+use switchboard_prompts::{
+    PromptArgument, PromptId, PromptResolutionSnapshot, PromptService, ProviderStatus,
+};
 use switchboard_workflow::{
     InputType, InputValue, RecipientRef, RunRecord, RunStatus, ScopeValue, Step, TerminalStatus,
     Workflow, WorkflowError, WorkflowStepInfo, bind_invocation, builtin_workflow,
@@ -533,9 +535,19 @@ enum PromptSchema {
 /// Provider-aware on a miss: `builtin`/`local` resolve directly (so a miss is
 /// definitively `Missing`), while an MCP miss is `Unresolved` (a sync may still
 /// make it appear).
-fn resolve_prompt_schema(prompts: &PromptService, id: &str) -> PromptSchema {
+fn resolve_prompt_schema(
+    prompts: &PromptService,
+    snapshot: &PromptResolutionSnapshot,
+    id: &str,
+) -> PromptSchema {
     match PromptId::parse(id) {
-        Ok(pid) => match prompts.get(&pid.provider, &pid.name) {
+        Ok(pid) => match if pid.provider == switchboard_prompts::LOCAL_PROVIDER
+            || pid.provider == switchboard_prompts::BUILTIN_PROVIDER
+        {
+            prompts.get(&pid.provider, &pid.name)
+        } else {
+            snapshot.get(&pid.provider, &pid.name)
+        } {
             Some(prompt) => PromptSchema::Resolved(prompt.arguments),
             None if pid.provider == switchboard_prompts::LOCAL_PROVIDER
                 || pid.provider == switchboard_prompts::BUILTIN_PROVIDER =>
@@ -602,6 +614,7 @@ pub struct AvailabilityIssue {
 /// Machine-readable recovery category for an unavailable workflow prompt.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum AvailabilityIssueKind {
     NeedsAuth,
     NotConfigured,
@@ -614,6 +627,7 @@ pub enum AvailabilityIssueKind {
 /// Whether a workflow's hardcoded prompts are runnable as picked.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(tag = "state", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum FormCompatibility {
     /// Every prompt resolved and every binding is valid.
     Ok,
@@ -705,7 +719,11 @@ fn merge_derived(
 /// `A \ T` becomes a field. Collisions with a declared input: a `text` input
 /// shadows-and-satisfies (one field, its value also feeds the prompt); a non-text
 /// input is the *only* collision that is an error.
-fn classify_form(workflow: &Workflow, prompts: &PromptService) -> ResolvedForm {
+fn classify_form(
+    workflow: &Workflow,
+    prompts: &PromptService,
+    snapshot: &PromptResolutionSnapshot,
+) -> ResolvedForm {
     let declared: BTreeMap<&str, InputType> = workflow
         .inputs
         .iter()
@@ -717,7 +735,7 @@ fn classify_form(workflow: &Workflow, prompts: &PromptService) -> ResolvedForm {
     let mut unresolved: Vec<String> = Vec::new();
 
     for (id, tvar_keys) in hardcoded_prompt_sends(workflow) {
-        match resolve_prompt_schema(prompts, id) {
+        match resolve_prompt_schema(prompts, snapshot, id) {
             PromptSchema::Malformed => issues.push(BindingIssue {
                 prompt: id.to_owned(),
                 argument: String::new(),
@@ -924,14 +942,25 @@ fn validate_derived_args(
 /// hardcoded prompts on demand (not in `list`); needs no `project_id` because
 /// prompts are user-global. This cache-only primitive may report `Unresolved`;
 /// the fresh IPC path below owns the sync boundary and returns a terminal result.
+#[cfg(test)]
 pub fn describe_workflow_form_impl(
     state: &AppState,
     name: &str,
     is_builtin: bool,
 ) -> Result<WorkflowFormDescriptor, AppError> {
+    let snapshot = state.prompts.resolution_snapshot();
+    describe_workflow_form_with_snapshot(state, name, is_builtin, &snapshot)
+}
+
+fn describe_workflow_form_with_snapshot(
+    state: &AppState,
+    name: &str,
+    is_builtin: bool,
+    snapshot: &PromptResolutionSnapshot,
+) -> Result<WorkflowFormDescriptor, AppError> {
     let workflow = snapshot_workflow(state, name, is_builtin)?;
     let invocable = workflow.gated_step_kind().is_none();
-    let form = classify_form(&workflow, &state.prompts);
+    let form = classify_form(&workflow, &state.prompts, snapshot);
     // A declared input that feeds a *required* prompt arg is effectively required,
     // even if declared `text?` — report it as required so the form demands it.
     let mut inputs = input_infos(&workflow);
@@ -967,13 +996,22 @@ pub async fn describe_workflow_form_fresh_impl(
     name: &str,
     is_builtin: bool,
 ) -> Result<WorkflowFormDescriptor, AppError> {
-    let observed_generation = state.prompts.sync_generation();
-    let initial = describe_workflow_form_impl(state, name, is_builtin)?;
+    let observed = state.prompts.resolution_snapshot();
+    let initial = describe_workflow_form_with_snapshot(state, name, is_builtin, &observed)?;
     if !matches!(initial.compatibility, FormCompatibility::Unresolved { .. }) {
         return Ok(initial);
     }
 
-    state.prompts.sync_if_generation(observed_generation).await;
+    let rebuilt = state
+        .prompts
+        .sync_if_generation(observed.generation())
+        .await;
+    if rebuilt {
+        state.emitter.emit(
+            crate::commands::PROMPTS_SYNCED_EVENT,
+            serde_json::Value::Null,
+        );
+    }
     describe_workflow_form_cache_only_impl(state, name, is_builtin)
 }
 
@@ -985,8 +1023,9 @@ pub fn describe_workflow_form_cache_only_impl(
     name: &str,
     is_builtin: bool,
 ) -> Result<WorkflowFormDescriptor, AppError> {
-    let mut descriptor = describe_workflow_form_impl(state, name, is_builtin)?;
-    settle_unresolved_compatibility(&mut descriptor, &state.prompts);
+    let snapshot = state.prompts.resolution_snapshot();
+    let mut descriptor = describe_workflow_form_with_snapshot(state, name, is_builtin, &snapshot)?;
+    settle_unresolved_compatibility(&mut descriptor, &snapshot);
     Ok(descriptor)
 }
 
@@ -996,7 +1035,7 @@ pub fn describe_workflow_form_cache_only_impl(
 /// successfully-listed provider simply lacks that prompt.
 fn settle_unresolved_compatibility(
     descriptor: &mut WorkflowFormDescriptor,
-    prompts: &PromptService,
+    snapshot: &PromptResolutionSnapshot,
 ) {
     let FormCompatibility::Unresolved {
         prompts: unresolved,
@@ -1004,14 +1043,13 @@ fn settle_unresolved_compatibility(
     else {
         return;
     };
-    let statuses = prompts.provider_status_snapshot();
     let issues = unresolved
         .iter()
         .map(|id| {
             let provider = PromptId::parse(id)
                 .map(|parsed| parsed.provider)
                 .unwrap_or_default();
-            let (kind, message) = match statuses.get(&provider) {
+            let (kind, message) = match snapshot.provider_status(&provider) {
                 Some(ProviderStatus::Ok { .. }) => (AvailabilityIssueKind::MissingPrompt, None),
                 Some(ProviderStatus::Errored { message }) => {
                     (AvailabilityIssueKind::ProviderError, Some(message.clone()))
@@ -1021,6 +1059,9 @@ fn settle_unresolved_compatibility(
                 }
                 Some(ProviderStatus::NeedsAuth) => (AvailabilityIssueKind::NeedsAuth, None),
                 Some(ProviderStatus::Unknown) => (AvailabilityIssueKind::Unknown, None),
+                None if snapshot.is_provider_configured(&provider) => {
+                    (AvailabilityIssueKind::Unknown, None)
+                }
                 None => (AvailabilityIssueKind::NotConfigured, None),
             };
             AvailabilityIssue {
@@ -1087,7 +1128,8 @@ pub fn validate_workflow_invocation_impl(
     // Bind (not just validate) the declared inputs so defaults are applied before
     // the required-shadow check sees them.
     let bound = bind_invocation(&workflow, &declared, &names)?;
-    let form = classify_form(&workflow, &state.prompts);
+    let snapshot = state.prompts.resolution_snapshot();
+    let form = classify_form(&workflow, &state.prompts, &snapshot);
     validate_derived_args(&form.derived_args, &form.compatibility, &derived)?;
     enforce_required_shadows(&form.required_shadows, &bound)?;
     Ok(())
@@ -1124,7 +1166,8 @@ pub fn invoke_workflow_impl(
     // schemas here (a prompt can change between form-open and invoke).
     let (declared, derived) = partition_payload(&workflow, inputs);
     let bound = bind_invocation(&workflow, &declared, &names)?;
-    let form = classify_form(&workflow, &state.prompts);
+    let snapshot = state.prompts.resolution_snapshot();
+    let form = classify_form(&workflow, &state.prompts, &snapshot);
     let derived_values = validate_derived_args(&form.derived_args, &form.compatibility, &derived)?;
     enforce_required_shadows(&form.required_shadows, &bound)?;
 

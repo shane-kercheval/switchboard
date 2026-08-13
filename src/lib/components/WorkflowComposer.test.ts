@@ -300,6 +300,59 @@ describe("WorkflowComposer", () => {
     expect(onconfigure).toHaveBeenCalledOnce();
   });
 
+  it("falls back safely for a newer availability issue kind", async () => {
+    const onretry = vi.fn();
+    render(WorkflowComposer, {
+      props: {
+        descriptor: descriptor([], [], {
+          compatibility: {
+            state: "unavailable",
+            issues: [
+              {
+                prompt: "tiddly:review",
+                provider: "tiddly",
+                kind: "maintenance",
+                message: null,
+              },
+            ],
+          } as unknown as FormCompatibility,
+        }),
+        agents: AGENTS,
+        inputs: {},
+        onremove: vi.fn(),
+        onretry,
+      },
+    });
+
+    expect(screen.getByTestId("workflow-prompt-unavailable")).toHaveTextContent(
+      "Provider tiddly is unavailable for tiddly:review",
+    );
+    await fireEvent.click(screen.getByTestId("workflow-prompt-check-again"));
+    expect(onretry).toHaveBeenCalledOnce();
+  });
+
+  it("blocks safely when a newer top-level compatibility state arrives", async () => {
+    const onretry = vi.fn();
+    render(WorkflowComposer, {
+      props: {
+        descriptor: descriptor([input({ name: "context" })], [], {
+          compatibility: { state: "maintenance" } as unknown as FormCompatibility,
+        }),
+        agents: AGENTS,
+        inputs: { context: "draft" },
+        onremove: vi.fn(),
+        onretry,
+      },
+    });
+
+    expect(screen.getByTestId("workflow-compatibility-unknown")).toHaveTextContent(
+      "can't run in this version",
+    );
+    expect(screen.queryByTestId("workflow-text-context")).toBeNull();
+    await fireEvent.click(screen.getByTestId("workflow-compatibility-check-again"));
+    expect(onretry).toHaveBeenCalledOnce();
+  });
+
   it("attaches and removes a forward source on a derived arg field", async () => {
     const { sources } = setupForward(descriptor([], [arg({ name: "context" })]), { context: "" });
 

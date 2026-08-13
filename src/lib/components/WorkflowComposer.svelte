@@ -243,8 +243,12 @@
   }
 
   const compat = $derived(descriptor.compatibility);
+  const compatibilityState = $derived(compat.state as string);
   const incompatible = $derived(compat.state === "incompatible" ? compat : null);
   const unavailable = $derived(compat.state === "unavailable" ? compat : null);
+  const unknownCompatibility = $derived(
+    !["ok", "incompatible", "unresolved", "unavailable"].includes(compatibilityState),
+  );
   // The backend's fresh command is authoritative and terminal. `unresolved` is
   // retained as a defensive wire fallback, but never waits for a global event.
   const unresolvedMissing = $derived(compat.state === "unresolved" ? compat.prompts : null);
@@ -274,6 +278,8 @@
         return `Provider ${issue.provider} failed: ${issue.message ?? "unknown provider error"}`;
       case "unknown":
         return `Provider ${issue.provider} did not finish resolving ${issue.prompt}.`;
+      default:
+        return `Provider ${issue.provider} is unavailable for ${issue.prompt}.`;
     }
   }
 
@@ -414,6 +420,24 @@
         </div>
       {/if}
     </div>
+  {:else if unknownCompatibility}
+    <div
+      class="text-status-failed flex flex-col gap-1 text-xs"
+      data-testid="workflow-compatibility-unknown"
+    >
+      <span class="font-medium">This workflow can't run in this version.</span>
+      <span>Its prompt compatibility could not be recognized. Check again after updating.</span>
+      {#if onretry}
+        <button
+          type="button"
+          class="border-border bg-panel text-fg hover:bg-raised mt-1 w-fit rounded border px-2 py-1 font-medium transition-colors"
+          data-testid="workflow-compatibility-check-again"
+          onclick={onretry}
+        >
+          Check again
+        </button>
+      {/if}
+    </div>
   {/if}
 
   {#snippet paneChip(name: string, pane: TranscriptPane, selected: boolean, onpick: () => void)}
@@ -506,7 +530,7 @@
     {/if}
   {/snippet}
 
-  {#if descriptor.invocable && !pending && !incompatible && !unresolvedMissing && !unavailable}
+  {#if descriptor.invocable && !pending && !incompatible && !unresolvedMissing && !unavailable && !unknownCompatibility}
     <div class="flex flex-col gap-3">
       {#each descriptor.inputs as input (input.name)}
         <div class="flex flex-col gap-1" data-testid={`workflow-field-${input.name}`}>
@@ -641,7 +665,7 @@
   {/if}
 
   <div class="flex items-center justify-end gap-2">
-    {#if missing.length > 0 && descriptor.invocable && !pending && !incompatible && !unresolvedMissing && !unavailable}
+    {#if missing.length > 0 && descriptor.invocable && !pending && !incompatible && !unresolvedMissing && !unavailable && !unknownCompatibility}
       <span class="text-muted text-xs" data-testid="workflow-missing">
         Fill required fields to run
       </span>

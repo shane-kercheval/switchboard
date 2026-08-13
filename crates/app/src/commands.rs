@@ -1348,9 +1348,9 @@ pub async fn test_mcp_connection_impl(
 /// refresh provider status and restore a prompt-mode compose draft that needed
 /// the cache warm. Every independent sync path — startup warm sync, the
 /// `sync_prompts` command, and add/remove — emits it via
-/// [`sync_prompts_and_notify`]. Request-owned workflow resolution is the one
-/// exception: its command reply carries the settled descriptor directly, and an
-/// event would make the selected workflow recursively describe/sync itself.
+/// [`sync_prompts_and_notify`]. Request-owned workflow rebuilds emit it directly;
+/// workflow listeners reclassify from cache only, so notification cannot feed
+/// back into another network sync.
 pub const PROMPTS_SYNCED_EVENT: &str = "prompts:synced";
 
 /// Rebuild the prompt cache, then emit [`PROMPTS_SYNCED_EVENT`]. The emit is
@@ -20790,7 +20790,7 @@ mod tests {
     #[tokio::test]
     async fn fresh_workflow_form_resolves_a_cold_mcp_prompt() {
         let server = spawn_workflow_mcp_server(false).await;
-        let (tmp, state, _) = fresh_state_with_mock();
+        let (tmp, state, emitter) = fresh_state_with_mock();
         let state = state_with_mcp_server(
             &tmp,
             state,
@@ -20810,6 +20810,15 @@ mod tests {
 
         assert_eq!(form.compatibility, FormCompatibility::Ok);
         assert_eq!(server.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            emitter
+                .snapshot()
+                .iter()
+                .filter(|(name, _)| name == PROMPTS_SYNCED_EVENT)
+                .count(),
+            1,
+            "a request-owned rebuild notifies global cache consumers once"
+        );
         assert!(
             form.derived_args
                 .iter()
@@ -20888,6 +20897,62 @@ mod tests {
         assert_eq!(summary.unwrap().compatibility, FormCompatibility::Ok);
         assert_eq!(server.calls.load(Ordering::SeqCst), 1);
         assert_eq!(state.prompts.sync_generation(), 1);
+    }
+
+    #[tokio::test]
+    async fn workflow_resolution_uses_the_prior_completed_snapshot_during_a_rebuild() {
+        let server = spawn_workflow_mcp_server(true).await;
+        let (tmp, state, _) = fresh_state_with_mock();
+        let state = state_with_mcp_server(
+            &tmp,
+            state,
+            &server.url,
+            Arc::new(switchboard_prompts::InMemorySecretStore::new()),
+        )
+        .with_workflows_dir(tmp.path().join("workflows"));
+        init_directory_impl(&state, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let project = create_project_in_only_dir(&state, "proj");
+        set_active_project_impl(&state, project.id).unwrap();
+        create_agent_impl(&state, "alice", HarnessKind::ClaudeCode, None, None).unwrap();
+        seed_workflow(
+            &state,
+            "mcp-review",
+            "name: mcp-review\ndescription: d\ninputs:\n  a: agent\nsteps:\n  - label: s\n    send:\n      to: \"{{ a }}\"\n      prompt: \"tiddly:review\"\n",
+        );
+
+        // Let generation 1 complete, then hold generation 2 after its deliberate
+        // local-only live-cache publication.
+        server.release.as_ref().unwrap().add_permits(1);
+        state.prompts.sync().await;
+        server.entered.acquire().await.unwrap().forget();
+        let mut second_sync = Box::pin(state.prompts.sync());
+        tokio::select! {
+            permit = server.entered.acquire() => permit.unwrap().forget(),
+            () = &mut second_sync => panic!("gated second sync completed before release"),
+        }
+
+        let form = describe_workflow_form_cache_only_impl(&state, "mcp-review", false).unwrap();
+        assert_eq!(form.compatibility, FormCompatibility::Ok);
+        assert!(
+            form.derived_args
+                .iter()
+                .any(|argument| argument.name == "context")
+        );
+        validate_workflow_invocation_impl(
+            &state,
+            project.id,
+            "mcp-review",
+            false,
+            &inputs(vec![("a", text("alice")), ("context", text("review this"))]),
+        )
+        .unwrap();
+        assert_eq!(state.prompts.sync_generation(), 1);
+
+        server.release.as_ref().unwrap().add_permits(1);
+        second_sync.await;
+        assert_eq!(state.prompts.sync_generation(), 2);
     }
 
     #[tokio::test(flavor = "current_thread")]

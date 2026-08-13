@@ -6023,7 +6023,7 @@ describe("ComposeBar — cross-agent forward", () => {
     expect(screen.queryByTestId("workflow-resolving")).toBeNull();
   });
 
-  it("does not refresh a workflow when a sync event arrives during its fresh describe", async () => {
+  it("coalesces sync events during a fresh describe into one cache-only refresh", async () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);
     const WORKFLOW = {
@@ -6041,7 +6041,6 @@ describe("ComposeBar — cross-agent forward", () => {
       invocable: true,
       inputs: WORKFLOW.inputs,
       steps: [],
-      derived_args: [] as unknown[],
     };
     let resolveDescribe: ((descriptor: unknown) => void) | undefined;
     let freshCalls = 0;
@@ -6053,7 +6052,21 @@ describe("ComposeBar — cross-agent forward", () => {
         freshCalls++;
         return new Promise((resolve) => (resolveDescribe = resolve));
       }
-      if (cmd === "refresh_workflow_form_from_cache") cacheOnlyCalls++;
+      if (cmd === "refresh_workflow_form_from_cache") {
+        cacheOnlyCalls++;
+        return {
+          ...base,
+          derived_args: [
+            {
+              name: "new",
+              required: false,
+              description: null,
+              prompts: ["tiddly:review"],
+            },
+          ],
+          compatibility: { state: "ok" },
+        };
+      }
       return null;
     });
 
@@ -6063,15 +6076,30 @@ describe("ComposeBar — cross-agent forward", () => {
     await fireEvent.click(screen.getByTestId("workflow-option-dir:race"));
     await waitFor(() => expect(freshCalls).toBe(1));
 
-    // The pending fresh request is already serialized with startup sync and will
-    // observe its result, so its completion event must not start another request.
+    // Multiple events during one fresh request coalesce. The fresh cache hit may
+    // represent the preceding completed generation, so one cache-only pass must
+    // apply the newer schema after the authoritative response settles.
+    listeners.get("prompts:synced")?.({ payload: null as unknown as NormalizedEvent });
     listeners.get("prompts:synced")?.({ payload: null as unknown as NormalizedEvent });
     await tick();
     expect(freshCalls).toBe(1);
     expect(cacheOnlyCalls).toBe(0);
 
-    resolveDescribe?.({ ...base, compatibility: { state: "ok" } });
-    await waitFor(() => screen.getByTestId("workflow-agent-worker-alice"));
+    resolveDescribe?.({
+      ...base,
+      derived_args: [
+        {
+          name: "old",
+          required: false,
+          description: null,
+          prompts: ["tiddly:review"],
+        },
+      ],
+      compatibility: { state: "ok" },
+    });
+    await waitFor(() => screen.getByTestId("workflow-arg-input-new"));
+    expect(cacheOnlyCalls).toBe(1);
+    expect(screen.queryByTestId("workflow-arg-input-old")).toBeNull();
   });
 
   it("uses only cache reclassification after an independent sync", async () => {
@@ -6145,6 +6173,198 @@ describe("ComposeBar — cross-agent forward", () => {
     expect(freshCalls).toBe(1);
     expect(cacheOnlyCalls).toBe(2);
     expect(screen.getByTestId("workflow-agent-worker-alice")).toBeInTheDocument();
+  });
+
+  it("prunes obsolete derived values and forwards after a successful schema refresh", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    const WORKFLOW = {
+      name: "schema-change",
+      is_builtin: false,
+      description: "d",
+      inputs: [{ name: "worker", ty: "agent", optional: false, description: null }],
+      invocable: true,
+      parse_error: null,
+    };
+    const base = {
+      name: WORKFLOW.name,
+      description: "d",
+      is_builtin: false,
+      invocable: true,
+      inputs: WORKFLOW.inputs,
+      steps: [],
+    };
+    const derived = (name: string) => ({
+      name,
+      required: false,
+      description: null,
+      prompts: ["tiddly:review"],
+    });
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "list_workflows") return [WORKFLOW];
+      if (cmd === "list_prompts") return [];
+      if (cmd === "describe_workflow_form") {
+        return { ...base, derived_args: [derived("old")], compatibility: { state: "ok" } };
+      }
+      if (cmd === "refresh_workflow_form_from_cache") {
+        return { ...base, derived_args: [derived("new")], compatibility: { state: "ok" } };
+      }
+      if (cmd === "invoke_workflow") return "run-1";
+      return null;
+    });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await fireEvent.click(screen.getByTestId("compose-workflow-button"));
+    await waitFor(() => screen.getByTestId("workflow-option-dir:schema-change"));
+    await fireEvent.click(screen.getByTestId("workflow-option-dir:schema-change"));
+    const oldInput = (await screen.findByTestId("workflow-arg-input-old")) as HTMLTextAreaElement;
+    await fireEvent.input(oldInput, { target: { value: "obsolete" } });
+    await fireEvent.click(screen.getByTestId("workflow-forward-picker-old"));
+    await fireEvent.click(await screen.findByTestId(`forward-picker-agent-${AGENT_A.id}`));
+    await waitFor(() => screen.getByTestId("workflow-forward-sources-old"));
+
+    listeners.get("prompts:synced")?.({ payload: null as unknown as NormalizedEvent });
+    const newInput = (await screen.findByTestId("workflow-arg-input-new")) as HTMLTextAreaElement;
+    expect(screen.queryByTestId("workflow-arg-input-old")).toBeNull();
+    expect(screen.queryByTestId("workflow-forward-sources-old")).toBeNull();
+    await fireEvent.input(newInput, { target: { value: "current" } });
+    await fireEvent.click(screen.getByTestId("workflow-agent-worker-alice"));
+    await fireEvent.click(screen.getByTestId("workflow-invoke-button"));
+    await waitFor(() => {
+      expect(invokeMock.mock.calls.some(([cmd]) => cmd === "invoke_workflow")).toBe(true);
+    });
+    const invocation = invokeMock.mock.calls.find(([cmd]) => cmd === "invoke_workflow");
+    expect(invocation?.[1]).toMatchObject({
+      inputs: { worker: AGENT_A.name, new: "current" },
+      forwardSources: {},
+    });
+    expect(invocation?.[1]).not.toMatchObject({ inputs: { old: expect.anything() } });
+  });
+
+  it("preserves derived drafts and forwards through a transient unavailable refresh", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    const WORKFLOW = {
+      name: "transient-outage",
+      is_builtin: false,
+      description: "d",
+      inputs: [{ name: "worker", ty: "agent", optional: false, description: null }],
+      invocable: true,
+      parse_error: null,
+    };
+    const argument = {
+      name: "context",
+      required: false,
+      description: null,
+      prompts: ["tiddly:review"],
+    };
+    const base = {
+      name: WORKFLOW.name,
+      description: "d",
+      is_builtin: false,
+      invocable: true,
+      inputs: WORKFLOW.inputs,
+      steps: [],
+    };
+    let cacheCalls = 0;
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "list_workflows") return [WORKFLOW];
+      if (cmd === "list_prompts") return [];
+      if (cmd === "describe_workflow_form") {
+        return { ...base, derived_args: [argument], compatibility: { state: "ok" } };
+      }
+      if (cmd === "refresh_workflow_form_from_cache") {
+        cacheCalls++;
+        return cacheCalls <= 2
+          ? {
+              ...base,
+              derived_args: [],
+              compatibility: {
+                state: "unavailable",
+                issues: [
+                  {
+                    prompt: "tiddly:review",
+                    provider: "tiddly",
+                    kind: "provider_error",
+                    message: "timed out",
+                  },
+                ],
+              },
+            }
+          : { ...base, derived_args: [argument], compatibility: { state: "ok" } };
+      }
+      return null;
+    });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await fireEvent.click(screen.getByTestId("compose-workflow-button"));
+    await waitFor(() => screen.getByTestId("workflow-option-dir:transient-outage"));
+    await fireEvent.click(screen.getByTestId("workflow-option-dir:transient-outage"));
+    const input = (await screen.findByTestId("workflow-arg-input-context")) as HTMLTextAreaElement;
+    await fireEvent.input(input, { target: { value: "keep me" } });
+    await fireEvent.click(screen.getByTestId("workflow-forward-picker-context"));
+    await fireEvent.click(await screen.findByTestId(`forward-picker-agent-${AGENT_A.id}`));
+
+    listeners.get("prompts:synced")?.({ payload: null as unknown as NormalizedEvent });
+    await waitFor(() => screen.getByTestId("workflow-prompt-unavailable"));
+    listeners.get("prompts:synced")?.({ payload: null as unknown as NormalizedEvent });
+    await waitFor(() => expect(cacheCalls).toBe(2));
+    listeners.get("prompts:synced")?.({ payload: null as unknown as NormalizedEvent });
+    const recovered = (await screen.findByTestId(
+      "workflow-arg-input-context",
+    )) as HTMLTextAreaElement;
+    expect(recovered).toHaveValue("keep me");
+    expect(screen.getByTestId("workflow-forward-sources-context")).toBeInTheDocument();
+  });
+
+  it("clears a declared value when its semantic input type changes", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    const WORKFLOW = {
+      name: "input-type-change",
+      is_builtin: false,
+      description: "d",
+      inputs: [{ name: "target", ty: "agent", optional: false, description: null }],
+      invocable: true,
+      parse_error: null,
+    };
+    const descriptorBase = {
+      name: WORKFLOW.name,
+      description: "d",
+      is_builtin: false,
+      invocable: true,
+      steps: [],
+      derived_args: [],
+      compatibility: { state: "ok" },
+    };
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "list_workflows") return [WORKFLOW];
+      if (cmd === "list_prompts") return [];
+      if (cmd === "describe_workflow_form") return { ...descriptorBase, inputs: WORKFLOW.inputs };
+      if (cmd === "refresh_workflow_form_from_cache") {
+        return {
+          ...descriptorBase,
+          inputs: [{ name: "target", ty: "text", optional: false, description: null }],
+        };
+      }
+      return null;
+    });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await fireEvent.click(screen.getByTestId("compose-workflow-button"));
+    await waitFor(() => screen.getByTestId("workflow-option-dir:input-type-change"));
+    await fireEvent.click(screen.getByTestId("workflow-option-dir:input-type-change"));
+    await fireEvent.click(await screen.findByTestId(`workflow-agent-target-${AGENT_A.name}`));
+    await waitFor(() =>
+      expect(screen.getByTestId(`workflow-agent-target-${AGENT_A.name}`)).toHaveAttribute(
+        "aria-checked",
+        "true",
+      ),
+    );
+
+    listeners.get("prompts:synced")?.({ payload: null as unknown as NormalizedEvent });
+    const textInput = (await screen.findByTestId("workflow-text-target")) as HTMLTextAreaElement;
+    expect(textInput).toHaveValue("");
   });
 });
 

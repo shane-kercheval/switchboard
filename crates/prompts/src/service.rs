@@ -16,9 +16,8 @@
 //! clone to a background task that warms the cache at startup while the original
 //! lives in `AppState`; both share the same cache `Arc`.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -149,6 +148,42 @@ pub enum ProviderStatus {
     Unknown,
 }
 
+/// One fully completed MCP cache generation. Workflow schema resolution clones
+/// this object once so prompt presence, provider status, and configuration
+/// identity can never come from different rebuilds.
+#[derive(Debug, Clone, Default)]
+pub struct PromptResolutionSnapshot {
+    generation: u64,
+    prompts: Vec<Prompt>,
+    provider_status: HashMap<String, ProviderStatus>,
+    configured_providers: HashSet<String>,
+}
+
+impl PromptResolutionSnapshot {
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    #[must_use]
+    pub fn get(&self, provider: &str, name: &str) -> Option<Prompt> {
+        self.prompts
+            .iter()
+            .find(|prompt| prompt.provider == provider && prompt.name == name)
+            .cloned()
+    }
+
+    #[must_use]
+    pub fn provider_status(&self, provider: &str) -> Option<&ProviderStatus> {
+        self.provider_status.get(provider)
+    }
+
+    #[must_use]
+    pub fn is_provider_configured(&self, provider: &str) -> bool {
+        self.configured_providers.contains(provider)
+    }
+}
+
 /// Resolves prompts from user-global config. Construct with [`PromptService::new`]
 /// in production (paths + secret store injected by `crates/app`);
 /// [`PromptService::disabled`] yields an inert service (lists nothing, render
@@ -168,11 +203,9 @@ pub struct PromptService {
     /// Serializes cache rebuilds so an older, slower `sync` can't finish after a
     /// newer one and overwrite the cache with stale results.
     sync_lock: Arc<tokio::sync::Mutex<()>>,
-    /// Monotonic count of completed cache rebuilds. Callers that observe a cache
-    /// miss use this with [`sync_if_generation`](Self::sync_if_generation) to
-    /// await a racing startup sync without immediately running a duplicate, or
-    /// to perform the retry themselves when no newer sync has completed.
-    sync_generation: Arc<AtomicU64>,
+    /// Atomically published MCP prompts + statuses + provider identities for one
+    /// completed rebuild. Its generation is the sync-coalescing authority.
+    resolution_snapshot: Arc<RwLock<PromptResolutionSnapshot>>,
     /// Serializes the config-file read-modify-write in `add`/`remove` so two
     /// concurrent edits can't both read the old file and clobber each other's
     /// change. Synchronous (the mutators are sync fns), distinct from `sync_lock`.
@@ -228,7 +261,7 @@ impl PromptService {
             cache: Arc::new(RwLock::new(Vec::new())),
             provider_status: Arc::new(RwLock::new(HashMap::new())),
             sync_lock: Arc::new(tokio::sync::Mutex::new(())),
-            sync_generation: Arc::new(AtomicU64::new(0)),
+            resolution_snapshot: Arc::new(RwLock::new(PromptResolutionSnapshot::default())),
             config_write_lock: Arc::new(std::sync::Mutex::new(())),
             include_builtins: true,
             oauth_clients: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -306,7 +339,7 @@ impl PromptService {
             cache: Arc::new(RwLock::new(Vec::new())),
             provider_status: Arc::new(RwLock::new(HashMap::new())),
             sync_lock: Arc::new(tokio::sync::Mutex::new(())),
-            sync_generation: Arc::new(AtomicU64::new(0)),
+            resolution_snapshot: Arc::new(RwLock::new(PromptResolutionSnapshot::default())),
             config_write_lock: Arc::new(std::sync::Mutex::new(())),
             include_builtins: false,
             oauth_clients: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -405,7 +438,7 @@ impl PromptService {
     /// caller's observation has settled before this future returns.
     pub async fn sync_if_generation(&self, observed_generation: u64) -> bool {
         let _guard = self.sync_lock.lock().await;
-        if self.sync_generation() != observed_generation {
+        if self.completed_generation() != observed_generation {
             return false;
         }
         self.sync_locked().await;
@@ -415,18 +448,24 @@ impl PromptService {
     /// The number of cache rebuilds that have fully settled in this process.
     #[must_use]
     pub fn sync_generation(&self) -> u64 {
-        self.sync_generation.load(Ordering::Acquire)
+        self.completed_generation()
     }
 
-    /// The provider outcomes published by the most recently completed sync.
-    /// Cache consumers use this instead of [`list_mcp_providers`](Self::list_mcp_providers),
-    /// whose Settings projection also performs fresh credential-store reads.
+    /// One coherent MCP schema/status/configuration generation from the most
+    /// recently completed sync. Never touches configuration or credentials.
     #[must_use]
-    pub fn provider_status_snapshot(&self) -> HashMap<String, ProviderStatus> {
-        self.provider_status
+    pub fn resolution_snapshot(&self) -> PromptResolutionSnapshot {
+        self.resolution_snapshot
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+
+    fn completed_generation(&self) -> u64 {
+        self.resolution_snapshot
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .generation
     }
 
     /// Rebuild the cache while `sync_lock` is held, then publish the completion
@@ -454,16 +493,28 @@ impl PromptService {
                 .await;
 
         let mut statuses: HashMap<String, ProviderStatus> = HashMap::new();
+        let mut mcp_prompts = Vec::new();
         for (name, status, provider_prompts) in results {
-            prompts.extend(provider_prompts);
+            mcp_prompts.extend(provider_prompts);
             statuses.insert(name, status);
         }
+        prompts.extend(mcp_prompts.iter().cloned());
+        let snapshot_statuses = statuses.clone();
         *self
             .provider_status
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = statuses;
         self.publish(prompts);
-        self.sync_generation.fetch_add(1, Ordering::Release);
+        let generation = self.completed_generation() + 1;
+        *self
+            .resolution_snapshot
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = PromptResolutionSnapshot {
+            generation,
+            prompts: mcp_prompts,
+            provider_status: snapshot_statuses,
+            configured_providers: configs.iter().map(|config| config.name.clone()).collect(),
+        };
     }
 
     /// List one provider's prompts per its auth mode, mapping the outcome to a

@@ -427,9 +427,13 @@
   // and a same-named copied user workflow share a name).
   let workflowFormGen = 0;
   // The generation of the network-owning fresh resolver, when one is in flight.
-  // Sync events must not supersede it because it already observes that sync;
-  // cache-only refreshes may supersede one another so the newest event wins.
+  // Sync events arriving during it are coalesced after its response; cache-only
+  // refreshes may supersede one another so the newest event wins.
   let workflowFreshGen: number | null = null;
+  // Monotonic receipt count for global prompt-sync events. A fresh request records
+  // its starting value and, if the count advances, follows its accepted response
+  // with one cache-only refresh against the latest completed snapshot.
+  let promptSyncEventGen = 0;
   let workflowInputs = $state<Record<string, WorkflowInputValue>>({});
   // Per-field forward sources for the workflow's fillable single-text fields,
   // keyed by field name. Persisted with the other forward families; reset whenever
@@ -483,6 +487,7 @@
       void loadPrompts().then(() => tryRestorePrompt(false));
     }
     const unlisten = listen("prompts:synced", () => {
+      promptSyncEventGen++;
       if (hadDraft) {
         void loadPrompts().then(() => tryRestorePrompt(true));
       }
@@ -1675,16 +1680,91 @@
     void loadWorkflowForm(workflow);
   }
 
-  /// Fetch (or re-fetch) the descriptor for the picked workflow and seed any
-  /// not-yet-present fields. An initial pick/manual check uses the fresh resolver;
-  /// a `prompts:synced` event can only use the cache-only resolver. Seeding is
-  /// additive so refreshes preserve what the user already typed. A monotonic
-  /// generation token guards stale replies.
+  /// Fetch (or re-fetch) the descriptor for the picked workflow and reconcile its
+  /// draft with the accepted schema. An initial pick/manual check uses the fresh
+  /// resolver; a `prompts:synced` event can only use the cache-only resolver. A
+  /// monotonic generation token guards stale replies.
+  function emptyWorkflowValue(
+    ty: WorkflowFormDescriptor["inputs"][number]["ty"],
+  ): WorkflowInputValue {
+    return ty === "agent_list" || ty === "text_list" ? [] : "";
+  }
+
+  function valueMatchesWorkflowType(
+    value: WorkflowInputValue | undefined,
+    ty: WorkflowFormDescriptor["inputs"][number]["ty"],
+  ): value is WorkflowInputValue {
+    return ty === "agent_list" || ty === "text_list"
+      ? Array.isArray(value)
+      : typeof value === "string";
+  }
+
+  function reconcileWorkflowFormState(
+    form: WorkflowFormDescriptor,
+    previous: WorkflowFormDescriptor | null,
+  ): {
+    inputs: Record<string, WorkflowInputValue>;
+    forwards: Record<string, ForwardSource[]>;
+  } {
+    const nextInputs: Record<string, WorkflowInputValue> = {};
+    const nextForwards: Record<string, ForwardSource[]> = {};
+    const previousInputs = new Map(previous?.inputs.map((input) => [input.name, input.ty]) ?? []);
+    const currentDeclared = new Set(form.inputs.map((input) => input.name));
+
+    for (const input of form.inputs) {
+      const value = workflowInputs[input.name];
+      const sameSemanticType =
+        previous === null
+          ? valueMatchesWorkflowType(value, input.ty)
+          : previousInputs.get(input.name) === input.ty;
+      nextInputs[input.name] =
+        sameSemanticType && valueMatchesWorkflowType(value, input.ty)
+          ? Array.isArray(value)
+            ? [...value]
+            : value
+          : emptyWorkflowValue(input.ty);
+      const inputForwards = workflowForwardSources[input.name];
+      if (input.ty === "text" && sameSemanticType && inputForwards) {
+        nextForwards[input.name] = [...inputForwards];
+      }
+    }
+
+    const previousDerived = new Set(previous?.derived_args.map((argument) => argument.name) ?? []);
+    if (form.compatibility.state === "ok") {
+      for (const argument of form.derived_args) {
+        const value = workflowInputs[argument.name];
+        const previousSchemaAuthoritative = previous?.compatibility.state === "ok";
+        const sameField = !previousSchemaAuthoritative || previousDerived.has(argument.name);
+        nextInputs[argument.name] = sameField && typeof value === "string" ? value : "";
+        const argumentForwards = workflowForwardSources[argument.name];
+        if (sameField && argumentForwards) {
+          nextForwards[argument.name] = [...argumentForwards];
+        }
+      }
+    } else {
+      // A provider outage can temporarily erase every derived schema. Preserve
+      // those hidden draft values until a successfully resolved schema can
+      // authoritatively reconcile them.
+      const draftDerived = Object.keys(workflowInputs).filter((name) => !currentDeclared.has(name));
+      for (const name of draftDerived) {
+        const value = workflowInputs[name];
+        if (!currentDeclared.has(name) && typeof value === "string") nextInputs[name] = value;
+        const draftForwards = workflowForwardSources[name];
+        if (!currentDeclared.has(name) && draftForwards) {
+          nextForwards[name] = [...draftForwards];
+        }
+      }
+    }
+
+    return { inputs: nextInputs, forwards: nextForwards };
+  }
+
   async function loadWorkflowForm(
     workflow: WorkflowListing,
     resolution: "fresh" | "cache_only" = "fresh",
   ): Promise<void> {
     const gen = ++workflowFormGen;
+    const syncEventsAtStart = promptSyncEventGen;
     if (resolution === "fresh") workflowFreshGen = gen;
     if (workflowForm === null) workflowFormError = null;
     workflowFormLoading = true;
@@ -1694,17 +1774,11 @@
           ? await api.describeWorkflowForm(workflow.name, workflow.is_builtin)
           : await api.refreshWorkflowFormFromCache(workflow.name, workflow.is_builtin);
       if (gen !== workflowFormGen) return; // superseded by a newer pick/re-fetch
+      const reconciled = reconcileWorkflowFormState(form, workflowForm);
       workflowForm = form;
       workflowFormError = null;
-      const seeded: Record<string, WorkflowInputValue> = { ...workflowInputs };
-      for (const input of form.inputs) {
-        if (input.name in seeded) continue;
-        seeded[input.name] = input.ty === "agent_list" || input.ty === "text_list" ? [] : "";
-      }
-      for (const arg of form.derived_args) {
-        if (!(arg.name in seeded)) seeded[arg.name] = "";
-      }
-      workflowInputs = seeded;
+      workflowInputs = reconciled.inputs;
+      workflowForwardSources = reconciled.forwards;
     } catch (err) {
       if (gen === workflowFormGen) {
         const message = err instanceof Error ? err.message : String(err);
@@ -1714,6 +1788,15 @@
     } finally {
       if (resolution === "fresh" && workflowFreshGen === gen) workflowFreshGen = null;
       if (gen === workflowFormGen) workflowFormLoading = false;
+    }
+    if (
+      resolution === "fresh" &&
+      gen === workflowFormGen &&
+      promptSyncEventGen > syncEventsAtStart &&
+      selectedWorkflow?.name === workflow.name &&
+      selectedWorkflow.is_builtin === workflow.is_builtin
+    ) {
+      void loadWorkflowForm(workflow, "cache_only");
     }
   }
 

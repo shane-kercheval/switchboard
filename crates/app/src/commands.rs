@@ -3704,12 +3704,8 @@ pub fn cancel_forward_impl(state: &AppState, forward_id: Uuid) {
 /// `project_ids`' instance locks — strictly in that order, so a project lock
 /// is never released while one of its agents' turns is still live (which would
 /// reopen the double-drive race the lock guards). The reusable
-/// cancel-and-drain lifecycle primitive: standalone and unit-tested;
-/// remove-directory wires it up (passing one directory's agents +
-/// project), and the app-quit handler is deferred.
-// Exercised by tests but not yet on a production call path — the
-// remove-working-directory lifecycle consumes it once that command exists.
-#[allow(dead_code)]
+/// cancel-and-drain lifecycle primitive: standalone and unit-tested; directory
+/// teardown and orderly application quit both use it.
 pub async fn drain_agents_then_release_locks(
     state: &AppState,
     agents: &[AgentId],

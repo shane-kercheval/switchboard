@@ -393,6 +393,7 @@
   let promptMenuAllowsLiteralInsert = $state(false);
   let prompts = $state<Prompt[]>([]);
   let focusPromptFieldOnMount = $state(false);
+  let promptMenuSyncing = $state(false);
   // Whether the cache has been read at least once, so the picker can show a
   // "loading" row instead of momentarily claiming there are no prompts.
   let promptsLoaded = $state(false);
@@ -1701,6 +1702,20 @@
       clearStatus();
     } catch (err) {
       showError(`Couldn't copy prompt: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  async function syncPromptMenu(): Promise<void> {
+    if (promptMenuSyncing) return;
+    promptMenuSyncing = true;
+    clearStatus();
+    try {
+      await api.syncPrompts();
+      await loadPrompts();
+    } catch (err) {
+      showError(`Couldn't sync prompts: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      promptMenuSyncing = false;
     }
   }
 
@@ -3145,6 +3160,8 @@
           onpick={pickPrompt}
           oninsert={promptMenuAllowsLiteralInsert ? setEmptyDraftFromPromptSearch : undefined}
           oncopy={copyPrompt}
+          onsync={() => void syncPromptMenu()}
+          syncing={promptMenuSyncing}
           onconfigure={onConfigurePrompts ? configurePrompts : undefined}
           onopenfolder={openPromptsFolder}
           onclose={() => (promptMenuOpen = false)}

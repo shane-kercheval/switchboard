@@ -511,6 +511,68 @@ describe("ComposeBar", () => {
     expect(screen.queryByTestId("prompt-menu")).toBeNull();
   });
 
+  it("syncs and refreshes prompts in place from the prompt menu", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    let listCalls = 0;
+    let syncCalls = 0;
+    let releaseSync!: () => void;
+    const syncGate = new Promise<void>((resolve) => {
+      releaseSync = resolve;
+    });
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "list_prompts") {
+        listCalls += 1;
+        return listCalls === 1 ? [REVIEW] : [REVIEW, SUMMARY];
+      }
+      if (cmd === "sync_prompts") {
+        syncCalls += 1;
+        await syncGate;
+        return null;
+      }
+      return null;
+    });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await fireEvent.click(screen.getByTestId("compose-prompt-button"));
+    await screen.findByTestId("prompt-option-local:review");
+
+    const sync = screen.getByTestId("prompt-menu-sync");
+    await fireEvent.click(sync);
+    await waitFor(() => expect(sync).toHaveTextContent("Syncing…"));
+    expect(sync).toBeDisabled();
+    await fireEvent.click(sync);
+    expect(syncCalls).toBe(1);
+
+    releaseSync();
+    await screen.findByTestId("prompt-option-tiddly:summary");
+    expect(screen.getByTestId("prompt-menu")).toBeInTheDocument();
+    expect(screen.getByTestId("prompt-menu-sync")).toBeEnabled();
+    expect(listCalls).toBe(2);
+  });
+
+  it("keeps prompt-menu sync retryable and reports a failed rebuild", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "list_prompts") return [REVIEW];
+      if (cmd === "sync_prompts") throw new Error("provider timed out");
+      return null;
+    });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await fireEvent.click(screen.getByTestId("compose-prompt-button"));
+    await fireEvent.click(await screen.findByTestId("prompt-menu-sync"));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("compose-send-error")).toHaveTextContent(
+        "Couldn't sync prompts: provider timed out",
+      ),
+    );
+    expect(screen.getByTestId("prompt-menu")).toBeInTheDocument();
+    expect(screen.getByTestId("prompt-menu-sync")).toBeEnabled();
+  });
+
   it("copies the workflow-authoring prompt from the workflow menu", async () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);

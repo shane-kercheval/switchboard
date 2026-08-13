@@ -18,6 +18,8 @@
     onpick,
     oninsert,
     oncopy,
+    onsync,
+    syncing = false,
     onconfigure,
     onopenfolder,
     onclose,
@@ -32,6 +34,10 @@
     /// Copy a read-only built-in into the user's own prompts. Only built-in rows
     /// surface the affordance; omitting the handler hides it everywhere.
     oncopy?: (prompt: Prompt) => void;
+    /// Rebuild every configured prompt source and refresh the passed-in list.
+    onsync?: () => void;
+    /// True while the prompt-source rebuild is pending.
+    syncing?: boolean;
     /// Open the Settings section that owns prompt sources.
     onconfigure?: () => void;
     /// Open the local prompts folder (where the user adds their own). Omitting the
@@ -207,12 +213,23 @@
     data-testid="prompt-menu-search"
     class="border-border bg-raised text-fg placeholder:text-muted focus-visible:ring-focus mt-1 w-full rounded-md border px-2.5 py-1.5 text-sm focus-visible:ring-1 focus-visible:outline-none"
   />
-  {#if onconfigure || onopenfolder}
+  {#if onsync || onconfigure || onopenfolder}
     <div class="mt-1 flex items-center gap-1">
+      {#if onsync}
+        <button
+          type="button"
+          class="text-muted hover:text-fg min-w-0 flex-1 rounded-md px-2.5 py-1 text-left text-xs disabled:cursor-wait disabled:opacity-60"
+          data-testid="prompt-menu-sync"
+          disabled={syncing}
+          onclick={() => onsync()}
+        >
+          {syncing ? "Syncing…" : "Sync prompts"}
+        </button>
+      {/if}
       {#if onconfigure}
         <button
           type="button"
-          class="text-muted hover:text-fg min-w-0 flex-1 rounded-md px-2.5 py-1 text-left text-xs"
+          class="text-muted hover:text-fg min-w-0 flex-1 rounded-md px-2.5 py-1 text-center text-xs"
           data-testid="prompt-menu-configure"
           onclick={() => onconfigure()}
         >

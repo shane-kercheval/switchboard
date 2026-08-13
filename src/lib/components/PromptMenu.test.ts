@@ -41,17 +41,29 @@ const BUILTIN: Prompt = {
   tags: [],
 };
 
-function setup(prompts: Prompt[] = PROMPTS, loading = false) {
+function setup(prompts: Prompt[] = PROMPTS, loading = false, syncing = false) {
   const onpick = vi.fn();
   const oninsert = vi.fn();
   const oncopy = vi.fn();
+  const onsync = vi.fn();
   const onconfigure = vi.fn();
   const onopenfolder = vi.fn();
   const onclose = vi.fn();
   render(PromptMenu, {
-    props: { prompts, loading, onpick, oninsert, oncopy, onconfigure, onopenfolder, onclose },
+    props: {
+      prompts,
+      loading,
+      syncing,
+      onpick,
+      oninsert,
+      oncopy,
+      onsync,
+      onconfigure,
+      onopenfolder,
+      onclose,
+    },
   });
-  return { onpick, oninsert, oncopy, onconfigure, onopenfolder, onclose };
+  return { onpick, oninsert, oncopy, onsync, onconfigure, onopenfolder, onclose };
 }
 
 describe("PromptMenu", () => {
@@ -197,13 +209,25 @@ describe("PromptMenu", () => {
     expect(onpick).not.toHaveBeenCalled();
   });
 
-  it("offers configure and open-folder actions", async () => {
-    const { onconfigure, onopenfolder } = setup();
+  it("offers sync before configure, plus the open-folder action", async () => {
+    const { onsync, onconfigure, onopenfolder } = setup();
+    const sync = screen.getByTestId("prompt-menu-sync");
+    const configure = screen.getByTestId("prompt-menu-configure");
+    expect(sync.compareDocumentPosition(configure) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+
+    await fireEvent.click(sync);
+    expect(onsync).toHaveBeenCalledTimes(1);
     await fireEvent.click(screen.getByTestId("prompt-menu-configure"));
     expect(onconfigure).toHaveBeenCalledTimes(1);
 
     await fireEvent.click(screen.getByTestId("prompt-menu-open-folder"));
     expect(onopenfolder).toHaveBeenCalledTimes(1);
+  });
+
+  it("disables sync and shows progress while a rebuild is pending", () => {
+    setup(PROMPTS, false, true);
+    expect(screen.getByTestId("prompt-menu-sync")).toBeDisabled();
+    expect(screen.getByTestId("prompt-menu-sync")).toHaveTextContent("Syncing…");
   });
 
   it("still picks the built-in row itself", async () => {

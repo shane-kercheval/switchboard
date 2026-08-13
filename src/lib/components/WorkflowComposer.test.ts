@@ -263,9 +263,10 @@ describe("WorkflowComposer", () => {
     expect(onretry).toHaveBeenCalledOnce();
   });
 
-  it("routes authentication and configuration issues to prompt settings", async () => {
+  it("offers provider sign-in directly and reserves settings for configuration issues", async () => {
     const onconfigure = vi.fn();
-    render(WorkflowComposer, {
+    const onsignin = vi.fn();
+    const { rerender } = render(WorkflowComposer, {
       props: {
         descriptor: descriptor([], [], {
           compatibility: {
@@ -273,6 +274,12 @@ describe("WorkflowComposer", () => {
             issues: [
               {
                 prompt: "tiddly:review",
+                provider: "tiddly",
+                kind: "needs_auth",
+                message: null,
+              },
+              {
+                prompt: "tiddly:summary",
                 provider: "tiddly",
                 kind: "needs_auth",
                 message: null,
@@ -289,15 +296,46 @@ describe("WorkflowComposer", () => {
         agents: AGENTS,
         inputs: {},
         onremove: vi.fn(),
+        onsignin,
         onconfigure,
       },
     });
 
     expect(screen.getByTestId("workflow-prompt-unavailable")).toHaveTextContent("needs sign-in");
+    expect(screen.getAllByTestId("workflow-prompt-sign-in-tiddly")).toHaveLength(1);
     expect(screen.getAllByTestId("workflow-prompt-settings")).toHaveLength(1);
     expect(screen.queryByTestId("workflow-prompt-check-again")).toBeNull();
+    await fireEvent.click(screen.getByTestId("workflow-prompt-sign-in-tiddly"));
+    expect(onsignin).toHaveBeenCalledOnce();
+    expect(onsignin).toHaveBeenCalledWith("tiddly");
     await fireEvent.click(screen.getByTestId("workflow-prompt-settings"));
     expect(onconfigure).toHaveBeenCalledOnce();
+
+    await rerender({
+      descriptor: descriptor([], [], {
+        compatibility: {
+          state: "unavailable",
+          issues: [
+            {
+              prompt: "tiddly:review",
+              provider: "tiddly",
+              kind: "needs_auth",
+              message: null,
+            },
+          ],
+        },
+      }),
+      agents: AGENTS,
+      inputs: {},
+      onremove: vi.fn(),
+      onsignin,
+      signingInProvider: "tiddly",
+      onconfigure,
+    });
+    expect(screen.getByTestId("workflow-prompt-sign-in-tiddly")).toBeDisabled();
+    expect(screen.getByTestId("workflow-prompt-sign-in-tiddly")).toHaveTextContent(
+      "Waiting for tiddly sign-in",
+    );
   });
 
   it("falls back safely for a newer availability issue kind", async () => {

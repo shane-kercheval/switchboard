@@ -41,6 +41,8 @@
     forwardSources = $bindable({}),
     onremove,
     onretry,
+    onsignin,
+    signingInProvider = null,
     onconfigure,
     invoke,
   }: {
@@ -68,6 +70,10 @@
     onremove: () => void;
     /// Check prompt resolution again after a settled provider failure.
     onretry?: () => void;
+    /// Start browser authentication for a provider that blocks this workflow.
+    onsignin?: (provider: string) => void;
+    /// Provider whose browser authentication flow is currently pending.
+    signingInProvider?: string | null;
     /// Open prompt-provider Settings for authentication or configuration issues.
     onconfigure?: () => void;
     /// The invoke button(s), rendered in the footer by the parent (so the parent
@@ -253,10 +259,16 @@
   // retained as a defensive wire fallback, but never waits for a global event.
   const unresolvedMissing = $derived(compat.state === "unresolved" ? compat.prompts : null);
   const pending = $derived(loading);
+  const authProviders = $derived([
+    ...new Set(
+      unavailable?.issues
+        .filter((issue) => issue.kind === "needs_auth")
+        .map((issue) => issue.provider) ?? [],
+    ),
+  ]);
   const needsProviderSettings = $derived(
-    unavailable?.issues.some(
-      (issue) => issue.kind === "needs_auth" || issue.kind === "not_configured",
-    ) ?? false,
+    unavailable?.issues.some((issue) => issue.kind === "not_configured") === true ||
+      (onsignin === undefined && authProviders.length > 0),
   );
   const canCheckAgain = $derived(
     unavailable?.issues.some(
@@ -395,8 +407,23 @@
       {#each unavailable.issues as issue (issue.prompt + issue.provider + issue.kind)}
         <span>• {availabilityMessage(issue)}</span>
       {/each}
-      {#if (needsProviderSettings && onconfigure) || (canCheckAgain && onretry)}
+      {#if (authProviders.length > 0 && onsignin) || (needsProviderSettings && onconfigure) || (canCheckAgain && onretry)}
         <div class="mt-1 flex flex-wrap gap-1.5">
+          {#if onsignin}
+            {#each authProviders as provider (provider)}
+              <button
+                type="button"
+                class="border-border bg-panel text-fg hover:bg-raised w-fit rounded border px-2 py-1 font-medium transition-colors disabled:cursor-wait disabled:opacity-60"
+                data-testid={`workflow-prompt-sign-in-${provider}`}
+                disabled={signingInProvider !== null}
+                onclick={() => onsignin?.(provider)}
+              >
+                {signingInProvider === provider
+                  ? `Waiting for ${provider} sign-in…`
+                  : `Sign in to ${provider}`}
+              </button>
+            {/each}
+          {/if}
           {#if needsProviderSettings && onconfigure}
             <button
               type="button"

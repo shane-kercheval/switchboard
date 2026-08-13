@@ -6043,6 +6043,192 @@ describe("ComposeBar — cross-agent forward", () => {
     expect(screen.queryByTestId("compose-workflow-load-failed")).toBeNull();
   });
 
+  it("signs in from an unavailable workflow and refreshes its form exactly once", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    const WORKFLOW = {
+      name: "oauth-workflow",
+      is_builtin: true,
+      description: "d",
+      inputs: [],
+      invocable: true,
+      parse_error: null,
+    };
+    const unavailable = {
+      ...WORKFLOW,
+      steps: [],
+      derived_args: [],
+      compatibility: {
+        state: "unavailable",
+        issues: [
+          {
+            prompt: "tiddly:review",
+            provider: "tiddly",
+            kind: "needs_auth",
+            message: null,
+          },
+        ],
+      },
+    };
+    const available = {
+      ...WORKFLOW,
+      steps: [],
+      derived_args: [],
+      compatibility: { state: "ok" },
+    };
+    let describeCalls = 0;
+    let releaseSignIn!: () => void;
+    const signInGate = new Promise<void>((resolve) => {
+      releaseSignIn = resolve;
+    });
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "list_workflows") return [WORKFLOW];
+      if (cmd === "list_prompts") return [];
+      if (cmd === "describe_workflow_form") {
+        describeCalls += 1;
+        return describeCalls === 1 ? unavailable : available;
+      }
+      if (cmd === "sign_in_mcp_provider") return await signInGate;
+      return null;
+    });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await fireEvent.click(screen.getByTestId("compose-workflow-button"));
+    await fireEvent.click(await screen.findByTestId("workflow-option-builtin:oauth-workflow"));
+    const signIn = await screen.findByTestId("workflow-prompt-sign-in-tiddly");
+
+    await fireEvent.click(signIn);
+    await waitFor(() => expect(signIn).toHaveTextContent("Waiting for tiddly sign-in"));
+    expect(signIn).toBeDisabled();
+    expect(invokeMock.mock.calls.filter(([cmd]) => cmd === "sign_in_mcp_provider")).toHaveLength(1);
+    await fireEvent.click(signIn);
+    expect(invokeMock.mock.calls.filter(([cmd]) => cmd === "sign_in_mcp_provider")).toHaveLength(1);
+
+    releaseSignIn();
+    await waitFor(() => expect(screen.queryByTestId("workflow-prompt-unavailable")).toBeNull());
+    expect(describeCalls).toBe(2);
+    expect(screen.getByTestId("workflow-invoke-button")).toBeEnabled();
+  });
+
+  it("does not refresh or surface an error after unmounting during workflow sign-in", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    const WORKFLOW = {
+      name: "oauth-workflow",
+      is_builtin: true,
+      description: "d",
+      inputs: [],
+      invocable: true,
+      parse_error: null,
+    };
+    const unavailable = {
+      ...WORKFLOW,
+      steps: [],
+      derived_args: [],
+      compatibility: {
+        state: "unavailable",
+        issues: [
+          {
+            prompt: "tiddly:review",
+            provider: "tiddly",
+            kind: "needs_auth",
+            message: null,
+          },
+        ],
+      },
+    };
+    let describeCalls = 0;
+    let releaseSignIn!: () => void;
+    let markSignInComplete!: () => void;
+    const signInGate = new Promise<void>((resolve) => {
+      releaseSignIn = resolve;
+    });
+    const signInComplete = new Promise<void>((resolve) => {
+      markSignInComplete = resolve;
+    });
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "list_workflows") return [WORKFLOW];
+      if (cmd === "list_prompts") return [];
+      if (cmd === "describe_workflow_form") {
+        describeCalls += 1;
+        return unavailable;
+      }
+      if (cmd === "sign_in_mcp_provider") {
+        await signInGate;
+        markSignInComplete();
+        return null;
+      }
+      return null;
+    });
+
+    const view = render(ComposeBar, {
+      props: { projectId: PROJECT_ID, agents: [AGENT_A] },
+    });
+    await fireEvent.click(screen.getByTestId("compose-workflow-button"));
+    await fireEvent.click(await screen.findByTestId("workflow-option-builtin:oauth-workflow"));
+    await fireEvent.click(await screen.findByTestId("workflow-prompt-sign-in-tiddly"));
+    await waitFor(() =>
+      expect(invokeMock.mock.calls.filter(([cmd]) => cmd === "sign_in_mcp_provider")).toHaveLength(
+        1,
+      ),
+    );
+
+    view.unmount();
+    releaseSignIn();
+    await signInComplete;
+    await Promise.resolve();
+    expect(describeCalls).toBe(1);
+  });
+
+  it("keeps an unavailable workflow retryable when browser sign-in fails", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    const WORKFLOW = {
+      name: "oauth-workflow",
+      is_builtin: true,
+      description: "d",
+      inputs: [],
+      invocable: true,
+      parse_error: null,
+    };
+    const unavailable = {
+      ...WORKFLOW,
+      steps: [],
+      derived_args: [],
+      compatibility: {
+        state: "unavailable",
+        issues: [
+          {
+            prompt: "tiddly:review",
+            provider: "tiddly",
+            kind: "needs_auth",
+            message: null,
+          },
+        ],
+      },
+    };
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "list_workflows") return [WORKFLOW];
+      if (cmd === "list_prompts") return [];
+      if (cmd === "describe_workflow_form") return unavailable;
+      if (cmd === "sign_in_mcp_provider") throw new Error("access_denied");
+      return null;
+    });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await fireEvent.click(screen.getByTestId("compose-workflow-button"));
+    await fireEvent.click(await screen.findByTestId("workflow-option-builtin:oauth-workflow"));
+    await fireEvent.click(await screen.findByTestId("workflow-prompt-sign-in-tiddly"));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("compose-send-error")).toHaveTextContent(
+        "Couldn't sign in to tiddly: access_denied",
+      ),
+    );
+    expect(screen.getByTestId("workflow-prompt-unavailable")).toBeInTheDocument();
+    expect(screen.getByTestId("workflow-prompt-sign-in-tiddly")).toBeEnabled();
+  });
+
   it("enters workflow mode, resolves the form, and invokes with declared + derived values", async () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);

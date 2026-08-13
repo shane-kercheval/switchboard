@@ -442,6 +442,8 @@
     untrack(() => reconcileForwardSourceMap(savedForwards.workflowFields, agents)),
   );
   let invokingWorkflow = $state(false);
+  let workflowSigningInProvider = $state<string | null>(null);
+  let workflowSignInGen = 0;
   // A saved prompt-mode draft to restore once the cache loads; consumed when
   // restoration settles. Null when the saved draft was plain.
   let pendingRestore = $state<PromptContent | null>(
@@ -1745,6 +1747,8 @@
   /// inputs + auto-derived prompt-argument fields) via `describe_workflow_form`.
   /// The prompt is hardcoded — nothing to pre-seed/pick — so fields seed empty.
   function pickWorkflow(workflow: WorkflowListing): void {
+    workflowSignInGen += 1;
+    workflowSigningInProvider = null;
     selectedWorkflow = workflow;
     workflowForm = null;
     workflowFormError = null;
@@ -1876,6 +1880,8 @@
   }
 
   function removeWorkflow(): void {
+    workflowSignInGen += 1;
+    workflowSigningInProvider = null;
     mode = "plain";
     selectedWorkflow = null;
     workflowForm = null;
@@ -1887,8 +1893,37 @@
   }
 
   function retryWorkflowForm(): void {
-    if (selectedWorkflow === null || workflowFormLoading) return;
+    if (selectedWorkflow === null || workflowFormLoading || workflowSigningInProvider !== null)
+      return;
     void loadWorkflowForm(selectedWorkflow);
+  }
+
+  async function signInWorkflowProvider(provider: string): Promise<void> {
+    if (selectedWorkflow === null || workflowSigningInProvider !== null) return;
+    const workflow = selectedWorkflow;
+    const attempt = ++workflowSignInGen;
+    workflowSigningInProvider = provider;
+    clearStatus();
+    try {
+      await api.signInMcpProvider(provider);
+      if (
+        unmounted ||
+        attempt !== workflowSignInGen ||
+        selectedWorkflow?.name !== workflow.name ||
+        selectedWorkflow.is_builtin !== workflow.is_builtin
+      ) {
+        return;
+      }
+      await loadWorkflowForm(workflow);
+    } catch (err) {
+      if (!unmounted && attempt === workflowSignInGen) {
+        showError(
+          `Couldn't sign in to ${provider}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    } finally {
+      if (!unmounted && attempt === workflowSignInGen) workflowSigningInProvider = null;
+    }
   }
 
   async function copyWorkflow(workflow: WorkflowListing): Promise<void> {
@@ -3668,6 +3703,8 @@
           bind:forwardSources={workflowForwardSources}
           onremove={removeWorkflow}
           onretry={retryWorkflowForm}
+          onsignin={(provider) => void signInWorkflowProvider(provider)}
+          signingInProvider={workflowSigningInProvider}
           onconfigure={onConfigurePrompts ? configurePrompts : undefined}
         >
           {#snippet invoke()}

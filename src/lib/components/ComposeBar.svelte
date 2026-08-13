@@ -430,10 +430,10 @@
   // Sync events arriving during it are coalesced after its response; cache-only
   // refreshes may supersede one another so the newest event wins.
   let workflowFreshGen: number | null = null;
-  // Monotonic receipt count for global prompt-sync events. A fresh request records
-  // its starting value and, if the count advances, follows its accepted response
-  // with one cache-only refresh against the latest completed snapshot.
-  let promptSyncEventGen = 0;
+  // Monotonic receipt count for authoritative prompt-resolution changes. A fresh
+  // request records its starting value and, if the count advances, follows its
+  // accepted response with one cache-only refresh against the latest snapshot.
+  let promptResolutionEventGen = 0;
   let workflowInputs = $state<Record<string, WorkflowInputValue>>({});
   // Per-field forward sources for the workflow's fillable single-text fields,
   // keyed by field name. Persisted with the other forward families; reset whenever
@@ -477,20 +477,22 @@
   // be cold (MCP prompts land only after the launch-time sync), so also re-try
   // when the backend signals a completed sync — and only then is "still absent"
   // proof the prompt is gone.
-  // A single `prompts:synced` subscription drives two cache-warm re-tries: (1)
-  // restoring a saved prompt-mode draft whose prompt was cold at mount, and (2)
-  // cache-only workflow reclassification. The latter must never call the fresh
-  // resolver: the event was emitted by a sync that already owns the network work.
+  // A settled sync can prove a saved prompt is absent; any authoritative
+  // resolution change can reclassify an open workflow. Keep those signals
+  // separate so a temporary provider invalidation never destroys a saved prompt
+  // draft. Workflow reclassification must remain cache-only.
   onMount(() => {
     const hadDraft = pendingRestore !== null;
     if (hadDraft) {
       void loadPrompts().then(() => tryRestorePrompt(false));
     }
-    const unlisten = listen("prompts:synced", () => {
-      promptSyncEventGen++;
+    const unlistenSynced = listen("prompts:synced", () => {
       if (hadDraft) {
         void loadPrompts().then(() => tryRestorePrompt(true));
       }
+    });
+    const unlistenChanged = listen("prompts:changed", () => {
+      promptResolutionEventGen++;
       if (
         mode === "workflow" &&
         selectedWorkflow !== null &&
@@ -500,7 +502,10 @@
         void loadWorkflowForm(selectedWorkflow, "cache_only");
       }
     });
-    return () => void unlisten.then((u) => u());
+    return () => {
+      void unlistenSynced.then((u) => u());
+      void unlistenChanged.then((u) => u());
+    };
   });
 
   // A saved workflow-mode draft resolves against the local workflow list, which is
@@ -1682,7 +1687,7 @@
 
   /// Fetch (or re-fetch) the descriptor for the picked workflow and reconcile its
   /// draft with the accepted schema. An initial pick/manual check uses the fresh
-  /// resolver; a `prompts:synced` event can only use the cache-only resolver. A
+  /// resolver; a `prompts:changed` event can only use the cache-only resolver. A
   /// monotonic generation token guards stale replies.
   function emptyWorkflowValue(
     ty: WorkflowFormDescriptor["inputs"][number]["ty"],
@@ -1764,7 +1769,7 @@
     resolution: "fresh" | "cache_only" = "fresh",
   ): Promise<void> {
     const gen = ++workflowFormGen;
-    const syncEventsAtStart = promptSyncEventGen;
+    const resolutionEventsAtStart = promptResolutionEventGen;
     if (resolution === "fresh") workflowFreshGen = gen;
     if (workflowForm === null) workflowFormError = null;
     workflowFormLoading = true;
@@ -1792,7 +1797,7 @@
     if (
       resolution === "fresh" &&
       gen === workflowFormGen &&
-      promptSyncEventGen > syncEventsAtStart &&
+      promptResolutionEventGen > resolutionEventsAtStart &&
       selectedWorkflow?.name === workflow.name &&
       selectedWorkflow.is_builtin === workflow.is_builtin
     ) {

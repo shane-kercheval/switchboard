@@ -1315,11 +1315,12 @@ pub async fn sign_out_mcp_provider_impl(state: &AppState, name: &str) -> Result<
 }
 
 /// Remove a generic MCP provider: deletes its config entry + keychain token and
-/// rebuilds the cache in the background.
+/// rebuilds the cache in the background. Settlement runs after errors too because
+/// one credential delete may have succeeded before another operation failed.
 pub fn remove_mcp_provider_impl(state: &AppState, name: &str) -> Result<(), AppError> {
-    state.prompts.remove_mcp_provider(name)?;
+    let result = state.prompts.remove_mcp_provider(name);
     spawn_prompt_sync(state);
-    Ok(())
+    Ok(result?)
 }
 
 /// Probe a **saved** provider by name with its stored credentials — the
@@ -1344,20 +1345,42 @@ pub async fn test_mcp_connection_impl(
     Ok(state.prompts.test_mcp_connection(url, bearer).await?)
 }
 
-/// Event emitted after a prompt-cache rebuild settles, so the frontend can
-/// refresh provider status and restore a prompt-mode compose draft that needed
-/// the cache warm. Every independent sync path — startup warm sync, the
-/// `sync_prompts` command, and provider mutations — emits through one of the
-/// sync-and-notify helpers below. Workflow listeners reclassify from cache only,
-/// so notification cannot feed back into another network sync.
+/// Event emitted whenever the authoritative MCP resolution snapshot changes.
+/// Workflow listeners reclassify cache-only on this signal; it deliberately
+/// says nothing about whether a network synchronization has settled.
+pub const PROMPTS_CHANGED_EVENT: &str = "prompts:changed";
+
+/// Event emitted after a prompt-cache rebuild settles. Saved prompt-draft
+/// restoration relies on this stronger meaning: only then is a still-missing
+/// prompt known to be absent rather than hidden by a temporarily cold cache.
 pub const PROMPTS_SYNCED_EVENT: &str = "prompts:synced";
 
-/// Rebuild the prompt cache, then emit [`PROMPTS_SYNCED_EVENT`]. The emit is
-/// bound to the sync here so no event-producing caller can warm the cache without
-/// notifying — the single chokepoint those independent paths route through.
+/// Bridge the prompt crate's Tauri-agnostic resolution watch channel to the
+/// frontend. The watch channel coalesces rapid changes; consumers always read
+/// the latest immutable snapshot, so intermediate generations are unnecessary.
+pub fn spawn_prompt_resolution_change_notifications(
+    prompts: &PromptService,
+    emitter: Arc<dyn EventEmitter>,
+) {
+    let mut changes = prompts.subscribe_resolution_changes();
+    tauri::async_runtime::spawn(async move {
+        while changes.changed().await.is_ok() {
+            let generation = *changes.borrow_and_update();
+            emitter.emit(
+                PROMPTS_CHANGED_EVENT,
+                serde_json::json!({ "generation": generation }),
+            );
+        }
+    });
+}
+
+/// Rebuild the prompt cache, then emit [`PROMPTS_SYNCED_EVENT`] only if that work
+/// published a completed snapshot. A provider mutation may invalidate an
+/// in-flight rebuild; its queued successor owns the eventual settled event.
 pub async fn sync_prompts_and_notify(prompts: PromptService, emitter: Arc<dyn EventEmitter>) {
-    prompts.sync().await;
-    emitter.emit(PROMPTS_SYNCED_EVENT, serde_json::Value::Null);
+    if prompts.sync().await {
+        emitter.emit(PROMPTS_SYNCED_EVENT, serde_json::Value::Null);
+    }
 }
 
 /// Conditionally rebuild the prompt cache, emitting only when this caller owned
@@ -19990,6 +20013,94 @@ mod tests {
         assert_eq!(names, vec![PROMPTS_SYNCED_EVENT.to_owned()]);
     }
 
+    #[tokio::test]
+    async fn resolution_change_bridge_emits_without_claiming_sync_settled() {
+        let emitter = Arc::new(RecordingEmitter::new());
+        let prompts = PromptService::disabled();
+        spawn_prompt_resolution_change_notifications(
+            &prompts,
+            Arc::clone(&emitter) as Arc<dyn EventEmitter>,
+        );
+
+        prompts.sync().await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if emitter
+                    .snapshot()
+                    .iter()
+                    .any(|(name, _)| name == PROMPTS_CHANGED_EVENT)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("resolution change should be bridged");
+
+        let events = emitter.snapshot();
+        assert!(events.iter().all(|(name, _)| name != PROMPTS_SYNCED_EVENT));
+        assert!(events.iter().any(|(name, payload)| {
+            name == PROMPTS_CHANGED_EVENT && payload["generation"] == serde_json::json!(1)
+        }));
+    }
+
+    #[tokio::test]
+    async fn failed_provider_removal_still_notifies_and_schedules_settlement() {
+        use switchboard_prompts::{SecretStore, SecretStoreError};
+
+        struct DeleteFailsStore;
+        impl SecretStore for DeleteFailsStore {
+            fn get(&self, _: &str) -> Result<Option<String>, SecretStoreError> {
+                Ok(None)
+            }
+
+            fn set(&self, _: &str, _: &str) -> Result<(), SecretStoreError> {
+                Ok(())
+            }
+
+            fn delete(&self, _: &str) -> Result<(), SecretStoreError> {
+                Err(SecretStoreError::Backend("delete failed".to_owned()))
+            }
+        }
+
+        let (tmp, state, emitter) = fresh_state_with_mock();
+        let config_path = tmp.path().join("config.yaml");
+        std::fs::write(
+            &config_path,
+            "mcp_providers:\n  - name: team\n    transport:\n      type: http\n      url: http://127.0.0.1:9/mcp\n    auth:\n      type: bearer\n",
+        )
+        .unwrap();
+        let prompts = PromptService::new(
+            config_path,
+            tmp.path().join("prompts"),
+            None,
+            Arc::new(DeleteFailsStore),
+        )
+        .with_provider_timeout(std::time::Duration::from_millis(100));
+        spawn_prompt_resolution_change_notifications(
+            &prompts,
+            Arc::clone(&emitter) as Arc<dyn EventEmitter>,
+        );
+        let state = state.with_prompts(prompts);
+
+        assert!(remove_mcp_provider_impl(&state, "team").is_err());
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let events = emitter.snapshot();
+                let changed = events.iter().any(|(name, _)| name == PROMPTS_CHANGED_EVENT);
+                let synced = events.iter().any(|(name, _)| name == PROMPTS_SYNCED_EVENT);
+                if changed && synced {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("partial removal failure should notify immediately and settle");
+    }
+
     // --- Workflow commands ----------------------------------------------------
 
     use crate::workflow_commands::{
@@ -20896,7 +21007,7 @@ mod tests {
 
         tokio::select! {
             permit = server.entered.acquire() => permit.unwrap().forget(),
-            () = &mut startup => panic!("gated startup sync completed before release"),
+            _ = &mut startup => panic!("gated startup sync completed before release"),
         }
         let mut describe = Box::pin(describe_workflow_form_fresh_impl(
             &state,
@@ -20908,7 +21019,8 @@ mod tests {
             result = &mut describe => panic!("workflow describe completed before startup sync: {result:?}"),
         }
         server.release.as_ref().unwrap().add_permits(1);
-        let ((), form) = tokio::join!(&mut startup, &mut describe);
+        let (published, form) = tokio::join!(&mut startup, &mut describe);
+        assert!(published);
         let form = form.unwrap();
 
         assert_eq!(form.compatibility, FormCompatibility::Ok);
@@ -20986,7 +21098,7 @@ mod tests {
         let mut second_sync = Box::pin(state.prompts.sync());
         tokio::select! {
             permit = server.entered.acquire() => permit.unwrap().forget(),
-            () = &mut second_sync => panic!("gated second sync completed before release"),
+            _ = &mut second_sync => panic!("gated second sync completed before release"),
         }
 
         let form = describe_workflow_form_cache_only_impl(&state, "mcp-review", false).unwrap();
@@ -21060,7 +21172,11 @@ mod tests {
         server.entered.acquire().await.unwrap().forget();
         assert!(state.prompts.get("tiddly", "review").is_some());
 
-        let mut stale_sync = Box::pin(state.prompts.sync());
+        let stale_emitter = Arc::new(RecordingEmitter::new());
+        let mut stale_sync = Box::pin(sync_prompts_and_notify(
+            state.prompts.clone(),
+            Arc::clone(&stale_emitter) as Arc<dyn EventEmitter>,
+        ));
         tokio::select! {
             permit = server.entered.acquire() => permit.unwrap().forget(),
             () = &mut stale_sync => panic!("gated sync completed before provider removal"),
@@ -21092,6 +21208,13 @@ mod tests {
 
         server.release.as_ref().unwrap().add_permits(1);
         stale_sync.await;
+        assert!(
+            stale_emitter
+                .snapshot()
+                .iter()
+                .all(|(name, _)| name != PROMPTS_SYNCED_EVENT),
+            "a rebuild invalidated by removal must not claim synchronization settled"
+        );
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
                 if emitter

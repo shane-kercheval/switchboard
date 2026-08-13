@@ -3893,6 +3893,11 @@ describe("ComposeBar prompt mode", () => {
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
 
     await waitFor(() => expect(screen.getByTestId("compose-restoring")).toBeInTheDocument());
+    listeners.get("prompts:changed")?.({ payload: null as unknown as NormalizedEvent });
+    await tick();
+    expect(screen.getByTestId("compose-restoring")).toBeInTheDocument();
+    expect(store.getCompose(PROJECT_ID).content).toMatchObject({ kind: "prompt", name: "ghost" });
+
     listeners.get("prompts:synced")?.({ payload: null as unknown as NormalizedEvent });
 
     await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
@@ -6079,8 +6084,8 @@ describe("ComposeBar — cross-agent forward", () => {
     // Multiple events during one fresh request coalesce. The fresh cache hit may
     // represent the preceding completed generation, so one cache-only pass must
     // apply the newer schema after the authoritative response settles.
-    listeners.get("prompts:synced")?.({ payload: null as unknown as NormalizedEvent });
-    listeners.get("prompts:synced")?.({ payload: null as unknown as NormalizedEvent });
+    listeners.get("prompts:changed")?.({ payload: null as unknown as NormalizedEvent });
+    listeners.get("prompts:changed")?.({ payload: null as unknown as NormalizedEvent });
     await tick();
     expect(freshCalls).toBe(1);
     expect(cacheOnlyCalls).toBe(0);
@@ -6159,11 +6164,11 @@ describe("ComposeBar — cross-agent forward", () => {
     await fireEvent.click(screen.getByTestId("workflow-option-dir:cache-refresh"));
     await waitFor(() => screen.getByTestId("workflow-prompt-unavailable"));
 
-    listeners.get("prompts:synced")?.({ payload: null as unknown as NormalizedEvent });
+    listeners.get("prompts:changed")?.({ payload: null as unknown as NormalizedEvent });
     await waitFor(() => expect(cacheOnlyCalls).toBe(1));
     // A newer sync must supersede an in-flight cache-only classification instead
     // of being dropped. Neither event is allowed to call the fresh endpoint.
-    listeners.get("prompts:synced")?.({ payload: null as unknown as NormalizedEvent });
+    listeners.get("prompts:changed")?.({ payload: null as unknown as NormalizedEvent });
     await waitFor(() => expect(cacheOnlyCalls).toBe(2));
     cacheReplies[1]?.({ ...base, compatibility: { state: "ok" } });
     await waitFor(() => screen.getByTestId("workflow-agent-worker-alice"));
@@ -6223,7 +6228,7 @@ describe("ComposeBar — cross-agent forward", () => {
     await fireEvent.click(await screen.findByTestId(`forward-picker-agent-${AGENT_A.id}`));
     await waitFor(() => screen.getByTestId("workflow-forward-sources-old"));
 
-    listeners.get("prompts:synced")?.({ payload: null as unknown as NormalizedEvent });
+    listeners.get("prompts:changed")?.({ payload: null as unknown as NormalizedEvent });
     const newInput = (await screen.findByTestId("workflow-arg-input-new")) as HTMLTextAreaElement;
     expect(screen.queryByTestId("workflow-arg-input-old")).toBeNull();
     expect(screen.queryByTestId("workflow-forward-sources-old")).toBeNull();
@@ -6305,11 +6310,11 @@ describe("ComposeBar — cross-agent forward", () => {
     await fireEvent.click(screen.getByTestId("workflow-forward-picker-context"));
     await fireEvent.click(await screen.findByTestId(`forward-picker-agent-${AGENT_A.id}`));
 
-    listeners.get("prompts:synced")?.({ payload: null as unknown as NormalizedEvent });
+    listeners.get("prompts:changed")?.({ payload: null as unknown as NormalizedEvent });
     await waitFor(() => screen.getByTestId("workflow-prompt-unavailable"));
-    listeners.get("prompts:synced")?.({ payload: null as unknown as NormalizedEvent });
+    listeners.get("prompts:changed")?.({ payload: null as unknown as NormalizedEvent });
     await waitFor(() => expect(cacheCalls).toBe(2));
-    listeners.get("prompts:synced")?.({ payload: null as unknown as NormalizedEvent });
+    listeners.get("prompts:changed")?.({ payload: null as unknown as NormalizedEvent });
     const recovered = (await screen.findByTestId(
       "workflow-arg-input-context",
     )) as HTMLTextAreaElement;
@@ -6362,7 +6367,7 @@ describe("ComposeBar — cross-agent forward", () => {
       ),
     );
 
-    listeners.get("prompts:synced")?.({ payload: null as unknown as NormalizedEvent });
+    listeners.get("prompts:changed")?.({ payload: null as unknown as NormalizedEvent });
     const textInput = (await screen.findByTestId("workflow-text-target")) as HTMLTextAreaElement;
     expect(textInput).toHaveValue("");
   });

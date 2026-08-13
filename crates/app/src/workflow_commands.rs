@@ -503,9 +503,9 @@ fn snapshot_workflow(state: &AppState, name: &str, is_builtin: bool) -> Result<W
 // user-fillable arguments are auto-derived from the resolved prompt, not declared
 // as inputs. The single primitive below resolves a prompt id to its declared
 // arguments and the classification rules turn each `send`'s bindings into form
-// fields + a compatibility verdict. Reused by the form descriptor, invoke
-// pre-flight, and (via `resolve_prompt_schema`) the runtime arg assembly, so the
-// three never derive prompt schemas three different ways.
+// fields + a compatibility verdict. Reused by the form descriptor and invoke
+// pre-flight; the same pass also captures the exact MCP argument map execution
+// receives after compatibility validation succeeds.
 
 /// Build an invocation-rejected [`WorkflowError`]. The crate's own `invocation`
 /// constructor is `pub(crate)`, so we construct the public variant directly —
@@ -517,7 +517,10 @@ fn invocation_msg(message: String) -> WorkflowError {
 /// One hardcoded prompt's schema-resolution outcome.
 enum PromptSchema {
     /// Resolved to its declared arguments (possibly empty).
-    Resolved(Vec<PromptArgument>),
+    Resolved {
+        id: PromptId,
+        arguments: Vec<PromptArgument>,
+    },
     /// A `builtin`/`local` id that doesn't resolve — **definitively missing**. These
     /// providers resolve directly (compiled-in / filesystem scan), so a miss can
     /// never become present via a sync (e.g. a `local:ghost` typo). A blocking
@@ -548,7 +551,10 @@ fn resolve_prompt_schema(
         } else {
             snapshot.get(&pid.provider, &pid.name)
         } {
-            Some(prompt) => PromptSchema::Resolved(prompt.arguments),
+            Some(prompt) => PromptSchema::Resolved {
+                id: pid,
+                arguments: prompt.arguments,
+            },
             None if pid.provider == switchboard_prompts::LOCAL_PROVIDER
                 || pid.provider == switchboard_prompts::BUILTIN_PROVIDER =>
             {
@@ -574,32 +580,6 @@ fn hardcoded_prompt_sends(workflow: &Workflow) -> Vec<(&str, Vec<&str>)> {
                 (id, keys)
             }),
             _ => None,
-        })
-        .collect()
-}
-
-fn mcp_prompt_argument_names(
-    workflow: &Workflow,
-    snapshot: &PromptResolutionSnapshot,
-) -> BTreeMap<(String, String), Vec<String>> {
-    hardcoded_prompt_sends(workflow)
-        .into_iter()
-        .filter_map(|(id, _)| {
-            let id = PromptId::parse(id).ok()?;
-            if id.provider == switchboard_prompts::LOCAL_PROVIDER
-                || id.provider == switchboard_prompts::BUILTIN_PROVIDER
-            {
-                return None;
-            }
-            let prompt = snapshot.get(&id.provider, &id.name)?;
-            Some((
-                (id.provider, id.name),
-                prompt
-                    .arguments
-                    .into_iter()
-                    .map(|argument| argument.name)
-                    .collect(),
-            ))
         })
         .collect()
 }
@@ -697,6 +677,9 @@ pub struct WorkflowFormDescriptor {
 struct ResolvedForm {
     derived_args: Vec<DerivedArgInfo>,
     compatibility: FormCompatibility,
+    /// Exact MCP schema subset accepted by this classification. Invocation
+    /// passes it to execution only after compatibility validation succeeds.
+    mcp_prompt_arg_names: BTreeMap<(String, String), Vec<String>>,
     /// Names of declared text inputs that feed a required prompt argument — must
     /// be enforced non-blank even when the input was declared optional.
     required_shadows: Vec<String>,
@@ -759,6 +742,7 @@ fn classify_form(
     let mut derived: BTreeMap<String, DerivedArgInfo> = BTreeMap::new();
     let mut issues: Vec<BindingIssue> = Vec::new();
     let mut unresolved: Vec<String> = Vec::new();
+    let mut mcp_prompt_arg_names: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
 
     for (id, tvar_keys) in hardcoded_prompt_sends(workflow) {
         match resolve_prompt_schema(prompts, snapshot, id) {
@@ -775,7 +759,18 @@ fn classify_form(
                 reason: format!("prompt `{id}` not found"),
             }),
             PromptSchema::Unresolved => unresolved.push(id.to_owned()),
-            PromptSchema::Resolved(args) => {
+            PromptSchema::Resolved {
+                id: prompt_id,
+                arguments: args,
+            } => {
+                if prompt_id.provider != switchboard_prompts::LOCAL_PROVIDER
+                    && prompt_id.provider != switchboard_prompts::BUILTIN_PROVIDER
+                {
+                    mcp_prompt_arg_names.insert(
+                        (prompt_id.provider, prompt_id.name),
+                        args.iter().map(|argument| argument.name.clone()).collect(),
+                    );
+                }
                 let arg_names: HashSet<&str> = args.iter().map(|a| a.name.as_str()).collect();
                 // Invalid bindings: T \ A — a template_vars key the prompt has no
                 // argument for. Any one is a blocking incompatibility (drift).
@@ -849,6 +844,7 @@ fn classify_form(
     ResolvedForm {
         derived_args: surviving,
         compatibility,
+        mcp_prompt_arg_names,
         required_shadows,
     }
 }
@@ -1267,7 +1263,7 @@ pub fn invoke_workflow_impl(
     }
 
     let run = WorkflowRun {
-        mcp_prompt_arg_names: mcp_prompt_argument_names(&workflow, &snapshot),
+        mcp_prompt_arg_names: form.mcp_prompt_arg_names,
         workflow,
         inputs: bound,
         user_args,

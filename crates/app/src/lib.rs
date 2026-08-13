@@ -318,8 +318,9 @@ use crate::commands::{
     set_active_agent_profile_impl, set_active_project_impl, set_agent_profiles_impl,
     set_message_pin_impl, set_preferences_impl, set_project_archived_impl,
     set_visible_project_impl, sign_in_mcp_provider_impl, sign_out_mcp_provider_impl,
-    stage_attachment_impl, sync_prompts_and_notify, terminal_open_argv, test_mcp_connection_impl,
-    test_saved_mcp_provider_impl, tracked_repos_inputs, tracked_roots, validate_external_url,
+    spawn_prompt_resolution_change_notifications, stage_attachment_impl, sync_prompts_and_notify,
+    terminal_open_argv, test_mcp_connection_impl, test_saved_mcp_provider_impl,
+    tracked_repos_inputs, tracked_roots, validate_external_url,
 };
 use crate::error::AppError;
 use crate::preferences::Preferences;
@@ -2047,6 +2048,7 @@ pub fn run() {
             // store. Built-in example prompts are baked into the service as a
             // read-only library — nothing is written into the user's folder.
             let prompts = build_prompt_service();
+            spawn_prompt_resolution_change_notifications(&prompts, Arc::clone(&state.emitter));
             // Warm the prompt cache in the background so a slow/cold MCP server
             // never blocks startup. `PromptService` is cheaply cloneable and
             // shares its cache `Arc`, so the clone the task syncs is the same

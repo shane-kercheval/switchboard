@@ -45,12 +45,13 @@ function setup(prompts: Prompt[] = PROMPTS, loading = false) {
   const onpick = vi.fn();
   const oninsert = vi.fn();
   const oncopy = vi.fn();
+  const onconfigure = vi.fn();
   const onopenfolder = vi.fn();
   const onclose = vi.fn();
   render(PromptMenu, {
-    props: { prompts, loading, onpick, oninsert, oncopy, onopenfolder, onclose },
+    props: { prompts, loading, onpick, oninsert, oncopy, onconfigure, onopenfolder, onclose },
   });
-  return { onpick, oninsert, oncopy, onopenfolder, onclose };
+  return { onpick, oninsert, oncopy, onconfigure, onopenfolder, onclose };
 }
 
 describe("PromptMenu", () => {
@@ -196,8 +197,11 @@ describe("PromptMenu", () => {
     expect(onpick).not.toHaveBeenCalled();
   });
 
-  it("offers an open-folder action", async () => {
-    const { onopenfolder } = setup();
+  it("offers configure and open-folder actions", async () => {
+    const { onconfigure, onopenfolder } = setup();
+    await fireEvent.click(screen.getByTestId("prompt-menu-configure"));
+    expect(onconfigure).toHaveBeenCalledTimes(1);
+
     await fireEvent.click(screen.getByTestId("prompt-menu-open-folder"));
     expect(onopenfolder).toHaveBeenCalledTimes(1);
   });

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, tick } from "svelte";
   import { ChevronRight, FolderOpen } from "@lucide/svelte";
   import { theme, type ThemeMode } from "$lib/theme.svelte";
   import { agentCopy } from "$lib/agentCopy.svelte";
@@ -36,7 +36,10 @@
   import { ALL_HARNESSES, HARNESS_LABEL } from "$lib/harnessDisplay";
   import { workflowAuthoringPrompt } from "$lib/workflowAuthoring";
 
-  let { onClose }: { onClose: () => void } = $props();
+  let {
+    onClose,
+    initialSection = null,
+  }: { onClose: () => void; initialSection?: "prompts" | null } = $props();
   // What macOS will actually do, as opposed to what the toggle below says. Only
   // the suppressed case is surfaced; `unavailable` (a dev build that isn't an
   // installed app) earns its place by *not* rendering that warning, since
@@ -47,6 +50,7 @@
   let workflowsDir = $state<string | null>(null);
   let workflowsDirError = $state<string | null>(null);
   let workflowPromptOpen = $state(false);
+  let promptsSection = $state<HTMLElement | undefined>(undefined);
   const workflowPrompt = $derived(workflowAuthoringPrompt(workflowsDir));
 
   const themeOptions: { mode: ThemeMode; label: string }[] = [
@@ -153,6 +157,10 @@
         notifyAvailability = null;
         console.error("[switchboard] notification availability check failed", e);
       });
+
+    if (initialSection === "prompts") {
+      void tick().then(() => promptsSection?.scrollIntoView?.({ block: "start" }));
+    }
   });
 
   function openPromptsDir(): void {
@@ -667,7 +675,11 @@
       </div>
     </section>
 
-    <section class={cn(sectionClass, "mt-7")}>
+    <section
+      bind:this={promptsSection}
+      class={cn(sectionClass, "mt-7")}
+      data-testid="prompt-settings-section"
+    >
       <div>
         <h2 class={sectionHeadingClass}>Prompt servers (MCP)</h2>
         <p class="text-muted mt-1 text-sm leading-relaxed">

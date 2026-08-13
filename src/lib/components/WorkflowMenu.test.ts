@@ -19,10 +19,13 @@ function listing(over: Partial<WorkflowListing> = {}): WorkflowListing {
 function setup(workflows: WorkflowListing[]) {
   const onpick = vi.fn();
   const oncopy = vi.fn();
+  const oncopyauthoringprompt = vi.fn(async () => true);
   const onopenfolder = vi.fn();
   const onclose = vi.fn();
-  render(WorkflowMenu, { props: { workflows, onpick, oncopy, onopenfolder, onclose } });
-  return { onpick, oncopy, onopenfolder, onclose };
+  render(WorkflowMenu, {
+    props: { workflows, onpick, oncopy, oncopyauthoringprompt, onopenfolder, onclose },
+  });
+  return { onpick, oncopy, oncopyauthoringprompt, onopenfolder, onclose };
 }
 
 describe("WorkflowMenu", () => {
@@ -79,8 +82,12 @@ describe("WorkflowMenu", () => {
     expect(screen.getByTestId("workflow-menu-empty")).toHaveTextContent("No matching workflows");
   });
 
-  it("offers an open-folder action", async () => {
-    const { onopenfolder } = setup([listing()]);
+  it("offers workflow-authoring and open-folder actions", async () => {
+    const { oncopyauthoringprompt, onopenfolder } = setup([listing()]);
+    await fireEvent.click(screen.getByTestId("workflow-menu-copy-authoring-prompt"));
+    expect(oncopyauthoringprompt).toHaveBeenCalledTimes(1);
+    await screen.findByText("Copied");
+
     await fireEvent.click(screen.getByTestId("workflow-menu-open-folder"));
     expect(onopenfolder).toHaveBeenCalledTimes(1);
   });

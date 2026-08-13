@@ -73,6 +73,21 @@ describe("SettingsView", () => {
     expect(onClose).toHaveBeenCalledOnce();
   });
 
+  it("opens at prompt settings when requested", async () => {
+    const scrollIntoView = vi.fn();
+    const original = HTMLElement.prototype.scrollIntoView;
+    HTMLElement.prototype.scrollIntoView = scrollIntoView;
+    try {
+      render(SettingsView, { props: { onClose: vi.fn(), initialSection: "prompts" } });
+      await waitFor(() => expect(scrollIntoView).toHaveBeenCalledWith({ block: "start" }));
+      expect(screen.getByTestId("prompt-settings-section")).toHaveTextContent(
+        "Prompt servers (MCP)",
+      );
+    } finally {
+      HTMLElement.prototype.scrollIntoView = original;
+    }
+  });
+
   it("renders a Supported CLIs section with the harness status list", async () => {
     render(SettingsView, { props: { onClose: vi.fn() } });
     expect(screen.getByText("Supported CLIs")).toBeInTheDocument();

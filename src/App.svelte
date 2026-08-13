@@ -141,6 +141,7 @@
 
   let dirError = $state<string | null>(null);
   let settingsOpen = $state<boolean>(false);
+  let settingsInitialSection = $state<"prompts" | null>(null);
   let editorShortcutError = $state<string | null>(null);
   let editorShortcutSeq = 0;
   let commandError = $state<string | null>(null);
@@ -354,11 +355,18 @@
   }
 
   function openSettings(): void {
+    settingsInitialSection = null;
+    settingsOpen = true;
+  }
+
+  function openPromptSettings(): void {
+    settingsInitialSection = "prompts";
     settingsOpen = true;
   }
 
   function closeSettings(): void {
     settingsOpen = false;
+    settingsInitialSection = null;
   }
 
   function toggleSettings(): void {
@@ -1430,7 +1438,7 @@
 
       <div class="flex min-h-0 flex-1 flex-col overflow-hidden">
         {#if settingsOpen}
-          <SettingsView onClose={closeSettings} />
+          <SettingsView onClose={closeSettings} initialSection={settingsInitialSection} />
         {:else if view.mode === "git"}
           {#if gitViewResumePending}
             <div class="flex min-h-0 flex-1 flex-col overflow-hidden">
@@ -1617,6 +1625,7 @@
                   agents={activeAgents}
                   focusOnMount={true}
                   focusRequest={composeFocusRequest}
+                  onConfigurePrompts={openPromptSettings}
                 />
               {/key}
             </div>

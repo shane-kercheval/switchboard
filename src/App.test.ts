@@ -3879,6 +3879,25 @@ describe("App", () => {
     await waitFor(() => expect(screen.getByTestId("settings-view")).toBeInTheDocument());
   });
 
+  it("opens prompt-source settings from the compose prompt menu", async () => {
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [agent({ id: "ag-1", project_id: "p-a", name: "assistant" })],
+    });
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument());
+    await fireEvent.click(screen.getByText("alpha"));
+    await waitFor(() => expect(screen.getByTestId("compose-prompt-button")).toBeInTheDocument());
+
+    await fireEvent.click(screen.getByTestId("compose-prompt-button"));
+    await fireEvent.click(await screen.findByTestId("prompt-menu-configure"));
+
+    await waitFor(() => expect(screen.getByTestId("settings-view")).toBeInTheDocument());
+    expect(screen.getByTestId("prompt-settings-section")).toHaveTextContent("Prompt servers (MCP)");
+  });
+
   it("global shortcuts are suppressed inside non-composer editable elements", async () => {
     seedProject({
       projectId: "p-a",

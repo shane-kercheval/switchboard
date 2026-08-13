@@ -108,7 +108,7 @@
     side = "top",
     delayDuration = 700,
     skipDelayDuration = 300,
-    disableHoverableContent = false,
+    disableHoverableContent = true,
     disabled = false,
     ignoreNonKeyboardFocus = undefined,
     reopen = "default",

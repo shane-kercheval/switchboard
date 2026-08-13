@@ -10,6 +10,7 @@
   import Button from "$lib/components/ui/Button.svelte";
   import Input from "$lib/components/ui/Input.svelte";
   import AgentProfileEditor from "$lib/components/AgentProfileEditor.svelte";
+  import Tooltip from "$lib/components/ui/Tooltip.svelte";
   import { cn } from "$lib/utils";
   import {
     SEGMENTED_CONTAINER_CLASS,
@@ -305,25 +306,35 @@
       data-testid="harness-picker"
     >
       {#each ALL_HARNESSES as kind (kind)}
-        <label
-          class="{SEGMENTED_ITEM_CLASS} has-[:focus-visible]:ring-focus flex items-center justify-center has-[:focus-visible]:ring-1 {harnessOptionClass(
-            kind,
-            selectable(kind),
-          )}"
-          title={reason(kind) ?? ""}
-        >
-          <input
-            type="radio"
-            name="harness"
-            value={kind}
-            class="sr-only"
-            checked={harness === kind}
-            disabled={formDisabled || !selectable(kind)}
-            onchange={() => selectHarness(kind)}
-            data-testid={`harness-${kind}`}
-          />
-          {HARNESS_LABEL[kind]}
-        </label>
+        {@const unavailableReason = reason(kind)}
+        {#snippet option(props: Record<string, unknown> = {})}
+          <label
+            {...props}
+            class="{SEGMENTED_ITEM_CLASS} has-[:focus-visible]:ring-focus flex items-center justify-center has-[:focus-visible]:ring-1 {harnessOptionClass(
+              kind,
+              selectable(kind),
+            )}"
+          >
+            <input
+              type="radio"
+              name="harness"
+              value={kind}
+              class="sr-only"
+              checked={harness === kind}
+              disabled={formDisabled || !selectable(kind)}
+              onchange={() => selectHarness(kind)}
+              data-testid={`harness-${kind}`}
+            />
+            {HARNESS_LABEL[kind]}
+          </label>
+        {/snippet}
+        {#if unavailableReason}
+          <Tooltip label={unavailableReason} side="bottom">
+            {#snippet trigger(props)}{@render option(props)}{/snippet}
+          </Tooltip>
+        {:else}
+          {@render option()}
+        {/if}
       {/each}
     </div>
     {#if selectedReason}
@@ -361,7 +372,6 @@
       class={cn("h-8 px-2", nameError && "border-status-failed")}
       aria-invalid={!nameValidation.ok}
       aria-describedby={nameError ? "agent-name-error" : undefined}
-      title={nameError ?? undefined}
       oninput={() => (nameTouched = true)}
       onkeydown={submitOnEnter}
     />

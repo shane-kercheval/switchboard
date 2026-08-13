@@ -39,7 +39,6 @@
 <img
   src={ICON_SRC[harness]}
   alt={HARNESS_LABEL[harness]}
-  title={HARNESS_LABEL[harness]}
   data-testid={testid}
   class={cn(
     "shrink-0 rounded-[5px] object-contain",

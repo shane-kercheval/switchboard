@@ -924,57 +924,69 @@
     {#snippet action()}
       <div class="flex items-center gap-0.5">
         {#if hiddenAgentCount > 0}
-          <button
-            type="button"
-            class="text-muted hover:text-fg shrink-0 px-1 text-[11px] hover:underline"
-            title="Show all agents"
-            aria-label={`${hiddenAgentCount} hidden — show all agents`}
-            data-testid="sidebar-show-all-agents"
-            onclick={() => showAllAgents(projectId, rosterIds)}
-          >
-            {hiddenAgentCount} hidden
-          </button>
+          <Tooltip label="Show all agents" side="bottom">
+            {#snippet trigger(props)}
+              <button
+                {...props}
+                type="button"
+                class="text-muted hover:text-fg shrink-0 px-1 text-[11px] hover:underline"
+                aria-label={`${hiddenAgentCount} hidden — show all agents`}
+                data-testid="sidebar-show-all-agents"
+                onclick={() => showAllAgents(projectId, rosterIds)}
+              >
+                {hiddenAgentCount} hidden
+              </button>
+            {/snippet}
+          </Tooltip>
         {/if}
         {#if agents.length > 0}
-          <button
-            type="button"
-            class={ICON_BUTTON_ON_PANEL_CLASS}
-            aria-label={allExpanded ? "Collapse all agents" : "Expand all agents"}
-            title={allExpanded ? "Collapse all" : "Expand all"}
-            data-testid="sidebar-toggle-all"
-            onclick={toggleAll}
-          >
-            <svg
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              stroke-width="1.5"
-              stroke-linecap="round"
-              stroke-linejoin="round"
-              class="h-4 w-4"
-              aria-hidden="true"
-            >
-              {#if allExpanded}
-                <path d="m17 11-5-5-5 5" />
-                <path d="m17 18-5-5-5 5" />
-              {:else}
-                <path d="m7 6 5 5 5-5" />
-                <path d="m7 13 5 5 5-5" />
-              {/if}
-            </svg>
-          </button>
+          <Tooltip label={allExpanded ? "Collapse all" : "Expand all"} side="bottom">
+            {#snippet trigger(props)}
+              <button
+                {...props}
+                type="button"
+                class={ICON_BUTTON_ON_PANEL_CLASS}
+                aria-label={allExpanded ? "Collapse all agents" : "Expand all agents"}
+                data-testid="sidebar-toggle-all"
+                onclick={toggleAll}
+              >
+                <svg
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="1.5"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  class="h-4 w-4"
+                  aria-hidden="true"
+                >
+                  {#if allExpanded}
+                    <path d="m17 11-5-5-5 5" />
+                    <path d="m17 18-5-5-5 5" />
+                  {:else}
+                    <path d="m7 6 5 5 5-5" />
+                    <path d="m7 13 5 5 5-5" />
+                  {/if}
+                </svg>
+              </button>
+            {/snippet}
+          </Tooltip>
         {/if}
         {#if onAddAgent}
-          <button
-            type="button"
-            class={ICON_BUTTON_ON_PANEL_CLASS}
-            title="Add agent"
-            aria-label="Add agent"
-            data-testid="sidebar-add-agent"
-            onclick={onAddAgent}
-          >
-            <PlusIcon />
-          </button>
+          <Tooltip label="Add agent" side="bottom">
+            {#snippet trigger(props)}
+              <button
+                {...props}
+                type="button"
+                class={ICON_BUTTON_ON_PANEL_CLASS}
+                aria-label="Add agent"
+                data-testid="sidebar-add-agent"
+                onclick={onAddAgent}
+              >
+                <PlusIcon />
+              </button>
+            {/snippet}
+          </Tooltip>
         {/if}
       </div>
     {/snippet}
@@ -1041,37 +1053,40 @@
                 aria-label="Agent name"
                 aria-invalid={!renameValidation.ok}
                 aria-describedby={renameError ? `agent-rename-error-${agent.id}` : undefined}
-                title={renameMessage ?? undefined}
                 data-testid="agent-rename-input"
                 onkeydown={(event) => onRenameKeydown(event, agent)}
                 onblur={cancelEdit}
               />
-              <button
-                type="button"
-                class={cn(
-                  ICON_BUTTON_CLASS,
-                  "shrink-0 disabled:cursor-not-allowed disabled:opacity-50",
-                )}
-                disabled={!canSave}
-                aria-label="Save name"
-                title="Save"
-                data-testid="agent-rename-save"
-                onmousedown={(event) => event.preventDefault()}
-                onclick={() => void commitEdit(agent)}
-              >
-                <svg
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  stroke-width="2"
-                  stroke-linecap="round"
-                  stroke-linejoin="round"
-                  class="h-4 w-4"
-                  aria-hidden="true"
-                >
-                  <path d="M20 6 9 17l-5-5" />
-                </svg>
-              </button>
+              <Tooltip label="Save" side="bottom">
+                {#snippet trigger(props)}
+                  <button
+                    {...props}
+                    type="button"
+                    class={cn(
+                      ICON_BUTTON_CLASS,
+                      "shrink-0 disabled:cursor-not-allowed disabled:opacity-50",
+                    )}
+                    disabled={!canSave}
+                    aria-label="Save name"
+                    data-testid="agent-rename-save"
+                    onmousedown={(event) => event.preventDefault()}
+                    onclick={() => void commitEdit(agent)}
+                  >
+                    <svg
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="2"
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                      class="h-4 w-4"
+                      aria-hidden="true"
+                    >
+                      <path d="M20 6 9 17l-5-5" />
+                    </svg>
+                  </button>
+                {/snippet}
+              </Tooltip>
             {:else}
               {@const agentHidden = isAgentHidden(projectId, rosterIds, agent.id)}
               <div class="flex min-h-7 min-w-0 flex-1 items-center px-1.5 text-left">
@@ -1332,7 +1347,7 @@
                         closeOnSelect={false}
                         class="text-status-failed gap-2"
                         data-testid="agent-action-remove"
-                        title="Deletes Switchboard's files for this agent; underlying session files are kept, and its responses are removed from the conversation."
+                        tooltip="Deletes Switchboard's files for this agent; underlying session files are kept, and its responses are removed from the conversation."
                       >
                         <Trash2 size={14} strokeWidth={1.8} class="shrink-0" aria-hidden="true" />
                         Delete agent
@@ -1466,9 +1481,13 @@
                   data-testid="agent-selection"
                 >
                   {#if selectedProfile.model}
-                    <span title={selectedProfile.model} data-testid="agent-selected-model"
-                      >{selectedProfile.model}</span
-                    >
+                    <Tooltip label={selectedProfile.model} side="top">
+                      {#snippet trigger(props)}
+                        <span {...props} data-testid="agent-selected-model"
+                          >{selectedProfile.model}</span
+                        >
+                      {/snippet}
+                    </Tooltip>
                   {:else if !selectedProfile.effort}
                     <span data-testid="agent-selection-default">Harness/session default</span>
                   {/if}
@@ -1517,23 +1536,31 @@
               <div class="mt-1.5 flex items-center gap-1" data-testid="agent-meta">
                 {#if runtime.meta.mcp_servers.length > 0}
                   {@const mcpCount = runtime.meta.mcp_servers.length}
-                  <span
-                    class="bg-panel text-muted inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px]"
-                    title={`${mcpCount} MCP server${mcpCount === 1 ? "" : "s"}`}
-                    data-testid="agent-mcp-chip"
-                  >
-                    <Plug size={11} strokeWidth={1.8} aria-hidden="true" />{mcpCount}
-                  </span>
+                  <Tooltip label={`${mcpCount} MCP server${mcpCount === 1 ? "" : "s"}`} side="top">
+                    {#snippet trigger(props)}
+                      <span
+                        {...props}
+                        class="bg-panel text-muted inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px]"
+                        data-testid="agent-mcp-chip"
+                      >
+                        <Plug size={11} strokeWidth={1.8} aria-hidden="true" />{mcpCount}
+                      </span>
+                    {/snippet}
+                  </Tooltip>
                 {/if}
                 {#if runtime.meta.skills.length > 0}
                   {@const skillCount = runtime.meta.skills.length}
-                  <span
-                    class="bg-panel text-muted inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px]"
-                    title={`${skillCount} skill${skillCount === 1 ? "" : "s"}`}
-                    data-testid="agent-skills-chip"
-                  >
-                    <Zap size={11} strokeWidth={1.8} aria-hidden="true" />{skillCount}
-                  </span>
+                  <Tooltip label={`${skillCount} skill${skillCount === 1 ? "" : "s"}`} side="top">
+                    {#snippet trigger(props)}
+                      <span
+                        {...props}
+                        class="bg-panel text-muted inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px]"
+                        data-testid="agent-skills-chip"
+                      >
+                        <Zap size={11} strokeWidth={1.8} aria-hidden="true" />{skillCount}
+                      </span>
+                    {/snippet}
+                  </Tooltip>
                 {/if}
               </div>
             {/if}

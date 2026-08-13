@@ -250,7 +250,6 @@
           class={cn(newNameMessage && "border-status-failed")}
           aria-invalid={!newValidation.ok}
           aria-describedby={newNameMessage ? "new-project-name-error" : undefined}
-          title={newNameMessage ?? undefined}
           onkeydown={submitNewFromName}
         />
         {#if newNameMessage}

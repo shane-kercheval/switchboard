@@ -21,6 +21,7 @@
   import WorkflowSteps from "$lib/components/WorkflowSteps.svelte";
   import ForwardSourceChip from "$lib/components/ui/ForwardSourceChip.svelte";
   import ForwardSourcePicker from "$lib/components/ui/ForwardSourcePicker.svelte";
+  import Tooltip from "$lib/components/ui/Tooltip.svelte";
 
   /// The workflow invocation form. A workflow parameterizes its *recipients* (its
   /// declared `agent`/`[agent]` inputs are named slots bound to real agents here),
@@ -427,16 +428,20 @@
           <!-- Each chip carries its own ✕; the bulk clear (same ⊘ glyph as
                "Clear recipients") only earns its place once there are several to
                drop at once. -->
-          <button
-            type="button"
-            class={cn(ICON_BUTTON_CLASS, "ml-0.5 shrink-0")}
-            data-testid={`workflow-forward-sources-${name}-clear`}
-            aria-label="Clear forward sources"
-            title="Clear forward sources"
-            onclick={() => clearArgSources(name)}
-          >
-            <ClearIcon />
-          </button>
+          <Tooltip label="Clear forward sources">
+            {#snippet trigger(props)}
+              <button
+                {...props}
+                type="button"
+                class={cn(ICON_BUTTON_CLASS, "ml-0.5 shrink-0")}
+                data-testid={`workflow-forward-sources-${name}-clear`}
+                aria-label="Clear forward sources"
+                onclick={() => clearArgSources(name)}
+              >
+                <ClearIcon />
+              </button>
+            {/snippet}
+          </Tooltip>
         {/if}
       </div>
     {/if}

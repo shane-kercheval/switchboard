@@ -546,22 +546,25 @@
                 </Tooltip>
               {:else}
                 <!-- Keyboard users can start the same edit from Rename in the pane menu. -->
-                <!-- svelte-ignore a11y_no_static_element_interactions -->
-                <span
-                  class={cn(
-                    "flex h-6 min-w-0 items-center truncate px-1.5 text-xs font-semibold",
-                    pane.members.length === 0 ? "text-muted" : "text-fg",
-                  )}
-                  data-testid="pane-name"
-                  title="Double-click to rename"
-                  ondblclick={(event) => {
-                    event.preventDefault();
-                    event.stopPropagation();
-                    startRename(pane);
-                  }}
-                >
-                  {pane.name}
-                </span>
+                <Tooltip label="Double-click to rename">
+                  {#snippet trigger(props)}
+                    <span
+                      {...props}
+                      class={cn(
+                        "flex h-6 min-w-0 items-center truncate px-1.5 text-xs font-semibold",
+                        pane.members.length === 0 ? "text-muted" : "text-fg",
+                      )}
+                      data-testid="pane-name"
+                      ondblclick={(event) => {
+                        event.preventDefault();
+                        event.stopPropagation();
+                        startRename(pane);
+                      }}
+                    >
+                      {pane.name}
+                    </span>
+                  {/snippet}
+                </Tooltip>
                 <div class="flex min-w-0 flex-1 items-center gap-1 overflow-hidden">
                   {#each paneMemberAgents(pane) as member (member.id)}
                     <span

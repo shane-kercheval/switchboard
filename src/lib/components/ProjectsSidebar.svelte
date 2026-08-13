@@ -599,37 +599,40 @@
                     aria-describedby={renameError
                       ? `project-rename-error-${project.id}`
                       : undefined}
-                    title={renameMessage ?? undefined}
                     data-testid="project-rename-input"
                     onkeydown={(event) => onRenameKeydown(event, project)}
                     onblur={cancelEdit}
                   />
-                  <button
-                    type="button"
-                    class={cn(
-                      projectRowActionClass,
-                      "shrink-0 disabled:cursor-not-allowed disabled:opacity-50",
-                    )}
-                    disabled={!canSave}
-                    aria-label="Save name"
-                    title="Save"
-                    data-testid="project-rename-save"
-                    onmousedown={(event) => event.preventDefault()}
-                    onclick={() => void commitEdit(project)}
-                  >
-                    <svg
-                      viewBox="0 0 24 24"
-                      fill="none"
-                      stroke="currentColor"
-                      stroke-width="2"
-                      stroke-linecap="round"
-                      stroke-linejoin="round"
-                      class="h-4 w-4"
-                      aria-hidden="true"
-                    >
-                      <path d="M20 6 9 17l-5-5" />
-                    </svg>
-                  </button>
+                  <Tooltip label="Save" side="bottom">
+                    {#snippet trigger(props)}
+                      <button
+                        {...props}
+                        type="button"
+                        class={cn(
+                          projectRowActionClass,
+                          "shrink-0 disabled:cursor-not-allowed disabled:opacity-50",
+                        )}
+                        disabled={!canSave}
+                        aria-label="Save name"
+                        data-testid="project-rename-save"
+                        onmousedown={(event) => event.preventDefault()}
+                        onclick={() => void commitEdit(project)}
+                      >
+                        <svg
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          stroke-width="2"
+                          stroke-linecap="round"
+                          stroke-linejoin="round"
+                          class="h-4 w-4"
+                          aria-hidden="true"
+                        >
+                          <path d="M20 6 9 17l-5-5" />
+                        </svg>
+                      </button>
+                    {/snippet}
+                  </Tooltip>
                 </div>
                 <div class="text-muted flex w-full items-center gap-1 text-xs leading-4">
                   <span class="truncate" title={project.directory}
@@ -824,7 +827,7 @@
                           disabled={busy || projectDeleting}
                           class="text-status-failed gap-2"
                           data-testid="project-action-delete"
-                          title={`${PROJECT_DELETE_TOOLTIP} Works even if the project's folder no longer exists.`}
+                          tooltip={`${PROJECT_DELETE_TOOLTIP} Works even if the project's folder no longer exists.`}
                         >
                           <Trash2 size={14} strokeWidth={1.8} class="shrink-0" aria-hidden="true" />
                           Delete project

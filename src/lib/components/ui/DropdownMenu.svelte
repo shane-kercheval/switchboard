@@ -38,7 +38,7 @@
     triggerTabindex,
     tooltipLabel,
     tooltipSide = "top",
-    tooltipDisableHoverableContent = false,
+    tooltipDisableHoverableContent = true,
     contentClass,
     contentTestid,
     align = "end",

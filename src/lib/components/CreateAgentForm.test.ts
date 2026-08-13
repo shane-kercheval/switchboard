@@ -357,9 +357,12 @@ describe("CreateAgentForm", () => {
     });
     const codexControl = screen.getByTestId("harness-codex") as HTMLInputElement;
     expect(codexControl.disabled).toBe(true);
-    expect(codexControl.closest("label")?.getAttribute("title")).toContain(
-      "Codex not found on PATH",
-    );
+    const codexLabel = codexControl.closest("label");
+    expect(codexLabel).not.toHaveAttribute("title");
+    await fireEvent.pointerEnter(codexLabel!);
+    expect(
+      await screen.findByText(/Codex not found on PATH/, {}, { timeout: 1_500 }),
+    ).toBeInTheDocument();
 
     // Claude control still selectable + submit succeeds with Claude.
     const claudeControl = screen.getByTestId("harness-claude_code") as HTMLInputElement;

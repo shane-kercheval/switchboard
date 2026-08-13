@@ -458,10 +458,16 @@ describe("Sidebar", () => {
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     await openAgentActions();
-    expect(screen.getByTestId("agent-action-remove")).toHaveAttribute(
-      "title",
-      "Deletes Switchboard's files for this agent; underlying session files are kept, and its responses are removed from the conversation.",
-    );
+    const deleteItem = screen.getByTestId("agent-action-remove");
+    expect(deleteItem).not.toHaveAttribute("title");
+    await fireEvent.pointerEnter(deleteItem);
+    expect(
+      await screen.findByText(
+        "Deletes Switchboard's files for this agent; underlying session files are kept, and its responses are removed from the conversation.",
+        {},
+        { timeout: 1_500 },
+      ),
+    ).toBeInTheDocument();
   });
 
   it("confirming remove calls removeAgent and failures keep the row", async () => {
@@ -1763,7 +1769,7 @@ describe("Sidebar inline rename", () => {
     const save = screen.getByTestId("agent-rename-save");
     expect(save).toBeDisabled();
     // The live message rides the input's title tooltip in the cramped card.
-    expect(input).toHaveAttribute("title", "An agent named 'bob' already exists");
+    expect(input).not.toHaveAttribute("title");
     expect(input).toHaveAttribute("aria-invalid", "true");
 
     // Enter is a no-op while invalid; the agent stays in edit mode.

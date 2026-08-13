@@ -25,7 +25,7 @@
     triggerLabel = "Forward output from an agent or pane",
     triggerText,
     tooltipLabel,
-    tooltipDisableHoverableContent = false,
+    tooltipDisableHoverableContent = true,
     showPaneShortcuts = false,
   }: {
     agents: AgentRecord[];

@@ -51,8 +51,8 @@ describe("Tooltip", () => {
     expect(content).toHaveTextContent("hello label");
   });
 
-  it("makes non-hoverable content pointer-transparent and closes after leaving the trigger", async () => {
-    render(Harness, { props: { mode: "non-hoverable" } });
+  it("makes content pointer-transparent by default and closes after leaving the trigger", async () => {
+    render(Harness, { props: { mode: "label" } });
     const trigger = screen.getByTestId("tt-trigger");
 
     await fireEvent.pointerEnter(trigger);

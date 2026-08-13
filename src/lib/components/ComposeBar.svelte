@@ -3231,19 +3231,23 @@
               <!-- Each chip carries its own ✕; the bulk clear (same ⊘ glyph as
                    "Clear recipients") only earns its place once there are several to
                    drop at once. -->
-              <button
-                type="button"
-                class={cn(ICON_BUTTON_CLASS, "ml-0.5 shrink-0 disabled:opacity-50")}
-                data-testid="forward-sources-clear"
-                aria-label="Clear forward sources"
-                title="Clear forward sources"
-                disabled={composerBusy}
-                onclick={() => {
-                  if (!composerBusy) forwardSources = [];
-                }}
-              >
-                <ClearIcon />
-              </button>
+              <Tooltip label="Clear forward sources">
+                {#snippet trigger(props)}
+                  <button
+                    {...props}
+                    type="button"
+                    class={cn(ICON_BUTTON_CLASS, "ml-0.5 shrink-0 disabled:opacity-50")}
+                    data-testid="forward-sources-clear"
+                    aria-label="Clear forward sources"
+                    disabled={composerBusy}
+                    onclick={() => {
+                      if (!composerBusy) forwardSources = [];
+                    }}
+                  >
+                    <ClearIcon />
+                  </button>
+                {/snippet}
+              </Tooltip>
             {/if}
           </div>
         {/if}

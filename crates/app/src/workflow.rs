@@ -46,7 +46,7 @@ use switchboard_dispatcher::{
 };
 use switchboard_harness::forward::{ForwardedBlock, compose_forwarded_message};
 use switchboard_harness::{CancelSource, TurnOutcome};
-use switchboard_prompts::{PromptId, PromptService};
+use switchboard_prompts::{BUILTIN_PROVIDER, LOCAL_PROVIDER, PromptId, PromptService};
 use switchboard_workflow::{
     OutputScope, RunRecord, RunStatus, Scope, ScopeValue, SendStep, Step, Templated,
     TerminalStatus, UNSUPPORTED_STEP_MESSAGE, WaitForAllStep, WaitForStep, Workflow, render,
@@ -152,6 +152,10 @@ pub struct WorkflowRun {
     pub agents: BTreeMap<String, AgentId>,
     pub dispatcher: Arc<Dispatcher>,
     pub prompts: PromptService,
+    /// MCP prompt schemas captured by invocation preflight. Execution uses this
+    /// immutable subset rather than the live cache, which is intentionally
+    /// local-only during the first phase of a concurrent rebuild.
+    pub mcp_prompt_arg_names: BTreeMap<(String, String), Vec<String>>,
     pub factories: Arc<dyn DispatchFactoryProvider>,
     /// `runs/<run-id>.jsonl` — where progress/terminal records are appended.
     pub run_path: PathBuf,
@@ -467,16 +471,26 @@ impl WorkflowRun {
         }
     }
 
-    /// The declared argument names of a hardcoded prompt, via the prompt cache
-    /// (the same `PromptService` lookup the form descriptor and invoke validation
-    /// use). Empty if the prompt isn't cached — invoke pre-flight already gated an
-    /// unresolved/incompatible workflow, so the schema is expected here; an empty
-    /// result simply passes no user args and lets `render` (a live fetch for MCP)
-    /// be the final authority.
+    /// The declared argument names of a hardcoded prompt. Local and built-in
+    /// prompts retain their direct resolution semantics; MCP names come from the
+    /// completed schema generation captured by invocation preflight.
     fn prompt_arg_names(&self, id: &PromptId) -> Vec<String> {
-        self.prompts
-            .get(&id.provider, &id.name)
-            .map(|p| p.arguments.into_iter().map(|a| a.name).collect())
+        if id.provider == LOCAL_PROVIDER || id.provider == BUILTIN_PROVIDER {
+            return self
+                .prompts
+                .get(&id.provider, &id.name)
+                .map(|prompt| {
+                    prompt
+                        .arguments
+                        .into_iter()
+                        .map(|argument| argument.name)
+                        .collect()
+                })
+                .unwrap_or_default();
+        }
+        self.mcp_prompt_arg_names
+            .get(&(id.provider.clone(), id.name.clone()))
+            .cloned()
             .unwrap_or_default()
     }
 
@@ -939,6 +953,7 @@ mod tests {
             agents: rig.agents.clone(),
             dispatcher: Arc::clone(&rig.dispatcher),
             prompts,
+            mcp_prompt_arg_names: BTreeMap::new(),
             factories: Arc::clone(&rig.provider) as Arc<dyn DispatchFactoryProvider>,
             run_path: run_path.clone(),
             progress,
@@ -970,6 +985,7 @@ mod tests {
             agents: rig.agents.clone(),
             dispatcher: Arc::clone(&rig.dispatcher),
             prompts,
+            mcp_prompt_arg_names: BTreeMap::new(),
             factories: Arc::clone(&rig.provider) as Arc<dyn DispatchFactoryProvider>,
             run_path: run_path.clone(),
             progress: Arc::new(NullProgressSink),

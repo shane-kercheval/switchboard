@@ -103,7 +103,7 @@
   import { shortcut } from "$lib/platform";
   import { isEditableShortcutTarget } from "$lib/keyboard";
   import { onDestroy, onMount, tick, untrack } from "svelte";
-  import { listen } from "@tauri-apps/api/event";
+  import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
   let {
     projectId,
@@ -362,9 +362,9 @@
       dropSub = undefined;
     }
     // Await the subscription promise before unlistening, so an unmount that beats
-    // the promise still tears the listener down (matching the `prompts:synced`
-    // cleanup below). A bare `unlisten?.()` would no-op in that race and leak a
-    // global listener that keeps staging into a stale project context.
+    // the promise still tears the listener down. A bare `unlisten?.()` would
+    // no-op in that race and leak a global listener that keeps staging into a
+    // stale project context.
     return () => void dropSub?.then((u) => u()).catch(() => {});
   });
 
@@ -393,6 +393,7 @@
   let promptMenuAllowsLiteralInsert = $state(false);
   let prompts = $state<Prompt[]>([]);
   let focusPromptFieldOnMount = $state(false);
+  let promptMenuSyncing = $state(false);
   // Whether the cache has been read at least once, so the picker can show a
   // "loading" row instead of momentarily claiming there are no prompts.
   let promptsLoaded = $state(false);
@@ -415,9 +416,10 @@
   let selectedWorkflow = $state<WorkflowListing | null>(null);
   // The resolved invocation form for the picked workflow (declared inputs +
   // auto-derived prompt-argument fields + compatibility). Fetched per-pick via
-  // `describe_workflow_form`; re-fetched on `prompts:synced` so a cold MCP cache
-  // resolves. Null while the initial fetch is pending or has failed; those two
-  // states render explicitly rather than falling through to plain compose.
+  // `describe_workflow_form`; independently completed prompt syncs reclassify it
+  // through a cache-only command. Null while the initial fetch is pending or has
+  // failed; those two states render explicitly rather than falling through to
+  // plain compose.
   let workflowForm = $state<WorkflowFormDescriptor | null>(null);
   let workflowFormLoading = $state(false);
   let workflowFormError = $state<string | null>(null);
@@ -425,10 +427,14 @@
   // newer one superseded it (name alone isn't a workflow's identity — a built-in
   // and a same-named copied user workflow share a name).
   let workflowFormGen = 0;
-  // Whether a prompt sync has settled since this workflow was picked. Before that,
-  // an `unresolved` prompt is genuinely pending (cold MCP cache); after a settled
-  // sync, a still-`unresolved` prompt is a real "not found" error, not a spinner.
-  let workflowSyncSettled = $state(false);
+  // The generation of the network-owning fresh resolver, when one is in flight.
+  // Sync events arriving during it are coalesced after its response; cache-only
+  // refreshes may supersede one another so the newest event wins.
+  let workflowFreshGen: number | null = null;
+  // Monotonic receipt count for authoritative prompt-resolution changes. A fresh
+  // request records its starting value and, if the count advances, follows its
+  // accepted response with one cache-only refresh against the latest snapshot.
+  let promptResolutionEventGen = 0;
   let workflowInputs = $state<Record<string, WorkflowInputValue>>({});
   // Per-field forward sources for the workflow's fillable single-text fields,
   // keyed by field name. Persisted with the other forward families; reset whenever
@@ -437,11 +443,18 @@
     untrack(() => reconcileForwardSourceMap(savedForwards.workflowFields, agents)),
   );
   let invokingWorkflow = $state(false);
+  let workflowSigningInProvider = $state<string | null>(null);
+  let workflowSignInGen = 0;
   // A saved prompt-mode draft to restore once the cache loads; consumed when
   // restoration settles. Null when the saved draft was plain.
   let pendingRestore = $state<PromptContent | null>(
     saved.content.kind === "prompt" ? saved.content : null,
   );
+  let promptRestoreRequestGen = 0;
+  let latestPromptResolutionGeneration = 0;
+  let promptRestoreIssue = $state<
+    "confirmed_missing" | "not_configured" | "temporarily_unavailable" | "request_failed" | null
+  >(null);
   // A saved workflow-mode invocation to restore once the workflow list loads.
   let pendingWorkflowRestore = $state<WorkflowContent | null>(
     saved.content.kind === "workflow" ? saved.content : null,
@@ -466,33 +479,71 @@
     }
   }
 
-  // Only touch the cache at mount when there's a saved prompt-mode draft to
-  // restore; otherwise the picker loads prompts lazily on open. (Avoids an
-  // unnecessary mount-time read in the common plain-draft case.) The cache may
-  // be cold (MCP prompts land only after the launch-time sync), so also re-try
-  // when the backend signals a completed sync — and only then is "still absent"
-  // proof the prompt is gone.
-  // A single `prompts:synced` subscription drives two cache-warm re-tries: (1)
-  // restoring a saved prompt-mode draft whose prompt was cold at mount, and (2)
-  // re-resolving the workflow form so a workflow hardcoding an MCP prompt leaves
-  // its "Resolving…" pending state once the cache warms — without a re-pick.
+  // Saved prompt restoration asks the backend for a provider-aware verdict from
+  // one coherent snapshot. A global list miss cannot distinguish deletion from
+  // auth, store, or transport failure. Workflow reclassification likewise stays
+  // cache-only on authoritative resolution changes.
   onMount(() => {
     const hadDraft = pendingRestore !== null;
-    if (hadDraft) {
-      void loadPrompts().then(() => tryRestorePrompt(false));
-    }
-    const unlisten = listen("prompts:synced", () => {
+    let active = true;
+    let listenerReady = false;
+    let changedDuringRegistration = false;
+    let unlisten: UnlistenFn | null = null;
+
+    function reclassifyFromPromptSnapshot(): void {
       if (hadDraft) {
-        void loadPrompts().then(() => tryRestorePrompt(true));
+        promptRestoreIssue = null;
+        void resolvePendingPrompt();
       }
-      if (mode === "workflow" && selectedWorkflow !== null) {
-        // A sync has now settled for this pick: a still-unresolved prompt after the
-        // re-fetch is a real "not found" error, not a perpetual pending state.
-        workflowSyncSettled = true;
-        void loadWorkflowForm(selectedWorkflow);
+      if (
+        mode === "workflow" &&
+        selectedWorkflow !== null &&
+        workflowForm !== null &&
+        workflowFreshGen === null
+      ) {
+        void loadWorkflowForm(selectedWorkflow, "cache_only");
       }
-    });
-    return () => void unlisten.then((u) => u());
+    }
+
+    function onPromptChanged(event: { payload: { generation: number } }): void {
+      latestPromptResolutionGeneration = Math.max(
+        latestPromptResolutionGeneration,
+        event.payload.generation,
+      );
+      promptResolutionEventGen = Math.max(promptResolutionEventGen, event.payload.generation);
+      if (!listenerReady) {
+        changedDuringRegistration = true;
+        return;
+      }
+      reclassifyFromPromptSnapshot();
+    }
+
+    async function register(): Promise<void> {
+      try {
+        const registered = await listen<{ generation: number }>("prompts:changed", onPromptChanged);
+        if (!active) {
+          registered();
+          return;
+        }
+        unlisten = registered;
+        listenerReady = true;
+        // One post-subscription read closes the read/subscribe gap. An event
+        // received while registration was pending is deliberately coalesced
+        // into this same pass rather than starting a competing request.
+        if (hadDraft || changedDuringRegistration) reclassifyFromPromptSnapshot();
+      } catch {
+        // The initial snapshot read still settles restoration if native event
+        // registration is unavailable.
+      }
+    }
+
+    if (hadDraft) void resolvePendingPrompt();
+    void register();
+    return () => {
+      active = false;
+      unlisten?.();
+      unlisten = null;
+    };
   });
 
   // A saved workflow-mode draft resolves against the local workflow list, which is
@@ -533,40 +584,75 @@
     textareaEl?.focus();
   });
 
-  /// Resolve a saved prompt-mode draft against the loaded cache. If the prompt
-  /// is present, re-enter prompt mode with the saved argument values. If it's
-  /// absent, only downgrade to plain once `syncSettled` — a completed sync proves
-  /// the prompt is actually gone (renamed/removed). A cold cache (`syncSettled`
-  /// false) is left pending so a transient miss never destroys the draft.
-  function tryRestorePrompt(syncSettled: boolean): void {
+  /// Resolve a saved prompt-mode draft against one coherent backend snapshot.
+  /// Every unavailable verdict preserves the structured draft; only the user's
+  /// explicit Start over action discards it.
+  async function resolvePendingPrompt(fresh = false): Promise<void> {
     if (pendingRestore === null) return;
     const snapshot = pendingRestore;
-    const found = prompts.find((p) => p.provider === snapshot.provider && p.name === snapshot.name);
-    if (found !== undefined) {
-      selectedPrompt = found;
-      promptArgs = Object.fromEntries(
-        found.arguments.map((a) => [a.name, snapshot.args[a.name] ?? ""]),
+    const request = ++promptRestoreRequestGen;
+    try {
+      const resolution = fresh
+        ? await api.resolveSavedPromptFresh(snapshot.provider, snapshot.name)
+        : await api.resolveSavedPrompt(snapshot.provider, snapshot.name);
+      if (request !== promptRestoreRequestGen || pendingRestore !== snapshot) return;
+      if (resolution.generation < latestPromptResolutionGeneration) return;
+      latestPromptResolutionGeneration = Math.max(
+        latestPromptResolutionGeneration,
+        resolution.generation,
       );
-      appendedText = snapshot.appendedText;
-      focusPromptFieldOnMount = focusPromptFieldOnMount || focusOnMount;
-      mode = "prompt";
-      pendingRestore = null;
-      restoring = false;
-      return;
-    }
-    if (syncSettled) {
-      // Proven gone: fall back to plain, carrying the appended text so nothing
-      // the user typed is lost.
-      draft = snapshot.appendedText;
-      mode = "plain";
-      pendingRestore = null;
-      restoring = false;
-      if (focusOnMount) requestAnimationFrame(() => textareaEl?.focus());
+      if (resolution.state === "available") {
+        promptRestoreIssue = null;
+        selectedPrompt = resolution.prompt;
+        promptArgs = Object.fromEntries(
+          resolution.prompt.arguments.map((a) => [a.name, snapshot.args[a.name] ?? ""]),
+        );
+        appendedText = snapshot.appendedText;
+        focusPromptFieldOnMount = focusPromptFieldOnMount || focusOnMount;
+        mode = "prompt";
+        pendingRestore = null;
+        restoring = false;
+        return;
+      }
+      promptRestoreIssue =
+        resolution.state === "confirmed_missing" || resolution.state === "not_configured"
+          ? resolution.state
+          : "temporarily_unavailable";
+    } catch {
+      // Preserve the persisted draft. A later prompt-state event or an explicit
+      // retry can resolve it without destroying the user's arguments.
+      if (request === promptRestoreRequestGen && pendingRestore === snapshot) {
+        promptRestoreIssue = "request_failed";
+      }
     }
   }
 
-  /// Resolve a saved workflow-mode invocation against the loaded workflow list.
-  ///
+  function retryPromptRestore(): void {
+    promptRestoreIssue = null;
+    void resolvePendingPrompt(true);
+  }
+
+  function discardPromptRestore(): void {
+    const snapshot = pendingRestore;
+    draft = snapshot?.appendedText ?? "";
+    pendingRestore = null;
+    promptRestoreIssue = null;
+    restoring = false;
+  }
+
+  function promptRestoreMessage(): string {
+    switch (promptRestoreIssue) {
+      case "confirmed_missing":
+        return "This prompt is no longer available from its provider.";
+      case "not_configured":
+        return "This prompt's provider is no longer configured.";
+      case "temporarily_unavailable":
+        return "This prompt's provider is temporarily unavailable.";
+      default:
+        return "Couldn't restore your saved prompt.";
+    }
+  }
+
   /// Resolve a saved workflow-mode invocation against the loaded workflow list.
   ///
   /// `listOk` distinguishes the two outcomes that a bare `find(...) === undefined`
@@ -606,7 +692,6 @@
     selectedWorkflow = found;
     workflowForm = null;
     workflowInputs = { ...snapshot.inputs };
-    workflowSyncSettled = false;
     mode = "workflow";
     void loadWorkflowForm(found);
   }
@@ -1620,6 +1705,20 @@
     }
   }
 
+  async function syncPromptMenu(): Promise<void> {
+    if (promptMenuSyncing) return;
+    promptMenuSyncing = true;
+    clearStatus();
+    try {
+      await api.syncPrompts();
+      await loadPrompts();
+    } catch (err) {
+      showError(`Couldn't sync prompts: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      promptMenuSyncing = false;
+    }
+  }
+
   /// Leave prompt mode, carrying Appended text back into the plain textarea.
   function removePrompt(): void {
     draft = appendedText;
@@ -1663,42 +1762,117 @@
   /// inputs + auto-derived prompt-argument fields) via `describe_workflow_form`.
   /// The prompt is hardcoded — nothing to pre-seed/pick — so fields seed empty.
   function pickWorkflow(workflow: WorkflowListing): void {
+    workflowSignInGen += 1;
+    workflowSigningInProvider = null;
     selectedWorkflow = workflow;
     workflowForm = null;
     workflowFormError = null;
     workflowInputs = {};
     workflowForwardSources = {};
-    workflowSyncSettled = false;
     mode = "workflow";
     workflowMenuOpen = false;
     void loadWorkflowForm(workflow);
   }
 
-  /// Fetch (or re-fetch) the descriptor for the picked workflow and seed any
-  /// not-yet-present fields. Seeding is additive so a re-fetch (e.g. after
-  /// `prompts:synced` resolves a previously-unresolved prompt) preserves what the
-  /// user already typed. A monotonic generation token guards stale replies — name
-  /// alone is not a workflow's identity (a built-in and a same-named copied user
-  /// workflow share a name), and the token is also future-proof against further
-  /// identity fields.
-  async function loadWorkflowForm(workflow: WorkflowListing): Promise<void> {
+  /// Fetch (or re-fetch) the descriptor for the picked workflow and reconcile its
+  /// draft with the accepted schema. An initial pick/manual check uses the fresh
+  /// resolver; a `prompts:changed` event can only use the cache-only resolver. A
+  /// monotonic generation token guards stale replies.
+  function emptyWorkflowValue(
+    ty: WorkflowFormDescriptor["inputs"][number]["ty"],
+  ): WorkflowInputValue {
+    return ty === "agent_list" || ty === "text_list" ? [] : "";
+  }
+
+  function valueMatchesWorkflowType(
+    value: WorkflowInputValue | undefined,
+    ty: WorkflowFormDescriptor["inputs"][number]["ty"],
+  ): value is WorkflowInputValue {
+    return ty === "agent_list" || ty === "text_list"
+      ? Array.isArray(value)
+      : typeof value === "string";
+  }
+
+  function reconcileWorkflowFormState(
+    form: WorkflowFormDescriptor,
+    previous: WorkflowFormDescriptor | null,
+  ): {
+    inputs: Record<string, WorkflowInputValue>;
+    forwards: Record<string, ForwardSource[]>;
+  } {
+    const nextInputs: Record<string, WorkflowInputValue> = {};
+    const nextForwards: Record<string, ForwardSource[]> = {};
+    const previousInputs = new Map(previous?.inputs.map((input) => [input.name, input.ty]) ?? []);
+    const currentDeclared = new Set(form.inputs.map((input) => input.name));
+
+    for (const input of form.inputs) {
+      const value = workflowInputs[input.name];
+      const sameSemanticType =
+        previous === null
+          ? valueMatchesWorkflowType(value, input.ty)
+          : previousInputs.get(input.name) === input.ty;
+      nextInputs[input.name] =
+        sameSemanticType && valueMatchesWorkflowType(value, input.ty)
+          ? Array.isArray(value)
+            ? [...value]
+            : value
+          : emptyWorkflowValue(input.ty);
+      const inputForwards = workflowForwardSources[input.name];
+      if (input.ty === "text" && sameSemanticType && inputForwards) {
+        nextForwards[input.name] = [...inputForwards];
+      }
+    }
+
+    const previousDerived = new Set(previous?.derived_args.map((argument) => argument.name) ?? []);
+    if (form.compatibility.state === "ok") {
+      for (const argument of form.derived_args) {
+        const value = workflowInputs[argument.name];
+        const previousSchemaAuthoritative = previous?.compatibility.state === "ok";
+        const sameField = !previousSchemaAuthoritative || previousDerived.has(argument.name);
+        nextInputs[argument.name] = sameField && typeof value === "string" ? value : "";
+        const argumentForwards = workflowForwardSources[argument.name];
+        if (sameField && argumentForwards) {
+          nextForwards[argument.name] = [...argumentForwards];
+        }
+      }
+    } else {
+      // A provider outage can temporarily erase every derived schema. Preserve
+      // those hidden draft values until a successfully resolved schema can
+      // authoritatively reconcile them.
+      const draftDerived = Object.keys(workflowInputs).filter((name) => !currentDeclared.has(name));
+      for (const name of draftDerived) {
+        const value = workflowInputs[name];
+        if (!currentDeclared.has(name) && typeof value === "string") nextInputs[name] = value;
+        const draftForwards = workflowForwardSources[name];
+        if (!currentDeclared.has(name) && draftForwards) {
+          nextForwards[name] = [...draftForwards];
+        }
+      }
+    }
+
+    return { inputs: nextInputs, forwards: nextForwards };
+  }
+
+  async function loadWorkflowForm(
+    workflow: WorkflowListing,
+    resolution: "fresh" | "cache_only" = "fresh",
+  ): Promise<void> {
     const gen = ++workflowFormGen;
+    const resolutionEventsAtStart = promptResolutionEventGen;
+    if (resolution === "fresh") workflowFreshGen = gen;
     if (workflowForm === null) workflowFormError = null;
     workflowFormLoading = true;
     try {
-      const form = await api.describeWorkflowForm(workflow.name, workflow.is_builtin);
+      const form =
+        resolution === "fresh"
+          ? await api.describeWorkflowForm(workflow.name, workflow.is_builtin)
+          : await api.refreshWorkflowFormFromCache(workflow.name, workflow.is_builtin);
       if (gen !== workflowFormGen) return; // superseded by a newer pick/re-fetch
+      const reconciled = reconcileWorkflowFormState(form, workflowForm);
       workflowForm = form;
       workflowFormError = null;
-      const seeded: Record<string, WorkflowInputValue> = { ...workflowInputs };
-      for (const input of form.inputs) {
-        if (input.name in seeded) continue;
-        seeded[input.name] = input.ty === "agent_list" || input.ty === "text_list" ? [] : "";
-      }
-      for (const arg of form.derived_args) {
-        if (!(arg.name in seeded)) seeded[arg.name] = "";
-      }
-      workflowInputs = seeded;
+      workflowInputs = reconciled.inputs;
+      workflowForwardSources = reconciled.forwards;
     } catch (err) {
       if (gen === workflowFormGen) {
         const message = err instanceof Error ? err.message : String(err);
@@ -1706,11 +1880,23 @@
         else showError(`Couldn't refresh workflow: ${message}`);
       }
     } finally {
+      if (resolution === "fresh" && workflowFreshGen === gen) workflowFreshGen = null;
       if (gen === workflowFormGen) workflowFormLoading = false;
+    }
+    if (
+      resolution === "fresh" &&
+      gen === workflowFormGen &&
+      promptResolutionEventGen > resolutionEventsAtStart &&
+      selectedWorkflow?.name === workflow.name &&
+      selectedWorkflow.is_builtin === workflow.is_builtin
+    ) {
+      void loadWorkflowForm(workflow, "cache_only");
     }
   }
 
   function removeWorkflow(): void {
+    workflowSignInGen += 1;
+    workflowSigningInProvider = null;
     mode = "plain";
     selectedWorkflow = null;
     workflowForm = null;
@@ -1718,13 +1904,41 @@
     workflowFormError = null;
     workflowInputs = {};
     workflowForwardSources = {};
-    workflowSyncSettled = false;
     workflowFormGen++; // invalidate any in-flight fetch for the removed workflow
   }
 
   function retryWorkflowForm(): void {
-    if (selectedWorkflow === null || workflowFormLoading) return;
+    if (selectedWorkflow === null || workflowFormLoading || workflowSigningInProvider !== null)
+      return;
     void loadWorkflowForm(selectedWorkflow);
+  }
+
+  async function signInWorkflowProvider(provider: string): Promise<void> {
+    if (selectedWorkflow === null || workflowSigningInProvider !== null) return;
+    const workflow = selectedWorkflow;
+    const attempt = ++workflowSignInGen;
+    workflowSigningInProvider = provider;
+    clearStatus();
+    try {
+      await api.signInMcpProvider(provider);
+      if (
+        unmounted ||
+        attempt !== workflowSignInGen ||
+        selectedWorkflow?.name !== workflow.name ||
+        selectedWorkflow.is_builtin !== workflow.is_builtin
+      ) {
+        return;
+      }
+      await loadWorkflowForm(workflow);
+    } catch (err) {
+      if (!unmounted && attempt === workflowSignInGen) {
+        showError(
+          `Couldn't sign in to ${provider}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    } finally {
+      if (!unmounted && attempt === workflowSignInGen) workflowSigningInProvider = null;
+    }
   }
 
   async function copyWorkflow(workflow: WorkflowListing): Promise<void> {
@@ -2946,6 +3160,8 @@
           onpick={pickPrompt}
           oninsert={promptMenuAllowsLiteralInsert ? setEmptyDraftFromPromptSearch : undefined}
           oncopy={copyPrompt}
+          onsync={() => void syncPromptMenu()}
+          syncing={promptMenuSyncing}
           onconfigure={onConfigurePrompts ? configurePrompts : undefined}
           onopenfolder={openPromptsFolder}
           onclose={() => (promptMenuOpen = false)}
@@ -3395,7 +3611,30 @@
         {@render attachmentChipRow()}
       {/if}
 
-      {#if restoring && workflowRestoreFailed}
+      {#if restoring && promptRestoreIssue !== null}
+        <div
+          class="flex h-16 items-center gap-3 px-1 text-sm"
+          data-testid="compose-prompt-restore-failed"
+        >
+          <span class="text-muted">{promptRestoreMessage()}</span>
+          <Button
+            size="sm"
+            variant="secondary"
+            onclick={retryPromptRestore}
+            data-testid="prompt-restore-retry"
+          >
+            Check again
+          </Button>
+          <Button
+            size="sm"
+            variant="ghost"
+            onclick={discardPromptRestore}
+            data-testid="prompt-restore-discard"
+          >
+            Start over
+          </Button>
+        </div>
+      {:else if restoring && workflowRestoreFailed}
         <!-- The workflow list failed to load, so we can't tell whether the saved
            workflow still exists. The snapshot is held (not discarded) until the
            user retries or explicitly starts over — a transient error must not
@@ -3475,12 +3714,15 @@
           descriptor={workflowForm}
           {agents}
           loading={workflowFormLoading}
-          syncSettled={workflowSyncSettled}
           {agentReadiness}
           panes={paneLayout.panes}
           bind:inputs={workflowInputs}
           bind:forwardSources={workflowForwardSources}
           onremove={removeWorkflow}
+          onretry={retryWorkflowForm}
+          onsignin={(provider) => void signInWorkflowProvider(provider)}
+          signingInProvider={workflowSigningInProvider}
+          onconfigure={onConfigurePrompts ? configurePrompts : undefined}
         >
           {#snippet invoke()}
             <Button

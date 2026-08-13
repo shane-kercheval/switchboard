@@ -1,6 +1,7 @@
 <script lang="ts">
   import type {
     AgentRecord,
+    AvailabilityIssue,
     DerivedArgInfo,
     WorkflowFormDescriptor,
     WorkflowInputValue,
@@ -35,11 +36,14 @@
     agents,
     panes = [],
     loading = false,
-    syncSettled = false,
     agentReadiness,
     inputs = $bindable(),
     forwardSources = $bindable({}),
     onremove,
+    onretry,
+    onsignin,
+    signingInProvider = null,
+    onconfigure,
     invoke,
   }: {
     descriptor: WorkflowFormDescriptor;
@@ -51,10 +55,6 @@
     /// True while the descriptor is being (re)fetched — a pending state distinct
     /// from an incompatibility: show a "resolving" affordance, not an error.
     loading?: boolean;
-    /// Whether a prompt sync has settled since this workflow was picked. Gates the
-    /// `unresolved` → "not found" escalation (before a sync settles, an unresolved
-    /// MCP prompt is genuinely pending).
-    syncSettled?: boolean;
     /// Classifies what each forward-source agent would contribute, so the user
     /// sees before picking that a source will be skipped — parity with the prompt
     /// composer's per-argument pickers.
@@ -68,6 +68,14 @@
     /// the parent reads them at invoke time. Live-UI-only, like the compose bar's.
     forwardSources?: Record<string, ForwardSource[]>;
     onremove: () => void;
+    /// Check prompt resolution again after a settled provider failure.
+    onretry?: () => void;
+    /// Start browser authentication for a provider that blocks this workflow.
+    onsignin?: (provider: string) => void;
+    /// Provider whose browser authentication flow is currently pending.
+    signingInProvider?: string | null;
+    /// Open prompt-provider Settings for authentication or configuration issues.
+    onconfigure?: () => void;
     /// The invoke button(s), rendered in the footer by the parent (so the parent
     /// owns the actual invoke call + busy state).
     invoke?: import("svelte").Snippet;
@@ -241,16 +249,51 @@
   }
 
   const compat = $derived(descriptor.compatibility);
+  const compatibilityState = $derived(compat.state as string);
   const incompatible = $derived(compat.state === "incompatible" ? compat : null);
-  // An `unresolved` prompt is pending (cold MCP cache) **only until a sync has
-  // settled** for this pick; after that, still-unresolved means the MCP prompt is
-  // genuinely gone, so it's a blocking "not found" error, not a perpetual spinner.
-  // (A missing local/builtin prompt never reaches here — the backend classifies it
-  // `incompatible` immediately.)
-  const unresolvedMissing = $derived(
-    compat.state === "unresolved" && syncSettled ? compat.prompts : null,
+  const unavailable = $derived(compat.state === "unavailable" ? compat : null);
+  const unknownCompatibility = $derived(
+    !["ok", "incompatible", "unresolved", "unavailable"].includes(compatibilityState),
   );
-  const pending = $derived(loading || (compat.state === "unresolved" && !syncSettled));
+  // The backend's fresh command is authoritative and terminal. `unresolved` is
+  // retained as a defensive wire fallback, but never waits for a global event.
+  const unresolvedMissing = $derived(compat.state === "unresolved" ? compat.prompts : null);
+  const pending = $derived(loading);
+  const authProviders = $derived([
+    ...new Set(
+      unavailable?.issues
+        .filter((issue) => issue.kind === "needs_auth")
+        .map((issue) => issue.provider) ?? [],
+    ),
+  ]);
+  const needsProviderSettings = $derived(
+    unavailable?.issues.some((issue) => issue.kind === "not_configured") === true ||
+      (onsignin === undefined && authProviders.length > 0),
+  );
+  const canCheckAgain = $derived(
+    unavailable?.issues.some(
+      (issue) => issue.kind !== "needs_auth" && issue.kind !== "not_configured",
+    ) ?? false,
+  );
+
+  function availabilityMessage(issue: AvailabilityIssue): string {
+    switch (issue.kind) {
+      case "needs_auth":
+        return `Provider ${issue.provider} needs sign-in before ${issue.prompt} can be used.`;
+      case "not_configured":
+        return `Provider ${issue.provider} is not configured for ${issue.prompt}.`;
+      case "missing_prompt":
+        return `Provider ${issue.provider} did not return ${issue.prompt}.`;
+      case "store_unavailable":
+        return `The credential store is unavailable for provider ${issue.provider}.`;
+      case "provider_error":
+        return `Provider ${issue.provider} failed: ${issue.message ?? "unknown provider error"}`;
+      case "unknown":
+        return `Provider ${issue.provider} did not finish resolving ${issue.prompt}.`;
+      default:
+        return `Provider ${issue.provider} is unavailable for ${issue.prompt}.`;
+    }
+  }
 
   const missing = $derived([
     ...descriptor.inputs.filter((i) => isMissingInput(i.name, i.ty, i.optional)).map((i) => i.name),
@@ -355,6 +398,73 @@
         <span>• prompt <code>{id}</code> is not available</span>
       {/each}
     </div>
+  {:else if unavailable}
+    <div
+      class="text-status-failed flex flex-col gap-1 text-xs"
+      data-testid="workflow-prompt-unavailable"
+    >
+      <span class="font-medium">This workflow can't load its prompts:</span>
+      {#each unavailable.issues as issue (issue.prompt + issue.provider + issue.kind)}
+        <span>• {availabilityMessage(issue)}</span>
+      {/each}
+      {#if (authProviders.length > 0 && onsignin) || (needsProviderSettings && onconfigure) || (canCheckAgain && onretry)}
+        <div class="mt-1 flex flex-wrap gap-1.5">
+          {#if onsignin}
+            {#each authProviders as provider (provider)}
+              <button
+                type="button"
+                class="border-border bg-panel text-fg hover:bg-raised w-fit rounded border px-2 py-1 font-medium transition-colors disabled:cursor-wait disabled:opacity-60"
+                data-testid={`workflow-prompt-sign-in-${provider}`}
+                disabled={signingInProvider !== null}
+                onclick={() => onsignin?.(provider)}
+              >
+                {signingInProvider === provider
+                  ? `Waiting for ${provider} sign-in…`
+                  : `Sign in to ${provider}`}
+              </button>
+            {/each}
+          {/if}
+          {#if needsProviderSettings && onconfigure}
+            <button
+              type="button"
+              class="border-border bg-panel text-fg hover:bg-raised w-fit rounded border px-2 py-1 font-medium transition-colors"
+              data-testid="workflow-prompt-settings"
+              onclick={onconfigure}
+            >
+              Open prompt settings
+            </button>
+          {/if}
+          {#if canCheckAgain && onretry}
+            <button
+              type="button"
+              class="border-border bg-panel text-fg hover:bg-raised w-fit rounded border px-2 py-1 font-medium transition-colors"
+              data-testid="workflow-prompt-check-again"
+              onclick={onretry}
+            >
+              Check again
+            </button>
+          {/if}
+        </div>
+      {/if}
+    </div>
+  {:else if unknownCompatibility}
+    <div
+      class="text-status-failed flex flex-col gap-1 text-xs"
+      data-testid="workflow-compatibility-unknown"
+    >
+      <span class="font-medium">This workflow can't run in this version.</span>
+      <span>Its prompt compatibility could not be recognized. Check again after updating.</span>
+      {#if onretry}
+        <button
+          type="button"
+          class="border-border bg-panel text-fg hover:bg-raised mt-1 w-fit rounded border px-2 py-1 font-medium transition-colors"
+          data-testid="workflow-compatibility-check-again"
+          onclick={onretry}
+        >
+          Check again
+        </button>
+      {/if}
+    </div>
   {/if}
 
   {#snippet paneChip(name: string, pane: TranscriptPane, selected: boolean, onpick: () => void)}
@@ -447,7 +557,7 @@
     {/if}
   {/snippet}
 
-  {#if descriptor.invocable && !pending && !incompatible && !unresolvedMissing}
+  {#if descriptor.invocable && !pending && !incompatible && !unresolvedMissing && !unavailable && !unknownCompatibility}
     <div class="flex flex-col gap-3">
       {#each descriptor.inputs as input (input.name)}
         <div class="flex flex-col gap-1" data-testid={`workflow-field-${input.name}`}>
@@ -582,7 +692,7 @@
   {/if}
 
   <div class="flex items-center justify-end gap-2">
-    {#if missing.length > 0 && descriptor.invocable && !pending && !incompatible && !unresolvedMissing}
+    {#if missing.length > 0 && descriptor.invocable && !pending && !incompatible && !unresolvedMissing && !unavailable && !unknownCompatibility}
       <span class="text-muted text-xs" data-testid="workflow-missing">
         Fill required fields to run
       </span>

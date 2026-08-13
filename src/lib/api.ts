@@ -36,6 +36,7 @@ import type {
   ProviderStatus,
   PathSource,
   Prompt,
+  SavedPromptResolution,
   PromptSource,
   RenderPromptOutcome,
   RepoListing,
@@ -708,6 +709,22 @@ export async function listPrompts(): Promise<Prompt[]> {
   return await invoke<Prompt[]>("list_prompts");
 }
 
+/// Resolve one saved prompt draft from the latest coherent cache snapshot.
+export async function resolveSavedPrompt(
+  provider: string,
+  name: string,
+): Promise<SavedPromptResolution> {
+  return await invoke<SavedPromptResolution>("resolve_saved_prompt", { provider, name });
+}
+
+/// Explicitly retry a saved MCP prompt with one bounded, coalesced refresh.
+export async function resolveSavedPromptFresh(
+  provider: string,
+  name: string,
+): Promise<SavedPromptResolution> {
+  return await invoke<SavedPromptResolution>("resolve_saved_prompt_fresh", { provider, name });
+}
+
 /// Render `name` from `provider` with `args`, resolving to a typed outcome:
 /// the finished text, or a needs-sign-in determination the composer acts on by
 /// launching the provider's browser sign-in. Serves both the composer's
@@ -744,13 +761,26 @@ export async function listWorkflows(): Promise<WorkflowListing[]> {
 
 /// Resolve a picked workflow's invocation form: declared inputs + auto-derived
 /// user-fillable prompt-argument fields + a compatibility verdict. No `projectId`
-/// — prompts are user-global. Resolved per-pick (not in `listWorkflows`); re-fetch
-/// on `prompts:synced` so a cold MCP cache resolves once sync lands.
+/// — prompts are user-global. Resolved per-pick (not in `listWorkflows`). An MCP
+/// cache miss conditionally awaits/runs a sync before the command replies, so the
+/// returned descriptor is settled even when the startup event was missed.
 export async function describeWorkflowForm(
   name: string,
   isBuiltin: boolean,
 ): Promise<WorkflowFormDescriptor> {
   return await invoke<WorkflowFormDescriptor>("describe_workflow_form", { name, isBuiltin });
+}
+
+/// Reclassify an open workflow after an independent prompt sync. This command is
+/// cache-only; unlike `describeWorkflowForm`, it never initiates another sync.
+export async function refreshWorkflowFormFromCache(
+  name: string,
+  isBuiltin: boolean,
+): Promise<WorkflowFormDescriptor> {
+  return await invoke<WorkflowFormDescriptor>("refresh_workflow_form_from_cache", {
+    name,
+    isBuiltin,
+  });
 }
 
 /// Validate a workflow invocation (capability gate + input/roster/prompt rules)

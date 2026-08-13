@@ -313,22 +313,24 @@ use crate::commands::{
     read_tracked_repo_from_inputs, recheck_harness_installs_impl, remove_agent_impl,
     remove_directory_impl, remove_mcp_provider_impl, remove_message_pins_impl,
     remove_queued_message_impl, remove_tracked_repo_impl, rename_agent_impl, rename_project_impl,
-    render_prompt_impl, reorder_agents_impl, resume_agent_in_terminal_impl, reveal_in_finder_argv,
+    render_prompt_impl, reorder_agents_impl, resolve_saved_prompt_fresh_impl,
+    resolve_saved_prompt_impl, resume_agent_in_terminal_impl, reveal_in_finder_argv,
     search_project_files_in_root, search_project_files_root_impl, send_message_impl,
     set_active_agent_profile_impl, set_active_project_impl, set_agent_profiles_impl,
     set_message_pin_impl, set_preferences_impl, set_project_archived_impl,
     set_visible_project_impl, sign_in_mcp_provider_impl, sign_out_mcp_provider_impl,
-    stage_attachment_impl, sync_prompts_and_notify, terminal_open_argv, test_mcp_connection_impl,
-    test_saved_mcp_provider_impl, tracked_repos_inputs, tracked_roots, validate_external_url,
+    spawn_prompt_resolution_change_notifications, stage_attachment_impl, sync_prompts_and_notify,
+    terminal_open_argv, test_mcp_connection_impl, test_saved_mcp_provider_impl,
+    tracked_repos_inputs, tracked_roots, validate_external_url,
 };
 use crate::error::AppError;
 use crate::preferences::Preferences;
 use crate::state::AppState;
 use crate::workflow_commands::{
     WorkflowFormDescriptor, WorkflowListing, WorkflowRunInfo, abandon_workflow_run_impl,
-    cancel_workflow_run_impl, copy_builtin_workflow_impl, describe_workflow_form_impl,
-    invoke_workflow_impl, list_workflow_runs_impl, list_workflows_impl, user_workflows_dir,
-    validate_workflow_invocation_impl,
+    cancel_workflow_run_impl, copy_builtin_workflow_impl, describe_workflow_form_cache_only_impl,
+    describe_workflow_form_fresh_impl, invoke_workflow_impl, list_workflow_runs_impl,
+    list_workflows_impl, user_workflows_dir, validate_workflow_invocation_impl,
 };
 
 use switchboard_core::{
@@ -562,6 +564,28 @@ async fn list_workspace_directories(
 #[tauri::command]
 async fn list_prompts(state: State<'_, AppState>) -> Result<Vec<Prompt>, String> {
     Ok(list_prompts_impl(state.inner()))
+}
+
+/// Resolve one persisted prompt selection against the latest coherent provider
+/// snapshot without touching credentials or the network.
+#[tauri::command]
+async fn resolve_saved_prompt(
+    state: State<'_, AppState>,
+    provider: String,
+    name: String,
+) -> Result<commands::SavedPromptResolution, String> {
+    Ok(resolve_saved_prompt_impl(state.inner(), &provider, &name))
+}
+
+/// Explicit recovery for a saved prompt: performs at most one conditional MCP
+/// refresh before returning a terminal provider-aware verdict.
+#[tauri::command]
+async fn resolve_saved_prompt_fresh(
+    state: State<'_, AppState>,
+    provider: String,
+    name: String,
+) -> Result<commands::SavedPromptResolution, String> {
+    Ok(resolve_saved_prompt_fresh_impl(state.inner(), &provider, &name).await)
 }
 
 /// Render `name` from `provider` with `args`, returning a typed outcome: the
@@ -1438,14 +1462,29 @@ async fn list_workflows(state: State<'_, AppState>) -> Result<Vec<WorkflowListin
 
 /// Resolve a picked workflow's invocation form: declared inputs + auto-derived
 /// user-fillable prompt-argument fields + a compatibility verdict. No `project_id`
-/// — prompts are user-global. Resolved per-pick (not in `list_workflows`).
+/// — prompts are user-global. Resolved per-pick (not in `list_workflows`); an MCP
+/// cache miss awaits or performs one coalesced sync before returning.
 #[tauri::command]
 async fn describe_workflow_form(
     state: State<'_, AppState>,
     name: String,
     is_builtin: bool,
 ) -> Result<WorkflowFormDescriptor, String> {
-    describe_workflow_form_impl(state.inner(), &name, is_builtin).map_err(|e| e.to_string())
+    describe_workflow_form_fresh_impl(state.inner(), &name, is_builtin)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Reclassify an open workflow after an independently initiated prompt sync.
+/// Reads only the published cache/status snapshot and never starts another sync.
+#[tauri::command]
+async fn refresh_workflow_form_from_cache(
+    state: State<'_, AppState>,
+    name: String,
+    is_builtin: bool,
+) -> Result<WorkflowFormDescriptor, String> {
+    describe_workflow_form_cache_only_impl(state.inner(), &name, is_builtin)
+        .map_err(|e| e.to_string())
 }
 
 /// Resolve any forward-fields (completed-only) and merge the composed text into
@@ -2032,6 +2071,7 @@ pub fn run() {
             // store. Built-in example prompts are baked into the service as a
             // read-only library — nothing is written into the user's folder.
             let prompts = build_prompt_service();
+            spawn_prompt_resolution_change_notifications(&prompts, Arc::clone(&state.emitter));
             // Warm the prompt cache in the background so a slow/cold MCP server
             // never blocks startup. `PromptService` is cheaply cloneable and
             // shares its cache `Arc`, so the clone the task syncs is the same
@@ -2138,6 +2178,8 @@ pub fn run() {
             set_visible_project,
             notify,
             list_prompts,
+            resolve_saved_prompt,
+            resolve_saved_prompt_fresh,
             render_prompt,
             get_prompt_source,
             sync_prompts,
@@ -2153,6 +2195,7 @@ pub fn run() {
             copy_builtin_prompt,
             list_workflows,
             describe_workflow_form,
+            refresh_workflow_form_from_cache,
             validate_workflow_invocation,
             invoke_workflow,
             cancel_workflow_run,

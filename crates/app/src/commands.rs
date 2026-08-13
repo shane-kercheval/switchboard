@@ -1166,6 +1166,80 @@ pub fn list_prompts_impl(state: &AppState) -> Vec<switchboard_prompts::Prompt> {
         .collect()
 }
 
+/// Cache-only verdict for restoring one persisted prompt draft. Unlike a global
+/// list miss, this distinguishes confirmed deletion from provider failure.
+#[derive(Debug, Clone, serde::Serialize, PartialEq)]
+#[serde(tag = "state", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum SavedPromptResolution {
+    Available {
+        prompt: switchboard_prompts::Prompt,
+        generation: u64,
+    },
+    ConfirmedMissing {
+        generation: u64,
+    },
+    TemporarilyUnavailable {
+        generation: u64,
+    },
+    NotConfigured {
+        generation: u64,
+    },
+}
+
+pub fn resolve_saved_prompt_impl(
+    state: &AppState,
+    provider: &str,
+    name: &str,
+) -> SavedPromptResolution {
+    let snapshot = state.prompts.resolution_snapshot();
+    let generation = snapshot.generation();
+    if provider == switchboard_prompts::LOCAL_PROVIDER
+        || provider == switchboard_prompts::BUILTIN_PROVIDER
+    {
+        return match state.prompts.get(provider, name) {
+            Some(prompt) => SavedPromptResolution::Available { prompt, generation },
+            None => SavedPromptResolution::ConfirmedMissing { generation },
+        };
+    }
+    if let Some(prompt) = snapshot.get(provider, name) {
+        return SavedPromptResolution::Available { prompt, generation };
+    }
+    if !snapshot.is_provider_configured(provider)
+        && (snapshot.was_provider_removed(provider) || snapshot.configuration_complete())
+    {
+        return SavedPromptResolution::NotConfigured { generation };
+    }
+    match snapshot.provider_status(provider) {
+        Some(switchboard_prompts::ProviderStatus::Ok { .. }) => {
+            SavedPromptResolution::ConfirmedMissing { generation }
+        }
+        _ => SavedPromptResolution::TemporarilyUnavailable { generation },
+    }
+}
+
+/// Perform at most one conditional MCP refresh, then classify the saved prompt
+/// against the newest coherent snapshot. Explicit user recovery uses this path;
+/// automatic event handling remains cache-only.
+pub async fn resolve_saved_prompt_fresh_impl(
+    state: &AppState,
+    provider: &str,
+    name: &str,
+) -> SavedPromptResolution {
+    if provider != switchboard_prompts::LOCAL_PROVIDER
+        && provider != switchboard_prompts::BUILTIN_PROVIDER
+    {
+        let observed_generation = state.prompts.sync_generation();
+        sync_prompts_if_generation_and_notify(
+            state.prompts.clone(),
+            Arc::clone(&state.emitter),
+            observed_generation,
+        )
+        .await;
+    }
+    resolve_saved_prompt_impl(state, provider, name)
+}
+
 /// Copy a built-in prompt into the user's prompts directory as `<name>.md`, so
 /// they can customize it as an owned file. Refuses to overwrite an existing file
 /// (the app never clobbers a user's prompt). After this, the copy is an ordinary
@@ -1315,11 +1389,12 @@ pub async fn sign_out_mcp_provider_impl(state: &AppState, name: &str) -> Result<
 }
 
 /// Remove a generic MCP provider: deletes its config entry + keychain token and
-/// rebuilds the cache in the background.
+/// rebuilds the cache in the background. Settlement runs after errors too because
+/// one credential delete may have succeeded before another operation failed.
 pub fn remove_mcp_provider_impl(state: &AppState, name: &str) -> Result<(), AppError> {
-    state.prompts.remove_mcp_provider(name)?;
+    let result = state.prompts.remove_mcp_provider(name);
     spawn_prompt_sync(state);
-    Ok(())
+    Ok(result?)
 }
 
 /// Probe a **saved** provider by name with its stored credentials — the
@@ -1344,31 +1419,83 @@ pub async fn test_mcp_connection_impl(
     Ok(state.prompts.test_mcp_connection(url, bearer).await?)
 }
 
-/// Event emitted after a prompt-cache rebuild settles, so the frontend can
-/// refresh provider status and restore a prompt-mode compose draft that needed
-/// the cache warm. Every sync path — startup warm sync, the `sync_prompts`
-/// command, and add/remove — emits it via [`sync_prompts_and_notify`]; binding
-/// the emit to the operation is what keeps a draft from getting stuck unrestored
-/// when the cache is warmed by a path other than add/remove.
+/// Event emitted whenever the authoritative MCP resolution snapshot changes.
+/// Workflow listeners reclassify cache-only on this signal; it deliberately
+/// says nothing about whether a network synchronization has settled.
+pub const PROMPTS_CHANGED_EVENT: &str = "prompts:changed";
+
+/// Event emitted after a prompt-cache rebuild settles. Saved prompt-draft
+/// restoration relies on this stronger meaning: only then is a still-missing
+/// prompt known to be absent rather than hidden by a temporarily cold cache.
 pub const PROMPTS_SYNCED_EVENT: &str = "prompts:synced";
 
-/// Rebuild the prompt cache, then emit [`PROMPTS_SYNCED_EVENT`]. The emit is
-/// bound to the sync here so no caller can warm the cache without notifying — the
-/// single chokepoint every sync path routes through.
-pub async fn sync_prompts_and_notify(prompts: PromptService, emitter: Arc<dyn EventEmitter>) {
-    prompts.sync().await;
-    emitter.emit(PROMPTS_SYNCED_EVENT, serde_json::Value::Null);
+/// Bridge the prompt crate's Tauri-agnostic resolution watch channel to the
+/// frontend. The watch channel coalesces rapid changes; consumers always read
+/// the latest immutable snapshot, so intermediate generations are unnecessary.
+pub fn spawn_prompt_resolution_change_notifications(
+    prompts: &PromptService,
+    emitter: Arc<dyn EventEmitter>,
+) {
+    let mut changes = prompts.subscribe_resolution_changes();
+    tauri::async_runtime::spawn(async move {
+        while changes.changed().await.is_ok() {
+            let generation = *changes.borrow_and_update();
+            emitter.emit(
+                PROMPTS_CHANGED_EVENT,
+                serde_json::json!({ "generation": generation }),
+            );
+        }
+    });
 }
 
-/// Rebuild the prompt cache off the command thread. `PromptService` is cheaply
-/// cloneable and shares its cache, so the spawned clone warms the same cache.
-/// Emits [`PROMPTS_SYNCED_EVENT`] when the rebuild finishes so Settings can
-/// refresh a just-added provider's status (the add/remove command returns before
-/// the background build completes, so the first read shows `Unknown`).
+/// Rebuild the prompt cache, then emit [`PROMPTS_SYNCED_EVENT`] after the latest
+/// provider revision publishes. Work invalidated by a concurrent provider
+/// mutation retries inside [`PromptService::sync`].
+pub async fn sync_prompts_and_notify(
+    prompts: PromptService,
+    emitter: Arc<dyn EventEmitter>,
+) -> switchboard_prompts::SyncOutcome {
+    let outcome = prompts.sync().await;
+    if let switchboard_prompts::SyncOutcome::Published { generation } = outcome {
+        emitter.emit(
+            PROMPTS_SYNCED_EVENT,
+            serde_json::json!({ "generation": generation }),
+        );
+    }
+    outcome
+}
+
+/// Conditionally rebuild the prompt cache, emitting only when this caller owned
+/// the rebuild. A caller that joined a newer completed generation must not
+/// duplicate the notification owned by that sync.
+pub async fn sync_prompts_if_generation_and_notify(
+    prompts: PromptService,
+    emitter: Arc<dyn EventEmitter>,
+    observed_generation: u64,
+) -> switchboard_prompts::SyncOutcome {
+    let outcome = prompts.sync_if_generation(observed_generation).await;
+    if let switchboard_prompts::SyncOutcome::Published { generation } = outcome {
+        emitter.emit(
+            PROMPTS_SYNCED_EVENT,
+            serde_json::json!({ "generation": generation }),
+        );
+    }
+    outcome
+}
+
+/// Conditionally rebuild the prompt cache off the command thread. Capturing the
+/// mutation's generation lets an older in-flight rebuild own settlement without
+/// issuing a duplicate provider listing; otherwise this task publishes and
+/// notifies. `PromptService` clones share the same cache.
 fn spawn_prompt_sync(state: &AppState) {
     let prompts = state.prompts.clone();
     let emitter = Arc::clone(&state.emitter);
-    tauri::async_runtime::spawn(sync_prompts_and_notify(prompts, emitter));
+    let observed_generation = prompts.sync_generation();
+    tauri::async_runtime::spawn(sync_prompts_if_generation_and_notify(
+        prompts,
+        emitter,
+        observed_generation,
+    ));
 }
 
 pub fn create_project_impl(
@@ -6036,7 +6163,7 @@ pub(crate) fn parse_uuid(value: &str) -> Result<Uuid, AppError> {
 mod tests {
     use super::*;
 
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
@@ -19967,21 +20094,111 @@ mod tests {
         )
         .await;
 
-        let names: Vec<String> = emitter
-            .snapshot()
-            .into_iter()
-            .map(|(name, _)| name)
-            .collect();
-        assert_eq!(names, vec![PROMPTS_SYNCED_EVENT.to_owned()]);
+        assert_eq!(
+            emitter.snapshot(),
+            vec![(
+                PROMPTS_SYNCED_EVENT.to_owned(),
+                serde_json::json!({ "generation": 1 })
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn resolution_change_bridge_emits_without_claiming_sync_settled() {
+        let emitter = Arc::new(RecordingEmitter::new());
+        let prompts = PromptService::disabled();
+        spawn_prompt_resolution_change_notifications(
+            &prompts,
+            Arc::clone(&emitter) as Arc<dyn EventEmitter>,
+        );
+
+        prompts.sync().await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if emitter
+                    .snapshot()
+                    .iter()
+                    .any(|(name, _)| name == PROMPTS_CHANGED_EVENT)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("resolution change should be bridged");
+
+        let events = emitter.snapshot();
+        assert!(events.iter().all(|(name, _)| name != PROMPTS_SYNCED_EVENT));
+        assert!(events.iter().any(|(name, payload)| {
+            name == PROMPTS_CHANGED_EVENT && payload["generation"] == serde_json::json!(1)
+        }));
+    }
+
+    #[tokio::test]
+    async fn failed_provider_removal_still_notifies_and_schedules_settlement() {
+        use switchboard_prompts::{SecretStore, SecretStoreError};
+
+        struct DeleteFailsStore;
+        impl SecretStore for DeleteFailsStore {
+            fn get(&self, _: &str) -> Result<Option<String>, SecretStoreError> {
+                Ok(None)
+            }
+
+            fn set(&self, _: &str, _: &str) -> Result<(), SecretStoreError> {
+                Ok(())
+            }
+
+            fn delete(&self, _: &str) -> Result<(), SecretStoreError> {
+                Err(SecretStoreError::Backend("delete failed".to_owned()))
+            }
+        }
+
+        let (tmp, state, emitter) = fresh_state_with_mock();
+        let config_path = tmp.path().join("config.yaml");
+        std::fs::write(
+            &config_path,
+            "mcp_providers:\n  - name: team\n    transport:\n      type: http\n      url: http://127.0.0.1:9/mcp\n    auth:\n      type: bearer\n",
+        )
+        .unwrap();
+        let prompts = PromptService::new(
+            config_path,
+            tmp.path().join("prompts"),
+            None,
+            Arc::new(DeleteFailsStore),
+        )
+        .with_provider_timeout(std::time::Duration::from_millis(100));
+        spawn_prompt_resolution_change_notifications(
+            &prompts,
+            Arc::clone(&emitter) as Arc<dyn EventEmitter>,
+        );
+        let state = state.with_prompts(prompts);
+
+        assert!(remove_mcp_provider_impl(&state, "team").is_err());
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let events = emitter.snapshot();
+                let changed = events.iter().any(|(name, _)| name == PROMPTS_CHANGED_EVENT);
+                let synced = events.iter().any(|(name, _)| name == PROMPTS_SYNCED_EVENT);
+                if changed && synced {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("partial removal failure should notify immediately and settle");
     }
 
     // --- Workflow commands ----------------------------------------------------
 
     use crate::workflow_commands::{
-        FormCompatibility, abandon_workflow_run_impl, cancel_workflow_run_impl,
-        copy_builtin_workflow_impl, describe_workflow_form_impl, invoke_workflow_impl,
-        list_workflow_runs_impl, list_workflows_impl, user_workflows_dir,
-        validate_workflow_invocation_impl,
+        AvailabilityIssueKind, FormCompatibility, abandon_workflow_run_impl,
+        cancel_workflow_run_impl, copy_builtin_workflow_impl,
+        describe_workflow_form_cache_only_impl, describe_workflow_form_fresh_impl,
+        describe_workflow_form_impl, invoke_workflow_impl, list_workflow_runs_impl,
+        list_workflows_impl, user_workflows_dir, validate_workflow_invocation_impl,
     };
     use switchboard_workflow::{InputValue, RunRecord, TerminalStatus};
 
@@ -20000,6 +20217,308 @@ mod tests {
             format!("{header}{body}\n"),
         )
         .unwrap();
+    }
+
+    #[derive(Clone)]
+    struct WorkflowPromptServer {
+        calls: Arc<AtomicUsize>,
+        entered: Arc<tokio::sync::Semaphore>,
+        release: Option<Arc<tokio::sync::Semaphore>>,
+        rendered_contexts: Arc<Mutex<Vec<Option<String>>>>,
+    }
+
+    impl rmcp::ServerHandler for WorkflowPromptServer {
+        fn get_info(&self) -> rmcp::model::ServerInfo {
+            let mut info = rmcp::model::ServerInfo::default();
+            info.capabilities = rmcp::model::ServerCapabilities::builder()
+                .enable_prompts()
+                .build();
+            info
+        }
+
+        async fn list_prompts(
+            &self,
+            _request: Option<rmcp::model::PaginatedRequestParams>,
+            _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+        ) -> Result<rmcp::model::ListPromptsResult, rmcp::model::ErrorData> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.entered.add_permits(1);
+            if let Some(release) = &self.release {
+                let permit = release.acquire().await.expect("test release gate is open");
+                permit.forget();
+            }
+            Ok(rmcp::model::ListPromptsResult {
+                meta: None,
+                next_cursor: None,
+                prompts: vec![
+                    rmcp::model::Prompt::new(
+                        "review",
+                        Some("Review code"),
+                        Some(vec![
+                            rmcp::model::PromptArgument::new("context")
+                                .with_description("context to review")
+                                .with_required(true),
+                        ]),
+                    ),
+                    rmcp::model::Prompt::new("summarize", Some("Summarize code"), None),
+                ],
+            })
+        }
+
+        async fn get_prompt(
+            &self,
+            request: rmcp::model::GetPromptRequestParams,
+            _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+        ) -> Result<rmcp::model::GetPromptResult, rmcp::model::ErrorData> {
+            let context = request
+                .arguments
+                .as_ref()
+                .and_then(|arguments| arguments.get("context"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
+            self.rendered_contexts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(context.clone());
+            let Some(context) = context else {
+                return Err(rmcp::model::ErrorData::new(
+                    rmcp::model::ErrorCode::INVALID_PARAMS,
+                    "missing required argument: context",
+                    None,
+                ));
+            };
+            Ok(rmcp::model::GetPromptResult::new(vec![
+                rmcp::model::PromptMessage::new_text(
+                    rmcp::model::PromptMessageRole::User,
+                    format!("Review {context}"),
+                ),
+            ]))
+        }
+    }
+
+    struct RunningWorkflowMcpServer {
+        url: String,
+        calls: Arc<AtomicUsize>,
+        entered: Arc<tokio::sync::Semaphore>,
+        release: Option<Arc<tokio::sync::Semaphore>>,
+        rendered_contexts: Arc<Mutex<Vec<Option<String>>>>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for RunningWorkflowMcpServer {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    async fn spawn_workflow_mcp_server(gated: bool) -> RunningWorkflowMcpServer {
+        use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+        use rmcp::transport::streamable_http_server::{
+            StreamableHttpServerConfig, StreamableHttpService,
+        };
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(tokio::sync::Semaphore::new(0));
+        let release = gated.then(|| Arc::new(tokio::sync::Semaphore::new(0)));
+        let rendered_contexts = Arc::new(Mutex::new(Vec::new()));
+        let handler = WorkflowPromptServer {
+            calls: Arc::clone(&calls),
+            entered: Arc::clone(&entered),
+            release: release.clone(),
+            rendered_contexts: Arc::clone(&rendered_contexts),
+        };
+        let service = StreamableHttpService::new(
+            move || Ok(handler.clone()),
+            Arc::new(LocalSessionManager::default()),
+            StreamableHttpServerConfig::default(),
+        );
+        let router = axum::Router::new().nest_service("/mcp", service);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        RunningWorkflowMcpServer {
+            url: format!("http://{addr}/mcp"),
+            calls,
+            entered,
+            release,
+            rendered_contexts,
+            task,
+        }
+    }
+
+    fn state_with_mcp_server(
+        tmp: &TempDir,
+        state: AppState,
+        url: &str,
+        secrets: Arc<dyn switchboard_prompts::SecretStore>,
+    ) -> AppState {
+        let prompts_dir = tmp.path().join("prompts");
+        std::fs::create_dir_all(&prompts_dir).unwrap();
+        let config_path = tmp.path().join("config.yaml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "mcp_providers:\n  - name: tiddly\n    transport:\n      type: http\n      url: {url}\n"
+            ),
+        )
+        .unwrap();
+        state.with_prompts(switchboard_prompts::PromptService::new(
+            config_path,
+            prompts_dir,
+            None,
+            secrets,
+        ))
+    }
+
+    #[tokio::test]
+    async fn saved_prompt_resolution_only_confirms_absence_from_authoritative_state() {
+        let server = spawn_workflow_mcp_server(false).await;
+        let (tmp, state, _) = fresh_state_with_mock();
+        let state = state_with_mcp_server(
+            &tmp,
+            state,
+            &server.url,
+            Arc::new(switchboard_prompts::InMemorySecretStore::new()),
+        );
+
+        assert!(matches!(
+            resolve_saved_prompt_impl(&state, "tiddly", "review"),
+            SavedPromptResolution::TemporarilyUnavailable { generation: 0 }
+        ));
+
+        state.prompts.sync().await;
+        assert!(matches!(
+            resolve_saved_prompt_impl(&state, "tiddly", "review"),
+            SavedPromptResolution::Available { generation: 1, .. }
+        ));
+        assert_eq!(
+            resolve_saved_prompt_impl(&state, "tiddly", "ghost"),
+            SavedPromptResolution::ConfirmedMissing { generation: 1 }
+        );
+
+        state.prompts.remove_mcp_provider("tiddly").unwrap();
+        assert_eq!(
+            resolve_saved_prompt_impl(&state, "tiddly", "review"),
+            SavedPromptResolution::NotConfigured { generation: 2 }
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_saved_prompt_retry_performs_one_bounded_refresh() {
+        let server = spawn_workflow_mcp_server(false).await;
+        let (tmp, state, emitter) = fresh_state_with_mock();
+        let state = state_with_mcp_server(
+            &tmp,
+            state,
+            "http://127.0.0.1:1/mcp",
+            Arc::new(switchboard_prompts::InMemorySecretStore::new()),
+        );
+        state.prompts.sync().await;
+        assert_eq!(
+            resolve_saved_prompt_impl(&state, "tiddly", "review"),
+            SavedPromptResolution::TemporarilyUnavailable { generation: 1 }
+        );
+        std::fs::write(
+            tmp.path().join("config.yaml"),
+            format!(
+                "mcp_providers:\n  - name: tiddly\n    transport:\n      type: http\n      url: {}\n",
+                server.url
+            ),
+        )
+        .unwrap();
+
+        let resolution = resolve_saved_prompt_fresh_impl(&state, "tiddly", "review").await;
+
+        assert!(matches!(
+            resolution,
+            SavedPromptResolution::Available { generation: 2, .. }
+        ));
+        assert_eq!(server.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            emitter.snapshot(),
+            vec![(
+                PROMPTS_SYNCED_EVENT.to_owned(),
+                serde_json::json!({ "generation": 2 })
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn saved_prompt_resolution_preserves_drafts_when_provider_listing_fails() {
+        let (tmp, state, _) = fresh_state_with_mock();
+        let state = state_with_mcp_server(
+            &tmp,
+            state,
+            "http://127.0.0.1:1/mcp",
+            Arc::new(switchboard_prompts::InMemorySecretStore::new()),
+        );
+        let prompts = state
+            .prompts
+            .clone()
+            .with_provider_timeout(std::time::Duration::from_millis(100));
+        let state = state.with_prompts(prompts);
+
+        state.prompts.sync().await;
+
+        assert_eq!(
+            resolve_saved_prompt_impl(&state, "tiddly", "review"),
+            SavedPromptResolution::TemporarilyUnavailable { generation: 1 }
+        );
+
+        let (tmp, state, _) = fresh_state_with_mock();
+        std::fs::write(
+            tmp.path().join("config.yaml"),
+            "mcp_providers:\n  - name: tiddly\n",
+        )
+        .unwrap();
+        let prompts = PromptService::new(
+            tmp.path().join("config.yaml"),
+            tmp.path().join("prompts"),
+            None,
+            Arc::new(switchboard_prompts::InMemorySecretStore::new()),
+        );
+        let state = state.with_prompts(prompts);
+        state.prompts.sync().await;
+
+        assert_eq!(
+            resolve_saved_prompt_impl(&state, "tiddly", "review"),
+            SavedPromptResolution::TemporarilyUnavailable { generation: 1 },
+            "a malformed config entry cannot prove that its provider was removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn observed_readded_provider_overrides_old_removal_marker() {
+        let server = spawn_workflow_mcp_server(false).await;
+        let (tmp, state, _) = fresh_state_with_mock();
+        let state = state_with_mcp_server(
+            &tmp,
+            state,
+            &server.url,
+            Arc::new(switchboard_prompts::InMemorySecretStore::new()),
+        );
+        state.prompts.remove_mcp_provider("tiddly").unwrap();
+        std::fs::write(
+            tmp.path().join("config.yaml"),
+            format!(
+                "mcp_providers:\n  - name: tiddly\n    transport:\n      type: http\n      url: {}\n  - name: malformed\n",
+                server.url
+            ),
+        )
+        .unwrap();
+
+        state.prompts.sync().await;
+
+        let snapshot = state.prompts.resolution_snapshot();
+        assert!(!snapshot.configuration_complete());
+        assert!(snapshot.is_provider_configured("tiddly"));
+        assert!(!snapshot.was_provider_removed("tiddly"));
+        assert!(matches!(
+            resolve_saved_prompt_impl(&state, "tiddly", "review"),
+            SavedPromptResolution::Available { .. }
+        ));
     }
 
     /// A prompts-enabled state (real `PromptService`, so built-ins resolve) with a
@@ -20614,6 +21133,553 @@ mod tests {
             form.compatibility,
             FormCompatibility::Unresolved { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn fresh_workflow_form_retries_a_cold_mcp_miss_and_settles_actionably() {
+        let (tmp, state, _) = fresh_state_with_mock();
+        let prompts_dir = tmp.path().join("prompts");
+        std::fs::create_dir_all(&prompts_dir).unwrap();
+        std::fs::write(
+            tmp.path().join("config.yaml"),
+            "mcp_providers:\n  - name: tiddly\n    transport:\n      type: http\n      url: http://127.0.0.1:1/mcp\n",
+        )
+        .unwrap();
+        let prompts = switchboard_prompts::PromptService::new(
+            tmp.path().join("config.yaml"),
+            prompts_dir,
+            None,
+            Arc::new(switchboard_prompts::InMemorySecretStore::new()),
+        )
+        .with_provider_timeout(std::time::Duration::from_millis(100));
+        let state = state
+            .with_prompts(prompts)
+            .with_workflows_dir(tmp.path().join("workflows"));
+        seed_workflow(
+            &state,
+            "mcpish",
+            "name: mcpish\ndescription: d\ninputs:\n  a: agent\nsteps:\n  - label: s\n    send:\n      to: \"{{ a }}\"\n      prompt: \"tiddly:ghost\"\n",
+        );
+        let before = state.prompts.sync_generation();
+
+        let form = describe_workflow_form_fresh_impl(&state, "mcpish", false)
+            .await
+            .unwrap();
+
+        assert_eq!(state.prompts.sync_generation(), before + 1);
+        match form.compatibility {
+            FormCompatibility::Unavailable { issues } => assert!(
+                issues
+                    .iter()
+                    .any(|issue| issue.kind == AvailabilityIssueKind::ProviderError),
+                "{issues:?}"
+            ),
+            other => panic!("expected a settled provider error, got {other:?}"),
+        }
+
+        let settled_generation = state.prompts.sync_generation();
+        let cached = describe_workflow_form_cache_only_impl(&state, "mcpish", false).unwrap();
+        assert_eq!(state.prompts.sync_generation(), settled_generation);
+        assert!(matches!(
+            cached.compatibility,
+            FormCompatibility::Unavailable { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn incomplete_provider_inventory_keeps_workflow_availability_unknown() {
+        let server = spawn_workflow_mcp_server(false).await;
+        let (tmp, state, _) = fresh_state_with_mock();
+        let prompts_dir = tmp.path().join("prompts");
+        std::fs::create_dir_all(&prompts_dir).unwrap();
+        std::fs::write(
+            tmp.path().join("config.yaml"),
+            "mcp_providers:\n  - name: tiddly\n",
+        )
+        .unwrap();
+        let prompts = switchboard_prompts::PromptService::new(
+            tmp.path().join("config.yaml"),
+            prompts_dir,
+            None,
+            Arc::new(switchboard_prompts::InMemorySecretStore::new()),
+        );
+        let state = state
+            .with_prompts(prompts)
+            .with_workflows_dir(tmp.path().join("workflows"));
+        seed_workflow(
+            &state,
+            "mcp-review",
+            "name: mcp-review\ndescription: d\ninputs:\n  a: agent\nsteps:\n  - label: s\n    send:\n      to: \"{{ a }}\"\n      prompt: \"tiddly:review\"\n",
+        );
+
+        let unavailable = describe_workflow_form_fresh_impl(&state, "mcp-review", false)
+            .await
+            .unwrap();
+        assert!(matches!(
+            unavailable.compatibility,
+            FormCompatibility::Unavailable { ref issues }
+                if issues.iter().any(|issue| issue.kind == AvailabilityIssueKind::Unknown)
+                    && issues.iter().all(|issue| issue.kind != AvailabilityIssueKind::NotConfigured)
+        ));
+
+        std::fs::write(
+            tmp.path().join("config.yaml"),
+            format!(
+                "mcp_providers:\n  - name: tiddly\n    transport:\n      type: http\n      url: {}\n",
+                server.url
+            ),
+        )
+        .unwrap();
+        state.prompts.sync().await;
+        let recovered =
+            describe_workflow_form_cache_only_impl(&state, "mcp-review", false).unwrap();
+        assert_eq!(recovered.compatibility, FormCompatibility::Ok);
+    }
+
+    #[tokio::test]
+    async fn fresh_workflow_form_resolves_a_cold_mcp_prompt() {
+        let server = spawn_workflow_mcp_server(false).await;
+        let (tmp, state, emitter) = fresh_state_with_mock();
+        let state = state_with_mcp_server(
+            &tmp,
+            state,
+            &server.url,
+            Arc::new(switchboard_prompts::InMemorySecretStore::new()),
+        )
+        .with_workflows_dir(tmp.path().join("workflows"));
+        seed_workflow(
+            &state,
+            "mcp-review",
+            "name: mcp-review\ndescription: d\ninputs:\n  a: agent\nsteps:\n  - label: s\n    send:\n      to: \"{{ a }}\"\n      prompt: \"tiddly:review\"\n",
+        );
+
+        let form = describe_workflow_form_fresh_impl(&state, "mcp-review", false)
+            .await
+            .unwrap();
+
+        assert_eq!(form.compatibility, FormCompatibility::Ok);
+        assert_eq!(server.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            emitter
+                .snapshot()
+                .iter()
+                .filter(|(name, _)| name == PROMPTS_SYNCED_EVENT)
+                .count(),
+            1,
+            "a request-owned rebuild notifies global cache consumers once"
+        );
+        assert!(
+            form.derived_args
+                .iter()
+                .any(|argument| argument.name == "context" && argument.required)
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_form_overlapping_startup_sync_reuses_its_result() {
+        let server = spawn_workflow_mcp_server(true).await;
+        let (tmp, state, emitter) = fresh_state_with_mock();
+        let state = state_with_mcp_server(
+            &tmp,
+            state,
+            &server.url,
+            Arc::new(switchboard_prompts::InMemorySecretStore::new()),
+        )
+        .with_workflows_dir(tmp.path().join("workflows"));
+        seed_workflow(
+            &state,
+            "mcp-review",
+            "name: mcp-review\ndescription: d\ninputs:\n  a: agent\nsteps:\n  - label: s\n    send:\n      to: \"{{ a }}\"\n      prompt: \"tiddly:review\"\n",
+        );
+        let before = state.prompts.sync_generation();
+        let mut startup = Box::pin(state.prompts.sync());
+
+        tokio::select! {
+            permit = server.entered.acquire() => permit.unwrap().forget(),
+            _ = &mut startup => panic!("gated startup sync completed before release"),
+        }
+        let mut describe = Box::pin(describe_workflow_form_fresh_impl(
+            &state,
+            "mcp-review",
+            false,
+        ));
+        tokio::select! {
+            () = tokio::task::yield_now() => {}
+            result = &mut describe => panic!("workflow describe completed before startup sync: {result:?}"),
+        }
+        server.release.as_ref().unwrap().add_permits(1);
+        let (published, form) = tokio::join!(&mut startup, &mut describe);
+        assert!(matches!(
+            published,
+            switchboard_prompts::SyncOutcome::Published { .. }
+        ));
+        let form = form.unwrap();
+
+        assert_eq!(form.compatibility, FormCompatibility::Ok);
+        assert_eq!(server.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.prompts.sync_generation(), before + 1);
+        assert!(
+            emitter
+                .snapshot()
+                .iter()
+                .all(|(name, _)| name != PROMPTS_SYNCED_EVENT),
+            "the conditional caller must not duplicate the sync owner's notification"
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_owned_sync_settles_after_one_invalidated_attempt() {
+        let server = spawn_workflow_mcp_server(true).await;
+        let (tmp, state, _) = fresh_state_with_mock();
+        let state = state_with_mcp_server(
+            &tmp,
+            state,
+            &server.url,
+            Arc::new(switchboard_prompts::InMemorySecretStore::new()),
+        )
+        .with_workflows_dir(tmp.path().join("workflows"));
+        seed_workflow(
+            &state,
+            "mcp-review",
+            "name: mcp-review\ndescription: d\ninputs:\n  a: agent\nsteps:\n  - label: s\n    send:\n      to: \"{{ a }}\"\n      prompt: \"tiddly:review\"\n",
+        );
+        let mut describe = Box::pin(describe_workflow_form_fresh_impl(
+            &state,
+            "mcp-review",
+            false,
+        ));
+        tokio::select! {
+            permit = server.entered.acquire() => permit.unwrap().forget(),
+            result = &mut describe => panic!("gated workflow sync completed early: {result:?}"),
+        }
+
+        state.prompts.remove_mcp_provider("tiddly").unwrap();
+        server.release.as_ref().unwrap().add_permits(1);
+        let form = describe.await.unwrap();
+
+        assert!(matches!(
+            form.compatibility,
+            FormCompatibility::Unavailable { ref issues }
+                if issues.iter().any(|issue| issue.kind == AvailabilityIssueKind::NotConfigured)
+        ));
+        assert_eq!(server.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            state.prompts.sync_generation(),
+            1,
+            "the conditional request must not retry and publish after invalidation"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_workflow_forms_share_one_cache_rebuild() {
+        let server = spawn_workflow_mcp_server(false).await;
+        let (tmp, state, _) = fresh_state_with_mock();
+        let state = state_with_mcp_server(
+            &tmp,
+            state,
+            &server.url,
+            Arc::new(switchboard_prompts::InMemorySecretStore::new()),
+        )
+        .with_workflows_dir(tmp.path().join("workflows"));
+        for (workflow, prompt) in [("mcp-review", "review"), ("mcp-summary", "summarize")] {
+            seed_workflow(
+                &state,
+                workflow,
+                &format!(
+                    "name: {workflow}\ndescription: d\ninputs:\n  a: agent\nsteps:\n  - label: s\n    send:\n      to: \"{{{{ a }}}}\"\n      prompt: \"tiddly:{prompt}\"\n"
+                ),
+            );
+        }
+
+        let (review, summary) = tokio::join!(
+            describe_workflow_form_fresh_impl(&state, "mcp-review", false),
+            describe_workflow_form_fresh_impl(&state, "mcp-summary", false),
+        );
+
+        assert_eq!(review.unwrap().compatibility, FormCompatibility::Ok);
+        assert_eq!(summary.unwrap().compatibility, FormCompatibility::Ok);
+        assert_eq!(server.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.prompts.sync_generation(), 1);
+    }
+
+    #[tokio::test]
+    async fn workflow_resolution_uses_the_prior_completed_snapshot_during_a_rebuild() {
+        let server = spawn_workflow_mcp_server(true).await;
+        let (tmp, state, _) = fresh_state_with_mock();
+        let state = state_with_mcp_server(
+            &tmp,
+            state,
+            &server.url,
+            Arc::new(switchboard_prompts::InMemorySecretStore::new()),
+        )
+        .with_workflows_dir(tmp.path().join("workflows"));
+        init_directory_impl(&state, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let project = create_project_in_only_dir(&state, "proj");
+        set_active_project_impl(&state, project.id).unwrap();
+        create_agent_impl(&state, "alice", HarnessKind::ClaudeCode, None, None).unwrap();
+        seed_workflow(
+            &state,
+            "mcp-review",
+            "name: mcp-review\ndescription: d\ninputs:\n  a: agent\nsteps:\n  - label: s\n    send:\n      to: \"{{ a }}\"\n      prompt: \"tiddly:review\"\n",
+        );
+
+        // Let generation 1 complete, then hold generation 2 after its deliberate
+        // local-only live-cache publication.
+        server.release.as_ref().unwrap().add_permits(1);
+        state.prompts.sync().await;
+        server.entered.acquire().await.unwrap().forget();
+        let mut second_sync = Box::pin(state.prompts.sync());
+        tokio::select! {
+            permit = server.entered.acquire() => permit.unwrap().forget(),
+            _ = &mut second_sync => panic!("gated second sync completed before release"),
+        }
+
+        let form = describe_workflow_form_cache_only_impl(&state, "mcp-review", false).unwrap();
+        assert_eq!(form.compatibility, FormCompatibility::Ok);
+        assert!(
+            form.derived_args
+                .iter()
+                .any(|argument| argument.name == "context")
+        );
+        let invocation = inputs(vec![("a", text("alice")), ("context", text("review this"))]);
+        validate_workflow_invocation_impl(&state, project.id, "mcp-review", false, &invocation)
+            .unwrap();
+        assert_eq!(state.prompts.sync_generation(), 1);
+
+        let run_id = invoke_workflow_impl(
+            &state,
+            project.id,
+            "mcp-review",
+            false,
+            &invocation,
+            tmp.path(),
+        )
+        .unwrap();
+        let done = lock(&state.workflow_runs)
+            .get(&run_id)
+            .unwrap()
+            .done
+            .clone();
+        tokio::time::timeout(std::time::Duration::from_secs(2), done.notified())
+            .await
+            .expect("workflow run should settle");
+        assert_eq!(
+            *server
+                .rendered_contexts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec![Some("review this".to_owned())],
+            "execution must use the same MCP argument schema as invocation preflight"
+        );
+
+        server.release.as_ref().unwrap().add_permits(1);
+        second_sync.await;
+        assert_eq!(state.prompts.sync_generation(), 2);
+    }
+
+    #[tokio::test]
+    async fn provider_removal_invalidates_workflows_and_stale_sync_publication_immediately() {
+        let server = spawn_workflow_mcp_server(true).await;
+        let (tmp, state, emitter) = fresh_state_with_mock();
+        let state = state_with_mcp_server(
+            &tmp,
+            state,
+            &server.url,
+            Arc::new(switchboard_prompts::InMemorySecretStore::new()),
+        )
+        .with_workflows_dir(tmp.path().join("workflows"));
+        std::fs::write(
+            tmp.path().join("config.yaml"),
+            format!(
+                "mcp_providers:\n  - name: tiddly\n    transport:\n      type: http\n      url: {0}\n  - name: healthy\n    transport:\n      type: http\n      url: {0}\n",
+                server.url
+            ),
+        )
+        .unwrap();
+        init_directory_impl(&state, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let project = create_project_in_only_dir(&state, "proj");
+        set_active_project_impl(&state, project.id).unwrap();
+        create_agent_impl(&state, "alice", HarnessKind::ClaudeCode, None, None).unwrap();
+        seed_workflow(
+            &state,
+            "mcp-review",
+            "name: mcp-review\ndescription: d\ninputs:\n  a: agent\nsteps:\n  - label: s\n    send:\n      to: \"{{ a }}\"\n      prompt: \"tiddly:review\"\n",
+        );
+
+        server.release.as_ref().unwrap().add_permits(2);
+        state.prompts.sync().await;
+        for _ in 0..2 {
+            server.entered.acquire().await.unwrap().forget();
+        }
+        assert!(state.prompts.get("tiddly", "review").is_some());
+        assert!(state.prompts.get("healthy", "review").is_some());
+
+        let mut stale_sync = Box::pin(sync_prompts_and_notify(
+            state.prompts.clone(),
+            Arc::clone(&emitter) as Arc<dyn EventEmitter>,
+        ));
+        for _ in 0..2 {
+            tokio::select! {
+                permit = server.entered.acquire() => permit.unwrap().forget(),
+                _ = &mut stale_sync => panic!("gated sync completed before provider removal"),
+            }
+        }
+
+        remove_mcp_provider_impl(&state, "tiddly").unwrap();
+        assert!(state.prompts.get("tiddly", "review").is_none());
+        let snapshot = state.prompts.resolution_snapshot();
+        assert!(!snapshot.is_provider_configured("tiddly"));
+        assert!(snapshot.get("tiddly", "review").is_none());
+        let form = describe_workflow_form_cache_only_impl(&state, "mcp-review", false).unwrap();
+        assert!(matches!(
+            form.compatibility,
+            FormCompatibility::Unavailable { ref issues }
+                if issues.iter().any(|issue| issue.kind == AvailabilityIssueKind::NotConfigured)
+        ));
+        assert!(
+            invoke_workflow_impl(
+                &state,
+                project.id,
+                "mcp-review",
+                false,
+                &inputs(vec![("a", text("alice")), ("context", text("review this"))]),
+                tmp.path(),
+            )
+            .is_err(),
+            "a removed provider must be rejected before a workflow run is registered"
+        );
+
+        server.release.as_ref().unwrap().add_permits(2);
+        tokio::select! {
+            permit = server.entered.acquire() => permit.unwrap().forget(),
+            _ = &mut stale_sync => panic!("replacement sync completed before release"),
+        }
+        server.release.as_ref().unwrap().add_permits(1);
+        stale_sync.await;
+
+        assert!(state.prompts.get("tiddly", "review").is_none());
+        assert!(state.prompts.get("healthy", "review").is_some());
+        let snapshot = state.prompts.resolution_snapshot();
+        assert!(!snapshot.is_provider_configured("tiddly"));
+        assert!(snapshot.get("tiddly", "review").is_none());
+        assert!(snapshot.get("healthy", "review").is_some());
+        assert_eq!(server.calls.load(Ordering::SeqCst), 5);
+        assert_eq!(
+            emitter
+                .snapshot()
+                .iter()
+                .filter(|(name, _)| name == PROMPTS_SYNCED_EVENT)
+                .count(),
+            1,
+            "the in-flight owner settles the latest revision; the queued mutation sync coalesces"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn workflow_settlement_never_rereads_a_blocked_credential_store() {
+        use switchboard_prompts::{SecretStore, SecretStoreError};
+
+        struct GatedStore {
+            reads: Arc<AtomicUsize>,
+            entered: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+            release: Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+        impl SecretStore for GatedStore {
+            fn get(&self, _: &str) -> Result<Option<String>, SecretStoreError> {
+                self.reads.fetch_add(1, Ordering::SeqCst);
+                if let Some(entered) = self
+                    .entered
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                {
+                    let _ = entered.send(());
+                }
+                let _ = self
+                    .release
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .recv_timeout(std::time::Duration::from_secs(5));
+                Ok(None)
+            }
+            fn set(&self, _: &str, _: &str) -> Result<(), SecretStoreError> {
+                Ok(())
+            }
+            fn delete(&self, _: &str) -> Result<(), SecretStoreError> {
+                Ok(())
+            }
+        }
+        struct ReleaseOnDrop(Option<std::sync::mpsc::Sender<()>>);
+        impl Drop for ReleaseOnDrop {
+            fn drop(&mut self) {
+                if let Some(release) = self.0.take() {
+                    let _ = release.send(());
+                }
+            }
+        }
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release = ReleaseOnDrop(Some(release_tx));
+        let reads = Arc::new(AtomicUsize::new(0));
+        let (tmp, state, _) = fresh_state_with_mock();
+        let prompts_dir = tmp.path().join("prompts");
+        std::fs::create_dir_all(&prompts_dir).unwrap();
+        let config_path = tmp.path().join("config.yaml");
+        std::fs::write(
+            &config_path,
+            "mcp_providers:\n  - name: tiddly\n    transport:\n      type: http\n      url: http://127.0.0.1:1/mcp\n",
+        )
+        .unwrap();
+        let prompts = switchboard_prompts::PromptService::new(
+            config_path,
+            prompts_dir,
+            None,
+            Arc::new(GatedStore {
+                reads: Arc::clone(&reads),
+                entered: Mutex::new(Some(entered_tx)),
+                release: Mutex::new(release_rx),
+            }),
+        )
+        .with_provider_timeout(std::time::Duration::from_millis(50));
+        let state = state
+            .with_prompts(prompts)
+            .with_workflows_dir(tmp.path().join("workflows"));
+        seed_workflow(
+            &state,
+            "blocked-store",
+            "name: blocked-store\ndescription: d\ninputs:\n  a: agent\nsteps:\n  - label: s\n    send:\n      to: \"{{ a }}\"\n      prompt: \"tiddly:review\"\n",
+        );
+        let mut describe = Box::pin(describe_workflow_form_fresh_impl(
+            &state,
+            "blocked-store",
+            false,
+        ));
+
+        tokio::select! {
+            entered = entered_rx => entered.unwrap(),
+            result = &mut describe => panic!("describe completed before the credential read entered: {result:?}"),
+        }
+        let unrelated = tokio::spawn(async {
+            tokio::task::yield_now().await;
+            7
+        });
+        assert_eq!(unrelated.await.unwrap(), 7);
+        let form = tokio::time::timeout(std::time::Duration::from_secs(1), &mut describe)
+            .await
+            .expect("the provider timeout must settle workflow resolution")
+            .unwrap();
+
+        assert!(matches!(
+            form.compatibility,
+            FormCompatibility::Unavailable { .. }
+        ));
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+        drop(release);
     }
 
     #[tokio::test]

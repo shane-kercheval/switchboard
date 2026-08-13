@@ -4154,6 +4154,7 @@ name = "switchboard-app"
 version = "0.0.1"
 dependencies = [
  "async-trait",
+ "axum",
  "chrono",
  "directories",
  "futures",
@@ -4161,6 +4162,7 @@ dependencies = [
  "keepawake",
  "keyring",
  "mac-usernotifications",
+ "rmcp",
  "serde",
  "serde_json",
  "serde_norway",

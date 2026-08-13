@@ -23,15 +23,16 @@ vi.mock("$lib/native", () => ({
   copyText: (text: string) => copyTextMock(text),
 }));
 
-const listeners = new Map<string, (e: { payload: NormalizedEvent }) => void>();
+const listeners = new Map<string, (e: { payload: unknown }) => void>();
 /// Default: record the callback and succeed. A test can override this to make a
 /// specific channel's subscription fail.
-const listenMock = vi.fn(async (name: string, cb: (e: { payload: NormalizedEvent }) => void) => {
+const listenMock = vi.fn(async (name: string, cb: (e: { payload: unknown }) => void) => {
   listeners.set(name, cb);
   return vi.fn();
 });
+type MockUnlisten = Awaited<ReturnType<typeof listenMock>>;
 vi.mock("@tauri-apps/api/event", () => ({
-  listen: (name: string, cb: (e: { payload: NormalizedEvent }) => void) => listenMock(name, cb),
+  listen: (name: string, cb: (e: { payload: unknown }) => void) => listenMock(name, cb),
 }));
 
 type DragDropPayload =
@@ -508,6 +509,68 @@ describe("ComposeBar", () => {
 
     expect(onConfigurePrompts).toHaveBeenCalledOnce();
     expect(screen.queryByTestId("prompt-menu")).toBeNull();
+  });
+
+  it("syncs and refreshes prompts in place from the prompt menu", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    let listCalls = 0;
+    let syncCalls = 0;
+    let releaseSync!: () => void;
+    const syncGate = new Promise<void>((resolve) => {
+      releaseSync = resolve;
+    });
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "list_prompts") {
+        listCalls += 1;
+        return listCalls === 1 ? [REVIEW] : [REVIEW, SUMMARY];
+      }
+      if (cmd === "sync_prompts") {
+        syncCalls += 1;
+        await syncGate;
+        return null;
+      }
+      return null;
+    });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await fireEvent.click(screen.getByTestId("compose-prompt-button"));
+    await screen.findByTestId("prompt-option-local:review");
+
+    const sync = screen.getByTestId("prompt-menu-sync");
+    await fireEvent.click(sync);
+    await waitFor(() => expect(sync).toHaveTextContent("Syncing…"));
+    expect(sync).toBeDisabled();
+    await fireEvent.click(sync);
+    expect(syncCalls).toBe(1);
+
+    releaseSync();
+    await screen.findByTestId("prompt-option-tiddly:summary");
+    expect(screen.getByTestId("prompt-menu")).toBeInTheDocument();
+    expect(screen.getByTestId("prompt-menu-sync")).toBeEnabled();
+    expect(listCalls).toBe(2);
+  });
+
+  it("keeps prompt-menu sync retryable and reports a failed rebuild", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "list_prompts") return [REVIEW];
+      if (cmd === "sync_prompts") throw new Error("provider timed out");
+      return null;
+    });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await fireEvent.click(screen.getByTestId("compose-prompt-button"));
+    await fireEvent.click(await screen.findByTestId("prompt-menu-sync"));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("compose-send-error")).toHaveTextContent(
+        "Couldn't sync prompts: provider timed out",
+      ),
+    );
+    expect(screen.getByTestId("prompt-menu")).toBeInTheDocument();
+    expect(screen.getByTestId("prompt-menu-sync")).toBeEnabled();
   });
 
   it("copies the workflow-authoring prompt from the workflow menu", async () => {
@@ -2073,11 +2136,19 @@ function mockPromptBackend(
     prompts?: Prompt[];
     render?: () => Promise<unknown>;
     signIn?: () => Promise<unknown>;
+    resolve?: () => Promise<unknown>;
   } = {},
 ): void {
   invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
     if (cmd === "search_project_files") return [];
     if (cmd === "list_prompts") return opts.prompts ?? [];
+    if (cmd === "resolve_saved_prompt" || cmd === "resolve_saved_prompt_fresh") {
+      if (opts.resolve) return await opts.resolve();
+      const prompt = (opts.prompts ?? [])[0];
+      return prompt
+        ? { state: "available", prompt, generation: 0 }
+        : { state: "confirmed_missing", generation: 0 };
+    }
     if (cmd === "render_prompt")
       return opts.render ? await opts.render() : { kind: "rendered", text: "RENDERED" };
     if (cmd === "sign_in_mcp_provider") return opts.signIn ? await opts.signIn() : null;
@@ -2224,6 +2295,13 @@ describe("prompt-mode fork", () => {
           return { path: `/proj/.switchboard/attachments/uuid__${name}`, original_name: name };
         }
         if (cmd === "list_prompts") return [SUMMARY, REVIEW];
+        if (cmd === "resolve_saved_prompt" || cmd === "resolve_saved_prompt_fresh") {
+          return {
+            state: "available",
+            prompt: args?.name === REVIEW.name ? REVIEW : SUMMARY,
+            generation: 0,
+          };
+        }
         if (cmd === "render_prompt")
           return opts.render ? await opts.render() : { kind: "rendered", text: "RENDERED" };
         if (cmd === "sign_in_mcp_provider") return opts.signIn ? await opts.signIn() : null;
@@ -3849,33 +3927,200 @@ describe("ComposeBar prompt mode", () => {
     store.flush();
     store._testing.reloadFromStorage();
 
-    let promptList: Prompt[] = []; // cache cold at mount (MCP not synced yet)
+    let resolution: unknown = { state: "temporarily_unavailable", generation: 0 };
     invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
       if (cmd === "search_project_files") return [];
-      if (cmd === "list_prompts") return promptList;
+      if (cmd === "resolve_saved_prompt") return resolution;
       return null;
     });
 
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
 
-    // Cold: shows the restoring placeholder (not plain), and must NOT clobber the
-    // saved snapshot in storage.
-    await waitFor(() => expect(screen.getByTestId("compose-restoring")).toBeInTheDocument());
+    // Cold: shows a recoverable restore failure (not plain), and must NOT clobber
+    // the saved snapshot in storage.
+    await waitFor(() =>
+      expect(screen.getByTestId("compose-prompt-restore-failed")).toBeInTheDocument(),
+    );
     expect(screen.queryByTestId("prompt-composer")).toBeNull();
     expect(store.getCompose(PROJECT_ID).content).toMatchObject({ kind: "prompt", name: "review" });
 
     // Sync completes with the prompt present → restore with args intact.
-    promptList = [REVIEW];
-    listeners.get("prompts:synced")?.({ payload: null as unknown as NormalizedEvent });
+    const callsBeforeEvent = invokeMock.mock.calls.filter(
+      ([cmd]) => cmd === "resolve_saved_prompt",
+    ).length;
+    resolution = { state: "available", prompt: REVIEW, generation: 1 };
+    listeners.get("prompts:changed")?.({ payload: { generation: 1 } });
 
     await waitFor(() => expect(screen.getByTestId("prompt-composer")).toBeInTheDocument());
+    expect(invokeMock.mock.calls.filter(([cmd]) => cmd === "resolve_saved_prompt")).toHaveLength(
+      callsBeforeEvent + 1,
+    );
     expect((screen.getByTestId("prompt-arg-focus") as HTMLTextAreaElement).value).toBe(
       "saved focus",
     );
     expect((screen.getByTestId("prompt-appended") as HTMLTextAreaElement).value).toBe("tail");
   });
 
-  it("downgrades a saved prompt draft to plain (carrying appended text) once a sync proves it gone", async () => {
+  it("settles saved-prompt restoration when event registration never settles", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    const store = await loadComposeStore();
+    store.setContent(PROJECT_ID, {
+      kind: "prompt",
+      provider: "tiddly",
+      name: "summary",
+      args: {},
+      appendedText: "",
+    });
+    store.flush();
+    store._testing.reloadFromStorage();
+
+    listenMock.mockImplementation(() => new Promise<MockUnlisten>(() => undefined));
+    mockPromptBackend({
+      resolve: async () => ({ state: "temporarily_unavailable", generation: 0 }),
+    });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+
+    await waitFor(() =>
+      expect(screen.getByTestId("compose-prompt-restore-failed")).toBeInTheDocument(),
+    );
+    expect(
+      listenMock.mock.calls.map(([name]) => name).filter((name) => name.startsWith("prompts:")),
+    ).toEqual(["prompts:changed"]);
+    expect(invokeMock.mock.calls.filter(([cmd]) => cmd === "resolve_saved_prompt")).toHaveLength(1);
+  });
+
+  it("coalesces publication during registration into one post-registration read", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    const store = await loadComposeStore();
+    store.setContent(PROJECT_ID, {
+      kind: "prompt",
+      provider: "tiddly",
+      name: "summary",
+      args: {},
+      appendedText: "tail",
+    });
+    store.flush();
+    store._testing.reloadFromStorage();
+
+    let finishRegistration: ((unlisten: MockUnlisten) => void) | undefined;
+    listenMock.mockImplementation((name: string, cb) => {
+      listeners.set(name, cb);
+      return new Promise<MockUnlisten>((resolve) => (finishRegistration = resolve));
+    });
+    let resolution: unknown = { state: "temporarily_unavailable", generation: 0 };
+    mockPromptBackend({ resolve: async () => resolution });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await waitFor(() =>
+      expect(screen.getByTestId("compose-prompt-restore-failed")).toBeInTheDocument(),
+    );
+
+    resolution = { state: "available", prompt: SUMMARY, generation: 1 };
+    listeners.get("prompts:changed")?.({ payload: { generation: 1 } });
+    finishRegistration?.(vi.fn());
+
+    await waitFor(() => expect(screen.getByTestId("prompt-composer")).toBeInTheDocument());
+    expect(invokeMock.mock.calls.filter(([cmd]) => cmd === "resolve_saved_prompt")).toHaveLength(2);
+  });
+
+  it("cleans up a prompt subscription that registers after unmount", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    const store = await loadComposeStore();
+    store.setContent(PROJECT_ID, {
+      kind: "prompt",
+      provider: "tiddly",
+      name: "summary",
+      args: {},
+      appendedText: "",
+    });
+    store.flush();
+    store._testing.reloadFromStorage();
+
+    let finishRegistration: ((unlisten: MockUnlisten) => void) | undefined;
+    listenMock.mockImplementation((name: string, cb) => {
+      listeners.set(name, cb);
+      return new Promise<MockUnlisten>((resolve) => (finishRegistration = resolve));
+    });
+    mockPromptBackend({
+      resolve: async () => ({ state: "available", prompt: SUMMARY, generation: 1 }),
+    });
+    const { unmount } = render(ComposeBar, {
+      props: { projectId: PROJECT_ID, agents: [AGENT_A] },
+    });
+    await waitFor(() => expect(finishRegistration).toBeDefined());
+    await waitFor(() =>
+      expect(invokeMock.mock.calls.filter(([cmd]) => cmd === "resolve_saved_prompt")).toHaveLength(
+        1,
+      ),
+    );
+
+    unmount();
+    const unlistenChanged = vi.fn();
+    finishRegistration?.(unlistenChanged);
+
+    await waitFor(() => expect(unlistenChanged).toHaveBeenCalledOnce());
+    expect(invokeMock.mock.calls.filter(([cmd]) => cmd === "resolve_saved_prompt")).toHaveLength(1);
+  });
+
+  it("settles restoration when prompt listener registration rejects", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    const store = await loadComposeStore();
+    store.setContent(PROJECT_ID, {
+      kind: "prompt",
+      provider: "tiddly",
+      name: "summary",
+      args: {},
+      appendedText: "",
+    });
+    store.flush();
+    store._testing.reloadFromStorage();
+
+    listenMock.mockRejectedValue(new Error("listener unavailable"));
+    mockPromptBackend({
+      resolve: async () => ({ state: "temporarily_unavailable", generation: 1 }),
+    });
+
+    render(ComposeBar, {
+      props: { projectId: PROJECT_ID, agents: [AGENT_A] },
+    });
+    await waitFor(() =>
+      expect(screen.getByTestId("compose-prompt-restore-failed")).toBeInTheDocument(),
+    );
+  });
+
+  it("settles restoration when prompt listener creation throws synchronously", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    const store = await loadComposeStore();
+    store.setContent(PROJECT_ID, {
+      kind: "prompt",
+      provider: "tiddly",
+      name: "summary",
+      args: {},
+      appendedText: "",
+    });
+    store.flush();
+    store._testing.reloadFromStorage();
+
+    listenMock.mockImplementation(() => {
+      throw new Error("native listen failed");
+    });
+    mockPromptBackend({
+      resolve: async () => ({ state: "temporarily_unavailable", generation: 1 }),
+    });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await waitFor(() =>
+      expect(screen.getByTestId("compose-prompt-restore-failed")).toBeInTheDocument(),
+    );
+  });
+
+  it("preserves a confirmed-missing prompt draft until the user starts over", async () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);
     const store = await loadComposeStore();
@@ -3888,17 +4133,146 @@ describe("ComposeBar prompt mode", () => {
     });
     store.flush();
     store._testing.reloadFromStorage();
-    mockPromptBackend({ prompts: [] }); // prompt never appears, even after sync
+    let resolution: unknown = { state: "temporarily_unavailable", generation: 0 };
+    mockPromptBackend({ resolve: async () => resolution });
 
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
 
-    await waitFor(() => expect(screen.getByTestId("compose-restoring")).toBeInTheDocument());
-    listeners.get("prompts:synced")?.({ payload: null as unknown as NormalizedEvent });
+    await waitFor(() =>
+      expect(screen.getByTestId("compose-prompt-restore-failed")).toBeInTheDocument(),
+    );
+    listeners.get("prompts:changed")?.({ payload: { generation: 1 } });
+    await waitFor(() =>
+      expect(screen.getByTestId("compose-prompt-restore-failed")).toBeInTheDocument(),
+    );
+    expect(store.getCompose(PROJECT_ID).content).toMatchObject({ kind: "prompt", name: "ghost" });
 
-    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
+    resolution = { state: "confirmed_missing", generation: 2 };
+    listeners.get("prompts:changed")?.({ payload: { generation: 2 } });
+
+    await waitFor(() =>
+      expect(
+        screen.getByText("This prompt is no longer available from its provider."),
+      ).toBeInTheDocument(),
+    );
+    expect(store.getCompose(PROJECT_ID).content).toMatchObject({
+      kind: "prompt",
+      name: "ghost",
+      args: { focus: "x" },
+    });
+    await fireEvent.click(screen.getByTestId("prompt-restore-discard"));
+    expect(screen.getByTestId("compose-textarea")).toBeInTheDocument();
     expect((screen.getByTestId("compose-textarea") as HTMLTextAreaElement).value).toBe(
       "leftover text",
     );
+  });
+
+  it("preserves a saved MCP prompt draft through provider failure and restores it later", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    const store = await loadComposeStore();
+    store.setContent(PROJECT_ID, {
+      kind: "prompt",
+      provider: "tiddly",
+      name: "summary",
+      args: { focus: "keep this" },
+      appendedText: "tail",
+    });
+    store.flush();
+    store._testing.reloadFromStorage();
+    let resolution: unknown = { state: "temporarily_unavailable", generation: 1 };
+    mockPromptBackend({ resolve: async () => resolution });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await waitFor(() => screen.getByTestId("compose-prompt-restore-failed"));
+    expect(store.getCompose(PROJECT_ID).content).toMatchObject({
+      kind: "prompt",
+      provider: "tiddly",
+      name: "summary",
+      args: { focus: "keep this" },
+    });
+
+    resolution = {
+      state: "available",
+      prompt: { ...SUMMARY, arguments: REVIEW.arguments },
+      generation: 2,
+    };
+    await fireEvent.click(screen.getByTestId("prompt-restore-retry"));
+    await waitFor(() => screen.getByTestId("prompt-composer"));
+    expect(invokeMock).toHaveBeenCalledWith("resolve_saved_prompt_fresh", {
+      provider: "tiddly",
+      name: "summary",
+    });
+    expect(screen.getByTestId("prompt-arg-focus")).toHaveValue("keep this");
+  });
+
+  it("lets the user leave an unavailable saved prompt without losing appended text", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    const store = await loadComposeStore();
+    store.setContent(PROJECT_ID, {
+      kind: "prompt",
+      provider: "tiddly",
+      name: "summary",
+      args: { focus: "structured value" },
+      appendedText: "keep this tail",
+    });
+    store.flush();
+    store._testing.reloadFromStorage();
+    mockPromptBackend({
+      resolve: async () => ({ state: "temporarily_unavailable", generation: 1 }),
+    });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await screen.findByTestId("compose-prompt-restore-failed");
+    await fireEvent.click(screen.getByTestId("prompt-restore-discard"));
+
+    expect(screen.getByTestId("compose-textarea")).toHaveValue("keep this tail");
+    await waitFor(() =>
+      expect(store.getCompose(PROJECT_ID).content).toEqual({
+        kind: "plain",
+        draft: "keep this tail",
+      }),
+    );
+  });
+
+  it("does not discard a saved draft from a restoration reply older than auth invalidation", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    const store = await loadComposeStore();
+    store.setContent(PROJECT_ID, {
+      kind: "prompt",
+      provider: "tiddly",
+      name: "summary",
+      args: { focus: "keep this" },
+      appendedText: "tail",
+    });
+    store.flush();
+    store._testing.reloadFromStorage();
+    let calls = 0;
+    let resolveOld!: (value: unknown) => void;
+    mockPromptBackend({
+      resolve: async () => {
+        calls++;
+        if (calls === 1) return { state: "temporarily_unavailable", generation: 0 };
+        if (calls === 2) return await new Promise((resolve) => (resolveOld = resolve));
+        return { state: "temporarily_unavailable", generation: 2 };
+      },
+    });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await waitFor(() => expect(calls).toBe(2));
+    listeners.get("prompts:changed")?.({ payload: { generation: 2 } });
+    await waitFor(() => expect(calls).toBe(3));
+    resolveOld({ state: "confirmed_missing", generation: 1 });
+    await tick();
+
+    expect(screen.getByTestId("compose-prompt-restore-failed")).toBeInTheDocument();
+    expect(store.getCompose(PROJECT_ID).content).toMatchObject({
+      kind: "prompt",
+      name: "summary",
+      args: { focus: "keep this" },
+    });
   });
 
   it("keeps prompt removal locked while the send render is in flight", async () => {
@@ -5731,6 +6105,192 @@ describe("ComposeBar — cross-agent forward", () => {
     expect(screen.queryByTestId("compose-workflow-load-failed")).toBeNull();
   });
 
+  it("signs in from an unavailable workflow and refreshes its form exactly once", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    const WORKFLOW = {
+      name: "oauth-workflow",
+      is_builtin: true,
+      description: "d",
+      inputs: [],
+      invocable: true,
+      parse_error: null,
+    };
+    const unavailable = {
+      ...WORKFLOW,
+      steps: [],
+      derived_args: [],
+      compatibility: {
+        state: "unavailable",
+        issues: [
+          {
+            prompt: "tiddly:review",
+            provider: "tiddly",
+            kind: "needs_auth",
+            message: null,
+          },
+        ],
+      },
+    };
+    const available = {
+      ...WORKFLOW,
+      steps: [],
+      derived_args: [],
+      compatibility: { state: "ok" },
+    };
+    let describeCalls = 0;
+    let releaseSignIn!: () => void;
+    const signInGate = new Promise<void>((resolve) => {
+      releaseSignIn = resolve;
+    });
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "list_workflows") return [WORKFLOW];
+      if (cmd === "list_prompts") return [];
+      if (cmd === "describe_workflow_form") {
+        describeCalls += 1;
+        return describeCalls === 1 ? unavailable : available;
+      }
+      if (cmd === "sign_in_mcp_provider") return await signInGate;
+      return null;
+    });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await fireEvent.click(screen.getByTestId("compose-workflow-button"));
+    await fireEvent.click(await screen.findByTestId("workflow-option-builtin:oauth-workflow"));
+    const signIn = await screen.findByTestId("workflow-prompt-sign-in-tiddly");
+
+    await fireEvent.click(signIn);
+    await waitFor(() => expect(signIn).toHaveTextContent("Waiting for tiddly sign-in"));
+    expect(signIn).toBeDisabled();
+    expect(invokeMock.mock.calls.filter(([cmd]) => cmd === "sign_in_mcp_provider")).toHaveLength(1);
+    await fireEvent.click(signIn);
+    expect(invokeMock.mock.calls.filter(([cmd]) => cmd === "sign_in_mcp_provider")).toHaveLength(1);
+
+    releaseSignIn();
+    await waitFor(() => expect(screen.queryByTestId("workflow-prompt-unavailable")).toBeNull());
+    expect(describeCalls).toBe(2);
+    expect(screen.getByTestId("workflow-invoke-button")).toBeEnabled();
+  });
+
+  it("does not refresh or surface an error after unmounting during workflow sign-in", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    const WORKFLOW = {
+      name: "oauth-workflow",
+      is_builtin: true,
+      description: "d",
+      inputs: [],
+      invocable: true,
+      parse_error: null,
+    };
+    const unavailable = {
+      ...WORKFLOW,
+      steps: [],
+      derived_args: [],
+      compatibility: {
+        state: "unavailable",
+        issues: [
+          {
+            prompt: "tiddly:review",
+            provider: "tiddly",
+            kind: "needs_auth",
+            message: null,
+          },
+        ],
+      },
+    };
+    let describeCalls = 0;
+    let releaseSignIn!: () => void;
+    let markSignInComplete!: () => void;
+    const signInGate = new Promise<void>((resolve) => {
+      releaseSignIn = resolve;
+    });
+    const signInComplete = new Promise<void>((resolve) => {
+      markSignInComplete = resolve;
+    });
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "list_workflows") return [WORKFLOW];
+      if (cmd === "list_prompts") return [];
+      if (cmd === "describe_workflow_form") {
+        describeCalls += 1;
+        return unavailable;
+      }
+      if (cmd === "sign_in_mcp_provider") {
+        await signInGate;
+        markSignInComplete();
+        return null;
+      }
+      return null;
+    });
+
+    const view = render(ComposeBar, {
+      props: { projectId: PROJECT_ID, agents: [AGENT_A] },
+    });
+    await fireEvent.click(screen.getByTestId("compose-workflow-button"));
+    await fireEvent.click(await screen.findByTestId("workflow-option-builtin:oauth-workflow"));
+    await fireEvent.click(await screen.findByTestId("workflow-prompt-sign-in-tiddly"));
+    await waitFor(() =>
+      expect(invokeMock.mock.calls.filter(([cmd]) => cmd === "sign_in_mcp_provider")).toHaveLength(
+        1,
+      ),
+    );
+
+    view.unmount();
+    releaseSignIn();
+    await signInComplete;
+    await Promise.resolve();
+    expect(describeCalls).toBe(1);
+  });
+
+  it("keeps an unavailable workflow retryable when browser sign-in fails", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    const WORKFLOW = {
+      name: "oauth-workflow",
+      is_builtin: true,
+      description: "d",
+      inputs: [],
+      invocable: true,
+      parse_error: null,
+    };
+    const unavailable = {
+      ...WORKFLOW,
+      steps: [],
+      derived_args: [],
+      compatibility: {
+        state: "unavailable",
+        issues: [
+          {
+            prompt: "tiddly:review",
+            provider: "tiddly",
+            kind: "needs_auth",
+            message: null,
+          },
+        ],
+      },
+    };
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "list_workflows") return [WORKFLOW];
+      if (cmd === "list_prompts") return [];
+      if (cmd === "describe_workflow_form") return unavailable;
+      if (cmd === "sign_in_mcp_provider") throw new Error("access_denied");
+      return null;
+    });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await fireEvent.click(screen.getByTestId("compose-workflow-button"));
+    await fireEvent.click(await screen.findByTestId("workflow-option-builtin:oauth-workflow"));
+    await fireEvent.click(await screen.findByTestId("workflow-prompt-sign-in-tiddly"));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("compose-send-error")).toHaveTextContent(
+        "Couldn't sign in to tiddly: access_denied",
+      ),
+    );
+    expect(screen.getByTestId("workflow-prompt-unavailable")).toBeInTheDocument();
+    expect(screen.getByTestId("workflow-prompt-sign-in-tiddly")).toBeEnabled();
+  });
+
   it("enters workflow mode, resolves the form, and invokes with declared + derived values", async () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);
@@ -5937,7 +6497,7 @@ describe("ComposeBar — cross-agent forward", () => {
     });
   });
 
-  it("resolves an unresolved workflow form on prompts:synced without a re-pick", async () => {
+  it("uses the authoritative workflow-form reply without waiting for prompts:synced", async () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);
     const WORKFLOW = {
@@ -5957,16 +6517,14 @@ describe("ComposeBar — cross-agent forward", () => {
       steps: [],
       derived_args: [] as unknown[],
     };
-    // The first describe lands while the MCP prompt is still cold (unresolved);
-    // after a sync the same call resolves to ok.
-    let synced = false;
     invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
       if (cmd === "list_workflows") return [WORKFLOW];
       if (cmd === "list_prompts") return [];
       if (cmd === "describe_workflow_form") {
-        return synced
-          ? { ...BASE, compatibility: { state: "ok" } }
-          : { ...BASE, compatibility: { state: "unresolved", prompts: ["tiddly:x"] } };
+        // The backend owns cold-cache recovery now: it conditionally syncs before
+        // returning, so this reply is settled even if the global startup event
+        // fired before the component subscribed.
+        return { ...BASE, compatibility: { state: "ok" } };
       }
       return null;
     });
@@ -5976,18 +6534,13 @@ describe("ComposeBar — cross-agent forward", () => {
     await waitFor(() => screen.getByTestId("workflow-option-dir:mcp-flow"));
     await fireEvent.click(screen.getByTestId("workflow-option-dir:mcp-flow"));
 
-    // Pending affordance shown; the agent field is withheld until resolution.
-    await waitFor(() => screen.getByTestId("workflow-resolving"));
-    expect(screen.queryByTestId("workflow-agent-worker-alice")).toBeNull();
-
-    // A completed sync re-fetches the descriptor, which now resolves → fields render.
-    synced = true;
-    listeners.get("prompts:synced")?.({ payload: null as unknown as NormalizedEvent });
+    // No prompts:synced event is fired after the pick. The command reply alone
+    // resolves the form, so a missed startup event cannot strand the spinner.
     await waitFor(() => screen.getByTestId("workflow-agent-worker-alice"));
     expect(screen.queryByTestId("workflow-resolving")).toBeNull();
   });
 
-  it("escalates a still-unresolved workflow to a not-found error after a sync settles", async () => {
+  it("treats a still-unresolved authoritative reply as settled instead of spinning", async () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);
     const WORKFLOW = {
@@ -6023,20 +6576,14 @@ describe("ComposeBar — cross-agent forward", () => {
     await waitFor(() => screen.getByTestId("workflow-option-dir:mcp-gone"));
     await fireEvent.click(screen.getByTestId("workflow-option-dir:mcp-gone"));
 
-    // Before a sync settles → pending spinner, not an error.
-    await waitFor(() => screen.getByTestId("workflow-resolving"));
-    expect(screen.queryByTestId("workflow-prompt-missing")).toBeNull();
-
-    // After a sync settles and it's still unresolved → blocking not-found error.
-    listeners.get("prompts:synced")?.({ payload: null as unknown as NormalizedEvent });
+    // This fallback protects against an older backend or an unexpected unresolved
+    // reply: a completed describe call is treated as settled, never an unbounded
+    // wait for a future global event.
     await waitFor(() => screen.getByTestId("workflow-prompt-missing"));
     expect(screen.queryByTestId("workflow-resolving")).toBeNull();
   });
 
-  it("drops a stale workflow-form reply that resolves out of order", async () => {
-    // The generation-token guard: an older describe reply that lands after a newer
-    // one must not overwrite the form. Drive two re-fetches whose replies resolve
-    // in reverse order and assert the newer (ok) wins, not the older (unresolved).
+  it("coalesces sync events during a fresh describe into one cache-only refresh", async () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);
     const WORKFLOW = {
@@ -6054,14 +6601,31 @@ describe("ComposeBar — cross-agent forward", () => {
       invocable: true,
       inputs: WORKFLOW.inputs,
       steps: [],
-      derived_args: [] as unknown[],
     };
-    const pending: Array<(d: unknown) => void> = [];
+    let resolveDescribe: ((descriptor: unknown) => void) | undefined;
+    let freshCalls = 0;
+    let cacheOnlyCalls = 0;
     invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
       if (cmd === "list_workflows") return [WORKFLOW];
       if (cmd === "list_prompts") return [];
       if (cmd === "describe_workflow_form") {
-        return new Promise((resolve) => pending.push(resolve));
+        freshCalls++;
+        return new Promise((resolve) => (resolveDescribe = resolve));
+      }
+      if (cmd === "refresh_workflow_form_from_cache") {
+        cacheOnlyCalls++;
+        return {
+          ...base,
+          derived_args: [
+            {
+              name: "new",
+              required: false,
+              description: null,
+              prompts: ["tiddly:review"],
+            },
+          ],
+          compatibility: { state: "ok" },
+        };
       }
       return null;
     });
@@ -6069,21 +6633,298 @@ describe("ComposeBar — cross-agent forward", () => {
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
     await fireEvent.click(screen.getByTestId("compose-workflow-button"));
     await waitFor(() => screen.getByTestId("workflow-option-dir:race"));
-    await fireEvent.click(screen.getByTestId("workflow-option-dir:race")); // fetch #1 (gen 1)
-    // Two prompt syncs trigger two more re-fetches (gen 2, then gen 3).
-    listeners.get("prompts:synced")?.({ payload: null as unknown as NormalizedEvent });
-    listeners.get("prompts:synced")?.({ payload: null as unknown as NormalizedEvent });
-    await waitFor(() => expect(pending.length).toBe(3));
+    await fireEvent.click(screen.getByTestId("workflow-option-dir:race"));
+    await waitFor(() => expect(freshCalls).toBe(1));
 
-    // Resolve the NEWEST (gen 3) as ok, then an older (gen 1) as unresolved.
-    pending[2]?.({ ...base, compatibility: { state: "ok" } });
+    // Multiple events during one fresh request coalesce. The fresh cache hit may
+    // represent the preceding completed generation, so one cache-only pass must
+    // apply the newer schema after the authoritative response settles.
+    listeners.get("prompts:changed")?.({ payload: { generation: 1 } });
+    listeners.get("prompts:changed")?.({ payload: { generation: 2 } });
+    await tick();
+    expect(freshCalls).toBe(1);
+    expect(cacheOnlyCalls).toBe(0);
+
+    resolveDescribe?.({
+      ...base,
+      derived_args: [
+        {
+          name: "old",
+          required: false,
+          description: null,
+          prompts: ["tiddly:review"],
+        },
+      ],
+      compatibility: { state: "ok" },
+    });
+    await waitFor(() => screen.getByTestId("workflow-arg-input-new"));
+    expect(cacheOnlyCalls).toBe(1);
+    expect(screen.queryByTestId("workflow-arg-input-old")).toBeNull();
+  });
+
+  it("uses only cache reclassification after an independent sync", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    const WORKFLOW = {
+      name: "cache-refresh",
+      is_builtin: false,
+      description: "d",
+      inputs: [{ name: "worker", ty: "agent", optional: false, description: null }],
+      invocable: true,
+      parse_error: null,
+    };
+    const base = {
+      name: WORKFLOW.name,
+      description: "d",
+      is_builtin: false,
+      invocable: true,
+      inputs: WORKFLOW.inputs,
+      steps: [],
+      derived_args: [] as unknown[],
+    };
+    let freshCalls = 0;
+    let cacheOnlyCalls = 0;
+    const cacheReplies: Array<(descriptor: unknown) => void> = [];
+    const unavailable = {
+      ...base,
+      compatibility: {
+        state: "unavailable",
+        issues: [
+          {
+            prompt: "tiddly:review",
+            provider: "tiddly",
+            kind: "provider_error",
+            message: "timed out",
+          },
+        ],
+      },
+    };
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "list_workflows") return [WORKFLOW];
+      if (cmd === "list_prompts") return [];
+      if (cmd === "describe_workflow_form") {
+        freshCalls++;
+        return unavailable;
+      }
+      if (cmd === "refresh_workflow_form_from_cache") {
+        cacheOnlyCalls++;
+        return new Promise((resolve) => cacheReplies.push(resolve));
+      }
+      return null;
+    });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await fireEvent.click(screen.getByTestId("compose-workflow-button"));
+    await waitFor(() => screen.getByTestId("workflow-option-dir:cache-refresh"));
+    await fireEvent.click(screen.getByTestId("workflow-option-dir:cache-refresh"));
+    await waitFor(() => screen.getByTestId("workflow-prompt-unavailable"));
+
+    listeners.get("prompts:changed")?.({ payload: { generation: 1 } });
+    await waitFor(() => expect(cacheOnlyCalls).toBe(1));
+    // A newer sync must supersede an in-flight cache-only classification instead
+    // of being dropped. Neither event is allowed to call the fresh endpoint.
+    listeners.get("prompts:changed")?.({ payload: { generation: 2 } });
+    await waitFor(() => expect(cacheOnlyCalls).toBe(2));
+    cacheReplies[1]?.({ ...base, compatibility: { state: "ok" } });
     await waitFor(() => screen.getByTestId("workflow-agent-worker-alice"));
-    pending[0]?.({ ...base, compatibility: { state: "unresolved", prompts: ["tiddly:x"] } });
+    cacheReplies[0]?.(unavailable);
     await tick();
 
-    // The stale unresolved reply is ignored — the form stays resolved.
+    expect(freshCalls).toBe(1);
+    expect(cacheOnlyCalls).toBe(2);
     expect(screen.getByTestId("workflow-agent-worker-alice")).toBeInTheDocument();
-    expect(screen.queryByTestId("workflow-resolving")).toBeNull();
+  });
+
+  it("prunes obsolete derived values and forwards after a successful schema refresh", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    const WORKFLOW = {
+      name: "schema-change",
+      is_builtin: false,
+      description: "d",
+      inputs: [{ name: "worker", ty: "agent", optional: false, description: null }],
+      invocable: true,
+      parse_error: null,
+    };
+    const base = {
+      name: WORKFLOW.name,
+      description: "d",
+      is_builtin: false,
+      invocable: true,
+      inputs: WORKFLOW.inputs,
+      steps: [],
+    };
+    const derived = (name: string) => ({
+      name,
+      required: false,
+      description: null,
+      prompts: ["tiddly:review"],
+    });
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "list_workflows") return [WORKFLOW];
+      if (cmd === "list_prompts") return [];
+      if (cmd === "describe_workflow_form") {
+        return { ...base, derived_args: [derived("old")], compatibility: { state: "ok" } };
+      }
+      if (cmd === "refresh_workflow_form_from_cache") {
+        return { ...base, derived_args: [derived("new")], compatibility: { state: "ok" } };
+      }
+      if (cmd === "invoke_workflow") return "run-1";
+      return null;
+    });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await fireEvent.click(screen.getByTestId("compose-workflow-button"));
+    await waitFor(() => screen.getByTestId("workflow-option-dir:schema-change"));
+    await fireEvent.click(screen.getByTestId("workflow-option-dir:schema-change"));
+    const oldInput = (await screen.findByTestId("workflow-arg-input-old")) as HTMLTextAreaElement;
+    await fireEvent.input(oldInput, { target: { value: "obsolete" } });
+    await fireEvent.click(screen.getByTestId("workflow-forward-picker-old"));
+    await fireEvent.click(await screen.findByTestId(`forward-picker-agent-${AGENT_A.id}`));
+    await waitFor(() => screen.getByTestId("workflow-forward-sources-old"));
+
+    listeners.get("prompts:changed")?.({ payload: { generation: 1 } });
+    const newInput = (await screen.findByTestId("workflow-arg-input-new")) as HTMLTextAreaElement;
+    expect(screen.queryByTestId("workflow-arg-input-old")).toBeNull();
+    expect(screen.queryByTestId("workflow-forward-sources-old")).toBeNull();
+    await fireEvent.input(newInput, { target: { value: "current" } });
+    await fireEvent.click(screen.getByTestId("workflow-agent-worker-alice"));
+    await fireEvent.click(screen.getByTestId("workflow-invoke-button"));
+    await waitFor(() => {
+      expect(invokeMock.mock.calls.some(([cmd]) => cmd === "invoke_workflow")).toBe(true);
+    });
+    const invocation = invokeMock.mock.calls.find(([cmd]) => cmd === "invoke_workflow");
+    expect(invocation?.[1]).toMatchObject({
+      inputs: { worker: AGENT_A.name, new: "current" },
+      forwardSources: {},
+    });
+    expect(invocation?.[1]).not.toMatchObject({ inputs: { old: expect.anything() } });
+  });
+
+  it("preserves derived drafts and forwards through a transient unavailable refresh", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    const WORKFLOW = {
+      name: "transient-outage",
+      is_builtin: false,
+      description: "d",
+      inputs: [{ name: "worker", ty: "agent", optional: false, description: null }],
+      invocable: true,
+      parse_error: null,
+    };
+    const argument = {
+      name: "context",
+      required: false,
+      description: null,
+      prompts: ["tiddly:review"],
+    };
+    const base = {
+      name: WORKFLOW.name,
+      description: "d",
+      is_builtin: false,
+      invocable: true,
+      inputs: WORKFLOW.inputs,
+      steps: [],
+    };
+    let cacheCalls = 0;
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "list_workflows") return [WORKFLOW];
+      if (cmd === "list_prompts") return [];
+      if (cmd === "describe_workflow_form") {
+        return { ...base, derived_args: [argument], compatibility: { state: "ok" } };
+      }
+      if (cmd === "refresh_workflow_form_from_cache") {
+        cacheCalls++;
+        return cacheCalls <= 2
+          ? {
+              ...base,
+              derived_args: [],
+              compatibility: {
+                state: "unavailable",
+                issues: [
+                  {
+                    prompt: "tiddly:review",
+                    provider: "tiddly",
+                    kind: "provider_error",
+                    message: "timed out",
+                  },
+                ],
+              },
+            }
+          : { ...base, derived_args: [argument], compatibility: { state: "ok" } };
+      }
+      return null;
+    });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await fireEvent.click(screen.getByTestId("compose-workflow-button"));
+    await waitFor(() => screen.getByTestId("workflow-option-dir:transient-outage"));
+    await fireEvent.click(screen.getByTestId("workflow-option-dir:transient-outage"));
+    const input = (await screen.findByTestId("workflow-arg-input-context")) as HTMLTextAreaElement;
+    await fireEvent.input(input, { target: { value: "keep me" } });
+    await fireEvent.click(screen.getByTestId("workflow-forward-picker-context"));
+    await fireEvent.click(await screen.findByTestId(`forward-picker-agent-${AGENT_A.id}`));
+
+    listeners.get("prompts:changed")?.({ payload: { generation: 1 } });
+    await waitFor(() => screen.getByTestId("workflow-prompt-unavailable"));
+    listeners.get("prompts:changed")?.({ payload: { generation: 2 } });
+    await waitFor(() => expect(cacheCalls).toBe(2));
+    listeners.get("prompts:changed")?.({ payload: { generation: 3 } });
+    const recovered = (await screen.findByTestId(
+      "workflow-arg-input-context",
+    )) as HTMLTextAreaElement;
+    expect(recovered).toHaveValue("keep me");
+    expect(screen.getByTestId("workflow-forward-sources-context")).toBeInTheDocument();
+  });
+
+  it("clears a declared value when its semantic input type changes", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    const WORKFLOW = {
+      name: "input-type-change",
+      is_builtin: false,
+      description: "d",
+      inputs: [{ name: "target", ty: "agent", optional: false, description: null }],
+      invocable: true,
+      parse_error: null,
+    };
+    const descriptorBase = {
+      name: WORKFLOW.name,
+      description: "d",
+      is_builtin: false,
+      invocable: true,
+      steps: [],
+      derived_args: [],
+      compatibility: { state: "ok" },
+    };
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "list_workflows") return [WORKFLOW];
+      if (cmd === "list_prompts") return [];
+      if (cmd === "describe_workflow_form") return { ...descriptorBase, inputs: WORKFLOW.inputs };
+      if (cmd === "refresh_workflow_form_from_cache") {
+        return {
+          ...descriptorBase,
+          inputs: [{ name: "target", ty: "text", optional: false, description: null }],
+        };
+      }
+      return null;
+    });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await fireEvent.click(screen.getByTestId("compose-workflow-button"));
+    await waitFor(() => screen.getByTestId("workflow-option-dir:input-type-change"));
+    await fireEvent.click(screen.getByTestId("workflow-option-dir:input-type-change"));
+    await fireEvent.click(await screen.findByTestId(`workflow-agent-target-${AGENT_A.name}`));
+    await waitFor(() =>
+      expect(screen.getByTestId(`workflow-agent-target-${AGENT_A.name}`)).toHaveAttribute(
+        "aria-checked",
+        "true",
+      ),
+    );
+
+    listeners.get("prompts:changed")?.({ payload: { generation: 1 } });
+    const textInput = (await screen.findByTestId("workflow-text-target")) as HTMLTextAreaElement;
+    expect(textInput).toHaveValue("");
   });
 });
 

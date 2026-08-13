@@ -24,6 +24,7 @@ use rmcp::transport::streamable_http_server::session::local::LocalSessionManager
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use switchboard_prompts::{
     InMemorySecretStore, PromptError, PromptService, ProviderStatus, SecretStore, SecretStoreError,
+    SyncOutcome,
 };
 use tempfile::TempDir;
 
@@ -398,10 +399,11 @@ async fn concurrent_first_use_constructs_one_client() {
     // Cold cache: a sync and a render race to build the client. Single-flight
     // means exactly one preflight (and one AuthClient) regardless of winner.
     let no_args = BTreeMap::new();
-    let ((), rendered) = tokio::join!(
+    let (published, rendered) = tokio::join!(
         harness.service.sync(),
         harness.service.render("tiddly", "greet", &no_args),
     );
+    assert!(matches!(published, SyncOutcome::Published { .. }));
     rendered.unwrap();
     assert_eq!(state.prm_fetches.load(Ordering::SeqCst), 1);
     assert_eq!(state.as_fetches.load(Ordering::SeqCst), 1);
@@ -424,10 +426,11 @@ async fn near_expiry_token_refreshes_exactly_once_under_concurrency() {
     // A concurrent sync and render both need a fresh token; the shared
     // client's internal mutex must serialize to exactly one refresh.
     let no_args = BTreeMap::new();
-    let ((), rendered) = tokio::join!(
+    let (published, rendered) = tokio::join!(
         harness.service.sync(),
         harness.service.render("tiddly", "greet", &no_args),
     );
+    assert!(matches!(published, SyncOutcome::Published { .. }));
     rendered.unwrap();
     assert_eq!(
         state.token_hits.load(Ordering::SeqCst),

@@ -5,6 +5,7 @@
   import { cn, formatDuration, isIsoTimestampAfter } from "$lib/utils";
   import { WORKFLOW_AUTHORING_GUIDE_URL } from "$lib/workflowAuthoring";
   import { createPinTracker, type ScrollGeometry } from "$lib/scrollPin";
+  import { attachPointerProbe, debugInput, debugSample, type PinScope } from "$lib/scrollPinDebug";
   import {
     ChevronRight,
     ChevronsDownUp,
@@ -760,22 +761,75 @@
     anchorHadLiveRegion = anchorEl.querySelector("[data-live-region]") !== null;
   }
 
-  function onScroll(): void {
+  /// Classify whatever movement has happened since the tracker last saw this
+  /// scroller and fold it into the pin/anchor bookkeeping. Driven by the
+  /// container's `scroll` events, and by `reanchor` while the tracker holds
+  /// unattributed input evidence (`gesturePending` — without it there is
+  /// nothing of the user's to lose, and sampling anyway would misread
+  /// engine-only movement, such as the `scrollTop` clamp to 0 that a mid-flush
+  /// remount produces, as a scroll to the top):
+  /// `scroll` is delivered asynchronously (at the next rendering update),
+  /// while a streamed chunk re-anchors within the same frame it arrives, so a
+  /// correction routinely lands BEFORE the event for the user's own scroll.
+  /// Its `notifyProgrammaticWrite` would then adopt the corrected position as
+  /// the baseline and the pending event would compute a zero delta — the
+  /// user's movement erased, which is why scrolling back down to re-pin failed
+  /// while a turn was streaming. Sampling here first makes the correction see
+  /// the movement instead of overwriting it.
+  function syncPin(): void {
     if (!container) return;
-    const attribution = outerPin.onScrollEvent(geometryOf(container));
-    // Genuine user movement relocates the reading position; clamps and noise
-    // must not overwrite a still-valid anchor OR the stored gap. A collapse's
-    // clamp event can fire BEFORE the ResizeObserver pass that corrects it —
-    // stomping the gap with the clamped value (zero) there would make the
-    // pass's gap-hold reproduce the slammed-to-bottom position instead of
-    // restoring the user's place (the scroll-hold contract). A real scroll
-    // also cancels any pending clicked-control hold: the user moved on.
+    const sampled = geometryOf(container);
+    const pinnedBefore = outerPin.pinned;
+    const attribution = outerPin.onScrollEvent(sampled);
+    debugSample("outer", attribution, sampled, pinnedBefore, outerPin.pinned);
+    // Genuine user movement relocates the reading position; clamps, elastic
+    // overscroll and noise must not overwrite a still-valid anchor OR the
+    // stored gap. A collapse's clamp event can fire BEFORE the ResizeObserver
+    // pass that corrects it — stomping the gap with the clamped value (zero)
+    // there would make the pass's gap-hold reproduce the slammed-to-bottom
+    // position instead of restoring the user's place (the scroll-hold
+    // contract). A real scroll also cancels any pending clicked-control hold:
+    // the user moved on.
     if (attribution === "up" || attribution === "down") {
       clearClickIntent();
       distanceFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
       captureAnchor();
     }
   }
+
+  /// Real input the transcript received: the movement about to show up is the
+  /// user's, not the engine's. Registered passively — this is the app's
+  /// hottest scroll surface and nothing here cancels a default action. Wheel
+  /// events over a nested live cap bubble here too; if the cap consumes them
+  /// the outer scroller doesn't move, and the evidence is spent (harmlessly)
+  /// by the very next sample.
+  ///
+  /// Wheel and trackpad ONLY, deliberately. Keyboard scrolling of the
+  /// transcript is not a supported interaction: the scroll container is not a
+  /// tab stop, so the keys reach it only from a control focused inside a
+  /// message. A scrollbar-thumb drag is not known to dispatch pointer events
+  /// in WKWebView — the debug module's probe exists to answer that. Both
+  /// therefore fall back to pure geometry attribution: a movement of theirs
+  /// that races a chunk's growth reads as an engine adjustment and does not
+  /// re-pin.
+  $effect(() => {
+    const el = container;
+    if (el === null) return;
+    const onWheel = (event: WheelEvent): void => {
+      // A horizontal swipe reports deltaY 0. The tracker ignores it; the
+      // diagnostics must agree, or a phantom upward-input count corrupts the
+      // measurements those counts exist to inform.
+      if (event.deltaY === 0) return;
+      outerPin.notifyGesture(event.deltaY);
+      debugInput("outer", event.deltaY > 0 ? "wheel-down" : "wheel-up");
+    };
+    el.addEventListener("wheel", onWheel, { passive: true });
+    const detachProbe = attachPointerProbe(el);
+    return () => {
+      el.removeEventListener("wheel", onWheel);
+      detachProbe?.();
+    };
+  });
 
   // Whether the previous reanchor pass saw conversation rows. Drives the
   // empty→first-rows transition below; not reactive state (only reanchor
@@ -837,6 +891,9 @@
   /// threshold of the bottom.
   function reanchor(): void {
     if (!container) return;
+    // Fold in user movement whose `scroll` event hasn't been delivered yet, so
+    // this pass corrects from where the user actually is (see `syncPin`).
+    if (outerPin.gesturePending) syncPin();
     // Consume this pass's provenance inputs up front so every exit path
     // advances them. `untrack` keeps the callers' dependency sets unchanged
     // (the scrollSignal effect already depends on the revision via the signal).
@@ -1166,16 +1223,43 @@
   /// top-fade flag.
   function liveScroll(node: HTMLElement, args: { key: string; signal: number }) {
     const pin = createPinTracker();
+    // Columns pin independently, so diagnostics name the column rather than
+    // aggregating every cap under one label.
+    const scope: PinScope = `cap:${args.key}`;
+    const samplePin = (): void => {
+      const sampled = geometryOf(node);
+      const pinnedBefore = pin.pinned;
+      const attribution = pin.onScrollEvent(sampled);
+      debugSample(scope, attribution, sampled, pinnedBefore, pin.pinned);
+    };
     const sync = (): void => {
-      pin.onScrollEvent(geometryOf(node));
+      samplePin();
       liveTopFade[args.key] = node.scrollTop > 8;
     };
+    const wheel = (event: WheelEvent): void => {
+      if (event.deltaY === 0) return; // See the outer handler.
+      pin.notifyGesture(event.deltaY);
+      debugInput(scope, event.deltaY > 0 ? "wheel-down" : "wheel-up");
+    };
     node.addEventListener("scroll", sync);
+    node.addEventListener("wheel", wheel, { passive: true });
     node.scrollTop = node.scrollHeight;
     pin.notifyProgrammaticWrite(geometryOf(node));
     liveTopFade[args.key] = node.scrollTop > 8;
     return {
       update(next: { key: string; signal: number }): void {
+        // Same delivery race as the outer scroller (see `syncPin`): the chunk
+        // that triggers this update is handled before the browser dispatches
+        // the `scroll` event for the user's own movement inside the cap, so
+        // classify from live geometry before following. Unconditional, unlike
+        // the outer gate: an unpinned cap takes no other sample and issues no
+        // follow-write, so its `lastMax` would freeze while the stream grew —
+        // and the reader's next scroll would arrive carrying every chunk's
+        // worth of growth, which reads as an engine adjustment however small
+        // the movement was. It is also what retires an elastic latch here,
+        // since an unpinned cap never reaches `notifyProgrammaticWrite`: the
+        // next stationary sample clears it.
+        samplePin();
         if (pin.pinned) {
           node.scrollTop = node.scrollHeight;
           pin.notifyProgrammaticWrite(geometryOf(node));
@@ -1184,6 +1268,7 @@
       },
       destroy(): void {
         node.removeEventListener("scroll", sync);
+        node.removeEventListener("wheel", wheel);
         // A completed turn never re-streams, so its top-fade flag is dead now.
         delete liveTopFade[args.key];
       },
@@ -1862,7 +1947,7 @@
 
 <div
   bind:this={container}
-  onscroll={onScroll}
+  onscroll={syncPin}
   data-testid="unified-transcript"
   class="bg-transcript [container-type:size] flex-1 overflow-y-auto px-8 py-4"
 >

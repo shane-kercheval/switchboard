@@ -14,29 +14,29 @@ import {
   resetState,
   transcriptContainer as transcript,
   distanceFromBottom,
+  unattributedScrollTo,
+  userScrollTo,
 } from "./harness";
 import { setProjectCompact, toggleKey } from "$lib/state/transcriptPreview.svelte";
 import { ALICE, PROJECT_ID, agentTurn, longText, textItem, userTurn } from "./fixtures";
 
 // Behavior 3 — the chat-app scroll contract, all measured in real WebKit (the
 // Tauri webview has NO native CSS scroll-anchoring, so the component re-anchors
-// itself; jsdom has no scroll geometry at all). A bare `scroll` (scrollbar or
-// keyboard — no wheel/touch) that moves scrollTop UP while the scrollable
-// extent held unpins — immediately, at any size, even mid-stream — and the view
-// holds when new content arrives; a clamp-induced scroll (collapse or viewport
-// growth shrinking the extent) must NOT unpin; returning to the bottom re-pins.
+// itself; jsdom has no scroll geometry at all). Input is ground truth for
+// intent: an upward wheel unpins immediately at any size, even mid-stream, and
+// the view holds when new content arrives. Movement with NO input — a clamp, a
+// spring, a scrollbar drag — never unpins, deliberately (see the tracker's
+// header). `userScrollTo` therefore drives every "the user scrolled" step.
 
 function scrollTo(top: number): void {
-  const c = transcript();
-  c.scrollTop = top;
-  c.dispatchEvent(new Event("scroll")); // bare scroll: scrollbar/keyboard shape
+  userScrollTo(transcript(), top);
 }
 
 beforeEach(() => {
   resetState();
 });
 
-test("a bare scroll up unpins and the view holds when new content arrives", async () => {
+test("a scroll up unpins and the view holds when new content arrives", async () => {
   await registerAgent(ALICE);
   seedTurns(ALICE.id, [
     userTurn({ id: "user-1", agentId: ALICE.id, text: longText(20) }),
@@ -102,12 +102,12 @@ test("a content-change (collapse) clamp does not unpin", async () => {
   await expect.poll(() => distanceFromBottom()).toBeGreaterThan(50);
 });
 
-test("a single small scroll up unpins even while streaming grows the content", async () => {
-  // The streaming-escape contract: a 5px scroll up — well inside the 32px
-  // re-pin threshold — must stop auto-follow on the spot. Under the old
-  // distance-from-bottom rule every streamed chunk re-pinned the view and reset
-  // the user's progress toward the threshold, so only a fast flick could escape
-  // a live stream. Two growth rounds verify both the unpin itself and that the
+test("a single small wheel up unpins even while streaming grows the content", async () => {
+  // The streaming-escape contract: a 5px upward wheel — well inside the 32px
+  // re-pin threshold — must stop auto-follow on the spot, because input is
+  // ground truth for intent. Under the old distance-from-bottom rule every
+  // streamed chunk re-pinned the view and reset the user's progress toward
+  // the threshold, so only a fast flick could escape a live stream. Two growth rounds verify both the unpin itself and that the
   // re-anchor's own scrollTop writes (which echo real `scroll` events in
   // WebKit) don't silently re-pin a view sitting <32px from the bottom.
   await registerAgent(ALICE);
@@ -152,6 +152,44 @@ test("a single small scroll up unpins even while streaming grows the content", a
     }),
   ]);
   await expect.poll(() => distanceFromBottom()).toBeGreaterThan(50);
+});
+
+test("unattributed movement never stops a following view", async () => {
+  // The design's central claim, stated at the level it matters: the browser
+  // moves the view — a spring settling, a clamp, an anchoring adjustment — and
+  // nobody touched an input device. Auto-follow must survive it, because the
+  // cost of getting this wrong is silent (following off until the user
+  // notices) while the cost of a wrongly-KEPT pin is one frame that the next
+  // chunk repairs. Every prior bug in this subsystem was a version of this.
+  await registerAgent(ALICE);
+  seedTurns(ALICE.id, [
+    userTurn({ id: "user-1", agentId: ALICE.id, text: longText(20) }),
+    agentTurn({
+      id: "agent-streaming",
+      agentId: ALICE.id,
+      status: "streaming",
+      items: [textItem(longText(30))],
+    }),
+  ]);
+
+  mountTranscript({ projectId: PROJECT_ID, agents: [ALICE] });
+  await expect.poll(() => transcript().scrollHeight > transcript().clientHeight + 200).toBe(true);
+  await expect.poll(() => distanceFromBottom()).toBeLessThan(32);
+
+  // Displace the view repeatedly with no input at all, streaming throughout.
+  for (const [round, top] of [0, 100, 40, 250].entries()) {
+    unattributedScrollTo(transcript(), top);
+    seedTurns(ALICE.id, [
+      userTurn({ id: "user-1", agentId: ALICE.id, text: longText(20) }),
+      agentTurn({
+        id: "agent-streaming",
+        agentId: ALICE.id,
+        status: "streaming",
+        items: [textItem(longText(40 + round * 10))],
+      }),
+    ]);
+    await expect.poll(() => distanceFromBottom()).toBeLessThan(32);
+  }
 });
 
 test("a viewport-growth clamp keeps the view pinned and following", async () => {
@@ -213,10 +251,9 @@ test("scrolling back to the bottom re-pins and follows new content", async () =>
   mountTranscript({ projectId: PROJECT_ID, agents: [ALICE] });
   await expect.poll(() => transcript().scrollHeight > transcript().clientHeight + 50).toBe(true);
 
-  // Scroll up (unpin), then back to the bottom (re-pin). The return scroll is
-  // a genuine downward move landing within the 32px threshold, so `onScroll`
-  // recomputes `pinned` true — the poll confirms no later re-anchor un-pinned
-  // the view in between.
+  // Wheel up (unpin), then wheel back to the bottom (re-pin): matched
+  // downward movement landing within the 32px threshold — the poll confirms
+  // no later re-anchor un-pinned the view in between.
   scrollTo(0);
   await expect.poll(() => distanceFromBottom()).toBeGreaterThan(100);
   scrollTo(transcript().scrollHeight);

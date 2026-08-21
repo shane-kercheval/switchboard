@@ -3,6 +3,7 @@
     agentIsWorking,
     cancelSend,
     dispatchUserTurn,
+    noteLocalSend,
     failSendStart,
     recordSendAccepted,
     runtimes,
@@ -2372,6 +2373,9 @@
     // Bump this project's local last-activity so it sorts/reads as active right
     // away, before any turn event round-trips. Once per send action.
     recordProjectsActivityLocally([dispatchProjectId], currentIsoTimestamp());
+    // Announce the send to this project's transcript so it follows the
+    // response, once per send action rather than per recipient.
+    noteLocalSend(dispatchProjectId, sendId);
     // Register the whole recipient set *before* any IPC call, so one recipient's
     // rejection can't erase an agent that was supposed to be in the send — and so
     // the completion notification fires once, on the last recipient, rather than

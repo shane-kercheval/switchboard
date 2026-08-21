@@ -66,6 +66,37 @@ export function distanceFromBottom(): number {
 }
 
 /**
+ * Move a scroller the way a user does: input first, then the position and its
+ * `scroll` event. Input is ground truth for intent in `$lib/scrollPin.ts`, so a
+ * bare `scrollTop` write with a synthetic `scroll` is NOT a user scroll — it is
+ * indistinguishable from the engine moving the view, and deliberately does not
+ * unpin. Every spec that means "the user scrolled here" must use this.
+ */
+export function userScrollTo(el: HTMLElement, top: number): void {
+  const delta = top - el.scrollTop;
+  if (delta !== 0) el.dispatchEvent(new WheelEvent("wheel", { deltaY: delta, bubbles: true }));
+  el.scrollTop = top;
+  el.dispatchEvent(new Event("scroll"));
+}
+
+/**
+ * Move a scroller with NO input attribution — position plus its `scroll` event,
+ * no wheel. This is what the engine's own motion looks like to the tracker: a
+ * spring, a clamp, an anchoring adjustment, a scrollbar drag. The deliberate
+ * counterpart to `userScrollTo`, and the reason the pair exists: the design's
+ * central claim is that unattributed movement can never stop auto-follow, so a
+ * suite where every simulated scroll carries input cannot state it.
+ *
+ * Named for what it IS rather than `engineScrollTo` — a programmatic
+ * assignment in a test does not prove WebKit produced the movement, and this
+ * file has been misled before by names describing intent instead of behavior.
+ */
+export function unattributedScrollTo(el: HTMLElement, top: number): void {
+  el.scrollTop = top;
+  el.dispatchEvent(new Event("scroll"));
+}
+
+/**
  * Deliver a normalized event to a captured per-agent listener (streaming drive).
  * Pass the spec's `vi.hoisted` listener map (see header) — the browser-mode
  * counterpart of the jsdom suite's listener map.

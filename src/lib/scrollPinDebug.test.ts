@@ -16,7 +16,7 @@ describe("disabled by default", () => {
     const addListener = vi.spyOn(el, "addEventListener");
 
     debugSample("outer", "up", { scrollTop: 10, scrollHeight: 100, clientHeight: 50 }, true, false);
-    debugInput("outer", "wheel-down");
+    debugInput("outer", "wheel-down", 42);
     const detach = attachPointerProbe(el);
 
     expect(log).not.toHaveBeenCalled();
@@ -32,6 +32,7 @@ describe("console handle", () => {
     expect(typeof handle?.enable).toBe("function");
     expect(typeof handle?.disable).toBe("function");
     expect(typeof handle?.verbose).toBe("function");
+    expect(typeof handle?.tail).toBe("function");
     expect(typeof handle?.summary).toBe("function");
     expect(typeof handle?.reset).toBe("function");
   });

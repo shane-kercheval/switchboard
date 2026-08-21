@@ -9,7 +9,7 @@ vi.mock("@tauri-apps/api/core", () => ({
 vi.mock("$lib/native", () => ({ copyText: vi.fn(async () => undefined) }));
 
 import { mountTranscript } from "./mount";
-import { registerAgent, seedTurns, resetState } from "./harness";
+import { registerAgent, seedTurns, resetState, userScrollTo } from "./harness";
 import { ALICE, PROJECT_ID, agentTurn, longText, textItem, userTurn } from "./fixtures";
 
 // Behavior 7: expanding a mid-list message keeps its footer anchored on screen —
@@ -47,8 +47,7 @@ test("expanding a mid-list message keeps its toggle anchored on screen", async (
   // Scroll to the top so the user message and its footer are on screen, then
   // record the toggle's viewport position.
   await expect.poll(() => transcript().scrollHeight > transcript().clientHeight + 100).toBe(true);
-  transcript().scrollTop = 0;
-  transcript().dispatchEvent(new Event("scroll"));
+  userScrollTo(transcript(), 0);
 
   const toggle = page.getByTestId("turn-preview-toggle");
   await expect.element(toggle).toBeInTheDocument();

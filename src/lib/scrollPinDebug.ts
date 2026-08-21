@@ -19,17 +19,19 @@
 ///   switchboardPinDebug.summary()  // attribution counts per scroller
 ///   switchboardPinDebug.disable()
 ///
-/// What it answers, in the order the questions are worth asking:
-/// - Does the engine's scroll-anchoring adjustment ("anchor") EVER fire here?
-///   That rule discards downward movement, which is what broke re-pinning
-///   mid-stream, and the gesture-evidence machinery exists solely to override
-///   it. A zero count over real use means both can go.
-/// - What actually unpins a following reader? Every pin transition is logged
-///   with the geometry that produced it, so an auto-follow drop-out names its
-///   own cause instead of being reconstructed from memory.
-/// - Does WebKit dispatch pointer events for scrollbar-thumb drags? If it
-///   does, drags can carry input provenance the way the wheel does; if it
-///   doesn't, that limit is a fact rather than an assumption.
+/// What it answers:
+/// - What actually flipped the pin? Every transition dumps the interleaved
+///   tail of inputs, samples and writes that led up to it — the three streams
+///   read TOGETHER are what separates the user from the engine, which is the
+///   whole design of the tracker.
+/// - Does the pin ever flip without matching input? Under the input-primary
+///   design nothing should: engine motion classifies inert, so a transition
+///   with no input in the tail is a bug, and the tail shows it.
+/// - Do scrollbar-thumb drags reach the DOM as pointer events? That decides
+///   whether the deliberately-unsupported evidence-free escape can come back
+///   with real provenance instead of geometry inference. The probe logs raw
+///   press coordinates because macOS overlay scrollbars are painted over the
+///   content, so no `offsetX`-vs-`clientWidth` test can identify one.
 
 import type { ScrollAttribution, ScrollGeometry } from "$lib/scrollPin";
 
@@ -38,13 +40,10 @@ import type { ScrollAttribution, ScrollGeometry } from "$lib/scrollPin";
 /// Columns pin independently, so they are counted independently.
 export type PinScope = "outer" | `cap:${string}`;
 
-/// How many samples of each shape print before only the counts keep rising.
-/// The open question this module exists to answer is a FREQUENCY one, and
-/// unbounded printing would answer it destructively: a single bounce is ~30
-/// lines, and a per-frame attribution during streaming is hundreds of console
-/// writes a second into the Web Inspector, which drops frames in WKWebView and
-/// changes the scroll timing under study. Counts are exact regardless; use
-/// `verbose()` when the individual samples are what you need.
+/// In verbose mode, how many samples of each shape print before only the
+/// counts keep rising. Unbounded printing perturbs the scroll timing under
+/// study (hundreds of console writes a second drops frames in WKWebView).
+/// Counts are exact regardless.
 const PRINT_LIMIT = 5;
 
 const FLAG = "switchboard-debug-pin";
@@ -62,6 +61,46 @@ let enabled = readFlag();
 let verbose = false;
 const counts = new Map<string, number>();
 const printed = new Map<string, number>();
+/// The tracker's position/extent baseline, mirrored so a printed line can show
+/// the DELTA and the EXTENT CHANGE the tracker actually branched on. Samples
+/// are not the whole story: `notifyProgrammaticWrite` resets that baseline too,
+/// and during streaming a write lands on every chunk. Reconstructing deltas
+/// from samples alone therefore produced impossible lines — a `+15` delta
+/// attributed to an upward scroll — because the write in between was invisible.
+/// `debugWrite` keeps this in step; a mirror that drifts is worse than none.
+const previous = new Map<PinScope, ScrollGeometry>();
+/// Samples since the last write, so a transition line says whether the tracker
+/// was measuring against a write's baseline or a real scroll's.
+const sinceWrite = new Map<PinScope, number>();
+
+/// Ring buffer of every input, sample and write in the order they happened,
+/// with timestamps. The three streams have to be read TOGETHER: a sample's
+/// numbers cannot say who moved the view, only that it moved, so the question
+/// "was there a wheel event just before this?" is what separates the user from
+/// the engine. Buffered rather than printed live because printing every event
+/// floods the inspector and perturbs the scroll timing under study; the tail is
+/// dumped only when the pin actually flips, which is rare and is exactly the
+/// moment worth reading.
+interface TraceEntry {
+  t: number;
+  text: string;
+}
+const trace: TraceEntry[] = [];
+const TRACE_MAX = 400;
+const TRACE_TAIL = 24;
+
+function record(text: string): void {
+  trace.push({ t: performance.now(), text });
+  if (trace.length > TRACE_MAX) trace.shift();
+}
+
+function dumpTail(reason: string, count = TRACE_TAIL): void {
+  const start = Math.max(0, trace.length - count);
+  const slice = trace.slice(start);
+  const base = slice[0]?.t ?? 0;
+  const body = slice.map((e) => `  +${(e.t - base).toFixed(1)}ms  ${e.text}`).join("\n");
+  console.log(`[pin] ===== ${reason} =====\n${body}`);
+}
 
 function bump(key: string): number {
   const next = (counts.get(key) ?? 0) + 1;
@@ -76,9 +115,30 @@ function shouldPrint(key: string): boolean {
   return seen <= PRINT_LIMIT;
 }
 
-function geo(g: ScrollGeometry): string {
+function geo(scope: PinScope, g: ScrollGeometry): string {
   const max = g.scrollHeight - g.clientHeight;
-  return `top=${g.scrollTop.toFixed(1)} max=${max} gap=${(max - g.scrollTop).toFixed(1)}`;
+  const prev = previous.get(scope);
+  const delta = prev === undefined ? 0 : g.scrollTop - prev.scrollTop;
+  const growth = prev === undefined ? 0 : max - (prev.scrollHeight - prev.clientHeight);
+  return [
+    `top=${g.scrollTop.toFixed(1)}`,
+    `max=${max}`,
+    `gap=${(max - g.scrollTop).toFixed(1)}`,
+    `delta=${delta.toFixed(1)}`,
+    `growth=${growth}`,
+    `sinceWrite=${sinceWrite.get(scope) ?? "-"}`,
+  ].join(" ");
+}
+
+/// Mirror a programmatic write's effect on the tracker's baseline. Must be
+/// called after EVERY `notifyProgrammaticWrite`, for the same reason that call
+/// itself is mandatory: the next sample's delta is measured from here.
+export function debugWrite(scope: PinScope, g: ScrollGeometry): void {
+  if (!enabled) return;
+  bump(`${scope}:write`);
+  record(`${scope} WRITE  ${geo(scope, g)}`);
+  previous.set(scope, { ...g });
+  sinceWrite.set(scope, 0);
 }
 
 /// Record one classified sample. Counts everything; prints pin transitions
@@ -95,22 +155,54 @@ export function debugSample(
   const key = `${scope}:${attribution}`;
   bump(key);
   const transition = pinnedBefore !== pinnedAfter;
-  if (!transition) {
-    if (attribution !== "anchor" && attribution !== "elastic") return;
-    if (!shouldPrint(key)) return;
-  }
+  // Formatted ONCE, before the baseline moves. Computing it again afterwards
+  // measured every sample against itself, so every live verbose line printed
+  // `delta=0 growth=0` while the ring buffer held the true values — a field
+  // that reads as data and is always zero is worse than no field.
+  const line = `${scope} ${attribution.padEnd(7)} ${geo(scope, g)}`;
   const pin = transition ? ` PIN ${pinnedBefore}->${pinnedAfter}` : "";
-  console.log(`[pin] ${scope} ${attribution} ${geo(g)}${pin}`);
+  record(`${line}${pin}`);
+  previous.set(scope, { ...g });
+  sinceWrite.set(scope, (sinceWrite.get(scope) ?? 0) + 1);
+  if (transition) {
+    // The whole reason this module exists: dump what led up to it.
+    dumpTail(`${scope} ${pinnedBefore ? "UNPIN" : "REPIN"} (${attribution})`);
+    return;
+  }
+  if (verbose && shouldPrint(key)) console.log(`[pin] ${line}`);
 }
 
-/// Record real input the scroller received, so a sample that follows can be
-/// read against what the user actually did. Counted always, printed only in
-/// verbose mode — wheel events arrive per frame.
-export function debugInput(scope: PinScope, kind: string): void {
+/// Dump the tail for a pin transition the SAMPLE path cannot see. The main
+/// unpin now happens in `notifyGesture`, before any sample exists, so a
+/// facility that only watched samples was blind to the design's central
+/// event — it promised "every transition dumps its history" and missed the
+/// one that matters most.
+export function debugTransition(scope: PinScope, reason: string, g: ScrollGeometry): void {
   if (!enabled) return;
-  const key = `${scope}:input:${kind}`;
-  bump(key);
-  if (verbose) console.log(`[pin] ${key}`);
+  bump(`${scope}:transition`);
+  record(`${scope} ${reason} ${geo(scope, g)}`);
+  previous.set(scope, { ...g });
+  dumpTail(`${scope} ${reason}`);
+}
+
+/// Record a decision the CALLER made — a forced pin, a write it chose to skip.
+/// Without these the trace shows only what the tracker saw, never what the
+/// application did about it, and a follow-write that never happened is
+/// indistinguishable from one that happened and was overridden.
+export function debugNote(scope: PinScope, label: string, value?: number): void {
+  if (!enabled) return;
+  bump(`${scope}:note:${label}`);
+  record(`${scope} NOTE   ${label}${value === undefined ? "" : ` ${value.toFixed(1)}`}`);
+}
+
+/// Record real input the scroller received, with its magnitude. The magnitude
+/// matters: a 3px upward tick in the middle of a downward flick is a different
+/// event from a deliberate 100px scroll away, and only the raw number tells
+/// them apart.
+export function debugInput(scope: PinScope, kind: string, value: number): void {
+  if (!enabled) return;
+  bump(`${scope}:input:${kind}`);
+  record(`${scope} INPUT  ${kind} deltaY=${value.toFixed(1)}`);
 }
 
 /// Probe for scrollbar-thumb drags: are they dispatched to the DOM at all, and
@@ -127,16 +219,22 @@ export function attachPointerProbe(el: HTMLElement): (() => void) | undefined {
   let moves = 0;
   const down = (event: PointerEvent): void => {
     if (!enabled) return;
-    onScrollbar = event.offsetX >= el.clientWidth;
+    // NOT a scrollbar test. macOS paints overlay scrollbars OVER the content,
+    // so `clientWidth` includes the strip under the thumb and an `offsetX >=
+    // clientWidth` check can never fire — an earlier version of this probe
+    // reported "content presses only" for exactly that reason, which was the
+    // broken check talking, not a finding. Log the raw numbers and judge a
+    // press in the rightmost ~15px by eye.
+    onScrollbar = event.offsetX >= el.clientWidth - 20;
     moves = 0;
-    console.log(
-      `[pin] outer pointerdown x=${event.offsetX.toFixed(0)} clientWidth=${el.clientWidth} onScrollbar=${onScrollbar}`,
+    record(
+      `outer POINTERDOWN x=${event.offsetX.toFixed(0)} clientWidth=${el.clientWidth} rectWidth=${el.getBoundingClientRect().width.toFixed(0)}`,
     );
   };
   const move = (event: PointerEvent): void => {
     if (!enabled || !onScrollbar || moves >= 3) return;
     moves += 1;
-    console.log(`[pin] outer pointermove(scrollbar) y=${event.clientY.toFixed(0)}`);
+    record(`outer POINTERMOVE(near right edge) y=${event.clientY.toFixed(0)}`);
   };
   const up = (): void => {
     onScrollbar = false;
@@ -157,6 +255,9 @@ interface PinDebugConsole {
   /// Print every sample instead of the first few of each shape. Perturbs the
   /// timing it measures; use for a specific interaction, not a session.
   verbose(on: boolean): void;
+  /// Dump the recorded tail on demand, for when something looked wrong but the
+  /// pin never flipped.
+  tail(count?: number): void;
   summary(): Record<string, number>;
   reset(): void;
 }
@@ -179,6 +280,9 @@ if (typeof globalThis !== "undefined") {
     verbose(on: boolean): void {
       verbose = on;
     },
+    tail(count = TRACE_TAIL): void {
+      dumpTail("tail on request", count);
+    },
     disable(): void {
       enabled = false;
       verbose = false;
@@ -194,6 +298,9 @@ if (typeof globalThis !== "undefined") {
     reset(): void {
       counts.clear();
       printed.clear();
+      previous.clear();
+      sinceWrite.clear();
+      trace.length = 0;
     },
   };
 }

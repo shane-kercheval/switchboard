@@ -16,7 +16,7 @@ vi.mock("@tauri-apps/api/webview", () => ({
 
 import { mountPanesWithComposer } from "./composeMount";
 import { ALICE, PROJECT_ID, agentTurn, longText, textItem, userTurn } from "./fixtures";
-import { distanceFromBottom, registerAgent, resetState, seedTurns } from "./harness";
+import { distanceFromBottom, registerAgent, resetState, seedTurns, userScrollTo } from "./harness";
 import { _testing as composeTesting } from "$lib/state/composeStore";
 import { _testing as panesTesting } from "$lib/state/transcriptPanes.svelte";
 import { _testing as selectionTesting } from "$lib/state/recipientSelection.svelte";
@@ -69,8 +69,7 @@ test("growing the composer does not pull an unpinned transcript to the bottom", 
 
   await expect.poll(distanceFromBottom).toBeLessThan(2);
   const transcript = page.getByTestId("unified-transcript").element() as HTMLElement;
-  transcript.scrollTop = 0;
-  transcript.dispatchEvent(new Event("scroll"));
+  userScrollTo(transcript, 0);
   await expect.poll(distanceFromBottom).toBeGreaterThan(100);
 
   await page.getByTestId("compose-textarea").fill("one\ntwo\nthree\nfour\nfive\nsix");

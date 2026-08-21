@@ -4,8 +4,16 @@
   import { HEARTBEAT_TIMEOUT_MS } from "$lib/types";
   import { cn, formatDuration, isIsoTimestampAfter } from "$lib/utils";
   import { WORKFLOW_AUTHORING_GUIDE_URL } from "$lib/workflowAuthoring";
-  import { createPinTracker, type ScrollGeometry } from "$lib/scrollPin";
-  import { attachPointerProbe, debugInput, debugSample, type PinScope } from "$lib/scrollPinDebug";
+  import { createPinTracker, type SampleSource, type ScrollGeometry } from "$lib/scrollPin";
+  import {
+    attachPointerProbe,
+    debugInput,
+    debugNote,
+    debugSample,
+    debugTransition,
+    debugWrite,
+    type PinScope,
+  } from "$lib/scrollPinDebug";
   import {
     ChevronRight,
     ChevronsDownUp,
@@ -20,6 +28,7 @@
   } from "@lucide/svelte";
   import {
     cancelSend,
+    getLocalSend,
     getTranscriptRevision,
     retryAgentHydration,
     retryAgentSubscription,
@@ -776,11 +785,11 @@
   /// user's movement erased, which is why scrolling back down to re-pin failed
   /// while a turn was streaming. Sampling here first makes the correction see
   /// the movement instead of overwriting it.
-  function syncPin(): void {
+  function syncPin(source: SampleSource): void {
     if (!container) return;
     const sampled = geometryOf(container);
     const pinnedBefore = outerPin.pinned;
-    const attribution = outerPin.onScrollEvent(sampled);
+    const attribution = outerPin.onScrollEvent(sampled, source);
     debugSample("outer", attribution, sampled, pinnedBefore, outerPin.pinned);
     // Genuine user movement relocates the reading position; clamps, elastic
     // overscroll and noise must not overwrite a still-valid anchor OR the
@@ -797,31 +806,91 @@
     }
   }
 
-  /// Real input the transcript received: the movement about to show up is the
-  /// user's, not the engine's. Registered passively — this is the app's
-  /// hottest scroll surface and nothing here cancels a default action. Wheel
-  /// events over a nested live cap bubble here too; if the cap consumes them
-  /// the outer scroller doesn't move, and the evidence is spent (harmlessly)
-  /// by the very next sample.
+  /// How a wheel should reach a scroller's tracker. Single-sourced because the
+  /// transcript and the caps must answer it identically; the same rule in two
+  /// places is the drift this module exists to prevent.
+  ///
+  /// - `"ignore"` — not scroll input for this element at all.
+  /// - `"intent"` — the direction is the user's, but THIS scroller will not
+  ///   move: a wheel a nested cap consumed, or a downward wheel on a view
+  ///   already at the bottom. It must still end an upward run (otherwise a
+  ///   decisive downward gesture never cancels the sub-threshold nudges before
+  ///   it, and the user unpins from input that was net downward), but it must
+  ///   NOT arm movement evidence for a movement that will never arrive.
+  /// - `"gesture"` — direction AND expected movement.
+  ///
+  /// Upward input that cannot move the scroller is `"ignore"`, not `"intent"`:
+  /// an upward swipe over a transcript too short to scroll is not an escape
+  /// from anything, and treating it as one switched auto-follow off before a
+  /// reply had even arrived.
+  function wheelRouting(el: HTMLElement, event: WheelEvent): "ignore" | "intent" | "gesture" {
+    if (event.deltaY === 0) return "ignore"; // a horizontal swipe
+    if (event.ctrlKey) return "ignore"; // pinch-zoom arrives as a ctrl-wheel
+    if (event.defaultPrevented) return "ignore"; // a descendant already took it
+    if (el.scrollHeight - el.clientHeight <= 1) return "ignore"; // nothing to scroll
+    if (event.deltaY < 0) return el.scrollTop > 1 ? "gesture" : "ignore";
+    return el.scrollTop + el.clientHeight < el.scrollHeight - 1 ? "gesture" : "intent";
+  }
+
+  /// Whether this wheel was aimed at a nested live cap THAT WILL CONSUME IT.
+  /// Such a wheel reaches the transcript by bubbling, and the transcript will
+  /// not move for it, so it carries intent but never provenance (see the
+  /// tracker header). Consumption is decided by the same routing rule the cap
+  /// itself uses: a region that cannot scroll in the wheel's direction — a
+  /// standalone stream's overflow-visible region, a cap already at the edge
+  /// the wheel pushes toward — passes the movement through to the transcript,
+  /// which then deserves full provenance. Membership alone was the shipped
+  /// bug: every wheel over a standalone stream's text was downgraded to
+  /// intent, so a small scroll up released the pin but never re-captured the
+  /// reading position, and each chunk restored the view to the bottom.
+  /// (WebKit can latch a gesture to the cap after it hits an edge and swallow
+  /// the chained movement; the evidence that arms for it then expires after
+  /// GESTURE_GRACE quiet samples rather than misattributing anything.)
+  function fromCap(event: WheelEvent): boolean {
+    const target = event.target instanceof Element ? event.target : null;
+    const region = target?.closest("[data-live-region]");
+    if (!(region instanceof HTMLElement)) return false;
+    return wheelRouting(region, event) === "gesture";
+  }
+
+  /// Real input the transcript received: the ground truth for whether the
+  /// user wants to follow. Registered passively — this is the app's hottest
+  /// scroll surface and nothing here cancels a default action.
   ///
   /// Wheel and trackpad ONLY, deliberately. Keyboard scrolling of the
   /// transcript is not a supported interaction: the scroll container is not a
   /// tab stop, so the keys reach it only from a control focused inside a
-  /// message. A scrollbar-thumb drag is not known to dispatch pointer events
-  /// in WKWebView — the debug module's probe exists to answer that. Both
-  /// therefore fall back to pure geometry attribution: a movement of theirs
-  /// that races a chunk's growth reads as an engine adjustment and does not
-  /// re-pin.
+  /// message. Scrollbar interaction emits no wheel events at all, and an
+  /// evidence-free escape is deliberately unsupported — see the tracker
+  /// header for why every geometry-based attempt at one failed.
   $effect(() => {
     const el = container;
     if (el === null) return;
     const onWheel = (event: WheelEvent): void => {
-      // A horizontal swipe reports deltaY 0. The tracker ignores it; the
-      // diagnostics must agree, or a phantom upward-input count corrupts the
-      // measurements those counts exist to inform.
-      if (event.deltaY === 0) return;
-      outerPin.notifyGesture(event.deltaY);
-      debugInput("outer", event.deltaY > 0 ? "wheel-down" : "wheel-up");
+      const routing = wheelRouting(el, event);
+      if (routing === "ignore") return;
+      // A wheel aimed at a nested cap reaches the transcript too, and its
+      // direction is still the user's, so it feeds the unpin accumulator. But
+      // the transcript may not move for it, so it arms no evidence. Note what
+      // this does and does not buy: a reader sitting AT the bottom sees no
+      // change, because the hold target is a zero gap and holding is the same
+      // picture as following. Where it shows is a reader holding a place in
+      // history — column scrolling never drags them.
+      const flipped =
+        routing === "intent" || fromCap(event)
+          ? outerPin.notifyIntent(event.deltaY)
+          : outerPin.notifyGesture(event.deltaY);
+      debugInput("outer", event.deltaY > 0 ? "wheel-down" : "wheel-up", event.deltaY);
+      if (flipped && container) {
+        // Capture what the reader is looking at NOW. The pin flipped in this
+        // handler, so no sample did it for us — and a cap-origin unpin never
+        // produces one at all, since the transcript itself does not move.
+        // Without this the hold reproduces the last captured gap, which for a
+        // reader at the bottom is zero: auto-follow "off" that still follows.
+        distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+        captureAnchor();
+        debugTransition("outer", "UNPIN (input)", geometryOf(container));
+      }
     };
     el.addEventListener("wheel", onWheel, { passive: true });
     const detachProbe = attachPointerProbe(el);
@@ -891,9 +960,12 @@
   /// threshold of the bottom.
   function reanchor(): void {
     if (!container) return;
-    // Fold in user movement whose `scroll` event hasn't been delivered yet, so
-    // this pass corrects from where the user actually is (see `syncPin`).
-    if (outerPin.gesturePending) syncPin();
+    // Sample before correcting: it folds in user movement whose `scroll`
+    // event hasn't been delivered yet (see `syncPin`), so the correction
+    // works from where the user actually is. Unconditional because it costs
+    // nothing — un-gestured movement classifies as "none" and cannot stomp
+    // the anchor, and a `"pass"` sample does not age input evidence.
+    syncPin("pass");
     // Consume this pass's provenance inputs up front so every exit path
     // advances them. `untrack` keeps the callers' dependency sets unchanged
     // (the scrollSignal effect already depends on the revision via the signal).
@@ -921,6 +993,7 @@
       clearClickIntent();
       container.scrollTop = container.scrollHeight;
       outerPin.notifyProgrammaticWrite(geometryOf(container));
+      debugWrite("outer", geometryOf(container));
       return;
     }
     const maxScroll = container.scrollHeight - container.clientHeight;
@@ -938,6 +1011,7 @@
           distanceFromBottom =
             container.scrollHeight - container.scrollTop - container.clientHeight;
           outerPin.notifyProgrammaticWrite(geometryOf(container));
+          debugWrite("outer", geometryOf(container));
           captureAnchor();
           return;
         }
@@ -945,6 +1019,7 @@
         clearClickIntent();
       }
     }
+    debugNote("outer", "reanchor pass: UNPINNED path", distanceFromBottom);
     let anchored = false;
     if (anchorEl?.isConnected === true) {
       const rect = anchorEl.getBoundingClientRect();
@@ -974,11 +1049,46 @@
       container.scrollTop = maxScroll - distanceFromBottom;
     }
     outerPin.notifyProgrammaticWrite(geometryOf(container));
+    debugWrite("outer", geometryOf(container));
     // The just-settled position is the new reference: an expand that fell back
     // to gap-hold must not keep suppressing anchor-restore for the unrelated
     // changes that follow it (e.g. streaming resuming below).
     captureAnchor();
   }
+
+  /// A local send force-pins: submitting a message is the user's explicit
+  /// request to see the response, wherever they had scrolled. Runs before the
+  /// first chunk arrives (the send appends the user turn synchronously), so
+  /// auto-follow is engaged when streaming starts. Only THIS project's sends
+  /// count — a forward can dispatch into another project from a closure that
+  /// outlived a project switch. Seeded with the current sequence so a mount
+  /// does not replay the previous send.
+  // Keyed by project and seeded on first sighting rather than at mount: the
+  // instance is remounted per project today, but reading `projectId` outside
+  // the effect would silently capture the mount-time value if that ever
+  // changed.
+  // A plain object, not a Map: this is bookkeeping the effect reads and writes
+  // itself, never rendered, so reactivity would be overhead — and the lint
+  // rule steering Map usage toward SvelteMap exists for the reactive case.
+  const seenSendSeq: Record<ProjectId, number> = {};
+  $effect(() => {
+    // `?? 0` so "no send yet" is a value: without it the first real send is
+    // indistinguishable from the first sighting and gets adopted as history.
+    const seq = getLocalSend(projectId)?.seq ?? 0;
+    const seen = seenSendSeq[projectId];
+    seenSendSeq[projectId] = seq;
+    // A send that predates this transcript's first sighting is history, not a
+    // request: adopt the sequence without following.
+    if (seen === undefined || seq === seen) return;
+    if (!container) return;
+    debugNote("outer", "local send force-pin", seq);
+    outerPin.setPinned(true, geometryOf(container));
+    distanceFromBottom = 0;
+    // Explicit, though the send's own transcript write also schedules a pass:
+    // this makes the force-pin's outcome independent of which effect runs
+    // first. Not duplicate work — remove it and the ordering decides.
+    reanchor();
+  });
 
   /// Content-change signal for the re-anchor effect. The store's transcript
   /// revision covers every produced-content write (it bumps in `setTranscript`
@@ -1226,25 +1336,29 @@
     // Columns pin independently, so diagnostics name the column rather than
     // aggregating every cap under one label.
     const scope: PinScope = `cap:${args.key}`;
-    const samplePin = (): void => {
+    const samplePin = (source: SampleSource): void => {
       const sampled = geometryOf(node);
       const pinnedBefore = pin.pinned;
-      const attribution = pin.onScrollEvent(sampled);
+      const attribution = pin.onScrollEvent(sampled, source);
       debugSample(scope, attribution, sampled, pinnedBefore, pin.pinned);
     };
     const sync = (): void => {
-      samplePin();
+      samplePin("scroll");
       liveTopFade[args.key] = node.scrollTop > 8;
     };
     const wheel = (event: WheelEvent): void => {
-      if (event.deltaY === 0) return; // See the outer handler.
-      pin.notifyGesture(event.deltaY);
-      debugInput(scope, event.deltaY > 0 ? "wheel-down" : "wheel-up");
+      const routing = wheelRouting(node, event);
+      if (routing === "ignore") return;
+      const flipped =
+        routing === "intent" ? pin.notifyIntent(event.deltaY) : pin.notifyGesture(event.deltaY);
+      debugInput(scope, event.deltaY > 0 ? "wheel-down" : "wheel-up", event.deltaY);
+      if (flipped) debugTransition(scope, "UNPIN (input)", geometryOf(node));
     };
     node.addEventListener("scroll", sync);
     node.addEventListener("wheel", wheel, { passive: true });
     node.scrollTop = node.scrollHeight;
     pin.notifyProgrammaticWrite(geometryOf(node));
+    debugWrite(scope, geometryOf(node));
     liveTopFade[args.key] = node.scrollTop > 8;
     return {
       update(next: { key: string; signal: number }): void {
@@ -1256,13 +1370,12 @@
         // follow-write, so its `lastMax` would freeze while the stream grew —
         // and the reader's next scroll would arrive carrying every chunk's
         // worth of growth, which reads as an engine adjustment however small
-        // the movement was. It is also what retires an elastic latch here,
-        // since an unpinned cap never reaches `notifyProgrammaticWrite`: the
-        // next stationary sample clears it.
-        samplePin();
+        // the movement was.
+        samplePin("pass");
         if (pin.pinned) {
           node.scrollTop = node.scrollHeight;
           pin.notifyProgrammaticWrite(geometryOf(node));
+          debugWrite(scope, geometryOf(node));
         }
         liveTopFade[next.key] = node.scrollTop > 8;
       },
@@ -1947,7 +2060,7 @@
 
 <div
   bind:this={container}
-  onscroll={syncPin}
+  onscroll={() => syncPin("scroll")}
   data-testid="unified-transcript"
   class="bg-transcript [container-type:size] flex-1 overflow-y-auto px-8 py-4"
 >

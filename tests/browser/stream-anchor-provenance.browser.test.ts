@@ -15,6 +15,7 @@ import {
   resetState,
   transcriptContainer as transcript,
   distanceFromBottom,
+  userScrollTo,
 } from "./harness";
 import { setProjectCompact, toggleKey } from "$lib/state/transcriptPreview.svelte";
 import { ALICE, BOB, PROJECT_ID, agentTurn, longText, textItem, userTurn } from "./fixtures";
@@ -30,9 +31,7 @@ import { ALICE, BOB, PROJECT_ID, agentTurn, longText, textItem, userTurn } from 
 // (completion transitions where the live wrapper unmounts before the pass).
 
 function scrollTo(top: number): void {
-  const c = transcript();
-  c.scrollTop = top;
-  c.dispatchEvent(new Event("scroll"));
+  userScrollTo(transcript(), top);
 }
 
 /** Document-space top of the fan-out block, for placing the viewport inside it

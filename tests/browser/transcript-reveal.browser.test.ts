@@ -15,6 +15,7 @@ import {
   resetState,
   transcriptContainer,
   distanceFromBottom,
+  userScrollTo,
 } from "./harness";
 import { ALICE, PROJECT_ID } from "./fixtures";
 import { buildLargeTranscript } from "$lib/dev/largeTranscript";
@@ -33,9 +34,7 @@ const blockCount = (): number => page.getByTestId("transcript-block").elements()
 // scrollTop + a synchronous scroll event, so onScroll → captureAnchor runs before
 // the (async) IntersectionObserver fires — matching the scroll-hold suite's shape.
 function scrollToTop(): void {
-  const c = transcriptContainer();
-  c.scrollTop = 0;
-  c.dispatchEvent(new Event("scroll"));
+  userScrollTo(transcriptContainer(), 0);
 }
 
 beforeEach(() => {
@@ -85,8 +84,7 @@ test("repeated reveals walk back to the start and retire the sentinel", async ()
   // Generous iteration cap — enough rounds even for a small batch size.
   for (let guard = 0; guard < 40 && blockCount() < 240; guard++) {
     const before = blockCount();
-    c.scrollTop = c.scrollHeight;
-    c.dispatchEvent(new Event("scroll"));
+    userScrollTo(c, c.scrollHeight);
     await settle();
     scrollToTop();
     await expect.poll(() => blockCount()).toBeGreaterThan(before);

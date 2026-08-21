@@ -1625,10 +1625,9 @@ describe("UnifiedTranscript — markdown rendering", () => {
     // Let the initial pin settle before simulating a user scroll.
     await waitFor(() => expect(container.scrollTop).toBe(1000));
 
-    // User scrolls up: 200px from the bottom (1000 - 300 - 500), so not pinned.
-    // A bare scroll event whose scrollTop DECREASED while the scrollable extent
-    // held is user-initiated — this is the scrollbar-drag / keyboard case (no
-    // wheel or touch involved).
+    // User scrolls up 200px. Input is what makes it intent — a bare scroll
+    // with no input is deliberately not an escape (see the module header).
+    await fireEvent.wheel(container, { deltaY: -200 });
     container.scrollTop = 300;
     await fireEvent.scroll(container);
 
@@ -1737,12 +1736,12 @@ describe("UnifiedTranscript — markdown rendering", () => {
     await waitFor(() => expect(container.scrollTop).toBe(1000));
   });
 
-  it("a small scroll up unpins immediately, and the gap-hold's own write can't re-pin", async () => {
-    // The core streaming-escape contract: unpinning keys on scroll DIRECTION,
-    // not on distance from the bottom, so a single small wheel tick — still
-    // within the 32px re-pin threshold — stops auto-follow even while chunks
-    // are re-pinning the view many times a second. The second act guards the
-    // snapshot discipline: the gap-hold's own downward scrollTop write echoes a
+  it("a small wheel tick up unpins immediately, and the gap-hold's own write can't re-pin", async () => {
+    // The core streaming-escape contract: unpinning keys on INPUT, not on
+    // geometry, so a small upward wheel tick — still within the 32px re-pin
+    // threshold — stops auto-follow the moment it arrives, before any chunk's
+    // follow-write can interfere. The second act guards the snapshot
+    // discipline: the gap-hold's own downward scrollTop write echoes a
     // `scroll` event, and because the write refreshed the snapshots that echo
     // computes a zero delta — without that, a just-unpinned view sitting <32px
     // from the bottom would be re-pinned by its own hold and slammed down on
@@ -1777,8 +1776,9 @@ describe("UnifiedTranscript — markdown rendering", () => {
     container.scrollTop = 500;
     await fireEvent.scroll(container);
 
-    // One small wheel tick: 5px up — well inside the 32px threshold. Direction
-    // says user; must unpin NOW.
+    // One small wheel tick: 5px up — well inside the 32px threshold. Input
+    // says user; must unpin NOW, in the wheel handler itself.
+    await fireEvent.wheel(container, { deltaY: -5 });
     container.scrollTop = 495;
     await fireEvent.scroll(container);
 
@@ -1808,10 +1808,10 @@ describe("UnifiedTranscript — markdown rendering", () => {
     await waitFor(() => expect(container.scrollTop).toBe(895));
   });
 
-  it("a sub-pixel downward drift is honored by the next gap-hold, not undone", async () => {
-    // Downward intent accumulates just like upward intent: a slow drift of
-    // sub-epsilon events classifies once the total crosses the epsilon, which
-    // refreshes the stored gap. Without that, the next streamed chunk would
+  it("a sub-pixel wheel-driven drift is honored by the next gap-hold, not undone", async () => {
+    // Matched downward movement — wheel input agreeing with the scroll's
+    // direction — refreshes the stored gap at any magnitude, including
+    // sub-pixel trackpad drifts. Without that, the next streamed chunk would
     // gap-hold to the stale pre-drift position and silently undo the user's
     // movement.
     const state = await loadState();
@@ -1838,13 +1838,15 @@ describe("UnifiedTranscript — markdown rendering", () => {
     });
     await waitFor(() => expect(container.scrollTop).toBe(1000));
 
-    // Unpin 200px above the bottom.
+    // Unpin via wheel, 200px above the bottom.
+    await fireEvent.wheel(container, { deltaY: -5 });
     container.scrollTop = 300;
     await fireEvent.scroll(container);
 
-    // Drift 7.5px down through ten 0.75px events — every one below the
-    // per-event epsilon; the signed total classifies on alternating events.
+    // Drift 7.5px down through ten 0.75px wheel-driven events: each sample's
+    // direction matches its pending input, so every one refreshes the gap.
     for (let i = 1; i <= 10; i++) {
+      await fireEvent.wheel(container, { deltaY: 0.75 });
       container.scrollTop = 300 + i * 0.75;
       await fireEvent.scroll(container);
     }
@@ -1861,11 +1863,76 @@ describe("UnifiedTranscript — markdown rendering", () => {
     await waitFor(() => expect(container.scrollTop).toBe(507.5));
   });
 
-  it("a genuine downward scroll to the bottom re-pins", async () => {
-    // Re-pinning is the one place the 32px threshold still applies, and it
-    // requires genuine downward movement — programmatic writes are excluded by
-    // the snapshot discipline, so only the user returning to the bottom
-    // re-engages auto-follow.
+  it("sending a message force-pins an unpinned reader", async () => {
+    // Submitting a message is the user's explicit request to see the
+    // response: wherever they had scrolled, the send snaps to the bottom and
+    // engages auto-follow BEFORE the first chunk arrives — otherwise the
+    // response streams in below the fold and following never starts.
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    const container = screen.getByTestId("unified-transcript");
+    Object.defineProperty(container, "scrollHeight", { configurable: true, value: 1000 });
+    Object.defineProperty(container, "clientHeight", { configurable: true, value: 500 });
+
+    fireTo(`agent:${CLAUDE_AGENT.id}`, {
+      type: "turn_start",
+      turn_id: "turn-1",
+      message_id: "msg-1",
+      send_id: "msg-1",
+      started_at: "2026-05-16T00:00:00Z",
+    });
+    fireTo(`agent:${CLAUDE_AGENT.id}`, {
+      type: "content_chunk",
+      turn_id: "turn-1",
+      kind: "text",
+      text: "earlier response",
+    });
+    await waitFor(() => expect(container.scrollTop).toBe(1000));
+
+    // Reader wheels up to re-read: unpinned, view held.
+    await fireEvent.wheel(container, { deltaY: -300 });
+    container.scrollTop = 200;
+    await fireEvent.scroll(container);
+
+    // They send a new message: the compose path announces the send for this
+    // project, then dispatches the user turn.
+    Object.defineProperty(container, "scrollHeight", { configurable: true, value: 1100 });
+    state.noteLocalSend(PROJECT_ID, "send-new");
+    state.dispatchUserTurn(
+      CLAUDE_AGENT.id,
+      "user-new",
+      "follow up",
+      [],
+      "send-new",
+      "2026-05-16T00:01:00Z",
+    );
+    await waitFor(() => expect(container.scrollTop).toBe(1100));
+
+    // And the response streams: still following.
+    Object.defineProperty(container, "scrollHeight", { configurable: true, value: 1300 });
+    fireTo(`agent:${CLAUDE_AGENT.id}`, {
+      type: "turn_start",
+      turn_id: "turn-2",
+      message_id: "user-new",
+      send_id: "send-new",
+      started_at: "2026-05-16T00:01:01Z",
+    });
+    fireTo(`agent:${CLAUDE_AGENT.id}`, {
+      type: "content_chunk",
+      turn_id: "turn-2",
+      kind: "text",
+      text: "the answer",
+    });
+    await waitFor(() => expect(container.scrollTop).toBe(1300));
+  });
+
+  it("a send in another project does not move this transcript", async () => {
+    // A forward dispatches from a closure that can outlive a project switch,
+    // so an unscoped send signal would force-pin whichever project the user
+    // had moved on to.
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
 
@@ -1890,11 +1957,53 @@ describe("UnifiedTranscript — markdown rendering", () => {
     });
     await waitFor(() => expect(container.scrollTop).toBe(1000));
 
-    // Scroll far up: unpinned.
+    await fireEvent.wheel(container, { deltaY: -300 });
+    container.scrollTop = 200;
+    await fireEvent.scroll(container);
+
+    state.noteLocalSend("some-other-project", "send-elsewhere");
+    await tick();
+
+    expect(container.scrollTop).toBe(200);
+  });
+
+  it("a genuine wheel-driven return to the bottom re-pins", async () => {
+    // Re-pinning is the one place the 32px threshold still applies, and it
+    // requires movement matching the user's input — programmatic writes are
+    // excluded by the snapshot discipline, so only the user returning to the
+    // bottom re-engages auto-follow.
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    const container = screen.getByTestId("unified-transcript");
+    Object.defineProperty(container, "scrollHeight", { configurable: true, value: 1000 });
+    Object.defineProperty(container, "clientHeight", { configurable: true, value: 500 });
+
+    fireTo(`agent:${CLAUDE_AGENT.id}`, {
+      type: "turn_start",
+      turn_id: "turn-1",
+      message_id: "msg-1",
+      send_id: "msg-1",
+      started_at: "2026-05-16T00:00:00Z",
+    });
+    fireTo(`agent:${CLAUDE_AGENT.id}`, {
+      type: "content_chunk",
+      turn_id: "turn-1",
+      kind: "text",
+      text: "first",
+    });
+    await waitFor(() => expect(container.scrollTop).toBe(1000));
+
+    // Wheel far up: unpinned.
+    await fireEvent.wheel(container, { deltaY: -400 });
     container.scrollTop = 100;
     await fireEvent.scroll(container);
 
-    // Scroll back down to 20px from the bottom: downward + within 32px → re-pin.
+    // Wheel back down to 20px from the bottom: matched downward movement
+    // within 32px → re-pin.
+    await fireEvent.wheel(container, { deltaY: 380 });
     container.scrollTop = 480;
     await fireEvent.scroll(container);
 

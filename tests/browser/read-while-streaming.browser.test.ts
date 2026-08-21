@@ -26,6 +26,7 @@ import {
   resetState,
   transcriptContainer,
   distanceFromBottom,
+  userScrollTo,
 } from "./harness";
 import type { NormalizedEvent } from "$lib/types";
 import { ALICE, BOB, PROJECT_ID, agentTurn, longText, textItem, userTurn } from "./fixtures";
@@ -43,9 +44,7 @@ import { buildLargeTranscript } from "$lib/dev/largeTranscript";
 // upward jump.)
 
 function scrollTo(top: number): void {
-  const c = transcriptContainer();
-  c.scrollTop = top;
-  c.dispatchEvent(new Event("scroll")); // bare scroll: scrollbar/keyboard shape
+  userScrollTo(transcriptContainer(), top);
 }
 
 /// The block the user is reading: first block intersecting the viewport top.

@@ -9,7 +9,7 @@ vi.mock("@tauri-apps/api/core", () => ({
 vi.mock("$lib/native", () => ({ copyText: vi.fn(async () => undefined) }));
 
 import { mountPanes } from "./mount";
-import { registerAgent, seedTurns, resetState } from "./harness";
+import { registerAgent, seedTurns, resetState, userScrollTo } from "./harness";
 import {
   MIN_PANE_WIDTH_PX,
   createEmptyPane,
@@ -128,9 +128,8 @@ test("two panes scroll independently: one held off-bottom, the other stays pinne
   await expect.poll(() => distanceFromBottom(transcriptOf(0))).toBeLessThan(32);
   await expect.poll(() => distanceFromBottom(transcriptOf(1))).toBeLessThan(32);
 
-  // Scroll pane A to the top (bare scroll: unpins A only).
-  transcriptOf(0).scrollTop = 0;
-  transcriptOf(0).dispatchEvent(new Event("scroll"));
+  // Scroll pane A to the top: unpins A only.
+  userScrollTo(transcriptOf(0), 0);
   await expect.poll(() => distanceFromBottom(transcriptOf(0))).toBeGreaterThan(100);
 
   // New content lands in BOTH panes: A holds its place, B stays pinned.

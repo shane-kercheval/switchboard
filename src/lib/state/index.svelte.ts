@@ -47,6 +47,7 @@ import type {
   Hydrate,
   MessageId,
   NormalizedEvent,
+  ProjectId,
   SendId,
   TurnId,
 } from "$lib/types";
@@ -78,6 +79,39 @@ let transcriptRevision = $state(0);
 
 export function getTranscriptRevision(): number {
   return transcriptRevision;
+}
+
+/// The most recent local send, PROJECT-SCOPED. Sending a message is the
+/// user's explicit request to see the response, so the transcript force-pins
+/// on it — wherever they had scrolled — and auto-follow engages before the
+/// first chunk. Without it, a user who scrolled up to read and then sent
+/// watched the response stream in below the fold (the position-hold contract
+/// doing its job one send too long).
+///
+/// Scoped, not global: a forward dispatches from a closure that can outlive a
+/// project switch (see `dispatchToRecipients`, which takes its project
+/// explicitly for that reason), so an unscoped signal would force-pin
+/// whichever project the user had moved on to. Published ONCE per send action
+/// rather than per recipient, because a fan-out to N agents is one send in
+/// this project's vocabulary — N turns, one send.
+///
+/// The state layer reports the domain fact; the transcript owns the decision
+/// to force-pin.
+/// KEYED by project rather than a single latest-send slot: two send actions in
+/// one synchronous block (held forwards flushing together) would otherwise
+/// leave only the last one visible, and a transcript whose own send was
+/// overwritten never follows its response. Same-project sends may safely
+/// coalesce — both ask for the same final state.
+const localSends = $state<Record<ProjectId, { sendId: SendId; seq: number }>>({});
+
+export function getLocalSend(projectId: ProjectId): { sendId: SendId; seq: number } | undefined {
+  return localSends[projectId];
+}
+
+/// Announce a local send action. Called once per send by the compose path,
+/// before it dispatches to the recipients.
+export function noteLocalSend(projectId: ProjectId, sendId: SendId): void {
+  localSends[projectId] = { sendId, seq: (localSends[projectId]?.seq ?? 0) + 1 };
 }
 
 export function setTranscript(agentId: AgentId, turns: Turn[]): void {
@@ -839,6 +873,9 @@ export const _testing = {
     }
     heartbeats.clear();
     transcriptRevision = 0;
+    for (const key of Object.keys(localSends)) {
+      delete localSends[key];
+    }
     for (const key of Object.keys(transcripts)) {
       delete transcripts[key];
     }

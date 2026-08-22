@@ -185,29 +185,41 @@ Note for the test below: a failed `apply_patch` emits neither a live `file_chang
 
 ## M5 — Forward-path hardening: block on any empty source
 
-**Sequencing is load-bearing: this must land after M2.** Before paginated text hydration is restored, every Codex forward resolves empty, so shipping this first would block all Codex forwards.
+**Sequencing is load-bearing: this must land after M2.** Until paginated text hydration is restored, every Codex source resolves empty — shipping this first would block every Codex forward *and* fail every workflow step that forwards from one.
 
 ### Goal & Outcome
 
-A forward can never again dispatch a message that silently omits a source.
+No forward path can dispatch a message that omits a selected source.
 
-- If **any** source resolves to no forwardable output, the forward is invalidated and **nothing is sent**; the compose bar shows why.
-- The user learns at the moment it matters, before a downstream agent consumes a truncated message.
-- Manual and workflow forwards share one empty-source policy.
+- If **any** selected source resolves to zero forwardable text, nothing is dispatched: manual message forwards and manual prompt forwards invalidate with a compose-bar error; workflow steps fail the step.
+- The user is told before a downstream agent consumes a truncated message — and in the workflow case, told at all.
+- All forward paths share **one** empty-source policy, enforced in one place.
 
 ### Implementation Outline
 
-The manual path's policy today is "skip empties, fail only if every source is empty," and it renders a partial-empty caption on the dispatched message. The workflow path **already fails on any empty source** (documented at `forward_message_impl`'s doc comment: "the workflow path supplies its own (fail on any) against the same primitives"). So this is convergence on the stricter existing policy, not a new one — say so in the code and commit message.
+**Correcting the premise this milestone was originally written on:** an earlier draft claimed the workflow path already enforced "fail on any empty," citing the doc comment on `forward_message_impl`. That comment is **stale and wrong**, and taking it at face value instead of tracing the code was the error. Verified against the current tree, **four** paths are permissive:
 
-Change the manual path to invalidate when any source resolves empty, reusing the existing `ForwardOutcome::Invalidated { reason }` → `compose-send-error` surface rather than adding a new one. The reason should name the source(s) and say the output could not be read — not that the agent "had no output," which asserts a fact we do not know.
+1. `forward_message_impl` — skips empties, fails only if *every* source is empty; records the rest for the partial-empty caption (`commands.rs` ~3330).
+2. Manual prompt forwarding — skips partial empties, permits an empty optional argument and empty appended sources (`commands.rs` ~3768).
+3. `resolve_workflow_forwards` — builds a `skipped` list, **never reads it**, and composes anyway (`commands.rs` ~3411).
+4. The workflow runtime — `absorb` inserts `result.text` into `OutputScope` unconditionally on `Completed` (including `""`), and `build_body`'s `forward_from` fails only when a source is **absent** (`None`), composing an empty block for a present-but-empty one (`app/src/workflow.rs` ~408, ~545–570).
 
-This makes the **partial-empty caption unreachable** for new sends: no partial forward can be dispatched, and the caption is live-session state that does not survive reload, so it cannot appear for historical messages either. Remove that now-dead path — the `skipped` plumbing through `heldForwards`, `types.ts`, and the `UnifiedTranscript` caption — rather than leaving unreachable UI behind. Verify the reachability claim against the code before deleting; if any live path can still produce it, keep it and fix its wording instead.
+Path 4 is the worst of the four and the reason this milestone matters most: a workflow step forwarding from an affected Codex agent hits the exact silent drop this plan opens with, and unlike the manual path it produces **no caption at all**. Multi-agent workflows are where this class of bug does the most damage — it is what consumed a reviewer's entire contribution in the incident above. Fix the stale doc comment as part of this work so it stops misleading readers.
+
+Introduce **one shared empty-resolution validator** and apply it before composition at all four sites. Manual paths return `ForwardOutcome::Invalidated { reason }`, reusing the existing `compose-send-error` surface — no new UI. Workflow validation/invocation returns the existing workflow error type so a step fails loudly rather than composing an empty block.
+
+**Scope the guarantee honestly.** The check is "resolves to zero forwardable text," not "we detected data loss." `resolve_source_completed_only` collapses *no completed turn*, *completed turn with only tool output*, and *hydration loss* into the same empty string, and a **partially** parsed non-empty answer still passes. So the copy must be neutral — name the source and say it has no forwardable text and nothing was sent — never assert that output "could not be read," which claims a cause we cannot know. If distinguishing genuine read failure is wanted later, that needs typed provenance and parser warnings carried through the resolver, not an inference from emptiness.
+
+**Frontend copy follows the policy.** `ForwardSourceChip`'s `readiness: empty` currently means "this source is skipped from the send" and is shared by the compose bar and the prompt/workflow composers; that consequence is now "this send is blocked." Update the chip plus `ComposeBar`, `PromptComposer`, `WorkflowComposer`, and `ForwardSourcePicker`.
+
+**Remove the partial-empty caption last**, only once all four backend paths are strict — otherwise prompt forwarding loses its remaining partial-empty signal while still able to produce one. At that point no path can dispatch a partial forward, and the caption is live-session state that does not survive reload, so it is unreachable for historical messages too. Verify that reachability claim against the code before deleting `skipped`, `heldForwards`' plumbing, the `types.ts` field, and the `UnifiedTranscript` caption; if any live producer remains, keep it and fix its wording instead.
 
 ### Definition of Done
 
-- Backend tests: a forward with one empty source invalidates and dispatches nothing; the existing all-empty test still passes (now a special case of the same rule); the reason names the source. Update `forward_all_empty_invalidates` and any test asserting partial-empty proceeds — those encode the old policy and must be rewritten to the new one, not deleted.
-- Frontend tests: `ComposeBar` surfaces the error and does not dispatch; remove the partial-empty caption tests in `UnifiedTranscript.test.ts` **only** if the removal is confirmed reachable-dead.
-- **The regression test for the original bug**: hydrate the M1 paginated fixture and assert `latest_completed_agent_text` returns the agent's answer text. This is the case that actually bit us, and it belongs with M2's parser work as well as here.
+- Backend tests, one per path: manual message forward, manual prompt **argument** forward, manual prompt **appended-text** forward, and workflow **field** forward — each invalidates/fails when any one source is empty, dispatches nothing, and names the source. A workflow step forwarding from a completed-but-empty source must fail the step rather than compose an empty block.
+- Rewrite (do not delete) tests encoding the old policy — `forward_all_empty_invalidates` becomes a special case of the new rule; any test asserting a partial-empty forward proceeds must be inverted.
+- Frontend tests: the error surfaces and no dispatch occurs; remove partial-empty caption tests only if the removal is confirmed reachable-dead.
+- **The regression test for the original bug**: hydrate the M1 paginated fixture and assert `latest_completed_agent_text` returns the agent's answer text. It belongs with M2's parser work as well — it is the parser fix, not the hardening, that closes the root cause.
 
 ---
 
@@ -215,24 +227,31 @@ This makes the **partial-empty caption unreachable** for new sends: no partial f
 
 ### Goal & Outcome
 
-When an agent renames a file, the transcript says so instead of showing it as an edit to the old path.
+When an agent renames a file, the transcript shows the move instead of presenting it as an edit to the old path.
 
-- A Codex edit that moves a file shows its destination; ordinary edits are unaffected.
-- Works for **both** rollout generations — legacy `patch_apply_end` already carries `move_path` (fact 6), so this improves historical transcripts too.
+- A renamed file reads as `source → destination` in **both** the collapsed row and the expanded view.
+- Ordinary edits are visually unchanged.
+- Works for **both** rollout generations — legacy `patch_apply_end` already carries `move_path` (fact 6), so historical transcripts improve too.
 
 ### Implementation Outline
 
 Independent of M2–M5; ordered last because it is an enhancement, not the repair. Scoped separately because it has **nothing to do with the version bump** — the data has always been available and is deliberately discarded today (`parse_apply_patch` consumes and drops `*** Move to:`, pinned by `move_to_line_is_consumed_and_path_stays_original`).
 
-This is the one cross-layer change in the plan: an additive destination field on `EditedFile` (Rust), its TypeScript mirror, and a minimal render in the tool-row component. Prefer an additive optional field over a new `EditChange` variant — a `Renamed` enum value alone cannot carry both source and destination. Populate it from `move_path` in both the legacy `patch_apply_end` facet builder and the M3 `FileChange` builder, and stop discarding `*** Move to:` in the patch-text parser; update that pinned test to assert the new behavior rather than deleting it.
+This is the plan's one cross-layer change: an additive **optional destination field** on `EditedFile`, its TypeScript mirror, and rendering. Prefer the optional field over a new `EditChange` variant — a `Renamed` value alone cannot carry both source and destination — and note that `ToolFacet::Mcp`'s `mutation` is the existing precedent for an additive optional facet field. Populate from `move_path` in both the legacy `patch_apply_end` facet builder and the M3 `FileChange` builder, and stop discarding `*** Move to:` in the patch-text parser; **update** that pinned test to assert the new behavior rather than deleting it. Resolve a relative `*** Move to:` value against the same cwd the source path is resolved against.
 
-**Codex-only, by design** — record why in the code: Claude renames by running `mv` in Bash, which already renders as a self-explanatory shell row, so there is no Claude-side signal to map and no cross-harness rename concept to build.
+**Both render surfaces, explicitly** — updating one would leave the other presenting a rename as an ordinary edit:
+
+- Collapsed: `toolDetail`'s edit arm currently joins `files.map(f => f.path)`; it must show the move.
+- Expanded: `ToolCallWidget`'s edit section renders `file.path` alone. Its existing per-file annotation is gated on `files.length > 1 && file.change !== "modified"`, which **structurally excludes the single-file rename** this milestone targets — and single-file is the realistic case (one rename across 3,201 local file-change records). This needs a new independent conditional, not an extension of that one.
+- The path row's copy action should target the **destination** — that is the file that exists after the operation.
+
+**Codex-only by design** — record why, and mark it inferred rather than observed: Claude has no rename-capable edit tool, so it renames via `mv` in Bash, which already renders as a self-explanatory shell row. That is a reasonable reading of Claude's tool vocabulary but is not backed by a captured fixture, unlike the Codex `move_path` parity claim.
 
 ### Definition of Done
 
-- Backend tests: `move_path` populated from both generations; a null `move_path` leaves ordinary edits unchanged; the `*** Move to:` patch-text path now retains the destination.
-- Frontend test: a renamed file renders its destination; an ordinary edit is unchanged.
-- `docs/harness-behavior.md` §5's `*** Move to:` open capture updated — note it is now represented, and that real renames are rare (one occurrence across 3,201 local file-change records).
+- Backend tests: destination populated from both generations; a null `move_path` leaves ordinary edits unchanged; the `*** Move to:` patch-text path retains the destination; a relative destination resolves against cwd.
+- Frontend tests: a **single-file** rename renders its destination in both collapsed and expanded views; an ordinary edit is unchanged; extend the existing real-WebKit long-path wrapping test with a rename case.
+- `docs/harness-behavior.md` §5's `*** Move to:` open capture updated — now represented, with the observed frequency noted (one occurrence across 3,201 local file-change records).
 
 ---
 
@@ -248,5 +267,6 @@ Docs match reality and the drift-detection suite is green.
 - Extend `live_codex_transcript_load_via_captured_locator_round_trips` to assert the rollout it exercised was actually `history_mode: paginated`; otherwise a future upstream legacy-fallback would let it pass without exercising the new path.
 - `docs/harness-behavior.md`: close **G30** with the shipped mechanism; update §3.6's Codex generation table (three generations, third supported, per-mode edit/exit-code sources); lift the §3.1 caveats this resolves and note that paginated threads now carry structured exit codes while legacy keeps the string-sniffing fallback; update §6's 0.148.0 note tail to "fixed"; record fact 9's two new item types (the `ContextCompaction` capture partially answers the compaction shape flagged unprobed in §3.1/G25 — record what was captured, do not extrapolate).
 - `docs/harness-update-review.md`: update the Codex row's follow-up (live 13/13, G30 closed).
+- Fix the stale doc comment on `forward_message_impl` claiming the workflow path fails on any empty source (M5) — it misled this plan's own first draft.
 - Blow-by-blow reasoning goes in the PR description; git owns chronology.
 - Known limitations recorded, not dropped: MCP error-variant capture status (M1); legacy threads keep string-sniffed exit status by design; `Reasoning` skipped; `Extension`/`ContextCompaction` captured but not consumed.

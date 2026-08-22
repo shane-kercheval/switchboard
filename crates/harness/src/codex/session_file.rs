@@ -380,6 +380,115 @@ fn turn_context_turn_id(payload: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// Flatten the text of a paginated `UserMessage` / `AgentMessage` item's
+/// content blocks. `None` means the record is malformed — `content` missing or
+/// not an array — which the caller warns on; `Some` is the flattened text,
+/// possibly empty.
+///
+/// **Reads each block's `text` field rather than gating on its `type` tag.**
+/// Codex is not consistent about that tag's casing — a `UserMessage` block is
+/// `{"type":"text"}` while an `AgentMessage` block is `{"type":"Text"}`, in the
+/// same file — so matching on it would silently drop one side of every
+/// conversation. Non-text blocks (images, audio, skills) carry no `text` field
+/// and contribute nothing, which needs no tag inventory to stay correct.
+///
+/// Blocks are joined with **no separator**, matching Codex's own canonical
+/// flattening (`UserMessageItem::message()` is a `.join("")`) — the legacy
+/// `user_message`/`agent_message` records are generated from that same
+/// flattening, so any separator here would make the two generations hydrate
+/// differently.
+///
+/// The trust boundary is deliberate: only a missing/non-array `content` reads
+/// as malformed. An array whose blocks are all unrecognized shapes flattens to
+/// `Some("")` — indistinguishable from genuinely-empty, consistent with the
+/// parser's unknown-types-skip-silently posture.
+fn item_message_text(item: &Value) -> Option<String> {
+    let blocks = item.get("content").and_then(Value::as_array)?;
+    Some(
+        blocks
+            .iter()
+            .filter_map(|block| block.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .concat(),
+    )
+}
+
+/// Which generation of rollout a session file is, read from
+/// `session_meta.history_mode`. This field — never a CLI-version comparison —
+/// is the durable predicate: a pagination-capable Codex still writes `Legacy`
+/// files whenever its store rejects pagination, and resuming a pre-flip thread
+/// keeps writing legacy records indefinitely.
+///
+/// [`Missing`](Self::Missing) and [`Unknown`](Self::Unknown) are deliberately
+/// distinct even though both parse through the legacy path. Missing means "file
+/// predates the field", which is the overwhelmingly common case and entirely
+/// unremarkable. Unknown means Codex has introduced a *third* persistence
+/// contract — and if that contract drops the records the legacy path reads, the
+/// way `Paginated` dropped them, hydration silently returns nothing. Collapsing
+/// the two would reproduce exactly the failure this whole module exists to fix,
+/// so `Unknown` always leaves a `ParseWarning` behind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HistoryMode {
+    /// No `history_mode` field — a rollout written before Codex added it.
+    Missing,
+    Legacy,
+    Paginated,
+    /// A value this build does not recognize. Parsed as legacy (the
+    /// conservative guess: never fabricate a reading of an unknown contract),
+    /// but always surfaced.
+    Unknown(String),
+}
+
+impl HistoryMode {
+    /// Read from a `session_meta` record's payload.
+    ///
+    /// Only a genuinely **absent** field is `Missing`. Upstream declares the
+    /// persisted field as a non-optional `#[serde(default)] ThreadHistoryMode`
+    /// — Codex writes a string or (pre-field versions) nothing at all, never
+    /// `null` — so a present-but-non-string value, `null` included, is a
+    /// changed contract and must take the warned `Unknown` path. Classifying
+    /// it as `Missing` would let a representation change slip past the
+    /// tripwire exactly the way the paginated flip did.
+    fn from_session_meta(payload: &Value) -> Self {
+        match payload.get("history_mode") {
+            None => Self::Missing,
+            Some(Value::String(s)) => match s.as_str() {
+                "legacy" => Self::Legacy,
+                "paginated" => Self::Paginated,
+                other => Self::Unknown(other.to_owned()),
+            },
+            Some(other) => Self::Unknown(other.to_string()),
+        }
+    }
+
+    /// Whether `event_msg/item_completed` carries this file's prompt, answer,
+    /// and tool detail. Only `Paginated` routes through that channel; every
+    /// other mode (including `Unknown`) reads the legacy `event_msg` records.
+    fn reads_item_completed(&self) -> bool {
+        matches!(self, Self::Paginated)
+    }
+}
+
+/// Read the enrichment-relevant fields off a `session_meta` payload.
+///
+/// This reader has no `ParseWarning` channel (it feeds live turn-end
+/// enrichment, not a `LoadedTranscript`), so an unrecognized `history_mode` is
+/// surfaced through tracing instead. Same rationale as the reconstruction path:
+/// an unknown persistence contract must never pass silently. The mode is read
+/// and dropped rather than carried — nothing on this path branches on it yet.
+fn absorb_session_meta(payload: &Value, enrichment: &mut Enrichment) {
+    if let Some(version) = payload.get("cli_version").and_then(Value::as_str) {
+        enrichment.cli_version = Some(version.to_owned());
+    }
+    if let HistoryMode::Unknown(value) = HistoryMode::from_session_meta(payload) {
+        tracing::warn!(
+            history_mode = %value,
+            "Codex session-file: unrecognized history_mode; \
+             reading as legacy — enrichment may be incomplete"
+        );
+    }
+}
+
 #[must_use]
 pub fn parse_session_content(content: &str) -> Enrichment {
     let mut enrichment = Enrichment::default();
@@ -410,10 +519,8 @@ pub fn parse_session_content(content: &str) -> Enrichment {
 
         match record_type {
             "session_meta" => {
-                if let Some(p) = payload
-                    && let Some(version) = p.get("cli_version").and_then(Value::as_str)
-                {
-                    enrichment.cli_version = Some(version.to_owned());
+                if let Some(p) = payload {
+                    absorb_session_meta(p, &mut enrichment);
                 }
                 enrichment.session_meta_raw = Some(strip_base_instructions(value));
             }
@@ -827,6 +934,10 @@ struct CodexReconstruction {
     /// requires (observed paths are already absolute; this is the defensive
     /// lexical join).
     current_cwd: Option<std::path::PathBuf>,
+    /// Which rollout generation this file is (see [`HistoryMode`]). Set from
+    /// `session_meta`, which Codex writes as the first record; a file with no
+    /// `session_meta` at all keeps the `Missing` default and reads as legacy.
+    history_mode: HistoryMode,
 }
 
 struct CodexAgentBuilder {
@@ -865,6 +976,7 @@ impl CodexReconstruction {
             current_model: None,
             current_effort: None,
             current_cwd: None,
+            history_mode: HistoryMode::Missing,
         }
     }
 
@@ -885,6 +997,26 @@ impl CodexReconstruction {
             .map(|dt| dt.with_timezone(&Utc));
 
         match record_type {
+            // Codex writes `session_meta` first, so the mode is known before any
+            // content record arrives. An unrecognized value is surfaced here
+            // rather than at the point content goes missing: by then the parser
+            // has nothing to attribute the loss to, which is precisely how the
+            // paginated switch went unnoticed.
+            "session_meta" => {
+                if let Some(p) = payload {
+                    self.history_mode = HistoryMode::from_session_meta(p);
+                    if let HistoryMode::Unknown(value) = &self.history_mode {
+                        let value = value.clone();
+                        self.warn(
+                            line_number,
+                            format!(
+                                "unrecognized session_meta.history_mode {value:?}; \
+                                 reading as legacy — transcript content may be incomplete"
+                            ),
+                        );
+                    }
+                }
+            }
             "event_msg" => self.handle_event_msg(line_number, payload, timestamp),
             "response_item" => self.handle_response_item(line_number, payload, timestamp),
             // Codex writes a `turn_context` at each turn's start carrying that
@@ -964,7 +1096,13 @@ impl CodexReconstruction {
             "task_complete" => {
                 self.close_current_agent(TurnStatus::Complete);
             }
-            "user_message" => {
+            // Prompt and answer text is **single-sourced per mode**: legacy
+            // rollouts carry `user_message`/`agent_message`, paginated ones carry
+            // the same content inside `item_completed`. The guards make that
+            // structural rather than trusted — the two channels are not observed
+            // to coexist, but if they ever did, an ungated parser would render
+            // every message twice.
+            "user_message" if !self.history_mode.reads_item_completed() => {
                 // Push to `self.turns` directly, not into `builder.items`:
                 // Codex emits `task_started` BEFORE `user_message`, so the
                 // agent builder is already open here. Anchor the user turn to
@@ -988,7 +1126,7 @@ impl CodexReconstruction {
                 };
                 self.turns.push(user_turn);
             }
-            "agent_message" => {
+            "agent_message" if !self.history_mode.reads_item_completed() => {
                 let Some(message) = p.get("message").and_then(Value::as_str) else {
                     return;
                 };
@@ -1015,6 +1153,15 @@ impl CodexReconstruction {
                 {
                     builder.usage = Some(usage);
                 }
+            }
+            // Paginated rollouts carry prompt, answer, and tool detail here
+            // instead of on the legacy `event_msg` records. Gated on the mode
+            // because legacy files also emit `item_completed`, but only for
+            // item types this parser does not consume (`Plan`, extensions) —
+            // ungated, the arm would be harmless today and wrong the moment
+            // that set widens.
+            "item_completed" if self.history_mode.reads_item_completed() => {
+                self.handle_item_completed(line_number, p, timestamp);
             }
             "patch_apply_end" => self.handle_patch_apply_end(line_number, p, timestamp),
             "mcp_tool_call_end" => {
@@ -1053,6 +1200,91 @@ impl CodexReconstruction {
                     }
                 }
             }
+            _ => {}
+        }
+    }
+
+    /// Paginated rollouts' replacement for the legacy `user_message` /
+    /// `agent_message` records. `item.type` is a Codex `TurnItem` variant; each
+    /// arm mirrors the contract of the legacy record it supersedes so both
+    /// generations hydrate identically.
+    ///
+    /// Tool variants (`CommandExecution` / `FileChange` / `McpToolCall`) are
+    /// deliberately absent: tool *rows* come from `response_item`, which is the
+    /// only complete record of tool activity — a failed call can emit no
+    /// `item_completed` at all. Unknown variants fall through silently, matching
+    /// the parser's existing posture toward record types it does not consume.
+    fn handle_item_completed(
+        &mut self,
+        line_number: usize,
+        payload: &Value,
+        timestamp: Option<DateTime<Utc>>,
+    ) {
+        let Some(item) = payload.get("item") else {
+            return;
+        };
+        match item.get("type").and_then(Value::as_str).unwrap_or("") {
+            "UserMessage" => {
+                // A recognized message item with unreadable content is warned,
+                // not skipped — a silent drop here is a miniature rerun of the
+                // silent loss this module exists to fix.
+                let Some(text) = item_message_text(item) else {
+                    self.warn(line_number, "UserMessage item missing content array");
+                    return;
+                };
+                // Pushed even when the text is empty: the prompt may have been
+                // image/audio/skill-only (`UserInput` has non-text variants), and
+                // the turn *boundary* is real even though the attachment is not
+                // representable. Inferred parity with the legacy path, which
+                // flattens the same prompt to an empty `message` string and
+                // pushes the turn (what legacy Codex actually writes for an
+                // attachment-only prompt is uncaptured). This restores the
+                // chronology, not the attachment itself.
+                //
+                // Same anchoring as the legacy `user_message` arm: Codex writes
+                // `task_started` before the prompt, so a builder is already open
+                // and the user turn is anchored to that task start — which keeps
+                // a timestamp-sorted transcript rendering the prompt directly
+                // above its reply.
+                let started_at = self.current_agent.as_ref().map_or_else(
+                    || timestamp.unwrap_or_else(Utc::now),
+                    |builder| builder.started_at,
+                );
+                self.turns.push(Turn::User {
+                    turn_id: Uuid::now_v7(),
+                    agent_id: self.agent_id,
+                    started_at,
+                    text,
+                    source: crate::transcript::UserPromptSource::Unknown,
+                });
+            }
+            "AgentMessage" => {
+                let Some(text) = item_message_text(item) else {
+                    self.warn(line_number, "AgentMessage item missing content array");
+                    return;
+                };
+                // Empty answer text is skipped — deliberately asymmetric with
+                // the UserMessage arm above (an agent item has no attachment
+                // variants whose boundary is worth preserving) and matching the
+                // live stream parser, whose `empty_agent_message_text_is_skipped`
+                // test pins the same policy. Live and reopened transcripts agree.
+                if text.is_empty() {
+                    return;
+                }
+                if let Some(builder) = self.current_agent.as_mut() {
+                    builder.items.push(TurnItem::Text {
+                        kind: ContentKind::Text,
+                        text,
+                    });
+                    if let Some(t) = timestamp {
+                        builder.last_seen_at = t;
+                    }
+                }
+            }
+            // Reasoning is captured but carries no renderable prose — the
+            // summary is empty and the raw content is encrypted (§3.2). Skipped
+            // for the same reason Codex reasoning has always been skipped, not
+            // as an oversight.
             _ => {}
         }
     }
@@ -1159,16 +1391,19 @@ impl CodexReconstruction {
             }
             // `response_item/message` carries the structured model-API form
             // of the conversation content (`content: [{type:"input_text",
-            // text:"..."}]`). We don't parse it — `event_msg/user_message`
-            // and `event_msg/agent_message` are the UI-friendly summaries
-            // that flow alongside in every observed Codex session, and
-            // consuming both would double-count text in the rehydrated
-            // transcript. Regression check: the session-file unit tests
-            // below (`load_codex_transcript_text_only_turn_produces_user_and_agent`
-            // and friends) construct fixtures using these `event_msg`
-            // records and assert non-empty `items`. If a future Codex
-            // release stops emitting `event_msg/agent_message`, those
-            // assertions fail before the parser change ships.
+            // text:"..."}]`). We never parse it, in either generation: text is
+            // **single-sourced per mode** — legacy files supply it through
+            // `event_msg/user_message` / `agent_message`, paginated files
+            // through `event_msg/item_completed` — and this record duplicates
+            // whichever of those is present, so consuming it would double-count
+            // every message.
+            //
+            // This arm once claimed the legacy records "flow alongside in every
+            // observed Codex session". That stopped being true at Codex 0.148,
+            // and the fixture suite did not notice because fixtures replay the
+            // shape they were recorded from (G30). The durable guard is the
+            // live suite, not these tests: `make test-live-codex` runs against
+            // whatever the installed CLI actually writes.
             _ => {}
         }
     }
@@ -3500,5 +3735,307 @@ not valid json
         );
         // And the content asymmetry is real: disk has pairs, live had none.
         assert!(disk.iter().any(|f| !f.edits.is_empty()));
+    }
+
+    // --- Paginated rollouts (history_mode) ---
+    //
+    // These cover the generation Codex 0.148+ writes, where prompt and answer
+    // text moved from `event_msg/user_message` / `agent_message` onto
+    // `event_msg/item_completed`. See the fixture inventory above this module.
+
+    fn agent_text(turn: &Turn) -> String {
+        let Turn::Agent { items, .. } = turn else {
+            panic!("expected an agent turn");
+        };
+        items
+            .iter()
+            .filter_map(|item| match item {
+                TurnItem::Text {
+                    kind: ContentKind::Text,
+                    text,
+                } => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
+    #[test]
+    fn paginated_rollout_hydrates_prompt_and_answer_exactly_once() {
+        let content =
+            std::fs::read_to_string(fixture_path("paginated-text-only.session.jsonl")).unwrap();
+        let result = parse_codex_transcript_content(&content, Uuid::now_v7());
+
+        let users: Vec<_> = result
+            .turns
+            .iter()
+            .filter(|t| matches!(t, Turn::User { .. }))
+            .collect();
+        let agents: Vec<_> = result
+            .turns
+            .iter()
+            .filter(|t| matches!(t, Turn::Agent { .. }))
+            .collect();
+
+        // Exactly one of each: the `response_item/message` twins carry the same
+        // content and must not be counted a second time.
+        assert_eq!(
+            users.len(),
+            1,
+            "prompt must render once, not once per channel"
+        );
+        assert_eq!(agents.len(), 1);
+        let Turn::User { text, .. } = users[0] else {
+            unreachable!()
+        };
+        assert_eq!(text, "say ack");
+        assert_eq!(agent_text(agents[0]), "ack");
+        assert!(
+            result.warnings.is_empty(),
+            "a known mode must parse silently"
+        );
+    }
+
+    /// The regression test for the bug that motivated this work: forwarding
+    /// from an idle Codex agent reads the transcript from disk, so an empty
+    /// hydration silently reported "<agent> had no output" while the answer sat
+    /// in the rollout.
+    #[test]
+    fn paginated_rollout_yields_forwardable_agent_text() {
+        let content =
+            std::fs::read_to_string(fixture_path("paginated-text-only.session.jsonl")).unwrap();
+        let result = parse_codex_transcript_content(&content, Uuid::now_v7());
+
+        let forwarded = crate::forward::latest_completed_agent_text(&result.turns);
+        assert_eq!(forwarded.as_deref(), Some("ack"));
+    }
+
+    #[test]
+    fn paginated_rollout_tolerates_both_text_block_casings() {
+        // `UserMessage` blocks are tagged `"text"`, `AgentMessage` blocks
+        // `"Text"`, in the same file. Gating on the tag would drop one side.
+        let content = jsonl_lines(&[
+            serde_json::json!({"type":"session_meta","payload":{"cli_version":"0.149.0","history_mode":"paginated"}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"t-1"}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"item_completed","item":{
+                "type":"UserMessage","id":"u1","content":[{"type":"text","text":"lower"}]}}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"item_completed","item":{
+                "type":"AgentMessage","id":"a1","content":[{"type":"Text","text":"upper"}]}}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"t-1"}}),
+        ]);
+        let result = parse_codex_transcript_content(&content, Uuid::now_v7());
+
+        let Some(Turn::User { text, .. }) =
+            result.turns.iter().find(|t| matches!(t, Turn::User { .. }))
+        else {
+            panic!("lowercase-tagged prompt block was dropped");
+        };
+        assert_eq!(text, "lower");
+        let agent = result
+            .turns
+            .iter()
+            .find(|t| matches!(t, Turn::Agent { .. }))
+            .expect("agent turn");
+        assert_eq!(agent_text(agent), "upper");
+    }
+
+    #[test]
+    fn legacy_rollout_with_explicit_mode_still_reads_legacy_records() {
+        let content =
+            std::fs::read_to_string(fixture_path("legacy-explicit-mode.session.jsonl")).unwrap();
+        let result = parse_codex_transcript_content(&content, Uuid::now_v7());
+
+        // Both halves, exactly once: the mode gating added to the legacy
+        // `agent_message` arm is precisely the change that could regress the
+        // answer side while the prompt still hydrates.
+        let users: Vec<_> = result
+            .turns
+            .iter()
+            .filter(|t| matches!(t, Turn::User { .. }))
+            .collect();
+        let agents: Vec<_> = result
+            .turns
+            .iter()
+            .filter(|t| matches!(t, Turn::Agent { .. }))
+            .collect();
+        assert_eq!(users.len(), 1);
+        assert_eq!(agents.len(), 1);
+        let Turn::User { text, .. } = users[0] else {
+            unreachable!()
+        };
+        assert_eq!(text, "say ack");
+        assert_eq!(agent_text(agents[0]), "ack");
+        assert!(result.warnings.is_empty());
+    }
+
+    #[test]
+    fn absent_history_mode_reads_legacy_and_stays_silent() {
+        // The overwhelmingly common case: every rollout written before Codex
+        // added the field. It must not warn — a warning here would cry wolf on
+        // most of the corpus.
+        let content = std::fs::read_to_string(fixture_path("exec-wrapper.session.jsonl")).unwrap();
+        let result = parse_codex_transcript_content(&content, Uuid::now_v7());
+
+        assert!(
+            result.turns.iter().any(|t| matches!(t, Turn::User { .. })),
+            "legacy records must still hydrate when no mode is declared"
+        );
+        assert!(
+            result.warnings.is_empty(),
+            "an absent mode is unremarkable, not a warning: {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn unknown_history_mode_reads_legacy_and_warns() {
+        let content =
+            std::fs::read_to_string(fixture_path("unknown-history-mode.session.jsonl")).unwrap();
+        let result = parse_codex_transcript_content(&content, Uuid::now_v7());
+
+        // Backward-compatible unknown format: content survives the fallback...
+        let Some(Turn::User { text, .. }) =
+            result.turns.iter().find(|t| matches!(t, Turn::User { .. }))
+        else {
+            panic!("legacy-readable records must still hydrate under an unknown mode");
+        };
+        assert_eq!(text, "say ack");
+        // ...but the unrecognized contract is still surfaced.
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.reason.contains("some_future_mode")),
+            "unknown mode must name the value it did not recognize: {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn unknown_history_mode_warns_when_the_fallback_finds_no_text() {
+        // The scenario the warning exists for: a future format that, like
+        // paginated did to legacy, stops writing the records the fallback
+        // reads. Hydration degrades — but it must not degrade *silently*.
+        let content =
+            std::fs::read_to_string(fixture_path("unknown-history-mode-degraded.session.jsonl"))
+                .unwrap();
+        let result = parse_codex_transcript_content(&content, Uuid::now_v7());
+
+        assert!(
+            !result.turns.iter().any(|t| matches!(t, Turn::User { .. })),
+            "an unknown mode must not be read as paginated on a guess"
+        );
+        let agent = result
+            .turns
+            .iter()
+            .find(|t| matches!(t, Turn::Agent { .. }))
+            .expect("turn boundaries survive: they come from records every mode writes");
+        assert_eq!(agent_text(agent), "", "text is genuinely unavailable here");
+        assert!(
+            !result.warnings.is_empty(),
+            "silent empty hydration is the exact failure this warning prevents"
+        );
+    }
+
+    #[test]
+    fn paginated_attachment_only_prompt_preserves_the_user_turn() {
+        // `UserInput` has image/audio/skill variants; an attachment-only prompt
+        // flattens to empty text but the turn boundary is real. Dropping it
+        // would leave the agent's answer orphaned with no prompt above it.
+        let content = jsonl_lines(&[
+            serde_json::json!({"type":"session_meta","payload":{"cli_version":"0.149.0","history_mode":"paginated"}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"t-1"}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"item_completed","item":{
+                "type":"UserMessage","id":"u1","content":[{"type":"image","image_url":"data:image/png;base64,AAAA"}]}}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"item_completed","item":{
+                "type":"AgentMessage","id":"a1","content":[{"type":"Text","text":"a red square"}]}}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"t-1"}}),
+        ]);
+        let result = parse_codex_transcript_content(&content, Uuid::now_v7());
+
+        let Some(Turn::User { text, .. }) =
+            result.turns.iter().find(|t| matches!(t, Turn::User { .. }))
+        else {
+            panic!("attachment-only prompt must keep its turn boundary");
+        };
+        assert_eq!(text, "", "the attachment is not representable; the turn is");
+        assert!(result.warnings.is_empty(), "a valid record must not warn");
+    }
+
+    #[test]
+    fn paginated_message_item_missing_content_warns() {
+        let content = jsonl_lines(&[
+            serde_json::json!({"type":"session_meta","payload":{"cli_version":"0.149.0","history_mode":"paginated"}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"t-1"}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"item_completed","item":{
+                "type":"UserMessage","id":"u1"}}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"item_completed","item":{
+                "type":"AgentMessage","id":"a1","content":"not-an-array"}}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"t-1"}}),
+        ]);
+        let result = parse_codex_transcript_content(&content, Uuid::now_v7());
+
+        // A recognized message item whose content cannot be read is a warned
+        // parse gap, never a silent skip.
+        assert_eq!(result.warnings.len(), 2, "{:?}", result.warnings);
+        assert!(result.warnings[0].reason.contains("UserMessage"));
+        assert!(result.warnings[1].reason.contains("AgentMessage"));
+    }
+
+    #[test]
+    fn paginated_multi_block_text_flattens_without_separator() {
+        // Codex's own flattening (`UserMessageItem::message()`) is a
+        // `.join("")`, and the legacy records are generated from it — so the
+        // paginated path must concatenate identically, not insert separators.
+        let content = jsonl_lines(&[
+            serde_json::json!({"type":"session_meta","payload":{"cli_version":"0.149.0","history_mode":"paginated"}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"t-1"}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"item_completed","item":{
+                "type":"UserMessage","id":"u1","content":[
+                    {"type":"text","text":"first"},
+                    {"type":"image","image_url":"data:image/png;base64,AAAA"},
+                    {"type":"text","text":"second"}]}}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"t-1"}}),
+        ]);
+        let result = parse_codex_transcript_content(&content, Uuid::now_v7());
+
+        let Some(Turn::User { text, .. }) =
+            result.turns.iter().find(|t| matches!(t, Turn::User { .. }))
+        else {
+            panic!("user turn missing");
+        };
+        assert_eq!(text, "firstsecond");
+    }
+
+    #[test]
+    fn non_string_history_mode_reads_legacy_and_warns() {
+        // Upstream persists `history_mode` as a non-optional enum — a string,
+        // or absent on pre-field rollouts, never any other shape. A present
+        // non-string value (null included) is a changed contract and must trip
+        // the warning; classifying it as "missing" would let a representation
+        // change slip past the tripwire exactly the way the paginated flip did.
+        for mode in [
+            serde_json::json!(2),
+            serde_json::json!(null),
+            serde_json::json!({"mode": "paginated"}),
+        ] {
+            let content = jsonl_lines(&[
+                serde_json::json!({"type":"session_meta","payload":{"cli_version":"0.199.0","history_mode":mode}}),
+                serde_json::json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"t-1"}}),
+                serde_json::json!({"type":"event_msg","payload":{"type":"user_message","message":"hi"}}),
+                serde_json::json!({"type":"event_msg","payload":{"type":"agent_message","message":"hello"}}),
+                serde_json::json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"t-1"}}),
+            ]);
+            let result = parse_codex_transcript_content(&content, Uuid::now_v7());
+
+            assert!(
+                result.turns.iter().any(|t| matches!(t, Turn::User { .. })),
+                "legacy fallback must still hydrate under mode {mode}"
+            );
+            assert!(
+                !result.warnings.is_empty(),
+                "a present non-string history_mode must warn, got none for {mode}"
+            );
+        }
     }
 }

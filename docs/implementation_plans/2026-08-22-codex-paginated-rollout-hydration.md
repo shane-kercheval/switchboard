@@ -52,6 +52,7 @@ Established empirically; the load-bearing ones must survive into code comments.
    - `McpToolCall` (**captured 2026-08-22, M1**): `{ id, server, tool, arguments, readOnlyHint, status, result, duration }`. Success is `status: "completed"`; failure is `status: "failed"` **with `result.isError: true`** — the same `isError` key the legacy `mcp_tool_call_end` handler already reads. **The capture disproved the assumed id join:** the item id is a synthetic `exec-<uuid>`, and MCP calls ride the **same `exec` wrapper** as shell and edit work (two MCP calls observed under one wrapper). MCP is therefore not a special case — it is the same wrapper-children shape as `CommandExecution`/`FileChange`.
 7. **Text-block case is inconsistent:** `UserMessage.content` blocks use `{"type":"text"}`, `AgentMessage.content` blocks use `{"type":"Text"}`. Read each block's `text` field; never gate on the exact `type` string.
 8. `Reasoning` items carry `summary_text: []` and encrypted content — nothing renderable, consistent with §3.2. Skipped.
+10. **A caught tool failure is unrecoverable — it leaves no trace anywhere.** When the wrapper's script wraps a failing call in `try/catch` and continues, the failed operation emits **no `item_completed`**, *and* the wrapper output reads `"Script completed"` with no diagnostic. Probe-verified: a caught `apply_patch` failure followed by a successful `exec_command` produced one `CommandExecution` child and a clean wrapper output. This is a hard ceiling on fidelity, not a parser gap — record it rather than chasing it later. The failure *is* preserved when it is **uncaught**: the script aborts and the wrapper output carries `"Script failed"` plus the diagnostic (this is what `paginated-failed-tool` and `paginated-mixed-batch` pin).
 9. **Two previously-unprobed item types now captured** and worth recording even though this work does not consume them: `item_completed/ContextCompaction` (Codex's compaction shape — noted as unprobed in §3.1's bookkeeping audit and load-bearing for **G25**) and `item_completed/Extension`.
 
 ## Design (decided in review; do not re-litigate)
@@ -92,7 +93,7 @@ Rationale to carry into comments:
 Close the one evidence gap and turn the captured rollouts into the fixture set every later milestone tests against.
 
 - A real paginated rollout containing an MCP tool call exists; its `McpToolCall` shape — **including whether its `id` equals the `response_item` `call_id`** — is documented, settling the MCP join rule.
-- Fixtures cover: paginated text-only turn; paginated single-command wrapper; paginated **batched** wrapper (one `exec` → `FileChange` + `CommandExecution`, fact 4); a failed wrapper with **zero** `item_completed` items (fact 3); paginated MCP turn; an explicit **unknown** `history_mode`; and a legacy control.
+- Fixtures cover: paginated text-only turn; paginated single-command wrapper; paginated **batched** wrapper (fact 4); a **mixed** batch where one operation succeeds and a later uncaught one fails (fact 10 — the only shape that pins retaining the wrapper alongside its children); a failed wrapper with **zero** `item_completed` items (fact 3); a paginated MCP turn covering all three result envelopes; an **unknown** `history_mode` in both readable and degraded variants; and a legacy control.
 - Captures are recorded before parser work begins, so an interruption loses nothing.
 
 ### Implementation Outline
@@ -104,7 +105,8 @@ Sanitize the real captures (this one plus the 2026-08-22 probes) following the c
 ### Definition of Done
 
 - ✅ MCP capture obtained (success **and** error variants, one live turn). The `id == call_id` hypothesis is **disproved** and recorded in fact 6 and the Design section.
-- ✅ Seven fixtures committed under `crates/harness/tests/fixtures/codex/`, documented in `session_file.rs`'s test module. No parser changes.
+- ✅ Nine fixtures under `crates/harness/tests/fixtures/codex/`, every record timestamped (the parser falls back to `Utc::now()` on absence, which would make chronology assertions wall-clock dependent), documented in `session_file.rs`'s test module. No parser changes.
+- ✅ The MCP transport-failure envelope (`result: null` + top-level `error`) is **source-derived** from upstream's `McpToolCallError` and labelled as such; a real transport failure could not be forced within the live-test cost discipline. M3 must reach parity with the live parser's `extract_mcp_output(result, error)`.
 
 ---
 
@@ -148,7 +150,7 @@ Tool rows on reopened paginated threads carry trustworthy status and full struct
 
 ### Implementation Outline
 
-Extend M2's `item_completed` dispatch with `CommandExecution` / `FileChange` / `McpToolCall`, implementing the attachment contract from the Design section — the `decode_single_exec_wrapper` dispatch bounded to the wrapper's `call → output` interval, with `handle_patch_apply_end`'s match-else-push-new-row as the child mechanism, and MCP joining by ID per M1's finding. Follow the existing "authoritative result outranks the format-sensitive fallback" ordering rules where `patch_apply_end` / `mcp_tool_call_end` already interact with `function_call_output`-derived state. The pairing rationale must land in a comment citing facts 2–5, and must state plainly that the single-vs-batched dispatch is new logic composed from two existing primitives.
+Extend M2's `item_completed` dispatch with `CommandExecution` / `FileChange` / `McpToolCall`, implementing the attachment contract from the Design section — the `decode_single_exec_wrapper` dispatch bounded to the wrapper's `call → output` interval, with `handle_patch_apply_end`'s match-else-push-new-row as the child mechanism. **All three item types — `CommandExecution`, `FileChange`, and `McpToolCall` — take that same path; none of them joins by id** (fact 2, confirmed for MCP by M1's capture). An item's id serves only to key the child row it produces. Follow the existing "authoritative result outranks the format-sensitive fallback" ordering rules where `patch_apply_end` / `mcp_tool_call_end` already interact with `function_call_output`-derived state. The pairing rationale must land in a comment citing facts 2–5, and must state plainly that the single-vs-batched dispatch is new logic composed from two existing primitives.
 
 Convert `FileChange.changes[].unified_diff` into the same edit-pair representation `patch_apply_end_facet` produces, so both generations render identically. For `CommandExecution`, the load-bearing part is `exit_code` → `is_error`; whether to also upgrade the displayed command from the wrapper JS to the clean `command` string is a judgment call to make against the code — do it if it stays facet-level, skip it with a comment if it would ripple further.
 

@@ -1523,46 +1523,70 @@ fn apply_mcp_result(items: &mut [TurnItem], call_id: &str, result: &McpResult) -
     false
 }
 
-/// ## Codex rollout fixtures
-///
-/// Two rollout generations exist on disk, distinguished by
-/// `session_meta.history_mode`. Files with **no** `history_mode` field predate
-/// it and are legacy by definition; the field itself is the only durable
-/// predicate (never a CLI-version comparison — a paginated-capable CLI still
-/// writes legacy files when its store rejects pagination).
-///
-/// Legacy fixtures (`exec-wrapper`, `apply-patch`, `mcp-content-mutations`, …)
-/// carry the `event_msg` prompt/answer/edit/MCP records. The `paginated-*`
-/// fixtures below were captured from real codex-cli 0.149.0 sessions, where
-/// those records are no longer written and the same content arrives on
-/// `event_msg/item_completed` instead. Each pins one shape:
-///
-/// - `paginated-text-only` — prompt + answer via `UserMessage`/`AgentMessage`,
-///   each alongside the `response_item/message` twin that carries the same
-///   content, so a parser that reads both double-counts. Also pins the
-///   inconsistent block casing (`UserMessage` uses `"text"`, `AgentMessage`
-///   uses `"Text"`) — read the block's `text` field, never gate on the tag.
-/// - `paginated-single-command` — one `exec` wrapper containing exactly one
-///   command. Pins that this renders as **one** row, not a wrapper row plus a
-///   child row.
-/// - `paginated-batched-wrapper` — one `exec` wrapper whose script calls
-///   `apply_patch` *and* `exec_command`, emitting two `item_completed` items
-///   against a single `call_id`. Pins that each operation gets its own row;
-///   the item ids (`exec-<uuid>`) match neither the wrapper's `id` (`ctc_…`)
-///   nor its `call_id`, so the association cannot be an id join.
-/// - `paginated-failed-tool` — a failed `apply_patch` wrapper that emits **no**
-///   `item_completed` at all; the failure survives only on the wrapper's
-///   `custom_tool_call_output`. This is why `response_item` stays the canonical
-///   source for tool rows: `item_completed` is not a complete record of tool
-///   activity.
-/// - `paginated-mcp` — MCP calls ride the same `exec` wrapper as everything
-///   else (two calls, one wrapper), carrying a success (`status: "completed"`)
-///   and a failure (`status: "failed"` with `result.isError: true`).
-/// - `unknown-history-mode` — an unrecognized mode value. Must parse via the
-///   legacy path *and* warn: silently defaulting is what let this whole class
-///   of change go unnoticed.
-/// - `legacy-explicit-mode` — `history_mode: "legacy"` stated outright, as
-///   opposed to the absent-field case every older fixture covers.
+// ## Codex rollout fixtures
+//
+// Two rollout generations exist on disk, distinguished by
+// `session_meta.history_mode`. Files with **no** `history_mode` field predate
+// it and are legacy by definition; the field itself is the only durable
+// predicate (never a CLI-version comparison — a paginated-capable CLI still
+// writes legacy files when its store rejects pagination).
+//
+// Legacy fixtures (`exec-wrapper`, `apply-patch`, `mcp-content-mutations`, …)
+// carry the `event_msg` prompt/answer/edit/MCP records. The `paginated-*`
+// fixtures below were captured from real codex-cli 0.149.0 sessions, where
+// those records are no longer written and the same content arrives on
+// `event_msg/item_completed` instead. Every record carries a synthetic
+// `timestamp`, as the legacy fixtures do: the parser falls back to `Utc::now()`
+// on absence, which would make any chronology assertion wall-clock dependent.
+//
+// Each fixture pins one shape:
+//
+// - `paginated-text-only` — prompt + answer via `UserMessage`/`AgentMessage`,
+//   each alongside the `response_item/message` twin that carries the same
+//   content, so a parser that reads both double-counts. Also pins the
+//   inconsistent block casing (`UserMessage` uses `"text"`, `AgentMessage`
+//   uses `"Text"`) — read the block's `text` field, never gate on the tag.
+// - `paginated-single-command` — one `exec` wrapper containing exactly one
+//   command. Pins that this renders as **one** row, not a wrapper row plus a
+//   child row.
+// - `paginated-batched-wrapper` — one `exec` wrapper whose script calls
+//   `apply_patch` *and* `exec_command`, emitting two `item_completed` items
+//   against a single `call_id`. Pins that each operation gets its own row;
+//   the item ids (`exec-<uuid>`) match neither the wrapper's `id` (`ctc_…`)
+//   nor its `call_id`, so the association cannot be an id join.
+// - `paginated-mixed-batch` — one wrapper where the first operation succeeds
+//   (emitting a child) and the second fails **uncaught**, aborting the script.
+//   The failure exists only on the wrapper's output (`Script failed` + the
+//   diagnostic), so this is the fixture that pins *retaining the wrapper
+//   alongside its children*. Ordering is load-bearing and was established by
+//   probe: a failing command still emits its own failed item, and a *caught*
+//   failure vanishes entirely (no item, and the wrapper reports success), so
+//   neither of those shapes can pin this rule.
+// - `paginated-failed-tool` — a failed `apply_patch` wrapper that emits **no**
+//   `item_completed` at all; the failure survives only on the wrapper's
+//   `custom_tool_call_output`. This is why `response_item` stays the canonical
+//   source for tool rows: `item_completed` is not a complete record of tool
+//   activity.
+// - `paginated-mcp` — MCP calls ride the same `exec` wrapper as everything
+//   else (two calls, one wrapper), covering all three envelopes: success
+//   (`status: "completed"`), a tool-reported error (`status: "failed"` with
+//   `result.isError: true`), and a transport failure (`result: null` with a
+//   top-level `error`). The live stream parser already distinguishes the last
+//   two; disk hydration must match it or protocol failures reopen blank. The
+//   transport record is **source-derived** from upstream's `McpToolCallError`
+//   — a real transport failure could not be forced within the live-test cost
+//   discipline — while the other two are captured.
+// - `unknown-history-mode` — an unrecognized mode whose records the legacy
+//   fallback *can* still read. Pins that an unknown mode warns even when
+//   nothing is lost, and that a backward-compatible future format still
+//   hydrates through the fallback.
+// - `unknown-history-mode-degraded` — the same unrecognized mode over
+//   `item_completed`-only content, so the fallback genuinely finds no text.
+//   Pins the outcome the warning exists for: boundaries/usage/model survive,
+//   text is empty, and a warning is present. Deliberately synthetic — no such
+//   format exists yet; it models the next one behaving as paginated did.
+// - `legacy-explicit-mode` — `history_mode: "legacy"` stated outright, as
+//   opposed to the absent-field case every older fixture covers.
 #[cfg(test)]
 mod tests {
     use super::*;

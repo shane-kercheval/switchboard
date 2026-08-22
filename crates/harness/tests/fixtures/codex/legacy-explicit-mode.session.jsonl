@@ -1,0 +1,6 @@
+{"type":"session_meta","payload":{"session_id":"00000000-0000-7000-8000-0000000000a7","id":"00000000-0000-7000-8000-0000000000a7","timestamp":"2026-08-11T09:24:20.000Z","cwd":"/private/tmp/facet-probe/scratch","originator":"codex_exec","cli_version":"0.146.0","source":"exec","thread_source":"user","model_provider":"openai","context_window":258400,"history_mode":"legacy"}}
+{"type":"event_msg","payload":{"type":"task_started","turn_id":"00000000-0000-7000-8000-000000000057","model_context_window":258400}}
+{"type":"turn_context","payload":{"turn_id":"00000000-0000-7000-8000-000000000057","cwd":"/private/tmp/facet-probe/scratch","model":"gpt-5.6-sol","effort":"high"}}
+{"type":"event_msg","payload":{"type":"user_message","message":"say ack"}}
+{"type":"event_msg","payload":{"type":"agent_message","message":"ack","phase":"final_answer"}}
+{"type":"event_msg","payload":{"type":"task_complete","turn_id":"00000000-0000-7000-8000-000000000057","last_agent_message":"ack"}}

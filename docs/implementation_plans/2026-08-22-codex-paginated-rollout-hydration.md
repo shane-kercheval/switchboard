@@ -49,7 +49,7 @@ Established empirically; the load-bearing ones must survive into code comments.
 6. **The richer-data gain is narrower than first reported — shell only.**
    - `FileChange.changes` is **at parity** with legacy `patch_apply_end.changes`: both are `{ "<abs path>": { type, unified_diff, move_path } }` (verified against `exec-wrapper.session.jsonl`). Differs only in `success` vs `status`. Neither `unified_diff` nor `move_path` is new.
    - `CommandExecution` is **genuinely new**: unwrapped `command` array, `parsed_cmd`, separate `stdout`/`stderr`, and a first-class integer `exit_code`. Legacy persisted no structured shell record at all (`ExecCommandEnd` is transient in both modes), which is why today's disk path sniffs `Script failed` / `Process exited with code` strings. Seeing *inside* a batched wrapper for shell work is likewise new.
-   - `McpToolCall`: `{ server, tool, arguments, status, result }` per the upstream struct — **source-inferred; no real capture yet** (M1 gates this).
+   - `McpToolCall` (**captured 2026-08-22, M1**): `{ id, server, tool, arguments, readOnlyHint, status, result, duration }`. Success is `status: "completed"`; failure is `status: "failed"` **with `result.isError: true`** — the same `isError` key the legacy `mcp_tool_call_end` handler already reads. **The capture disproved the assumed id join:** the item id is a synthetic `exec-<uuid>`, and MCP calls ride the **same `exec` wrapper** as shell and edit work (two MCP calls observed under one wrapper). MCP is therefore not a special case — it is the same wrapper-children shape as `CommandExecution`/`FileChange`.
 7. **Text-block case is inconsistent:** `UserMessage.content` blocks use `{"type":"text"}`, `AgentMessage.content` blocks use `{"type":"Text"}`. Read each block's `text` field; never gate on the exact `type` string.
 8. `Reasoning` items carry `summary_text: []` and encrypted content — nothing renderable, consistent with §3.2. Skipped.
 9. **Two previously-unprobed item types now captured** and worth recording even though this work does not consume them: `item_completed/ContextCompaction` (Codex's compaction shape — noted as unprobed in §3.1's bookkeeping audit and load-bearing for **G25**) and `item_completed/Extension`.
@@ -76,7 +76,7 @@ Rationale to carry into comments:
   - `decode_single_exec_wrapper` already answers "is this wrapper exactly one call?"
   - The **new glue** is dispatching on that answer, bounded to the wrapper's `call → output` interval (fact 5): a wrapper the decoder proves is exactly one command is **enriched in place** (so a single shell command never renders twice); anything else has its `item_completed` children **pushed as their own rows** with the wrapper retained as container and failure evidence; a wrapper with zero completions is left untouched. Reusing match-else-create *alone* would be wrong — it would create a duplicate row for every ordinary single-command wrapper.
   - **Precision worth a comment:** `decode_single_exec_wrapper` recognizes only a single `tools.exec_command(...)`. A lone `apply_patch` wrapper therefore takes the children branch by construction. That matches legacy precedent (today's `patch_apply_end` also lands in its own row) but is not obvious from the function name.
-  - **MCP joins by ID.** Upstream conversion suggests `McpToolCall.id == call_id`; M1's real capture is a required gate before treating that as settled.
+  - **MCP is not a special case.** The gate this plan required has run: MCP items carry `exec-<uuid>` ids and arrive as children of an `exec` wrapper exactly like `CommandExecution`/`FileChange`, so they take the same attachment path. The earlier "joins by `call_id`" hypothesis, inferred from upstream conversion code, is **wrong** — do not implement it. Map `status: "failed"` / `result.isError` onto `is_error` through the existing MCP result handling.
 - **Structured status outranks string-sniffing**, extending the precedent already in the parser (`function_call_output` `is_error` gating). On paginated files `exit_code`/`status` set `is_error`; the legacy string path is untouched.
 
 **Both file readers get fixed.** `CodexReconstruction` (reopen) and the `Enrichment` filled by `parse_session_content` (post-terminal re-read powering live `ToolFacetUpdated`) read the same bytes for different purposes. Fixing one leaves the other broken.
@@ -103,8 +103,8 @@ Sanitize the real captures (this one plus the 2026-08-22 probes) following the c
 
 ### Definition of Done
 
-- MCP capture obtained and its shape (and the `id == call_id` question) recorded, or the gap explicitly noted.
-- Fixtures committed; no parser changes yet.
+- ✅ MCP capture obtained (success **and** error variants, one live turn). The `id == call_id` hypothesis is **disproved** and recorded in fact 6 and the Design section.
+- ✅ Seven fixtures committed under `crates/harness/tests/fixtures/codex/`, documented in `session_file.rs`'s test module. No parser changes.
 
 ---
 

@@ -1523,6 +1523,46 @@ fn apply_mcp_result(items: &mut [TurnItem], call_id: &str, result: &McpResult) -
     false
 }
 
+/// ## Codex rollout fixtures
+///
+/// Two rollout generations exist on disk, distinguished by
+/// `session_meta.history_mode`. Files with **no** `history_mode` field predate
+/// it and are legacy by definition; the field itself is the only durable
+/// predicate (never a CLI-version comparison — a paginated-capable CLI still
+/// writes legacy files when its store rejects pagination).
+///
+/// Legacy fixtures (`exec-wrapper`, `apply-patch`, `mcp-content-mutations`, …)
+/// carry the `event_msg` prompt/answer/edit/MCP records. The `paginated-*`
+/// fixtures below were captured from real codex-cli 0.149.0 sessions, where
+/// those records are no longer written and the same content arrives on
+/// `event_msg/item_completed` instead. Each pins one shape:
+///
+/// - `paginated-text-only` — prompt + answer via `UserMessage`/`AgentMessage`,
+///   each alongside the `response_item/message` twin that carries the same
+///   content, so a parser that reads both double-counts. Also pins the
+///   inconsistent block casing (`UserMessage` uses `"text"`, `AgentMessage`
+///   uses `"Text"`) — read the block's `text` field, never gate on the tag.
+/// - `paginated-single-command` — one `exec` wrapper containing exactly one
+///   command. Pins that this renders as **one** row, not a wrapper row plus a
+///   child row.
+/// - `paginated-batched-wrapper` — one `exec` wrapper whose script calls
+///   `apply_patch` *and* `exec_command`, emitting two `item_completed` items
+///   against a single `call_id`. Pins that each operation gets its own row;
+///   the item ids (`exec-<uuid>`) match neither the wrapper's `id` (`ctc_…`)
+///   nor its `call_id`, so the association cannot be an id join.
+/// - `paginated-failed-tool` — a failed `apply_patch` wrapper that emits **no**
+///   `item_completed` at all; the failure survives only on the wrapper's
+///   `custom_tool_call_output`. This is why `response_item` stays the canonical
+///   source for tool rows: `item_completed` is not a complete record of tool
+///   activity.
+/// - `paginated-mcp` — MCP calls ride the same `exec` wrapper as everything
+///   else (two calls, one wrapper), carrying a success (`status: "completed"`)
+///   and a failure (`status: "failed"` with `result.isError: true`).
+/// - `unknown-history-mode` — an unrecognized mode value. Must parse via the
+///   legacy path *and* warn: silently defaulting is what let this whole class
+///   of change go unnoticed.
+/// - `legacy-explicit-mode` — `history_mode: "legacy"` stated outright, as
+///   opposed to the absent-field case every older fixture covers.
 #[cfg(test)]
 mod tests {
     use super::*;

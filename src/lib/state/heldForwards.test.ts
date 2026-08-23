@@ -5,7 +5,7 @@ import {
   reconcileForwardSources,
 } from "./heldForwards.svelte";
 import type { ForwardSource } from "./heldForwards.svelte";
-import type { Turn } from "./types";
+import type { Turn, TurnItem } from "./types";
 import type { AgentRecord } from "$lib/types";
 
 const agent = (id: string, name: string): AgentRecord => ({
@@ -97,13 +97,17 @@ describe("reconcileForwardSourceMap", () => {
 const agentTurn = (
   status: "streaming" | "complete" | "failed" | "cancelled",
   at: string,
+  // A completed turn defaults to carrying answer text — readiness requires the
+  // newest completed turn to have forwardable text, mirroring the backend's
+  // `latest_completed_agent_text`.
+  items: TurnItem[] = [{ item_kind: "text", kind: "text", text: "an answer" }],
 ): Turn => ({
   role: "agent",
   turn_id: `turn-${at}`,
   agent_id: "agent-a",
   started_at: at,
   status,
-  items: [],
+  items,
 });
 
 const userTurn = (at: string): Turn => ({
@@ -138,14 +142,58 @@ describe("forwardReadiness", () => {
     );
   });
 
-  it("is empty when the only turn failed or was cancelled", () => {
-    // No completed output to carry; the source will be skipped at dispatch.
-    expect(forwardReadiness([agentTurn("failed", "1")])).toBe("empty");
-    expect(forwardReadiness([agentTurn("cancelled", "1")])).toBe("empty");
+  it("is ready when the newest turn failed or was cancelled (forwards the note)", () => {
+    // The backend forwards a generated failure note for a failed/cancelled
+    // latest turn — non-empty, deliberately forwardable ("tell the next agent
+    // that X failed") — so the send succeeds and the chip must not claim it
+    // would be blocked. (Inverts the old classification, which showed a
+    // blocking warning on a path that dispatches fine.)
+    expect(forwardReadiness([agentTurn("failed", "1")])).toBe("ready");
+    expect(forwardReadiness([agentTurn("cancelled", "1")])).toBe("ready");
   });
 
   it("is ready when a later turn failed but an earlier one completed", () => {
+    // Ready via the failure note (the backend forwards the *note*, not the
+    // older completed text — latest-turn outcome wins).
     expect(forwardReadiness([agentTurn("complete", "1"), agentTurn("failed", "2")])).toBe("ready");
+  });
+
+  it("is empty for a textless completion even behind an older failure", () => {
+    // Newest turn completed (no note applies) but carries no answer text.
+    expect(forwardReadiness([agentTurn("failed", "1"), agentTurn("complete", "2", [])])).toBe(
+      "empty",
+    );
+  });
+
+  it("is empty for a completed turn with only tool/thinking items", () => {
+    // The case the any-empty policy blocks at dispatch: completed, but no
+    // answer text — the chip must warn instead of claiming ready.
+    expect(
+      forwardReadiness([
+        agentTurn("complete", "1", [
+          {
+            item_kind: "tool",
+            tool_use_id: "t1",
+            kind: "builtin",
+            name: "Bash",
+            input: {},
+            facet: { facet_kind: "other" },
+            output: "did things",
+            is_error: false,
+            started_at: "1",
+          },
+          { item_kind: "text", kind: "thinking", text: "pondering" },
+        ]),
+      ]),
+    ).toBe("empty");
+  });
+
+  it("is empty when the newest completion is textless despite an older textual one", () => {
+    // The backend forwards the *newest* completed turn's text, so the older
+    // answer does not make this source forwardable.
+    expect(forwardReadiness([agentTurn("complete", "1"), agentTurn("complete", "2", [])])).toBe(
+      "empty",
+    );
   });
 
   it("ignores user turns", () => {

@@ -166,6 +166,7 @@ fn edited_file(path: String, pairs: Vec<(String, String)>) -> EditedFile {
         change: EditChange::Modified,
         edits,
         truncated,
+        moved_to: None,
     }
 }
 

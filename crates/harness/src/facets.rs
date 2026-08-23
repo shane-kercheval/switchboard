@@ -110,6 +110,23 @@ pub struct EditedFile {
     pub change: EditChange,
     pub edits: Vec<EditPair>,
     pub truncated: bool,
+    /// Destination of a rename/move — `path` is the *source*; after the
+    /// operation the file lives here. **`path` staying the source is
+    /// load-bearing:** the live↔disk facet pairing (`emit_facet_upgrades`)
+    /// keys on source path sets — the live `file_change` row only ever knows
+    /// the source — so flipping `path` to the destination would silently stop
+    /// renames (and only renames) from receiving their live diff upgrade.
+    ///
+    /// Additive optional field (the
+    /// `ToolFacet::Mcp.mutation` precedent) rather than an `EditChange`
+    /// variant, because a variant alone cannot carry both endpoints. Only
+    /// Codex populates it (`apply_patch`'s `*** Move to:` section /
+    /// `move_path` in structured change maps, both rollout generations);
+    /// Claude has no rename-capable edit tool and — inferred from its tool
+    /// vocabulary, not captured — renames via `mv` in Bash, which already
+    /// renders as a self-explanatory shell row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moved_to: Option<String>,
 }
 
 /// How an [`EditedFile`] changed. `#[non_exhaustive]`: an unrecognized
@@ -452,13 +469,32 @@ mod tests {
                     new: "bar".to_owned(),
                 }],
                 truncated: false,
+                moved_to: Some("/tmp/b.txt".to_owned()),
             }],
         };
         let value = serde_json::to_value(&facet).unwrap();
         assert_eq!(value["facet_kind"], "edit");
         assert_eq!(value["files"][0]["change"], "modified");
+        // Pin the wire key: the TS mirror reads `moved_to`, so a serde rename
+        // would silently strip rename data from the frontend.
+        assert_eq!(value["files"][0]["moved_to"], "/tmp/b.txt");
         let back: ToolFacet = serde_json::from_value(value).unwrap();
         assert_eq!(back, facet);
+
+        // Absent stays absent on the wire (skip_serializing_if), and a payload
+        // without the field deserializes (serde default) — old wire shapes
+        // remain readable.
+        let plain = ToolFacet::Edit {
+            files: vec![EditedFile {
+                path: "/tmp/a.txt".to_owned(),
+                change: EditChange::Modified,
+                edits: Vec::new(),
+                truncated: false,
+                moved_to: None,
+            }],
+        };
+        let value = serde_json::to_value(&plain).unwrap();
+        assert!(value["files"][0].get("moved_to").is_none());
     }
 
     #[test]

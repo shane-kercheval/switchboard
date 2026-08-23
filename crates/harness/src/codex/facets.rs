@@ -56,6 +56,10 @@ pub(crate) fn file_change_facet(item: &Value) -> ToolFacet {
                 change: change_kind(c.get("kind").and_then(Value::as_str).unwrap_or("")),
                 edits: Vec::new(),
                 truncated: false,
+                // The live item announces paths/kinds only; a rename's
+                // destination arrives with the content in the turn-end
+                // enrichment (`move_path`), like the diff itself.
+                moved_to: None,
             })
         })
         .collect();
@@ -101,9 +105,24 @@ pub(crate) fn parse_apply_patch(patch: &str, cwd: Option<&Path>) -> Option<Vec<E
             break;
         }
         if let Some(path) = line.strip_prefix("*** Update File: ") {
-            // `*** Move to:` (rename) is unobserved live; the facet keeps the
-            // original path and the move target is visible in the raw input.
-            if lines.peek().is_some_and(|l| l.starts_with("*** Move to: ")) {
+            // `*** Move to:` (rename): `path` stays the source; the target is
+            // carried on `moved_to`, resolved against the same cwd as the
+            // source. Real renames are rare — one across 3,201 observed
+            // file-change records — but dropping the line rendered them as
+            // in-place edits to a path that no longer exists.
+            // The marker is consumed whenever present; the destination is
+            // populated only for a non-blank target — a malformed empty
+            // `*** Move to:` must degrade to an ordinary edit, never
+            // fabricate the cwd as a plausible-looking destination
+            // (`resolve_path("", cwd)` would yield the cwd itself).
+            let move_marker = lines
+                .peek()
+                .and_then(|l| l.strip_prefix("*** Move to: "))
+                .map(str::trim);
+            let moved_to = move_marker
+                .filter(|target| !target.is_empty())
+                .map(|target| resolve_path(target, cwd));
+            if move_marker.is_some() {
                 lines.next();
             }
             let mut edits: Vec<EditPair> = Vec::new();
@@ -153,6 +172,7 @@ pub(crate) fn parse_apply_patch(patch: &str, cwd: Option<&Path>) -> Option<Vec<E
                 change: EditChange::Modified,
                 edits,
                 truncated,
+                moved_to,
             });
         } else if let Some(path) = line.strip_prefix("*** Add File: ") {
             let mut content: Vec<&str> = Vec::new();
@@ -169,6 +189,7 @@ pub(crate) fn parse_apply_patch(patch: &str, cwd: Option<&Path>) -> Option<Vec<E
                     new,
                 }],
                 truncated,
+                moved_to: None,
             });
         } else if let Some(path) = line.strip_prefix("*** Delete File: ") {
             // The patch does not carry the deleted content — empty pair list
@@ -178,6 +199,7 @@ pub(crate) fn parse_apply_patch(patch: &str, cwd: Option<&Path>) -> Option<Vec<E
                 change: EditChange::Deleted,
                 edits: Vec::new(),
                 truncated: false,
+                moved_to: None,
             });
         }
         // Any other line at section level (including delimiter-lookalikes
@@ -229,6 +251,7 @@ fn patch_apply_end_file(path: &str, change: &Value) -> EditedFile {
                     new,
                 }],
                 truncated,
+                moved_to: None,
             }
         }
         "delete" | "remove" => {
@@ -252,6 +275,7 @@ fn patch_apply_end_file(path: &str, change: &Value) -> EditedFile {
                 change: EditChange::Deleted,
                 edits,
                 truncated,
+                moved_to: None,
             }
         }
         _ => {
@@ -265,6 +289,16 @@ fn patch_apply_end_file(path: &str, change: &Value) -> EditedFile {
                 change: EditChange::Modified,
                 edits,
                 truncated,
+                // `move_path` — observed absolute in every capture; both
+                // rollout generations carry the same `changes` map (fact 6),
+                // so legacy `patch_apply_end` and paginated `FileChange`
+                // renames surface identically through this one builder.
+                moved_to: change
+                    .get("move_path")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|target| !target.is_empty())
+                    .map(str::to_owned),
             }
         }
     }
@@ -527,12 +561,61 @@ mod tests {
     }
 
     #[test]
-    fn move_to_line_is_consumed_and_path_stays_original() {
+    fn move_to_line_keeps_source_path_and_captures_destination() {
+        // Previously the destination was consumed and dropped; a rename
+        // rendered as an in-place edit to a path that no longer exists.
         let patch = "*** Begin Patch\n*** Update File: /tmp/a.txt\n*** Move to: /tmp/b.txt\n@@\n-x\n+y\n*** End Patch\n";
         let files = parse_apply_patch(patch, None).unwrap();
         assert_eq!(files.len(), 1);
-        assert_eq!(files[0].path, "/tmp/a.txt");
-        assert_eq!(files[0].edits.len(), 1);
+        assert_eq!(files[0].path, "/tmp/a.txt", "path stays the source");
+        assert_eq!(files[0].moved_to.as_deref(), Some("/tmp/b.txt"));
+        assert_eq!(files[0].edits.len(), 1, "the diff still parses");
+    }
+
+    #[test]
+    fn blank_move_to_target_degrades_to_an_ordinary_edit() {
+        // A malformed empty `*** Move to:` must not fabricate the cwd as a
+        // plausible-looking destination — the edit survives, the rename
+        // affordance stays absent.
+        let patch = "*** Begin Patch\n*** Update File: /tmp/a.txt\n*** Move to: \n@@\n-x\n+y\n*** End Patch\n";
+        let files = parse_apply_patch(patch, Some(Path::new("/work"))).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].moved_to, None);
+        assert_eq!(files[0].edits.len(), 1, "the edit itself is preserved");
+
+        // Same normalization on the structured side.
+        let payload = json!({"changes": {
+            "/tmp/a.txt": {"type": "update", "unified_diff": "@@ -1 +1 @@\n-x\n+y\n", "move_path": ""}
+        }});
+        let ToolFacet::Edit { files } = patch_apply_end_facet(&payload) else {
+            panic!("expected Edit");
+        };
+        assert_eq!(files[0].moved_to, None);
+    }
+
+    #[test]
+    fn relative_move_to_resolves_against_cwd() {
+        let patch = "*** Begin Patch\n*** Update File: a.txt\n*** Move to: sub/b.txt\n@@\n-x\n+y\n*** End Patch\n";
+        let files = parse_apply_patch(patch, Some(Path::new("/work"))).unwrap();
+        assert_eq!(files[0].path, "/work/a.txt");
+        assert_eq!(files[0].moved_to.as_deref(), Some("/work/sub/b.txt"));
+    }
+
+    #[test]
+    fn patch_apply_end_move_path_populates_destination_and_null_stays_none() {
+        // Both rollout generations carry the same `changes` map, so this one
+        // builder covers legacy `patch_apply_end` and paginated `FileChange`.
+        let payload = json!({"changes": {
+            "/tmp/a.txt": {"type": "update", "unified_diff": "@@ -1 +1 @@\n-x\n+y\n", "move_path": "/tmp/b.txt"},
+            "/tmp/c.txt": {"type": "update", "unified_diff": "@@ -1 +1 @@\n-p\n+q\n", "move_path": null}
+        }});
+        let ToolFacet::Edit { files } = patch_apply_end_facet(&payload) else {
+            panic!("expected Edit");
+        };
+        let renamed = files.iter().find(|f| f.path == "/tmp/a.txt").unwrap();
+        assert_eq!(renamed.moved_to.as_deref(), Some("/tmp/b.txt"));
+        let plain = files.iter().find(|f| f.path == "/tmp/c.txt").unwrap();
+        assert_eq!(plain.moved_to, None, "null move_path is an ordinary edit");
     }
 
     #[test]

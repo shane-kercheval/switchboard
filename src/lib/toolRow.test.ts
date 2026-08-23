@@ -205,6 +205,56 @@ describe("toolDetail", () => {
     expect(toolDetail({ facet_kind: "edit", files: [] }, {})).toBeUndefined();
   });
 
+  it("shows both endpoints of a renamed file in the edit detail", () => {
+    // A rename rendered as only its source path reads as an in-place edit to
+    // a file that no longer exists.
+    const renamed: ToolFacet = {
+      facet_kind: "edit",
+      files: [
+        {
+          path: "/repo/old.ts",
+          change: "modified",
+          edits: [],
+          truncated: false,
+          moved_to: "/repo/new.ts",
+        },
+      ],
+    };
+    expect(toolDetail(renamed, {})).toBe("/repo/old.ts → /repo/new.ts");
+  });
+
+  it("names a contentless move Rename, and a move with edits Edit", () => {
+    const pureMove: ToolFacet = {
+      facet_kind: "edit",
+      files: [
+        {
+          path: "/repo/old.ts",
+          change: "modified",
+          edits: [],
+          truncated: false,
+          moved_to: "/repo/new.ts",
+        },
+      ],
+    };
+    // A move that also rewrites content has a diff to read, so it stays an
+    // Edit — the rename is an annotation on it, not the operation itself.
+    const moveWithEdits: ToolFacet = {
+      facet_kind: "edit",
+      files: [
+        {
+          path: "/repo/old.ts",
+          change: "modified",
+          edits: [{ old: "x\n", new: "y\n" }],
+          truncated: false,
+          moved_to: "/repo/new.ts",
+        },
+      ],
+    };
+    expect(toolVerb(pureMove, "apply_patch")).toBe("Rename");
+    expect(toolVerb(moveWithEdits, "apply_patch")).toBe("Edit");
+    expect(toolIcon(pureMove)).not.toBe(toolIcon(moveWithEdits));
+  });
+
   it("shows the path for write and read facets", () => {
     expect(
       toolDetail({ facet_kind: "write", path: "/repo/x.txt", content: "", truncated: false }, {}),

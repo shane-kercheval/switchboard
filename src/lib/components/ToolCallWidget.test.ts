@@ -624,6 +624,106 @@ describe("ToolCallWidget facet bodies", () => {
     expect(container.querySelector('[data-origin="added"]')).toBeNull();
   });
 
+  it("renders a single-file rename with both endpoints, annotation, and destination copy", async () => {
+    // Single-file is the realistic rename case, and the pre-existing
+    // change-kind annotation is gated on `files.length > 1` — this exercises
+    // the independent rename conditional it structurally excludes.
+    const facet: ToolFacet = {
+      facet_kind: "edit",
+      files: [
+        {
+          path: "/repo/old-name.ts",
+          change: "modified",
+          edits: [{ old: "x\n", new: "y\n" }],
+          truncated: false,
+          moved_to: "/repo/new-name.ts",
+        },
+      ],
+    };
+    copyTextMock.mockClear();
+    const { getByTestId } = render(ToolCallWidget, { tool: withFacet(facet) });
+
+    // Edits render no header detail (the widget suppresses `toolDetail` for
+    // them); the path row IS the collapsed surface — visible without
+    // expanding, asserted here pre-click.
+    const pathEl = getByTestId("tool-edit-path");
+    expect(pathEl).toHaveTextContent("/repo/old-name.ts");
+    expect(pathEl).toHaveTextContent("/repo/new-name.ts");
+    expect(getByTestId("tool-edit-renamed")).toHaveTextContent("(renamed)");
+
+    // The copy action targets the destination — the file that exists after
+    // the operation.
+    await fireEvent.click(getByTestId("tool-path-copy"));
+    expect(copyTextMock).toHaveBeenCalledWith("/repo/new-name.ts");
+  });
+
+  it("renders a contentless rename as a Rename row with no diff apology", () => {
+    // A move with no content change has no diff by construction. Reporting it
+    // through the generic empty-edits path claimed the content was
+    // "unavailable" — a failure that never happened — under an "Edit" verb
+    // that pointed at a path the operation had just removed.
+    const facet: ToolFacet = {
+      facet_kind: "edit",
+      files: [
+        {
+          path: "/repo/old-name.ts",
+          change: "modified",
+          edits: [],
+          truncated: false,
+          moved_to: "/repo/new-name.ts",
+        },
+      ],
+    };
+    const { getByTestId, queryByTestId } = render(ToolCallWidget, {
+      tool: withFacet(facet),
+      turnSettled: true,
+    });
+
+    expect(getByTestId("tool-verb")).toHaveTextContent("Rename");
+    const pathEl = getByTestId("tool-edit-path");
+    expect(pathEl).toHaveTextContent("/repo/old-name.ts → /repo/new-name.ts");
+    expect(queryByTestId("tool-edit-pending")).toBeNull();
+    // The verb already says it; the annotation would repeat itself.
+    expect(queryByTestId("tool-edit-renamed")).toBeNull();
+  });
+
+  it("keeps the rename annotation when a move also changed content", () => {
+    // Verb is "Edit" here — there is a diff to read — so the annotation is the
+    // only signal that the path moved.
+    const facet: ToolFacet = {
+      facet_kind: "edit",
+      files: [
+        {
+          path: "/repo/old-name.ts",
+          change: "modified",
+          edits: [{ old: "x\n", new: "y\n" }],
+          truncated: false,
+          moved_to: "/repo/new-name.ts",
+        },
+      ],
+    };
+    const { getByTestId } = render(ToolCallWidget, { tool: withFacet(facet), turnSettled: true });
+    expect(getByTestId("tool-verb")).toHaveTextContent("Edit");
+    expect(getByTestId("tool-edit-renamed")).toHaveTextContent("(renamed)");
+  });
+
+  it("renders an ordinary edit without any rename affordances", () => {
+    const facet: ToolFacet = {
+      facet_kind: "edit",
+      files: [
+        {
+          path: "/repo/plain.ts",
+          change: "modified",
+          edits: [{ old: "x\n", new: "y\n" }],
+          truncated: false,
+        },
+      ],
+    };
+    const { getByTestId, queryByTestId } = render(ToolCallWidget, { tool: withFacet(facet) });
+    expect(queryByTestId("tool-edit-renamed")).toBeNull();
+    expect(getByTestId("tool-edit-path")).not.toHaveTextContent("→");
+  });
+
   it("keeps a homogeneous multi-file deletion quiet until expanded", async () => {
     const facet: ToolFacet = {
       facet_kind: "edit",

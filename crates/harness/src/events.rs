@@ -1070,6 +1070,7 @@ mod tests {
                         new: "bar".to_owned(),
                     }],
                     truncated: false,
+                    moved_to: None,
                 }],
             },
         };

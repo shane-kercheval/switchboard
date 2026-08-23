@@ -47,11 +47,13 @@
     synthesizeMcpTextEditDiff,
     synthesizeWriteDiff,
     truncateDiff,
+    effectiveEditPath,
   } from "$lib/toolDiff";
   import { formatToolInput, redactDisplay } from "$lib/toolInput";
   import { copyText } from "$lib/native";
   import {
     isGenericFacet,
+    isPureRename,
     knownMcpMutation,
     toolDetail,
     toolIcon,
@@ -399,22 +401,56 @@
         </section>
       {:else if !interrupted && facet.facet_kind === "edit"}
         {#each facet.files as file, index (file.path)}
+          {@const renameOnly = isPureRename(file)}
           <section class="space-y-1" aria-label="File edit" data-testid="tool-edit-file">
             <div
               class="group/path text-muted flex items-start gap-2 font-mono text-[11px]"
               data-testid="tool-path-row"
             >
-              <span class={cn(FILE_PATH_CLASS, "flex-1")} data-testid="tool-edit-path">
-                {file.path}
+              <!-- A rename lays its two endpoints out as flex items so the
+                   line breaks at the arrow rather than mid-path: each endpoint
+                   stays whole when it fits, and the pair still shares one line
+                   when there is room. The arrow rides with the source so it
+                   never orphans onto the second line. A single endpoint too
+                   long for the row still breaks inside itself — the wrap rule
+                   is unchanged, only the preferred break point is. -->
+              <span
+                class={cn(FILE_PATH_CLASS, "flex-1", file.moved_to && "flex flex-wrap gap-x-1")}
+                data-testid="tool-edit-path"
+              >
+                {#if file.moved_to}
+                  <span class={FILE_PATH_CLASS} data-testid="tool-edit-path-source"
+                    >{file.path} →</span
+                  >
+                  <span class={FILE_PATH_CLASS} data-testid="tool-edit-path-destination"
+                    >{file.moved_to}</span
+                  >
+                {:else}
+                  {file.path}
+                {/if}
               </span>
+              <!-- Only when the verb doesn't already say it: a move that also
+                   changed content reads as "Edit", and there the annotation is
+                   the sole signal that the path moved. Independent of the
+                   multi-file change annotation below, which is gated on
+                   `files.length > 1` and so structurally excludes the
+                   single-file rename — the realistic case. -->
+              {#if file.moved_to && verb !== "Rename"}
+                <span class="shrink-0" data-testid="tool-edit-renamed">(renamed)</span>
+              {/if}
               {#if verb === "Edit" && facet.files.length > 1 && file.change !== "modified"}
                 <span class="shrink-0">({file.change})</span>
               {/if}
-              {@render copyPathAction(file.path)}
+              {@render copyPathAction(file.moved_to ?? file.path)}
             </div>
             {#if !deleteFacet || open}
               {@const diff = collapsedFileDiffs[index]}
-              {#if file.edits.length === 0}
+              {#if renameOnly}
+                <!-- A move with no content change has no diff to show, so the
+                     path row above is the whole story. Saying content is
+                     "unavailable" here would report a failure that didn't
+                     happen. -->
+              {:else if file.edits.length === 0}
                 <!-- A live Codex edit announces paths without content; the facet
                      is upgraded from the session file at turn end. Empty edits on
                      a settled turn mean the content never became available. -->
@@ -424,13 +460,17 @@
                     : "Diff will appear when the turn completes."}
                 </p>
               {:else if diff !== undefined}
-                {@render inlineDiff(diff, languageForPath(file.path), "tool-edit-expand")}
+                {@render inlineDiff(
+                  diff,
+                  languageForPath(effectiveEditPath(file)),
+                  "tool-edit-expand",
+                )}
               {:else if open}
                 <AsyncToolDiff
                   sourceKind="file"
                   {file}
                   coordinator={expandedDiffCoordinator}
-                  language={languageForPath(file.path)}
+                  language={languageForPath(effectiveEditPath(file))}
                   testid="tool-edit-async"
                 />
               {:else}

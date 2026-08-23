@@ -217,7 +217,7 @@ fn parse_item_completed(obj: &Value, turn_id: TurnId) -> ParseOutcome {
             let result = item.get("result");
             let error = item.get("error");
             let status = item.get("status").and_then(Value::as_str).unwrap_or("");
-            let is_error = status == "failed" || error.is_some_and(|v| !v.is_null());
+            let is_error = status == "failed" || mcp_result_indicates_error(result, error);
             let output = extract_mcp_output(result, error);
             ParseOutcome::Event(AdapterEvent::ToolCompleted {
                 turn_id,
@@ -255,7 +255,11 @@ fn parse_item_completed(obj: &Value, turn_id: TurnId) -> ParseOutcome {
 ///   `serde_json::to_string`.
 /// - Never panic on malformed shapes — missing or wrong-typed fields collapse
 ///   to the empty/error case.
-fn extract_mcp_output(result: Option<&Value>, error: Option<&Value>) -> String {
+///
+/// `pub(super)`: the session-file hydrator routes both rollout generations'
+/// MCP results through this same function, so live and reopened transcripts
+/// cannot drift on the non-text/empty/error envelopes.
+pub(super) fn extract_mcp_output(result: Option<&Value>, error: Option<&Value>) -> String {
     // Result extraction first.
     if let Some(result) = result
         && !result.is_null()
@@ -290,6 +294,21 @@ fn extract_mcp_output(result: Option<&Value>, error: Option<&Value>) -> String {
         return err_str;
     }
     "[non-text tool result omitted]".to_owned()
+}
+
+/// Whether an MCP call's result/error payload proves failure independent of
+/// its `status`: a non-null top-level `error`, or `result.isError: true` — a
+/// tool-reported error under a `completed` status is still a failure.
+///
+/// `pub(super)`: shared with the session-file hydrator (both rollout
+/// generations), the same way [`extract_mcp_output`] is — the live and disk
+/// surfaces must agree on what counts as failure, not just on output text.
+pub(super) fn mcp_result_indicates_error(result: Option<&Value>, error: Option<&Value>) -> bool {
+    error.is_some_and(|v| !v.is_null())
+        || result
+            .and_then(|r| r.get("isError"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
 }
 
 /// Stringify the `error` field of an `mcp_tool_call.item.completed` event.
@@ -851,6 +870,20 @@ mod tests {
             parse_line(line, tid(), &mut state),
             ParseOutcome::Skip
         ));
+    }
+
+    #[test]
+    fn mcp_completed_status_with_result_is_error_fails_live() {
+        // Shared failure evidence with the disk hydrator: a tool-reported
+        // error under a `completed` status is a failure on both surfaces.
+        let line = r#"{"type":"item.completed","item":{"id":"item_0","type":"mcp_tool_call","server":"srv","tool":"do","arguments":{},"result":{"content":[{"type":"text","text":"boom"}],"isError":true},"error":null,"status":"completed"}}"#;
+        let mut state = CodexParserState::default();
+        let ParseOutcome::Event(AdapterEvent::ToolCompleted { is_error, .. }) =
+            parse_line(line, tid(), &mut state)
+        else {
+            panic!("expected ToolCompleted");
+        };
+        assert!(is_error);
     }
 
     #[test]

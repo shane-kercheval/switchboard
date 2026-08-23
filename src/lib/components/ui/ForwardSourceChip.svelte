@@ -11,7 +11,8 @@
   // stands for a single agent. `onRemove` drops it.
   //
   // `readiness` is what this source will contribute at dispatch, and only `empty`
-  // is a warning — that source is *skipped* from the send. A boolean cannot express
+  // is a warning — an empty source *blocks* the send (any-empty invalidates).
+  // A boolean cannot express
   // this: a `pending` agent (one still generating) is about to contribute normally,
   // and flagging it as a failure told the user the opposite of what would happen.
   //
@@ -36,12 +37,12 @@
 
   // `null` for `ready` — no icon, no tooltip, neutral chip. `tooltip` is the
   // pointer explanation; `srText` is the same consequence phrased to read
-  // naturally after the agent name for a screen reader ("bob, will be skipped…").
+  // naturally after the agent name for a screen reader ("bob, has no forwardable output…").
   const stateHint = $derived(
     readiness === "empty"
       ? {
-          tooltip: "This agent has no completed output, so it will be left out of the forward",
-          srText: "will be skipped from the forward",
+          tooltip: "This agent has no forwardable output — sending now would be blocked",
+          srText: "has no forwardable output; sending now would be blocked",
         }
       : readiness === "pending"
         ? {

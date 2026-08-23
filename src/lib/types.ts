@@ -31,11 +31,12 @@ export type TurnOutcome =
 // returned `resolved.body` through the normal send path (so the forward groups,
 // cancels, and renders exactly like any send). `resolved.body` is the composed
 // message (the frontend can't compose it — the forwarded blocks hold each
-// source's resolved output, which only the backend has); `resolved.skipped`
-// names sources that had no output (the partial-empty caption). `invalidated` /
-// `cancelled` mean nothing resolved (restore the composer).
+// source's resolved output, which only the backend has). `resolved` is always
+// complete: a source with no forwardable text invalidates the forward instead
+// of being silently skipped. `invalidated` / `cancelled` mean nothing resolved
+// (restore the composer).
 export type ForwardOutcome =
-  | { status: "resolved"; body: string; skipped: string[] }
+  | { status: "resolved"; body: string }
   | { status: "invalidated"; reason: string }
   | { status: "cancelled" };
 
@@ -106,6 +107,10 @@ export type EditedFile = {
   // end), not "no change".
   edits: EditPair[];
   truncated: boolean;
+  // Destination of a rename/move — `path` is the source; after the operation
+  // the file lives here. Absent for ordinary edits (Codex-only today; Claude
+  // renames via `mv` in Bash, which renders as a shell row).
+  moved_to?: string;
 };
 
 export type EditChange = "added" | "modified" | "deleted";

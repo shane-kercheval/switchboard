@@ -11,6 +11,7 @@ import {
   synthesizeMcpTextEditDiff,
   synthesizeWriteDiff,
   truncateDiff,
+  effectiveEditPath,
 } from "$lib/toolDiff";
 
 const structuredPatchSpy = vi.hoisted(() => vi.fn());
@@ -23,6 +24,28 @@ vi.mock("diff", async (importOriginal) => {
 function file(edits: { old: string; new: string }[], truncated = false): EditedFile {
   return { path: "/repo/src/a.ts", change: "modified", edits, truncated };
 }
+
+describe("effectiveEditPath", () => {
+  it("uses the rename destination for diff identity, else the source", () => {
+    // A rename that changes extension (config.js → config.ts) must key
+    // language selection and the synthesized FileDiff.path on the
+    // destination — the content the diff transitions to lives there; the
+    // source no longer exists after the operation.
+    const renamed: EditedFile = {
+      path: "/repo/config.js",
+      change: "modified",
+      edits: [{ old: "x", new: "y" }],
+      truncated: false,
+      moved_to: "/repo/config.ts",
+    };
+    expect(effectiveEditPath(renamed)).toBe("/repo/config.ts");
+    expect(synthesizeEditDiff(renamed).path).toBe("/repo/config.ts");
+
+    const plain = file([{ old: "x", new: "y" }]);
+    expect(effectiveEditPath(plain)).toBe("/repo/src/a.ts");
+    expect(synthesizeEditDiff(plain).path).toBe("/repo/src/a.ts");
+  });
+});
 
 function line(content: string): DiffLine {
   return { origin: "added", old_lineno: null, new_lineno: 1, content };

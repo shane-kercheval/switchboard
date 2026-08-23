@@ -205,6 +205,24 @@ describe("toolDetail", () => {
     expect(toolDetail({ facet_kind: "edit", files: [] }, {})).toBeUndefined();
   });
 
+  it("shows both endpoints of a renamed file in the edit detail", () => {
+    // A rename rendered as only its source path reads as an in-place edit to
+    // a file that no longer exists.
+    const renamed: ToolFacet = {
+      facet_kind: "edit",
+      files: [
+        {
+          path: "/repo/old.ts",
+          change: "modified",
+          edits: [],
+          truncated: false,
+          moved_to: "/repo/new.ts",
+        },
+      ],
+    };
+    expect(toolDetail(renamed, {})).toBe("/repo/old.ts → /repo/new.ts");
+  });
+
   it("shows the path for write and read facets", () => {
     expect(
       toolDetail({ facet_kind: "write", path: "/repo/x.txt", content: "", truncated: false }, {}),

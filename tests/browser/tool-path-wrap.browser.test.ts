@@ -16,13 +16,16 @@ beforeEach(() => {
   resetState();
 });
 
-function pathMetrics(testid: string): {
+function pathMetrics(
+  testid: string,
+  index = 0,
+): {
   height: number;
   lineHeight: number;
   scrollWidth: number;
   clientWidth: number;
 } {
-  const element = page.getByTestId(testid).elements()[0] as HTMLElement | undefined;
+  const element = page.getByTestId(testid).elements()[index] as HTMLElement | undefined;
   if (element === undefined) return { height: 0, lineHeight: 0, scrollWidth: 1, clientWidth: 0 };
   const style = getComputedStyle(element);
   return {
@@ -62,6 +65,24 @@ test("filesystem paths below tool headers wrap without horizontal clipping", asy
             ],
           },
         }),
+        toolItem({
+          id: "rename",
+          name: "apply_patch",
+          facet: {
+            facet_kind: "edit",
+            files: [
+              {
+                // A rename doubles the path text (source → destination) —
+                // the worst wrapping case for this row.
+                path: longPath,
+                change: "modified",
+                edits: [{ old: "x\n", new: "y\n" }],
+                truncated: false,
+                moved_to: longPath.replace("file-with-a-long-name", "renamed-to-a-long-name"),
+              },
+            ],
+          },
+        }),
       ],
     }),
   ]);
@@ -70,8 +91,8 @@ test("filesystem paths below tool headers wrap without horizontal clipping", asy
 
   const pathRows = page.getByTestId("tool-path-row");
   const copyButtons = page.getByTestId("tool-path-copy");
-  await expect.poll(() => pathRows.elements().length).toBe(2);
-  await expect.poll(() => copyButtons.elements().length).toBe(2);
+  await expect.poll(() => pathRows.elements().length).toBe(3);
+  await expect.poll(() => copyButtons.elements().length).toBe(3);
 
   const firstCopyContainer = copyButtons.nth(0).element().parentElement as HTMLElement;
   expect(getComputedStyle(firstCopyContainer).opacity).toBe("0");
@@ -84,17 +105,23 @@ test("filesystem paths below tool headers wrap without horizontal clipping", asy
     Math.abs(copyRect.x + copyRect.width / 2 - (statusRect.x + statusRect.width / 2)),
   ).toBeLessThan(1);
 
-  for (const testid of ["tool-read-path", "tool-edit-path"]) {
-    await expect.poll(() => pathMetrics(testid).height).toBeGreaterThan(20);
+  // The second edit path is the rename row — source → destination doubles the
+  // text, the worst wrapping case.
+  for (const [testid, index] of [
+    ["tool-read-path", 0],
+    ["tool-edit-path", 0],
+    ["tool-edit-path", 1],
+  ] as const) {
+    await expect.poll(() => pathMetrics(testid, index).height).toBeGreaterThan(20);
     await expect
       .poll(() => {
-        const metrics = pathMetrics(testid);
+        const metrics = pathMetrics(testid, index);
         return metrics.height > metrics.lineHeight * 1.5;
       })
       .toBe(true);
     await expect
       .poll(() => {
-        const metrics = pathMetrics(testid);
+        const metrics = pathMetrics(testid, index);
         return metrics.scrollWidth <= metrics.clientWidth + 1;
       })
       .toBe(true);

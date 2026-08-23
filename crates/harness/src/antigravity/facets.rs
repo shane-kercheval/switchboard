@@ -127,6 +127,7 @@ fn classify_antigravity_tool_facet_with_encoding(
                     change: EditChange::Modified,
                     edits: vec![EditPair { old, new }],
                     truncated: source_truncated || t1 || t2,
+                    moved_to: None,
                 }],
             }
         }

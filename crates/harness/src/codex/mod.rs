@@ -1275,7 +1275,69 @@ mod tests {
         assert!(result.is_none());
     }
 
-    /// The offline twin of `live_codex_apply_patch_emits_edit_facet` for the
+    /// Structural pin for the invariant on `EditedFile.moved_to`'s doc: the
+    /// pairing keys on **source** path sets (the live row only ever knows the
+    /// source), so a rename's disk facet must still pair to its live row.
+    /// Flipping `EditedFile.path` to the destination would fail exactly this.
+    #[tokio::test]
+    async fn facet_upgrade_pairs_a_rename_by_its_source_path() {
+        use crate::facets::ToolFacet;
+        let home = tempfile::TempDir::new().unwrap();
+        let cwd = tempfile::TempDir::new().unwrap();
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 8, 22).unwrap();
+        let thread_id = "00000000-0000-7000-8000-0000000000c3";
+        let dir = session_file::session_directory(home.path(), date);
+        std::fs::create_dir_all(&dir).unwrap();
+        let rollout = dir.join(format!("rollout-1747000000002-{thread_id}.jsonl"));
+        let content = concat!(
+            "{\"timestamp\":\"2026-08-22T00:00:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"t1\"}}\n",
+            "{\"timestamp\":\"2026-08-22T00:00:02Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"patch_apply_end\",\"call_id\":\"exec-r1\",\"success\":true,\"status\":\"completed\",\"changes\":{\"/tmp/old.txt\":{\"type\":\"update\",\"unified_diff\":\"@@ -1 +1 @@\\n-x\\n+y\\n\",\"move_path\":\"/tmp/new.txt\"}}}}\n",
+        );
+        std::fs::write(&rollout, content).unwrap();
+
+        let locator = CodexLocator {
+            thread_id: thread_id.to_owned(),
+            partition_date: date,
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        // The live row knows only the source path — renames announce no
+        // destination live.
+        let live_edit_calls = vec![("item_7".to_owned(), vec!["/tmp/old.txt".to_owned()])];
+        emit_terminal_with_enrichment(
+            &tx,
+            Some(&locator),
+            home.path(),
+            cwd.path(),
+            switchboard_core::AgentId::now_v7(),
+            uuid::Uuid::now_v7(),
+            TurnOutcome::Completed,
+            Utc::now(),
+            None,
+            false,
+            &live_edit_calls,
+        )
+        .await;
+        drop(tx);
+
+        let mut upgraded = None;
+        while let Some(e) = rx.recv().await {
+            if let AdapterEvent::ToolFacetUpdated {
+                tool_use_id, facet, ..
+            } = e
+            {
+                upgraded = Some((tool_use_id, facet));
+            }
+        }
+        let (tool_use_id, facet) = upgraded.expect("rename must pair by source path");
+        assert_eq!(tool_use_id, "item_7");
+        let ToolFacet::Edit { files } = facet else {
+            panic!("edit facet expected");
+        };
+        assert_eq!(files[0].path, "/tmp/old.txt");
+        assert_eq!(files[0].moved_to.as_deref(), Some("/tmp/new.txt"));
+    }
+
+    /// The offline twin of `live_codex_apply_patch_emits_edit_facet` for the    /// The offline twin of `live_codex_apply_patch_emits_edit_facet` for the
     /// paginated generation: a rollout whose edit content lives on
     /// `item_completed/FileChange` (no `patch_apply_end` exists there) must
     /// still upgrade the live `file_change` row with the diff at turn end.

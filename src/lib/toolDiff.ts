@@ -92,17 +92,31 @@ export function createExpandedDiffCoordinator(
   };
 }
 
+/// The path where the edit's result lives: the rename destination when the
+/// edit is a move, else the (unchanged) source. Diff-internal identity —
+/// synthesized `FileDiff.path`, syntax-highlighting language — keys on this,
+/// because the content the diff transitions *to* exists at the destination;
+/// only the visible label shows both endpoints.
+export function effectiveEditPath(file: EditedFile): string {
+  return file.moved_to ?? file.path;
+}
+
 export function synthesizeEditDiff(file: EditedFile): FileDiff;
 export function synthesizeEditDiff(file: EditedFile, timeoutMs: number): FileDiff | undefined;
 export function synthesizeEditDiff(file: EditedFile, timeoutMs?: number): FileDiff | undefined {
-  return synthesizeTextEditDiff(file.path, file.edits, file.truncated, timeoutMs);
+  return synthesizeTextEditDiff(effectiveEditPath(file), file.edits, file.truncated, timeoutMs);
 }
 
 export function synthesizeEditDiffAsync(
   file: EditedFile,
   timeoutMs = EXPANDED_EDIT_DIFF_TIMEOUT_MS,
 ): Promise<FileDiff | undefined> {
-  return synthesizeTextEditDiffAsync(file.path, file.edits, file.truncated, timeoutMs);
+  return synthesizeTextEditDiffAsync(
+    effectiveEditPath(file),
+    file.edits,
+    file.truncated,
+    timeoutMs,
+  );
 }
 
 /**
@@ -124,7 +138,7 @@ export function synthesizeCollapsedEditDiffs(
       continue;
     }
     const result = synthesizeTextEditDiff(
-      file.path,
+      effectiveEditPath(file),
       file.edits,
       file.truncated,
       undefined,

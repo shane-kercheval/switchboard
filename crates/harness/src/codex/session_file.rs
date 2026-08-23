@@ -5569,4 +5569,49 @@ not valid json
             "one edit, not one per generation: {edits:?}"
         );
     }
+
+    #[test]
+    fn rename_move_path_survives_hydration_in_both_generations() {
+        // Loader-level, not helper-level: proves the mode routing delivers the
+        // rename to `patch_apply_end_facet` in each generation — a gating or
+        // routing regression could drop it from one while helper tests stay
+        // green.
+        let change = serde_json::json!({"/tmp/old.txt": {
+            "type": "update", "unified_diff": "@@ -1 +1 @@\n-x\n+y\n",
+            "move_path": "/tmp/new.txt"}});
+
+        // Legacy: `patch_apply_end` record.
+        let legacy = jsonl_lines(&[
+            serde_json::json!({"type":"session_meta","payload":{"cli_version":"0.146.0","history_mode":"legacy"}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"t-1"}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"patch_apply_end","call_id":"exec-p1","success":true,"status":"completed","changes":change}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"t-1"}}),
+        ]);
+        let result = parse_codex_transcript_content(&legacy, Uuid::now_v7());
+        let rows = tool_rows(&result.turns);
+        let crate::facets::ToolFacet::Edit { files } = &rows[0].facet else {
+            panic!("legacy edit facet expected: {rows:?}");
+        };
+        assert_eq!(files[0].moved_to.as_deref(), Some("/tmp/new.txt"));
+
+        // Paginated: `item_completed/FileChange` child.
+        let paginated = jsonl_lines(&[
+            serde_json::json!({"type":"session_meta","payload":{"cli_version":"0.149.0","history_mode":"paginated"}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"t-1"}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"custom_tool_call","id":"ctc_1","status":"completed","call_id":"call_1","name":"exec","input":"dynamic"}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"item_completed","item":{
+                "type":"FileChange","id":"exec-fc","status":"completed","changes":change}}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"custom_tool_call_output","id":"ctco_1","call_id":"call_1","output":[{"type":"input_text","text":"ok"}]}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"t-1"}}),
+        ]);
+        let result = parse_codex_transcript_content(&paginated, Uuid::now_v7());
+        let edit = tool_rows(&result.turns)
+            .into_iter()
+            .find(|r| r.name == "apply_patch")
+            .expect("paginated edit row");
+        let crate::facets::ToolFacet::Edit { files } = &edit.facet else {
+            panic!("paginated edit facet expected");
+        };
+        assert_eq!(files[0].moved_to.as_deref(), Some("/tmp/new.txt"));
+    }
 }

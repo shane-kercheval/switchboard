@@ -47,6 +47,7 @@
     synthesizeMcpTextEditDiff,
     synthesizeWriteDiff,
     truncateDiff,
+    effectiveEditPath,
   } from "$lib/toolDiff";
   import { formatToolInput, redactDisplay } from "$lib/toolInput";
   import { copyText } from "$lib/native";
@@ -405,12 +406,19 @@
               data-testid="tool-path-row"
             >
               <span class={cn(FILE_PATH_CLASS, "flex-1")} data-testid="tool-edit-path">
-                {file.path}
+                {file.path}{#if file.moved_to}
+                  → {file.moved_to}{/if}
               </span>
+              <!-- Independent of the multi-file change annotation below: that
+                   one is gated on `files.length > 1`, which structurally
+                   excludes the single-file rename — the realistic case. -->
+              {#if file.moved_to}
+                <span class="shrink-0" data-testid="tool-edit-renamed">(renamed)</span>
+              {/if}
               {#if verb === "Edit" && facet.files.length > 1 && file.change !== "modified"}
                 <span class="shrink-0">({file.change})</span>
               {/if}
-              {@render copyPathAction(file.path)}
+              {@render copyPathAction(file.moved_to ?? file.path)}
             </div>
             {#if !deleteFacet || open}
               {@const diff = collapsedFileDiffs[index]}
@@ -424,13 +432,17 @@
                     : "Diff will appear when the turn completes."}
                 </p>
               {:else if diff !== undefined}
-                {@render inlineDiff(diff, languageForPath(file.path), "tool-edit-expand")}
+                {@render inlineDiff(
+                  diff,
+                  languageForPath(effectiveEditPath(file)),
+                  "tool-edit-expand",
+                )}
               {:else if open}
                 <AsyncToolDiff
                   sourceKind="file"
                   {file}
                   coordinator={expandedDiffCoordinator}
-                  language={languageForPath(file.path)}
+                  language={languageForPath(effectiveEditPath(file))}
                   testid="tool-edit-async"
                 />
               {:else}

@@ -107,6 +107,10 @@ export type EditedFile = {
   // end), not "no change".
   edits: EditPair[];
   truncated: boolean;
+  // Destination of a rename/move — `path` is the source; after the operation
+  // the file lives here. Absent for ordinary edits (Codex-only today; Claude
+  // renames via `mv` in Bash, which renders as a shell row).
+  moved_to?: string;
 };
 
 export type EditChange = "added" | "modified" | "deleted";

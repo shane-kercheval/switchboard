@@ -85,7 +85,11 @@ export function toolDetail(facet: ToolFacet, input: unknown): string | undefined
     case "shell":
       return nonEmpty(redactDisplay(oneLine(facet.command)));
     case "edit":
-      return nonEmpty(facet.files.map((f) => f.path).join(", "));
+      // A rename shows both endpoints — rendering only the source would
+      // present the move as an in-place edit to a path that no longer exists.
+      return nonEmpty(
+        facet.files.map((f) => (f.moved_to ? `${f.path} → ${f.moved_to}` : f.path)).join(", "),
+      );
     case "write":
     case "read":
       return nonEmpty(facet.path);

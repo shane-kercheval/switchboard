@@ -344,7 +344,7 @@ Grouped by theme; this is the candidate scope for the failure/metadata-surfacing
 
 ## 5. Open captures / unverified
 
-- **Codex `*** Move to:` patch sections (§3.6)** — the probe did not exercise a move. It renders under its original path rather than fabricating unverified move semantics.
+- **Codex `*** Move to:` patch sections (§3.6)** — now **represented**: the edit facet carries the destination on `EditedFile.moved_to` (populated from `*** Move to:` in patch text and `move_path` in structured change maps, both rollout generations) and the transcript renders `source → destination`. A *live* move remains unobserved — real renames are rare (one across 3,201 local file-change records) — so the field's shape rests on the captured `move_path` values and the documented patch grammar, not a live probe.
 - **Gemini `[Thought: true]` live-stream literal (§3.2)** — observed in-app inside a `message` stream-json event's `content`, under a newer/different model config than the original headless probe (which yielded `thoughts:[]` in the stream, never reasoning). Unknown whether it's a reasoning marker we should reclassify to `ContentKind::Thinking` (strip the prefix, emit the remainder) or plain model-authored text. Capture needs `gemini -p "<prompt>" --output-format stream-json` against that same config. Until captured, the live stream surfaces no Gemini reasoning and `[Thought: true]` falls through as `Text`.
 - **Gemini bad-token (401) auth shape** — never observed; our substring detector is a guess. Capture needs a *stale-but-present* token (a clean logout gives the exit-41 shape instead).
 - **Gemini hard quota wall** — none observed (it stalls/retries). Treated as "nothing to classify."

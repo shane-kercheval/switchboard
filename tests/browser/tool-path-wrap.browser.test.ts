@@ -126,4 +126,17 @@ test("filesystem paths below tool headers wrap without horizontal clipping", asy
       })
       .toBe(true);
   }
+
+  // A rename breaks **at the arrow**, not mid-path: the two endpoints are flex
+  // items, so at this width they land on different lines with each path whole,
+  // rather than the single run of text splitting wherever it runs out of room.
+  // Geometry is the only way to assert a break point — the text content is
+  // identical either way, which is why this lives in the WebKit suite.
+  const source = page.getByTestId("tool-edit-path-source").element();
+  const destination = page.getByTestId("tool-edit-path-destination").element();
+  await expect
+    .poll(() => destination.getBoundingClientRect().top - source.getBoundingClientRect().top)
+    .toBeGreaterThan(0);
+  // The arrow stays with the source — it must never orphan onto line two.
+  expect(source.textContent?.trim().endsWith("→")).toBe(true);
 });

@@ -64,7 +64,7 @@
     agents?: AgentRecord[];
     panes?: TranscriptPane[];
     /// Classifies what each agent would contribute, so the per-field picker and
-    /// chips can warn before send that a source will be skipped.
+    /// chips can warn before send that an empty source would block it.
     agentReadiness?: (id: AgentId) => ForwardReadiness;
     onremove: () => void;
     /// The compose bar's send button, rendered in the footer row beside Preview

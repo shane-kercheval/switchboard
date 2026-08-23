@@ -550,6 +550,21 @@ impl WorkflowRun {
         for name in &names {
             let key = canonicalize_for_uniqueness(name.trim());
             match outputs.get(&key) {
+                // Present-but-empty fails the step exactly like absent output —
+                // the uniform any-empty forward policy, gated by the shared
+                // `is_forwardable_text` predicate and phrased through the shared
+                // `empty_sources_reason`, so neither rule nor copy can drift
+                // from the manual/prompt paths. This was the worst of the four
+                // permissive paths: a completed-but-empty source used to
+                // compose an empty block into the body with no signal at all,
+                // silently truncating the downstream agent's input. (A doc
+                // comment on `forward_message_impl` long claimed this path
+                // already failed on any empty source; it did not.)
+                Some(text) if !switchboard_harness::is_forwardable_text(text) => {
+                    return Err(StepError::Failed(
+                        switchboard_harness::empty_sources_reason(&[name.trim().to_owned()]),
+                    ));
+                }
                 Some(text) => blocks.push((name.trim().to_owned(), text.clone())),
                 None => {
                     return Err(StepError::Failed(format!(
@@ -1831,6 +1846,34 @@ mod tests {
                 status: TerminalStatus::Failed,
                 ..
             })
+        ));
+    }
+
+    #[tokio::test]
+    async fn forward_from_completed_but_empty_output_fails_the_step() {
+        // The path that silently ate a reviewer's contribution: agent `a`
+        // completes with NO text, and the step forwarding from it used to
+        // compose an empty block into `b`'s prompt with no signal anywhere.
+        // Present-but-empty must fail the step exactly like absent output.
+        let rig = rig(vec![
+            ("a", vec![MockScenario::CompletesEmpty]),
+            ("b", vec![MockScenario::Streaming]),
+        ]);
+        let yaml = "name: f\ndescription: d\ninputs:\n  a: agent\n  b: agent\nsteps:\n  - label: work\n    send:\n      to: \"{{ a }}\"\n      text: go\n  - label: settle\n    wait_for:\n      agent: \"{{ a }}\"\n  - label: hand off\n    send:\n      to: \"{{ b }}\"\n      forward_from: \"{{ a }}\"\n      text: use it\n";
+        let (run, _dir, path) = build_run(
+            &rig,
+            PromptService::disabled(),
+            yaml,
+            "f",
+            supplied(vec![("a", text("a")), ("b", text("b"))]),
+            CancellationToken::new(),
+        );
+        assert_eq!(run.execute().await, RunStatus::Failed);
+        let last = records(&path).pop().unwrap();
+        assert!(matches!(
+            &last,
+            RunRecord::Terminal { status: TerminalStatus::Failed, reason: Some(r), .. }
+                if r.contains("no forwardable text")
         ));
     }
 

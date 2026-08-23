@@ -50,7 +50,6 @@
   } from "$lib/state/unified";
   import {
     FORWARD_SENTINEL,
-    forwardCaptionFor,
     heldForwardsFor,
     type HeldForward,
   } from "$lib/state/heldForwards.svelte";
@@ -1830,13 +1829,10 @@
        `userBody`), so the user's own typed text isn't visually claimed as
        forwarded; the body renders VERBATIM (sentinels intact). `data-forwarded`
        (derived from the body's canonical sentinel, so durable across reload)
-       marks the turn for tests/hooks. The partial-empty caption names which
-       sources were included vs. skipped; it renders in the meta row (outside the
-       collapse clip) so it stays visible even while collapsed — and is live-only
-       (a skipped source leaves no trace in the body to rebuild it from). -->
+       marks the turn for tests/hooks. A dispatched forward is always complete —
+       a source with no forwardable text blocks the send at the backend
+       (`ForwardOutcome`), so there is no partial-forward state to caption. -->
   {@const forwarded = FORWARD_SENTINEL.test(row.text)}
-  {@const caption =
-    row.send_id !== undefined ? forwardCaptionFor(projectId, row.send_id) : undefined}
   <div
     class="group min-w-0 flex-1"
     data-testid="turn"
@@ -1866,11 +1862,6 @@
       previewDefaultCompact: defaultCompact,
       messageIdentity: messageIdentityForRow(row),
     })}
-    {#if caption !== undefined}
-      <div class="text-muted mt-0.5 text-xs" data-testid="forward-caption">
-        ↪ forwarded from {caption.included.join(", ")} · {caption.skipped.join(", ")} had no output
-      </div>
-    {/if}
   </div>
 {/snippet}
 

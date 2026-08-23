@@ -56,7 +56,7 @@
     /// from an incompatibility: show a "resolving" affordance, not an error.
     loading?: boolean;
     /// Classifies what each forward-source agent would contribute, so the user
-    /// sees before picking that a source will be skipped — parity with the prompt
+    /// sees before picking that an empty source would block the launch — parity with the prompt
     /// composer's per-argument pickers.
     agentReadiness?: (id: string) => ForwardReadiness;
     /// Bound input values, keyed by name. Scalar inputs and derived args hold a

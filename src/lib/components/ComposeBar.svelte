@@ -14,7 +14,6 @@
   import {
     addHeldForward,
     removeHeldForward,
-    setForwardCaption,
     forwardSourceKey,
     expandForwardSources,
     forwardSourceForAgent,
@@ -287,14 +286,6 @@
   /// so they cannot disagree about the same agent.
   function agentReadiness(agentId: AgentId): ForwardReadiness {
     return forwardReadiness(transcripts[agentId]);
-  }
-
-  /// Agent names that actually carried output, for the partial-empty caption —
-  /// derived from the expanded agent ids minus the backend's skipped names.
-  function includedNames(sources: ForwardSource[], skipped: string[]): string[] {
-    return expandForwardSources(sources)
-      .map((id) => agents.find((a) => a.id === id)?.name)
-      .filter((name): name is string => name !== undefined && !skipped.includes(name));
   }
 
   /// The current chips as the `Attachment` wire shape (drops the local `id`),
@@ -2166,19 +2157,13 @@
           // Dispatch the composed body as a normal send under this forward's
           // send_id — the user message + responses render and group via the
           // existing machinery. The forward marker is derived from the body's
-          // sentinel lines at render time (durable across reload); only the
-          // partial-empty caption needs the live store (it can't be reconstructed
-          // — skipped sources leave no trace in the wire body).
+          // sentinel lines at render time (durable across reload). The body is
+          // always complete: any empty source invalidates instead of being
+          // silently skipped.
           dispatchToRecipients(outcome.body, attachments, targets, sendId, forwardProjectId);
-          if (outcome.skipped.length > 0) {
-            setForwardCaption(forwardProjectId, sendId, {
-              included: includedNames(sources, outcome.skipped),
-              skipped: outcome.skipped,
-            });
-          }
         } else {
-          // invalidated (a source failed/cancelled, or all sources empty) or the
-          // user cancelled the hold — nothing resolved; restore the composer.
+          // invalidated (a source failed/cancelled, or any source resolved with
+          // no forwardable text) or the user cancelled — restore the composer.
           restoreForward(body, sources, attachments);
           if (outcome.status === "invalidated") showError(`Forward not sent: ${outcome.reason}`);
         }
@@ -2294,12 +2279,6 @@
         removeHeldForward(forwardProjectId, forwardId);
         if (outcome.status === "resolved") {
           dispatchToRecipients(outcome.body, attachments, targets, sendId, forwardProjectId);
-          if (outcome.skipped.length > 0) {
-            setForwardCaption(forwardProjectId, sendId, {
-              included: includedNames(allSources, outcome.skipped),
-              skipped: outcome.skipped,
-            });
-          }
         } else {
           restoreForwardPrompt(
             prompt,
@@ -3419,7 +3398,9 @@
                 <HarnessIcon harness={item.agent.harness} size="sm" class="h-4 w-4" />
                 <span class="text-fg">{item.agent.name}</span>
                 {#if agentReadiness(item.agent.id) === "empty"}
-                  <span class="text-muted ml-auto text-[11px] italic">will be skipped</span>
+                  <span class="text-muted ml-auto text-[11px] italic"
+                    >no output — blocks the send</span
+                  >
                 {:else if agentReadiness(item.agent.id) === "pending"}
                   <span class="text-muted ml-auto text-[11px] italic">still generating</span>
                 {/if}

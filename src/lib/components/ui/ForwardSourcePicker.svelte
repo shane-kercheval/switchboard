@@ -34,7 +34,7 @@
     onPickPane: (pane: TranscriptPane) => void;
     disabled?: boolean;
     /// Optional: classify what each agent would contribute, so the user sees
-    /// before picking that a source will be skipped. Only `empty` is flagged —
+    /// before picking that an empty source would block the send. Only `empty` is flagged —
     /// a `pending` agent is still generating and will be waited for.
     agentReadiness?: (id: AgentId) => ForwardReadiness;
     triggerClass?: string;
@@ -135,7 +135,7 @@
       <HarnessIcon harness={agent.harness} size="sm" class="h-4 w-4 shrink-0" />
       <span class="text-fg">{agent.name}</span>
       {#if agentReadiness?.(agent.id) === "empty"}
-        <span class="text-muted ml-auto text-[11px] italic">will be skipped</span>
+        <span class="text-muted ml-auto text-[11px] italic">no output — blocks the send</span>
       {:else if agentReadiness?.(agent.id) === "pending"}
         <span class="text-muted ml-auto text-[11px] italic">still generating</span>
       {/if}

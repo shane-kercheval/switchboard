@@ -16,6 +16,7 @@
 // it. The hold lives here instead.
 
 import type { AgentId, AgentRecord, ProjectId, SendId } from "$lib/types";
+import { answerTextOf } from "./unified";
 import type { Turn } from "$lib/state/types";
 import type { TranscriptPane } from "$lib/state/transcriptPanes.svelte";
 
@@ -94,32 +95,50 @@ export function reconcileForwardSourceMap(
 ///
 /// - `ready`   — the agent is idle with a completed turn; the forward resolves it now.
 /// - `pending` — the agent has a turn in flight; the send **holds** for it.
-/// - `empty`   — the agent is idle with nothing completed; the source is **skipped**,
-///               and if every source is empty the forward is invalidated entirely.
+/// - `empty`   — the agent is idle with no forwardable text to contribute;
+///               dispatching would **block the whole send** (any empty source
+///               invalidates the forward), so the picker flags it first.
 export type ForwardReadiness = "ready" | "pending" | "empty";
 
 /// Classify what a source will contribute, from that agent's turns.
 ///
 /// The rule comes from `forward_message_impl` (crates/app/src/commands.rs), which
 /// "holds outside any queue while each source agent's current in-flight turn
-/// settles, then composes … each non-empty source's latest **completed** output."
-/// Two consequences the shape of this function depends on:
+/// settles, then composes … each source's latest **completed** output."
+/// Three consequences the shape of this function depends on:
 ///
 /// 1. **An in-flight turn means `pending` regardless of history.** An agent with an
 ///    older completed turn *and* a newer streaming one forwards the *new* turn, so
 ///    it is not ready — the send waits. Readiness is therefore "has completed output
 ///    AND nothing in flight", not "has completed output". A predicate written as
 ///    `hasCompleted || isStreaming` gets exactly this case backwards.
-/// 2. **`empty` is a real warning.** `ForwardOutcome::Resolved` skips such a source
-///    from the composed body, and `Invalidated` fires when every source is empty.
+/// 2. **`empty` warns of a blocked send.** Any source resolving with no forwardable
+///    text invalidates the whole forward at the backend, so this flag is the
+///    user's chance to see it before submitting. Advisory only — the backend
+///    validator is the single enforcement point; this derivation can be stale.
+/// 3. **Completed is not enough — the *newest completed* turn must carry text.**
+///    The backend forwards `latest_completed_agent_text`, which is blank for a
+///    turn that produced only tool/thinking items, and it reads the newest
+///    completed turn — so an older textual completion behind a newer empty one
+///    still resolves empty.
 ///
-/// A turn that only ever `failed` or `cancelled` leaves the agent `empty`: there is
-/// no completed output to carry.
+/// A source whose **newest turn failed or was cancelled is `ready`**, not
+/// `empty`: the backend forwards a generated failure note for it
+/// (`latest_turn_failure_note`) — non-empty, deliberately forwardable content
+/// ("tell the next agent that X failed"), so the send is not blocked.
 export function forwardReadiness(turns: readonly Turn[] | undefined): ForwardReadiness {
   const agentTurns = (turns ?? []).filter((turn) => turn.role === "agent");
   if (agentTurns.some((turn) => turn.status === "streaming")) return "pending";
-  if (agentTurns.some((turn) => turn.status === "complete")) return "ready";
-  return "empty";
+  const newest = agentTurns.at(-1);
+  if (newest === undefined) return "empty";
+  if (newest.status === "failed" || newest.status === "cancelled") return "ready";
+  // Newest completed turn, matching the backend's rev-find — and extracted via
+  // the canonical `answerTextOf` so "what counts as the answer" (thinking and
+  // tools excluded) lives in exactly one place and readiness cannot drift from
+  // copy/forward/render semantics.
+  const newestCompleted = [...agentTurns].reverse().find((turn) => turn.status === "complete");
+  if (newestCompleted === undefined) return "empty";
+  return answerTextOf(newestCompleted).trim().length > 0 ? "ready" : "empty";
 }
 
 /// A submitted-but-still-holding forward. Carries everything needed to render
@@ -135,21 +154,7 @@ export interface HeldForward {
   recipients: AgentId[];
 }
 
-/// The partial-empty caption for a dispatched forward, keyed by `send_id`. Set
-/// only when ≥1 source was skipped for having no output.
-///
-/// **Live-only by design.** Unlike the forward *marker* (which the transcript
-/// derives from the sentinel lines in the message body — durable across reload),
-/// this caption cannot be reconstructed: a skipped source leaves no trace in the
-/// wire body, so "X had no output" is unrecoverable after a reload. It's a
-/// "resolved while you were away" courtesy, not load-bearing history.
-export interface ForwardCaption {
-  included: string[];
-  skipped: string[];
-}
-
 const held = $state<Record<ProjectId, HeldForward[]>>({});
-const captions = $state<Record<ProjectId, Record<SendId, ForwardCaption>>>({});
 
 /// The project's in-flight held forwards, in submission order ([] when none).
 export function heldForwardsFor(projectId: ProjectId): HeldForward[] {
@@ -174,25 +179,6 @@ export function removeHeldForward(projectId: ProjectId, forwardId: string): void
   }
 }
 
-/// The partial-empty caption for a dispatched forward's `send_id`, or `undefined`
-/// when the forward skipped no sources (the common case).
-export function forwardCaptionFor(
-  projectId: ProjectId,
-  sendId: SendId,
-): ForwardCaption | undefined {
-  return captions[projectId]?.[sendId];
-}
-
-/// Record a partial-empty caption for a dispatched forward. Call only when ≥1
-/// source was skipped.
-export function setForwardCaption(
-  projectId: ProjectId,
-  sendId: SendId,
-  caption: ForwardCaption,
-): void {
-  captions[projectId] = { ...(captions[projectId] ?? {}), [sendId]: caption };
-}
-
 /// The canonical manual-forward sentinel (`docs/workflow-spec.md` §`send`). The
 /// transcript uses this to mark a message as a forward **durably** — derived from
 /// the body that the journal persists, so the styling survives reload without a
@@ -211,6 +197,5 @@ export const FORWARD_SENTINEL = /^=== START forwarded from .+ ===$/m;
 export const _testing = {
   reset(): void {
     for (const key of Object.keys(held)) delete held[key];
-    for (const key of Object.keys(captions)) delete captions[key];
   },
 };

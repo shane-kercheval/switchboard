@@ -28,6 +28,12 @@ pub enum MockScenario {
     /// must concatenate only the two `Text` chunks, never the `Thinking` one.
     StreamingWithThinking,
 
+    /// Completes with **no content at all** — just `TurnEnd(Completed)`. Models
+    /// a real harness turn that produced only thinking/tool items (or whose
+    /// text was lost to a parse gap): completed, but nothing forwardable. The
+    /// vehicle for the any-empty forward policy tests.
+    CompletesEmpty,
+
     /// Intentionally violates the stream contract — panics mid-stream before
     /// `TurnEnd`. The **only** legitimate use is testing the dispatcher's
     /// `AgentIdleGuard` Drop path under producer-task panic. Never use in
@@ -246,6 +252,22 @@ impl HarnessAdapter for MockHarnessAdapter {
                         usage: None,
                         context_window_source: None,
                         stable_message_id: Some("mock-message".to_owned()),
+                        first_message_id: None,
+                        spend: None,
+                        model: None,
+                        effort: None,
+                    });
+                });
+            }
+            MockScenario::CompletesEmpty => {
+                tokio::spawn(async move {
+                    let _ = tx.send(AdapterEvent::TurnEnd {
+                        turn_id,
+                        outcome: TurnOutcome::Completed,
+                        ended_at: Utc::now(),
+                        usage: None,
+                        context_window_source: None,
+                        stable_message_id: Some("mock-empty".to_owned()),
                         first_message_id: None,
                         spend: None,
                         model: None,

@@ -5033,7 +5033,7 @@ describe("ComposeBar — cross-agent forward", () => {
     await seedCompletedTurn(AGENT_B.id);
     invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
       if (cmd === "forward_message") {
-        return { status: "resolved", body: "composed body", skipped: [] };
+        return { status: "resolved", body: "composed body" };
       }
       if (cmd === "send_message") return "msg-1";
       return null;
@@ -5082,7 +5082,7 @@ describe("ComposeBar — cross-agent forward", () => {
           const name = source.split("/").pop() ?? source;
           return { path: `/proj/.switchboard/attachments/uuid__${name}`, original_name: name };
         }
-        if (cmd === "forward_message") return { status: "resolved", body: "composed", skipped: [] };
+        if (cmd === "forward_message") return { status: "resolved", body: "composed" };
         if (cmd === "send_message") return "msg-1";
         return null;
       },
@@ -5117,8 +5117,7 @@ describe("ComposeBar — cross-agent forward", () => {
     await state.registerAgent(AGENT_B);
     await seedCompletedTurn(AGENT_B.id);
     invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
-      if (cmd === "forward_message")
-        return { status: "resolved", body: "composed body", skipped: [] };
+      if (cmd === "forward_message") return { status: "resolved", body: "composed body" };
       if (cmd === "send_message") return "msg-fwd";
       return null;
     });
@@ -5183,8 +5182,7 @@ describe("ComposeBar — cross-agent forward", () => {
     expect(state.runtimes[AGENT_A.id]?.pending_sends ?? []).toHaveLength(0);
 
     invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
-      if (cmd === "forward_message")
-        return { status: "resolved", body: FORWARDED_BODY, skipped: [] };
+      if (cmd === "forward_message") return { status: "resolved", body: FORWARDED_BODY };
       if (cmd === "send_message") return "msg-fwd";
       return null;
     });
@@ -5219,7 +5217,7 @@ describe("ComposeBar — cross-agent forward", () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);
     await state.registerAgent(AGENT_B);
-    // AGENT_B is idle with no completed turn → the forward skips it entirely.
+    // AGENT_B is idle with no completed turn → dispatching would be blocked.
 
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
     await pickForwardSource(AGENT_B.id);
@@ -5232,7 +5230,7 @@ describe("ComposeBar — cross-agent forward", () => {
       "data-state-readiness",
       "empty",
     );
-    expect(within(chipEl).getByText(/will be skipped from the forward/i)).toBeInTheDocument();
+    expect(within(chipEl).getByText(/has no forwardable output/i)).toBeInTheDocument();
   });
 
   it("does not warn on a source that is still streaming", async () => {
@@ -5287,7 +5285,7 @@ describe("ComposeBar — cross-agent forward", () => {
     await fireEvent.input(textarea, { target: { value: "@" } });
     const row = await screen.findByTestId(`forward-option-forward-agent:${AGENT_B.id}`);
     expect(row).toHaveTextContent("still generating");
-    expect(row).not.toHaveTextContent("will be skipped");
+    expect(row).not.toHaveTextContent("blocks the send");
 
     await fireEvent.click(row);
     // The chip carries the same pending state the row advertised.
@@ -5335,7 +5333,7 @@ describe("ComposeBar — cross-agent forward", () => {
     await state.registerAgent(AGENT_B);
     await seedCompletedTurn(AGENT_B.id);
     invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
-      if (cmd === "forward_message") return { status: "resolved", body: "x", skipped: [] };
+      if (cmd === "forward_message") return { status: "resolved", body: "x" };
       if (cmd === "send_message") return "msg-1";
       return null;
     });
@@ -5364,7 +5362,7 @@ describe("ComposeBar — cross-agent forward", () => {
     await seedCompletedTurn(AGENT_B.id);
     await seedCompletedTurn(AGENT_C.id);
     invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
-      if (cmd === "forward_message") return { status: "resolved", body: "x", skipped: [] };
+      if (cmd === "forward_message") return { status: "resolved", body: "x" };
       if (cmd === "send_message") return "msg-1";
       return null;
     });
@@ -5408,6 +5406,82 @@ describe("ComposeBar — cross-agent forward", () => {
         "aggregate this",
       );
     });
+  });
+
+  it("flags a completed tools-only turn as empty, matching the backend rule", async () => {
+    // Completed is not enough: the backend forwards the newest completed
+    // turn's *text*, which is blank for a tools/thinking-only turn — the chip
+    // must warn before submit rather than claim ready and fail at dispatch.
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    state.transcripts[AGENT_B.id] = [
+      {
+        role: "agent",
+        turn_id: "t-tools-only",
+        agent_id: AGENT_B.id,
+        started_at: "2026-05-16T00:00:00Z",
+        status: "complete",
+        items: [
+          {
+            item_kind: "tool",
+            tool_use_id: "t1",
+            kind: "builtin",
+            name: "Bash",
+            input: {},
+            facet: { facet_kind: "other" },
+            output: "did things",
+            is_error: false,
+            started_at: "2026-05-16T00:00:00Z",
+          },
+          { item_kind: "text", kind: "thinking", text: "pondering" },
+        ],
+      },
+    ];
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    await pickForwardSource(AGENT_B.id);
+
+    const chipEl = screen.getByTestId("forward-source-chip-bob");
+    expect(chipEl).toHaveAttribute("data-readiness", "empty");
+  });
+
+  it("surfaces the empty-source invalidation reason and dispatches nothing", async () => {
+    // The any-empty policy's frontend half: the backend blocks the send and
+    // the user sees why in the compose-bar error, with the composer restored.
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    await seedCompletedTurn(AGENT_B.id);
+    const dispatched: string[] = [];
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "forward_message") {
+        return {
+          status: "invalidated",
+          reason: "bob has no forwardable text available; nothing was sent",
+        };
+      }
+      if (cmd === "send_message") dispatched.push(cmd);
+      return null;
+    });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    await pickForwardSource(AGENT_B.id);
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    await fireEvent.input(textarea, { target: { value: "aggregate this" } });
+    await fireEvent.click(screen.getByTestId("compose-send"));
+
+    await waitFor(() => {
+      expect(screen.getByTestId("compose-send-error")).toHaveTextContent(
+        "no forwardable text available",
+      );
+    });
+    expect(dispatched).toEqual([]);
+    // Restored, not consumed: chip and typed text return to the composer.
+    expect(screen.getByTestId("forward-source-chip-bob")).toBeInTheDocument();
+    expect((screen.getByTestId("compose-textarea") as HTMLTextAreaElement).value).toBe(
+      "aggregate this",
+    );
   });
 
   it("restores the composer when a held forward is cancelled", async () => {
@@ -5616,7 +5690,7 @@ describe("ComposeBar — cross-agent forward", () => {
     // Navigate to another project while the forward is still holding.
     await rerender({ projectId: OTHER_PROJECT, agents: [AGENT_A] });
     // The hold settles only after the switch.
-    resolveForward({ status: "resolved", body: "composed", skipped: [] });
+    resolveForward({ status: "resolved", body: "composed" });
 
     // The entry must be gone from the project it was submitted under — not leaked.
     await waitFor(() => expect(held.heldForwardsFor(PROJECT_ID)).toHaveLength(0));
@@ -5698,7 +5772,7 @@ describe("ComposeBar — cross-agent forward", () => {
     await seedCompletedTurn(AGENT_A.id);
     await seedCompletedTurn(AGENT_B.id);
     invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
-      if (cmd === "forward_message") return { status: "resolved", body: "composed", skipped: [] };
+      if (cmd === "forward_message") return { status: "resolved", body: "composed" };
       if (cmd === "send_message") return "msg-1";
       return null;
     });
@@ -5724,7 +5798,7 @@ describe("ComposeBar — cross-agent forward", () => {
     await state.registerAgent(AGENT_A);
     await state.registerAgent(AGENT_B);
     await seedCompletedTurn(AGENT_B.id);
-    mockPromptForwardBackend({ status: "resolved", body: "x", skipped: [] });
+    mockPromptForwardBackend({ status: "resolved", body: "x" });
 
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
     // Plain mode: the ↪ Forward button shows and a source chip can be added.
@@ -5743,7 +5817,7 @@ describe("ComposeBar — cross-agent forward", () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);
     await state.registerAgent(AGENT_B);
-    mockPromptForwardBackend({ status: "resolved", body: "x", skipped: [] });
+    mockPromptForwardBackend({ status: "resolved", body: "x" });
 
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
     await enterPromptMode("prompt-option-local:review");
@@ -5768,7 +5842,7 @@ describe("ComposeBar — cross-agent forward", () => {
     await state.registerAgent(AGENT_A);
     await state.registerAgent(AGENT_B);
     await seedCompletedTurn(AGENT_B.id);
-    mockPromptForwardBackend({ status: "resolved", body: "RENDERED", skipped: [] });
+    mockPromptForwardBackend({ status: "resolved", body: "RENDERED" });
 
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
     // Add a plain forward source, then switch to a prompt (no per-field forward).
@@ -5797,7 +5871,7 @@ describe("ComposeBar — cross-agent forward", () => {
     await state.registerAgent(AGENT_A);
     await state.registerAgent(AGENT_B);
     await seedCompletedTurn(AGENT_B.id);
-    mockPromptForwardBackend({ status: "resolved", body: "RENDERED + APPENDED", skipped: [] });
+    mockPromptForwardBackend({ status: "resolved", body: "RENDERED + APPENDED" });
 
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
     await enterPromptMode("prompt-option-local:review");
@@ -5825,7 +5899,7 @@ describe("ComposeBar — cross-agent forward", () => {
     await state.registerAgent(AGENT_A);
     await state.registerAgent(AGENT_B);
     await seedCompletedTurn(AGENT_B.id);
-    mockPromptForwardBackend({ status: "resolved", body: "RENDERED WITH FORWARD", skipped: [] });
+    mockPromptForwardBackend({ status: "resolved", body: "RENDERED WITH FORWARD" });
 
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
     await enterPromptMode("prompt-option-local:review");
@@ -5864,7 +5938,7 @@ describe("ComposeBar — cross-agent forward", () => {
     await state.registerAgent(AGENT_A);
     await state.registerAgent(AGENT_B);
     await seedCompletedTurn(AGENT_B.id);
-    mockPromptForwardBackend({ status: "resolved", body: "BODY", skipped: [] });
+    mockPromptForwardBackend({ status: "resolved", body: "BODY" });
 
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
     await enterPromptMode("prompt-option-local:review");
@@ -5978,7 +6052,7 @@ describe("ComposeBar — cross-agent forward", () => {
     await state.registerAgent(AGENT_A);
     await state.registerAgent(AGENT_B);
     await seedCompletedTurn(AGENT_B.id);
-    mockPromptForwardBackend({ status: "resolved", body: "RENDERED BODY", skipped: [] });
+    mockPromptForwardBackend({ status: "resolved", body: "RENDERED BODY" });
 
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
     fireDrop(["/a/diagram.png"]);

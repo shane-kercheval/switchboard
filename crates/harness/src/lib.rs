@@ -49,7 +49,10 @@ pub use events::{
 pub use facets::{
     EditChange, EditPair, EditedFile, McpMutation, McpMutationField, TodoItem, ToolFacet,
 };
-pub use forward::{ForwardedBlock, compose_forwarded_message, latest_completed_agent_text};
+pub use forward::{
+    ForwardedBlock, compose_forwarded_message, empty_sources_reason, is_forwardable_text,
+    latest_completed_agent_text,
+};
 pub use gemini::GeminiAdapter;
 pub use gemini::session_file::{
     CandidateMatch as GeminiCandidateMatch, classify_candidate as classify_gemini_candidate,

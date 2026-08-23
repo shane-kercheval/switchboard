@@ -253,7 +253,7 @@ describe("PromptComposer per-argument forwarding", () => {
     await waitFor(() => expect(screen.queryByTestId("forward-source-chip-bob")).toBeNull());
   });
 
-  it("warns on a chip whose source will be skipped at dispatch", () => {
+  it("warns on a chip whose empty source would block the dispatch", () => {
     setupForward(
       { focus: "", tone: "" },
       {
@@ -269,7 +269,7 @@ describe("PromptComposer per-argument forwarding", () => {
     );
     // The consequence reaches assistive tech as real (visually-hidden) text, not
     // an aria-label on a role-less icon span.
-    expect(within(chip).getByText(/will be skipped from the forward/i)).toBeInTheDocument();
+    expect(within(chip).getByText(/has no forwardable output/i)).toBeInTheDocument();
   });
 
   it("does not warn on a chip whose source is still generating", () => {

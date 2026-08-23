@@ -21,7 +21,8 @@ use switchboard_dispatcher::{
 };
 use switchboard_harness::{
     CancelSource, ForwardedBlock, HarnessAdapter, MessageId, TurnOutcome,
-    compose_forwarded_message, latest_completed_agent_text, subprocess::PathSource,
+    compose_forwarded_message, empty_sources_reason, is_forwardable_text,
+    latest_completed_agent_text, subprocess::PathSource,
 };
 use switchboard_prompts::PromptService;
 use tokio_util::sync::CancellationToken;
@@ -3192,10 +3193,9 @@ pub fn cancel_agent_impl(state: &AppState, agent_id: AgentId) -> CancelOutcome {
 /// **dispatches** that body itself, through the normal send path, so the forward
 /// renders and behaves exactly like any other send (grouping, queued-state,
 /// send-cancel, failure rendering all via the existing machinery — the §7
-/// binding principle). `skipped` names sources that had no completed output (the
-/// UI-only partial-empty caption; empty when none were skipped). `Invalidated` —
-/// a source's turn failed/cancelled, or **every** source was empty, so there is
-/// nothing to send and the composer restores. `Cancelled` — the user cancelled
+/// binding principle). `Invalidated` —
+/// a source's turn failed/cancelled, or **any** source resolved with no
+/// forwardable text, so nothing is sent and the composer restores. `Cancelled` — the user cancelled
 /// the hold before it resolved (also restores). The two non-resolved arms are
 /// deliberately distinct so the frontend can phrase the restore ("a source
 /// failed" vs. "you cancelled").
@@ -3213,10 +3213,10 @@ pub enum ForwardOutcome {
         /// The composed forwarded body for the frontend to dispatch (and render
         /// verbatim) — it can't compose this itself, since the forwarded blocks
         /// contain each source's resolved output, which only the backend has.
+        /// Always complete: a source with no forwardable text invalidates the
+        /// forward instead of being silently skipped, so there is no
+        /// partial-empty state to report.
         body: String,
-        /// Display names of sources skipped for having no completed output —
-        /// the UI-only partial-empty caption. Empty when nothing was skipped.
-        skipped: Vec<String>,
     },
     Invalidated {
         reason: String,
@@ -3245,10 +3245,12 @@ enum SourceResolution {
 /// Deliberately resolve-only — no recipients, no dispatch (see [`ForwardOutcome`]
 /// for why the frontend dispatches). The hold is cancellable:
 /// `cancel_forward_impl(forward_id)` fires the token this registers, releasing
-/// the wait without resolving. A source's turn failing/cancelling, or **all**
-/// sources resolving empty, invalidates the forward. Empty-source policy here is
-/// the manual one — skip empties, fail only if every source is empty; the
-/// workflow path supplies its own (fail on any) against the same primitives.
+/// the wait without resolving. A source's turn failing/cancelling, or **any**
+/// source resolving empty, invalidates the forward — the uniform policy across
+/// every forward path (message, prompt, workflow field, workflow runtime),
+/// enforced by the shared [`empty_source_names`] validator. (An earlier
+/// version of this comment claimed the workflow path already failed on any
+/// empty source; it did not, and the claim misled a plan built on it.)
 ///
 /// `home_dir` is passed in (not resolved here) so tests stage a temp home; the
 /// shim forwards `$HOME`. Pane sources are expanded to member agent ids by the
@@ -3327,43 +3329,21 @@ async fn forward_resolve(
         }
     }
 
-    // Manual empty-source policy: keep the non-empty sources in declared order,
-    // record the skipped ones for the UI caption. The blocks are owned here so
-    // the borrowed `ForwardedBlock`s composed below outlive the call.
-    let mut blocks: Vec<(String, String)> = Vec::new();
-    let mut skipped: Vec<String> = Vec::new();
-    for resolution in resolved {
-        if let SourceResolution::Resolved { name, text } = resolution {
-            if text.trim().is_empty() {
-                skipped.push(name);
-            } else {
-                blocks.push((name, text));
-            }
-        }
-    }
-
-    // All sources empty ⇒ nothing to forward: fail and restore (manual policy).
-    if blocks.is_empty() {
+    // Any-empty invalidates — the uniform policy across every forward path
+    // (message, prompt, workflow field, workflow runtime): the user selected
+    // each source deliberately, and a dispatched message that silently omits
+    // one is worse than a blocked send. The all-empty case is a special case
+    // of the same rule.
+    let empty = empty_source_names(&resolved);
+    if !empty.is_empty() {
         return Ok(ForwardOutcome::Invalidated {
-            reason: "none of the forwarded agents had any output to send".to_owned(),
+            reason: empty_sources_reason(&empty),
         });
     }
 
-    let forwarded = compose_forwarded_message(
-        &body,
-        &blocks
-            .iter()
-            .map(|(name, text)| ForwardedBlock {
-                agent_name: name,
-                text,
-            })
-            .collect::<Vec<_>>(),
-    );
+    let forwarded = compose_resolutions(&resolved, &body);
 
-    Ok(ForwardOutcome::Resolved {
-        body: forwarded,
-        skipped,
-    })
+    Ok(ForwardOutcome::Resolved { body: forwarded })
 }
 
 /// Resolve a workflow's forward-fields in **completed-only** mode: each field's
@@ -3404,15 +3384,22 @@ pub(crate) async fn resolve_workflow_forwards(
             resolutions
                 .push(resolve_source_completed_only(state, source, home_dir, journal).await?);
         }
+        // Any-empty fails the invocation — same policy as the manual paths,
+        // surfaced through the workflow error type so launch fails loudly
+        // instead of composing a field that silently omits a source.
+        let empty = empty_source_names(&resolutions);
+        if !empty.is_empty() {
+            return Err(AppError::Workflow(
+                switchboard_workflow::WorkflowError::Invocation {
+                    message: format!("field \"{field}\": {}", empty_sources_reason(&empty)),
+                },
+            ));
+        }
         let typed_lead = match inputs.get(field) {
             Some(switchboard_workflow::InputValue::Text(s)) => s.as_str(),
             _ => "",
         };
-        let mut skipped = Vec::new();
-        resolved.insert(
-            field.clone(),
-            compose_resolutions(&resolutions, typed_lead, &mut skipped),
-        );
+        resolved.insert(field.clone(), compose_resolutions(&resolutions, typed_lead));
     }
     Ok(resolved)
 }
@@ -3621,9 +3608,11 @@ async fn resolve_source(
 
 /// One prompt argument filled by forwarding (the frontend sends one per argument
 /// that has ≥1 source). `required` lets the backend fail the forward when a
-/// required argument resolves fully empty — its typed text is empty **and** all
-/// its sources are empty; a typed-only required-empty argument is caught by the
-/// composer's existing gating before this is called.
+/// required argument still composes empty **after** the any-empty source
+/// validator — reachable only for an argument with no sources and no typed
+/// text, since any empty *source* already invalidated earlier; a typed-only
+/// required-empty argument is caught by the composer's existing gating before
+/// this is called.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ForwardArg {
     pub name: String,
@@ -3676,27 +3665,46 @@ pub async fn forward_prompt_impl(
     .await
 }
 
-/// Collect a slice of resolved sources into a composed value: empty sources are
-/// recorded in `skipped`, non-empty ones become canonical blocks led by `typed`.
-fn compose_resolutions(
-    slice: &[SourceResolution],
-    typed: &str,
-    skipped: &mut Vec<String>,
-) -> String {
-    let mut blocks: Vec<(String, String)> = Vec::new();
-    for resolution in slice {
-        if let SourceResolution::Resolved {
-            name: source_name,
-            text,
-        } = resolution
+/// Names of sources that resolved with **no forwardable text** — the shared
+/// empty-source validator every forward path applies before composing.
+///
+/// One policy, everywhere: if *any* selected source resolves empty, nothing is
+/// dispatched. The check is deliberately just "zero forwardable text" — the
+/// resolver collapses "no completed turn", "completed with only tool output",
+/// and "hydration loss" into the same empty string, so the copy built from
+/// these names must stay neutral about the cause (see
+/// [`empty_sources_reason`]); a partially-parsed non-empty answer still
+/// passes, so this is a dispatch guard, not a data-loss detector.
+fn empty_source_names(resolutions: &[SourceResolution]) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for resolution in resolutions {
+        if let SourceResolution::Resolved { name, text } = resolution
+            && !is_forwardable_text(text)
+            // First-seen dedup: the prompt path flattens every field's sources
+            // into one list, and the same agent can feed two fields — without
+            // this the reason reads "Alice, Alice have no forwardable text…".
+            && !names.contains(name)
         {
-            if text.trim().is_empty() {
-                skipped.push(source_name.clone());
-            } else {
-                blocks.push((source_name.clone(), text.clone()));
-            }
+            names.push(name.clone());
         }
     }
+    names
+}
+
+/// Compose one field's forwarded value from its resolved sources. Callers have
+/// already applied [`empty_source_names`], so every `Resolved` here is
+/// non-empty.
+fn compose_resolutions(slice: &[SourceResolution], typed: &str) -> String {
+    let blocks: Vec<(String, String)> = slice
+        .iter()
+        .filter_map(|resolution| match resolution {
+            SourceResolution::Resolved {
+                name: source_name,
+                text,
+            } => Some((source_name.clone(), text.clone())),
+            SourceResolution::Invalidated { .. } => None,
+        })
+        .collect();
     compose_forwarded_message(
         typed,
         &blocks
@@ -3759,23 +3767,34 @@ async fn forward_prompt_resolve(
         }
     }
 
+    // Any-empty invalidates, across every field at once — argument sources and
+    // appended-text sources alike (the uniform policy; see `empty_source_names`).
+    // Checked on the flat list so one pass covers all fields.
+    let empty = empty_source_names(&resolved);
+    if !empty.is_empty() {
+        return Ok(ForwardOutcome::Invalidated {
+            reason: empty_sources_reason(&empty),
+        });
+    }
+
     // Regroup the flat resolutions per field (the flat list is in declared
     // arg/source order followed by the appended sources, so a running cursor slices
     // each field's run), compose each forwarded argument's value, and fill the args
     // map. Correct only because `resolve_all_sources` (via `try_join_all`)
     // preserves input order — a reordering combinator would silently mis-assign
     // sources to fields.
-    let mut skipped: Vec<String> = Vec::new();
     let mut cursor = 0;
     for arg in forward_args {
         let slice = &resolved[cursor..cursor + arg.sources.len()];
         cursor += arg.sources.len();
         let typed = args.get(&arg.name).cloned().unwrap_or_default();
-        let composed = compose_resolutions(slice, &typed, &mut skipped);
-        // A required argument with no value to send (no typed text and every
-        // source empty) fails — the typed-only case is gated in the composer.
-        // The explicit check yields the friendly message; the `required` flag is
-        // caller-supplied, so it is *not* trusted as the sole guard.
+        let composed = compose_resolutions(slice, &typed);
+        // A required argument can still compose empty after the any-empty
+        // validator above: one with **no sources at all** and no typed text
+        // (the validator only sees resolved sources, so a source-less arg
+        // never reaches it). This check is that case's guard, not a duplicate
+        // of the validator — the `required` flag is caller-supplied, so it is
+        // *not* trusted as the sole gate either way.
         if arg.required && composed.trim().is_empty() {
             return Ok(ForwardOutcome::Invalidated {
                 reason: format!(
@@ -3795,15 +3814,11 @@ async fn forward_prompt_resolve(
         }
     }
 
-    // The appended text's run is whatever follows the arguments' sources. Compose
-    // it (typed appended lead + its forwarded blocks); the appended text is never
-    // "required", so there is no empty-check.
-    let appended = compose_resolutions(&resolved[cursor..], appended_text, &mut skipped);
+    // The appended text's run is whatever follows the arguments' sources.
+    // Compose it (typed appended lead + its forwarded blocks); its sources were
+    // validated with the rest above.
+    let appended = compose_resolutions(&resolved[cursor..], appended_text);
 
-    // The same agent can feed two fields and be empty in both — dedupe so the
-    // skipped caption never lists a name twice.
-    skipped.sort_unstable();
-    skipped.dedup();
     let rendered = state.prompts.render(provider, name, &args).await?;
     // Combine like the frontend's `combinePromptMessage`: the rendered prompt,
     // then (when non-empty) a blank line and the composed appended tail.
@@ -3813,7 +3828,7 @@ async fn forward_prompt_resolve(
     } else {
         format!("{}\n\n{trimmed_appended}", rendered.text)
     };
-    Ok(ForwardOutcome::Resolved { body, skipped })
+    Ok(ForwardOutcome::Resolved { body })
 }
 
 /// Cancel a held manual forward by `forward_id`: fire the registered hold token
@@ -6522,10 +6537,10 @@ mod tests {
         std::fs::write(&path, claude_session_jsonl(text)).unwrap();
     }
 
-    /// Assert a forward resolved, returning its composed body + skipped names.
-    fn resolved(outcome: &ForwardOutcome) -> (&str, &[String]) {
+    /// Assert a forward resolved, returning its composed body.
+    fn resolved(outcome: &ForwardOutcome) -> &str {
         match outcome {
-            ForwardOutcome::Resolved { body, skipped } => (body, skipped),
+            ForwardOutcome::Resolved { body } => body,
             other => panic!("expected Resolved, got {other:?}"),
         }
     }
@@ -7254,7 +7269,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let (body, skipped) = resolved(&outcome);
+        let body = resolved(&outcome);
         assert!(
             body.contains("gemini's most recent turn failed"),
             "forwards the failure note: {body:?}"
@@ -7267,7 +7282,6 @@ mod tests {
             !body.contains("STALE ANSWER"),
             "does not silently grab the stale older answer: {body:?}"
         );
-        assert!(skipped.is_empty());
     }
 
     #[tokio::test]
@@ -7314,7 +7328,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let (body, _) = resolved(&outcome);
+        let body = resolved(&outcome);
         assert!(
             body.contains("was cancelled before producing output"),
             "forwards the cancellation note: {body:?}"
@@ -7386,7 +7400,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let (body, _) = resolved(&outcome);
+        let body = resolved(&outcome);
         assert!(
             body.contains("FRESH ANSWER"),
             "the later completed turn's content wins: {body:?}"
@@ -7427,6 +7441,34 @@ mod tests {
             body.contains("gemini"),
             "block attributes the source: {body}"
         );
+    }
+
+    #[tokio::test]
+    async fn workflow_forward_empty_source_fails_the_invocation() {
+        // The uniform any-empty policy on the workflow-field path: an empty
+        // source fails the launch loudly instead of composing a field that
+        // silently omits it (this path used to build a `skipped` list and
+        // never read it).
+        let (tmp, state, _emitter) = fresh_state_with_mock();
+        let home = TempDir::new().unwrap();
+        let (_recipient, project_id) = project_with_agent(&state, &tmp).await;
+        let empty = seed_source(&state, home.path(), project_id, "reviewer-1", "");
+
+        let mut forward_sources = std::collections::BTreeMap::new();
+        forward_sources.insert("context".to_owned(), vec![empty]);
+        let err = resolve_workflow_forwards(
+            &state,
+            &forward_sources,
+            &std::collections::BTreeMap::new(),
+            home.path(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, AppError::Workflow(_)));
+        let msg = err.to_string();
+        assert!(msg.contains("reviewer-1"), "names the source: {msg}");
+        assert!(msg.contains("no forwardable text"), "neutral copy: {msg}");
+        assert!(msg.contains("context"), "names the field: {msg}");
     }
 
     #[tokio::test]
@@ -7483,8 +7525,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let (body, skipped) = resolved(&outcome);
-        assert!(skipped.is_empty());
+        let body = resolved(&outcome);
         assert_eq!(
             body,
             "=== START forwarded from reviewer-1 ===\nLGTM with nits\n=== END forwarded from reviewer-1 ==="
@@ -7507,7 +7548,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let (body, _) = resolved(&outcome);
+        let body = resolved(&outcome);
         assert_eq!(
             body,
             "Please aggregate:\n\n=== START forwarded from reviewer-1 ===\nthe review\n=== END forwarded from reviewer-1 ==="
@@ -7543,8 +7584,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let (body, skipped) = resolved(&outcome);
-        assert!(skipped.is_empty());
+        let body = resolved(&outcome);
         assert_eq!(
             body,
             "=== START forwarded from reviewer-1 ===\nfirst review\n=== END forwarded from reviewer-1 ===\n\n=== START forwarded from reviewer-2 ===\nsecond review\n=== END forwarded from reviewer-2 ==="
@@ -7552,7 +7592,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forward_partial_empty_skips_the_empty_source_and_reports_it() {
+    async fn forward_any_empty_source_invalidates_and_names_it() {
+        // The uniform any-empty policy: one empty source among non-empty ones
+        // blocks the whole send — a dispatched message silently omitting a
+        // deliberately selected source is worse than a blocked send. (This
+        // inverts the old skip-and-caption behavior; the incident that drove
+        // the change was a multi-agent review losing one reviewer's entire
+        // contribution to a silently partial forward.)
         let (tmp, state, _emitter) = fresh_state_with_mock();
         let home = TempDir::new().unwrap();
         let (_recipient, project_id) = project_with_agent(&state, &tmp).await;
@@ -7568,13 +7614,22 @@ mod tests {
         )
         .await
         .unwrap();
-        let (body, skipped) = resolved(&outcome);
-        // The empty source is reported (the UI-only caption) but absent from the wire.
-        assert_eq!(skipped, &["reviewer-2".to_owned()]);
-        assert_eq!(
-            body,
-            "=== START forwarded from reviewer-1 ===\nreal output\n=== END forwarded from reviewer-1 ===",
-            "the wire body carries only the non-empty source — the skip is UI-only"
+        let ForwardOutcome::Invalidated { reason } = outcome else {
+            panic!("any-empty must invalidate, got {outcome:?}");
+        };
+        assert!(
+            reason.contains("reviewer-2"),
+            "names the empty source: {reason}"
+        );
+        assert!(
+            !reason.contains("reviewer-1"),
+            "does not implicate the source that had text: {reason}"
+        );
+        assert!(
+            reason.contains("no forwardable text"),
+            "neutral copy — not \"had no output\" (a fact about the agent we \
+             don't know) nor \"could not be read\" (a cause we can't \
+             distinguish): {reason}"
         );
     }
 
@@ -7595,10 +7650,12 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(
-            matches!(outcome, ForwardOutcome::Invalidated { .. }),
-            "all-empty fails (restore), got {outcome:?}"
-        );
+        let ForwardOutcome::Invalidated { reason } = outcome else {
+            panic!("all-empty fails (restore), got {outcome:?}");
+        };
+        // A special case of the uniform any-empty rule — same validator, both
+        // names listed.
+        assert!(reason.contains("reviewer-1") && reason.contains("reviewer-2"));
     }
 
     #[tokio::test]
@@ -7727,7 +7784,7 @@ mod tests {
             }
         );
         let outcome = outcome.unwrap();
-        let (body, _) = resolved(&outcome);
+        let body = resolved(&outcome);
         assert!(
             body.contains("fresh-live-output") && !body.contains("OLD-DISK"),
             "resolved the live-captured new text, not the stale disk turn: {body:?}"
@@ -8028,7 +8085,7 @@ mod tests {
         .await
         .expect("a forward from an idle source must not wait on an unrelated busy agent")
         .unwrap();
-        let (body, _) = resolved(&outcome);
+        let body = resolved(&outcome);
         assert!(
             body.contains("REVIEWER-OLD"),
             "forwards reviewer's existing output: {body:?}"
@@ -8043,7 +8100,7 @@ mod tests {
         // trick is needed to sequence the release against it.
         f.gate.notify_one();
         let held = held.as_mut().await.unwrap();
-        let (held_body, _) = resolved(&held);
+        let held_body = resolved(&held);
         assert!(
             held_body.contains("PLANNER-LIVE"),
             "the held forward resolves planner's just-finished turn: {held_body:?}"
@@ -8098,7 +8155,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let (body, _) = resolved(&outcome);
+        let body = resolved(&outcome);
         send_msg(&f.state, planner.id, body).await.unwrap();
 
         // reviewer produces newer output while the forward is still queued.
@@ -8155,7 +8212,7 @@ mod tests {
 
         f.gate.notify_one();
         let outcome = outcome.as_mut().await.unwrap();
-        let (body, _) = resolved(&outcome);
+        let body = resolved(&outcome);
         assert!(
             body.contains("TURN-ONE-TEXT") && !body.contains("TURN-TWO-TEXT"),
             "the forward resolves the turn that was running when it registered, not \
@@ -8198,7 +8255,7 @@ mod tests {
 
         f.gate.notify_one();
         let outcome = outcome.as_mut().await.unwrap();
-        let (body, _) = resolved(&outcome);
+        let body = resolved(&outcome);
         assert!(
             body.contains("TURN-TWO-TEXT") && !body.contains("TURN-ONE-TEXT"),
             "resolves the turn that was running when the forward registered: {body:?}"
@@ -8288,14 +8345,14 @@ mod tests {
         let from_bob = from_bob.unwrap();
         let from_alice = from_alice.unwrap();
         assert!(
-            resolved(&from_bob).0.contains("BOB-LIVE"),
+            resolved(&from_bob).contains("BOB-LIVE"),
             "alice's forward resolves bob's just-finished turn: {:?}",
-            resolved(&from_bob).0
+            resolved(&from_bob)
         );
         assert!(
-            resolved(&from_alice).0.contains("ALICE-LIVE"),
+            resolved(&from_alice).contains("ALICE-LIVE"),
             "bob's forward resolves alice's just-finished turn: {:?}",
-            resolved(&from_alice).0
+            resolved(&from_alice)
         );
     }
 
@@ -19714,8 +19771,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let (body, skipped) = resolved(&outcome);
-        assert!(skipped.is_empty());
+        let body = resolved(&outcome);
         // The typed arg rendered, and the forwarded arg filled with the canonical
         // block shape (shared `compose_forwarded_message`).
         assert!(
@@ -19761,7 +19817,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forward_prompt_optional_arg_empty_proceeds() {
+    async fn forward_prompt_optional_arg_empty_source_invalidates() {
+        // Even an *optional* argument's empty source blocks the send: the user
+        // attached that source deliberately, and "optional" describes the
+        // argument's requiredness to the prompt, not permission to silently
+        // drop a selected source. (Inverts the old proceed-and-caption
+        // behavior — same uniform any-empty policy as the message path.)
         let (_tmp, home, state, project_id) = prompt_forward_state().await;
         let empty = seed_source(&state, home.path(), project_id, "reviewer-1", "");
 
@@ -19782,14 +19843,82 @@ mod tests {
         )
         .await
         .unwrap();
-        // Optional arg resolves empty → the send still proceeds (renders the
-        // prompt with an empty value), and the empty source is reported as skipped.
-        let (body, skipped) = resolved(&outcome);
-        assert!(
-            body.contains("Notes:"),
-            "rendered with empty optional arg: {body:?}"
+        let ForwardOutcome::Invalidated { reason } = outcome else {
+            panic!("empty optional-arg source must invalidate, got {outcome:?}");
+        };
+        assert!(reason.contains("reviewer-1"), "{reason}");
+        assert!(reason.contains("no forwardable text"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn forward_prompt_same_empty_agent_in_two_fields_named_once() {
+        // The flat validator sees every field's sources; the same agent feeding
+        // two arguments must not read "Alice, Alice have no forwardable text…".
+        let (_tmp, home, state, project_id) = prompt_forward_state().await;
+        let empty = seed_source(&state, home.path(), project_id, "reviewer-1", "");
+
+        let outcome = forward_prompt_impl(
+            &state,
+            "local".to_owned(),
+            "notes".to_owned(),
+            std::collections::BTreeMap::new(),
+            vec![
+                ForwardArg {
+                    name: "extra".to_owned(),
+                    sources: vec![empty],
+                    required: false,
+                },
+                ForwardArg {
+                    name: "context".to_owned(),
+                    sources: vec![empty],
+                    required: false,
+                },
+            ],
+            String::new(),
+            Vec::new(),
+            Uuid::now_v7(),
+            home.path(),
+        )
+        .await
+        .unwrap();
+        let ForwardOutcome::Invalidated { reason } = outcome else {
+            panic!("expected invalidated, got {outcome:?}");
+        };
+        assert_eq!(
+            reason.matches("reviewer-1").count(),
+            1,
+            "first-seen dedup: {reason}"
         );
-        assert_eq!(skipped, &["reviewer-1".to_owned()]);
+        assert!(
+            reason.contains("has no forwardable text"),
+            "singular verb: {reason}"
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_prompt_appended_empty_source_invalidates() {
+        // The appended text's sources are validated with the arguments' — the
+        // any-empty policy is per-forward, not per-field.
+        let (_tmp, home, state, project_id) = prompt_forward_state().await;
+        let empty = seed_source(&state, home.path(), project_id, "reviewer-1", "");
+
+        let outcome = forward_prompt_impl(
+            &state,
+            "local".to_owned(),
+            "notes".to_owned(),
+            std::collections::BTreeMap::new(),
+            vec![],
+            "see below:".to_owned(),
+            vec![empty],
+            Uuid::now_v7(),
+            home.path(),
+        )
+        .await
+        .unwrap();
+        let ForwardOutcome::Invalidated { reason } = outcome else {
+            panic!("empty appended source must invalidate, got {outcome:?}");
+        };
+        assert!(reason.contains("reviewer-1"), "{reason}");
     }
 
     #[tokio::test]
@@ -19820,8 +19949,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let (body, skipped) = resolved(&outcome);
-        assert!(skipped.is_empty());
+        let body = resolved(&outcome);
         assert!(body.contains("Notes:"), "rendered prompt present: {body:?}");
         assert!(
             body.contains(
@@ -19859,7 +19987,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let (body, _) = resolved(&outcome);
+        let body = resolved(&outcome);
         assert!(
             body.contains(
                 "My take:\n\n=== START forwarded from reviewer-1 ===\nLGTM\n=== END forwarded from reviewer-1 ==="

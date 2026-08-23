@@ -67,6 +67,28 @@ fn concat_text_items(items: &[TurnItem]) -> String {
     out
 }
 
+/// Whether resolved text counts as forwardable — the single emptiness rule
+/// behind the any-empty forward policy. Every enforcement site (manual message
+/// forward, prompt forward, workflow-field resolution, and the workflow
+/// runtime's `forward_from`) routes through this predicate so "forwardable"
+/// cannot drift between paths.
+#[must_use]
+pub fn is_forwardable_text(text: &str) -> bool {
+    !text.trim().is_empty()
+}
+
+/// The user-facing reason for an any-empty invalidation, shared by every
+/// enforcement site so the copy cannot drift either. Neutral by design: it
+/// names the source and states that it has no forwardable text — never "had no
+/// output" (asserting a fact about the agent we don't know) or "could not be
+/// read" (asserting a cause we can't distinguish).
+#[must_use]
+pub fn empty_sources_reason(names: &[String]) -> String {
+    let list = names.join(", ");
+    let has = if names.len() == 1 { "has" } else { "have" };
+    format!("{list} {has} no forwardable text available; nothing was sent")
+}
+
 /// One forwarded source: the agent's display name and its resolved output text.
 /// Borrowed for the lifetime of the compose call — the caller owns both.
 #[derive(Debug, Clone, Copy)]

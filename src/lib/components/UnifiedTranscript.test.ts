@@ -4436,15 +4436,15 @@ describe("UnifiedTranscript — cross-agent forward", () => {
     expect(heldEl).not.toHaveTextContent("unknown");
   });
 
-  it("renders a forward verbatim, marked via its body sentinel, with a partial-empty caption", async () => {
+  it("renders a forward verbatim, marked via its body sentinel", async () => {
     const state = await loadState();
-    const held = await loadHeld();
     await state.registerAgent(CLAUDE_AGENT);
     // A forward dispatches as a normal send; the marker is derived from the
-    // body's sentinel (durable across reload), not a live store.
+    // body's sentinel (durable across reload), not a live store. There is no
+    // partial-empty caption: a source with no forwardable text blocks the
+    // send at the backend, so a dispatched forward is always complete.
     const body = "=== START forwarded from bob ===\nthe review\n=== END forwarded from bob ===";
     state.dispatchUserTurn(CLAUDE_AGENT.id, "u-1", body, [], "s-2", "2026-05-16T00:00:00Z");
-    held.setForwardCaption(PROJECT_ID, "s-2", { included: ["bob"], skipped: ["carol"] });
 
     render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
@@ -4458,12 +4458,7 @@ describe("UnifiedTranscript — cross-agent forward", () => {
     // Verbatim: the sentinel text is present, unchanged; marked as a forward.
     expect(turn).toHaveTextContent("START forwarded from bob");
     expect(turn).toHaveAttribute("data-forwarded", "true");
-
-    // The partial-empty caption is separate from the wire body (it names the
-    // included + skipped sources) and lives in the meta row.
-    const caption = screen.getByTestId("forward-caption");
-    expect(caption).toHaveTextContent("forwarded from bob");
-    expect(caption).toHaveTextContent("carol had no output");
+    expect(screen.queryByTestId("forward-caption")).toBeNull();
   });
 
   it("bands only the forwarded blocks, leaving the user's typed text plain", async () => {

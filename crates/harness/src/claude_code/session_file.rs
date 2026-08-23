@@ -417,11 +417,15 @@ struct AgentTurnBuilder {
     last_model: Option<String>,
     /// The most recent assistant record's **top-level** `effort`, kept-last the
     /// same way. Note the nesting differs from the model: `effort` sits on the
-    /// record, not inside `message`. Written by Claude since 2.1.212 and
-    /// **disk-only** — the live stream carries no effort, so the adapter stamps
-    /// the dispatched selection instead (`claude_code/mod.rs`) and the two
-    /// agree. Absent on records written by older CLI versions, which keep
-    /// hydrating with `None`.
+    /// record, not inside `message`. Written by Claude since 2.1.212 **for
+    /// models with an effort axis** and **disk-only** — the live stream carries
+    /// no effort, so the adapter stamps the dispatched selection instead
+    /// (`claude_code/mod.rs`, gated on the same axis fact). Absent in two
+    /// distinct cases that both hydrate as `None`: records written by older CLI
+    /// versions (transient — resolves as sessions age out), and any turn run on
+    /// a no-axis model such as Haiku, which writes no key at any CLI version
+    /// (permanent — see `harness-behavior.md` §3.4 Caveats). A missing field
+    /// here is expected shape, not drift.
     last_effort: Option<String>,
     /// The most recent assistant record's `message.stop_reason`, kept-last.
     /// At EOF it answers "did the model owe a continuation?": `tool_use` /

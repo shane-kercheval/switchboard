@@ -1035,16 +1035,26 @@ struct CodexReconstruction {
 /// renders as one row, not a wrapper row plus a duplicate child); anything else
 /// — batched scripts, dynamic scripts, and (by construction, since the decoder
 /// recognizes only `exec_command`) a lone `apply_patch` wrapper — gets each
-/// item pushed as its **own row**, with the wrapper retained as the container
-/// and as the only failure evidence: a failed operation may emit no item at all,
-/// and an uncaught failure's diagnostic lives solely in the wrapper output.
+/// item pushed as its **own row**, and the wrapper row is then **superseded**:
+/// its children already render every operation it performed, so keeping it
+/// would show each operation twice and expose the raw script the live stream
+/// never surfaces.
+///
+/// A wrapper that attaches **no** child keeps its row — it is then the only
+/// record that the operation happened, and the only failure evidence: a call
+/// rejected before execution emits no item at all, and an uncaught failure's
+/// diagnostic lives solely in the wrapper output. A wrapper **enriched in
+/// place** keeps its row for the opposite reason: it is no longer a container
+/// but one of the operations, so no later sibling may supersede it.
 /// Where one arriving tool item lands (see [`CodexReconstruction::claim_wrapper_slot`]).
 enum WrapperSlot {
     /// First item of a proved single-command wrapper: enrich the wrapper's own
     /// row at this index.
     EnrichInPlace(usize),
     /// Batched/dynamic wrapper (or a surprise extra item): push a new child row.
-    OwnRow,
+    /// `Some(index)` supersedes the wrapper row; `None` leaves it alone because
+    /// it has itself become an operation row (enriched in place).
+    OwnRow(Option<usize>),
     /// No wrapper interval open; warned and dropped.
     Orphaned,
 }
@@ -1072,6 +1082,11 @@ struct CodexAgentBuilder {
     started_at: DateTime<Utc>,
     last_seen_at: DateTime<Utc>,
     items: Vec<TurnItem>,
+    /// Indices into `items` of `exec` wrapper rows whose operations are each
+    /// rendered by a child row of their own; dropped when the turn closes (see
+    /// [`WrapperSlot::OwnRow`]). Recorded rather than removed eagerly because
+    /// every open `row_index` is an index into this same vector.
+    superseded_rows: Vec<usize>,
     usage: Option<TurnUsage>,
     context_window: Option<u32>,
     pending_mcp_results: HashMap<String, McpResult>,
@@ -1080,6 +1095,53 @@ struct CodexAgentBuilder {
     /// own `turn_id`, minted fresh each parse). Set when the turn's
     /// `turn_context` arrives; `None` for a turn that writes none.
     hydration_key: Option<String>,
+}
+
+/// Drop the `exec` wrapper rows their own children already render. Applied at
+/// turn close, once every index is final.
+///
+/// A **failed** wrapper is kept even when it has children. Its children only
+/// cover the operations that got far enough to emit an item, so a batch whose
+/// second operation failed hard shows one successful child and nothing else —
+/// the wrapper's `Script error:` output is then the sole record that anything
+/// went wrong. A redundant failed row costs the reader a second look; a
+/// silently dropped failure costs them the failure.
+fn drop_superseded_rows(items: Vec<TurnItem>, superseded: &[usize]) -> Vec<TurnItem> {
+    if superseded.is_empty() {
+        return items;
+    }
+    items
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, item)| {
+            let failed = matches!(
+                &item,
+                TurnItem::Tool {
+                    is_error: Some(true),
+                    ..
+                }
+            );
+            (failed || !superseded.contains(&index)).then_some(item)
+        })
+        .collect()
+}
+
+impl CodexAgentBuilder {
+    /// Mark an `exec` wrapper row as rendered by its children. Idempotent: a
+    /// batched wrapper supersedes the same row once per child.
+    fn supersede_wrapper_row(&mut self, row_index: usize) {
+        if !self.superseded_rows.contains(&row_index) {
+            self.superseded_rows.push(row_index);
+        }
+    }
+
+    /// Reinstate a wrapper row enriched in place: it now *is* one of the
+    /// operations, so a sibling child that superseded it first (a `FileChange`
+    /// can arrive before the `CommandExecution` that claims the slot) must not
+    /// take the command down with it.
+    fn keep_wrapper_row(&mut self, row_index: usize) {
+        self.superseded_rows.retain(|&index| index != row_index);
+    }
 }
 
 /// Captured `mcp_tool_call_end` payload — applied to the matching
@@ -1209,6 +1271,7 @@ impl CodexReconstruction {
                     started_at,
                     last_seen_at: started_at,
                     items: Vec::new(),
+                    superseded_rows: Vec::new(),
                     usage: None,
                     context_window,
                     pending_mcp_results: HashMap::new(),
@@ -1443,20 +1506,53 @@ impl CodexReconstruction {
     /// capture history. Any other kind always takes its own row and leaves the
     /// slot for the command.
     fn claim_wrapper_slot(&mut self, line_number: usize, item_type: &str) -> WrapperSlot {
-        let Some(wrapper) = self.open_wrapper.as_mut() else {
+        let (single_command, slot_taken, row_index) = {
+            let Some(wrapper) = self.open_wrapper.as_mut() else {
+                self.warn(
+                    line_number,
+                    format!("{item_type} item outside any exec wrapper interval"),
+                );
+                return WrapperSlot::Orphaned;
+            };
+            if item_type == "CommandExecution"
+                && wrapper.single_command
+                && !wrapper.command_slot_taken
+            {
+                wrapper.command_slot_taken = true;
+                return WrapperSlot::EnrichInPlace(wrapper.row_index);
+            }
+            (
+                wrapper.single_command,
+                wrapper.command_slot_taken,
+                wrapper.row_index,
+            )
+        };
+        // A wrapper `decode_single_exec_wrapper` accepted is structurally proved
+        // to be exactly one `tools.exec_command` call, so its one expected item
+        // is that call's own `CommandExecution`. Anything else — a second
+        // command, a `FileChange`, an `McpToolCall` — is unaccounted for by the
+        // proof, and is warned in **either record order**: the anomaly is the
+        // shape, not the sequencing, and a tripwire that fires only when the
+        // stray item happens to arrive second reports the order instead of the
+        // thing it watches for. Corpus evidence for treating this as drift
+        // rather than ordinary shell behaviour is dated in `harness-behavior.md`
+        // §3.6 — a real-world frequency, not a proof it cannot happen.
+        //
+        // Batched wrappers are untouched: `single_command` is false there, so
+        // every child still supersedes the container as usual.
+        if single_command {
             self.warn(
                 line_number,
-                format!("{item_type} item outside any exec wrapper interval"),
+                format!("{item_type} item on an exec wrapper proved to be a single command"),
             );
-            return WrapperSlot::Orphaned;
-        };
-        if item_type == "CommandExecution" && wrapper.single_command && !wrapper.command_slot_taken
-        {
-            wrapper.command_slot_taken = true;
-            WrapperSlot::EnrichInPlace(wrapper.row_index)
-        } else {
-            WrapperSlot::OwnRow
         }
+        if slot_taken {
+            // The wrapper row now *holds* the command — an operation row, not a
+            // container. Superseding it would delete a real shell call whose
+            // only offence was that another item followed it.
+            return WrapperSlot::OwnRow(None);
+        }
+        WrapperSlot::OwnRow(Some(row_index))
     }
 
     /// `CommandExecution`: the structured shell record paginated rollouts
@@ -1516,7 +1612,11 @@ impl CodexReconstruction {
                 }
                 *completed_at = timestamp;
             }
+            builder.keep_wrapper_row(row_index);
             return;
+        }
+        if let WrapperSlot::OwnRow(Some(wrapper_row)) = slot {
+            builder.supersede_wrapper_row(wrapper_row);
         }
         builder.items.push(TurnItem::Tool {
             tool_use_id: row_id,
@@ -1651,10 +1751,8 @@ impl CodexReconstruction {
         item: &Value,
         timestamp: Option<DateTime<Utc>>,
     ) {
-        if matches!(
-            self.claim_wrapper_slot(line_number, "FileChange"),
-            WrapperSlot::Orphaned
-        ) {
+        let slot = self.claim_wrapper_slot(line_number, "FileChange");
+        if matches!(slot, WrapperSlot::Orphaned) {
             return;
         }
         let facet = super::facets::patch_apply_end_facet(item);
@@ -1694,6 +1792,9 @@ impl CodexReconstruction {
         let Some(builder) = self.current_agent.as_mut() else {
             return;
         };
+        if let WrapperSlot::OwnRow(Some(wrapper_row)) = slot {
+            builder.supersede_wrapper_row(wrapper_row);
+        }
         builder.items.push(TurnItem::Tool {
             tool_use_id: row_id,
             kind: ToolKind::Builtin,
@@ -1720,10 +1821,8 @@ impl CodexReconstruction {
         item: &Value,
         timestamp: Option<DateTime<Utc>>,
     ) {
-        if matches!(
-            self.claim_wrapper_slot(line_number, "McpToolCall"),
-            WrapperSlot::Orphaned
-        ) {
+        let slot = self.claim_wrapper_slot(line_number, "McpToolCall");
+        if matches!(slot, WrapperSlot::Orphaned) {
             return;
         }
         let server = item.get("server").and_then(Value::as_str).unwrap_or("");
@@ -1781,6 +1880,9 @@ impl CodexReconstruction {
         let Some(builder) = self.current_agent.as_mut() else {
             return;
         };
+        if let WrapperSlot::OwnRow(Some(wrapper_row)) = slot {
+            builder.supersede_wrapper_row(wrapper_row);
+        }
         builder.items.push(TurnItem::Tool {
             tool_use_id: row_id,
             kind: ToolKind::Mcp,
@@ -2039,7 +2141,7 @@ impl CodexReconstruction {
             started_at: builder.started_at,
             ended_at: Some(builder.last_seen_at),
             status,
-            items: builder.items,
+            items: drop_superseded_rows(builder.items, &builder.superseded_rows),
             usage: builder.usage,
             // Per-turn model + effort from this turn's `turn_context` (last-wins
             // up to this close). Distinct from the first-wins `meta.model`.
@@ -2208,9 +2310,9 @@ fn decode_single_exec_wrapper(script: &str) -> Option<DecodedExecWrapper> {
     let rest = rest.strip_prefix('=')?.trim_start();
     let rest = rest.strip_prefix("await")?.trim_start();
     let rest = rest.strip_prefix("tools.exec_command(")?;
-    let mut values = serde_json::Deserializer::from_str(rest).into_iter::<Value>();
-    let arguments = values.next()?.ok()?;
-    let rest = rest.get(values.byte_offset()..)?.trim_start();
+    let arguments_end = js_object_span(rest)?;
+    let arguments = parse_js_object(rest.get(..arguments_end)?)?;
+    let rest = rest.get(arguments_end..)?.trim_start();
     let rest = rest.strip_prefix(')')?.trim_start();
     let rest = rest.strip_prefix(';')?.trim_start();
 
@@ -2232,6 +2334,122 @@ fn decode_single_exec_wrapper(script: &str) -> Option<DecodedExecWrapper> {
         facet,
         emits_full_result,
     })
+}
+
+/// Byte offset just past the `{…}` (or `[…]`) literal starting at `source[0]`,
+/// tracking string state so a brace inside a quoted value doesn't close it.
+/// `None` if `source` doesn't open with a literal or the literal is unclosed.
+fn js_object_span(source: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (index, character) in source.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match character {
+            '"' => in_string = true,
+            '{' | '[' => depth += 1,
+            '}' | ']' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(index + character.len_utf8());
+                }
+            }
+            // Anything before the opening brace means this isn't a literal.
+            _ if depth == 0 && !character.is_whitespace() => return None,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Parse the argument literal of a `tools.exec_command(…)` call.
+///
+/// Codex writes a **JavaScript** object literal, not JSON, and the shape has
+/// changed across releases: 0.149 writes bare identifier keys over several
+/// lines (`{\n  cmd: "…",\n  workdir: "…"\n}`) where earlier releases wrote
+/// single-line quoted JSON (`{"cmd":"…"}`). Both must decode — a rollout is
+/// read long after the CLI that wrote it, and a decode failure here is silent
+/// (the wrapper degrades to an unrecognized tool showing raw script text), so
+/// it cannot be left to whichever form the fixtures happen to carry.
+fn parse_js_object(source: &str) -> Option<Value> {
+    serde_json::from_str::<Value>(source)
+        .or_else(|_| serde_json::from_str::<Value>(&quote_bare_keys(source)))
+        .ok()
+}
+
+/// Rewrite bare identifier keys as quoted JSON keys, leaving strings untouched.
+///
+/// A key is only quoted when the identifier is followed by `:` — without that
+/// check the `false` in `[true, false]` would be quoted into a string, since it
+/// sits in the same after-a-comma position a key does.
+fn quote_bare_keys(source: &str) -> String {
+    let mut out = String::with_capacity(source.len() + 16);
+    let mut characters = source.char_indices().peekable();
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut at_key_position = false;
+    while let Some((index, character)) = characters.next() {
+        if in_string {
+            out.push(character);
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        if character.is_whitespace() {
+            out.push(character);
+            continue;
+        }
+        match character {
+            '"' => {
+                in_string = true;
+                at_key_position = false;
+                out.push(character);
+            }
+            '{' | ',' => {
+                at_key_position = true;
+                out.push(character);
+            }
+            _ if at_key_position && is_javascript_identifier_start(character) => {
+                let mut end = index + character.len_utf8();
+                while let Some(&(next_index, next)) = characters.peek() {
+                    if is_javascript_identifier_continue(next) {
+                        end = next_index + next.len_utf8();
+                        characters.next();
+                    } else {
+                        break;
+                    }
+                }
+                let identifier = &source[index..end];
+                if source[end..].trim_start().starts_with(':') {
+                    out.push('"');
+                    out.push_str(identifier);
+                    out.push('"');
+                } else {
+                    out.push_str(identifier);
+                }
+                at_key_position = false;
+            }
+            _ => {
+                at_key_position = false;
+                out.push(character);
+            }
+        }
+    }
+    out
 }
 
 fn is_javascript_identifier_start(character: char) -> bool {
@@ -4667,6 +4885,59 @@ not valid json
     }
 
     #[test]
+    fn wrapper_script_decodes_in_both_argument_literal_forms() {
+        // The argument literal is JavaScript, not JSON, and its shape changed
+        // across releases: 0.149 writes bare identifier keys over several lines
+        // (`bare`, verbatim from a captured rollout) where earlier releases
+        // wrote single-line quoted JSON (`quoted`, the form the legacy
+        // `exec-wrapper` fixtures carry). A rollout is read long after the CLI
+        // that wrote it, so both must decode to the same call.
+        //
+        // This decode fails **silently** — nothing is logged — which is how the
+        // bare-key form went unnoticed across a version bump: both fixtures
+        // pinning the collapse path carried the quoted form, so the path had a
+        // passing test and no production coverage. The cost of a failed decode
+        // is uneven (see `harness-behavior.md` §3.6): a wrapper whose children
+        // are well-formed is unaffected, since they supersede it and carry
+        // their own facets; the visible cost falls on **childless** wrappers,
+        // which render as raw script text. One narrow compound path reaches
+        // past that — a decode failure can also erase a *child-bearing*
+        // wrapper's failure record — pinned both ways by
+        // `decode_failure_with_a_blind_child_loses_the_failure_flag`, which
+        // carries the four conditions it needs.
+        let bare = "const r = await tools.exec_command({\n  cmd: \"pwd\",\n               workdir: \"/tmp/scratch\",\n  yield_time_ms: 10000,\n               max_output_tokens: 2000\n});\ntext(r);\n";
+        let quoted = "const r = await tools.exec_command({\"cmd\":\"pwd\",\
+             \"workdir\":\"/tmp/scratch\"});\ntext(r);\n";
+
+        for script in [bare, quoted] {
+            let decoded = decode_single_exec_wrapper(script)
+                .unwrap_or_else(|| panic!("must decode: {script:?}"));
+            assert!(
+                matches!(
+                    &decoded.facet,
+                    crate::facets::ToolFacet::Shell { command, cwd }
+                        if command == "pwd" && cwd.as_deref() == Some("/tmp/scratch")
+                ),
+                "{:?} from {script:?}",
+                decoded.facet
+            );
+            assert!(decoded.emits_full_result, "{script:?}");
+        }
+    }
+
+    #[test]
+    fn bare_key_quoting_leaves_non_key_identifiers_alone() {
+        // `false` sits in the same after-a-comma position a key does; quoting
+        // it would turn a boolean into the string "false".
+        let source = r#"{cmd: "x", flags: [true, false, null], "already": 1, nested: {inner: 2}}"#;
+        let value = parse_js_object(source).expect("decodes");
+        assert_eq!(value["cmd"], "x");
+        assert_eq!(value["flags"], serde_json::json!([true, false, null]));
+        assert_eq!(value["already"], 1);
+        assert_eq!(value["nested"]["inner"], 2);
+    }
+
+    #[test]
     fn paginated_exit_code_outranks_wrapper_output_sniffing() {
         // A command can fail while its wrapper script completes (the script
         // printed the output and moved on) — the wrapper output then reads
@@ -4701,9 +4972,13 @@ not valid json
         let result = parse_codex_transcript_content(&content, Uuid::now_v7());
 
         let rows = tool_rows(&result.turns);
-        // Wrapper (container) + edit child + shell child.
-        assert_eq!(rows.len(), 3, "{rows:?}");
-        assert_eq!(rows[0].name, "exec");
+        // One row per operation — the succeeded wrapper is superseded by the
+        // children that render its work, exactly as the live stream shows it.
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert!(
+            !rows.iter().any(|r| r.name == "exec"),
+            "wrapper row must not survive alongside its children: {rows:?}"
+        );
         let edit = rows
             .iter()
             .find(|r| r.name == "apply_patch")
@@ -4779,8 +5054,13 @@ not valid json
         let result = parse_codex_transcript_content(&content, Uuid::now_v7());
 
         let rows = tool_rows(&result.turns);
-        // Wrapper + success + tool-reported error + transport failure.
-        assert_eq!(rows.len(), 4, "{rows:?}");
+        // Success + tool-reported error + transport failure; the succeeded
+        // wrapper that carried them is superseded by its children.
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        assert!(
+            !rows.iter().any(|r| r.name == "exec"),
+            "wrapper row must not survive alongside its children: {rows:?}"
+        );
 
         let ok = rows
             .iter()
@@ -5082,6 +5362,172 @@ not valid json
         let wrapper = rows.iter().find(|r| r.name == "exec").expect("wrapper");
         assert_eq!(wrapper.output.as_deref(), Some("Done!"));
         assert!(rows.iter().any(|r| r.name == "apply_patch"));
+        // The stray item warns here too, arriving *before* the command that
+        // claims the slot — the order-independent half of the pair asserted in
+        // `sibling_after_the_command_does_not_delete_the_enriched_row`.
+        assert_eq!(result.warnings.len(), 1, "{:?}", result.warnings);
+        assert!(
+            result.warnings[0].reason.contains("single command"),
+            "{:?}",
+            result.warnings[0]
+        );
+    }
+
+    /// A single-command wrapper whose `CommandExecution` lands **first**, then
+    /// a sibling item. Mirror of `file_change_first_does_not_consume_the_command_in_place_slot`
+    /// — that one pins the ordering that worked; this pins the one that did not.
+    fn single_command_wrapper_then_sibling(sibling: &serde_json::Value) -> LoadedTranscript {
+        let content = jsonl_lines(&[
+            serde_json::json!({"type":"session_meta","payload":{"cli_version":"0.149.0","history_mode":"paginated"}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"t-1"}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"custom_tool_call","id":"ctc_1","status":"completed","call_id":"call_1","name":"exec","input":"const r = await tools.exec_command({\n  cmd: \"apply_patch <<EOF\"\n});\ntext(r.output);\n"}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"item_completed","item":{
+                "type":"CommandExecution","id":"exec-cmd-first","command":["/bin/zsh","-lc","apply_patch <<EOF"],
+                "status":"completed","exit_code":0,"aggregated_output":"Done!"}}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"item_completed","item":sibling}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"custom_tool_call_output","id":"ctco_1","call_id":"call_1","output":[{"type":"input_text","text":"Script completed\n"}]}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"t-1"}}),
+        ]);
+        parse_codex_transcript_content(&content, Uuid::now_v7())
+    }
+
+    #[test]
+    fn sibling_after_the_command_does_not_delete_the_enriched_row() {
+        // The content-loss regression: once the command has enriched the
+        // wrapper, the wrapper row *is* the shell operation. A later sibling
+        // superseding it dropped a real command from the reopened transcript,
+        // decided purely by which record Codex wrote second.
+        let result = single_command_wrapper_then_sibling(&serde_json::json!({
+            "type":"FileChange","id":"exec-fc-second","status":"completed",
+            "changes":{"/tmp/a.txt":{"type":"update","unified_diff":"@@ -1 +1 @@\n-a\n+b\n","move_path":null}}
+        }));
+
+        let rows = tool_rows(&result.turns);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        let command = rows.iter().find(|r| r.name == "exec").expect("command row");
+        assert_eq!(command.output.as_deref(), Some("Done!"));
+        assert!(rows.iter().any(|r| r.name == "apply_patch"), "{rows:?}");
+        // Same anomaly, same single warning as the file-change-*first* ordering
+        // (`file_change_first_does_not_consume_the_command_in_place_slot`) —
+        // that pair is what pins the tripwire to the shape rather than to which
+        // record Codex happened to write second.
+        assert_eq!(result.warnings.len(), 1, "{:?}", result.warnings);
+        assert!(
+            result.warnings[0].reason.contains("single command"),
+            "{:?}",
+            result.warnings[0]
+        );
+    }
+
+    #[test]
+    fn second_command_item_keeps_both_rows_and_warns() {
+        // A repeated command record contradicts the wrapper's single-call
+        // proof. The extra row is kept — it may carry real work, and this
+        // project drops content only when there is nowhere truthful to put it
+        // — but the anomaly leaves a trace.
+        let result = single_command_wrapper_then_sibling(&serde_json::json!({
+            "type":"CommandExecution","id":"exec-cmd-duplicate","command":["/bin/zsh","-lc","apply_patch <<EOF"],
+            "status":"completed","exit_code":0,"aggregated_output":"Done again!"
+        }));
+
+        let rows = tool_rows(&result.turns);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        let enriched = rows
+            .iter()
+            .find(|r| r.name == "exec")
+            .expect("enriched row");
+        assert_eq!(enriched.output.as_deref(), Some("Done!"));
+        assert_eq!(result.warnings.len(), 1, "{:?}", result.warnings);
+        assert!(
+            result.warnings[0].reason.contains("single command"),
+            "{:?}",
+            result.warnings[0]
+        );
+    }
+
+    #[test]
+    fn mcp_item_on_a_single_command_wrapper_warns() {
+        // Unlike a file change, an MCP call cannot come from a shell command —
+        // the proved script contains no MCP call to make one.
+        let result = single_command_wrapper_then_sibling(&serde_json::json!({
+            "type":"McpToolCall","id":"exec-mcp-surprise","server":"srv","tool":"do","arguments":{},
+            "status":"completed","result":{"content":[{"type":"text","text":"ok"}],"isError":false}
+        }));
+
+        let rows = tool_rows(&result.turns);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert!(rows.iter().any(|r| r.name == "exec"), "{rows:?}");
+        assert_eq!(result.warnings.len(), 1, "{:?}", result.warnings);
+    }
+
+    /// One `exec` wrapper whose script decodes or not, plus a child blinded to
+    /// its own outcome, with the failure recorded **only** in the wrapper's
+    /// full-result exit code.
+    fn blind_child_transcript(script: &str) -> LoadedTranscript {
+        let content = jsonl_lines(&[
+            serde_json::json!({"type":"session_meta","payload":{"cli_version":"0.149.0","history_mode":"paginated"}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"t-1"}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"custom_tool_call","id":"ctc_1","status":"completed","call_id":"call_1","name":"exec","input":script}}),
+            // Both of the child's own outcome signals are blinded: a non-string
+            // `status`, and no `exit_code` at all. Either one alone still
+            // convicts (`command_execution_is_error` falls back to the exit
+            // code), so the scenario needs both.
+            serde_json::json!({"type":"event_msg","payload":{"type":"item_completed","item":{
+                "type":"CommandExecution","id":"exec-blind","command":["/bin/zsh","-lc","false"],
+                "status":{"weird":"shape"},"aggregated_output":""}}}),
+            // The wrapper output carries neither plain-text failure marker
+            // (`Script failed` header, process-exit line) — the nonzero exit
+            // survives only inside the full-result JSON, which
+            // `structured_script_exit_code` reads and a failed decode forfeits.
+            serde_json::json!({"type":"response_item","payload":{"type":"custom_tool_call_output","id":"ctco_1","call_id":"call_1","output":[{"type":"input_text","text":"Script completed\nWall time 0.1 seconds\nOutput:\n{\"output\":\"\",\"exit_code\":1}"}]}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"t-1"}}),
+        ]);
+        parse_codex_transcript_content(&content, Uuid::now_v7())
+    }
+
+    #[test]
+    fn decode_failure_with_a_blind_child_loses_the_failure_flag() {
+        // The compound path §3.6 documents, pinned from both sides so the doc
+        // claim stays checkable. Four independent conditions must align, each
+        // owned by a different function — wrapper decode
+        // (`decode_single_exec_wrapper`), the child's two own signals
+        // (`command_execution_is_error`), and the wrapper's plain-text sniff
+        // (`function_call_output_is_error`). Any one of them changing behaviour
+        // moves this, which is exactly why it is pinned rather than described:
+        // whoever breaks the chain is told, and the doc is updated in the same
+        // commit rather than quietly going stale.
+        //
+        // Rescue path — the wrapper decodes, so its full-result exit code is
+        // read and the wrapper is marked failed. `drop_superseded_rows` keeps a
+        // failed row regardless of supersession, so the failure survives.
+        let decodable = "const r = await tools.exec_command({\"cmd\":\"false\"});\ntext(r);\n";
+        let rescued = blind_child_transcript(decodable);
+        assert!(
+            tool_rows(&rescued.turns)
+                .iter()
+                .any(|row| row.is_error == Some(true)),
+            "a decodable wrapper must keep the failure: {:?}",
+            tool_rows(&rescued.turns)
+        );
+
+        // Blind spot — the same transcript with a dynamic script the decoder
+        // cannot read. Nothing else changes, and no row is marked failed.
+        let dynamic = "const opts = build(); const r = await tools.exec_command(opts); text(r);";
+        let lost = blind_child_transcript(dynamic);
+        let rows = tool_rows(&lost.turns);
+        assert!(
+            !rows.iter().any(|row| row.is_error == Some(true)),
+            "documented blind spot changed — update §3.6 in this commit: {rows:?}"
+        );
+        // What remains is developer-visible only. No transcript row reports the
+        // failure, so nothing restores it for the user.
+        assert!(
+            lost.warnings
+                .iter()
+                .any(|warning| warning.reason.contains("status is not a string")),
+            "{:?}",
+            lost.warnings
+        );
     }
 
     #[test]
@@ -5527,16 +5973,15 @@ not valid json
             "{:?}",
             mcp[0].output
         );
-        // The rogue record targeted the wrapper's call_id — the wrapper row
-        // must not have absorbed its result either.
-        let wrapper = rows.iter().find(|r| r.name == "exec").expect("wrapper");
+        // The rogue record targeted the wrapper's call_id, so assert against
+        // every row rather than the wrapper alone — the wrapper is superseded
+        // by its MCP child here, and a leak must be caught wherever it lands.
         assert!(
-            !wrapper
+            !rows.iter().any(|r| r
                 .output
                 .as_deref()
-                .is_some_and(|o| o.contains("rogue-legacy-result")),
-            "{:?}",
-            wrapper.output
+                .is_some_and(|o| o.contains("rogue-legacy-result"))),
+            "{rows:?}"
         );
     }
 

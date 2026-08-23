@@ -272,3 +272,81 @@ Docs match reality and the drift-detection suite is green.
 - Fix the stale doc comment on `forward_message_impl` claiming the workflow path fails on any empty source (M5) — it misled this plan's own first draft.
 - Blow-by-blow reasoning goes in the PR description; git owns chronology.
 - Known limitations recorded, not dropped: MCP error-variant capture status (M1); legacy threads keep string-sniffed exit status by design; `Reasoning` skipped; `Extension`/`ContextCompaction` captured but not consumed.
+
+---
+
+## M8 — Manual-testing fixes: duplicate wrapper rows, rename presentation
+
+Found by manual testing on a real 0.149.0 thread after M7 closed, verified by
+parsing that rollout directly. Both are user-visible; the first is a defect this
+plan introduced.
+
+### Goal & Outcome
+
+A reopened paginated transcript shows **one row per operation** — matching the
+live view, which never surfaces the `exec` wrapper — and a rename reads as a
+rename rather than an edit whose diff failed to load.
+
+### What was wrong
+
+1. **Every operation rendered twice** (a wrapper row plus its child row): 23
+   items where live showed ~12. M3 retained the wrapper "as the container"
+   while also emitting a row per child, so disk and live diverged by
+   construction.
+2. **The single-command collapse path was dead against the shipped CLI.**
+   `decode_single_exec_wrapper` parsed the argument literal with `serde_json`,
+   but 0.149 writes a JavaScript object literal with **bare keys**
+   (`{\n  cmd: "…",\n  workdir: "…"\n}`). Both fixtures pinning the collapse
+   path carried the older single-line quoted-JSON form (`paginated-mixed-batch`
+   already used bare keys), so the test passed and production never took the
+   path. Pre-existing; invisible on `main` because a paginated
+   transcript rendered nothing at all.
+3. **A contentless rename claimed its diff was unavailable.** A pure move has no
+   content change, so the empty-edits branch reported a failure that never
+   happened, under an "Edit" verb pointing at a path the operation had removed.
+
+### Implementation Outline
+
+- Supersede the wrapper row once a child renders its work; drop the superseded
+  rows at turn close, when every index is final. Two rows survive on purpose:
+  a wrapper that attached **no** child, and a **failed** wrapper — children
+  cover only the operations that got far enough to emit an item, so a batch
+  whose second operation failed hard has its diagnostic nowhere else. The
+  mixed-batch test written in M3 is what caught the first attempt at this rule.
+- A wrapper enriched **in place** is reinstated: it is then one of the
+  operations, and a `FileChange` sibling can supersede it before the
+  `CommandExecution` that claims the slot arrives.
+- Accept both argument-literal forms (`parse_js_object` / `quote_bare_keys`),
+  with an inline test carrying the verbatim 0.149 script text. Bare-key quoting
+  is gated on a following `:` so the `false` in `[true, false]` — same
+  after-a-comma position a key occupies — is not turned into a string.
+- Frontend: a contentless move gets its own verb (**Rename**), icon, and
+  `source → destination` path row, and renders no diff paragraph. A move that
+  also changed content stays **Edit** and keeps the `(renamed)` annotation,
+  which is then the only signal the path moved.
+
+### Definition of Done
+
+- Parsing the captured real thread yields one row per operation, plus the
+  sandbox-rejected `rm -rf` the live view lost entirely. **Live-only evidence**
+  — that rollout is not in the repo. The same shapes are pinned reproducibly by
+  `paginated-batched-wrapper` (a wrapper with both an edit and a command child)
+  and `paginated-failed-tool` (the childless failed wrapper).
+- `docs/harness-behavior.md` §3.6 records the supersede rule, both exceptions,
+  and the argument-literal format change as a silent-failure surface to re-probe
+  on bump.
+
+### Carried forward
+
+The `exec` wrapper decoder fails **silently** — nothing is logged — which is
+exactly how this went unnoticed across a CLI bump. A warning there would have
+surfaced it on the first paginated thread. The cost is uneven, and
+`harness-behavior.md` §3.6 carries the precise version: a wrapper with
+well-formed children is unaffected (they supersede it and carry their own
+facets); the visible cost falls on **childless** wrappers, which render as raw
+script text. One narrow compound path reaches past that and can erase a
+*child-bearing* wrapper's failure record too — four conditions must align, and
+`decode_failure_with_a_blind_child_loses_the_failure_flag` pins it from both
+sides so the doc claim stays checkable rather than needing to be re-derived. Not added here because a wrapper legitimately fails to decode whenever
+it batches or computes its arguments, so the warning needs a narrower predicate
+than "decode failed" to avoid firing on healthy transcripts.

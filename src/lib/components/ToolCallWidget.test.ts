@@ -657,6 +657,56 @@ describe("ToolCallWidget facet bodies", () => {
     expect(copyTextMock).toHaveBeenCalledWith("/repo/new-name.ts");
   });
 
+  it("renders a contentless rename as a Rename row with no diff apology", () => {
+    // A move with no content change has no diff by construction. Reporting it
+    // through the generic empty-edits path claimed the content was
+    // "unavailable" — a failure that never happened — under an "Edit" verb
+    // that pointed at a path the operation had just removed.
+    const facet: ToolFacet = {
+      facet_kind: "edit",
+      files: [
+        {
+          path: "/repo/old-name.ts",
+          change: "modified",
+          edits: [],
+          truncated: false,
+          moved_to: "/repo/new-name.ts",
+        },
+      ],
+    };
+    const { getByTestId, queryByTestId } = render(ToolCallWidget, {
+      tool: withFacet(facet),
+      turnSettled: true,
+    });
+
+    expect(getByTestId("tool-verb")).toHaveTextContent("Rename");
+    const pathEl = getByTestId("tool-edit-path");
+    expect(pathEl).toHaveTextContent("/repo/old-name.ts → /repo/new-name.ts");
+    expect(queryByTestId("tool-edit-pending")).toBeNull();
+    // The verb already says it; the annotation would repeat itself.
+    expect(queryByTestId("tool-edit-renamed")).toBeNull();
+  });
+
+  it("keeps the rename annotation when a move also changed content", () => {
+    // Verb is "Edit" here — there is a diff to read — so the annotation is the
+    // only signal that the path moved.
+    const facet: ToolFacet = {
+      facet_kind: "edit",
+      files: [
+        {
+          path: "/repo/old-name.ts",
+          change: "modified",
+          edits: [{ old: "x\n", new: "y\n" }],
+          truncated: false,
+          moved_to: "/repo/new-name.ts",
+        },
+      ],
+    };
+    const { getByTestId } = render(ToolCallWidget, { tool: withFacet(facet), turnSettled: true });
+    expect(getByTestId("tool-verb")).toHaveTextContent("Edit");
+    expect(getByTestId("tool-edit-renamed")).toHaveTextContent("(renamed)");
+  });
+
   it("renders an ordinary edit without any rename affordances", () => {
     const facet: ToolFacet = {
       facet_kind: "edit",

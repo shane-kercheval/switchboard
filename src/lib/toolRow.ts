@@ -11,6 +11,7 @@
 import {
   FilePen,
   FilePlus,
+  FileSymlink,
   FileText,
   FileX,
   ListChecks,
@@ -20,7 +21,7 @@ import {
   Wrench,
 } from "@lucide/svelte";
 import type { ToolCall } from "$lib/state/types";
-import type { McpMutation, ToolFacet } from "$lib/types";
+import type { EditedFile, McpMutation, ToolFacet } from "$lib/types";
 import { redactDisplay, toolInputPreview } from "$lib/toolInput";
 
 /// All lucide icons share one component shape; alias it off a concrete icon
@@ -65,13 +66,23 @@ export function toolVerb(facet: ToolFacet, rawName: string): string {
   }
 }
 
+/// A file that only moved. `moved_to` can also accompany real content changes
+/// — `apply_patch` relocates and rewrites in one section — and that case stays
+/// an Edit, because there is a diff to read. Only the contentless move is a
+/// rename, and it is the case with no diff to show.
+export function isPureRename(file: EditedFile): boolean {
+  return file.moved_to !== undefined && file.edits.length === 0;
+}
+
 /// A homogeneous patch reads by its change kind: harnesses without separate
 /// write/delete tools arrive as Edit facets, but the user is looking at a
 /// creation or deletion regardless of how many files the call touched. Mixed
 /// patches stay "Edit" and identify exceptional change kinds per file.
-function editVerb(files: { change: string }[]): string {
-  if (files.length > 0 && files.every((file) => file.change === "added")) return "Write";
-  if (files.length > 0 && files.every((file) => file.change === "deleted")) return "Delete";
+function editVerb(files: EditedFile[]): string {
+  if (files.length === 0) return "Edit";
+  if (files.every(isPureRename)) return "Rename";
+  if (files.every((file) => file.change === "added")) return "Write";
+  if (files.every((file) => file.change === "deleted")) return "Delete";
   return "Edit";
 }
 
@@ -170,9 +181,16 @@ export function toolIcon(facet: ToolFacet): ToolIconComponent {
     case "shell":
       return SquareTerminal;
     case "edit":
-      if (editVerb(facet.files) === "Write") return FilePlus;
-      if (editVerb(facet.files) === "Delete") return FileX;
-      return FilePen;
+      switch (editVerb(facet.files)) {
+        case "Rename":
+          return FileSymlink;
+        case "Write":
+          return FilePlus;
+        case "Delete":
+          return FileX;
+        default:
+          return FilePen;
+      }
     case "write":
       return FilePlus;
     case "read":

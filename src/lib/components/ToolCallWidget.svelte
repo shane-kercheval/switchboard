@@ -53,6 +53,7 @@
   import { copyText } from "$lib/native";
   import {
     isGenericFacet,
+    isPureRename,
     knownMcpMutation,
     toolDetail,
     toolIcon,
@@ -400,19 +401,24 @@
         </section>
       {:else if !interrupted && facet.facet_kind === "edit"}
         {#each facet.files as file, index (file.path)}
+          {@const renameOnly = isPureRename(file)}
           <section class="space-y-1" aria-label="File edit" data-testid="tool-edit-file">
             <div
               class="group/path text-muted flex items-start gap-2 font-mono text-[11px]"
               data-testid="tool-path-row"
             >
+              <!-- Both endpoints in one text node so the arrow keeps its
+                   spacing and wraps with the paths rather than between them. -->
               <span class={cn(FILE_PATH_CLASS, "flex-1")} data-testid="tool-edit-path">
-                {file.path}{#if file.moved_to}
-                  → {file.moved_to}{/if}
+                {file.moved_to ? `${file.path} → ${file.moved_to}` : file.path}
               </span>
-              <!-- Independent of the multi-file change annotation below: that
-                   one is gated on `files.length > 1`, which structurally
-                   excludes the single-file rename — the realistic case. -->
-              {#if file.moved_to}
+              <!-- Only when the verb doesn't already say it: a move that also
+                   changed content reads as "Edit", and there the annotation is
+                   the sole signal that the path moved. Independent of the
+                   multi-file change annotation below, which is gated on
+                   `files.length > 1` and so structurally excludes the
+                   single-file rename — the realistic case. -->
+              {#if file.moved_to && verb !== "Rename"}
                 <span class="shrink-0" data-testid="tool-edit-renamed">(renamed)</span>
               {/if}
               {#if verb === "Edit" && facet.files.length > 1 && file.change !== "modified"}
@@ -422,7 +428,12 @@
             </div>
             {#if !deleteFacet || open}
               {@const diff = collapsedFileDiffs[index]}
-              {#if file.edits.length === 0}
+              {#if renameOnly}
+                <!-- A move with no content change has no diff to show, so the
+                     path row above is the whole story. Saying content is
+                     "unavailable" here would report a failure that didn't
+                     happen. -->
+              {:else if file.edits.length === 0}
                 <!-- A live Codex edit announces paths without content; the facet
                      is upgraded from the session file at turn end. Empty edits on
                      a settled turn mean the content never became available. -->

@@ -116,9 +116,12 @@ pub enum Turn {
         /// no model, or before any announcement (Antigravity).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model: Option<String>,
-        /// The reasoning effort this turn ran at — **Codex only**
-        /// (`turn_context.effort`). `None` for Claude/Gemini/Antigravity, which
-        /// expose no per-turn effort (Claude's is sidebar-intent only).
+        /// The reasoning effort this turn ran at. Codex reads
+        /// `turn_context.effort`; Claude reads the top-level `effort` its
+        /// session file has carried on each assistant record since CLI 2.1.212.
+        /// `None` for Gemini/Antigravity (no per-turn effort), for a Claude
+        /// agent left on "Default", and for Claude turns written by an older
+        /// CLI.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         effort: Option<String>,
         /// Per-turn real-spend attribution restored on reopen. The session-file

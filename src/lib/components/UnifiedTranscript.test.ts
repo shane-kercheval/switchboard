@@ -961,9 +961,9 @@ describe("UnifiedTranscript — fan-out groups", () => {
     expect(columns[0]!.querySelector('[data-testid="message-model"]')).toHaveTextContent(
       "claude-opus-4-8",
     );
-    expect(columns[0]!.querySelector('[data-testid="message-effort"]')).toBeNull();
-    expect(columns[1]!.querySelector('[data-testid="message-model"]')).toHaveTextContent("gpt-5.5");
-    expect(columns[1]!.querySelector('[data-testid="message-effort"]')).toHaveTextContent("high");
+    expect(columns[1]!.querySelector('[data-testid="message-model"]')).toHaveTextContent(
+      "gpt-5.5 (high)",
+    );
   });
 
   it("shows a queued indicator for a recipient with no response yet", async () => {
@@ -2786,13 +2786,13 @@ describe("UnifiedTranscript hydration failures", () => {
 
     render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CODEX_AGENT] } });
 
-    expect(screen.getByTestId("message-model")).toHaveTextContent("gpt-5.5");
-    expect(screen.getByTestId("message-effort")).toHaveTextContent("high");
+    expect(screen.getByTestId("message-model")).toHaveTextContent("gpt-5.5 (high)");
   });
 
-  it("agent-turn footer shows model with no effort when the turn has only a model", async () => {
+  it("agent-turn footer shows a bare model when the turn carries no effort", async () => {
     const state = await loadState();
-    // The Claude case: per-turn model is exposed, per-turn effort is not.
+    // A Claude agent left on "Default": we pass no `--effort`, so nothing is
+    // stamped live and the model renders unqualified.
     state.transcripts[CLAUDE_AGENT.id] = [
       {
         role: "agent",
@@ -2808,7 +2808,76 @@ describe("UnifiedTranscript hydration failures", () => {
     render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     expect(screen.getByTestId("message-model")).toHaveTextContent("claude-opus-4-8");
-    expect(screen.queryByTestId("message-effort")).toBeNull();
+    expect(screen.getByTestId("message-model")).not.toHaveTextContent("(");
+  });
+
+  it("agent-turn footer pairs a Claude turn's model and effort", async () => {
+    const state = await loadState();
+    // Claude carries per-turn effort since CLI 2.1.212 (stamped live from the
+    // dispatched selection, read back from the session file on reopen), so it
+    // renders the same paired shape Codex does.
+    state.transcripts[CLAUDE_AGENT.id] = [
+      {
+        role: "agent",
+        turn_id: "agent-1",
+        agent_id: CLAUDE_AGENT.id,
+        started_at: "2026-05-16T00:00:01Z",
+        status: "complete",
+        items: [{ item_kind: "text", kind: "text", text: "hi" }],
+        model: "claude-opus-5",
+        effort: "high",
+      },
+    ];
+
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    expect(screen.getByTestId("message-model")).toHaveTextContent("claude-opus-5 (high)");
+  });
+
+  it("agent-turn footer withholds model and effort on a failed turn", async () => {
+    const state = await loadState();
+    // A failed turn's reported execution config is unreliable, so neither axis
+    // is shown. Effort needs its own gate: a failed turn often carries no model,
+    // and an ungated effort would render a bare level with nothing to qualify.
+    state.transcripts[CLAUDE_AGENT.id] = [
+      {
+        role: "agent",
+        turn_id: "agent-1",
+        agent_id: CLAUDE_AGENT.id,
+        started_at: "2026-05-16T00:00:01Z",
+        status: "failed",
+        error: "boom",
+        items: [],
+        effort: "high",
+      },
+    ];
+
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    expect(screen.queryByTestId("message-model")).toBeNull();
+  });
+
+  it("agent-turn footer withholds a Codex turn's effort when the turn failed", async () => {
+    const state = await loadState();
+    // Codex stamps `turn_context.effort` on its terminal regardless of outcome,
+    // so this path predates Claude carrying effort at all.
+    state.transcripts[CODEX_AGENT.id] = [
+      {
+        role: "agent",
+        turn_id: "agent-1",
+        agent_id: CODEX_AGENT.id,
+        started_at: "2026-05-16T00:00:01Z",
+        status: "failed",
+        error: "boom",
+        items: [],
+        model: "gpt-5.6-sol",
+        effort: "high",
+      },
+    ];
+
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CODEX_AGENT] } });
+
+    expect(screen.queryByTestId("message-model")).toBeNull();
   });
 
   it("agent-turn footer omits model/effort when the turn carries neither", async () => {
@@ -2828,7 +2897,6 @@ describe("UnifiedTranscript hydration failures", () => {
 
     expect(screen.getByTestId("turn")).toBeInTheDocument();
     expect(screen.queryByTestId("message-model")).toBeNull();
-    expect(screen.queryByTestId("message-effort")).toBeNull();
   });
 });
 

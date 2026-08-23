@@ -157,6 +157,7 @@ impl HarnessAdapter for ClaudeCodeAdapter {
             tx,
             turn_id,
             agent_id,
+            agent.effort.clone(),
             options.cancel_token,
         ));
 
@@ -404,7 +405,11 @@ fn to_base36(mut value: u32) -> String {
 // Parallels the Codex / Gemini producers: a single per-line control-flow loop
 // plus the cancel and post-loop terminal handling. Splitting it would fragment
 // that flow without improving readability.
-#[allow(clippy::too_many_lines)]
+// Arg count matches the Codex/Gemini producers, which carry the same allow:
+// the params are independent handles (child, pipes, tx, ids, dispatched effort,
+// cancel token) with no meaningful grouping — bundling them into a struct here
+// would add a type without removing a decision.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn run_producer(
     mut child: tokio::process::Child,
     stdout: tokio::process::ChildStdout,
@@ -412,6 +417,7 @@ async fn run_producer(
     tx: tokio::sync::mpsc::UnboundedSender<AdapterEvent>,
     turn_id: TurnId,
     agent_id: AgentId,
+    dispatched_effort: Option<String>,
     cancel_token: CancellationToken,
 ) {
     // Drain stderr concurrently; prevents pipe-full deadlock if the subprocess
@@ -435,7 +441,7 @@ async fn run_producer(
     // cancel outcome; a binary token can't carry the source). So the cancel
     // path must skip the truncation synthesis below.
     let mut cancelled = false;
-    let mut parser_state = ParserState::default();
+    let mut parser_state = ParserState::with_dispatched_effort(dispatched_effort.clone());
 
     let mut lines = tokio::io::BufReader::new(stdout).lines();
 
@@ -480,7 +486,7 @@ async fn run_producer(
                                     .map(str::to_owned),
                                 spend: None,
                                 model: None,
-                                effort: None,
+                                effort: dispatched_effort.clone(),
                             });
                         let _ = tx.send(event);
                         terminal_seen = true;
@@ -526,7 +532,7 @@ async fn run_producer(
                             .map(str::to_owned),
                         spend: None,
                         model: None,
-                        effort: None,
+                        effort: dispatched_effort.clone(),
                     });
                 let _ = tx.send(event);
                 terminal_seen = true;
@@ -616,6 +622,7 @@ async fn run_producer(
                 turn_id,
                 &stderr_tail,
                 parser_state.first_assistant_message_id().map(str::to_owned),
+                dispatched_effort.clone(),
             )
         });
     let _ = tx.send(event);
@@ -628,6 +635,7 @@ fn synthesize_truncation_turn_end(
     turn_id: TurnId,
     stderr_tail: &Mutex<VecDeque<String>>,
     first_message_id: Option<String>,
+    dispatched_effort: Option<String>,
 ) -> AdapterEvent {
     let stderr_msg = crate::subprocess::format_stderr_tail(stderr_tail);
     let message = if stderr_msg.is_empty() {
@@ -650,7 +658,9 @@ fn synthesize_truncation_turn_end(
         first_message_id,
         spend: None,
         model: None,
-        effort: None,
+        // A failed turn still ran at the dispatched effort — carry it so the
+        // Failed row matches the on-disk copy the way `model` does.
+        effort: dispatched_effort,
     }
 }
 
@@ -1260,7 +1270,7 @@ mod tests {
         let turn_id = Uuid::now_v7();
 
         let with_id =
-            synthesize_truncation_turn_end(turn_id, &stderr, Some("msg_first".to_owned()));
+            synthesize_truncation_turn_end(turn_id, &stderr, Some("msg_first".to_owned()), None);
         match with_id {
             AdapterEvent::TurnEnd {
                 outcome: TurnOutcome::Failed { .. },
@@ -1272,7 +1282,7 @@ mod tests {
 
         // No assistant message before the crash → no identity (dedup falls back
         // to turn_id, as before).
-        let without_id = synthesize_truncation_turn_end(turn_id, &stderr, None);
+        let without_id = synthesize_truncation_turn_end(turn_id, &stderr, None, None);
         match without_id {
             AdapterEvent::TurnEnd {
                 first_message_id, ..

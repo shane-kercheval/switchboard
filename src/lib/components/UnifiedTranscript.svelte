@@ -587,6 +587,15 @@
     return turn.status === "complete" ? turn.model : undefined;
   }
 
+  /// Same rule as `modelOf`, for the same reason: on a failed or cancelled turn
+  /// the harness's reported execution config is unreliable, so it is withheld
+  /// rather than shown. Gating effort separately matters because a failed turn
+  /// often has no model at all — leaving effort ungated renders a level with
+  /// nothing to qualify (a bare `high` beside the timestamp).
+  function effortOf(turn: AgentTurn): string | undefined {
+    return turn.status === "complete" ? turn.effort : undefined;
+  }
+
   /// A fan-out column's runtime selection footer: latest agent turn wins, matching
   /// `columnAt` and the copy aggregation's "column owns its agent rows" contract.
   function columnModel(colRows: NonUserRow[]): string | undefined {
@@ -600,7 +609,7 @@
   function columnEffort(colRows: NonUserRow[]): string | undefined {
     for (let i = colRows.length - 1; i >= 0; i--) {
       const r = colRows[i]!;
-      if (r.kind === "agent") return r.turn.effort;
+      if (r.kind === "agent") return effortOf(r.turn);
     }
     return undefined;
   }
@@ -613,6 +622,16 @@
       }
     }
     return undefined;
+  }
+
+  /// Per-turn model and effort read as one identity ("what this turn ran on"),
+  /// so they render as `model (effort)` rather than two loose columns. Effort
+  /// alone renders bare — a lone `(high)` reads as a fragment, and the pairing
+  /// is only meaningful when there is a model to qualify. Harness-agnostic:
+  /// Codex and Claude both supply effort, Gemini/Antigravity never do.
+  function modelWithEffort(model: string | undefined, effort: string | undefined): string {
+    if (!model) return effort ?? "";
+    return effort ? `${model} (${effort})` : model;
   }
 
   function formatTime(iso: string): string {
@@ -1740,14 +1759,9 @@
     >
       <div class="flex min-w-0 items-center gap-2">
         <div class="flex min-w-0 flex-wrap items-center justify-end gap-x-2">
-          {#if model}
+          {#if model || effort}
             <span class="text-muted max-w-full truncate text-xs" data-testid="message-model"
-              >{model}</span
-            >
-          {/if}
-          {#if effort}
-            <span class="text-muted max-w-full truncate text-xs" data-testid="message-effort"
-              >{effort}</span
+              >{modelWithEffort(model, effort)}</span
             >
           {/if}
           {#if at}
@@ -1990,7 +2004,7 @@
       spend: turn.spend,
       costUsd: turn.usage?.total_cost_usd,
       model: modelOf(turn),
-      effort: turn.effort,
+      effort: effortOf(turn),
       previewKey: showToggle ? key : undefined,
       previewDefaultCompact: defaultCompact,
       messageIdentity: messageIdentityForRow(row, agentById[turn.agent_id]?.harness),

@@ -108,9 +108,18 @@ pub struct ParserState {
     /// way as the id above — so at `TurnEnd` it is the **final non-subagent**
     /// assistant model (a subagent on a different model never reaches here).
     /// Stamped on the live per-turn `TurnEnd.model`; the reopen counterpart
-    /// reads the same `message.model` from the session file. Claude exposes no
-    /// per-turn effort, so `TurnEnd.effort` stays `None`.
+    /// reads the same `message.model` from the session file.
     last_assistant_model: Option<String>,
+    /// The effort this dispatch was launched with — the value the adapter put
+    /// behind `--effort`, injected at construction rather than parsed, because
+    /// **Claude's live stream carries no effort** (only the session file does,
+    /// since 2.1.212 — see `harness-behavior.md` §3.4). Stamping what we sent
+    /// is what lets the live footer agree with the reopened one instead of the
+    /// value appearing only after a restart. `None` when the agent's effort is
+    /// unset ("Default" in the Model settings dialog): we pass no flag, Claude
+    /// picks its own level, and we deliberately render nothing live rather than
+    /// guess — the session file still records the real level for the reopen.
+    dispatched_effort: Option<String>,
     /// Telemetry from the most recent **successful** `result`, kept-last,
     /// awaiting emission as the turn's single Completed `TurnEnd` at stream
     /// EOF ([`ParserState::take_final_turn_end`]). A background-agent dispatch
@@ -177,11 +186,63 @@ impl ParserState {
             // ids must survive every intermediate result so the single
             // terminal carries whole-dispatch identity.
             model: self.last_assistant_model.clone(),
-            effort: None,
+            effort: self.terminal_effort(),
             stable_message_id: self.last_assistant_message_id.clone(),
             first_message_id: self.first_assistant_message_id.clone(),
         })
     }
+
+    /// Construct a state for a dispatch launched with `effort` (the value
+    /// passed to `--effort`, or `None` when the agent leaves it unset).
+    pub(crate) fn with_dispatched_effort(effort: Option<String>) -> Self {
+        Self {
+            dispatched_effort: effort,
+            ..Self::default()
+        }
+    }
+
+    /// The effort to stamp on this turn's terminal, or `None` to render nothing.
+    ///
+    /// **Gated on the model that actually ran**, because the dispatched value is
+    /// an assertion rather than an observation — Claude's live stream reports no
+    /// effort for any model, so the only honest thing to echo is a value we know
+    /// the harness will corroborate on disk. It does not always: a model with no
+    /// reasoning-effort axis accepts `--effort` silently and records **nothing**
+    /// (probed @ 2.1.241 — `--model haiku --effort max|low` → no `effort` key,
+    /// while Sonnet 5 records `max`/`low` verbatim). Stamping there would show a
+    /// level live that vanishes when the same turn is re-read from disk.
+    ///
+    /// **Default-closed**, and that is the load-bearing property: only families
+    /// verified to record effort are echoed, so an unrecognized or future model
+    /// degrades to "blank live, correct on reopen" rather than to a wrong value.
+    /// A no-axis model added to the picker is therefore safe by default, and the
+    /// per-model live assertions in the live suite are what promote a new family
+    /// into this list (see the "Model catalog" step in `harness-update-review.md`).
+    ///
+    /// Keys off the resolved id Claude reports (`message.model`), never the alias
+    /// the user picked — aliases move between model generations, and an alias is
+    /// not what the session file records. A turn with no assistant record at all
+    /// (an auth or argument failure that died before the model ran) has no
+    /// resolved id, so it stamps nothing, which is also the truthful answer.
+    fn terminal_effort(&self) -> Option<String> {
+        let model = self.last_assistant_model.as_deref()?;
+        model_records_effort(model).then(|| self.dispatched_effort.clone())?
+    }
+}
+
+/// Whether a resolved Claude model id records `effort` in its session file.
+///
+/// Substring match on the family segment, not an exact id list: ids carry
+/// generation and date suffixes (`claude-opus-5`, `claude-haiku-4-5-20251001`)
+/// that would make an exact list stale on every point release, whereas the
+/// family is the unit the effort axis actually belongs to. Verified @ 2.1.241:
+/// Opus 5 / Sonnet 5 / Fable 5 record the requested level verbatim; Haiku 4.5
+/// records no key at all (`harness-behavior.md` §3.4).
+fn model_records_effort(model: &str) -> bool {
+    const EFFORT_RECORDING_FAMILIES: [&str; 3] = ["opus", "sonnet", "fable"];
+    EFFORT_RECORDING_FAMILIES
+        .iter()
+        .any(|family| model.contains(family))
 }
 
 /// Parse one stream-json line. Stateful: `state` accumulates text-block
@@ -428,7 +489,7 @@ fn parse_result(obj: &Value, turn_id: TurnId, state: &mut ParserState) -> ParseO
             context_window_source,
             spend,
             model: state.last_assistant_model.clone(),
-            effort: None,
+            effort: state.terminal_effort(),
             stable_message_id: state.last_assistant_message_id.clone(),
             first_message_id: state.first_assistant_message_id.clone(),
         });
@@ -1088,6 +1149,87 @@ mod tests {
             }
             _ => panic!("expected ContentChunk"),
         }
+    }
+
+    /// Drive a turn to its folded terminal on `model`, returning the stamped effort.
+    fn terminal_effort_for(model: &str, dispatched: Option<&str>) -> Option<String> {
+        let mut state = ParserState::with_dispatched_effort(dispatched.map(str::to_owned));
+        let turn = tid();
+        let assistant = format!(
+            r#"{{"type":"assistant","message":{{"id":"m1","model":"{model}","content":[{{"type":"text","text":"ok"}}]}}}}"#
+        );
+        let _ = parse_line(&assistant, turn, aid(), &mut state);
+        let _ = parse_line(
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"ok"}"#,
+            turn,
+            aid(),
+            &mut state,
+        );
+        match state.take_final_turn_end(turn, TurnOutcome::Completed) {
+            Some(AdapterEvent::TurnEnd { effort, .. }) => effort,
+            other => panic!("expected a folded TurnEnd, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn terminal_stamps_dispatched_effort_for_models_that_record_it() {
+        // Claude's live stream carries no effort at all, so the only source for
+        // the live footer is the value we dispatched. Echoing it is sound only
+        // where the session file corroborates it — verified for these families.
+        for model in ["claude-opus-5", "claude-sonnet-5", "claude-fable-5"] {
+            assert_eq!(
+                terminal_effort_for(model, Some("xhigh")),
+                Some("xhigh".to_owned()),
+                "{model} records effort on disk, so the live stamp must match"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_withholds_effort_for_a_model_with_no_effort_axis() {
+        // Haiku accepts `--effort` silently and records NO effort key, so
+        // stamping would show a level live that vanishes on reopen. This is the
+        // regression that made the ungated stamp wrong for a default picker
+        // model (`harness-behavior.md` §3.4).
+        assert_eq!(
+            terminal_effort_for("claude-haiku-4-5-20251001", Some("max")),
+            None
+        );
+    }
+
+    #[test]
+    fn terminal_withholds_effort_for_an_unrecognized_model() {
+        // Default-closed: a model we have never probed degrades to "blank live,
+        // correct on reopen" rather than to a confidently wrong value.
+        assert_eq!(terminal_effort_for("claude-mythos-5", Some("high")), None);
+        assert_eq!(terminal_effort_for("some-vendor-model", Some("high")), None);
+    }
+
+    #[test]
+    fn terminal_withholds_effort_when_no_model_ran() {
+        // An auth/argument failure dies before any assistant record, so there is
+        // no resolved model — and no honest effort to report either.
+        let mut state = ParserState::with_dispatched_effort(Some("high".to_owned()));
+        let turn = tid();
+        match parse_line(
+            r#"{"type":"result","is_error":true,"result":"boom"}"#,
+            turn,
+            aid(),
+            &mut state,
+        ) {
+            ParseOutcome::Event(AdapterEvent::TurnEnd { effort, model, .. }) => {
+                assert_eq!(model, None);
+                assert_eq!(effort, None);
+            }
+            other => panic!("expected a failure TurnEnd, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn terminal_effort_is_none_when_the_agent_left_it_unset() {
+        // "Default" in the Model settings dialog: no `--effort` is passed, so
+        // Claude picks its own level and we have nothing truthful to stamp.
+        assert_eq!(terminal_effort_for("claude-opus-5", None), None);
     }
 
     #[test]

@@ -938,6 +938,72 @@ struct CodexReconstruction {
     /// `session_meta`, which Codex writes as the first record; a file with no
     /// `session_meta` at all keeps the `Missing` default and reads as legacy.
     history_mode: HistoryMode,
+    /// The `exec` wrapper whose `custom_tool_call → custom_tool_call_output`
+    /// interval the parser is currently inside (paginated files only). A
+    /// paginated tool `item_completed` (`CommandExecution` / `FileChange` /
+    /// `McpToolCall`) belongs to this wrapper — file-order adjacency puts a
+    /// tool's items strictly between its wrapper's call and output records —
+    /// and cannot be joined any other way: the items carry synthetic
+    /// `exec-<uuid>` ids matching neither the wrapper's record id nor its
+    /// `call_id`. Cleared when the wrapper's output record arrives, and
+    /// defensively whenever a turn closes.
+    ///
+    /// Only `exec`-named wrappers open an interval — deliberate: if a future
+    /// paginated Codex emits standalone tool shapes (a bare `apply_patch`
+    /// call, MCP as a direct `function_call`), their items warn "outside any
+    /// exec wrapper interval" and only the *enrichment* is lost; the
+    /// `response_item` row itself still hydrates.
+    ///
+    /// That is also why an orphaned item is warned and **dropped** rather than
+    /// rendered standalone — a chosen tradeoff, resting on `response_item`
+    /// being the canonical record: every tool call already has a row, so an
+    /// item's content is never the only copy, and no probe has ever produced a
+    /// call-less item — orphans can only arise from contract drift, exactly
+    /// when pairing rules are least trustworthy. Rendering a late item as its
+    /// own row would duplicate the operation its (already-closed) wrapper row
+    /// shows. The cost is developer-visible only (a `ParseWarning`); the user
+    /// sees an unenriched row.
+    open_wrapper: Option<OpenWrapper>,
+}
+
+/// See [`CodexReconstruction::open_wrapper`]. The single-vs-batched dispatch is
+/// **new logic composed from two existing primitives**: `decode_single_exec_wrapper`
+/// already proves whether a wrapper is exactly one canonical `exec_command`
+/// call, and `handle_patch_apply_end` already established match-else-push-new-row
+/// as the child mechanism. A wrapper proved single-command is enriched **in
+/// place** by its one `CommandExecution` item (so an ordinary shell command
+/// renders as one row, not a wrapper row plus a duplicate child); anything else
+/// — batched scripts, dynamic scripts, and (by construction, since the decoder
+/// recognizes only `exec_command`) a lone `apply_patch` wrapper — gets each
+/// item pushed as its **own row**, with the wrapper retained as the container
+/// and as the only failure evidence: a failed operation may emit no item at all,
+/// and an uncaught failure's diagnostic lives solely in the wrapper output.
+/// Where one arriving tool item lands (see [`CodexReconstruction::claim_wrapper_slot`]).
+enum WrapperSlot {
+    /// First item of a proved single-command wrapper: enrich the wrapper's own
+    /// row at this index.
+    EnrichInPlace(usize),
+    /// Batched/dynamic wrapper (or a surprise extra item): push a new child row.
+    OwnRow,
+    /// No wrapper interval open; warned and dropped.
+    Orphaned,
+}
+
+struct OpenWrapper {
+    call_id: String,
+    /// Index of the wrapper's row in the open builder's `items`.
+    row_index: usize,
+    /// `decode_single_exec_wrapper` succeeded: the wrapper is exactly one
+    /// canonical `exec_command` call.
+    single_command: bool,
+    /// The in-place slot has been consumed. Tracked separately from "any child
+    /// arrived": only a `CommandExecution` is ever eligible for the slot
+    /// (kind-gated in `claim_wrapper_slot`), so a `FileChange`/`McpToolCall`
+    /// arriving first takes its own row *without* eating the command's
+    /// enrichment — otherwise the command would fall through to a child row
+    /// and duplicate the wrapper, the exact regression the single-command
+    /// test pins.
+    command_slot_taken: bool,
 }
 
 struct CodexAgentBuilder {
@@ -977,6 +1043,7 @@ impl CodexReconstruction {
             current_effort: None,
             current_cwd: None,
             history_mode: HistoryMode::Missing,
+            open_wrapper: None,
         }
     }
 
@@ -1074,6 +1141,8 @@ impl CodexReconstruction {
                     .get("model_context_window")
                     .and_then(Value::as_u64)
                     .and_then(|v| u32::try_from(v).ok());
+                // A new turn can never inherit a prior turn's wrapper interval.
+                self.open_wrapper = None;
                 self.current_agent = Some(CodexAgentBuilder {
                     turn_id: Uuid::now_v7(),
                     agent_id: self.agent_id,
@@ -1205,15 +1274,17 @@ impl CodexReconstruction {
     }
 
     /// Paginated rollouts' replacement for the legacy `user_message` /
-    /// `agent_message` records. `item.type` is a Codex `TurnItem` variant; each
-    /// arm mirrors the contract of the legacy record it supersedes so both
-    /// generations hydrate identically.
+    /// `agent_message` / `patch_apply_end` / `mcp_tool_call_end` records.
+    /// `item.type` is a Codex `TurnItem` variant; each arm mirrors the contract
+    /// of the legacy record it supersedes so both generations hydrate
+    /// identically.
     ///
-    /// Tool variants (`CommandExecution` / `FileChange` / `McpToolCall`) are
-    /// deliberately absent: tool *rows* come from `response_item`, which is the
-    /// only complete record of tool activity — a failed call can emit no
-    /// `item_completed` at all. Unknown variants fall through silently, matching
-    /// the parser's existing posture toward record types it does not consume.
+    /// Tool variants attach to the open `exec` wrapper interval (see
+    /// [`OpenWrapper`]) — they *enrich or extend* the tool rows, they do not
+    /// replace them: rows come from `response_item`, the only complete record
+    /// of tool activity, since a failed call can emit no `item_completed` at
+    /// all. Unknown variants fall through silently, matching the parser's
+    /// existing posture toward record types it does not consume.
     fn handle_item_completed(
         &mut self,
         line_number: usize,
@@ -1281,12 +1352,378 @@ impl CodexReconstruction {
                     }
                 }
             }
+            "CommandExecution" => self.attach_command_execution(line_number, item, timestamp),
+            "FileChange" => self.attach_file_change(line_number, item, timestamp),
+            "McpToolCall" => self.attach_mcp_tool_call(line_number, item, timestamp),
             // Reasoning is captured but carries no renderable prose — the
             // summary is empty and the raw content is encrypted (§3.2). Skipped
             // for the same reason Codex reasoning has always been skipped, not
             // as an oversight.
             _ => {}
         }
+    }
+
+    /// Take the open wrapper for one arriving tool item, or warn. `Orphaned`
+    /// means no wrapper interval is open — the item is dropped with a warning
+    /// rather than guessed onto some other row (a mis-attached exit code or
+    /// diff is a plausible-looking wrong answer, strictly worse than a visibly
+    /// missing one; full rationale on [`CodexReconstruction::open_wrapper`]).
+    ///
+    /// The in-place slot is **kind-gated**: only a `CommandExecution` can
+    /// enrich the wrapper row, because "single-command" is `decode_single_exec_wrapper`'s
+    /// proof of exactly one `exec_command` call — structural, not trusted from
+    /// capture history. Any other kind always takes its own row and leaves the
+    /// slot for the command.
+    fn claim_wrapper_slot(&mut self, line_number: usize, item_type: &str) -> WrapperSlot {
+        let Some(wrapper) = self.open_wrapper.as_mut() else {
+            self.warn(
+                line_number,
+                format!("{item_type} item outside any exec wrapper interval"),
+            );
+            return WrapperSlot::Orphaned;
+        };
+        if item_type == "CommandExecution" && wrapper.single_command && !wrapper.command_slot_taken
+        {
+            wrapper.command_slot_taken = true;
+            WrapperSlot::EnrichInPlace(wrapper.row_index)
+        } else {
+            WrapperSlot::OwnRow
+        }
+    }
+
+    /// `CommandExecution`: the structured shell record paginated rollouts
+    /// added — legacy persisted none, which is why the legacy path resorts to
+    /// sniffing `Script failed` strings. The structured status/`exit_code` is
+    /// authoritative for `is_error` (set here, so the wrapper output's
+    /// string-sniffing fallback — which only fills `None` — never overrides it;
+    /// an *unreadable* status deliberately leaves `None`, degrading to exactly
+    /// that legacy heuristic plus a warning).
+    fn attach_command_execution(
+        &mut self,
+        line_number: usize,
+        item: &Value,
+        timestamp: Option<DateTime<Utc>>,
+    ) {
+        let slot = self.claim_wrapper_slot(line_number, "CommandExecution");
+        if matches!(slot, WrapperSlot::Orphaned) {
+            return;
+        }
+        let exit_failed = self.read_exit_code_failed(line_number, item);
+        let is_error = self.command_execution_is_error(line_number, item, exit_failed);
+        let facet = command_execution_item_facet(item);
+        // Output precedence: `aggregated_output`, else structured
+        // stdout/stderr. Written even when empty **only on affirmative
+        // success** — an empty string is then the command's true output, and
+        // blank beats the wrapper's "Script completed / Wall time…"
+        // boilerplate. Failure *and unknown* write only non-empty output,
+        // leaving the slot `None` so the wrapper's `Script error:` diagnostic
+        // (often the only failure evidence) can still fill it — an unknown
+        // outcome must not suppress the one place its explanation may live.
+        let structured_output = command_execution_output(item);
+        let output = if is_error == Some(false) {
+            Some(structured_output)
+        } else {
+            (!structured_output.is_empty()).then_some(structured_output)
+        };
+        let row_id = self.item_row_id(line_number, item, "command");
+        let Some(builder) = self.current_agent.as_mut() else {
+            return;
+        };
+        if let WrapperSlot::EnrichInPlace(row_index) = slot {
+            // Single-command wrapper: this item *is* the wrapper's one call.
+            if let Some(TurnItem::Tool {
+                facet: row_facet,
+                is_error: row_error,
+                output: row_output,
+                completed_at,
+                ..
+            }) = builder.items.get_mut(row_index)
+            {
+                if !matches!(facet, crate::facets::ToolFacet::Other) {
+                    *row_facet = facet;
+                }
+                *row_error = is_error;
+                if let Some(text) = output {
+                    *row_output = Some(text);
+                }
+                *completed_at = timestamp;
+            }
+            return;
+        }
+        builder.items.push(TurnItem::Tool {
+            tool_use_id: row_id,
+            kind: ToolKind::Builtin,
+            facet,
+            name: "exec_command".to_owned(),
+            input: item.get("command").cloned().unwrap_or(Value::Null),
+            // The `Option` is pushed through un-flattened: no output-record
+            // pairing ever reaches a child row (its id matches no `call_id`),
+            // so `None` here stays `None` — "no output recorded", honest for
+            // the failure/unknown cases above.
+            output,
+            is_error,
+            started_at: timestamp.unwrap_or(builder.last_seen_at),
+            completed_at: timestamp,
+        });
+    }
+
+    /// Whether the structured `exit_code` signals failure. `None` when absent
+    /// (the field is optional upstream — a declined command never ran) — or
+    /// **present but non-numeric**, which warns: a present field in an
+    /// unreadable shape is upstream contract drift, not a success.
+    fn read_exit_code_failed(&mut self, line_number: usize, item: &Value) -> Option<bool> {
+        let value = match item.get("exit_code") {
+            None | Some(Value::Null) => return None,
+            Some(value) => value,
+        };
+        if let Some(code) = value.as_i64() {
+            return Some(code != 0);
+        }
+        self.warn(
+            line_number,
+            format!("CommandExecution exit_code is not numeric: {value}"),
+        );
+        None
+    }
+
+    /// `is_error` for a `CommandExecution`, from its `status` OR-combined with
+    /// the exit code — a `failed`/`declined` status is not erased by a zero
+    /// exit, and a nonzero exit is not erased by a stale `completed`.
+    /// `declined` (the user refused the tool) must read as unsuccessful:
+    /// asserting a declined command ran is actively misleading. An
+    /// unrecognized status warns and yields `None` — never fabricate a reading
+    /// of an unknown contract (the `HistoryMode::Unknown` posture); the
+    /// in-place path then degrades to the wrapper-output string sniff, while a
+    /// child row keeps `None` permanently (no pairing reaches it). Today the
+    /// frontend renders `None` and `Some(false)` identically (`toolRowState`
+    /// fails only on `is_error === true`), so `None` costs nothing visible and
+    /// keeps the wire honest for a future distinct "unknown" rendering.
+    fn command_execution_is_error(
+        &mut self,
+        line_number: usize,
+        item: &Value,
+        exit_failed: Option<bool>,
+    ) -> Option<bool> {
+        // Matched on the raw value first, like `HistoryMode::from_session_meta`:
+        // a present-but-non-string status is the same schema drift as an
+        // unrecognized string and must take the same warned-unknown path —
+        // folding it into "missing" would assert success on malformed data.
+        let status = match item.get("status") {
+            // `status` is a required field upstream — absence is schema drift.
+            None | Some(Value::Null) => {
+                self.warn(line_number, "CommandExecution item missing status");
+                return exit_failed;
+            }
+            Some(Value::String(s)) => s.as_str(),
+            Some(other) => {
+                self.warn(
+                    line_number,
+                    format!("CommandExecution status is not a string: {other}"),
+                );
+                return if exit_failed == Some(true) {
+                    Some(true)
+                } else {
+                    None
+                };
+            }
+        };
+        match status {
+            "completed" => Some(exit_failed == Some(true)),
+            "failed" | "declined" => Some(true),
+            "in_progress" => {
+                // Inside an `item_completed` record this means the file was
+                // truncated mid-operation — incomplete, not successful.
+                self.warn(
+                    line_number,
+                    "CommandExecution item_completed with in_progress status",
+                );
+                Some(true)
+            }
+            other => {
+                self.warn(
+                    line_number,
+                    format!("CommandExecution has unrecognized status {other:?}"),
+                );
+                // Asymmetric on purpose: a readable nonzero exit convicts
+                // (positive failure evidence from a field we *can* read is not
+                // discarded because a different field went unreadable), but a
+                // zero exit does not acquit — an unknown status could be a
+                // declined-like state where the command never ran at all.
+                if exit_failed == Some(true) {
+                    Some(true)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    /// Deterministic row id for a paginated tool item. The `id` field is
+    /// required upstream, so absence warns as schema drift; the fallback is
+    /// derived from the line number — a fresh UUID would make two parses of
+    /// the same file produce different transcripts, hiding the drift and
+    /// breaking parse determinism.
+    fn item_row_id(&mut self, line_number: usize, item: &Value, kind: &str) -> String {
+        if let Some(id) = item.get("id").and_then(Value::as_str) {
+            return id.to_owned();
+        }
+        self.warn(line_number, format!("{kind} item missing id"));
+        format!("item-missing-id-{kind}-line-{line_number}")
+    }
+
+    /// `FileChange`: same `changes` map as legacy `patch_apply_end` (fact 6),
+    /// so the same facet builder serves both generations — both render
+    /// identically. Always its own row: the decoder recognizes only
+    /// `exec_command`, so an edit's wrapper is never "single-command" and the
+    /// in-place slot cannot fire — matching the legacy generation-2
+    /// presentation (wrapper row + separate `apply_patch` row).
+    fn attach_file_change(
+        &mut self,
+        line_number: usize,
+        item: &Value,
+        timestamp: Option<DateTime<Utc>>,
+    ) {
+        if matches!(
+            self.claim_wrapper_slot(line_number, "FileChange"),
+            WrapperSlot::Orphaned
+        ) {
+            return;
+        }
+        let facet = super::facets::patch_apply_end_facet(item);
+        if !matches!(facet, crate::facets::ToolFacet::Edit { .. }) {
+            self.warn(line_number, "FileChange item missing structured changes");
+            return;
+        }
+        // `status` is *optional* upstream (unlike CommandExecution's), so
+        // absence reads as completed without a warning. `declined` — the user
+        // refused the edit — must read as unsuccessful; an unrecognized string
+        // or a non-string value warns and stays `None` (unknown, not guessed)
+        // — the same raw-value-first match as the command and MCP handlers, so
+        // schema drift cannot masquerade as an absent optional field.
+        let is_error = match item.get("status") {
+            None | Some(Value::Null) => Some(false),
+            Some(Value::String(status)) => match status.as_str() {
+                "completed" => Some(false),
+                "failed" | "declined" => Some(true),
+                other => {
+                    self.warn(
+                        line_number,
+                        format!("FileChange has unrecognized status {other:?}"),
+                    );
+                    None
+                }
+            },
+            Some(other) => {
+                self.warn(
+                    line_number,
+                    format!("FileChange status is not a string: {other}"),
+                );
+                None
+            }
+        };
+        let output = patch_apply_end_output(item);
+        let row_id = self.item_row_id(line_number, item, "file-change");
+        let Some(builder) = self.current_agent.as_mut() else {
+            return;
+        };
+        builder.items.push(TurnItem::Tool {
+            tool_use_id: row_id,
+            kind: ToolKind::Builtin,
+            facet,
+            name: "apply_patch".to_owned(),
+            input: item.get("changes").cloned().unwrap_or(Value::Null),
+            output: Some(output),
+            is_error,
+            started_at: timestamp.unwrap_or(builder.last_seen_at),
+            completed_at: timestamp,
+        });
+    }
+
+    /// `McpToolCall`: MCP calls ride the same wrapper as shell/edit work (M1
+    /// capture) — same attachment, own row. Three result envelopes: success;
+    /// tool-reported error (`status: "failed"` + `result.isError`); transport
+    /// failure (`result: null` + top-level `error` — **source-derived** from
+    /// upstream's `McpToolCallError`, no live capture exists). The live stream
+    /// parser distinguishes all three; hydration must match or protocol
+    /// failures reopen with a failed status and no diagnostic.
+    fn attach_mcp_tool_call(
+        &mut self,
+        line_number: usize,
+        item: &Value,
+        timestamp: Option<DateTime<Utc>>,
+    ) {
+        if matches!(
+            self.claim_wrapper_slot(line_number, "McpToolCall"),
+            WrapperSlot::Orphaned
+        ) {
+            return;
+        }
+        let server = item.get("server").and_then(Value::as_str).unwrap_or("");
+        let tool = item.get("tool").and_then(Value::as_str).unwrap_or("");
+        let arguments = item.get("arguments").cloned().unwrap_or(Value::Null);
+        let error = item.get("error").filter(|v| !v.is_null());
+        let result = item.get("result");
+        // Result/error evidence convicts regardless of status: a tool-reported
+        // error under a `completed` status is still a failure. Shared with the
+        // live stream parser so the two surfaces agree on what counts as
+        // failure, not just on output extraction.
+        let evidence_failed = super::parser::mcp_result_indicates_error(result, error);
+        // Same explicit matrix as `command_execution_is_error`, minus exit
+        // codes (MCP has none) — an unreadable or future status must warn and
+        // stay unknown, never silently read as success. `McpToolCallStatus`
+        // serializes camelCase ("inProgress"), unlike the shell statuses.
+        let is_error = match item.get("status") {
+            None | Some(Value::Null) => {
+                self.warn(line_number, "McpToolCall item missing status");
+                if evidence_failed { Some(true) } else { None }
+            }
+            Some(Value::String(s)) => match s.as_str() {
+                "completed" => Some(evidence_failed),
+                "failed" => Some(true),
+                "inProgress" => {
+                    self.warn(
+                        line_number,
+                        "McpToolCall item_completed with inProgress status",
+                    );
+                    Some(true)
+                }
+                other => {
+                    self.warn(
+                        line_number,
+                        format!("McpToolCall has unrecognized status {other:?}"),
+                    );
+                    if evidence_failed { Some(true) } else { None }
+                }
+            },
+            Some(other) => {
+                self.warn(
+                    line_number,
+                    format!("McpToolCall status is not a string: {other}"),
+                );
+                if evidence_failed { Some(true) } else { None }
+            }
+        };
+        // The live parser's extractor, shared so the two paths cannot drift:
+        // non-text results get its placeholder, empty/null results fall to the
+        // error field — a transcript must not show an MCP image result as
+        // nothing on reopen while the live view showed a placeholder.
+        let output = super::parser::extract_mcp_output(result, error);
+        let facet = crate::facets::classify_mcp_tool_facet(server, tool, &arguments);
+        let row_id = self.item_row_id(line_number, item, "mcp");
+        let Some(builder) = self.current_agent.as_mut() else {
+            return;
+        };
+        builder.items.push(TurnItem::Tool {
+            tool_use_id: row_id,
+            kind: ToolKind::Mcp,
+            facet,
+            name: format!("{server}.{tool}"),
+            input: arguments,
+            output: Some(output),
+            is_error,
+            started_at: timestamp.unwrap_or(builder.last_seen_at),
+            completed_at: timestamp,
+        });
     }
 
     fn handle_response_item(
@@ -1350,6 +1787,15 @@ impl CodexReconstruction {
                     self.warn(line_number, "function_call_output missing call_id");
                     return;
                 };
+                // The wrapper's output record closes its attachment interval
+                // (fact: a tool's items land strictly before it).
+                if self
+                    .open_wrapper
+                    .as_ref()
+                    .is_some_and(|w| w.call_id == call_id)
+                {
+                    self.open_wrapper = None;
+                }
                 let output = decode_function_call_output(p.get("output"));
                 let completed_at = timestamp;
                 let Some(builder) = self.current_agent.as_mut() else {
@@ -1431,6 +1877,7 @@ impl CodexReconstruction {
             _ => crate::facets::ToolFacet::Other,
         };
         let started_at = timestamp.unwrap_or_else(Utc::now);
+        let single_command = raw_name == "exec" && decode_single_exec_wrapper(input).is_some();
         let Some(builder) = self.current_agent.as_mut() else {
             return;
         };
@@ -1445,6 +1892,19 @@ impl CodexReconstruction {
             started_at,
             completed_at: None,
         });
+        // Paginated files interleave the wrapper's tool items between this
+        // record and its output record; open the attachment interval. Legacy
+        // files never emit those items, so the state is inert there — but it is
+        // only *read* under the paginated gate, keeping the modes structurally
+        // separate.
+        if raw_name == "exec" && self.history_mode.reads_item_completed() {
+            self.open_wrapper = Some(OpenWrapper {
+                call_id: call_id.to_owned(),
+                row_index: builder.items.len() - 1,
+                single_command,
+                command_slot_taken: false,
+            });
+        }
     }
 
     fn handle_patch_apply_end(
@@ -1496,6 +1956,12 @@ impl CodexReconstruction {
     }
 
     fn close_current_agent(&mut self, status: TurnStatus) {
+        // A wrapper interval cannot outlive its turn: without this, a truncated
+        // file (wrapper output never written) followed by a stray item after
+        // `task_complete` would claim the stale slot and then vanish at the
+        // no-builder check — a silent drop. The `task_started` clear restates
+        // the same invariant from the other side.
+        self.open_wrapper = None;
         let Some(builder) = self.current_agent.take() else {
             return;
         };
@@ -1545,34 +2011,73 @@ impl CodexReconstruction {
     }
 }
 
-/// Decode a Codex `mcp_tool_call_end.result`. Variants:
-/// - `{"Ok": {"content": [{"type":"text","text":"..."}], "isError": false}}`
+/// Structured output of a `CommandExecution` item: `aggregated_output`, else
+/// non-empty stdout/stderr joined. Callers decide whether an empty result is
+/// written (success: yes — blank beats wrapper boilerplate) or left for the
+/// wrapper output to fill (failure: the wrapper often holds the only
+/// diagnostic).
+fn command_execution_output(item: &Value) -> String {
+    if let Some(aggregated) = item
+        .get("aggregated_output")
+        .and_then(Value::as_str)
+        .filter(|t| !t.is_empty())
+    {
+        return aggregated.to_owned();
+    }
+    ["stdout", "stderr"]
+        .iter()
+        .filter_map(|field| item.get(*field).and_then(Value::as_str))
+        .filter(|t| !t.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Shell facet for a `CommandExecution` item. The `command` array is the real
+/// argv (`["/bin/zsh", "-lc", "<cmd>"]` in every capture); unwrap the standard
+/// shell wrapper for display, else join the argv. `cwd` is a `file://` URI.
+fn command_execution_item_facet(item: &Value) -> crate::facets::ToolFacet {
+    let Some(argv) = item.get("command").and_then(Value::as_array) else {
+        return crate::facets::ToolFacet::Other;
+    };
+    let parts: Vec<&str> = argv.iter().filter_map(Value::as_str).collect();
+    if parts.len() != argv.len() || parts.is_empty() {
+        return crate::facets::ToolFacet::Other;
+    }
+    let command = if parts.len() == 3 && (parts[1] == "-lc" || parts[1] == "-c") {
+        parts[2].to_owned()
+    } else {
+        parts.join(" ")
+    };
+    let cwd = item
+        .get("cwd")
+        .and_then(Value::as_str)
+        .map(|uri| uri.strip_prefix("file://").unwrap_or(uri).to_owned());
+    crate::facets::ToolFacet::Shell { command, cwd }
+}
+
+/// Decode a **legacy** `mcp_tool_call_end.result` envelope:
+/// - `{"Ok": {"content": [...], "isError": false}}`
 /// - `{"Err": "error message"}`
 ///
-/// Returns `(output_string, is_error)`.
+/// Returns `(output_string, is_error)`. The `Ok` payload routes through the
+/// live parser's [`super::parser::extract_mcp_output`] — the same function the
+/// paginated `McpToolCall` path calls directly — so all three surfaces (live
+/// stream, legacy disk, paginated disk) decode content identically.
+///
+/// **Deliberate legacy behavior change (parity fix):** a legacy `Ok` payload
+/// whose content is all-non-text or empty previously hydrated as `""`; it now
+/// yields the live path's `[non-text tool result omitted]` placeholder. Live
+/// streams never carried the legacy envelope, so legacy threads had the exact
+/// live/disk divergence this fixes — the unchanged legacy fixtures are not
+/// evidence of a frozen legacy path here, they just carry no non-text MCP
+/// content.
 fn decode_mcp_result(result: Option<&Value>) -> (String, bool) {
-    let Some(result) = result else {
+    let Some(result) = result.filter(|v| !v.is_null()) else {
         return (String::new(), false);
     };
     if let Some(ok) = result.get("Ok") {
         let is_error = ok.get("isError").and_then(Value::as_bool).unwrap_or(false);
-        let content = ok.get("content").and_then(Value::as_array);
-        let text = content
-            .map(|blocks| {
-                blocks
-                    .iter()
-                    .filter_map(|b| {
-                        if b.get("type").and_then(Value::as_str) == Some("text") {
-                            b.get("text").and_then(Value::as_str).map(str::to_owned)
-                        } else {
-                            None
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
-            .unwrap_or_default();
-        (text, is_error)
+        (super::parser::extract_mcp_output(Some(ok), None), is_error)
     } else if let Some(err) = result.get("Err") {
         let msg = err.as_str().unwrap_or("").to_owned();
         (msg, true)
@@ -4037,5 +4542,790 @@ not valid json
                 "a present non-string history_mode must warn, got none for {mode}"
             );
         }
+    }
+
+    // --- Paginated tool items (M3: wrapper-children attachment) ---
+
+    fn tool_rows(turns: &[Turn]) -> Vec<ToolSnapshot> {
+        let Some(Turn::Agent { items, .. }) =
+            turns.iter().find(|t| matches!(t, Turn::Agent { .. }))
+        else {
+            panic!("agent turn missing");
+        };
+        items
+            .iter()
+            .filter_map(|item| match item {
+                TurnItem::Tool {
+                    tool_use_id,
+                    name,
+                    input,
+                    facet,
+                    output,
+                    is_error,
+                    ..
+                } => Some(ToolSnapshot {
+                    tool_use_id: tool_use_id.clone(),
+                    name: name.clone(),
+                    input: input.clone(),
+                    facet: facet.clone(),
+                    output: output.clone(),
+                    is_error: *is_error,
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn paginated_single_command_wrapper_is_one_row_with_structured_exit() {
+        let content =
+            std::fs::read_to_string(fixture_path("paginated-single-command.session.jsonl"))
+                .unwrap();
+        let result = parse_codex_transcript_content(&content, Uuid::now_v7());
+
+        let rows = tool_rows(&result.turns);
+        // The duplicate-row regression: the CommandExecution item must enrich
+        // the wrapper in place, not add a second row for the same command.
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let row = &rows[0];
+        assert_eq!(row.name, "exec");
+        assert!(matches!(
+            &row.facet,
+            crate::facets::ToolFacet::Shell { command, .. } if command == "echo hi"
+        ));
+        assert_eq!(row.is_error, Some(false));
+        assert!(row.output.as_deref().is_some_and(|o| o.contains("hi")));
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    }
+
+    #[test]
+    fn paginated_exit_code_outranks_wrapper_output_sniffing() {
+        // A command can fail while its wrapper script completes (the script
+        // printed the output and moved on) — the wrapper output then reads
+        // "Script completed" and the legacy string-sniff would call it a
+        // success. The structured exit_code is authoritative.
+        let content = jsonl_lines(&[
+            serde_json::json!({"type":"session_meta","payload":{"cli_version":"0.149.0","history_mode":"paginated"}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"t-1"}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"custom_tool_call","id":"ctc_1","status":"completed","call_id":"call_1","name":"exec","input":"const r = await tools.exec_command({\"cmd\":\"false\"});\ntext(r.output);\n"}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"item_completed","item":{
+                "type":"CommandExecution","id":"exec-x","command":["/bin/zsh","-lc","false"],
+                "status":"failed","stdout":"","stderr":"","aggregated_output":"","exit_code":1}}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"custom_tool_call_output","id":"ctco_1","call_id":"call_1","output":[{"type":"input_text","text":"Script completed\nWall time 0.0 seconds\nOutput:\n"}]}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"t-1"}}),
+        ]);
+        let result = parse_codex_transcript_content(&content, Uuid::now_v7());
+
+        let rows = tool_rows(&result.turns);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].is_error,
+            Some(true),
+            "exit_code 1 must survive a 'Script completed' wrapper output"
+        );
+    }
+
+    #[test]
+    fn paginated_batched_wrapper_gets_a_row_per_operation() {
+        let content =
+            std::fs::read_to_string(fixture_path("paginated-batched-wrapper.session.jsonl"))
+                .unwrap();
+        let result = parse_codex_transcript_content(&content, Uuid::now_v7());
+
+        let rows = tool_rows(&result.turns);
+        // Wrapper (container) + edit child + shell child.
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        assert_eq!(rows[0].name, "exec");
+        let edit = rows
+            .iter()
+            .find(|r| r.name == "apply_patch")
+            .expect("edit row");
+        let crate::facets::ToolFacet::Edit { files } = &edit.facet else {
+            panic!("edit child must carry a content-bearing Edit facet");
+        };
+        assert_eq!(files[0].edits[0].old, "foo");
+        assert_eq!(files[0].edits[0].new, "bar");
+        assert_eq!(edit.is_error, Some(false));
+        let shell = rows
+            .iter()
+            .find(|r| r.name == "exec_command")
+            .expect("shell row");
+        assert!(matches!(
+            &shell.facet,
+            crate::facets::ToolFacet::Shell { command, .. } if command == "ls"
+        ));
+        assert_eq!(shell.is_error, Some(false));
+        assert_eq!(shell.output.as_deref(), Some("alpha.txt\n"));
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    }
+
+    #[test]
+    fn paginated_mixed_batch_keeps_wrapper_failure_evidence_alongside_child() {
+        let content =
+            std::fs::read_to_string(fixture_path("paginated-mixed-batch.session.jsonl")).unwrap();
+        let result = parse_codex_transcript_content(&content, Uuid::now_v7());
+
+        let rows = tool_rows(&result.turns);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        // The successful operation is its own row...
+        let shell = rows
+            .iter()
+            .find(|r| r.name == "exec_command")
+            .expect("shell child");
+        assert_eq!(shell.is_error, Some(false));
+        // ...and the wrapper retains the uncaught failure's diagnostic, which
+        // exists nowhere else (the failed patch emitted no item).
+        let wrapper = rows.iter().find(|r| r.name == "exec").expect("wrapper row");
+        assert_eq!(wrapper.is_error, Some(true));
+        assert!(
+            wrapper
+                .output
+                .as_deref()
+                .is_some_and(|o| o.contains("apply_patch verification failed")),
+            "wrapper output is the only failure evidence: {:?}",
+            wrapper.output
+        );
+    }
+
+    #[test]
+    fn paginated_failed_wrapper_with_no_items_hydrates_unchanged() {
+        let content =
+            std::fs::read_to_string(fixture_path("paginated-failed-tool.session.jsonl")).unwrap();
+        let result = parse_codex_transcript_content(&content, Uuid::now_v7());
+
+        let rows = tool_rows(&result.turns);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].is_error, Some(true));
+        assert!(
+            rows[0]
+                .output
+                .as_deref()
+                .is_some_and(|o| o.contains("apply_patch verification failed"))
+        );
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    }
+
+    #[test]
+    fn paginated_mcp_children_carry_all_three_result_envelopes() {
+        let content = std::fs::read_to_string(fixture_path("paginated-mcp.session.jsonl")).unwrap();
+        let result = parse_codex_transcript_content(&content, Uuid::now_v7());
+
+        let rows = tool_rows(&result.turns);
+        // Wrapper + success + tool-reported error + transport failure.
+        assert_eq!(rows.len(), 4, "{rows:?}");
+
+        let ok = rows
+            .iter()
+            .find(|r| r.name == "probe_server.list_filters")
+            .expect("mcp success row");
+        assert_eq!(ok.is_error, Some(false));
+        assert!(
+            ok.output
+                .as_deref()
+                .is_some_and(|o| o.contains("All Notes"))
+        );
+
+        // Tool-reported error: status failed + result.isError, diagnostic in content.
+        let tool_err = rows
+            .iter()
+            .find(|r| r.name == "probe_server.get_item")
+            .expect("tool-error row");
+        assert_eq!(tool_err.is_error, Some(true));
+        assert!(
+            tool_err
+                .output
+                .as_deref()
+                .is_some_and(|o| o.contains("validation errors"))
+        );
+        // Transport failure: result null + top-level error — the diagnostic must
+        // not reopen blank.
+        let transport = rows
+            .iter()
+            .find(|r| r.name == "probe_server.search_items")
+            .expect("transport-failure row");
+        assert_eq!(transport.is_error, Some(true));
+        assert!(
+            transport
+                .output
+                .as_deref()
+                .is_some_and(|o| o.contains("transport error"))
+        );
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    }
+
+    #[test]
+    fn paginated_tool_item_outside_any_wrapper_warns_and_never_misattaches() {
+        // An item with no open wrapper interval must not be guessed onto some
+        // other row — a plausible-looking wrong attachment is strictly worse
+        // than a visibly missing one.
+        let content = jsonl_lines(&[
+            serde_json::json!({"type":"session_meta","payload":{"cli_version":"0.149.0","history_mode":"paginated"}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"t-1"}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"item_completed","item":{
+                "type":"CommandExecution","id":"exec-orphan","command":["/bin/zsh","-lc","ls"],
+                "status":"completed","aggregated_output":"x\n","exit_code":0}}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"t-1"}}),
+        ]);
+        let result = parse_codex_transcript_content(&content, Uuid::now_v7());
+
+        assert!(tool_rows(&result.turns).is_empty());
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.reason.contains("outside any exec wrapper")),
+            "{:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn paginated_malformed_tool_items_degrade_without_panicking_or_misreading() {
+        // Adversarial shapes: non-numeric exit_code must not read as success
+        // when status says failed; a FileChange without structured changes
+        // warns instead of fabricating an edit.
+        let content = jsonl_lines(&[
+            serde_json::json!({"type":"session_meta","payload":{"cli_version":"0.149.0","history_mode":"paginated"}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"t-1"}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"custom_tool_call","id":"ctc_1","status":"completed","call_id":"call_1","name":"exec","input":"dynamic script"}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"item_completed","item":{
+                "type":"CommandExecution","id":"exec-bad","command":["/bin/zsh","-lc","x"],
+                "status":"failed","exit_code":"not-a-number"}}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"item_completed","item":{
+                "type":"FileChange","id":"exec-noedit","status":"completed"}}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"custom_tool_call_output","id":"ctco_1","call_id":"call_1","output":[{"type":"input_text","text":"Script failed\n"}]}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"t-1"}}),
+        ]);
+        let result = parse_codex_transcript_content(&content, Uuid::now_v7());
+
+        let rows = tool_rows(&result.turns);
+        // Wrapper + the degraded shell child; the changeless FileChange warned.
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        let shell = rows
+            .iter()
+            .find(|r| r.name == "exec_command")
+            .expect("shell child");
+        assert_eq!(
+            shell.is_error,
+            Some(true),
+            "status: failed must carry when exit_code is unreadable"
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.reason.contains("exit_code is not numeric")),
+            "a present-but-unreadable exit_code is contract drift and must warn: {:?}",
+            result.warnings
+        );
+        assert!(
+            result.warnings.iter().any(|w| w
+                .reason
+                .contains("FileChange item missing structured changes")),
+            "{:?}",
+            result.warnings
+        );
+    }
+
+    fn paginated_shell_lines(item: &serde_json::Value) -> String {
+        jsonl_lines(&[
+            serde_json::json!({"type":"session_meta","payload":{"cli_version":"0.149.0","history_mode":"paginated"}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"t-1"}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"custom_tool_call","id":"ctc_1","status":"completed","call_id":"call_1","name":"exec","input":"const r = await tools.exec_command({\"cmd\":\"x\"});\ntext(r.output);\n"}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"item_completed","item":item.clone()}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"custom_tool_call_output","id":"ctco_1","call_id":"call_1","output":[{"type":"input_text","text":"Script completed\nWall time 0.0 seconds\nOutput:\nwrapper-printed-text"}]}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"t-1"}}),
+        ])
+    }
+
+    #[test]
+    fn declined_command_and_edit_read_as_unsuccessful() {
+        // The user refused the tool. Upstream statuses include "declined" for
+        // both commands and patches; a declined record typically has no exit
+        // code, so recognizing only "failed" reported it as a success.
+        let content = paginated_shell_lines(&serde_json::json!({
+            "type":"CommandExecution","id":"exec-declined",
+            "command":["/bin/zsh","-lc","x"],"status":"declined"}));
+        let result = parse_codex_transcript_content(&content, Uuid::now_v7());
+        assert_eq!(tool_rows(&result.turns)[0].is_error, Some(true));
+
+        let content = jsonl_lines(&[
+            serde_json::json!({"type":"session_meta","payload":{"cli_version":"0.149.0","history_mode":"paginated"}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"t-1"}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"custom_tool_call","id":"ctc_1","status":"completed","call_id":"call_1","name":"exec","input":"dynamic"}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"item_completed","item":{
+                "type":"FileChange","id":"exec-fc-declined","status":"declined",
+                "changes":{"/tmp/a.txt":{"type":"update","unified_diff":"@@ -1 +1 @@\n-a\n+b\n","move_path":null}}}}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"custom_tool_call_output","id":"ctco_1","call_id":"call_1","output":[{"type":"input_text","text":"Script failed\n"}]}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"t-1"}}),
+        ]);
+        let result = parse_codex_transcript_content(&content, Uuid::now_v7());
+        let edit = tool_rows(&result.turns)
+            .into_iter()
+            .find(|r| r.name == "apply_patch")
+            .expect("edit row");
+        assert_eq!(edit.is_error, Some(true));
+    }
+
+    #[test]
+    fn status_and_exit_code_combine_rather_than_override() {
+        // failed status + exit 0: the status is not erased by the exit code.
+        let content = paginated_shell_lines(&serde_json::json!({
+            "type":"CommandExecution","id":"exec-a",
+            "command":["/bin/zsh","-lc","x"],"status":"failed","exit_code":0}));
+        let result = parse_codex_transcript_content(&content, Uuid::now_v7());
+        assert_eq!(tool_rows(&result.turns)[0].is_error, Some(true));
+
+        // completed status + nonzero exit: the exit code is not erased either.
+        let content = paginated_shell_lines(&serde_json::json!({
+            "type":"CommandExecution","id":"exec-b",
+            "command":["/bin/zsh","-lc","x"],"status":"completed","exit_code":3}));
+        let result = parse_codex_transcript_content(&content, Uuid::now_v7());
+        assert_eq!(tool_rows(&result.turns)[0].is_error, Some(true));
+    }
+
+    #[test]
+    fn unrecognized_command_status_warns_and_defers_to_wrapper_sniff() {
+        // Never fabricate a reading of an unknown contract: is_error stays
+        // None, so the wrapper output's string sniff (which only fills None)
+        // decides — the legacy heuristic plus a warning.
+        let content = paginated_shell_lines(&serde_json::json!({
+            "type":"CommandExecution","id":"exec-c",
+            "command":["/bin/zsh","-lc","x"],"status":"timed_out"}));
+        let result = parse_codex_transcript_content(&content, Uuid::now_v7());
+        let row = &tool_rows(&result.turns)[0];
+        assert_eq!(
+            row.is_error,
+            Some(false),
+            "wrapper said 'Script completed' and the status was unreadable"
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.reason.contains("unrecognized status")),
+            "{:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn missing_command_status_warns_but_missing_file_change_status_does_not() {
+        // CommandExecution.status is required upstream — absence is drift.
+        let content = paginated_shell_lines(&serde_json::json!({
+            "type":"CommandExecution","id":"exec-d",
+            "command":["/bin/zsh","-lc","x"],"exit_code":0}));
+        let result = parse_codex_transcript_content(&content, Uuid::now_v7());
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.reason.contains("missing status")),
+            "{:?}",
+            result.warnings
+        );
+
+        // FileChange.status is Option upstream — absence is normal.
+        let content = jsonl_lines(&[
+            serde_json::json!({"type":"session_meta","payload":{"cli_version":"0.149.0","history_mode":"paginated"}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"t-1"}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"custom_tool_call","id":"ctc_1","status":"completed","call_id":"call_1","name":"exec","input":"dynamic"}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"item_completed","item":{
+                "type":"FileChange","id":"exec-fc-nostatus",
+                "changes":{"/tmp/a.txt":{"type":"update","unified_diff":"@@ -1 +1 @@\n-a\n+b\n","move_path":null}}}}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"custom_tool_call_output","id":"ctco_1","call_id":"call_1","output":[{"type":"input_text","text":"ok"}]}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"t-1"}}),
+        ]);
+        let result = parse_codex_transcript_content(&content, Uuid::now_v7());
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    }
+
+    #[test]
+    fn structured_output_beats_wrapper_boilerplate_on_success() {
+        // The structured record's output differs from what the wrapper script
+        // printed — the row must show the command's real output.
+        let content = paginated_shell_lines(&serde_json::json!({
+            "type":"CommandExecution","id":"exec-e","command":["/bin/zsh","-lc","x"],
+            "status":"completed","exit_code":0,"aggregated_output":"real-command-output"}));
+        let result = parse_codex_transcript_content(&content, Uuid::now_v7());
+        assert_eq!(
+            tool_rows(&result.turns)[0].output.as_deref(),
+            Some("real-command-output")
+        );
+
+        // Success with genuinely empty output: blank is the true output; the
+        // wrapper's "Script completed / Wall time…" noise must not replace it.
+        let content = paginated_shell_lines(&serde_json::json!({
+            "type":"CommandExecution","id":"exec-f","command":["/bin/zsh","-lc","true"],
+            "status":"completed","exit_code":0,"aggregated_output":""}));
+        let result = parse_codex_transcript_content(&content, Uuid::now_v7());
+        assert_eq!(tool_rows(&result.turns)[0].output.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn failed_command_with_empty_output_keeps_wrapper_diagnostic() {
+        // On failure the wrapper output often holds the only diagnostic; an
+        // empty structured output must leave the slot open for it.
+        let content = jsonl_lines(&[
+            serde_json::json!({"type":"session_meta","payload":{"cli_version":"0.149.0","history_mode":"paginated"}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"t-1"}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"custom_tool_call","id":"ctc_1","status":"completed","call_id":"call_1","name":"exec","input":"const r = await tools.exec_command({\"cmd\":\"x\"});\ntext(r.output);\n"}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"item_completed","item":{
+                "type":"CommandExecution","id":"exec-g","command":["/bin/zsh","-lc","x"],
+                "status":"failed","exit_code":1,"aggregated_output":""}}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"custom_tool_call_output","id":"ctco_1","call_id":"call_1","output":[{"type":"input_text","text":"Script failed\nScript error:\nthe-only-diagnostic"}]}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"t-1"}}),
+        ]);
+        let result = parse_codex_transcript_content(&content, Uuid::now_v7());
+        let row = &tool_rows(&result.turns)[0];
+        assert_eq!(row.is_error, Some(true));
+        assert!(
+            row.output
+                .as_deref()
+                .is_some_and(|o| o.contains("the-only-diagnostic")),
+            "{:?}",
+            row.output
+        );
+    }
+
+    #[test]
+    fn file_change_first_does_not_consume_the_command_in_place_slot() {
+        // Kind-gated slot: a single-command wrapper whose first item is a
+        // FileChange (e.g. apply_patch run *through* exec_command) must still
+        // enrich the wrapper with the command item — otherwise the command
+        // falls to a child row and duplicates the wrapper.
+        let content = jsonl_lines(&[
+            serde_json::json!({"type":"session_meta","payload":{"cli_version":"0.149.0","history_mode":"paginated"}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"t-1"}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"custom_tool_call","id":"ctc_1","status":"completed","call_id":"call_1","name":"exec","input":"const r = await tools.exec_command({\"cmd\":\"apply_patch <<EOF\"});\ntext(r.output);\n"}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"item_completed","item":{
+                "type":"FileChange","id":"exec-fc-first","status":"completed",
+                "changes":{"/tmp/a.txt":{"type":"update","unified_diff":"@@ -1 +1 @@\n-a\n+b\n","move_path":null}}}}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"item_completed","item":{
+                "type":"CommandExecution","id":"exec-cmd-second","command":["/bin/zsh","-lc","apply_patch <<EOF"],
+                "status":"completed","exit_code":0,"aggregated_output":"Done!"}}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"custom_tool_call_output","id":"ctco_1","call_id":"call_1","output":[{"type":"input_text","text":"Script completed\n"}]}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"t-1"}}),
+        ]);
+        let result = parse_codex_transcript_content(&content, Uuid::now_v7());
+        let rows = tool_rows(&result.turns);
+        // Wrapper (enriched in place by the command) + edit child. NOT three.
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        let wrapper = rows.iter().find(|r| r.name == "exec").expect("wrapper");
+        assert_eq!(wrapper.output.as_deref(), Some("Done!"));
+        assert!(rows.iter().any(|r| r.name == "apply_patch"));
+    }
+
+    #[test]
+    fn stray_item_after_task_complete_warns_instead_of_vanishing() {
+        // Truncated-file edge: the wrapper output never arrived, the turn
+        // closed, and a stray item follows. The interval must not survive the
+        // turn — the item warns as orphaned rather than silently claiming a
+        // stale slot and vanishing at the no-builder check.
+        let content = jsonl_lines(&[
+            serde_json::json!({"type":"session_meta","payload":{"cli_version":"0.149.0","history_mode":"paginated"}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"t-1"}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"custom_tool_call","id":"ctc_1","status":"completed","call_id":"call_1","name":"exec","input":"const r = await tools.exec_command({\"cmd\":\"x\"});\ntext(r.output);\n"}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"t-1"}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"item_completed","item":{
+                "type":"CommandExecution","id":"exec-late","command":["/bin/zsh","-lc","x"],
+                "status":"completed","exit_code":0}}}),
+        ]);
+        let result = parse_codex_transcript_content(&content, Uuid::now_v7());
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.reason.contains("outside any exec wrapper")),
+            "{:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn missing_item_id_warns_and_stays_deterministic_across_parses() {
+        // A fresh UUID here would make two parses of the same file produce
+        // different transcripts — hiding upstream drift (`id` is required)
+        // and breaking parse determinism. Compare the affected row's id only:
+        // turn ids are legitimately minted per parse.
+        let content = jsonl_lines(&[
+            serde_json::json!({"type":"session_meta","payload":{"cli_version":"0.149.0","history_mode":"paginated"}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"t-1"}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"custom_tool_call","id":"ctc_1","status":"completed","call_id":"call_1","name":"exec","input":"dynamic"}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"item_completed","item":{
+                "type":"CommandExecution","command":["/bin/zsh","-lc","x"],
+                "status":"completed","exit_code":0}}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"custom_tool_call_output","id":"ctco_1","call_id":"call_1","output":[{"type":"input_text","text":"ok"}]}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"t-1"}}),
+        ]);
+        let first = parse_codex_transcript_content(&content, Uuid::now_v7());
+        let second = parse_codex_transcript_content(&content, Uuid::now_v7());
+
+        let id_of = |result: &LoadedTranscript| {
+            tool_rows(&result.turns)
+                .into_iter()
+                .find(|r| r.name == "exec_command")
+                .expect("child row")
+                .tool_use_id
+        };
+        assert_eq!(id_of(&first), id_of(&second));
+        assert!(id_of(&first).starts_with("item-missing-id-command-line-"));
+        assert!(
+            first
+                .warnings
+                .iter()
+                .any(|w| w.reason.contains("missing id")),
+            "{:?}",
+            first.warnings
+        );
+    }
+
+    #[test]
+    fn mcp_item_decoding_matches_live_extractor_on_edge_envelopes() {
+        // Parity with the live parser: all-non-text content yields its
+        // placeholder (not ""), and a null result with a structured error
+        // yields the stringified error.
+        let content = jsonl_lines(&[
+            serde_json::json!({"type":"session_meta","payload":{"cli_version":"0.149.0","history_mode":"paginated"}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"t-1"}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"custom_tool_call","id":"ctc_1","status":"completed","call_id":"call_1","name":"exec","input":"dynamic"}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"item_completed","item":{
+                "type":"McpToolCall","id":"exec-img","server":"srv","tool":"render","arguments":{},
+                "status":"completed","result":{"content":[{"type":"image","data":"AAAA"}],"isError":false}}}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"item_completed","item":{
+                "type":"McpToolCall","id":"exec-objerr","server":"srv","tool":"boom","arguments":{},
+                "status":"failed","result":null,"error":{"code":42,"reason":"nope"}}}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"custom_tool_call_output","id":"ctco_1","call_id":"call_1","output":[{"type":"input_text","text":"done"}]}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"t-1"}}),
+        ]);
+        let result = parse_codex_transcript_content(&content, Uuid::now_v7());
+        let rows = tool_rows(&result.turns);
+
+        let image = rows
+            .iter()
+            .find(|r| r.name == "srv.render")
+            .expect("image row");
+        assert_eq!(
+            image.output.as_deref(),
+            Some("[non-text tool result omitted]")
+        );
+        assert_eq!(image.is_error, Some(false));
+
+        let objerr = rows
+            .iter()
+            .find(|r| r.name == "srv.boom")
+            .expect("error row");
+        assert_eq!(objerr.is_error, Some(true));
+        assert!(
+            objerr.output.as_deref().is_some_and(|o| o.contains("nope")),
+            "a structured error must not reopen blank: {:?}",
+            objerr.output
+        );
+    }
+
+    #[test]
+    fn unknown_status_with_empty_output_keeps_wrapper_diagnostic() {
+        // The cell the status matrix and output rule disagreed on: an unknown
+        // status with empty structured output must NOT write Some("") — that
+        // would block the wrapper's `Script error:` fill, blanking the only
+        // diagnostic in exactly the scenario "honest unknown" was built for.
+        let content = jsonl_lines(&[
+            serde_json::json!({"type":"session_meta","payload":{"cli_version":"0.149.0","history_mode":"paginated"}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"t-1"}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"custom_tool_call","id":"ctc_1","status":"completed","call_id":"call_1","name":"exec","input":"const r = await tools.exec_command({\"cmd\":\"x\"});\ntext(r.output);\n"}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"item_completed","item":{
+                "type":"CommandExecution","id":"exec-h","command":["/bin/zsh","-lc","x"],
+                "status":"timed_out","aggregated_output":""}}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"custom_tool_call_output","id":"ctco_1","call_id":"call_1","output":[{"type":"input_text","text":"Script failed\nScript error:\ntimeout-diagnostic"}]}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"t-1"}}),
+        ]);
+        let result = parse_codex_transcript_content(&content, Uuid::now_v7());
+        let row = &tool_rows(&result.turns)[0];
+        assert_eq!(row.is_error, Some(true), "the wrapper sniff decides");
+        assert!(
+            row.output
+                .as_deref()
+                .is_some_and(|o| o.contains("timeout-diagnostic")),
+            "unknown outcome must not suppress the diagnostic: {:?}",
+            row.output
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.reason.contains("unrecognized status")),
+            "{:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn non_string_command_status_warns_and_defers_to_wrapper_sniff() {
+        // Present-but-wrong-type is the same schema drift as an unrecognized
+        // string; folding it into "missing" asserted success at exit 0.
+        let content = paginated_shell_lines(&serde_json::json!({
+            "type":"CommandExecution","id":"exec-i",
+            "command":["/bin/zsh","-lc","x"],"status":42,"exit_code":0}));
+        let result = parse_codex_transcript_content(&content, Uuid::now_v7());
+        let row = &tool_rows(&result.turns)[0];
+        assert_eq!(
+            row.is_error,
+            Some(false),
+            "wrapper said 'Script completed'; the sniff fills the unknown"
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.reason.contains("status is not a string")),
+            "{:?}",
+            result.warnings
+        );
+
+        // With positive failure evidence the conviction survives the bad type.
+        let content = paginated_shell_lines(&serde_json::json!({
+            "type":"CommandExecution","id":"exec-j",
+            "command":["/bin/zsh","-lc","x"],"status":42,"exit_code":3}));
+        let result = parse_codex_transcript_content(&content, Uuid::now_v7());
+        assert_eq!(tool_rows(&result.turns)[0].is_error, Some(true));
+    }
+
+    #[test]
+    fn mcp_unknown_or_incomplete_status_warns_instead_of_reading_as_success() {
+        let content = jsonl_lines(&[
+            serde_json::json!({"type":"session_meta","payload":{"cli_version":"0.149.0","history_mode":"paginated"}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"t-1"}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"custom_tool_call","id":"ctc_1","status":"completed","call_id":"call_1","name":"exec","input":"dynamic"}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"item_completed","item":{
+                "type":"McpToolCall","id":"exec-m1","server":"srv","tool":"a","arguments":{},
+                "status":"inProgress","result":null}}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"item_completed","item":{
+                "type":"McpToolCall","id":"exec-m2","server":"srv","tool":"b","arguments":{},
+                "status":"cancelled","result":{"content":[{"type":"text","text":"partial"}],"isError":false}}}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"custom_tool_call_output","id":"ctco_1","call_id":"call_1","output":[{"type":"input_text","text":"done"}]}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"t-1"}}),
+        ]);
+        let result = parse_codex_transcript_content(&content, Uuid::now_v7());
+        let rows = tool_rows(&result.turns);
+
+        // Truncated mid-call: incomplete, not successful.
+        let incomplete = rows.iter().find(|r| r.name == "srv.a").expect("row");
+        assert_eq!(incomplete.is_error, Some(true));
+        // Unknown status with a clean result: honest unknown, warned — a child
+        // row keeps None (no pairing reaches it; renders as "done" today).
+        let unknown = rows.iter().find(|r| r.name == "srv.b").expect("row");
+        assert_eq!(unknown.is_error, None);
+        assert_eq!(
+            result
+                .warnings
+                .iter()
+                .filter(|w| w.reason.contains("McpToolCall"))
+                .count(),
+            2,
+            "{:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn command_output_falls_back_to_stdout_stderr_when_aggregated_absent() {
+        let content = paginated_shell_lines(&serde_json::json!({
+            "type":"CommandExecution","id":"exec-k","command":["/bin/zsh","-lc","x"],
+            "status":"completed","exit_code":0,"stdout":"out-line","stderr":"err-line"}));
+        let result = parse_codex_transcript_content(&content, Uuid::now_v7());
+        assert_eq!(
+            tool_rows(&result.turns)[0].output.as_deref(),
+            Some("out-line\nerr-line")
+        );
+    }
+
+    #[test]
+    fn legacy_ok_envelope_with_non_text_content_gets_live_placeholder() {
+        // The disclosed legacy behavior change: a legacy `Ok` payload whose
+        // content is all-non-text now yields the live parser's placeholder
+        // instead of hydrating as "" — the same extractor serves all surfaces.
+        let (output, is_error) = decode_mcp_result(Some(&serde_json::json!({
+            "Ok": {"content": [{"type":"image","data":"AAAA"}], "isError": false}
+        })));
+        assert_eq!(output, "[non-text tool result omitted]");
+        assert!(!is_error);
+    }
+
+    #[test]
+    fn batched_unknown_status_child_keeps_output_and_error_none() {
+        // Pins the child-row Option pass-through: an own-row command child with
+        // unknown status and empty structured output must carry output: None
+        // ("no output recorded" — no pairing ever reaches a child) and
+        // is_error: None. Reintroducing `unwrap_or_default()` on the child
+        // path would flatten output to Some("") and pass every other test.
+        let content = jsonl_lines(&[
+            serde_json::json!({"type":"session_meta","payload":{"cli_version":"0.149.0","history_mode":"paginated"}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"t-1"}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"custom_tool_call","id":"ctc_1","status":"completed","call_id":"call_1","name":"exec","input":"dynamic batched script"}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"item_completed","item":{
+                "type":"CommandExecution","id":"exec-child-unknown","command":["/bin/zsh","-lc","x"],
+                "status":"timed_out","aggregated_output":""}}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"custom_tool_call_output","id":"ctco_1","call_id":"call_1","output":[{"type":"input_text","text":"Script failed\n"}]}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"t-1"}}),
+        ]);
+        let result = parse_codex_transcript_content(&content, Uuid::now_v7());
+        let child = tool_rows(&result.turns)
+            .into_iter()
+            .find(|r| r.name == "exec_command")
+            .expect("child row");
+        assert_eq!(child.output, None);
+        assert_eq!(child.is_error, None);
+    }
+
+    #[test]
+    fn mcp_result_evidence_convicts_under_unknown_status() {
+        // An unreadable status does not launder a tool-reported error into
+        // "unknown": result.isError convicts regardless.
+        let content = jsonl_lines(&[
+            serde_json::json!({"type":"session_meta","payload":{"cli_version":"0.149.0","history_mode":"paginated"}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"t-1"}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"custom_tool_call","id":"ctc_1","status":"completed","call_id":"call_1","name":"exec","input":"dynamic"}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"item_completed","item":{
+                "type":"McpToolCall","id":"exec-me","server":"srv","tool":"c","arguments":{},
+                "status":"cancelled","result":{"content":[{"type":"text","text":"boom"}],"isError":true}}}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"custom_tool_call_output","id":"ctco_1","call_id":"call_1","output":[{"type":"input_text","text":"done"}]}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"t-1"}}),
+        ]);
+        let result = parse_codex_transcript_content(&content, Uuid::now_v7());
+        let row = tool_rows(&result.turns)
+            .into_iter()
+            .find(|r| r.name == "srv.c")
+            .expect("row");
+        assert_eq!(row.is_error, Some(true));
+    }
+
+    #[test]
+    fn non_string_file_change_status_warns_and_stays_unknown() {
+        // The same raw-value rule as commands and MCP: a numeric status is
+        // schema drift, not an absent optional field asserting success.
+        let content = jsonl_lines(&[
+            serde_json::json!({"type":"session_meta","payload":{"cli_version":"0.149.0","history_mode":"paginated"}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"t-1"}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"custom_tool_call","id":"ctc_1","status":"completed","call_id":"call_1","name":"exec","input":"dynamic"}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"item_completed","item":{
+                "type":"FileChange","id":"exec-fc-42","status":42,
+                "changes":{"/tmp/a.txt":{"type":"update","unified_diff":"@@ -1 +1 @@\n-a\n+b\n","move_path":null}}}}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"custom_tool_call_output","id":"ctco_1","call_id":"call_1","output":[{"type":"input_text","text":"ok"}]}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"t-1"}}),
+        ]);
+        let result = parse_codex_transcript_content(&content, Uuid::now_v7());
+        let edit = tool_rows(&result.turns)
+            .into_iter()
+            .find(|r| r.name == "apply_patch")
+            .expect("edit row");
+        assert_eq!(edit.is_error, None);
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.reason.contains("FileChange status is not a string")),
+            "{:?}",
+            result.warnings
+        );
     }
 }

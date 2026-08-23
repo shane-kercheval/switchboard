@@ -137,8 +137,10 @@ pub struct Enrichment {
     /// `context_window` is left `None` here; the adapter overlays it
     /// separately from the `task_started`-derived [`Self::context_window`].
     pub per_turn_usage: Option<TurnUsage>,
-    /// The **current turn's** content-bearing `Edit` facets, one per
-    /// legacy `apply_patch` calls or `patch_apply_end` events, in record order.
+    /// The **current turn's** content-bearing `Edit` facets, in record order —
+    /// mode-selected single source: legacy `apply_patch` calls /
+    /// `patch_apply_end` events on legacy rollouts, `item_completed/FileChange`
+    /// items on paginated ones.
     /// Turn-scoped (reset at each `task_started`, like
     /// [`Self::per_turn_usage`]). The adapter zips these onto the turn's live
     /// `file_change` tool ids and emits `ToolFacetUpdated` — rollout records are
@@ -469,24 +471,26 @@ impl HistoryMode {
     }
 }
 
-/// Read the enrichment-relevant fields off a `session_meta` payload.
+/// Read the enrichment-relevant fields off a `session_meta` payload and return
+/// the file's [`HistoryMode`] — the patch-facet extraction below branches on it.
 ///
 /// This reader has no `ParseWarning` channel (it feeds live turn-end
 /// enrichment, not a `LoadedTranscript`), so an unrecognized `history_mode` is
 /// surfaced through tracing instead. Same rationale as the reconstruction path:
-/// an unknown persistence contract must never pass silently. The mode is read
-/// and dropped rather than carried — nothing on this path branches on it yet.
-fn absorb_session_meta(payload: &Value, enrichment: &mut Enrichment) {
+/// an unknown persistence contract must never pass silently.
+fn absorb_session_meta(payload: &Value, enrichment: &mut Enrichment) -> HistoryMode {
     if let Some(version) = payload.get("cli_version").and_then(Value::as_str) {
         enrichment.cli_version = Some(version.to_owned());
     }
-    if let HistoryMode::Unknown(value) = HistoryMode::from_session_meta(payload) {
+    let mode = HistoryMode::from_session_meta(payload);
+    if let HistoryMode::Unknown(value) = &mode {
         tracing::warn!(
             history_mode = %value,
             "Codex session-file: unrecognized history_mode; \
              reading as legacy — enrichment may be incomplete"
         );
     }
+    mode
 }
 
 #[must_use]
@@ -494,6 +498,10 @@ pub fn parse_session_content(content: &str) -> Enrichment {
     let mut enrichment = Enrichment::default();
     let mut model_set = false; // first-turn_context wins (set-once gate)
     let mut patch_call_ids: Vec<Option<String>> = Vec::new();
+    // Codex writes `session_meta` first, so the mode is known before any patch
+    // record arrives. Patch facets are single-sourced per mode, mirroring the
+    // reconstruction path's text gates.
+    let mut history_mode = HistoryMode::Missing;
     // Running shell cwd (turn_context precedes the turn's tool records) —
     // resolves relative apply_patch paths; observed paths are absolute.
     let mut current_cwd: Option<std::path::PathBuf> = None;
@@ -520,7 +528,7 @@ pub fn parse_session_content(content: &str) -> Enrichment {
         match record_type {
             "session_meta" => {
                 if let Some(p) = payload {
-                    absorb_session_meta(p, &mut enrichment);
+                    history_mode = absorb_session_meta(p, &mut enrichment);
                 }
                 enrichment.session_meta_raw = Some(strip_base_instructions(value));
             }
@@ -552,12 +560,19 @@ pub fn parse_session_content(content: &str) -> Enrichment {
                         .map(std::path::PathBuf::from);
                 }
             }
-            "response_item" => capture_legacy_patch_facet(
-                payload,
-                current_cwd.as_deref(),
-                &mut enrichment,
-                &mut patch_call_ids,
-            ),
+            // Gated like the reconstruction path's text arms: patch facets
+            // are single-sourced per mode. On a paginated file the
+            // `item_completed/FileChange` items below are canonical; letting a
+            // standalone legacy-shaped `apply_patch` call also contribute
+            // would double a patch into the ordinal facet list.
+            "response_item" if !history_mode.reads_item_completed() => {
+                capture_legacy_patch_facet(
+                    payload,
+                    current_cwd.as_deref(),
+                    &mut enrichment,
+                    &mut patch_call_ids,
+                );
+            }
             "event_msg" => {
                 let Some(p) = payload else { continue };
                 match p.get("type").and_then(Value::as_str).unwrap_or("") {
@@ -611,16 +626,11 @@ pub fn parse_session_content(content: &str) -> Enrichment {
                             enrichment.per_turn_usage = Some(usage);
                         }
                     }
-                    "patch_apply_end" => {
-                        let facet = super::facets::patch_apply_end_facet(p);
-                        if matches!(facet, crate::facets::ToolFacet::Edit { .. }) {
-                            upsert_patch_facet(
-                                &mut enrichment.patch_facets,
-                                &mut patch_call_ids,
-                                p.get("call_id").and_then(Value::as_str),
-                                facet,
-                            );
-                        }
+                    "patch_apply_end" if !history_mode.reads_item_completed() => {
+                        capture_patch_apply_end_facet(p, &mut enrichment, &mut patch_call_ids);
+                    }
+                    "item_completed" if history_mode.reads_item_completed() => {
+                        capture_paginated_patch_facet(p, &mut enrichment, &mut patch_call_ids);
                     }
                     _ => {}
                 }
@@ -630,6 +640,56 @@ pub fn parse_session_content(content: &str) -> Enrichment {
     }
 
     enrichment
+}
+
+/// Legacy rollouts' edit-content source: `patch_apply_end`, upserted by
+/// `call_id` so a generation-1 standalone `apply_patch` call's facet is
+/// replaced (not duplicated) when its structured result arrives.
+fn capture_patch_apply_end_facet(
+    payload: &Value,
+    enrichment: &mut Enrichment,
+    patch_call_ids: &mut Vec<Option<String>>,
+) {
+    let facet = super::facets::patch_apply_end_facet(payload);
+    if matches!(facet, crate::facets::ToolFacet::Edit { .. }) {
+        upsert_patch_facet(
+            &mut enrichment.patch_facets,
+            patch_call_ids,
+            payload.get("call_id").and_then(Value::as_str),
+            facet,
+        );
+    }
+}
+
+/// Paginated rollouts' edit-content source: an `item_completed/FileChange`
+/// carries the same `changes` map `patch_apply_end` did — same facet builder,
+/// so both generations upgrade the live row identically. Appended in record
+/// order: `emit_facet_upgrades` pairs live rows to these ordinally with a
+/// path-set guard, never by id. Counts stay aligned with the live rows because
+/// a failed `apply_patch` emits neither a live `file_change` row nor a
+/// `FileChange` item (fact 3 — the failure lives only on the wrapper output).
+/// Whether a *declined* patch emits an item or a live row is unprobed; if the
+/// counts ever desync, `emit_facet_upgrades`' path-set fallback is the
+/// backstop (fail-soft, matching legacy's exposure). The converse gap — a
+/// paginated file carrying only a legacy-shaped standalone `apply_patch` call
+/// — deliberately yields zero facets here (the legacy source is mode-gated
+/// off), leaving the live row paths-only until reopen recovers the content.
+fn capture_paginated_patch_facet(
+    payload: &Value,
+    enrichment: &mut Enrichment,
+    patch_call_ids: &mut Vec<Option<String>>,
+) {
+    let Some(item) = payload.get("item") else {
+        return;
+    };
+    if item.get("type").and_then(Value::as_str) != Some("FileChange") {
+        return;
+    }
+    let facet = super::facets::patch_apply_end_facet(item);
+    if matches!(facet, crate::facets::ToolFacet::Edit { .. }) {
+        enrichment.patch_facets.push(facet);
+        patch_call_ids.push(None);
+    }
 }
 
 fn capture_legacy_patch_facet(
@@ -1232,8 +1292,16 @@ impl CodexReconstruction {
             "item_completed" if self.history_mode.reads_item_completed() => {
                 self.handle_item_completed(line_number, p, timestamp);
             }
-            "patch_apply_end" => self.handle_patch_apply_end(line_number, p, timestamp),
-            "mcp_tool_call_end" => {
+            // Gated like the text arms above: edit/MCP enrichment is
+            // single-sourced per mode. On a paginated file the canonical
+            // source is `item_completed`; a rogue legacy record here would
+            // otherwise push a row duplicating the FileChange/McpToolCall
+            // child already created (match-else-push never matches the
+            // synthetic child ids).
+            "patch_apply_end" if !self.history_mode.reads_item_completed() => {
+                self.handle_patch_apply_end(line_number, p, timestamp);
+            }
+            "mcp_tool_call_end" if !self.history_mode.reads_item_completed() => {
                 let Some(call_id) = p.get("call_id").and_then(Value::as_str) else {
                     self.warn(line_number, "mcp_tool_call_end missing call_id");
                     return;
@@ -5326,6 +5394,129 @@ not valid json
                 .any(|w| w.reason.contains("FileChange status is not a string")),
             "{:?}",
             result.warnings
+        );
+    }
+
+    // --- Paginated live-enrichment patch facets (M4) ---
+
+    #[test]
+    fn paginated_enrichment_collects_file_change_patch_facets_in_order() {
+        use crate::facets::ToolFacet;
+        let content =
+            std::fs::read_to_string(fixture_path("paginated-batched-wrapper.session.jsonl"))
+                .unwrap();
+        let enrichment = parse_session_content(&content);
+        assert_eq!(enrichment.patch_facets.len(), 1);
+        let ToolFacet::Edit { files } = &enrichment.patch_facets[0] else {
+            panic!("content-bearing Edit facet expected");
+        };
+        assert_eq!(files[0].edits[0].old, "foo");
+        assert_eq!(files[0].edits[0].new, "bar");
+
+        // Order is load-bearing, and one facet cannot prove it: two edits to
+        // the SAME path have identical path sets, so the ordinal pairing is
+        // the only thing keeping each live row matched to its own diff — a
+        // reversal or dedup here would swap the diffs with no warning.
+        let edit = |old: &str, new: &str, id: &str| {
+            serde_json::json!({"type":"event_msg","payload":{"type":"item_completed","item":{
+                "type":"FileChange","id":id,"status":"completed",
+                "changes":{"/tmp/a.txt":{"type":"update",
+                    "unified_diff":format!("@@ -1 +1 @@\n-{old}\n+{new}\n"),"move_path":null}}}}})
+        };
+        let content = jsonl_lines(&[
+            serde_json::json!({"type":"session_meta","payload":{"cli_version":"0.149.0","history_mode":"paginated"}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"t-1"}}),
+            edit("foo", "bar", "exec-first"),
+            edit("bar", "baz", "exec-second"),
+        ]);
+        let enrichment = parse_session_content(&content);
+        assert_eq!(enrichment.patch_facets.len(), 2);
+        let transitions: Vec<(String, String)> = enrichment
+            .patch_facets
+            .iter()
+            .map(|f| {
+                let ToolFacet::Edit { files } = f else {
+                    panic!("edit facet expected");
+                };
+                (files[0].edits[0].old.clone(), files[0].edits[0].new.clone())
+            })
+            .collect();
+        assert_eq!(
+            transitions,
+            vec![
+                ("foo".to_owned(), "bar".to_owned()),
+                ("bar".to_owned(), "baz".to_owned())
+            ],
+            "record order must be preserved"
+        );
+    }
+
+    #[test]
+    fn paginated_enrichment_single_sources_patch_facets() {
+        // A paginated file carrying BOTH a legacy-shaped standalone
+        // `apply_patch` call and the canonical FileChange item must yield one
+        // facet, not two — a doubled facet would desync the ordinal pairing
+        // against the live rows.
+        let patch = "*** Begin Patch\n*** Update File: /tmp/a.txt\n@@\n-a\n+b\n*** End Patch\n";
+        let content = jsonl_lines(&[
+            serde_json::json!({"type":"session_meta","payload":{"cli_version":"0.149.0","history_mode":"paginated"}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"t-1"}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"custom_tool_call","id":"ctc_1","status":"completed","call_id":"call_1","name":"apply_patch","input":patch}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"item_completed","item":{
+                "type":"FileChange","id":"exec-fc","status":"completed",
+                "changes":{"/tmp/a.txt":{"type":"update","unified_diff":"@@ -1 +1 @@\n-a\n+b\n","move_path":null}}}}}),
+        ]);
+        let enrichment = parse_session_content(&content);
+        assert_eq!(enrichment.patch_facets.len(), 1, "single-sourced per mode");
+    }
+
+    #[test]
+    fn paginated_enrichment_patch_facets_are_turn_scoped() {
+        // A new task_started must clear the prior turn's facets — the upgrade
+        // must never replay a previous turn's patches onto this turn's rows.
+        let content = jsonl_lines(&[
+            serde_json::json!({"type":"session_meta","payload":{"cli_version":"0.149.0","history_mode":"paginated"}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"t-1"}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"item_completed","item":{
+                "type":"FileChange","id":"exec-old","status":"completed",
+                "changes":{"/tmp/old.txt":{"type":"update","unified_diff":"@@ -1 +1 @@\n-x\n+y\n","move_path":null}}}}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"t-1"}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"t-2"}}),
+        ]);
+        let enrichment = parse_session_content(&content);
+        assert!(
+            enrichment.patch_facets.is_empty(),
+            "prior turn's facet leaked"
+        );
+    }
+
+    #[test]
+    fn rogue_legacy_records_on_paginated_file_do_not_duplicate_rows() {
+        // The reconstruction-side single-source gate: a contract-violating
+        // legacy `patch_apply_end` on a paginated file must not push a second
+        // edit row next to the FileChange child (match-else-push would never
+        // match the child's synthetic id).
+        let content = jsonl_lines(&[
+            serde_json::json!({"type":"session_meta","payload":{"cli_version":"0.149.0","history_mode":"paginated"}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"t-1"}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"custom_tool_call","id":"ctc_1","status":"completed","call_id":"call_1","name":"exec","input":"dynamic"}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"item_completed","item":{
+                "type":"FileChange","id":"exec-fc","status":"completed",
+                "changes":{"/tmp/a.txt":{"type":"update","unified_diff":"@@ -1 +1 @@\n-a\n+b\n","move_path":null}}}}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"patch_apply_end","call_id":"exec-rogue","success":true,"status":"completed",
+                "changes":{"/tmp/a.txt":{"type":"update","unified_diff":"@@ -1 +1 @@\n-a\n+b\n","move_path":null}}}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"custom_tool_call_output","id":"ctco_1","call_id":"call_1","output":[{"type":"input_text","text":"ok"}]}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"t-1"}}),
+        ]);
+        let result = parse_codex_transcript_content(&content, Uuid::now_v7());
+        let edits: Vec<_> = tool_rows(&result.turns)
+            .into_iter()
+            .filter(|r| r.name == "apply_patch")
+            .collect();
+        assert_eq!(
+            edits.len(),
+            1,
+            "one edit, not one per generation: {edits:?}"
         );
     }
 }

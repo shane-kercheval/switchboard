@@ -5491,6 +5491,56 @@ not valid json
     }
 
     #[test]
+    fn rogue_legacy_mcp_end_on_paginated_file_does_not_touch_rows() {
+        // The other half of the reconstruction-side gate: a contract-violating
+        // legacy `mcp_tool_call_end` on a paginated file must neither mutate
+        // the wrapper row nor add a second MCP row — the paginated
+        // `McpToolCall` item is the single source, and its result must win.
+        let content = jsonl_lines(&[
+            serde_json::json!({"type":"session_meta","payload":{"cli_version":"0.149.0","history_mode":"paginated"}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"t-1"}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"custom_tool_call","id":"ctc_1","status":"completed","call_id":"call_1","name":"exec","input":"dynamic"}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"item_completed","item":{
+                "type":"McpToolCall","id":"exec-mcp","server":"srv","tool":"do","arguments":{},
+                "status":"completed","result":{"content":[{"type":"text","text":"paginated-result"}],"isError":false}}}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"mcp_tool_call_end","call_id":"call_1",
+                "invocation":{"server":"srv","tool":"do"},
+                "result":{"Ok":{"content":[{"type":"text","text":"rogue-legacy-result"}],"isError":true}}}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"custom_tool_call_output","id":"ctco_1","call_id":"call_1","output":[{"type":"input_text","text":"done"}]}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"t-1"}}),
+        ]);
+        let result = parse_codex_transcript_content(&content, Uuid::now_v7());
+        let rows = tool_rows(&result.turns);
+
+        let mcp: Vec<_> = rows.iter().filter(|r| r.name == "srv.do").collect();
+        assert_eq!(
+            mcp.len(),
+            1,
+            "one MCP row, not one per generation: {rows:?}"
+        );
+        assert_eq!(mcp[0].is_error, Some(false), "the paginated result decides");
+        assert!(
+            mcp[0]
+                .output
+                .as_deref()
+                .is_some_and(|o| o.contains("paginated-result")),
+            "{:?}",
+            mcp[0].output
+        );
+        // The rogue record targeted the wrapper's call_id — the wrapper row
+        // must not have absorbed its result either.
+        let wrapper = rows.iter().find(|r| r.name == "exec").expect("wrapper");
+        assert!(
+            !wrapper
+                .output
+                .as_deref()
+                .is_some_and(|o| o.contains("rogue-legacy-result")),
+            "{:?}",
+            wrapper.output
+        );
+    }
+
+    #[test]
     fn rogue_legacy_records_on_paginated_file_do_not_duplicate_rows() {
         // The reconstruction-side single-source gate: a contract-violating
         // legacy `patch_apply_end` on a paginated file must not push a second

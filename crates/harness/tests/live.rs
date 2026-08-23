@@ -569,9 +569,11 @@ fn session_meta_model(events: &[AdapterEvent]) -> Option<String> {
 #[ignore = "requires claude installed — run with: make test-live"]
 async fn live_claude_model_and_effort_dispatch() {
     // The selected model surfaces in `SessionMeta` (proving `--model` took
-    // effect end-to-end), and dispatching with an effort set completes without
-    // error. Per-turn *effort* exposure is asserted elsewhere — here the effort
-    // contract is the build_args unit test plus "dispatch succeeds."
+    // effect end-to-end), and the dispatched effort is stamped on the terminal.
+    // Claude's live stream carries no effort of its own (verified @ 2.1.241), so
+    // the stamp is the adapter echoing what it passed — that is what lets the
+    // live footer match the reopened one. The disk half is covered by
+    // `live_claude_session_file_effort_matches_the_dispatched_level`.
     let adapter = ClaudeCodeAdapter::new();
     let mut agent = live_agent();
     agent.model = Some("sonnet".to_owned());
@@ -609,6 +611,98 @@ async fn live_claude_model_and_effort_dispatch() {
         ),
         "dispatch with model+effort must complete; got {terminal:?}"
     );
+    let AdapterEvent::TurnEnd { effort, .. } = terminal else {
+        unreachable!("matched TurnEnd above")
+    };
+    assert_eq!(
+        effort.as_deref(),
+        Some("low"),
+        "the dispatched --effort must be stamped on the live terminal"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires claude installed — run with: make test-live"]
+async fn live_claude_session_file_effort_matches_the_dispatched_level() {
+    // Drift guard for the 2.1.212 contract AND for the live-stamp gate that
+    // rests on it. Claude writes a **top-level** `effort` on each assistant
+    // record (not under `message`, unlike the model) — but only for models that
+    // have a reasoning-effort axis. Both halves are asserted per model here,
+    // because both are upstream behavior a fixture cannot detect:
+    //
+    //   - an effort-recording family that stopped recording would strand the
+    //     reopen path while the live stamp kept claiming a level;
+    //   - Haiku *starting* to record would mean the gate is needlessly
+    //     withholding a level we could show.
+    //
+    // It is also the staleness tripwire for the gate's exact-id allowlist: when
+    // an alias moves to a new generation the new id is not listed, the live echo
+    // stops, and the live-vs-disk assertion below fails — telling us to probe
+    // the new id rather than letting it echo unverified.
+    //
+    // Either drift is silent offline, which is what let the ungated stamp ship.
+    // Every alias the gate echoes for, plus the one it withholds for. Covering
+    // only a subset would leave an upstream change to an uncovered family
+    // silently recreating the bug this gate exists to prevent.
+    for (model, expected) in [
+        ("opus", Some("low")),
+        ("sonnet", Some("low")),
+        ("fable", Some("low")),
+        ("haiku", None),
+    ] {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let adapter = ClaudeCodeAdapter::new();
+        let mut agent = live_agent();
+        agent.model = Some(model.to_owned());
+        agent.effort = Some("low".to_owned());
+
+        let stream = adapter
+            .dispatch(
+                &agent,
+                tmp.path(),
+                "Reply with only the number 4 and nothing else.",
+                Uuid::now_v7(),
+                DispatchOptions::default(),
+            )
+            .await
+            .expect("dispatch should succeed with real claude");
+        let events: Vec<AdapterEvent> = stream.collect().await;
+
+        let locator = match agent.session_locator {
+            Some(SessionLocator::Uuid(id)) => id,
+            other => panic!("expected a uuid locator, got {other:?}"),
+        };
+        let transcript = load_claude_transcript(&home_dir(), tmp.path(), locator, agent.id)
+            .expect("load_claude_transcript must succeed");
+        let disk: Vec<Option<String>> = transcript
+            .turns
+            .iter()
+            .filter_map(|t| match t {
+                switchboard_harness::Turn::Agent { effort, .. } => Some(effort.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            disk,
+            vec![expected.map(str::to_owned)],
+            "--model {model} --effort low: unexpected on-disk effort"
+        );
+
+        // The live stamp must agree with what the file records — that agreement
+        // is the entire justification for echoing a dispatched value at all.
+        let terminal = events
+            .iter()
+            .find_map(|e| match e {
+                AdapterEvent::TurnEnd { effort, .. } => Some(effort.clone()),
+                _ => None,
+            })
+            .expect("terminal TurnEnd");
+        assert_eq!(
+            terminal,
+            expected.map(str::to_owned),
+            "--model {model}: live stamp must match the on-disk record"
+        );
+    }
 }
 
 #[tokio::test]

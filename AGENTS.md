@@ -44,6 +44,16 @@ All via `make`:
 
 Prerequisites: see `README.md`. Rust toolchain pinned in `rust-toolchain.toml`; Node in `.nvmrc`; pnpm via `packageManager` in `package.json` (`corepack enable`).
 
+### Agents: run long commands in the FOREGROUND, and wait
+
+**When an agent is driving this repo non-interactively (`claude -p` / SDK / CI), every child process is killed when the turn ends.** Backgrounding a long command does not survive the turn — not with the harness's own background flag, not with `nohup`, not with `&`. The command is SIGTERMed mid-run (`make: *** [target] Terminated: 15`) and you are left with a partial log that is easy to misread as a result.
+
+So: **run the slow targets synchronously and block on them**, with a generous timeout, even though it means the turn sits idle for minutes. That is the correct trade — it is the only way to get a real answer.
+
+- `make check` and `make test-live*` are the usual victims. They take minutes.
+- If a command genuinely cannot fit in one turn, **do not fake it**: say what you ran, paste the partial output, and state plainly that the run did not complete. A truncated suite is not a passing suite. Never report a count from a killed run as if the suite finished — count the tests that actually reported, and label the run incomplete.
+- This is about the _agent's_ process lifetime, not the app's. `make dev` is expected to be launched by a human and left running.
+
 ## Version pinning policy
 
 - `package.json` and `Cargo.toml` use caret-range constraints (`^x.y.z` / bare versions).

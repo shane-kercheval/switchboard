@@ -440,8 +440,11 @@ pub enum NormalizedEvent {
         /// The model this turn ran on, rendered per-turn in the transcript
         /// footer. `None` = render nothing. See [`AdapterEvent::TurnEnd`].
         model: Option<String>,
-        /// The reasoning effort this turn ran at (Codex only), rendered per-turn
-        /// in the footer. `None` = render nothing.
+        /// The reasoning effort this turn ran at, rendered per-turn in the
+        /// footer beside the model. `None` = render nothing. Codex reads it
+        /// back from the session file; Claude's live stream exposes no effort,
+        /// so its adapter stamps the value it dispatched with (the session file
+        /// records the same string — `harness-behavior.md` §3.4).
         effort: Option<String>,
         /// **Live-matched** hydration key — the same per-turn id this turn will
         /// carry on disk, so a turn that streamed live *and* is later re-read from

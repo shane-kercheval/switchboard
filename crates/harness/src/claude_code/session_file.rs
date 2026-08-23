@@ -413,8 +413,20 @@ struct AgentTurnBuilder {
     first_message_id: Option<String>,
     /// The most recent assistant record's `message.model`, kept-last so it ends
     /// up as the turn's model. Per-turn — distinct from `first_model` (the
-    /// agent-scoped `SessionMetaInfo.model`). Claude has no per-turn effort.
+    /// agent-scoped `SessionMetaInfo.model`).
     last_model: Option<String>,
+    /// The most recent assistant record's **top-level** `effort`, kept-last the
+    /// same way. Note the nesting differs from the model: `effort` sits on the
+    /// record, not inside `message`. Written by Claude since 2.1.212 **for
+    /// models with an effort axis** and **disk-only** — the live stream carries
+    /// no effort, so the adapter stamps the dispatched selection instead
+    /// (`claude_code/mod.rs`, gated on the same axis fact). Absent in two
+    /// distinct cases that both hydrate as `None`: records written by older CLI
+    /// versions (transient — resolves as sessions age out), and any turn run on
+    /// a no-axis model such as Haiku, which writes no key at any CLI version
+    /// (permanent — see `harness-behavior.md` §3.4 Caveats). A missing field
+    /// here is expected shape, not drift.
+    last_effort: Option<String>,
     /// The most recent assistant record's `message.stop_reason`, kept-last.
     /// At EOF it answers "did the model owe a continuation?": `tool_use` /
     /// `pause_turn` (or unknown/absent) mean the turn was still in flight when
@@ -781,6 +793,7 @@ impl ReconstructionState {
             last_message_id: None,
             first_message_id: None,
             last_model: None,
+            last_effort: None,
             last_stop_reason: None,
             continuation_of,
         });
@@ -816,6 +829,12 @@ impl ReconstructionState {
             .and_then(Value::as_str)
         {
             builder.last_model = Some(model.to_owned());
+        }
+
+        // Keep-last the per-turn effort. Top-level on the record (not under
+        // `message`, unlike the model above).
+        if let Some(effort) = record.get("effort").and_then(Value::as_str) {
+            builder.last_effort = Some(effort.to_owned());
         }
 
         // Track the stop_reason — at EOF it decides whether the tail turn was
@@ -972,10 +991,9 @@ impl ReconstructionState {
             status,
             items: builder.items,
             usage: builder.usage,
-            // Per-turn model from this turn's final assistant record. Claude
-            // exposes no per-turn effort.
+            // Per-turn model and effort from this turn's final assistant record.
             model: builder.last_model,
-            effort: None,
+            effort: builder.last_effort,
             // Cost/overage are restored by the app's metadata overlay (joining
             // the turnmeta sidecar on `stable_message_id`); the parser itself
             // never reads `.switchboard/` state.
@@ -1893,8 +1911,8 @@ mod tests {
     #[test]
     fn hydrate_stamps_per_turn_model_from_each_assistant_record() {
         // Two turns on different models → two agent turns whose `model` differs.
-        // Claude exposes no per-turn effort, so `effort` is `None`. `meta.model`
-        // stays first-wins (agent-scoped).
+        // These fixtures carry no `effort` (the pre-2.1.212 shape), so `effort`
+        // stays `None`. `meta.model` stays first-wins (agent-scoped).
         let home = TempDir::new().unwrap();
         let cwd = TempDir::new().unwrap();
         let agent_id = Uuid::now_v7();
@@ -1925,6 +1943,72 @@ mod tests {
             ]
         );
         assert_eq!(result.meta.unwrap().model, "claude-sonnet-4-6");
+    }
+
+    #[test]
+    fn hydrate_stamps_per_turn_effort_from_the_record_top_level() {
+        // `effort` sits on the record, NOT under `message` (unlike `model`) —
+        // Claude has written it there since CLI 2.1.212. Kept-last per turn,
+        // exactly like the model, so a mid-conversation profile switch is
+        // reconstructed per turn rather than collapsed to one value.
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        let agent_id = Uuid::now_v7();
+        let session_id = Uuid::now_v7();
+        let mut first = assistant_text_record("1", "claude-opus-5", "2026-05-14T04:43:16Z");
+        first["effort"] = json!("high");
+        let mut second = assistant_text_record("2", "claude-opus-5", "2026-05-14T04:44:16Z");
+        second["effort"] = json!("max");
+        let content = jsonl(&[
+            user_record("a", "2026-05-14T04:43:15Z"),
+            first,
+            user_record("b", "2026-05-14T04:44:15Z"),
+            second,
+        ]);
+        stage_session_file(home.path(), cwd.path(), session_id, &content);
+
+        let result = load_claude_transcript(home.path(), cwd.path(), session_id, agent_id).unwrap();
+
+        let efforts: Vec<_> = result
+            .turns
+            .iter()
+            .filter_map(|t| match t {
+                Turn::Agent { effort, .. } => Some(effort.clone()),
+                Turn::User { .. } | Turn::System { .. } => None,
+            })
+            .collect();
+        assert_eq!(
+            efforts,
+            vec![Some("high".to_owned()), Some("max".to_owned())]
+        );
+    }
+
+    #[test]
+    fn hydrate_leaves_effort_none_when_the_record_omits_it() {
+        // Pre-2.1.212 session files, and any turn an agent ran on "Default"
+        // effort, carry no `effort` key. Hydration must stay silent rather than
+        // invent a level — the footer renders a bare model in that case.
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        let agent_id = Uuid::now_v7();
+        let session_id = Uuid::now_v7();
+        let content = jsonl(&[
+            user_record("a", "2026-05-14T04:43:15Z"),
+            assistant_text_record("1", "claude-opus-5", "2026-05-14T04:43:16Z"),
+        ]);
+        stage_session_file(home.path(), cwd.path(), session_id, &content);
+
+        let result = load_claude_transcript(home.path(), cwd.path(), session_id, agent_id).unwrap();
+
+        let efforts: Vec<_> = result
+            .turns
+            .iter()
+            .filter_map(|t| match t {
+                Turn::Agent { effort, .. } => Some(effort.clone()),
+                Turn::User { .. } | Turn::System { .. } => None,
+            })
+            .collect();
+        assert_eq!(efforts, vec![None]);
     }
 
     /// The two anchors on a multi-assistant tool-use turn. A single agent turn

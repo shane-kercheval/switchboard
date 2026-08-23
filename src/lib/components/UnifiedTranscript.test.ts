@@ -966,6 +966,30 @@ describe("UnifiedTranscript — fan-out groups", () => {
     );
   });
 
+  it("withholds a fan-out column's model and effort when that recipient failed", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    await state.registerAgent(CODEX_AGENT);
+    // `columnEffort` routes through `effortOf` for the same reason the single-turn
+    // footer does — without it a failed column renders a bare level with no model
+    // beside it, since `columnModel` suppresses the model on a non-complete turn.
+    seedFanout(
+      state,
+      { status: "complete", text: "alice reply", model: "claude-opus-5", effort: "high" },
+      { status: "failed", text: "bob partial", model: "gpt-5.5", effort: "high" },
+    );
+
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT, CODEX_AGENT] },
+    });
+
+    const columns = screen.getAllByTestId("fanout-column");
+    expect(columns[0]!.querySelector('[data-testid="message-model"]')).toHaveTextContent(
+      "claude-opus-5 (high)",
+    );
+    expect(columns[1]!.querySelector('[data-testid="message-model"]')).toBeNull();
+  });
+
   it("shows a queued indicator for a recipient with no response yet", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);

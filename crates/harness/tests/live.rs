@@ -635,8 +635,21 @@ async fn live_claude_session_file_effort_matches_the_dispatched_level() {
     //   - Haiku *starting* to record would mean the gate is needlessly
     //     withholding a level we could show.
     //
+    // It is also the staleness tripwire for the gate's exact-id allowlist: when
+    // an alias moves to a new generation the new id is not listed, the live echo
+    // stops, and the live-vs-disk assertion below fails — telling us to probe
+    // the new id rather than letting it echo unverified.
+    //
     // Either drift is silent offline, which is what let the ungated stamp ship.
-    for (model, expected) in [("sonnet", Some("low")), ("haiku", None)] {
+    // Every alias the gate echoes for, plus the one it withholds for. Covering
+    // only a subset would leave an upstream change to an uncovered family
+    // silently recreating the bug this gate exists to prevent.
+    for (model, expected) in [
+        ("opus", Some("low")),
+        ("sonnet", Some("low")),
+        ("fable", Some("low")),
+        ("haiku", None),
+    ] {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let adapter = ClaudeCodeAdapter::new();
         let mut agent = live_agent();

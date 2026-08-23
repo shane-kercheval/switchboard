@@ -230,19 +230,42 @@ impl ParserState {
     }
 }
 
-/// Whether a resolved Claude model id records `effort` in its session file.
+/// Whether a resolved Claude model id is **verified** to record `effort` in its
+/// session file.
 ///
-/// Substring match on the family segment, not an exact id list: ids carry
-/// generation and date suffixes (`claude-opus-5`, `claude-haiku-4-5-20251001`)
-/// that would make an exact list stale on every point release, whereas the
-/// family is the unit the effort axis actually belongs to. Verified @ 2.1.241:
-/// Opus 5 / Sonnet 5 / Fable 5 record the requested level verbatim; Haiku 4.5
-/// records no key at all (`harness-behavior.md` §3.4).
+/// Exact ids, not a family prefix or substring, and that is deliberate. The
+/// effort axis is a per-*model* property, not a per-family one: within the same
+/// family, Haiku 4.5 has no axis at all, and `harness-behavior.md` §3.4 records
+/// that Sonnet 4.6 / Opus 4.6 *execute* at a capped level. A family match would
+/// therefore assert this property for ids it was never checked against —
+/// including older generations and any third-party id that merely contains the
+/// family word (`some-vendor-opus-proxy`).
+///
+/// **Probed @ 2.1.241 with Switchboard's exact `-p` flags** — the requested
+/// level is written back verbatim for exactly these three:
+///
+/// | id | `--effort` sent | recorded |
+/// |---|---|---|
+/// | `claude-opus-5` | `high` | `"high"` |
+/// | `claude-sonnet-5` | `max` / `low` | `"max"` / `"low"` |
+/// | `claude-fable-5` | `low` | `"low"` |
+/// | `claude-haiku-4-5-20251001` | `max` / `low` | *no key written* |
+///
+/// Every other id — older, newer, or third-party — is **withheld because it is
+/// unverified, not because it is known to diverge.** Whether a capped model
+/// records the requested or the effective level is an open question nobody has
+/// probed; withholding sidesteps it rather than betting on an answer.
+///
+/// **Default-closed, and the staleness path is a failing test rather than a
+/// wrong value.** When an alias moves to a new generation, the new id is absent
+/// here, so the live echo stops (blank live, still correct on reopen) and
+/// `live_claude_session_file_effort_matches_the_dispatched_level` fails on the
+/// live-vs-disk mismatch — which is the signal to probe the new id and add it.
+/// See the "Model catalog" step in `harness-update-review.md`.
 fn model_records_effort(model: &str) -> bool {
-    const EFFORT_RECORDING_FAMILIES: [&str; 3] = ["opus", "sonnet", "fable"];
-    EFFORT_RECORDING_FAMILIES
-        .iter()
-        .any(|family| model.contains(family))
+    const EFFORT_RECORDING_MODELS: [&str; 3] =
+        ["claude-opus-5", "claude-sonnet-5", "claude-fable-5"];
+    EFFORT_RECORDING_MODELS.contains(&model)
 }
 
 /// Parse one stream-json line. Stateful: `state` accumulates text-block
@@ -1198,11 +1221,30 @@ mod tests {
     }
 
     #[test]
-    fn terminal_withholds_effort_for_an_unrecognized_model() {
-        // Default-closed: a model we have never probed degrades to "blank live,
-        // correct on reopen" rather than to a confidently wrong value.
-        assert_eq!(terminal_effort_for("claude-mythos-5", Some("high")), None);
-        assert_eq!(terminal_effort_for("some-vendor-model", Some("high")), None);
+    fn terminal_withholds_effort_for_every_unverified_model() {
+        // Default-closed on an EXACT id list. Each of these was admitted by the
+        // earlier family-substring match, and none of them was ever probed:
+        //   - older generations of a listed family, which §3.4 records as
+        //     *executing* at a capped level (whether they record the requested
+        //     or the effective value is unprobed — withholding sidesteps it);
+        //   - a newer/unknown first-party id, e.g. Mythos, in the catalog but
+        //     unreachable through the alias picker and never probed;
+        //   - a third-party id that merely contains a family word.
+        // All degrade to "blank live, correct on reopen", never to a wrong value.
+        for model in [
+            "claude-sonnet-4-6",
+            "claude-opus-4-6",
+            "claude-mythos-5",
+            "some-vendor-opus-proxy",
+            "bedrock/anthropic.claude-opus-5",
+            "some-vendor-model",
+        ] {
+            assert_eq!(
+                terminal_effort_for(model, Some("max")),
+                None,
+                "{model} is unverified and must not be echoed live"
+            );
+        }
     }
 
     #[test]

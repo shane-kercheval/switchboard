@@ -1337,7 +1337,7 @@ mod tests {
         assert_eq!(files[0].moved_to.as_deref(), Some("/tmp/new.txt"));
     }
 
-    /// The offline twin of `live_codex_apply_patch_emits_edit_facet` for the    /// The offline twin of `live_codex_apply_patch_emits_edit_facet` for the
+    /// The offline twin of `live_codex_apply_patch_emits_edit_facet` for the
     /// paginated generation: a rollout whose edit content lives on
     /// `item_completed/FileChange` (no `patch_apply_end` exists there) must
     /// still upgrade the live `file_change` row with the diff at turn end.

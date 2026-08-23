@@ -371,6 +371,33 @@ async fn live_codex_transcript_load_via_captured_locator_round_trips() {
 
     let (thread_id, partition_date) = captured_codex_locator(&live_events);
 
+    // Guard the guard: assert the rollout this run wrote is actually
+    // `history_mode: paginated` — otherwise a future upstream legacy-fallback
+    // (both callers retry with `history_mode: None` when the store rejects
+    // pagination) would let this test pass without exercising the paginated
+    // hydration path it exists to protect.
+    let rollout_dir = real_home()
+        .join(".codex/sessions")
+        .join(partition_date.format("%Y/%m/%d").to_string());
+    let rollout = std::fs::read_dir(&rollout_dir)
+        .expect("session partition dir")
+        .filter_map(Result::ok)
+        .find(|e| e.file_name().to_string_lossy().contains(&thread_id))
+        .expect("rollout file for the captured thread");
+    let first_line = std::io::BufRead::lines(std::io::BufReader::new(
+        std::fs::File::open(rollout.path()).expect("open rollout"),
+    ))
+    .next()
+    .expect("rollout first line")
+    .expect("readable first line");
+    let session_meta: serde_json::Value =
+        serde_json::from_str(&first_line).expect("session_meta parses");
+    assert_eq!(
+        session_meta["payload"]["history_mode"], "paginated",
+        "this CLI wrote a non-paginated rollout — the paginated hydration path \
+         is no longer exercised by this test"
+    );
+
     let transcript = switchboard_harness::load_codex_transcript(
         &real_home(),
         tmp.path(),

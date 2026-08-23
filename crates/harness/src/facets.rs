@@ -115,7 +115,9 @@ pub struct EditedFile {
     /// load-bearing:** the live↔disk facet pairing (`emit_facet_upgrades`)
     /// keys on source path sets — the live `file_change` row only ever knows
     /// the source — so flipping `path` to the destination would silently stop
-    /// renames (and only renames) from receiving their live diff upgrade. Additive optional field (the
+    /// renames (and only renames) from receiving their live diff upgrade.
+    ///
+    /// Additive optional field (the
     /// `ToolFacet::Mcp.mutation` precedent) rather than an `EditChange`
     /// variant, because a variant alone cannot carry both endpoints. Only
     /// Codex populates it (`apply_patch`'s `*** Move to:` section /

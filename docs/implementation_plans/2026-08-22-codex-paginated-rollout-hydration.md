@@ -1,6 +1,6 @@
 # Codex paginated-rollout hydration (G30)
 
-**Status: planned.** Branch: `fix/codex-paginated-rollout-hydration`. One PR; milestones below are commits, not separate review units.
+**Status: complete (2026-08-22).** Branch: `fix/codex-paginated-rollout-hydration`. One PR; milestones landed as commits, each reviewed pre-commit. One deliberate deferral: naming the *argument* (not just the source) in prompt-forward invalidation copy — adjudicated non-blocking, revisit only if prompts grow many args with disjoint sources.
 
 ## Problem
 

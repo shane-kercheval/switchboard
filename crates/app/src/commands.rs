@@ -2857,6 +2857,32 @@ pub fn search_project_files_root_impl(
     Ok(project.directory)
 }
 
+/// Ranks a candidate path against a (already-lowercased) query so filename
+/// hits outrank hits that only land in a directory component: an exact
+/// filename match sorts first, then a filename prefix match, then any other
+/// filename match, then a match that only appears earlier in the path (e.g.
+/// a directory name). `None` means the path doesn't match at all. An empty
+/// query matches everything at the same rank, preserving plain path order.
+fn file_search_rank(path: &str, query: &str) -> Option<u8> {
+    if query.is_empty() {
+        return Some(0);
+    }
+    let lower = path.to_lowercase();
+    if !lower.contains(query) {
+        return None;
+    }
+    let basename = lower.rsplit('/').next().unwrap_or(&lower);
+    Some(if basename == query {
+        0
+    } else if basename.starts_with(query) {
+        1
+    } else if basename.contains(query) {
+        2
+    } else {
+        3
+    })
+}
+
 /// Search user-visible project files under `root`, honoring ignore rules while
 /// keeping hidden files eligible for explicit mentions.
 pub fn search_project_files_in_root(
@@ -2866,13 +2892,32 @@ pub fn search_project_files_in_root(
 ) -> Result<Vec<String>, AppError> {
     let query = query.to_lowercase();
     let limit = limit.clamp(1, 100);
+
+    // Preflight `root` itself so a missing/unreadable project directory still
+    // fails loudly. Once past this check, this is a display-only best-effort
+    // search: a single unreadable entry deeper in the tree (permission
+    // denied, a broken symlink, a file that raced a delete) shouldn't wipe
+    // out matches already found elsewhere, so those errors are skipped below
+    // rather than aborting the whole search.
+    std::fs::metadata(root).map_err(|source| AppError::ProjectFileSearch {
+        root: root.to_path_buf(),
+        source: ignore::Error::Io(source),
+    })?;
+
     let mut builder = WalkBuilder::new(root);
     builder
         .hidden(false)
         .require_git(false)
         .sort_by_file_path(std::cmp::Ord::cmp);
 
-    let mut matches = Vec::new();
+    // A non-empty query needs the whole ignore-aware tree scanned before
+    // ranking, since a filename match can live anywhere in path order — e.g.
+    // `docs/harness-behavior.md` sorts after `crates/harness/Cargo.toml`, so
+    // stopping the walk as soon as `limit` matches were *found* (rather than
+    // ranked) silently preferred whichever directory the walker reached
+    // first. An empty query has nothing to rank on, so it keeps the cheap
+    // stop-at-`limit` browse behavior.
+    let mut matches: Vec<(u8, String)> = Vec::new();
     for entry in builder
         .filter_entry(|entry| {
             entry.file_name() != std::ffi::OsStr::new(".git")
@@ -2880,11 +2925,18 @@ pub fn search_project_files_in_root(
         })
         .build()
     {
-        let entry = entry.map_err(|source| AppError::ProjectFileSearch {
-            root: root.to_path_buf(),
-            source,
-        })?;
-        if matches.len() >= limit {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(source) => {
+                tracing::warn!(
+                    root = %root.display(),
+                    error = %source,
+                    "skipping unreadable entry during project file search",
+                );
+                continue;
+            }
+        };
+        if query.is_empty() && matches.len() >= limit {
             break;
         }
         let Some(file_type) = entry.file_type() else {
@@ -2897,11 +2949,14 @@ pub fn search_project_files_in_root(
             continue;
         };
         let path = relative.to_string_lossy().replace('\\', "/");
-        if query.is_empty() || path.to_lowercase().contains(&query) {
-            matches.push(path);
-        }
+        let Some(rank) = file_search_rank(&path, &query) else {
+            continue;
+        };
+        matches.push((rank, path));
     }
-    Ok(matches)
+    matches.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    matches.truncate(limit);
+    Ok(matches.into_iter().map(|(_, path)| path).collect())
 }
 
 /// Resolves the agent (across all loaded projects) and accepts the send into
@@ -6240,6 +6295,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_project_files_ranks_filename_matches_over_directory_matches() {
+        let (tmp, state, _emitter) = fresh_state_with_mock();
+        init_directory_impl(&state, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let project = create_project_in_only_dir(&state, "alpha");
+
+        // "crates" sorts alphabetically before "docs", so a naive
+        // stop-after-`limit`-matches walk fills the result with
+        // `crates/harness/*` before ever reaching `docs/harness-behavior.md`,
+        // even though only the latter's filename actually contains the query.
+        std::fs::create_dir_all(tmp.path().join("crates/harness")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("docs")).unwrap();
+        std::fs::write(tmp.path().join("crates/harness/Cargo.toml"), "").unwrap();
+        std::fs::write(tmp.path().join("docs/harness-behavior.md"), "").unwrap();
+        std::fs::write(tmp.path().join("docs/harness-update-review.md"), "").unwrap();
+
+        let root = search_project_files_root_impl(&state, project.id).unwrap();
+        let matches = search_project_files_in_root(&root, "harness", 2).unwrap();
+        assert_eq!(
+            matches,
+            vec![
+                "docs/harness-behavior.md".to_owned(),
+                "docs/harness-update-review.md".to_owned(),
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn search_project_files_reports_walk_failures() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().to_path_buf();
@@ -6248,6 +6332,62 @@ mod tests {
         match err {
             AppError::ProjectFileSearch { root: actual, .. } => assert_eq!(actual, root),
             other => panic!("expected project file search error, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn search_project_files_skips_unreadable_nested_entries_but_keeps_good_matches() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (tmp, state, _emitter) = fresh_state_with_mock();
+        init_directory_impl(&state, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let project = create_project_in_only_dir(&state, "alpha");
+
+        std::fs::create_dir_all(tmp.path().join("locked")).unwrap();
+        std::fs::write(tmp.path().join("locked/harness-secret.md"), "").unwrap();
+        std::fs::write(tmp.path().join("harness-behavior.md"), "").unwrap();
+
+        let locked = tmp.path().join("locked");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // A sandbox/CI runner executing as root ignores Unix permission bits,
+        // which would make the restriction above a no-op and this test
+        // assert nothing meaningful — detect that and skip rather than
+        // asserting on a condition we can't actually induce here.
+        let permissions_enforced = std::fs::read_dir(&locked).is_err();
+
+        let root = search_project_files_root_impl(&state, project.id).unwrap();
+        let result = search_project_files_in_root(&root, "harness", 20);
+
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        if !permissions_enforced {
+            eprintln!(
+                "skipping: running with elevated privileges that ignore Unix permission bits"
+            );
+            return;
+        }
+        assert_eq!(result.unwrap(), vec!["harness-behavior.md".to_owned()]);
+    }
+
+    #[test]
+    fn file_search_rank_matches_the_documented_tier_order() {
+        let cases = [
+            ("src/main.rs", "", Some(0)),
+            ("src/main.rs", "main.rs", Some(0)),
+            ("src/main.rs", "main", Some(1)),
+            ("src/build.rs", "uild", Some(2)),
+            ("crates/harness/Cargo.toml", "harness", Some(3)),
+            ("src/main.rs", "zzz", None),
+        ];
+        for (path, query, expected) in cases {
+            assert_eq!(
+                file_search_rank(path, query),
+                expected,
+                "path={path:?} query={query:?}"
+            );
         }
     }
 

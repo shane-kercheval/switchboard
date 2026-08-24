@@ -112,6 +112,20 @@ describe("CreateAgentForm", () => {
     } satisfies AgentFormSubmit);
   });
 
+  it("lists Antigravity ahead of Gemini in the harness picker", () => {
+    renderForm();
+    const picker = screen.getByTestId("harness-picker");
+    const ids = Array.from(picker.querySelectorAll("input[type=radio]")).map((el) =>
+      el.getAttribute("data-testid"),
+    );
+    expect(ids).toEqual([
+      "harness-claude_code",
+      "harness-codex",
+      "harness-antigravity",
+      "harness-gemini",
+    ]);
+  });
+
   it("preselects the saved primary and secondary defaults", async () => {
     preferences.agent_defaults.claude_code = {
       primary: { model: "sonnet", effort: "medium" },

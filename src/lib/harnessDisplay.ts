@@ -29,9 +29,27 @@ export const HARNESS_LABEL: Record<HarnessKind, string> = {
 /// `["claude_code", …]` array — a bare array is type-legal while incomplete and
 /// silently drops a harness from probes/banners/pickers. Insertion order
 /// (claude → codex → gemini → antigravity) is **load-bearing**: it governs
-/// auto-create sequencing and display order across banners, the picker, and
-/// the status list. Reorder only if the backend's `HARNESSES` constant changes.
+/// auto-create sequencing and any surface that hasn't opted into a different
+/// display order (see `HARNESS_ORDER_GEMINI_LAST` below). Reorder only if
+/// the backend's `HARNESSES` constant changes.
 export const ALL_HARNESSES = Object.keys(HARNESS_LABEL) as HarnessKind[];
+
+/// Display order for surfaces that list harnesses to the user (the
+/// create-agent picker, the settings harness-status table, the settings
+/// Agent Defaults list): Antigravity ahead of Gemini. Antigravity superseded
+/// Gemini for individual Google accounts (2026-06-18) — Gemini is
+/// corporate-account-only going forward and much less commonly set up from
+/// here on, so leading with it reads as outdated. Derived from
+/// `ALL_HARNESSES` (not a literal array) so a new
+/// `HarnessKind` can't be silently dropped from these surfaces.
+/// `ALL_HARNESSES`'s own insertion order stays untouched — it governs
+/// auto-create sequencing and any other backend-order-sensitive surface;
+/// only presentational lists that choose to de-prioritize Gemini should use
+/// this instead.
+export const HARNESS_ORDER_GEMINI_LAST: HarnessKind[] = [
+  ...ALL_HARNESSES.filter((h) => h !== "gemini"),
+  ...ALL_HARNESSES.filter((h) => h === "gemini"),
+];
 
 /// Brand/icon-derived accent colors for transcript attribution and compact
 /// harness identity. Chosen from the actual icon artwork — except gemini and

@@ -20,6 +20,14 @@ use switchboard_harness::{
 use uuid::Uuid;
 
 const FAKE_AGY: &str = env!("CARGO_BIN_EXE_fake_agy");
+
+/// Hang-guard for the auth fast-fail tests. Their fixtures park forever, so a
+/// working fast-fail finishes in well under a second and a broken one would
+/// hang indefinitely — this bound exists only to turn that hang into a legible
+/// failure. Deliberately generous: these run alongside the full workspace
+/// suite, where process-spawn contention makes any tight wall-clock bound
+/// flaky, and tightening it would not make the assertion any stronger.
+const FAST_FAIL_HANG_GUARD: std::time::Duration = std::time::Duration::from_mins(1);
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/antigravity");
 
 fn agy_agent() -> AgentRecord {
@@ -609,6 +617,176 @@ async fn auth_failure_line_on_stdout_emits_auth_failure() {
             ..
         } => {}
         other => panic!("expected AuthFailure, got {other:?}"),
+    }
+}
+
+/// `agy` 1.1.x moved its `Error:` diagnostics from stdout to stderr (probed
+/// @ 1.1.19: a print-timeout is `Error: timeout waiting for response` on
+/// stderr with exit 1, where it used to be on stdout with exit 0). The whole
+/// classification path — not just the pure classifier — must surface it
+/// verbatim as a `HarnessError`; before the stderr scan it degraded to the
+/// generic "exited without producing an answer" `AdapterFailure`.
+#[tokio::test]
+async fn error_line_on_stderr_surfaces_as_harness_error() {
+    let home = tempfile::TempDir::new().unwrap();
+    let cwd = tempfile::TempDir::new().unwrap();
+    let adapter = AntigravityAdapter::with_binary_and_home(FAKE_AGY, home.path());
+    let agent = agy_agent();
+
+    write_script(
+        cwd.path(),
+        &json!({
+            "conversation_uuid": Uuid::new_v4().to_string(),
+            // A timeout kills the turn before any conversation dir exists.
+            "create_brain_dir": false,
+            "stderr": [drip("Error: timeout waiting for response", 0)],
+            "exit_code": 1,
+        }),
+    );
+
+    let events = dispatch(&adapter, &agent, cwd.path(), "hi").await;
+    match outcome(&events) {
+        TurnOutcome::Failed {
+            kind: FailureKind::HarnessError,
+            message,
+        } => assert_eq!(message, "Error: timeout waiting for response"),
+        other => panic!("expected HarnessError, got {other:?}"),
+    }
+}
+
+/// The auth fast-fail must fire from **stderr**, not just stdout.
+///
+/// Whether `agy` 1.1.19 still prints `Authentication required…` on stdout is
+/// **unverified** — reproducing it requires logging the developer out, and the
+/// probe that attempted it disrupted a live session. The adapter therefore
+/// watches both streams, and this test covers the stderr half.
+///
+/// It is deliberately end-to-end rather than a `classify_outcome` unit test.
+/// stderr is drained by a separate task that is only awaited *after* the child
+/// exits, so a post-exit classification test would pass even if the mid-run
+/// force-kill never fired — leaving a real logged-out turn hung for the ~30s
+/// OAuth window.
+///
+/// **What proves the contract is the fixture, not the clock.** `fake_agy`
+/// parks forever and never closes stdout, so the producer loop can never reach
+/// its `stdout_eof && exit_status` terminator on its own: the dispatch
+/// completing *at all* means the adapter detected the auth line and killed the
+/// child. The `timeout` only converts a regression from an infinite hang into
+/// a legible failure, so it is set generously rather than tightly — a tight
+/// bound would add load-sensitivity (this runs alongside the whole workspace
+/// suite) without strengthening the proof by one bit.
+#[tokio::test]
+async fn auth_failure_line_on_stderr_fast_fails_and_reaps_the_child() {
+    let home = tempfile::TempDir::new().unwrap();
+    let cwd = tempfile::TempDir::new().unwrap();
+    let adapter = AntigravityAdapter::with_binary_and_home(FAKE_AGY, home.path());
+    let agent = agy_agent();
+
+    write_script(
+        cwd.path(),
+        &json!({
+            "conversation_uuid": Uuid::new_v4().to_string(),
+            "create_brain_dir": false,
+            "stderr": [drip("Authentication required. Please visit the URL to log in:", 0)],
+            "hang": true,
+        }),
+    );
+
+    let events = tokio::time::timeout(
+        FAST_FAIL_HANG_GUARD,
+        dispatch(&adapter, &agent, cwd.path(), "hi"),
+    )
+    .await
+    .expect("stderr auth line must force-kill agy, not wait out the OAuth window");
+
+    match outcome(&events) {
+        TurnOutcome::Failed {
+            kind: FailureKind::AuthFailure,
+            message,
+        } => assert!(
+            message.contains("Antigravity authentication required"),
+            "authored auth message expected; got: {message}"
+        ),
+        other => panic!("expected AuthFailure, got {other:?}"),
+    }
+}
+
+/// End-to-end version of the eviction guard: the stderr tail holds 16 lines
+/// and front-evicts, so a signal read back from it is gone once a chatty burst
+/// follows. Here the auth line is buried under 20 benign lines *and* the
+/// process then parks — so the turn can only finish if the fast-fail fired
+/// from state captured while stderr was being drained, not from a later scan
+/// of the tail. As above, the parked fixture is what proves the contract; the
+/// timeout is a hang-guard, not a latency assertion.
+#[tokio::test]
+async fn auth_line_buried_under_stderr_chatter_still_fast_fails() {
+    let home = tempfile::TempDir::new().unwrap();
+    let cwd = tempfile::TempDir::new().unwrap();
+    let adapter = AntigravityAdapter::with_binary_and_home(FAKE_AGY, home.path());
+    let agent = agy_agent();
+
+    let mut stderr = vec![drip(
+        "Authentication required. Please visit the URL to log in:",
+        0,
+    )];
+    stderr.extend((0..20).map(|i| drip(&format!("benign follow-up line {i}"), 0)));
+
+    write_script(
+        cwd.path(),
+        &json!({
+            "conversation_uuid": Uuid::new_v4().to_string(),
+            "create_brain_dir": false,
+            "stderr": stderr,
+            "hang": true,
+        }),
+    );
+
+    let events = tokio::time::timeout(
+        FAST_FAIL_HANG_GUARD,
+        dispatch(&adapter, &agent, cwd.path(), "hi"),
+    )
+    .await
+    .expect("auth signal must survive stderr-tail eviction and force-kill agy");
+
+    match outcome(&events) {
+        TurnOutcome::Failed {
+            kind: FailureKind::AuthFailure,
+            ..
+        } => {}
+        other => panic!("expected AuthFailure, got {other:?}"),
+    }
+}
+
+/// Same eviction hazard for the `Error:` signal: the real failure message must
+/// survive a burst of trailing stderr rather than degrading to the generic
+/// "exited without producing an answer" `AdapterFailure`.
+#[tokio::test]
+async fn error_line_buried_under_stderr_chatter_still_surfaces_verbatim() {
+    let home = tempfile::TempDir::new().unwrap();
+    let cwd = tempfile::TempDir::new().unwrap();
+    let adapter = AntigravityAdapter::with_binary_and_home(FAKE_AGY, home.path());
+    let agent = agy_agent();
+
+    let mut stderr = vec![drip("Error: timeout waiting for response", 0)];
+    stderr.extend((0..20).map(|i| drip(&format!("benign follow-up line {i}"), 0)));
+
+    write_script(
+        cwd.path(),
+        &json!({
+            "conversation_uuid": Uuid::new_v4().to_string(),
+            "create_brain_dir": false,
+            "stderr": stderr,
+            "exit_code": 1,
+        }),
+    );
+
+    let events = dispatch(&adapter, &agent, cwd.path(), "hi").await;
+    match outcome(&events) {
+        TurnOutcome::Failed {
+            kind: FailureKind::HarnessError,
+            message,
+        } => assert_eq!(message, "Error: timeout waiting for response"),
+        other => panic!("expected HarnessError, got {other:?}"),
     }
 }
 

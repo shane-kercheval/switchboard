@@ -28,6 +28,12 @@
 //!   "warning_not_found": "<stale-uuid>", // optional: emit the fork "conversation not found" signal
 //!   "records": [ {"json": "<raw transcript.jsonl line>", "delay_ms": 0} ],
 //!   "stdout": [ {"text": "<answer line>", "delay_ms": 0} ],
+//!   "stderr": [ {"text": "<diagnostic line>", "delay_ms": 0} ],
+//!                                    //   optional: written to stderr after stdout and
+//!                                    //   before any `hang`. agy 1.1.x emits its
+//!                                    //   `Error:` diagnostics here rather than on
+//!                                    //   stdout; pair with `hang` to model the
+//!                                    //   auth-line-then-block case.
 //!   "exit_code": 0,
 //!   "log_file_content": "<text>",    // optional: appended to the --log-file after
 //!                                    //   the conversation-id lines. Stages content
@@ -78,6 +84,14 @@ struct Script {
     records: Vec<Drip>,
     #[serde(default)]
     stdout: Vec<Drip>,
+    /// Diagnostic lines for stderr, written after `stdout` and before `hang`.
+    /// `agy` 1.1.x moved its `Error:` output off stdout, so the adapter now
+    /// scans both streams; this lets a test stage that shape. Combined with
+    /// `hang` it models the auth fast-fail: emit the auth line, then block, so
+    /// the test proves the adapter kills the child instead of waiting out the
+    /// real CLI's ~30s OAuth window.
+    #[serde(default)]
+    stderr: Vec<Drip>,
     #[serde(default)]
     exit_code: i32,
     /// Stage content for the per-dispatch CLI log scan. When non-empty and
@@ -229,6 +243,14 @@ fn main() {
         }
         let _ = writeln!(out, "{}", line.text);
         let _ = out.flush();
+    }
+
+    for line in &script.stderr {
+        if line.delay_ms > 0 {
+            sleep(Duration::from_millis(line.delay_ms));
+        }
+        let _ = writeln!(err, "{}", line.text);
+        let _ = err.flush();
     }
 
     if script.hang {

@@ -325,13 +325,26 @@ fn resolve_home_dir(override_path: Option<&Path>) -> PathBuf {
 /// scan (and the conversation-id capture) read only this turn's output — never
 /// another concurrent `agy`'s log.
 ///
+/// `--disable-slash-commands` keeps a slash-leading message a *message*. Print
+/// mode grew local slash-command handling (agy 1.1.9–1.1.12): a recognized
+/// command is answered by the CLI itself without ever reaching the model —
+/// `-p "/model"` prints a tab-separated row, spends no quota, and **creates no
+/// conversation** (so the adapter has nothing to capture and the turn fails),
+/// while an interactive-only one such as `-p "/clear"` exits 2. Unrecognized
+/// commands and path-shaped text (`/tmp/...`) already fall through to the
+/// model. A Switchboard send always targets the model, so we opt out wholesale.
+/// Same tradeoff Claude takes (see `harness-behavior.md` §0): the harness's own
+/// slash commands and skills are deliberately unreachable through the ordinary
+/// composer, and would need an explicit command action to expose.
+///
 /// No per-agent model or effort flag: Antigravity's model is harness-owned
 /// global config (set inside Antigravity, off-limits to us) and its effort is
 /// folded into that model's display name — there is no `agy` flag for either.
 /// An Antigravity agent therefore never carries a model/effort (registration
 /// forbids it), so this takes no `&AgentRecord` and emits neither flag.
 fn build_args(prompt: &str, cwd: &Path, resume_id: Option<Uuid>, log_file: &Path) -> Vec<String> {
-    let mut args = vec!["-p".to_owned(), prompt.to_owned()];
+    let mut args = vec!["-p".to_owned(), transport_prompt(prompt)];
+    args.push("--disable-slash-commands".to_owned());
     args.push("--add-dir".to_owned());
     args.push(cwd.to_string_lossy().into_owned());
     if let Some(uuid) = resume_id {
@@ -344,6 +357,92 @@ fn build_args(prompt: &str, cwd: &Path, resume_id: Option<Uuid>, log_file: &Path
     args.push("--log-file".to_owned());
     args.push(log_file.to_string_lossy().into_owned());
     args
+}
+
+/// Control signals recorded from `agy`'s stderr **as each line is drained**.
+///
+/// `agy` 1.1.x moved its diagnostics from stdout to stderr, so stderr now
+/// carries two things the turn's outcome depends on: the `Authentication
+/// required…` line (which must force-kill the process before its ~30s OAuth
+/// block) and the `Error:` line naming the real failure. Neither may be read
+/// back from the bounded stderr *tail*: that buffer is capped at
+/// [`crate::subprocess::STDERR_TAIL_CAPACITY`] and front-evicts, so a chatty
+/// burst after either line would drop it permanently — reinstating exactly the
+/// hang and the message-loss this adapter exists to prevent. Because the real
+/// 1.1.19 auth-failure output cannot be probed without logging the developer
+/// out, there is no evidence bounding how much `agy` prints around it, so
+/// "observed stderr is quiet" is an absence of counter-evidence, not a safety
+/// argument.
+///
+/// Both signals are therefore **sticky**: set once when first seen, never
+/// recomputed. The tail keeps its original job — the human-readable fallback
+/// message when nothing matched.
+#[derive(Default)]
+struct StderrSignals {
+    /// Set when any drained line matches [`is_auth_failure_line`]. Read on the
+    /// producer's poll tick to force-kill, and again post-exit as a backstop.
+    auth_failed: std::sync::atomic::AtomicBool,
+    /// First `Error:` line seen, kept for terminal classification.
+    first_error: Mutex<Option<String>>,
+}
+
+impl StderrSignals {
+    /// Per-line observer handed to the stderr drain. Runs on the drain task.
+    fn observe(&self, line: &str) {
+        if is_auth_failure_line(line) {
+            self.auth_failed
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        let trimmed = line.trim();
+        if trimmed.starts_with("Error:")
+            && let Ok(mut slot) = self.first_error.lock()
+            && slot.is_none()
+        {
+            *slot = Some(trimmed.to_owned());
+        }
+    }
+
+    fn auth_failed(&self) -> bool {
+        self.auth_failed.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// A poisoned lock yields no line rather than propagating — stderr is a
+    /// diagnostic channel and must never itself be what fails a turn.
+    fn first_error(&self) -> Option<String> {
+        self.first_error.lock().ok().and_then(|slot| slot.clone())
+    }
+}
+
+/// The exact text handed to `agy -p` for a given dispatch prompt.
+///
+/// `agy` 1.1.18 started rejecting a prompt whose value is *exactly* a known
+/// flag token — `-p "--sandbox"` (also `--model`, `--add-dir`, `-p`, `-c`, …)
+/// exits 2 with `Error: -p took "--sandbox" as its prompt…` before any model
+/// call. Anything else passes through: `--notaflag` and `--sandbox looks like
+/// a flag` both reach the model, and the attached `-p=<value>` form does *not*
+/// help (the check is on the value, not the parse). A single leading ASCII
+/// space clears it without changing the message's meaning.
+///
+/// The guard is deliberately wider than the upstream rule — every `-` leading
+/// prompt, not just exact flag tokens — because reproducing "is this one of
+/// agy's flags" would mean maintaining a copy of agy's flag list that silently
+/// rots on each CLI bump. A leading space is inert for ordinary dash-leading
+/// text (a markdown bullet), so over-applying costs nothing.
+///
+/// **Why this can stay private, unlike Claude's `claude_transport_prompt`.**
+/// Claude's session file records the dispatched text verbatim, so its journal
+/// correlation has to re-derive the transport form. Antigravity's readers all
+/// go through [`user_request_body`], which **trims** — and the correlation
+/// needle is trimmed too — so the space cancels on both sides of every
+/// comparison: `transcript_echoes_prompt` (the capture fallback) and the
+/// journaled-send merge, which reads `Turn::User` text from the same trimmed
+/// extraction. Nothing outside this module can observe the difference.
+fn transport_prompt(prompt: &str) -> String {
+    if prompt.starts_with('-') {
+        format!(" {prompt}")
+    } else {
+        prompt.to_owned()
+    }
 }
 
 /// Per-dispatch CLI log path under the system temp dir. `turn_id` is unique
@@ -413,13 +512,18 @@ async fn run_producer(ctx: ProducerCtx) {
     let stderr_tail: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::with_capacity(
         crate::subprocess::STDERR_TAIL_CAPACITY,
     )));
-    let stderr_task = tokio::spawn(crate::subprocess::drain_stderr(
-        stderr,
-        agent_id,
-        turn_id,
-        Arc::clone(&stderr_tail),
-        "antigravity",
-    ));
+    let stderr_signals = Arc::new(StderrSignals::default());
+    let stderr_task = tokio::spawn({
+        let signals = Arc::clone(&stderr_signals);
+        crate::subprocess::drain_stderr_with_observer(
+            stderr,
+            agent_id,
+            turn_id,
+            Arc::clone(&stderr_tail),
+            "antigravity",
+            move |line| signals.observe(line),
+        )
+    });
 
     let is_resume = resume_id.is_some();
     // A plain resume re-emits nothing: the locator already lives on the registry
@@ -478,6 +582,10 @@ async fn run_producer(ctx: ProducerCtx) {
                         if is_auth_failure_line(&line) {
                             // Fast-fail: the OAuth fallback is mid-flight (browser
                             // open, ~30s block ahead). Stop now and force-kill.
+                            // The same check runs against stderr on the poll tick
+                            // below — `agy` 1.1.x moved its diagnostics to stderr
+                            // and whether the auth line moved with them is
+                            // unverified (see the tick arm).
                             auth_failed = true;
                             break;
                         }
@@ -503,6 +611,25 @@ async fn run_producer(ctx: ProducerCtx) {
                 }
             }
             _ = poll.tick() => {
+                // Mid-run auth watch on **stderr**, mirroring the stdout arm
+                // above. `agy` 1.1.x moved its diagnostics from stdout to
+                // stderr; whether the `Authentication required…` line moved
+                // with them is **unverified** — reproducing it requires
+                // logging the developer out, and the probe that attempted it
+                // disrupted a live session, so it was abandoned rather than
+                // retried. Watching both streams makes the answer moot: if the
+                // line still lands on stdout the arm above fires first, and if
+                // it moved here this bounds the ~30s OAuth block instead of
+                // letting the turn hang.
+                //
+                // The flag is set by the drain task the moment the line is
+                // read, so unlike a scan of the bounded tail it cannot be lost
+                // to eviction (see `StderrSignals`). The only cost is up to one
+                // poll interval of latency, against a 30s hang.
+                if !auth_failed && stderr_signals.auth_failed() {
+                    auth_failed = true;
+                    break;
+                }
                 if conversation_id.is_none() {
                     match capture_conversation_id(&log_file_path, &home_dir, spawn_time, &prompt) {
                         CaptureOutcome::Bound(uuid) => {
@@ -758,6 +885,8 @@ async fn run_producer(ctx: ProducerCtx) {
             log_error,
         },
         &stdout_buf,
+        stderr_signals.auth_failed(),
+        stderr_signals.first_error(),
         &stderr_tail,
     );
     let _ = tx.send(AdapterEvent::TurnEnd {
@@ -1346,9 +1475,16 @@ fn extract_rpc_descriptive_tail(detail: &str) -> String {
 /// Stale-resume (conversation-not-found) is intentionally **not** a failure
 /// here — the producer heals it (recaptures the forked conversation, whose
 /// transcript carries the terminal answer) and the turn completes.
+///
+/// `stderr_auth` / `stderr_error` are the signals [`StderrSignals`] recorded as
+/// stderr was drained; they are passed in rather than re-derived from
+/// `stderr_tail` because that tail evicts. The tail itself is used only for the
+/// human-readable fallback message when nothing above matched.
 fn classify_outcome(
     sig: &OutcomeSignals,
     stdout_lines: &[String],
+    stderr_auth: bool,
+    stderr_error: Option<String>,
     stderr_tail: &Mutex<VecDeque<String>>,
 ) -> TurnOutcome {
     if sig.auth_failed {
@@ -1366,20 +1502,53 @@ fn classify_outcome(
     // Note: persisting the captured locator is now the dispatcher sink's job;
     // a persist failure fails the turn there, not here. The adapter only
     // classifies what it observed about the `agy` run itself.
+    //
+    // **The single auth surface in this function.** Every auth-flavored line,
+    // on either stream, resolves here — the line need not be `Error:`-prefixed
+    // (`Authentication required…` is not), so it is checked before, and
+    // separately from, the error scan below.
+    //
+    // The producer normally fast-fails mid-run and sets `sig.auth_failed`
+    // above; this covers `agy` exiting before that was observed. In practice
+    // the stdout half is unreachable — the producer's stdout arm matches the
+    // same predicate synchronously per line and breaks *before* the
+    // `Error:`/`Warning:` filter that populates `stdout_lines`, so an auth line
+    // can never reach this slice. It is scanned anyway so this pure function's
+    // contract is self-contained ("an auth line in either input is an auth
+    // failure") instead of silently depending on a filter ordering maintained
+    // in the producer's `select!` loop, which a later edit there could change
+    // without anything here noticing.
+    if stderr_auth || stdout_lines.iter().any(|line| is_auth_failure_line(line)) {
+        return TurnOutcome::Failed {
+            kind: FailureKind::AuthFailure,
+            message: ANTIGRAVITY_AUTH_MESSAGE.to_owned(),
+        };
+    }
     // A concrete `Error:` line is the real root cause and must win over the
     // generic "unresumable" classification below — e.g. a first turn that
     // timed out and so never created a conversation dir should surface the
     // timeout, not "conversation could not be located."
-    if let Some(error) = first_error_line(stdout_lines) {
-        let (kind, message) = if is_auth_failure_line(&error) {
-            (
-                FailureKind::AuthFailure,
-                ANTIGRAVITY_AUTH_MESSAGE.to_owned(),
-            )
-        } else {
-            (FailureKind::HarnessError, error)
+    //
+    // **Both streams are considered.** `agy` 1.1.x moved its `Error:` lines
+    // from stdout to stderr (probed @ 1.1.19: the print-timeout error is now
+    // `Error: timeout waiting for response` on stderr with exit 1, where it
+    // used to be `Error: timed out waiting for response` on stdout with exit
+    // 0). stdout wins to preserve the previous precedence and keep older `agy`
+    // builds working; the stderr line — captured as it was drained, not
+    // rescanned from the evicting tail — restores the real `HarnessError`
+    // message on current ones. Without it a timeout degrades to the generic
+    // "exited without producing an answer" `AdapterFailure` below.
+    //
+    // No auth re-check here: the branch above already returned for any
+    // auth-flavored line, on either stream, so anything reaching this point is
+    // a genuine harness error. (An `is_auth_failure_line` test used to sit
+    // here; it was unreachable even before stderr was consulted, because
+    // `stdout_lines` cannot contain an auth line — see above.)
+    if let Some(error) = first_error_line(stdout_lines).or(stderr_error) {
+        return TurnOutcome::Failed {
+            kind: FailureKind::HarnessError,
+            message: error,
         };
-        return TurnOutcome::Failed { kind, message };
     }
     // Log-derived RPC error: the only place `RESOURCE_EXHAUSTED` / network
     // failures surface (stdout/stderr stay empty and `agy` exits 0). Wins
@@ -1548,6 +1717,49 @@ mod tests {
         std::fs::write(&path, content).unwrap();
         let cursor = paths::complete_line_count(&path);
         assert_eq!(seed_carry_forward_model(&path, cursor), None);
+    }
+
+    #[test]
+    fn build_args_disables_slash_commands_so_a_slash_message_reaches_the_model() {
+        // agy print mode answers its own slash commands locally: `/model`
+        // prints a TSV row and creates no conversation, `/clear` exits 2.
+        // Switchboard sends always target the model, so the flag is
+        // unconditional — not gated on the prompt's first character.
+        let log = PathBuf::from("/tmp/x.log");
+        for prompt in ["/model", "/clear", "plain message"] {
+            let args = build_args(prompt, Path::new("/work/proj"), None, &log);
+            assert!(
+                args.contains(&"--disable-slash-commands".to_owned()),
+                "{args:?}"
+            );
+            assert_eq!(args[1], prompt, "slash text is passed through verbatim");
+        }
+    }
+
+    #[test]
+    fn build_args_space_prefixes_dash_leading_prompts() {
+        // agy 1.1.18 rejects a prompt whose value is exactly a flag token
+        // (exit 2, pre-dispatch). The guard covers every dash-leading prompt,
+        // not just real flag names, to avoid mirroring agy's flag list.
+        let log = PathBuf::from("/tmp/x.log");
+        for (prompt, transported) in [
+            ("--sandbox", " --sandbox"),
+            ("-p", " -p"),
+            ("--notaflag", " --notaflag"),
+            ("- a markdown bullet", " - a markdown bullet"),
+        ] {
+            let args = build_args(prompt, Path::new("/work/proj"), None, &log);
+            assert_eq!(args[1], transported, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn build_args_leaves_non_dash_prompts_untouched() {
+        let log = PathBuf::from("/tmp/x.log");
+        for prompt in ["hello", "/model", " already spaced", ""] {
+            let args = build_args(prompt, Path::new("/work/proj"), None, &log);
+            assert_eq!(args[1], prompt, "{args:?}");
+        }
     }
 
     #[test]
@@ -2081,6 +2293,248 @@ mod tests {
         Mutex::new(VecDeque::new())
     }
 
+    /// A stderr stream as the producer would have seen it: every line is fed
+    /// through the real [`StderrSignals::observe`] and into a real bounded
+    /// tail, so a test exercises the same capture path the drain task uses —
+    /// including eviction, which is the whole reason the signals are sticky.
+    struct Stderr {
+        signals: StderrSignals,
+        tail: Mutex<VecDeque<String>>,
+    }
+
+    fn stderr_of(lines: &[&str]) -> Stderr {
+        let signals = StderrSignals::default();
+        let mut tail: VecDeque<String> = VecDeque::new();
+        for line in lines {
+            signals.observe(line);
+            if tail.len() >= crate::subprocess::STDERR_TAIL_CAPACITY {
+                tail.pop_front();
+            }
+            tail.push_back((*line).to_owned());
+        }
+        Stderr {
+            signals,
+            tail: Mutex::new(tail),
+        }
+    }
+
+    /// `classify_outcome` with no stderr activity — the common case for tests
+    /// about stdout/log/transcript classification.
+    fn classify_no_stderr(sig: &OutcomeSignals, stdout_lines: &[String]) -> TurnOutcome {
+        classify_outcome(sig, stdout_lines, false, None, &empty_tail())
+    }
+
+    fn classify_with_stderr(
+        sig: &OutcomeSignals,
+        stdout_lines: &[String],
+        stderr: &Stderr,
+    ) -> TurnOutcome {
+        classify_outcome(
+            sig,
+            stdout_lines,
+            stderr.signals.auth_failed(),
+            stderr.signals.first_error(),
+            &stderr.tail,
+        )
+    }
+
+    #[test]
+    fn classify_outcome_error_line_on_stderr_is_harness_error() {
+        // agy 1.1.x moved its `Error:` diagnostics to stderr. Before this was
+        // handled, a print-timeout landed on the generic "exited without
+        // producing an answer" AdapterFailure with the real cause buried in a
+        // stderr tail; it must surface verbatim as a HarnessError instead.
+        let sig = OutcomeSignals {
+            saw_terminal_answer: false,
+            saw_stdout_content: false,
+            ..ok_signals()
+        };
+        let stderr = stderr_of(&["Error: timeout waiting for response"]);
+        match classify_with_stderr(&sig, &[], &stderr) {
+            TurnOutcome::Failed { kind, message } => {
+                assert!(matches!(kind, FailureKind::HarnessError), "{kind:?}");
+                assert_eq!(message, "Error: timeout waiting for response");
+            }
+            other => panic!("expected HarnessError; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_outcome_prefers_stdout_error_over_stderr_error() {
+        // Precedence is unchanged from before the stderr scan existed: an
+        // older agy that still writes to stdout keeps winning, so the fallback
+        // can never reorder a shape we already classified correctly.
+        let sig = OutcomeSignals {
+            saw_terminal_answer: false,
+            saw_stdout_content: false,
+            ..ok_signals()
+        };
+        let stderr = stderr_of(&["Error: from stderr"]);
+        match classify_with_stderr(&sig, &["Error: from stdout".to_owned()], &stderr) {
+            TurnOutcome::Failed { message, .. } => assert_eq!(message, "Error: from stdout"),
+            other => panic!("expected HarnessError; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_outcome_auth_line_on_stderr_is_auth_failure() {
+        // Post-exit backstop for the case where agy exits before the
+        // producer's mid-run watch observes the line. The auth line is not
+        // `Error:`-prefixed, so the error scan alone would miss it.
+        let sig = OutcomeSignals {
+            saw_terminal_answer: false,
+            saw_stdout_content: false,
+            ..ok_signals()
+        };
+        let stderr = stderr_of(&["Authentication required. Please visit the URL to log in:"]);
+        match classify_with_stderr(&sig, &[], &stderr) {
+            TurnOutcome::Failed { kind, message } => {
+                assert!(matches!(kind, FailureKind::AuthFailure), "{kind:?}");
+                assert_eq!(message, ANTIGRAVITY_AUTH_MESSAGE);
+            }
+            other => panic!("expected AuthFailure; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_outcome_auth_shaped_error_line_is_auth_not_harness_error() {
+        // `Error: authentication timed out.` is BOTH an `Error:` line and an
+        // auth line — agy prints it after the OAuth wait elapses. It must get
+        // the authored auth message, not its verbatim text as a HarnessError.
+        //
+        // Deliberately the ONLY line in the fixture: an earlier revision also
+        // fed `Authentication required…`, which satisfied the auth check on its
+        // own and left this case untested.
+        let sig = OutcomeSignals {
+            saw_terminal_answer: false,
+            saw_stdout_content: false,
+            ..ok_signals()
+        };
+        let stderr = stderr_of(&["Error: authentication timed out."]);
+        match classify_with_stderr(&sig, &[], &stderr) {
+            TurnOutcome::Failed { kind, message } => {
+                assert!(matches!(kind, FailureKind::AuthFailure), "{kind:?}");
+                assert_eq!(message, ANTIGRAVITY_AUTH_MESSAGE);
+            }
+            other => panic!("expected AuthFailure; got {other:?}"),
+        }
+    }
+
+    /// The stderr tail is capped at `STDERR_TAIL_CAPACITY` and front-evicts,
+    /// so a signal read back from it is lost once enough lines follow. Both
+    /// signals are captured as lines are drained instead; these two tests pin
+    /// that, and both fail if classification ever goes back to rescanning the
+    /// tail.
+    #[test]
+    fn classify_outcome_auth_survives_being_evicted_from_the_stderr_tail() {
+        let mut lines = vec!["Authentication required. Please visit the URL to log in:"];
+        lines.extend(std::iter::repeat_n(
+            "benign follow-up chatter",
+            crate::subprocess::STDERR_TAIL_CAPACITY + 4,
+        ));
+        let stderr = stderr_of(&lines);
+        assert!(
+            !stderr
+                .tail
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|l| is_auth_failure_line(l)),
+            "fixture must actually evict the auth line, else it proves nothing"
+        );
+
+        let sig = OutcomeSignals {
+            saw_terminal_answer: false,
+            saw_stdout_content: false,
+            ..ok_signals()
+        };
+        match classify_with_stderr(&sig, &[], &stderr) {
+            TurnOutcome::Failed { kind, message } => {
+                assert!(matches!(kind, FailureKind::AuthFailure), "{kind:?}");
+                assert_eq!(message, ANTIGRAVITY_AUTH_MESSAGE);
+            }
+            other => panic!("expected AuthFailure; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_outcome_error_survives_being_evicted_from_the_stderr_tail() {
+        let mut lines = vec!["Error: timeout waiting for response"];
+        lines.extend(std::iter::repeat_n(
+            "benign follow-up chatter",
+            crate::subprocess::STDERR_TAIL_CAPACITY + 4,
+        ));
+        let stderr = stderr_of(&lines);
+        assert!(
+            first_error_line(
+                &stderr
+                    .tail
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+            )
+            .is_none(),
+            "fixture must actually evict the error line, else it proves nothing"
+        );
+
+        let sig = OutcomeSignals {
+            saw_terminal_answer: false,
+            saw_stdout_content: false,
+            ..ok_signals()
+        };
+        match classify_with_stderr(&sig, &[], &stderr) {
+            TurnOutcome::Failed { kind, message } => {
+                assert!(matches!(kind, FailureKind::HarnessError), "{kind:?}");
+                assert_eq!(message, "Error: timeout waiting for response");
+            }
+            other => panic!("expected HarnessError; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stderr_signals_keep_the_first_error_line_not_the_last() {
+        // Classification names the root cause; a later cascading error must
+        // not overwrite the one that started it.
+        let stderr = stderr_of(&["Error: first cause", "Error: downstream effect"]);
+        assert_eq!(
+            stderr.signals.first_error().as_deref(),
+            Some("Error: first cause")
+        );
+    }
+
+    #[test]
+    fn classify_outcome_auth_line_on_stdout_is_auth_failure() {
+        // Unreachable from the live producer (its stdout arm breaks on the
+        // same predicate before this slice is populated), asserted so the pure
+        // function's contract stays total over both inputs rather than
+        // depending on that ordering.
+        let sig = OutcomeSignals {
+            saw_terminal_answer: false,
+            saw_stdout_content: false,
+            ..ok_signals()
+        };
+        let stdout = vec!["Authentication required. Please visit the URL to log in:".to_owned()];
+        match classify_no_stderr(&sig, &stdout) {
+            TurnOutcome::Failed { kind, .. } => {
+                assert!(matches!(kind, FailureKind::AuthFailure), "{kind:?}");
+            }
+            other => panic!("expected AuthFailure; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_outcome_stderr_without_error_still_completes_a_good_turn() {
+        // Diagnostic chatter on stderr must not fail a turn that produced a
+        // terminal transcript answer — only `Error:`/auth lines are signals.
+        let stderr = stderr_of(&["some incidental stderr chatter"]);
+        assert_eq!(
+            classify_with_stderr(&ok_signals(), &[], &stderr),
+            TurnOutcome::Completed
+        );
+    }
+
     /// Baseline signals: a clean turn that streamed an answer and saw no
     /// failure flags. Individual tests flip one field.
     fn ok_signals() -> OutcomeSignals {
@@ -2100,7 +2554,7 @@ mod tests {
             auth_failed: true,
             ..ok_signals()
         };
-        match classify_outcome(&sig, &[], &empty_tail()) {
+        match classify_no_stderr(&sig, &[]) {
             TurnOutcome::Failed {
                 kind: FailureKind::AuthFailure,
                 message,
@@ -2125,7 +2579,7 @@ mod tests {
             ambiguous_capture: true,
             ..ok_signals()
         };
-        match classify_outcome(&sig, &[], &empty_tail()) {
+        match classify_no_stderr(&sig, &[]) {
             TurnOutcome::Failed {
                 kind: FailureKind::AdapterFailure,
                 message,
@@ -2145,7 +2599,7 @@ mod tests {
             saw_stdout_content: true,
             ..ok_signals()
         };
-        match classify_outcome(&sig, &[], &empty_tail()) {
+        match classify_no_stderr(&sig, &[]) {
             TurnOutcome::Failed {
                 kind: FailureKind::AdapterFailure,
                 message,
@@ -2166,7 +2620,7 @@ mod tests {
             ..ok_signals()
         };
         let lines = vec!["Error: timed out waiting for response".to_owned()];
-        match classify_outcome(&sig, &lines, &empty_tail()) {
+        match classify_no_stderr(&sig, &lines) {
             TurnOutcome::Failed {
                 kind: FailureKind::HarnessError,
                 message,
@@ -2185,7 +2639,7 @@ mod tests {
             saw_stdout_content: false,
             ..ok_signals()
         };
-        match classify_outcome(&sig, &[], &empty_tail()) {
+        match classify_no_stderr(&sig, &[]) {
             TurnOutcome::Failed {
                 kind: FailureKind::AdapterFailure,
                 message,
@@ -2199,11 +2653,9 @@ mod tests {
         // Stale-resume is healed by the producer (recapture), not failed by
         // the classifier. A "conversation not found" line plus a streamed
         // answer still classifies Completed.
-        let tail = Mutex::new(VecDeque::from([
-            "Warning: conversation \"abc\" not found.".to_owned()
-        ]));
+        let stderr = stderr_of(&["Warning: conversation \"abc\" not found."]);
         assert!(matches!(
-            classify_outcome(&ok_signals(), &[], &tail),
+            classify_with_stderr(&ok_signals(), &[], &stderr),
             TurnOutcome::Completed
         ));
     }
@@ -2212,7 +2664,7 @@ mod tests {
     fn classify_outcome_error_line_is_harness_error() {
         let lines = vec!["Error: timed out waiting for response".to_owned()];
         let sig = ok_signals();
-        match classify_outcome(&sig, &lines, &empty_tail()) {
+        match classify_no_stderr(&sig, &lines) {
             TurnOutcome::Failed {
                 kind: FailureKind::HarnessError,
                 message,
@@ -2225,7 +2677,7 @@ mod tests {
     fn classify_outcome_auth_error_line_is_auth_failure() {
         let lines = vec!["Error: authentication timed out.".to_owned()];
         let sig = ok_signals();
-        match classify_outcome(&sig, &lines, &empty_tail()) {
+        match classify_no_stderr(&sig, &lines) {
             TurnOutcome::Failed {
                 kind: FailureKind::AuthFailure,
                 message,
@@ -2250,7 +2702,7 @@ mod tests {
             log_error: Some("Antigravity quota exhausted — Google Cloud individual quota reached. Resets in 143h34m25s.".to_owned()),
             ..ok_signals()
         };
-        match classify_outcome(&sig, &[], &empty_tail()) {
+        match classify_no_stderr(&sig, &[]) {
             TurnOutcome::Failed {
                 kind: FailureKind::HarnessError,
                 message,
@@ -2273,7 +2725,7 @@ mod tests {
             log_error: Some("Antigravity quota exhausted.".to_owned()),
             ..ok_signals()
         };
-        match classify_outcome(&sig, &[], &empty_tail()) {
+        match classify_no_stderr(&sig, &[]) {
             TurnOutcome::Failed {
                 kind: FailureKind::HarnessError,
                 message,
@@ -2293,7 +2745,7 @@ mod tests {
             ..ok_signals()
         };
         let stdout = vec!["Error: timed out waiting for response".to_owned()];
-        match classify_outcome(&sig, &stdout, &empty_tail()) {
+        match classify_no_stderr(&sig, &stdout) {
             TurnOutcome::Failed {
                 kind: FailureKind::HarnessError,
                 message,
@@ -2445,7 +2897,7 @@ mod tests {
             ..ok_signals()
         };
         assert!(matches!(
-            classify_outcome(&sig, &[], &empty_tail()),
+            classify_no_stderr(&sig, &[]),
             TurnOutcome::Completed
         ));
     }
@@ -2461,7 +2913,7 @@ mod tests {
             saw_stdout_content: true,
             ..ok_signals()
         };
-        match classify_outcome(&sig, &[], &empty_tail()) {
+        match classify_no_stderr(&sig, &[]) {
             TurnOutcome::Failed {
                 kind: FailureKind::AdapterFailure,
                 message,
@@ -2478,7 +2930,7 @@ mod tests {
             ..ok_signals()
         };
         assert!(matches!(
-            classify_outcome(&sig, &[], &empty_tail()),
+            classify_no_stderr(&sig, &[]),
             TurnOutcome::Failed {
                 kind: FailureKind::AdapterFailure,
                 ..

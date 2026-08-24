@@ -692,10 +692,10 @@
   function selectHeaderPane(pane: TranscriptPane): void {
     const projectId = selection.activeProjectId;
     if (projectId === null) return;
-    const key = paneTabKey(projectId, pane.id);
+    const paneId = pane.id;
+    const key = paneTabKey(projectId, paneId);
     delete paneTabCompleted[key];
     paneTabWasActive = paneTabWasActive.filter((id) => id !== key);
-    const wasMaximized = activePaneLayout?.maximized !== null;
     // Capture the roster alongside `projectId`: the reveal is deferred two
     // animation frames (below), and `activeRosterIds` is a live derivation, so
     // reading it inside the closure would pair the old project with whatever
@@ -711,10 +711,23 @@
       // The user navigated away before the deferred reveal ran — drop it rather
       // than mutate a project's layout they're no longer looking at.
       if (selection.activeProjectId !== projectId) return;
-      revealPane(projectId, rosterIds, pane.id);
-      if (wasMaximized && pane.members.length > 0) {
-        targetRecipients(projectId, [...pane.members]);
+      // Whether a pane was maximized, and this pane's live membership, are
+      // both read live rather than trusted from before the defer — a
+      // same-project gesture (another tab click, pane cycling, a membership
+      // edit) can change either while this was pending.
+      const live = layoutFor(projectId, rosterIds);
+      const livePane = live.panes.find((p) => p.id === paneId);
+      // Reveal only after a required retarget succeeds — mirrors `cyclePane`'s
+      // hidden-target branch. `targetRecipients` refuses while a send is
+      // rendering; revealing anyway would swap the maximized view to this pane
+      // while the compose selection silently failed to follow, leaving the
+      // user looking at a pane their next send won't actually reach. A reveal
+      // that doesn't need to retarget (nothing maximized, or nothing to
+      // target) is never a selection risk, so it stays unconditional.
+      if (live.maximized !== null && livePane !== undefined && livePane.members.length > 0) {
+        if (!targetRecipients(projectId, [...livePane.members])) return;
       }
+      revealPane(projectId, rosterIds, paneId);
     });
   }
 
@@ -734,11 +747,7 @@
     const rosterIds = activeAgents.map((a) => a.id);
     const pane = paneToCycleTo(projectId, rosterIds, selectionFor(projectId), direction);
     if (pane === null) return;
-    const targetAndReveal = (): void => {
-      if (targetRecipients(projectId, [...pane.members])) {
-        revealPane(projectId, rosterIds, pane.id);
-      }
-    };
+    const paneId = pane.id;
     // Cycling onto a hidden pane (minimized, or any pane while another is
     // maximized) remounts its transcript, so show the spinner first — exactly
     // like clicking a header tab. An already-visible target just re-targets, so
@@ -747,12 +756,19 @@
     const targetHidden =
       paneLayout !== null &&
       (paneLayout.maximized !== null
-        ? paneLayout.maximized !== pane.id
-        : paneLayout.minimized.includes(pane.id));
+        ? paneLayout.maximized !== paneId
+        : paneLayout.minimized.includes(paneId));
     if (targetHidden) {
       void withTranscriptBusy(() => {
         if (selection.activeProjectId !== projectId) return;
-        targetAndReveal();
+        // Re-read live rather than trust `pane` from before the defer — a
+        // same-project gesture can change membership (or remove the pane)
+        // while this was pending.
+        const livePane = layoutFor(projectId, rosterIds).panes.find((p) => p.id === paneId);
+        if (livePane === undefined || livePane.members.length === 0) return;
+        if (targetRecipients(projectId, [...livePane.members])) {
+          revealPane(projectId, rosterIds, paneId);
+        }
       });
     } else {
       targetRecipients(projectId, [...pane.members]);

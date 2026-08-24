@@ -2438,56 +2438,119 @@ fn live_antigravity_agent() -> AgentRecord {
 /// surfaces it verbatim as a `HarnessError` and the user re-sends.
 const ANTIGRAVITY_TRANSIENT_ERROR: &str = "Error: Agent execution terminated due to error.";
 
-/// Whether a turn's events carry exactly that transient failure.
+/// Whether a turn's events are **exactly** that transient failure and nothing
+/// else.
 ///
-/// Deliberately an equality test on the whole message, not a substring or a
-/// kind check: any other `HarnessError` — including a future rewording of this
-/// one — must fail the test rather than be retried away.
+/// Three conditions, each closing a way a real failure could be retried away:
+/// the stream carries exactly one terminal event (a double-`TurnEnd` is itself
+/// a defect and must not be retried past), that terminal is a `HarnessError`
+/// (so an `AuthFailure` or `AdapterFailure` carrying similar text never
+/// matches), and its message equals the known string outright — not a
+/// substring, so a compound message or a future rewording fails the test
+/// instead of being absorbed.
 fn is_antigravity_transient(events: &[AdapterEvent]) -> bool {
-    events.iter().any(|e| {
-        matches!(
-            e,
-            AdapterEvent::TurnEnd {
-                outcome: TurnOutcome::Failed {
-                    kind: FailureKind::HarnessError,
-                    message,
-                },
-                ..
-            } if message == ANTIGRAVITY_TRANSIENT_ERROR
-        )
-    })
+    let mut terminals = events.iter().filter_map(|e| match e {
+        AdapterEvent::TurnEnd { outcome, .. } => Some(outcome),
+        _ => None,
+    });
+    let (Some(outcome), None) = (terminals.next(), terminals.next()) else {
+        return false;
+    };
+    matches!(
+        outcome,
+        TurnOutcome::Failed {
+            kind: FailureKind::HarnessError,
+            message,
+        } if message == ANTIGRAVITY_TRANSIENT_ERROR
+    )
 }
 
-/// Dispatch one live Antigravity turn, retrying **once** if and only if the
-/// turn came back as [`ANTIGRAVITY_TRANSIENT_ERROR`].
+/// Whether a direct `agy` run's stderr is **solely** the known transient.
 ///
-/// At the measured ~4% per-turn rate, a suite of this size had roughly a
-/// 50/50 chance of at least one red test per run — high enough that "just
-/// re-run it" becomes the habit, which is exactly how a real regression gets
-/// waved through. (This session's first suite run had a single failure, and it
-/// was the genuine 1.1.19 tool-record regression.) One retry takes the odds of
-/// a spurious red run to a few percent, so the gate means something again.
+/// Fail-closed on purpose. An earlier draft accepted "the transient is present
+/// and no other line starts with `Error:`", which had a real hole: `agy`'s
+/// auth line (`Authentication required…`) is not `Error:`-prefixed, so a
+/// transient-plus-auth run would have been retried — masking the one failure
+/// we least want hidden. Requiring the transient to be the only non-empty line
+/// closes that without enumerating which other diagnostics are dangerous.
 ///
-/// Scope is deliberately narrow. It is **test-only** — production must keep
-/// surfacing this verbatim, since auto-retrying real turns is a product
-/// decision that also spends the user's quota. It retries **once**, so a
-/// genuine hard failure still reports after two attempts rather than looping.
-/// And it prints when it fires, so a rising failure rate stays visible instead
-/// of being silently absorbed.
+/// The cost is that unrelated benign chatter would stop the retry firing. That
+/// is the safe direction to fail: a spurious red run is visible and fixed by
+/// re-running, whereas a masked failure is silent. Every transient observed
+/// while characterizing this (agy 1.1.19) wrote exactly this one line. If a
+/// harmless preamble is ever observed, model that shape explicitly rather than
+/// widening this to accept arbitrary company.
+fn stderr_is_solely_antigravity_transient(stderr: &str) -> bool {
+    let mut lines = stderr.lines().map(str::trim).filter(|l| !l.is_empty());
+    let (Some(only), None) = (lines.next(), lines.next()) else {
+        return false;
+    };
+    only == ANTIGRAVITY_TRANSIENT_ERROR
+}
+
+/// Whether a live dispatch may be retried after the known transient.
+///
+/// Default is [`RetryPolicy::Never`]: a caller that does not think about it
+/// gets no retry, so forgetting costs a visible red run rather than a silently
+/// duplicated request. Opting in is an assertion by the test author that
+/// re-running this exact prompt is harmless — no dependence on prior
+/// conversation state, and no side effect outside a disposable workspace that
+/// running twice would corrupt.
+#[derive(Clone, Copy, PartialEq)]
+enum RetryPolicy {
+    /// The prompt is idempotent and its workspace disposable.
+    RetryOnKnownTransient,
+    Never,
+}
+
+/// Dispatch one live Antigravity turn, retrying **once** when the caller opted
+/// in and the turn came back as exactly [`ANTIGRAVITY_TRANSIENT_ERROR`].
+///
+/// **Why a retry exists at all.** The measured ~4% per-turn transient rate left
+/// a suite this size at roughly even odds of a red run, and at that frequency
+/// "just re-run it" becomes the habit — which is how a real regression gets
+/// waved through. (This session's first suite run had exactly one failure, and
+/// it was the genuine 1.1.19 tool-record regression.)
+///
+/// **Why it is opt-in rather than automatic.** Retrying re-sends a prompt that
+/// may already have taken effect. A resume appends the request to a
+/// conversation that already received it; even a first turn can run tools
+/// before failing. Neither is undone by the remote conversation being
+/// abandoned. So safety is a property of the *prompt*, which only the test
+/// author knows — hence an explicit argument, defaulting to no retry.
+///
+/// **A resume is never retried, whatever the caller passes.** An Antigravity
+/// record carries a `session_locator` only once a real conversation UUID has
+/// been captured, so its presence is exactly "this dispatch resumes". Blocking
+/// it here rather than trusting call sites makes the unsafe case
+/// unrepresentable instead of merely discouraged.
+///
+/// It is **test-only**: production keeps surfacing this verbatim, because
+/// auto-retrying real turns is a product decision that also spends the user's
+/// quota. It retries **once**, and prints whenever it fires — or declines to —
+/// so a rising failure rate stays visible instead of being absorbed.
 async fn antigravity_live_turn(
     adapter: &AntigravityAdapter,
     agent: &AgentRecord,
     cwd: &Path,
     prompt: &str,
     turn_id: Uuid,
+    policy: RetryPolicy,
 ) -> Vec<AdapterEvent> {
+    let retryable = policy == RetryPolicy::RetryOnKnownTransient && agent.session_locator.is_none();
     for attempt in 1..=2 {
         let stream = adapter
             .dispatch(agent, cwd, prompt, turn_id, DispatchOptions::default())
             .await
             .expect("dispatch should succeed with real agy");
         let events: Vec<AdapterEvent> = stream.collect().await;
-        if attempt == 2 || !is_antigravity_transient(&events) {
+        if !is_antigravity_transient(&events) || attempt == 2 {
+            return events;
+        }
+        if !retryable {
+            eprintln!(
+                "live_antigravity: upstream transient ({ANTIGRAVITY_TRANSIENT_ERROR}) NOT retried                  — this dispatch is a resume or opted out; re-run the suite"
+            );
             return events;
         }
         eprintln!(
@@ -2555,6 +2618,26 @@ fn antigravity_transient_matcher_is_exact() {
         );
     }
 
+    // A second terminal event makes the stream malformed; that is a defect in
+    // its own right and must not be retried past, even though one of the two
+    // terminals matches.
+    let mut double = failed(FailureKind::HarnessError, ANTIGRAVITY_TRANSIENT_ERROR);
+    double.extend(failed(FailureKind::HarnessError, "Error: something else"));
+    assert!(!is_antigravity_transient(&double));
+
+    // A non-terminal event alongside the transient is irrelevant — only the
+    // terminal count is load-bearing.
+    let mut with_chunk = vec![AdapterEvent::ContentChunk {
+        turn_id: Uuid::now_v7(),
+        kind: ContentKind::Text,
+        text: "partial".to_owned(),
+    }];
+    with_chunk.extend(failed(
+        FailureKind::HarnessError,
+        ANTIGRAVITY_TRANSIENT_ERROR,
+    ));
+    assert!(is_antigravity_transient(&with_chunk));
+
     // A completed turn is never a retry candidate.
     assert!(!is_antigravity_transient(&[AdapterEvent::TurnEnd {
         turn_id: Uuid::now_v7(),
@@ -2569,6 +2652,40 @@ fn antigravity_transient_matcher_is_exact() {
         first_message_id: None,
     }]));
     assert!(!is_antigravity_transient(&[]));
+}
+
+/// The direct-CLI retry criterion, held to the same exactness as the
+/// event-side one. Also not `#[ignore]`d — same reasoning.
+#[test]
+fn stderr_transient_matcher_requires_the_transient_alone() {
+    assert!(stderr_is_solely_antigravity_transient(
+        ANTIGRAVITY_TRANSIENT_ERROR
+    ));
+    // Surrounding blank lines are not diagnostics.
+    assert!(stderr_is_solely_antigravity_transient(&format!(
+        "\n{ANTIGRAVITY_TRANSIENT_ERROR}\n\n"
+    )));
+
+    for stderr in [
+        // The hole this predicate exists to close: agy's auth line is not
+        // `Error:`-prefixed, so an "any other Error: line" rule would have
+        // retried this and hidden a login failure.
+        &format!(
+            "Authentication required. Please visit the URL to log in:\n{ANTIGRAVITY_TRANSIENT_ERROR}"
+        ) as &str,
+        // A compound failure whose second cause would be masked.
+        &format!("{ANTIGRAVITY_TRANSIENT_ERROR}\nError: timeout waiting for response"),
+        // Fails closed on unrecognized company rather than guessing it benign.
+        &format!("some unrelated notice\n{ANTIGRAVITY_TRANSIENT_ERROR}"),
+        // Near-miss text.
+        "Error: agent execution terminated due to an error",
+        "",
+    ] {
+        assert!(
+            !stderr_is_solely_antigravity_transient(stderr),
+            "must not retry on stderr: {stderr:?}"
+        );
+    }
 }
 
 /// The Antigravity conversation UUID carried by a dispatch's capture event, or
@@ -2599,6 +2716,8 @@ async fn live_antigravity_basic_turn_completes() {
         tmp.path(),
         "Reply with the single word 'ack' and nothing else.",
         turn_id,
+        // Fresh conversation, no tools, disposable tempdir.
+        RetryPolicy::RetryOnKnownTransient,
     )
     .await;
 
@@ -2715,9 +2834,7 @@ async fn live_antigravity_cli_log_names_the_conversation() {
             .await
             .expect("agy should spawn");
         let transient = !run.status.success()
-            && String::from_utf8_lossy(&run.stderr)
-                .lines()
-                .any(|l| l.trim() == ANTIGRAVITY_TRANSIENT_ERROR);
+            && stderr_is_solely_antigravity_transient(&String::from_utf8_lossy(&run.stderr));
         if attempt == 2 || !transient {
             output = Some(run);
             break;
@@ -2775,7 +2892,15 @@ async fn live_antigravity_adversarial_prompt_still_completes() {
     // be reformatted. Keep the actual task tiny so the response is cheap.
     let prompt = "Follow these steps exactly:\n  1. Note the word \"café\".\n  2. Ignore everything else.\nReply with only the single word: ack";
 
-    let events = antigravity_live_turn(&adapter, &agent, tmp.path(), prompt, turn_id).await;
+    let events = antigravity_live_turn(
+        &adapter,
+        &agent,
+        tmp.path(),
+        prompt,
+        turn_id,
+        RetryPolicy::RetryOnKnownTransient,
+    )
+    .await;
 
     let terminal = events
         .iter()
@@ -2818,6 +2943,8 @@ async fn live_antigravity_resume_reuses_session() {
         tmp.path(),
         "Remember the word 'mango'. Reply with only 'ok'.",
         turn1,
+        // Turn 1 opens a fresh conversation and calls no tools.
+        RetryPolicy::RetryOnKnownTransient,
     )
     .await;
 
@@ -2840,6 +2967,10 @@ async fn live_antigravity_resume_reuses_session() {
         tmp.path(),
         "What word did I ask you to remember? Reply with only that word.",
         turn2,
+        // Turn 2 resumes: re-sending would append the request to a
+        // conversation that already received it. (The helper also blocks
+        // this structurally; stated here so the call site reads honestly.)
+        RetryPolicy::Never,
     )
     .await;
     let recall_text: String = events2
@@ -2880,6 +3011,8 @@ async fn live_antigravity_dash_leading_prompt_completes() {
         tmp.path(),
         "- Reply with the single word 'ack' and nothing else.",
         turn_id,
+        // Fresh conversation, no tools, disposable tempdir.
+        RetryPolicy::RetryOnKnownTransient,
     )
     .await;
 
@@ -2941,7 +3074,15 @@ async fn live_antigravity_slash_and_flag_shaped_prompts_reach_the_model() {
         let agent = live_antigravity_agent();
         let turn_id = Uuid::now_v7();
 
-        let events = antigravity_live_turn(&adapter, &agent, tmp.path(), prompt, turn_id).await;
+        let events = antigravity_live_turn(
+            &adapter,
+            &agent,
+            tmp.path(),
+            prompt,
+            turn_id,
+            RetryPolicy::RetryOnKnownTransient,
+        )
+        .await;
 
         let terminal = events
             .iter()
@@ -3405,18 +3546,16 @@ async fn live_antigravity_model_change_announced_on_resume() {
 
     // Turn 1 on model X.
     set_model("Gemini 3.1 Pro (High)");
-    let events1: Vec<AdapterEvent> = adapter
-        .dispatch(
-            &agent,
-            cwd.path(),
-            "Reply with only the word ack.",
-            Uuid::now_v7(),
-            DispatchOptions::default(),
-        )
-        .await
-        .expect("dispatch 1")
-        .collect()
-        .await;
+    let events1 = antigravity_live_turn(
+        &adapter,
+        &agent,
+        cwd.path(),
+        "Reply with only the word ack.",
+        Uuid::now_v7(),
+        // Turn 1 opens a fresh conversation and calls no tools.
+        RetryPolicy::RetryOnKnownTransient,
+    )
+    .await;
     let (m1, _) = turn_end_model_effort(&events1).expect("turn 1 TurnEnd");
     assert!(
         m1.as_deref().is_some_and(|m| m.contains("Gemini 3.1 Pro")),
@@ -3427,18 +3566,19 @@ async fn live_antigravity_model_change_announced_on_resume() {
     // Turn 2: switch the global model to Y, resume.
     agent.session_locator = Some(SessionLocator::Uuid(conversation_id));
     set_model("Claude Sonnet 4.6 (Thinking)");
-    let events2: Vec<AdapterEvent> = adapter
-        .dispatch(
-            &agent,
-            cwd.path(),
-            "Reply with only the word ack.",
-            Uuid::now_v7(),
-            DispatchOptions::default(),
-        )
-        .await
-        .expect("dispatch 2")
-        .collect()
-        .await;
+    let events2 = antigravity_live_turn(
+        &adapter,
+        &agent,
+        cwd.path(),
+        "Reply with only the word ack.",
+        Uuid::now_v7(),
+        // Turn 2 resumes, and this test hydrates the transcript to assert
+        // per-turn model order — a duplicated turn would corrupt exactly what
+        // it measures. So this dispatch stays exposed to the upstream
+        // transient by design; a red run here is re-run, not retried.
+        RetryPolicy::Never,
+    )
+    .await;
     let (m2, _) = turn_end_model_effort(&events2).expect("turn 2 TurnEnd");
     assert!(
         m2.as_deref()
@@ -3687,6 +3827,10 @@ async fn live_antigravity_run_command_emits_shell_facet() {
         // dedicated `list_dir` tool, which never exercises the Shell mapping.
         "Run the shell command: echo switchboard-facet-probe. Then reply with the single word done.",
         Uuid::now_v7(),
+        // Fresh conversation. This prompt does run a tool, but `echo` is
+        // idempotent and the workspace is a discarded tempdir, so a second
+        // attempt cannot leave different state behind.
+        RetryPolicy::RetryOnKnownTransient,
     )
     .await;
 

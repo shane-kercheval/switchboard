@@ -1347,6 +1347,9 @@ pub async fn drain_stderr_with_observer<F>(
                 tracing::debug!(agent_id = %agent_id, %turn_id, "{harness_name} stderr: {line}");
                 observe(&line);
                 if let Ok(mut buf) = tail.lock() {
+                    // Eviction policy: mirrored by the Antigravity adapter's
+                    // `stderr_of` test fixture. Changing it here means changing
+                    // it there, or its eviction guards test a stale model.
                     if buf.len() >= STDERR_TAIL_CAPACITY {
                         buf.pop_front();
                     }

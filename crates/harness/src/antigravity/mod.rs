@@ -2304,6 +2304,12 @@ mod tests {
 
     fn stderr_of(lines: &[&str]) -> Stderr {
         let signals = StderrSignals::default();
+        // NOTE: this mirrors `drain_stderr_with_observer`'s eviction policy
+        // rather than driving the real async drain, which would be heavy
+        // machinery for a synchronous predicate test. If that policy changes,
+        // change it here too — otherwise the eviction guards below would keep
+        // passing against a stale model of the real behavior. (The integration
+        // tests `*_buried_under_stderr_chatter_*` exercise the genuine path.)
         let mut tail: VecDeque<String> = VecDeque::new();
         for line in lines {
             signals.observe(line);

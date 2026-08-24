@@ -610,7 +610,15 @@ async fn auth_failure_line_on_stdout_emits_auth_failure() {
         }),
     );
 
-    let events = dispatch(&adapter, &agent, cwd.path(), "hi").await;
+    // Same hang-guard as the stderr siblings below: the fixture parks forever,
+    // so a broken fast-fail would stall the whole default suite rather than
+    // report a bounded failure.
+    let events = tokio::time::timeout(
+        FAST_FAIL_HANG_GUARD,
+        dispatch(&adapter, &agent, cwd.path(), "hi"),
+    )
+    .await
+    .expect("stdout auth line must force-kill agy, not wait out the OAuth window");
     match outcome(&events) {
         TurnOutcome::Failed {
             kind: FailureKind::AuthFailure,

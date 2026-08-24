@@ -13,7 +13,7 @@
   /// here stores a targeted pane — a stored target could drift from the real
   /// recipient set and lie.
   import { Check, Maximize2, Minimize2, MoreHorizontal, Pencil, Square, X } from "@lucide/svelte";
-  import type { AgentRecord, ConversationItem, ProjectId } from "$lib/types";
+  import type { AgentId, AgentRecord, ConversationItem, ProjectId } from "$lib/types";
   import UnifiedTranscript from "$lib/components/UnifiedTranscript.svelte";
   import Button from "$lib/components/ui/Button.svelte";
   import EmptyState from "$lib/components/ui/EmptyState.svelte";
@@ -42,6 +42,7 @@
     unassignedAgentIds,
     unassignAgentFromPane,
     moveAgentToPane,
+    type PaneId,
     type TranscriptPane,
   } from "$lib/state/transcriptPanes.svelte";
   import {
@@ -149,44 +150,106 @@
     return pane.members.length > 0 && targetRecipients(projectId, [...pane.members]);
   }
 
+  /// Hide a pane (minimize or close) and keep the recipient selection
+  /// consistent with what's still on screen. Resolves the hidden pane and its
+  /// visible survivors from the **live** layout at the moment this actually
+  /// runs, not from a snapshot the caller took earlier — minimize defers this
+  /// call two animation frames behind `runWithBusy`, and a same-project
+  /// keyboard gesture (pane cycling, numbered targeting) can land in that
+  /// window, so deciding from a stale snapshot could overwrite a newer
+  /// selection. A pane already gone by the time this runs (closed by another
+  /// gesture first) is a no-op.
+  ///
+  /// The recipient write is the sole gate: `targetRecipients` already refuses
+  /// while a send is rendering, so nothing here duplicates that policy —
+  /// `hide` only runs once the write succeeds, the same all-or-nothing
+  /// contract `targetPane` already applies to Cmd+click. Applying `hide` first
+  /// and then finding the write refused would strand the selection pointed at
+  /// agents whose pane just vanished, which is the mis-send risk pane
+  /// targeting exists to avoid.
+  ///
+  /// When exactly one *visible* pane remains afterward, that survivor is
+  /// targeted (replace semantics drop the hidden pane's agents as a side
+  /// effect) — unless the survivor is empty, in which case targeting it would
+  /// silently clear the selection to nothing (the same footgun `targetPane`
+  /// guards against), so the hidden pane's agents are dropped from the current
+  /// selection instead, leaving everything else untouched. That's also the
+  /// fallback whenever more than one pane remains visible.
+  function hidePaneAndRetarget(
+    pid: ProjectId,
+    ids: AgentId[],
+    hiddenPaneId: PaneId,
+    hide: () => void,
+  ): void {
+    const live = layoutFor(pid, ids);
+    const hiddenPane = live.panes.find((p) => p.id === hiddenPaneId);
+    if (hiddenPane === undefined) return;
+    const remainingVisible = live.panes.filter(
+      (p) => p.id !== hiddenPaneId && !live.minimized.includes(p.id),
+    );
+    const survivor = remainingVisible.length === 1 ? remainingVisible[0]! : null;
+    const nextSelection =
+      survivor !== null && survivor.members.length > 0
+        ? [...survivor.members]
+        : selectionFor(pid).filter((id) => !hiddenPane.members.includes(id));
+    if (!targetRecipients(pid, nextSelection)) return;
+    hide();
+  }
+
   /// Minimize/maximize remount or re-lay-out the transcript in one synchronous
-  /// flush, so run them behind the host's busy spinner. Project + roster are
-  /// captured up front because the spinner defers the mutation a couple of frames.
+  /// flush, so run them behind the host's busy spinner. Project, roster, and
+  /// the pane's id are captured up front only as identifiers — the spinner
+  /// defers the mutation a couple of frames, so `hidePaneAndRetarget` re-reads
+  /// the pane and its survivors from live layout once the callback actually
+  /// runs rather than trusting what was true at click time.
   function minimizePaneBusy(pane: TranscriptPane): void {
     const pid = projectId;
     const ids = [...rosterIds];
-    runWithBusy(() => minimizePane(pid, ids, pane.id));
+    const paneId = pane.id;
+    runWithBusy(() => {
+      hidePaneAndRetarget(pid, ids, paneId, () => minimizePane(pid, ids, paneId));
+    });
   }
 
   function toggleMaximizePaneBusy(pane: TranscriptPane): void {
     const pid = projectId;
     const ids = [...rosterIds];
+    const paneId = pane.id;
+    // Which control the user pressed — "Restore panes" or "Maximize X" — is
+    // decided by what was true at click time, since that's what the button
+    // they saw and pressed actually said.
     const wasMaximized = maximizedPane?.id === pane.id;
     runWithBusy(() => {
+      const live = layoutFor(pid, ids);
       if (wasMaximized) {
-        restoreMaximizedPane(pid, ids);
-      } else {
-        maximizePane(pid, ids, pane.id);
-        if (pane.members.length > 0) targetRecipients(pid, [...pane.members]);
+        // The user pressed "Restore panes" for what was, at that moment, the
+        // maximized pane. A same-project gesture (e.g. cycling to another
+        // pane) can maximize a different pane while this was pending — that's
+        // the newer state, so leave it alone rather than silently clearing it
+        // out from under the user. Only restore if this pane is still the one
+        // actually maximized.
+        if (live.maximized === paneId) restoreMaximizedPane(pid, ids);
+        return;
       }
+      // Re-read live membership rather than trust `pane` from before the
+      // defer, for the same reason `hidePaneAndRetarget` does — membership
+      // (or the pane itself) can have changed while this was pending.
+      const livePane = live.panes.find((p) => p.id === paneId);
+      if (livePane === undefined) return;
+      if (livePane.members.length > 0 && !targetRecipients(pid, [...livePane.members])) return;
+      maximizePane(pid, ids, paneId);
     });
   }
 
   /// Close a pane: a deliberate "I'm done with these agents for now". The pane's
   /// agents are dismissed — unassigned from any pane (so they leave the view) and
   /// deselected (so they stop receiving sends). They only return via "Return to
-  /// unified view". When the close leaves a single pane, that survivor is
+  /// unified view". When the close leaves a single visible pane, that survivor is
   /// targeted so you land on the agents you're left with.
   function handleClosePane(pane: TranscriptPane): void {
-    const remaining = layout.panes.filter((p) => p.id !== pane.id);
-    closePane(projectId, rosterIds, pane.id);
-    if (remaining.length === 1) {
-      // Replace semantics drop the dismissed pane's agents from the selection
-      // while targeting the lone survivor.
-      targetRecipients(projectId, [...remaining[0]!.members]);
-    } else {
-      for (const id of pane.members) deselectAgent(projectId, id);
-    }
+    hidePaneAndRetarget(projectId, rosterIds, pane.id, () =>
+      closePane(projectId, rosterIds, pane.id),
+    );
   }
 
   /// Bring every dismissed agent back into a single unified pane — the explicit
@@ -581,8 +644,8 @@
                         data-testid="pane-member-remove"
                         onclick={(event) => {
                           event.stopPropagation();
+                          if (!deselectAgent(projectId, member.id)) return;
                           unassignAgentFromPane(projectId, rosterIds, member.id);
-                          deselectAgent(projectId, member.id);
                         }}
                       >
                         <X size={10} strokeWidth={2} aria-hidden="true" />
@@ -663,8 +726,8 @@
                     {@const currentPane = layout.panes.find((p) => p.members.includes(agent.id))}
                     <DropdownMenuItem
                       onSelect={() => {
+                        if (!selectAgent(projectId, agent.id)) return;
                         moveAgentToPane(projectId, rosterIds, agent.id, pane.id);
-                        selectAgent(projectId, agent.id);
                       }}
                       disabled={alreadyInPane}
                       class="gap-2"

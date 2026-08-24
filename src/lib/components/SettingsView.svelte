@@ -33,7 +33,7 @@
     notificationAvailability,
   } from "$lib/api";
   import type { AgentProfile, HarnessKind, NotificationAvailability } from "$lib/types";
-  import { ALL_HARNESSES, HARNESS_LABEL } from "$lib/harnessDisplay";
+  import { HARNESS_LABEL, HARNESS_ORDER_GEMINI_LAST } from "$lib/harnessDisplay";
   import { workflowAuthoringPrompt } from "$lib/workflowAuthoring";
 
   let {
@@ -259,7 +259,7 @@
 
       {#if preferenceLoadState.ready}
         <div class="space-y-2">
-          {#each ALL_HARNESSES as harness (harness)}
+          {#each HARNESS_ORDER_GEMINI_LAST as harness (harness)}
             <details
               class="border-border bg-raised rounded-md border"
               open={harness === "claude_code"}

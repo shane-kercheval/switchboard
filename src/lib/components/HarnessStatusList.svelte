@@ -10,6 +10,7 @@
   import Button from "./ui/Button.svelte";
   import {
     ALL_HARNESSES,
+    HARNESS_ORDER_GEMINI_LAST,
     HARNESS_SETUP_URL,
     HARNESS_LABEL,
     HARNESS_LOGIN_HINT,
@@ -164,18 +165,6 @@
   function openSetup(harness: HarnessKind): void {
     void api.openExternalUrl(HARNESS_SETUP_URL[harness]);
   }
-
-  /// Table-only display order: Antigravity ahead of Gemini — Antigravity
-  /// superseded Gemini for individual Google accounts (2026-06-18), and the
-  /// Gemini row carries the availability note, so it reads better last.
-  /// Derived from ALL_HARNESSES rather than a literal array so a new
-  /// HarnessKind can't be silently dropped from this table. The global
-  /// insertion order stays untouched — it governs auto-create sequencing
-  /// and the picker (see harnessDisplay).
-  const DISPLAY_ORDER: HarnessKind[] = [
-    ...ALL_HARNESSES.filter((h) => h !== "gemini"),
-    ...ALL_HARNESSES.filter((h) => h === "gemini"),
-  ];
 </script>
 
 <div class="flex flex-col gap-2">
@@ -183,7 +172,7 @@
     data-testid="harness-status"
     class="harness-status-container border-border divide-border/60 flex flex-col divide-y rounded-lg border"
   >
-    {#each DISPLAY_ORDER as harness (harness)}
+    {#each HARNESS_ORDER_GEMINI_LAST as harness (harness)}
       {@const install = harnessAvailability.status(harness)}
       <!-- Derived, not read straight off `install.installed`, so this list obeys
            the same provisional-result rule as gating: a negative answer taken

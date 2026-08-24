@@ -1917,14 +1917,21 @@
   </div>
 {/snippet}
 
-<!-- A held cross-agent forward: the user's typed body (verbatim, if any) plus a
+<!-- A held cross-agent forward: the prompt name (if this hold is a prompt
+     forward — its body is never pre-composed, so the name is the only content
+     available while it waits), the user's typed body (verbatim, if any), and a
      "waiting for {sources}…" footer — distinct copy from a busy recipient's
-     "Queued…" — and a cancel control. Cancelling fires `cancel_forward`; the
+     "Queued…" — with a cancel control. Cancelling fires `cancel_forward`; the
      compose bar's awaiting `forward_message` then resolves cancelled, removes
      this entry, and restores the composer (text + source chips). -->
 {#snippet heldForwardRow(held: HeldForward)}
   {@const sourceNames = held.sources.map((s) => s.name).join(", ")}
   <div class="group min-w-0 flex-1" data-testid="held-forward" data-forward-id={held.forwardId}>
+    {#if held.promptName !== undefined}
+      <div class="text-fg text-sm font-medium" data-testid="held-forward-prompt-name">
+        {held.promptName}
+      </div>
+    {/if}
     {#if held.body.trim() !== ""}
       <div
         class="border-accent/60 bg-focus-soft w-full max-w-full overflow-hidden rounded-xl border-l-2 px-4 py-2"

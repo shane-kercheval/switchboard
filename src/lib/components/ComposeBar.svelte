@@ -80,7 +80,12 @@
   import { classifyKind, nextLabel } from "$lib/attachments";
   import { registerSend } from "$lib/state/sendCompletion";
   import { getCurrentWebview } from "@tauri-apps/api/webview";
-  import { buildRenderArgs, combinePromptMessage, missingRequiredArgs } from "$lib/prompt";
+  import {
+    buildRenderArgs,
+    combinePromptMessage,
+    missingRequiredArgs,
+    promptDisplayName,
+  } from "$lib/prompt";
   import Textarea from "$lib/components/ui/Textarea.svelte";
   import StopIcon from "$lib/components/ui/StopIcon.svelte";
   import HarnessIcon from "$lib/components/ui/HarnessIcon.svelte";
@@ -2245,14 +2250,16 @@
     // ComposeBar instance, so the cleanup must key the global store by *this*
     // forward's project, not the now-stale reactive `projectId` prop.
     const forwardProjectId = projectId;
-    // body "" — a prompt forward composes server-side (render after fill), so the
-    // held row only signals the wait; there's no pre-composed body to show.
+    // body "" — a prompt forward composes server-side (render after fill), so
+    // there's no pre-composed body to show; the held row names the prompt
+    // instead so the wait isn't entirely content-free.
     addHeldForward(forwardProjectId, {
       forwardId,
       sendId,
       body: "",
       sources: allSources,
       recipients,
+      promptName: promptDisplayName(prompt),
     });
     const forwardArgs: api.ForwardArg[] = prompt.arguments
       .filter((a) => (argSources[a.name]?.length ?? 0) > 0)

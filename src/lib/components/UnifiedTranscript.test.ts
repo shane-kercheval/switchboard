@@ -4455,6 +4455,29 @@ describe("UnifiedTranscript — cross-agent forward", () => {
     );
   });
 
+  it("shows the prompt name on a held prompt forward, whose body is always empty", async () => {
+    const state = await loadState();
+    const held = await loadHeld();
+    await state.registerAgent(CLAUDE_AGENT);
+    await state.registerAgent(CODEX_AGENT);
+    held.addHeldForward(PROJECT_ID, {
+      forwardId: "fwd-1",
+      sendId: "s-1",
+      body: "",
+      sources: [{ id: CODEX_AGENT.id, name: "bob" }],
+      recipients: [CLAUDE_AGENT.id],
+      promptName: "Summarize thread",
+    });
+
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT, CODEX_AGENT] },
+    });
+
+    const heldEl = await screen.findByTestId("held-forward");
+    expect(heldEl).toHaveTextContent("Summarize thread");
+    expect(heldEl).toHaveTextContent("waiting for bob");
+  });
+
   it("clears the held-forward indicator when the forward resolves (removed from store)", async () => {
     const state = await loadState();
     const held = await loadHeld();

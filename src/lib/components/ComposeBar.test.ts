@@ -5972,6 +5972,10 @@ describe("ComposeBar — cross-agent forward", () => {
       expect(forwards).toHaveLength(1);
       expect(held.expandForwardSources(forwards[0]?.sources ?? [])).toEqual([AGENT_B.id]);
       expect(forwards[0]?.recipients).toEqual([AGENT_A.id]);
+      // The prompt's body is never pre-composed (it renders server-side after
+      // sources resolve), so the held entry carries the prompt's display name
+      // — the only content the transcript can show while it waits.
+      expect(forwards[0]?.promptName).toBe("review");
     });
     expect(invokeMock.mock.calls.filter(([c]) => c === "send_message")).toHaveLength(0);
   });

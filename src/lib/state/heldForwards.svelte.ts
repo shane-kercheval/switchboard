@@ -152,6 +152,12 @@ export interface HeldForward {
   body: string;
   sources: ForwardSource[];
   recipients: AgentId[];
+  /// Display name of the prompt being filled, when this hold is a prompt
+  /// forward (`body` is always `""` in that case — the render happens
+  /// server-side after every argument's sources resolve, so there is nothing
+  /// else to show the user while it waits). Undefined for a plain-body
+  /// forward, which has no prompt.
+  promptName?: string;
 }
 
 const held = $state<Record<ProjectId, HeldForward[]>>({});

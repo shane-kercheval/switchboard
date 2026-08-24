@@ -568,6 +568,24 @@ describe("App", () => {
     await waitFor(() => expect(screen.queryByTestId(/^banner-/)).not.toBeInTheDocument());
   });
 
+  it("forces the projects sidebar open on startup when projects exist, even if it was left closed", async () => {
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [agent({ id: "ag-1", project_id: "p-a", name: "assistant" })],
+    });
+    // Simulates a relaunch after the user closed the sidebar in a prior
+    // session (the persisted value would already read false by the time
+    // App mounts) — the sidebar is the only project picker, so a launch
+    // that finds projects behind a closed sidebar must reopen it.
+    const { layout } = await import("$lib/layout.svelte");
+    layout.projectsSidebarOpen = false;
+
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument());
+  });
+
   it("shows a missing Claude CLI in the welcome status list without a global banner", async () => {
     backend.notInstalled.add("claude_code");
     await mountApp();

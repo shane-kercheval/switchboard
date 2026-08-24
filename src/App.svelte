@@ -452,9 +452,20 @@
     // before issuing any probe, and arms its own backstop for a lost event.
     void refreshHarnessAvailability();
     void loadPreferences();
-    void loadWorkspace().catch((err) => {
-      dirError = err instanceof Error ? err.message : String(err);
-    });
+    void loadWorkspace()
+      .then(() => {
+        // A closed sidebar is a legitimate device-local preference while the
+        // app is running, but a launch that finds existing projects behind a
+        // closed sidebar is a trap: the sidebar is the only picker, and the
+        // reopen toggle only appears once you already know to look for it.
+        // Force it open exactly once, at startup, whenever there's something
+        // in it to pick from — never mid-session, so a deliberate close later
+        // is respected.
+        if (projects.list.length > 0) layout.projectsSidebarOpen = true;
+      })
+      .catch((err) => {
+        dirError = err instanceof Error ? err.message : String(err);
+      });
 
     window.addEventListener("keydown", handleGlobalKeydown);
     const removeDevSeed = installDevTranscriptSeed(() => activeAgents);

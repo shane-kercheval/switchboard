@@ -3,9 +3,10 @@
 **Status: active.** Branch: `harness-review/antigravity-1.1.19`.
 
 This plan remediates the findings of the 2026-08-23 harness-update review of Antigravity
-(`agy` 1.0.14 → 1.1.19, 34 releases). The review found four breaking changes and two new
-capabilities. The decision (with the project owner) is to **address everything that broke and
-implement everything that opened up** — not to patch minimally and defer.
+(`agy` 1.0.14 → 1.1.19, 34 releases). The review found four breaking changes and three new
+capabilities (model/effort selection, a structured output stream, and a quota query). The
+decision (with the project owner) is to **address everything that broke and implement
+everything that opened up** — not to patch minimally and defer.
 
 ## Required reading before implementing
 
@@ -14,7 +15,7 @@ implement everything that opened up** — not to patch minimally and defer.
   (`live_antigravity_*` prefix is load-bearing for `make test-live-antigravity`).
 - `docs/harness-behavior.md` §0, §1.1–1.4, §3, §3.3, §3.4, §4 (G1/G11/G15/G16/G18/G21/G24),
   §6 (the Antigravity 1.1.2 invalid-tool-call entry — this plan supersedes it), §7.3.
-- `docs/harness-update-review.md` — the playbook this review ran under; M5 updates it.
+- `docs/harness-update-review.md` — the playbook this review ran under; M6 updates it.
 - `docs/research/archive/antigravity-cli-observed.md` — frozen provenance for the old
   contract. Cite it; do not edit it.
 - `crates/harness/src/antigravity/mod.rs` module doc — the current five-bullet contract
@@ -223,7 +224,7 @@ All in `crates/harness/src/antigravity/`.
    drift-proof, and probes confirm space-prefixed prompts dispatch and answer normally.
    The journal/transcript keep the exact user text (same posture as Claude's slash prefix —
    check how `claude_code` documents its space and match that framing). Note G18's "Antigravity
-   unchanged" cell becomes "space-prefixed" in the docs pass (M5).
+   unchanged" cell becomes "space-prefixed" in the docs pass (M6).
 3. **Failure scan covers stderr.** `classify_outcome` already receives the stderr tail;
    extend it so `first_error_line` / `is_auth_failure_line` run over the stderr lines as well
    as stdout (stdout first — order preserves existing precedence). Keep the existing "no
@@ -260,7 +261,7 @@ All in `crates/harness/src/antigravity/`.
 - Live tests (naming: `live_antigravity_*`): a slash-leading prompt (`/model …`-shaped)
   completes as a model turn; a prompt exactly equal to a flag token completes. Update the
   existing dash-leading live test only if its assertion breaks.
-- Known limitation recorded (code comment + M5 docs): the auth-line stream location @ 1.1.19
+- Known limitation recorded (code comment + M6 docs): the auth-line stream location @ 1.1.19
   is unverified (probe is destructive); scanning both streams makes the answer moot.
 
 ---
@@ -421,7 +422,7 @@ implemented as though it were evidence.
    call a result belongs to, do **not** invent a heuristic: leave the ambiguous result
    unattached and close that planner record's pending tools as "no result recorded". Wrong
    provenance (showing B's output under A) is worse for the user than an explicit unknown.
-   Note the residual asymmetry honestly in the code comment and in M5's docs: the **live**
+   Note the residual asymmetry honestly in the code comment and in M6's docs: the **live**
    path is exact for this case (M2's stream `ERROR` events carry `step_index`); **hydration**
    is only as exact as the disk invariant allows.
 4. **Hydration** (`session_file.rs`): at each turn boundary (terminal answer record / next
@@ -440,9 +441,10 @@ implemented as though it were evidence.
   whichever behavior the capture proved (exact pairing, or the conservative unattached
   policy); a normal all-success multi-tool turn unchanged; a turn with zero tool calls
   unaffected.
-- `make test-live-antigravity` fully green (15/15) — this milestone closes the review's
+- `make test-live-antigravity` fully green (all 15 pre-existing tests plus any added by
+  M1/M2) — this milestone closes the review's
   failing test.
-- README "Harness support and limitations" gains the user-facing entry (write it in M5 with
+- README "Harness support and limitations" gains the user-facing entry (write it in M6 with
   the rest of the docs; note it here so it isn't lost): reopening a project cannot show
   Antigravity tool calls that failed — the CLI doesn't save them — they appear as
   "no result recorded".
@@ -467,7 +469,7 @@ Codex have (§3.3/§3.4 "Status: shipped" machinery):
 - A stale catalog entry (model retired server-side) fails the turn pre-dispatch with agy's
   own self-describing error, verbatim — cheap, loud, quota-free.
 
-### Design rationale (must survive into code comments / the M5 docs)
+### Design rationale (must survive into code comments / the M6 docs)
 
 - **Why a per-model effort matrix here when Claude deliberately has none:** Claude's CLI
   accepts every level for every model and silently degrades — a matrix would drift silently
@@ -613,7 +615,95 @@ Codex have (§3.3/§3.4 "Status: shipped" machinery):
 
 ---
 
-## Milestone 5 — Documentation and review close-out
+## Milestone 5 — Rate-limit / quota surface via `/usage`
+
+### Goal & Outcome
+
+Antigravity 1.1.11/1.1.12 added non-interactive print-mode answers for read-only slash
+commands. `-p "/usage"` (alias `/quota`) with `--output-format json` returns a structured
+quota payload **without starting an agent turn, spending quota, or creating a conversation**
+(`num_turns: 0`, empty `conversation_id`, runs in a couple of seconds). This fills the
+rate-limit sidebar cell that is ❌ for Antigravity today. After this milestone:
+
+- After each completed Antigravity turn, the agent's sidebar shows two quota gauge lines —
+  5-hour and weekly window, with percent used and reset time — exactly like Codex's existing
+  two-window rendering.
+- The gauges show the bucket for **the agent's model group** ("Gemini Models" vs "Claude and
+  GPT models"): selected model first (M4), carry-forward observed model otherwise, clean-hide
+  if the model is unknown (§3 sidebar absent-field convention).
+- The values are restart-durable via the existing metadata sidecar, with the existing
+  "snapshot from …" tooltip semantics.
+- A quota fetch failure changes nothing visible and never affects the turn.
+
+Probe evidence (2026-08-23 @ 1.1.19), `agy -p "/usage" --output-format json`:
+
+```
+"command": {"name": "usage", "data": {"description": "…", "groups": [
+  {"name": "Gemini Models", "description": "Models within this group: Gemini Flash, Gemini Pro",
+   "buckets": [
+     {"id":"gemini-weekly","name":"Weekly Limit Remaining","window":"weekly",
+      "remaining_fraction":0.9857,"reset_time":"2026-08-30T23:57:21Z","description":"…"},
+     {"id":"gemini-5h","name":"Five Hour Limit Remaining","window":"5h",
+      "remaining_fraction":0.9500,"reset_time":"2026-08-24T04:57:21Z","description":"…"}]},
+  {"name": "Claude and GPT models", "buckets": [
+     {"id":"3p-weekly",…}, {"id":"3p-5h",…}]}]}}
+```
+
+`/credits` also answers structurally (`{"remaining_credits":0,"upgrade_uri":…}`) —
+**deliberately out of scope**: the overage-credits product story is a separate question;
+record it as a known extension in the M6 docs, don't build it. `/context` is
+interactive-only in print mode (exit 2) — the context bar stays absent for Antigravity.
+
+### Implementation Outline
+
+1. **Fetch lives in the adapter** (harness-specific logic never leaks to the dispatcher/app).
+   After a turn classifies **`Completed`** — and only then — the producer runs
+   `agy -p "/usage" --output-format json` (stdin closed, per-dispatch `--log-file`, no
+   `--add-dir` needed) and parses `command.data.groups`. The completed-turns-only gate is
+   load-bearing: an auth-dead agent fails its turn before any fetch, so the fetch can't be
+   the thing that trips `agy`'s interactive OAuth fallback. Apply the same defensive guards
+   as dispatch anyway (bounded timeout of a few seconds, auth-line force-kill from M1's
+   shared matchers).
+2. **Emission reuses the existing normalized rate-limit event** (the type Claude's
+   `rate_limit_event` and Codex's `rate_limits` already map into — read `events.rs` and both
+   emitters before shaping this). Mapping: `used_percent = (1 − remaining_fraction) × 100`;
+   `resets_at` from `reset_time`; 5-hour bucket → primary window, weekly → secondary
+   (mirroring Codex's `window_minutes` labeling — 300 / 10080). Both groups are carried on
+   the event (or the event is emitted per-group with a discriminator — choose whichever the
+   existing type accommodates without extension); the **frontend** picks the group by the
+   agent's model, since the model can change per turn while the sidecar snapshot persists.
+   If the existing type cannot carry the group split cleanly, stop and report rather than
+   extending the shared wire type unilaterally.
+3. **Timing constraint:** the event must land on the turn's own stream so the dispatcher's
+   existing sidecar persistence picks it up (that is what makes it restart-durable for
+   free). Whether it is emitted just before `TurnEnd` (bounded delay, like the post-turn
+   enrichment Codex already does) or the dispatcher tolerates it after — read the dispatcher
+   sink first; the constraint is: **never delay turn-end unboundedly, never fail the turn**.
+   On fetch/parse failure, emit nothing.
+4. **Model → group mapping** is display-time: Gemini-family model names → "Gemini Models"
+   buckets; Claude/GPT names → "Claude and GPT models" buckets; unknown → render nothing.
+   Keep the mapping in the frontend next to the Antigravity catalog (M4) so the two stay in
+   one place.
+5. **Honest-scope note for the M6 docs:** this is point-in-time, account-scoped polling —
+   concurrent Antigravity use outside Switchboard moves the numbers. Identical semantics to
+   Claude/Codex account-window quotas; say so rather than implying per-agent attribution.
+
+### Definition of Done
+
+- Fixture tests: `fake_agy` answers the `/usage` invocation with the captured JSON; adapter
+  emits the normalized event with correct percent/reset mapping; malformed/absent payload →
+  no event, turn unaffected; a failed turn → no fetch at all.
+- Frontend tests: gauge lines render for a Gemini-model agent from the Gemini buckets and
+  for a Claude-model agent from the 3p buckets; unknown model renders nothing; snapshot
+  restores from the sidecar.
+- Live test `live_antigravity_usage_payload_shape` asserting the contract we now render:
+  `command.data.groups[].buckets[]` with `remaining_fraction` ∈ [0,1] and a parseable
+  `reset_time` — the drift tripwire for a payload Google can reshape silently.
+- §3 metadata table update and the polling-semantics note are queued for M6.
+
+---
+
+## Milestone 6 — Documentation and review close-out
 
 ### Goal & Outcome
 
@@ -633,7 +723,9 @@ snapshot row).
      model text" for the Antigravity half).
    - §1.1/§1.2/§1.4 Antigravity rows: stream-`result` signal, stderr `Error:` lines,
      non-zero exits (and the decision not to gate on them), timeout wording change.
-   - §3 metadata table: Antigravity tokens cell ❌ → ✅ (no window).
+   - §3 metadata table: Antigravity tokens cell ❌ → ✅ (no window); rate-limit/quota cell
+     ❌ → ✅ (M5's `/usage` polling — note the point-in-time account-scoped semantics, and
+     record `/credits` as a known unbuilt extension).
    - §3.3: rewrite the Antigravity paragraph — model selection is now shipped via
      `--model` (the "no usable per-call model control — and we won't build one" decision is
      reversed with the evidence: no settings-file mutation, stable slugs, fast dispatch);
@@ -656,8 +748,9 @@ snapshot row).
 3. **`docs/system-design.md` §9** capability matrix: Antigravity model selection
    native-now; effort likewise.
 4. **`docs/harness-update-review.md`:** "Last reviewed" Antigravity row → `1.1.19` /
-   2026-08-23 / one-line verdict (breaking ×4, fixed; model+effort+stream-json adopted; live
-   15/15); prepend the Review-history entry; **fix the stale §2 sources row** — `agy` now
+   2026-08-23 / one-line verdict (breaking ×4, fixed; model+effort+stream-json+quota
+   adopted; live count per the final suite); prepend the Review-history entry;
+   **fix the stale §2 sources row** — `agy` now
    has `agy changelog` (the "no public changelog — review = re-probe" premise is obsolete);
    update §5's framing accordingly (changelog first, probes to verify, since the changelog
    was demonstrably incomplete — the tool-record loss appears in no changelog entry).
@@ -668,4 +761,5 @@ snapshot row).
 
 - All listed docs updated; no stale Antigravity claim remains in §0/§3.3/§3.4.
 - Playbook row + history entry present; changelog-source row fixed.
-- `make check` exit 0; live antigravity suite 15/15, run in the foreground.
+- `make check` exit 0; the full live antigravity suite green (the original 15 plus every
+  live test this plan adds), run in the foreground.

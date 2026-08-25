@@ -8,6 +8,7 @@
   /// gated entry refresh; the global refresh button forces a re-read + fetch.
   import { untrack } from "svelte";
   import { SvelteSet } from "svelte/reactivity";
+  import { FolderPlus, RefreshCw } from "@lucide/svelte";
   import { cn } from "$lib/utils";
   import Button from "$lib/components/ui/Button.svelte";
   import EmptyState from "$lib/components/ui/EmptyState.svelte";
@@ -318,25 +319,67 @@
       </div>
 
       <div class="flex min-w-0 flex-1 items-center gap-2">
-        {#if gitView.repos.length > 1}
-          {@const label = allReposCollapsed
-            ? "Expand all repositories"
-            : "Collapse all repositories"}
-          <Tooltip {label} side="bottom" reopen="fresh-hover">
+        <div class="flex shrink-0 items-center gap-0.5">
+          <Tooltip label="Add repository" side="bottom" reopen="fresh-hover">
             {#snippet trigger(props)}
               <button
                 {...props}
                 type="button"
-                class={ICON_BUTTON_CLASS}
-                aria-label={label}
-                data-testid="git-repos-toggle-all"
-                onclick={toggleAllRepos}
+                class={cn(ICON_BUTTON_CLASS, "disabled:opacity-50")}
+                aria-label="Add repository"
+                data-testid="git-add-repo"
+                disabled={adding}
+                onclick={onAddRepo}
               >
-                <ExpandCollapseIcon expanded={!allReposCollapsed} size={14} />
+                {#if adding}
+                  <Spinner class="h-3.5 w-3.5" />
+                {:else}
+                  <FolderPlus size={15} strokeWidth={1.8} aria-hidden="true" />
+                {/if}
               </button>
             {/snippet}
           </Tooltip>
-        {/if}
+
+          <Tooltip label="Refresh all repositories" side="bottom" reopen="fresh-hover">
+            {#snippet trigger(props)}
+              <button
+                {...props}
+                type="button"
+                class={cn(ICON_BUTTON_CLASS, "disabled:opacity-50")}
+                aria-label="Refresh all repositories"
+                data-testid="git-refresh-all"
+                disabled={refreshing}
+                onclick={onGlobalRefresh}
+              >
+                {#if refreshing}
+                  <Spinner class="h-3.5 w-3.5" />
+                {:else}
+                  <RefreshCw size={15} strokeWidth={1.8} aria-hidden="true" />
+                {/if}
+              </button>
+            {/snippet}
+          </Tooltip>
+
+          {#if gitView.repos.length > 1}
+            {@const label = allReposCollapsed
+              ? "Expand all repositories"
+              : "Collapse all repositories"}
+            <Tooltip {label} side="bottom" reopen="fresh-hover">
+              {#snippet trigger(props)}
+                <button
+                  {...props}
+                  type="button"
+                  class={ICON_BUTTON_CLASS}
+                  aria-label={label}
+                  data-testid="git-repos-toggle-all"
+                  onclick={toggleAllRepos}
+                >
+                  <ExpandCollapseIcon expanded={!allReposCollapsed} size={14} />
+                </button>
+              {/snippet}
+            </Tooltip>
+          {/if}
+        </div>
         <div
           class={cn(SEGMENTED_MAIN_CONTAINER_CLASS, "inline-grid grid-cols-3")}
           role="radiogroup"
@@ -373,34 +416,6 @@
           />
           Show branches without folders
         </label>
-      </div>
-
-      <div class="flex shrink-0 items-center gap-2">
-        <Button
-          variant="secondary"
-          size="sm"
-          data-testid="git-add-repo"
-          disabled={adding}
-          onclick={onAddRepo}
-        >
-          {#if adding}
-            <Spinner class="mr-1.5 h-3.5 w-3.5" />
-          {/if}
-          Add Repo
-        </Button>
-
-        <Button
-          variant="secondary"
-          size="sm"
-          data-testid="git-refresh-all"
-          disabled={refreshing}
-          onclick={onGlobalRefresh}
-        >
-          {#if refreshing}
-            <Spinner class="mr-1.5 h-3.5 w-3.5" />
-          {/if}
-          Refresh
-        </Button>
       </div>
     </div>
 

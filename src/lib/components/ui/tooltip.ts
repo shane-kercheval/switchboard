@@ -1,0 +1,1 @@
+export const SUPPLEMENTAL_TOOLTIP_DELAY = 1000;

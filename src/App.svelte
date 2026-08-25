@@ -28,6 +28,7 @@
   import CommandPaletteButton from "$lib/components/ui/CommandPaletteButton.svelte";
   import SidebarToggleButton from "$lib/components/ui/SidebarToggleButton.svelte";
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
+  import { SUPPLEMENTAL_TOOLTIP_DELAY } from "$lib/components/ui/tooltip";
   import ExpandCollapseIcon from "$lib/components/ui/ExpandCollapseIcon.svelte";
   import { ICON_BUTTON_CLASS, ICON_SIZE } from "$lib/components/ui/iconButton";
   import { FolderOpen, GitBranch, Pin, Plus, UsersRound } from "@lucide/svelte";
@@ -1185,9 +1186,18 @@
           <div class="flex min-w-0 flex-1 items-center gap-2" data-testid="breadcrumb">
             <div class="text-fg truncate text-sm font-semibold">{activeProject.name}</div>
             <div class="text-muted shrink-0 text-xs">·</div>
-            <div class="text-muted truncate text-xs" title={activeProject.directory}>
-              {activeProject.directory}
-            </div>
+            <Tooltip
+              label={activeProject.directory}
+              delayDuration={SUPPLEMENTAL_TOOLTIP_DELAY}
+              focusable={false}
+              side="bottom"
+            >
+              {#snippet trigger(props)}
+                <div {...props} class="text-muted truncate text-xs">
+                  {activeProject.directory}
+                </div>
+              {/snippet}
+            </Tooltip>
           </div>
         {:else}
           <div class="flex-1"></div>

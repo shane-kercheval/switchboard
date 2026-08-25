@@ -171,6 +171,10 @@ describe("GitView", () => {
     expect(screen.getByTestId("repo-action-remove")).toBeInTheDocument();
     expect(screen.getByTestId("repo-refresh")).not.toHaveAttribute("tabindex", "-1");
     expect(screen.getByTestId("repo-action-remove")).not.toHaveAttribute("tabindex", "-1");
+    expect(screen.getByTestId("git-add-repo")).toHaveAccessibleName("Add repository");
+    expect(screen.getByTestId("git-add-repo")).not.toHaveTextContent("Add Repo");
+    expect(screen.getByTestId("git-refresh-all")).toHaveAccessibleName("Refresh all repositories");
+    expect(screen.getByTestId("git-refresh-all")).not.toHaveTextContent("Refresh");
     screen.getByTestId("repo-action-remove").focus();
     expect(screen.getByTestId("repo-action-remove")).toHaveFocus();
     expect(screen.queryByTestId("git-repos-toggle-all")).not.toBeInTheDocument();
@@ -224,6 +228,18 @@ describe("GitView", () => {
     await waitFor(() => expect(screen.getAllByTestId("git-repo")).toHaveLength(2));
 
     const toggleAll = screen.getByTestId("git-repos-toggle-all");
+    const addRepo = screen.getByTestId("git-add-repo");
+    const refreshAllButton = screen.getByTestId("git-refresh-all");
+    const branchFilter = screen.getByTestId("branch-filter-both");
+    expect(
+      addRepo.compareDocumentPosition(refreshAllButton) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+    expect(
+      refreshAllButton.compareDocumentPosition(toggleAll) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+    expect(toggleAll.compareDocumentPosition(branchFilter) & Node.DOCUMENT_POSITION_FOLLOWING).toBe(
+      Node.DOCUMENT_POSITION_FOLLOWING,
+    );
     expect(toggleAll).toHaveAccessibleName("Collapse all repositories");
     expect(screen.getAllByTestId("repo-branches")).toHaveLength(2);
 

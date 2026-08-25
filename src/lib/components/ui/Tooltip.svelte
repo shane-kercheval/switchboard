@@ -83,6 +83,13 @@
     disableHoverableContent?: boolean;
     disabled?: boolean;
     ignoreNonKeyboardFocus?: boolean;
+    /// Disable pointer-driven opening when an existing control owns keyboard
+    /// access to details whose nested text/icons retain their own hover tooltips.
+    openOnHover?: boolean;
+    /// Set false for supplemental text whose full value is already exposed in
+    /// the DOM, especially when it sits inside another interactive control.
+    /// This prevents the delegated trigger props from adding a new Tab stop.
+    focusable?: boolean;
     /// Actionable state controls close on activation and stay quiet until the
     /// pointer genuinely leaves and re-enters. They also use the full hover
     /// delay on every entry instead of the recent-tooltip grace period.
@@ -111,6 +118,8 @@
     disableHoverableContent = true,
     disabled = false,
     ignoreNonKeyboardFocus = undefined,
+    openOnHover = true,
+    focusable = true,
     reopen = "default",
     open = $bindable(false),
     trigger,
@@ -206,6 +215,28 @@
       [freshHoverAttachmentKey]: freshHoverAttachment,
     };
   }
+
+  function tooltipTriggerProps(props: Record<string, unknown>): Record<PropertyKey, unknown> {
+    let enhancedProps = freshHoverTriggerProps(props);
+    if (!openOnHover) {
+      enhancedProps = { ...enhancedProps };
+      for (const key of Object.keys(enhancedProps)) {
+        if (
+          key === "onpointerenter" ||
+          key === "onpointermove" ||
+          key === "onpointerleave" ||
+          key === "onmouseenter" ||
+          key === "onmousemove" ||
+          key === "onmouseleave"
+        ) {
+          delete enhancedProps[key];
+        }
+      }
+    }
+    if (focusable) return enhancedProps;
+    const { tabindex: _tabindex, ...nonFocusableProps } = enhancedProps;
+    return nonFocusableProps;
+  }
 </script>
 
 <Bits.Provider {delayDuration} skipDelayDuration={reopen === "fresh-hover" ? 0 : skipDelayDuration}>
@@ -218,7 +249,7 @@
   >
     <Bits.Trigger {tether}>
       {#snippet child({ props })}
-        {@render trigger(freshHoverTriggerProps(props))}
+        {@render trigger(tooltipTriggerProps(props))}
       {/snippet}
     </Bits.Trigger>
     {#if !disabled}

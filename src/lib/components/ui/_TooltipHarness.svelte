@@ -16,6 +16,8 @@
       | "bound"
       | "bound-fresh"
       | "focus-override"
+      | "non-focusable"
+      | "focus-only"
       | "non-hoverable"
       | "dynamic",
   }: {
@@ -27,6 +29,8 @@
       | "bound"
       | "bound-fresh"
       | "focus-override"
+      | "non-focusable"
+      | "focus-only"
       | "non-hoverable"
       | "dynamic";
   } = $props();
@@ -94,6 +98,18 @@
   <Tooltip label="focus override" reopen="fresh-hover" ignoreNonKeyboardFocus={false}>
     {#snippet trigger(props)}
       <button {...props} type="button" data-testid="tt-trigger">trigger</button>
+    {/snippet}
+  </Tooltip>
+{:else if mode === "non-focusable"}
+  <Tooltip label="supplemental detail" focusable={false}>
+    {#snippet trigger(props)}
+      <span {...props} data-testid="tt-trigger">detail</span>
+    {/snippet}
+  </Tooltip>
+{:else if mode === "focus-only"}
+  <Tooltip label="keyboard detail" openOnHover={false}>
+    {#snippet trigger(props)}
+      <button {...props} type="button" data-testid="tt-trigger">detail</button>
     {/snippet}
   </Tooltip>
 {:else if mode === "non-hoverable"}

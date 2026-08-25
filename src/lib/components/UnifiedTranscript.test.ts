@@ -2294,7 +2294,7 @@ describe("UnifiedTranscript — per-message copy", () => {
     expect(copyTextMock).toHaveBeenCalledWith("Answer text");
   });
 
-  it("shows a timestamp (titled with the ISO start) on each message", async () => {
+  it("shows a timestamp without a native title tooltip on each message", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
     state.transcripts[CLAUDE_AGENT.id] = [
@@ -2312,7 +2312,10 @@ describe("UnifiedTranscript — per-message copy", () => {
 
     const time = screen.getByTestId("turn").querySelector('[data-testid="message-time"]');
     if (!time) throw new Error("expected a timestamp on the message");
-    expect(time).toHaveAttribute("title", "2026-05-16T08:30:00Z");
+    expect(time).toHaveAttribute("datetime", "2026-05-16T08:30:00Z");
+    expect(time).toHaveAccessibleName("2026-05-16T08:30:00Z");
+    expect(time).not.toHaveAttribute("tabindex");
+    expect(time).not.toHaveAttribute("title");
     expect(time.textContent?.trim()).not.toBe("");
   });
 
@@ -2581,7 +2584,11 @@ describe("UnifiedTranscript — per-message cost + overage", () => {
           },
         ],
         usage: { input_tokens: 10, output_tokens: 5, total_cost_usd: 0.0125 },
-        spend: { real_spend: true, is_overage: true, overage_resets_at: null },
+        spend: {
+          real_spend: true,
+          is_overage: true,
+          overage_resets_at: "2026-05-16T12:00:00Z",
+        },
       },
     ];
 
@@ -2591,7 +2598,17 @@ describe("UnifiedTranscript — per-message cost + overage", () => {
     const overage = screen.getByTestId("message-overage");
     const toggle = screen.getByTestId("turn-preview-toggle");
     expect(overage).toBeInTheDocument();
+    expect(overage).toHaveAttribute("tabindex", "0");
     expect(overage.compareDocumentPosition(toggle) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      await fireEvent.focus(overage);
+      await vi.advanceTimersByTimeAsync(1100);
+      expect(screen.getByTestId("tooltip-content")).toHaveTextContent("window resets");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("renders neither cost nor marker on a normal-quota Claude turn", async () => {

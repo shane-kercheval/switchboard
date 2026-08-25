@@ -47,6 +47,7 @@
   import Spinner from "$lib/components/ui/Spinner.svelte";
   import StatusDot from "$lib/components/ui/StatusDot.svelte";
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
+  import { SUPPLEMENTAL_TOOLTIP_DELAY } from "$lib/components/ui/tooltip";
   import { workflowRuns, cancelRun } from "$lib/state/workflows.svelte";
   import DropdownMenu from "$lib/components/ui/DropdownMenu.svelte";
   import DropdownMenuItem from "$lib/components/ui/DropdownMenuItem.svelte";
@@ -635,9 +636,15 @@
                   </Tooltip>
                 </div>
                 <div class="text-muted flex w-full items-center gap-1 text-xs leading-4">
-                  <span class="truncate" title={project.directory}
-                    >{basename(project.directory)}</span
+                  <Tooltip
+                    label={project.directory}
+                    delayDuration={SUPPLEMENTAL_TOOLTIP_DELAY}
+                    side="right"
                   >
+                    {#snippet trigger(props)}
+                      <span {...props} class="truncate">{basename(project.directory)}</span>
+                    {/snippet}
+                  </Tooltip>
                 </div>
                 {#if renameError}
                   <div
@@ -650,35 +657,44 @@
                 {/if}
               </div>
             {:else}
-              <button
-                type="button"
-                class="flex min-w-0 flex-1 flex-col items-start gap-0.5 px-2.5 py-2 text-left"
-                data-testid="project-select"
-                onclick={(event) => onProjectButtonClick(event, project)}
-                onmousedown={(event) => onProjectButtonMouseDown(event, project)}
-                ondblclick={(event) => {
-                  event.preventDefault();
-                  startEdit(project);
-                }}
+              <Tooltip
+                label={project.directory}
+                delayDuration={SUPPLEMENTAL_TOOLTIP_DELAY}
+                side="right"
               >
-                <div class="flex w-full items-center gap-2">
-                  <span class="text-fg truncate text-[13px] font-semibold">
-                    {project.name}
-                  </span>
-                  {#if !project.available}
-                    <Badge class="ml-auto shrink-0" testid="project-unavailable">unavailable</Badge>
-                  {/if}
-                </div>
-                <div class="text-muted flex w-full items-center gap-1 text-xs leading-4">
-                  <span class="truncate" title={project.directory}
-                    >{basename(project.directory)}</span
+                {#snippet trigger(props)}
+                  <button
+                    {...props}
+                    type="button"
+                    class="flex min-w-0 flex-1 flex-col items-start gap-0.5 px-2.5 py-2 text-left"
+                    data-testid="project-select"
+                    onclick={(event) => onProjectButtonClick(event, project)}
+                    onmousedown={(event) => onProjectButtonMouseDown(event, project)}
+                    ondblclick={(event) => {
+                      event.preventDefault();
+                      startEdit(project);
+                    }}
                   >
-                  <span>·</span>
-                  <span class="shrink-0"
-                    >{relativeTime(project.last_activity, new Date(relativeNow))}</span
-                  >
-                </div>
-              </button>
+                    <div class="flex w-full items-center gap-2">
+                      <span class="text-fg truncate text-[13px] font-semibold">
+                        {project.name}
+                      </span>
+                      {#if !project.available}
+                        <Badge class="ml-auto shrink-0" testid="project-unavailable"
+                          >unavailable</Badge
+                        >
+                      {/if}
+                    </div>
+                    <div class="text-muted flex w-full items-center gap-1 text-xs leading-4">
+                      <span class="truncate">{basename(project.directory)}</span>
+                      <span>·</span>
+                      <span class="shrink-0"
+                        >{relativeTime(project.last_activity, new Date(relativeNow))}</span
+                      >
+                    </div>
+                  </button>
+                {/snippet}
+              </Tooltip>
               <div class="flex shrink-0 items-center gap-0.5 pr-1.5">
                 {#if !completed || archivedView === "archived"}
                   <div

@@ -322,6 +322,24 @@ function rowSelectButton(index = 0): HTMLButtonElement {
   return btn as HTMLButtonElement;
 }
 
+describe("ProjectsSidebar — supplemental directory tooltip", () => {
+  it("uses the existing project button as the keyboard trigger", async () => {
+    await renderWith([projectIn(PROJECT_1, "alpha", "/work/alpha")]);
+    const select = rowSelectButton();
+    expect(select.querySelector('[tabindex="0"]')).toBeNull();
+
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      await fireEvent.keyDown(window, { key: "Tab" });
+      await fireEvent.focus(select);
+      await vi.advanceTimersByTimeAsync(1100);
+      expect(screen.getByTestId("tooltip-content")).toHaveTextContent("/work/alpha");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
 describe("ProjectsSidebar — relative activity labels", () => {
   const A1 = "00000000-0000-7000-8000-0000000000r1";
 

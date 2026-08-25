@@ -22,6 +22,7 @@
   import Spinner from "$lib/components/ui/Spinner.svelte";
   import DiffView from "$lib/components/DiffView.svelte";
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
+  import { SUPPLEMENTAL_TOOLTIP_DELAY } from "$lib/components/ui/tooltip";
   import AsyncIconButton from "$lib/components/ui/AsyncIconButton.svelte";
   import { ICON_BUTTON_CLASS, ROW_ACTION_ICON_CLASS } from "$lib/components/ui/iconButton";
   import {
@@ -580,7 +581,15 @@
                     >{badge.letter}</span
                   >
                   <span class="min-w-0 flex-1">
-                    <span class="block truncate" title={file.path}>{basename(file.path)}</span>
+                    <Tooltip
+                      label={file.path}
+                      delayDuration={SUPPLEMENTAL_TOOLTIP_DELAY}
+                      focusable={false}
+                    >
+                      {#snippet trigger(props)}
+                        <span {...props} class="block truncate">{basename(file.path)}</span>
+                      {/snippet}
+                    </Tooltip>
                     {#if directory}
                       <span class="text-muted/60 block truncate font-mono text-[10px] leading-4">
                         {directory}

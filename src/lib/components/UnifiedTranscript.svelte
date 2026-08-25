@@ -71,6 +71,7 @@
   import ErrorDetailsDialog from "$lib/components/ui/ErrorDetailsDialog.svelte";
   import Button from "$lib/components/ui/Button.svelte";
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
+  import { SUPPLEMENTAL_TOOLTIP_DELAY } from "$lib/components/ui/tooltip";
   import {
     isCompact,
     setManyOverrides,
@@ -1724,13 +1725,18 @@
          `real_spend` without `is_overage` → cost shows, marker stays hidden. -->
     <div class="flex shrink-0 items-center gap-2">
       {#if spend?.is_overage}
-        <span
-          class="text-warning text-xs"
-          data-testid="message-overage"
-          title={spend?.overage_resets_at
+        <Tooltip
+          label={spend?.overage_resets_at
             ? `Spending overage credits — window resets ${new Date(spend.overage_resets_at).toLocaleString()}`
-            : "Spending overage credits"}>⚡ using credits</span
+            : "Spending overage credits"}
+          delayDuration={SUPPLEMENTAL_TOOLTIP_DELAY}
         >
+          {#snippet trigger(props)}
+            <span {...props} class="text-warning text-xs" data-testid="message-overage"
+              >⚡ using credits</span
+            >
+          {/snippet}
+        </Tooltip>
       {/if}
       {#if spend?.real_spend && costUsd != null}
         <span class="text-muted text-xs" data-testid="message-cost">${costUsd.toFixed(4)}</span>
@@ -1756,12 +1762,17 @@
             >
           {/if}
           {#if at}
-            <time
-              class="text-muted max-w-full truncate text-xs"
-              datetime={at}
-              title={at}
-              data-testid="message-time">{formatTime(at)}</time
-            >
+            <Tooltip label={at} delayDuration={SUPPLEMENTAL_TOOLTIP_DELAY} focusable={false}>
+              {#snippet trigger(props)}
+                <time
+                  {...props}
+                  class="text-muted max-w-full truncate text-xs"
+                  datetime={at}
+                  aria-label={at}
+                  data-testid="message-time">{formatTime(at)}</time
+                >
+              {/snippet}
+            </Tooltip>
           {/if}
         </div>
       </div>

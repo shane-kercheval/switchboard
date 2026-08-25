@@ -21,14 +21,18 @@
   import GitStatusIcon from "$lib/components/GitStatusIcon.svelte";
   import Spinner from "$lib/components/ui/Spinner.svelte";
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
+  import { SUPPLEMENTAL_TOOLTIP_DELAY } from "$lib/components/ui/tooltip";
   import AsyncIconButton from "$lib/components/ui/AsyncIconButton.svelte";
   import DropdownMenu from "$lib/components/ui/DropdownMenu.svelte";
   import DropdownMenuItem from "$lib/components/ui/DropdownMenuItem.svelte";
   import { ICON_BUTTON_CLASS, ROW_ACTION_ICON_CLASS } from "$lib/components/ui/iconButton";
   import {
+    indicatorTooltipSummary,
     localBranchIndicators,
     remoteBranchIndicators,
     remoteOnlyIndicator,
+    worktreeWarningIndicators,
+    type GitStatusIndicator,
   } from "$lib/gitStatusIndicators";
   import type {
     BranchView,
@@ -381,25 +385,33 @@
       {/snippet}
     </Tooltip>
 
-    <div class="flex min-w-0 flex-1 items-baseline gap-1.5">
-      <span class="text-fg max-w-[65%] shrink-0 truncate text-sm font-semibold" title={repo.root}
-        >{repo.name}</span
-      >
-      <span class="flex max-w-full min-w-0 flex-1 items-baseline gap-1.5 overflow-hidden">
-        <span class="text-border shrink-0 text-[11px]">/</span>
-        <span class="text-muted min-w-0 truncate font-mono text-[11px] leading-4" title={repo.root}>
-          {displayPath(repo.root)}
-        </span>
-      </span>
-      {#if repo.is_bare}
-        <Badge testid="repo-bare" class="shrink-0">bare</Badge>
-      {/if}
-      {#if !repo.available}
-        <Badge testid="repo-unavailable" class="bg-warning-soft text-warning shrink-0">
-          unavailable
-        </Badge>
-      {/if}
-    </div>
+    <Tooltip label={repo.root} delayDuration={SUPPLEMENTAL_TOOLTIP_DELAY}>
+      {#snippet trigger(props)}
+        <div
+          {...props}
+          class="flex min-w-0 flex-1 items-baseline gap-1.5"
+          data-testid="repo-identity"
+        >
+          <span class="text-fg max-w-[65%] shrink-0 truncate text-sm font-semibold"
+            >{repo.name}</span
+          >
+          <span class="flex max-w-full min-w-0 flex-1 items-baseline gap-1.5 overflow-hidden">
+            <span class="text-border shrink-0 text-[11px]">/</span>
+            <span class="text-muted min-w-0 truncate font-mono text-[11px] leading-4">
+              {displayPath(repo.root)}
+            </span>
+          </span>
+          {#if repo.is_bare}
+            <Badge testid="repo-bare" class="shrink-0">bare</Badge>
+          {/if}
+          {#if !repo.available}
+            <Badge testid="repo-unavailable" class="bg-warning-soft text-warning shrink-0">
+              unavailable
+            </Badge>
+          {/if}
+        </div>
+      {/snippet}
+    </Tooltip>
 
     <div class="flex shrink-0 items-center gap-0.5">
       {#if fetchState?.kind === "failed"}
@@ -564,6 +576,7 @@
         {#each localBranches as branch (branch.name)}
           {@const selected = isLocalSelected(branch.name)}
           {@const worktreePath = branch.worktree?.path ?? null}
+          {@const branchIndicators = localBranchIndicators(branch, repo.default_branch)}
           {@const actionsOpen = worktreePath !== null && openWorktreeActionsPath === worktreePath}
           <div
             class={cn(
@@ -579,15 +592,21 @@
             <!-- Clicking the row selects the branch: it expands to show commits
                  and the panel opens on a default target. The actions menu is a
                  sibling button so the two clicks don't nest. -->
-            <button
-              type="button"
-              class="flex min-w-0 flex-1 items-center gap-2 text-left"
-              data-testid="branch-select"
-              data-selected={selected}
-              onclick={() => onSelectLocal(branch)}
-            >
-              {@render branchInner(branch)}
-            </button>
+            <Tooltip delayDuration={SUPPLEMENTAL_TOOLTIP_DELAY} openOnHover={false}>
+              {#snippet trigger(props)}
+                <button
+                  {...props}
+                  type="button"
+                  class="flex min-w-0 flex-1 items-center gap-2 text-left"
+                  data-testid="branch-select"
+                  data-selected={selected}
+                  onclick={() => onSelectLocal(branch)}
+                >
+                  {@render branchInner(branch, branchIndicators)}
+                </button>
+              {/snippet}
+              {@render gitRowTooltipContent([branch.name, worktreePath], branchIndicators)}
+            </Tooltip>
             {#if worktreePath !== null}
               <DropdownMenu
                 open={actionsOpen}
@@ -707,6 +726,10 @@
 
         {#each visibleRemoteOnlyBranches as branch (branch.name)}
           {@const selected = isRemoteSelected(branch.name)}
+          {@const branchIndicators = [
+            remoteOnlyIndicator(branch.name),
+            ...remoteBranchIndicators(branch, repo.default_branch),
+          ]}
           <div
             class={cn(
               "flex min-h-8 items-center gap-2 rounded-md px-2 py-1.5 opacity-80 transition-colors",
@@ -715,15 +738,21 @@
             data-testid="git-remote-branch"
             data-branch={branch.name}
           >
-            <button
-              type="button"
-              class="flex min-w-0 flex-1 items-center gap-2 text-left"
-              data-testid="branch-select"
-              data-selected={selected}
-              onclick={() => onSelectRemote(branch.name)}
-            >
-              {@render remoteInner(branch)}
-            </button>
+            <Tooltip delayDuration={SUPPLEMENTAL_TOOLTIP_DELAY} openOnHover={false}>
+              {#snippet trigger(props)}
+                <button
+                  {...props}
+                  type="button"
+                  class="flex min-w-0 flex-1 items-center gap-2 text-left"
+                  data-testid="branch-select"
+                  data-selected={selected}
+                  onclick={() => onSelectRemote(branch.name)}
+                >
+                  {@render remoteInner(branch, branchIndicators)}
+                </button>
+              {/snippet}
+              {@render gitRowTooltipContent([branch.name], branchIndicators)}
+            </Tooltip>
           </div>
           {#if selected}
             {@render commitList(null, false)}
@@ -745,6 +774,7 @@
         {#if branchFilter !== "remote"}
           {#each repo.detached_worktrees as wt (wt.path)}
             {@const dselected = isUncommittedSelected(wt.path)}
+            {@const warningIndicators = worktreeWarningIndicators(wt)}
             <div
               class={cn(
                 "flex min-h-8 items-center gap-2 rounded-md px-2 py-1.5 transition-colors",
@@ -754,19 +784,34 @@
             >
               {#if wt.warning === "prunable"}
                 <!-- Directory is gone — nothing to inspect, so not openable. -->
-                <div class="flex min-w-0 flex-1 items-center gap-2">
-                  {@render detachedInner(wt)}
-                </div>
+                <Tooltip delayDuration={SUPPLEMENTAL_TOOLTIP_DELAY} openOnHover={false}>
+                  {#snippet trigger(props)}
+                    <div
+                      {...props}
+                      class="flex min-w-0 flex-1 items-center gap-2"
+                      data-testid="detached-identity"
+                    >
+                      {@render detachedInner(wt, warningIndicators)}
+                    </div>
+                  {/snippet}
+                  {@render gitRowTooltipContent([wt.path], warningIndicators)}
+                </Tooltip>
               {:else}
-                <button
-                  type="button"
-                  class="flex min-w-0 flex-1 items-center gap-2 text-left"
-                  data-testid="worktree-select"
-                  data-selected={dselected}
-                  onclick={() => onSelectDetached(wt)}
-                >
-                  {@render detachedInner(wt)}
-                </button>
+                <Tooltip delayDuration={SUPPLEMENTAL_TOOLTIP_DELAY} openOnHover={false}>
+                  {#snippet trigger(props)}
+                    <button
+                      {...props}
+                      type="button"
+                      class="flex min-w-0 flex-1 items-center gap-2 text-left"
+                      data-testid="worktree-select"
+                      data-selected={dselected}
+                      onclick={() => onSelectDetached(wt)}
+                    >
+                      {@render detachedInner(wt, warningIndicators)}
+                    </button>
+                  {/snippet}
+                  {@render gitRowTooltipContent([wt.path], warningIndicators)}
+                </Tooltip>
               {/if}
             </div>
           {/each}
@@ -824,31 +869,63 @@
           </div>
           {#each range.commits as commit (commit.oid)}
             {@const cSel = isCommitSelected(commit.oid)}
-            <button
-              type="button"
-              class={cn(
-                "flex w-full items-center gap-1.5 rounded-md px-2 py-1 text-left text-xs transition-colors",
-                cSel ? "bg-selected text-fg" : cn("text-muted", hoverBg),
-              )}
-              data-testid="commit-row"
-              data-oid={commit.oid}
-              data-selected={cSel}
-              onclick={() => selectCommit(repo.root, commit)}
+            <Tooltip
+              label={[
+                commit.short_oid,
+                commit.subject,
+                commit.unpushed ? "Not pushed" : null,
+                !commit.unpushed && commit.branch_work ? "Branch work" : null,
+              ]
+                .filter((part) => part !== null)
+                .join(" · ")}
+              delayDuration={SUPPLEMENTAL_TOOLTIP_DELAY}
+              openOnHover={false}
             >
-              {#if hasUnpushed || hasBranchWork}
-                {@render commitDot(commit.unpushed, commit.branch_work)}
-              {/if}
-              <span class="text-muted shrink-0 font-mono text-[11px]" title={commit.short_oid}>
-                {compactCommitTimestamp(commit)}
-              </span>
-              <!-- The subject is the row's payload — promoted to `text-fg` so
-                   the list reads as scannable subjects with recessed
-                   timestamps, not a uniform gray wall. Selection color still
-                   wins (the row's own `text-fg` when selected). -->
-              <span class="text-fg min-w-0 flex-1 truncate" title={commit.subject}
-                >{commit.subject}</span
-              >
-            </button>
+              {#snippet trigger(props)}
+                <button
+                  {...props}
+                  type="button"
+                  class={cn(
+                    "flex w-full items-center gap-1.5 rounded-md px-2 py-1 text-left text-xs transition-colors",
+                    cSel ? "bg-selected text-fg" : cn("text-muted", hoverBg),
+                  )}
+                  data-testid="commit-row"
+                  data-oid={commit.oid}
+                  data-selected={cSel}
+                  onclick={() => selectCommit(repo.root, commit)}
+                >
+                  {#if hasUnpushed || hasBranchWork}
+                    {@render commitDot(commit.unpushed, commit.branch_work)}
+                  {/if}
+                  <Tooltip
+                    label={commit.short_oid}
+                    delayDuration={SUPPLEMENTAL_TOOLTIP_DELAY}
+                    focusable={false}
+                  >
+                    {#snippet trigger(props)}
+                      <span {...props} class="text-muted shrink-0 font-mono text-[11px]">
+                        {compactCommitTimestamp(commit)}
+                      </span>
+                    {/snippet}
+                  </Tooltip>
+                  <!-- The subject is the row's payload — promoted to `text-fg` so
+                       the list reads as scannable subjects with recessed
+                       timestamps, not a uniform gray wall. Selection color still
+                       wins (the row's own `text-fg` when selected). -->
+                  <Tooltip
+                    label={commit.subject}
+                    delayDuration={SUPPLEMENTAL_TOOLTIP_DELAY}
+                    focusable={false}
+                  >
+                    {#snippet trigger(props)}
+                      <span {...props} class="text-fg min-w-0 flex-1 truncate"
+                        >{commit.subject}</span
+                      >
+                    {/snippet}
+                  </Tooltip>
+                </button>
+              {/snippet}
+            </Tooltip>
           {/each}
           {#if range.truncated}
             <p class="text-muted/70 px-2 py-1 text-[10px]">…older commits not shown</p>
@@ -876,7 +953,13 @@
        renders. -->
   <span class="inline-flex h-4 w-2 shrink-0 items-center justify-center">
     {#if unpushed}
-      <Tooltip side="top" delayDuration={0} skipDelayDuration={0} disableHoverableContent>
+      <Tooltip
+        side="top"
+        delayDuration={0}
+        skipDelayDuration={0}
+        disableHoverableContent
+        focusable={false}
+      >
         {#snippet trigger(props)}
           <span
             {...props}
@@ -896,7 +979,13 @@
         </div>
       </Tooltip>
     {:else if branchWork}
-      <Tooltip side="top" delayDuration={0} skipDelayDuration={0} disableHoverableContent>
+      <Tooltip
+        side="top"
+        delayDuration={0}
+        skipDelayDuration={0}
+        disableHoverableContent
+        focusable={false}
+      >
         {#snippet trigger(props)}
           <span
             {...props}
@@ -919,77 +1008,95 @@
   </span>
 {/snippet}
 
-{#snippet remoteInner(branch: RemoteBranchView)}
+{#snippet remoteInner(
+  branch: RemoteBranchView,
+  indicators: ReturnType<typeof remoteBranchIndicators>,
+)}
   <div class="min-w-0 flex-1">
     <div class="flex min-w-0 items-center gap-1.5">
-      <span class="text-muted truncate text-[13px] leading-5" title={branch.name}>
-        {branch.name}
-      </span>
+      <Tooltip label={branch.name} delayDuration={SUPPLEMENTAL_TOOLTIP_DELAY} focusable={false}>
+        {#snippet trigger(props)}
+          <span {...props} class="text-muted truncate text-[13px] leading-5">
+            {branch.name}
+          </span>
+        {/snippet}
+      </Tooltip>
       <div class="flex shrink-0 items-center gap-1">
-        <GitStatusIcon indicator={remoteOnlyIndicator(branch.name)} />
+        <GitStatusIcon indicator={indicators[0]!} focusable={false} />
       </div>
     </div>
     <div class="text-muted truncate text-[11px] leading-4">No local folder</div>
   </div>
   <div class="flex shrink-0 items-center gap-1">
-    {#each remoteBranchIndicators(branch, repo.default_branch) as indicator (indicator.key)}
-      <GitStatusIcon {indicator} />
+    {#each indicators.slice(1) as indicator (indicator.key)}
+      <GitStatusIcon {indicator} focusable={false} />
     {/each}
   </div>
 {/snippet}
 
-{#snippet branchInner(branch: BranchView)}
+{#snippet branchInner(branch: BranchView, indicators: ReturnType<typeof localBranchIndicators>)}
+  {@const worktree = branch.worktree}
   <div class="min-w-0 flex-1">
     <div class="flex min-w-0 items-center gap-1.5">
-      <span class="text-fg truncate text-[13px] leading-5" title={branch.name}>{branch.name}</span>
+      <Tooltip label={branch.name} delayDuration={SUPPLEMENTAL_TOOLTIP_DELAY} focusable={false}>
+        {#snippet trigger(props)}
+          <span {...props} class="text-fg truncate text-[13px] leading-5">{branch.name}</span>
+        {/snippet}
+      </Tooltip>
       <div class="flex shrink-0 items-center gap-1">
-        {#each localBranchIndicators(branch, repo.default_branch) as indicator (indicator.key)}
-          <GitStatusIcon {indicator} />
+        {#each indicators as indicator (indicator.key)}
+          <GitStatusIcon {indicator} focusable={false} />
         {/each}
       </div>
     </div>
-    {#if branch.worktree}
-      <div class="text-muted truncate font-mono text-[11px] leading-4" title={branch.worktree.path}>
-        {displayPath(branch.worktree.path)}
-      </div>
+    {#if worktree}
+      <Tooltip label={worktree.path} delayDuration={SUPPLEMENTAL_TOOLTIP_DELAY} focusable={false}>
+        {#snippet trigger(props)}
+          <div {...props} class="text-muted truncate font-mono text-[11px] leading-4">
+            {displayPath(worktree.path)}
+          </div>
+        {/snippet}
+      </Tooltip>
     {:else}
       <div class="text-muted truncate text-[11px] leading-4">No local folder</div>
     {/if}
   </div>
 {/snippet}
 
-{#snippet detachedInner(wt: WorktreeView)}
+{#snippet detachedInner(wt: WorktreeView, indicators: GitStatusIndicator[])}
   <div class="min-w-0 flex-1">
     <div class="flex min-w-0 items-center gap-1.5">
       <span class="text-muted truncate font-mono text-[12px] leading-5">
         {wt.detached_hash ?? "detached"}
       </span>
       <div class="flex shrink-0 items-center gap-1">
-        {#if wt.warning === "orphaned"}
-          <GitStatusIcon
-            indicator={{
-              key: "orphaned",
-              label: "orphaned",
-              tone: "warning",
-              title: "Orphaned folder",
-              description: "The branch this folder was on was deleted.",
-            }}
-          />
-        {:else if wt.warning === "prunable"}
-          <GitStatusIcon
-            indicator={{
-              key: "prunable",
-              label: "prunable",
-              tone: "warning",
-              title: "Missing folder",
-              description: "This folder path is gone; the git worktree record can be pruned.",
-            }}
-          />
-        {/if}
+        {#each indicators as indicator (indicator.key)}
+          <GitStatusIcon {indicator} focusable={false} />
+        {/each}
       </div>
     </div>
-    <div class="text-muted truncate font-mono text-[11px] leading-4" title={wt.path}>
-      {basename(wt.path)}
+    <Tooltip label={wt.path} delayDuration={SUPPLEMENTAL_TOOLTIP_DELAY} focusable={false}>
+      {#snippet trigger(props)}
+        <div {...props} class="text-muted truncate font-mono text-[11px] leading-4">
+          {basename(wt.path)}
+        </div>
+      {/snippet}
+    </Tooltip>
+  </div>
+{/snippet}
+
+{#snippet gitRowTooltipContent(
+  identityParts: Array<string | null>,
+  indicators: GitStatusIndicator[],
+)}
+  <div class="max-w-80">
+    <div class="text-[13px] leading-4 font-medium">
+      {identityParts.filter((part) => part !== null).join(" · ")}
     </div>
+    {#each indicators as indicator (indicator.key)}
+      <div class="text-primary-fg/70 mt-1 text-xs leading-4">
+        {indicatorTooltipSummary(indicator)}
+      </div>
+    {/each}
   </div>
 {/snippet}

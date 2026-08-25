@@ -88,6 +88,23 @@ pub enum CoreError {
         axis: crate::harness::SelectionAxis,
     },
 
+    /// An effort was selected with no model to apply it to.
+    ///
+    /// Distinct from [`Self::SelectionUnsupported`], which is a statement about
+    /// the *harness*: this one is about the *profile* being incoherent whatever
+    /// the harness supports. It exists for Antigravity, whose valid effort
+    /// levels are a property of the chosen model — `agy` rejects an effort that
+    /// the model does not offer, and offers none at all without a model — so an
+    /// effort alone cannot be dispatched or even validated. Refused at the
+    /// persistence boundary rather than dropped at dispatch, which would leave
+    /// a stored profile claiming something the turn never did.
+    #[error(
+        "{harness} cannot apply a reasoning effort without a model          — the valid levels depend on which model is selected"
+    )]
+    EffortWithoutModel {
+        harness: crate::harness::HarnessKind,
+    },
+
     #[error("agent {0} cannot activate a secondary profile because none is configured")]
     SecondaryProfileMissing(crate::agent::AgentId),
 

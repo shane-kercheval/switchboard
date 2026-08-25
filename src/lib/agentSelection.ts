@@ -52,7 +52,38 @@ export const MODEL_OPTIONS: Record<HarnessKind, SelectionOption[]> = {
     { label: "Gemini 3.1 Pro (preview)", value: "gemini-3.1-pro-preview" },
     { label: "Gemini 3.1 Flash-Lite (preview)", value: "gemini-3.1-flash-lite-preview" },
   ],
-  antigravity: [],
+  /// Stable slugs from `agy models` (probed @ 1.1.19, 2026-08-25), with the
+  /// harness's own display names. **Effort-bearing models are listed by their
+  /// base slug**, not the effort-folded variant `agy models` also prints
+  /// (`gemini-3.1-pro`, not `gemini-3.1-pro-high`): the folded form conflicts
+  /// with `--effort`, and the two-control shape is what matches every other
+  /// harness here. Which levels each accepts lives in `effortOptionsFor`.
+  ///
+  /// "(Thinking)" is Google's own display name for the two Claude models, not
+  /// an effort label this picker adds — they have no effort axis at all
+  /// (probed: `--effort is not supported for model "claude-sonnet-4-6"`).
+  ///
+  /// `GPT-OSS 120B (Medium)` is different and deliberately absent from
+  /// `ANTIGRAVITY_MODEL_EFFORTS`: `medium` is a real level for it, but it is
+  /// the *only* one and is optional (probed — bare dispatch works, `low`/`high`
+  /// are rejected with `available: medium`). A control whose single choice
+  /// cannot change the outcome is not worth showing, so the effort picker stays
+  /// hidden for it. Its turn footer still reads back `medium`, because the turn
+  /// genuinely ran at it.
+  ///
+  /// Curated rather than fetched: `agy models` needs auth and network, and its
+  /// `--output-format json` is advertised but rejected @ 1.1.19. A retired
+  /// entry fails loudly and cheaply — `agy` rejects an unknown model
+  /// pre-dispatch, quota-free, listing what is available.
+  antigravity: [
+    { label: "Gemini 3.7 Flash", value: "gemini-3.7-flash" },
+    { label: "Gemini 3.6 Flash", value: "gemini-3.6-flash" },
+    { label: "Gemini 3.5 Flash", value: "gemini-3.5-flash" },
+    { label: "Gemini 3.1 Pro", value: "gemini-3.1-pro" },
+    { label: "Claude Sonnet 4.6 (Thinking)", value: "claude-sonnet-4-6" },
+    { label: "Claude Opus 4.6 (Thinking)", value: "claude-opus-4-6-thinking" },
+    { label: "GPT-OSS 120B (Medium)", value: "gpt-oss-120b" },
+  ],
 };
 
 /// How the **model** picker renders per harness — the single source of truth
@@ -68,15 +99,18 @@ export const MODEL_PRESENTATION: Record<HarnessKind, "segmented" | "dropdown"> =
   claude_code: "segmented",
   codex: "segmented",
   gemini: "dropdown",
-  antigravity: "segmented",
+  // Seven entries with names as long as "Claude Sonnet 4.6 (Thinking)" would
+  // truncate as pills.
+  antigravity: "dropdown",
 };
 
-/// Per-harness effort options. Empty for Gemini (config-only) and Antigravity
-/// (folded into the model name). Codex `none` is a *real* level (forces no
-/// extended reasoning), distinct from leaving effort unset. This is the **full**
-/// per-harness set; Codex effort validity is additionally **per-model** (see
-/// `effortOptionsFor`), so a form scoped to a chosen model must derive its
-/// options through that helper rather than reading this map directly.
+/// Per-harness effort options. Empty for Gemini (config-only). Codex `none` is
+/// a *real* level (forces no extended reasoning), distinct from leaving effort
+/// unset. This is the **full** per-harness set; effort validity is additionally
+/// **per-model** for Codex *and* Antigravity (see `effortOptionsFor`), so a
+/// form scoped to a chosen model must derive its options through that helper
+/// rather than reading this map directly — for Antigravity especially, where
+/// several models have no effort axis at all.
 export const EFFORT_OPTIONS: Record<HarnessKind, SelectionOption[]> = {
   claude_code: [
     { label: "Low", value: "low" },
@@ -96,7 +130,27 @@ export const EFFORT_OPTIONS: Record<HarnessKind, SelectionOption[]> = {
     { label: "Ultra", value: "ultra" },
   ],
   gemini: [],
-  antigravity: [],
+  antigravity: [
+    { label: "Low", value: "low" },
+    { label: "Medium", value: "medium" },
+    { label: "High", value: "high" },
+  ],
+};
+
+/// Antigravity effort levels **per model**, keyed by the slugs in
+/// `MODEL_OPTIONS.antigravity`. Probed @ 1.1.19: `agy` validates this
+/// client-side before dispatch, so a wrong entry fails loudly and quota-free
+/// with the CLI naming the valid set — unlike Claude, which silently degrades.
+///
+/// A model absent from this map has **no effort axis**: `agy` rejects
+/// `--effort` for it outright. Note Gemini 3.1 Pro offers only low/high while
+/// the Flash models add medium — the sets genuinely differ, which is why this
+/// is per-model rather than one list.
+const ANTIGRAVITY_MODEL_EFFORTS: Record<string, readonly string[]> = {
+  "gemini-3.7-flash": ["low", "medium", "high"],
+  "gemini-3.6-flash": ["low", "medium", "high"],
+  "gemini-3.5-flash": ["low", "medium", "high"],
+  "gemini-3.1-pro": ["low", "high"],
 };
 
 /// Codex effort levels only the GPT-5.6 model family accepts. Earlier Codex
@@ -131,10 +185,32 @@ export function effortOptionsFor(
   model: string | undefined,
 ): SelectionOption[] {
   const base = EFFORT_OPTIONS[harness];
-  if (harness !== "codex" || model == null || model === "") return base;
+  const unset = model == null || model === "";
+  if (harness === "antigravity") {
+    // An effort is meaningless without a model here: `agy` decides validity
+    // from the model, and several models have no axis at all. Returning an
+    // empty set is what hides the control (see `AgentProfileEditor`), so an
+    // unselected or no-axis model shows no effort picker rather than one whose
+    // every option would be rejected at dispatch.
+    if (unset) return [];
+    const levels = ANTIGRAVITY_MODEL_EFFORTS[model];
+    if (levels === undefined) return [];
+    return base.filter((option) => levels.includes(option.value));
+  }
+  if (harness !== "codex" || unset) return base;
   const isCuratedLegacy =
     MODEL_OPTIONS.codex.some((o) => o.value === model) && !CODEX_MAX_ULTRA_MODELS.has(model);
   return isCuratedLegacy ? base.filter((o) => !CODEX_HIGH_TIER_EFFORTS.has(o.value)) : base;
+}
+
+/// Whether this harness/model pair **requires** an effort to dispatch.
+///
+/// Antigravity-only: `agy` rejects a bare axis-bearing model with
+/// `requires --effort (available: …)`, so the picker must not offer a
+/// "Default" for those. Every other harness treats effort as optional — an
+/// unset effort means "pass no flag, let the harness choose".
+export function effortIsRequired(harness: HarnessKind, model: string | undefined): boolean {
+  return harness === "antigravity" && effortOptionsFor(harness, model).length > 0;
 }
 
 /// Built-in fallback used until persisted preferences load. This same shape is
@@ -153,8 +229,10 @@ export const DEFAULT_AGENT_PROFILES: Preferences["agent_defaults"] = {
     primary: { model: "auto", effort: null },
     secondary: null,
   },
+  // Matches the model Antigravity itself defaults to, and carries an explicit
+  // effort because `agy` rejects an effort-bearing model dispatched without one.
   antigravity: {
-    primary: { model: null, effort: null },
+    primary: { model: "gemini-3.1-pro", effort: "high" },
     secondary: null,
   },
 };
@@ -165,7 +243,9 @@ export const SUGGESTED_SECONDARY_PROFILE: Record<HarnessKind, AgentProfile> = {
   claude_code: { model: "sonnet", effort: "medium" },
   codex: { model: "gpt-5.6-terra", effort: "medium" },
   gemini: { model: "gemini-2.5-flash", effort: null },
-  antigravity: { model: null, effort: null },
+  // A cheaper, faster tier than the primary default, matching the pattern the
+  // other harnesses use for their secondary.
+  antigravity: { model: "gemini-3.5-flash", effort: "medium" },
 };
 
 /// A model-derived name stops describing an agent once it can switch between

@@ -158,6 +158,9 @@ struct Reconstruction {
     /// Distinct from `model` (first-wins, agent-scoped `meta.model`). `None`
     /// before the first announcement.
     current_model: Option<String>,
+    /// Carried forward alongside the model: Antigravity folds the effort into
+    /// the announced display name, and re-announces only on change.
+    current_effort: Option<String>,
     current: Option<AgentBuilder>,
     warnings: Vec<ParseWarning>,
     /// Carried forward so a record missing `created_at` inherits the previous
@@ -226,6 +229,7 @@ impl Reconstruction {
             current: None,
             model: None,
             current_model: None,
+            current_effort: None,
             warnings: Vec::new(),
             last_ts: DateTime::<Utc>::default(),
         }
@@ -284,11 +288,12 @@ impl Reconstruction {
             // `close_current()` above already stamped the prior turn with the
             // old `current_model`; now fold in this turn's announcement (if any)
             // for the turn that follows. `model` stays first-wins (meta).
-            if let Some(m) = extract_model_from_record(rec) {
+            if let Some((model, effort)) = extract_model_from_record(rec) {
                 if self.model.is_none() {
-                    self.model = Some(m.clone());
+                    self.model = Some(model.clone());
                 }
-                self.current_model = Some(m);
+                self.current_model = Some(model);
+                self.current_effort = effort;
             }
             return;
         }
@@ -474,7 +479,7 @@ impl Reconstruction {
             // model name embeds Antigravity's effort tier, so there's no
             // separate effort axis).
             model: self.current_model.clone(),
-            effort: None,
+            effort: self.current_effort.clone(),
             // Antigravity has no cost/overage, no `stable_message_id`, and no
             // native per-turn id at all — so no hydration key. The merge falls
             // back to `turn_id` for keyless turns; it's the one harness never
@@ -712,7 +717,10 @@ mod tests {
                 Some("Gemini 3.5 Flash".to_owned()),
                 Some("Gemini 3.5 Flash".to_owned()),
                 Some("Gemini 3.5 Flash".to_owned()),
-                Some("Claude Sonnet 4.6".to_owned()),
+                // "(Thinking)" is part of this model's name, not an effort
+                // level — no longer stripped, and `agy` rejects `--effort` for
+                // it, so there is nothing to split off.
+                Some("Claude Sonnet 4.6 (Thinking)".to_owned()),
             ]
         );
     }

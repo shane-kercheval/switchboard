@@ -855,13 +855,15 @@ describe("Sidebar", () => {
     expect(screen.queryByTestId("change-profile-primary-effort")).toBeNull();
   });
 
-  it("Antigravity exposes no change actions", async () => {
+  it("Antigravity exposes the profile action like every other harness", async () => {
+    // It had none while its model was harness-owned global config; `agy` 1.1.x
+    // made both axes per-invocation, so the action is no longer withheld.
     const state = await loadState();
     await state.registerAgent(ANTIGRAVITY_AGENT);
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [ANTIGRAVITY_AGENT] } });
 
     await openAgentActions();
-    expect(screen.queryByTestId("agent-profile-settings")).toBeNull();
+    expect(screen.queryByTestId("agent-profile-settings")).not.toBeNull();
   });
 
   it("model settings saves primary model and effort atomically", async () => {
@@ -882,6 +884,33 @@ describe("Sidebar", () => {
     expect(setAgentProfilesMock).toHaveBeenCalledExactlyOnceWith(
       agent.id,
       { model: "sonnet", effort: "high" },
+      null,
+    );
+  });
+
+  it("Claude keeps its effort when the model is returned to Default", async () => {
+    // The state a backend rule briefly rejected: Claude and Codex emit their
+    // effort flag independently of the model, so "harness default model, at an
+    // explicit effort" is valid and reachable — set an effort, then put the
+    // model picker back to Default.
+    const state = await loadState();
+    const agent = { ...CLAUDE_AGENT, model: "opus", effort: "high" };
+    await state.registerAgent(agent);
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
+
+    await openAgentActions();
+    await waitFor(() => expect(screen.getByTestId("agent-profile-settings")).toBeInTheDocument());
+    await fireEvent.click(screen.getByTestId("agent-profile-settings"));
+    await screen.findByTestId("change-profile-primary-model");
+
+    await choosePicker("change-profile-primary-model", "");
+    expect(pickerValue("change-profile-primary-model")).toBe("");
+    expect(pickerValue("change-profile-primary-effort")).toBe("high");
+
+    await fireEvent.click(screen.getByTestId("change-save"));
+    expect(setAgentProfilesMock).toHaveBeenCalledExactlyOnceWith(
+      agent.id,
+      { model: null, effort: "high" },
       null,
     );
   });

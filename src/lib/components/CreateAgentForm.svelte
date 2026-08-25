@@ -65,8 +65,8 @@
   /// session as-is. The user manages model/effort from the agent's actions menu
   /// afterward (the canonical place for an existing agent). The empty string is
   /// the "unset" sentinel for a create-mode harness with no capability on an
-  /// axis (Antigravity's model; Gemini/Antigravity effort) — it maps to
-  /// `undefined` on submit so the backend stores `None`.
+  /// axis (Gemini's effort) — it maps to `undefined` on submit so the backend
+  /// stores `None`.
   function defaultsFor(kind: HarnessKind): {
     primary: AgentProfile;
     secondary: AgentProfile | null;

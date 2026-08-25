@@ -609,22 +609,48 @@ describe("CreateAgentForm", () => {
     expect(screen.getByTestId("create-profile")).not.toHaveTextContent("Reasoning effort");
   });
 
-  it("create + Antigravity: both controls replaced by notes; submit carries no model/effort", async () => {
+  it("create + Antigravity: model and effort are selectable, and submit carries them", async () => {
+    // `agy` 1.1.x made `--model`/`--effort` usable headlessly without touching
+    // the harness's own global config, so Antigravity now gets the same two
+    // controls as Claude and Codex rather than a not-supported note.
     const { onSubmit } = renderForm();
     await fireEvent.click(screen.getByTestId("harness-antigravity"));
-    expect(screen.queryByTestId("model-select")).not.toBeInTheDocument();
-    expect(screen.queryByTestId("effort-select")).not.toBeInTheDocument();
-    expect(screen.getByTestId("create-profile-unsupported")).toHaveTextContent(
-      "selected inside Antigravity",
-    );
+    expect(screen.getByTestId("model-select")).toBeInTheDocument();
+    expect(screen.getByTestId("effort-select")).toBeInTheDocument();
+    expect(screen.queryByTestId("create-profile-unsupported")).not.toBeInTheDocument();
     await fireEvent.click(screen.getByTestId("confirm-create-agent"));
     expect(onSubmit).toHaveBeenCalledExactlyOnceWith({
       mode: "create",
-      name: "antigravity",
+      // Now model-derived like every other harness with a model, rather than
+      // the bare harness name it used when it had none.
+      name: "gemini-3-1-pro-high",
       harness: "antigravity",
-      primary: { model: null, effort: null },
+      primary: { model: "gemini-3.1-pro", effort: "high" },
       secondary: null,
     } satisfies AgentFormSubmit);
+  });
+
+  it("create + Antigravity: a model with no effort axis hides the effort control", async () => {
+    // `agy` rejects `--effort` for these outright, so there is no valid choice
+    // to present — the control is hidden rather than shown with options that
+    // would fail at dispatch.
+    renderForm();
+    await fireEvent.click(screen.getByTestId("harness-antigravity"));
+    const select = screen.getByTestId("model-select");
+    await fireEvent.change(select, { target: { value: "claude-sonnet-4-6" } });
+    expect(screen.queryByTestId("effort-select")).not.toBeInTheDocument();
+  });
+
+  it("create + Antigravity: an effort-bearing model offers no Default and only its own levels", async () => {
+    // Gemini 3.1 Pro has low/high but not medium, and `agy` rejects a bare
+    // effort-bearing model — so "Default" must not be offered.
+    renderForm();
+    await fireEvent.click(screen.getByTestId("harness-antigravity"));
+    // Segmented picker: each option is its own testid-bearing button.
+    expect(screen.getByTestId("effort-select-option-low")).toBeInTheDocument();
+    expect(screen.getByTestId("effort-select-option-high")).toBeInTheDocument();
+    expect(screen.queryByTestId("effort-select-option-medium")).toBeNull();
+    expect(screen.queryByTestId("effort-select-option-no-override")).toBeNull();
   });
 
   it("changing the model and effort pickers submits the chosen values", async () => {
@@ -737,8 +763,10 @@ describe("CreateAgentForm", () => {
     expect(nameInput.value).toBe("gpt-5-6-sol-high");
     await fireEvent.click(screen.getByTestId("harness-gemini"));
     expect(nameInput.value).toBe("gemini");
+    // Antigravity now derives from its model like Claude/Codex; Gemini stays
+    // bare because its default model is the non-descriptive `auto`.
     await fireEvent.click(screen.getByTestId("harness-antigravity"));
-    expect(nameInput.value).toBe("antigravity");
+    expect(nameInput.value).toBe("gemini-3-1-pro-high");
   });
 
   it("editing the name freezes it against later picker and harness changes", async () => {

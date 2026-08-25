@@ -246,7 +246,7 @@ impl HarnessAdapter for AntigravityAdapter {
             .and_then(SessionLocator::as_uuid);
 
         let log_file_path = build_log_file_path(turn_id);
-        let args = build_args(prompt, cwd, resume_id, &log_file_path);
+        let args = build_args(agent, prompt, cwd, resume_id, &log_file_path);
 
         let mut command = tokio::process::Command::new(&binary);
         command
@@ -357,12 +357,32 @@ fn resolve_home_dir(override_path: Option<&Path>) -> PathBuf {
 /// slash commands and skills are deliberately unreachable through the ordinary
 /// composer, and would need an explicit command action to expose.
 ///
-/// No per-agent model or effort flag: Antigravity's model is harness-owned
-/// global config (set inside Antigravity, off-limits to us) and its effort is
-/// folded into that model's display name — there is no `agy` flag for either.
-/// An Antigravity agent therefore never carries a model/effort (registration
-/// forbids it), so this takes no `&AgentRecord` and emits neither flag.
-fn build_args(prompt: &str, cwd: &Path, resume_id: Option<Uuid>, log_file: &Path) -> Vec<String> {
+/// `--model` / `--effort` carry the agent's profile, sent on **every** dispatch
+/// including resumes — probe-confirmed to override a conversation's prior model
+/// mid-session while keeping its context, so one uniform per-turn path beats a
+/// change-only special case (the same decision the other harnesses took, see
+/// `harness-behavior.md` §3.3).
+///
+/// Both were unavailable until `agy` 1.1.x: `--model` now dispatches headlessly
+/// *without* mutating Antigravity's own global `settings.json`, which was the
+/// objection that ruled it out.
+///
+/// **`--effort` is never sent without `--model`.** Which levels are valid is a
+/// property of the model — `agy` offers none at all with no model selected — so
+/// an effort alone cannot be dispatched. The persistence boundary already
+/// refuses to store that combination (`CoreError::EffortWithoutModel`); this
+/// guard means even a record that reached us some other way cannot produce an
+/// invocation the CLI would reject. The mirror case, a model whose axis
+/// *requires* an effort, is deliberately left to `agy`: it rejects that
+/// pre-dispatch, quota-free, naming the valid levels, and duplicating its model
+/// catalog here to pre-empt that would give the catalog two sources of truth.
+fn build_args(
+    agent: &AgentRecord,
+    prompt: &str,
+    cwd: &Path,
+    resume_id: Option<Uuid>,
+    log_file: &Path,
+) -> Vec<String> {
     let mut args = vec!["-p".to_owned(), transport_prompt(prompt)];
     args.push("--output-format".to_owned());
     args.push("stream-json".to_owned());
@@ -378,6 +398,14 @@ fn build_args(prompt: &str, cwd: &Path, resume_id: Option<Uuid>, log_file: &Path
     args.push(PRINT_TIMEOUT.to_owned());
     args.push("--log-file".to_owned());
     args.push(log_file.to_string_lossy().into_owned());
+    if let Some(model) = agent.model.as_deref().filter(|m| !m.trim().is_empty()) {
+        args.push("--model".to_owned());
+        args.push(model.to_owned());
+        if let Some(effort) = agent.effort.as_deref().filter(|e| !e.trim().is_empty()) {
+            args.push("--effort".to_owned());
+            args.push(effort.to_owned());
+        }
+    }
     args
 }
 
@@ -570,7 +598,8 @@ async fn run_producer(ctx: ProducerCtx) {
     // live `TurnEnd.model` matches the hydrator (Antigravity re-announces only
     // on change). This dispatch's drain overwrites it last-wins if this turn
     // announces a new model.
-    let mut model: Option<String> = if is_resume {
+    // Announced model plus, where the display name carries one, its effort.
+    let mut model: Option<(String, Option<String>)> = if is_resume {
         transcript_path
             .as_deref()
             .and_then(|p| seed_carry_forward_model(p, cursor))
@@ -1040,13 +1069,15 @@ async fn run_producer(ctx: ProducerCtx) {
         stable_message_id: None,
         first_message_id: None,
         spend: None,
-        // Per-turn model: this dispatch's announcement if any, else the
-        // carry-forward seeded from prior turns on resume — so an unchanged
+        // Per-turn model and effort: this dispatch's announcement if any, else
+        // the carry-forward seeded from prior turns on resume — so an unchanged
         // resume's footer matches the hydrator live, not only on reopen. `None`
-        // only when no announcement has ever appeared (a truncated attach). The
-        // model name embeds the effort tier, so there's no separate effort axis.
-        model: model.clone(),
-        effort: None,
+        // only when no announcement has ever appeared (a truncated attach).
+        // Antigravity announces the two as one display name; the effort is
+        // split off only when the parenthetical names a real level, since for
+        // several models it is part of the name (see `split_announced_model`).
+        model: model.as_ref().map(|(name, _)| name.clone()),
+        effort: model.as_ref().and_then(|(_, effort)| effort.clone()),
     });
 
     // Post-terminal SessionMeta (mirrors Codex's enrichment ordering: flows
@@ -1057,7 +1088,7 @@ async fn run_producer(ctx: ProducerCtx) {
     // loaded at dispatch time.
     let _ = tx.send(AdapterEvent::SessionMeta {
         agent_id,
-        model: model.unwrap_or_default(),
+        model: model.map(|(name, _)| name).unwrap_or_default(),
         harness_version,
         tools: Vec::new(),
         mcp_servers,
@@ -1075,7 +1106,7 @@ fn drain_transcript(
     turn_id: TurnId,
     parser_state: &mut AntigravityParserState,
     saw_terminal_answer: &mut bool,
-    model: &mut Option<String>,
+    model: &mut Option<(String, Option<String>)>,
     tx: &tokio::sync::mpsc::UnboundedSender<AdapterEvent>,
 ) {
     let full_transcript = paths::is_full_transcript_path(path);
@@ -1087,8 +1118,8 @@ fn drain_transcript(
         }
         // Last-wins: a new announcement this turn overwrites the resume seed
         // (and any earlier announcement in the same drain).
-        if let Some(m) = extract_model_from_record(rec) {
-            *model = Some(m);
+        if let Some(announced) = extract_model_from_record(rec) {
+            *model = Some(announced);
         }
         let events = if full_transcript {
             record_to_live_events_with_encoding(
@@ -1368,7 +1399,7 @@ fn read_records_past_cursor(path: &Path, cursor: usize) -> (Vec<TranscriptRecord
 /// `None` when no prior announcement exists (e.g. a truncated attach) — which
 /// already matches the hydrator. This dispatch's own drain overwrites it
 /// last-wins if a new announcement appears this turn.
-fn seed_carry_forward_model(path: &Path, cursor: usize) -> Option<String> {
+fn seed_carry_forward_model(path: &Path, cursor: usize) -> Option<(String, Option<String>)> {
     let content = std::fs::read_to_string(path).ok()?;
     let complete = &content[..=content.rfind('\n')?];
     let mut model = None;
@@ -1377,9 +1408,9 @@ fn seed_carry_forward_model(path: &Path, cursor: usize) -> Option<String> {
             continue;
         }
         if let Ok(rec) = serde_json::from_str::<TranscriptRecord>(line)
-            && let Some(m) = extract_model_from_record(&rec)
+            && let Some(announced) = extract_model_from_record(&rec)
         {
-            model = Some(m);
+            model = Some(announced);
         }
     }
     model
@@ -1398,24 +1429,54 @@ fn seed_carry_forward_model(path: &Path, cursor: usize) -> Option<String> {
 /// to any rewording/localization of that sentence; it degrades to `None`
 /// (display-only, no dispatch impact). Prefer a structured source if one
 /// ever surfaces.
-fn extract_model_from_record(rec: &TranscriptRecord) -> Option<String> {
+fn extract_model_from_record(rec: &TranscriptRecord) -> Option<(String, Option<String>)> {
     if rec.record_type != "USER_INPUT" {
         return None;
     }
     let content = rec.content.as_deref()?;
     let after = content.split("Model Selection` from ").nth(1)?;
     let to = after.split(" to ").nth(1)?;
-    // Trim, in order: the " (tier)" parenthetical, a trailing newline, and
-    // the sentence boundary. Splitting on ". " (period+space) — not bare
-    // "." — keeps version numbers like "3.5" intact.
-    let raw = to.split(" (").next().unwrap_or(to);
-    let raw = raw.split('\n').next().unwrap_or(raw);
+    // Trim, in order: a trailing newline, the closing envelope tag, and the
+    // sentence boundary. Splitting on ". " (period+space) — not bare "." —
+    // keeps version numbers like "3.5" intact.
+    //
+    // The envelope tag is cut explicitly. It used to fall out for free from a
+    // `split(" (")` that discarded everything after the parenthetical; now that
+    // the parenthetical is parsed rather than dropped, nothing else would strip
+    // a `(High).</USER_SETTINGS_CHANGE>` tail.
+    let raw = to.split('\n').next().unwrap_or(to);
+    let raw = raw.split("</USER_SETTINGS_CHANGE>").next().unwrap_or(raw);
     let raw = raw.split(". ").next().unwrap_or(raw);
     let raw = raw.trim().trim_end_matches('.').trim();
     if raw.is_empty() || raw.eq_ignore_ascii_case("None") {
-        None
+        return None;
+    }
+    Some(split_announced_model(raw))
+}
+
+/// Split an announced display name into its model and, where the parenthetical
+/// names one, its effort level.
+///
+/// Antigravity announces `Gemini 3.1 Pro (High)` — model and effort in one
+/// string. Only a parenthetical that maps to a real level is split off; every
+/// other one stays part of the name, because for several models it *is* the
+/// name (`Claude Sonnet 4.6 (Thinking)`, `GPT-OSS 120B (Medium)` — those have
+/// no effort axis and `agy` rejects `--effort` for them). An earlier version
+/// stripped every parenthetical unconditionally, which both discarded the
+/// effort and mangled those names.
+fn split_announced_model(display: &str) -> (String, Option<String>) {
+    const LEVELS: [&str; 3] = ["low", "medium", "high"];
+    let Some((name, tail)) = display.rsplit_once(" (") else {
+        return (display.to_owned(), None);
+    };
+    let Some(inner) = tail.strip_suffix(')') else {
+        return (display.to_owned(), None);
+    };
+    let level = inner.trim().to_ascii_lowercase();
+    if LEVELS.contains(&level.as_str()) {
+        (name.trim().to_owned(), Some(level))
     } else {
-        Some(raw.to_owned())
+        (display.to_owned(), None)
     }
 }
 
@@ -1809,7 +1870,7 @@ mod tests {
         turn_id: TurnId,
         parser_state: AntigravityParserState,
         saw_terminal_answer: bool,
-        model: Option<String>,
+        model: Option<(String, Option<String>)>,
         tx: tokio::sync::mpsc::UnboundedSender<AdapterEvent>,
         rx: tokio::sync::mpsc::UnboundedReceiver<AdapterEvent>,
     }
@@ -1904,7 +1965,7 @@ mod tests {
         let cursor = paths::complete_line_count(&path);
         assert_eq!(
             seed_carry_forward_model(&path, cursor),
-            Some("Gemini 3.1 Pro".to_owned())
+            Some(("Gemini 3.1 Pro".to_owned(), Some("high".to_owned())))
         );
     }
 
@@ -1929,7 +1990,7 @@ mod tests {
         // unconditional — not gated on the prompt's first character.
         let log = PathBuf::from("/tmp/x.log");
         for prompt in ["/model", "/clear", "plain message"] {
-            let args = build_args(prompt, Path::new("/work/proj"), None, &log);
+            let args = build_args(&bare_agent(), prompt, Path::new("/work/proj"), None, &log);
             assert!(
                 args.contains(&"--disable-slash-commands".to_owned()),
                 "{args:?}"
@@ -1950,7 +2011,7 @@ mod tests {
             ("--notaflag", " --notaflag"),
             ("- a markdown bullet", " - a markdown bullet"),
         ] {
-            let args = build_args(prompt, Path::new("/work/proj"), None, &log);
+            let args = build_args(&bare_agent(), prompt, Path::new("/work/proj"), None, &log);
             assert_eq!(args[1], transported, "{args:?}");
         }
     }
@@ -1959,7 +2020,7 @@ mod tests {
     fn build_args_leaves_non_dash_prompts_untouched() {
         let log = PathBuf::from("/tmp/x.log");
         for prompt in ["hello", "/model", " already spaced", ""] {
-            let args = build_args(prompt, Path::new("/work/proj"), None, &log);
+            let args = build_args(&bare_agent(), prompt, Path::new("/work/proj"), None, &log);
             assert_eq!(args[1], prompt, "{args:?}");
         }
     }
@@ -1967,7 +2028,7 @@ mod tests {
     #[test]
     fn build_args_first_turn_omits_conversation() {
         let log = PathBuf::from("/tmp/x.log");
-        let args = build_args("hello", Path::new("/work/proj"), None, &log);
+        let args = build_args(&bare_agent(), "hello", Path::new("/work/proj"), None, &log);
         assert_eq!(args[0], "-p");
         assert_eq!(args[1], "hello");
         assert!(!args.contains(&"--conversation".to_owned()));
@@ -1982,7 +2043,13 @@ mod tests {
         // cap; we override it so long turns aren't cut while actively working.
         let log = PathBuf::from("/tmp/x.log");
         for resume in [None, Some(Uuid::new_v4())] {
-            let args = build_args("hello", Path::new("/work/proj"), resume, &log);
+            let args = build_args(
+                &bare_agent(),
+                "hello",
+                Path::new("/work/proj"),
+                resume,
+                &log,
+            );
             let idx = args
                 .iter()
                 .position(|a| a == "--print-timeout")
@@ -1996,7 +2063,7 @@ mod tests {
         // `--add-dir <cwd>` is load-bearing: without it `agy` runs the model's
         // file/command tools against $HOME, not the project dir.
         let log = PathBuf::from("/tmp/x.log");
-        let args = build_args("hello", Path::new("/work/proj"), None, &log);
+        let args = build_args(&bare_agent(), "hello", Path::new("/work/proj"), None, &log);
         let idx = args
             .iter()
             .position(|a| a == "--add-dir")
@@ -2008,7 +2075,13 @@ mod tests {
     fn build_args_resume_passes_conversation_uuid() {
         let uuid = Uuid::new_v4();
         let log = PathBuf::from("/tmp/y.log");
-        let args = build_args("hi", Path::new("/work/proj"), Some(uuid), &log);
+        let args = build_args(
+            &bare_agent(),
+            "hi",
+            Path::new("/work/proj"),
+            Some(uuid),
+            &log,
+        );
         let idx = args.iter().position(|a| a == "--conversation").unwrap();
         assert_eq!(args[idx + 1], uuid.to_string());
         // Workspace is re-established on resume too (agy is one-shot).
@@ -2016,22 +2089,64 @@ mod tests {
     }
 
     #[test]
-    fn build_args_never_emits_model_or_effort_flags() {
-        // Antigravity has no per-invocation model/effort control — neither flag
-        // should ever appear, on first turn or resume.
+    fn build_args_sends_the_selected_model_and_effort_every_dispatch() {
+        // Sent on resumes too, not just first turns: probe-confirmed that
+        // `--model` overrides a conversation's prior model mid-session while
+        // keeping its context, so one uniform path beats a change-only case.
         let log = PathBuf::from("/tmp/x.log");
-        for resume in [None, Some(Uuid::new_v4())] {
-            let args = build_args("hello", Path::new("/work/proj"), resume, &log);
-            assert!(
-                !args.iter().any(|a| a == "-m" || a == "--model"),
-                "{args:?}"
-            );
-            assert!(!args.iter().any(|a| a == "--effort"), "{args:?}");
-            assert!(
-                !args.iter().any(|a| a.contains("reasoning")),
-                "no reasoning/effort config: {args:?}"
-            );
+        let agent = AgentRecord {
+            model: Some("gemini-3.1-pro".to_owned()),
+            effort: Some("high".to_owned()),
+            ..bare_agent()
+        };
+        for resume in [None, Some(Uuid::now_v7())] {
+            let args = build_args(&agent, "hi", Path::new("/work/proj"), resume, &log);
+            let model_at = args.iter().position(|a| a == "--model").expect("--model");
+            assert_eq!(args[model_at + 1], "gemini-3.1-pro");
+            let effort_at = args.iter().position(|a| a == "--effort").expect("--effort");
+            assert_eq!(args[effort_at + 1], "high");
         }
+    }
+
+    #[test]
+    fn build_args_omits_both_flags_when_nothing_is_selected() {
+        let log = PathBuf::from("/tmp/x.log");
+        let args = build_args(&bare_agent(), "hi", Path::new("/work/proj"), None, &log);
+        assert!(!args.iter().any(|a| a == "--model"), "{args:?}");
+        assert!(!args.iter().any(|a| a == "--effort"), "{args:?}");
+    }
+
+    #[test]
+    fn build_args_sends_a_no_axis_model_without_an_effort() {
+        // `claude-sonnet-4-6` and `gpt-oss-120b` have no effort axis and `agy`
+        // rejects `--effort` for them (probed). A model alone is a valid
+        // invocation.
+        let log = PathBuf::from("/tmp/x.log");
+        let agent = AgentRecord {
+            model: Some("claude-sonnet-4-6".to_owned()),
+            effort: None,
+            ..bare_agent()
+        };
+        let args = build_args(&agent, "hi", Path::new("/work/proj"), None, &log);
+        assert!(args.iter().any(|a| a == "--model"), "{args:?}");
+        assert!(!args.iter().any(|a| a == "--effort"), "{args:?}");
+    }
+
+    #[test]
+    fn build_args_never_sends_an_effort_without_a_model() {
+        // Structural backstop. The persistence boundary already refuses to
+        // store this (`CoreError::EffortWithoutModel`); this guarantees that
+        // even a record arriving some other way cannot produce an invocation
+        // `agy` would reject, since effort validity is a property of the model.
+        let log = PathBuf::from("/tmp/x.log");
+        let agent = AgentRecord {
+            model: None,
+            effort: Some("high".to_owned()),
+            ..bare_agent()
+        };
+        let args = build_args(&agent, "hi", Path::new("/work/proj"), None, &log);
+        assert!(!args.iter().any(|a| a == "--effort"), "{args:?}");
+        assert!(!args.iter().any(|a| a == "--model"), "{args:?}");
     }
 
     #[test]
@@ -2477,9 +2592,51 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            extract_model_from_record(&rec).as_deref(),
-            Some("Gemini 3.5 Flash")
+            extract_model_from_record(&rec),
+            Some(("Gemini 3.5 Flash".to_owned(), Some("high".to_owned())))
         );
+    }
+
+    #[test]
+    fn a_non_level_parenthetical_stays_part_of_the_model_name() {
+        // The Claude models have no effort axis (probed: `--effort is not
+        // supported for model …`), so their parenthetical *is* the name. An
+        // earlier version stripped every parenthetical, mangling them.
+        for announced in [
+            "Claude Sonnet 4.6 (Thinking)",
+            "Claude Opus 4.6 (Thinking)",
+            "Gemini 3.1 Pro",
+        ] {
+            let (name, effort) = split_announced_model(announced);
+            assert_eq!(name, announced);
+            assert_eq!(effort, None, "{announced}");
+        }
+    }
+
+    #[test]
+    fn gpt_oss_display_name_splits_because_its_level_is_real() {
+        // Not an exception to the rule above: `medium` is genuinely this
+        // model's effort (probed — `--effort medium` dispatches while
+        // `low`/`high` are rejected), so the turn ran at it and the footer
+        // should say so. The picker separately declines to offer it, being the
+        // only level and optional; see `split_announced_model`.
+        assert_eq!(
+            split_announced_model("GPT-OSS 120B (Medium)"),
+            ("GPT-OSS 120B".to_owned(), Some("medium".to_owned()))
+        );
+    }
+
+    #[test]
+    fn announced_levels_split_case_insensitively() {
+        for (announced, level) in [
+            ("Gemini 3.1 Pro (High)", "high"),
+            ("Gemini 3.5 Flash (LOW)", "low"),
+            ("Gemini 3.7 Flash (medium)", "medium"),
+        ] {
+            let (name, effort) = split_announced_model(announced);
+            assert!(!name.contains('('), "{name}");
+            assert_eq!(effort.as_deref(), Some(level));
+        }
     }
 
     #[test]
@@ -2489,6 +2646,23 @@ mod tests {
         )
         .unwrap();
         assert_eq!(extract_model_from_record(&rec), None);
+    }
+
+    /// An Antigravity agent with no model/effort selection — the default for
+    /// arg-shape tests that are not about the selection flags.
+    fn bare_agent() -> AgentRecord {
+        AgentRecord {
+            model: None,
+            effort: None,
+            profiles: switchboard_core::AgentProfiles::default(),
+            forked_from_session: None,
+            id: Uuid::now_v7(),
+            project_id: Uuid::now_v7(),
+            name: "agy".to_owned(),
+            harness: switchboard_core::HarnessKind::Antigravity,
+            session_locator: None,
+            created_at: chrono::Utc::now(),
+        }
     }
 
     fn empty_tail() -> Mutex<VecDeque<String>> {

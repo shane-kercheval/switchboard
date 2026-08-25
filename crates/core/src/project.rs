@@ -443,6 +443,11 @@ impl Project {
                 axis: SelectionAxis::Effort,
             });
         }
+        // See `set_agent_profiles` for why an effort with no model is refused
+        // here and why its mirror (a model that requires an effort) is not.
+        if harness.effort_requires_model() && effort.is_some() && model.is_none() {
+            return Err(CoreError::EffortWithoutModel { harness });
+        }
         if let Some(secondary) = &profiles.secondary {
             if secondary.model.is_some() && !harness.supports_model_selection() {
                 return Err(CoreError::SelectionUnsupported {
@@ -455,6 +460,12 @@ impl Project {
                     harness,
                     axis: SelectionAxis::Effort,
                 });
+            }
+            if harness.effort_requires_model()
+                && secondary.effort.is_some()
+                && secondary.model.is_none()
+            {
+                return Err(CoreError::EffortWithoutModel { harness });
             }
         }
         if profiles.secondary.is_none() {
@@ -624,6 +635,26 @@ impl Project {
                     harness,
                     axis: SelectionAxis::Effort,
                 });
+            }
+            // An effort with no model is incoherent **only where the harness
+            // derives its levels from the model** — see
+            // `HarnessKind::effort_requires_model`. Claude and Codex emit their
+            // effort flag independently, so "default model at high effort" is
+            // valid for them and must keep persisting; gating on the capability
+            // rather than applying this unconditionally is what preserves that.
+            //
+            // Where it does apply (Antigravity), refuse to store rather than
+            // silently drop the flag at dispatch, which would leave the record
+            // asserting a selection the turn never applied. The mirror case — a
+            // model that *requires* an effort and has none — is deliberately NOT
+            // checked here: that would mean duplicating the model catalog into
+            // core, and `agy` already rejects it pre-dispatch, quota-free, with
+            // a message naming the valid levels, surfaced verbatim.
+            if harness.effort_requires_model()
+                && profile.effort.is_some()
+                && profile.model.is_none()
+            {
+                return Err(CoreError::EffortWithoutModel { harness });
             }
         }
         agents[idx].model = primary.model;
@@ -1798,26 +1829,167 @@ mod tests {
         assert_eq!(record.effort, None);
     }
 
+    /// An effort with no model is refused at **both** persistence sites and for
+    /// **both** profile slots. Antigravity's valid levels are a property of the
+    /// chosen model, so an effort alone is not dispatchable — and storing it
+    /// would leave a record asserting a selection no turn can apply.
+    #[test]
+    fn effort_without_a_model_is_refused_at_registration() {
+        let (_tmp, project) = fresh_project();
+        let err = project
+            .register_agent("a", HarnessKind::Antigravity, None, Some("high".to_owned()))
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                CoreError::EffortWithoutModel {
+                    harness: HarnessKind::Antigravity
+                }
+            ),
+            "{err:?}"
+        );
+        assert!(
+            project.list_agents().unwrap().is_empty(),
+            "rejected before the append — no orphan record"
+        );
+    }
+
+    #[test]
+    fn effort_without_a_model_is_refused_when_setting_profiles() {
+        let (_tmp, project) = fresh_project();
+        let agent = project
+            .register_agent("a", HarnessKind::Antigravity, None, None)
+            .unwrap();
+
+        // Primary slot.
+        let err = project
+            .set_agent_profiles(
+                agent.id,
+                AgentProfile {
+                    model: None,
+                    effort: Some("high".to_owned()),
+                },
+                None,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, CoreError::EffortWithoutModel { .. }),
+            "{err:?}"
+        );
+
+        // Secondary slot — the same rule, not just the primary one.
+        let err = project
+            .set_agent_profiles(
+                agent.id,
+                AgentProfile {
+                    model: Some("gemini-3.1-pro".to_owned()),
+                    effort: Some("high".to_owned()),
+                },
+                Some(AgentProfile {
+                    model: None,
+                    effort: Some("low".to_owned()),
+                }),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, CoreError::EffortWithoutModel { .. }),
+            "{err:?}"
+        );
+    }
+
+    /// The regression this capability gate exists to prevent. Claude and Codex
+    /// emit their effort flag independently of the model, so "harness's own
+    /// default model, at an explicit effort" is a valid, dispatchable profile —
+    /// and one the editor actively produces when a user sets an effort and then
+    /// returns the model picker to "Default". An unconditional
+    /// effort-requires-model rule rejected it on save.
+    #[test]
+    fn effort_without_a_model_stays_valid_where_the_harness_allows_it() {
+        for harness in [HarnessKind::ClaudeCode, HarnessKind::Codex] {
+            let (_tmp, project) = fresh_project();
+
+            // At registration.
+            let record = project
+                .register_agent("a", harness, None, Some("high".to_owned()))
+                .unwrap_or_else(|e| panic!("{harness:?} registration: {e:?}"));
+            assert_eq!(record.model, None);
+            assert_eq!(record.effort.as_deref(), Some("high"));
+
+            // And when editing profiles afterwards, in both slots.
+            project
+                .set_agent_profiles(
+                    record.id,
+                    AgentProfile {
+                        model: None,
+                        effort: Some("high".to_owned()),
+                    },
+                    Some(AgentProfile {
+                        model: None,
+                        effort: Some("low".to_owned()),
+                    }),
+                )
+                .unwrap_or_else(|e| panic!("{harness:?} set_agent_profiles: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn antigravity_now_persists_a_model_and_effort() {
+        // The capability that `agy` 1.1.x opened: `--model` dispatches
+        // headlessly without touching the harness's own global config, so the
+        // selection is ours to store.
+        let (_tmp, project) = fresh_project();
+        let record = project
+            .register_agent(
+                "a",
+                HarnessKind::Antigravity,
+                Some("gemini-3.1-pro".to_owned()),
+                Some("high".to_owned()),
+            )
+            .unwrap();
+        assert_eq!(record.model.as_deref(), Some("gemini-3.1-pro"));
+        assert_eq!(record.effort.as_deref(), Some("high"));
+    }
+
+    /// A model with no effort is **not** refused here. Which models require one
+    /// is a catalog fact, and duplicating that catalog into core would give it
+    /// two sources of truth; `agy` rejects the combination pre-dispatch,
+    /// quota-free, naming the valid levels.
+    #[test]
+    fn a_model_without_an_effort_is_left_to_the_harness_to_judge() {
+        let (_tmp, project) = fresh_project();
+        let record = project
+            .register_agent(
+                "a",
+                HarnessKind::Antigravity,
+                Some("gemini-3.1-pro".to_owned()),
+                None,
+            )
+            .unwrap();
+        assert_eq!(record.effort, None);
+    }
+
     #[test]
     fn register_agent_rejects_model_on_unsupporting_harness() {
         // The generic create path is harness-agnostic, so the capability
         // invariant is enforced at the persistence boundary (the single
-        // chokepoint), not just at the app layer. An Antigravity model never
-        // reaches the registry.
+        // chokepoint), not just at the app layer. Gemini has no effort axis, so
+        // an effort never reaches the registry for one. (Antigravity used to be
+        // the model example here; `agy` 1.1.x made `--model` usable, so it now
+        // supports both axes.)
         let (_tmp, project) = fresh_project();
         let err = project
             .register_agent(
                 "a",
-                HarnessKind::Antigravity,
-                Some("whatever".to_owned()),
-                None,
+                HarnessKind::Gemini,
+                Some("gemini-3-pro-preview".to_owned()),
+                Some("high".to_owned()),
             )
             .unwrap_err();
         assert!(matches!(
             err,
             CoreError::SelectionUnsupported {
-                harness: HarnessKind::Antigravity,
-                axis: SelectionAxis::Model
+                harness: HarnessKind::Gemini,
+                axis: SelectionAxis::Effort
             }
         ));
         // Rejected *before* the append — no orphan record.

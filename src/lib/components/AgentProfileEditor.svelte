@@ -4,6 +4,7 @@
     MODEL_OPTIONS,
     MODEL_PRESENTATION,
     SUGGESTED_SECONDARY_PROFILE,
+    effortIsRequired,
     effortOptionsFor,
     type SelectionOption,
   } from "$lib/agentSelection";
@@ -56,8 +57,28 @@
 
   function effortOptions(profile: AgentProfile): SelectionOption[] {
     const base = effortOptionsFor(harness, profile.model ?? undefined);
-    const options = allowUnset ? [{ label: "Default", value: "" }, ...base] : base;
+    // No "Default" where the harness demands a level: `agy` rejects an
+    // effort-bearing model dispatched without one, so offering "Default" would
+    // offer a choice that fails every turn.
+    const options =
+      allowUnset && !effortIsRequired(harness, profile.model ?? undefined)
+        ? [{ label: "Default", value: "" }, ...base]
+        : base;
     return withCurrent(options, profile.effort);
+  }
+
+  /// Whether to render the effort control at all for this profile.
+  ///
+  /// Harness capability is necessary but not sufficient: Antigravity supports
+  /// the axis, yet several of its models have none, and with no model selected
+  /// there is nothing to derive levels from. An empty option set means there is
+  /// no valid choice to present, so the control is hidden rather than shown
+  /// empty or filled with options that would be rejected at dispatch.
+  function showEffort(profile: AgentProfile): boolean {
+    if (!effortSupported) return false;
+    if (effortOptionsFor(harness, profile.model ?? undefined).length > 0) return true;
+    // An off-catalog persisted value still needs somewhere to display.
+    return profile.effort != null && profile.effort !== "";
   }
 
   function presentation(profile: AgentProfile): "segmented" | "dropdown" {
@@ -73,8 +94,11 @@
     if (current === null) return;
     const model = value === "" ? null : value;
     const validEfforts = effortOptionsFor(harness, model ?? undefined);
+    const keepUnset = current.effort === null && allowUnset;
     const effort =
-      current.effort === null && allowUnset
+      // A model whose axis is mandatory cannot stay unset — pick a level rather
+      // than persist a profile that fails on dispatch.
+      keepUnset && !effortIsRequired(harness, model ?? undefined)
         ? null
         : current.effort !== null && validEfforts.some((o) => o.value === current.effort)
           ? current.effort
@@ -127,7 +151,7 @@
         />
       </label>
     {/if}
-    {#if effortSupported}
+    {#if showEffort(profile)}
       <label class="block space-y-1">
         <span class="text-muted text-xs">Reasoning effort</span>
         <SelectionPicker

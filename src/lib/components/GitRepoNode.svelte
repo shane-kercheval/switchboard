@@ -428,7 +428,7 @@
           "flex shrink-0 items-center gap-0.5 overflow-hidden transition-[max-width,opacity]",
           busy
             ? "pointer-events-auto max-w-[140px] opacity-100"
-            : "pointer-events-none max-w-0 opacity-0 group-focus-within:pointer-events-auto group-focus-within:max-w-[140px] group-focus-within:opacity-100 group-hover:pointer-events-auto group-hover:max-w-[140px] group-hover:opacity-100",
+            : "pointer-events-none max-w-0 opacity-0 group-hover:pointer-events-auto group-hover:max-w-[140px] group-hover:opacity-100 focus-within:pointer-events-auto focus-within:max-w-[140px] focus-within:opacity-100",
         )}
       >
         <Tooltip label="Refresh repository" side="top">

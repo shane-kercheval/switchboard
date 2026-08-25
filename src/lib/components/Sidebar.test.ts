@@ -515,11 +515,14 @@ describe("Sidebar", () => {
     expect(screen.getByTestId("agent-context-bar")).toBeInTheDocument();
 
     const toggleAll = screen.getByTestId("sidebar-toggle-all");
+    expect(toggleAll).toHaveAccessibleName("Collapse all agents");
     await fireEvent.click(toggleAll);
     expect(screen.queryByTestId("agent-context-bar")).toBeNull();
+    expect(toggleAll).toHaveAccessibleName("Expand all agents");
 
     await fireEvent.click(toggleAll);
     expect(screen.getByTestId("agent-context-bar")).toBeInTheDocument();
+    expect(toggleAll).toHaveAccessibleName("Collapse all agents");
   });
 
   it("does not render a per-agent cost total on the card (cost moved to the message)", async () => {

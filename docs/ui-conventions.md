@@ -59,6 +59,7 @@ The non-obvious "which primitive for what":
 - **Run state → `StatusDot`** (or the `status-*` tokens directly). Pass `StatusDot`'s `label` only when the dot is the *sole* signal (it then gets an accessible name + tooltip); omit it when a sibling text label already carries the meaning.
 - **Menus → `DropdownMenu` + `DropdownMenuItem`** (wraps `bits-ui`, so focus/keyboard/escape/ARIA come for free). Never hand-roll a menu.
 - **`Badge`** is a plain neutral chip for incidental labels (e.g. an unknown transcript item kind) — it has no harness/status variants by design.
+- **Expand/collapse actions → `ExpandCollapseIcon`**. Pass the content's current `expanded` state; the glyph communicates the pending action (`expanded` renders Collapse, collapsed renders Expand). Rotating disclosure chevrons, maximize/minimize, and sidebar visibility controls are different interactions and keep their own icons.
 - Forms/overlays: `Button`, `Dialog`, `Input`, `Textarea`. Layout: `AppShell`, `SidebarPanel` + `SidebarSection`, `EmptyState`, `Banner` — express structure through these, not duplicated flex/border classes per screen.
 
 ## Theming

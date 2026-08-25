@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { ChevronsDownUp, ChevronsUpDown, Clock3, LocateFixed, Pin } from "@lucide/svelte";
+  import { Clock3, LocateFixed, Pin } from "@lucide/svelte";
   import { tick } from "svelte";
   import { SvelteMap, SvelteSet } from "svelte/reactivity";
   import { ICON_BUTTON_ON_PANEL_CLASS } from "$lib/components/ui/iconButton";
@@ -41,6 +41,7 @@
   import AgentMessageBody from "$lib/components/AgentMessageBody.svelte";
   import UserMessageBody from "$lib/components/UserMessageBody.svelte";
   import CopyButton from "$lib/components/ui/CopyButton.svelte";
+  import ExpandCollapseIcon from "$lib/components/ui/ExpandCollapseIcon.svelte";
   import ResizeHandle from "$lib/components/ui/ResizeHandle.svelte";
   import SidebarPanel from "$lib/components/ui/SidebarPanel.svelte";
   import SidebarSection from "$lib/components/ui/SidebarSection.svelte";
@@ -330,11 +331,7 @@
                 data-testid="pins-toggle-all"
                 onclick={() => setPinsCollapsed(projectId, collapsiblePinKeys, !allPinsCollapsed)}
               >
-                {#if allPinsCollapsed}
-                  <ChevronsUpDown size={14} aria-hidden="true" />
-                {:else}
-                  <ChevronsDownUp size={14} aria-hidden="true" />
-                {/if}
+                <ExpandCollapseIcon expanded={!allPinsCollapsed} size={14} />
               </button>
             {/snippet}
           </Tooltip>
@@ -460,11 +457,10 @@
                       data-testid="pinned-message-toggle"
                       onclick={() => togglePinCollapsed(projectId, item.pin.key)}
                     >
-                      {#if isPinCollapsed(projectId, item.pin.key)}
-                        <ChevronsUpDown size={14} aria-hidden="true" />
-                      {:else}
-                        <ChevronsDownUp size={14} aria-hidden="true" />
-                      {/if}
+                      <ExpandCollapseIcon
+                        expanded={!isPinCollapsed(projectId, item.pin.key)}
+                        size={14}
+                      />
                     </button>
                   {/snippet}
                 </Tooltip>

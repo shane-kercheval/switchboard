@@ -28,16 +28,9 @@
   import CommandPaletteButton from "$lib/components/ui/CommandPaletteButton.svelte";
   import SidebarToggleButton from "$lib/components/ui/SidebarToggleButton.svelte";
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
+  import ExpandCollapseIcon from "$lib/components/ui/ExpandCollapseIcon.svelte";
   import { ICON_BUTTON_CLASS, ICON_SIZE } from "$lib/components/ui/iconButton";
-  import {
-    ChevronsDownUp,
-    ChevronsUpDown,
-    FolderOpen,
-    GitBranch,
-    Pin,
-    Plus,
-    UsersRound,
-  } from "@lucide/svelte";
+  import { FolderOpen, GitBranch, Pin, Plus, UsersRound } from "@lucide/svelte";
   import {
     hasOverrides,
     normalizeProjectCompact,
@@ -1247,11 +1240,7 @@
                     data-tauri-no-drag
                     class={cn(ICON_BUTTON_CLASS, "shrink-0")}
                   >
-                    {#if compactEnabled}
-                      <ChevronsUpDown size={ICON_SIZE} aria-hidden="true" />
-                    {:else}
-                      <ChevronsDownUp size={ICON_SIZE} aria-hidden="true" />
-                    {/if}
+                    <ExpandCollapseIcon expanded={!compactEnabled} size={ICON_SIZE} />
                   </button>
                 {/snippet}
               </Tooltip>

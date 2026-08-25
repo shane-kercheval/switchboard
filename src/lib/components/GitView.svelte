@@ -1,15 +1,20 @@
 <script lang="ts">
   /// The Git view's center-pane body: the repos→branches tree with a controls row
-  /// (global refresh, local/remote filter, show-inactive toggle). The view toggle
-  /// itself lives in the title bar (App.svelte); this is everything below it.
+  /// (repo expansion, global refresh, local/remote filter, show-inactive toggle).
+  /// The view toggle itself lives in the title bar (App.svelte); this is everything
+  /// below it.
   ///
   /// No polling — `enterGitView` (called by App on toggle) runs the staleness-
   /// gated entry refresh; the global refresh button forces a re-read + fetch.
   import { untrack } from "svelte";
+  import { SvelteSet } from "svelte/reactivity";
   import { cn } from "$lib/utils";
   import Button from "$lib/components/ui/Button.svelte";
   import EmptyState from "$lib/components/ui/EmptyState.svelte";
   import ResizeHandle from "$lib/components/ui/ResizeHandle.svelte";
+  import Tooltip from "$lib/components/ui/Tooltip.svelte";
+  import ExpandCollapseIcon from "$lib/components/ui/ExpandCollapseIcon.svelte";
+  import { ICON_BUTTON_CLASS } from "$lib/components/ui/iconButton";
   import {
     GIT_REPO_DEFAULT_WIDTH,
     GIT_REPO_MAX_WIDTH,
@@ -51,6 +56,7 @@
 
   let branchFilter = $state<"local" | "remote" | "both">("both");
   let showInactive = $state(false);
+  const collapsedRepoRoots = new SvelteSet<string>();
   let refreshing = $state(false);
   let adding = $state(false);
   let addError = $state<string | null>(null);
@@ -66,6 +72,23 @@
   let draftRepoWidth = $state<number | null>(null);
   const repoWidth = $derived(draftRepoWidth ?? layout.gitRepoWidth);
   let detailExpanded = $state(false);
+  const allReposCollapsed = $derived(
+    gitView.repos.length > 0 &&
+      gitView.repos.every((listing) => collapsedRepoRoots.has(listing.repo.root)),
+  );
+
+  function setRepoExpanded(repoRoot: string, expanded: boolean): void {
+    if (expanded) collapsedRepoRoots.delete(repoRoot);
+    else collapsedRepoRoots.add(repoRoot);
+  }
+
+  function toggleAllRepos(): void {
+    if (allReposCollapsed) {
+      for (const listing of gitView.repos) collapsedRepoRoots.delete(listing.repo.root);
+    } else {
+      for (const listing of gitView.repos) collapsedRepoRoots.add(listing.repo.root);
+    }
+  }
 
   function onWindowPointerMove(): void {
     if (hoverSuppressed.value) hoverSuppressed.value = false;
@@ -184,6 +207,13 @@
         run: () => void onGlobalRefresh(),
       },
       {
+        id: "git.toggle-repositories",
+        title: allReposCollapsed ? "Expand all repositories" : "Collapse all repositories",
+        group: "Git",
+        disabled: gitView.repos.length < 2,
+        run: () => toggleAllRepos(),
+      },
+      {
         id: "git.filter-both",
         title: "Branch filter: Both",
         group: "Git",
@@ -280,7 +310,7 @@
 <div class="flex min-h-0 flex-1 flex-col overflow-hidden" data-testid="git-view">
   {#if !detailExpanded}
     <div class="border-border/60 bg-surface flex min-h-11 items-center gap-3 border-b px-4 py-2">
-      <div class="min-w-0">
+      <div class="min-w-0 shrink-0">
         <div class="text-fg text-sm leading-5 font-semibold">Repositories</div>
         <div class="text-muted text-[11px] leading-4">
           {gitView.repos.length} tracked
@@ -288,6 +318,25 @@
       </div>
 
       <div class="flex min-w-0 flex-1 items-center gap-2">
+        {#if gitView.repos.length > 1}
+          {@const label = allReposCollapsed
+            ? "Expand all repositories"
+            : "Collapse all repositories"}
+          <Tooltip {label} side="bottom" reopen="fresh-hover">
+            {#snippet trigger(props)}
+              <button
+                {...props}
+                type="button"
+                class={ICON_BUTTON_CLASS}
+                aria-label={label}
+                data-testid="git-repos-toggle-all"
+                onclick={toggleAllRepos}
+              >
+                <ExpandCollapseIcon expanded={!allReposCollapsed} size={14} />
+              </button>
+            {/snippet}
+          </Tooltip>
+        {/if}
         <div
           class={cn(SEGMENTED_MAIN_CONTAINER_CLASS, "inline-grid grid-cols-3")}
           role="radiogroup"
@@ -420,6 +469,8 @@
               {branchFilter}
               {showInactive}
               fetchState={fetchStates[listing.repo.root]}
+              expanded={!collapsedRepoRoots.has(listing.repo.root)}
+              onExpandedChange={(expanded) => setRepoExpanded(listing.repo.root, expanded)}
             />
           {/each}
         {/if}

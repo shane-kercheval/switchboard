@@ -82,6 +82,8 @@ function props(root: string) {
     branchFilter: "both" as const,
     showInactive: false,
     fetchState: undefined,
+    expanded: true,
+    onExpandedChange: vi.fn(),
   };
 }
 

@@ -68,14 +68,17 @@
     branchFilter,
     showInactive,
     fetchState,
+    expanded,
+    onExpandedChange,
   }: {
     listing: RepoListing;
     branchFilter: "local" | "remote" | "both";
     showInactive: boolean;
     fetchState: FetchState | undefined;
+    expanded: boolean;
+    onExpandedChange: (expanded: boolean) => void;
   } = $props();
 
-  let expanded = $state(true);
   let busy = $state(false);
   let homePath = $state<string | null>(null);
   let actionError = $state<string | null>(null);
@@ -360,7 +363,7 @@
           class="text-muted hover:bg-control-hover hover:text-fg flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-full transition-colors"
           aria-label={expanded ? "Collapse repo" : "Expand repo"}
           aria-expanded={expanded}
-          onclick={() => (expanded = !expanded)}
+          onclick={() => onExpandedChange(!expanded)}
         >
           <svg
             viewBox="0 0 24 24"

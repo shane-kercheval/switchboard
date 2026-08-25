@@ -16,8 +16,6 @@
   } from "$lib/scrollPinDebug";
   import {
     ChevronRight,
-    ChevronsDownUp,
-    ChevronsUpDown,
     Columns2,
     CornerUpRight,
     MessagesSquare,
@@ -26,6 +24,7 @@
     SquareSlash,
     Workflow,
   } from "@lucide/svelte";
+  import ExpandCollapseIcon from "$lib/components/ui/ExpandCollapseIcon.svelte";
   import {
     cancelSend,
     getLocalSend,
@@ -1650,11 +1649,7 @@
     onclick={() => toggleKey(projectId, key, defaultCompact)}
   >
     <!-- Same expand/collapse glyph as the header control. -->
-    {#if compact}
-      <ChevronsUpDown class="h-3.5 w-3.5" aria-hidden="true" />
-    {:else}
-      <ChevronsDownUp class="h-3.5 w-3.5" aria-hidden="true" />
-    {/if}
+    <ExpandCollapseIcon expanded={!compact} class="h-3.5 w-3.5" />
     <span>{label}</span>
   </button>
 {/snippet}
@@ -1681,11 +1676,7 @@
         aria-label={label}
         onclick={() => setManyOverrides(projectId, keys, anyExpanded)}
       >
-        {#if anyExpanded}
-          <ChevronsDownUp class="h-4 w-4" aria-hidden="true" />
-        {:else}
-          <ChevronsUpDown class="h-4 w-4" aria-hidden="true" />
-        {/if}
+        <ExpandCollapseIcon expanded={anyExpanded} class="h-4 w-4" />
       </button>
     {/snippet}
   </Tooltip>

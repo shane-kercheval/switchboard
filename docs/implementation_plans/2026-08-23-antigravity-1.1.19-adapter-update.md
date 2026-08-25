@@ -382,14 +382,28 @@ After this milestone:
 Disk transcripts no longer record failed tool calls at all (breakage 1) — that history is
 upstream data loss and cannot be recovered. Mitigate so the loss never renders as a stuck UI:
 
+**M3 is the completion gate for the dangling-tool fix.** M2 delivered the live half only;
+until this milestone lands, a user watches a tool get correctly marked failed at turn end and
+then sees it revert to a spinner on reopen, because the failure was never written to disk and
+the hydrator has no equivalent close-out. M2 must not be described as having fixed dangling
+tools on its own, and the two ship together.
+
 - On **reopen/hydration**, a turn whose planner requested a tool that has no result record
-  shows that tool as failed (authored "Antigravity did not record a result for this tool
-  call" output), not as pending forever — and later tools in the same turn pair to their own
-  results (no FIFO shift).
-- On the **live path**, the same backstop closes any tool still pending when the turn ends
-  (belt-and-suspenders under the M2 stream ERROR events — e.g. if a future agy stops
-  emitting them).
-- `live_antigravity_invalid_file_read_completes_as_tool_error` passes again.
+  shows that tool as failed, not as pending forever — and later tools in the same turn pair
+  to their own results (no FIFO shift). Output text comes from
+  `parser.rs`'s `MISSING_TOOL_RESULT_OUTPUT`; **reuse that constant, do not author a second
+  copy**, so the live and reopened renderings of the same failure cannot drift apart.
+- **Already delivered by M2 — do not rebuild:** the live close-out backstop.
+  `AntigravityParserState::close_pending_tools` already closes *any* tool still pending at
+  the final post-exit drain, not only stream-flagged ones, which is what this section
+  originally scoped as M3's live half.
+- **Still M3's on the live side:** the capture-gated question of whether richer live
+  attribution can ever be made safely. M2 deliberately resolves at turn end and attributes a
+  harness message only in the unambiguous one-tool/one-failure case; if the captures below
+  establish a real step→call invariant, this milestone may tighten that. If they don't, M2's
+  behavior stands — this is investigation, not a commitment.
+- `live_antigravity_invalid_file_read_completes_as_tool_error` passes (M2 already restored
+  its live path; M3 must keep it passing).
 
 ### Implementation Outline
 
@@ -441,6 +455,14 @@ implemented as though it were evidence.
   whichever behavior the capture proved (exact pairing, or the conservative unattached
   policy); a normal all-success multi-tool turn unchanged; a turn with zero tool calls
   unaffected.
+- **Required: a live-vs-hydrated parity test** over the same fixture turn. The defect this
+  milestone closes is not "hydration leaves tools open" so much as "the live and reopened
+  views of one turn disagree", and only a paired assertion catches that class directly.
+  Assert **structural** parity — both renderings terminal, `is_error: true`, and non-empty
+  output — **not identical text**: in the unambiguous single-tool case the live path
+  legitimately shows agy's own per-tool message, which is absent from disk and therefore
+  unrecoverable on reopen. Text equality *is* assertable in the ambiguous (N>1) case, where
+  both paths use `MISSING_TOOL_RESULT_OUTPUT`.
 - `make test-live-antigravity` fully green (all 15 pre-existing tests plus any added by
   M1/M2) — this milestone closes the review's
   failing test.

@@ -174,14 +174,26 @@ struct PendingToolResult {
     is_error: bool,
 }
 
-/// Fallback shown for a rejected tool call when the stream carried no message.
+/// Shown for a tool call that ended without a recorded result.
 ///
-/// Normally unused: the `ERROR` step's `tool_info.error.message` is surfaced
-/// verbatim instead, which is both more specific and drift-resilient. This
-/// covers only the shape where that field is absent or blank — better than an
-/// empty tool output, which would read as "succeeded with no result".
-pub(crate) const STREAM_TOOL_FAILURE_OUTPUT: &str =
-    "Antigravity rejected this tool call and recorded no result for it.";
+/// **States only what is known.** An earlier wording said Antigravity
+/// "rejected" the call, which claims a cause this constant cannot vouch for:
+/// [`AntigravityParserState::close_pending_tools`] closes *every* still-open
+/// tool at turn end, including one with no stream failure recorded against it
+/// at all — a turn cut short, say. All that is actually established in the
+/// general case is the absence of a result.
+///
+/// Preferred over an empty output, which would read as "succeeded with nothing
+/// to show". Where the stream *did* supply a message it is used verbatim
+/// instead, being more specific and drift-resilient.
+///
+/// **Shared with hydration on purpose.** Reopening a project cannot recover the
+/// stream's per-tool message — it was never written to disk — so the reopen
+/// path shows this same text. Both paths referencing one constant is what keeps
+/// the two renderings of the same failure from drifting apart; do not author a
+/// second copy of this string.
+pub(crate) const MISSING_TOOL_RESULT_OUTPUT: &str =
+    "Antigravity did not record a result for this tool call.";
 
 impl AntigravityParserState {
     /// Record a tool failure observed on the **stream** rather than the
@@ -224,8 +236,15 @@ impl AntigravityParserState {
     /// - exactly one pending tool and exactly one recorded failure → that
     ///   message belongs to that tool, unambiguously;
     /// - anything else → every pending tool is still closed as failed, but with
-    ///   authored copy, and the unattributed harness messages are surfaced on
-    ///   the turn's own diagnostics rather than guessed onto a tool.
+    ///   [`MISSING_TOOL_RESULT_OUTPUT`], and the unattributed harness messages
+    ///   are surfaced on the turn's own diagnostics rather than guessed onto a
+    ///   tool.
+    ///
+    /// Note the second branch also covers a tool left open with **no** stream
+    /// failure recorded against it — a turn cut short, for instance. That is
+    /// why the fallback text asserts only the absence of a result rather than a
+    /// rejection: closing the tool is right (nothing more can arrive), but the
+    /// cause is not established.
     ///
     /// Deliberately no step-index or tool-name heuristic for the many-to-many
     /// case: the step→call invariant is not established by any capture we hold,
@@ -263,7 +282,7 @@ impl AntigravityParserState {
         while let Some(pending) = self.pending_tool_ids.pop_front() {
             let output = single_message
                 .clone()
-                .unwrap_or_else(|| STREAM_TOOL_FAILURE_OUTPUT.to_owned());
+                .unwrap_or_else(|| MISSING_TOOL_RESULT_OUTPUT.to_owned());
             events.push(AdapterEvent::ToolCompleted {
                 turn_id,
                 tool_use_id: pending.tool_use_id,
@@ -980,7 +999,7 @@ mod tests {
                 } => {
                     assert!(*is_error);
                     assert_eq!(
-                        output, STREAM_TOOL_FAILURE_OUTPUT,
+                        output, MISSING_TOOL_RESULT_OUTPUT,
                         "an unattributable harness message must not be shown on a guessed tool"
                     );
                 }
@@ -1015,7 +1034,42 @@ mod tests {
         assert!(unattributed.is_empty());
         match &closed[0] {
             AdapterEvent::ToolCompleted { output, .. } => {
-                assert_eq!(output, STREAM_TOOL_FAILURE_OUTPUT);
+                assert_eq!(output, MISSING_TOOL_RESULT_OUTPUT);
+            }
+            other => panic!("expected ToolCompleted; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn close_pending_tools_closes_a_tool_with_no_recorded_failure_at_all() {
+        // A tool left open with zero stream evidence — a turn cut short, say.
+        // It must still close (nothing more can arrive), but the copy may not
+        // claim a rejection, because none was observed.
+        let turn_id = Uuid::now_v7();
+        let mut state = AntigravityParserState::default();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let rec: TranscriptRecord = serde_json::from_str(
+            r#"{"step_index":2,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"run_command","args":{}}]}"#,
+        )
+        .unwrap();
+        for event in record_to_live_events(&rec, turn_id, &mut state) {
+            let _ = tx.send(event);
+        }
+        while rx.try_recv().is_ok() {}
+
+        let (closed, unattributed) = state.close_pending_tools(turn_id);
+        assert!(unattributed.is_empty(), "nothing was recorded to attribute");
+        assert_eq!(closed.len(), 1, "the tool must not be left spinning");
+        match &closed[0] {
+            AdapterEvent::ToolCompleted {
+                output, is_error, ..
+            } => {
+                assert!(*is_error);
+                assert_eq!(output, MISSING_TOOL_RESULT_OUTPUT);
+                assert!(
+                    !output.to_ascii_lowercase().contains("rejected"),
+                    "must not assert a cause that was never observed: {output}"
+                );
             }
             other => panic!("expected ToolCompleted; got {other:?}"),
         }

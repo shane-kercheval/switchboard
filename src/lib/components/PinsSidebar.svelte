@@ -1,5 +1,6 @@
 <script lang="ts">
   import { ChevronsDownUp, ChevronsUpDown, Clock3, LocateFixed, Pin } from "@lucide/svelte";
+  import { tick } from "svelte";
   import { SvelteMap, SvelteSet } from "svelte/reactivity";
   import { ICON_BUTTON_ON_PANEL_CLASS } from "$lib/components/ui/iconButton";
   import type { AgentRecord, ConversationItem, ProjectId } from "$lib/types";
@@ -13,11 +14,13 @@
   } from "$lib/messageIdentity";
   import {
     loadMessagePins,
+    pinsScrollTopFor,
     isPinCollapsed,
     pinsLoaded,
     pinsFor,
     pinsUnavailableReason,
     setPinsCollapsed,
+    setPinsScrollTop,
     setStoredPinPinned,
     togglePinCollapsed,
   } from "$lib/state/messagePins.svelte";
@@ -60,6 +63,7 @@
   } = $props();
 
   let draftWidth = $state<number | null>(null);
+  let scrollElement = $state<HTMLDivElement>();
   const pinsSortMode = $derived(layout.pinsSortModeFor(projectId));
   const rosterIds = $derived(agents.map((agent) => agent.id));
   const jumpPaneIndex = $derived(buildJumpPaneIndex(projectId, rosterIds));
@@ -186,6 +190,22 @@
     void loadMessagePins(projectId);
   });
 
+  $effect(() => {
+    const element = scrollElement;
+    const currentProjectId = projectId;
+    if (element === undefined || !pinsLoaded(currentProjectId)) return;
+    const scrollTop = pinsScrollTopFor(currentProjectId);
+    void tick().then(() => {
+      if (scrollElement === element && projectId === currentProjectId) {
+        element.scrollTop = scrollTop;
+      }
+    });
+  });
+
+  function rememberScroll(scrollTop: number): void {
+    if (pinsLoaded(projectId)) setPinsScrollTop(projectId, scrollTop);
+  }
+
   function canJump(entry: NavigatorEntry): boolean {
     return canResolveJumpFromIndex(jumpPaneIndex, entry.agentIds);
   }
@@ -230,7 +250,12 @@
       draftWidth = null;
     }}
   />
-  <SidebarSection title="Pins">
+  <SidebarSection
+    title="Pins"
+    bind:scrollRef={scrollElement}
+    scrollTestid="pins-scroll"
+    onScroll={rememberScroll}
+  >
     {#snippet action()}
       <div class="flex items-center gap-1">
         {#if showPinsSort}

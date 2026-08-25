@@ -16,9 +16,13 @@ const AGENT: AgentRecord = {
 };
 const PIN_KEY = `agent:hydration:${AGENT.id}:message-1`;
 let persistedPins = [{ key: PIN_KEY, pinned_at: "2026-08-07T12:01:00Z" }];
+let listPinsGate: Promise<void> | null = null;
 
 const invokeMock = vi.fn(async (cmd: string, args?: Record<string, unknown>) => {
-  if (cmd === "list_message_pins") return persistedPins;
+  if (cmd === "list_message_pins") {
+    await listPinsGate;
+    return persistedPins;
+  }
   if (cmd === "set_message_pin") {
     if (args?.pinned === true && !persistedPins.some((pin) => pin.key === args.key)) {
       persistedPins = [
@@ -64,6 +68,7 @@ afterEach(() => {
   pins._testing.reset();
   layoutStore._testing.reset();
   persistedPins = [{ key: PIN_KEY, pinned_at: "2026-08-07T12:01:00Z" }];
+  listPinsGate = null;
   invokeMock.mockClear();
 });
 
@@ -123,6 +128,83 @@ describe("PinsSidebar", () => {
     expect(screen.getByTestId("pins-empty")).toHaveTextContent(
       "Pinned messages appear here in full",
     );
+  });
+
+  it("restores each project's scroll position after the sidebar remounts", async () => {
+    await transcript.registerAgent(AGENT);
+    transcript.transcripts[AGENT.id] = [
+      {
+        role: "agent",
+        turn_id: "turn-1",
+        agent_id: AGENT.id,
+        started_at: "2026-08-07T12:00:00Z",
+        status: "complete",
+        hydration_key: "message-1",
+        items: [{ item_kind: "text", kind: "text", text: "important answer" }],
+      },
+    ];
+
+    const firstProject = render(PinsSidebar, {
+      props: { projectId: PROJECT, agents: [AGENT] },
+    });
+    await screen.findByTestId("pinned-message-body");
+    const firstScroller = screen.getByTestId("pins-scroll");
+    firstScroller.scrollTop = 173;
+    await fireEvent.scroll(firstScroller);
+    firstProject.unmount();
+
+    const otherProject = render(PinsSidebar, {
+      props: { projectId: OTHER_PROJECT, agents: [AGENT] },
+    });
+    await screen.findByTestId("pinned-message-body");
+    await waitFor(() => expect(screen.getByTestId("pins-scroll").scrollTop).toBe(0));
+    otherProject.unmount();
+
+    render(PinsSidebar, { props: { projectId: PROJECT, agents: [AGENT] } });
+    await screen.findByTestId("pinned-message-body");
+    await waitFor(() => expect(screen.getByTestId("pins-scroll").scrollTop).toBe(173));
+  });
+
+  it("preserves the loaded scroll position through a forced pin reload", async () => {
+    await transcript.registerAgent(AGENT);
+    transcript.transcripts[AGENT.id] = [
+      {
+        role: "agent",
+        turn_id: "turn-1",
+        agent_id: AGENT.id,
+        started_at: "2026-08-07T12:00:00Z",
+        status: "complete",
+        hydration_key: "message-1",
+        items: [
+          {
+            item_kind: "text",
+            kind: "text",
+            text: Array.from({ length: 40 }, (_, index) => `Pinned paragraph ${index + 1}.`).join(
+              "\n\n",
+            ),
+          },
+        ],
+      },
+    ];
+
+    render(PinsSidebar, { props: { projectId: PROJECT, agents: [AGENT] } });
+    await screen.findByTestId("pinned-message-body");
+    const scroller = screen.getByTestId("pins-scroll");
+    scroller.scrollTop = 173;
+    await fireEvent.scroll(scroller);
+
+    let releasePinList!: () => void;
+    listPinsGate = new Promise<void>((resolve) => (releasePinList = resolve));
+    const reload = pins.loadMessagePins(PROJECT, true);
+    await waitFor(() => expect(screen.getByTestId("pins-loading")).toBeInTheDocument());
+
+    scroller.scrollTop = 0;
+    await fireEvent.scroll(scroller);
+    releasePinList();
+    await reload;
+
+    await screen.findByTestId("pinned-message-body");
+    await waitFor(() => expect(screen.getByTestId("pins-scroll").scrollTop).toBe(173));
   });
 
   it("keeps the message-toggle tooltip quiet until a full-delay re-entry", async () => {

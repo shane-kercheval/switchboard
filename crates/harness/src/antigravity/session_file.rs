@@ -196,7 +196,8 @@ struct PendingToolResult {
 
 struct PendingToolStart {
     item_idx: usize,
-    planner_step: i64,
+    /// See `parser::PendingToolStart::expected_result_step`.
+    expected_result_step: i64,
 }
 
 impl AgentBuilder {
@@ -321,8 +322,8 @@ impl Reconstruction {
                 for (call_index, call) in calls.iter().enumerate() {
                     let tool_use_id = format!("{}:{}:{}", rec.step_index, call_index, call.name);
                     let idx = builder.items.len();
-                    let result =
-                        pop_plausible_result(&mut builder.pending_tool_results, rec.step_index);
+                    let expected = super::parser::expected_result_step(rec.step_index, call_index);
+                    let result = take_result_for_step(&mut builder.pending_tool_results, expected);
                     let (kind, facet) = super::facets::classify_antigravity_tool_with_encoding(
                         &call.name,
                         &call.args,
@@ -342,7 +343,7 @@ impl Reconstruction {
                     if result.is_none() {
                         builder.pending_tools.push_back(PendingToolStart {
                             item_idx: idx,
-                            planner_step: rec.step_index,
+                            expected_result_step: expected,
                         });
                     }
                 }
@@ -364,13 +365,22 @@ impl Reconstruction {
         } else if rec.is_tool_result() {
             let is_error = rec.tool_result_is_error();
             let output = rec.tool_result_output();
-            if let Some(pending) = builder.pending_tools.front()
-                && rec.step_index > pending.planner_step
+            // Exact-step attribution, mirroring the live parser — see
+            // `parser::PendingToolStart::expected_result_step` for the captures
+            // behind it. The arrival-order rule this replaces handed a result to
+            // whichever call was oldest, which silently swapped identities as
+            // soon as any call produced no record (agy writes nothing for a
+            // rejected tool): the rejected call absorbed the *next* tool's
+            // output and rendered as a success.
+            if let Some(index) = builder
+                .pending_tools
+                .iter()
+                .position(|pending| pending.expected_result_step == rec.step_index)
             {
                 let pending = builder
                     .pending_tools
-                    .pop_front()
-                    .expect("front checked above");
+                    .remove(index)
+                    .expect("index from position");
                 if let Some(TurnItem::Tool {
                     output: out,
                     is_error: err,
@@ -400,7 +410,7 @@ impl Reconstruction {
     /// `Failed` — covering both harness-reported failures and a transcript
     /// truncated before its terminal record.
     fn close_current(&mut self) {
-        let Some(b) = self.current.take() else {
+        let Some(mut b) = self.current.take() else {
             return;
         };
         for result in &b.pending_tool_results {
@@ -411,6 +421,39 @@ impl Reconstruction {
                     result.step_index
                 ),
             );
+        }
+        // Close every tool that never got a result. Mirrors the live path's
+        // turn-end close-out, and is what stops a reopened project from showing
+        // a tool spinning forever: agy writes **no record at all** for a tool
+        // call it rejects, so on disk that call is simply never answered. The
+        // specific error is unrecoverable here — it existed only on the live
+        // control stream — so this states what disk can support and shares the
+        // live path's wording via one constant rather than a second copy.
+        // The instant this turn closed. Bound once and reused for both the
+        // orphaned tools below and the `Turn::Agent` stamp further down, so the
+        // two are identical by construction rather than by two expressions that
+        // happen to agree.
+        let turn_ended_at = b
+            .ended_at
+            .map_or(b.last_seen_at, |ended| ended.max(b.last_seen_at));
+        for pending in b.pending_tools.drain(..) {
+            if let Some(TurnItem::Tool {
+                output,
+                is_error,
+                completed_at,
+                ..
+            }) = b.items.get_mut(pending.item_idx)
+            {
+                *output = Some(super::parser::MISSING_TOOL_RESULT_OUTPUT.to_owned());
+                *is_error = Some(true);
+                // Closed when the turn closed, matching the live path's
+                // turn-end close-out. Stamping the tool's own start instead
+                // would report a zero-duration tool that finished before tools
+                // which actually ran after it — the reopened view disagreeing
+                // with the live one about ordering, which is the divergence
+                // this milestone exists to remove.
+                *completed_at = Some(turn_ended_at);
+            }
         }
         let status = if b.failed {
             TurnStatus::Failed
@@ -423,10 +466,7 @@ impl Reconstruction {
             turn_id: b.turn_id,
             agent_id: b.agent_id,
             started_at: b.started_at,
-            ended_at: Some(
-                b.ended_at
-                    .map_or(b.last_seen_at, |ended| ended.max(b.last_seen_at)),
-            ),
+            ended_at: Some(turn_ended_at),
             status,
             items: b.items,
             usage: None,
@@ -464,13 +504,16 @@ impl Reconstruction {
     }
 }
 
-fn pop_plausible_result(
+/// Take a buffered result belonging to exactly this step. No nearest-match
+/// fallback — see the live parser's `take_result_for_step` for why guessing is
+/// the bug this replaced.
+fn take_result_for_step(
     pending_results: &mut VecDeque<PendingToolResult>,
-    planner_step: i64,
+    expected_step: i64,
 ) -> Option<PendingToolResult> {
     let idx = pending_results
         .iter()
-        .position(|result| result.step_index > planner_step)?;
+        .position(|result| result.step_index == expected_step)?;
     pending_results.remove(idx)
 }
 
@@ -810,15 +853,15 @@ mod tests {
     }
 
     #[test]
-    fn adjacent_mcp_wrappers_pair_normal_and_invalid_results_on_reload() {
+    fn mcp_wrappers_pair_normal_and_invalid_results_on_reload() {
         let content = concat!(
             r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-07-14T23:38:49Z","content":"<USER_REQUEST>\ntest MCP tools\n</USER_REQUEST>"}"#,
             "\n",
             r#"{"step_index":8,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-07-14T23:38:50Z","tool_calls":[{"name":"call_mcp_tool","args":{"ServerName":"\"notes_alias\"","ToolName":"\"edit_content\"","Arguments":"{\"id\":\"note-example\",\"type\":\"note\",\"old_str\":\"before\",\"new_str\":\"after\"}"}}]}"#,
             "\n",
-            r#"{"step_index":9,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-07-14T23:38:51Z","tool_calls":[{"name":"call_mcp_tool","args":{"ServerName":"\"prompts_alias\"","ToolName":"\"create_prompt\"","Arguments":"{\"name\":\"sample-prompt\",\"content\":\"Prompt body\"}"}}]}"#,
+            r#"{"step_index":10,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-07-14T23:38:51Z","tool_calls":[{"name":"call_mcp_tool","args":{"ServerName":"\"prompts_alias\"","ToolName":"\"create_prompt\"","Arguments":"{\"name\":\"sample-prompt\",\"content\":\"Prompt body\"}"}}]}"#,
             "\n",
-            r#"{"step_index":10,"source":"MODEL","type":"CortexStepMcpTool","status":"DONE","created_at":"2026-07-14T23:38:52Z","content":"edit ok"}"#,
+            r#"{"step_index":9,"source":"MODEL","type":"CortexStepMcpTool","status":"DONE","created_at":"2026-07-14T23:38:52Z","content":"edit ok"}"#,
             "\n",
             r#"{"step_index":11,"source":"SYSTEM","type":"ERROR_MESSAGE","status":"DONE","created_at":"2026-07-14T23:38:53Z","error":"There was a problem parsing the tool call. Error Message: invalid tool call error (invalid_args) creation rejected"}"#,
             "\n",
@@ -933,14 +976,26 @@ mod tests {
         );
         let t = parse_antigravity_transcript_content(content, agent_id());
         let items = agent_items(&t.turns[1]);
-        assert!(matches!(
-            &items[0],
+        // The orphan result is still refused — that is the point of the test —
+        // but the tool no longer dangles: it closes as failed with neutral copy,
+        // so a reopened project shows a resolved tool rather than a spinner.
+        match &items[0] {
             TurnItem::Tool {
-                output: None,
-                completed_at: None,
-                ..
+                output, is_error, ..
+            } => {
+                assert_eq!(
+                    output.as_deref(),
+                    Some(super::super::parser::MISSING_TOOL_RESULT_OUTPUT)
+                );
+                assert_ne!(
+                    output.as_deref(),
+                    Some("orphan"),
+                    "the unmatched result must never be attached"
+                );
+                assert_eq!(*is_error, Some(true));
             }
-        ));
+            other => panic!("expected a Tool item; got {other:?}"),
+        }
         assert_eq!(t.warnings.len(), 1);
         assert!(
             t.warnings[0].reason.contains("no matching tool call"),
@@ -1015,11 +1070,13 @@ mod tests {
         // The tool started but its result line was truncated away.
         let items = agent_items(&t.turns[1]);
         assert_eq!(items.len(), 1);
+        // Its result line was truncated away, so on reopen it closes as failed
+        // rather than spinning forever.
         assert!(matches!(
             &items[0],
             TurnItem::Tool {
-                completed_at: None,
-                output: None,
+                output: Some(_),
+                is_error: Some(true),
                 ..
             }
         ));

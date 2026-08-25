@@ -3140,6 +3140,80 @@ async fn live_antigravity_dash_leading_prompt_completes() {
     );
 }
 
+/// Drift tripwire for the **step→call invariant** the tool pairing now rests
+/// on: a call announced by a planner record at step `P` has its result at
+/// `P + 1 + call_index`.
+///
+/// This is an inferred property of agy's undocumented internal step numbering,
+/// derived from ten planner records across five captured transcripts. Fixtures
+/// freeze that inference; only a real run can notice Google changing it. If it
+/// ever shifts, tool results start attaching to the wrong call — silently, and
+/// with plausible-looking output — so this is worth a live turn.
+///
+/// Uses a multi-tool prompt because a single-call turn cannot distinguish
+/// `P + 1 + call_index` from a simple "next step" rule.
+#[tokio::test]
+#[ignore = "requires agy authenticated (run `agy`) — run with: make test-live"]
+async fn live_antigravity_tool_result_steps_follow_the_call_index() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let adapter = AntigravityAdapter::new();
+    let agent = live_antigravity_agent();
+
+    let events = antigravity_live_turn(
+        &adapter,
+        &agent,
+        tmp.path(),
+        "Run these two shell commands: 'echo STEP_PROBE_ONE' then 'echo STEP_PROBE_TWO'. \
+         Then reply with only the word done.",
+        Uuid::now_v7(),
+        // Fresh conversation; both tools are idempotent echoes in a tempdir.
+        RetryPolicy::RetryOnKnownTransient,
+    )
+    .await;
+
+    let conversation = antigravity_capture(&events).expect("captured conversation id");
+    let transcript =
+        switchboard_harness::antigravity::paths::transcript_path(&home_dir(), conversation);
+    let content = std::fs::read_to_string(&transcript)
+        .unwrap_or_else(|e| panic!("reading {}: {e}", transcript.display()));
+
+    // Collect (planner step, call count) and the steps results actually landed
+    // on, straight from the real transcript.
+    let mut expected: Vec<i64> = Vec::new();
+    let mut observed: Vec<i64> = Vec::new();
+    for line in content.lines().filter(|l| !l.trim().is_empty()) {
+        let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if record["source"] != "MODEL" {
+            continue;
+        }
+        let step = record["step_index"].as_i64().unwrap_or_default();
+        if record["type"] == "PLANNER_RESPONSE" {
+            if let Some(calls) = record["tool_calls"].as_array() {
+                for index in 0..calls.len() {
+                    expected.push(step + 1 + i64::try_from(index).unwrap());
+                }
+            }
+        } else {
+            observed.push(step);
+        }
+    }
+
+    assert!(
+        expected.len() >= 2,
+        "need a multi-tool turn to test the invariant; transcript: {content}"
+    );
+    expected.sort_unstable();
+    observed.sort_unstable();
+    assert_eq!(
+        observed, expected,
+        "tool result steps must be `planner_step + 1 + call_index`; if this fails, \
+         agy's step numbering changed and tool results will attach to the wrong call. \
+         transcript: {content}"
+    );
+}
+
 /// Drift tripwire for the `stream-json` contract, which is now the adapter's
 /// **primary** conversation-id capture and terminal signal. A fixture replays
 /// our own recorded shape and so cannot catch Google reshaping the payload;

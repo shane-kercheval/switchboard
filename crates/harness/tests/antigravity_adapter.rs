@@ -419,6 +419,263 @@ async fn fork_and_heal_recaptures_new_conversation_and_next_dispatch_resumes_it(
     );
 }
 
+/// **Live/hydrated parity** over the real capture that motivated M3
+/// (`tool-failure-cross-planner.transcript.jsonl`): `view_file` rejected — agy
+/// writes no record for it — then `run_command` succeeding.
+///
+/// Drives **both readers from one run**: `fake_agy` replays the captured
+/// records and the matching tool-`ERROR` stream event, the live events are
+/// collected from the adapter, and the transcript `fake_agy` actually wrote is
+/// then hydrated. An earlier version of this test only called the hydrator and
+/// asserted properties of that one side — it could not have detected the very
+/// divergence its name claims to guard.
+///
+/// Parity is **structural, not textual, and deliberately so**: live, the
+/// rejected tool carries agy's own per-tool message from the control stream;
+/// that message never reaches disk, so the reopened view shows the shared
+/// neutral constant. Demanding identical text would assert a falsehood about
+/// what disk can recover. Timing is likewise excluded — `ToolCompleted` carries
+/// no timestamp, so there is no live value to compare against hydration's
+/// `completed_at`; that contract is asserted separately on each side.
+#[tokio::test]
+async fn live_and_hydrated_views_agree_on_a_rejected_tool() {
+    let home = tempfile::TempDir::new().unwrap();
+    let cwd = tempfile::TempDir::new().unwrap();
+    let adapter = AntigravityAdapter::with_binary_and_home(FAKE_AGY, home.path());
+    let agent = agy_agent();
+    let uuid = Uuid::new_v4();
+
+    // Replay the captured transcript through `fake_agy`, minus the record agy
+    // never writes for a rejected call — the stream reports that one instead.
+    let captured = std::fs::read_to_string(format!(
+        "{FIXTURES}/tool-failure-cross-planner.transcript.jsonl"
+    ))
+    .unwrap();
+    let records: Vec<Value> = captured
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| json!({"json": line, "delay_ms": 0}))
+        .collect();
+
+    write_script(
+        cwd.path(),
+        &json!({
+            "conversation_uuid": uuid.to_string(),
+            "stream": [
+                init_event(uuid),
+                // view_file is planner step 2, call 0 → its result slot is 3.
+                tool_error_event(3),
+                result_event("SUCCESS", None),
+            ],
+            "records": records,
+            "exit_code": 0,
+        }),
+    );
+
+    let events = dispatch(&adapter, &agent, cwd.path(), "two tools").await;
+
+    // Live side: (tool_use_id, is_error, output present).
+    let mut live: Vec<(String, bool, bool)> = events
+        .iter()
+        .filter_map(|event| match event {
+            AdapterEvent::ToolCompleted {
+                tool_use_id,
+                output,
+                is_error,
+                ..
+            } => Some((tool_use_id.clone(), *is_error, !output.trim().is_empty())),
+            _ => None,
+        })
+        .collect();
+
+    // Hydrated side: the transcript `fake_agy` just wrote.
+    let loaded =
+        load_antigravity_transcript(home.path(), cwd.path(), Some(uuid), agent.id).unwrap();
+    let agent_turn = loaded
+        .turns
+        .iter()
+        .find(|t| matches!(t, Turn::Agent { .. }))
+        .expect("an agent turn");
+    let Turn::Agent { items, .. } = agent_turn else {
+        unreachable!()
+    };
+    let mut hydrated: Vec<(String, bool, bool)> = items
+        .iter()
+        .filter_map(|item| match item {
+            TurnItem::Tool {
+                tool_use_id,
+                output,
+                is_error,
+                ..
+            } => Some((
+                tool_use_id.clone(),
+                is_error.unwrap_or(false),
+                output.as_deref().is_some_and(|o| !o.trim().is_empty()),
+            )),
+            _ => None,
+        })
+        .collect();
+
+    live.sort();
+    hydrated.sort();
+    assert_eq!(
+        live.len(),
+        2,
+        "both calls must resolve live; got: {events:?}"
+    );
+    assert_eq!(
+        live, hydrated,
+        "the live and reopened views must agree on which tool failed and that \
+         both resolved"
+    );
+    // Pin the expectation itself, so a change that corrupts *both* readers in
+    // the same direction still fails rather than agreeing on the wrong answer.
+    assert_eq!(
+        live,
+        vec![
+            ("2:0:view_file".to_owned(), true, true),
+            ("4:0:run_command".to_owned(), false, true),
+        ]
+    );
+}
+
+/// The timing half of the live/hydrated contract, asserted separately on each
+/// side because the two carry it differently: `AdapterEvent::ToolCompleted` has
+/// no timestamp field, so there is nothing to compare against hydration's
+/// `completed_at`.
+///
+/// **Hydration:** an orphaned tool closes at the *turn's* end, not its own
+/// start. Stamping its start would report a zero-duration tool that finished
+/// before tools which actually ran after it — in this capture, `view_file`
+/// starts 11s before the turn ends and 5s before `run_command` even begins.
+#[tokio::test]
+async fn hydrated_orphan_tool_closes_at_turn_end_not_at_its_start() {
+    let home = tempfile::TempDir::new().unwrap();
+    let cwd = tempfile::TempDir::new().unwrap();
+    let agent = agy_agent();
+    let uuid = Uuid::new_v4();
+
+    let dest = paths::transcript_path(home.path(), uuid);
+    std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+    std::fs::copy(
+        format!("{FIXTURES}/tool-failure-cross-planner.transcript.jsonl"),
+        &dest,
+    )
+    .unwrap();
+
+    let loaded =
+        load_antigravity_transcript(home.path(), cwd.path(), Some(uuid), agent.id).unwrap();
+    let agent_turn = loaded
+        .turns
+        .iter()
+        .find(|t| matches!(t, Turn::Agent { .. }))
+        .expect("an agent turn");
+    let Turn::Agent {
+        items,
+        ended_at: turn_ended_at,
+        ..
+    } = agent_turn
+    else {
+        unreachable!()
+    };
+
+    let orphan = items
+        .iter()
+        .find_map(|item| match item {
+            TurnItem::Tool {
+                tool_use_id,
+                started_at,
+                completed_at,
+                is_error: Some(true),
+                ..
+            } if tool_use_id.starts_with("2:0:") => Some((*started_at, *completed_at)),
+            _ => None,
+        })
+        .expect("the rejected view_file call");
+    let (started_at, completed_at) = orphan;
+
+    assert_eq!(
+        completed_at, *turn_ended_at,
+        "the orphaned tool must close when the turn closed"
+    );
+    assert!(
+        completed_at.is_some_and(|done| done > started_at),
+        "must not report a zero-duration tool: started {started_at:?}, completed {completed_at:?}"
+    );
+
+    // And it must not appear to have finished before a tool that ran later.
+    let later_start = items
+        .iter()
+        .find_map(|item| match item {
+            TurnItem::Tool {
+                tool_use_id,
+                started_at,
+                ..
+            } if tool_use_id.starts_with("4:0:") => Some(*started_at),
+            _ => None,
+        })
+        .expect("the run_command call");
+    assert!(
+        completed_at.is_some_and(|done| done >= later_start),
+        "the failed tool must not sort as finishing before a tool that started after it"
+    );
+}
+
+/// **Live:** the synthetic close-out for a rejected tool is emitted after the
+/// transcript's own content and before `TurnEnd` — the ordering that "closes at
+/// turn end" actually means on the live side.
+#[tokio::test]
+async fn live_orphan_tool_closes_after_content_and_before_turn_end() {
+    let home = tempfile::TempDir::new().unwrap();
+    let cwd = tempfile::TempDir::new().unwrap();
+    let adapter = AntigravityAdapter::with_binary_and_home(FAKE_AGY, home.path());
+    let agent = agy_agent();
+    let uuid = Uuid::new_v4();
+
+    write_script(
+        cwd.path(),
+        &json!({
+            "conversation_uuid": uuid.to_string(),
+            "stream": [init_event(uuid), tool_error_event(3), result_event("SUCCESS", None)],
+            "records": [
+                {"json": user_record("hi", "2026-05-19T19:00:00Z"), "delay_ms": 0},
+                {"json": tool_call_record("2026-05-19T19:00:01Z"), "delay_ms": 0},
+                {"json": terminal_record("2026-05-19T19:00:02Z", "ack"), "delay_ms": 20},
+            ],
+            "exit_code": 0,
+        }),
+    );
+
+    let events = dispatch(&adapter, &agent, cwd.path(), "hi").await;
+    let position = |pred: fn(&AdapterEvent) -> bool| {
+        events
+            .iter()
+            .position(pred)
+            .unwrap_or_else(|| panic!("event not found in: {events:?}"))
+    };
+
+    let answer = position(|e| {
+        matches!(
+            e,
+            AdapterEvent::ContentChunk {
+                kind: switchboard_harness::ContentKind::Text,
+                ..
+            }
+        )
+    });
+    let closed = position(|e| matches!(e, AdapterEvent::ToolCompleted { is_error: true, .. }));
+    let turn_end = position(|e| matches!(e, AdapterEvent::TurnEnd { .. }));
+
+    assert!(
+        answer < closed,
+        "the close-out runs after the transcript's content is drained"
+    );
+    assert!(
+        closed < turn_end,
+        "the close-out must precede TurnEnd so the tool is resolved on the turn"
+    );
+}
+
 /// Hydration against a real-shape `transcript.jsonl` captured from `agy`
 /// (multi-step tool use). Stages it where the loader resolves the path from the
 /// conversation UUID and asserts the reconstructed turns.

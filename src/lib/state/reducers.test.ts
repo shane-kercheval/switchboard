@@ -353,7 +353,13 @@ describe("transcriptReducer", () => {
     it("appends a cancelled agent turn stamped with the resolved send_id", () => {
       const turns = transcriptReducer(
         [],
-        { type: "message_cancelled", message_id: MESSAGE_1, agent_id: AGENT_A, at: RECEIVED_AT },
+        {
+          type: "message_cancelled",
+          message_id: MESSAGE_1,
+          send_id: "send-1",
+          agent_id: AGENT_A,
+          at: RECEIVED_AT,
+        },
         AGENT_A,
         RECEIVED_AT,
         "send-1",
@@ -369,7 +375,13 @@ describe("transcriptReducer", () => {
     it("is a no-op when no send_id resolves (stray event)", () => {
       const turns = transcriptReducer(
         [],
-        { type: "message_cancelled", message_id: MESSAGE_1, agent_id: AGENT_A, at: RECEIVED_AT },
+        {
+          type: "message_cancelled",
+          message_id: MESSAGE_1,
+          send_id: "send-1",
+          agent_id: AGENT_A,
+          at: RECEIVED_AT,
+        },
         AGENT_A,
         RECEIVED_AT,
         undefined,
@@ -1552,6 +1564,7 @@ describe("runtimeReducer", () => {
     const r = runtimeReducer(starting, {
       type: "message_cancelled",
       message_id: MESSAGE_1,
+      send_id: "send-1",
       agent_id: AGENT_A,
       at: "2026-05-16T00:00:00Z",
     });
@@ -1569,6 +1582,7 @@ describe("runtimeReducer", () => {
     const r = runtimeReducer(processing, {
       type: "message_cancelled",
       message_id: MESSAGE_2,
+      send_id: "send-2",
       agent_id: AGENT_A,
       at: "2026-05-16T00:00:00Z",
     });
@@ -1585,10 +1599,31 @@ describe("runtimeReducer", () => {
     const r = runtimeReducer(starting, {
       type: "message_cancelled",
       message_id: MESSAGE_2,
+      send_id: "send-2",
       agent_id: AGENT_A,
       at: "2026-05-16T00:00:00Z",
     });
     expect(r).toBe(starting);
+  });
+
+  it("message_cancelled falls back to send_id without pruning another queued send", () => {
+    const starting: AgentRuntime = {
+      ...fresh(),
+      run_status: "starting",
+      pending_sends: [
+        { send_id: "send-1", user_turn_id: "user-1" },
+        { send_id: "send-2", user_turn_id: "user-2" },
+      ],
+    };
+    const r = runtimeReducer(starting, {
+      type: "message_cancelled",
+      message_id: MESSAGE_2,
+      send_id: "send-2",
+      agent_id: AGENT_A,
+      at: "2026-05-16T00:00:00Z",
+    });
+    expect(r.run_status).toBe("starting");
+    expect(r.pending_sends).toEqual([{ send_id: "send-1", user_turn_id: "user-1" }]);
   });
 
   it("message_failed while processing is a no-op (turn already started; must not stomp)", () => {

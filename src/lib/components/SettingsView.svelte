@@ -442,8 +442,9 @@
       <div>
         <h2 class={sectionHeadingClass}>Notifications</h2>
         <p class="text-muted mt-1 text-sm leading-relaxed">
-          Switchboard can post a macOS notification when your agents finish — when every recipient
-          of a send has responded, and when a workflow run reaches its end.
+          Switchboard can post a macOS notification when your agents finish — after every recipient
+          has responded and any work queued behind it has also finished, and when a workflow run
+          reaches its end.
         </p>
         <p class="text-muted mt-2 text-sm leading-relaxed">
           While you're working in Switchboard, the project on screen never notifies. Other projects

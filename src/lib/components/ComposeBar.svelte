@@ -2365,9 +2365,10 @@
     noteLocalSend(dispatchProjectId, sendId);
     // Register the whole recipient set *before* any IPC call, so one recipient's
     // rejection can't erase an agent that was supposed to be in the send — and so
-    // the completion notification fires once, on the last recipient, rather than
-    // once per agent. Only sends dispatched here are registered, which is what
-    // keeps workflow steps from notifying individually.
+    // the completion tracker can join sends queued onto the same busy agents into
+    // one queue-drained notification rather than notifying between turns. Only
+    // sends dispatched here are registered, which is what keeps workflow steps
+    // from notifying individually.
     registerSend(
       sendId,
       dispatchProjectId,

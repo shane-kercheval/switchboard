@@ -502,11 +502,13 @@ pub enum NormalizedEvent {
     /// `turn_id`. The dispatcher's authoritative signal that a not-yet-started
     /// send is gone, so the frontend renders its cancellation from this event
     /// rather than guessing (a *running* turn's cancellation still arrives as a
-    /// `TurnEnd { Cancelled }`). Like `MessageFailed`, this is a non-turn,
-    /// message-keyed event and carries no durable journal record (a
-    /// queued-but-unstarted send is live-UI-only).
+    /// `TurnEnd { Cancelled }`). `send_id` preserves attribution even if this
+    /// event reaches the frontend before the accepted-send IPC receipt. Like
+    /// `MessageFailed`, this is a non-turn event and carries no durable journal
+    /// record (a queued-but-unstarted send is live-UI-only).
     MessageCancelled {
         message_id: MessageId,
+        send_id: SendId,
         agent_id: AgentId,
         at: DateTime<Utc>,
     },

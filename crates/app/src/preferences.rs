@@ -146,8 +146,8 @@ pub struct Preferences {
     /// Diff panel layout. Defaults to unified.
     pub diff_style: DiffStyle,
 
-    /// Whether an OS notification fires when agents finish — a send's recipients
-    /// all settling, or a workflow run reaching its terminal.
+    /// Whether an OS notification fires when agents finish — a manual activity
+    /// batch reaching queue-drained idle, or a workflow run reaching its terminal.
     ///
     /// One switch, not two, because Switchboard cannot express "sound but no
     /// banner" itself: whether a delivered notification is shown as a banner is

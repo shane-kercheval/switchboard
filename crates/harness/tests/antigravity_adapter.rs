@@ -798,6 +798,283 @@ async fn error_line_buried_under_stderr_chatter_still_surfaces_verbatim() {
     }
 }
 
+fn init_event(uuid: Uuid) -> Value {
+    drip(
+        &json!({
+            "event": "init",
+            "conversation_id": uuid.to_string(),
+            "init": {"cwd": "/tmp", "permission_mode": "bypass", "tools": []},
+        })
+        .to_string(),
+        0,
+    )
+}
+
+fn tool_error_event(step_index: i64) -> Value {
+    drip(
+        &json!({
+            "event": "step_update",
+            "step_update": {
+                "step_index": step_index, "state": "ERROR",
+                "step_type": "tool", "tool_name": "view_file",
+            },
+        })
+        .to_string(),
+        0,
+    )
+}
+
+fn result_event(status: &str, error: Option<&str>) -> Value {
+    let mut result = json!({"status": status, "response": ""});
+    if let Some(error) = error {
+        result["error"] = json!(error);
+    }
+    drip(&json!({"event": "result", "result": result}).to_string(), 0)
+}
+
+/// The stream's `init` event is the primary conversation-id capture.
+///
+/// Both other capture paths are disabled so the stream is the *only* possible
+/// source: the CLI-log line is suppressed, and the transcript deliberately
+/// omits a `USER_INPUT` record matching the dispatch prompt, which is what the
+/// filesystem fallback correlates on. Without that second exclusion the test
+/// would pass with the `init` handler deleted — asserting a conclusion its own
+/// setup did not support.
+#[tokio::test]
+async fn stream_init_captures_the_conversation_without_the_log_line() {
+    let home = tempfile::TempDir::new().unwrap();
+    let cwd = tempfile::TempDir::new().unwrap();
+    let adapter = AntigravityAdapter::with_binary_and_home(FAKE_AGY, home.path());
+    let agent = agy_agent();
+    let uuid = Uuid::new_v4();
+
+    write_script(
+        cwd.path(),
+        &json!({
+            "conversation_uuid": uuid.to_string(),
+            "suppress_conversation_log": true,
+            "stream": [init_event(uuid), result_event("SUCCESS", None)],
+            // No prompt-matching USER_INPUT record — see the doc comment.
+            "records": [
+                {"json": terminal_record("2026-05-19T19:00:01Z", "ack"), "delay_ms": 0},
+            ],
+            "exit_code": 0,
+        }),
+    );
+
+    let events = dispatch(&adapter, &agent, cwd.path(), "hi").await;
+    assert_eq!(captured_uuid(&events), Some(uuid));
+    assert!(matches!(outcome(&events), TurnOutcome::Completed));
+}
+
+/// A stale resume: `agy` reports the conversation gone, forks a fresh one, and
+/// the stream's `init` names the replacement. The adapter should heal from that
+/// directly rather than falling back to scraping the CLI log or matching prompt
+/// text against directories.
+///
+/// Same discipline as the capture test above — the log line is suppressed and
+/// the transcript carries no prompt-matching `USER_INPUT`, so neither fallback
+/// can produce the id. The text fork signal is injected so the intended
+/// post-loop branch is the one under test.
+///
+/// Whether a real forked resume's `init` reports the *new* id is unprobed
+/// (forcing one needs a server-expired conversation); this pins the adapter's
+/// behavior for the shape where it does, and the fallbacks remain covered by
+/// `fork_and_heal_recaptures_new_conversation_and_next_dispatch_resumes_it`.
+#[tokio::test]
+async fn stream_init_heals_a_forked_resume_without_the_log_line() {
+    let home = tempfile::TempDir::new().unwrap();
+    let cwd = tempfile::TempDir::new().unwrap();
+    let adapter = AntigravityAdapter::with_binary_and_home(FAKE_AGY, home.path());
+    let stale = Uuid::new_v4();
+    let forked = Uuid::new_v4();
+    let agent = agy_agent_resuming(stale);
+
+    write_script(
+        cwd.path(),
+        &json!({
+            "conversation_uuid": forked.to_string(),
+            "suppress_conversation_log": true,
+            "warning_not_found": stale.to_string(),
+            "stream": [init_event(forked), result_event("SUCCESS", None)],
+            "records": [
+                {"json": terminal_record("2026-05-19T19:00:01Z", "ack"), "delay_ms": 0},
+            ],
+            "exit_code": 0,
+        }),
+    );
+
+    let events = dispatch(&adapter, &agent, cwd.path(), "hi").await;
+    assert_eq!(
+        captured_uuid(&events),
+        Some(forked),
+        "the healed locator must be the id the stream reported, not the stale one"
+    );
+    assert!(
+        matches!(outcome(&events), TurnOutcome::Completed),
+        "a healed fork still completes; got: {:?}",
+        outcome(&events)
+    );
+}
+
+/// The reason the stream is load-bearing rather than a nicety: agy 1.1.19
+/// writes **no transcript record** for a tool call it rejects, so the tool
+/// would otherwise stay pending forever and a later tool's result would
+/// FIFO-pair onto it. The stream's `ERROR` step is the only evidence.
+#[tokio::test]
+async fn stream_tool_error_completes_the_tool_as_failed() {
+    let home = tempfile::TempDir::new().unwrap();
+    let cwd = tempfile::TempDir::new().unwrap();
+    let adapter = AntigravityAdapter::with_binary_and_home(FAKE_AGY, home.path());
+    let agent = agy_agent();
+    let uuid = Uuid::new_v4();
+
+    write_script(
+        cwd.path(),
+        &json!({
+            "conversation_uuid": uuid.to_string(),
+            "stream": [
+                init_event(uuid),
+                // Step 3 is the tool result slot the transcript omits.
+                tool_error_event(3),
+                result_event("SUCCESS", None),
+            ],
+            "records": [
+                {"json": user_record("read a missing file", "2026-05-19T19:00:00Z"), "delay_ms": 0},
+                {"json": tool_call_record("2026-05-19T19:00:01Z"), "delay_ms": 0},
+                // Note: no tool-result record — that is the upstream data loss.
+                {"json": terminal_record("2026-05-19T19:00:02Z", "ack"), "delay_ms": 30},
+            ],
+            "exit_code": 0,
+        }),
+    );
+
+    let events = dispatch(&adapter, &agent, cwd.path(), "read a missing file").await;
+    let completed: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            AdapterEvent::ToolCompleted {
+                is_error, output, ..
+            } => Some((*is_error, output.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(completed.len(), 1, "got: {events:?}");
+    assert!(completed[0].0, "tool must be marked failed");
+    assert!(
+        !completed[0].1.trim().is_empty(),
+        "a failed tool needs a user-facing explanation, not an empty output"
+    );
+}
+
+/// A failed `result` is the most direct statement of why a turn ended, so its
+/// message is surfaced verbatim.
+#[tokio::test]
+async fn stream_result_error_surfaces_as_harness_error() {
+    let home = tempfile::TempDir::new().unwrap();
+    let cwd = tempfile::TempDir::new().unwrap();
+    let adapter = AntigravityAdapter::with_binary_and_home(FAKE_AGY, home.path());
+    let agent = agy_agent();
+    let uuid = Uuid::new_v4();
+
+    write_script(
+        cwd.path(),
+        &json!({
+            "conversation_uuid": uuid.to_string(),
+            "stream": [
+                init_event(uuid),
+                result_event("ERROR", Some("timeout waiting for response")),
+            ],
+            "records": [
+                {"json": user_record("hi", "2026-05-19T19:00:00Z"), "delay_ms": 0},
+            ],
+            "exit_code": 1,
+        }),
+    );
+
+    let events = dispatch(&adapter, &agent, cwd.path(), "hi").await;
+    match outcome(&events) {
+        TurnOutcome::Failed {
+            kind: FailureKind::HarnessError,
+            message,
+        } => assert_eq!(message, "timeout waiting for response"),
+        other => panic!("expected HarnessError, got {other:?}"),
+    }
+}
+
+/// The corroboration rule, end to end: agy 1.1.18 shipped a fix for a dropped
+/// stream reporting a failed turn as a clean success, so a `SUCCESS` result
+/// with nothing readable in the transcript must still fail loud rather than
+/// render a blank successful turn.
+#[tokio::test]
+async fn stream_success_without_a_transcript_answer_still_fails_loud() {
+    let home = tempfile::TempDir::new().unwrap();
+    let cwd = tempfile::TempDir::new().unwrap();
+    let adapter = AntigravityAdapter::with_binary_and_home(FAKE_AGY, home.path());
+    let agent = agy_agent();
+    let uuid = Uuid::new_v4();
+
+    write_script(
+        cwd.path(),
+        &json!({
+            "conversation_uuid": uuid.to_string(),
+            "stream": [init_event(uuid), result_event("SUCCESS", None)],
+            // A user record but no terminal answer.
+            "records": [
+                {"json": user_record("hi", "2026-05-19T19:00:00Z"), "delay_ms": 0},
+            ],
+            "exit_code": 0,
+        }),
+    );
+
+    let events = dispatch(&adapter, &agent, cwd.path(), "hi").await;
+    match outcome(&events) {
+        TurnOutcome::Failed {
+            kind: FailureKind::AdapterFailure,
+            ..
+        } => {}
+        other => panic!("expected fail-loud AdapterFailure, got {other:?}"),
+    }
+}
+
+/// Non-stream stdout lines must still reach the plain-text handlers — that
+/// fallthrough is what keeps the pre-stream control signals working, and
+/// whether `agy` still emits them alongside the stream is unverified.
+#[tokio::test]
+async fn non_stream_stdout_lines_still_reach_the_text_handlers() {
+    let home = tempfile::TempDir::new().unwrap();
+    let cwd = tempfile::TempDir::new().unwrap();
+    let adapter = AntigravityAdapter::with_binary_and_home(FAKE_AGY, home.path());
+    let agent = agy_agent();
+    let uuid = Uuid::new_v4();
+
+    write_script(
+        cwd.path(),
+        &json!({
+            "conversation_uuid": uuid.to_string(),
+            "stream": [init_event(uuid)],
+            // No `result` event; the failure is announced the pre-stream way.
+            "stdout": [
+                drip("some unstructured chatter", 0),
+                drip("Error: timeout waiting for response", 0),
+            ],
+            "records": [
+                {"json": user_record("hi", "2026-05-19T19:00:00Z"), "delay_ms": 0},
+            ],
+            "exit_code": 1,
+        }),
+    );
+
+    let events = dispatch(&adapter, &agent, cwd.path(), "hi").await;
+    match outcome(&events) {
+        TurnOutcome::Failed {
+            kind: FailureKind::HarnessError,
+            message,
+        } => assert_eq!(message, "Error: timeout waiting for response"),
+        other => panic!("expected the text-path HarnessError, got {other:?}"),
+    }
+}
+
 /// Wiring seam (dispatch): the loaders run at dispatch time and their output
 /// must reach the emitted `SessionMeta`. Proves `ProducerCtx` → `SessionMeta`
 /// carries the loaded vecs, which the structural-only live test cannot.

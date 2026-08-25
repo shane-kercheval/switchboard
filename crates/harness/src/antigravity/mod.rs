@@ -4,49 +4,60 @@
 //! free / Google AI Pro / Ultra tiers. It is a Go-based client for a
 //! server-side agent, with a contract distinct from every other harness:
 //!
-//! - **No structured stream protocol.** `agy -p` writes the model's final
-//!   answer as plain text to stdout (a server-side "drip"), and `Error:` /
-//!   `Warning:` / `Authentication required` lines on failure. There is no
-//!   `--output-format stream-json`.
+//! - **Two channels, deliberately.** Since agy 1.1.8 `-p` accepts
+//!   `--output-format stream-json`, an NDJSON stream the adapter passes on
+//!   every dispatch. It is adopted as the **control** channel only — the
+//!   conversation id (`init`), tool failures (`step_update` `state:"ERROR"`),
+//!   and the terminal verdict (`result`). **Displayed content still comes from
+//!   the conversation transcript**, because the stream carries no reasoning
+//!   text (probed: `agent_response` events have `text_delta` and `usage`, no
+//!   `thinking`), and because live and hydrated views must reconstruct the same
+//!   text from the same source or they diverge on reopen. The pre-stream
+//!   detectors below remain beneath it as fallbacks: the two failure shapes
+//!   that cannot be probed without destroying developer state (auth, quota) are
+//!   exactly the ones not to cut over blind on, and `stream-json` is young —
+//!   1.1.18 was still fixing a dropped stream that reported a failed turn as a
+//!   clean success. Hence: a stream *failure* is authoritative, a stream
+//!   *success* only corroborates.
+//! - **The stream is the only witness to a failed tool call.** agy 1.1.19
+//!   writes **no transcript record at all** for a tool call rejected during
+//!   argument validation — the `step_index` sequence simply skips it. Without
+//!   the stream that tool stays pending forever and the next tool's result
+//!   FIFO-pairs onto it. Reopened history cannot recover these (the data is not
+//!   on disk); see the dangling-tool backstop in [`session_file`].
 //! - **One-shot process = one turn.** `agy -p` runs exactly one turn and
-//!   exits. Process exit — not a stream/transcript record — is the
-//!   authoritative turn terminator. `agy` exits 0 on essentially every
-//!   condition (success, empty prompt, unknown conversation, timeout,
-//!   auth failure), so the exit code is useless for outcome detection;
-//!   stdout text is the failure signal.
-//! - **Server-assigned conversation UUID.** The UUID is minted server-side.
-//!   `agy` records it in *this dispatch's* private `--log-file` (a line like
-//!   `… server.go:755] Created conversation <uuid>`), which is the primary,
-//!   deterministic capture source: read straight from our own log, it is the
-//!   conversation this exact invocation used — available in ~seconds
-//!   regardless of cold-start latency, and never cross-attributed from a
-//!   concurrent or background `agy` (each writes its own log). It is then
-//!   emitted as a `SessionLocatorCaptured` event and persisted by the
-//!   dispatcher onto the agent's registry record for resume / hydration. A
-//!   filesystem fallback (watch `brain/<uuid>/` for a dir whose
-//!   transcript echoes the prompt) covers the case where that Google-internal
-//!   log line ever moves — see [`capture_conversation_id`].
-//! - **Transcript-sourced content; stdout is a control channel.** All
-//!   displayed content — assistant text, `thinking`, and tool lifecycle
-//!   (`ToolStarted` / `ToolCompleted`) — comes from tailing the conversation's
-//!   the preferred full transcript (or compact fallback; see [`paths`]). stdout is **not** used for content:
-//!   on a resume turn `agy` replays the whole conversation's prior answers to
-//!   stdout, which would make each turn accumulate every earlier answer. The
-//!   transcript records one completed `PLANNER_RESPONSE` per turn and the
-//!   resume cursor isolates only the new turn's records, so it is the clean
-//!   per-turn source (and matches what hydration reconstructs from disk).
-//!   stdout is read only for control signals: the auth-failure fast-fail
-//!   below, `Error:` lines, and a "produced output" liveness signal (used to
-//!   tell output-without-a-readable-answer apart from no-output — *not* a
-//!   success signal; a turn is `Completed` only on a transcript terminal
-//!   answer).
+//!   exits. Process exit — not a stream/transcript record — remains the
+//!   authoritative turn terminator. Exit codes became meaningful in the 1.1.x
+//!   line (timeout and empty prompt exit 1; a prompt that is exactly a flag
+//!   token exits 2), but outcome classification stays **signal-based** rather
+//!   than gating on them: the full exit-code map is unprobed, and the stream
+//!   plus stderr signals are sufficient.
+//! - **Server-assigned conversation UUID.** The UUID is minted server-side and
+//!   read from the stream's `init` event, which carries it on every turn
+//!   including resumes. Two fallbacks survive beneath that, in order: this
+//!   dispatch's private `--log-file` (a `… Created conversation <uuid>` line —
+//!   a Google-internal debug string, so it is no longer trusted as primary),
+//!   then a filesystem watch correlating `brain/<uuid>/` by prompt. Whichever
+//!   binds is emitted as `SessionLocatorCaptured` and persisted by the
+//!   dispatcher onto the agent's registry record.
+//! - **Transcript-sourced content; stdout carries both channels.** Assistant
+//!   text, `thinking`, and tool lifecycle come from tailing the conversation's
+//!   preferred full transcript (or compact fallback; see [`paths`]). Raw stdout
+//!   text is **not** displayed: on a resume `agy` replays the whole
+//!   conversation's prior answers there, which would make each turn accumulate
+//!   every earlier one. (The *stream* has no such problem — probed: a resume
+//!   emits only the new turn's steps.) Non-stream stdout lines still feed the
+//!   pre-stream control signals: the auth fast-fail below, `Error:` lines, and
+//!   a "produced output" liveness signal — *not* a success signal, since a turn
+//!   is `Completed` only on a transcript terminal answer.
 //! - **Auth fast-fail.** When the keyring token is stale, `agy -p` falls
 //!   back to interactive OAuth: it prints `Authentication required...`,
 //!   opens a browser, and blocks ~30s before timing out. There is no flag
-//!   to suppress this. The adapter detects the `Authentication required`
-//!   stdout line, force-kills immediately, and emits `AuthFailure` —
-//!   bounding the hang. (The browser tab cannot be prevented; documented as
-//!   a known limitation.)
+//!   to suppress this. The adapter watches **both stdout and stderr** for that
+//!   line (1.1.x moved its diagnostics to stderr; whether the auth line moved
+//!   with them is unverified, so both are watched), force-kills immediately,
+//!   and emits `AuthFailure` — bounding the hang. (The browser tab cannot be
+//!   prevented; documented as a known limitation.)
 //!
 //! Ground-truth reference: `docs/research/archive/antigravity-cli-observed.md`.
 
@@ -56,6 +67,7 @@ pub mod parser;
 pub mod paths;
 pub mod session_file;
 pub mod skills;
+mod stream;
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -325,6 +337,14 @@ fn resolve_home_dir(override_path: Option<&Path>) -> PathBuf {
 /// scan (and the conversation-id capture) read only this turn's output — never
 /// another concurrent `agy`'s log.
 ///
+/// `--output-format stream-json` turns on the structured control channel
+/// (agy 1.1.8). It does **not** displace the transcript as the content source
+/// — see the module doc for that split. What it adds is three things the
+/// transcript cannot supply: the conversation id as a contractual field rather
+/// than a scraped Google-internal log line, the terminal outcome with its own
+/// error message, and — the reason it is load-bearing — tool failures, which
+/// agy 1.1.19 omits from the transcript entirely.
+///
 /// `--disable-slash-commands` keeps a slash-leading message a *message*. Print
 /// mode grew local slash-command handling (agy 1.1.9–1.1.12): a recognized
 /// command is answered by the CLI itself without ever reaching the model —
@@ -344,6 +364,8 @@ fn resolve_home_dir(override_path: Option<&Path>) -> PathBuf {
 /// forbids it), so this takes no `&AgentRecord` and emits neither flag.
 fn build_args(prompt: &str, cwd: &Path, resume_id: Option<Uuid>, log_file: &Path) -> Vec<String> {
     let mut args = vec!["-p".to_owned(), transport_prompt(prompt)];
+    args.push("--output-format".to_owned());
+    args.push("stream-json".to_owned());
     args.push("--disable-slash-commands".to_owned());
     args.push("--add-dir".to_owned());
     args.push(cwd.to_string_lossy().into_owned());
@@ -557,6 +579,15 @@ async fn run_producer(ctx: ProducerCtx) {
     };
     let mut saw_terminal_answer = false;
     let mut saw_stdout_content = false;
+    // Conversation id most recently announced by the stream's `init` event.
+    // Distinct from `conversation_id`: on a resume that one is already set from
+    // the registry locator, while this records what `agy` actually reported —
+    // the two differing is a fork signal.
+    let mut stream_conversation_id: Option<Uuid> = None;
+    // Terminal payload from the stream, when one arrived. Absent for a run
+    // that died before emitting `result`, which falls through to the
+    // pre-stream classification chain unchanged.
+    let mut stream_result: Option<stream::StreamResult> = None;
     let mut auth_failed = false;
     let mut ambiguous_capture = false;
     // Set post-loop when a required (re)capture could not locate the
@@ -588,6 +619,70 @@ async fn run_producer(ctx: ProducerCtx) {
                             // unverified (see the tick arm).
                             auth_failed = true;
                             break;
+                        }
+                        // Stream-json first; anything that is not a stream
+                        // line falls through to the plain-text handlers below.
+                        // That fallthrough is deliberate rather than vestigial:
+                        // whether `agy` still prints its auth line and bare
+                        // `Error:` lines alongside the stream is unverified
+                        // (reproducing the auth shape needs a logged-out CLI),
+                        // so the pre-stream signals stay wired.
+                        if let Some(event) = stream::parse_line(&line) {
+                            // Any parsed stream line proves the process is
+                            // producing structured output — the liveness
+                            // signal `classify_outcome` uses to tell
+                            // output-without-a-readable-answer from silence.
+                            saw_stdout_content = true;
+                            match event {
+                                stream::StreamEvent::Init { conversation_id: id } => {
+                                    // Primary capture. Contractual and
+                                    // immediate, where the log-line scrape is
+                                    // a Google-internal debug string; that and
+                                    // the filesystem watch remain as fallbacks
+                                    // if this ever stops arriving.
+                                    //
+                                    // A capture event is emitted **once**: on a
+                                    // resume the id is already known, and
+                                    // re-announcing it would read as a fork to
+                                    // the dispatcher sink. The id is still kept
+                                    // as a fork candidate — if a resume's
+                                    // conversation expired server-side, `agy`
+                                    // mints a fresh one, and this is the most
+                                    // direct evidence of the replacement.
+                                    // Whether a forked resume's `init` actually
+                                    // reports the *new* id is **unprobed**
+                                    // (forcing one needs a server-expired
+                                    // conversation), so the fork-heal path
+                                    // below only prefers this when it differs
+                                    // and otherwise falls through to the
+                                    // pre-existing log/filesystem correlation
+                                    // unchanged. Defensive, never depended on.
+                                    stream_conversation_id = Some(id);
+                                    if conversation_id.is_none() {
+                                        conversation_id = Some(id);
+                                        transcript_path =
+                                            Some(paths::preferred_transcript_path(&home_dir, id));
+                                        cursor = 0;
+                                        emit_locator_captured(&tx, id);
+                                    }
+                                }
+                                stream::StreamEvent::ToolFailed { step_index, message } => {
+                                    // The one signal with no transcript
+                                    // equivalent (agy 1.1.19 writes no record
+                                    // for a rejected tool call). Recorded, not
+                                    // paired: which tool it belongs to cannot
+                                    // be known until the transcript has caught
+                                    // up, so resolution happens at the final
+                                    // drain below.
+                                    parser_state
+                                        .record_stream_tool_failure(step_index, message);
+                                }
+                                stream::StreamEvent::Result(result) => {
+                                    stream_result = Some(result);
+                                }
+                                stream::StreamEvent::Ignored => {}
+                            }
+                            continue;
                         }
                         let trimmed = line.trim();
                         if trimmed.starts_with("Error:") || trimmed.starts_with("Warning:") {
@@ -766,7 +861,27 @@ async fn run_producer(ctx: ProducerCtx) {
     // event the wire vocabulary doesn't have — out of scope here. The turn
     // still completed (a real answer streamed), so it is not failed.
     let resume_forked = is_resume && conversation_not_found(&stdout_buf, &stderr_tail);
-    if conversation_id.is_none() || resume_forked {
+    // On a confirmed fork, prefer the id the control stream itself reported
+    // when it differs from the one we resumed — that is a direct statement of
+    // the replacement, where the fallbacks below infer it from a
+    // Google-internal log string or by matching prompt text against
+    // directories. Falls through untouched when the stream said nothing, or
+    // echoed the id we passed (the unprobed case).
+    let streamed_fork = resume_forked
+        .then_some(stream_conversation_id)
+        .flatten()
+        .filter(|id| Some(*id) != resume_id);
+    if let Some(uuid) = streamed_fork {
+        tracing::warn!(
+            %turn_id, agent_id = %agent_id, new_conversation = %uuid,
+            "antigravity: resumed conversation no longer exists server-side; agy forked a \
+             fresh conversation (id from the control stream). Healing the registry locator \
+             to the new id; this turn's prior context was lost."
+        );
+        transcript_path = Some(paths::preferred_transcript_path(&home_dir, uuid));
+        cursor = 0;
+        emit_locator_captured(&tx, uuid);
+    } else if conversation_id.is_none() || resume_forked {
         match capture_conversation_id(&log_file_path, &home_dir, spawn_time, &prompt) {
             CaptureOutcome::Bound(uuid) => {
                 if resume_forked {
@@ -850,6 +965,31 @@ async fn run_producer(ctx: ProducerCtx) {
             }
         }
     }
+    // Final drain complete: the process has exited and the transcript is fully
+    // flushed, so anything still pending has no result and did not succeed.
+    // This is the only point where attributing the stream's tool failures is
+    // sound — see `AntigravityParserState::close_pending_tools` for why nothing
+    // is paired earlier. Emitting here means a failed tool flips from running
+    // to failed at turn end rather than mid-turn; that latency is the price of
+    // never showing the failure on the wrong tool.
+    let (closed, unattributed) = parser_state.close_pending_tools(turn_id);
+    for event in closed {
+        let _ = tx.send(event);
+    }
+    if !unattributed.is_empty() {
+        // Ambiguous attribution: the tools are still closed as failed above
+        // (no spinner survives), but their harness messages could not be tied
+        // to a specific call, so they are surfaced here rather than guessed
+        // onto one.
+        tracing::warn!(
+            %turn_id,
+            agent_id = %agent_id,
+            messages = ?unattributed,
+            "antigravity: stream reported tool failures that could not be attributed to a \
+             specific tool call; affected tools closed as failed with authored copy"
+        );
+    }
+
     let unmatched_tool_result_steps = parser_state.unmatched_tool_result_steps();
     if !unmatched_tool_result_steps.is_empty() {
         tracing::warn!(
@@ -885,6 +1025,7 @@ async fn run_producer(ctx: ProducerCtx) {
             log_error,
         },
         &stdout_buf,
+        stream_result.as_ref(),
         stderr_signals.auth_failed(),
         stderr_signals.first_error(),
         &stderr_tail,
@@ -1476,6 +1617,13 @@ fn extract_rpc_descriptive_tail(detail: &str) -> String {
 /// here — the producer heals it (recaptures the forked conversation, whose
 /// transcript carries the terminal answer) and the turn completes.
 ///
+/// `stream_result` is the terminal `result` event when `agy` emitted one. It
+/// is the most direct statement of what happened, so a failure there wins over
+/// the older text-scraped signals — but a *success* there only corroborates:
+/// `Completed` still requires a terminal answer in the transcript, because the
+/// transcript is what the UI renders and agy 1.1.18's own changelog records a
+/// dropped stream once reporting a failed turn as a clean success.
+///
 /// `stderr_auth` / `stderr_error` are the signals [`StderrSignals`] recorded as
 /// stderr was drained; they are passed in rather than re-derived from
 /// `stderr_tail` because that tail evicts. The tail itself is used only for the
@@ -1483,6 +1631,7 @@ fn extract_rpc_descriptive_tail(detail: &str) -> String {
 fn classify_outcome(
     sig: &OutcomeSignals,
     stdout_lines: &[String],
+    stream_result: Option<&stream::StreamResult>,
     stderr_auth: bool,
     stderr_error: Option<String>,
     stderr_tail: &Mutex<VecDeque<String>>,
@@ -1524,6 +1673,47 @@ fn classify_outcome(
             message: ANTIGRAVITY_AUTH_MESSAGE.to_owned(),
         };
     }
+    // The stream's own terminal verdict, when it failed. This is the most
+    // direct statement available of why the turn ended, so it outranks the
+    // text-scraped `Error:` lines below — those are the pre-stream signals and
+    // now serve older `agy` builds and runs that died before emitting
+    // `result`. Auth-shaped text still routes to the authored auth message,
+    // keeping the "one auth surface" property above intact.
+    //
+    // Only a *failure* is consumed here. A `SUCCESS` result deliberately falls
+    // through to the transcript-terminal-answer requirement below: the
+    // transcript is what the UI renders, and agy 1.1.18 shipped a fix for a
+    // dropped stream reporting a failed turn as a clean success — so a stream
+    // that says "fine" is corroboration, never a substitute.
+    //
+    // **Gated on the turn having produced no answer.** Live-probed @ 1.1.19:
+    // `agy` taints the whole turn's `result.status` with `ERROR` when a single
+    // tool call is rejected, even though the model recovered and answered —
+    // e.g. a `view_file` on a missing path yields
+    // `status:"ERROR"` + `… invalid tool call error (invalid_args) failed to
+    // read file …` on a turn whose transcript carries a normal answer. Failing
+    // on that would mark every recovered tool failure as a failed turn, which
+    // is ordinary agentic behavior, and the failure is already surfaced
+    // precisely — as a failed *tool* row, from the same stream. So a terminal
+    // answer wins: same shape as Gemini's streamed-then-error rescue (G17),
+    // and it leaves the no-answer cases (timeout, hard failure) failing as
+    // they should. Residual risk mirrors G17's: a turn that genuinely failed
+    // *after* answering renders as success.
+    if let Some(result) = stream_result
+        && !result.succeeded
+        && !sig.saw_terminal_answer
+        && let Some(error) = result.error.as_deref()
+    {
+        let (kind, message) = if is_auth_failure_line(error) {
+            (
+                FailureKind::AuthFailure,
+                ANTIGRAVITY_AUTH_MESSAGE.to_owned(),
+            )
+        } else {
+            (FailureKind::HarnessError, error.to_owned())
+        };
+        return TurnOutcome::Failed { kind, message };
+    }
     // A concrete `Error:` line is the real root cause and must win over the
     // generic "unresumable" classification below — e.g. a first turn that
     // timed out and so never created a conversation dir should surface the
@@ -1538,6 +1728,18 @@ fn classify_outcome(
     // rescanned from the evicting tail — restores the real `HarnessError`
     // message on current ones. Without it a timeout degrades to the generic
     // "exited without producing an answer" `AdapterFailure` below.
+    //
+    // **Deliberately not gated on `saw_terminal_answer`, unlike the stream
+    // branch above.** That gate exists because agy taints a whole turn's
+    // `result.status` when one tool call is rejected. This branch is left
+    // ungated because the text channel is not known to carry that failure mode
+    // at all: before the stream was adopted, this exact scenario — tool
+    // rejected, model recovers and answers — classified as `Completed` through
+    // this very code, with the only symptom a stuck tool row. That is only
+    // possible if neither scan found anything, which is observation, not
+    // inference. It is **not** a claim that a text `Error:` line and a stream
+    // `result.ERROR` mean the same thing in general; if a rejected tool ever
+    // does print here, this branch needs the same gate.
     //
     // No auth re-check here: the branch above already returned for any
     // auth-flavored line, on either stream, so anything reaching this point is
@@ -2324,10 +2526,15 @@ mod tests {
         }
     }
 
+    /// `classify_outcome` driven by a stream terminal result and nothing else.
+    fn classify_with_stream(sig: &OutcomeSignals, result: &stream::StreamResult) -> TurnOutcome {
+        classify_outcome(sig, &[], Some(result), false, None, &empty_tail())
+    }
+
     /// `classify_outcome` with no stderr activity — the common case for tests
     /// about stdout/log/transcript classification.
     fn classify_no_stderr(sig: &OutcomeSignals, stdout_lines: &[String]) -> TurnOutcome {
-        classify_outcome(sig, stdout_lines, false, None, &empty_tail())
+        classify_outcome(sig, stdout_lines, None, false, None, &empty_tail())
     }
 
     fn classify_with_stderr(
@@ -2338,10 +2545,156 @@ mod tests {
         classify_outcome(
             sig,
             stdout_lines,
+            None,
             stderr.signals.auth_failed(),
             stderr.signals.first_error(),
             &stderr.tail,
         )
+    }
+
+    #[test]
+    fn classify_outcome_stream_failure_outranks_a_text_error_line() {
+        // The stream states the outcome directly; the text-scraped lines are
+        // the pre-stream fallback. When both are present the stream wins.
+        let sig = OutcomeSignals {
+            saw_terminal_answer: false,
+            saw_stdout_content: true,
+            ..ok_signals()
+        };
+        let stderr = stderr_of(&["Error: timeout waiting for response"]);
+        let result = stream::StreamResult {
+            succeeded: false,
+            error: Some("model overloaded".to_owned()),
+        };
+        match classify_outcome(
+            &sig,
+            &[],
+            Some(&result),
+            stderr.signals.auth_failed(),
+            stderr.signals.first_error(),
+            &stderr.tail,
+        ) {
+            TurnOutcome::Failed { kind, message } => {
+                assert!(matches!(kind, FailureKind::HarnessError), "{kind:?}");
+                assert_eq!(message, "model overloaded");
+            }
+            other => panic!("expected the stream's message; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_outcome_stream_failure_yields_to_a_transcript_answer() {
+        // Live-probed @ 1.1.19: agy taints the turn's `result.status` with
+        // ERROR when any tool call is rejected, even though the model
+        // recovered and answered. Failing on that would mark ordinary agentic
+        // turns as failed; the tool failure is already surfaced as a failed
+        // tool row from the same stream.
+        assert_eq!(
+            classify_with_stream(
+                &ok_signals(),
+                &stream::StreamResult {
+                    succeeded: false,
+                    error: Some(
+                        "cortex tool view_file: invalid tool call error (invalid_args) \
+                         failed to read file: no such file or directory"
+                            .to_owned()
+                    ),
+                },
+            ),
+            TurnOutcome::Completed
+        );
+    }
+
+    #[test]
+    fn classify_outcome_stream_auth_text_becomes_the_authored_auth_message() {
+        // Keeps the "one auth surface" property: an auth-flavored message
+        // arriving via the stream must not leak raw text as a HarnessError.
+        let sig = OutcomeSignals {
+            saw_terminal_answer: false,
+            saw_stdout_content: true,
+            ..ok_signals()
+        };
+        match classify_with_stream(
+            &sig,
+            &stream::StreamResult {
+                succeeded: false,
+                error: Some("Authentication required. Please visit the URL".to_owned()),
+            },
+        ) {
+            TurnOutcome::Failed { kind, message } => {
+                assert!(matches!(kind, FailureKind::AuthFailure), "{kind:?}");
+                assert_eq!(message, ANTIGRAVITY_AUTH_MESSAGE);
+            }
+            other => panic!("expected AuthFailure; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_outcome_stream_success_does_not_substitute_for_a_transcript_answer() {
+        // The load-bearing corroboration rule. agy 1.1.18 fixed a dropped
+        // stream reporting a failed turn as a clean success, so a SUCCESS
+        // result with nothing readable in the transcript must still fail loud
+        // rather than complete a blank turn.
+        let sig = OutcomeSignals {
+            saw_terminal_answer: false,
+            saw_stdout_content: true,
+            ..ok_signals()
+        };
+        match classify_with_stream(
+            &sig,
+            &stream::StreamResult {
+                succeeded: true,
+                error: None,
+            },
+        ) {
+            TurnOutcome::Failed { kind, .. } => {
+                assert!(matches!(kind, FailureKind::AdapterFailure), "{kind:?}");
+            }
+            other => panic!("expected fail-loud; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_outcome_stream_success_with_a_transcript_answer_completes() {
+        assert_eq!(
+            classify_with_stream(
+                &ok_signals(),
+                &stream::StreamResult {
+                    succeeded: true,
+                    error: None,
+                },
+            ),
+            TurnOutcome::Completed
+        );
+    }
+
+    #[test]
+    fn classify_outcome_stream_failure_without_a_message_falls_through() {
+        // A failed result carrying no message must not produce an empty
+        // HarnessError; the older signals still get their chance.
+        let sig = OutcomeSignals {
+            saw_terminal_answer: false,
+            saw_stdout_content: false,
+            ..ok_signals()
+        };
+        let stderr = stderr_of(&["Error: timeout waiting for response"]);
+        let result = stream::StreamResult {
+            succeeded: false,
+            error: None,
+        };
+        match classify_outcome(
+            &sig,
+            &[],
+            Some(&result),
+            stderr.signals.auth_failed(),
+            stderr.signals.first_error(),
+            &stderr.tail,
+        ) {
+            TurnOutcome::Failed { message, .. } => {
+                assert_eq!(message, "Error: timeout waiting for response");
+            }
+            other => panic!("expected the stderr fallback; got {other:?}"),
+        }
     }
 
     #[test]

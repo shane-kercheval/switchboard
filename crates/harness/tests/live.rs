@@ -2436,7 +2436,22 @@ fn live_antigravity_agent() -> AgentRecord {
 /// 8/8 at eight-way, and 2 failures across 36 turns at four-way. It is
 /// upstream and not something the adapter can prevent — production correctly
 /// surfaces it verbatim as a `HarnessError` and the user re-sends.
-const ANTIGRAVITY_TRANSIENT_ERROR: &str = "Error: Agent execution terminated due to error.";
+const ANTIGRAVITY_TRANSIENT_ERROR: &str = "Agent execution terminated due to error.";
+
+/// The same failure, as `agy` formats it on **stderr** in text mode. Adopting
+/// `--output-format stream-json` moved this error onto stdout inside the
+/// `result` event, where it arrives *unprefixed* — so both spellings are live
+/// depending on which channel reported it, and a predicate keyed to only one
+/// silently stops retrying. (That is exactly what happened when the stream
+/// landed: the retry went quiet until a live run surfaced it. The exact-match
+/// discipline is what made that loud instead of invisible.)
+fn is_antigravity_transient_message(message: &str) -> bool {
+    let message = message.trim();
+    message == ANTIGRAVITY_TRANSIENT_ERROR
+        || message
+            .strip_prefix("Error: ")
+            .is_some_and(|rest| rest == ANTIGRAVITY_TRANSIENT_ERROR)
+}
 
 /// Whether a turn's events are **exactly** that transient failure and nothing
 /// else.
@@ -2461,7 +2476,7 @@ fn is_antigravity_transient(events: &[AdapterEvent]) -> bool {
         TurnOutcome::Failed {
             kind: FailureKind::HarnessError,
             message,
-        } if message == ANTIGRAVITY_TRANSIENT_ERROR
+        } if is_antigravity_transient_message(message)
     )
 }
 
@@ -2485,7 +2500,36 @@ fn stderr_is_solely_antigravity_transient(stderr: &str) -> bool {
     let (Some(only), None) = (lines.next(), lines.next()) else {
         return false;
     };
-    only == ANTIGRAVITY_TRANSIENT_ERROR
+    is_antigravity_transient_message(only)
+}
+
+/// Whether a direct `agy --output-format stream-json` run failed with **only**
+/// the known transient.
+///
+/// Fail-closed for the same reason as its stderr sibling, and held to the same
+/// standard: exactly one terminal `result`, its error exactly the transient,
+/// and no unparseable stdout line alongside it. A compound stream — the
+/// transient plus a second terminal, or plus a diagnostic we cannot read — is
+/// precisely the shape a real wire-format regression would take, and this
+/// guard protects a drift tripwire, so retrying past that would blind the one
+/// test whose whole job is to notice.
+fn stdout_is_solely_antigravity_transient(stdout: &str) -> bool {
+    let mut results = Vec::new();
+    for line in stdout.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
+            // Unreadable output next to the transient: refuse to retry.
+            return false;
+        };
+        if event["event"] == "result" {
+            results.push(event);
+        }
+    }
+    let [result] = results.as_slice() else {
+        return false;
+    };
+    result["result"]["error"]
+        .as_str()
+        .is_some_and(is_antigravity_transient_message)
 }
 
 /// Whether a live dispatch may be retried after the known transient.
@@ -2586,9 +2630,15 @@ fn antigravity_transient_matcher_is_exact() {
         }]
     }
 
+    // Both spellings are live: unprefixed from the stream's `result.error`,
+    // prefixed from agy's text-mode stderr formatting.
     assert!(is_antigravity_transient(&failed(
         FailureKind::HarnessError,
         ANTIGRAVITY_TRANSIENT_ERROR
+    )));
+    assert!(is_antigravity_transient(&failed(
+        FailureKind::HarnessError,
+        &format!("Error: {ANTIGRAVITY_TRANSIENT_ERROR}")
     )));
 
     // Near-misses that must NOT be retried away.
@@ -2667,6 +2717,8 @@ fn stderr_transient_matcher_requires_the_transient_alone() {
     )));
 
     for stderr in [
+        // A doubled prefix is not one of the two accepted spellings.
+        &format!("Error: Error: {ANTIGRAVITY_TRANSIENT_ERROR}") as &str,
         // The hole this predicate exists to close: agy's auth line is not
         // `Error:`-prefixed, so an "any other Error: line" rule would have
         // retried this and hidden a login failure.
@@ -2684,6 +2736,50 @@ fn stderr_transient_matcher_requires_the_transient_alone() {
         assert!(
             !stderr_is_solely_antigravity_transient(stderr),
             "must not retry on stderr: {stderr:?}"
+        );
+    }
+}
+
+/// The stream-side retry criterion, held to the same exactness as the stderr
+/// one. Not `#[ignore]`d — the live path exercises it on only a few percent of
+/// turns, far too rare to catch a regression here.
+#[test]
+fn stdout_transient_matcher_requires_a_single_clean_result() {
+    let transient =
+        |e: &str| format!(r#"{{"event":"result","result":{{"status":"ERROR","error":"{e}"}}}}"#);
+    let init = r#"{"event":"init","conversation_id":"5a8dd0c7-3450-4048-a5fb-27ae8f663dee"}"#;
+
+    // Ordinary shape: init, steps, one terminal carrying only the transient.
+    assert!(stdout_is_solely_antigravity_transient(&format!(
+        "{init}
+{}
+",
+        transient(ANTIGRAVITY_TRANSIENT_ERROR)
+    )));
+
+    for stdout in [
+        // Two terminals — malformed, and one of them would be masked.
+        format!(
+            "{}
+{}",
+            transient(ANTIGRAVITY_TRANSIENT_ERROR),
+            transient("something else entirely")
+        ),
+        // Unreadable output beside the transient: refuse rather than guess.
+        format!(
+            "{}
+not json at all",
+            transient(ANTIGRAVITY_TRANSIENT_ERROR)
+        ),
+        // A different error.
+        transient("timeout waiting for response"),
+        // No terminal at all.
+        init.to_owned(),
+        String::new(),
+    ] {
+        assert!(
+            !stdout_is_solely_antigravity_transient(&stdout),
+            "must not retry on stdout: {stdout:?}"
         );
     }
 }
@@ -3041,6 +3137,103 @@ async fn live_antigravity_dash_leading_prompt_completes() {
             }
         ),
         "dash-leading prompt must complete, got: {terminal:?}"
+    );
+}
+
+/// Drift tripwire for the `stream-json` contract, which is now the adapter's
+/// **primary** conversation-id capture and terminal signal. A fixture replays
+/// our own recorded shape and so cannot catch Google reshaping the payload;
+/// only a real run can. Asserts the three event types exist, that `init`
+/// carries a parseable conversation id, and that `result` reports a status —
+/// the fields classification depends on.
+///
+/// Runs `agy` directly rather than through the adapter because the adapter
+/// deliberately consumes only part of the stream; this guards the wire format
+/// itself.
+#[tokio::test]
+#[ignore = "requires agy authenticated (run `agy`) — run with: make test-live"]
+async fn live_antigravity_stream_json_init_and_result_shapes() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let log = tmp.path().join("agy.log");
+    let mut output = None;
+    for attempt in 1..=2 {
+        let run = tokio::process::Command::new("agy")
+            .args([
+                "-p",
+                "Reply with the single word 'ack' and nothing else.",
+                "--output-format",
+                "stream-json",
+                "--disable-slash-commands",
+                "--dangerously-skip-permissions",
+                "--log-file",
+            ])
+            .arg(&log)
+            .current_dir(tmp.path())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .await
+            .expect("agy should spawn");
+        // Under stream-json the transient is reported inside the `result`
+        // event on **stdout**, not as a stderr line — so this run detects it
+        // there. The text-mode sibling below keeps the stderr predicate.
+        let transient = !run.status.success()
+            && stdout_is_solely_antigravity_transient(&String::from_utf8_lossy(&run.stdout));
+        if attempt == 2 || !transient {
+            output = Some(run);
+            break;
+        }
+        eprintln!(
+            "live_antigravity: retrying once after upstream transient ({ANTIGRAVITY_TRANSIENT_ERROR})"
+        );
+    }
+    let output = output.expect("loop assigns on the final attempt");
+    assert!(
+        output.status.success(),
+        "agy exited non-zero: {:?}; stdout: {}; stderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout).trim(),
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let events: Vec<serde_json::Value> = stdout
+        .lines()
+        .filter_map(|l| serde_json::from_str(l.trim()).ok())
+        .collect();
+    assert!(
+        !events.is_empty(),
+        "stream-json produced no parseable NDJSON; stdout: {stdout:?}"
+    );
+
+    let init = events
+        .iter()
+        .find(|e| e["event"] == "init")
+        .unwrap_or_else(|| panic!("no `init` event; got: {events:?}"));
+    let conversation_id = init["conversation_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("`init` carries no conversation_id: {init}"));
+    assert!(
+        Uuid::parse_str(conversation_id).is_ok(),
+        "`init.conversation_id` must parse as a UUID; got {conversation_id:?}"
+    );
+
+    assert!(
+        events
+            .iter()
+            .any(|e| e["event"] == "step_update" && e["step_update"]["step_type"].is_string()),
+        "no `step_update` carrying a `step_type`; got: {events:?}"
+    );
+
+    let result = events
+        .iter()
+        .find(|e| e["event"] == "result")
+        .unwrap_or_else(|| panic!("no terminal `result` event; got: {events:?}"));
+    assert_eq!(
+        result["result"]["status"].as_str(),
+        Some("SUCCESS"),
+        "expected a SUCCESS status on a trivial turn; got {result}"
     );
 }
 

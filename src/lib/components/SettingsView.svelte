@@ -17,6 +17,7 @@
   import Input from "$lib/components/ui/Input.svelte";
   import CopyButton from "$lib/components/ui/CopyButton.svelte";
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
+  import { SUPPLEMENTAL_TOOLTIP_DELAY } from "$lib/components/ui/tooltip";
   import {
     loadPreferences,
     preferenceLoadState,
@@ -441,8 +442,9 @@
       <div>
         <h2 class={sectionHeadingClass}>Notifications</h2>
         <p class="text-muted mt-1 text-sm leading-relaxed">
-          Switchboard can post a macOS notification when your agents finish — when every recipient
-          of a send has responded, and when a workflow run reaches its end.
+          Switchboard can post a macOS notification when your agents finish — after every recipient
+          has responded and any work queued behind it has also finished, and when a workflow run
+          reaches its end.
         </p>
         <p class="text-muted mt-2 text-sm leading-relaxed">
           While you're working in Switchboard, the project on screen never notifies. Other projects
@@ -592,17 +594,33 @@
         <div class="min-w-0 flex-1">
           <div class="text-muted text-xs leading-4">Workflows folder</div>
           {#if workflowsDir}
-            <div
-              class="text-fg truncate font-mono text-[11px] leading-4"
-              title={workflowsDir}
-              data-testid="workflows-dir"
+            <Tooltip
+              label={workflowsDir}
+              delayDuration={SUPPLEMENTAL_TOOLTIP_DELAY}
+              focusable={false}
             >
-              {workflowsDir}
-            </div>
+              {#snippet trigger(props)}
+                <div
+                  {...props}
+                  class="text-fg truncate font-mono text-[11px] leading-4"
+                  data-testid="workflows-dir"
+                >
+                  {workflowsDir}
+                </div>
+              {/snippet}
+            </Tooltip>
           {:else if workflowsDirError}
-            <div class="text-status-failed truncate text-xs leading-4" title={workflowsDirError}>
-              {workflowsDirError}
-            </div>
+            <Tooltip
+              label={workflowsDirError}
+              delayDuration={SUPPLEMENTAL_TOOLTIP_DELAY}
+              focusable={false}
+            >
+              {#snippet trigger(props)}
+                <div {...props} class="text-status-failed truncate text-xs leading-4">
+                  {workflowsDirError}
+                </div>
+              {/snippet}
+            </Tooltip>
           {:else}
             <div class="text-muted truncate text-xs leading-4">Loading…</div>
           {/if}
@@ -694,17 +712,33 @@
         <div class="min-w-0 flex-1">
           <div class="text-muted text-xs leading-4">Local prompts folder</div>
           {#if promptsDir}
-            <div
-              class="text-fg truncate font-mono text-[11px] leading-4"
-              title={promptsDir}
-              data-testid="local-prompts-dir"
+            <Tooltip
+              label={promptsDir}
+              delayDuration={SUPPLEMENTAL_TOOLTIP_DELAY}
+              focusable={false}
             >
-              {promptsDir}
-            </div>
+              {#snippet trigger(props)}
+                <div
+                  {...props}
+                  class="text-fg truncate font-mono text-[11px] leading-4"
+                  data-testid="local-prompts-dir"
+                >
+                  {promptsDir}
+                </div>
+              {/snippet}
+            </Tooltip>
           {:else if promptsDirError}
-            <div class="text-status-failed truncate text-xs leading-4" title={promptsDirError}>
-              {promptsDirError}
-            </div>
+            <Tooltip
+              label={promptsDirError}
+              delayDuration={SUPPLEMENTAL_TOOLTIP_DELAY}
+              focusable={false}
+            >
+              {#snippet trigger(props)}
+                <div {...props} class="text-status-failed truncate text-xs leading-4">
+                  {promptsDirError}
+                </div>
+              {/snippet}
+            </Tooltip>
           {:else}
             <div class="text-muted truncate text-xs leading-4">Loading…</div>
           {/if}

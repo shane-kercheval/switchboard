@@ -90,6 +90,7 @@
   import StopIcon from "$lib/components/ui/StopIcon.svelte";
   import HarnessIcon from "$lib/components/ui/HarnessIcon.svelte";
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
+  import { SUPPLEMENTAL_TOOLTIP_DELAY } from "$lib/components/ui/tooltip";
   import ClearIcon from "$lib/components/ui/ClearIcon.svelte";
   import { COMPOSER_ACTION_BUTTON_CLASS, ICON_BUTTON_CLASS } from "$lib/components/ui/iconButton";
   import PromptMenu from "$lib/components/PromptMenu.svelte";
@@ -2364,9 +2365,10 @@
     noteLocalSend(dispatchProjectId, sendId);
     // Register the whole recipient set *before* any IPC call, so one recipient's
     // rejection can't erase an agent that was supposed to be in the send — and so
-    // the completion notification fires once, on the last recipient, rather than
-    // once per agent. Only sends dispatched here are registered, which is what
-    // keeps workflow steps from notifying individually.
+    // the completion tracker can join sends queued onto the same busy agents into
+    // one queue-drained notification rather than notifying between turns. Only
+    // sends dispatched here are registered, which is what keeps workflow steps
+    // from notifying individually.
     registerSend(
       sendId,
       dispatchProjectId,
@@ -3572,7 +3574,15 @@
                   class="text-muted shrink-0 font-mono text-[10px] whitespace-nowrap"
                   aria-hidden="true">{chip.label}</span
                 >
-                <span class="truncate" title={chip.original_name}>{chip.original_name}</span>
+                <Tooltip
+                  label={chip.original_name}
+                  delayDuration={SUPPLEMENTAL_TOOLTIP_DELAY}
+                  focusable={false}
+                >
+                  {#snippet trigger(props)}
+                    <span {...props} class="truncate">{chip.original_name}</span>
+                  {/snippet}
+                </Tooltip>
                 <button
                   type="button"
                   class="text-muted hover:text-fg hover:bg-control-hover flex h-4 w-4 shrink-0 items-center justify-center rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-50"

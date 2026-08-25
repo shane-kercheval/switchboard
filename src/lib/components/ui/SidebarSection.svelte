@@ -10,10 +10,25 @@
     /// Optional content pinned between the header and the scrollable body (e.g.
     /// a filter/search input that should stay put while the list scrolls).
     subheader?: Snippet;
+    scrollRef?: HTMLDivElement;
+    scrollTestid?: string;
+    onScroll?: (scrollTop: number) => void;
     children: Snippet;
   };
 
-  let { title, action, subheader, children }: Props = $props();
+  let {
+    title,
+    action,
+    subheader,
+    scrollRef = $bindable(),
+    scrollTestid,
+    onScroll,
+    children,
+  }: Props = $props();
+
+  function handleScroll(event: Event & { currentTarget: EventTarget & HTMLDivElement }): void {
+    onScroll?.(event.currentTarget.scrollTop);
+  }
 </script>
 
 <div class="flex min-h-0 flex-1 flex-col">
@@ -30,7 +45,12 @@
       {@render subheader()}
     </div>
   {/if}
-  <div class="flex-1 overflow-y-auto">
+  <div
+    class="flex-1 overflow-y-auto"
+    bind:this={scrollRef}
+    data-testid={scrollTestid}
+    onscroll={handleScroll}
+  >
     {@render children()}
   </div>
 </div>

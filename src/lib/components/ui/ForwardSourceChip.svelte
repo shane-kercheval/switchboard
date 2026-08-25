@@ -2,6 +2,7 @@
   import { cn } from "$lib/utils";
   import { Ban, LoaderCircle } from "@lucide/svelte";
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
+  import { SUPPLEMENTAL_TOOLTIP_DELAY } from "$lib/components/ui/tooltip";
   import type { ForwardReadiness, ForwardSource } from "$lib/state/heldForwards.svelte";
 
   // A forward-source chip — the agent whose latest output will be forwarded.
@@ -78,7 +79,11 @@
     <polyline points="15 17 20 12 15 7" />
     <path d="M4 18v-2a4 4 0 0 1 4-4h12" />
   </svg>
-  <span class="truncate" title={source.name}>{source.name}</span>
+  <Tooltip label={source.name} delayDuration={SUPPLEMENTAL_TOOLTIP_DELAY} focusable={false}>
+    {#snippet trigger(props)}
+      <span {...props} class="truncate">{source.name}</span>
+    {/snippet}
+  </Tooltip>
   {#if stateHint !== null}
     <span class="sr-only">, {stateHint.srText}</span>
     <Tooltip label={stateHint.tooltip} delayDuration={0}>

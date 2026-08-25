@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
+  indicatorTooltipSummary,
   indicatorToneClass,
   localBranchIndicators,
   remoteBranchIndicators,
+  worktreeWarningIndicators,
 } from "./gitStatusIndicators";
 import type { BranchView, RemoteBranchView, SyncState, WorktreeView } from "./types";
 
@@ -158,5 +160,27 @@ describe("indicatorToneClass", () => {
     expect(indicatorToneClass("warning")).toContain("warning");
     expect(indicatorToneClass("neutral")).toContain("muted");
     expect(indicatorToneClass("muted")).toContain("muted");
+  });
+});
+
+describe("tooltip status summaries", () => {
+  it("uses explanatory text without repeating the terse visual label", () => {
+    const indicator = localBranchIndicators(
+      branch({ sync: { kind: "ahead", commits: 3 } }),
+      null,
+    )[0]!;
+
+    expect(indicatorTooltipSummary(indicator)).toBe("Ahead of upstream: 3 unpushed commit(s).");
+    expect(indicatorTooltipSummary(indicator)).not.toContain("↑3");
+  });
+
+  it("provides canonical detached-worktree warning explanations", () => {
+    expect(worktreeWarningIndicators(worktree({ warning: "prunable" }))).toEqual([
+      expect.objectContaining({
+        key: "prunable",
+        title: "Missing folder",
+        description: "This folder path is gone; the git worktree record can be pruned.",
+      }),
+    ]);
   });
 });

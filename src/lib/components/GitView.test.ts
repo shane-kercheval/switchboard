@@ -171,8 +171,13 @@ describe("GitView", () => {
     expect(screen.getByTestId("repo-action-remove")).toBeInTheDocument();
     expect(screen.getByTestId("repo-refresh")).not.toHaveAttribute("tabindex", "-1");
     expect(screen.getByTestId("repo-action-remove")).not.toHaveAttribute("tabindex", "-1");
+    expect(screen.getByTestId("git-add-repo")).toHaveAccessibleName("Add repository");
+    expect(screen.getByTestId("git-add-repo")).not.toHaveTextContent("Add Repo");
+    expect(screen.getByTestId("git-refresh-all")).toHaveAccessibleName("Refresh all repositories");
+    expect(screen.getByTestId("git-refresh-all")).not.toHaveTextContent("Refresh");
     screen.getByTestId("repo-action-remove").focus();
     expect(screen.getByTestId("repo-action-remove")).toHaveFocus();
+    expect(screen.queryByTestId("git-repos-toggle-all")).not.toBeInTheDocument();
   });
 
   it("repo header actions show async success feedback", async () => {
@@ -209,10 +214,57 @@ describe("GitView", () => {
     const ids = contributedCommands().map((c) => c.id);
     expect(ids).toContain("git.add-repo");
     expect(ids).toContain("git.refresh-all");
+    expect(ids).toContain("git.toggle-repositories");
     expect(ids).toContain("git.toggle-detail");
 
     unmount();
     expect(contributedCommands()).toEqual([]);
+  });
+
+  it("collapses and expands all repositories while preserving individual toggles", async () => {
+    wire([repo(), repo({ root: "/repos/other", name: "other" })]);
+    await refreshAll();
+    render(GitView);
+    await waitFor(() => expect(screen.getAllByTestId("git-repo")).toHaveLength(2));
+
+    const toggleAll = screen.getByTestId("git-repos-toggle-all");
+    const addRepo = screen.getByTestId("git-add-repo");
+    const refreshAllButton = screen.getByTestId("git-refresh-all");
+    const branchFilter = screen.getByTestId("branch-filter-both");
+    expect(
+      addRepo.compareDocumentPosition(refreshAllButton) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+    expect(
+      refreshAllButton.compareDocumentPosition(toggleAll) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+    expect(toggleAll.compareDocumentPosition(branchFilter) & Node.DOCUMENT_POSITION_FOLLOWING).toBe(
+      Node.DOCUMENT_POSITION_FOLLOWING,
+    );
+    expect(toggleAll).toHaveAccessibleName("Collapse all repositories");
+    expect(screen.getAllByTestId("repo-branches")).toHaveLength(2);
+
+    await fireEvent.click(toggleAll);
+    expect(screen.queryAllByTestId("repo-branches")).toHaveLength(0);
+    expect(toggleAll).toHaveAccessibleName("Expand all repositories");
+
+    await fireEvent.click(toggleAll);
+    expect(screen.getAllByTestId("repo-branches")).toHaveLength(2);
+
+    const firstRepo = screen.getAllByTestId("git-repo")[0]!;
+    await fireEvent.click(within(firstRepo).getByRole("button", { name: "Collapse repo" }));
+    expect(screen.getAllByTestId("repo-branches")).toHaveLength(1);
+    expect(toggleAll).toHaveAccessibleName("Collapse all repositories");
+
+    await waitFor(() =>
+      expect(gitCommand("git.toggle-repositories").title).toBe("Collapse all repositories"),
+    );
+    await gitCommand("git.toggle-repositories").run();
+    expect(screen.queryAllByTestId("repo-branches")).toHaveLength(0);
+    await waitFor(() =>
+      expect(gitCommand("git.toggle-repositories").title).toBe("Expand all repositories"),
+    );
+    await gitCommand("git.toggle-repositories").run();
+    expect(screen.getAllByTestId("repo-branches")).toHaveLength(2);
   });
 
   it("git.toggle-detail runs, and ⌘⇧D is suppressed while the palette is open", async () => {

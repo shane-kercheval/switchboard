@@ -19,6 +19,8 @@
   import { basename, cn } from "$lib/utils";
   import Input from "$lib/components/ui/Input.svelte";
   import Button from "$lib/components/ui/Button.svelte";
+  import Tooltip from "$lib/components/ui/Tooltip.svelte";
+  import { SUPPLEMENTAL_TOOLTIP_DELAY } from "$lib/components/ui/tooltip";
   import {
     SEGMENTED_CONTAINER_CLASS,
     SEGMENTED_ITEM_CLASS,
@@ -231,12 +233,16 @@
           Choose folder…
         </Button>
         {#if newFolder}
-          <p
-            class="text-muted bg-panel truncate rounded px-2 py-1.5 font-mono text-xs"
-            title={newFolder}
-          >
-            {newFolder}
-          </p>
+          <Tooltip label={newFolder} delayDuration={SUPPLEMENTAL_TOOLTIP_DELAY} focusable={false}>
+            {#snippet trigger(props)}
+              <p
+                {...props}
+                class="text-muted bg-panel truncate rounded px-2 py-1.5 font-mono text-xs"
+              >
+                {newFolder}
+              </p>
+            {/snippet}
+          </Tooltip>
         {/if}
       </div>
       <div class="space-y-1.5">
@@ -326,8 +332,15 @@
         {:else}
           <p class="text-warning text-xs leading-relaxed" data-testid="add-existing-none">
             No Switchboard projects found in
-            <span class="font-mono" title={addFolder ?? ""}>{addFolder}</span>. Make sure you picked
-            the working directory that contains a
+            <Tooltip
+              label={addFolder ?? ""}
+              delayDuration={SUPPLEMENTAL_TOOLTIP_DELAY}
+              focusable={false}
+            >
+              {#snippet trigger(props)}
+                <span {...props} class="font-mono">{addFolder}</span>
+              {/snippet}</Tooltip
+            >. Make sure you picked the working directory that contains a
             <code class="bg-panel text-fg rounded px-1 font-mono">.switchboard/</code>
             folder — or switch to "New project" to create one there.
           </p>

@@ -16,8 +16,6 @@
   } from "$lib/scrollPinDebug";
   import {
     ChevronRight,
-    ChevronsDownUp,
-    ChevronsUpDown,
     Columns2,
     CornerUpRight,
     MessagesSquare,
@@ -26,6 +24,7 @@
     SquareSlash,
     Workflow,
   } from "@lucide/svelte";
+  import ExpandCollapseIcon from "$lib/components/ui/ExpandCollapseIcon.svelte";
   import {
     cancelSend,
     getLocalSend,
@@ -72,6 +71,7 @@
   import ErrorDetailsDialog from "$lib/components/ui/ErrorDetailsDialog.svelte";
   import Button from "$lib/components/ui/Button.svelte";
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
+  import { SUPPLEMENTAL_TOOLTIP_DELAY } from "$lib/components/ui/tooltip";
   import {
     isCompact,
     setManyOverrides,
@@ -1650,11 +1650,7 @@
     onclick={() => toggleKey(projectId, key, defaultCompact)}
   >
     <!-- Same expand/collapse glyph as the header control. -->
-    {#if compact}
-      <ChevronsUpDown class="h-3.5 w-3.5" aria-hidden="true" />
-    {:else}
-      <ChevronsDownUp class="h-3.5 w-3.5" aria-hidden="true" />
-    {/if}
+    <ExpandCollapseIcon expanded={!compact} class="h-3.5 w-3.5" />
     <span>{label}</span>
   </button>
 {/snippet}
@@ -1681,11 +1677,7 @@
         aria-label={label}
         onclick={() => setManyOverrides(projectId, keys, anyExpanded)}
       >
-        {#if anyExpanded}
-          <ChevronsDownUp class="h-4 w-4" aria-hidden="true" />
-        {:else}
-          <ChevronsUpDown class="h-4 w-4" aria-hidden="true" />
-        {/if}
+        <ExpandCollapseIcon expanded={anyExpanded} class="h-4 w-4" />
       </button>
     {/snippet}
   </Tooltip>
@@ -1733,13 +1725,18 @@
          `real_spend` without `is_overage` → cost shows, marker stays hidden. -->
     <div class="flex shrink-0 items-center gap-2">
       {#if spend?.is_overage}
-        <span
-          class="text-warning text-xs"
-          data-testid="message-overage"
-          title={spend?.overage_resets_at
+        <Tooltip
+          label={spend?.overage_resets_at
             ? `Spending overage credits — window resets ${new Date(spend.overage_resets_at).toLocaleString()}`
-            : "Spending overage credits"}>⚡ using credits</span
+            : "Spending overage credits"}
+          delayDuration={SUPPLEMENTAL_TOOLTIP_DELAY}
         >
+          {#snippet trigger(props)}
+            <span {...props} class="text-warning text-xs" data-testid="message-overage"
+              >⚡ using credits</span
+            >
+          {/snippet}
+        </Tooltip>
       {/if}
       {#if spend?.real_spend && costUsd != null}
         <span class="text-muted text-xs" data-testid="message-cost">${costUsd.toFixed(4)}</span>
@@ -1765,12 +1762,17 @@
             >
           {/if}
           {#if at}
-            <time
-              class="text-muted max-w-full truncate text-xs"
-              datetime={at}
-              title={at}
-              data-testid="message-time">{formatTime(at)}</time
-            >
+            <Tooltip label={at} delayDuration={SUPPLEMENTAL_TOOLTIP_DELAY} focusable={false}>
+              {#snippet trigger(props)}
+                <time
+                  {...props}
+                  class="text-muted max-w-full truncate text-xs"
+                  datetime={at}
+                  aria-label={at}
+                  data-testid="message-time">{formatTime(at)}</time
+                >
+              {/snippet}
+            </Tooltip>
           {/if}
         </div>
       </div>

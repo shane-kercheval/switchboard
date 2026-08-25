@@ -2370,6 +2370,7 @@ fn emit_message_cancelled(
     emitter: &dyn EventEmitter,
     channel: &str,
     message_id: MessageId,
+    send_id: SendId,
     agent_id: AgentId,
 ) {
     emit_event(
@@ -2377,6 +2378,7 @@ fn emit_message_cancelled(
         channel,
         &NormalizedEvent::MessageCancelled {
             message_id,
+            send_id,
             agent_id,
             at: Utc::now(),
         },
@@ -2398,7 +2400,7 @@ fn drop_queued_send(
     backlog.retain_mut(|m| {
         if m.send_id == send_id {
             resolve_dropped_completion(m, TurnOutcome::Cancelled { source });
-            emit_message_cancelled(emitter, channel, m.message_id, agent_id);
+            emit_message_cancelled(emitter, channel, m.message_id, m.send_id, agent_id);
             false
         } else {
             true
@@ -2417,7 +2419,7 @@ fn drop_all_queued(
 ) {
     for mut item in backlog.drain(..) {
         resolve_dropped_completion(&mut item, TurnOutcome::Cancelled { source });
-        emit_message_cancelled(emitter, channel, item.message_id, agent_id);
+        emit_message_cancelled(emitter, channel, item.message_id, item.send_id, agent_id);
     }
 }
 

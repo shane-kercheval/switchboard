@@ -22,10 +22,14 @@
   const GIT_PENCIL_ICON_SIZE = 14;
   const GIT_ICON_STROKE = 1.8;
 
-  let { indicator, testid }: { indicator: GitStatusIndicator; testid?: string } = $props();
+  let {
+    indicator,
+    testid,
+    focusable = true,
+  }: { indicator: GitStatusIndicator; testid?: string; focusable?: boolean } = $props();
 </script>
 
-<Tooltip side="top" delayDuration={0} skipDelayDuration={0} disableHoverableContent>
+<Tooltip side="top" delayDuration={0} skipDelayDuration={0} disableHoverableContent {focusable}>
   {#snippet trigger(props)}
     <!-- A read-only status indicator: footprint + tone color only, no hover
          affordance (background or icon-color change) — a hover effect would

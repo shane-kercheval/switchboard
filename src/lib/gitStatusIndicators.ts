@@ -109,17 +109,8 @@ function branchStateIndicators(branch: BranchView): GitStatusIndicator[] {
 /// Worktree-level signal: any uncommitted change (dirty OR untracked) collapses
 /// to one "changes" indicator; the staged/unstaged/untracked split is only
 /// surfaced in the diff panel, not the tree.
-function worktreeIndicators(wt: WorktreeView): GitStatusIndicator[] {
+export function worktreeWarningIndicators(wt: WorktreeView): GitStatusIndicator[] {
   const indicators: GitStatusIndicator[] = [];
-  if (wt.dirty || wt.untracked) {
-    indicators.push({
-      key: "uncommitted",
-      label: "changes",
-      tone: "warning",
-      title: "Uncommitted changes",
-      description: "This folder has modified or new files.",
-    });
-  }
   if (wt.warning === "orphaned") {
     indicators.push({
       key: "orphaned",
@@ -138,6 +129,25 @@ function worktreeIndicators(wt: WorktreeView): GitStatusIndicator[] {
     });
   }
   return indicators;
+}
+
+function worktreeIndicators(wt: WorktreeView): GitStatusIndicator[] {
+  const indicators: GitStatusIndicator[] = [];
+  if (wt.dirty || wt.untracked) {
+    indicators.push({
+      key: "uncommitted",
+      label: "changes",
+      tone: "warning",
+      title: "Uncommitted changes",
+      description: "This folder has modified or new files.",
+    });
+  }
+  indicators.push(...worktreeWarningIndicators(wt));
+  return indicators;
+}
+
+export function indicatorTooltipSummary(indicator: GitStatusIndicator): string {
+  return `${indicator.title}: ${indicator.description}`;
 }
 
 /// All indicators for a local branch, in render order: branch relationship/state

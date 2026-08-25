@@ -17,6 +17,7 @@ const { branchSelection, branchCommits, diffTarget, selectCommit, _testing } =
 const { palette, _testing: paletteTesting } = await import("$lib/state/commandPalette.svelte");
 
 afterEach(() => {
+  vi.useRealTimers();
   _testing.reset();
   paletteTesting.reset();
   invokeMock.mockReset();
@@ -82,6 +83,8 @@ function props(root: string) {
     branchFilter: "both" as const,
     showInactive: false,
     fetchState: undefined,
+    expanded: true,
+    onExpandedChange: vi.fn(),
   };
 }
 
@@ -294,5 +297,91 @@ describe("GitRepoNode actions-trigger hover", () => {
     await fireEvent.keyDown(window, { key: "ArrowDown" });
     await tick();
     expect(trigger.className).not.toContain("group-hover:opacity-100");
+  });
+});
+
+describe("GitRepoNode supplemental text tooltips", () => {
+  it("uses one long-delay keyboard target for repository identity", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    render(GitRepoNode, { props: props("/a") });
+    await tick();
+
+    const identity = screen.getByTestId("repo-identity");
+    const repoName = screen.getByText("a");
+    const repoPath = screen.getByText("/a");
+    expect(identity).toHaveAttribute("tabindex", "0");
+    expect(repoName).not.toHaveAttribute("tabindex");
+    expect(repoPath).not.toHaveAttribute("tabindex");
+    expect(repoName).not.toHaveAttribute("title");
+    expect(repoPath).not.toHaveAttribute("title");
+
+    await fireEvent.pointerEnter(identity);
+    await vi.advanceTimersByTimeAsync(600);
+    expect(screen.queryByTestId("tooltip-content")).not.toBeInTheDocument();
+
+    await vi.advanceTimersByTimeAsync(500);
+    expect(screen.getByTestId("tooltip-content")).toHaveTextContent("/a");
+  });
+
+  it("opens branch details from the existing branch button without a nested tab stop", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    render(GitRepoNode, { props: props("/a") });
+    await tick();
+
+    const branch = screen.getByTestId("branch-select");
+    expect(branch.querySelector('[tabindex="0"]')).toBeNull();
+
+    await fireEvent.keyDown(window, { key: "Tab" });
+    await fireEvent.focus(branch);
+    await vi.advanceTimersByTimeAsync(1100);
+    const tooltip = screen.getByTestId("tooltip-content");
+    expect(tooltip).toHaveTextContent("main · /a/wt");
+    expect(tooltip).toHaveTextContent(
+      "Local only: No upstream is configured; this branch has not been pushed.",
+    );
+  });
+
+  it("opens the canonical prunable-worktree explanation from its existing focus target", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const componentProps = props("/a");
+    componentProps.listing.repo.detached_worktrees = [
+      {
+        path: "/a/missing-worktree",
+        dirty: false,
+        untracked: false,
+        detached_hash: "deadbee",
+        warning: "prunable",
+      },
+    ];
+    render(GitRepoNode, { props: componentProps });
+    await tick();
+
+    const identity = screen.getByTestId("detached-identity");
+    expect(identity).toHaveAttribute("tabindex", "0");
+    expect(identity.querySelector('[tabindex="0"]')).toBeNull();
+
+    await fireEvent.keyDown(window, { key: "Tab" });
+    await fireEvent.focus(identity);
+    await vi.advanceTimersByTimeAsync(1100);
+    const tooltip = screen.getByTestId("tooltip-content");
+    expect(tooltip).toHaveTextContent("/a/missing-worktree");
+    expect(tooltip).toHaveTextContent(
+      "Missing folder: This folder path is gone; the git worktree record can be pruned.",
+    );
+  });
+
+  it("opens commit identity from the existing commit button", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    selectRepoA();
+    render(GitRepoNode, { props: props("/a") });
+    await tick();
+
+    const commitRow = screen.getAllByTestId("commit-row")[0]!;
+    expect(commitRow.querySelector('[tabindex="0"]')).toBeNull();
+
+    await fireEvent.keyDown(window, { key: "Tab" });
+    await fireEvent.focus(commitRow);
+    await vi.advanceTimersByTimeAsync(1100);
+    expect(screen.getByTestId("tooltip-content")).toHaveTextContent("aaaaaaa · a");
   });
 });

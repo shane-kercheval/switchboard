@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/svelte";
 import McpServersSettings from "./McpServersSettings.svelte";
@@ -95,6 +95,10 @@ beforeEach(() => {
         throw new Error(`unexpected invoke: ${cmd}`);
     }
   });
+});
+
+afterEach(() => {
+  vi.useRealTimers();
 });
 
 describe("McpServersSettings", () => {
@@ -284,7 +288,9 @@ describe("McpServersSettings — OAuth", () => {
 
     expect(screen.getByTestId("mcp-status-tiddly")).toHaveTextContent("Needs sign-in");
     expect(screen.getByTestId("mcp-row-tiddly")).toHaveTextContent("not signed in");
-    expect(screen.getByTestId("mcp-sign-in-tiddly")).toBeInTheDocument();
+    const signIn = screen.getByTestId("mcp-sign-in-tiddly") as HTMLButtonElement;
+    expect(signIn.disabled).toBe(false);
+    expect(signIn.parentElement).not.toHaveAttribute("tabindex");
     // Signed out: no sign-out or row-level test yet.
     expect(screen.queryByTestId("mcp-sign-out-tiddly")).not.toBeInTheDocument();
     expect(screen.queryByTestId("mcp-test-tiddly")).not.toBeInTheDocument();
@@ -437,8 +443,14 @@ describe("McpServersSettings — OAuth delta hardening", () => {
     await waitFor(() => expect(screen.getByTestId("mcp-row-tiddly")).toBeInTheDocument());
 
     const signIn = screen.getByTestId("mcp-sign-in-tiddly") as HTMLButtonElement;
+    const tooltipTrigger = signIn.parentElement!;
     expect(signIn.disabled).toBe(true);
-    expect(signIn.title).toContain("keychain");
+    expect(signIn).not.toHaveAttribute("title");
+    expect(tooltipTrigger).toHaveAttribute("tabindex", "0");
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    await fireEvent.focus(tooltipTrigger);
+    await vi.advanceTimersByTimeAsync(1100);
+    expect(screen.getByTestId("tooltip-content")).toHaveTextContent("keychain");
     // The row is still recognizably an OAuth row (button present, not hidden),
     // and Remove stays available.
     expect((screen.getByTestId("mcp-remove-tiddly") as HTMLButtonElement).disabled).toBe(false);

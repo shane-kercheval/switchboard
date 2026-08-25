@@ -2,6 +2,8 @@
   import { convertFileSrc } from "@tauri-apps/api/core";
   import type { UnifiedRow } from "$lib/state/unified";
   import Markdown from "$lib/components/ui/Markdown.svelte";
+  import Tooltip from "$lib/components/ui/Tooltip.svelte";
+  import { SUPPLEMENTAL_TOOLTIP_DELAY } from "$lib/components/ui/tooltip";
 
   type UserRow = Extract<UnifiedRow, { kind: "user" }>;
   type QuotedSegment =
@@ -55,13 +57,21 @@
   <div class="mt-1.5 flex flex-wrap gap-1.5" data-testid="user-attachments">
     {#each row.attachments as attachment (attachment.path)}
       {#if attachment.kind === "image"}
-        <img
-          src={convertFileSrc(attachment.path)}
-          alt={attachment.original_name}
-          title={attachment.original_name}
-          data-testid={`attachment-thumb-${attachment.label}`}
-          class="border-border h-16 w-16 rounded-md border object-cover"
-        />
+        <Tooltip
+          label={attachment.original_name}
+          delayDuration={SUPPLEMENTAL_TOOLTIP_DELAY}
+          focusable={false}
+        >
+          {#snippet trigger(props)}
+            <img
+              {...props}
+              src={convertFileSrc(attachment.path)}
+              alt={attachment.original_name}
+              data-testid={`attachment-thumb-${attachment.label}`}
+              class="border-border h-16 w-16 rounded-md border object-cover"
+            />
+          {/snippet}
+        </Tooltip>
       {:else}
         <span
           class="border-border bg-panel text-fg inline-flex max-w-[14rem] items-center gap-1.5 rounded-full border px-2 py-px text-xs"
@@ -81,7 +91,15 @@
             <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z" />
             <path d="M14 3v5h5" />
           </svg>
-          <span class="truncate" title={attachment.original_name}>{attachment.original_name}</span>
+          <Tooltip
+            label={attachment.original_name}
+            delayDuration={SUPPLEMENTAL_TOOLTIP_DELAY}
+            focusable={false}
+          >
+            {#snippet trigger(props)}
+              <span {...props} class="truncate">{attachment.original_name}</span>
+            {/snippet}
+          </Tooltip>
         </span>
       {/if}
     {/each}

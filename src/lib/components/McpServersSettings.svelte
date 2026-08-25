@@ -4,6 +4,8 @@
   import Button from "$lib/components/ui/Button.svelte";
   import Input from "$lib/components/ui/Input.svelte";
   import SegmentedSelect from "$lib/components/ui/SegmentedSelect.svelte";
+  import Tooltip from "$lib/components/ui/Tooltip.svelte";
+  import { SUPPLEMENTAL_TOOLTIP_DELAY } from "$lib/components/ui/tooltip";
   import {
     addMcpProvider,
     listMcpProviders,
@@ -372,18 +374,32 @@
       {#each providers as provider (provider.name)}
         {@const action = rowAction[provider.name]}
         {@const notice = rowNotice[provider.name]}
+        {@const providerStatusTitle = statusTitle(provider.status)}
         <li class="space-y-2 py-2" data-testid={`mcp-row-${provider.name}`}>
           <div class="flex items-center justify-between gap-3">
             <div class="min-w-0">
               <div class="text-fg flex items-center gap-2 text-sm">
                 <span class="font-medium">{provider.name}</span>
-                <span
-                  class={cn("text-xs", TONE_CLASS[statusTone(provider.status)])}
-                  title={statusTitle(provider.status)}
-                  data-testid={`mcp-status-${provider.name}`}
-                >
-                  {statusLabel(provider.status)}
-                </span>
+                {#if providerStatusTitle}
+                  <Tooltip label={providerStatusTitle} delayDuration={SUPPLEMENTAL_TOOLTIP_DELAY}>
+                    {#snippet trigger(props)}
+                      <span
+                        {...props}
+                        class={cn("text-xs", TONE_CLASS[statusTone(provider.status)])}
+                        data-testid={`mcp-status-${provider.name}`}
+                      >
+                        {statusLabel(provider.status)}
+                      </span>
+                    {/snippet}
+                  </Tooltip>
+                {:else}
+                  <span
+                    class={cn("text-xs", TONE_CLASS[statusTone(provider.status)])}
+                    data-testid={`mcp-status-${provider.name}`}
+                  >
+                    {statusLabel(provider.status)}
+                  </span>
+                {/if}
                 {#if !provider.has_token}
                   <span class="text-muted text-xs"
                     >· {isOauth(provider) ? "not signed in" : "no token"}</span
@@ -394,16 +410,26 @@
             </div>
             <div class="flex shrink-0 items-center gap-2">
               {#if isOauth(provider)}
-                <Button
-                  variant="secondary"
-                  size="sm"
-                  data-testid={`mcp-sign-in-${provider.name}`}
-                  disabled={action !== undefined || signInBlocked(provider)}
-                  title={signInBlocked(provider) ? "The OS keychain could not be read" : undefined}
-                  onclick={() => void startSignIn(provider.name)}
+                <Tooltip
+                  label="The OS keychain could not be read"
+                  delayDuration={SUPPLEMENTAL_TOOLTIP_DELAY}
+                  disabled={!signInBlocked(provider)}
+                  focusable={signInBlocked(provider)}
                 >
-                  {action === "signing-in" ? "Waiting for browser…" : "Sign in"}
-                </Button>
+                  {#snippet trigger(props)}
+                    <span {...props} class="inline-flex">
+                      <Button
+                        variant="secondary"
+                        size="sm"
+                        data-testid={`mcp-sign-in-${provider.name}`}
+                        disabled={action !== undefined || signInBlocked(provider)}
+                        onclick={() => void startSignIn(provider.name)}
+                      >
+                        {action === "signing-in" ? "Waiting for browser…" : "Sign in"}
+                      </Button>
+                    </span>
+                  {/snippet}
+                </Tooltip>
                 {#if provider.has_token}
                   <Button
                     variant="secondary"

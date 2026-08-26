@@ -40,9 +40,36 @@ All via `make`:
 - `make lint` — runs clippy, eslint, svelte-check.
 - `make fmt` — formats Rust + frontend.
 - `make check` — everything CI runs (fmt check, lint, test, type-check, **and** the browser suite). Run this before opening a PR.
-- `make clean` — removes build artifacts.
+- `make clean-stale` — deletes build artifacts nothing has touched in a week, keeping the warm cache. **Run this when builds start feeling slow** — see "Build times are a `target/` problem" below. Needs `cargo install cargo-sweep` once.
+- `make clean` — removes all build artifacts (forces a full rebuild).
 
 Prerequisites: see `README.md`. Rust toolchain pinned in `rust-toolchain.toml`; Node in `.nvmrc`; pnpm via `packageManager` in `package.json` (`corepack enable`).
+
+### Use the `make` targets — do not hand-roll `cargo` commands
+
+**A `cargo` invocation whose flags differ from the Makefile's builds a second, parallel set of artifacts.** Cargo fingerprints on the exact flag set, so `cargo test --workspace --locked` and the Makefile's `cargo test --workspace --all-features --locked` share nothing: running both compiles the workspace twice and doubles what `target/` has to carry forever. This has actually happened — an agent split `make check` into per-crate `cargo` calls to fit a timeout, dropped `--all-features`, and turned a slow gate into a much slower one.
+
+If a target is too slow to fit one turn, split it by **package** (`-p switchboard-harness`) while keeping every other flag byte-identical to the Makefile line you are standing in for. Never drop or add a flag to make it faster.
+
+Note also that `cargo clippy` and `cargo test` **cannot share compiled artifacts** — clippy emits metadata only, tests need real codegen — so `make check` legitimately pays two builds. That is inherent, not a misconfiguration; don't "optimize" it away.
+
+### Build times are a `target/` problem, not a test problem
+
+If the suite feels unbearably slow, **measure before believing it's the tests**. The tests are fast: the full Rust workspace is ~1,980 tests in about a minute, and the jsdom frontend suite ~2,090 in under a minute, on a healthy tree.
+
+Cargo never garbage-collects `target/`. It accumulates one artifact set per crate/feature/target-kind combination and keeps all of them forever. On 2026-08-25 this repo's had reached **1,003,147 files / 249 GB**, with 469 distinct fingerprint entries for `switchboard-harness` alone. The symptom is not slow compilation — it's a filesystem scan every cargo invocation pays _before_ compiling anything:
+
+|                                           | Bloated tree             | After `cargo clean` |
+| ----------------------------------------- | ------------------------ | ------------------- |
+| No-op `cargo check` on the smallest crate | 7.2s                     | <1s                 |
+| `cargo clippy --workspace --all-targets`  | 8m55s                    | 39s                 |
+| `cargo test --workspace`                  | never finished in 10 min | 66s                 |
+
+**Diagnosing it:** `du -sh target`, `ls target/debug/deps | wc -l`, and — the decisive one — `ls target/debug/.fingerprint | sed 's/-[0-9a-f]\{16\}$//' | sort | uniq -c | sort -rn | head`. Double-digit-plus fingerprint counts for a single crate mean accumulated garbage, not a broken build.
+
+**Fixing it:** `make clean-stale` first (keeps the warm cache). `make clean` only if that isn't enough — it costs a full rebuild, which is a few minutes for this workspace.
+
+Two settings already work against regrowth, and both should stay: `CARGO_INCREMENTAL=0` on the whole-workspace `make` targets (incremental compilation exists for rebuilding one changed crate; on a build-everything target it buys nothing and grew 26 GB here), and `[profile.dev.package."*"] debug = false` in `Cargo.toml` (dependency debug symbols were the largest single contributor; our own crates keep theirs).
 
 ### Agents: run long commands in the FOREGROUND, and wait
 
@@ -52,6 +79,8 @@ So: **run the slow targets synchronously and block on them**, with a generous ti
 
 - `make check` and `make test-live*` are the usual victims. They take minutes.
 - If a command genuinely cannot fit in one turn, **do not fake it**: say what you ran, paste the partial output, and state plainly that the run did not complete. A truncated suite is not a passing suite. Never report a count from a killed run as if the suite finished — count the tests that actually reported, and label the run incomplete.
+- **Hitting the foreground timeout is not a reason to background it.** The tempting move — a foreground call is killed at the tool's timeout ceiling, so retry the same command with the background flag — produces _nothing_: backgrounding does not extend the deadline, it removes the completion record. Re-run in the foreground (a slow run is often a one-off: a wedged CLI turn, or a loaded machine), or split the target into per-crate invocations that each fit. If neither works, report the incomplete run per the bullet above. This has been fallen into after the rule was already written, so treat the foreground requirement as covering the retry too, not just the first attempt.
+- **Wall-clock assertions get flaky when a live suite is running.** `make test-live*` saturates the machine (observed load ~8), and the offline suite has bounded process-spawn waits — `fake_claude`'s pidfile handshake is 10s, and it starves under that load while taking 0.5s idle. Do not interleave the two, and before blaming a diff for a timing failure, re-measure on an idle machine.
 - This is about the _agent's_ process lifetime, not the app's. `make dev` is expected to be launched by a human and left running.
 
 ## Version pinning policy

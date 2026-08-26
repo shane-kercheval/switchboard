@@ -1,13 +1,21 @@
 //! Parser for Antigravity's `transcript.jsonl` records and for the
 //! `agy -p` stdout error/auth signals.
 //!
-//! Antigravity has no structured stream protocol (unlike Claude / Codex /
-//! Gemini stream-json). Two parseable surfaces exist:
+//! Antigravity's structured stream (`--output-format stream-json`, agy 1.1.8)
+//! is a **control channel only** — it carries no thinking text, so it never
+//! supplies displayed content; see [`super::stream`]. Three parseable surfaces
+//! exist:
 //!
-//! - **stdout** carries the model's final answer text (server-side
-//!   "drip"), plus `Error:` / `Warning:` / `Authentication required` lines
-//!   on failure. `agy` exits 0 on essentially every condition, so stdout
-//!   text — not the exit code — is the failure signal.
+//! - **stdout** carries the model's final answer text (server-side "drip")
+//!   under the pre-1.1.8 text mode, and the NDJSON control stream otherwise.
+//!   Its answer text is unusable as the content source regardless, because it
+//!   replays prior answers on resume.
+//! - **stderr** carries the `Error:` / `Warning:` / `Authentication required`
+//!   lines. agy 1.1.x moved these off stdout, and they must be captured **as
+//!   drained** rather than read back from the bounded tail, which front-evicts.
+//!   Outcome classification is signal-based and never gates on the exit status:
+//!   exit behavior varies by failure shape (timeout and empty prompt exit 1, an
+//!   exactly-a-flag-token prompt exits 2) but the full map is unprobed.
 //! - **the conversation transcript** carries one record per "step": user input,
 //!   model planner responses (with `thinking` + `tool_calls`), and tool
 //!   results (`RUN_COMMAND`, `VIEW_FILE`, other `CortexStep*` types). It
@@ -117,8 +125,10 @@ impl TranscriptRecord {
 
     /// A planner response with non-empty `content` and no tool calls is the
     /// model's final answer — the signal that the turn produced output.
-    /// Used for outcome classification (no structured terminal record
-    /// exists).
+    /// Used for outcome classification. It is not the only terminal signal —
+    /// the control stream's `result` event carries agy's own verdict — but it
+    /// is the one that proves the turn produced *content*, which is why a
+    /// stream success without it still fails the turn loud.
     pub fn is_terminal_answer(&self) -> bool {
         self.is_planner_response()
             && self.tool_calls.as_ref().is_none_or(Vec::is_empty)
@@ -140,21 +150,51 @@ fn tool_result_content_is_error(content: &str) -> bool {
     false
 }
 
-/// Per-turn parser state. Tracks the FIFO of in-flight tool invocations and
-/// early tool results so a result record can be paired with the `ToolStarted`
-/// it completes. Antigravity's result records carry no tool id, and observed
-/// transcripts can write a result before the planner record that names the
-/// tool call, so both sides are buffered by arrival order.
+/// Per-turn parser state. Tracks in-flight tool invocations and early tool
+/// results so a result record can be paired with the `ToolStarted` it
+/// completes — by **exact expected step**, never arrival order (see
+/// `expected_result_step`). Antigravity's result records carry no tool id, and
+/// observed transcripts can write a result before the planner record that names
+/// the tool call, so both sides are buffered until their expected step is
+/// claimed. Both queues still *store* entries in the order they are seen —
+/// only the **match** is exact, never the buffering.
 #[derive(Debug, Default)]
 pub struct AntigravityParserState {
     pending_tool_ids: VecDeque<PendingToolStart>,
     pending_tool_results: VecDeque<PendingToolResult>,
+    /// Tool failures seen on the control stream, held unpaired until the final
+    /// drain. Kept apart from `pending_tool_results` on purpose — see
+    /// [`AntigravityParserState::record_stream_tool_failure`].
+    stream_tool_failures: VecDeque<StreamToolFailure>,
+}
+
+#[derive(Debug)]
+struct StreamToolFailure {
+    step_index: i64,
+    message: Option<String>,
 }
 
 #[derive(Debug)]
 struct PendingToolStart {
     tool_use_id: String,
-    planner_step: i64,
+    /// The transcript `step_index` this call's result will occupy, if it
+    /// produces one: `planner_step + 1 + call_index`.
+    ///
+    /// **Capture-established, not assumed** (agy 1.1.19, 2026-08-24). Ten
+    /// planner records across five transcripts agree, covering single-call,
+    /// multi-call, success, invisible failure, and MCP wrappers — the two
+    /// `tool-failure-*.transcript.jsonl` fixtures are the probes that forced
+    /// the failure shapes, and `tool-vocabulary` supplies the two multi-call
+    /// records (planner 26 → 27,28 and planner 30 → 31,32).
+    ///
+    /// Replaces an arrival-order (FIFO) rule that was wrong in two ways. It
+    /// mispaired whenever a call produced no record — agy writes nothing for a
+    /// rejected tool — handing the *next* tool's result to the silent one. And
+    /// it was sensitive to file order, which agy does not guarantee: in
+    /// `tool-vocabulary.transcript.jsonl` the result at step 27 is written
+    /// *before* its planner at step 26. Matching on this number is immune to
+    /// both.
+    expected_result_step: i64,
 }
 
 #[derive(Debug)]
@@ -164,7 +204,124 @@ struct PendingToolResult {
     is_error: bool,
 }
 
+/// Shown for a tool call that ended without a recorded result.
+///
+/// **States only what is known.** An earlier wording said Antigravity
+/// "rejected" the call, which claims a cause this constant cannot vouch for:
+/// [`AntigravityParserState::close_pending_tools`] closes *every* still-open
+/// tool at turn end, including one with no stream failure recorded against it
+/// at all — a turn cut short, say. All that is actually established in the
+/// general case is the absence of a result.
+///
+/// Preferred over an empty output, which would read as "succeeded with nothing
+/// to show". Where the stream *did* supply a message it is used verbatim
+/// instead, being more specific and drift-resilient.
+///
+/// **Shared with hydration on purpose.** Reopening a project cannot recover the
+/// stream's per-tool message — it was never written to disk — so the reopen
+/// path shows this same text. Both paths referencing one constant is what keeps
+/// the two renderings of the same failure from drifting apart; do not author a
+/// second copy of this string.
+pub(crate) const MISSING_TOOL_RESULT_OUTPUT: &str =
+    "Antigravity did not record a result for this tool call.";
+
 impl AntigravityParserState {
+    /// Record a tool failure observed on the **stream** rather than the
+    /// transcript. Deliberately does **not** pair it yet.
+    ///
+    /// **Why nothing is paired here.** Pairing needs to know which pending tool
+    /// the failure belongs to, and mid-turn there is no sound way to know.
+    /// stdout is read as lines arrive while the transcript is polled every
+    /// ~100ms, so a *later* tool's failure routinely reaches this queue before
+    /// an *earlier* tool's planner record has been tailed. Every mid-turn rule
+    /// therefore measures polling lag rather than identity — including "pair
+    /// when exactly one tool is currently pending", which looks safe and is
+    /// not: with B's failure queued and only A tailed so far, A is the sole
+    /// candidate and would wrongly take B's error. Feeding these into
+    /// `pending_tool_results` (as an earlier revision did) is worse still,
+    /// because an unrelated planner's `pop_plausible_result` can then claim
+    /// one — that rule is only safe for the strictly-ordered transcript source
+    /// it was written for.
+    ///
+    /// Misattribution is the failure to avoid: it shows a tool that succeeded
+    /// as failed, hides the real failure's message, and strands the tool that
+    /// actually failed. A dangling tool for the rest of the turn is strictly
+    /// better, and [`Self::close_pending_tools`] resolves it at the one moment
+    /// the picture is provably complete.
+    pub(crate) fn record_stream_tool_failure(&mut self, step_index: i64, message: Option<String>) {
+        self.stream_tool_failures.push_back(StreamToolFailure {
+            step_index,
+            message,
+        });
+    }
+
+    /// Resolve every unfinished tool at the **final post-exit drain**, once the
+    /// process has exited and the transcript is fully flushed.
+    ///
+    /// That boundary is what makes this sound: anything still pending has no
+    /// transcript result, and a tool with no result did not succeed. So the
+    /// pending set *is* the failed set, and no ordering question remains.
+    ///
+    /// Each stream failure is attributed to the tool whose
+    /// [`PendingToolStart::expected_result_step`] it names — the same
+    /// capture-established relationship used for ordinary results, so several
+    /// failures in one turn each land on their own call rather than collapsing
+    /// to generic copy. A failure naming a step no pending tool expects is
+    /// **not** guessed onto anything; it is returned for diagnostics, and any
+    /// tool left without a message closes with [`MISSING_TOOL_RESULT_OUTPUT`].
+    ///
+    /// Returns the events to emit plus any `(step_index, message)` pairs that
+    /// could not be attributed. The step index rides along because it is the
+    /// raw material for re-deriving the invariant if agy's numbering ever
+    /// shifts.
+    pub(crate) fn close_pending_tools(
+        &mut self,
+        turn_id: TurnId,
+    ) -> (Vec<AdapterEvent>, Vec<(i64, String)>) {
+        let mut events = Vec::new();
+        let mut unattributed = Vec::new();
+
+        for failure in self.stream_tool_failures.drain(..) {
+            match self
+                .pending_tool_ids
+                .iter()
+                .position(|pending| pending.expected_result_step == failure.step_index)
+            {
+                Some(index) => {
+                    let pending = self
+                        .pending_tool_ids
+                        .remove(index)
+                        .expect("index from position");
+                    events.push(AdapterEvent::ToolCompleted {
+                        turn_id,
+                        tool_use_id: pending.tool_use_id,
+                        output: failure
+                            .message
+                            .unwrap_or_else(|| MISSING_TOOL_RESULT_OUTPUT.to_owned()),
+                        is_error: true,
+                    });
+                }
+                None => {
+                    if let Some(message) = failure.message {
+                        unattributed.push((failure.step_index, message));
+                    }
+                }
+            }
+        }
+
+        // Whatever remains had no result and no failure naming it — close it
+        // too, stating only what is known.
+        while let Some(pending) = self.pending_tool_ids.pop_front() {
+            events.push(AdapterEvent::ToolCompleted {
+                turn_id,
+                tool_use_id: pending.tool_use_id,
+                output: MISSING_TOOL_RESULT_OUTPUT.to_owned(),
+                is_error: true,
+            });
+        }
+        (events, unattributed)
+    }
+
     pub fn unmatched_tool_result_steps(&self) -> Vec<i64> {
         self.pending_tool_results
             .iter()
@@ -263,9 +420,8 @@ pub(crate) fn record_to_live_events_with_encoding(
                 name: call.name.clone(),
                 input: call.args.clone(),
             });
-            if let Some(result) =
-                pop_plausible_result(&mut state.pending_tool_results, rec.step_index)
-            {
+            let expected = expected_result_step(rec.step_index, call_index);
+            if let Some(result) = take_result_for_step(&mut state.pending_tool_results, expected) {
                 out.push(AdapterEvent::ToolCompleted {
                     turn_id,
                     tool_use_id,
@@ -275,7 +431,7 @@ pub(crate) fn record_to_live_events_with_encoding(
             } else {
                 state.pending_tool_ids.push_back(PendingToolStart {
                     tool_use_id: tool_use_id.clone(),
-                    planner_step: rec.step_index,
+                    expected_result_step: expected,
                 });
             }
         }
@@ -284,13 +440,23 @@ pub(crate) fn record_to_live_events_with_encoding(
     if rec.is_tool_result() {
         let is_error = rec.tool_result_is_error();
         let output = rec.tool_result_output();
-        if let Some(pending) = state.pending_tool_ids.front()
-            && rec.step_index > pending.planner_step
+        // Attach to the call that *expects* this step, never to whichever call
+        // happens to be oldest. The old arrival-order rule ("first pending tool
+        // whose planner step is lower") silently swapped identities the moment
+        // any call produced no record: with A at planner 2 (rejected, nothing
+        // written) and B at planner 4, B's result at step 5 satisfied `> 2` and
+        // was emitted under A's id — A rendered as a success carrying B's
+        // output while B was later closed as failed carrying A's error. See
+        // `expected_result_step` for the evidence behind the replacement.
+        if let Some(index) = state
+            .pending_tool_ids
+            .iter()
+            .position(|pending| pending.expected_result_step == rec.step_index)
         {
             let pending = state
                 .pending_tool_ids
-                .pop_front()
-                .expect("front checked above");
+                .remove(index)
+                .expect("index from position");
             out.push(AdapterEvent::ToolCompleted {
                 turn_id,
                 tool_use_id: pending.tool_use_id,
@@ -298,6 +464,9 @@ pub(crate) fn record_to_live_events_with_encoding(
                 is_error,
             });
         } else {
+            // The call this belongs to has not been tailed yet (agy does not
+            // guarantee file order — a result can precede its planner record).
+            // Buffered for the planner side to claim by the same exact step.
             state.pending_tool_results.push_back(PendingToolResult {
                 step_index: rec.step_index,
                 output,
@@ -309,17 +478,40 @@ pub(crate) fn record_to_live_events_with_encoding(
     out
 }
 
-fn pop_plausible_result(
+/// The transcript step a tool call's result occupies, if it produces one.
+///
+/// See [`PendingToolStart::expected_result_step`] for the captures this rests
+/// on and why it replaced an arrival-order rule.
+pub(crate) fn expected_result_step(planner_step: i64, call_index: usize) -> i64 {
+    planner_step + 1 + i64::try_from(call_index).unwrap_or(i64::MAX)
+}
+
+/// Take a buffered result that belongs to exactly this step.
+///
+/// Deliberately **no fallback to the nearest or oldest candidate**. A result
+/// with no matching expectation means the step relationship this adapter
+/// relies on did not hold, and guessing is precisely the wrong-provenance bug
+/// this replaced: attaching it anyway would show one tool's output under
+/// another's name, confidently. It is left unclaimed instead, and the tool
+/// that expected a result it never got is closed as failed at turn end.
+fn take_result_for_step(
     pending_results: &mut VecDeque<PendingToolResult>,
-    planner_step: i64,
+    expected_step: i64,
 ) -> Option<PendingToolResult> {
     let idx = pending_results
         .iter()
-        .position(|result| result.step_index > planner_step)?;
+        .position(|result| result.step_index == expected_step)?;
     pending_results.remove(idx)
 }
 
-/// Detect Antigravity's unauthenticated-dispatch signal on a stdout line.
+/// Detect Antigravity's unauthenticated-dispatch signal on an output line.
+///
+/// Applied to **both** streams: agy 1.1.x moved diagnostics to stderr (where
+/// `StderrSignals` observes each line as it drains, so a chatty burst can't
+/// evict the match from the bounded tail), while the stdout scan in
+/// `classify_outcome` is retained as a backstop. The 1.1.x auth shape is
+/// unverified — probing requires logging the developer out — so neither
+/// stream is dropped.
 ///
 /// Verified shapes (captured from a real logged-out `agy -p` run): the
 /// interactive-OAuth fallback prints `Authentication required. Please visit
@@ -457,7 +649,7 @@ mod tests {
             } => {
                 assert_eq!(
                     tool_use_id, "2:0:run_command",
-                    "FIFO-paired to the start id"
+                    "result must pair to the start id at its expected step"
                 );
                 assert!(output.contains("MARKER.txt"));
                 assert!(!is_error);
@@ -508,11 +700,17 @@ mod tests {
     }
 
     #[test]
-    fn adjacent_mcp_wrappers_pair_normal_and_invalid_results_fifo() {
+    fn mcp_wrappers_pair_normal_and_invalid_results_to_their_own_calls() {
+        // Step numbers follow the real relationship (`planner + 1 + call_index`):
+        // planner 8 → result 9, planner 10 → result 11. An earlier revision of
+        // this fixture used adjacent planners at 8 and 9, a shape agy cannot
+        // actually produce — a tool-calling planner reserves the steps its
+        // results occupy, and no captured transcript has two planners closer
+        // than that. It only passed because pairing was arrival-ordered.
         let records = [
             r#"{"step_index":8,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"call_mcp_tool","args":{"ServerName":"\"notes_alias\"","ToolName":"\"edit_content\"","Arguments":"{\"id\":\"note-example\",\"type\":\"note\",\"old_str\":\"before\",\"new_str\":\"after\"}"}}]}"#,
-            r#"{"step_index":9,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"call_mcp_tool","args":{"ServerName":"\"prompts_alias\"","ToolName":"\"create_prompt\"","Arguments":"{\"name\":\"sample-prompt\",\"content\":\"Prompt body\"}"}}]}"#,
-            r#"{"step_index":10,"source":"MODEL","type":"CortexStepMcpTool","status":"DONE","content":"edit ok"}"#,
+            r#"{"step_index":9,"source":"MODEL","type":"CortexStepMcpTool","status":"DONE","content":"edit ok"}"#,
+            r#"{"step_index":10,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"call_mcp_tool","args":{"ServerName":"\"prompts_alias\"","ToolName":"\"create_prompt\"","Arguments":"{\"name\":\"sample-prompt\",\"content\":\"Prompt body\"}"}}]}"#,
             r#"{"step_index":11,"source":"SYSTEM","type":"ERROR_MESSAGE","status":"DONE","error":"There was a problem parsing the tool call. Error Message: invalid tool call error (invalid_args) creation rejected"}"#,
         ];
         let mut state = AntigravityParserState::default();
@@ -573,7 +771,7 @@ mod tests {
         assert_eq!(completions[0].0, "8:0:call_mcp_tool");
         assert_eq!(completions[0].1, "edit ok");
         assert!(!completions[0].2);
-        assert_eq!(completions[1].0, "9:0:call_mcp_tool");
+        assert_eq!(completions[1].0, "10:0:call_mcp_tool");
         assert!(completions[1].1.contains("creation rejected"));
         assert!(completions[1].2);
         assert!(state.pending_tool_ids.is_empty());
@@ -760,6 +958,378 @@ mod tests {
         ));
         assert!(!is_auth_failure_line("ack"));
         assert!(!is_auth_failure_line("Error: empty prompt."));
+    }
+
+    /// The exact ordering that made every mid-turn pairing rule unsound: B's
+    /// failure reaches the stream before *any* transcript record is tailed, so
+    /// when planner A is finally seen, A is the only pending tool. A rule that
+    /// paired "when exactly one tool is pending" would hand A the error that
+    /// belongs to B — showing a tool that succeeded as failed and stranding
+    /// the one that actually failed.
+    #[test]
+    fn stream_failure_arriving_before_any_transcript_record_never_lands_on_the_wrong_tool() {
+        let turn_id = Uuid::now_v7();
+        let mut state = AntigravityParserState::default();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        // Stream: tool B (step 5) failed. Nothing tailed yet.
+        state.record_stream_tool_failure(5, Some("B blew up".to_owned()));
+
+        // Transcript catches up: planner A (step 2), A's result (step 3),
+        // planner B (step 4). A must keep its own successful output.
+        for line in [
+            r#"{"step_index":2,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"run_command","args":{}}]}"#,
+            r#"{"step_index":3,"source":"MODEL","type":"RUN_COMMAND","status":"DONE","content":"A ok"}"#,
+            r#"{"step_index":4,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"view_file","args":{}}]}"#,
+        ] {
+            let rec: TranscriptRecord = serde_json::from_str(line).unwrap();
+            for event in record_to_live_events(&rec, turn_id, &mut state) {
+                let _ = tx.send(event);
+            }
+        }
+
+        let mut completions: Vec<(String, String, bool)> = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let AdapterEvent::ToolCompleted {
+                tool_use_id,
+                output,
+                is_error,
+                ..
+            } = event
+            {
+                completions.push((tool_use_id, output, is_error));
+            }
+        }
+        assert_eq!(
+            completions.len(),
+            1,
+            "only A resolves mid-turn: {completions:?}"
+        );
+        assert!(
+            completions[0].0.starts_with("2:"),
+            "A's own id: {completions:?}"
+        );
+        assert_eq!(completions[0].1, "A ok", "A keeps its own output");
+        assert!(
+            !completions[0].2,
+            "A succeeded and must not be marked failed"
+        );
+
+        // Final drain: B is the only tool left, and the only recorded failure,
+        // so its message is attributable.
+        let (closed, unattributed) = state.close_pending_tools(turn_id);
+        assert!(unattributed.is_empty(), "{unattributed:?}");
+        assert_eq!(closed.len(), 1);
+        match &closed[0] {
+            AdapterEvent::ToolCompleted {
+                tool_use_id,
+                output,
+                is_error,
+                ..
+            } => {
+                assert!(tool_use_id.starts_with("4:"), "B's id: {tool_use_id}");
+                assert_eq!(output, "B blew up");
+                assert!(*is_error);
+            }
+            other => panic!("expected B's failure; got {other:?}"),
+        }
+    }
+
+    /// The identity swap that arrival-order pairing produced, pinned so it
+    /// cannot return. Shape taken from a real capture
+    /// (`tool-failure-cross-planner.transcript.jsonl`): A is rejected and agy
+    /// writes nothing for it, so under the old rule B's result at step 5
+    /// satisfied `> 2` and was emitted under **A's** id — A rendered as a
+    /// success carrying B's output, and B was then closed as failed carrying
+    /// A's error. Both tools wrong, both confidently.
+    #[test]
+    fn a_rejected_tool_never_absorbs_the_next_tools_result() {
+        let turn_id = Uuid::now_v7();
+        let mut state = AntigravityParserState::default();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let feed = |line: &str,
+                    state: &mut AntigravityParserState,
+                    tx: &tokio::sync::mpsc::UnboundedSender<AdapterEvent>| {
+            let rec: TranscriptRecord = serde_json::from_str(line).unwrap();
+            for event in record_to_live_events(&rec, turn_id, state) {
+                let _ = tx.send(event);
+            }
+        };
+
+        // planner(2) = A (view_file). Its result step, 3, is never written.
+        feed(
+            r#"{"step_index":2,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"view_file","args":{}}]}"#,
+            &mut state,
+            &tx,
+        );
+        state.record_stream_tool_failure(3, Some("A REAL ERROR".to_owned()));
+        // planner(4) = B (run_command), result at 5.
+        feed(
+            r#"{"step_index":4,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"run_command","args":{}}]}"#,
+            &mut state,
+            &tx,
+        );
+        feed(
+            r#"{"step_index":5,"source":"MODEL","type":"RUN_COMMAND","status":"DONE","content":"B REAL OUTPUT"}"#,
+            &mut state,
+            &tx,
+        );
+
+        let mut got: Vec<(String, String, bool)> = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let AdapterEvent::ToolCompleted {
+                tool_use_id,
+                output,
+                is_error,
+                ..
+            } = event
+            {
+                got.push((tool_use_id, output, is_error));
+            }
+        }
+        // B resolves live, on its own id, with its own output.
+        assert_eq!(
+            got,
+            vec![(
+                "4:0:run_command".to_owned(),
+                "B REAL OUTPUT".to_owned(),
+                false
+            )]
+        );
+
+        // A closes at turn end with its own error — never B's output.
+        let (closed, unattributed) = state.close_pending_tools(turn_id);
+        assert!(unattributed.is_empty(), "{unattributed:?}");
+        assert_eq!(closed.len(), 1);
+        match &closed[0] {
+            AdapterEvent::ToolCompleted {
+                tool_use_id,
+                output,
+                is_error,
+                ..
+            } => {
+                assert_eq!(tool_use_id, "2:0:view_file");
+                assert_eq!(output, "A REAL ERROR");
+                assert!(*is_error);
+            }
+            other => panic!("expected A's failure; got {other:?}"),
+        }
+    }
+
+    /// The same-planner shape from `tool-failure-same-planner.transcript.jsonl`:
+    /// two calls in one record, the first rejected. The surviving result at
+    /// step 4 belongs to call index 1, which arrival-order pairing would have
+    /// handed to call index 0.
+    #[test]
+    fn two_calls_in_one_record_attribute_by_call_index() {
+        let turn_id = Uuid::now_v7();
+        let mut state = AntigravityParserState::default();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let planner: TranscriptRecord = serde_json::from_str(r#"{"step_index":2,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"view_file","args":{}},{"name":"run_command","args":{}}]}"#).unwrap();
+        for event in record_to_live_events(&planner, turn_id, &mut state) {
+            let _ = tx.send(event);
+        }
+        state.record_stream_tool_failure(3, Some("view_file rejected".to_owned()));
+        let result: TranscriptRecord = serde_json::from_str(r#"{"step_index":4,"source":"MODEL","type":"GENERIC","status":"DONE","content":"echo output"}"#).unwrap();
+        for event in record_to_live_events(&result, turn_id, &mut state) {
+            let _ = tx.send(event);
+        }
+
+        let mut got: Vec<(String, String, bool)> = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let AdapterEvent::ToolCompleted {
+                tool_use_id,
+                output,
+                is_error,
+                ..
+            } = event
+            {
+                got.push((tool_use_id, output, is_error));
+            }
+        }
+        assert_eq!(
+            got,
+            vec![(
+                "2:1:run_command".to_owned(),
+                "echo output".to_owned(),
+                false
+            )],
+            "step 4 belongs to call index 1, not index 0"
+        );
+
+        let (closed, _) = state.close_pending_tools(turn_id);
+        match &closed[0] {
+            AdapterEvent::ToolCompleted {
+                tool_use_id,
+                output,
+                ..
+            } => {
+                assert_eq!(tool_use_id, "2:0:view_file");
+                assert_eq!(output, "view_file rejected");
+            }
+            other => panic!("expected call 0's failure; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn close_pending_tools_attributes_several_failures_to_their_own_calls() {
+        // Two tools, two failures. Each failure names the step its own call
+        // expects, so both land exactly — no collapsing to generic copy, and
+        // no possibility of showing one tool's error under the other's name.
+        let turn_id = Uuid::now_v7();
+        let mut state = AntigravityParserState::default();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        for line in [
+            r#"{"step_index":2,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"view_file","args":{}}]}"#,
+            r#"{"step_index":4,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"run_command","args":{}}]}"#,
+        ] {
+            let rec: TranscriptRecord = serde_json::from_str(line).unwrap();
+            for event in record_to_live_events(&rec, turn_id, &mut state) {
+                let _ = tx.send(event);
+            }
+        }
+        while rx.try_recv().is_ok() {}
+
+        state.record_stream_tool_failure(3, Some("view_file blew up".to_owned()));
+        state.record_stream_tool_failure(5, Some("run_command blew up".to_owned()));
+
+        let (closed, unattributed) = state.close_pending_tools(turn_id);
+        assert!(unattributed.is_empty(), "{unattributed:?}");
+        let mut got: Vec<(String, String)> = closed
+            .into_iter()
+            .filter_map(|event| match event {
+                AdapterEvent::ToolCompleted {
+                    tool_use_id,
+                    output,
+                    is_error: true,
+                    ..
+                } => Some((tool_use_id, output)),
+                _ => None,
+            })
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                ("2:0:view_file".to_owned(), "view_file blew up".to_owned()),
+                (
+                    "4:0:run_command".to_owned(),
+                    "run_command blew up".to_owned()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn close_pending_tools_does_not_guess_a_failure_onto_an_unexpecting_tool() {
+        // A failure naming a step no pending call expects means the step
+        // relationship did not hold. Attaching it anyway is the wrong-provenance
+        // bug; the tool still closes as failed, but with neutral copy, and the
+        // orphaned message is handed back for diagnostics.
+        let turn_id = Uuid::now_v7();
+        let mut state = AntigravityParserState::default();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let rec: TranscriptRecord = serde_json::from_str(
+            r#"{"step_index":2,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"view_file","args":{}}]}"#,
+        )
+        .unwrap();
+        for event in record_to_live_events(&rec, turn_id, &mut state) {
+            let _ = tx.send(event);
+        }
+        while rx.try_recv().is_ok() {}
+
+        // Expects step 3; the failure names 99.
+        state.record_stream_tool_failure(99, Some("belongs to nothing here".to_owned()));
+
+        let (closed, unattributed) = state.close_pending_tools(turn_id);
+        assert_eq!(
+            unattributed,
+            vec![(99, "belongs to nothing here".to_owned())]
+        );
+        assert_eq!(closed.len(), 1);
+        match &closed[0] {
+            AdapterEvent::ToolCompleted {
+                tool_use_id,
+                output,
+                is_error,
+                ..
+            } => {
+                assert_eq!(tool_use_id, "2:0:view_file");
+                assert!(*is_error);
+                assert_eq!(output, MISSING_TOOL_RESULT_OUTPUT);
+            }
+            other => panic!("expected ToolCompleted; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn close_pending_tools_uses_authored_copy_when_the_stream_carried_no_message() {
+        let turn_id = Uuid::now_v7();
+        let mut state = AntigravityParserState::default();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let rec: TranscriptRecord = serde_json::from_str(
+            r#"{"step_index":2,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"view_file","args":{}}]}"#,
+        )
+        .unwrap();
+        for event in record_to_live_events(&rec, turn_id, &mut state) {
+            let _ = tx.send(event);
+        }
+        while rx.try_recv().is_ok() {}
+
+        state.record_stream_tool_failure(3, None);
+        let (closed, unattributed) = state.close_pending_tools(turn_id);
+        assert!(unattributed.is_empty());
+        match &closed[0] {
+            AdapterEvent::ToolCompleted { output, .. } => {
+                assert_eq!(output, MISSING_TOOL_RESULT_OUTPUT);
+            }
+            other => panic!("expected ToolCompleted; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn close_pending_tools_closes_a_tool_with_no_recorded_failure_at_all() {
+        // A tool left open with zero stream evidence — a turn cut short, say.
+        // It must still close (nothing more can arrive), but the copy may not
+        // claim a rejection, because none was observed.
+        let turn_id = Uuid::now_v7();
+        let mut state = AntigravityParserState::default();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let rec: TranscriptRecord = serde_json::from_str(
+            r#"{"step_index":2,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"run_command","args":{}}]}"#,
+        )
+        .unwrap();
+        for event in record_to_live_events(&rec, turn_id, &mut state) {
+            let _ = tx.send(event);
+        }
+        while rx.try_recv().is_ok() {}
+
+        let (closed, unattributed) = state.close_pending_tools(turn_id);
+        assert!(unattributed.is_empty(), "nothing was recorded to attribute");
+        assert_eq!(closed.len(), 1, "the tool must not be left spinning");
+        match &closed[0] {
+            AdapterEvent::ToolCompleted {
+                output, is_error, ..
+            } => {
+                assert!(*is_error);
+                assert_eq!(output, MISSING_TOOL_RESULT_OUTPUT);
+                assert!(
+                    !output.to_ascii_lowercase().contains("rejected"),
+                    "must not assert a cause that was never observed: {output}"
+                );
+            }
+            other => panic!("expected ToolCompleted; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn close_pending_tools_is_a_no_op_when_every_tool_resolved() {
+        let turn_id = Uuid::now_v7();
+        let mut state = AntigravityParserState::default();
+        assert_eq!(state.close_pending_tools(turn_id).0.len(), 0);
     }
 
     #[test]

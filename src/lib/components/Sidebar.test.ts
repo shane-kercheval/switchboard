@@ -858,13 +858,15 @@ describe("Sidebar", () => {
     expect(screen.queryByTestId("change-profile-primary-effort")).toBeNull();
   });
 
-  it("Antigravity exposes no change actions", async () => {
+  it("Antigravity exposes the profile action like every other harness", async () => {
+    // It had none while its model was harness-owned global config; `agy` 1.1.x
+    // made both axes per-invocation, so the action is no longer withheld.
     const state = await loadState();
     await state.registerAgent(ANTIGRAVITY_AGENT);
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [ANTIGRAVITY_AGENT] } });
 
     await openAgentActions();
-    expect(screen.queryByTestId("agent-profile-settings")).toBeNull();
+    expect(screen.queryByTestId("agent-profile-settings")).not.toBeNull();
   });
 
   it("model settings saves primary model and effort atomically", async () => {
@@ -900,14 +902,18 @@ describe("Sidebar", () => {
     await fireEvent.click(screen.getByTestId("agent-profile-settings"));
 
     await screen.findByTestId("change-profile-primary-model");
-    expect(pickerHasOption("change-profile-primary-model", "")).toBe(true);
-    expect(pickerHasOption("change-profile-primary-effort", "")).toBe(true);
-    expect(screen.getByTestId("change-profile-primary-model-option-no-override")).toHaveTextContent(
-      "Default",
-    );
-    expect(
-      screen.getByTestId("change-profile-primary-effort-option-no-override"),
-    ).toHaveTextContent("Default");
+    // An attached agent arrives with no model/effort — "Attach existing" offers
+    // no pickers, so the profile is genuinely unset until someone edits it here.
+    // Opening the dialog must not silently pin a value: nothing is selected, and
+    // saving without touching a picker round-trips the nulls unchanged.
+    //
+    // There is deliberately no "Default" option to represent that state. It was
+    // removed as clutter on the common path; the backend rule it guarded — a
+    // null model with an explicit effort staying valid for Claude/Codex — is
+    // covered at `crates/core/src/project.rs`
+    // (`effort_without_a_model_stays_valid_where_the_harness_allows_it`).
+    expect(pickerHasOption("change-profile-primary-model", "")).toBe(false);
+    expect(pickerHasOption("change-profile-primary-effort", "")).toBe(false);
     expect(pickerValue("change-profile-primary-model")).toBe("");
     expect(pickerValue("change-profile-primary-effort")).toBe("");
     await fireEvent.click(screen.getByTestId("change-profile-secondary-toggle"));

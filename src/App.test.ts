@@ -789,14 +789,14 @@ describe("App", () => {
 
     // All four harnesses are installed, but Gemini is excluded from auto-seeding
     // (no longer on individual plans) → one agent each for Claude/Codex/
-    // Antigravity, named after the model+effort it'll run (Antigravity's
-    // harness-owned model falls back to the bare harness name), in HARNESSES
-    // order.
+    // Antigravity, named after the model+effort it'll run, in HARNESSES order.
+    // Antigravity used to fall back to the bare harness name because its model
+    // was harness-owned config; it now carries a selection like the others.
     await waitFor(() => expect(createAgentCalls()).toHaveLength(3));
     expect(createAgentCalls()).toEqual([
       { name: "opus-high", harness: "claude_code" },
       { name: "gpt-5-6-sol-high", harness: "codex" },
-      { name: "antigravity", harness: "antigravity" },
+      { name: "gemini-3-7-flash-high", harness: "antigravity" },
     ]);
     // Auto-seeded → the roster is populated, not the empty first-agent prompt.
     await waitFor(() => expect(screen.getAllByTestId("sidebar-agent")).toHaveLength(3));
@@ -835,10 +835,10 @@ describe("App", () => {
         secondaryEffort: undefined,
       },
       {
-        name: "antigravity",
+        name: "gemini-3-7-flash-high",
         harness: "antigravity",
-        model: undefined,
-        effort: undefined,
+        model: "gemini-3.7-flash",
+        effort: "high",
         secondaryModel: undefined,
         secondaryEffort: undefined,
       },

@@ -1,4 +1,4 @@
-.PHONY: dev build open run install-app uninstall-app debug-app uninstall-debug-app deploy test test-browser lint fmt check check-rust check-frontend clean install test-live test-live-claude test-live-codex test-live-gemini test-live-antigravity
+.PHONY: dev build open run install-app uninstall-app debug-app uninstall-debug-app deploy test test-browser lint fmt check check-rust check-frontend clean clean-stale install test-live test-live-claude test-live-codex test-live-gemini test-live-antigravity
 
 # Crates that carry live (`#[ignore]`-gated) harness tests.
 LIVE_PKGS := -p switchboard-harness -p switchboard-dispatcher -p switchboard-app
@@ -9,6 +9,13 @@ LIVE_PKGS := -p switchboard-harness -p switchboard-dispatcher -p switchboard-app
 install:
 	@node -e 'const m=Number(process.versions.node.split(".")[0]); if(m<22){console.error("Switchboard needs Node >= 22 (you have "+process.versions.node+"). Switch Node versions and retry.");process.exit(1)}'
 	pnpm install --frozen-lockfile
+
+# Incremental compilation is off for the whole-workspace targets below.
+# It exists to speed up rebuilding one changed crate; for a target that builds
+# everything it buys nothing and costs a great deal of disk (it grew to 26 GB
+# here before the 2026-08-25 cleanup). `make dev` deliberately does NOT set
+# this — the edit-rebuild loop is exactly the case incremental is for.
+NO_INCR := CARGO_INCREMENTAL=0
 
 DEFAULT_DEV_PORT := 1420
 DEV_PORT ?= $(DEFAULT_DEV_PORT)
@@ -95,7 +102,7 @@ deploy: build install-app
 	open /Applications/Switchboard.app
 
 test:
-	cargo test --workspace --all-features --locked
+	$(NO_INCR) cargo test --workspace --all-features --locked
 	pnpm test
 
 # Real-WebKit frontend tests (Vitest browser mode) for the layout-coupled slice
@@ -109,7 +116,7 @@ test-browser:
 
 lint:
 	cargo fmt --all -- --check
-	cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+	$(NO_INCR) cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 	pnpm lint
 	pnpm check
 	pnpm format:check
@@ -120,8 +127,8 @@ fmt:
 
 check-rust:
 	cargo fmt --all -- --check
-	cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-	cargo test --workspace --all-features --locked
+	$(NO_INCR) cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+	$(NO_INCR) cargo test --workspace --all-features --locked
 
 check-frontend:
 	pnpm install --frozen-lockfile
@@ -153,6 +160,23 @@ test-live-gemini:
 
 test-live-antigravity:
 	cargo test --locked $(LIVE_PKGS) antigravity -- --ignored
+
+# Delete build artifacts nothing has touched in a week, WITHOUT throwing away
+# the warm cache (unlike `clean`, which forces a full rebuild).
+#
+# Cargo never garbage-collects `target/` — it accumulates one set of artifacts
+# per crate/feature/target-kind combination, forever. Left alone it reached
+# 1,003,147 files / 249 GB here, at which point a no-op `cargo check` on the
+# smallest crate took 7.2s and `make check` stopped finishing at all: the cost
+# is a filesystem scan paid up front by every cargo invocation, before any
+# compilation. Run this when builds start feeling slow; it is safe at any time
+# (everything it deletes is regenerated from source).
+clean-stale:
+	@command -v cargo-sweep >/dev/null 2>&1 || { \
+		echo "cargo-sweep not installed. Run: cargo install cargo-sweep"; exit 1; }
+	@echo "target/ before: $$(du -sh target 2>/dev/null | cut -f1)"
+	cargo sweep --time 7
+	@echo "target/ after:  $$(du -sh target 2>/dev/null | cut -f1)"
 
 clean:
 	cargo clean

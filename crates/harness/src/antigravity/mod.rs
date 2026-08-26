@@ -4,49 +4,60 @@
 //! free / Google AI Pro / Ultra tiers. It is a Go-based client for a
 //! server-side agent, with a contract distinct from every other harness:
 //!
-//! - **No structured stream protocol.** `agy -p` writes the model's final
-//!   answer as plain text to stdout (a server-side "drip"), and `Error:` /
-//!   `Warning:` / `Authentication required` lines on failure. There is no
-//!   `--output-format stream-json`.
+//! - **Two channels, deliberately.** Since agy 1.1.8 `-p` accepts
+//!   `--output-format stream-json`, an NDJSON stream the adapter passes on
+//!   every dispatch. It is adopted as the **control** channel only — the
+//!   conversation id (`init`), tool failures (`step_update` `state:"ERROR"`),
+//!   and the terminal verdict (`result`). **Displayed content still comes from
+//!   the conversation transcript**, because the stream carries no reasoning
+//!   text (probed: `agent_response` events have `text_delta` and `usage`, no
+//!   `thinking`), and because live and hydrated views must reconstruct the same
+//!   text from the same source or they diverge on reopen. The pre-stream
+//!   detectors below remain beneath it as fallbacks: the two failure shapes
+//!   that cannot be probed without destroying developer state (auth, quota) are
+//!   exactly the ones not to cut over blind on, and `stream-json` is young —
+//!   1.1.18 was still fixing a dropped stream that reported a failed turn as a
+//!   clean success. Hence: a stream *failure* is authoritative, a stream
+//!   *success* only corroborates.
+//! - **The stream is the only witness to a failed tool call.** agy 1.1.19
+//!   writes **no transcript record at all** for a tool call rejected during
+//!   argument validation — the `step_index` sequence simply skips it. Without
+//!   the stream that tool stays pending forever and the next tool's result
+//!   FIFO-pairs onto it. Reopened history cannot recover these (the data is not
+//!   on disk); see the dangling-tool backstop in [`session_file`].
 //! - **One-shot process = one turn.** `agy -p` runs exactly one turn and
-//!   exits. Process exit — not a stream/transcript record — is the
-//!   authoritative turn terminator. `agy` exits 0 on essentially every
-//!   condition (success, empty prompt, unknown conversation, timeout,
-//!   auth failure), so the exit code is useless for outcome detection;
-//!   stdout text is the failure signal.
-//! - **Server-assigned conversation UUID.** The UUID is minted server-side.
-//!   `agy` records it in *this dispatch's* private `--log-file` (a line like
-//!   `… server.go:755] Created conversation <uuid>`), which is the primary,
-//!   deterministic capture source: read straight from our own log, it is the
-//!   conversation this exact invocation used — available in ~seconds
-//!   regardless of cold-start latency, and never cross-attributed from a
-//!   concurrent or background `agy` (each writes its own log). It is then
-//!   emitted as a `SessionLocatorCaptured` event and persisted by the
-//!   dispatcher onto the agent's registry record for resume / hydration. A
-//!   filesystem fallback (watch `brain/<uuid>/` for a dir whose
-//!   transcript echoes the prompt) covers the case where that Google-internal
-//!   log line ever moves — see [`capture_conversation_id`].
-//! - **Transcript-sourced content; stdout is a control channel.** All
-//!   displayed content — assistant text, `thinking`, and tool lifecycle
-//!   (`ToolStarted` / `ToolCompleted`) — comes from tailing the conversation's
-//!   the preferred full transcript (or compact fallback; see [`paths`]). stdout is **not** used for content:
-//!   on a resume turn `agy` replays the whole conversation's prior answers to
-//!   stdout, which would make each turn accumulate every earlier answer. The
-//!   transcript records one completed `PLANNER_RESPONSE` per turn and the
-//!   resume cursor isolates only the new turn's records, so it is the clean
-//!   per-turn source (and matches what hydration reconstructs from disk).
-//!   stdout is read only for control signals: the auth-failure fast-fail
-//!   below, `Error:` lines, and a "produced output" liveness signal (used to
-//!   tell output-without-a-readable-answer apart from no-output — *not* a
-//!   success signal; a turn is `Completed` only on a transcript terminal
-//!   answer).
+//!   exits. Process exit — not a stream/transcript record — remains the
+//!   authoritative turn terminator. Exit codes became meaningful in the 1.1.x
+//!   line (timeout and empty prompt exit 1; a prompt that is exactly a flag
+//!   token exits 2), but outcome classification stays **signal-based** rather
+//!   than gating on them: the full exit-code map is unprobed, and the stream
+//!   plus stderr signals are sufficient.
+//! - **Server-assigned conversation UUID.** The UUID is minted server-side and
+//!   read from the stream's `init` event, which carries it on every turn
+//!   including resumes. Two fallbacks survive beneath that, in order: this
+//!   dispatch's private `--log-file` (a `… Created conversation <uuid>` line —
+//!   a Google-internal debug string, so it is no longer trusted as primary),
+//!   then a filesystem watch correlating `brain/<uuid>/` by prompt. Whichever
+//!   binds is emitted as `SessionLocatorCaptured` and persisted by the
+//!   dispatcher onto the agent's registry record.
+//! - **Transcript-sourced content; stdout carries both channels.** Assistant
+//!   text, `thinking`, and tool lifecycle come from tailing the conversation's
+//!   preferred full transcript (or compact fallback; see [`paths`]). Raw stdout
+//!   text is **not** displayed: on a resume `agy` replays the whole
+//!   conversation's prior answers there, which would make each turn accumulate
+//!   every earlier one. (The *stream* has no such problem — probed: a resume
+//!   emits only the new turn's steps.) Non-stream stdout lines still feed the
+//!   pre-stream control signals: the auth fast-fail below, `Error:` lines, and
+//!   a "produced output" liveness signal — *not* a success signal, since a turn
+//!   is `Completed` only on a transcript terminal answer.
 //! - **Auth fast-fail.** When the keyring token is stale, `agy -p` falls
 //!   back to interactive OAuth: it prints `Authentication required...`,
 //!   opens a browser, and blocks ~30s before timing out. There is no flag
-//!   to suppress this. The adapter detects the `Authentication required`
-//!   stdout line, force-kills immediately, and emits `AuthFailure` —
-//!   bounding the hang. (The browser tab cannot be prevented; documented as
-//!   a known limitation.)
+//!   to suppress this. The adapter watches **both stdout and stderr** for that
+//!   line (1.1.x moved its diagnostics to stderr; whether the auth line moved
+//!   with them is unverified, so both are watched), force-kills immediately,
+//!   and emits `AuthFailure` — bounding the hang. (The browser tab cannot be
+//!   prevented; documented as a known limitation.)
 //!
 //! Ground-truth reference: `docs/research/archive/antigravity-cli-observed.md`.
 
@@ -56,6 +67,7 @@ pub mod parser;
 pub mod paths;
 pub mod session_file;
 pub mod skills;
+mod stream;
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -234,7 +246,7 @@ impl HarnessAdapter for AntigravityAdapter {
             .and_then(SessionLocator::as_uuid);
 
         let log_file_path = build_log_file_path(turn_id);
-        let args = build_args(prompt, cwd, resume_id, &log_file_path);
+        let args = build_args(agent, prompt, cwd, resume_id, &log_file_path);
 
         let mut command = tokio::process::Command::new(&binary);
         command
@@ -325,13 +337,56 @@ fn resolve_home_dir(override_path: Option<&Path>) -> PathBuf {
 /// scan (and the conversation-id capture) read only this turn's output — never
 /// another concurrent `agy`'s log.
 ///
-/// No per-agent model or effort flag: Antigravity's model is harness-owned
-/// global config (set inside Antigravity, off-limits to us) and its effort is
-/// folded into that model's display name — there is no `agy` flag for either.
-/// An Antigravity agent therefore never carries a model/effort (registration
-/// forbids it), so this takes no `&AgentRecord` and emits neither flag.
-fn build_args(prompt: &str, cwd: &Path, resume_id: Option<Uuid>, log_file: &Path) -> Vec<String> {
-    let mut args = vec!["-p".to_owned(), prompt.to_owned()];
+/// `--output-format stream-json` turns on the structured control channel
+/// (agy 1.1.8). It does **not** displace the transcript as the content source
+/// — see the module doc for that split. What it adds is three things the
+/// transcript cannot supply: the conversation id as a contractual field rather
+/// than a scraped Google-internal log line, the terminal outcome with its own
+/// error message, and — the reason it is load-bearing — tool failures, which
+/// agy 1.1.19 omits from the transcript entirely.
+///
+/// `--disable-slash-commands` keeps a slash-leading message a *message*. Print
+/// mode grew local slash-command handling (agy 1.1.9–1.1.12): a recognized
+/// command is answered by the CLI itself without ever reaching the model —
+/// `-p "/model"` prints a tab-separated row, spends no quota, and **creates no
+/// conversation** (so the adapter has nothing to capture and the turn fails),
+/// while an interactive-only one such as `-p "/clear"` exits 2. Unrecognized
+/// commands and path-shaped text (`/tmp/...`) already fall through to the
+/// model. A Switchboard send always targets the model, so we opt out wholesale.
+/// Same tradeoff Claude takes (see `harness-behavior.md` §0): the harness's own
+/// slash commands and skills are deliberately unreachable through the ordinary
+/// composer, and would need an explicit command action to expose.
+///
+/// `--model` / `--effort` carry the agent's profile, sent on **every** dispatch
+/// including resumes — probe-confirmed to override a conversation's prior model
+/// mid-session while keeping its context, so one uniform per-turn path beats a
+/// change-only special case (the same decision the other harnesses took, see
+/// `harness-behavior.md` §3.3).
+///
+/// Both were unavailable until `agy` 1.1.x: `--model` now dispatches headlessly
+/// *without* mutating Antigravity's own global `settings.json`, which was the
+/// objection that ruled it out.
+///
+/// **`--effort` is never sent without `--model`.** Which levels are valid is a
+/// property of the model — `agy` offers none at all with no model selected — so
+/// an effort alone cannot be dispatched. The persistence boundary already
+/// refuses to store that combination (`CoreError::EffortWithoutModel`); this
+/// guard means even a record that reached us some other way cannot produce an
+/// invocation the CLI would reject. The mirror case, a model whose axis
+/// *requires* an effort, is deliberately left to `agy`: it rejects that
+/// pre-dispatch, quota-free, naming the valid levels, and duplicating its model
+/// catalog here to pre-empt that would give the catalog two sources of truth.
+fn build_args(
+    agent: &AgentRecord,
+    prompt: &str,
+    cwd: &Path,
+    resume_id: Option<Uuid>,
+    log_file: &Path,
+) -> Vec<String> {
+    let mut args = vec!["-p".to_owned(), transport_prompt(prompt)];
+    args.push("--output-format".to_owned());
+    args.push("stream-json".to_owned());
+    args.push("--disable-slash-commands".to_owned());
     args.push("--add-dir".to_owned());
     args.push(cwd.to_string_lossy().into_owned());
     if let Some(uuid) = resume_id {
@@ -343,7 +398,101 @@ fn build_args(prompt: &str, cwd: &Path, resume_id: Option<Uuid>, log_file: &Path
     args.push(PRINT_TIMEOUT.to_owned());
     args.push("--log-file".to_owned());
     args.push(log_file.to_string_lossy().into_owned());
+    if let Some(model) = agent.model.as_deref().filter(|m| !m.trim().is_empty()) {
+        args.push("--model".to_owned());
+        args.push(model.to_owned());
+        if let Some(effort) = agent.effort.as_deref().filter(|e| !e.trim().is_empty()) {
+            args.push("--effort".to_owned());
+            args.push(effort.to_owned());
+        }
+    }
     args
+}
+
+/// Control signals recorded from `agy`'s stderr **as each line is drained**.
+///
+/// `agy` 1.1.x moved its diagnostics from stdout to stderr, so stderr now
+/// carries two things the turn's outcome depends on: the `Authentication
+/// required…` line (which must force-kill the process before its ~30s OAuth
+/// block) and the `Error:` line naming the real failure. Neither may be read
+/// back from the bounded stderr *tail*: that buffer is capped at
+/// [`crate::subprocess::STDERR_TAIL_CAPACITY`] and front-evicts, so a chatty
+/// burst after either line would drop it permanently — reinstating exactly the
+/// hang and the message-loss this adapter exists to prevent. Because the real
+/// 1.1.19 auth-failure output cannot be probed without logging the developer
+/// out, there is no evidence bounding how much `agy` prints around it, so
+/// "observed stderr is quiet" is an absence of counter-evidence, not a safety
+/// argument.
+///
+/// Both signals are therefore **sticky**: set once when first seen, never
+/// recomputed. The tail keeps its original job — the human-readable fallback
+/// message when nothing matched.
+#[derive(Default)]
+struct StderrSignals {
+    /// Set when any drained line matches [`is_auth_failure_line`]. Read on the
+    /// producer's poll tick to force-kill, and again post-exit as a backstop.
+    auth_failed: std::sync::atomic::AtomicBool,
+    /// First `Error:` line seen, kept for terminal classification.
+    first_error: Mutex<Option<String>>,
+}
+
+impl StderrSignals {
+    /// Per-line observer handed to the stderr drain. Runs on the drain task.
+    fn observe(&self, line: &str) {
+        if is_auth_failure_line(line) {
+            self.auth_failed
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        let trimmed = line.trim();
+        if trimmed.starts_with("Error:")
+            && let Ok(mut slot) = self.first_error.lock()
+            && slot.is_none()
+        {
+            *slot = Some(trimmed.to_owned());
+        }
+    }
+
+    fn auth_failed(&self) -> bool {
+        self.auth_failed.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// A poisoned lock yields no line rather than propagating — stderr is a
+    /// diagnostic channel and must never itself be what fails a turn.
+    fn first_error(&self) -> Option<String> {
+        self.first_error.lock().ok().and_then(|slot| slot.clone())
+    }
+}
+
+/// The exact text handed to `agy -p` for a given dispatch prompt.
+///
+/// `agy` 1.1.18 started rejecting a prompt whose value is *exactly* a known
+/// flag token — `-p "--sandbox"` (also `--model`, `--add-dir`, `-p`, `-c`, …)
+/// exits 2 with `Error: -p took "--sandbox" as its prompt…` before any model
+/// call. Anything else passes through: `--notaflag` and `--sandbox looks like
+/// a flag` both reach the model, and the attached `-p=<value>` form does *not*
+/// help (the check is on the value, not the parse). A single leading ASCII
+/// space clears it without changing the message's meaning.
+///
+/// The guard is deliberately wider than the upstream rule — every `-` leading
+/// prompt, not just exact flag tokens — because reproducing "is this one of
+/// agy's flags" would mean maintaining a copy of agy's flag list that silently
+/// rots on each CLI bump. A leading space is inert for ordinary dash-leading
+/// text (a markdown bullet), so over-applying costs nothing.
+///
+/// **Why this can stay private, unlike Claude's `claude_transport_prompt`.**
+/// Claude's session file records the dispatched text verbatim, so its journal
+/// correlation has to re-derive the transport form. Antigravity's readers all
+/// go through [`user_request_body`], which **trims** — and the correlation
+/// needle is trimmed too — so the space cancels on both sides of every
+/// comparison: `transcript_echoes_prompt` (the capture fallback) and the
+/// journaled-send merge, which reads `Turn::User` text from the same trimmed
+/// extraction. Nothing outside this module can observe the difference.
+fn transport_prompt(prompt: &str) -> String {
+    if prompt.starts_with('-') {
+        format!(" {prompt}")
+    } else {
+        prompt.to_owned()
+    }
 }
 
 /// Per-dispatch CLI log path under the system temp dir. `turn_id` is unique
@@ -413,13 +562,18 @@ async fn run_producer(ctx: ProducerCtx) {
     let stderr_tail: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::with_capacity(
         crate::subprocess::STDERR_TAIL_CAPACITY,
     )));
-    let stderr_task = tokio::spawn(crate::subprocess::drain_stderr(
-        stderr,
-        agent_id,
-        turn_id,
-        Arc::clone(&stderr_tail),
-        "antigravity",
-    ));
+    let stderr_signals = Arc::new(StderrSignals::default());
+    let stderr_task = tokio::spawn({
+        let signals = Arc::clone(&stderr_signals);
+        crate::subprocess::drain_stderr_with_observer(
+            stderr,
+            agent_id,
+            turn_id,
+            Arc::clone(&stderr_tail),
+            "antigravity",
+            move |line| signals.observe(line),
+        )
+    });
 
     let is_resume = resume_id.is_some();
     // A plain resume re-emits nothing: the locator already lives on the registry
@@ -444,7 +598,8 @@ async fn run_producer(ctx: ProducerCtx) {
     // live `TurnEnd.model` matches the hydrator (Antigravity re-announces only
     // on change). This dispatch's drain overwrites it last-wins if this turn
     // announces a new model.
-    let mut model: Option<String> = if is_resume {
+    // Announced model plus, where the display name carries one, its effort.
+    let mut model: Option<(String, Option<String>)> = if is_resume {
         transcript_path
             .as_deref()
             .and_then(|p| seed_carry_forward_model(p, cursor))
@@ -453,6 +608,15 @@ async fn run_producer(ctx: ProducerCtx) {
     };
     let mut saw_terminal_answer = false;
     let mut saw_stdout_content = false;
+    // Conversation id most recently announced by the stream's `init` event.
+    // Distinct from `conversation_id`: on a resume that one is already set from
+    // the registry locator, while this records what `agy` actually reported —
+    // the two differing is a fork signal.
+    let mut stream_conversation_id: Option<Uuid> = None;
+    // Terminal payload from the stream, when one arrived. Absent for a run
+    // that died before emitting `result`, which falls through to the
+    // pre-stream classification chain unchanged.
+    let mut stream_result: Option<stream::StreamResult> = None;
     let mut auth_failed = false;
     let mut ambiguous_capture = false;
     // Set post-loop when a required (re)capture could not locate the
@@ -478,8 +642,76 @@ async fn run_producer(ctx: ProducerCtx) {
                         if is_auth_failure_line(&line) {
                             // Fast-fail: the OAuth fallback is mid-flight (browser
                             // open, ~30s block ahead). Stop now and force-kill.
+                            // The same check runs against stderr on the poll tick
+                            // below — `agy` 1.1.x moved its diagnostics to stderr
+                            // and whether the auth line moved with them is
+                            // unverified (see the tick arm).
                             auth_failed = true;
                             break;
+                        }
+                        // Stream-json first; anything that is not a stream
+                        // line falls through to the plain-text handlers below.
+                        // That fallthrough is deliberate rather than vestigial:
+                        // whether `agy` still prints its auth line and bare
+                        // `Error:` lines alongside the stream is unverified
+                        // (reproducing the auth shape needs a logged-out CLI),
+                        // so the pre-stream signals stay wired.
+                        if let Some(event) = stream::parse_line(&line) {
+                            // Any parsed stream line proves the process is
+                            // producing structured output — the liveness
+                            // signal `classify_outcome` uses to tell
+                            // output-without-a-readable-answer from silence.
+                            saw_stdout_content = true;
+                            match event {
+                                stream::StreamEvent::Init { conversation_id: id } => {
+                                    // Primary capture. Contractual and
+                                    // immediate, where the log-line scrape is
+                                    // a Google-internal debug string; that and
+                                    // the filesystem watch remain as fallbacks
+                                    // if this ever stops arriving.
+                                    //
+                                    // A capture event is emitted **once**: on a
+                                    // resume the id is already known, and
+                                    // re-announcing it would read as a fork to
+                                    // the dispatcher sink. The id is still kept
+                                    // as a fork candidate — if a resume's
+                                    // conversation expired server-side, `agy`
+                                    // mints a fresh one, and this is the most
+                                    // direct evidence of the replacement.
+                                    // Whether a forked resume's `init` actually
+                                    // reports the *new* id is **unprobed**
+                                    // (forcing one needs a server-expired
+                                    // conversation), so the fork-heal path
+                                    // below only prefers this when it differs
+                                    // and otherwise falls through to the
+                                    // pre-existing log/filesystem correlation
+                                    // unchanged. Defensive, never depended on.
+                                    stream_conversation_id = Some(id);
+                                    if conversation_id.is_none() {
+                                        conversation_id = Some(id);
+                                        transcript_path =
+                                            Some(paths::preferred_transcript_path(&home_dir, id));
+                                        cursor = 0;
+                                        emit_locator_captured(&tx, id);
+                                    }
+                                }
+                                stream::StreamEvent::ToolFailed { step_index, message } => {
+                                    // The one signal with no transcript
+                                    // equivalent (agy 1.1.19 writes no record
+                                    // for a rejected tool call). Recorded, not
+                                    // paired: which tool it belongs to cannot
+                                    // be known until the transcript has caught
+                                    // up, so resolution happens at the final
+                                    // drain below.
+                                    parser_state
+                                        .record_stream_tool_failure(step_index, message);
+                                }
+                                stream::StreamEvent::Result(result) => {
+                                    stream_result = Some(result);
+                                }
+                                stream::StreamEvent::Ignored => {}
+                            }
+                            continue;
                         }
                         let trimmed = line.trim();
                         if trimmed.starts_with("Error:") || trimmed.starts_with("Warning:") {
@@ -503,6 +735,25 @@ async fn run_producer(ctx: ProducerCtx) {
                 }
             }
             _ = poll.tick() => {
+                // Mid-run auth watch on **stderr**, mirroring the stdout arm
+                // above. `agy` 1.1.x moved its diagnostics from stdout to
+                // stderr; whether the `Authentication required…` line moved
+                // with them is **unverified** — reproducing it requires
+                // logging the developer out, and the probe that attempted it
+                // disrupted a live session, so it was abandoned rather than
+                // retried. Watching both streams makes the answer moot: if the
+                // line still lands on stdout the arm above fires first, and if
+                // it moved here this bounds the ~30s OAuth block instead of
+                // letting the turn hang.
+                //
+                // The flag is set by the drain task the moment the line is
+                // read, so unlike a scan of the bounded tail it cannot be lost
+                // to eviction (see `StderrSignals`). The only cost is up to one
+                // poll interval of latency, against a 30s hang.
+                if !auth_failed && stderr_signals.auth_failed() {
+                    auth_failed = true;
+                    break;
+                }
                 if conversation_id.is_none() {
                     match capture_conversation_id(&log_file_path, &home_dir, spawn_time, &prompt) {
                         CaptureOutcome::Bound(uuid) => {
@@ -639,7 +890,27 @@ async fn run_producer(ctx: ProducerCtx) {
     // event the wire vocabulary doesn't have — out of scope here. The turn
     // still completed (a real answer streamed), so it is not failed.
     let resume_forked = is_resume && conversation_not_found(&stdout_buf, &stderr_tail);
-    if conversation_id.is_none() || resume_forked {
+    // On a confirmed fork, prefer the id the control stream itself reported
+    // when it differs from the one we resumed — that is a direct statement of
+    // the replacement, where the fallbacks below infer it from a
+    // Google-internal log string or by matching prompt text against
+    // directories. Falls through untouched when the stream said nothing, or
+    // echoed the id we passed (the unprobed case).
+    let streamed_fork = resume_forked
+        .then_some(stream_conversation_id)
+        .flatten()
+        .filter(|id| Some(*id) != resume_id);
+    if let Some(uuid) = streamed_fork {
+        tracing::warn!(
+            %turn_id, agent_id = %agent_id, new_conversation = %uuid,
+            "antigravity: resumed conversation no longer exists server-side; agy forked a \
+             fresh conversation (id from the control stream). Healing the registry locator \
+             to the new id; this turn's prior context was lost."
+        );
+        transcript_path = Some(paths::preferred_transcript_path(&home_dir, uuid));
+        cursor = 0;
+        emit_locator_captured(&tx, uuid);
+    } else if conversation_id.is_none() || resume_forked {
         match capture_conversation_id(&log_file_path, &home_dir, spawn_time, &prompt) {
             CaptureOutcome::Bound(uuid) => {
                 if resume_forked {
@@ -723,6 +994,31 @@ async fn run_producer(ctx: ProducerCtx) {
             }
         }
     }
+    // Final drain complete: the process has exited and the transcript is fully
+    // flushed, so anything still pending has no result and did not succeed.
+    // This is the only point where attributing the stream's tool failures is
+    // sound — see `AntigravityParserState::close_pending_tools` for why nothing
+    // is paired earlier. Emitting here means a failed tool flips from running
+    // to failed at turn end rather than mid-turn; that latency is the price of
+    // never showing the failure on the wrong tool.
+    let (closed, unattributed) = parser_state.close_pending_tools(turn_id);
+    for event in closed {
+        let _ = tx.send(event);
+    }
+    if !unattributed.is_empty() {
+        // Ambiguous attribution: the tools are still closed as failed above
+        // (no spinner survives), but their harness messages could not be tied
+        // to a specific call, so they are surfaced here rather than guessed
+        // onto one.
+        tracing::warn!(
+            %turn_id,
+            agent_id = %agent_id,
+            messages = ?unattributed,
+            "antigravity: stream reported tool failures that could not be attributed to a \
+             specific tool call; affected tools closed as failed with authored copy"
+        );
+    }
+
     let unmatched_tool_result_steps = parser_state.unmatched_tool_result_steps();
     if !unmatched_tool_result_steps.is_empty() {
         tracing::warn!(
@@ -758,6 +1054,9 @@ async fn run_producer(ctx: ProducerCtx) {
             log_error,
         },
         &stdout_buf,
+        stream_result.as_ref(),
+        stderr_signals.auth_failed(),
+        stderr_signals.first_error(),
         &stderr_tail,
     );
     let _ = tx.send(AdapterEvent::TurnEnd {
@@ -770,13 +1069,15 @@ async fn run_producer(ctx: ProducerCtx) {
         stable_message_id: None,
         first_message_id: None,
         spend: None,
-        // Per-turn model: this dispatch's announcement if any, else the
-        // carry-forward seeded from prior turns on resume — so an unchanged
+        // Per-turn model and effort: this dispatch's announcement if any, else
+        // the carry-forward seeded from prior turns on resume — so an unchanged
         // resume's footer matches the hydrator live, not only on reopen. `None`
-        // only when no announcement has ever appeared (a truncated attach). The
-        // model name embeds the effort tier, so there's no separate effort axis.
-        model: model.clone(),
-        effort: None,
+        // only when no announcement has ever appeared (a truncated attach).
+        // Antigravity announces the two as one display name; the effort is
+        // split off only when the parenthetical names a real level, since for
+        // several models it is part of the name (see `split_announced_model`).
+        model: model.as_ref().map(|(name, _)| name.clone()),
+        effort: model.as_ref().and_then(|(_, effort)| effort.clone()),
     });
 
     // Post-terminal SessionMeta (mirrors Codex's enrichment ordering: flows
@@ -787,7 +1088,7 @@ async fn run_producer(ctx: ProducerCtx) {
     // loaded at dispatch time.
     let _ = tx.send(AdapterEvent::SessionMeta {
         agent_id,
-        model: model.unwrap_or_default(),
+        model: model.map(|(name, _)| name).unwrap_or_default(),
         harness_version,
         tools: Vec::new(),
         mcp_servers,
@@ -805,7 +1106,7 @@ fn drain_transcript(
     turn_id: TurnId,
     parser_state: &mut AntigravityParserState,
     saw_terminal_answer: &mut bool,
-    model: &mut Option<String>,
+    model: &mut Option<(String, Option<String>)>,
     tx: &tokio::sync::mpsc::UnboundedSender<AdapterEvent>,
 ) {
     let full_transcript = paths::is_full_transcript_path(path);
@@ -817,8 +1118,8 @@ fn drain_transcript(
         }
         // Last-wins: a new announcement this turn overwrites the resume seed
         // (and any earlier announcement in the same drain).
-        if let Some(m) = extract_model_from_record(rec) {
-            *model = Some(m);
+        if let Some(announced) = extract_model_from_record(rec) {
+            *model = Some(announced);
         }
         let events = if full_transcript {
             record_to_live_events_with_encoding(
@@ -1098,7 +1399,7 @@ fn read_records_past_cursor(path: &Path, cursor: usize) -> (Vec<TranscriptRecord
 /// `None` when no prior announcement exists (e.g. a truncated attach) — which
 /// already matches the hydrator. This dispatch's own drain overwrites it
 /// last-wins if a new announcement appears this turn.
-fn seed_carry_forward_model(path: &Path, cursor: usize) -> Option<String> {
+fn seed_carry_forward_model(path: &Path, cursor: usize) -> Option<(String, Option<String>)> {
     let content = std::fs::read_to_string(path).ok()?;
     let complete = &content[..=content.rfind('\n')?];
     let mut model = None;
@@ -1107,9 +1408,9 @@ fn seed_carry_forward_model(path: &Path, cursor: usize) -> Option<String> {
             continue;
         }
         if let Ok(rec) = serde_json::from_str::<TranscriptRecord>(line)
-            && let Some(m) = extract_model_from_record(&rec)
+            && let Some(announced) = extract_model_from_record(&rec)
         {
-            model = Some(m);
+            model = Some(announced);
         }
     }
     model
@@ -1128,24 +1429,54 @@ fn seed_carry_forward_model(path: &Path, cursor: usize) -> Option<String> {
 /// to any rewording/localization of that sentence; it degrades to `None`
 /// (display-only, no dispatch impact). Prefer a structured source if one
 /// ever surfaces.
-fn extract_model_from_record(rec: &TranscriptRecord) -> Option<String> {
+fn extract_model_from_record(rec: &TranscriptRecord) -> Option<(String, Option<String>)> {
     if rec.record_type != "USER_INPUT" {
         return None;
     }
     let content = rec.content.as_deref()?;
     let after = content.split("Model Selection` from ").nth(1)?;
     let to = after.split(" to ").nth(1)?;
-    // Trim, in order: the " (tier)" parenthetical, a trailing newline, and
-    // the sentence boundary. Splitting on ". " (period+space) — not bare
-    // "." — keeps version numbers like "3.5" intact.
-    let raw = to.split(" (").next().unwrap_or(to);
-    let raw = raw.split('\n').next().unwrap_or(raw);
+    // Trim, in order: a trailing newline, the closing envelope tag, and the
+    // sentence boundary. Splitting on ". " (period+space) — not bare "." —
+    // keeps version numbers like "3.5" intact.
+    //
+    // The envelope tag is cut explicitly. It used to fall out for free from a
+    // `split(" (")` that discarded everything after the parenthetical; now that
+    // the parenthetical is parsed rather than dropped, nothing else would strip
+    // a `(High).</USER_SETTINGS_CHANGE>` tail.
+    let raw = to.split('\n').next().unwrap_or(to);
+    let raw = raw.split("</USER_SETTINGS_CHANGE>").next().unwrap_or(raw);
     let raw = raw.split(". ").next().unwrap_or(raw);
     let raw = raw.trim().trim_end_matches('.').trim();
     if raw.is_empty() || raw.eq_ignore_ascii_case("None") {
-        None
+        return None;
+    }
+    Some(split_announced_model(raw))
+}
+
+/// Split an announced display name into its model and, where the parenthetical
+/// names one, its effort level.
+///
+/// Antigravity announces `Gemini 3.1 Pro (High)` — model and effort in one
+/// string. Only a parenthetical that maps to a real level is split off; every
+/// other one stays part of the name, because for several models it *is* the
+/// name (`Claude Sonnet 4.6 (Thinking)`, `GPT-OSS 120B (Medium)` — those have
+/// no effort axis and `agy` rejects `--effort` for them). An earlier version
+/// stripped every parenthetical unconditionally, which both discarded the
+/// effort and mangled those names.
+fn split_announced_model(display: &str) -> (String, Option<String>) {
+    const LEVELS: [&str; 3] = ["low", "medium", "high"];
+    let Some((name, tail)) = display.rsplit_once(" (") else {
+        return (display.to_owned(), None);
+    };
+    let Some(inner) = tail.strip_suffix(')') else {
+        return (display.to_owned(), None);
+    };
+    let level = inner.trim().to_ascii_lowercase();
+    if LEVELS.contains(&level.as_str()) {
+        (name.trim().to_owned(), Some(level))
     } else {
-        Some(raw.to_owned())
+        (display.to_owned(), None)
     }
 }
 
@@ -1346,9 +1677,24 @@ fn extract_rpc_descriptive_tail(detail: &str) -> String {
 /// Stale-resume (conversation-not-found) is intentionally **not** a failure
 /// here — the producer heals it (recaptures the forked conversation, whose
 /// transcript carries the terminal answer) and the turn completes.
+///
+/// `stream_result` is the terminal `result` event when `agy` emitted one. It
+/// is the most direct statement of what happened, so a failure there wins over
+/// the older text-scraped signals — but a *success* there only corroborates:
+/// `Completed` still requires a terminal answer in the transcript, because the
+/// transcript is what the UI renders and agy 1.1.18's own changelog records a
+/// dropped stream once reporting a failed turn as a clean success.
+///
+/// `stderr_auth` / `stderr_error` are the signals [`StderrSignals`] recorded as
+/// stderr was drained; they are passed in rather than re-derived from
+/// `stderr_tail` because that tail evicts. The tail itself is used only for the
+/// human-readable fallback message when nothing above matched.
 fn classify_outcome(
     sig: &OutcomeSignals,
     stdout_lines: &[String],
+    stream_result: Option<&stream::StreamResult>,
+    stderr_auth: bool,
+    stderr_error: Option<String>,
     stderr_tail: &Mutex<VecDeque<String>>,
 ) -> TurnOutcome {
     if sig.auth_failed {
@@ -1366,20 +1712,106 @@ fn classify_outcome(
     // Note: persisting the captured locator is now the dispatcher sink's job;
     // a persist failure fails the turn there, not here. The adapter only
     // classifies what it observed about the `agy` run itself.
-    // A concrete `Error:` line is the real root cause and must win over the
-    // generic "unresumable" classification below — e.g. a first turn that
-    // timed out and so never created a conversation dir should surface the
-    // timeout, not "conversation could not be located."
-    if let Some(error) = first_error_line(stdout_lines) {
-        let (kind, message) = if is_auth_failure_line(&error) {
+    //
+    // **The single auth surface in this function.** Every auth-flavored line,
+    // on either stream, resolves here — the line need not be `Error:`-prefixed
+    // (`Authentication required…` is not), so it is checked before, and
+    // separately from, the error scan below.
+    //
+    // The producer normally fast-fails mid-run and sets `sig.auth_failed`
+    // above; this covers `agy` exiting before that was observed. In practice
+    // the stdout half is unreachable — the producer's stdout arm matches the
+    // same predicate synchronously per line and breaks *before* the
+    // `Error:`/`Warning:` filter that populates `stdout_lines`, so an auth line
+    // can never reach this slice. It is scanned anyway so this pure function's
+    // contract is self-contained ("an auth line in either input is an auth
+    // failure") instead of silently depending on a filter ordering maintained
+    // in the producer's `select!` loop, which a later edit there could change
+    // without anything here noticing.
+    if stderr_auth || stdout_lines.iter().any(|line| is_auth_failure_line(line)) {
+        return TurnOutcome::Failed {
+            kind: FailureKind::AuthFailure,
+            message: ANTIGRAVITY_AUTH_MESSAGE.to_owned(),
+        };
+    }
+    // The stream's own terminal verdict, when it failed. This is the most
+    // direct statement available of why the turn ended, so it outranks the
+    // text-scraped `Error:` lines below — those are the pre-stream signals and
+    // now serve older `agy` builds and runs that died before emitting
+    // `result`. Auth-shaped text still routes to the authored auth message,
+    // keeping the "one auth surface" property above intact.
+    //
+    // Only a *failure* is consumed here. A `SUCCESS` result deliberately falls
+    // through to the transcript-terminal-answer requirement below: the
+    // transcript is what the UI renders, and agy 1.1.18 shipped a fix for a
+    // dropped stream reporting a failed turn as a clean success — so a stream
+    // that says "fine" is corroboration, never a substitute.
+    //
+    // **Gated on the turn having produced no answer.** Live-probed @ 1.1.19:
+    // `agy` taints the whole turn's `result.status` with `ERROR` when a single
+    // tool call is rejected, even though the model recovered and answered —
+    // e.g. a `view_file` on a missing path yields
+    // `status:"ERROR"` + `… invalid tool call error (invalid_args) failed to
+    // read file …` on a turn whose transcript carries a normal answer. Failing
+    // on that would mark every recovered tool failure as a failed turn, which
+    // is ordinary agentic behavior, and the failure is already surfaced
+    // precisely — as a failed *tool* row, from the same stream. So a terminal
+    // answer wins: same shape as Gemini's streamed-then-error rescue (G17),
+    // and it leaves the no-answer cases (timeout, hard failure) failing as
+    // they should. Residual risk mirrors G17's: a turn that genuinely failed
+    // *after* answering renders as success.
+    if let Some(result) = stream_result
+        && !result.succeeded
+        && !sig.saw_terminal_answer
+        && let Some(error) = result.error.as_deref()
+    {
+        let (kind, message) = if is_auth_failure_line(error) {
             (
                 FailureKind::AuthFailure,
                 ANTIGRAVITY_AUTH_MESSAGE.to_owned(),
             )
         } else {
-            (FailureKind::HarnessError, error)
+            (FailureKind::HarnessError, error.to_owned())
         };
         return TurnOutcome::Failed { kind, message };
+    }
+    // A concrete `Error:` line is the real root cause and must win over the
+    // generic "unresumable" classification below — e.g. a first turn that
+    // timed out and so never created a conversation dir should surface the
+    // timeout, not "conversation could not be located."
+    //
+    // **Both streams are considered.** `agy` 1.1.x moved its `Error:` lines
+    // from stdout to stderr (probed @ 1.1.19: the print-timeout error is now
+    // `Error: timeout waiting for response` on stderr with exit 1, where it
+    // used to be `Error: timed out waiting for response` on stdout with exit
+    // 0). stdout wins to preserve the previous precedence and keep older `agy`
+    // builds working; the stderr line — captured as it was drained, not
+    // rescanned from the evicting tail — restores the real `HarnessError`
+    // message on current ones. Without it a timeout degrades to the generic
+    // "exited without producing an answer" `AdapterFailure` below.
+    //
+    // **Deliberately not gated on `saw_terminal_answer`, unlike the stream
+    // branch above.** That gate exists because agy taints a whole turn's
+    // `result.status` when one tool call is rejected. This branch is left
+    // ungated because the text channel is not known to carry that failure mode
+    // at all: before the stream was adopted, this exact scenario — tool
+    // rejected, model recovers and answers — classified as `Completed` through
+    // this very code, with the only symptom a stuck tool row. That is only
+    // possible if neither scan found anything, which is observation, not
+    // inference. It is **not** a claim that a text `Error:` line and a stream
+    // `result.ERROR` mean the same thing in general; if a rejected tool ever
+    // does print here, this branch needs the same gate.
+    //
+    // No auth re-check here: the branch above already returned for any
+    // auth-flavored line, on either stream, so anything reaching this point is
+    // a genuine harness error. (An `is_auth_failure_line` test used to sit
+    // here; it was unreachable even before stderr was consulted, because
+    // `stdout_lines` cannot contain an auth line — see above.)
+    if let Some(error) = first_error_line(stdout_lines).or(stderr_error) {
+        return TurnOutcome::Failed {
+            kind: FailureKind::HarnessError,
+            message: error,
+        };
     }
     // Log-derived RPC error: the only place `RESOURCE_EXHAUSTED` / network
     // failures surface (stdout/stderr stay empty and `agy` exits 0). Wins
@@ -1438,7 +1870,7 @@ mod tests {
         turn_id: TurnId,
         parser_state: AntigravityParserState,
         saw_terminal_answer: bool,
-        model: Option<String>,
+        model: Option<(String, Option<String>)>,
         tx: tokio::sync::mpsc::UnboundedSender<AdapterEvent>,
         rx: tokio::sync::mpsc::UnboundedReceiver<AdapterEvent>,
     }
@@ -1533,7 +1965,7 @@ mod tests {
         let cursor = paths::complete_line_count(&path);
         assert_eq!(
             seed_carry_forward_model(&path, cursor),
-            Some("Gemini 3.1 Pro".to_owned())
+            Some(("Gemini 3.1 Pro".to_owned(), Some("high".to_owned())))
         );
     }
 
@@ -1551,9 +1983,52 @@ mod tests {
     }
 
     #[test]
+    fn build_args_disables_slash_commands_so_a_slash_message_reaches_the_model() {
+        // agy print mode answers its own slash commands locally: `/model`
+        // prints a TSV row and creates no conversation, `/clear` exits 2.
+        // Switchboard sends always target the model, so the flag is
+        // unconditional — not gated on the prompt's first character.
+        let log = PathBuf::from("/tmp/x.log");
+        for prompt in ["/model", "/clear", "plain message"] {
+            let args = build_args(&bare_agent(), prompt, Path::new("/work/proj"), None, &log);
+            assert!(
+                args.contains(&"--disable-slash-commands".to_owned()),
+                "{args:?}"
+            );
+            assert_eq!(args[1], prompt, "slash text is passed through verbatim");
+        }
+    }
+
+    #[test]
+    fn build_args_space_prefixes_dash_leading_prompts() {
+        // agy 1.1.18 rejects a prompt whose value is exactly a flag token
+        // (exit 2, pre-dispatch). The guard covers every dash-leading prompt,
+        // not just real flag names, to avoid mirroring agy's flag list.
+        let log = PathBuf::from("/tmp/x.log");
+        for (prompt, transported) in [
+            ("--sandbox", " --sandbox"),
+            ("-p", " -p"),
+            ("--notaflag", " --notaflag"),
+            ("- a markdown bullet", " - a markdown bullet"),
+        ] {
+            let args = build_args(&bare_agent(), prompt, Path::new("/work/proj"), None, &log);
+            assert_eq!(args[1], transported, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn build_args_leaves_non_dash_prompts_untouched() {
+        let log = PathBuf::from("/tmp/x.log");
+        for prompt in ["hello", "/model", " already spaced", ""] {
+            let args = build_args(&bare_agent(), prompt, Path::new("/work/proj"), None, &log);
+            assert_eq!(args[1], prompt, "{args:?}");
+        }
+    }
+
+    #[test]
     fn build_args_first_turn_omits_conversation() {
         let log = PathBuf::from("/tmp/x.log");
-        let args = build_args("hello", Path::new("/work/proj"), None, &log);
+        let args = build_args(&bare_agent(), "hello", Path::new("/work/proj"), None, &log);
         assert_eq!(args[0], "-p");
         assert_eq!(args[1], "hello");
         assert!(!args.contains(&"--conversation".to_owned()));
@@ -1568,7 +2043,13 @@ mod tests {
         // cap; we override it so long turns aren't cut while actively working.
         let log = PathBuf::from("/tmp/x.log");
         for resume in [None, Some(Uuid::new_v4())] {
-            let args = build_args("hello", Path::new("/work/proj"), resume, &log);
+            let args = build_args(
+                &bare_agent(),
+                "hello",
+                Path::new("/work/proj"),
+                resume,
+                &log,
+            );
             let idx = args
                 .iter()
                 .position(|a| a == "--print-timeout")
@@ -1582,7 +2063,7 @@ mod tests {
         // `--add-dir <cwd>` is load-bearing: without it `agy` runs the model's
         // file/command tools against $HOME, not the project dir.
         let log = PathBuf::from("/tmp/x.log");
-        let args = build_args("hello", Path::new("/work/proj"), None, &log);
+        let args = build_args(&bare_agent(), "hello", Path::new("/work/proj"), None, &log);
         let idx = args
             .iter()
             .position(|a| a == "--add-dir")
@@ -1594,7 +2075,13 @@ mod tests {
     fn build_args_resume_passes_conversation_uuid() {
         let uuid = Uuid::new_v4();
         let log = PathBuf::from("/tmp/y.log");
-        let args = build_args("hi", Path::new("/work/proj"), Some(uuid), &log);
+        let args = build_args(
+            &bare_agent(),
+            "hi",
+            Path::new("/work/proj"),
+            Some(uuid),
+            &log,
+        );
         let idx = args.iter().position(|a| a == "--conversation").unwrap();
         assert_eq!(args[idx + 1], uuid.to_string());
         // Workspace is re-established on resume too (agy is one-shot).
@@ -1602,22 +2089,65 @@ mod tests {
     }
 
     #[test]
-    fn build_args_never_emits_model_or_effort_flags() {
-        // Antigravity has no per-invocation model/effort control — neither flag
-        // should ever appear, on first turn or resume.
+    fn build_args_sends_the_selected_model_and_effort_every_dispatch() {
+        // Sent on resumes too, not just first turns: probe-confirmed that
+        // `--model` overrides a conversation's prior model mid-session while
+        // keeping its context, so one uniform path beats a change-only case.
         let log = PathBuf::from("/tmp/x.log");
-        for resume in [None, Some(Uuid::new_v4())] {
-            let args = build_args("hello", Path::new("/work/proj"), resume, &log);
-            assert!(
-                !args.iter().any(|a| a == "-m" || a == "--model"),
-                "{args:?}"
-            );
-            assert!(!args.iter().any(|a| a == "--effort"), "{args:?}");
-            assert!(
-                !args.iter().any(|a| a.contains("reasoning")),
-                "no reasoning/effort config: {args:?}"
-            );
+        let agent = AgentRecord {
+            model: Some("gemini-3.1-pro".to_owned()),
+            effort: Some("high".to_owned()),
+            ..bare_agent()
+        };
+        for resume in [None, Some(Uuid::now_v7())] {
+            let args = build_args(&agent, "hi", Path::new("/work/proj"), resume, &log);
+            let model_at = args.iter().position(|a| a == "--model").expect("--model");
+            assert_eq!(args[model_at + 1], "gemini-3.1-pro");
+            let effort_at = args.iter().position(|a| a == "--effort").expect("--effort");
+            assert_eq!(args[effort_at + 1], "high");
         }
+    }
+
+    #[test]
+    fn build_args_omits_both_flags_when_nothing_is_selected() {
+        let log = PathBuf::from("/tmp/x.log");
+        let args = build_args(&bare_agent(), "hi", Path::new("/work/proj"), None, &log);
+        assert!(!args.iter().any(|a| a == "--model"), "{args:?}");
+        assert!(!args.iter().any(|a| a == "--effort"), "{args:?}");
+    }
+
+    #[test]
+    fn build_args_sends_a_no_axis_model_without_an_effort() {
+        // The two Claude models have no effort axis at all — `agy` rejects
+        // `--effort` for them outright (probed). A model alone is a valid
+        // invocation. (`gpt-oss-120b` is a different case: it accepts exactly
+        // one level, `medium`, and also dispatches bare.)
+        let log = PathBuf::from("/tmp/x.log");
+        let agent = AgentRecord {
+            model: Some("claude-sonnet-4-6".to_owned()),
+            effort: None,
+            ..bare_agent()
+        };
+        let args = build_args(&agent, "hi", Path::new("/work/proj"), None, &log);
+        assert!(args.iter().any(|a| a == "--model"), "{args:?}");
+        assert!(!args.iter().any(|a| a == "--effort"), "{args:?}");
+    }
+
+    #[test]
+    fn build_args_never_sends_an_effort_without_a_model() {
+        // Structural backstop. The persistence boundary already refuses to
+        // store this (`CoreError::EffortWithoutModel`); this guarantees that
+        // even a record arriving some other way cannot produce an invocation
+        // `agy` would reject, since effort validity is a property of the model.
+        let log = PathBuf::from("/tmp/x.log");
+        let agent = AgentRecord {
+            model: None,
+            effort: Some("high".to_owned()),
+            ..bare_agent()
+        };
+        let args = build_args(&agent, "hi", Path::new("/work/proj"), None, &log);
+        assert!(!args.iter().any(|a| a == "--effort"), "{args:?}");
+        assert!(!args.iter().any(|a| a == "--model"), "{args:?}");
     }
 
     #[test]
@@ -2063,9 +2593,51 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            extract_model_from_record(&rec).as_deref(),
-            Some("Gemini 3.5 Flash")
+            extract_model_from_record(&rec),
+            Some(("Gemini 3.5 Flash".to_owned(), Some("high".to_owned())))
         );
+    }
+
+    #[test]
+    fn a_non_level_parenthetical_stays_part_of_the_model_name() {
+        // The Claude models have no effort axis (probed: `--effort is not
+        // supported for model …`), so their parenthetical *is* the name. An
+        // earlier version stripped every parenthetical, mangling them.
+        for announced in [
+            "Claude Sonnet 4.6 (Thinking)",
+            "Claude Opus 4.6 (Thinking)",
+            "Gemini 3.1 Pro",
+        ] {
+            let (name, effort) = split_announced_model(announced);
+            assert_eq!(name, announced);
+            assert_eq!(effort, None, "{announced}");
+        }
+    }
+
+    #[test]
+    fn gpt_oss_display_name_splits_because_its_level_is_real() {
+        // Not an exception to the rule above: `medium` is genuinely this
+        // model's effort (probed — `--effort medium` dispatches while
+        // `low`/`high` are rejected), so the turn ran at it and the footer
+        // should say so. The picker separately declines to offer it, being the
+        // only level and optional; see `split_announced_model`.
+        assert_eq!(
+            split_announced_model("GPT-OSS 120B (Medium)"),
+            ("GPT-OSS 120B".to_owned(), Some("medium".to_owned()))
+        );
+    }
+
+    #[test]
+    fn announced_levels_split_case_insensitively() {
+        for (announced, level) in [
+            ("Gemini 3.1 Pro (High)", "high"),
+            ("Gemini 3.5 Flash (LOW)", "low"),
+            ("Gemini 3.7 Flash (medium)", "medium"),
+        ] {
+            let (name, effort) = split_announced_model(announced);
+            assert!(!name.contains('('), "{name}");
+            assert_eq!(effort.as_deref(), Some(level));
+        }
     }
 
     #[test]
@@ -2077,8 +2649,424 @@ mod tests {
         assert_eq!(extract_model_from_record(&rec), None);
     }
 
+    /// An Antigravity agent with no model/effort selection — the default for
+    /// arg-shape tests that are not about the selection flags.
+    fn bare_agent() -> AgentRecord {
+        AgentRecord {
+            model: None,
+            effort: None,
+            profiles: switchboard_core::AgentProfiles::default(),
+            forked_from_session: None,
+            id: Uuid::now_v7(),
+            project_id: Uuid::now_v7(),
+            name: "agy".to_owned(),
+            harness: switchboard_core::HarnessKind::Antigravity,
+            session_locator: None,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
     fn empty_tail() -> Mutex<VecDeque<String>> {
         Mutex::new(VecDeque::new())
+    }
+
+    /// A stderr stream as the producer would have seen it: every line is fed
+    /// through the real [`StderrSignals::observe`] and into a real bounded
+    /// tail, so a test exercises the same capture path the drain task uses —
+    /// including eviction, which is the whole reason the signals are sticky.
+    struct Stderr {
+        signals: StderrSignals,
+        tail: Mutex<VecDeque<String>>,
+    }
+
+    fn stderr_of(lines: &[&str]) -> Stderr {
+        let signals = StderrSignals::default();
+        // NOTE: this mirrors `drain_stderr_with_observer`'s eviction policy
+        // rather than driving the real async drain, which would be heavy
+        // machinery for a synchronous predicate test. If that policy changes,
+        // change it here too — otherwise the eviction guards below would keep
+        // passing against a stale model of the real behavior. (The integration
+        // tests `*_buried_under_stderr_chatter_*` exercise the genuine path.)
+        let mut tail: VecDeque<String> = VecDeque::new();
+        for line in lines {
+            signals.observe(line);
+            if tail.len() >= crate::subprocess::STDERR_TAIL_CAPACITY {
+                tail.pop_front();
+            }
+            tail.push_back((*line).to_owned());
+        }
+        Stderr {
+            signals,
+            tail: Mutex::new(tail),
+        }
+    }
+
+    /// `classify_outcome` driven by a stream terminal result and nothing else.
+    fn classify_with_stream(sig: &OutcomeSignals, result: &stream::StreamResult) -> TurnOutcome {
+        classify_outcome(sig, &[], Some(result), false, None, &empty_tail())
+    }
+
+    /// `classify_outcome` with no stderr activity — the common case for tests
+    /// about stdout/log/transcript classification.
+    fn classify_no_stderr(sig: &OutcomeSignals, stdout_lines: &[String]) -> TurnOutcome {
+        classify_outcome(sig, stdout_lines, None, false, None, &empty_tail())
+    }
+
+    fn classify_with_stderr(
+        sig: &OutcomeSignals,
+        stdout_lines: &[String],
+        stderr: &Stderr,
+    ) -> TurnOutcome {
+        classify_outcome(
+            sig,
+            stdout_lines,
+            None,
+            stderr.signals.auth_failed(),
+            stderr.signals.first_error(),
+            &stderr.tail,
+        )
+    }
+
+    #[test]
+    fn classify_outcome_stream_failure_outranks_a_text_error_line() {
+        // The stream states the outcome directly; the text-scraped lines are
+        // the pre-stream fallback. When both are present the stream wins.
+        let sig = OutcomeSignals {
+            saw_terminal_answer: false,
+            saw_stdout_content: true,
+            ..ok_signals()
+        };
+        let stderr = stderr_of(&["Error: timeout waiting for response"]);
+        let result = stream::StreamResult {
+            succeeded: false,
+            error: Some("model overloaded".to_owned()),
+        };
+        match classify_outcome(
+            &sig,
+            &[],
+            Some(&result),
+            stderr.signals.auth_failed(),
+            stderr.signals.first_error(),
+            &stderr.tail,
+        ) {
+            TurnOutcome::Failed { kind, message } => {
+                assert!(matches!(kind, FailureKind::HarnessError), "{kind:?}");
+                assert_eq!(message, "model overloaded");
+            }
+            other => panic!("expected the stream's message; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_outcome_stream_failure_yields_to_a_transcript_answer() {
+        // Live-probed @ 1.1.19: agy taints the turn's `result.status` with
+        // ERROR when any tool call is rejected, even though the model
+        // recovered and answered. Failing on that would mark ordinary agentic
+        // turns as failed; the tool failure is already surfaced as a failed
+        // tool row from the same stream.
+        assert_eq!(
+            classify_with_stream(
+                &ok_signals(),
+                &stream::StreamResult {
+                    succeeded: false,
+                    error: Some(
+                        "cortex tool view_file: invalid tool call error (invalid_args) \
+                         failed to read file: no such file or directory"
+                            .to_owned()
+                    ),
+                },
+            ),
+            TurnOutcome::Completed
+        );
+    }
+
+    #[test]
+    fn classify_outcome_stream_auth_text_becomes_the_authored_auth_message() {
+        // Keeps the "one auth surface" property: an auth-flavored message
+        // arriving via the stream must not leak raw text as a HarnessError.
+        let sig = OutcomeSignals {
+            saw_terminal_answer: false,
+            saw_stdout_content: true,
+            ..ok_signals()
+        };
+        match classify_with_stream(
+            &sig,
+            &stream::StreamResult {
+                succeeded: false,
+                error: Some("Authentication required. Please visit the URL".to_owned()),
+            },
+        ) {
+            TurnOutcome::Failed { kind, message } => {
+                assert!(matches!(kind, FailureKind::AuthFailure), "{kind:?}");
+                assert_eq!(message, ANTIGRAVITY_AUTH_MESSAGE);
+            }
+            other => panic!("expected AuthFailure; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_outcome_stream_success_does_not_substitute_for_a_transcript_answer() {
+        // The load-bearing corroboration rule. agy 1.1.18 fixed a dropped
+        // stream reporting a failed turn as a clean success, so a SUCCESS
+        // result with nothing readable in the transcript must still fail loud
+        // rather than complete a blank turn.
+        let sig = OutcomeSignals {
+            saw_terminal_answer: false,
+            saw_stdout_content: true,
+            ..ok_signals()
+        };
+        match classify_with_stream(
+            &sig,
+            &stream::StreamResult {
+                succeeded: true,
+                error: None,
+            },
+        ) {
+            TurnOutcome::Failed { kind, .. } => {
+                assert!(matches!(kind, FailureKind::AdapterFailure), "{kind:?}");
+            }
+            other => panic!("expected fail-loud; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_outcome_stream_success_with_a_transcript_answer_completes() {
+        assert_eq!(
+            classify_with_stream(
+                &ok_signals(),
+                &stream::StreamResult {
+                    succeeded: true,
+                    error: None,
+                },
+            ),
+            TurnOutcome::Completed
+        );
+    }
+
+    #[test]
+    fn classify_outcome_stream_failure_without_a_message_falls_through() {
+        // A failed result carrying no message must not produce an empty
+        // HarnessError; the older signals still get their chance.
+        let sig = OutcomeSignals {
+            saw_terminal_answer: false,
+            saw_stdout_content: false,
+            ..ok_signals()
+        };
+        let stderr = stderr_of(&["Error: timeout waiting for response"]);
+        let result = stream::StreamResult {
+            succeeded: false,
+            error: None,
+        };
+        match classify_outcome(
+            &sig,
+            &[],
+            Some(&result),
+            stderr.signals.auth_failed(),
+            stderr.signals.first_error(),
+            &stderr.tail,
+        ) {
+            TurnOutcome::Failed { message, .. } => {
+                assert_eq!(message, "Error: timeout waiting for response");
+            }
+            other => panic!("expected the stderr fallback; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_outcome_error_line_on_stderr_is_harness_error() {
+        // agy 1.1.x moved its `Error:` diagnostics to stderr. Before this was
+        // handled, a print-timeout landed on the generic "exited without
+        // producing an answer" AdapterFailure with the real cause buried in a
+        // stderr tail; it must surface verbatim as a HarnessError instead.
+        let sig = OutcomeSignals {
+            saw_terminal_answer: false,
+            saw_stdout_content: false,
+            ..ok_signals()
+        };
+        let stderr = stderr_of(&["Error: timeout waiting for response"]);
+        match classify_with_stderr(&sig, &[], &stderr) {
+            TurnOutcome::Failed { kind, message } => {
+                assert!(matches!(kind, FailureKind::HarnessError), "{kind:?}");
+                assert_eq!(message, "Error: timeout waiting for response");
+            }
+            other => panic!("expected HarnessError; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_outcome_prefers_stdout_error_over_stderr_error() {
+        // Precedence is unchanged from before the stderr scan existed: an
+        // older agy that still writes to stdout keeps winning, so the fallback
+        // can never reorder a shape we already classified correctly.
+        let sig = OutcomeSignals {
+            saw_terminal_answer: false,
+            saw_stdout_content: false,
+            ..ok_signals()
+        };
+        let stderr = stderr_of(&["Error: from stderr"]);
+        match classify_with_stderr(&sig, &["Error: from stdout".to_owned()], &stderr) {
+            TurnOutcome::Failed { message, .. } => assert_eq!(message, "Error: from stdout"),
+            other => panic!("expected HarnessError; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_outcome_auth_line_on_stderr_is_auth_failure() {
+        // Post-exit backstop for the case where agy exits before the
+        // producer's mid-run watch observes the line. The auth line is not
+        // `Error:`-prefixed, so the error scan alone would miss it.
+        let sig = OutcomeSignals {
+            saw_terminal_answer: false,
+            saw_stdout_content: false,
+            ..ok_signals()
+        };
+        let stderr = stderr_of(&["Authentication required. Please visit the URL to log in:"]);
+        match classify_with_stderr(&sig, &[], &stderr) {
+            TurnOutcome::Failed { kind, message } => {
+                assert!(matches!(kind, FailureKind::AuthFailure), "{kind:?}");
+                assert_eq!(message, ANTIGRAVITY_AUTH_MESSAGE);
+            }
+            other => panic!("expected AuthFailure; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_outcome_auth_shaped_error_line_is_auth_not_harness_error() {
+        // `Error: authentication timed out.` is BOTH an `Error:` line and an
+        // auth line — agy prints it after the OAuth wait elapses. It must get
+        // the authored auth message, not its verbatim text as a HarnessError.
+        //
+        // Deliberately the ONLY line in the fixture: an earlier revision also
+        // fed `Authentication required…`, which satisfied the auth check on its
+        // own and left this case untested.
+        let sig = OutcomeSignals {
+            saw_terminal_answer: false,
+            saw_stdout_content: false,
+            ..ok_signals()
+        };
+        let stderr = stderr_of(&["Error: authentication timed out."]);
+        match classify_with_stderr(&sig, &[], &stderr) {
+            TurnOutcome::Failed { kind, message } => {
+                assert!(matches!(kind, FailureKind::AuthFailure), "{kind:?}");
+                assert_eq!(message, ANTIGRAVITY_AUTH_MESSAGE);
+            }
+            other => panic!("expected AuthFailure; got {other:?}"),
+        }
+    }
+
+    /// The stderr tail is capped at `STDERR_TAIL_CAPACITY` and front-evicts,
+    /// so a signal read back from it is lost once enough lines follow. Both
+    /// signals are captured as lines are drained instead; these two tests pin
+    /// that, and both fail if classification ever goes back to rescanning the
+    /// tail.
+    #[test]
+    fn classify_outcome_auth_survives_being_evicted_from_the_stderr_tail() {
+        let mut lines = vec!["Authentication required. Please visit the URL to log in:"];
+        lines.extend(std::iter::repeat_n(
+            "benign follow-up chatter",
+            crate::subprocess::STDERR_TAIL_CAPACITY + 4,
+        ));
+        let stderr = stderr_of(&lines);
+        assert!(
+            !stderr
+                .tail
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|l| is_auth_failure_line(l)),
+            "fixture must actually evict the auth line, else it proves nothing"
+        );
+
+        let sig = OutcomeSignals {
+            saw_terminal_answer: false,
+            saw_stdout_content: false,
+            ..ok_signals()
+        };
+        match classify_with_stderr(&sig, &[], &stderr) {
+            TurnOutcome::Failed { kind, message } => {
+                assert!(matches!(kind, FailureKind::AuthFailure), "{kind:?}");
+                assert_eq!(message, ANTIGRAVITY_AUTH_MESSAGE);
+            }
+            other => panic!("expected AuthFailure; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_outcome_error_survives_being_evicted_from_the_stderr_tail() {
+        let mut lines = vec!["Error: timeout waiting for response"];
+        lines.extend(std::iter::repeat_n(
+            "benign follow-up chatter",
+            crate::subprocess::STDERR_TAIL_CAPACITY + 4,
+        ));
+        let stderr = stderr_of(&lines);
+        assert!(
+            first_error_line(
+                &stderr
+                    .tail
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+            )
+            .is_none(),
+            "fixture must actually evict the error line, else it proves nothing"
+        );
+
+        let sig = OutcomeSignals {
+            saw_terminal_answer: false,
+            saw_stdout_content: false,
+            ..ok_signals()
+        };
+        match classify_with_stderr(&sig, &[], &stderr) {
+            TurnOutcome::Failed { kind, message } => {
+                assert!(matches!(kind, FailureKind::HarnessError), "{kind:?}");
+                assert_eq!(message, "Error: timeout waiting for response");
+            }
+            other => panic!("expected HarnessError; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stderr_signals_keep_the_first_error_line_not_the_last() {
+        // Classification names the root cause; a later cascading error must
+        // not overwrite the one that started it.
+        let stderr = stderr_of(&["Error: first cause", "Error: downstream effect"]);
+        assert_eq!(
+            stderr.signals.first_error().as_deref(),
+            Some("Error: first cause")
+        );
+    }
+
+    #[test]
+    fn classify_outcome_auth_line_on_stdout_is_auth_failure() {
+        // Unreachable from the live producer (its stdout arm breaks on the
+        // same predicate before this slice is populated), asserted so the pure
+        // function's contract stays total over both inputs rather than
+        // depending on that ordering.
+        let sig = OutcomeSignals {
+            saw_terminal_answer: false,
+            saw_stdout_content: false,
+            ..ok_signals()
+        };
+        let stdout = vec!["Authentication required. Please visit the URL to log in:".to_owned()];
+        match classify_no_stderr(&sig, &stdout) {
+            TurnOutcome::Failed { kind, .. } => {
+                assert!(matches!(kind, FailureKind::AuthFailure), "{kind:?}");
+            }
+            other => panic!("expected AuthFailure; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_outcome_stderr_without_error_still_completes_a_good_turn() {
+        // Diagnostic chatter on stderr must not fail a turn that produced a
+        // terminal transcript answer — only `Error:`/auth lines are signals.
+        let stderr = stderr_of(&["some incidental stderr chatter"]);
+        assert_eq!(
+            classify_with_stderr(&ok_signals(), &[], &stderr),
+            TurnOutcome::Completed
+        );
     }
 
     /// Baseline signals: a clean turn that streamed an answer and saw no
@@ -2100,7 +3088,7 @@ mod tests {
             auth_failed: true,
             ..ok_signals()
         };
-        match classify_outcome(&sig, &[], &empty_tail()) {
+        match classify_no_stderr(&sig, &[]) {
             TurnOutcome::Failed {
                 kind: FailureKind::AuthFailure,
                 message,
@@ -2125,7 +3113,7 @@ mod tests {
             ambiguous_capture: true,
             ..ok_signals()
         };
-        match classify_outcome(&sig, &[], &empty_tail()) {
+        match classify_no_stderr(&sig, &[]) {
             TurnOutcome::Failed {
                 kind: FailureKind::AdapterFailure,
                 message,
@@ -2145,7 +3133,7 @@ mod tests {
             saw_stdout_content: true,
             ..ok_signals()
         };
-        match classify_outcome(&sig, &[], &empty_tail()) {
+        match classify_no_stderr(&sig, &[]) {
             TurnOutcome::Failed {
                 kind: FailureKind::AdapterFailure,
                 message,
@@ -2166,7 +3154,7 @@ mod tests {
             ..ok_signals()
         };
         let lines = vec!["Error: timed out waiting for response".to_owned()];
-        match classify_outcome(&sig, &lines, &empty_tail()) {
+        match classify_no_stderr(&sig, &lines) {
             TurnOutcome::Failed {
                 kind: FailureKind::HarnessError,
                 message,
@@ -2185,7 +3173,7 @@ mod tests {
             saw_stdout_content: false,
             ..ok_signals()
         };
-        match classify_outcome(&sig, &[], &empty_tail()) {
+        match classify_no_stderr(&sig, &[]) {
             TurnOutcome::Failed {
                 kind: FailureKind::AdapterFailure,
                 message,
@@ -2199,11 +3187,9 @@ mod tests {
         // Stale-resume is healed by the producer (recapture), not failed by
         // the classifier. A "conversation not found" line plus a streamed
         // answer still classifies Completed.
-        let tail = Mutex::new(VecDeque::from([
-            "Warning: conversation \"abc\" not found.".to_owned()
-        ]));
+        let stderr = stderr_of(&["Warning: conversation \"abc\" not found."]);
         assert!(matches!(
-            classify_outcome(&ok_signals(), &[], &tail),
+            classify_with_stderr(&ok_signals(), &[], &stderr),
             TurnOutcome::Completed
         ));
     }
@@ -2212,7 +3198,7 @@ mod tests {
     fn classify_outcome_error_line_is_harness_error() {
         let lines = vec!["Error: timed out waiting for response".to_owned()];
         let sig = ok_signals();
-        match classify_outcome(&sig, &lines, &empty_tail()) {
+        match classify_no_stderr(&sig, &lines) {
             TurnOutcome::Failed {
                 kind: FailureKind::HarnessError,
                 message,
@@ -2225,7 +3211,7 @@ mod tests {
     fn classify_outcome_auth_error_line_is_auth_failure() {
         let lines = vec!["Error: authentication timed out.".to_owned()];
         let sig = ok_signals();
-        match classify_outcome(&sig, &lines, &empty_tail()) {
+        match classify_no_stderr(&sig, &lines) {
             TurnOutcome::Failed {
                 kind: FailureKind::AuthFailure,
                 message,
@@ -2250,7 +3236,7 @@ mod tests {
             log_error: Some("Antigravity quota exhausted — Google Cloud individual quota reached. Resets in 143h34m25s.".to_owned()),
             ..ok_signals()
         };
-        match classify_outcome(&sig, &[], &empty_tail()) {
+        match classify_no_stderr(&sig, &[]) {
             TurnOutcome::Failed {
                 kind: FailureKind::HarnessError,
                 message,
@@ -2273,7 +3259,7 @@ mod tests {
             log_error: Some("Antigravity quota exhausted.".to_owned()),
             ..ok_signals()
         };
-        match classify_outcome(&sig, &[], &empty_tail()) {
+        match classify_no_stderr(&sig, &[]) {
             TurnOutcome::Failed {
                 kind: FailureKind::HarnessError,
                 message,
@@ -2293,7 +3279,7 @@ mod tests {
             ..ok_signals()
         };
         let stdout = vec!["Error: timed out waiting for response".to_owned()];
-        match classify_outcome(&sig, &stdout, &empty_tail()) {
+        match classify_no_stderr(&sig, &stdout) {
             TurnOutcome::Failed {
                 kind: FailureKind::HarnessError,
                 message,
@@ -2445,7 +3431,7 @@ mod tests {
             ..ok_signals()
         };
         assert!(matches!(
-            classify_outcome(&sig, &[], &empty_tail()),
+            classify_no_stderr(&sig, &[]),
             TurnOutcome::Completed
         ));
     }
@@ -2461,7 +3447,7 @@ mod tests {
             saw_stdout_content: true,
             ..ok_signals()
         };
-        match classify_outcome(&sig, &[], &empty_tail()) {
+        match classify_no_stderr(&sig, &[]) {
             TurnOutcome::Failed {
                 kind: FailureKind::AdapterFailure,
                 message,
@@ -2478,7 +3464,7 @@ mod tests {
             ..ok_signals()
         };
         assert!(matches!(
-            classify_outcome(&sig, &[], &empty_tail()),
+            classify_no_stderr(&sig, &[]),
             TurnOutcome::Failed {
                 kind: FailureKind::AdapterFailure,
                 ..

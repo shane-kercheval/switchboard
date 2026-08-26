@@ -10,6 +10,7 @@ import {
   MODEL_OPTIONS,
   defaultAgentName,
   defaultAgentNameForProfiles,
+  effortIsRequired,
   effortOptionsFor,
 } from "./agentSelection";
 import { canonicalizeForUniqueness, validateAgentName } from "./agentName";
@@ -74,6 +75,53 @@ describe("effortOptionsFor", () => {
 
   it("returns the harness list unchanged for non-Codex harnesses", () => {
     expect(effortOptionsFor("claude_code", "opus")).toEqual(EFFORT_OPTIONS.claude_code);
+  });
+
+  /// Antigravity's effort axis is per-model in a way no other harness's is: the
+  /// levels differ by model, some models have none at all, and where the axis
+  /// exists it is **mandatory**. Getting any of these wrong fails the dispatch
+  /// before a model runs (`agy` validates client-side), so each shape is
+  /// pinned rather than left to the picker to discover.
+  it("derives Antigravity effort per model, including the no-axis and single-level shapes", () => {
+    expect(values("antigravity", "gemini-3.7-flash")).toEqual(["low", "medium", "high"]);
+    // 3.1 Pro genuinely lacks medium — the sets differ, which is why the map is
+    // per-model rather than one list.
+    expect(values("antigravity", "gemini-3.1-pro")).toEqual(["low", "high"]);
+
+    // The two Claude models have no axis: `agy` rejects `--effort` outright, so
+    // an empty list is what hides the control.
+    expect(values("antigravity", "claude-sonnet-4-6")).toEqual([]);
+    expect(values("antigravity", "claude-opus-4-6-thinking")).toEqual([]);
+
+    // GPT-OSS accepts exactly one level. It must NOT be empty — an empty list
+    // hides the control, and hiding it is what used to leave the picker
+    // disagreeing with the turn footer, which renders `medium` regardless.
+    expect(values("antigravity", "gpt-oss-120b")).toEqual(["medium"]);
+  });
+
+  it("makes Antigravity effort mandatory exactly where an axis exists", () => {
+    for (const model of ["gemini-3.7-flash", "gemini-3.1-pro", "gpt-oss-120b"]) {
+      expect(effortIsRequired("antigravity", model), model).toBe(true);
+    }
+    for (const model of ["claude-sonnet-4-6", "claude-opus-4-6-thinking", undefined]) {
+      expect(effortIsRequired("antigravity", model), String(model)).toBe(false);
+    }
+    // Every other harness treats effort as optional — unset means "pass no
+    // flag." The negative half is what keeps this from becoming a global rule.
+    expect(effortIsRequired("claude_code", "opus")).toBe(false);
+    expect(effortIsRequired("codex", "gpt-5.6-sol")).toBe(false);
+  });
+
+  it("offers only models agy still accepts, and no retired Flash generation", () => {
+    const slugs = MODEL_OPTIONS.antigravity.map((o) => o.value);
+    expect(slugs).not.toContain("gemini-3.6-flash");
+    expect(slugs).not.toContain("gemini-3.5-flash");
+    expect(slugs).toContain("gemini-3.7-flash");
+    // Effort belongs to the effort control, never folded into a model label —
+    // otherwise the label contradicts the footer beneath it.
+    for (const { label } of MODEL_OPTIONS.antigravity) {
+      expect(label, label).not.toMatch(/\((Low|Medium|High)\)$/);
+    }
   });
 
   it("keeps medium available as the safe clamp target for every curated Codex model", () => {

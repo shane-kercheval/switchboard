@@ -1311,12 +1311,45 @@ pub async fn drain_stderr(
     tail: Arc<Mutex<VecDeque<String>>>,
     harness_name: &'static str,
 ) {
+    drain_stderr_with_observer(stderr, agent_id, turn_id, tail, harness_name, |_| {}).await;
+}
+
+/// [`drain_stderr`], plus a per-line observer invoked **before** the line
+/// reaches the bounded tail.
+///
+/// Exists because the tail is a *display* buffer — capped at
+/// [`STDERR_TAIL_CAPACITY`] and front-evicting — so it cannot be the source of
+/// truth for any signal that must not be missed. An adapter that classifies on
+/// stderr content (Antigravity reads auth and `Error:` lines from it) has to
+/// record what it saw as the line arrives; rescanning the tail later loses
+/// anything a chatty subsequent burst has already evicted, permanently and
+/// silently.
+///
+/// The observer is a generic extension point, not a harness-specific hook: the
+/// predicate and the state it accumulates live in the calling adapter. Keeping
+/// the read loop, `tracing` emission, tail eviction, and read-error handling in
+/// one place here is the point — a per-adapter copy of this loop would drift
+/// most easily in its least-exercised branch, the read-error path.
+pub async fn drain_stderr_with_observer<F>(
+    stderr: tokio::process::ChildStderr,
+    agent_id: AgentId,
+    turn_id: TurnId,
+    tail: Arc<Mutex<VecDeque<String>>>,
+    harness_name: &'static str,
+    mut observe: F,
+) where
+    F: FnMut(&str) + Send,
+{
     let mut lines = tokio::io::BufReader::new(stderr).lines();
     loop {
         match lines.next_line().await {
             Ok(Some(line)) => {
                 tracing::debug!(agent_id = %agent_id, %turn_id, "{harness_name} stderr: {line}");
+                observe(&line);
                 if let Ok(mut buf) = tail.lock() {
+                    // Eviction policy: mirrored by the Antigravity adapter's
+                    // `stderr_of` test fixture. Changing it here means changing
+                    // it there, or its eviction guards test a stale model.
                     if buf.len() >= STDERR_TAIL_CAPACITY {
                         buf.pop_front();
                     }

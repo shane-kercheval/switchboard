@@ -45,6 +45,18 @@ missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 must_use_candidate = "allow"
 
+# Dependencies compile without debug info; our own crates keep theirs.
+#
+# Debug symbols for third-party code are the single largest contributor to
+# `target/` growth, and they buy nothing here — stepping into Tauri or tokio
+# internals is not part of any workflow this project has. Dropping them cuts
+# build-directory size roughly in half and speeds up linking, which is the
+# slowest phase of the Tauri crate's build. Delete this block if you ever
+# genuinely need to debug into a dependency; it costs one full rebuild each
+# way, because changing a profile invalidates every artifact built under it.
+[profile.dev.package."*"]
+debug = false
+
 [profile.release]
 codegen-units = 1
 lto = true

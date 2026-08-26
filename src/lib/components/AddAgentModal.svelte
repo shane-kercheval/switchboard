@@ -37,6 +37,6 @@
   }: Props = $props();
 </script>
 
-<Dialog bind:open title="Add an agent" contentClass="max-w-lg" onClose={onCancel}>
+<Dialog bind:open title="Add an agent" contentClass="max-w-[612px]" onClose={onCancel}>
   <CreateAgentForm {busy} {error} {onSubmit} {onCancel} {roster} {availability} />
 </Dialog>

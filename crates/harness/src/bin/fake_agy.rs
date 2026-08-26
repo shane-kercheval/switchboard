@@ -27,7 +27,17 @@
 //!   "create_brain_dir": true,        // false → simulate a missing transcript (unresumable)
 //!   "warning_not_found": "<stale-uuid>", // optional: emit the fork "conversation not found" signal
 //!   "records": [ {"json": "<raw transcript.jsonl line>", "delay_ms": 0} ],
+//!   "stream": [ {"json": "<one stream-json NDJSON line>", "delay_ms": 0} ],
+//!                                    //   optional: written to stdout before the
+//!                                    //   `stdout` drip. Empty models a pre-1.1.8
+//!                                    //   text-mode agy (exercises the fallbacks).
 //!   "stdout": [ {"text": "<answer line>", "delay_ms": 0} ],
+//!   "stderr": [ {"text": "<diagnostic line>", "delay_ms": 0} ],
+//!                                    //   optional: written to stderr after stdout and
+//!                                    //   before any `hang`. agy 1.1.x emits its
+//!                                    //   `Error:` diagnostics here rather than on
+//!                                    //   stdout; pair with `hang` to model the
+//!                                    //   auth-line-then-block case.
 //!   "exit_code": 0,
 //!   "log_file_content": "<text>",    // optional: appended to the --log-file after
 //!                                    //   the conversation-id lines. Stages content
@@ -78,6 +88,14 @@ struct Script {
     records: Vec<Drip>,
     #[serde(default)]
     stdout: Vec<Drip>,
+    /// Diagnostic lines for stderr, written after `stdout` and before `hang`.
+    /// `agy` 1.1.x moved its `Error:` output off stdout, so the adapter now
+    /// scans both streams; this lets a test stage that shape. Combined with
+    /// `hang` it models the auth fast-fail: emit the auth line, then block, so
+    /// the test proves the adapter kills the child instead of waiting out the
+    /// real CLI's ~30s OAuth window.
+    #[serde(default)]
+    stderr: Vec<Drip>,
     #[serde(default)]
     exit_code: i32,
     /// Stage content for the per-dispatch CLI log scan. When non-empty and
@@ -93,6 +111,15 @@ struct Script {
     /// line ever moves).
     #[serde(default)]
     suppress_conversation_log: bool,
+    /// Emitted verbatim on stdout **before** the `stdout` drip, one JSON line
+    /// each. Models `--output-format stream-json`, which the adapter now
+    /// passes on every dispatch: the `init` event is its primary
+    /// conversation-id capture, a tool `ERROR` step is the only signal for a
+    /// tool failure agy writes no transcript record for, and `result` is the
+    /// terminal verdict. Left empty, the fixture behaves like a pre-1.1.8
+    /// text-mode `agy`, which is how the fallback chain is exercised.
+    #[serde(default)]
+    stream: Vec<Drip>,
     /// When true, park indefinitely after writing records/stdout (never exit
     /// on our own), so a cancellation test can fire the token mid-turn. Stays
     /// killable (a sleeping process dies on SIGTERM/SIGKILL).
@@ -223,12 +250,30 @@ fn main() {
     // Drip the model's answer to stdout (the live-text source).
     let stdout = io::stdout();
     let mut out = stdout.lock();
+    // Stream events first: the adapter reads them from the same stdout pipe
+    // and captures the conversation id from `init`, so they must precede any
+    // text the test expects to be classified afterwards.
+    for line in &script.stream {
+        if line.delay_ms > 0 {
+            sleep(Duration::from_millis(line.delay_ms));
+        }
+        let _ = writeln!(out, "{}", line.json);
+        let _ = out.flush();
+    }
     for line in &script.stdout {
         if line.delay_ms > 0 {
             sleep(Duration::from_millis(line.delay_ms));
         }
         let _ = writeln!(out, "{}", line.text);
         let _ = out.flush();
+    }
+
+    for line in &script.stderr {
+        if line.delay_ms > 0 {
+            sleep(Duration::from_millis(line.delay_ms));
+        }
+        let _ = writeln!(err, "{}", line.text);
+        let _ = err.flush();
     }
 
     if script.hang {

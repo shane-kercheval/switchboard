@@ -5,8 +5,10 @@
   ///
   /// **What this gives you:** focus trap, escape-key dismissal, click-outside
   /// dismissal, ARIA semantics — all handled by `bits-ui` at the primitive
-  /// layer. The wrapper only adds styling (centered overlay, white card,
-  /// border) and a `title` slot for the heading.
+  /// layer. The wrapper adds styling (centered overlay, card, border), a
+  /// `title` slot for the heading, and the height discipline every modal needs:
+  /// the card is capped to the viewport and its **body** scrolls, so a tall
+  /// form can't push its own header and submit button off both screen edges.
   ///
   /// **What this doesn't yet give you:** trigger button, separate header /
   /// footer slots, or animations. Add when a second modal needs them — not
@@ -73,7 +75,13 @@
     />
     <BitsDialog.Content
       class={cn(
-        "border-border/90 bg-raised fixed top-1/2 left-1/2 z-50 w-[calc(100vw-2rem)] -translate-x-1/2 -translate-y-1/2 rounded-lg border shadow-[0_18px_60px_rgba(0,0,0,0.22)]",
+        // Height is capped and the *body* scrolls, not the whole card. The
+        // card is centered with -translate-y-1/2, so an unbounded tall body
+        // overflows off **both** edges at once — the title bar disappears
+        // upward while the submit button disappears downward, and neither is
+        // reachable. `100dvh` rather than `100vh` so a mobile/dynamic toolbar
+        // can't reintroduce the clip.
+        "border-border/90 bg-raised fixed top-1/2 left-1/2 z-50 flex max-h-[calc(100dvh-2rem)] w-[calc(100vw-2rem)] -translate-x-1/2 -translate-y-1/2 flex-col rounded-lg border shadow-[0_18px_60px_rgba(0,0,0,0.22)]",
         contentClass ?? "max-w-md",
       )}
       data-testid="dialog-content"
@@ -85,7 +93,12 @@
       }}
       {onOpenAutoFocus}
     >
-      <div class="border-border/80 flex items-center justify-between gap-3 border-b px-4 py-3">
+      <!-- `shrink-0` keeps the title and ✕ pinned while the body scrolls; a
+           dismiss control that scrolls out of reach is the failure this whole
+           arrangement exists to prevent. -->
+      <div
+        class="border-border/80 flex shrink-0 items-center justify-between gap-3 border-b px-4 py-3"
+      >
         <BitsDialog.Title class="text-fg text-sm font-semibold" data-testid="dialog-title">
           {title}
         </BitsDialog.Title>
@@ -111,7 +124,13 @@
           </BitsDialog.Close>
         {/if}
       </div>
-      <div class="p-4">
+      <!-- `min-h-0` is load-bearing, not defensive: a flex child defaults to
+           `min-height: auto`, which refuses to shrink below its content, so
+           `overflow-y-auto` would never engage and the card would grow past the
+           cap above. Consumers that scroll their own sub-regions (the Messages
+           navigator, the command palette) size those under this cap and so
+           never reach this scrollbar. -->
+      <div class="min-h-0 flex-1 overflow-y-auto p-4">
         {@render children()}
       </div>
     </BitsDialog.Content>

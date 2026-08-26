@@ -39,10 +39,19 @@
     return v === "" ? "no-override" : v;
   }
 
-  // Always one row: one equal-width column per option. Sets with more than
-  // five options (the only current case is Codex's eight effort levels, all
-  // short single-word labels) step down to a smaller font + tighter padding so
-  // they still fit on one line instead of wrapping to a second row.
+  // Always one row: one equal-width column per option. A set with more than
+  // five options steps down to a smaller font + tighter padding so it still
+  // fits on one line instead of wrapping to a second row, which reads as a
+  // broken pill. Codex's eight effort levels are the only set that trips it.
+  //
+  // Deliberately count-only, *not* label-length aware. Antigravity's five model
+  // pills briefly needed a length trigger too — "Gemini 3.7 Flash" clipped —
+  // but that was at the old `max-w-lg` dialog width. Widening the add-agent and
+  // model-settings dialogs to 612px removed the need: measured in WebKit, those
+  // five fit with zero overflow at every inner width down to 500px, and only
+  // clip at 472px. Shrinking their text now would be paying a permanent
+  // legibility cost for a window narrower than ~564px, where the app is barely
+  // usable anyway. `segmented-fit.browser.test.ts` holds the line.
   const columnCount = $derived(Math.max(1, options.length));
   const gridStyle = $derived(`grid-template-columns: repeat(${columnCount}, minmax(0, 1fr));`);
   const compact = $derived(options.length > 5);

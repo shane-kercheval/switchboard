@@ -12609,19 +12609,21 @@ mod tests {
         let project = create_project_in_only_dir(&state, "alpha");
         set_active_project_impl(&state, project.id).unwrap();
 
+        // Antigravity gained both axes with `agy` 1.1.x, so its own
+        // unsupported case is an *effort with no model*: the valid levels are a
+        // property of the chosen model, and `agy` offers none without one.
         let err = create_agent_impl(
             &state,
             "a",
             HarnessKind::Antigravity,
-            Some("anything".to_owned()),
             None,
+            Some("high".to_owned()),
         )
         .unwrap_err();
         assert!(matches!(
             err,
-            AppError::Core(CoreError::SelectionUnsupported {
-                harness: HarnessKind::Antigravity,
-                axis: SelectionAxis::Model
+            AppError::Core(CoreError::EffortWithoutModel {
+                harness: HarnessKind::Antigravity
             })
         ));
         let err = create_agent_impl(

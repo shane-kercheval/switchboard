@@ -33,9 +33,14 @@ pub enum HarnessKind {
 
 impl HarnessKind {
     /// Whether Switchboard can set this harness's model per agent (via a
-    /// per-invocation CLI flag). True for Claude (`--model`), Codex (`-m`), and
-    /// Gemini (`-m`); false for Antigravity, whose model is a global,
-    /// harness-owned config we never touch (per `harness-behavior.md` §3.3).
+    /// per-invocation CLI flag). True for every harness: Claude (`--model`),
+    /// Codex (`-m`), Gemini (`-m`), Antigravity (`--model`).
+    ///
+    /// Antigravity was false until `agy` 1.1.x made `--model` work headlessly
+    /// without mutating the harness's own global config — the two facts that
+    /// had ruled it out (`harness-behavior.md` §3.3). The arm is still written
+    /// out per variant rather than collapsed to `true` so that adding a harness
+    /// remains a deliberate decision here.
     ///
     /// The single authority for the model-selection gate — command validation,
     /// picker visibility, and the per-agent change action all derive from this
@@ -44,17 +49,24 @@ impl HarnessKind {
     #[must_use]
     pub fn supports_model_selection(self) -> bool {
         match self {
-            Self::ClaudeCode | Self::Codex | Self::Gemini => true,
-            Self::Antigravity => false,
+            Self::ClaudeCode | Self::Codex | Self::Gemini | Self::Antigravity => true,
         }
     }
 
     /// Whether Switchboard can set this harness's reasoning-effort level per
-    /// agent. True for Claude (`--effort`) and Codex (`-c
-    /// model_reasoning_effort=`); false for Gemini (thinking is `settings.json`
-    /// config-only, no CLI flag) and Antigravity (effort is folded into the
-    /// model display name, which we can't set anyway) — per
+    /// agent. True for Claude (`--effort`), Codex (`-c
+    /// model_reasoning_effort=`) and Antigravity (`--effort`); false for Gemini
+    /// (thinking is `settings.json` config-only, no CLI flag) — per
     /// `harness-behavior.md` §3.4.
+    ///
+    /// **Antigravity's levels are per-model and mandatory where they exist.**
+    /// Unlike Claude, which accepts any level for any model and silently
+    /// degrades, `agy` validates client-side before dispatch: a model with an
+    /// effort axis *requires* one, a model without an axis *rejects* one, and
+    /// the valid set differs by model (Gemini 3.1 Pro has low/high; the Flash
+    /// models add medium). This flag only says the axis is drivable; which
+    /// levels a given model accepts is the picker's business — see
+    /// `effortOptionsFor` in `src/lib/agentSelection.ts`.
     ///
     /// A *separate* axis from model selection with a *different* capability set
     /// (Gemini has model but not effort), so it is its own gate. Same authority
@@ -62,8 +74,35 @@ impl HarnessKind {
     #[must_use]
     pub fn supports_effort_selection(self) -> bool {
         match self {
-            Self::ClaudeCode | Self::Codex => true,
-            Self::Gemini | Self::Antigravity => false,
+            Self::ClaudeCode | Self::Codex | Self::Antigravity => true,
+            Self::Gemini => false,
+        }
+    }
+
+    /// Whether this harness's reasoning effort is only meaningful **alongside a
+    /// model** — i.e. whether an effort with no model selected is a coherent
+    /// profile.
+    ///
+    /// False for Claude and Codex: their effort flag is independent of the
+    /// model flag, so "harness's own default model, at high effort" is a valid
+    /// configuration and both adapters emit the effort on its own. Gemini has
+    /// no effort axis at all, so the question does not arise.
+    ///
+    /// True for Antigravity, where the valid levels are a *property of the
+    /// model*: `agy` decides them per model, offers none with no model
+    /// selected, and rejects a level the chosen model does not have. An effort
+    /// alone therefore cannot be validated or dispatched, so storing one would
+    /// leave a record asserting a selection no turn can apply.
+    ///
+    /// Same authority + exhaustiveness role as the siblings above: the
+    /// persistence boundary reads this rather than naming a harness, so adding
+    /// one forces the decision here instead of silently inheriting a rule
+    /// written for a different harness's constraints.
+    #[must_use]
+    pub fn effort_requires_model(self) -> bool {
+        match self {
+            Self::Antigravity => true,
+            Self::ClaudeCode | Self::Codex | Self::Gemini => false,
         }
     }
 
@@ -233,7 +272,7 @@ mod tests {
         assert!(HarnessKind::ClaudeCode.supports_model_selection());
         assert!(HarnessKind::Codex.supports_model_selection());
         assert!(HarnessKind::Gemini.supports_model_selection());
-        assert!(!HarnessKind::Antigravity.supports_model_selection());
+        assert!(HarnessKind::Antigravity.supports_model_selection());
     }
 
     #[test]
@@ -241,7 +280,17 @@ mod tests {
         assert!(HarnessKind::ClaudeCode.supports_effort_selection());
         assert!(HarnessKind::Codex.supports_effort_selection());
         assert!(!HarnessKind::Gemini.supports_effort_selection());
-        assert!(!HarnessKind::Antigravity.supports_effort_selection());
+        assert!(HarnessKind::Antigravity.supports_effort_selection());
+    }
+
+    #[test]
+    fn effort_requires_model_is_antigravity_only() {
+        // Claude and Codex emit `--effort` independently of `--model`, so
+        // "default model at high effort" is a valid profile for them.
+        assert!(HarnessKind::Antigravity.effort_requires_model());
+        assert!(!HarnessKind::ClaudeCode.effort_requires_model());
+        assert!(!HarnessKind::Codex.effort_requires_model());
+        assert!(!HarnessKind::Gemini.effort_requires_model());
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # One-prompt Keychain storage for MCP credentials
 
-**Status:** in progress (Milestone 1 verified) · **Created:** 2026-08-26
+**Status:** in progress (Milestone 2 implemented; review pending) · **Created:** 2026-08-26
 
 Switchboard currently stores every MCP prompt-provider credential in a separate
 macOS Keychain item. Bearer credentials use the provider name as the item
@@ -410,8 +410,11 @@ The production type/module docs must retain the non-obvious rationale for:
   - concurrent writes to distinct keys preserve every value;
   - updating one key preserves all siblings;
   - deleting an absent logical key is idempotent;
-  - serialization failure and raw write failure leave the previous cached and
-    durable record visible;
+  - raw write failure leaves the previous cached and durable record visible;
+  - the concrete record round-trips through JSON encoding; because its strings,
+    maps, and sets are infallibly serializable by `serde_json`, do not add a codec
+    abstraction solely to inject an unreachable serialization failure. Retain a
+    secret-safe encode-error mapping for API correctness;
   - a corrupt JSON record and an unknown format version return errors and cause
     no write;
   - explicit raw reads map `NoEntry` to absence and keep denial/unavailability

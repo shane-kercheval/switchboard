@@ -1839,8 +1839,8 @@ fn build_debug_secret_store(dir: &std::path::Path) -> crate::secret_store::FileS
     crate::secret_store::FileSecretStore::new(dir.join("mcp-secrets.json"))
 }
 
-/// Keychain service name for the aggregate MCP credential record and legacy
-/// per-provider migration inputs (release only — debug uses the file store).
+/// Keychain service name for the aggregate MCP credential record (release only
+/// — debug uses the file store).
 #[cfg(any(not(debug_assertions), test))]
 fn keyring_service() -> &'static str {
     "switchboard"

@@ -369,10 +369,11 @@ Bearer and OAuth credentials remain logically keyed by provider, but a release
 build persists the complete logical map as one cached, versioned Keychain item.
 This keeps repeated provider and OAuth reads in memory after one aggregate load
 and prevents Keychain authorization prompts from multiplying with provider
-count. Existing per-provider items migrate lazily on first use: the aggregate
-copy is persisted before the old item is deleted, and a durable pending marker
-retries interrupted cleanup without hiding the usable aggregate credential.
-Debug builds retain their separate plaintext development store.
+count. The cutover from the older per-provider format is intentionally breaking:
+users reauthenticate once, and the aggregate store never reads or deletes the
+old entries. After confirming the new credentials work, users may remove those
+obsolete entries manually in Keychain Access. Debug builds retain their separate
+plaintext development store.
 
 ### Addressing prompts
 

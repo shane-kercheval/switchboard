@@ -8,6 +8,7 @@
 use std::path::Path;
 
 use futures::StreamExt;
+use serde_json::json;
 use switchboard_core::{AgentRecord, HarnessKind, SessionLocator};
 use switchboard_harness::{
     AdapterEvent, AntigravityAdapter, ClaudeCodeAdapter, CodexAdapter, ContentKind,
@@ -3155,7 +3156,204 @@ async fn live_antigravity_dash_leading_prompt_completes() {
 #[tokio::test]
 #[ignore = "requires agy authenticated (run `agy`) — run with: make test-live"]
 async fn live_antigravity_tool_result_steps_follow_the_call_index() {
-    let tmp = tempfile::TempDir::new().unwrap();
+    // Runs the scenario up to twice. See `MULTI_TOOL_PROMPT` for why one
+    // attempt isn't enough and `is_benign_merge` for why the retry predicate
+    // must *prove* the benign case rather than infer it.
+    for attempt in 1..=2 {
+        let (outcome, content) = run_multi_tool_step_probe().await;
+        let (expected, observed) = step_pairs(&content);
+
+        if expected.len() < 2 {
+            if attempt == 1 && is_benign_merge(&outcome, &content) {
+                eprintln!(
+                    "live_antigravity: model merged both jobs into one run_command; \
+                     retrying once to exercise the multi-call invariant"
+                );
+                continue;
+            }
+            panic!(
+                "multi-tool precondition not exercised after retry \
+                 (expected >= 2 tool calls, saw {}; outcome {outcome:?}); transcript: {content}",
+                expected.len()
+            );
+        }
+
+        assert_eq!(
+            observed, expected,
+            "tool result steps must be `planner_step + 1 + call_index`; if this fails, \
+             agy's step numbering changed and tool results will attach to the wrong call. \
+             transcript: {content}"
+        );
+        return;
+    }
+    unreachable!("loop returns or panics on the final attempt")
+}
+
+/// Whether a single-tool-call turn is the **known benign non-exercise**: the
+/// model completed the turn but did both requested jobs inside one shell call.
+///
+/// This must be *proven*, not inferred from what's missing. G32 means agy
+/// writes **no transcript record at all** for a tool call it rejects — so
+/// "the model merged the two jobs" and "the file-reading tool failed and left
+/// no trace" produce a byte-identical transcript: one `run_command` entry and
+/// nothing else. Retrying on that shape alone would let this test absorb the
+/// exact class of upstream regression it exists to catch.
+///
+/// So the bar is positive evidence on three counts: the turn `Completed`, the
+/// sole call is `run_command`, and its `CommandLine` contains **both**
+/// sentinels — the echo token and the filename it was told not to read from the
+/// shell. Anything else fails immediately, unretried.
+fn is_benign_merge(outcome: &TurnOutcome, content: &str) -> bool {
+    if !matches!(outcome, TurnOutcome::Completed) {
+        return false;
+    }
+    let mut calls = planner_tool_calls(content);
+    let (Some(call), None) = (calls.next(), calls.next()) else {
+        return false;
+    };
+    if call["name"].as_str() != Some("run_command") {
+        return false;
+    }
+    let command_line = call["args"]["CommandLine"].as_str().unwrap_or_default();
+    command_line.contains(STEP_PROBE_ECHO_TOKEN) && command_line.contains(STEP_PROBE_FILE)
+}
+
+/// Every tool call announced by a planner record, in file order.
+fn planner_tool_calls(content: &str) -> impl Iterator<Item = serde_json::Value> + '_ {
+    transcript_records(content)
+        .filter(|r| r["type"] == "PLANNER_RESPONSE")
+        .flat_map(|r| {
+            r["tool_calls"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+        })
+}
+
+/// Sentinels the merged-shell-command classifier looks for. Distinct strings so
+/// neither can satisfy the other's check.
+const STEP_PROBE_ECHO_TOKEN: &str = "STEP_PROBE_ONE";
+const STEP_PROBE_FILE: &str = "STEP_PROBE.txt";
+
+/// Guards `is_benign_merge`'s discipline. **Not `#[ignore]`d**: this classifier
+/// decides whether the live drift alarm is allowed to re-arm, so it must not be
+/// exercised only by the live path it guards — the same reasoning that keeps
+/// `antigravity_transient_matcher_is_exact` in the default suite.
+///
+/// The rejection cases are the point. Under G32 a failed tool leaves no
+/// transcript record, so a genuine upstream breakage is *shape-identical* to a
+/// benign merge; only the positive evidence below separates them.
+#[test]
+fn benign_merge_requires_positive_evidence_of_both_jobs() {
+    fn planner(tool_calls: &serde_json::Value) -> String {
+        json!({
+            "step_index": 2, "source": "MODEL", "type": "PLANNER_RESPONSE",
+            "status": "DONE", "tool_calls": tool_calls,
+        })
+        .to_string()
+    }
+    fn shell(command_line: &str) -> serde_json::Value {
+        json!([{"name": "run_command", "args": {"CommandLine": command_line}}])
+    }
+
+    let merged = planner(&shell("echo STEP_PROBE_ONE; cat STEP_PROBE.txt"));
+    assert!(
+        is_benign_merge(&TurnOutcome::Completed, &merged),
+        "one shell call that demonstrably did both jobs is the benign case"
+    );
+
+    // The regression this exists to catch: the model ran the echo and never
+    // read the file. Identical shape to a merge, minus the proof.
+    assert!(
+        !is_benign_merge(
+            &TurnOutcome::Completed,
+            &planner(&shell("echo STEP_PROBE_ONE"))
+        ),
+        "a command missing the file sentinel is an omitted read, not a merge"
+    );
+    assert!(
+        !is_benign_merge(
+            &TurnOutcome::Completed,
+            &planner(&shell("cat STEP_PROBE.txt"))
+        ),
+        "a command missing the echo sentinel is not a merge either"
+    );
+
+    // A lone non-shell call could mean the shell tool itself broke.
+    let lone_read =
+        planner(&json!([{"name": "view_file", "args": {"AbsolutePath": "STEP_PROBE.txt"}}]));
+    assert!(!is_benign_merge(&TurnOutcome::Completed, &lone_read));
+
+    // The tool-name check is load-bearing on its own, not merely implied by the
+    // sentinel check: an unfamiliar tool that happens to carry both sentinels in
+    // a `CommandLine` arg is a shape we do not understand, and "we do not
+    // understand this" must never resolve to "benign."
+    let unknown_tool = planner(&json!([{
+        "name": "some_future_tool",
+        "args": {"CommandLine": "echo STEP_PROBE_ONE; cat STEP_PROBE.txt"},
+    }]));
+    assert!(
+        !is_benign_merge(&TurnOutcome::Completed, &unknown_tool),
+        "only run_command is a recognized merge; anything else fails loud"
+    );
+
+    // A turn that didn't complete is never classified — the shortfall may be
+    // the failure itself, not a model choice.
+    assert!(
+        !is_benign_merge(
+            &TurnOutcome::Failed {
+                kind: FailureKind::HarnessError,
+                message: "boom".to_owned(),
+            },
+            &merged
+        ),
+        "an incomplete turn must never be treated as a benign merge"
+    );
+
+    // Two real calls aren't a merge at all; the caller never asks, but the
+    // classifier must not claim it.
+    let two_calls = planner(&json!([
+        {"name": "run_command", "args": {"CommandLine": "echo STEP_PROBE_ONE"}},
+        {"name": "view_file", "args": {"AbsolutePath": "STEP_PROBE.txt"}},
+    ]));
+    assert!(!is_benign_merge(&TurnOutcome::Completed, &two_calls));
+
+    assert!(!is_benign_merge(&TurnOutcome::Completed, ""));
+}
+
+/// Asks for one shell command and one file read, each as its own tool call.
+///
+/// **This does not guarantee two calls, and must not be described as if it
+/// did.** `agy` has no flag to restrict which tools the model may use
+/// (checked @ 1.1.20: only `--dangerously-skip-permissions` and
+/// `--disable-slash-commands` exist), so the model can always satisfy both
+/// jobs with a single `run_command` running `echo …; cat STEP_PROBE.txt` — the
+/// same merge that made an earlier "two shell commands" version flaky. Naming
+/// the tools and forbidding the shell read makes the merge unlikely, not
+/// impossible; the caller retries once and then fails loudly.
+///
+/// The deterministic proof of the step invariant lives in the fixture tests
+/// (`tool-failure-cross-planner`, `tool-vocabulary`). This live test exists
+/// only to catch the real CLI renumbering its steps.
+const MULTI_TOOL_PROMPT: &str = "Do exactly two things, using a separate tool call for each. \
+     First, use your shell-command tool to run: echo STEP_PROBE_ONE \
+     Second, use your file-reading tool to read the file STEP_PROBE.txt in the workspace \
+     directory. Do not read that file with the shell. \
+     Then reply with only the word done.";
+
+/// Dispatch one multi-tool probe turn; return its terminal outcome and raw
+/// transcript. The outcome is load-bearing — `is_benign_merge` refuses to
+/// classify a turn it can't first confirm completed.
+async fn run_multi_tool_step_probe() -> (TurnOutcome, String) {
+    // Non-hidden prefix: see the note in `tests/tool_use.rs` — `tempfile`'s
+    // default is `.tmp`, and `agy` historically refused a hidden workspace.
+    let tmp = tempfile::Builder::new()
+        .prefix("agy-step-probe")
+        .tempdir()
+        .expect("tempdir");
+    std::fs::write(tmp.path().join("STEP_PROBE.txt"), "step probe fixture\n")
+        .expect("seed the file the second tool call reads");
     let adapter = AntigravityAdapter::new();
     let agent = live_antigravity_agent();
 
@@ -3163,28 +3361,35 @@ async fn live_antigravity_tool_result_steps_follow_the_call_index() {
         &adapter,
         &agent,
         tmp.path(),
-        "Run these two shell commands: 'echo STEP_PROBE_ONE' then 'echo STEP_PROBE_TWO'. \
-         Then reply with only the word done.",
+        MULTI_TOOL_PROMPT,
         Uuid::now_v7(),
-        // Fresh conversation; both tools are idempotent echoes in a tempdir.
+        // Fresh conversation; an idempotent echo plus a read of a file we
+        // seeded ourselves, both inside a tempdir.
         RetryPolicy::RetryOnKnownTransient,
     )
     .await;
 
+    let outcome = events
+        .iter()
+        .find_map(|e| match e {
+            AdapterEvent::TurnEnd { outcome, .. } => Some(outcome.clone()),
+            _ => None,
+        })
+        .expect("a TurnEnd");
     let conversation = antigravity_capture(&events).expect("captured conversation id");
     let transcript =
         switchboard_harness::antigravity::paths::transcript_path(&home_dir(), conversation);
     let content = std::fs::read_to_string(&transcript)
         .unwrap_or_else(|e| panic!("reading {}: {e}", transcript.display()));
+    (outcome, content)
+}
 
-    // Collect (planner step, call count) and the steps results actually landed
-    // on, straight from the real transcript.
+/// From a raw transcript: the steps results *should* land on (one per tool call,
+/// at `planner_step + 1 + call_index`) and the steps they *did* land on.
+fn step_pairs(content: &str) -> (Vec<i64>, Vec<i64>) {
     let mut expected: Vec<i64> = Vec::new();
     let mut observed: Vec<i64> = Vec::new();
-    for line in content.lines().filter(|l| !l.trim().is_empty()) {
-        let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
+    for record in transcript_records(content) {
         if record["source"] != "MODEL" {
             continue;
         }
@@ -3199,19 +3404,16 @@ async fn live_antigravity_tool_result_steps_follow_the_call_index() {
             observed.push(step);
         }
     }
-
-    assert!(
-        expected.len() >= 2,
-        "need a multi-tool turn to test the invariant; transcript: {content}"
-    );
     expected.sort_unstable();
     observed.sort_unstable();
-    assert_eq!(
-        observed, expected,
-        "tool result steps must be `planner_step + 1 + call_index`; if this fails, \
-         agy's step numbering changed and tool results will attach to the wrong call. \
-         transcript: {content}"
-    );
+    (expected, observed)
+}
+
+fn transcript_records(content: &str) -> impl Iterator<Item = serde_json::Value> + '_ {
+    content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
 }
 
 /// Drift tripwire for the `stream-json` contract, which is now the adapter's

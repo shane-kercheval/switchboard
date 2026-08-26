@@ -1,13 +1,21 @@
 //! Parser for Antigravity's `transcript.jsonl` records and for the
 //! `agy -p` stdout error/auth signals.
 //!
-//! Antigravity has no structured stream protocol (unlike Claude / Codex /
-//! Gemini stream-json). Two parseable surfaces exist:
+//! Antigravity's structured stream (`--output-format stream-json`, agy 1.1.8)
+//! is a **control channel only** — it carries no thinking text, so it never
+//! supplies displayed content; see [`super::stream`]. Three parseable surfaces
+//! exist:
 //!
-//! - **stdout** carries the model's final answer text (server-side
-//!   "drip"), plus `Error:` / `Warning:` / `Authentication required` lines
-//!   on failure. `agy` exits 0 on essentially every condition, so stdout
-//!   text — not the exit code — is the failure signal.
+//! - **stdout** carries the model's final answer text (server-side "drip")
+//!   under the pre-1.1.8 text mode, and the NDJSON control stream otherwise.
+//!   Its answer text is unusable as the content source regardless, because it
+//!   replays prior answers on resume.
+//! - **stderr** carries the `Error:` / `Warning:` / `Authentication required`
+//!   lines. agy 1.1.x moved these off stdout, and they must be captured **as
+//!   drained** rather than read back from the bounded tail, which front-evicts.
+//!   Outcome classification is signal-based and never gates on the exit status:
+//!   exit behavior varies by failure shape (timeout and empty prompt exit 1, an
+//!   exactly-a-flag-token prompt exits 2) but the full map is unprobed.
 //! - **the conversation transcript** carries one record per "step": user input,
 //!   model planner responses (with `thinking` + `tool_calls`), and tool
 //!   results (`RUN_COMMAND`, `VIEW_FILE`, other `CortexStep*` types). It
@@ -117,8 +125,10 @@ impl TranscriptRecord {
 
     /// A planner response with non-empty `content` and no tool calls is the
     /// model's final answer — the signal that the turn produced output.
-    /// Used for outcome classification (no structured terminal record
-    /// exists).
+    /// Used for outcome classification. It is not the only terminal signal —
+    /// the control stream's `result` event carries agy's own verdict — but it
+    /// is the one that proves the turn produced *content*, which is why a
+    /// stream success without it still fails the turn loud.
     pub fn is_terminal_answer(&self) -> bool {
         self.is_planner_response()
             && self.tool_calls.as_ref().is_none_or(Vec::is_empty)
@@ -140,11 +150,14 @@ fn tool_result_content_is_error(content: &str) -> bool {
     false
 }
 
-/// Per-turn parser state. Tracks the FIFO of in-flight tool invocations and
-/// early tool results so a result record can be paired with the `ToolStarted`
-/// it completes. Antigravity's result records carry no tool id, and observed
-/// transcripts can write a result before the planner record that names the
-/// tool call, so both sides are buffered by arrival order.
+/// Per-turn parser state. Tracks in-flight tool invocations and early tool
+/// results so a result record can be paired with the `ToolStarted` it
+/// completes — by **exact expected step**, never arrival order (see
+/// `expected_result_step`). Antigravity's result records carry no tool id, and
+/// observed transcripts can write a result before the planner record that names
+/// the tool call, so both sides are buffered until their expected step is
+/// claimed. Both queues still *store* entries in the order they are seen —
+/// only the **match** is exact, never the buffering.
 #[derive(Debug, Default)]
 pub struct AntigravityParserState {
     pending_tool_ids: VecDeque<PendingToolStart>,
@@ -491,7 +504,14 @@ fn take_result_for_step(
     pending_results.remove(idx)
 }
 
-/// Detect Antigravity's unauthenticated-dispatch signal on a stdout line.
+/// Detect Antigravity's unauthenticated-dispatch signal on an output line.
+///
+/// Applied to **both** streams: agy 1.1.x moved diagnostics to stderr (where
+/// `StderrSignals` observes each line as it drains, so a chatty burst can't
+/// evict the match from the bounded tail), while the stdout scan in
+/// `classify_outcome` is retained as a backstop. The 1.1.x auth shape is
+/// unverified — probing requires logging the developer out — so neither
+/// stream is dropped.
 ///
 /// Verified shapes (captured from a real logged-out `agy -p` run): the
 /// interactive-OAuth fallback prints `Authentication required. Please visit
@@ -629,7 +649,7 @@ mod tests {
             } => {
                 assert_eq!(
                     tool_use_id, "2:0:run_command",
-                    "FIFO-paired to the start id"
+                    "result must pair to the start id at its expected step"
                 );
                 assert!(output.contains("MARKER.txt"));
                 assert!(!is_error);

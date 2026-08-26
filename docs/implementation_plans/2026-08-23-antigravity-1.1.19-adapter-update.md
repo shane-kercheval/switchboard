@@ -1,12 +1,21 @@
 # Antigravity `agy` 1.0.14 → 1.1.19: fix the breakages, adopt the new capabilities
 
-**Status: active.** Branch: `harness-review/antigravity-1.1.19`.
+**Status: complete.** Branch: `harness-review/antigravity-1.1.19`.
+
+**Version note:** planned against `agy` 1.1.19; `agy` auto-updated to **1.1.20** mid-review,
+and all final verification was run against 1.1.20 (18/18 live). The 1.1.20 delta was probed
+and is benign — see `docs/harness-behavior.md` §6.
 
 This plan remediates the findings of the 2026-08-23 harness-update review of Antigravity
-(`agy` 1.0.14 → 1.1.19, 34 releases). The review found four breaking changes and three new
+(`agy` 1.0.14 → 1.1.20, 35 releases). The review found four breaking changes and three new
 capabilities (model/effort selection, a structured output stream, and a quota query). The
-decision (with the project owner) is to **address everything that broke and implement
+decision (with the project owner) was to **address everything that broke and implement
 everything that opened up** — not to patch minimally and defer.
+
+**Outcome: five of six milestones shipped. M5 (quota) was built and then cut** — the
+`/usage` poll works, but it costs 3.7–6.6s of phantom-busy time on every turn and the ways
+around that cost more than the gauge is worth on the least-used harness. The capability is
+recorded in `harness-behavior.md` §5.1 so it isn't rediscovered as an easy win.
 
 ## Required reading before implementing
 
@@ -637,7 +646,22 @@ Codex have (§3.3/§3.4 "Status: shipped" machinery):
 
 ---
 
-## Milestone 5 — Rate-limit / quota surface via `/usage`
+## Milestone 5 — Rate-limit / quota surface via `/usage` — **BUILT, THEN CUT**
+
+> **Not shipped.** This milestone was implemented to green tests (adapter poll, normalizer,
+> `fake_agy` support, 21 tests, 2 live tests) and then removed at review. The poll is a second
+> `agy` invocation that spawns its own language server: **3.7–6.6s** and **~150–250 MB RSS**,
+> measured. Because an agent is marked idle only when its adapter event channel closes, awaiting
+> the poll after `TurnEnd` leaves the agent visibly "processing" for that window — with an
+> already-inert Stop button — on every successful turn. The alternatives cost more than the gauge
+> is worth on Switchboard's least-used harness: polling concurrently doubles peak `agy` processes
+> per agent *and* gives up freshness (quota updates at turn end — verified), while moving the poll
+> off the turn lifecycle means the dispatcher's per-agent actor must own it.
+>
+> The payload shape, the two-pool model-family split, the measurements, and the cheap future
+> shape (poll once at project open, from the app layer) are recorded in `harness-behavior.md`
+> §5.1. The code is recoverable from the branch's stash entry. **Everything below is the
+> as-designed plan, kept for provenance — it does not describe shipped behavior.**
 
 ### Goal & Outcome
 

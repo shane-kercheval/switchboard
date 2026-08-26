@@ -177,13 +177,23 @@ struct AgentBuilder {
     last_seen_at: DateTime<Utc>,
     ended_at: Option<DateTime<Utc>>,
     items: Vec<TurnItem>,
-    /// Indices into `items` of `Tool` entries awaiting their result record.
-    /// Antigravity result records carry no tool id, so FIFO pairing is the
-    /// only available identity once both sides are present.
+    /// `Tool` entries awaiting their result record, each carrying the step the
+    /// result must land on.
+    ///
+    /// Antigravity result records carry no tool id, so identity comes from the
+    /// **step number**, not arrival order: a call at `call_index` inside the
+    /// planner record at `planner_step` is answered at
+    /// `planner_step + 1 + call_index`. **Do not reintroduce FIFO pairing.**
+    /// It was the original rule and it was wrong in two ways — agy writes no
+    /// record at all for a rejected tool, so the *next* tool's result was
+    /// handed to the silent one, and file order is not guaranteed. Both
+    /// produced silent identity swaps (one tool's output rendered under
+    /// another's name), which is why matching is exact and unmatched entries
+    /// are closed with an authored line rather than paired to whatever arrived.
     pending_tools: VecDeque<PendingToolStart>,
     /// Result records can appear before the planner record that names the tool
-    /// call. Buffer them FIFO so reload follows the same tolerant pairing as
-    /// the live transcript tail.
+    /// call. Buffer them until their expected step is claimed, so reload
+    /// follows the same exact-step pairing as the live transcript tail.
     pending_tool_results: VecDeque<PendingToolResult>,
     saw_terminal: bool,
     failed: bool,

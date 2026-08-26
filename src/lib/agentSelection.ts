@@ -89,12 +89,11 @@ export const MODEL_OPTIONS: Record<HarnessKind, SelectionOption[]> = {
 /// How the **model** picker renders per harness — the single source of truth
 /// both the create form and the sidebar change-model dialog read, so the two
 /// can't drift. Segmented (a toggle) for the short curated lists; a dropdown
-/// only for Gemini, whose list is long with long labels that would truncate as
-/// pills. Effort is always segmented (every effort set is short single words),
-/// so there is no `EFFORT_PRESENTATION`. Antigravity's value is inert — it has
-/// no model picker (the form shows a note instead). The sidebar additionally
-/// falls back to a dropdown when it must show an off-catalog persisted value
-/// whose label length is unbounded (see `Sidebar.svelte`).
+/// for Gemini and Antigravity, whose lists are long with labels long enough to
+/// truncate as pills. Effort is always segmented (every effort set is short
+/// single words), so there is no `EFFORT_PRESENTATION`. The sidebar
+/// additionally falls back to a dropdown when it must show an off-catalog
+/// persisted value whose label length is unbounded (see `Sidebar.svelte`).
 export const MODEL_PRESENTATION: Record<HarnessKind, "segmented" | "dropdown"> = {
   claude_code: "segmented",
   codex: "segmented",

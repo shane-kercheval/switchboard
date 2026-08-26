@@ -22,7 +22,7 @@ const AGGREGATE_FORMAT_VERSION: u32 = 1;
 /// signature changes each compile, so it re-asks for each access). Tokens here
 /// live as JSON in the dev config dir — gitignored runtime data on the
 /// developer's own machine — so plaintext is an acceptable dev tradeoff. Release
-/// builds use [`KeyringSecretStore`] (the real OS keychain); see
+/// builds use [`AggregateSecretStore`] (the real OS keychain); see
 /// `build_prompt_service`.
 #[cfg(debug_assertions)]
 pub struct FileSecretStore {
@@ -156,10 +156,49 @@ impl RawCredentialBackend for KeyringCredentialBackend {
     }
 
     fn delete(&self, account: &str) -> Result<(), SecretStoreError> {
-        match self.entry(account)?.delete_credential() {
-            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-            Err(error) => Err(map_error(error)),
-        }
+        delete_credential(&self.service, account)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn delete_credential(service: &str, account: &str) -> Result<(), SecretStoreError> {
+    use security_framework::item::{ItemClass, ItemSearchOptions};
+    use security_framework::os::macos::keychain::{SecKeychain, SecPreferencesDomain};
+
+    // keyring 3.6's macOS backend discards SecKeychainItemDelete's OSStatus and
+    // can report success after a rejected deletion. Use its same explicit User
+    // keychain scope and generic-password identity through an API that preserves
+    // the status; migration may clear its durable marker only after that proof.
+    let keychain = SecKeychain::default_for_domain(SecPreferencesDomain::User)
+        .map_err(keyring::macos::decode_error)
+        .map_err(map_error)?;
+    let mut query = ItemSearchOptions::new();
+    query
+        .keychains(std::slice::from_ref(&keychain))
+        .class(ItemClass::generic_password())
+        .service(service)
+        .account(account);
+    map_macos_delete_result(query.delete())
+}
+
+#[cfg(target_os = "macos")]
+fn map_macos_delete_result(
+    result: Result<(), security_framework::base::Error>,
+) -> Result<(), SecretStoreError> {
+    match result.map_err(keyring::macos::decode_error) {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(error) => Err(map_error(error)),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn delete_credential(service: &str, account: &str) -> Result<(), SecretStoreError> {
+    match keyring::Entry::new(service, account)
+        .map_err(map_error)?
+        .delete_credential()
+    {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(error) => Err(map_error(error)),
     }
 }
 
@@ -201,8 +240,12 @@ impl AggregateRecord {
 /// concurrent OAuth refreshes cannot overwrite one another. A candidate is
 /// persisted before it replaces the snapshot. Publishing first and attempting
 /// rollback would be unsafe because a platform write error can be ambiguous.
+///
+/// Legacy migration is serialized per logical key, not globally. It persists
+/// the aggregate value and a pending-cleanup marker before deleting the old
+/// item, so a crash at either boundary leaves a durable credential copy and a
+/// later operation can finish cleanup idempotently.
 #[derive(Clone)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub struct AggregateSecretStore {
     inner: Arc<AggregateSecretStoreInner>,
 }
@@ -211,13 +254,17 @@ struct AggregateSecretStoreInner {
     raw: Arc<dyn RawCredentialBackend>,
     snapshot: RwLock<Option<Arc<AggregateRecord>>>,
     mutation_lock: Mutex<()>,
+    migration_gates: Mutex<BTreeMap<String, Arc<Mutex<()>>>>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+enum AggregateKeyState {
+    Settled(Option<String>),
+    PendingCleanup(Option<String>),
+    Unchecked,
+}
+
+#[cfg_attr(debug_assertions, allow(dead_code))]
 impl AggregateSecretStore {
-    // Release selection still intentionally uses the keyed store while this
-    // independently tested backend is not yet the configured production path.
-    #[cfg_attr(test, allow(dead_code))]
     pub fn new(service: impl Into<String>) -> Self {
         Self::with_backend(Arc::new(KeyringCredentialBackend::new(service)))
     }
@@ -228,8 +275,16 @@ impl AggregateSecretStore {
                 raw,
                 snapshot: RwLock::new(None),
                 mutation_lock: Mutex::new(()),
+                migration_gates: Mutex::new(BTreeMap::new()),
             }),
         }
+    }
+
+    fn migration_gate(&self, key: &str) -> Arc<Mutex<()>> {
+        mutex_lock(&self.inner.migration_gates)
+            .entry(key.to_owned())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
 
     fn cached_snapshot(&self) -> Option<Arc<AggregateRecord>> {
@@ -271,29 +326,165 @@ impl AggregateSecretStore {
         *write_lock(&self.inner.snapshot) = Some(snapshot.clone());
         snapshot
     }
+
+    fn key_state(record: &AggregateRecord, key: &str) -> AggregateKeyState {
+        let value = record.secrets.get(key).cloned();
+        if record.pending_legacy_deletions.contains(key) {
+            AggregateKeyState::PendingCleanup(value)
+        } else if value.is_some() || record.legacy_checked.contains(key) {
+            AggregateKeyState::Settled(value)
+        } else {
+            AggregateKeyState::Unchecked
+        }
+    }
+
+    /// Delete the legacy item while the caller holds only this key's migration
+    /// gate. The global mutation lock is deliberately acquired only afterward,
+    /// when clearing the durable marker: an authorization dialog for one legacy
+    /// item must not stall cached reads or migration for sibling providers.
+    fn finish_pending_cleanup(&self, key: &str) -> Result<(), SecretStoreError> {
+        let snapshot = self.initialized_snapshot()?;
+        if !snapshot.pending_legacy_deletions.contains(key) {
+            return Ok(());
+        }
+
+        self.inner.raw.delete(key)?;
+
+        let clear_result = {
+            let _mutation = mutex_lock(&self.inner.mutation_lock);
+            let current = self.initialized_snapshot_locked()?;
+            if current.pending_legacy_deletions.contains(key) {
+                let mut candidate = current.as_ref().clone();
+                candidate.pending_legacy_deletions.remove(key);
+                self.persist_candidate(candidate)
+            } else {
+                Ok(())
+            }
+        };
+        if let Err(error) = clear_result {
+            // The credential copy is already gone. Keeping the durable marker
+            // is harmless and makes a later operation retry idempotently.
+            tracing::warn!(
+                error = %error,
+                "legacy credential was deleted but its cleanup marker remains"
+            );
+        }
+        Ok(())
+    }
+
+    fn finish_pending_cleanup_best_effort(&self, key: &str) {
+        if let Err(error) = self.finish_pending_cleanup(key) {
+            // The aggregate copy is authoritative before cleanup starts. A
+            // failed legacy deletion must not turn a successfully persisted
+            // OAuth refresh token into a reported save failure: the server may
+            // already have invalidated the previous rotating refresh token.
+            tracing::warn!(
+                error = %error,
+                "legacy credential cleanup remains pending"
+            );
+        }
+    }
 }
 
 impl SecretStore for AggregateSecretStore {
     fn get(&self, key: &str) -> Result<Option<String>, SecretStoreError> {
-        Ok(self.initialized_snapshot()?.secrets.get(key).cloned())
+        let initial = self.initialized_snapshot()?;
+        if let AggregateKeyState::Settled(value) = Self::key_state(&initial, key) {
+            return Ok(value);
+        }
+
+        let gate = self.migration_gate(key);
+        let _key_migration = mutex_lock(&gate);
+        let current = self.initialized_snapshot()?;
+        match Self::key_state(&current, key) {
+            AggregateKeyState::Settled(value) => return Ok(value),
+            AggregateKeyState::PendingCleanup(value) => {
+                self.finish_pending_cleanup_best_effort(key);
+                return Ok(value);
+            }
+            AggregateKeyState::Unchecked => {}
+        }
+
+        // The legacy Keychain read happens without the global mutation lock.
+        // Different providers may therefore resolve separate authorization
+        // dialogs independently, while this key's gate prevents duplicate work.
+        let legacy_value = self.inner.raw.read(key)?;
+        let (value, cleanup_pending) = {
+            let _mutation = mutex_lock(&self.inner.mutation_lock);
+            let latest = self.initialized_snapshot_locked()?;
+            match Self::key_state(&latest, key) {
+                AggregateKeyState::Settled(value) => (value, false),
+                AggregateKeyState::PendingCleanup(value) => (value, true),
+                AggregateKeyState::Unchecked => {
+                    let mut candidate = latest.as_ref().clone();
+                    candidate.legacy_checked.insert(key.to_owned());
+                    if let Some(secret) = &legacy_value {
+                        candidate.secrets.insert(key.to_owned(), secret.clone());
+                        candidate.pending_legacy_deletions.insert(key.to_owned());
+                    }
+                    self.persist_candidate(candidate)?;
+                    let cleanup_pending = legacy_value.is_some();
+                    (legacy_value, cleanup_pending)
+                }
+            }
+        };
+
+        if cleanup_pending {
+            self.finish_pending_cleanup_best_effort(key);
+        }
+        Ok(value)
     }
 
     fn set(&self, key: &str, value: &str) -> Result<(), SecretStoreError> {
-        let _mutation = mutex_lock(&self.inner.mutation_lock);
-        let current = self.initialized_snapshot_locked()?;
-        let mut candidate = current.as_ref().clone();
-        candidate.secrets.insert(key.to_owned(), value.to_owned());
-        self.persist_candidate(candidate)
+        let gate = self.migration_gate(key);
+        let _key_migration = mutex_lock(&gate);
+        let cleanup_pending = {
+            let _mutation = mutex_lock(&self.inner.mutation_lock);
+            let current = self.initialized_snapshot_locked()?;
+            let cleanup_pending = !current.legacy_checked.contains(key)
+                || current.pending_legacy_deletions.contains(key);
+            let mut candidate = current.as_ref().clone();
+            candidate.secrets.insert(key.to_owned(), value.to_owned());
+            candidate.legacy_checked.insert(key.to_owned());
+            if cleanup_pending {
+                candidate.pending_legacy_deletions.insert(key.to_owned());
+            }
+            self.persist_candidate(candidate)?;
+            cleanup_pending
+        };
+
+        if cleanup_pending {
+            self.finish_pending_cleanup_best_effort(key);
+        }
+        Ok(())
     }
 
     fn delete(&self, key: &str) -> Result<(), SecretStoreError> {
-        let _mutation = mutex_lock(&self.inner.mutation_lock);
-        let current = self.initialized_snapshot_locked()?;
-        let mut candidate = current.as_ref().clone();
-        if candidate.secrets.remove(key).is_none() {
-            return Ok(());
+        let gate = self.migration_gate(key);
+        let _key_migration = mutex_lock(&gate);
+        let cleanup_pending = {
+            let _mutation = mutex_lock(&self.inner.mutation_lock);
+            let current = self.initialized_snapshot_locked()?;
+            let cleanup_pending = !current.legacy_checked.contains(key)
+                || current.pending_legacy_deletions.contains(key);
+            let mut candidate = current.as_ref().clone();
+            candidate.secrets.remove(key);
+            candidate.legacy_checked.insert(key.to_owned());
+            if cleanup_pending {
+                candidate.pending_legacy_deletions.insert(key.to_owned());
+            }
+            if candidate != *current {
+                self.persist_candidate(candidate)?;
+            }
+            cleanup_pending
+        };
+
+        if cleanup_pending {
+            // Explicit deletion is stricter than migration cleanup: provider
+            // removal must not report success while a credential copy remains.
+            self.finish_pending_cleanup(key)?;
         }
-        self.persist_candidate(candidate)
+        Ok(())
     }
 }
 
@@ -336,38 +527,6 @@ fn write_lock<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Stores each logical provider credential under `(service, key)` in the OS
-/// keychain. `service` namespaces the entries. Used by **release** builds; debug
-/// builds use [`FileSecretStore`] (so it's unused by the debug lib, though still
-/// exercised by the tests below).
-#[cfg_attr(debug_assertions, allow(dead_code))]
-pub struct KeyringSecretStore {
-    backend: KeyringCredentialBackend,
-}
-
-#[cfg_attr(debug_assertions, allow(dead_code))]
-impl KeyringSecretStore {
-    pub fn new(service: impl Into<String>) -> Self {
-        Self {
-            backend: KeyringCredentialBackend::new(service),
-        }
-    }
-}
-
-impl SecretStore for KeyringSecretStore {
-    fn get(&self, key: &str) -> Result<Option<String>, SecretStoreError> {
-        self.backend.read(key)
-    }
-
-    fn set(&self, key: &str, value: &str) -> Result<(), SecretStoreError> {
-        self.backend.write(key, value)
-    }
-
-    fn delete(&self, key: &str) -> Result<(), SecretStoreError> {
-        self.backend.delete(key)
-    }
-}
-
 /// Map a keyring error to a generic, **secret-free** message. Deliberately does
 /// *not* use `keyring::Error`'s `Display` for `BadEncoding`, which embeds the raw
 /// stored bytes — credential material must never reach an error string.
@@ -399,48 +558,106 @@ mod tests {
 
     #[derive(Default)]
     struct FakeRawState {
-        value: Option<String>,
-        reads: usize,
-        writes: usize,
-        deletes: usize,
-        fail_next_read: bool,
-        fail_next_write: bool,
+        values: BTreeMap<String, String>,
+        reads: BTreeMap<String, usize>,
+        writes: BTreeMap<String, usize>,
+        deletes: BTreeMap<String, usize>,
+        fail_next_reads: BTreeSet<String>,
+        fail_next_writes: BTreeSet<String>,
+        fail_next_deletes: BTreeSet<String>,
     }
 
     #[derive(Default)]
     struct FakeRawCredentialBackend {
         state: Mutex<FakeRawState>,
-        next_write_block: Mutex<Option<Arc<WriteBlock>>>,
+        next_read_blocks: Mutex<BTreeMap<String, Arc<OperationBlock>>>,
+        next_write_blocks: Mutex<BTreeMap<String, Arc<OperationBlock>>>,
+        next_delete_blocks: Mutex<BTreeMap<String, Arc<OperationBlock>>>,
     }
 
     impl FakeRawCredentialBackend {
         fn seed(&self, value: String) {
-            mutex_lock(&self.state).value = Some(value);
+            self.seed_account(AGGREGATE_ACCOUNT, value);
+        }
+
+        fn seed_record(&self, record: &AggregateRecord) {
+            self.seed(encode_record(record).unwrap());
         }
 
         fn fail_next_read(&self) {
-            mutex_lock(&self.state).fail_next_read = true;
+            self.fail_next_read_for(AGGREGATE_ACCOUNT);
+        }
+
+        fn fail_next_read_for(&self, account: &str) {
+            mutex_lock(&self.state)
+                .fail_next_reads
+                .insert(account.to_owned());
         }
 
         fn fail_next_write(&self) {
-            mutex_lock(&self.state).fail_next_write = true;
+            self.fail_next_write_for(AGGREGATE_ACCOUNT);
         }
 
-        fn block_next_write(&self) -> Arc<WriteBlock> {
-            let block = Arc::new(WriteBlock::default());
-            *mutex_lock(&self.next_write_block) = Some(block.clone());
+        fn fail_next_write_for(&self, account: &str) {
+            mutex_lock(&self.state)
+                .fail_next_writes
+                .insert(account.to_owned());
+        }
+
+        fn fail_next_delete(&self, account: &str) {
+            mutex_lock(&self.state)
+                .fail_next_deletes
+                .insert(account.to_owned());
+        }
+
+        fn seed_account(&self, account: &str, value: String) {
+            mutex_lock(&self.state)
+                .values
+                .insert(account.to_owned(), value);
+        }
+
+        fn seed_legacy(&self, key: &str, value: &str) {
+            self.seed_account(key, value.to_owned());
+        }
+
+        fn account_value(&self, account: &str) -> Option<String> {
+            mutex_lock(&self.state).values.get(account).cloned()
+        }
+
+        fn block_next_read(&self, account: &str) -> Arc<OperationBlock> {
+            let block = Arc::new(OperationBlock::default());
+            mutex_lock(&self.next_read_blocks).insert(account.to_owned(), block.clone());
+            block
+        }
+
+        fn block_next_write(&self) -> Arc<OperationBlock> {
+            let block = Arc::new(OperationBlock::default());
+            mutex_lock(&self.next_write_blocks).insert(AGGREGATE_ACCOUNT.to_owned(), block.clone());
+            block
+        }
+
+        fn block_next_delete(&self, account: &str) -> Arc<OperationBlock> {
+            let block = Arc::new(OperationBlock::default());
+            mutex_lock(&self.next_delete_blocks).insert(account.to_owned(), block.clone());
             block
         }
 
         fn counts(&self) -> (usize, usize, usize) {
+            self.account_counts(AGGREGATE_ACCOUNT)
+        }
+
+        fn account_counts(&self, account: &str) -> (usize, usize, usize) {
             let state = mutex_lock(&self.state);
-            (state.reads, state.writes, state.deletes)
+            (
+                state.reads.get(account).copied().unwrap_or_default(),
+                state.writes.get(account).copied().unwrap_or_default(),
+                state.deletes.get(account).copied().unwrap_or_default(),
+            )
         }
 
         fn durable_record(&self) -> AggregateRecord {
-            let encoded = mutex_lock(&self.state)
-                .value
-                .clone()
+            let encoded = self
+                .account_value(AGGREGATE_ACCOUNT)
                 .expect("aggregate record should be persisted");
             decode_record(&encoded).unwrap()
         }
@@ -448,53 +665,74 @@ mod tests {
 
     impl RawCredentialBackend for FakeRawCredentialBackend {
         fn read(&self, account: &str) -> Result<Option<String>, SecretStoreError> {
-            assert_eq!(account, AGGREGATE_ACCOUNT);
-            let mut state = mutex_lock(&self.state);
-            state.reads += 1;
-            if std::mem::take(&mut state.fail_next_read) {
-                return Err(SecretStoreError::Backend(
-                    "fake credential store is unavailable".to_owned(),
-                ));
+            {
+                let mut state = mutex_lock(&self.state);
+                *state.reads.entry(account.to_owned()).or_default() += 1;
+                if state.fail_next_reads.remove(account) {
+                    return Err(SecretStoreError::Backend(
+                        "fake credential store is unavailable".to_owned(),
+                    ));
+                }
             }
-            Ok(state.value.clone())
+
+            let block = mutex_lock(&self.next_read_blocks).remove(account);
+            if let Some(block) = block {
+                block.wait_for_release();
+            }
+
+            Ok(mutex_lock(&self.state).values.get(account).cloned())
         }
 
         fn write(&self, account: &str, value: &str) -> Result<(), SecretStoreError> {
-            assert_eq!(account, AGGREGATE_ACCOUNT);
             {
                 let mut state = mutex_lock(&self.state);
-                state.writes += 1;
-                if std::mem::take(&mut state.fail_next_write) {
+                *state.writes.entry(account.to_owned()).or_default() += 1;
+                if state.fail_next_writes.remove(account) {
                     return Err(SecretStoreError::Backend(
                         "fake credential write failed".to_owned(),
                     ));
                 }
             }
 
-            if let Some(block) = mutex_lock(&self.next_write_block).take() {
+            let block = mutex_lock(&self.next_write_blocks).remove(account);
+            if let Some(block) = block {
                 block.wait_for_release();
             }
 
-            mutex_lock(&self.state).value = Some(value.to_owned());
+            mutex_lock(&self.state)
+                .values
+                .insert(account.to_owned(), value.to_owned());
             Ok(())
         }
 
         fn delete(&self, account: &str) -> Result<(), SecretStoreError> {
-            assert_eq!(account, AGGREGATE_ACCOUNT);
-            let mut state = mutex_lock(&self.state);
-            state.deletes += 1;
-            state.value = None;
+            {
+                let mut state = mutex_lock(&self.state);
+                *state.deletes.entry(account.to_owned()).or_default() += 1;
+                if state.fail_next_deletes.remove(account) {
+                    return Err(SecretStoreError::Backend(
+                        "fake credential delete failed".to_owned(),
+                    ));
+                }
+            }
+
+            let block = mutex_lock(&self.next_delete_blocks).remove(account);
+            if let Some(block) = block {
+                block.wait_for_release();
+            }
+
+            mutex_lock(&self.state).values.remove(account);
             Ok(())
         }
     }
 
     #[derive(Default)]
-    struct WriteBlock {
+    struct OperationBlock {
         entered: (Mutex<bool>, Condvar),
         released: (Mutex<bool>, Condvar),
     }
 
-    impl WriteBlock {
+    impl OperationBlock {
         fn wait_for_release(&self) {
             let (entered_lock, entered_changed) = &self.entered;
             *mutex_lock(entered_lock) = true;
@@ -543,11 +781,23 @@ mod tests {
     }
 
     #[test]
-    fn absent_credential_reads_as_none_and_delete_is_idempotent() {
+    fn keyring_backend_maps_absence() {
         use_mock_store();
-        let store = KeyringSecretStore::new("switchboard-test");
-        assert_eq!(store.get("never-set").unwrap(), None);
-        store.delete("never-set").unwrap();
+        let backend = KeyringCredentialBackend::new("switchboard-test");
+        assert_eq!(backend.read("never-set").unwrap(), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_delete_maps_only_absence_to_success_without_leaking_platform_details() {
+        let absent = security_framework::base::Error::from_code(-25_300);
+        let denied = security_framework::base::Error::from_code(-25_293);
+
+        map_macos_delete_result(Err(absent)).unwrap();
+        let error = map_macos_delete_result(Err(denied)).unwrap_err();
+        let rendered = format!("{error:?} {error}");
+        assert!(rendered.contains("secret store platform failure"));
+        assert!(!rendered.contains("-25293"));
     }
 
     #[test]
@@ -570,12 +820,354 @@ mod tests {
     }
 
     #[test]
+    fn legacy_bearer_migrates_aggregate_first_and_deletes_the_old_item() {
+        let (store, raw) = aggregate_store();
+        raw.seed_legacy("team", "legacy-bearer");
+
+        assert_eq!(store.get("team").unwrap().as_deref(), Some("legacy-bearer"));
+
+        let durable = raw.durable_record();
+        assert_eq!(
+            durable.secrets.get("team").map(String::as_str),
+            Some("legacy-bearer")
+        );
+        assert!(durable.legacy_checked.contains("team"));
+        assert!(!durable.pending_legacy_deletions.contains("team"));
+        assert_eq!(raw.account_value("team"), None);
+        assert_eq!(raw.account_counts("team"), (1, 0, 1));
+    }
+
+    #[test]
+    fn legacy_oauth_envelope_migrates_as_an_opaque_value() {
+        let (store, raw) = aggregate_store();
+        let envelope =
+            r#"{"registration":{"client_id":"id"},"tokens":{"refresh_token":"rotating"}}"#;
+        raw.seed_legacy("oauth:team", envelope);
+
+        assert_eq!(store.get("oauth:team").unwrap().as_deref(), Some(envelope));
+        assert_eq!(
+            raw.durable_record()
+                .secrets
+                .get("oauth:team")
+                .map(String::as_str),
+            Some(envelope)
+        );
+        assert_eq!(raw.account_value("oauth:team"), None);
+    }
+
+    #[test]
+    fn confirmed_absent_legacy_item_is_not_reprobed_after_restart() {
+        let (store, raw) = aggregate_store();
+
+        assert_eq!(store.get("missing").unwrap(), None);
+        assert_eq!(raw.account_counts("missing"), (1, 0, 0));
+
+        let restarted_store = AggregateSecretStore::with_backend(raw.clone());
+        assert_eq!(restarted_store.get("missing").unwrap(), None);
+        assert_eq!(raw.account_counts("missing"), (1, 0, 0));
+        assert!(raw.durable_record().legacy_checked.contains("missing"));
+    }
+
+    #[test]
+    fn failed_migration_persistence_leaves_the_legacy_item_untouched() {
+        let (store, raw) = aggregate_store();
+        raw.seed_legacy("team", "legacy-secret");
+        raw.fail_next_write();
+
+        let error = store.get("team").unwrap_err();
+
+        assert_eq!(raw.account_value("team").as_deref(), Some("legacy-secret"));
+        assert_eq!(raw.account_counts("team"), (1, 0, 0));
+        assert_eq!(raw.account_value(AGGREGATE_ACCOUNT), None);
+        let rendered = format!("{error:?} {error}");
+        assert!(!rendered.contains("legacy-secret"));
+    }
+
+    #[test]
+    fn unavailable_legacy_read_is_not_mistaken_for_an_absent_item() {
+        let (store, raw) = aggregate_store();
+        raw.fail_next_read_for("team");
+
+        assert!(store.get("team").is_err());
+        assert_eq!(raw.account_counts("team"), (1, 0, 0));
+        assert_eq!(raw.account_value(AGGREGATE_ACCOUNT), None);
+
+        assert_eq!(store.get("team").unwrap(), None);
+        assert_eq!(raw.account_counts("team"), (2, 0, 0));
+        assert!(raw.durable_record().legacy_checked.contains("team"));
+    }
+
+    #[test]
+    fn crash_state_serves_aggregate_value_and_finishes_legacy_cleanup() {
+        let (store, raw) = aggregate_store();
+        let mut record = AggregateRecord::empty();
+        record
+            .secrets
+            .insert("team".to_owned(), "aggregate-secret".to_owned());
+        record.legacy_checked.insert("team".to_owned());
+        record.pending_legacy_deletions.insert("team".to_owned());
+        raw.seed_record(&record);
+        raw.seed_legacy("team", "legacy-secret");
+
+        assert_eq!(
+            store.get("team").unwrap().as_deref(),
+            Some("aggregate-secret")
+        );
+
+        assert_eq!(raw.account_value("team"), None);
+        let durable = raw.durable_record();
+        assert_eq!(
+            durable.secrets.get("team").map(String::as_str),
+            Some("aggregate-secret")
+        );
+        assert!(!durable.pending_legacy_deletions.contains("team"));
+    }
+
+    #[test]
+    fn failed_legacy_delete_keeps_a_durable_marker_and_retries() {
+        let (store, raw) = aggregate_store();
+        raw.seed_legacy("team", "legacy-secret");
+        raw.fail_next_delete("team");
+
+        assert_eq!(store.get("team").unwrap().as_deref(), Some("legacy-secret"));
+        assert!(
+            raw.durable_record()
+                .pending_legacy_deletions
+                .contains("team")
+        );
+        assert_eq!(raw.account_value("team").as_deref(), Some("legacy-secret"));
+
+        assert_eq!(store.get("team").unwrap().as_deref(), Some("legacy-secret"));
+        assert_eq!(raw.account_value("team"), None);
+        assert!(
+            !raw.durable_record()
+                .pending_legacy_deletions
+                .contains("team")
+        );
+        assert_eq!(raw.account_counts("team"), (1, 0, 2));
+    }
+
+    #[test]
+    fn failed_marker_clear_is_harmless_and_repairs_on_retry() {
+        let (store, raw) = aggregate_store();
+        let mut record = AggregateRecord::empty();
+        record
+            .secrets
+            .insert("team".to_owned(), "aggregate-secret".to_owned());
+        record.legacy_checked.insert("team".to_owned());
+        record.pending_legacy_deletions.insert("team".to_owned());
+        raw.seed_record(&record);
+        raw.seed_legacy("team", "legacy-secret");
+        raw.fail_next_write();
+
+        assert_eq!(
+            store.get("team").unwrap().as_deref(),
+            Some("aggregate-secret")
+        );
+        assert_eq!(raw.account_value("team"), None);
+        assert!(
+            raw.durable_record()
+                .pending_legacy_deletions
+                .contains("team")
+        );
+
+        assert_eq!(
+            store.get("team").unwrap().as_deref(),
+            Some("aggregate-secret")
+        );
+        assert!(
+            !raw.durable_record()
+                .pending_legacy_deletions
+                .contains("team")
+        );
+    }
+
+    #[test]
+    fn set_keeps_the_new_value_when_legacy_cleanup_must_retry() {
+        let (store, raw) = aggregate_store();
+        raw.seed_legacy("oauth:team", "stale-envelope");
+        raw.fail_next_delete("oauth:team");
+
+        store.set("oauth:team", "new-envelope").unwrap();
+
+        let durable = raw.durable_record();
+        assert_eq!(
+            durable.secrets.get("oauth:team").map(String::as_str),
+            Some("new-envelope")
+        );
+        assert!(durable.pending_legacy_deletions.contains("oauth:team"));
+        assert_eq!(
+            store.get("oauth:team").unwrap().as_deref(),
+            Some("new-envelope")
+        );
+        assert_eq!(raw.account_value("oauth:team"), None);
+    }
+
+    #[test]
+    fn set_retries_cleanup_from_a_preexisting_pending_marker() {
+        let (store, raw) = aggregate_store();
+        let mut record = AggregateRecord::empty();
+        record
+            .secrets
+            .insert("oauth:team".to_owned(), "old-envelope".to_owned());
+        record.legacy_checked.insert("oauth:team".to_owned());
+        record
+            .pending_legacy_deletions
+            .insert("oauth:team".to_owned());
+        raw.seed_record(&record);
+        raw.seed_legacy("oauth:team", "legacy-envelope");
+        raw.fail_next_delete("oauth:team");
+
+        store.set("oauth:team", "new-envelope").unwrap();
+
+        let pending = raw.durable_record();
+        assert_eq!(
+            pending.secrets.get("oauth:team").map(String::as_str),
+            Some("new-envelope")
+        );
+        assert!(pending.pending_legacy_deletions.contains("oauth:team"));
+        assert_eq!(
+            raw.account_value("oauth:team").as_deref(),
+            Some("legacy-envelope")
+        );
+
+        assert_eq!(
+            store.get("oauth:team").unwrap().as_deref(),
+            Some("new-envelope")
+        );
+        assert_eq!(raw.account_value("oauth:team"), None);
+        assert!(
+            !raw.durable_record()
+                .pending_legacy_deletions
+                .contains("oauth:team")
+        );
+    }
+
+    #[test]
+    fn explicit_delete_surfaces_legacy_cleanup_failure_until_no_copy_remains() {
+        let (store, raw) = aggregate_store();
+        raw.seed_legacy("team", "legacy-secret");
+        raw.fail_next_delete("team");
+
+        assert!(store.delete("team").is_err());
+        let after_failure = raw.durable_record();
+        assert!(!after_failure.secrets.contains_key("team"));
+        assert!(after_failure.pending_legacy_deletions.contains("team"));
+        assert_eq!(raw.account_value("team").as_deref(), Some("legacy-secret"));
+
+        store.delete("team").unwrap();
+        assert_eq!(raw.account_value("team"), None);
+        let settled = raw.durable_record();
+        assert!(!settled.secrets.contains_key("team"));
+        assert!(!settled.pending_legacy_deletions.contains("team"));
+    }
+
+    #[test]
+    fn concurrent_first_reads_of_one_key_perform_one_legacy_read() {
+        let (store, raw) = aggregate_store();
+        raw.seed_legacy("team", "legacy-secret");
+        let workers = 8;
+        let barrier = Arc::new(Barrier::new(workers));
+        let handles: Vec<_> = (0..workers)
+            .map(|_: usize| {
+                let store = store.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    assert_eq!(store.get("team").unwrap().as_deref(), Some("legacy-secret"));
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        assert_eq!(raw.account_counts("team"), (1, 0, 1));
+    }
+
+    #[test]
+    fn blocked_legacy_read_does_not_block_cached_reads_or_sibling_migration() {
+        let (store, raw) = aggregate_store();
+        store.set("cached", "cached-secret").unwrap();
+        raw.seed_legacy("blocked", "blocked-secret");
+        raw.seed_legacy("sibling", "sibling-secret");
+        let read_block = raw.block_next_read("blocked");
+
+        let blocked_store = store.clone();
+        let blocked = std::thread::spawn(move || blocked_store.get("blocked").unwrap());
+        read_block.wait_until_entered();
+
+        assert_eq!(
+            store.get("cached").unwrap().as_deref(),
+            Some("cached-secret")
+        );
+        let sibling_store = store.clone();
+        let (result_tx, result_rx) = mpsc::channel();
+        let sibling = std::thread::spawn(move || {
+            result_tx.send(sibling_store.get("sibling")).unwrap();
+        });
+        let sibling_result = result_rx.recv_timeout(Duration::from_secs(5));
+
+        read_block.release();
+        assert_eq!(blocked.join().unwrap().as_deref(), Some("blocked-secret"));
+        sibling.join().unwrap();
+        assert_eq!(
+            sibling_result
+                .expect("sibling migration should not wait for a legacy read")
+                .unwrap()
+                .as_deref(),
+            Some("sibling-secret")
+        );
+        let durable = raw.durable_record();
+        assert_eq!(durable.secrets.len(), 3);
+    }
+
+    #[test]
+    fn blocked_pending_cleanup_does_not_block_a_sibling_migration() {
+        let (store, raw) = aggregate_store();
+        let mut record = AggregateRecord::empty();
+        record
+            .secrets
+            .insert("blocked".to_owned(), "aggregate-secret".to_owned());
+        record.legacy_checked.insert("blocked".to_owned());
+        record.pending_legacy_deletions.insert("blocked".to_owned());
+        raw.seed_record(&record);
+        raw.seed_legacy("blocked", "legacy-secret");
+        raw.seed_legacy("sibling", "sibling-secret");
+        let delete_block = raw.block_next_delete("blocked");
+
+        let blocked_store = store.clone();
+        let blocked = std::thread::spawn(move || blocked_store.get("blocked").unwrap());
+        delete_block.wait_until_entered();
+
+        let sibling_store = store.clone();
+        let (result_tx, result_rx) = mpsc::channel();
+        let sibling = std::thread::spawn(move || {
+            result_tx.send(sibling_store.get("sibling")).unwrap();
+        });
+        let sibling_result = result_rx.recv_timeout(Duration::from_secs(5));
+
+        delete_block.release();
+        assert_eq!(blocked.join().unwrap().as_deref(), Some("aggregate-secret"));
+        sibling.join().unwrap();
+        assert_eq!(
+            sibling_result
+                .expect("sibling migration should not wait for legacy cleanup")
+                .unwrap()
+                .as_deref(),
+            Some("sibling-secret")
+        );
+    }
+
+    #[test]
     fn aggregate_store_caches_a_confirmed_absent_record() {
         let (store, raw) = aggregate_store();
 
         assert_eq!(store.get("bearer").unwrap(), None);
         assert_eq!(store.get("oauth:provider").unwrap(), None);
-        assert_eq!(raw.counts(), (1, 0, 0));
+        assert_eq!(raw.counts(), (1, 2, 0));
+        assert_eq!(raw.account_counts("bearer"), (1, 0, 0));
+        assert_eq!(raw.account_counts("oauth:provider"), (1, 0, 0));
     }
 
     #[test]
@@ -600,7 +1192,7 @@ mod tests {
             durable.secrets.get("oauth:provider").map(String::as_str),
             Some("oauth-envelope-json")
         );
-        assert_eq!(raw.counts(), (1, 3, 0));
+        assert_eq!(raw.counts(), (1, 5, 0));
     }
 
     #[test]
@@ -619,7 +1211,7 @@ mod tests {
             restarted_store.get("oauth:provider").unwrap().as_deref(),
             Some("oauth-envelope-json")
         );
-        assert_eq!(raw.counts(), (2, 2, 0));
+        assert_eq!(raw.counts(), (2, 4, 0));
     }
 
     #[test]
@@ -662,7 +1254,7 @@ mod tests {
         for handle in handles {
             handle.join().unwrap();
         }
-        assert_eq!(raw.counts(), (1, 0, 0));
+        assert_eq!(raw.counts(), (1, workers, 0));
     }
 
     #[test]
@@ -672,7 +1264,7 @@ mod tests {
 
         assert!(store.get("provider").is_err());
         assert_eq!(store.get("provider").unwrap(), None);
-        assert_eq!(raw.counts(), (2, 0, 0));
+        assert_eq!(raw.counts(), (2, 1, 0));
     }
 
     #[test]
@@ -707,17 +1299,20 @@ mod tests {
                 Some(format!("secret-{index}").as_str())
             );
         }
-        assert_eq!(raw.counts(), (1, workers, 0));
+        assert_eq!(raw.counts(), (1, workers * 2, 0));
     }
 
     #[test]
-    fn deleting_an_absent_logical_key_does_not_rewrite_the_record() {
+    fn repeated_delete_of_a_confirmed_absent_key_does_not_rewrite_the_record() {
         let (store, raw) = aggregate_store();
 
         store.delete("missing").unwrap();
+        let counts_after_legacy_cleanup = raw.counts();
         store.delete("missing").unwrap();
 
-        assert_eq!(raw.counts(), (1, 0, 0));
+        assert_eq!(counts_after_legacy_cleanup, (1, 2, 0));
+        assert_eq!(raw.counts(), counts_after_legacy_cleanup);
+        assert_eq!(raw.account_counts("missing"), (0, 0, 1));
     }
 
     #[test]

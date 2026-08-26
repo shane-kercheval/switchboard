@@ -1799,8 +1799,8 @@ fn workflows_dir_path() -> Option<std::path::PathBuf> {
 /// prompts come from the read-only library baked into the service — nothing is
 /// written into the user's folder.
 ///
-/// The injected secret store is the OS keychain (`KeyringSecretStore`), namespaced
-/// by build so debug tokens stay separate from a release install's.
+/// Release builds use one cached aggregate Keychain record; debug builds use a
+/// dev-only plaintext file so rebuilds never trigger Keychain authorization.
 fn build_prompt_service() -> switchboard_prompts::PromptService {
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
     if let Some(dir) = config_dir() {
@@ -1821,21 +1821,27 @@ fn build_prompt_service() -> switchboard_prompts::PromptService {
 /// the developer's own machine.
 #[cfg(not(debug_assertions))]
 fn build_secret_store(_dir: &std::path::Path) -> Arc<dyn switchboard_prompts::SecretStore> {
-    Arc::new(crate::secret_store::KeyringSecretStore::new(
-        keyring_service(),
-    ))
+    Arc::new(build_release_secret_store())
 }
 
 #[cfg(debug_assertions)]
 fn build_secret_store(dir: &std::path::Path) -> Arc<dyn switchboard_prompts::SecretStore> {
-    Arc::new(crate::secret_store::FileSecretStore::new(
-        dir.join("mcp-secrets.json"),
-    ))
+    Arc::new(build_debug_secret_store(dir))
 }
 
-/// Keychain service name for stored provider bearers (release only — debug uses
-/// the file store, so this isn't compiled there).
-#[cfg(not(debug_assertions))]
+#[cfg(any(not(debug_assertions), test))]
+fn build_release_secret_store() -> crate::secret_store::AggregateSecretStore {
+    crate::secret_store::AggregateSecretStore::new(keyring_service())
+}
+
+#[cfg(debug_assertions)]
+fn build_debug_secret_store(dir: &std::path::Path) -> crate::secret_store::FileSecretStore {
+    crate::secret_store::FileSecretStore::new(dir.join("mcp-secrets.json"))
+}
+
+/// Keychain service name for the aggregate MCP credential record and legacy
+/// per-provider migration inputs (release only — debug uses the file store).
+#[cfg(any(not(debug_assertions), test))]
 fn keyring_service() -> &'static str {
     "switchboard"
 }
@@ -2253,7 +2259,10 @@ pub fn run() {
 // builds; `cargo test --release` turns those off and the symbol away.
 #[cfg(all(test, debug_assertions))]
 mod tests {
-    use super::{ActivationCommandError, debug_config_dir, run_open_argv};
+    use super::{
+        ActivationCommandError, build_debug_secret_store, build_release_secret_store,
+        debug_config_dir, run_open_argv,
+    };
     use crate::error::AppError;
     use std::path::PathBuf;
     use uuid::Uuid;
@@ -2285,6 +2294,13 @@ mod tests {
         if let Some(path) = debug_config_dir(None) {
             assert!(path.ends_with("switchboard-dev"));
         }
+    }
+
+    #[test]
+    fn secret_store_factories_select_the_build_mode_backends() {
+        let _: crate::secret_store::AggregateSecretStore = build_release_secret_store();
+        let _: crate::secret_store::FileSecretStore =
+            build_debug_secret_store(std::path::Path::new("/tmp/switchboard-test"));
     }
 
     #[tokio::test]

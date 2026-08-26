@@ -346,8 +346,7 @@ local_prompt_dirs:
 
 # MCP prompt servers, added via Settings → "Add MCP server". Only non-secret
 # config lives here; credentials (a pasted bearer token, or OAuth's client
-# registration + tokens) are stored in the OS keychain, keyed by the provider
-# name — never in this file.
+# registration + tokens) are stored in the OS keychain — never in this file.
 mcp_providers:
   - name: tiddly                    # the prefix (tiddly:my-prompt)
     transport:
@@ -365,6 +364,15 @@ mcp_providers:
 ```
 
 **V1: all MCP servers are added through one generic form, with two auth modes.** Settings offers an "Add MCP server" form (name + URL + an authentication mode); the non-secret config is written to `config.yaml` and credentials live in the OS keychain, never in `config.yaml`. **Bearer** is a token the user pastes (for Tiddly, a Personal Access Token minted in Tiddly's own UI/CLI) — the path for servers without OAuth support and for headless use. **OAuth** (`auth: { type: oauth }`) is browser sign-in per the MCP authorization spec: Switchboard discovers the server's authorization server (RFC 9728/8414), dynamically registers a client (RFC 7591, reused across sign-ins), and runs an Authorization Code + PKCE flow against an ephemeral loopback listener; sign-out clears tokens but keeps the registration. The integration is fully generic — no server-specific knowledge lives in Switchboard; a server advertises its own scopes via `scopes_supported`, and a per-provider `scopes:` override exists as an escape hatch. This delivers the browser-login/no-token-handling experience the earlier-planned "Connect Tiddly" preset was for, through the generic form; a named preset remains possible post-V1 sugar. **stdio MCP providers** are deferred (V1 is HTTP-only); a `transport: { type: stdio, … }` entry is not yet supported and can return additively without changing the config model.
+
+Bearer and OAuth credentials remain logically keyed by provider, but a release
+build persists the complete logical map as one cached, versioned Keychain item.
+This keeps repeated provider and OAuth reads in memory after one aggregate load
+and prevents Keychain authorization prompts from multiplying with provider
+count. Existing per-provider items migrate lazily on first use: the aggregate
+copy is persisted before the old item is deleted, and a durable pending marker
+retries interrupted cleanup without hiding the usable aggregate credential.
+Debug builds retain their separate plaintext development store.
 
 ### Addressing prompts
 

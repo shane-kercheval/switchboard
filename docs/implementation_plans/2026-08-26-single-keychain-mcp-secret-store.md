@@ -1,6 +1,6 @@
 # One-prompt Keychain storage for MCP credentials
 
-**Status:** in progress (Milestone 2 implemented; review pending) · **Created:** 2026-08-26
+**Status:** in progress (Milestone 3 implemented and reviewed; macOS acceptance pending) · **Created:** 2026-08-26
 
 Switchboard currently stores every MCP prompt-provider credential in a separate
 macOS Keychain item. Bearer credentials use the provider name as the item
@@ -482,6 +482,22 @@ Remove the old per-item production `SecretStore` implementation after its raw
 legacy read/delete operations have been absorbed into the new backend. Do not
 keep two selectable release stores. The old on-disk Keychain items remain the
 migration input, not a supported alternative architecture.
+
+The backend audit for this cutover exposed an existing macOS deletion gap:
+`keyring` 3.6 discards the OS status returned by its legacy deletion call. Use a
+status-propagating `SecItemDelete` wrapper for macOS instead. A disposable probe
+must create the item through `keyring`, delete it through the replacement, and
+confirm absence through `keyring` before relying on the two API families to
+address the same generic-password record. Only an actual success or
+`errSecItemNotFound` may satisfy the store's deletion contract.
+
+Compatibility verification on 2026-08-26 passed with a disposable, randomized
+service/account: the probe created a generic-password item through `keyring`,
+deleted it through `security-framework`'s status-propagating `ItemSearchOptions`
+query scoped to the same User keychain, generic-password class, service, and
+account, then confirmed `keyring` returned `NoEntry`. The probe removed its item
+and never used the production Switchboard namespace. A real ACL-denied deletion
+remains part of the pending manual macOS acceptance.
 
 Update documentation in the same milestone:
 

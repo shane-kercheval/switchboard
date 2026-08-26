@@ -1,6 +1,6 @@
 # One-prompt Keychain storage for MCP credentials
 
-**Status:** proposed · **Created:** 2026-08-26
+**Status:** in progress (Milestone 1 verified) · **Created:** 2026-08-26
 
 Switchboard currently stores every MCP prompt-provider credential in a separate
 macOS Keychain item. Bearer credentials use the provider name as the item
@@ -319,6 +319,23 @@ design and waiting for stable signing.
   modified, printed, or deleted.
 - If the result is not exactly one prompt, implementation stops with the plan
   explicitly reported as blocked by the failed premise.
+
+### Verification record — 2026-08-26
+
+- Verified on macOS 26.6.2 (build 25G83), Apple silicon (`arm64`), using the
+  locked `keyring` 3.6.3 and `security-framework` 3.7.0 dependency path.
+- The seed probe was linker-signed ad hoc with designated requirement CDHash
+  `e922bd0f6d0155a6b38610dd88ab3819b2f62ff8`. After a source change and
+  rebuild, the probe was linker-signed ad hoc with designated requirement
+  CDHash `39bc49b2693429531d5bcddfbb7e2e78efceaf7d`.
+- The rebuilt probe's first `get_password` presented one authorization dialog.
+  After entering the Keychain password and choosing **Always Allow**, its second
+  `get_password`, `set_password`, and final `get_password` completed without
+  another dialog. This validates the one-item ACL premise, including the locked
+  macOS backend's internal lookup during `set_password`.
+- The probe used a dedicated non-production service/account, accessed no real
+  Switchboard credential, printed no secret, and successfully deleted the
+  disposable item after the observation.
 
 ---
 

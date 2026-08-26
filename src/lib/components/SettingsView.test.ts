@@ -134,6 +134,15 @@ describe("SettingsView", () => {
     );
   });
 
+  it("lists Antigravity ahead of Gemini in Agent Defaults", () => {
+    render(SettingsView, { props: { onClose: vi.fn() } });
+    const section = screen.getByTestId("agent-defaults-settings");
+    const labels = Array.from(section.querySelectorAll("summary")).map((el) =>
+      el.textContent?.trim(),
+    );
+    expect(labels).toEqual(["Claude", "Codex", "Antigravity", "Gemini"]);
+  });
+
   it("keeps backend preference controls unavailable until saved values are authoritative", async () => {
     prefsTesting.reset({ ready: false });
     let resolvePreferences!: (value: Preferences) => void;

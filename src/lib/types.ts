@@ -312,10 +312,17 @@ export type NormalizedEvent =
       at: string;
     }
   // A queued send was cancelled before it started (its backlog item was dropped
-  // by cancel_send / cancel_agent). Keyed by `message_id`, no `turn_id`. The
-  // authoritative signal that a not-yet-started send is gone — the frontend
-  // renders its cancelled row from this rather than optimistically guessing.
-  | { type: "message_cancelled"; message_id: MessageId; agent_id: AgentId; at: string };
+  // by cancel_send / cancel_agent). Carries `message_id` plus the originating
+  // `send_id`, with no `turn_id`. The authoritative signal that a not-yet-started
+  // send is gone — the frontend renders its cancelled row from this rather than
+  // optimistically guessing.
+  | {
+      type: "message_cancelled";
+      message_id: MessageId;
+      send_id: SendId;
+      agent_id: AgentId;
+      at: string;
+    };
 
 // Synthetic reducer input — fired by the state module's heartbeat timer when
 // no per-turn activity has been observed for HEARTBEAT_TIMEOUT_MS while a turn

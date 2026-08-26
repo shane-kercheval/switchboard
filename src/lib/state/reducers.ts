@@ -141,9 +141,8 @@ export function transcriptReducer(
     case "message_cancelled": {
       // A *queued* send was dropped before it started (backend-authoritative —
       // see `NormalizedEvent::MessageCancelled`). Render a cancelled agent turn
-      // under its prompt. `sendId` is resolved by the caller from the pending
-      // entry (by `message_id`); without it there is nothing to attribute, so
-      // this is a stray and a no-op. Idempotent on the derived `turn_id`.
+      // under its prompt. `sendId` comes from the event's backend-authoritative
+      // send identity. Idempotent on the derived `turn_id`.
       if (sendId === undefined) return turns;
       const turn_id = `cancelled-${input.message_id}`;
       if (findTurn(turns, turn_id) !== undefined) return turns;
@@ -620,15 +619,22 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
     }
 
     case "message_cancelled": {
-      // A queued send was dropped before starting. Prune its pending entry
-      // (exact `message_id` match — no front-fallback; the backend always
-      // carries the real id). Cancellation is not an error, so no `last_error`.
+      // A queued send was dropped before starting. Prefer the accepted receipt,
+      // then fall back to the event's authoritative send id when cancellation
+      // races ahead of `recordSendAccepted`. Never infer by queue position: a
+      // user may cancel any queued send. Cancellation is not an error, so no
+      // `last_error`.
       // Flip to idle only if this was the *starting* send (nothing is running);
       // a queued send cancelled while another turn runs leaves run_status alone.
-      const idx = runtime.pending_sends?.findIndex((p) => p.message_id === input.message_id) ?? -1;
+      const exactMessageIdx =
+        runtime.pending_sends?.findIndex((p) => p.message_id === input.message_id) ?? -1;
+      const idx =
+        exactMessageIdx >= 0
+          ? exactMessageIdx
+          : (runtime.pending_sends?.findIndex((p) => p.send_id === input.send_id) ?? -1);
       if (idx < 0) return runtime;
       const pending_sends = removePending(runtime.pending_sends, idx);
-      return runtime.run_status === "starting"
+      return runtime.run_status === "starting" && idx === 0
         ? { ...runtime, run_status: "idle", pending_sends }
         : { ...runtime, pending_sends };
     }

@@ -23,6 +23,7 @@
   import ForwardSourceChip from "$lib/components/ui/ForwardSourceChip.svelte";
   import ForwardSourcePicker from "$lib/components/ui/ForwardSourcePicker.svelte";
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
+  import { SUPPLEMENTAL_TOOLTIP_DELAY } from "$lib/components/ui/tooltip";
 
   /// The workflow invocation form. A workflow parameterizes its *recipients* (its
   /// declared `agent`/`[agent]` inputs are named slots bound to real agents here),
@@ -468,29 +469,33 @@
   {/if}
 
   {#snippet paneChip(name: string, pane: TranscriptPane, selected: boolean, onpick: () => void)}
-    <button
-      type="button"
-      aria-pressed={selected}
-      class={paneChipClass(selected)}
-      data-testid={`workflow-pane-${name}-${pane.id}`}
-      title={paneMemberNames(pane).join(", ")}
-      onclick={onpick}
-    >
-      <svg
-        viewBox="0 0 24 24"
-        fill="none"
-        stroke="currentColor"
-        stroke-width="1.8"
-        stroke-linecap="round"
-        stroke-linejoin="round"
-        class="text-accent h-3.5 w-3.5 shrink-0"
-        aria-hidden="true"
-      >
-        <rect x="3" y="4" width="18" height="16" rx="2" />
-        <path d="M12 4v16" />
-      </svg>
-      {pane.name}
-    </button>
+    <Tooltip label={paneMemberNames(pane).join(", ")} delayDuration={SUPPLEMENTAL_TOOLTIP_DELAY}>
+      {#snippet trigger(props)}
+        <button
+          {...props}
+          type="button"
+          aria-pressed={selected}
+          class={paneChipClass(selected)}
+          data-testid={`workflow-pane-${name}-${pane.id}`}
+          onclick={onpick}
+        >
+          <svg
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.8"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            class="text-accent h-3.5 w-3.5 shrink-0"
+            aria-hidden="true"
+          >
+            <rect x="3" y="4" width="18" height="16" rx="2" />
+            <path d="M12 4v16" />
+          </svg>
+          {pane.name}
+        </button>
+      {/snippet}
+    </Tooltip>
   {/snippet}
 
   <!-- Sets the pane chips (group selectors) apart from the agent chips (leaves)

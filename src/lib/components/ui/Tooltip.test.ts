@@ -51,6 +51,33 @@ describe("Tooltip", () => {
     expect(content).toHaveTextContent("hello label");
   });
 
+  it("keeps supplemental hover text out of the keyboard tab order", async () => {
+    render(Harness, { props: { mode: "non-focusable" } });
+    const trigger = screen.getByTestId("tt-trigger");
+    expect(trigger).not.toHaveAttribute("tabindex");
+
+    await fireEvent.pointerEnter(trigger);
+    await vi.advanceTimersByTimeAsync(700);
+    expect(await waitFor(() => screen.getByTestId("tooltip-content"))).toHaveTextContent(
+      "supplemental detail",
+    );
+  });
+
+  it("can delegate details to keyboard focus without claiming nested hover", async () => {
+    render(Harness, { props: { mode: "focus-only" } });
+    const trigger = screen.getByTestId("tt-trigger");
+
+    await fireEvent.pointerEnter(trigger);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(screen.queryByTestId("tooltip-content")).not.toBeInTheDocument();
+
+    await fireEvent.keyDown(window, { key: "Tab" });
+    await fireEvent.focus(trigger);
+    expect(await waitFor(() => screen.getByTestId("tooltip-content"))).toHaveTextContent(
+      "keyboard detail",
+    );
+  });
+
   it("makes content pointer-transparent by default and closes after leaving the trigger", async () => {
     render(Harness, { props: { mode: "label" } });
     const trigger = screen.getByTestId("tt-trigger");

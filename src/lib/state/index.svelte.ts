@@ -53,7 +53,13 @@ import type {
 } from "$lib/types";
 import { HEARTBEAT_TIMEOUT_MS } from "$lib/types";
 import { _internal, freshRuntime, runtimeReducer, transcriptReducer } from "./reducers";
-import { settleAgentsRemoved, settleRecipient } from "./sendCompletion";
+import {
+  markRecipientStarted,
+  settleAgentIdle,
+  settleAgentsRemoved,
+  settleRecipient,
+  settleTurn,
+} from "./sendCompletion";
 import type { AgentRuntime, PendingSend, RuntimeMap, ToolCall, TranscriptMap, Turn } from "./types";
 
 /// Per-agent turn lists, keyed by `agent_id`. The unified-view renderer
@@ -705,12 +711,6 @@ function handleEvent(agentId: AgentId, event: NormalizedEvent): void {
   // the same entry in lockstep.
   const startEntry =
     event.type === "turn_start" ? pendingEntryFor(priorRuntime, event.message_id) : undefined;
-  // For a `message_cancelled` event, resolve the send_id of the dropped queued
-  // entry (exact message_id match) so the reducer can render its cancelled row.
-  const cancelledSendId =
-    event.type === "message_cancelled"
-      ? priorRuntime.pending_sends?.find((p) => p.message_id === event.message_id)?.send_id
-      : undefined;
   // For a `message_failed` event, resolve the failed send via the same
   // `pendingEntryFor` lookup `turn_start` uses (and that `runtimeReducer`
   // mirrors via `pickPendingIndex`): exact message_id, else the front entry
@@ -733,28 +733,27 @@ function handleEvent(agentId: AgentId, event: NormalizedEvent): void {
   // send the frontend didn't originate (e.g. a workflow dispatch), so its fan-out
   // turns still group side-by-side live without waiting for a reload's journal merge.
   const eventSendId = event.type === "turn_start" ? event.send_id : undefined;
+  const cancelledSendId = event.type === "message_cancelled" ? event.send_id : undefined;
   const sendId = startEntry?.send_id ?? eventSendId ?? cancelledSendId ?? failedSendId;
+  if (event.type === "turn_start") markRecipientStarted(sendId, agentId, event.turn_id);
   // Settle the send tracker from the events that carry a terminal outcome. Driven
   // from this existing boundary rather than a second `listen` per agent — that
   // would break the one-listener-per-agent invariant this module documents.
   if (event.type === "turn_end") {
-    const turn = priorTurns.find((t) => t.role === "agent" && t.turn_id === event.turn_id);
     const outcome =
       event.outcome.status === "cancelled"
         ? "cancelled"
         : event.outcome.status === "failed"
           ? "failed"
           : "completed";
-    settleRecipient(
-      turn?.role === "agent" ? (turn.send_id ?? undefined) : undefined,
-      agentId,
-      outcome,
-    );
+    settleTurn(event.turn_id, agentId, outcome);
     turnTerminalHook?.(agentId, outcome);
   } else if (event.type === "message_failed") {
     settleRecipient(failedSendId, agentId, "failed");
   } else if (event.type === "message_cancelled") {
-    settleRecipient(cancelledSendId, agentId, "cancelled");
+    settleRecipient(event.send_id, agentId, "cancelled");
+  } else if (event.type === "agent_idle") {
+    settleAgentIdle(agentId);
   }
   setTranscript(
     agentId,

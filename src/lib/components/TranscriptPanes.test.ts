@@ -7,7 +7,10 @@ import type { AgentRecord, ConversationItem, NormalizedEvent } from "$lib/types"
 // `vi.mock` is hoisted above imports, so the mocks below still apply.
 import TranscriptPanes from "./TranscriptPanes.svelte";
 import {
+  createEmptyPane,
   layoutFor,
+  maximizePane,
+  minimizePane,
   moveAgentToPane,
   moveAgentToNewPane,
   toggleAgentHidden,
@@ -21,6 +24,11 @@ import {
 } from "$lib/state/recipientSelection.svelte";
 import { setProjectCompact, _testing as previewState } from "$lib/state/transcriptPreview.svelte";
 import { workflowRuns, _testing as workflowState } from "$lib/state/workflows.svelte";
+import {
+  beginOperation,
+  finishOperation,
+  _testing as composeOperationsState,
+} from "$lib/state/composeOperations.svelte";
 import { tick } from "svelte";
 
 const listeners = new Map<string, (e: { payload: NormalizedEvent }) => void>();
@@ -140,6 +148,7 @@ beforeEach(() => {
   panesState.reset();
   selectionState.reset();
   workflowState.reset();
+  composeOperationsState.reset();
   focusSpy.mockReset();
   listeners.clear();
   invokeMock.mockReset();
@@ -406,6 +415,58 @@ describe("pane chrome (headers, rename, close)", () => {
     expect(selectionFor(PROJECT_ID)).toEqual([ALICE.id, carol.id]);
   });
 
+  it("closing a pane targets the sole visible survivor, ignoring an already-minimized sibling", async () => {
+    const carol = numberedAgent(3);
+    const agents = [ALICE, BOB, carol];
+    const rosterIds = agents.map((a) => a.id);
+    moveAgentToNewPane(PROJECT_ID, rosterIds, BOB.id); // pane 2: bob
+    const carolPaneId = moveAgentToNewPane(PROJECT_ID, rosterIds, carol.id); // pane 3: carol
+    minimizePane(PROJECT_ID, rosterIds, carolPaneId);
+    setRecipients(PROJECT_ID, [ALICE.id, BOB.id, carol.id]);
+    render(TranscriptPanes, { props: { projectId: PROJECT_ID, agents } });
+
+    // Only pane 1 (alice) and pane 2 (bob) are visible; pane 3 (carol) is
+    // minimized. Closing bob's pane leaves exactly one *visible* pane, so
+    // alice is targeted — carol drops out of the selection even though her
+    // pane wasn't touched, because targeting replaces the whole set.
+    await fireEvent.click(screen.getAllByTestId("pane-actions")[1]!);
+    await fireEvent.click(screen.getByTestId("pane-close"));
+
+    expect(selectionFor(PROJECT_ID)).toEqual([ALICE.id]);
+  });
+
+  it("closing a pane leaves selection untouched when the sole visible survivor is empty", async () => {
+    await seedTwoAgentTranscripts();
+    moveAgentToNewPane(PROJECT_ID, ROSTER_IDS, BOB.id); // pane 1: alice, pane 2: bob
+    unassignAgentFromPane(PROJECT_ID, ROSTER_IDS, ALICE.id); // pane 1 now empty
+    setRecipients(PROJECT_ID, [ALICE.id, BOB.id]);
+    renderPanes();
+
+    // The sole visible survivor (pane 1) is empty — targeting it would silently
+    // clear the selection, so bob is deselected directly instead and alice's
+    // (unrelated) selection survives.
+    await fireEvent.click(screen.getAllByTestId("pane-actions")[1]!);
+    await fireEvent.click(screen.getByTestId("pane-close"));
+
+    expect(selectionFor(PROJECT_ID)).toEqual([ALICE.id]);
+  });
+
+  it("closing a pane is refused while a send is rendering", async () => {
+    await seedTwoAgentTranscripts();
+    moveAgentToNewPane(PROJECT_ID, ROSTER_IDS, BOB.id);
+    setRecipients(PROJECT_ID, [BOB.id]);
+    renderPanes();
+
+    const opId = beginOperation(PROJECT_ID, { kind: "prompt_send" })!;
+    await fireEvent.click(screen.getAllByTestId("pane-actions")[1]!);
+    await fireEvent.click(screen.getByTestId("pane-close"));
+
+    expect(paneEls()).toHaveLength(2);
+    expect(layoutFor(PROJECT_ID, ROSTER_IDS).panes).toHaveLength(2);
+    expect(selectionFor(PROJECT_ID)).toEqual([BOB.id]);
+    finishOperation(PROJECT_ID, opId);
+  });
+
   it("returns to the unified view from a multi-pane split, preserving selection", async () => {
     const carol = numberedAgent(3);
     const agents = [ALICE, BOB, carol];
@@ -511,6 +572,36 @@ describe("pane chrome (headers, rename, close)", () => {
     expect(selectionFor(PROJECT_ID)).toEqual([ALICE.id]);
   });
 
+  it("removing a pane member chip is refused while a send is rendering", async () => {
+    await seedTwoAgentTranscripts();
+    moveAgentToNewPane(PROJECT_ID, ROSTER_IDS, BOB.id);
+    setRecipients(PROJECT_ID, [ALICE.id, BOB.id]);
+    renderPanes();
+
+    const opId = beginOperation(PROJECT_ID, { kind: "prompt_send" })!;
+    await fireEvent.click(within(paneEls()[1]!).getByTestId("pane-member-remove"));
+
+    expect(layoutFor(PROJECT_ID, ROSTER_IDS).panes[1]!.members).toEqual([BOB.id]);
+    expect(selectionFor(PROJECT_ID)).toEqual([ALICE.id, BOB.id]);
+    finishOperation(PROJECT_ID, opId);
+  });
+
+  it("adding an agent to a pane from the actions menu is refused while a send is rendering", async () => {
+    await seedTwoAgentTranscripts();
+    moveAgentToNewPane(PROJECT_ID, ROSTER_IDS, BOB.id);
+    setRecipients(PROJECT_ID, []);
+    renderPanes();
+
+    const opId = beginOperation(PROJECT_ID, { kind: "prompt_send" })!;
+    const paneB = paneEls()[1]!;
+    await fireEvent.click(within(paneB).getByTestId("pane-actions"));
+    await fireEvent.click(screen.getByTestId(`pane-add-agent-${ALICE.id}`));
+
+    expect(layoutFor(PROJECT_ID, ROSTER_IDS).panes[1]!.members).toEqual([BOB.id]);
+    expect(selectionFor(PROJECT_ID)).toEqual([]);
+    finishOperation(PROJECT_ID, opId);
+  });
+
   it("minimizes a pane without changing membership", async () => {
     await seedTwoAgentTranscripts();
     moveAgentToNewPane(PROJECT_ID, ROSTER_IDS, BOB.id);
@@ -524,6 +615,106 @@ describe("pane chrome (headers, rename, close)", () => {
       layoutFor(PROJECT_ID, ROSTER_IDS).panes[1]!.id,
     ]);
     expect(screen.queryByText("hello from bob")).not.toBeInTheDocument();
+  });
+
+  it("minimizing a pane deselects its members when other panes stay visible", async () => {
+    await seedTwoAgentTranscripts();
+    moveAgentToNewPane(PROJECT_ID, ROSTER_IDS, BOB.id);
+    createEmptyPane(PROJECT_ID, ROSTER_IDS);
+    setRecipients(PROJECT_ID, [ALICE.id, BOB.id]);
+    renderPanes();
+
+    await fireEvent.click(screen.getAllByTestId("pane-minimize")[1]!);
+
+    expect(selectionFor(PROJECT_ID)).toEqual([ALICE.id]);
+  });
+
+  it("minimizing a pane selects the sole remaining visible pane", async () => {
+    await seedTwoAgentTranscripts();
+    moveAgentToNewPane(PROJECT_ID, ROSTER_IDS, BOB.id);
+    const emptyPaneId = createEmptyPane(PROJECT_ID, ROSTER_IDS);
+    minimizePane(PROJECT_ID, ROSTER_IDS, emptyPaneId);
+    setRecipients(PROJECT_ID, [BOB.id]);
+    renderPanes();
+
+    expect(paneEls()).toHaveLength(2);
+    await fireEvent.click(screen.getAllByTestId("pane-minimize")[1]!);
+
+    expect(paneEls()).toHaveLength(1);
+    expect(selectionFor(PROJECT_ID)).toEqual([ALICE.id]);
+  });
+
+  it("minimizing a pane leaves selection untouched when the sole remaining visible pane is empty", async () => {
+    await seedTwoAgentTranscripts();
+    moveAgentToNewPane(PROJECT_ID, ROSTER_IDS, BOB.id); // pane 1: alice, pane 2: bob
+    unassignAgentFromPane(PROJECT_ID, ROSTER_IDS, ALICE.id); // pane 1 now empty
+    const thirdPaneId = createEmptyPane(PROJECT_ID, ROSTER_IDS); // pane 3, already minimized
+    minimizePane(PROJECT_ID, ROSTER_IDS, thirdPaneId);
+    setRecipients(PROJECT_ID, [ALICE.id, BOB.id]);
+    renderPanes();
+
+    // Visible panes are pane 1 (empty) and pane 2 (bob). Minimizing pane 2
+    // would leave the empty pane 1 as the sole survivor — targeting it would
+    // silently clear the selection, so bob is deselected directly instead and
+    // alice's (unrelated, unassigned) selection survives.
+    await fireEvent.click(screen.getAllByTestId("pane-minimize")[1]!);
+
+    expect(paneEls()).toHaveLength(1);
+    expect(selectionFor(PROJECT_ID)).toEqual([ALICE.id]);
+  });
+
+  it("minimizing a pane is refused while a send is rendering", async () => {
+    await seedTwoAgentTranscripts();
+    moveAgentToNewPane(PROJECT_ID, ROSTER_IDS, BOB.id);
+    moveAgentToNewPane(PROJECT_ID, ROSTER_IDS, ALICE.id);
+    setRecipients(PROJECT_ID, [BOB.id]);
+    renderPanes();
+
+    const opId = beginOperation(PROJECT_ID, { kind: "prompt_send" })!;
+    await fireEvent.click(screen.getAllByTestId("pane-minimize")[1]!);
+
+    expect(paneEls()).toHaveLength(3);
+    expect(layoutFor(PROJECT_ID, ROSTER_IDS).minimized).toEqual([]);
+    expect(selectionFor(PROJECT_ID)).toEqual([BOB.id]);
+    finishOperation(PROJECT_ID, opId);
+  });
+
+  it("minimizing a pane resolves the sole visible survivor from live layout, not the click-time snapshot", async () => {
+    const carol = numberedAgent(3);
+    const agents = [ALICE, BOB, carol];
+    const rosterIds = agents.map((a) => a.id);
+    moveAgentToNewPane(PROJECT_ID, rosterIds, BOB.id); // pane 2: bob
+    const carolPaneId = moveAgentToNewPane(PROJECT_ID, rosterIds, carol.id); // pane 3: carol
+    setRecipients(PROJECT_ID, [BOB.id, carol.id]);
+
+    let deferredAction: (() => void) | null = null;
+    render(TranscriptPanes, {
+      props: {
+        projectId: PROJECT_ID,
+        agents,
+        runWithBusy: (action: () => void) => {
+          deferredAction = action;
+        },
+      },
+    });
+
+    // Minimize bob's pane, but the host holds the mutation behind the busy
+    // spinner (as `App.withTranscriptBusy` really does for two animation
+    // frames) instead of running it immediately.
+    await fireEvent.click(screen.getAllByTestId("pane-minimize")[1]!);
+    expect(deferredAction).not.toBeNull();
+
+    // A same-project gesture (e.g. pane cycling) lands while the minimize is
+    // still pending: carol's pane gets minimized independently.
+    minimizePane(PROJECT_ID, rosterIds, carolPaneId);
+
+    deferredAction!();
+
+    // At click time two panes (alice, carol) would have remained visible —
+    // the stale-snapshot bug would only deselect bob. By the time this ran,
+    // carol's pane was already minimized too, so alice is the sole visible
+    // survivor and gets targeted instead.
+    expect(selectionFor(PROJECT_ID)).toEqual([ALICE.id]);
   });
 
   it("shows only maximize controls for exactly two panes", async () => {
@@ -554,6 +745,87 @@ describe("pane chrome (headers, rename, close)", () => {
     expect(paneEls()).toHaveLength(2);
     expect(screen.getByText("hello from alice")).toBeInTheDocument();
     expect(screen.getByText("hello from bob")).toBeInTheDocument();
+  });
+
+  it("maximizing a pane is refused while a send is rendering", async () => {
+    await seedTwoAgentTranscripts();
+    moveAgentToNewPane(PROJECT_ID, ROSTER_IDS, BOB.id);
+    setRecipients(PROJECT_ID, [ALICE.id]);
+    renderPanes();
+
+    const opId = beginOperation(PROJECT_ID, { kind: "prompt_send" })!;
+    await fireEvent.click(screen.getAllByTestId("pane-maximize")[1]!);
+
+    expect(paneEls()).toHaveLength(2);
+    expect(layoutFor(PROJECT_ID, ROSTER_IDS).maximized).toBeNull();
+    expect(selectionFor(PROJECT_ID)).toEqual([ALICE.id]);
+    finishOperation(PROJECT_ID, opId);
+  });
+
+  it("maximizing a pane targets live membership, not the click-time snapshot", async () => {
+    await seedTwoAgentTranscripts();
+    moveAgentToNewPane(PROJECT_ID, ROSTER_IDS, BOB.id); // pane 1: alice, pane 2: bob
+    setRecipients(PROJECT_ID, []);
+
+    let deferredAction: (() => void) | null = null;
+    render(TranscriptPanes, {
+      props: {
+        projectId: PROJECT_ID,
+        agents: ROSTER,
+        runWithBusy: (action: () => void) => {
+          deferredAction = action;
+        },
+      },
+    });
+
+    await fireEvent.click(screen.getAllByTestId("pane-maximize")[1]!); // pane 2: bob
+    expect(deferredAction).not.toBeNull();
+
+    // A same-project gesture removes bob from the pane while the maximize is
+    // still pending behind the busy spinner.
+    unassignAgentFromPane(PROJECT_ID, ROSTER_IDS, BOB.id);
+
+    deferredAction!();
+
+    // The stale click-time snapshot still said "bob"; live membership at
+    // execution time is empty, so nothing is targeted — bob must not be
+    // selected for a pane he's no longer in.
+    expect(selectionFor(PROJECT_ID)).toEqual([]);
+    expect(layoutFor(PROJECT_ID, ROSTER_IDS).maximized).not.toBeNull();
+  });
+
+  it("restoring a maximized pane checks live state, not the click-time snapshot", async () => {
+    await seedTwoAgentTranscripts();
+    const bobPaneId = moveAgentToNewPane(PROJECT_ID, ROSTER_IDS, BOB.id); // pane 1: alice, pane 2: bob
+    const alicePaneId = layoutFor(PROJECT_ID, ROSTER_IDS).panes[0]!.id;
+    maximizePane(PROJECT_ID, ROSTER_IDS, alicePaneId);
+
+    let deferredAction: (() => void) | null = null;
+    render(TranscriptPanes, {
+      props: {
+        projectId: PROJECT_ID,
+        agents: ROSTER,
+        runWithBusy: (action: () => void) => {
+          deferredAction = action;
+        },
+      },
+    });
+
+    // Alice's pane is maximized, so its header control renders as "Restore
+    // panes". Click it — the restore is queued behind the busy spinner.
+    await fireEvent.click(screen.getByTestId("pane-maximize"));
+    expect(deferredAction).not.toBeNull();
+
+    // A same-project gesture (e.g. cycling) maximizes bob's pane instead
+    // while the restore is still pending.
+    maximizePane(PROJECT_ID, ROSTER_IDS, bobPaneId);
+
+    deferredAction!();
+
+    // The stale click-time intent was "restore alice's maximize"; live state
+    // at execution time has bob maximized instead, so the newer maximize
+    // survives rather than being silently cleared.
+    expect(layoutFor(PROJECT_ID, ROSTER_IDS).maximized).toBe(bobPaneId);
   });
 
   it("keeps the maximize tooltip quiet until a full-delay re-entry", async () => {

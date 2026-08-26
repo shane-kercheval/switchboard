@@ -775,12 +775,14 @@ describe("stopAgent", () => {
     fireTo(`agent:${AGENT_A}`, {
       type: "message_cancelled",
       message_id: "msg-1",
+      send_id: "send-1",
       agent_id: AGENT_A,
       at: "2026-05-16T00:00:02Z",
     });
     fireTo(`agent:${AGENT_A}`, {
       type: "message_cancelled",
       message_id: "msg-2",
+      send_id: "send-2",
       agent_id: AGENT_A,
       at: "2026-05-16T00:00:02Z",
     });
@@ -814,6 +816,7 @@ describe("stopAgent", () => {
     fireTo(`agent:${AGENT_A}`, {
       type: "message_cancelled",
       message_id: "msg-2",
+      send_id: "send-2",
       agent_id: AGENT_A,
       at: "2026-05-16T00:00:02Z",
     });
@@ -853,11 +856,56 @@ describe("stopAgent", () => {
     fireTo(`agent:${AGENT_A}`, {
       type: "message_cancelled",
       message_id: MESSAGE_1,
+      send_id: "send-1",
       agent_id: AGENT_A,
       at: "2026-05-16T00:00:02Z",
     });
     expect(state.runtimes[AGENT_A]?.pending_sends).toBeUndefined();
     expect(cancelledSendIds(state, AGENT_A)).toEqual(["send-1"]);
+  });
+
+  it("correlates queued cancellations that arrive before accepted receipts", async () => {
+    const state = await loadState();
+    const tracker = await import("./sendCompletion");
+    tracker._testing.reset();
+    await state.registerAgent(agentRecord(AGENT_A));
+    tracker.registerSend("send-1", "p-1", "switchboard", [{ id: AGENT_A, name: "claude" }]);
+    tracker.registerSend("send-2", "p-1", "switchboard", [{ id: AGENT_A, name: "claude" }]);
+    state.dispatchUserTurn(AGENT_A, "user-1", "first", [], "send-1");
+    state.dispatchUserTurn(AGENT_A, "user-2", "second", [], "send-2");
+
+    state.stopAgent(AGENT_A);
+    expect(state.runtimes[AGENT_A]?.pending_sends?.every((p) => p.cancel_requested)).toBe(true);
+
+    fireTo(`agent:${AGENT_A}`, {
+      type: "message_cancelled",
+      message_id: "msg-2",
+      send_id: "send-2",
+      agent_id: AGENT_A,
+      at: "2026-05-16T00:00:02Z",
+    });
+    expect(state.runtimes[AGENT_A]?.pending_sends?.map((p) => p.send_id)).toEqual(["send-1"]);
+    expect(cancelledSendIds(state, AGENT_A)).toEqual(["send-2"]);
+
+    fireTo(`agent:${AGENT_A}`, {
+      type: "message_cancelled",
+      message_id: "msg-1",
+      send_id: "send-1",
+      agent_id: AGENT_A,
+      at: "2026-05-16T00:00:03Z",
+    });
+    expect(state.runtimes[AGENT_A]?.pending_sends).toBeUndefined();
+    expect(cancelledSendIds(state, AGENT_A)).toEqual(["send-2", "send-1"]);
+    expect(tracker._testing.size()).toBe(0);
+    expect(tracker._testing.batchCount()).toBe(0);
+    expect(tracker._testing.activeAgentCount()).toBe(0);
+    expect(tracker._testing.startedTurnCount()).toBe(0);
+
+    invokeMock.mockClear();
+    state.recordSendAccepted(AGENT_A, "user-1", "msg-1");
+    state.recordSendAccepted(AGENT_A, "user-2", "msg-2");
+    expect(invokeMock.mock.calls.some(([command]) => command === "cancel_send")).toBe(false);
+    expect(invokeMock.mock.calls.some(([command]) => command === "notify")).toBe(false);
   });
 });
 
@@ -920,6 +968,7 @@ describe("cancelSend pre-accept race", () => {
     fireTo(`agent:${AGENT_A}`, {
       type: "message_cancelled",
       message_id: MESSAGE_1,
+      send_id: "send-1",
       agent_id: AGENT_A,
       at: "2026-05-16T00:00:02Z",
     });
@@ -1401,13 +1450,15 @@ describe("send-completion notifications", () => {
   }
 
   const SEND = "00000000-0000-7000-8000-0000000000e1";
+  const SECOND_SEND = "00000000-0000-7000-8000-0000000000e2";
+  const MESSAGE_2 = "00000000-0000-7000-8000-0000000000f2";
   /// The `notify` command's argument objects, in call order.
   const notified = (): Record<string, unknown>[] =>
     invokeMock.mock.calls
       .filter((c) => c[0] === "notify")
       .map((c) => c[1] as Record<string, unknown>);
 
-  it("notifies once when a fan-out's last recipient ends", async () => {
+  it("notifies once when a fan-out's last recipient queue drains", async () => {
     const { state, tracker } = await setup();
     tracker.registerSend(SEND, "p-1", "switchboard", [
       { id: AGENT_A, name: "claude" },
@@ -1432,6 +1483,7 @@ describe("send-completion notifications", () => {
       outcome: { status: "completed" },
       ended_at: "2026-05-15T00:00:01Z",
     } as NormalizedEvent);
+    fireTo(`agent:${AGENT_A}`, { type: "agent_idle", agent_id: AGENT_A });
     expect(notified()).toHaveLength(0);
 
     fireTo(`agent:${AGENT_B}`, {
@@ -1440,6 +1492,48 @@ describe("send-completion notifications", () => {
       outcome: { status: "completed" },
       ended_at: "2026-05-15T00:00:02Z",
     } as NormalizedEvent);
+    expect(notified()).toHaveLength(0);
+    fireTo(`agent:${AGENT_B}`, { type: "agent_idle", agent_id: AGENT_B });
+    expect(notified()).toHaveLength(1);
+  });
+
+  it("does not notify between queued turns for the same agent", async () => {
+    const { state, tracker } = await setup();
+    tracker.registerSend(SEND, "p-1", "switchboard", [{ id: AGENT_A, name: "claude" }]);
+    state.dispatchUserTurn(AGENT_A, "user-1", "first", [], SEND);
+    fireTo(`agent:${AGENT_A}`, {
+      type: "turn_start",
+      turn_id: TURN_1,
+      message_id: MESSAGE_1,
+      started_at: "2026-05-15T00:00:00Z",
+    } as NormalizedEvent);
+
+    tracker.registerSend(SECOND_SEND, "p-1", "switchboard", [{ id: AGENT_A, name: "claude" }]);
+    state.dispatchUserTurn(AGENT_A, "user-2", "second", [], SECOND_SEND);
+
+    fireTo(`agent:${AGENT_A}`, {
+      type: "turn_end",
+      turn_id: TURN_1,
+      outcome: { status: "completed" },
+      ended_at: "2026-05-15T00:00:01Z",
+    } as NormalizedEvent);
+    expect(notified()).toHaveLength(0);
+
+    fireTo(`agent:${AGENT_A}`, {
+      type: "turn_start",
+      turn_id: TURN_2,
+      message_id: MESSAGE_2,
+      started_at: "2026-05-15T00:00:02Z",
+    } as NormalizedEvent);
+    fireTo(`agent:${AGENT_A}`, {
+      type: "turn_end",
+      turn_id: TURN_2,
+      outcome: { status: "completed" },
+      ended_at: "2026-05-15T00:00:03Z",
+    } as NormalizedEvent);
+    expect(notified()).toHaveLength(0);
+
+    fireTo(`agent:${AGENT_A}`, { type: "agent_idle", agent_id: AGENT_A });
     expect(notified()).toHaveLength(1);
   });
 
@@ -1484,6 +1578,7 @@ describe("send-completion notifications", () => {
       outcome: { status: "completed" },
       ended_at: "2026-05-15T00:00:01Z",
     } as NormalizedEvent);
+    fireTo(`agent:${AGENT_B}`, { type: "agent_idle", agent_id: AGENT_B });
 
     const calls = notified();
     expect(calls).toHaveLength(1);
@@ -1515,6 +1610,7 @@ describe("send-completion notifications", () => {
       outcome: { status: "completed" },
       ended_at: "2026-05-15T00:00:01Z",
     } as NormalizedEvent);
+    fireTo(`agent:${AGENT_A}`, { type: "agent_idle", agent_id: AGENT_A });
 
     expect(notified()).toHaveLength(0);
     void state;

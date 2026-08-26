@@ -4,7 +4,6 @@
     ArrowLeftRight,
     ArrowUp,
     Check,
-    ChevronsUpDown,
     Columns2,
     Eye,
     EyeOff,
@@ -32,6 +31,7 @@
   } from "$lib/state/workspace.svelte";
   import { DRAG_SLOP_PX, dropIndexForPointer, movedOrder } from "$lib/agentReorder";
   import { shortcut } from "$lib/platform";
+  import ExpandCollapseIcon from "$lib/components/ui/ExpandCollapseIcon.svelte";
   import { SUPPORTS_EFFORT_SELECTION, SUPPORTS_MODEL_SELECTION } from "$lib/harnessDisplay";
   import {
     EFFORT_OPTIONS,
@@ -950,24 +950,7 @@
                 data-testid="sidebar-toggle-all"
                 onclick={toggleAll}
               >
-                <svg
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  stroke-width="1.5"
-                  stroke-linecap="round"
-                  stroke-linejoin="round"
-                  class="h-4 w-4"
-                  aria-hidden="true"
-                >
-                  {#if allExpanded}
-                    <path d="m17 11-5-5-5 5" />
-                    <path d="m17 18-5-5-5 5" />
-                  {:else}
-                    <path d="m7 6 5 5 5-5" />
-                    <path d="m7 13 5 5 5-5" />
-                  {/if}
-                </svg>
+                <ExpandCollapseIcon expanded={allExpanded} size={14} />
               </button>
             {/snippet}
           </Tooltip>
@@ -1189,11 +1172,11 @@
                       class="gap-2"
                       data-testid="agent-action-collapse"
                     >
-                      <ChevronsUpDown
+                      <ExpandCollapseIcon
+                        expanded={!isCollapsed}
                         size={14}
                         strokeWidth={1.8}
                         class="text-muted shrink-0"
-                        aria-hidden="true"
                       />
                       {isCollapsed ? "Expand" : "Collapse"}
                     </DropdownMenuItem>

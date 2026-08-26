@@ -3,7 +3,7 @@
   import type { AgentProfile, AgentRecord, HarnessAvailability, HarnessKind } from "$lib/types";
   import type { AgentFormSubmit } from "./CreateAgentForm.types";
   import { harnessUnavailableReason, isHarnessSelectable } from "$lib/harnessAvailability";
-  import { ALL_HARNESSES, HARNESS_LABEL } from "$lib/harnessDisplay";
+  import { HARNESS_LABEL, HARNESS_ORDER_GEMINI_LAST } from "$lib/harnessDisplay";
   import { defaultAgentName, defaultAgentNameForProfiles } from "$lib/agentSelection";
   import { loadPreferences, preferenceLoadState, preferences } from "$lib/preferences.svelte";
   import { normalizeAgentName, validateAgentName } from "$lib/agentName";
@@ -296,16 +296,16 @@
          by the fieldset+legend) styled as a segmented control: the input is
          visually hidden and the label is the pill; `has-[:focus-visible]` lights
          the pill when the radio is keyboard-focused. -->
-    <!-- One pill per harness, looped over `ALL_HARNESSES` (no hardcoded set or
-         fixed column count) so a new harness picks up the picker automatically.
-         Columns are inline-styled because Tailwind can't generate a dynamic
-         `grid-cols-N`. -->
+    <!-- One pill per harness, looped over `HARNESS_ORDER_GEMINI_LAST` (no
+         hardcoded set or fixed column count) so a new harness picks up the
+         picker automatically. Columns are inline-styled because Tailwind
+         can't generate a dynamic `grid-cols-N`. -->
     <div
       class={cn(SEGMENTED_CONTAINER_CLASS, "grid")}
-      style="grid-template-columns: repeat({ALL_HARNESSES.length}, minmax(0, 1fr));"
+      style="grid-template-columns: repeat({HARNESS_ORDER_GEMINI_LAST.length}, minmax(0, 1fr));"
       data-testid="harness-picker"
     >
-      {#each ALL_HARNESSES as kind (kind)}
+      {#each HARNESS_ORDER_GEMINI_LAST as kind (kind)}
         {@const unavailableReason = reason(kind)}
         {#snippet option(props: Record<string, unknown> = {})}
           <label

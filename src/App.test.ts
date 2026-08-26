@@ -568,6 +568,24 @@ describe("App", () => {
     await waitFor(() => expect(screen.queryByTestId(/^banner-/)).not.toBeInTheDocument());
   });
 
+  it("forces the projects sidebar open on startup when projects exist, even if it was left closed", async () => {
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [agent({ id: "ag-1", project_id: "p-a", name: "assistant" })],
+    });
+    // Simulates a relaunch after the user closed the sidebar in a prior
+    // session (the persisted value would already read false by the time
+    // App mounts) — the sidebar is the only project picker, so a launch
+    // that finds projects behind a closed sidebar must reopen it.
+    const { layout } = await import("$lib/layout.svelte");
+    layout.projectsSidebarOpen = false;
+
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument());
+  });
+
   it("shows a missing Claude CLI in the welcome status list without a global banner", async () => {
     backend.notInstalled.add("claude_code");
     await mountApp();
@@ -2200,6 +2218,30 @@ describe("App", () => {
     ).not.toBe(0);
   });
 
+  it("restores the Pins scroll position after switching to Agents and back", async () => {
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [agent({ id: "ag-1", project_id: "p-a", name: "assistant" })],
+    });
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("project-row")).toBeInTheDocument());
+    await fireEvent.click(screen.getByText("alpha"));
+    await waitFor(() => expect(screen.getByTestId("sidebar")).toBeInTheDocument());
+    await fireEvent.click(screen.getByTestId("right-sidebar-mode-pins"));
+    await waitFor(() => expect(screen.getByTestId("pins-sidebar")).toBeInTheDocument());
+
+    const pinsScroll = screen.getByTestId("pins-scroll");
+    pinsScroll.scrollTop = 137;
+    await fireEvent.scroll(pinsScroll);
+
+    await fireEvent.click(screen.getByTestId("right-sidebar-mode-agents"));
+    await waitFor(() => expect(screen.getByTestId("sidebar")).toBeInTheDocument());
+    await fireEvent.click(screen.getByTestId("right-sidebar-mode-pins"));
+    await waitFor(() => expect(screen.getByTestId("pins-scroll").scrollTop).toBe(137));
+  });
+
   it("restores the selected right-sidebar content for each project", async () => {
     seedProject({
       projectId: "p-a",
@@ -3076,6 +3118,104 @@ describe("App", () => {
     expect(layoutA.minimized).toContain(pane2);
   });
 
+  it("opening a hidden pane tab checks live maximized state, not the click-time snapshot", async () => {
+    const panes = await import("$lib/state/transcriptPanes.svelte");
+    const selection = await import("$lib/state/recipientSelection.svelte");
+    panes._testing.reset();
+    selection._testing.reset();
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [
+        agent({ id: "ag-1", project_id: "p-a", name: "alice" }),
+        agent({ id: "ag-2", project_id: "p-a", name: "bob" }),
+        agent({ id: "ag-3", project_id: "p-a", name: "carol" }),
+      ],
+    });
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument());
+    await fireEvent.click(screen.getByText("alpha"));
+    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
+
+    const roster = ["ag-1", "ag-2", "ag-3"];
+    const pane2 = panes.moveAgentToNewPane("p-a", roster, "ag-2"); // pane 1: alice, pane 2: bob
+    panes.moveAgentToNewPane("p-a", roster, "ag-3"); // pane 3: carol
+    panes.minimizePane("p-a", roster, pane2); // pane 2 hidden; nothing maximized yet
+    selection.setRecipients("p-a", ["ag-3"]);
+    await waitFor(() =>
+      expect(paneChipById(pane2)).toHaveAttribute("data-pane-state", "minimized"),
+    );
+
+    // Click bob's hidden tab: the reveal is queued behind the busy spinner.
+    // At this exact moment nothing is maximized.
+    fireEvent.click(paneChipById(pane2));
+    // A same-project gesture maximizes pane 3 while the reveal is still
+    // pending — the click-time snapshot said "nothing maximized", but by the
+    // time the deferred callback runs, it should see live state instead.
+    const pane3 = panes.layoutFor("p-a", roster).panes[2]!.id;
+    panes.maximizePane("p-a", roster, pane3);
+
+    // Once the deferred reveal lands, pane 2 replaces pane 3 as the maximized
+    // pane (revealing while maximized always takes over the focused view),
+    // and bob is targeted — the live maximized state at execution time, not
+    // "nothing was maximized when I clicked", decides whether targeting
+    // follows the reveal.
+    await waitFor(() => expect(panes.layoutFor("p-a", roster).maximized).toBe(pane2));
+    expect(selection.selectionFor("p-a")).toEqual(["ag-2"]);
+
+    panes._testing.reset();
+    selection._testing.reset();
+  });
+
+  it("opening a hidden pane tab is refused while a send is rendering", async () => {
+    const panes = await import("$lib/state/transcriptPanes.svelte");
+    const selection = await import("$lib/state/recipientSelection.svelte");
+    panes._testing.reset();
+    selection._testing.reset();
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [
+        agent({ id: "ag-1", project_id: "p-a", name: "alice" }),
+        agent({ id: "ag-2", project_id: "p-a", name: "bob" }),
+      ],
+    });
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument());
+    await fireEvent.click(screen.getByText("alpha"));
+    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
+
+    const roster = ["ag-1", "ag-2"];
+    const pane2 = panes.moveAgentToNewPane("p-a", roster, "ag-2"); // pane 1: alice, pane 2: bob
+    const pane1 = panes.layoutFor("p-a", roster).panes[0]!.id;
+    panes.maximizePane("p-a", roster, pane1); // pane 2 is hidden behind the maximize
+    selection.setRecipients("p-a", ["ag-1"]);
+    await waitFor(() =>
+      expect(paneChipById(pane2)).toHaveAttribute("data-pane-state", "behind_maximized"),
+    );
+
+    // Locked: opening bob's hidden tab would both swap the maximized view to
+    // it and retarget the compose selection — the gesture is atomic under the
+    // prompt-render lock, so a refused retarget must not reveal either.
+    const ops = await import("$lib/state/composeOperations.svelte");
+    const blockingOp = ops.beginOperation("p-a", { kind: "prompt_send" })!;
+    await fireEvent.click(paneChipById(pane2));
+    await waitFor(() => expect(screen.queryByTestId("transcript-busy-overlay")).toBeNull());
+    expect(panes.layoutFor("p-a", roster).maximized).toBe(pane1);
+    expect(selection.selectionFor("p-a")).toEqual(["ag-1"]);
+
+    // Unlocked: the same click retargets and reveals.
+    ops.finishOperation("p-a", blockingOp);
+    await fireEvent.click(paneChipById(pane2));
+    await waitFor(() => expect(panes.layoutFor("p-a", roster).maximized).toBe(pane2));
+    expect(selection.selectionFor("p-a")).toEqual(["ag-2"]);
+
+    panes._testing.reset();
+    selection._testing.reset();
+  });
+
   it("keeps pane tab completion markers across project switches", async () => {
     const panes = await import("$lib/state/transcriptPanes.svelte");
     const state = await import("$lib/state/index.svelte");
@@ -3340,6 +3480,52 @@ describe("App", () => {
     await waitFor(() => expect(selection.selectionFor("p-a")).toEqual(["ag-2"]));
     expect(panes.layoutFor("p-a", roster).maximized).toBe(pane2);
     await waitFor(() => expect(screen.queryByTestId("transcript-busy-overlay")).toBeNull());
+
+    panes._testing.reset();
+    selection._testing.reset();
+  });
+
+  it("cycling onto a hidden pane checks live membership, not the click-time snapshot", async () => {
+    const panes = await import("$lib/state/transcriptPanes.svelte");
+    const selection = await import("$lib/state/recipientSelection.svelte");
+    panes._testing.reset();
+    selection._testing.reset();
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [
+        agent({ id: "ag-1", project_id: "p-a", name: "alice" }),
+        agent({ id: "ag-2", project_id: "p-a", name: "bob" }),
+        agent({ id: "ag-3", project_id: "p-a", name: "carol" }),
+      ],
+    });
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument());
+    await fireEvent.click(screen.getByText("alpha"));
+    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
+
+    const roster = ["ag-1", "ag-2", "ag-3"];
+    panes.moveAgentToNewPane("p-a", roster, "ag-2"); // pane 1: alice, pane 2: bob
+    panes.moveAgentToNewPane("p-a", roster, "ag-3"); // pane 3: carol
+    const pane1 = panes.layoutFor("p-a", roster).panes[0]!.id;
+    panes.maximizePane("p-a", roster, pane1); // pane 2 (bob) is the next hidden target
+    selection.setRecipients("p-a", ["ag-3"]);
+    await waitFor(() => expect(paneChipById(pane1)).toHaveAttribute("data-pane-state", "visible"));
+
+    // ⌘⇧] targets bob's pane, but the reveal is queued behind the busy
+    // spinner — bob is a member at this exact moment.
+    fireEvent.keyDown(window, { key: "}", code: "BracketRight", metaKey: true, shiftKey: true });
+    // A same-project gesture empties bob's pane while the cycle is still
+    // pending. The click-time snapshot still says "bob"; live membership at
+    // execution time is empty, so the cycle must not target or reveal it.
+    const pane2 = panes.layoutFor("p-a", roster).panes[1]!.id;
+    panes.unassignAgentFromPane("p-a", roster, "ag-2");
+
+    await waitFor(() => expect(screen.queryByTestId("transcript-busy-overlay")).toBeNull());
+    expect(selection.selectionFor("p-a")).toEqual(["ag-3"]);
+    expect(panes.layoutFor("p-a", roster).maximized).toBe(pane1);
+    expect(panes.layoutFor("p-a", roster).panes.find((p) => p.id === pane2)?.members).toEqual([]);
 
     panes._testing.reset();
     selection._testing.reset();

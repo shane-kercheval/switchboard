@@ -802,16 +802,14 @@ async fn concurrent_send_to_different_agents_both_succeed() {
 
 #[tokio::test]
 async fn panic_in_producer_recovers_and_a_later_send_completes() {
-    // MockScenario::Panic kills the producer task mid-stream (no terminal).
-    // The actor recovers — a subsequent send to the same agent runs to
-    // agent_idle. (Re-expresses the old "restores to idle" as "a later send
-    // completes," since there is no status flag to assert in the actor model.)
+    // MockScenario::Panic kills the producer task mid-stream without an adapter
+    // terminal. The dispatcher synthesizes a failed terminal, and the actor
+    // remains usable for a subsequent send to the same agent.
     let dispatcher = Arc::new(Dispatcher::new());
     let emitter = Arc::new(RecordingEmitter::new());
     let agent = agent_record();
-    // One per-actor factory: first turn panics, the second (and any further)
-    // streams. The actor must recover from the panicked producer and run the
-    // queued healthy turn.
+    // One per-actor factory: the first turn panics and the second streams. The
+    // actor must recover from the panicked producer and run the healthy turn.
     let factory = TestFactory::sequence(
         [MockScenario::Panic, MockScenario::Streaming],
         agent.clone(),
@@ -830,21 +828,26 @@ async fn panic_in_producer_recovers_and_a_later_send_completes() {
         )
         .await;
 
-    // The panicked turn produced a TurnStart (proving the turn went live before
-    // the producer died) but never a terminal — the actor drains to AgentIdle.
+    // The panicked turn starts, receives a dispatcher-synthesized failed
+    // terminal, and then drains to AgentIdle.
     within(
         &emitter,
         "agent_idle after panic",
         emitter.wait_for_type("agent_idle", 1),
     )
     .await;
+    let first_events = emitter.snapshot();
     assert!(
-        emitter
-            .snapshot()
+        first_events
             .iter()
             .any(|(_, v)| event_type(v) == "turn_start"),
         "TurnStart should have been emitted before the producer panicked"
     );
+    let first_terminal = first_events
+        .iter()
+        .find(|(_, value)| event_type(value) == "turn_end")
+        .expect("the dispatcher synthesizes a terminal after producer panic");
+    assert_eq!(first_terminal.1["outcome"]["status"], "failed");
 
     // A fresh, healthy send to the same agent runs to completion — the actor is
     // usable again, not stuck.
@@ -864,9 +867,10 @@ async fn panic_in_producer_recovers_and_a_later_send_completes() {
         emitter.wait_for_type("agent_idle", 2),
     )
     .await;
-    assert!(
-        count_type(&emitter.snapshot(), "turn_end") >= 1,
-        "the later healthy send produced a terminal"
+    assert_eq!(
+        count_type(&emitter.snapshot(), "turn_end"),
+        2,
+        "both the recovered panic and later healthy send produce one terminal"
     );
 }
 
@@ -3921,12 +3925,13 @@ async fn cancel_agent_cancels_in_flight_clears_backlog_and_stays_alive() {
     )
     .await;
     // Turn 2 queued behind it (distinct send).
+    let queued_send_id = Uuid::now_v7();
     dispatcher
         .send_message(
             agent.id,
             "queued",
             vec![],
-            Uuid::now_v7(),
+            queued_send_id,
             TestFactory::new(
                 MockScenario::Streaming,
                 agent.clone(),
@@ -3959,6 +3964,16 @@ async fn cancel_agent_cancels_in_flight_clears_backlog_and_stays_alive() {
         count_type(&emitter.snapshot(), "message_cancelled"),
         1,
         "the dropped queued send emits MessageCancelled so the UI renders it (not the running turn, which gets a Cancelled terminal)"
+    );
+    let cancelled = emitter
+        .snapshot()
+        .into_iter()
+        .find(|(_, value)| event_type(value) == "message_cancelled")
+        .expect("the queued send emits MessageCancelled");
+    assert_eq!(
+        cancelled.1["send_id"],
+        queued_send_id.to_string(),
+        "MessageCancelled carries authoritative send correlation"
     );
 
     // The actor is still alive: a fresh send dispatches normally.

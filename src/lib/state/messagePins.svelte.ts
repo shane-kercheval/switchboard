@@ -50,6 +50,10 @@ const byProject = $state<Record<ProjectId, ProjectPins>>({});
 const queues = new Map<ProjectId, Promise<void>>();
 // eslint-disable-next-line svelte/prefer-svelte-reactivity
 const loads = new Map<ProjectId, Promise<void>>();
+// Scroll offsets are mount-time snapshots, not reactive message state. Keeping
+// them outside `byProject` avoids repainting the Pins tree on every scroll.
+// eslint-disable-next-line svelte/prefer-svelte-reactivity
+const scrollTops = new Map<ProjectId, number>();
 
 function registerLoad(projectId: ProjectId, load: Promise<void>): Promise<void> {
   loads.set(projectId, load);
@@ -328,6 +332,15 @@ export function setPinsCollapsed(projectId: ProjectId, keys: string[], collapsed
   for (const key of keys) state.collapsed[key] = collapsed;
 }
 
+export function pinsScrollTopFor(projectId: ProjectId): number {
+  return scrollTops.get(projectId) ?? 0;
+}
+
+export function setPinsScrollTop(projectId: ProjectId, scrollTop: number): void {
+  if (!Number.isFinite(scrollTop)) return;
+  scrollTops.set(projectId, Math.max(0, scrollTop));
+}
+
 export async function loadMessagePins(projectId: ProjectId, force = false): Promise<void> {
   const state = ensureState(projectId);
   const active = loads.get(projectId);
@@ -416,5 +429,6 @@ export const _testing = {
     for (const key of Object.keys(byProject)) delete byProject[key];
     queues.clear();
     loads.clear();
+    scrollTops.clear();
   },
 };

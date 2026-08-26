@@ -27,8 +27,8 @@ import { HARNESS_DEFAULT_AGENT_NAME } from "./harnessDisplay";
 /// `label` the friendlier display text.
 export type SelectionOption = { label: string; value: string };
 
-/// Per-harness model options. Empty for Antigravity (model is harness-owned
-/// config we can't set — the form renders a note instead).
+/// Per-harness model options. Every harness has a real list — Antigravity's
+/// arrived with agy 1.1.19, which made `--model` a per-invocation flag.
 export const MODEL_OPTIONS: Record<HarnessKind, SelectionOption[]> = {
   claude_code: [
     { label: "Fable", value: "fable" },
@@ -59,17 +59,45 @@ export const MODEL_OPTIONS: Record<HarnessKind, SelectionOption[]> = {
   /// with `--effort`, and the two-control shape is what matches every other
   /// harness here. Which levels each accepts lives in `effortOptionsFor`.
   ///
-  /// "(Thinking)" is Google's own display name for the two Claude models, not
-  /// an effort label this picker adds — they have no effort axis at all
-  /// (probed: `--effort is not supported for model "claude-sonnet-4-6"`).
+  /// The two Claude models have **no effort axis at all** — `agy` rejects the
+  /// flag outright (probed: `--effort is not supported for model
+  /// "claude-sonnet-4-6"`). Their `(Thinking)` suffix is part of Google's own
+  /// display name, not an effort this picker could offer; note it survives in
+  /// the Opus *slug* (`claude-opus-4-6-thinking`), which is where it actually
+  /// belongs.
   ///
-  /// `GPT-OSS 120B (Medium)` is different and deliberately absent from
-  /// `ANTIGRAVITY_MODEL_EFFORTS`: `medium` is a real level for it, but it is
-  /// the *only* one and is optional (probed — bare dispatch works, `low`/`high`
-  /// are rejected with `available: medium`). A control whose single choice
-  /// cannot change the outcome is not worth showing, so the effort picker stays
-  /// hidden for it. Its turn footer still reads back `medium`, because the turn
-  /// genuinely ran at it.
+  /// The labels drop both `(Thinking)` and the `Claude ` prefix, deliberately.
+  /// Neither disambiguates anything: agy offers no non-thinking variant of
+  /// either model, and `Sonnet`/`Opus` name exactly one vendor's models — the
+  /// same reason Claude Code's own picker reads `Opus`/`Sonnet`/`Haiku` bare.
+  /// Together they took the longest entry from 28 characters to 10, which is
+  /// what let this picker be a toggle instead of a dropdown.
+  ///
+  /// The Gemini entries keep their prefix on purpose; that is not an
+  /// inconsistency. `3.7 Flash` and `3.1 Pro` are version numbers with no
+  /// product attached, while `Sonnet` and `Opus` are unambiguous on their own.
+  ///
+  /// The known cost of dropping `(Thinking)`: the turn footer shows agy's
+  /// announced name, and `split_announced_model` leaves the suffix attached
+  /// because it is not a real level — so the footer reads
+  /// `Claude Sonnet 4.6 (Thinking)` where the picker reads `Sonnet 4.6`. A
+  /// cosmetic mismatch on two models, traded for a control that fits.
+  ///
+  /// GPT-OSS is different: `medium` is a *real* level for it (probed — bare
+  /// dispatch works, `--effort medium` works, `low`/`high` are rejected with
+  /// `available: medium`). So it carries a single-value effort entry rather
+  /// than a `(Medium)` suffix baked into its label. That is not decoration —
+  /// it makes the picker agree with the transcript. `split_announced_model`
+  /// already splits a trailing parenthetical off as effort when it names a real
+  /// level, so agy's announced `GPT-OSS 120B (Medium)` renders in the turn
+  /// footer as model `GPT-OSS 120B` + effort `medium`. A label carrying the
+  /// suffix would contradict the footer directly below it.
+  ///
+  /// Only the newest Flash generation is offered. agy's catalog also lists
+  /// 3.6 and 3.5 Flash; three near-identical generations is a picker that costs
+  /// the user a decision without giving them one. Retiring an entry does not
+  /// strand an agent already using it — the slug stays valid at dispatch, and
+  /// the sidebar falls back to a dropdown for an off-catalog persisted value.
   ///
   /// Curated rather than fetched: `agy models` needs auth and network, and its
   /// `--output-format json` is advertised but rejected @ 1.1.19. A retired
@@ -77,20 +105,18 @@ export const MODEL_OPTIONS: Record<HarnessKind, SelectionOption[]> = {
   /// pre-dispatch, quota-free, listing what is available.
   antigravity: [
     { label: "Gemini 3.7 Flash", value: "gemini-3.7-flash" },
-    { label: "Gemini 3.6 Flash", value: "gemini-3.6-flash" },
-    { label: "Gemini 3.5 Flash", value: "gemini-3.5-flash" },
     { label: "Gemini 3.1 Pro", value: "gemini-3.1-pro" },
-    { label: "Claude Sonnet 4.6 (Thinking)", value: "claude-sonnet-4-6" },
-    { label: "Claude Opus 4.6 (Thinking)", value: "claude-opus-4-6-thinking" },
-    { label: "GPT-OSS 120B (Medium)", value: "gpt-oss-120b" },
+    { label: "Sonnet 4.6", value: "claude-sonnet-4-6" },
+    { label: "Opus 4.6", value: "claude-opus-4-6-thinking" },
+    { label: "GPT-OSS 120B", value: "gpt-oss-120b" },
   ],
 };
 
 /// How the **model** picker renders per harness — the single source of truth
 /// both the create form and the sidebar change-model dialog read, so the two
 /// can't drift. Segmented (a toggle) for the short curated lists; a dropdown
-/// for Gemini and Antigravity, whose lists are long with labels long enough to
-/// truncate as pills. Effort is always segmented (every effort set is short
+/// only for Gemini, whose list is long with labels long enough to truncate as
+/// pills. Effort is always segmented (every effort set is short
 /// single words), so there is no `EFFORT_PRESENTATION`. The sidebar
 /// additionally falls back to a dropdown when it must show an off-catalog
 /// persisted value whose label length is unbounded (see `Sidebar.svelte`).
@@ -98,9 +124,11 @@ export const MODEL_PRESENTATION: Record<HarnessKind, "segmented" | "dropdown"> =
   claude_code: "segmented",
   codex: "segmented",
   gemini: "dropdown",
-  // Seven entries with names as long as "Claude Sonnet 4.6 (Thinking)" would
-  // truncate as pills.
-  antigravity: "dropdown",
+  // Five entries after retiring the older Flash generations, longest label
+  // "Gemini 3.7 Flash" at 16 characters — comparable to Codex's segmented row.
+  // Both this and the `(Thinking)` drop above were judged against the running
+  // app: five pills carrying the suffixes were tried first and rejected.
+  antigravity: "segmented",
 };
 
 /// Per-harness effort options. Empty for Gemini (config-only). Codex `none` is
@@ -142,14 +170,18 @@ export const EFFORT_OPTIONS: Record<HarnessKind, SelectionOption[]> = {
 /// with the CLI naming the valid set — unlike Claude, which silently degrades.
 ///
 /// A model absent from this map has **no effort axis**: `agy` rejects
-/// `--effort` for it outright. Note Gemini 3.1 Pro offers only low/high while
-/// the Flash models add medium — the sets genuinely differ, which is why this
-/// is per-model rather than one list.
+/// `--effort` for it outright. The sets genuinely differ per model — Flash
+/// takes all three levels, 3.1 Pro only low/high, GPT-OSS only medium — which
+/// is why this is a per-model map rather than one list.
 const ANTIGRAVITY_MODEL_EFFORTS: Record<string, readonly string[]> = {
   "gemini-3.7-flash": ["low", "medium", "high"],
-  "gemini-3.6-flash": ["low", "medium", "high"],
-  "gemini-3.5-flash": ["low", "medium", "high"],
   "gemini-3.1-pro": ["low", "high"],
+  // Single-valued, and that is the point: the control renders as one
+  // already-selected option, which states what the turn will run at instead of
+  // leaving the user to infer it from a label suffix. Kept in this map (rather
+  // than absent, which hides the control) so the picker and the turn footer
+  // describe the model the same way.
+  "gpt-oss-120b": ["medium"],
 };
 
 /// Codex effort levels only the GPT-5.6 model family accepts. Earlier Codex
@@ -228,10 +260,11 @@ export const DEFAULT_AGENT_PROFILES: Preferences["agent_defaults"] = {
     primary: { model: "auto", effort: null },
     secondary: null,
   },
-  // Matches the model Antigravity itself defaults to, and carries an explicit
-  // effort because `agy` rejects an effort-bearing model dispatched without one.
+  // Carries an explicit effort because `agy` rejects an effort-bearing model
+  // dispatched without one — "no model selected" is not a state this harness
+  // can start in.
   antigravity: {
-    primary: { model: "gemini-3.1-pro", effort: "high" },
+    primary: { model: "gemini-3.7-flash", effort: "high" },
     secondary: null,
   },
 };
@@ -242,9 +275,12 @@ export const SUGGESTED_SECONDARY_PROFILE: Record<HarnessKind, AgentProfile> = {
   claude_code: { model: "sonnet", effort: "medium" },
   codex: { model: "gpt-5.6-terra", effort: "medium" },
   gemini: { model: "gemini-2.5-flash", effort: null },
-  // A cheaper, faster tier than the primary default, matching the pattern the
-  // other harnesses use for their secondary.
-  antigravity: { model: "gemini-3.5-flash", effort: "medium" },
+  // Inverted relative to the other harnesses, whose secondary steps *down* to a
+  // cheaper tier: Antigravity's primary default is already the fast one, so the
+  // useful second slot is the more capable model. Effort must be `low` or
+  // `high` here — 3.1 Pro is the one curated model with no `medium`, and
+  // pairing it with `medium` would fail the dispatch client-side.
+  antigravity: { model: "gemini-3.1-pro", effort: "high" },
 };
 
 /// A model-derived name stops describing an agent once it can switch between

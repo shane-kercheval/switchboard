@@ -2118,9 +2118,10 @@ mod tests {
 
     #[test]
     fn build_args_sends_a_no_axis_model_without_an_effort() {
-        // `claude-sonnet-4-6` and `gpt-oss-120b` have no effort axis and `agy`
-        // rejects `--effort` for them (probed). A model alone is a valid
-        // invocation.
+        // The two Claude models have no effort axis at all — `agy` rejects
+        // `--effort` for them outright (probed). A model alone is a valid
+        // invocation. (`gpt-oss-120b` is a different case: it accepts exactly
+        // one level, `medium`, and also dispatches bare.)
         let log = PathBuf::from("/tmp/x.log");
         let agent = AgentRecord {
             model: Some("claude-sonnet-4-6".to_owned()),

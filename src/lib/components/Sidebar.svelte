@@ -1749,7 +1749,7 @@
   open={editingAgent !== null}
   onClose={closeChange}
   title="Model settings"
-  contentClass="max-w-lg"
+  contentClass="max-w-[612px]"
   dismissible={!editBusy}
 >
   <div class="space-y-3" data-testid="change-selection-panel">
@@ -1759,7 +1759,6 @@
         bind:primary={editPrimary}
         bind:secondary={editSecondary}
         secondarySuggestion={preferences.agent_defaults[editingAgent.harness].secondary}
-        allowUnset
         disabled={editBusy}
         testidPrefix="change-profile"
       />

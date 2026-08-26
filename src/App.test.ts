@@ -796,7 +796,7 @@ describe("App", () => {
     expect(createAgentCalls()).toEqual([
       { name: "opus-high", harness: "claude_code" },
       { name: "gpt-5-6-sol-high", harness: "codex" },
-      { name: "gemini-3-1-pro-high", harness: "antigravity" },
+      { name: "gemini-3-7-flash-high", harness: "antigravity" },
     ]);
     // Auto-seeded → the roster is populated, not the empty first-agent prompt.
     await waitFor(() => expect(screen.getAllByTestId("sidebar-agent")).toHaveLength(3));
@@ -835,9 +835,9 @@ describe("App", () => {
         secondaryEffort: undefined,
       },
       {
-        name: "gemini-3-1-pro-high",
+        name: "gemini-3-7-flash-high",
         harness: "antigravity",
-        model: "gemini-3.1-pro",
+        model: "gemini-3.7-flash",
         effort: "high",
         secondaryModel: undefined,
         secondaryEffort: undefined,

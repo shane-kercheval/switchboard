@@ -637,9 +637,9 @@ describe("CreateAgentForm", () => {
       mode: "create",
       // Now model-derived like every other harness with a model, rather than
       // the bare harness name it used when it had none.
-      name: "gemini-3-1-pro-high",
+      name: "gemini-3-7-flash-high",
       harness: "antigravity",
-      primary: { model: "gemini-3.1-pro", effort: "high" },
+      primary: { model: "gemini-3.7-flash", effort: "high" },
       secondary: null,
     } satisfies AgentFormSubmit);
   });
@@ -650,8 +650,7 @@ describe("CreateAgentForm", () => {
     // would fail at dispatch.
     renderForm();
     await fireEvent.click(screen.getByTestId("harness-antigravity"));
-    const select = screen.getByTestId("model-select");
-    await fireEvent.change(select, { target: { value: "claude-sonnet-4-6" } });
+    await choosePicker("model-select", "claude-sonnet-4-6");
     expect(screen.queryByTestId("effort-select")).not.toBeInTheDocument();
   });
 
@@ -660,6 +659,9 @@ describe("CreateAgentForm", () => {
     // effort-bearing model — so "Default" must not be offered.
     renderForm();
     await fireEvent.click(screen.getByTestId("harness-antigravity"));
+    // 3.1 Pro is not the default (3.7 Flash is), so select it explicitly —
+    // it is the one curated model whose levels exclude `medium`.
+    await choosePicker("model-select", "gemini-3.1-pro");
     // Segmented picker: each option is its own testid-bearing button.
     expect(screen.getByTestId("effort-select-option-low")).toBeInTheDocument();
     expect(screen.getByTestId("effort-select-option-high")).toBeInTheDocument();
@@ -780,7 +782,7 @@ describe("CreateAgentForm", () => {
     // Antigravity now derives from its model like Claude/Codex; Gemini stays
     // bare because its default model is the non-descriptive `auto`.
     await fireEvent.click(screen.getByTestId("harness-antigravity"));
-    expect(nameInput.value).toBe("gemini-3-1-pro-high");
+    expect(nameInput.value).toBe("gemini-3-7-flash-high");
   });
 
   it("editing the name freezes it against later picker and harness changes", async () => {

@@ -4,7 +4,6 @@
     MODEL_OPTIONS,
     MODEL_PRESENTATION,
     SUGGESTED_SECONDARY_PROFILE,
-    effortIsRequired,
     effortOptionsFor,
     type SelectionOption,
   } from "$lib/agentSelection";
@@ -22,7 +21,6 @@
     secondary: AgentProfile | null;
     secondarySuggestion?: AgentProfile | null;
     disabled?: boolean;
-    allowUnset?: boolean;
     testidPrefix?: string;
     legacyPrimaryTestids?: boolean;
   };
@@ -33,7 +31,6 @@
     secondary = $bindable(),
     secondarySuggestion = null,
     disabled = false,
-    allowUnset = false,
     testidPrefix = "agent-profile",
     legacyPrimaryTestids = false,
   }: Props = $props();
@@ -49,22 +46,11 @@
   }
 
   function modelOptions(profile: AgentProfile): SelectionOption[] {
-    const options = allowUnset
-      ? [{ label: "Default", value: "" }, ...MODEL_OPTIONS[harness]]
-      : MODEL_OPTIONS[harness];
-    return withCurrent(options, profile.model);
+    return withCurrent(MODEL_OPTIONS[harness], profile.model);
   }
 
   function effortOptions(profile: AgentProfile): SelectionOption[] {
-    const base = effortOptionsFor(harness, profile.model ?? undefined);
-    // No "Default" where the harness demands a level: `agy` rejects an
-    // effort-bearing model dispatched without one, so offering "Default" would
-    // offer a choice that fails every turn.
-    const options =
-      allowUnset && !effortIsRequired(harness, profile.model ?? undefined)
-        ? [{ label: "Default", value: "" }, ...base]
-        : base;
-    return withCurrent(options, profile.effort);
+    return withCurrent(effortOptionsFor(harness, profile.model ?? undefined), profile.effort);
   }
 
   /// Whether to render the effort control at all for this profile.
@@ -94,17 +80,14 @@
     if (current === null) return;
     const model = value === "" ? null : value;
     const validEfforts = effortOptionsFor(harness, model ?? undefined);
-    const keepUnset = current.effort === null && allowUnset;
     const effort =
-      // A model whose axis is mandatory cannot stay unset — pick a level rather
-      // than persist a profile that fails on dispatch.
-      keepUnset && !effortIsRequired(harness, model ?? undefined)
-        ? null
-        : current.effort !== null && validEfforts.some((o) => o.value === current.effort)
-          ? current.effort
-          : (validEfforts.find((option) => option.value === "medium")?.value ??
-            validEfforts[0]?.value ??
-            null);
+      // Every profile carries an explicit level where the model has an axis;
+      // there is no "let the harness decide" option to fall back to.
+      current.effort !== null && validEfforts.some((o) => o.value === current.effort)
+        ? current.effort
+        : (validEfforts.find((option) => option.value === "medium")?.value ??
+          validEfforts[0]?.value ??
+          null);
     const next = { ...current, model, effort };
     if (slot === "primary") primary = next;
     else secondary = next;

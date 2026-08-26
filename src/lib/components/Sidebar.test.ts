@@ -891,33 +891,6 @@ describe("Sidebar", () => {
     );
   });
 
-  it("Claude keeps its effort when the model is returned to Default", async () => {
-    // The state a backend rule briefly rejected: Claude and Codex emit their
-    // effort flag independently of the model, so "harness default model, at an
-    // explicit effort" is valid and reachable — set an effort, then put the
-    // model picker back to Default.
-    const state = await loadState();
-    const agent = { ...CLAUDE_AGENT, model: "opus", effort: "high" };
-    await state.registerAgent(agent);
-    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
-
-    await openAgentActions();
-    await waitFor(() => expect(screen.getByTestId("agent-profile-settings")).toBeInTheDocument());
-    await fireEvent.click(screen.getByTestId("agent-profile-settings"));
-    await screen.findByTestId("change-profile-primary-model");
-
-    await choosePicker("change-profile-primary-model", "");
-    expect(pickerValue("change-profile-primary-model")).toBe("");
-    expect(pickerValue("change-profile-primary-effort")).toBe("high");
-
-    await fireEvent.click(screen.getByTestId("change-save"));
-    expect(setAgentProfilesMock).toHaveBeenCalledExactlyOnceWith(
-      agent.id,
-      { model: null, effort: "high" },
-      null,
-    );
-  });
-
   it("Model settings preserves an agent's unpinned primary profile", async () => {
     const state = await loadState();
     const agent = { ...CLAUDE_AGENT, model: null, effort: null };
@@ -929,14 +902,18 @@ describe("Sidebar", () => {
     await fireEvent.click(screen.getByTestId("agent-profile-settings"));
 
     await screen.findByTestId("change-profile-primary-model");
-    expect(pickerHasOption("change-profile-primary-model", "")).toBe(true);
-    expect(pickerHasOption("change-profile-primary-effort", "")).toBe(true);
-    expect(screen.getByTestId("change-profile-primary-model-option-no-override")).toHaveTextContent(
-      "Default",
-    );
-    expect(
-      screen.getByTestId("change-profile-primary-effort-option-no-override"),
-    ).toHaveTextContent("Default");
+    // An attached agent arrives with no model/effort — "Attach existing" offers
+    // no pickers, so the profile is genuinely unset until someone edits it here.
+    // Opening the dialog must not silently pin a value: nothing is selected, and
+    // saving without touching a picker round-trips the nulls unchanged.
+    //
+    // There is deliberately no "Default" option to represent that state. It was
+    // removed as clutter on the common path; the backend rule it guarded — a
+    // null model with an explicit effort staying valid for Claude/Codex — is
+    // covered at `crates/core/src/project.rs`
+    // (`effort_without_a_model_stays_valid_where_the_harness_allows_it`).
+    expect(pickerHasOption("change-profile-primary-model", "")).toBe(false);
+    expect(pickerHasOption("change-profile-primary-effort", "")).toBe(false);
     expect(pickerValue("change-profile-primary-model")).toBe("");
     expect(pickerValue("change-profile-primary-effort")).toBe("");
     await fireEvent.click(screen.getByTestId("change-profile-secondary-toggle"));

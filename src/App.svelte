@@ -109,6 +109,7 @@
     setViewMode,
     enterGitView,
     revealProjectBranch,
+    cancelProjectBranchReveal,
     selectedWorktreePathForEditor,
   } from "$lib/state/gitView.svelte";
   import {
@@ -376,6 +377,7 @@
   // only — never persisted (the app always opens to Projects).
   function selectView(mode: "projects" | "git"): void {
     settingsOpen = false;
+    cancelProjectBranchReveal();
     if (mode === "git") {
       projectViewResumePending = false;
       // Entering Git renders the full repos→branches tree in one synchronous

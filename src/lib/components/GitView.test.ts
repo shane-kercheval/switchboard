@@ -20,7 +20,8 @@ vi.mock("$lib/native", () => ({
   copyText: (text: string) => copyTextMock(text),
 }));
 
-const { refreshAll, fetchStates, _testing } = await import("$lib/state/gitView.svelte");
+const { refreshAll, fetchStates, requestRepoReveal, _testing } =
+  await import("$lib/state/gitView.svelte");
 const {
   contributedCommands,
   openPalette,
@@ -265,6 +266,73 @@ describe("GitView", () => {
     );
     await gitCommand("git.toggle-repositories").run();
     expect(screen.getAllByTestId("repo-branches")).toHaveLength(2);
+  });
+
+  it("retains repository expansion and scroll position across remounts", async () => {
+    wire([repo(), repo({ root: "/repos/other", name: "other" })]);
+    await refreshAll();
+    const firstRender = render(GitView);
+    await waitFor(() => expect(screen.getAllByTestId("git-repo")).toHaveLength(2));
+
+    const firstRepo = screen.getAllByTestId("git-repo")[0]!;
+    await fireEvent.click(within(firstRepo).getByRole("button", { name: "Collapse repo" }));
+    const firstList = screen.getByTestId("git-repo-list");
+    firstList.scrollTop = 137;
+    await fireEvent.scroll(firstList);
+    firstRender.unmount();
+
+    render(GitView);
+    await waitFor(() => expect(screen.getAllByTestId("git-repo")).toHaveLength(2));
+    const repos = screen.getAllByTestId("git-repo");
+    expect(within(repos[0]!).queryByTestId("repo-branches")).not.toBeInTheDocument();
+    expect(within(repos[1]!).getByTestId("repo-branches")).toBeInTheDocument();
+    expect(screen.getByTestId("git-repo-list").scrollTop).toBe(137);
+  });
+
+  it("reveals only the requested collapsed repository and scrolls it into view", async () => {
+    wire([repo(), repo({ root: "/repos/other", name: "other" })]);
+    await refreshAll();
+    render(GitView);
+    await waitFor(() => expect(screen.getAllByTestId("git-repo")).toHaveLength(2));
+
+    await fireEvent.click(screen.getByTestId("git-repos-toggle-all"));
+    expect(screen.queryAllByTestId("repo-branches")).toHaveLength(0);
+    const scrollSpy = vi.spyOn(Element.prototype, "scrollIntoView");
+
+    requestRepoReveal("/repos/other");
+
+    await waitFor(() => expect(screen.getAllByTestId("repo-branches")).toHaveLength(1));
+    const repos = screen.getAllByTestId("git-repo");
+    expect(within(repos[0]!).queryByTestId("repo-branches")).not.toBeInTheDocument();
+    expect(within(repos[1]!).getByTestId("repo-branches")).toBeInTheDocument();
+    expect(scrollSpy).toHaveBeenCalledWith({ block: "nearest" });
+    expect(scrollSpy.mock.instances.at(-1)).toBe(repos[1]);
+    scrollSpy.mockRestore();
+  });
+
+  it("restores the repository pane before revealing from a full-screen diff", async () => {
+    wire([repo()]);
+    await refreshAll();
+    render(GitView);
+    await waitFor(() => expect(screen.getByTestId("git-repo")).toBeInTheDocument());
+
+    const mainRow = document.querySelector(
+      '[data-testid="git-branch"][data-branch="main"]',
+    ) as HTMLElement;
+    await fireEvent.click(within(mainRow).getByTestId("branch-select"));
+    await waitFor(() => expect(screen.getByTestId("diff-panel")).toBeInTheDocument());
+    await fireEvent.click(screen.getByRole("button", { name: "Collapse repo" }));
+    await fireEvent.click(screen.getByTestId("detail-expand-toggle"));
+    expect(screen.queryByTestId("git-repo-list")).not.toBeInTheDocument();
+    const scrollSpy = vi.spyOn(Element.prototype, "scrollIntoView");
+
+    requestRepoReveal("/repos/app");
+
+    await waitFor(() => expect(screen.getByTestId("git-repo-list")).toBeInTheDocument());
+    expect(screen.getByTestId("repo-branches")).toBeInTheDocument();
+    expect(scrollSpy).toHaveBeenCalledWith({ block: "nearest" });
+    expect(scrollSpy.mock.instances.at(-1)).toBe(screen.getByTestId("git-repo"));
+    scrollSpy.mockRestore();
   });
 
   it("git.toggle-detail runs, and ⌘⇧D is suppressed while the palette is open", async () => {

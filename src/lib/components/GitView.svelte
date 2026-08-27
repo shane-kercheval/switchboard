@@ -6,8 +6,7 @@
   ///
   /// No polling — `enterGitView` (called by App on toggle) runs the staleness-
   /// gated entry refresh; the global refresh button forces a re-read + fetch.
-  import { untrack } from "svelte";
-  import { SvelteSet } from "svelte/reactivity";
+  import { tick, untrack } from "svelte";
   import { FolderPlus, RefreshCw } from "@lucide/svelte";
   import { cn } from "$lib/utils";
   import Button from "$lib/components/ui/Button.svelte";
@@ -44,6 +43,9 @@
     removeRepo,
     gitRefresh,
     hoverSuppressed,
+    collapsedRepoRoots,
+    repoListScroll,
+    takeRepoReveal,
   } from "$lib/state/gitView.svelte";
   import {
     setCommandSource,
@@ -57,7 +59,6 @@
 
   let branchFilter = $state<"local" | "remote" | "both">("both");
   let showInactive = $state(false);
-  const collapsedRepoRoots = new SvelteSet<string>();
   let refreshing = $state(false);
   let adding = $state(false);
   let addError = $state<string | null>(null);
@@ -73,6 +74,7 @@
   let draftRepoWidth = $state<number | null>(null);
   const repoWidth = $derived(draftRepoWidth ?? layout.gitRepoWidth);
   let detailExpanded = $state(false);
+  let repoListElement = $state<HTMLDivElement>();
   const allReposCollapsed = $derived(
     gitView.repos.length > 0 &&
       gitView.repos.every((listing) => collapsedRepoRoots.has(listing.repo.root)),
@@ -89,6 +91,24 @@
     } else {
       for (const listing of gitView.repos) collapsedRepoRoots.add(listing.repo.root);
     }
+  }
+
+  function rememberRepoScroll(node: HTMLElement): { destroy: () => void } {
+    node.scrollTop = repoListScroll.top;
+    const remember = (): void => {
+      repoListScroll.top = node.scrollTop;
+    };
+    node.addEventListener("scroll", remember, { passive: true });
+    return {
+      destroy: () => node.removeEventListener("scroll", remember),
+    };
+  }
+
+  function scrollRepoIntoView(root: string): void {
+    const repo = Array.from(
+      repoListElement?.querySelectorAll('[data-testid="git-repo"]') ?? [],
+    ).find((node) => node.getAttribute("data-repo-root") === root);
+    repo?.scrollIntoView({ block: "nearest" });
   }
 
   function onWindowPointerMove(): void {
@@ -129,6 +149,14 @@
     if (panel === null) {
       detailExpanded = false;
     }
+  });
+
+  $effect(() => {
+    const repoRoot = takeRepoReveal();
+    if (repoRoot === null) return;
+    collapsedRepoRoots.delete(repoRoot);
+    detailExpanded = false;
+    void tick().then(() => scrollRepoIntoView(repoRoot));
   });
 
   $effect(() => {
@@ -451,6 +479,8 @@
         class="git-scrollbar bg-raised flex min-h-0 shrink-0 [scrollbar-gutter:stable] flex-col gap-1 overflow-y-scroll p-2"
         style={`width: ${repoWidth}px`}
         data-testid="git-repo-list"
+        bind:this={repoListElement}
+        use:rememberRepoScroll
       >
         {#if gitView.status === "loading" && gitView.repos.length === 0}
           <EmptyState testid="git-loading" title="Loading repositories…" />

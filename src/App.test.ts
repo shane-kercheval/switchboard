@@ -4139,10 +4139,54 @@ describe("App", () => {
     // The tracked repo loaded via list_tracked_repos.
     await waitFor(() => expect(screen.getByTestId("git-repo")).toBeInTheDocument());
 
-    // Toggle back to Projects: the view is gone, the sidebar returns.
-    await fireEvent.click(screen.getByTestId("view-toggle-projects"));
+    await fireEvent.click(screen.getByRole("button", { name: "Collapse repo" }));
+    const repoList = screen.getByTestId("git-repo-list");
+    repoList.scrollTop = 42;
+    await fireEvent.scroll(repoList);
+
+    // ⌘⇧G leaves and re-enters without resetting the tree position.
+    await fireEvent.keyDown(window, { key: "g", code: "KeyG", metaKey: true, shiftKey: true });
     await waitFor(() => expect(screen.queryByTestId("git-view")).not.toBeInTheDocument());
     expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument();
+
+    await fireEvent.keyDown(window, { key: "g", code: "KeyG", metaKey: true, shiftKey: true });
+    await waitFor(() => expect(screen.getByTestId("git-repo")).toBeInTheDocument());
+    expect(screen.getByRole("button", { name: "Expand repo" })).toBeInTheDocument();
+    expect(screen.getByTestId("git-repo-list").scrollTop).toBe(42);
+  });
+
+  it("generic ⌘⇧G entry cancels a pending project reveal", async () => {
+    seedProject({ projectId: "p-a", directory: DIR_A, name: "alpha" });
+    backend.trackedRepos = [
+      {
+        repo: {
+          root: DIR_A,
+          name: "alpha-repo",
+          default_branch: "main",
+          available: true,
+          is_bare: false,
+          local_branches: [],
+          remote_branches: [],
+          detached_worktrees: [],
+        },
+        linked_projects: {},
+      } satisfies RepoListing,
+    ];
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument());
+    const gitState = await import("$lib/state/gitView.svelte");
+    gitState.collapsedRepoRoots.add(DIR_A);
+    gitState.requestRepoReveal(DIR_A);
+
+    await fireEvent.keyDown(window, {
+      key: "g",
+      code: "KeyG",
+      metaKey: true,
+      shiftKey: true,
+    });
+
+    await waitFor(() => expect(screen.getByTestId("git-repo")).toBeInTheDocument());
+    expect(screen.getByRole("button", { name: "Expand repo" })).toBeInTheDocument();
   });
 
   it("shows project loading immediately when returning from Git view to an active project", async () => {

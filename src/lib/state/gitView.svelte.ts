@@ -11,6 +11,7 @@
 // this never persists. It lives here (not component-local) so it's testable.
 
 import * as api from "$lib/api";
+import { SvelteSet } from "svelte/reactivity";
 import type {
   BranchKind,
   BranchView,
@@ -53,6 +54,32 @@ type RepoRuntime = {
 };
 
 export const view = $state<{ mode: ViewMode }>({ mode: "projects" });
+
+/// Session-only tree position. GitView is unmounted when the user returns to
+/// Projects, so this state lives beside the view mode rather than in the
+/// component.
+export const collapsedRepoRoots = new SvelteSet<string>();
+export const repoListScroll = $state<{ top: number }>({ top: 0 });
+
+// A consume-once request for GitView to expand and scroll to one repository.
+const repoReveal = $state<{ root: string | null }>({ root: null });
+
+export function requestRepoReveal(root: string): void {
+  repoReveal.root = root;
+}
+
+/// Supersede pending project navigation when the user explicitly switches
+/// views. Temporary overlays leave it intact for GitView to consume on return.
+export function cancelProjectBranchReveal(): void {
+  gitRevealSeq += 1;
+  repoReveal.root = null;
+}
+
+export function takeRepoReveal(): string | null {
+  const root = repoReveal.root;
+  repoReveal.root = null;
+  return root;
+}
 
 /// A branch (or remote-tracking ref) selected in the tree. Identifies it for the
 /// on-demand commit read; `kind` picks the local vs. remote ref namespace. When
@@ -594,14 +621,16 @@ async function resolveProjectBranchTarget(
 
 async function selectProjectBranchTarget(target: ProjectBranchTarget): Promise<void> {
   view.mode = "git";
+  requestRepoReveal(target.repoRoot);
   const ref: SelectedRef = { repoRoot: target.repoRoot, kind: "local", name: target.branch.name };
-  if (refsEqual(branchSelection.current, ref)) return;
-  await selectBranch(ref, {
-    worktreePath: target.worktreePath,
-    hasChanges:
-      target.branch.worktree?.dirty === true || target.branch.worktree?.untracked === true,
-    worktreeSubtitle: target.worktreePath,
-  });
+  if (!refsEqual(branchSelection.current, ref)) {
+    await selectBranch(ref, {
+      worktreePath: target.worktreePath,
+      hasChanges:
+        target.branch.worktree?.dirty === true || target.branch.worktree?.untracked === true,
+      worktreeSubtitle: target.worktreePath,
+    });
+  }
 }
 
 /// Switch to Git view and select the local branch/worktree linked to a project.
@@ -648,6 +677,9 @@ function applyRepos(repos: RepoListing[]): void {
   }
   // Drop runtime for repos no longer tracked.
   const live = new Set(repos.map((r) => r.repo.root));
+  for (const root of [...collapsedRepoRoots]) {
+    if (!live.has(root)) collapsedRepoRoots.delete(root);
+  }
   for (const root of [...runtime.keys()]) {
     if (!live.has(root)) {
       runtime.delete(root);
@@ -763,6 +795,9 @@ async function runBounded<T>(
 export const _testing = {
   reset(): void {
     view.mode = "projects";
+    collapsedRepoRoots.clear();
+    repoListScroll.top = 0;
+    repoReveal.root = null;
     gitView.repos = [];
     gitView.status = "pending";
     runtime.clear();

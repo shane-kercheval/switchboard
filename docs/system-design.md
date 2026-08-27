@@ -68,7 +68,6 @@ Switchboard-managed state lives in a `.switchboard/` directory at the working di
 <directory>/
 └── .switchboard/
     ├── config.yaml             # directory-level config (placeholder in v1; mostly empty)
-    ├── workflows/              # workflow definitions (YAML), shared across projects in this directory
     ├── projects.jsonl          # index of projects: { id, name, created_at } — appended on
     │                           #   create, rewritten in place on rename/delete
     │                           #   (like registry.jsonl)
@@ -95,6 +94,7 @@ Switchboard-managed state lives in a `.switchboard/` directory at the working di
 │                               #   on macOS this is ~/Library/Application Support/switchboard/)
 ├── config.yaml                 # personal preferences + prompt providers (local_prompt_dirs, mcp_providers — see §6)
 ├── prompts/                    # default local prompt store (user's own prompts; built-ins are baked-in read-only, not written here — see §6)
+├── workflows/                  # user-global workflow definitions (YAML), shared across every project
 └── workspace.yaml              # app-managed: the working directories the user works across,
                                 #   each with a cached snapshot of its projects, plus the
                                 #   user-global set of archived project ids (view-state)

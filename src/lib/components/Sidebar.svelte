@@ -1,8 +1,6 @@
 <script lang="ts">
   import {
-    ArrowDown,
     ArrowLeftRight,
-    ArrowUp,
     Check,
     Columns2,
     Eye,
@@ -30,7 +28,6 @@
     setAgentProfiles,
   } from "$lib/state/workspace.svelte";
   import { DRAG_SLOP_PX, dropIndexForPointer, movedOrder } from "$lib/agentReorder";
-  import { shortcut } from "$lib/platform";
   import ExpandCollapseIcon from "$lib/components/ui/ExpandCollapseIcon.svelte";
   import { SUPPORTS_EFFORT_SELECTION, SUPPORTS_MODEL_SELECTION } from "$lib/harnessDisplay";
   import {
@@ -402,9 +399,8 @@
       const agent = agents.find((candidate) => candidate.id === agentId);
       if (agent !== undefined) onAgentCardDoubleClick(agent, event);
     };
-    // Alt+Arrow reorders the focused card (the menu items advertise the
-    // chord). Skipped while typing — Alt+Arrow is a text-caret motion inside
-    // the rename input.
+    // Alt+Arrow reorders the focused card. Skipped while typing — Alt+Arrow is
+    // a text-caret motion inside the rename input.
     const handleKeydown = (event: KeyboardEvent): void => {
       onAgentCardKeydown(agentId, event);
       if (event.defaultPrevented) return;
@@ -434,8 +430,8 @@
   // --- Roster reordering -------------------------------------------------
   // Roster order is the canonical display order app-wide (these cards, the
   // compose chips and their ⌘1..9 numbering, pane columns), so all reorder
-  // gestures funnel into one commit path. Two gestures: Move up/down (menu
-  // items + Alt+Arrow), and dragging the far-right hover grip.
+  // gestures funnel into one commit path: Alt+Arrow and dragging the far-right
+  // hover grip.
 
   let reorderError = $state<{ agentId: AgentId; message: string } | null>(null);
 
@@ -1237,49 +1233,6 @@
                           aria-hidden="true"
                         />
                         Model settings…
-                      </DropdownMenuItem>
-                    {/if}
-                    <!-- Roster reorder. Disabled (not hidden) at the ends so the
-                         boundary reads as "can't move further", not a missing
-                         feature. closeOnSelect={false}: moving several positions
-                         is one menu trip. -->
-                    {#if agents.length > 1}
-                      {@const rosterIndex = rosterIds.indexOf(agent.id)}
-                      <DropdownMenuItem
-                        onSelect={() => void moveAgentBy(agent.id, -1)}
-                        closeOnSelect={false}
-                        disabled={rosterIndex === 0}
-                        class="gap-2"
-                        data-testid="agent-move-up"
-                      >
-                        <ArrowUp
-                          size={14}
-                          strokeWidth={1.8}
-                          class="text-muted shrink-0"
-                          aria-hidden="true"
-                        />
-                        Move up
-                        <span class="text-muted ml-auto font-mono text-xs"
-                          >{shortcut("alt", "↑")}</span
-                        >
-                      </DropdownMenuItem>
-                      <DropdownMenuItem
-                        onSelect={() => void moveAgentBy(agent.id, 1)}
-                        closeOnSelect={false}
-                        disabled={rosterIndex === agents.length - 1}
-                        class="gap-2"
-                        data-testid="agent-move-down"
-                      >
-                        <ArrowDown
-                          size={14}
-                          strokeWidth={1.8}
-                          class="text-muted shrink-0"
-                          aria-hidden="true"
-                        />
-                        Move down
-                        <span class="text-muted ml-auto font-mono text-xs"
-                          >{shortcut("alt", "↓")}</span
-                        >
                       </DropdownMenuItem>
                     {/if}
                     <!-- Pane assignment. Move, never copy: an agent can belong

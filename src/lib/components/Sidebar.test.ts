@@ -1933,44 +1933,16 @@ describe("Sidebar — agent reordering", () => {
     return el;
   }
 
-  it("menu Move down commits the adjacent swap", async () => {
+  it("keeps reorder actions out of the agent menu", async () => {
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: THREE_AGENTS } });
-    const menu = await openAgentActions(0);
-    await fireEvent.click(within(menu).getByTestId("agent-move-down"));
-    expect(reorderAgentsMock).toHaveBeenCalledWith(PROJECT_ID, [
-      CODEX_AGENT.id,
-      CLAUDE_AGENT.id,
-      GEMINI_AGENT.id,
-    ]);
-  });
-
-  it("menu Move up commits the adjacent swap", async () => {
-    render(Sidebar, { props: { projectId: PROJECT_ID, agents: THREE_AGENTS } });
-    const menu = await openAgentActions(2);
-    await fireEvent.click(within(menu).getByTestId("agent-move-up"));
-    expect(reorderAgentsMock).toHaveBeenCalledWith(PROJECT_ID, [
-      CLAUDE_AGENT.id,
-      GEMINI_AGENT.id,
-      CODEX_AGENT.id,
-    ]);
-  });
-
-  it("disables Move up on the first agent and Move down on the last", async () => {
-    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT, CODEX_AGENT] } });
-    const first = await openAgentActions(0);
-    expect(within(first).getByTestId("agent-move-up")).toHaveAttribute("data-disabled");
-    expect(within(first).getByTestId("agent-move-down")).not.toHaveAttribute("data-disabled");
-    const last = await openAgentActions(1);
-    expect(within(last).getByTestId("agent-move-down")).toHaveAttribute("data-disabled");
-    expect(within(last).getByTestId("agent-move-up")).not.toHaveAttribute("data-disabled");
-  });
-
-  it("hides move items and grips for a single-agent roster", async () => {
-    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
-    expect(screen.queryAllByTestId("agent-drag-grip")).toHaveLength(0);
-    const menu = await openAgentActions(0);
+    const menu = await openAgentActions(1);
     expect(within(menu).queryByTestId("agent-move-up")).not.toBeInTheDocument();
     expect(within(menu).queryByTestId("agent-move-down")).not.toBeInTheDocument();
+  });
+
+  it("hides the drag grip for a single-agent roster", async () => {
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+    expect(screen.queryAllByTestId("agent-drag-grip")).toHaveLength(0);
   });
 
   it("a plain drag-grip click does not toggle the card", async () => {
@@ -2025,8 +1997,10 @@ describe("Sidebar — agent reordering", () => {
   it("surfaces a rejected reorder as an inline error on the moved card", async () => {
     reorderAgentsMock.mockRejectedValue(new Error("roster changed"));
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: THREE_AGENTS } });
-    const menu = await openAgentActions(0);
-    await fireEvent.click(within(menu).getByTestId("agent-move-down"));
+    await fireEvent.keyDown(screen.getAllByTestId("agent-name")[0]!, {
+      key: "ArrowDown",
+      altKey: true,
+    });
     const error = await screen.findByTestId("agent-reorder-error");
     expect(error).toHaveTextContent("roster changed");
     // The error renders under the card that was moved.

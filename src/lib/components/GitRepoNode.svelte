@@ -61,6 +61,7 @@
     setBranchMenuOpen,
     anyBranchMenuOpen,
     setViewMode,
+    snapshotRepoSort,
   } from "$lib/state/gitView.svelte";
   import { activateProject } from "$lib/state/workspace.svelte";
   import { palette } from "$lib/state/commandPalette.svelte";
@@ -176,6 +177,7 @@
     try {
       await refreshRepo(repo.root);
       await fetchRepo(repo.root);
+      snapshotRepoSort();
     } finally {
       busy = false;
     }

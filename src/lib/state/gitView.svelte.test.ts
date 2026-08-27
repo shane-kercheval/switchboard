@@ -35,6 +35,9 @@ const {
   revealProjectBranch,
   cancelProjectBranchReveal,
   collapsedRepoRoots,
+  repoSort,
+  repoListingsInDisplayOrder,
+  snapshotRepoSort,
   takeRepoReveal,
   _testing,
 } = await import("./gitView.svelte");
@@ -51,6 +54,7 @@ const listing = (root: string): RepoListing => ({
     default_branch: "main",
     available: true,
     is_bare: false,
+    last_commit_at: null,
     local_branches: [],
     remote_branches: [],
     detached_worktrees: [],
@@ -83,6 +87,7 @@ const unavailableListing = (root: string): RepoListing => ({
     default_branch: null,
     available: false,
     is_bare: false,
+    last_commit_at: null,
     local_branches: [],
     remote_branches: [],
     detached_worktrees: [],
@@ -137,6 +142,7 @@ describe("gitView store", () => {
     expect(view.mode).toBe("git");
     expect(gitView.repos.map((r) => r.repo.root)).toEqual(["/a", "/b"]);
     expect(gitView.status).toBe("complete");
+    expect(repoSort.roots).toEqual(["/a", "/b"]);
   });
 
   it("refreshAll failure leaves a failed status without throwing", async () => {
@@ -443,6 +449,33 @@ describe("gitView store", () => {
     expect(fetchStates["/a"]).toMatchObject({ kind: "ok" });
     // Fetch success triggers a single-repo re-read.
     expect(invokeMock.mock.calls.some((c) => c[0] === "read_tracked_repo")).toBe(true);
+  });
+
+  it("keeps the captured order during passive fetch updates until explicitly resnapshot", async () => {
+    const first = listing("/a");
+    first.repo.last_commit_at = "2026-08-20T20:00:00Z";
+    const second = listing("/b");
+    second.repo.last_commit_at = "2026-08-19T20:00:00Z";
+    wire({ list: [first, second] });
+    await refreshAll();
+    expect(repoListingsInDisplayOrder().map((item) => item.repo.root)).toEqual(["/a", "/b"]);
+
+    const updatedSecond = listing("/b");
+    updatedSecond.repo.last_commit_at = "2026-08-25T20:00:00Z";
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "fetch_repo") return Promise.resolve(null);
+      if (cmd === "read_tracked_repo") return Promise.resolve(updatedSecond);
+      return Promise.resolve(null);
+    });
+    await fetchRepo("/b");
+
+    expect(gitView.repos.find((item) => item.repo.root === "/b")?.repo.last_commit_at).toBe(
+      "2026-08-25T20:00:00Z",
+    );
+    expect(repoListingsInDisplayOrder().map((item) => item.repo.root)).toEqual(["/a", "/b"]);
+
+    snapshotRepoSort();
+    expect(repoListingsInDisplayOrder().map((item) => item.repo.root)).toEqual(["/b", "/a"]);
   });
 
   it("concurrent fetches for the same root dedupe to one subprocess", async () => {

@@ -20,9 +20,9 @@ use switchboard_core::CoreError;
 
 use crate::error::AppError;
 
-/// The ordered set of tracked repo roots. Order is insertion order — the UI
-/// renders repos in the sequence the user added them. This is exactly the shape
-/// that persists to `git-view.yaml`.
+/// The ordered set of tracked repo roots. The persisted order is insertion
+/// order; the UI may project it through a user-selected sort. This is exactly
+/// the shape that persists to `git-view.yaml`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GitRegistry {
     roots: Vec<PathBuf>,

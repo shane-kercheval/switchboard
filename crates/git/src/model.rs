@@ -39,6 +39,9 @@ pub struct RepoView {
     /// worktrees layout). Its branches and linked worktrees still list; the bare
     /// root simply reports no working-tree status of its own.
     pub is_bare: bool,
+    /// Newest committer timestamp among the distinct local and remote branch
+    /// tips, as RFC-3339. `None` for an empty or unavailable repository.
+    pub last_commit_at: Option<String>,
     pub local_branches: Vec<BranchView>,
     pub remote_branches: Vec<RemoteBranchView>,
     /// Worktrees checked out at a detached HEAD (no branch to attach them to),
@@ -59,6 +62,7 @@ impl RepoView {
             default_branch: None,
             available: false,
             is_bare: false,
+            last_commit_at: None,
             local_branches: Vec::new(),
             remote_branches: Vec::new(),
             detached_worktrees: Vec::new(),

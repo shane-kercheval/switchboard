@@ -54,6 +54,7 @@ const repo = (over: Partial<RepoListing["repo"]> = {}): RepoListing => ({
     default_branch: "main",
     available: true,
     is_bare: false,
+    last_commit_at: null,
     local_branches: [
       {
         name: "main",
@@ -236,13 +237,17 @@ describe("GitView", () => {
     const toggleAll = screen.getByTestId("git-repos-toggle-all");
     const addRepo = screen.getByTestId("git-add-repo");
     const refreshAllButton = screen.getByTestId("git-refresh-all");
+    const sortRepos = screen.getByTestId("git-repos-sort");
     const branchFilter = screen.getByTestId("branch-filter-both");
     expect(
       addRepo.compareDocumentPosition(refreshAllButton) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
     expect(
-      refreshAllButton.compareDocumentPosition(toggleAll) & Node.DOCUMENT_POSITION_FOLLOWING,
+      refreshAllButton.compareDocumentPosition(sortRepos) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+    expect(sortRepos.compareDocumentPosition(toggleAll) & Node.DOCUMENT_POSITION_FOLLOWING).toBe(
+      Node.DOCUMENT_POSITION_FOLLOWING,
+    );
     expect(toggleAll.compareDocumentPosition(branchFilter) & Node.DOCUMENT_POSITION_FOLLOWING).toBe(
       Node.DOCUMENT_POSITION_FOLLOWING,
     );
@@ -271,6 +276,60 @@ describe("GitView", () => {
     );
     await gitCommand("git.toggle-repositories").run();
     expect(screen.getAllByTestId("repo-branches")).toHaveLength(2);
+  });
+
+  it("sorts by latest commit by default and retains alphabetical mode across remounts", async () => {
+    wire([
+      repo({
+        root: "/repos/zebra",
+        name: "zebra",
+        last_commit_at: "2026-08-20T23:00:00+09:00",
+      }),
+      repo({ root: "/repos/beta", name: "beta", last_commit_at: null }),
+      repo({
+        root: "/repos/alpha",
+        name: "Alpha",
+        last_commit_at: "2026-08-20T20:00:00Z",
+      }),
+    ]);
+    await refreshAll();
+    const firstRender = render(GitView);
+    await waitFor(() => expect(screen.getAllByTestId("git-repo")).toHaveLength(3));
+
+    const renderedRoots = (): (string | null)[] =>
+      screen.getAllByTestId("git-repo").map((node) => node.getAttribute("data-repo-root"));
+    const sort = screen.getByTestId("git-repos-sort");
+    expect(sort).toHaveAccessibleName("Sort repositories by name");
+    expect(renderedRoots()).toEqual(["/repos/alpha", "/repos/zebra", "/repos/beta"]);
+
+    await fireEvent.click(sort);
+    expect(sort).toHaveAccessibleName("Sort repositories by latest commit");
+    expect(renderedRoots()).toEqual(["/repos/alpha", "/repos/beta", "/repos/zebra"]);
+
+    firstRender.unmount();
+    render(GitView);
+    await waitFor(() => expect(screen.getAllByTestId("git-repo")).toHaveLength(3));
+    expect(screen.getByTestId("git-repos-sort")).toHaveAccessibleName(
+      "Sort repositories by latest commit",
+    );
+    expect(renderedRoots()).toEqual(["/repos/alpha", "/repos/beta", "/repos/zebra"]);
+  });
+
+  it("breaks equal latest-commit ties by name and then root", async () => {
+    const timestamp = "2026-08-20T20:00:00Z";
+    wire([
+      repo({ root: "/repos/zeta", name: "zeta", last_commit_at: timestamp }),
+      repo({ root: "/repos/b/shared", name: "shared", last_commit_at: timestamp }),
+      repo({ root: "/repos/alpha", name: "alpha", last_commit_at: timestamp }),
+      repo({ root: "/repos/a/shared", name: "shared", last_commit_at: timestamp }),
+    ]);
+    await refreshAll();
+    render(GitView);
+    await waitFor(() => expect(screen.getAllByTestId("git-repo")).toHaveLength(4));
+
+    expect(
+      screen.getAllByTestId("git-repo").map((node) => node.getAttribute("data-repo-root")),
+    ).toEqual(["/repos/alpha", "/repos/a/shared", "/repos/b/shared", "/repos/zeta"]);
   });
 
   it("retains repository expansion and scroll position across remounts", async () => {

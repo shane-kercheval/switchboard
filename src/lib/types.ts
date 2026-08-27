@@ -640,6 +640,7 @@ export type RepoView = {
   default_branch: string | null;
   available: boolean;
   is_bare: boolean;
+  last_commit_at: string | null;
   local_branches: BranchView[];
   remote_branches: RemoteBranchView[];
   detached_worktrees: WorktreeView[];

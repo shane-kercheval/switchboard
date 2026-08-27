@@ -55,6 +55,7 @@ function listing(root: string): RepoListing {
       default_branch: "main",
       available: true,
       is_bare: false,
+      last_commit_at: null,
       local_branches: [
         {
           name: "main",

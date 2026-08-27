@@ -55,7 +55,11 @@ fn commit_all(dir: &Path, message: &str) {
 /// under the `TOPOLOGICAL | TIME` revwalk and sibling order becomes
 /// non-deterministic — a fixed epoch makes order-sensitive tests stable.
 fn git_dated(dir: &Path, epoch: i64, args: &[&str]) -> String {
-    let date = format!("@{epoch} +0000");
+    git_dated_with_offset(dir, epoch, "+0000", args)
+}
+
+fn git_dated_with_offset(dir: &Path, epoch: i64, offset: &str, args: &[&str]) -> String {
+    let date = format!("@{epoch} {offset}");
     let output = Command::new("git")
         .args(args)
         .current_dir(dir)
@@ -76,6 +80,11 @@ fn git_dated(dir: &Path, epoch: i64, args: &[&str]) -> String {
 fn commit_all_at(dir: &Path, message: &str, epoch: i64) {
     git(dir, &["add", "-A"]);
     git_dated(dir, epoch, &["commit", "-q", "-m", message]);
+}
+
+fn commit_all_at_offset(dir: &Path, message: &str, epoch: i64, offset: &str) {
+    git(dir, &["add", "-A"]);
+    git_dated_with_offset(dir, epoch, offset, &["commit", "-q", "-m", message]);
 }
 
 /// A repo with one commit on `main`. Returns the tempdir (kept alive by caller).
@@ -134,6 +143,70 @@ fn unavailable_path_yields_marked_view_not_error() {
     assert!(view.local_branches.is_empty());
     assert!(view.remote_branches.is_empty());
     assert!(view.default_branch.is_none());
+    assert!(view.last_commit_at.is_none());
+}
+
+#[test]
+fn repo_last_commit_at_uses_newest_local_or_remote_branch_tip() {
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    write(repo.path(), "README.md", "main\n");
+    commit_all_at(repo.path(), "main", 1_700_000_000);
+
+    git(repo.path(), &["switch", "-q", "-c", "feature"]);
+    write(repo.path(), "feature.txt", "feature\n");
+    commit_all_at(repo.path(), "feature", 1_700_000_100);
+
+    git(repo.path(), &["switch", "-q", "main"]);
+    let local_view = read_repo(repo.path()).unwrap();
+    assert_eq!(
+        local_view.last_commit_at.as_deref(),
+        Some("2023-11-14T22:15:00+00:00")
+    );
+
+    git(repo.path(), &["switch", "-q", "-c", "remote-only"]);
+    write(repo.path(), "remote.txt", "remote\n");
+    commit_all_at(repo.path(), "remote", 1_700_000_200);
+    let remote_tip = git(repo.path(), &["rev-parse", "HEAD"]);
+    git(repo.path(), &["switch", "-q", "main"]);
+    git(repo.path(), &["branch", "-D", "remote-only"]);
+    git(
+        repo.path(),
+        &["update-ref", "refs/remotes/upstream/recent", &remote_tip],
+    );
+
+    let view = read_repo(repo.path()).unwrap();
+    assert_eq!(
+        view.last_commit_at.as_deref(),
+        Some("2023-11-14T22:16:40+00:00")
+    );
+}
+
+#[test]
+fn repo_last_commit_at_compares_instants_across_offsets() {
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    write(repo.path(), "README.md", "main\n");
+    commit_all_at_offset(repo.path(), "main", 1_700_000_200, "-0500");
+
+    git(repo.path(), &["switch", "-q", "-c", "later-wall-clock"]);
+    write(repo.path(), "feature.txt", "feature\n");
+    commit_all_at_offset(repo.path(), "feature", 1_700_000_100, "+0900");
+
+    let view = read_repo(repo.path()).unwrap();
+    assert_eq!(
+        view.last_commit_at.as_deref(),
+        Some("2023-11-14T17:16:40-05:00")
+    );
+}
+
+#[test]
+fn empty_repo_has_no_last_commit_at() {
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+
+    let view = read_repo(repo.path()).unwrap();
+    assert!(view.last_commit_at.is_none());
 }
 
 #[test]

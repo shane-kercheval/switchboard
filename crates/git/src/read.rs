@@ -9,7 +9,7 @@ use git2::{
     Status, StatusOptions,
 };
 
-use chrono::{FixedOffset, LocalResult, TimeZone};
+use chrono::{DateTime, FixedOffset, LocalResult, TimeZone};
 use url::Url;
 
 use crate::error::{GitError, Result};
@@ -321,12 +321,26 @@ fn build_repo_view(repo: &Repository, root: PathBuf, name: String) -> Result<Rep
     // enumeration can attach worktrees without rescanning.
     let worktrees = collect_worktrees(repo).map_err(err)?;
     let github_remotes = github_remote_urls(repo);
+    // Both readers populate one set so local and remote tips dedupe without
+    // re-enumerating refs after their view models are built.
+    let mut branch_tips = HashSet::new();
 
-    let local_branches =
-        read_local_branches(repo, default_tip.as_ref(), &worktrees, &github_remotes)
-            .map_err(err)?;
-    let remote_branches =
-        read_remote_branches(repo, default_tip.as_ref(), &github_remotes).map_err(err)?;
+    let local_branches = read_local_branches(
+        repo,
+        default_tip.as_ref(),
+        &worktrees,
+        &github_remotes,
+        &mut branch_tips,
+    )
+    .map_err(err)?;
+    let remote_branches = read_remote_branches(
+        repo,
+        default_tip.as_ref(),
+        &github_remotes,
+        &mut branch_tips,
+    )
+    .map_err(err)?;
+    let last_commit_at = latest_branch_tip_commit_time(repo, &branch_tips);
     let detached_worktrees = worktrees.into_detached();
 
     Ok(RepoView {
@@ -335,6 +349,7 @@ fn build_repo_view(repo: &Repository, root: PathBuf, name: String) -> Result<Rep
         default_branch,
         available: true,
         is_bare: repo.is_bare(),
+        last_commit_at,
         local_branches,
         remote_branches,
         detached_worktrees,
@@ -383,6 +398,7 @@ fn read_local_branches(
     default_tip: Option<&Oid>,
     worktrees: &Worktrees,
     github_remotes: &HashMap<String, Url>,
+    branch_tips: &mut HashSet<Oid>,
 ) -> std::result::Result<Vec<BranchView>, git2::Error> {
     let mut views = Vec::new();
     for branch in repo.branches(Some(BranchType::Local))? {
@@ -391,6 +407,7 @@ fn read_local_branches(
             continue; // non-UTF-8 branch name — skip rather than fail the whole read
         };
         let tip = branch.get().target();
+        branch_tips.extend(tip);
         let (upstream, sync, dangling) = upstream_status(repo, &branch, tip);
         let github_url = if dangling {
             None
@@ -418,6 +435,7 @@ fn read_remote_branches(
     repo: &Repository,
     default_tip: Option<&Oid>,
     github_remotes: &HashMap<String, Url>,
+    branch_tips: &mut HashSet<Oid>,
 ) -> std::result::Result<Vec<RemoteBranchView>, git2::Error> {
     let mut views = Vec::new();
     for branch in repo.branches(Some(BranchType::Remote))? {
@@ -429,8 +447,10 @@ fn read_remote_branches(
         if name.ends_with("/HEAD") {
             continue;
         }
+        let tip = branch.get().target();
+        branch_tips.extend(tip);
         let github_url = remote_branch_github_url(repo, github_remotes, &branch);
-        let (merged, behind_base) = ancestry_signals(repo, branch.get().target(), default_tip);
+        let (merged, behind_base) = ancestry_signals(repo, tip, default_tip);
         views.push(RemoteBranchView {
             name,
             github_url,
@@ -440,6 +460,18 @@ fn read_remote_branches(
     }
     views.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(views)
+}
+
+fn latest_branch_tip_commit_time(repo: &Repository, branch_tips: &HashSet<Oid>) -> Option<String> {
+    branch_tips
+        .iter()
+        .filter_map(|oid| repo.find_commit(*oid).ok())
+        .filter_map(|commit| {
+            let time = commit.committer().when();
+            commit_datetime(time).map(|datetime| (time.seconds(), datetime))
+        })
+        .max_by_key(|(seconds, _)| *seconds)
+        .map(|(_, datetime)| datetime.to_rfc3339())
 }
 
 fn local_branch_github_url(
@@ -1560,9 +1592,14 @@ fn merge_imports_only_default_branch(
 /// preserving the author's recorded offset. `None` if the stored values don't
 /// form a valid instant (defensive).
 fn format_commit_time(time: git2::Time) -> Option<String> {
-    let offset = FixedOffset::east_opt(time.offset_minutes() * 60)?;
+    commit_datetime(time).map(|datetime| datetime.to_rfc3339())
+}
+
+fn commit_datetime(time: git2::Time) -> Option<DateTime<FixedOffset>> {
+    let offset_seconds = time.offset_minutes().checked_mul(60)?;
+    let offset = FixedOffset::east_opt(offset_seconds)?;
     match offset.timestamp_opt(time.seconds(), 0) {
-        LocalResult::Single(dt) => Some(dt.to_rfc3339()),
+        LocalResult::Single(datetime) => Some(datetime),
         _ => None,
     }
 }

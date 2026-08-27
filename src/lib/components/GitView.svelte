@@ -7,7 +7,7 @@
   /// No polling — `enterGitView` (called by App on toggle) runs the staleness-
   /// gated entry refresh; the global refresh button forces a re-read + fetch.
   import { tick, untrack } from "svelte";
-  import { FolderPlus, RefreshCw } from "@lucide/svelte";
+  import { ArrowDownAZ, Clock3, FolderPlus, RefreshCw } from "@lucide/svelte";
   import { cn } from "$lib/utils";
   import Button from "$lib/components/ui/Button.svelte";
   import EmptyState from "$lib/components/ui/EmptyState.svelte";
@@ -45,6 +45,10 @@
     hoverSuppressed,
     collapsedRepoRoots,
     repoListScroll,
+    repoSort,
+    repoListingsInDisplayOrder,
+    setRepoSortMode,
+    snapshotRepoSort,
     takeRepoReveal,
   } from "$lib/state/gitView.svelte";
   import {
@@ -79,6 +83,11 @@
     gitView.repos.length > 0 &&
       gitView.repos.every((listing) => collapsedRepoRoots.has(listing.repo.root)),
   );
+  const sortedRepos = $derived.by(repoListingsInDisplayOrder);
+
+  function toggleRepoSort(): void {
+    setRepoSortMode(repoSort.mode === "recent" ? "alphabetical" : "recent");
+  }
 
   function setRepoExpanded(repoRoot: string, expanded: boolean): void {
     if (expanded) collapsedRepoRoots.delete(repoRoot);
@@ -173,8 +182,9 @@
   async function onGlobalRefresh(): Promise<void> {
     refreshing = true;
     try {
-      await refreshAll();
+      await refreshAll({ snapshotOrder: false });
       await fetchAll();
+      snapshotRepoSort();
     } finally {
       refreshing = false;
     }
@@ -389,6 +399,29 @@
           </Tooltip>
 
           {#if gitView.repos.length > 1}
+            {@const sortLabel =
+              repoSort.mode === "recent"
+                ? "Sort repositories by name"
+                : "Sort repositories by latest commit"}
+            <Tooltip label={sortLabel} side="bottom" reopen="fresh-hover">
+              {#snippet trigger(props)}
+                <button
+                  {...props}
+                  type="button"
+                  class={ICON_BUTTON_CLASS}
+                  aria-label={sortLabel}
+                  data-testid="git-repos-sort"
+                  onclick={toggleRepoSort}
+                >
+                  {#if repoSort.mode === "recent"}
+                    <Clock3 size={14} aria-hidden="true" />
+                  {:else}
+                    <ArrowDownAZ size={14} aria-hidden="true" />
+                  {/if}
+                </button>
+              {/snippet}
+            </Tooltip>
+
             {@const label = allReposCollapsed
               ? "Expand all repositories"
               : "Collapse all repositories"}
@@ -508,7 +541,7 @@
             {/snippet}
           </EmptyState>
         {:else}
-          {#each gitView.repos as listing (listing.repo.root)}
+          {#each sortedRepos as listing (listing.repo.root)}
             <GitRepoNode
               {listing}
               {branchFilter}

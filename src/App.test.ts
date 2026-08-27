@@ -789,21 +789,19 @@ describe("App", () => {
 
     // All four harnesses are installed, but Gemini is excluded from auto-seeding
     // (no longer on individual plans) → one agent each for Claude/Codex/
-    // Antigravity, named after the model+effort it'll run, in HARNESSES order.
-    // Antigravity used to fall back to the bare harness name because its model
-    // was harness-owned config; it now carries a selection like the others.
+    // Antigravity, in HARNESSES order. Its two default profiles use the stable
+    // harness name rather than naming only one of the configurations.
     await waitFor(() => expect(createAgentCalls()).toHaveLength(3));
     expect(createAgentCalls()).toEqual([
-      { name: "opus-high", harness: "claude_code" },
-      { name: "gpt-5-6-sol-high", harness: "codex" },
-      { name: "gemini-3-7-flash-high", harness: "antigravity" },
+      { name: "claude", harness: "claude_code" },
+      { name: "codex", harness: "codex" },
+      { name: "antigravity", harness: "antigravity" },
     ]);
     // Auto-seeded → the roster is populated, not the empty first-agent prompt.
     await waitFor(() => expect(screen.getAllByTestId("sidebar-agent")).toHaveLength(3));
     expect(screen.queryByTestId("confirm-create-agent")).not.toBeInTheDocument();
 
-    // Each seeded agent is born with its harness's default model/effort
-    // (Antigravity carries neither).
+    // Each seeded agent is born with its harness's default profiles.
     const seededArgs = invokeMock.mock.calls
       .filter(([c]) => c === "create_agent")
       .map(
@@ -819,28 +817,28 @@ describe("App", () => {
       );
     expect(seededArgs).toEqual([
       {
-        name: "opus-high",
+        name: "claude",
         harness: "claude_code",
         model: "opus",
         effort: "high",
-        secondaryModel: undefined,
-        secondaryEffort: undefined,
+        secondaryModel: "sonnet",
+        secondaryEffort: "medium",
       },
       {
-        name: "gpt-5-6-sol-high",
+        name: "codex",
         harness: "codex",
         model: "gpt-5.6-sol",
         effort: "high",
-        secondaryModel: undefined,
-        secondaryEffort: undefined,
+        secondaryModel: "gpt-5.6-terra",
+        secondaryEffort: "medium",
       },
       {
-        name: "gemini-3-7-flash-high",
+        name: "antigravity",
         harness: "antigravity",
-        model: "gemini-3.7-flash",
+        model: "gemini-3.1-pro",
         effort: "high",
-        secondaryModel: undefined,
-        secondaryEffort: undefined,
+        secondaryModel: "gemini-3.7-flash",
+        secondaryEffort: "high",
       },
     ]);
   });
@@ -921,8 +919,8 @@ describe("App", () => {
 
     await waitFor(() => expect(createAgentCalls()).toHaveLength(2));
     expect(createAgentCalls()).toEqual([
-      { name: "opus-high", harness: "claude_code" },
-      { name: "gpt-5-6-sol-high", harness: "codex" },
+      { name: "claude", harness: "claude_code" },
+      { name: "codex", harness: "codex" },
     ]);
   });
 
@@ -1514,7 +1512,7 @@ describe("App", () => {
     const recipients = await import("$lib/state/recipientSelection.svelte");
     seedProject({ projectId: "p-a", directory: DIR_A, name: "alpha", agents: [] });
     backend.agentQueue.push(
-      agent({ id: "ag-first", project_id: "p-a", name: "opus-high", session_locator: null }),
+      agent({ id: "ag-first", project_id: "p-a", name: "claude", session_locator: null }),
     );
     await mountApp();
     await waitFor(() => expect(screen.getByTestId("project-row")).toBeInTheDocument());
@@ -1540,12 +1538,12 @@ describe("App", () => {
     expect(createCalls).toHaveLength(1);
     // The form preselects and submits Claude's defaults.
     expect(createCalls[0]?.[1]).toEqual({
-      name: "opus-high",
+      name: "claude",
       harness: "claude_code",
       model: "opus",
       effort: "high",
-      secondaryModel: undefined,
-      secondaryEffort: undefined,
+      secondaryModel: "sonnet",
+      secondaryEffort: "medium",
     });
   });
 
@@ -1554,7 +1552,7 @@ describe("App", () => {
     const recipients = await import("$lib/state/recipientSelection.svelte");
     seedProject({ projectId: "p-a", directory: DIR_A, name: "alpha", agents: [] });
     backend.agentQueue.push(
-      agent({ id: "ag-first", project_id: "p-a", name: "opus-high", session_locator: null }),
+      agent({ id: "ag-first", project_id: "p-a", name: "claude", session_locator: null }),
     );
     await mountApp();
     await waitFor(() => expect(screen.getByTestId("project-row")).toBeInTheDocument());

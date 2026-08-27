@@ -250,22 +250,21 @@ export function effortIsRequired(harness: HarnessKind, model: string | undefined
 export const DEFAULT_AGENT_PROFILES: Preferences["agent_defaults"] = {
   claude_code: {
     primary: { model: "opus", effort: "high" },
-    secondary: null,
+    secondary: { model: "sonnet", effort: "medium" },
   },
   codex: {
     primary: { model: "gpt-5.6-sol", effort: "high" },
-    secondary: null,
+    secondary: { model: "gpt-5.6-terra", effort: "medium" },
   },
   gemini: {
     primary: { model: "auto", effort: null },
-    secondary: null,
+    secondary: { model: "gemini-2.5-flash", effort: null },
   },
-  // Carries an explicit effort because `agy` rejects an effort-bearing model
-  // dispatched without one — "no model selected" is not a state this harness
-  // can start in.
+  // Both carry explicit effort because `agy` rejects these effort-bearing
+  // models when dispatched without one.
   antigravity: {
-    primary: { model: "gemini-3.7-flash", effort: "high" },
-    secondary: null,
+    primary: { model: "gemini-3.1-pro", effort: "high" },
+    secondary: { model: "gemini-3.7-flash", effort: "high" },
   },
 };
 
@@ -275,12 +274,7 @@ export const SUGGESTED_SECONDARY_PROFILE: Record<HarnessKind, AgentProfile> = {
   claude_code: { model: "sonnet", effort: "medium" },
   codex: { model: "gpt-5.6-terra", effort: "medium" },
   gemini: { model: "gemini-2.5-flash", effort: null },
-  // Inverted relative to the other harnesses, whose secondary steps *down* to a
-  // cheaper tier: Antigravity's primary default is already the fast one, so the
-  // useful second slot is the more capable model. Effort must be `low` or
-  // `high` here — 3.1 Pro is the one curated model with no `medium`, and
-  // pairing it with `medium` would fail the dispatch client-side.
-  antigravity: { model: "gemini-3.1-pro", effort: "high" },
+  antigravity: { model: "gemini-3.7-flash", effort: "high" },
 };
 
 /// A model-derived name stops describing an agent once it can switch between

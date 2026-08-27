@@ -110,20 +110,6 @@ describe("SettingsView", () => {
       expect(invokeMock).toHaveBeenCalledWith("set_preferences", {
         preferences: expect.objectContaining({
           agent_defaults: expect.objectContaining({
-            codex: expect.objectContaining({
-              primary: { model: "gpt-5.6-terra", effort: "high" },
-            }),
-          }),
-        }),
-      }),
-    );
-
-    await fireEvent.click(screen.getByTestId("settings-profile-codex-secondary-toggle"));
-    expect(screen.getByTestId("settings-profile-codex-secondary-model")).toBeInTheDocument();
-    await waitFor(() =>
-      expect(invokeMock).toHaveBeenLastCalledWith("set_preferences", {
-        preferences: expect.objectContaining({
-          agent_defaults: expect.objectContaining({
             codex: {
               primary: { model: "gpt-5.6-terra", effort: "high" },
               secondary: { model: "gpt-5.6-terra", effort: "medium" },
@@ -132,6 +118,24 @@ describe("SettingsView", () => {
         }),
       }),
     );
+
+    await fireEvent.click(screen.getByTestId("settings-profile-codex-secondary-toggle"));
+    expect(screen.queryByTestId("settings-profile-codex-secondary-model")).toBeNull();
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenLastCalledWith("set_preferences", {
+        preferences: expect.objectContaining({
+          agent_defaults: expect.objectContaining({
+            codex: {
+              primary: { model: "gpt-5.6-terra", effort: "high" },
+              secondary: null,
+            },
+          }),
+        }),
+      }),
+    );
+
+    await fireEvent.click(screen.getByTestId("settings-profile-codex-secondary-toggle"));
+    expect(screen.getByTestId("settings-profile-codex-secondary-model")).toBeInTheDocument();
   });
 
   it("lists Antigravity ahead of Gemini in Agent Defaults", () => {
@@ -141,6 +145,40 @@ describe("SettingsView", () => {
       el.textContent?.trim(),
     );
     expect(labels).toEqual(["Claude", "Codex", "Antigravity", "Gemini"]);
+  });
+
+  it("shows Pro high and Flash high as the Antigravity defaults", async () => {
+    render(SettingsView, { props: { onClose: vi.fn() } });
+    await fireEvent.click(screen.getByText("Antigravity", { selector: "summary" }));
+
+    expect(screen.getByTestId("settings-profile-antigravity-primary-model")).toHaveAttribute(
+      "data-value",
+      "gemini-3.1-pro",
+    );
+    expect(screen.getByTestId("settings-profile-antigravity-primary-effort")).toHaveAttribute(
+      "data-value",
+      "high",
+    );
+    expect(screen.getByTestId("settings-profile-antigravity-secondary-model")).toHaveAttribute(
+      "data-value",
+      "gemini-3.7-flash",
+    );
+    expect(screen.getByTestId("settings-profile-antigravity-secondary-effort")).toHaveAttribute(
+      "data-value",
+      "high",
+    );
+  });
+
+  it("enables the secondary default for every harness", () => {
+    render(SettingsView, { props: { onClose: vi.fn() } });
+
+    for (const harness of ["claude_code", "codex", "gemini", "antigravity"]) {
+      expect(screen.getByTestId(`settings-profile-${harness}-secondary-toggle`)).toHaveAttribute(
+        "aria-checked",
+        "true",
+      );
+      expect(screen.getByTestId(`settings-profile-${harness}-secondary`)).toBeInTheDocument();
+    }
   });
 
   it("keeps backend preference controls unavailable until saved values are authoritative", async () => {

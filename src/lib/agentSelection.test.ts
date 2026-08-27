@@ -45,6 +45,19 @@ describe("agentSelection capability tables stay consistent", () => {
       }
     });
   }
+
+  it("defaults Antigravity to Pro high with Flash high as secondary", () => {
+    expect(DEFAULT_AGENT_PROFILES.antigravity).toEqual({
+      primary: { model: "gemini-3.1-pro", effort: "high" },
+      secondary: { model: "gemini-3.7-flash", effort: "high" },
+    });
+  });
+
+  it("enables a secondary profile for every harness", () => {
+    for (const harness of ALL_HARNESSES) {
+      expect(DEFAULT_AGENT_PROFILES[harness].secondary, harness).not.toBeNull();
+    }
+  });
 });
 
 describe("effortOptionsFor", () => {
@@ -134,14 +147,18 @@ describe("effortOptionsFor", () => {
 describe("built-in agent defaults", () => {
   for (const harness of ALL_HARNESSES) {
     it(`${harness}: uses supported model and effort values`, () => {
-      const { model, effort } = DEFAULT_AGENT_PROFILES[harness].primary;
-      if (model !== null) {
-        expect(MODEL_OPTIONS[harness].map((option) => option.value)).toContain(model);
-      }
-      if (effort !== null) {
-        expect(
-          effortOptionsFor(harness, model ?? undefined).map((option) => option.value),
-        ).toContain(effort);
+      const defaults = DEFAULT_AGENT_PROFILES[harness];
+      for (const profile of [defaults.primary, defaults.secondary]) {
+        expect(profile).not.toBeNull();
+        const { model, effort } = profile!;
+        if (model !== null) {
+          expect(MODEL_OPTIONS[harness].map((option) => option.value)).toContain(model);
+        }
+        if (effort !== null) {
+          expect(
+            effortOptionsFor(harness, model ?? undefined).map((option) => option.value),
+          ).toContain(effort);
+        }
       }
     });
   }

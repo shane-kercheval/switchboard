@@ -105,10 +105,10 @@ describe("CreateAgentForm", () => {
     await fireEvent.click(screen.getByTestId("confirm-create-agent"));
     expect(onSubmit).toHaveBeenCalledExactlyOnceWith({
       mode: "create",
-      name: "opus-high",
+      name: "claude",
       harness: "claude_code",
       primary: { model: "opus", effort: "high" },
-      secondary: null,
+      secondary: { model: "sonnet", effort: "medium" },
     } satisfies AgentFormSubmit);
   });
 
@@ -159,7 +159,7 @@ describe("CreateAgentForm", () => {
       name: "my-agent",
       harness: "claude_code",
       primary: { model: "opus", effort: "high" },
-      secondary: null,
+      secondary: { model: "sonnet", effort: "medium" },
     } satisfies AgentFormSubmit);
   });
 
@@ -178,10 +178,10 @@ describe("CreateAgentForm", () => {
     await fireEvent.click(screen.getByTestId("confirm-create-agent"));
     expect(onSubmit).toHaveBeenCalledExactlyOnceWith({
       mode: "create",
-      name: "gpt-5-6-sol-high",
+      name: "codex",
       harness: "codex",
       primary: { model: "gpt-5.6-sol", effort: "high" },
-      secondary: null,
+      secondary: { model: "gpt-5.6-terra", effort: "medium" },
     } satisfies AgentFormSubmit);
   });
 
@@ -269,7 +269,7 @@ describe("CreateAgentForm", () => {
       name: "gemini",
       harness: "gemini",
       primary: { model: "auto", effort: null },
-      secondary: null,
+      secondary: { model: "gemini-2.5-flash", effort: null },
     } satisfies AgentFormSubmit);
   });
 
@@ -384,10 +384,10 @@ describe("CreateAgentForm", () => {
     await fireEvent.click(screen.getByTestId("confirm-create-agent"));
     expect(onSubmit).toHaveBeenCalledExactlyOnceWith({
       mode: "create",
-      name: "opus-high",
+      name: "claude",
       harness: "claude_code",
       primary: { model: "opus", effort: "high" },
-      secondary: null,
+      secondary: { model: "sonnet", effort: "medium" },
     } satisfies AgentFormSubmit);
   });
 
@@ -517,10 +517,10 @@ describe("CreateAgentForm", () => {
   });
 
   it("flags the default name on open when it already collides with the roster", () => {
-    // Realistic add-another-agent case: an auto-created "opus-high" already
+    // Realistic add-another-agent case: an auto-created "claude" already
     // exists, so the form opens with its default name already flagged.
     const onSubmit = vi.fn();
-    render(CreateAgentForm, { props: { onSubmit, roster: [rosterAgent("opus-high")] } });
+    render(CreateAgentForm, { props: { onSubmit, roster: [rosterAgent("claude")] } });
     expect(screen.getByTestId("agent-name-error")).toHaveTextContent("already exists");
     expect((screen.getByTestId("confirm-create-agent") as HTMLButtonElement).disabled).toBe(true);
   });
@@ -536,7 +536,7 @@ describe("CreateAgentForm", () => {
       name: "my-agent",
       harness: "claude_code",
       primary: { model: "opus", effort: "high" },
-      secondary: null,
+      secondary: { model: "sonnet", effort: "medium" },
     } satisfies AgentFormSubmit);
   });
 
@@ -596,10 +596,10 @@ describe("CreateAgentForm", () => {
     await fireEvent.click(screen.getByTestId("confirm-create-agent"));
     expect(onSubmit).toHaveBeenCalledExactlyOnceWith({
       mode: "create",
-      name: "gpt-5-5-medium",
+      name: "codex",
       harness: "codex",
       primary: { model: "gpt-5.5", effort: "medium" },
-      secondary: null,
+      secondary: { model: "gpt-5.6-terra", effort: "medium" },
     } satisfies AgentFormSubmit);
   });
 
@@ -635,12 +635,10 @@ describe("CreateAgentForm", () => {
     await fireEvent.click(screen.getByTestId("confirm-create-agent"));
     expect(onSubmit).toHaveBeenCalledExactlyOnceWith({
       mode: "create",
-      // Now model-derived like every other harness with a model, rather than
-      // the bare harness name it used when it had none.
-      name: "gemini-3-7-flash-high",
+      name: "antigravity",
       harness: "antigravity",
-      primary: { model: "gemini-3.7-flash", effort: "high" },
-      secondary: null,
+      primary: { model: "gemini-3.1-pro", effort: "high" },
+      secondary: { model: "gemini-3.7-flash", effort: "high" },
     } satisfies AgentFormSubmit);
   });
 
@@ -676,10 +674,10 @@ describe("CreateAgentForm", () => {
     await fireEvent.click(screen.getByTestId("confirm-create-agent"));
     expect(onSubmit).toHaveBeenCalledExactlyOnceWith({
       mode: "create",
-      name: "sonnet-max",
+      name: "claude",
       harness: "claude_code",
       primary: { model: "sonnet", effort: "max" },
-      secondary: null,
+      secondary: { model: "sonnet", effort: "medium" },
     } satisfies AgentFormSubmit);
   });
 
@@ -693,10 +691,10 @@ describe("CreateAgentForm", () => {
     await fireEvent.click(screen.getByTestId("confirm-create-agent"));
     expect(onSubmit).toHaveBeenCalledExactlyOnceWith({
       mode: "create",
-      name: "gpt-5-6-sol-high",
+      name: "codex",
       harness: "codex",
       primary: { model: "gpt-5.6-sol", effort: "high" },
-      secondary: null,
+      secondary: { model: "gpt-5.6-terra", effort: "medium" },
     } satisfies AgentFormSubmit);
   });
 
@@ -743,16 +741,18 @@ describe("CreateAgentForm", () => {
     await fireEvent.click(screen.getByTestId("confirm-create-agent"));
     expect(onSubmit).toHaveBeenCalledExactlyOnceWith({
       mode: "create",
-      name: "haiku-low",
+      name: "claude",
       harness: "claude_code",
       primary: { model: "haiku", effort: "low" },
-      secondary: null,
+      secondary: { model: "sonnet", effort: "medium" },
     } satisfies AgentFormSubmit);
   });
 
-  it("create: the name tracks the model/effort pickers until the user edits it", async () => {
+  it("create: without Secondary, the name tracks the model/effort pickers", async () => {
     renderForm();
     const nameInput = screen.getByTestId("agent-name") as HTMLInputElement;
+    expect(nameInput.value).toBe("claude");
+    await fireEvent.click(screen.getByTestId("create-profile-secondary-toggle"));
     expect(nameInput.value).toBe("opus-high");
     await choosePicker("model-select", "sonnet");
     expect(nameInput.value).toBe("sonnet-high");
@@ -763,26 +763,26 @@ describe("CreateAgentForm", () => {
   it("create: Secondary switches the untouched auto-name to the harness and back", async () => {
     renderForm();
     const nameInput = screen.getByTestId("agent-name") as HTMLInputElement;
-    expect(nameInput.value).toBe("opus-high");
-
-    await fireEvent.click(screen.getByTestId("create-profile-secondary-toggle"));
     expect(nameInput.value).toBe("claude");
 
     await fireEvent.click(screen.getByTestId("create-profile-secondary-toggle"));
     expect(nameInput.value).toBe("opus-high");
+
+    await fireEvent.click(screen.getByTestId("create-profile-secondary-toggle"));
+    expect(nameInput.value).toBe("claude");
   });
 
   it("create: switching harness re-derives the auto-name (incl. bare-name harnesses)", async () => {
     renderForm();
     const nameInput = screen.getByTestId("agent-name") as HTMLInputElement;
     await fireEvent.click(screen.getByTestId("harness-codex"));
-    expect(nameInput.value).toBe("gpt-5-6-sol-high");
+    expect(nameInput.value).toBe("codex");
     await fireEvent.click(screen.getByTestId("harness-gemini"));
     expect(nameInput.value).toBe("gemini");
-    // Antigravity now derives from its model like Claude/Codex; Gemini stays
-    // bare because its default model is the non-descriptive `auto`.
+    // Multi-profile defaults use the stable harness name; Gemini stays bare
+    // because its default model is the non-descriptive `auto`.
     await fireEvent.click(screen.getByTestId("harness-antigravity"));
-    expect(nameInput.value).toBe("gemini-3-7-flash-high");
+    expect(nameInput.value).toBe("antigravity");
   });
 
   it("editing the name freezes it against later picker and harness changes", async () => {
@@ -802,7 +802,7 @@ describe("CreateAgentForm", () => {
       name: "my-thing",
       harness: "codex",
       primary: { model: "gpt-5.6-sol", effort: "high" },
-      secondary: null,
+      secondary: { model: "gpt-5.6-terra", effort: "medium" },
     } satisfies AgentFormSubmit);
   });
 
@@ -810,7 +810,7 @@ describe("CreateAgentForm", () => {
     const onSubmit = vi.fn();
     render(CreateAgentForm, { props: { onSubmit, roster: [rosterAgent("codex")] } });
     const nameInput = screen.getByTestId("agent-name") as HTMLInputElement;
-    // Default "opus-high" is valid: not invalid, no description.
+    // Default "claude" is valid: not invalid, no description.
     expect(nameInput.getAttribute("aria-invalid")).toBe("false");
     expect(nameInput.getAttribute("aria-describedby")).toBeNull();
 

@@ -11,6 +11,8 @@
 // this never persists. It lives here (not component-local) so it's testable.
 
 import * as api from "$lib/api";
+import { SvelteMap, SvelteSet } from "svelte/reactivity";
+import { compareIsoTimestampsDescending } from "$lib/utils";
 import type {
   BranchKind,
   BranchView,
@@ -31,6 +33,7 @@ const FETCH_STALE_MS = 60_000;
 const FETCH_CONCURRENCY = 4;
 
 export type ViewMode = "projects" | "git";
+export type RepoSortMode = "recent" | "alphabetical";
 
 /// Per-repo fetch state, mirroring the backend model: never fetched, last fetch
 /// failed, or succeeded at a time. Drives the quiet fetch-failure indicator —
@@ -53,6 +56,38 @@ type RepoRuntime = {
 };
 
 export const view = $state<{ mode: ViewMode }>({ mode: "projects" });
+
+/// Session-only tree position. GitView is unmounted when the user returns to
+/// Projects, so this state lives beside the view mode rather than in the
+/// component.
+export const collapsedRepoRoots = new SvelteSet<string>();
+export const repoListScroll = $state<{ top: number }>({ top: 0 });
+/// Session-only sort choice and stable order, kept outside GitView so navigation
+/// preserves both across component remounts.
+export const repoSort = $state<{ mode: RepoSortMode; roots: string[] }>({
+  mode: "recent",
+  roots: [],
+});
+
+// A consume-once request for GitView to expand and scroll to one repository.
+const repoReveal = $state<{ root: string | null }>({ root: null });
+
+export function requestRepoReveal(root: string): void {
+  repoReveal.root = root;
+}
+
+/// Supersede pending project navigation when the user explicitly switches
+/// views. Temporary overlays leave it intact for GitView to consume on return.
+export function cancelProjectBranchReveal(): void {
+  gitRevealSeq += 1;
+  repoReveal.root = null;
+}
+
+export function takeRepoReveal(): string | null {
+  const root = repoReveal.root;
+  repoReveal.root = null;
+  return root;
+}
 
 /// A branch (or remote-tracking ref) selected in the tree. Identifies it for the
 /// on-demand commit read; `kind` picks the local vs. remote ref namespace. When
@@ -122,24 +157,24 @@ export function hoverableClass(cls: string): string {
   return hoverSuppressed.value ? "" : cls;
 }
 
-/// Repo roots whose worktree-actions menu is currently open. The commit keyboard
+/// Repo roots whose branch-actions menu is currently open. The commit keyboard
 /// navigator bails while any is open so the arrows drive the menu, not the commit
 /// list — global (not node-local) so a menu open in one repo also yields the keys
 /// when the selected commit lives in a different repo node. A keyed set (not a
 /// counter) so it's idempotent: a stray double-close or a reset can't drive it
 /// negative. Read at event time, so plain (non-reactive) state is enough.
 // eslint-disable-next-line svelte/prefer-svelte-reactivity
-const openWorktreeMenuRoots = new Set<string>();
+const openBranchMenuRoots = new Set<string>();
 
-/// Mark (or clear) a repo node's worktree-actions menu as open. Idempotent.
-export function setWorktreeMenuOpen(repoRoot: string, open: boolean): void {
-  if (open) openWorktreeMenuRoots.add(repoRoot);
-  else openWorktreeMenuRoots.delete(repoRoot);
+/// Mark (or clear) a repo node's branch-actions menu as open. Idempotent.
+export function setBranchMenuOpen(repoRoot: string, open: boolean): void {
+  if (open) openBranchMenuRoots.add(repoRoot);
+  else openBranchMenuRoots.delete(repoRoot);
 }
 
-/// Whether any repo node has a worktree-actions menu open.
-export function anyWorktreeMenuOpen(): boolean {
-  return openWorktreeMenuRoots.size > 0;
+/// Whether any repo node has a branch-actions menu open.
+export function anyBranchMenuOpen(): boolean {
+  return openBranchMenuRoots.size > 0;
 }
 
 /// A navigable entry in the commit pane: the worktree's uncommitted row (shown
@@ -334,6 +369,49 @@ export const gitView = $state<{
   status: "pending" | "loading" | "complete" | "failed";
 }>({ repos: [], status: "pending" });
 
+const repoNameCollator = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
+
+function compareRepoListings(a: RepoListing, b: RepoListing): number {
+  if (repoSort.mode === "recent") {
+    const aTime = a.repo.last_commit_at;
+    const bTime = b.repo.last_commit_at;
+    if (aTime !== null && bTime !== null) {
+      const byTime = compareIsoTimestampsDescending(aTime, bTime);
+      if (byTime !== 0) return byTime;
+    } else if (aTime !== null) {
+      return -1;
+    } else if (bTime !== null) {
+      return 1;
+    }
+  }
+  const byName = repoNameCollator.compare(a.repo.name, b.repo.name);
+  if (byName !== 0) return byName;
+  if (a.repo.root === b.repo.root) return 0;
+  return a.repo.root < b.repo.root ? -1 : 1;
+}
+
+/// Capture one stable repository order from the current data. Passive refreshes
+/// may update rows afterward, but do not move them while the user is reading.
+export function snapshotRepoSort(): void {
+  repoSort.roots = [...gitView.repos].sort(compareRepoListings).map((listing) => listing.repo.root);
+}
+
+export function setRepoSortMode(mode: RepoSortMode): void {
+  repoSort.mode = mode;
+  snapshotRepoSort();
+}
+
+export function repoListingsInDisplayOrder(): RepoListing[] {
+  const byRoot = new SvelteMap(gitView.repos.map((listing) => [listing.repo.root, listing]));
+  const ordered = repoSort.roots.flatMap((root) => {
+    const listing = byRoot.get(root);
+    if (listing === undefined) return [];
+    byRoot.delete(root);
+    return [listing];
+  });
+  return [...ordered, ...byRoot.values()];
+}
+
 /// Per-repo refresh/fetch bookkeeping, keyed by canonical repo root (the
 /// `RepoListing.repo.root` string). Not reactive UI state — plain maps.
 // eslint-disable-next-line svelte/prefer-svelte-reactivity
@@ -356,6 +434,8 @@ export function setViewMode(mode: ViewMode): void {
 
 /// Switch into the Git view and run the staleness-gated entry refresh.
 export async function enterGitView(): Promise<void> {
+  if (gitView.status === "complete") snapshotRepoSort();
+  else repoSort.roots = [];
   view.mode = "git";
   await refreshStale();
 }
@@ -371,10 +451,11 @@ async function loadTrackedRepos(): Promise<void> {
   gitView.status = "complete";
 }
 
-export async function refreshAll(): Promise<void> {
+export async function refreshAll(opts: { snapshotOrder?: boolean } = {}): Promise<void> {
   gitView.status = gitView.repos.length === 0 ? "loading" : gitView.status;
   try {
     await loadTrackedRepos();
+    if (opts.snapshotOrder !== false) snapshotRepoSort();
   } catch (e) {
     console.warn("[switchboard] git view refreshAll failed", e);
     gitView.status = "failed";
@@ -395,6 +476,7 @@ export async function refreshAll(): Promise<void> {
 export async function addRepo(path: string): Promise<void> {
   await api.addTrackedRepo(path);
   await loadTrackedRepos();
+  snapshotRepoSort();
   void fetchStaleRepos();
 }
 
@@ -406,6 +488,7 @@ export async function addRepo(path: string): Promise<void> {
 export async function removeRepo(path: string): Promise<void> {
   await api.removeTrackedRepo(path);
   await loadTrackedRepos();
+  snapshotRepoSort();
 }
 
 /// Entry refresh (called on view entry): full read if nothing's loaded, else
@@ -593,15 +676,18 @@ async function resolveProjectBranchTarget(
 }
 
 async function selectProjectBranchTarget(target: ProjectBranchTarget): Promise<void> {
+  snapshotRepoSort();
   view.mode = "git";
+  requestRepoReveal(target.repoRoot);
   const ref: SelectedRef = { repoRoot: target.repoRoot, kind: "local", name: target.branch.name };
-  if (refsEqual(branchSelection.current, ref)) return;
-  await selectBranch(ref, {
-    worktreePath: target.worktreePath,
-    hasChanges:
-      target.branch.worktree?.dirty === true || target.branch.worktree?.untracked === true,
-    worktreeSubtitle: target.worktreePath,
-  });
+  if (!refsEqual(branchSelection.current, ref)) {
+    await selectBranch(ref, {
+      worktreePath: target.worktreePath,
+      hasChanges:
+        target.branch.worktree?.dirty === true || target.branch.worktree?.untracked === true,
+      worktreeSubtitle: target.worktreePath,
+    });
+  }
 }
 
 /// Switch to Git view and select the local branch/worktree linked to a project.
@@ -648,6 +734,9 @@ function applyRepos(repos: RepoListing[]): void {
   }
   // Drop runtime for repos no longer tracked.
   const live = new Set(repos.map((r) => r.repo.root));
+  for (const root of [...collapsedRepoRoots]) {
+    if (!live.has(root)) collapsedRepoRoots.delete(root);
+  }
   for (const root of [...runtime.keys()]) {
     if (!live.has(root)) {
       runtime.delete(root);
@@ -763,6 +852,11 @@ async function runBounded<T>(
 export const _testing = {
   reset(): void {
     view.mode = "projects";
+    collapsedRepoRoots.clear();
+    repoListScroll.top = 0;
+    repoSort.mode = "recent";
+    repoSort.roots = [];
+    repoReveal.root = null;
     gitView.repos = [];
     gitView.status = "pending";
     runtime.clear();
@@ -776,7 +870,7 @@ export const _testing = {
     diffTarget.current = null;
     navFocus.pane = null;
     hoverSuppressed.value = false;
-    openWorktreeMenuRoots.clear();
+    openBranchMenuRoots.clear();
     gitRefresh.revision = 0;
   },
   runtimeSize(): number {

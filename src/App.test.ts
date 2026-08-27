@@ -789,21 +789,19 @@ describe("App", () => {
 
     // All four harnesses are installed, but Gemini is excluded from auto-seeding
     // (no longer on individual plans) → one agent each for Claude/Codex/
-    // Antigravity, named after the model+effort it'll run, in HARNESSES order.
-    // Antigravity used to fall back to the bare harness name because its model
-    // was harness-owned config; it now carries a selection like the others.
+    // Antigravity, in HARNESSES order. Its two default profiles use the stable
+    // harness name rather than naming only one of the configurations.
     await waitFor(() => expect(createAgentCalls()).toHaveLength(3));
     expect(createAgentCalls()).toEqual([
-      { name: "opus-high", harness: "claude_code" },
-      { name: "gpt-5-6-sol-high", harness: "codex" },
-      { name: "gemini-3-7-flash-high", harness: "antigravity" },
+      { name: "claude", harness: "claude_code" },
+      { name: "codex", harness: "codex" },
+      { name: "antigravity", harness: "antigravity" },
     ]);
     // Auto-seeded → the roster is populated, not the empty first-agent prompt.
     await waitFor(() => expect(screen.getAllByTestId("sidebar-agent")).toHaveLength(3));
     expect(screen.queryByTestId("confirm-create-agent")).not.toBeInTheDocument();
 
-    // Each seeded agent is born with its harness's default model/effort
-    // (Antigravity carries neither).
+    // Each seeded agent is born with its harness's default profiles.
     const seededArgs = invokeMock.mock.calls
       .filter(([c]) => c === "create_agent")
       .map(
@@ -819,28 +817,28 @@ describe("App", () => {
       );
     expect(seededArgs).toEqual([
       {
-        name: "opus-high",
+        name: "claude",
         harness: "claude_code",
         model: "opus",
         effort: "high",
-        secondaryModel: undefined,
-        secondaryEffort: undefined,
+        secondaryModel: "sonnet",
+        secondaryEffort: "medium",
       },
       {
-        name: "gpt-5-6-sol-high",
+        name: "codex",
         harness: "codex",
         model: "gpt-5.6-sol",
         effort: "high",
-        secondaryModel: undefined,
-        secondaryEffort: undefined,
+        secondaryModel: "gpt-5.6-terra",
+        secondaryEffort: "medium",
       },
       {
-        name: "gemini-3-7-flash-high",
+        name: "antigravity",
         harness: "antigravity",
-        model: "gemini-3.7-flash",
+        model: "gemini-3.1-pro",
         effort: "high",
-        secondaryModel: undefined,
-        secondaryEffort: undefined,
+        secondaryModel: "gemini-3.7-flash",
+        secondaryEffort: "high",
       },
     ]);
   });
@@ -921,8 +919,8 @@ describe("App", () => {
 
     await waitFor(() => expect(createAgentCalls()).toHaveLength(2));
     expect(createAgentCalls()).toEqual([
-      { name: "opus-high", harness: "claude_code" },
-      { name: "gpt-5-6-sol-high", harness: "codex" },
+      { name: "claude", harness: "claude_code" },
+      { name: "codex", harness: "codex" },
     ]);
   });
 
@@ -1440,6 +1438,7 @@ describe("App", () => {
           default_branch: "main",
           available: true,
           is_bare: false,
+          last_commit_at: null,
           local_branches: [],
           remote_branches: [],
           detached_worktrees: [],
@@ -1514,7 +1513,7 @@ describe("App", () => {
     const recipients = await import("$lib/state/recipientSelection.svelte");
     seedProject({ projectId: "p-a", directory: DIR_A, name: "alpha", agents: [] });
     backend.agentQueue.push(
-      agent({ id: "ag-first", project_id: "p-a", name: "opus-high", session_locator: null }),
+      agent({ id: "ag-first", project_id: "p-a", name: "claude", session_locator: null }),
     );
     await mountApp();
     await waitFor(() => expect(screen.getByTestId("project-row")).toBeInTheDocument());
@@ -1540,12 +1539,12 @@ describe("App", () => {
     expect(createCalls).toHaveLength(1);
     // The form preselects and submits Claude's defaults.
     expect(createCalls[0]?.[1]).toEqual({
-      name: "opus-high",
+      name: "claude",
       harness: "claude_code",
       model: "opus",
       effort: "high",
-      secondaryModel: undefined,
-      secondaryEffort: undefined,
+      secondaryModel: "sonnet",
+      secondaryEffort: "medium",
     });
   });
 
@@ -1554,7 +1553,7 @@ describe("App", () => {
     const recipients = await import("$lib/state/recipientSelection.svelte");
     seedProject({ projectId: "p-a", directory: DIR_A, name: "alpha", agents: [] });
     backend.agentQueue.push(
-      agent({ id: "ag-first", project_id: "p-a", name: "opus-high", session_locator: null }),
+      agent({ id: "ag-first", project_id: "p-a", name: "claude", session_locator: null }),
     );
     await mountApp();
     await waitFor(() => expect(screen.getByTestId("project-row")).toBeInTheDocument());
@@ -2827,6 +2826,7 @@ describe("App", () => {
           default_branch: "main",
           available: true,
           is_bare: false,
+          last_commit_at: null,
           local_branches: [],
           remote_branches: [],
           detached_worktrees: [],
@@ -3850,6 +3850,7 @@ describe("App", () => {
           default_branch: "main",
           available: true,
           is_bare: false,
+          last_commit_at: null,
           local_branches: [],
           remote_branches: [],
           detached_worktrees: [],
@@ -4123,6 +4124,7 @@ describe("App", () => {
           default_branch: "main",
           available: true,
           is_bare: false,
+          last_commit_at: null,
           local_branches: [],
           remote_branches: [],
           detached_worktrees: [],
@@ -4141,10 +4143,55 @@ describe("App", () => {
     // The tracked repo loaded via list_tracked_repos.
     await waitFor(() => expect(screen.getByTestId("git-repo")).toBeInTheDocument());
 
-    // Toggle back to Projects: the view is gone, the sidebar returns.
-    await fireEvent.click(screen.getByTestId("view-toggle-projects"));
+    await fireEvent.click(screen.getByRole("button", { name: "Collapse repo" }));
+    const repoList = screen.getByTestId("git-repo-list");
+    repoList.scrollTop = 42;
+    await fireEvent.scroll(repoList);
+
+    // ⌘⇧G leaves and re-enters without resetting the tree position.
+    await fireEvent.keyDown(window, { key: "g", code: "KeyG", metaKey: true, shiftKey: true });
     await waitFor(() => expect(screen.queryByTestId("git-view")).not.toBeInTheDocument());
     expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument();
+
+    await fireEvent.keyDown(window, { key: "g", code: "KeyG", metaKey: true, shiftKey: true });
+    await waitFor(() => expect(screen.getByTestId("git-repo")).toBeInTheDocument());
+    expect(screen.getByRole("button", { name: "Expand repo" })).toBeInTheDocument();
+    expect(screen.getByTestId("git-repo-list").scrollTop).toBe(42);
+  });
+
+  it("generic ⌘⇧G entry cancels a pending project reveal", async () => {
+    seedProject({ projectId: "p-a", directory: DIR_A, name: "alpha" });
+    backend.trackedRepos = [
+      {
+        repo: {
+          root: DIR_A,
+          name: "alpha-repo",
+          default_branch: "main",
+          available: true,
+          is_bare: false,
+          last_commit_at: null,
+          local_branches: [],
+          remote_branches: [],
+          detached_worktrees: [],
+        },
+        linked_projects: {},
+      } satisfies RepoListing,
+    ];
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument());
+    const gitState = await import("$lib/state/gitView.svelte");
+    gitState.collapsedRepoRoots.add(DIR_A);
+    gitState.requestRepoReveal(DIR_A);
+
+    await fireEvent.keyDown(window, {
+      key: "g",
+      code: "KeyG",
+      metaKey: true,
+      shiftKey: true,
+    });
+
+    await waitFor(() => expect(screen.getByTestId("git-repo")).toBeInTheDocument());
+    expect(screen.getByRole("button", { name: "Expand repo" })).toBeInTheDocument();
   });
 
   it("shows project loading immediately when returning from Git view to an active project", async () => {
@@ -4162,6 +4209,7 @@ describe("App", () => {
           default_branch: "main",
           available: true,
           is_bare: false,
+          last_commit_at: null,
           local_branches: [],
           remote_branches: [],
           detached_worktrees: [],
@@ -4200,6 +4248,7 @@ describe("App", () => {
           default_branch: "main",
           available: true,
           is_bare: false,
+          last_commit_at: null,
           local_branches: [
             {
               name: "main",
@@ -4208,6 +4257,7 @@ describe("App", () => {
               behind_base: null,
               merged: null,
               dangling: false,
+              github_url: null,
               worktree: {
                 path: DIR_A,
                 dirty: false,
@@ -4217,7 +4267,9 @@ describe("App", () => {
               },
             },
           ],
-          remote_branches: [{ name: "origin/main", merged: null, behind_base: null }],
+          remote_branches: [
+            { name: "origin/main", github_url: null, merged: null, behind_base: null },
+          ],
           detached_worktrees: [],
         },
         linked_projects: {
@@ -4261,6 +4313,7 @@ describe("App", () => {
           default_branch: "main",
           available: true,
           is_bare: false,
+          last_commit_at: null,
           local_branches: [
             {
               name: "main",
@@ -4269,6 +4322,7 @@ describe("App", () => {
               behind_base: null,
               merged: null,
               dangling: false,
+              github_url: null,
               worktree: {
                 path: DIR_A,
                 dirty: false,
@@ -4278,7 +4332,9 @@ describe("App", () => {
               },
             },
           ],
-          remote_branches: [{ name: "origin/main", merged: null, behind_base: null }],
+          remote_branches: [
+            { name: "origin/main", github_url: null, merged: null, behind_base: null },
+          ],
           detached_worktrees: [],
         },
         linked_projects: {
@@ -4325,6 +4381,7 @@ describe("App", () => {
           default_branch: "main",
           available: true,
           is_bare: false,
+          last_commit_at: null,
           local_branches: [],
           remote_branches: [],
           detached_worktrees: [

@@ -620,13 +620,16 @@ export type BranchView = {
   behind_base: number | null;
   merged: boolean | null;
   dangling: boolean;
+  github_url: string | null;
   worktree: WorktreeView | null;
 };
 
-// Remote branches carry only the cleanup signals (merged, behind_base) — the
-// local-branch fields are meaningless for a remote-tracking ref.
+// Remote branches carry only the cleanup status signals (merged, behind_base),
+// plus optional hosting metadata — the local-branch fields are meaningless for
+// a remote-tracking ref.
 export type RemoteBranchView = {
   name: string;
+  github_url: string | null;
   merged: boolean | null;
   behind_base: number | null;
 };
@@ -637,6 +640,7 @@ export type RepoView = {
   default_branch: string | null;
   available: boolean;
   is_bare: boolean;
+  last_commit_at: string | null;
   local_branches: BranchView[];
   remote_branches: RemoteBranchView[];
   detached_worktrees: WorktreeView[];

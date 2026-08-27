@@ -20,7 +20,8 @@ vi.mock("$lib/native", () => ({
   copyText: (text: string) => copyTextMock(text),
 }));
 
-const { refreshAll, fetchStates, _testing } = await import("$lib/state/gitView.svelte");
+const { refreshAll, fetchStates, requestRepoReveal, _testing } =
+  await import("$lib/state/gitView.svelte");
 const {
   contributedCommands,
   openPalette,
@@ -53,6 +54,7 @@ const repo = (over: Partial<RepoListing["repo"]> = {}): RepoListing => ({
     default_branch: "main",
     available: true,
     is_bare: false,
+    last_commit_at: null,
     local_branches: [
       {
         name: "main",
@@ -61,6 +63,7 @@ const repo = (over: Partial<RepoListing["repo"]> = {}): RepoListing => ({
         behind_base: null,
         merged: null,
         dangling: false,
+        github_url: null,
         worktree: {
           path: "/repos/app",
           dirty: true,
@@ -76,12 +79,13 @@ const repo = (over: Partial<RepoListing["repo"]> = {}): RepoListing => ({
         behind_base: null,
         merged: true,
         dangling: false,
+        github_url: null,
         worktree: null, // inactive (no worktree)
       },
     ],
     remote_branches: [
-      { name: "origin/main", merged: null, behind_base: null },
-      { name: "origin/remote-only", merged: null, behind_base: null },
+      { name: "origin/main", github_url: null, merged: null, behind_base: null },
+      { name: "origin/remote-only", github_url: null, merged: null, behind_base: null },
     ],
     detached_worktrees: [],
     ...over,
@@ -154,10 +158,13 @@ describe("GitView", () => {
 
     await waitFor(() => expect(screen.getByTestId("git-repo")).toBeInTheDocument());
     // Active branch (has a worktree) shows; linked projects stay out of the row.
-    expect(document.querySelector('[data-testid="git-branch"][data-branch="main"]')).not.toBeNull();
+    const mainRow = document.querySelector(
+      '[data-testid="git-branch"][data-branch="main"]',
+    ) as HTMLElement;
+    expect(mainRow).not.toBeNull();
     expect(screen.queryByTestId("linked-project")).not.toBeInTheDocument();
     await waitFor(() => expect(screen.getAllByText("~/app").length).toBeGreaterThan(0));
-    await fireEvent.click(screen.getByTestId("worktree-actions-trigger"));
+    await fireEvent.click(within(mainRow).getByTestId("branch-actions-trigger"));
     expect(screen.getByTestId("worktree-action-open-project")).toHaveTextContent(
       "Open Project: app-proj",
     );
@@ -230,13 +237,17 @@ describe("GitView", () => {
     const toggleAll = screen.getByTestId("git-repos-toggle-all");
     const addRepo = screen.getByTestId("git-add-repo");
     const refreshAllButton = screen.getByTestId("git-refresh-all");
+    const sortRepos = screen.getByTestId("git-repos-sort");
     const branchFilter = screen.getByTestId("branch-filter-both");
     expect(
       addRepo.compareDocumentPosition(refreshAllButton) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
     expect(
-      refreshAllButton.compareDocumentPosition(toggleAll) & Node.DOCUMENT_POSITION_FOLLOWING,
+      refreshAllButton.compareDocumentPosition(sortRepos) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+    expect(sortRepos.compareDocumentPosition(toggleAll) & Node.DOCUMENT_POSITION_FOLLOWING).toBe(
+      Node.DOCUMENT_POSITION_FOLLOWING,
+    );
     expect(toggleAll.compareDocumentPosition(branchFilter) & Node.DOCUMENT_POSITION_FOLLOWING).toBe(
       Node.DOCUMENT_POSITION_FOLLOWING,
     );
@@ -265,6 +276,127 @@ describe("GitView", () => {
     );
     await gitCommand("git.toggle-repositories").run();
     expect(screen.getAllByTestId("repo-branches")).toHaveLength(2);
+  });
+
+  it("sorts by latest commit by default and retains alphabetical mode across remounts", async () => {
+    wire([
+      repo({
+        root: "/repos/zebra",
+        name: "zebra",
+        last_commit_at: "2026-08-20T23:00:00+09:00",
+      }),
+      repo({ root: "/repos/beta", name: "beta", last_commit_at: null }),
+      repo({
+        root: "/repos/alpha",
+        name: "Alpha",
+        last_commit_at: "2026-08-20T20:00:00Z",
+      }),
+    ]);
+    await refreshAll();
+    const firstRender = render(GitView);
+    await waitFor(() => expect(screen.getAllByTestId("git-repo")).toHaveLength(3));
+
+    const renderedRoots = (): (string | null)[] =>
+      screen.getAllByTestId("git-repo").map((node) => node.getAttribute("data-repo-root"));
+    const sort = screen.getByTestId("git-repos-sort");
+    expect(sort).toHaveAccessibleName("Sort repositories by name");
+    expect(renderedRoots()).toEqual(["/repos/alpha", "/repos/zebra", "/repos/beta"]);
+
+    await fireEvent.click(sort);
+    expect(sort).toHaveAccessibleName("Sort repositories by latest commit");
+    expect(renderedRoots()).toEqual(["/repos/alpha", "/repos/beta", "/repos/zebra"]);
+
+    firstRender.unmount();
+    render(GitView);
+    await waitFor(() => expect(screen.getAllByTestId("git-repo")).toHaveLength(3));
+    expect(screen.getByTestId("git-repos-sort")).toHaveAccessibleName(
+      "Sort repositories by latest commit",
+    );
+    expect(renderedRoots()).toEqual(["/repos/alpha", "/repos/beta", "/repos/zebra"]);
+  });
+
+  it("breaks equal latest-commit ties by name and then root", async () => {
+    const timestamp = "2026-08-20T20:00:00Z";
+    wire([
+      repo({ root: "/repos/zeta", name: "zeta", last_commit_at: timestamp }),
+      repo({ root: "/repos/b/shared", name: "shared", last_commit_at: timestamp }),
+      repo({ root: "/repos/alpha", name: "alpha", last_commit_at: timestamp }),
+      repo({ root: "/repos/a/shared", name: "shared", last_commit_at: timestamp }),
+    ]);
+    await refreshAll();
+    render(GitView);
+    await waitFor(() => expect(screen.getAllByTestId("git-repo")).toHaveLength(4));
+
+    expect(
+      screen.getAllByTestId("git-repo").map((node) => node.getAttribute("data-repo-root")),
+    ).toEqual(["/repos/alpha", "/repos/a/shared", "/repos/b/shared", "/repos/zeta"]);
+  });
+
+  it("retains repository expansion and scroll position across remounts", async () => {
+    wire([repo(), repo({ root: "/repos/other", name: "other" })]);
+    await refreshAll();
+    const firstRender = render(GitView);
+    await waitFor(() => expect(screen.getAllByTestId("git-repo")).toHaveLength(2));
+
+    const firstRepo = screen.getAllByTestId("git-repo")[0]!;
+    await fireEvent.click(within(firstRepo).getByRole("button", { name: "Collapse repo" }));
+    const firstList = screen.getByTestId("git-repo-list");
+    firstList.scrollTop = 137;
+    await fireEvent.scroll(firstList);
+    firstRender.unmount();
+
+    render(GitView);
+    await waitFor(() => expect(screen.getAllByTestId("git-repo")).toHaveLength(2));
+    const repos = screen.getAllByTestId("git-repo");
+    expect(within(repos[0]!).queryByTestId("repo-branches")).not.toBeInTheDocument();
+    expect(within(repos[1]!).getByTestId("repo-branches")).toBeInTheDocument();
+    expect(screen.getByTestId("git-repo-list").scrollTop).toBe(137);
+  });
+
+  it("reveals only the requested collapsed repository and scrolls it into view", async () => {
+    wire([repo(), repo({ root: "/repos/other", name: "other" })]);
+    await refreshAll();
+    render(GitView);
+    await waitFor(() => expect(screen.getAllByTestId("git-repo")).toHaveLength(2));
+
+    await fireEvent.click(screen.getByTestId("git-repos-toggle-all"));
+    expect(screen.queryAllByTestId("repo-branches")).toHaveLength(0);
+    const scrollSpy = vi.spyOn(Element.prototype, "scrollIntoView");
+
+    requestRepoReveal("/repos/other");
+
+    await waitFor(() => expect(screen.getAllByTestId("repo-branches")).toHaveLength(1));
+    const repos = screen.getAllByTestId("git-repo");
+    expect(within(repos[0]!).queryByTestId("repo-branches")).not.toBeInTheDocument();
+    expect(within(repos[1]!).getByTestId("repo-branches")).toBeInTheDocument();
+    expect(scrollSpy).toHaveBeenCalledWith({ block: "nearest" });
+    expect(scrollSpy.mock.instances.at(-1)).toBe(repos[1]);
+    scrollSpy.mockRestore();
+  });
+
+  it("restores the repository pane before revealing from a full-screen diff", async () => {
+    wire([repo()]);
+    await refreshAll();
+    render(GitView);
+    await waitFor(() => expect(screen.getByTestId("git-repo")).toBeInTheDocument());
+
+    const mainRow = document.querySelector(
+      '[data-testid="git-branch"][data-branch="main"]',
+    ) as HTMLElement;
+    await fireEvent.click(within(mainRow).getByTestId("branch-select"));
+    await waitFor(() => expect(screen.getByTestId("diff-panel")).toBeInTheDocument());
+    await fireEvent.click(screen.getByRole("button", { name: "Collapse repo" }));
+    await fireEvent.click(screen.getByTestId("detail-expand-toggle"));
+    expect(screen.queryByTestId("git-repo-list")).not.toBeInTheDocument();
+    const scrollSpy = vi.spyOn(Element.prototype, "scrollIntoView");
+
+    requestRepoReveal("/repos/app");
+
+    await waitFor(() => expect(screen.getByTestId("git-repo-list")).toBeInTheDocument());
+    expect(screen.getByTestId("repo-branches")).toBeInTheDocument();
+    expect(scrollSpy).toHaveBeenCalledWith({ block: "nearest" });
+    expect(scrollSpy.mock.instances.at(-1)).toBe(screen.getByTestId("git-repo"));
+    scrollSpy.mockRestore();
   });
 
   it("git.toggle-detail runs, and ⌘⇧D is suppressed while the palette is open", async () => {
@@ -344,7 +476,7 @@ describe("GitView", () => {
     const mainRow = document.querySelector(
       '[data-testid="git-branch"][data-branch="main"]',
     ) as HTMLElement;
-    const trigger = within(mainRow).getByTestId("worktree-actions-trigger");
+    const trigger = within(mainRow).getByTestId("branch-actions-trigger");
 
     expect(mainRow).toHaveAttribute("data-actions-open", "false");
     await fireEvent.click(trigger);
@@ -358,7 +490,7 @@ describe("GitView", () => {
     await waitFor(() => expect(mainRow).toHaveAttribute("data-actions-open", "false"));
   });
 
-  it("does not restore a stale open worktree menu after worktree actions unmount", async () => {
+  it("does not restore a stale branch menu after its branch disappears", async () => {
     const withWorktree = repo();
     wire([withWorktree]);
     await refreshAll();
@@ -368,19 +500,19 @@ describe("GitView", () => {
     let mainRow = document.querySelector(
       '[data-testid="git-branch"][data-branch="main"]',
     ) as HTMLElement;
-    await fireEvent.click(within(mainRow).getByTestId("worktree-actions-trigger"));
+    await fireEvent.click(within(mainRow).getByTestId("branch-actions-trigger"));
     expect(mainRow).toHaveAttribute("data-actions-open", "true");
 
     wire([
       repo({
-        local_branches: withWorktree.repo.local_branches.map((branch) =>
-          branch.name === "main" ? { ...branch, worktree: null } : branch,
-        ),
+        local_branches: withWorktree.repo.local_branches.filter((branch) => branch.name !== "main"),
       }),
     ]);
     await refreshAll();
     await waitFor(() =>
-      expect(within(mainRow).queryByTestId("worktree-actions-trigger")).not.toBeInTheDocument(),
+      expect(
+        document.querySelector('[data-testid="git-branch"][data-branch="main"]'),
+      ).not.toBeInTheDocument(),
     );
 
     wire([withWorktree]);
@@ -389,7 +521,7 @@ describe("GitView", () => {
       document.querySelector('[data-testid="git-branch"][data-branch="main"]'),
     )) as HTMLElement;
 
-    expect(within(mainRow).getByTestId("worktree-actions-trigger")).toBeInTheDocument();
+    expect(within(mainRow).getByTestId("branch-actions-trigger")).toBeInTheDocument();
     expect(mainRow).toHaveAttribute("data-actions-open", "false");
   });
 
@@ -444,6 +576,7 @@ describe("GitView", () => {
             behind_base: null,
             merged: null,
             dangling: false,
+            github_url: null,
             worktree: {
               path: "/repos/app-feature",
               dirty: false,
@@ -459,6 +592,7 @@ describe("GitView", () => {
             behind_base: null,
             merged: null,
             dangling: false,
+            github_url: null,
             worktree: null,
           },
         ],

@@ -15,6 +15,7 @@ const branch = (over: Partial<BranchView> = {}): BranchView => ({
   behind_base: null,
   merged: null,
   dangling: false,
+  github_url: null,
   worktree: null,
   ...over,
 });
@@ -134,6 +135,7 @@ describe("remoteBranchIndicators", () => {
   it("carries only the two cleanup signals (merged, behind_base)", () => {
     const b = (over: Partial<RemoteBranchView> = {}): RemoteBranchView => ({
       name: "origin/feature",
+      github_url: null,
       merged: null,
       behind_base: null,
       ...over,
@@ -146,6 +148,7 @@ describe("remoteBranchIndicators", () => {
   it("suppresses merged on the default branch's own remote ref (origin/<default>)", () => {
     const b = (over: Partial<RemoteBranchView> = {}): RemoteBranchView => ({
       name: "origin/main",
+      github_url: null,
       merged: true,
       behind_base: null,
       ...over,

@@ -33,6 +33,12 @@ const {
   gitRefresh,
   loadProjectRepo,
   revealProjectBranch,
+  cancelProjectBranchReveal,
+  collapsedRepoRoots,
+  repoSort,
+  repoListingsInDisplayOrder,
+  snapshotRepoSort,
+  takeRepoReveal,
   _testing,
 } = await import("./gitView.svelte");
 
@@ -48,6 +54,7 @@ const listing = (root: string): RepoListing => ({
     default_branch: "main",
     available: true,
     is_bare: false,
+    last_commit_at: null,
     local_branches: [],
     remote_branches: [],
     detached_worktrees: [],
@@ -66,6 +73,7 @@ const listingWithWorktree = (root: string, wtPath: string): RepoListing => {
       behind_base: null,
       merged: null,
       dangling: false,
+      github_url: null,
       worktree: { path: wtPath, dirty: true, untracked: false, detached_hash: null, warning: null },
     },
   ];
@@ -79,6 +87,7 @@ const unavailableListing = (root: string): RepoListing => ({
     default_branch: null,
     available: false,
     is_bare: false,
+    last_commit_at: null,
     local_branches: [],
     remote_branches: [],
     detached_worktrees: [],
@@ -133,6 +142,7 @@ describe("gitView store", () => {
     expect(view.mode).toBe("git");
     expect(gitView.repos.map((r) => r.repo.root)).toEqual(["/a", "/b"]);
     expect(gitView.status).toBe("complete");
+    expect(repoSort.roots).toEqual(["/a", "/b"]);
   });
 
   it("refreshAll failure leaves a failed status without throwing", async () => {
@@ -224,6 +234,7 @@ describe("gitView store", () => {
         behind_base: null,
         merged: null,
         dangling: false,
+        github_url: null,
         worktree: {
           path: "/a/wt",
           dirty: false,
@@ -347,6 +358,7 @@ describe("gitView store", () => {
           behind_base: null,
           merged: null,
           dangling: false,
+          github_url: null,
           worktree: null,
         },
       ];
@@ -437,6 +449,33 @@ describe("gitView store", () => {
     expect(fetchStates["/a"]).toMatchObject({ kind: "ok" });
     // Fetch success triggers a single-repo re-read.
     expect(invokeMock.mock.calls.some((c) => c[0] === "read_tracked_repo")).toBe(true);
+  });
+
+  it("keeps the captured order during passive fetch updates until explicitly resnapshot", async () => {
+    const first = listing("/a");
+    first.repo.last_commit_at = "2026-08-20T20:00:00Z";
+    const second = listing("/b");
+    second.repo.last_commit_at = "2026-08-19T20:00:00Z";
+    wire({ list: [first, second] });
+    await refreshAll();
+    expect(repoListingsInDisplayOrder().map((item) => item.repo.root)).toEqual(["/a", "/b"]);
+
+    const updatedSecond = listing("/b");
+    updatedSecond.repo.last_commit_at = "2026-08-25T20:00:00Z";
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "fetch_repo") return Promise.resolve(null);
+      if (cmd === "read_tracked_repo") return Promise.resolve(updatedSecond);
+      return Promise.resolve(null);
+    });
+    await fetchRepo("/b");
+
+    expect(gitView.repos.find((item) => item.repo.root === "/b")?.repo.last_commit_at).toBe(
+      "2026-08-25T20:00:00Z",
+    );
+    expect(repoListingsInDisplayOrder().map((item) => item.repo.root)).toEqual(["/a", "/b"]);
+
+    snapshotRepoSort();
+    expect(repoListingsInDisplayOrder().map((item) => item.repo.root)).toEqual(["/b", "/a"]);
   });
 
   it("concurrent fetches for the same root dedupe to one subprocess", async () => {
@@ -539,6 +578,17 @@ describe("gitView store", () => {
     expect(gitView.repos.map((r) => r.repo.root)).toEqual(["/b"]);
   });
 
+  it("drops collapsed state for a repository removed from the tracked list", async () => {
+    wire({ list: [listing("/a"), listing("/b")] });
+    await refreshAll();
+    collapsedRepoRoots.add("/a");
+
+    wire({ list: [listing("/b")] });
+    await refreshAll();
+
+    expect(collapsedRepoRoots.has("/a")).toBe(false);
+  });
+
   it("a fetch settling after its repo is removed leaves no dangling fetch state", async () => {
     // Race: a background fetch is in flight when the user removes the repo. The
     // backend's tracked-membership gate then rejects the now-untracked fetch, and
@@ -592,6 +642,7 @@ describe("gitView store", () => {
       repoRoot: "/a",
       worktreePath: "/a/wt",
     });
+    expect(takeRepoReveal()).toBe("/a");
   });
 
   it("revealProjectBranch loads the full repo aggregate before opening Git view", async () => {
@@ -639,6 +690,59 @@ describe("gitView store", () => {
     expect(branchSelection.current).toEqual({ repoRoot: "/b", kind: "local", name: "main" });
   });
 
+  it("a superseded commit load cannot reveal its repository after the newer request", async () => {
+    const firstCommits = deferred<[]>();
+    let firstCommitsStarted!: () => void;
+    const firstStarted = new Promise<void>((resolve) => (firstCommitsStarted = resolve));
+    invokeMock.mockImplementation((cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "read_tracked_repo") {
+        const path = String(args?.path);
+        if (path === "/a/wt") return Promise.resolve(listingWithProject("/a", "/a/wt", "p1"));
+        if (path === "/b/wt") return Promise.resolve(listingWithProject("/b", "/b/wt", "p2"));
+      }
+      if (cmd === "list_tracked_repos")
+        return Promise.resolve([
+          listingWithProject("/a", "/a/wt", "p1"),
+          listingWithProject("/b", "/b/wt", "p2"),
+        ]);
+      if (cmd === "branch_commits" && args?.repoRoot === "/a") {
+        firstCommitsStarted();
+        return firstCommits.promise;
+      }
+      if (cmd === "branch_commits") return Promise.resolve([]);
+      return Promise.resolve(null);
+    });
+
+    const first = revealProjectBranch("p1", "/a/wt");
+    await firstStarted;
+    expect(takeRepoReveal()).toBe("/a");
+    const second = revealProjectBranch("p2", "/b/wt");
+
+    await expect(second).resolves.toEqual({ kind: "revealed" });
+    expect(takeRepoReveal()).toBe("/b");
+
+    firstCommits.resolve([]);
+    await expect(first).resolves.toEqual({ kind: "superseded" });
+    expect(takeRepoReveal()).toBeNull();
+  });
+
+  it("cancelling a pending project reveal prevents it from opening Git later", async () => {
+    const read = deferred<RepoListing>();
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "read_tracked_repo") return read.promise;
+      if (cmd === "branch_commits") return Promise.resolve([]);
+      return Promise.resolve(null);
+    });
+
+    const revealing = revealProjectBranch("p1", "/a/wt");
+    cancelProjectBranchReveal();
+    read.resolve(listingWithProject("/a", "/a/wt", "p1"));
+
+    await expect(revealing).resolves.toEqual({ kind: "superseded" });
+    expect(view.mode).toBe("projects");
+    expect(takeRepoReveal()).toBeNull();
+  });
+
   it("revealProjectBranch does not collapse an already selected branch", async () => {
     invokeMock.mockImplementation((cmd: string) => {
       if (cmd === "read_tracked_repo")
@@ -650,11 +754,13 @@ describe("gitView store", () => {
     });
 
     await expect(revealProjectBranch("p1", "/a/wt")).resolves.toEqual({ kind: "revealed" });
+    expect(takeRepoReveal()).toBe("/a");
     await expect(revealProjectBranch("p1", "/a/wt")).resolves.toEqual({ kind: "revealed" });
 
     expect(view.mode).toBe("git");
     expect(branchSelection.current).toEqual({ repoRoot: "/a", kind: "local", name: "main" });
     expect(diffTarget.current?.kind).toBe("uncommitted");
+    expect(takeRepoReveal()).toBe("/a");
   });
 
   it("revealProjectBranch adds an untracked project repo before selecting it", async () => {

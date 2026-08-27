@@ -42,7 +42,10 @@ fn default_agent_defaults() -> BTreeMap<HarnessKind, AgentDefaults> {
                     model: Some("opus".to_owned()),
                     effort: Some("high".to_owned()),
                 },
-                secondary: None,
+                secondary: Some(AgentProfile {
+                    model: Some("sonnet".to_owned()),
+                    effort: Some("medium".to_owned()),
+                }),
             },
         ),
         (
@@ -52,7 +55,10 @@ fn default_agent_defaults() -> BTreeMap<HarnessKind, AgentDefaults> {
                     model: Some("gpt-5.6-sol".to_owned()),
                     effort: Some("high".to_owned()),
                 },
-                secondary: None,
+                secondary: Some(AgentProfile {
+                    model: Some("gpt-5.6-terra".to_owned()),
+                    effort: Some("medium".to_owned()),
+                }),
             },
         ),
         (
@@ -62,10 +68,25 @@ fn default_agent_defaults() -> BTreeMap<HarnessKind, AgentDefaults> {
                     model: Some("auto".to_owned()),
                     effort: None,
                 },
-                secondary: None,
+                secondary: Some(AgentProfile {
+                    model: Some("gemini-2.5-flash".to_owned()),
+                    effort: None,
+                }),
             },
         ),
-        (HarnessKind::Antigravity, AgentDefaults::default()),
+        (
+            HarnessKind::Antigravity,
+            AgentDefaults {
+                primary: AgentProfile {
+                    model: Some("gemini-3.1-pro".to_owned()),
+                    effort: Some("high".to_owned()),
+                },
+                secondary: Some(AgentProfile {
+                    model: Some("gemini-3.7-flash".to_owned()),
+                    effort: Some("high".to_owned()),
+                }),
+            },
+        ),
     ])
 }
 
@@ -393,6 +414,31 @@ mod tests {
         let loaded = load(&path);
 
         assert_eq!(loaded.agent_defaults, default_agent_defaults());
+    }
+
+    #[test]
+    fn every_harness_has_a_secondary_default() {
+        let defaults = Preferences::default();
+
+        assert!(
+            defaults
+                .agent_defaults
+                .values()
+                .all(|value| value.secondary.is_some())
+        );
+        assert_eq!(
+            defaults.agent_defaults[&HarnessKind::Antigravity],
+            AgentDefaults {
+                primary: AgentProfile {
+                    model: Some("gemini-3.1-pro".to_owned()),
+                    effort: Some("high".to_owned()),
+                },
+                secondary: Some(AgentProfile {
+                    model: Some("gemini-3.7-flash".to_owned()),
+                    effort: Some("high".to_owned()),
+                }),
+            }
+        );
     }
 
     #[test]

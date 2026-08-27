@@ -56,8 +56,6 @@
   let descending = $state(true);
   let pinnedOnly = $state(false);
   let highlighted = $state(0);
-  let findTooltipOpen = $state(false);
-  let findTooltipSuppressed = $state(false);
   /// The entry whose full text shows in the preview panel. Keyboard moves set
   /// it immediately (the preview follows the highlight); hover sets it through
   /// a short debounce so running the cursor down the list doesn't flash panels.
@@ -79,12 +77,6 @@
   const rosterIds = $derived(agents.map((a) => a.id));
   const pinsReady = $derived(pinsLoaded(projectId));
   const jumpPaneIndex = $derived(buildJumpPaneIndex(projectId, rosterIds));
-
-  $effect(() => {
-    if (!open) return;
-    if (findTooltipOpen) findTooltipSuppressed = true;
-    findTooltipOpen = false;
-  });
 
   type IndexSource = {
     projectId: ProjectId;
@@ -237,22 +229,7 @@
 
   function close(): void {
     navigatorState.open = false;
-    findTooltipOpen = false;
     if (hoverTimer !== null) clearTimeout(hoverTimer);
-  }
-
-  function manageFindTooltipSuppression(node: HTMLElement): { destroy: () => void } {
-    const release = () => {
-      if (!open) findTooltipSuppressed = false;
-    };
-    node.addEventListener("pointerenter", release);
-    node.addEventListener("pointerleave", release);
-    return {
-      destroy: () => {
-        node.removeEventListener("pointerenter", release);
-        node.removeEventListener("pointerleave", release);
-      },
-    };
   }
 
   function setHighlighted(index: number): void {
@@ -347,11 +324,14 @@
   ];
 </script>
 
+<!-- `disabled` skips the portal while the dialog is open; `suppressed` keeps
+     pointer opening latched until a fresh hover after it closes. -->
 <Tooltip
-  bind:open={findTooltipOpen}
   label="Find messages (⌘F)"
   side="bottom"
-  disabled={open || findTooltipSuppressed}
+  reopen="fresh-hover"
+  disabled={open}
+  suppressed={open}
   ignoreNonKeyboardFocus
 >
   {#snippet trigger(props)}
@@ -363,12 +343,7 @@
       aria-expanded={open}
       data-testid="transcript-navigator-toggle"
       data-tauri-no-drag
-      use:manageFindTooltipSuppression
-      onclick={() => {
-        findTooltipOpen = false;
-        findTooltipSuppressed = true;
-        navigatorState.open = true;
-      }}
+      onclick={() => (navigatorState.open = true)}
     >
       <TableOfContents size={16} aria-hidden="true" />
     </button>

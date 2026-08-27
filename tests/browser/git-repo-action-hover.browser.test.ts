@@ -9,6 +9,7 @@ const { listing } = vi.hoisted(() => ({
       default_branch: "main",
       available: true,
       is_bare: false,
+      last_commit_at: null,
       local_branches: [],
       remote_branches: [],
       detached_worktrees: [],

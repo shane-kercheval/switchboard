@@ -143,6 +143,63 @@ describe("Tooltip", () => {
     expect(screen.queryByTestId("tooltip-content")).not.toBeInTheDocument();
   });
 
+  it("requires a fresh hover when external suppression ends over the trigger", async () => {
+    render(Harness, { props: { mode: "suppressed" } });
+    const trigger = screen.getByTestId("tt-trigger");
+
+    await fireEvent.pointerEnter(trigger);
+    await vi.advanceTimersByTimeAsync(700);
+    expect(await waitFor(() => screen.getByTestId("tooltip-content"))).toHaveTextContent(
+      "externally suppressed",
+    );
+
+    await fireEvent.click(screen.getByTestId("tt-suppress"));
+    await waitFor(() => expect(screen.queryByTestId("tooltip-content")).not.toBeInTheDocument());
+    await fireEvent.click(screen.getByTestId("tt-release"));
+    await fireEvent.pointerMove(trigger);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(screen.queryByTestId("tooltip-content")).not.toBeInTheDocument();
+
+    await fireEvent.pointerLeave(trigger);
+    await fireEvent.pointerEnter(trigger);
+    await vi.advanceTimersByTimeAsync(700);
+    expect(await waitFor(() => screen.getByTestId("tooltip-content"))).toHaveTextContent(
+      "externally suppressed",
+    );
+  });
+
+  it("allows the next hover when external suppression ends outside the trigger", async () => {
+    render(Harness, { props: { mode: "suppressed" } });
+    const trigger = screen.getByTestId("tt-trigger");
+
+    await fireEvent.pointerEnter(trigger);
+    await fireEvent.click(screen.getByTestId("tt-suppress"));
+    await fireEvent.pointerLeave(trigger);
+    await fireEvent.click(screen.getByTestId("tt-release"));
+    await fireEvent.pointerMove(trigger);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(screen.queryByTestId("tooltip-content")).not.toBeInTheDocument();
+
+    await fireEvent.pointerEnter(trigger);
+    await vi.advanceTimersByTimeAsync(700);
+    expect(await waitFor(() => screen.getByTestId("tooltip-content"))).toHaveTextContent(
+      "externally suppressed",
+    );
+  });
+
+  it("does not reopen on leave and re-entry while externally suppressed", async () => {
+    render(Harness, { props: { mode: "suppressed" } });
+    const trigger = screen.getByTestId("tt-trigger");
+
+    await fireEvent.click(screen.getByTestId("tt-suppress"));
+    await fireEvent.pointerEnter(trigger);
+    await fireEvent.pointerLeave(trigger);
+    await fireEvent.pointerEnter(trigger);
+    await fireEvent.pointerMove(trigger);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(screen.queryByTestId("tooltip-content")).not.toBeInTheDocument();
+  });
+
   it("does not restore a state-control tooltip when the window regains focus", async () => {
     render(Harness, { props: { mode: "fresh-hover" } });
     const trigger = screen.getByTestId("tt-trigger");

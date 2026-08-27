@@ -74,7 +74,14 @@
   import { createAttachmentKey, type Attachment } from "svelte/attachments";
   import { Tooltip as Bits, Portal } from "bits-ui";
 
-  type ReopenBehavior = "default" | "fresh-hover";
+  type ReopenProps =
+    | {
+        reopen: "fresh-hover";
+        /// Caller-owned active suppression. Releasing it keeps pointer opening
+        /// latched until the trigger receives a native pointerenter.
+        suppressed?: boolean;
+      }
+    | { reopen?: "default"; suppressed?: never };
 
   type Common = {
     side?: "top" | "bottom" | "left" | "right";
@@ -93,11 +100,13 @@
     /// Actionable state controls close on activation and stay quiet until the
     /// pointer genuinely leaves and re-enters. They also use the full hover
     /// delay on every entry instead of the recent-tooltip grace period.
-    reopen?: ReopenBehavior;
     open?: boolean;
     /// Receives the bits-ui trigger props — spread them onto your element.
+    /// Attributes declared afterward replace matching delegated handlers,
+    /// including click, focus/blur, and pointer enter/leave. Compose caller
+    /// behavior with a `use:` action or native listener instead.
     trigger: Snippet<[Record<string, unknown>]>;
-  };
+  } & ReopenProps;
   type LabelProps = Common & {
     label: string;
     /// Keyboard-shortcut hint shown beneath the label (label mode only).
@@ -121,6 +130,7 @@
     openOnHover = true,
     focusable = true,
     reopen = "default",
+    suppressed = false,
     open = $bindable(false),
     trigger,
     ...rest
@@ -133,6 +143,7 @@
   let activationSuppressed = false;
   let windowSuppressed = false;
   let pointerInside = false;
+  let wasExternallySuppressed = false;
 
   type EventHandler = (event: Event) => void;
 
@@ -142,13 +153,22 @@
 
   function closeAndSuppressAfterActivation(): void {
     tether.close();
-    activationSuppressed = pointerInside;
+    activationSuppressed = true;
   }
 
   function suppressForWindowChange(): void {
     tether.close();
     windowSuppressed = true;
   }
+
+  $effect(() => {
+    if (suppressed) {
+      tether.close();
+    } else if (wasExternallySuppressed) {
+      activationSuppressed = true;
+    }
+    wasExternallySuppressed = suppressed;
+  });
 
   const freshHoverAttachment: Attachment<HTMLElement> = (node) => {
     activationSuppressed = false;
@@ -173,23 +193,27 @@
   function handlePointerEnter(event: PointerEvent, bitsHandler: EventHandler | undefined): void {
     const freshEntry = !pointerInside;
     pointerInside = true;
+    if (suppressed) return;
+    // A native pointerenter proves a real re-entry even if layout movement made
+    // the preceding pointerleave unobservable to this trigger.
+    activationSuppressed = false;
     if (windowSuppressed && freshEntry) windowSuppressed = false;
-    if (!activationSuppressed && !windowSuppressed) bitsHandler?.(event);
+    if (!windowSuppressed) bitsHandler?.(event);
   }
 
   function handlePointerMove(event: PointerEvent, bitsHandler: EventHandler | undefined): void {
-    if (!activationSuppressed && !windowSuppressed) bitsHandler?.(event);
+    if (!suppressed && !activationSuppressed && !windowSuppressed) bitsHandler?.(event);
   }
 
   function handlePointerLeave(event: PointerEvent, bitsHandler: EventHandler | undefined): void {
     bitsHandler?.(event);
-    activationSuppressed = false;
+    activationSuppressed = true;
     windowSuppressed = false;
     pointerInside = false;
   }
 
   function handleFocus(event: FocusEvent, bitsHandler: EventHandler | undefined): void {
-    if (focusAfterWindowChangeAllowed()) bitsHandler?.(event);
+    if (!suppressed && focusAfterWindowChangeAllowed()) bitsHandler?.(event);
   }
 
   function freshHoverTriggerProps(props: Record<string, unknown>): Record<PropertyKey, unknown> {

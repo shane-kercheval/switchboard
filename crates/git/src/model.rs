@@ -9,7 +9,7 @@
 //! - **Worktree-level** ([`WorktreeView`]): uncommitted changes and the
 //!   orphaned/prunable warnings — only present for a branch that is checked out.
 //!
-//! Remote branches ([`RemoteBranchView`]) carry only the two cleanup signals
+//! Remote branches ([`RemoteBranchView`]) carry only the two cleanup status signals
 //! (`merged`, `behind_base`) — the rest is meaningless for a remote-tracking
 //! ref (no working tree, no own-upstream, can't have a deleted upstream).
 
@@ -39,6 +39,9 @@ pub struct RepoView {
     /// worktrees layout). Its branches and linked worktrees still list; the bare
     /// root simply reports no working-tree status of its own.
     pub is_bare: bool,
+    /// Newest committer timestamp among the distinct local and remote branch
+    /// tips, as RFC-3339. `None` for an empty or unavailable repository.
+    pub last_commit_at: Option<String>,
     pub local_branches: Vec<BranchView>,
     pub remote_branches: Vec<RemoteBranchView>,
     /// Worktrees checked out at a detached HEAD (no branch to attach them to),
@@ -59,6 +62,7 @@ impl RepoView {
             default_branch: None,
             available: false,
             is_bare: false,
+            last_commit_at: None,
             local_branches: Vec::new(),
             remote_branches: Vec::new(),
             detached_worktrees: Vec::new(),
@@ -86,6 +90,9 @@ pub struct BranchView {
     /// The branch had an upstream that no longer exists (the remote branch was
     /// deleted) — a stale-branch cleanup signal.
     pub dangling: bool,
+    /// Canonical browser URL for this branch when its live upstream uses a
+    /// recognized GitHub-owned remote.
+    pub github_url: Option<String>,
     /// The worktree this branch is checked out in, if any.
     pub worktree: Option<WorktreeView>,
 }
@@ -117,11 +124,15 @@ pub enum SyncState {
     Unknown,
 }
 
-/// A remote-tracking branch (`origin/*`). Carries only the cleanup signals — see
-/// the module doc for why the local-branch fields don't apply.
+/// A remote-tracking branch (`origin/*`). Carries only the cleanup status
+/// signals, plus optional hosting metadata — see the module doc for why the
+/// local-branch fields don't apply.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RemoteBranchView {
     pub name: String,
+    /// Canonical browser URL when this remote-tracking branch uses a recognized
+    /// GitHub-owned remote.
+    pub github_url: Option<String>,
     /// Already an ancestor of the default branch? ("stale remote, safe to
     /// delete"). `None` when the default branch can't be resolved.
     pub merged: Option<bool>,

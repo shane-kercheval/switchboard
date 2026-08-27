@@ -55,7 +55,11 @@ fn commit_all(dir: &Path, message: &str) {
 /// under the `TOPOLOGICAL | TIME` revwalk and sibling order becomes
 /// non-deterministic — a fixed epoch makes order-sensitive tests stable.
 fn git_dated(dir: &Path, epoch: i64, args: &[&str]) -> String {
-    let date = format!("@{epoch} +0000");
+    git_dated_with_offset(dir, epoch, "+0000", args)
+}
+
+fn git_dated_with_offset(dir: &Path, epoch: i64, offset: &str, args: &[&str]) -> String {
+    let date = format!("@{epoch} {offset}");
     let output = Command::new("git")
         .args(args)
         .current_dir(dir)
@@ -76,6 +80,11 @@ fn git_dated(dir: &Path, epoch: i64, args: &[&str]) -> String {
 fn commit_all_at(dir: &Path, message: &str, epoch: i64) {
     git(dir, &["add", "-A"]);
     git_dated(dir, epoch, &["commit", "-q", "-m", message]);
+}
+
+fn commit_all_at_offset(dir: &Path, message: &str, epoch: i64, offset: &str) {
+    git(dir, &["add", "-A"]);
+    git_dated_with_offset(dir, epoch, offset, &["commit", "-q", "-m", message]);
 }
 
 /// A repo with one commit on `main`. Returns the tempdir (kept alive by caller).
@@ -134,6 +143,70 @@ fn unavailable_path_yields_marked_view_not_error() {
     assert!(view.local_branches.is_empty());
     assert!(view.remote_branches.is_empty());
     assert!(view.default_branch.is_none());
+    assert!(view.last_commit_at.is_none());
+}
+
+#[test]
+fn repo_last_commit_at_uses_newest_local_or_remote_branch_tip() {
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    write(repo.path(), "README.md", "main\n");
+    commit_all_at(repo.path(), "main", 1_700_000_000);
+
+    git(repo.path(), &["switch", "-q", "-c", "feature"]);
+    write(repo.path(), "feature.txt", "feature\n");
+    commit_all_at(repo.path(), "feature", 1_700_000_100);
+
+    git(repo.path(), &["switch", "-q", "main"]);
+    let local_view = read_repo(repo.path()).unwrap();
+    assert_eq!(
+        local_view.last_commit_at.as_deref(),
+        Some("2023-11-14T22:15:00+00:00")
+    );
+
+    git(repo.path(), &["switch", "-q", "-c", "remote-only"]);
+    write(repo.path(), "remote.txt", "remote\n");
+    commit_all_at(repo.path(), "remote", 1_700_000_200);
+    let remote_tip = git(repo.path(), &["rev-parse", "HEAD"]);
+    git(repo.path(), &["switch", "-q", "main"]);
+    git(repo.path(), &["branch", "-D", "remote-only"]);
+    git(
+        repo.path(),
+        &["update-ref", "refs/remotes/upstream/recent", &remote_tip],
+    );
+
+    let view = read_repo(repo.path()).unwrap();
+    assert_eq!(
+        view.last_commit_at.as_deref(),
+        Some("2023-11-14T22:16:40+00:00")
+    );
+}
+
+#[test]
+fn repo_last_commit_at_compares_instants_across_offsets() {
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    write(repo.path(), "README.md", "main\n");
+    commit_all_at_offset(repo.path(), "main", 1_700_000_200, "-0500");
+
+    git(repo.path(), &["switch", "-q", "-c", "later-wall-clock"]);
+    write(repo.path(), "feature.txt", "feature\n");
+    commit_all_at_offset(repo.path(), "feature", 1_700_000_100, "+0900");
+
+    let view = read_repo(repo.path()).unwrap();
+    assert_eq!(
+        view.last_commit_at.as_deref(),
+        Some("2023-11-14T17:16:40-05:00")
+    );
+}
+
+#[test]
+fn empty_repo_has_no_last_commit_at() {
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+
+    let view = read_repo(repo.path()).unwrap();
+    assert!(view.last_commit_at.is_none());
 }
 
 #[test]
@@ -388,6 +461,164 @@ fn remote_branches_carry_merged_and_behind_base_only() {
             .any(|b| b.name.ends_with("/HEAD")),
         "origin/HEAD must be filtered out"
     );
+}
+
+#[test]
+fn github_urls_follow_the_branch_remote_and_hide_a_deleted_upstream() {
+    let (_bare, clone) = cloned_repo();
+    git(clone.path(), &["checkout", "-q", "-b", "feature/slash"]);
+    git(
+        clone.path(),
+        &["push", "-q", "-u", "origin", "feature/slash"],
+    );
+    git(clone.path(), &["remote", "rename", "origin", "fork"]);
+    git(
+        clone.path(),
+        &[
+            "remote",
+            "set-url",
+            "fork",
+            "git@github.com:acme/widgets.git",
+        ],
+    );
+
+    let view = read_repo(clone.path()).unwrap();
+    let local = branch_view(&view, "feature/slash");
+    assert_eq!(local.upstream.as_deref(), Some("fork/feature/slash"));
+    assert_eq!(
+        local.github_url.as_deref(),
+        Some("https://github.com/acme/widgets/tree/feature/slash")
+    );
+    let remote = view
+        .remote_branches
+        .iter()
+        .find(|branch| branch.name == "fork/feature/slash")
+        .expect("fork/feature/slash should be listed");
+    assert_eq!(
+        remote.github_url.as_deref(),
+        Some("https://github.com/acme/widgets/tree/feature/slash")
+    );
+
+    git(
+        clone.path(),
+        &["update-ref", "-d", "refs/remotes/fork/feature/slash"],
+    );
+    let view = read_repo(clone.path()).unwrap();
+    let local = branch_view(&view, "feature/slash");
+    assert!(local.dangling);
+    assert_eq!(local.github_url, None);
+}
+
+#[test]
+fn local_github_url_uses_the_configured_upstream_branch_name() {
+    let (_bare, clone) = cloned_repo();
+    git(clone.path(), &["checkout", "-q", "-b", "published"]);
+    git(clone.path(), &["push", "-q", "origin", "published"]);
+    git(
+        clone.path(),
+        &["checkout", "-q", "-b", "local-name", "main"],
+    );
+    git(
+        clone.path(),
+        &[
+            "branch",
+            "--set-upstream-to",
+            "origin/published",
+            "local-name",
+        ],
+    );
+    git(
+        clone.path(),
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/acme/widgets.git",
+        ],
+    );
+
+    let view = read_repo(clone.path()).unwrap();
+    assert_eq!(
+        branch_view(&view, "local-name").github_url.as_deref(),
+        Some("https://github.com/acme/widgets/tree/published")
+    );
+}
+
+#[test]
+fn remote_github_urls_reverse_unique_fetch_mappings_and_hide_ambiguous_ones() {
+    let (_bare, clone) = cloned_repo();
+    git(
+        clone.path(),
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/acme/widgets.git",
+        ],
+    );
+    git(
+        clone.path(),
+        &["config", "--unset-all", "remote.origin.fetch"],
+    );
+    git(
+        clone.path(),
+        &[
+            "config",
+            "--add",
+            "remote.origin.fetch",
+            "+refs/heads/feature:refs/remotes/origin/review-feature",
+        ],
+    );
+    git(
+        clone.path(),
+        &["update-ref", "refs/remotes/origin/review-feature", "HEAD"],
+    );
+
+    let view = read_repo(clone.path()).unwrap();
+    let renamed = view
+        .remote_branches
+        .iter()
+        .find(|branch| branch.name == "origin/review-feature")
+        .expect("renamed tracking ref should be listed");
+    assert_eq!(
+        renamed.github_url.as_deref(),
+        Some("https://github.com/acme/widgets/tree/feature")
+    );
+
+    git(
+        clone.path(),
+        &["config", "--unset-all", "remote.origin.fetch"],
+    );
+    for refspec in [
+        "+refs/heads/*:refs/remotes/origin/*",
+        "+refs/pull/*/head:refs/remotes/origin/pr/*",
+    ] {
+        git(
+            clone.path(),
+            &["config", "--add", "remote.origin.fetch", refspec],
+        );
+    }
+    git(
+        clone.path(),
+        &["update-ref", "refs/remotes/origin/pr/123", "HEAD"],
+    );
+
+    let view = read_repo(clone.path()).unwrap();
+    let main = view
+        .remote_branches
+        .iter()
+        .find(|branch| branch.name == "origin/main")
+        .expect("ordinary remote branch should remain listed");
+    assert_eq!(
+        main.github_url.as_deref(),
+        Some("https://github.com/acme/widgets/tree/main")
+    );
+    let pull_request = view
+        .remote_branches
+        .iter()
+        .find(|branch| branch.name == "origin/pr/123")
+        .expect("pull-request tracking ref should be listed");
+    assert_eq!(pull_request.github_url, None);
 }
 
 // --- worktrees: dirty/untracked, detached, orphaned, prunable -------------

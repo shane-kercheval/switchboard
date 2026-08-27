@@ -6,9 +6,8 @@
   ///
   /// No polling — `enterGitView` (called by App on toggle) runs the staleness-
   /// gated entry refresh; the global refresh button forces a re-read + fetch.
-  import { untrack } from "svelte";
-  import { SvelteSet } from "svelte/reactivity";
-  import { FolderPlus, RefreshCw } from "@lucide/svelte";
+  import { tick, untrack } from "svelte";
+  import { ArrowDownAZ, Clock3, FolderPlus, RefreshCw } from "@lucide/svelte";
   import { cn } from "$lib/utils";
   import Button from "$lib/components/ui/Button.svelte";
   import EmptyState from "$lib/components/ui/EmptyState.svelte";
@@ -44,6 +43,13 @@
     removeRepo,
     gitRefresh,
     hoverSuppressed,
+    collapsedRepoRoots,
+    repoListScroll,
+    repoSort,
+    repoListingsInDisplayOrder,
+    setRepoSortMode,
+    snapshotRepoSort,
+    takeRepoReveal,
   } from "$lib/state/gitView.svelte";
   import {
     setCommandSource,
@@ -57,7 +63,6 @@
 
   let branchFilter = $state<"local" | "remote" | "both">("both");
   let showInactive = $state(false);
-  const collapsedRepoRoots = new SvelteSet<string>();
   let refreshing = $state(false);
   let adding = $state(false);
   let addError = $state<string | null>(null);
@@ -73,10 +78,16 @@
   let draftRepoWidth = $state<number | null>(null);
   const repoWidth = $derived(draftRepoWidth ?? layout.gitRepoWidth);
   let detailExpanded = $state(false);
+  let repoListElement = $state<HTMLDivElement>();
   const allReposCollapsed = $derived(
     gitView.repos.length > 0 &&
       gitView.repos.every((listing) => collapsedRepoRoots.has(listing.repo.root)),
   );
+  const sortedRepos = $derived.by(repoListingsInDisplayOrder);
+
+  function toggleRepoSort(): void {
+    setRepoSortMode(repoSort.mode === "recent" ? "alphabetical" : "recent");
+  }
 
   function setRepoExpanded(repoRoot: string, expanded: boolean): void {
     if (expanded) collapsedRepoRoots.delete(repoRoot);
@@ -89,6 +100,24 @@
     } else {
       for (const listing of gitView.repos) collapsedRepoRoots.add(listing.repo.root);
     }
+  }
+
+  function rememberRepoScroll(node: HTMLElement): { destroy: () => void } {
+    node.scrollTop = repoListScroll.top;
+    const remember = (): void => {
+      repoListScroll.top = node.scrollTop;
+    };
+    node.addEventListener("scroll", remember, { passive: true });
+    return {
+      destroy: () => node.removeEventListener("scroll", remember),
+    };
+  }
+
+  function scrollRepoIntoView(root: string): void {
+    const repo = Array.from(
+      repoListElement?.querySelectorAll('[data-testid="git-repo"]') ?? [],
+    ).find((node) => node.getAttribute("data-repo-root") === root);
+    repo?.scrollIntoView({ block: "nearest" });
   }
 
   function onWindowPointerMove(): void {
@@ -132,6 +161,14 @@
   });
 
   $effect(() => {
+    const repoRoot = takeRepoReveal();
+    if (repoRoot === null) return;
+    collapsedRepoRoots.delete(repoRoot);
+    detailExpanded = false;
+    void tick().then(() => scrollRepoIntoView(repoRoot));
+  });
+
+  $effect(() => {
     window.addEventListener("keydown", handleKeydown);
     return () => window.removeEventListener("keydown", handleKeydown);
   });
@@ -145,8 +182,9 @@
   async function onGlobalRefresh(): Promise<void> {
     refreshing = true;
     try {
-      await refreshAll();
+      await refreshAll({ snapshotOrder: false });
       await fetchAll();
+      snapshotRepoSort();
     } finally {
       refreshing = false;
     }
@@ -361,6 +399,29 @@
           </Tooltip>
 
           {#if gitView.repos.length > 1}
+            {@const sortLabel =
+              repoSort.mode === "recent"
+                ? "Sort repositories by name"
+                : "Sort repositories by latest commit"}
+            <Tooltip label={sortLabel} side="bottom" reopen="fresh-hover">
+              {#snippet trigger(props)}
+                <button
+                  {...props}
+                  type="button"
+                  class={ICON_BUTTON_CLASS}
+                  aria-label={sortLabel}
+                  data-testid="git-repos-sort"
+                  onclick={toggleRepoSort}
+                >
+                  {#if repoSort.mode === "recent"}
+                    <Clock3 size={14} aria-hidden="true" />
+                  {:else}
+                    <ArrowDownAZ size={14} aria-hidden="true" />
+                  {/if}
+                </button>
+              {/snippet}
+            </Tooltip>
+
             {@const label = allReposCollapsed
               ? "Expand all repositories"
               : "Collapse all repositories"}
@@ -451,6 +512,8 @@
         class="git-scrollbar bg-raised flex min-h-0 shrink-0 [scrollbar-gutter:stable] flex-col gap-1 overflow-y-scroll p-2"
         style={`width: ${repoWidth}px`}
         data-testid="git-repo-list"
+        bind:this={repoListElement}
+        use:rememberRepoScroll
       >
         {#if gitView.status === "loading" && gitView.repos.length === 0}
           <EmptyState testid="git-loading" title="Loading repositories…" />
@@ -478,7 +541,7 @@
             {/snippet}
           </EmptyState>
         {:else}
-          {#each gitView.repos as listing (listing.repo.root)}
+          {#each sortedRepos as listing (listing.repo.root)}
             <GitRepoNode
               {listing}
               {branchFilter}

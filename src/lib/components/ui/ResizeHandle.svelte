@@ -61,6 +61,7 @@
   const KEYBOARD_STEP_PX = 16;
 
   let drag: { startX: number; startValue: number; last: number; moved: boolean } | null = null;
+  let resizeTooltipSuppressed = $state(false);
   /// Armed by the first arrow press, finalized on key release / blur — the
   /// keyboard counterpart of `drag`, so a held key repeats drafts but persists
   /// once.
@@ -86,8 +87,23 @@
     ariaMax = Math.round(max());
   }
 
+  function manageKeyboardFocus(node: HTMLElement): { destroy: () => void } {
+    // Native listeners compose with Tooltip's delegated focus handlers; Svelte
+    // attributes here would replace them after `{...props}`.
+    const onFocus = (): void => refreshAria();
+    node.addEventListener("focus", onFocus);
+    node.addEventListener("blur", finalizeKeyboard);
+    return {
+      destroy(): void {
+        node.removeEventListener("focus", onFocus);
+        node.removeEventListener("blur", finalizeKeyboard);
+      },
+    };
+  }
+
   function onPointerDown(event: PointerEvent): void {
     const start = startValue();
+    resizeTooltipSuppressed = true;
     drag = { startX: event.clientX, startValue: start, last: start, moved: false };
     event.preventDefault();
   }
@@ -104,6 +120,7 @@
     if (drag === null) return;
     if (drag.moved) onCommit(drag.last);
     drag = null;
+    if (keyboardDraft === null) resizeTooltipSuppressed = false;
   }
 
   function onKeydown(event: KeyboardEvent): void {
@@ -114,6 +131,7 @@
     const current = keyboardDraft?.last ?? startValue();
     const next = clampValue(current + sign * direction * KEYBOARD_STEP_PX, min, max());
     keyboardDraft = { last: next };
+    resizeTooltipSuppressed = true;
     refreshAria(next);
     onDraft?.(next);
   }
@@ -122,6 +140,7 @@
     if (keyboardDraft === null) return;
     onCommit(keyboardDraft.last);
     keyboardDraft = null;
+    if (drag === null) resizeTooltipSuppressed = false;
   }
 
   function onKeyup(event: KeyboardEvent): void {
@@ -142,7 +161,14 @@
   onblur={onWindowBlur}
 />
 
-<Tooltip label="Drag to resize · double-click to reset">
+<!-- Keep the tooltip inside the sized pane; top placement on a full-height
+     handle pushes it against the window edge instead of beside the divider. -->
+<Tooltip
+  side={edge === "start" ? "right" : "left"}
+  reopen="fresh-hover"
+  suppressed={resizeTooltipSuppressed}
+  ignoreNonKeyboardFocus={false}
+>
   {#snippet trigger(props)}
     <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
     <div
@@ -155,6 +181,7 @@
       aria-valuemax={ariaMax}
       tabindex="0"
       data-testid={testid}
+      use:manageKeyboardFocus
       class={cn(
         "focus-visible:ring-focus shrink-0 cursor-col-resize touch-none focus-visible:ring-1 focus-visible:outline-none",
         className,
@@ -163,8 +190,11 @@
       ondblclick={onReset}
       onkeydown={onKeydown}
       onkeyup={onKeyup}
-      onfocus={() => refreshAria()}
-      onblur={finalizeKeyboard}
     ></div>
   {/snippet}
+  <!-- The trigger already exposes this identity as its accessible name. -->
+  <div class="text-[13px] font-medium" aria-hidden="true">{label}</div>
+  <div class="text-primary-fg/70 mt-1 text-[12px]">
+    Drag · <span class="font-mono">← →</span> · double-click to reset
+  </div>
 </Tooltip>

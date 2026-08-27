@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen } from "@testing-library/svelte";
+import { fireEvent, render, screen, waitFor } from "@testing-library/svelte";
 import ResizeHandle from "./ResizeHandle.svelte";
 
 type Overrides = Partial<{
@@ -41,6 +41,85 @@ describe("ResizeHandle", () => {
     await drag(handle, 100, [140, 160]);
     expect(onDraft.mock.calls.map((c) => c[0])).toEqual([340, 360]);
     expect(onCommit).toHaveBeenCalledExactlyOnceWith(360);
+  });
+
+  it("hides the resize tooltip throughout a drag and requires a fresh hover afterward", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const handle = mount();
+      await fireEvent.pointerEnter(handle);
+      await vi.advanceTimersByTimeAsync(700);
+      const tooltip = await waitFor(() => screen.getByTestId("tooltip-content"));
+      expect(tooltip).toHaveTextContent("Resize");
+      expect(tooltip).toHaveTextContent("← →");
+      expect(tooltip).toHaveTextContent("double-click to reset");
+      expect(screen.getByText("Resize")).toHaveAttribute("aria-hidden", "true");
+
+      await fireEvent.pointerDown(handle, { clientX: 100 });
+      await waitFor(() => expect(screen.queryByTestId("tooltip-content")).not.toBeInTheDocument());
+      await fireEvent.pointerMove(window, { clientX: 140 });
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(screen.queryByTestId("tooltip-content")).not.toBeInTheDocument();
+
+      await fireEvent.pointerUp(window);
+      await fireEvent.pointerMove(handle);
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(screen.queryByTestId("tooltip-content")).not.toBeInTheDocument();
+
+      await fireEvent.pointerLeave(handle);
+      await fireEvent.pointerEnter(handle);
+      await vi.advanceTimersByTimeAsync(700);
+      expect(await waitFor(() => screen.getByTestId("tooltip-content"))).toHaveTextContent(
+        "Resize",
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("stays suppressed when the pointer leaves and re-enters during a drag", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const handle = mount();
+      await fireEvent.pointerEnter(handle);
+      await vi.advanceTimersByTimeAsync(700);
+      await waitFor(() => screen.getByTestId("tooltip-content"));
+
+      await fireEvent.pointerDown(handle, { clientX: 100 });
+      await fireEvent.pointerLeave(handle);
+      await fireEvent.pointerEnter(handle);
+      await fireEvent.pointerMove(handle);
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(screen.queryByTestId("tooltip-content")).not.toBeInTheDocument();
+
+      await fireEvent.pointerLeave(handle);
+      await fireEvent.pointerUp(window);
+      await fireEvent.pointerEnter(handle);
+      await vi.advanceTimersByTimeAsync(700);
+      expect(await waitFor(() => screen.getByTestId("tooltip-content"))).toHaveTextContent(
+        "Resize",
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([
+    ["end", "left"],
+    ["start", "right"],
+  ] as const)("places an %s-edge tooltip on the %s", async (edge, side) => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const handle = mount({ edge });
+      await fireEvent.pointerEnter(handle);
+      await vi.advanceTimersByTimeAsync(700);
+      expect(await waitFor(() => screen.getByTestId("tooltip-content"))).toHaveAttribute(
+        "data-side",
+        side,
+      );
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("inverts the axis for a start-edge handle", async () => {
@@ -140,6 +219,35 @@ describe("ResizeHandle", () => {
     await fireEvent.keyUp(handle, { key: "ArrowLeft" });
     expect(onCommit).toHaveBeenCalledExactlyOnceWith(316);
     expect(handle.getAttribute("aria-valuenow")).toBe("316");
+  });
+
+  it("hides the tooltip during keyboard resizing until the handle is focused again", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const handle = mount();
+      await fireEvent.keyDown(window, { key: "Tab" });
+      await fireEvent.focus(handle);
+      await vi.advanceTimersByTimeAsync(700);
+      expect(await waitFor(() => screen.getByTestId("tooltip-content"))).toHaveTextContent(
+        "Resize",
+      );
+
+      await fireEvent.keyDown(handle, { key: "ArrowRight" });
+      await waitFor(() => expect(screen.queryByTestId("tooltip-content")).not.toBeInTheDocument());
+      await fireEvent.keyUp(handle, { key: "ArrowRight" });
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(screen.queryByTestId("tooltip-content")).not.toBeInTheDocument();
+
+      await fireEvent.blur(handle);
+      await fireEvent.keyDown(window, { key: "Tab" });
+      await fireEvent.focus(handle);
+      await vi.advanceTimersByTimeAsync(700);
+      expect(await waitFor(() => screen.getByTestId("tooltip-content"))).toHaveTextContent(
+        "Resize",
+      );
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("keyboard steps clamp at the bounds and invert for a start-edge handle", async () => {

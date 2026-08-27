@@ -19,6 +19,7 @@
       | "non-focusable"
       | "focus-only"
       | "non-hoverable"
+      | "suppressed"
       | "dynamic",
   }: {
     mode?:
@@ -32,11 +33,13 @@
       | "non-focusable"
       | "focus-only"
       | "non-hoverable"
+      | "suppressed"
       | "dynamic";
   } = $props();
   let toggleCount = $state(0);
   let showFirst = $state(true);
   let boundOpen = $state(false);
+  let externallySuppressed = $state(false);
   let dynamicReopen = $state<"default" | "fresh-hover">("fresh-hover");
 </script>
 
@@ -114,6 +117,18 @@
   </Tooltip>
 {:else if mode === "non-hoverable"}
   <Tooltip label="non-hoverable tooltip" disableHoverableContent>
+    {#snippet trigger(props)}
+      <button {...props} type="button" data-testid="tt-trigger">trigger</button>
+    {/snippet}
+  </Tooltip>
+{:else if mode === "suppressed"}
+  <button type="button" data-testid="tt-suppress" onclick={() => (externallySuppressed = true)}>
+    suppress
+  </button>
+  <button type="button" data-testid="tt-release" onclick={() => (externallySuppressed = false)}>
+    release
+  </button>
+  <Tooltip label="externally suppressed" reopen="fresh-hover" suppressed={externallySuppressed}>
     {#snippet trigger(props)}
       <button {...props} type="button" data-testid="tt-trigger">trigger</button>
     {/snippet}

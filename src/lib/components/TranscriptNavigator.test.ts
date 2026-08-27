@@ -329,8 +329,17 @@ describe("TranscriptNavigator", () => {
     await fireEvent.click(screen.getByTestId("dialog-close"));
     await waitFor(() => expect(screen.queryByTestId("dialog-content")).not.toBeInTheDocument());
     await tick();
-    await vi.advanceTimersByTimeAsync(500);
-    expect(screen.queryByTestId("tooltip-content")).not.toBeInTheDocument();
+    await fireEvent.pointerMove(toggle);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(screen.getByTestId("tooltip-content")).toHaveAttribute("data-state", "closed");
+
+    await fireEvent.pointerLeave(toggle);
+    await fireEvent.pointerEnter(toggle);
+    await vi.advanceTimersByTimeAsync(700);
+    await waitFor(() =>
+      expect(screen.getByTestId("tooltip-content")).toHaveAttribute("data-state", "delayed-open"),
+    );
+    expect(screen.getByTestId("tooltip-content")).toHaveTextContent("Find messages");
   });
 
   it("keeps a visible find tooltip closed when the dialog opens externally", async () => {
@@ -351,8 +360,17 @@ describe("TranscriptNavigator", () => {
     await fireEvent.click(screen.getByTestId("dialog-close"));
     await waitFor(() => expect(screen.queryByTestId("dialog-content")).not.toBeInTheDocument());
     await tick();
-    await vi.advanceTimersByTimeAsync(500);
-    expect(screen.queryByTestId("tooltip-content")).not.toBeInTheDocument();
+    await fireEvent.pointerMove(toggle);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(screen.getByTestId("tooltip-content")).toHaveAttribute("data-state", "closed");
+
+    await fireEvent.pointerLeave(toggle);
+    await fireEvent.pointerEnter(toggle);
+    await vi.advanceTimersByTimeAsync(700);
+    await waitFor(() =>
+      expect(screen.getByTestId("tooltip-content")).toHaveAttribute("data-state", "delayed-open"),
+    );
+    expect(screen.getByTestId("tooltip-content")).toHaveTextContent("Find messages");
   });
 
   it("type-to-filter narrows the list; the role filter composes with it", async () => {

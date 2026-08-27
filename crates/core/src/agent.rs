@@ -7,8 +7,10 @@ use crate::harness::HarnessKind;
 pub type AgentId = Uuid;
 
 /// One model/reasoning-effort configuration. Both axes stay optional because
-/// harness capabilities differ: Gemini has a model but no effort axis, while
-/// Antigravity exposes neither through Switchboard.
+/// neither is required: an agent may leave either (or both) unset and take the
+/// harness's own default. Antigravity is the one harness that constrains the
+/// pair — its valid effort levels are a property of the chosen model, so an
+/// effort without a model is rejected (`HarnessKind::effort_requires_model`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct AgentProfile {
     pub model: Option<String>,
@@ -47,7 +49,7 @@ pub struct AgentProfiles {
 ///
 /// **Identity → registry, regardless of when it's learned.** A session locator
 /// is agent *identity*, so it belongs on the `AgentRecord` whether it's
-/// pre-generated at creation (Claude, Gemini) or assigned by the harness at
+/// pre-generated at creation (Claude) or assigned by the harness at
 /// runtime (Codex, Antigravity). The governing rule is the *nature* of the
 /// data, not its acquisition time: consolidated identity lives in the registry;
 /// temporal/per-turn telemetry (cost, rate-limit) lives in a sidecar.
@@ -58,8 +60,8 @@ pub struct AgentProfiles {
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum SessionLocator {
-    /// Claude, Gemini, Antigravity — a single session UUID, pre-generated at
-    /// agent creation (Claude/Gemini) or captured at runtime (Antigravity).
+    /// Claude and Antigravity — a single session UUID, pre-generated at
+    /// agent creation (Claude) or captured at runtime (Antigravity).
     Uuid(Uuid),
     /// Codex — the runtime `thread_id` (a `String`, **not** guaranteed to be a
     /// UUID) plus the **local** date Codex partitioned its rollout file under
@@ -75,7 +77,7 @@ pub enum SessionLocator {
 
 impl SessionLocator {
     /// The session UUID, if this locator is the `Uuid` variant
-    /// (Claude/Gemini/Antigravity). `None` for a `Codex` locator (which has no
+    /// (Claude/Antigravity). `None` for a `Codex` locator (which has no
     /// single UUID). The natural accessor for the harnesses whose session is
     /// one UUID — used by arg-building, collision scans, and hydration.
     #[must_use]
@@ -103,17 +105,16 @@ impl SessionLocator {
 
     /// Whether this locator's shape is the one `harness` uses. The mapping is
     /// the inverse of [`crate::project::Project::register_agent`]'s per-harness
-    /// assignment: `Codex` ⇒ `HarnessKind::Codex`; `Uuid` ⇒ Claude / Gemini /
+    /// assignment: `Codex` ⇒ `HarnessKind::Codex`; `Uuid` ⇒ Claude /
     /// Antigravity. The single source of truth for "does this locator belong on
     /// this agent," so the registry update op can reject a mismatched capture
     /// rather than persist a record that would silently fail to resume.
     #[must_use]
     pub fn is_valid_for(&self, harness: HarnessKind) -> bool {
         match self {
-            SessionLocator::Uuid(_) => matches!(
-                harness,
-                HarnessKind::ClaudeCode | HarnessKind::Gemini | HarnessKind::Antigravity
-            ),
+            SessionLocator::Uuid(_) => {
+                matches!(harness, HarnessKind::ClaudeCode | HarnessKind::Antigravity)
+            }
             SessionLocator::Codex { .. } => harness == HarnessKind::Codex,
         }
     }
@@ -137,7 +138,7 @@ impl SessionLocator {
 /// directory context through every call.
 ///
 /// `session_locator` is the agent's session identity (see [`SessionLocator`]).
-/// Claude/Gemini pre-generate it at creation; Codex/Antigravity leave it `None`
+/// Claude pre-generates it at creation; Codex/Antigravity leave it `None`
 /// until the harness assigns one at runtime. The field is always written (as
 /// `null` when no locator yet), and the key is **required** on read — a record
 /// missing it entirely is treated as corruption and fails loud (see
@@ -208,7 +209,7 @@ pub struct AgentRecord {
     /// record. Serde alone cannot do this: it validates each field in isolation
     /// and cannot compare one against `harness`.
     ///
-    /// So: the Codex/Gemini/Antigravity **adapters** ignore this field, and are
+    /// So: the Codex/Antigravity **adapters** ignore this field, and are
     /// correct to — their `build_args` never reads it. Do not add "defensive"
     /// handling there; it would imply the state is reachable through normal use
     /// and invert the invariant. But the field is **not inert for non-Claude
@@ -312,7 +313,7 @@ impl AgentRecord {
 /// *missing* `Option` field with `None` silently; here that would mask a record
 /// written before the locator migration — one carrying the old `session_id` key
 /// and no `session_locator` — by loading it as "no locator" and dropping a
-/// Claude/Gemini agent's resume continuity. Forcing the key present turns that
+/// Claude agent's resume continuity. Forcing the key present turns that
 /// into a loud failure instead, surfacing an unmigrated record rather than
 /// degrading silently.
 fn deserialize_required_locator<'de, D>(deserializer: D) -> Result<Option<SessionLocator>, D::Error>
@@ -515,7 +516,6 @@ mod tests {
     fn is_valid_for_matches_the_registration_mapping() {
         let uuid = SessionLocator::Uuid(Uuid::now_v7());
         assert!(uuid.is_valid_for(HarnessKind::ClaudeCode));
-        assert!(uuid.is_valid_for(HarnessKind::Gemini));
         assert!(uuid.is_valid_for(HarnessKind::Antigravity));
         assert!(!uuid.is_valid_for(HarnessKind::Codex));
 
@@ -525,7 +525,6 @@ mod tests {
         };
         assert!(codex.is_valid_for(HarnessKind::Codex));
         assert!(!codex.is_valid_for(HarnessKind::ClaudeCode));
-        assert!(!codex.is_valid_for(HarnessKind::Gemini));
         assert!(!codex.is_valid_for(HarnessKind::Antigravity));
     }
 

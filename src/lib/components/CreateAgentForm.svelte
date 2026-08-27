@@ -3,7 +3,7 @@
   import type { AgentProfile, AgentRecord, HarnessAvailability, HarnessKind } from "$lib/types";
   import type { AgentFormSubmit } from "./CreateAgentForm.types";
   import { harnessUnavailableReason, isHarnessSelectable } from "$lib/harnessAvailability";
-  import { HARNESS_LABEL, HARNESS_ORDER_GEMINI_LAST } from "$lib/harnessDisplay";
+  import { HARNESS_LABEL, ALL_HARNESSES } from "$lib/harnessDisplay";
   import { defaultAgentName, defaultAgentNameForProfiles } from "$lib/agentSelection";
   import { loadPreferences, preferenceLoadState, preferences } from "$lib/preferences.svelte";
   import { normalizeAgentName, validateAgentName } from "$lib/agentName";
@@ -65,7 +65,7 @@
   /// session as-is. The user manages model/effort from the agent's actions menu
   /// afterward (the canonical place for an existing agent). The empty string is
   /// the "unset" sentinel for a create-mode harness with no capability on an
-  /// axis (Gemini's effort) — it maps to `undefined` on submit so the backend
+  /// axis — it maps to `undefined` on submit so the backend
   /// stores `None`.
   function defaultsFor(kind: HarnessKind): {
     primary: AgentProfile;
@@ -140,7 +140,7 @@
     /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 
   /// Attach-id validation is harness-aware, matching the backend contract:
-  /// Claude/Gemini/Antigravity identify a session by a UUID (`parse_uuid`),
+  /// Claude/Antigravity identify a session by a UUID (`parse_uuid`),
   /// but a Codex thread-id is an arbitrary string used verbatim — so the form
   /// must accept a non-UUID Codex id (a garbage value simply matches no
   /// session file and the backend rejects it). Non-empty is the right floor;
@@ -208,7 +208,7 @@
   function selectHarness(kind: HarnessKind): void {
     harness = kind;
     // Reset the pickers to the new harness's default so a stale, out-of-list
-    // value (e.g. a Codex model carried over to Gemini) can't be submitted.
+    // value (e.g. a Codex model carried over to Antigravity) can't be submitted.
     const defaults = defaultsFor(kind);
     primary = defaults.primary;
     secondary = defaults.secondary;
@@ -296,16 +296,16 @@
          by the fieldset+legend) styled as a segmented control: the input is
          visually hidden and the label is the pill; `has-[:focus-visible]` lights
          the pill when the radio is keyboard-focused. -->
-    <!-- One pill per harness, looped over `HARNESS_ORDER_GEMINI_LAST` (no
+    <!-- One pill per harness, looped over `ALL_HARNESSES` (no
          hardcoded set or fixed column count) so a new harness picks up the
          picker automatically. Columns are inline-styled because Tailwind
          can't generate a dynamic `grid-cols-N`. -->
     <div
       class={cn(SEGMENTED_CONTAINER_CLASS, "grid")}
-      style="grid-template-columns: repeat({HARNESS_ORDER_GEMINI_LAST.length}, minmax(0, 1fr));"
+      style="grid-template-columns: repeat({ALL_HARNESSES.length}, minmax(0, 1fr));"
       data-testid="harness-picker"
     >
-      {#each HARNESS_ORDER_GEMINI_LAST as kind (kind)}
+      {#each ALL_HARNESSES as kind (kind)}
         {@const unavailableReason = reason(kind)}
         {#snippet option(props: Record<string, unknown> = {})}
           <label

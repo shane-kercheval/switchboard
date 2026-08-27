@@ -10,7 +10,8 @@
 //! (see `docs/research/archive/antigravity-cli-observed.md`), so the `cwd` parameter is
 //! reserved for a future workspace scope and not scanned today.
 //!
-//! Kept separate from `gemini/skills.rs` rather than shared: Gemini's skills
+//! Kept separate from the other harnesses' skills loaders rather than shared:
+//! their layouts
 //! are flat (`~/.agents/skills/<name>/`) while Antigravity's are nested under
 //! plugins, so the directory walk genuinely differs — they share the `SKILL.md`
 //! convention but not the layout. Keep loaders separate until a stable shared

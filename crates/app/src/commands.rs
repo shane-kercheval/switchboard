@@ -2339,7 +2339,7 @@ pub fn reorder_agents_impl(
     Ok(agents)
 }
 
-/// Attach an existing harness session (Claude Code, Codex, Gemini, or
+/// Attach an existing harness session (Claude Code, Codex, or
 /// Antigravity) as a new Switchboard agent in the active project.
 ///
 /// Validation order:
@@ -2351,15 +2351,15 @@ pub fn reorder_agents_impl(
 /// 2. Take the directory-level `registry_write` mutex; the remaining steps run
 ///    under it so the cross-project session-id check + register form one atomic
 ///    step. Resolve the active project and its owning directory.
-/// 3. `existing_session_id` parses as a UUID — Claude/Gemini/Antigravity only;
+/// 3. `existing_session_id` parses as a UUID — Claude/Antigravity only;
 ///    Codex's thread-id is an arbitrary string and is used verbatim.
-/// 4. Per-harness session existence under `home_dir`. Claude / Gemini check a
+/// 4. Per-harness session existence under `home_dir`. Claude checks a
 ///    session file; Codex's discovery also returns the parsed `YYYY-MM-DD`
 ///    partition date; Antigravity checks that the server-assigned conversation
 ///    directory `brain/<uuid>/` exists (the transcript inside may be absent —
 ///    hydration degrades gracefully).
 /// 5. Session-id collision scan (loaded or not — the scan walks projects on
-///    disk). Scope differs by harness: Claude and Gemini scan only the active
+///    disk). Scope differs by harness: Claude scans only the active
 ///    project's **own directory** (`enumerate_directory_projects`) because
 ///    their session ids are caller-controlled and cwd-namespaced, so a widened
 ///    scan would false-reject a legitimately-distinct same-id-different-cwd
@@ -2402,7 +2402,7 @@ pub fn attach_agent_impl(
     // Capability check first — before any session-file lookup or registry
     // write. Load-bearing on this path (not just defense in depth): the
     // per-harness `register_attached_*` methods structurally omit the axes they
-    // can't carry (Gemini takes no effort, Antigravity takes neither), so an
+    // can't carry (Antigravity requires a model alongside an effort), so an
     // unsupported axis from the IPC must be rejected here or it would be
     // silently dropped rather than refused.
     check_selection_supported(harness, model.as_deref(), effort.as_deref())?;
@@ -2419,7 +2419,7 @@ pub fn attach_agent_impl(
         .cloned()
         .ok_or(AppError::NoDirectory)?;
 
-    // Claude/Gemini/Antigravity identify a session by a UUID, parsed per-arm
+    // Claude/Antigravity identify a session by a UUID, parsed per-arm
     // below. Codex's thread-id is an arbitrary string (not guaranteed a UUID),
     // so its arm uses `existing_session_id` verbatim — parsing it here would
     // wrongly reject a valid non-UUID Codex session.
@@ -2459,29 +2459,16 @@ pub fn attach_agent_impl(
                 effort,
             )?;
             // Codex-only: force SessionMeta on subsequent dispatches until one
-            // is genuinely observed. Claude/Gemini/Antigravity emit SessionMeta
+            // is genuinely observed. Claude/Antigravity emit SessionMeta
             // every dispatch — see step 7 docstring.
             lock(&state.needs_session_meta).insert(record.id);
             record
-        }
-        HarnessKind::Gemini => {
-            let session_uuid = parse_uuid(existing_session_id)?;
-            let candidate = locate_gemini_candidate(home_dir, &directory.path, session_uuid)?;
-            tracing::debug!(
-                session_id = %session_uuid,
-                path = %candidate.display(),
-                "gemini attach: bound to candidate"
-            );
-            check_gemini_session_id_unique(state, &directory, &session_uuid)?;
-            // Effort is already guaranteed `None` by `check_selection_supported`
-            // (Gemini lacks effort support); only `model` flows through.
-            project.register_attached_gemini_agent(name, session_uuid, model)?
         }
         HarnessKind::Antigravity => {
             let session_uuid = parse_uuid(existing_session_id)?;
             // Claude-shaped attach: a conversation UUID maps to exactly one
             // path (`brain/<uuid>/`), so validate that directory exists inline
-            // — no Codex/Gemini-style ambiguity locator (there is nothing to
+            // — no Codex-style ambiguity locator (there is nothing to
             // disambiguate). The brain dir, not the deeper
             // `.system_generated/.../transcript.jsonl`, is the existence
             // marker: a conversation present only as the encrypted `.pb` store
@@ -2498,7 +2485,7 @@ pub fn attach_agent_impl(
                 });
             }
             check_antigravity_session_id_unique(state, session_uuid)?;
-            // Claude/Gemini-shaped: the conversation UUID is the session
+            // Claude-shaped: the conversation UUID is the session
             // locator and is written straight onto the registry record — no
             // sidecar, no pre-generated-id ordering.
             project.register_attached_antigravity_agent(name, session_uuid)?
@@ -2584,7 +2571,7 @@ fn enumerate_all_projects(state: &AppState) -> Result<Vec<Project>, AppError> {
 /// Enumerate every project on disk under a **single** directory, preferring
 /// the in-memory `state.projects` entry for already-loaded projects.
 ///
-/// Used by the Claude / Gemini attach-flow collision scans. Those harnesses'
+/// Used by the Claude attach-flow collision scan. That harness's
 /// session ids are caller-supplied and namespaced by cwd (the directory), so a
 /// scan must stay **per-directory** — widening it across directories would
 /// false-reject a legitimately-distinct same-id-different-cwd session.
@@ -2607,9 +2594,9 @@ fn enumerate_directory_projects(
 }
 
 /// The UUID an agent's session locator carries, if it's the `Uuid` variant
-/// (Claude/Gemini/Antigravity). `None` for a Codex locator (which has no single
+/// (Claude/Antigravity). `None` for a Codex locator (which has no single
 /// UUID) or an unset locator. Thin `agent`-level adapter over
-/// [`SessionLocator::as_uuid`]; used by the Claude/Gemini collision scans,
+/// [`SessionLocator::as_uuid`]; used by the Claude collision scan,
 /// hydration, and session-info, which compare against a session UUID.
 fn locator_uuid(agent: &AgentRecord) -> Option<Uuid> {
     agent
@@ -2644,112 +2631,6 @@ fn check_claude_session_id_unique(
         }
     }
     Ok(())
-}
-
-/// Per-directory Gemini session-id collision check. Gemini agents carry
-/// `AgentRecord.session_locator = Some(SessionLocator::Uuid(uuid))` (Claude shape). Walks every project on
-/// disk in the **attach's target directory** and rejects if any agent already
-/// attached to the same UUID. Scoped per-directory for the same cwd-namespacing
-/// reason as Claude.
-fn check_gemini_session_id_unique(
-    state: &AppState,
-    directory: &Directory,
-    candidate: &Uuid,
-) -> Result<(), AppError> {
-    for project in enumerate_directory_projects(state, directory)? {
-        for agent in project.list_agents()? {
-            if agent.harness != HarnessKind::Gemini {
-                continue;
-            }
-            if locator_uuid(&agent) == Some(*candidate) {
-                return Err(AppError::SessionAlreadyAttached {
-                    existing_agent_id: agent.id,
-                    existing_agent_name: agent.name,
-                    existing_project_id: project.id,
-                    existing_project_name: project.config.name.clone(),
-                });
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Locate the Gemini session file for `session_id` in the cwd's
-/// `~/.gemini/tmp/<project-name>/chats/` directory. Wraps the shared
-/// header-scan classifier so attach uses the same disambiguation rule as
-/// transcript hydration — divergence between attach and hydrate is the
-/// exact bug class this helper exists to prevent.
-///
-/// Outcomes:
-/// - One candidate classifies as `Unambiguous` against the target → return
-///   its path.
-/// - Any candidate is `Ambiguous` (single file, multiple distinct session
-///   headers) → `AmbiguousSessionFile` with the candidate path. Under UUID
-///   v4 this is ~1/2^32, but `tracing::warn!` keeps the case forensically
-///   visible if it ever fires in production.
-/// - Candidate read fails (permissions, EIO, race-removed) →
-///   `AttachLookupFailed` carrying the path + source. Failing loud
-///   matches hydration's behavior; swallowing the error would silently
-///   collapse "session file unreadable" into "session does not exist"
-///   and send the user chasing UUID red herrings instead of `chmod`.
-/// - No candidate matches → `SessionFileNotFound`.
-fn locate_gemini_candidate(
-    home_dir: &Path,
-    cwd: &Path,
-    session_id: Uuid,
-) -> Result<PathBuf, AppError> {
-    let candidates =
-        switchboard_harness::gemini_session_file_candidates(home_dir, cwd, &session_id);
-    let mut chosen: Option<PathBuf> = None;
-    for path in &candidates {
-        let content =
-            std::fs::read_to_string(path).map_err(|err| AppError::AttachLookupFailed {
-                message: format!(
-                    "failed to read Gemini session candidate {}: {err}",
-                    path.display()
-                ),
-            })?;
-        match switchboard_harness::classify_gemini_candidate(&content, session_id) {
-            switchboard_harness::GeminiCandidateMatch::Unambiguous => {
-                chosen = Some(path.clone());
-                break;
-            }
-            switchboard_harness::GeminiCandidateMatch::Ambiguous => {
-                tracing::warn!(
-                    session_id = %session_id,
-                    path = %path.display(),
-                    "gemini attach: candidate file contains multiple session headers; rejecting as ambiguous"
-                );
-                return Err(AppError::AmbiguousSessionFile {
-                    harness: HarnessKind::Gemini,
-                    session_id: session_id.to_string(),
-                    paths: vec![path.clone()],
-                });
-            }
-            // `NoTarget` plus any future additive variant of the
-            // `#[non_exhaustive]` enum we don't yet recognize: doesn't
-            // match this target, continue to the next candidate.
-            // Conservative default — safer to fall through to
-            // `SessionFileNotFound` than to bind an unknown classifier
-            // outcome to the user's UUID.
-            _ => {}
-        }
-    }
-    chosen.ok_or_else(|| {
-        let expected = home_dir
-            .join(".gemini")
-            .join("tmp")
-            .join("<project>")
-            .join("chats")
-            .join(format!(
-                "session-*-{}.jsonl",
-                switchboard_harness::gemini_session_id_prefix(&session_id)
-            ));
-        AppError::SessionFileNotFound {
-            harness: HarnessKind::Gemini,
-            expected_path: expected.to_string_lossy().into_owned(),
-        }
-    })
 }
 
 /// Cross-directory Codex session-id collision check. The `thread_id` now lives
@@ -2790,7 +2671,7 @@ fn check_codex_session_id_unique(state: &AppState, candidate: &str) -> Result<()
 /// Reject attaching a conversation UUID already bound to another Antigravity
 /// agent across **all loaded directories**. The conversation id now lives on the
 /// `AgentRecord` (`session_locator`), so the scan reads the record — the same
-/// source Claude/Gemini use. Cross-directory because Antigravity conversation
+/// source Claude uses. Cross-directory because Antigravity conversation
 /// ids are server-assigned and globally unique: two agents resuming one
 /// `--conversation <uuid>` would interleave server-side
 /// (same-session-parallel-invocation).
@@ -3114,7 +2995,6 @@ pub(crate) fn adapter_for(
     match agent.harness {
         HarnessKind::ClaudeCode => Ok(Arc::clone(&state.claude_adapter)),
         HarnessKind::Codex => Ok(Arc::clone(&state.codex_adapter)),
-        HarnessKind::Gemini => Ok(Arc::clone(&state.gemini_adapter)),
         HarnessKind::Antigravity => Ok(Arc::clone(&state.antigravity_adapter)),
         _ => Err(AppError::UnsupportedHarness),
     }
@@ -4138,7 +4018,7 @@ fn load_agent_transcript_raw(
         }
         HarnessKind::Codex => {
             // The thread-id + partition-date now live on the record
-            // (`session_locator` → `Codex`), like Gemini — no sidecar lookup.
+            // (`session_locator` → `Codex`) — no sidecar lookup.
             // A never-dispatched agent (no locator) loads as empty but still
             // surfaces registry meta (empty thread-id → loader's empty path).
             let (session_id, partition_date) = match agent
@@ -4157,20 +4037,9 @@ fn load_agent_transcript_raw(
                 agent.id,
             )?)
         }
-        HarnessKind::Gemini => {
-            let Some(session_id) = locator_uuid(agent) else {
-                return Ok(switchboard_harness::LoadedTranscript::default());
-            };
-            Ok(switchboard_harness::load_gemini_transcript(
-                home_dir,
-                &directory_path,
-                session_id,
-                agent.id,
-            )?)
-        }
         HarnessKind::Antigravity => {
             // The conversation UUID now lives on the record (`session_locator`),
-            // like Gemini — no sidecar lookup. `None` (never dispatched) is
+            // — no sidecar lookup. `None` (never dispatched) is
             // passed through so the loader still surfaces registry meta.
             Ok(switchboard_harness::load_antigravity_transcript(
                 home_dir,
@@ -4187,7 +4056,7 @@ fn load_agent_transcript_raw(
 /// session file to open, and the interactive command to resume the session in a
 /// terminal. Both are `None` until the agent has a resolvable session — `Open`
 /// needs the file to exist on disk; `Resume` needs the agent to have dispatched
-/// at least once (for Claude/Gemini/Antigravity that coincides with the locator
+/// at least once (for Claude/Antigravity that coincides with the locator
 /// being on the record; for Codex the id lives in a sidecar written
 /// post-dispatch, so resume can be offered even if the local transcript file is
 /// absent).
@@ -4217,13 +4086,6 @@ pub(crate) fn resolve_session_file(
             let path = switchboard_harness::claude_session_file_path(home_dir, directory, &sid);
             path.exists().then_some(path)
         }
-        HarnessKind::Gemini => {
-            let sid = locator_uuid(agent)?;
-            let mut candidates =
-                switchboard_harness::gemini_session_file_candidates(home_dir, directory, &sid);
-            candidates.sort_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
-            candidates.pop()
-        }
         HarnessKind::Codex => {
             let (thread_id, partition_date) = agent
                 .session_locator
@@ -4249,8 +4111,8 @@ pub(crate) fn resolve_session_file(
 /// since we last read it." Gated on `(source_path, modified_at, byte_len)`
 /// together: `byte_len` is a near-free, more reliable signal than mtime alone
 /// for an append-only JSONL (and the offset baseline if incremental re-read is
-/// ever added), and `source_path` catches a file that moved (e.g. Gemini's
-/// candidate selection picking a different file).
+/// ever added), and `source_path` catches a file that moved (e.g. a harness
+/// whose candidate selection picks a different file).
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct SessionFingerprint {
     pub source_path: String,
@@ -4323,7 +4185,7 @@ pub fn project_session_fingerprints_impl(
 
 /// Resolve the per-agent session actions ([`AgentSessionInfo`]). Mirrors
 /// [`load_agent_transcript`]'s per-harness session-id resolution
-/// (Claude/Gemini/Antigravity from `AgentRecord.session_locator`; Codex from its
+/// (Claude/Antigravity from `AgentRecord.session_locator`; Codex from its
 /// sidecar — a corrupt Codex sidecar fails loud, never-dispatched is the
 /// legitimate empty case). `home_dir` is injected for testability; the Tauri
 /// shim reads `$HOME`.
@@ -4336,12 +4198,12 @@ pub fn agent_session_info_impl(
     let directory = project.directory.clone();
 
     let session_file = resolve_session_file(&agent, &directory, home_dir);
-    // Resume identifier (only when the agent can be resumed): Claude/Gemini by
+    // Resume identifier (only when the agent can be resumed): Claude by
     // session uuid but only once a file exists; Codex/Antigravity by their
     // locator regardless. Shares the file resolution above; this match only
     // covers the identifier (and the unsupported-harness guard).
     let resume_ref: Option<String> = match agent.harness {
-        HarnessKind::ClaudeCode | HarnessKind::Gemini => locator_uuid(&agent)
+        HarnessKind::ClaudeCode => locator_uuid(&agent)
             .filter(|_| session_file.is_some())
             .map(|sid| sid.to_string()),
         HarnessKind::Codex => agent
@@ -5737,10 +5599,6 @@ pub fn check_codex_binary_impl(state: &AppState) -> Result<(), AppError> {
     state.codex_adapter.probe().map_err(AppError::Probe)
 }
 
-pub fn check_gemini_binary_impl(state: &AppState) -> Result<(), AppError> {
-    state.gemini_adapter.probe().map_err(AppError::Probe)
-}
-
 /// Probe `agy` on PATH via the registered Antigravity adapter — same shape
 /// as the other three harness binary checks.
 pub fn check_antigravity_binary_impl(state: &AppState) -> Result<(), AppError> {
@@ -5765,7 +5623,7 @@ const ANTIGRAVITY_KEYCHAIN_ACCOUNT: &str = "antigravity";
 /// hosts will surface as auth-missing, which is correct because
 /// Antigravity is macOS-only in v1).
 ///
-/// Unlike Codex/Gemini, there is no on-disk config file we can probe —
+/// Unlike Codex, there is no on-disk config file we can probe —
 /// `agy` reads credentials exclusively via macOS Keychain. The signature
 /// therefore takes no `home_dir` parameter; the keychain lookup is
 /// system-wide. The Tauri shim drops the `$HOME` forwarding it does for
@@ -5877,43 +5735,6 @@ pub fn check_codex_auth_impl(home_dir: &Path) -> Result<(), AppError> {
             harness: HarnessKind::Codex,
             expected_path: auth_path.to_string_lossy().into_owned(),
         })
-    }
-}
-
-/// Supported Gemini auth methods. The file is considered authenticated
-/// iff `security.auth.selectedType` is one of these. Failing closed on
-/// missing/unknown values means a malformed or empty `settings.json`
-/// surfaces as "not authenticated," prompting the user to run `gemini`
-/// interactively rather than silently letting a dispatch fail with a
-/// less-actionable error.
-const SUPPORTED_GEMINI_AUTH_TYPES: &[&str] =
-    &["oauth-personal", "gemini-api-key", "vertex-ai", "workspace"];
-
-/// Best-effort Gemini subscription-auth detection. Reads
-/// `<home>/.gemini/settings.json` and checks
-/// `security.auth.selectedType` against the supported set. Returns
-/// `Err(AppError::AuthNotConfigured)` if the file is missing, unparseable,
-/// the field is absent, or the value isn't recognized. Mirrors
-/// `check_codex_auth_impl` shape; `home_dir` is a parameter so tests
-/// stage a temp directory without touching `$HOME`.
-pub fn check_gemini_auth_impl(home_dir: &Path) -> Result<(), AppError> {
-    let settings_path = home_dir.join(".gemini").join("settings.json");
-    let auth_err = || AppError::AuthNotConfigured {
-        harness: HarnessKind::Gemini,
-        expected_path: settings_path.to_string_lossy().into_owned(),
-    };
-    let bytes = std::fs::read(&settings_path).map_err(|_| auth_err())?;
-    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| auth_err())?;
-    let selected = value
-        .get("security")
-        .and_then(|s| s.get("auth"))
-        .and_then(|a| a.get("selectedType"))
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(auth_err)?;
-    if SUPPORTED_GEMINI_AUTH_TYPES.contains(&selected) {
-        Ok(())
-    } else {
-        Err(auth_err())
     }
 }
 
@@ -6042,7 +5863,6 @@ pub fn harness_adapter_for(
     match harness {
         HarnessKind::ClaudeCode => Some(Arc::clone(&state.claude_adapter)),
         HarnessKind::Codex => Some(Arc::clone(&state.codex_adapter)),
-        HarnessKind::Gemini => Some(Arc::clone(&state.gemini_adapter)),
         HarnessKind::Antigravity => Some(Arc::clone(&state.antigravity_adapter)),
         _ => None,
     }
@@ -6399,7 +6219,6 @@ mod tests {
             Arc::clone(&mock),
             Arc::clone(&mock),
             Arc::clone(&mock),
-            Arc::clone(&mock),
             emitter.clone() as Arc<dyn EventEmitter>,
         );
         (tmp, state, emitter)
@@ -6516,7 +6335,6 @@ mod tests {
         let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::with_scenario(scenario));
         let emitter = Arc::new(RecordingEmitter::new());
         let state = AppState::new(
-            Arc::clone(&mock),
             Arc::clone(&mock),
             Arc::clone(&mock),
             Arc::clone(&mock),
@@ -6809,7 +6627,6 @@ mod tests {
             claude,
             Arc::clone(&mock),
             Arc::clone(&mock),
-            Arc::clone(&mock),
             Arc::new(RecordingEmitter::new()) as Arc<dyn EventEmitter>,
         );
         let tmp = TempDir::new().unwrap();
@@ -7054,7 +6871,6 @@ mod tests {
         let emitter = Arc::new(RecordingEmitter::new());
         let state = AppState::new(
             adapter,
-            Arc::clone(&mock),
             Arc::clone(&mock),
             Arc::clone(&mock),
             emitter.clone() as Arc<dyn EventEmitter>,
@@ -7366,7 +7182,7 @@ mod tests {
         let home = TempDir::new().unwrap();
         let (_recipient, project_id) = project_with_agent(&state, &tmp).await;
         // A completed turn sits on disk — the "stale" answer the old code grabbed.
-        let source = seed_source(&state, home.path(), project_id, "gemini", "STALE ANSWER");
+        let source = seed_source(&state, home.path(), project_id, "scout", "STALE ANSWER");
         // The agent's most recent turn (per the journal) failed and wrote no
         // content to its session file.
         let send = Uuid::now_v7();
@@ -7411,7 +7227,7 @@ mod tests {
         .unwrap();
         let body = resolved(&outcome);
         assert!(
-            body.contains("gemini's most recent turn failed"),
+            body.contains("scout's most recent turn failed"),
             "forwards the failure note: {body:?}"
         );
         assert!(
@@ -7430,7 +7246,7 @@ mod tests {
         let (tmp, state, _emitter) = fresh_state_with_mock();
         let home = TempDir::new().unwrap();
         let (_recipient, project_id) = project_with_agent(&state, &tmp).await;
-        let source = seed_source(&state, home.path(), project_id, "gemini", "STALE ANSWER");
+        let source = seed_source(&state, home.path(), project_id, "scout", "STALE ANSWER");
         // The agent's most recent turn was cancelled (distinct wording from failed).
         let send = Uuid::now_v7();
         let turn = Uuid::now_v7();
@@ -7485,7 +7301,7 @@ mod tests {
         let (tmp, state, _emitter) = fresh_state_with_mock();
         let home = TempDir::new().unwrap();
         let (_recipient, project_id) = project_with_agent(&state, &tmp).await;
-        let source = seed_source(&state, home.path(), project_id, "gemini", "FRESH ANSWER");
+        let source = seed_source(&state, home.path(), project_id, "scout", "FRESH ANSWER");
         // An earlier turn failed, but a *later* turn completed (no Outcome). The
         // most-recent-turn logic must read this as completed, not poisoned.
         let failed_send = Uuid::now_v7();
@@ -7558,7 +7374,7 @@ mod tests {
         let (tmp, state, _emitter) = fresh_state_with_mock();
         let home = TempDir::new().unwrap();
         let (_recipient, project_id) = project_with_agent(&state, &tmp).await;
-        let source = seed_source(&state, home.path(), project_id, "gemini", "FRESH ANSWER");
+        let source = seed_source(&state, home.path(), project_id, "scout", "FRESH ANSWER");
 
         let mut forward_sources = std::collections::BTreeMap::new();
         forward_sources.insert("context".to_owned(), vec![source]);
@@ -7578,7 +7394,7 @@ mod tests {
             "forwarded completed output: {body}"
         );
         assert!(
-            body.contains("gemini"),
+            body.contains("scout"),
             "block attributes the source: {body}"
         );
     }
@@ -7891,7 +7707,6 @@ mod tests {
             Arc::clone(&claude),
             Arc::clone(&mock),
             Arc::clone(&mock),
-            Arc::clone(&mock),
             emitter.clone() as Arc<dyn EventEmitter>,
         );
         init_directory_impl(&state, tmp.path().to_str().unwrap())
@@ -8132,7 +7947,6 @@ mod tests {
         let emitter = Arc::new(RecordingEmitter::new());
         let state = AppState::new(
             claude,
-            Arc::clone(&mock),
             Arc::clone(&mock),
             Arc::clone(&mock),
             emitter.clone() as Arc<dyn EventEmitter>,
@@ -8423,7 +8237,6 @@ mod tests {
             claude,
             codex,
             Arc::clone(&mock),
-            Arc::clone(&mock),
             emitter.clone() as Arc<dyn EventEmitter>,
         );
         let tmp = TempDir::new().unwrap();
@@ -8530,7 +8343,6 @@ mod tests {
         let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
         let emitter = Arc::new(RecordingEmitter::new());
         let state = AppState::new(
-            Arc::clone(&mock),
             Arc::clone(&mock),
             Arc::clone(&mock),
             Arc::clone(&mock),
@@ -8717,7 +8529,6 @@ mod tests {
             Arc::clone(&mock),
             Arc::clone(&mock),
             Arc::clone(&mock),
-            Arc::clone(&mock),
             emitter as Arc<dyn EventEmitter>,
         ));
         let info = init_directory_impl(&state, tmp.path().to_str().unwrap())
@@ -8782,16 +8593,9 @@ mod tests {
             "/nonexistent/claude-xyz",
         ));
         let codex: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
-        let gemini: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
         let emitter = Arc::new(RecordingEmitter::new());
         let antigravity: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
-        let state = AppState::new(
-            claude,
-            codex,
-            gemini,
-            antigravity,
-            emitter as Arc<dyn EventEmitter>,
-        );
+        let state = AppState::new(claude, codex, antigravity, emitter as Arc<dyn EventEmitter>);
         let err = check_claude_binary_impl(&state).unwrap_err();
         assert!(matches!(err, AppError::Probe(_)));
     }
@@ -8852,106 +8656,11 @@ mod tests {
         let claude: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
         let codex: Arc<dyn HarnessAdapter> =
             Arc::new(CodexAdapter::with_binary_path("/nonexistent/codex-xyz"));
-        let gemini: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
         let emitter = Arc::new(RecordingEmitter::new());
         let antigravity: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
-        let state = AppState::new(
-            claude,
-            codex,
-            gemini,
-            antigravity,
-            emitter as Arc<dyn EventEmitter>,
-        );
+        let state = AppState::new(claude, codex, antigravity, emitter as Arc<dyn EventEmitter>);
         let err = check_codex_binary_impl(&state).unwrap_err();
         assert!(matches!(err, AppError::Probe(_)));
-    }
-
-    #[test]
-    fn check_gemini_binary_with_mock_adapter_returns_ok() {
-        let (_tmp, state, _) = fresh_state_with_mock();
-        assert!(check_gemini_binary_impl(&state).is_ok());
-    }
-
-    #[test]
-    fn check_gemini_binary_with_missing_binary_returns_error() {
-        use switchboard_harness::GeminiAdapter;
-        let claude: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
-        let codex: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
-        let gemini: Arc<dyn HarnessAdapter> =
-            Arc::new(GeminiAdapter::with_binary_path("/nonexistent/gemini-xyz"));
-        let emitter = Arc::new(RecordingEmitter::new());
-        let antigravity: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
-        let state = AppState::new(
-            claude,
-            codex,
-            gemini,
-            antigravity,
-            emitter as Arc<dyn EventEmitter>,
-        );
-        let err = check_gemini_binary_impl(&state).unwrap_err();
-        assert!(matches!(err, AppError::Probe(_)));
-    }
-
-    fn stage_gemini_settings(home: &Path, body: &str) {
-        std::fs::create_dir_all(home.join(".gemini")).unwrap();
-        std::fs::write(home.join(".gemini").join("settings.json"), body).unwrap();
-    }
-
-    #[test]
-    fn check_gemini_auth_returns_error_when_settings_missing() {
-        let tmp = TempDir::new().unwrap();
-        let err = check_gemini_auth_impl(tmp.path()).unwrap_err();
-        match err {
-            AppError::AuthNotConfigured {
-                harness,
-                expected_path,
-            } => {
-                assert_eq!(harness, HarnessKind::Gemini);
-                assert!(expected_path.contains(".gemini"));
-                assert!(expected_path.ends_with("settings.json"));
-            }
-            other => panic!("expected AuthNotConfigured, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn check_gemini_auth_returns_error_when_selected_type_missing() {
-        let tmp = TempDir::new().unwrap();
-        stage_gemini_settings(tmp.path(), r#"{"security":{"auth":{}}}"#);
-        assert!(matches!(
-            check_gemini_auth_impl(tmp.path()),
-            Err(AppError::AuthNotConfigured { .. })
-        ));
-    }
-
-    #[test]
-    fn check_gemini_auth_returns_error_when_selected_type_unknown() {
-        // Fail-closed: unknown auth type surfaces as not-authenticated
-        // rather than silently allowing the user past the gate.
-        let tmp = TempDir::new().unwrap();
-        stage_gemini_settings(
-            tmp.path(),
-            r#"{"security":{"auth":{"selectedType":"future-method"}}}"#,
-        );
-        assert!(matches!(
-            check_gemini_auth_impl(tmp.path()),
-            Err(AppError::AuthNotConfigured { .. })
-        ));
-    }
-
-    #[test]
-    fn check_gemini_auth_accepts_each_supported_selected_type() {
-        for selected in &["oauth-personal", "gemini-api-key", "vertex-ai", "workspace"] {
-            let tmp = TempDir::new().unwrap();
-            stage_gemini_settings(
-                tmp.path(),
-                &format!(r#"{{"security":{{"auth":{{"selectedType":"{selected}"}}}}}}"#),
-            );
-            assert!(
-                check_gemini_auth_impl(tmp.path()).is_ok(),
-                "expected Ok for selected_type={selected}"
-            );
-        }
     }
 
     #[test]
@@ -9229,10 +8938,9 @@ mod tests {
             "/nonexistent/claude-xyz123",
         ));
         let codex: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
-        let gemini: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
         let antigravity: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
         let emitter = Arc::new(RecordingEmitter::new());
-        let state = AppState::new(claude, codex, gemini, antigravity, emitter);
+        let state = AppState::new(claude, codex, antigravity, emitter);
 
         // Exercised the way the Tauri command composes them, so the routing
         // under test is the routing that ships.
@@ -9250,16 +8958,9 @@ mod tests {
         use switchboard_harness::AntigravityAdapter;
         let claude: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
         let codex: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
-        let gemini: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
         let antigravity: Arc<dyn HarnessAdapter> = Arc::new(AntigravityAdapter::new());
         let emitter = Arc::new(RecordingEmitter::new());
-        let state = AppState::new(
-            claude,
-            codex,
-            gemini,
-            antigravity,
-            emitter as Arc<dyn EventEmitter>,
-        );
+        let state = AppState::new(claude, codex, antigravity, emitter as Arc<dyn EventEmitter>);
         check_antigravity_binary_impl(&state)
             .expect("agy binary must be on PATH; install from https://antigravity.google/download");
     }
@@ -9269,35 +8970,12 @@ mod tests {
         use switchboard_harness::AntigravityAdapter;
         let claude: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
         let codex: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
-        let gemini: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
         let antigravity: Arc<dyn HarnessAdapter> =
             Arc::new(AntigravityAdapter::with_binary_path("/nonexistent/agy-xyz"));
         let emitter = Arc::new(RecordingEmitter::new());
-        let state = AppState::new(
-            claude,
-            codex,
-            gemini,
-            antigravity,
-            emitter as Arc<dyn EventEmitter>,
-        );
+        let state = AppState::new(claude, codex, antigravity, emitter as Arc<dyn EventEmitter>);
         let err = check_antigravity_binary_impl(&state).unwrap_err();
         assert!(matches!(err, AppError::Probe(_)));
-    }
-
-    /// Drift-detection live test: if Gemini moves its auth file or
-    /// renames the `security.auth.selectedType` key, this assertion fails
-    /// on the developer's machine before silent miscategorization ships.
-    #[test]
-    #[ignore = "requires gemini login — run with: make test-live"]
-    fn live_gemini_check_auth_finds_real_settings_file() {
-        let home = std::env::var_os("HOME")
-            .map(std::path::PathBuf::from)
-            .expect("HOME must be set");
-        check_gemini_auth_impl(&home).expect(
-            "Gemini settings.json must live at ~/.gemini/settings.json with a supported \
-             `security.auth.selectedType` on a logged-in machine; if this fails, the \
-             Gemini CLI may have moved its auth file or renamed the field",
-        );
     }
 
     #[tokio::test]
@@ -9406,7 +9084,6 @@ mod tests {
     async fn send_message_routes_to_adapter_matching_agent_harness() {
         let claude_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let codex_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let gemini_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let antigravity_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let claude: Arc<dyn HarnessAdapter> = Arc::new(TaggedMockAdapter {
             tag: "from-claude-adapter",
@@ -9416,10 +9093,6 @@ mod tests {
             tag: "from-codex-adapter",
             dispatch_count: codex_count.clone(),
         });
-        let gemini: Arc<dyn HarnessAdapter> = Arc::new(TaggedMockAdapter {
-            tag: "from-gemini-adapter",
-            dispatch_count: gemini_count.clone(),
-        });
         let antigravity: Arc<dyn HarnessAdapter> = Arc::new(TaggedMockAdapter {
             tag: "from-antigravity-adapter",
             dispatch_count: antigravity_count.clone(),
@@ -9428,7 +9101,6 @@ mod tests {
         let state = AppState::new(
             claude,
             codex,
-            gemini,
             antigravity,
             emitter.clone() as Arc<dyn EventEmitter>,
         );
@@ -9441,12 +9113,10 @@ mod tests {
         let claude_agent =
             create_agent_impl(&state, "c1", HarnessKind::ClaudeCode, None, None).unwrap();
         let codex_agent = create_agent_impl(&state, "x1", HarnessKind::Codex, None, None).unwrap();
-        let gemini_agent =
-            create_agent_impl(&state, "g1", HarnessKind::Gemini, None, None).unwrap();
         let antigravity_agent =
             create_agent_impl(&state, "a1", HarnessKind::Antigravity, None, None).unwrap();
 
-        // Four distinct agents → four independent actors. Each
+        // Three distinct agents → three independent actors. Each
         // `send_message_impl` returns immediately; await each agent's turn
         // completing via the cumulative `agent_idle` count (one per agent).
         send_msg(&state, claude_agent.id, "hi").await.unwrap();
@@ -9463,18 +9133,11 @@ mod tests {
             emitter.wait_for_type("agent_idle", 2),
         )
         .await;
-        send_msg(&state, gemini_agent.id, "hi").await.unwrap();
-        within(
-            &emitter,
-            "gemini agent_idle",
-            emitter.wait_for_type("agent_idle", 3),
-        )
-        .await;
         send_msg(&state, antigravity_agent.id, "hi").await.unwrap();
         within(
             &emitter,
             "antigravity agent_idle",
-            emitter.wait_for_type("agent_idle", 4),
+            emitter.wait_for_type("agent_idle", 3),
         )
         .await;
 
@@ -9489,11 +9152,6 @@ mod tests {
             "Codex agent dispatch must hit the Codex adapter exactly once"
         );
         assert_eq!(
-            gemini_count.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "Gemini agent dispatch must hit the Gemini adapter exactly once"
-        );
-        assert_eq!(
             antigravity_count.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "Antigravity agent dispatch must hit the Antigravity adapter exactly once"
@@ -9501,11 +9159,10 @@ mod tests {
 
         // Secondary check: the emitted ContentChunk tags match the
         // adapter-of-origin per agent_id. Catches mis-routing where dispatch
-        // counts are still 1/1/1/1 but the wrong adapter served each.
+        // counts are still 1/1/1 but the wrong adapter served each.
         let events = emitter.snapshot();
         let claude_channel = format!("agent:{}", claude_agent.id);
         let codex_channel = format!("agent:{}", codex_agent.id);
-        let gemini_channel = format!("agent:{}", gemini_agent.id);
         let claude_text = events
             .iter()
             .find(|(name, payload)| name == &claude_channel && payload["type"] == "content_chunk")
@@ -9514,10 +9171,6 @@ mod tests {
             .iter()
             .find(|(name, payload)| name == &codex_channel && payload["type"] == "content_chunk")
             .expect("content_chunk on codex channel");
-        let gemini_text = events
-            .iter()
-            .find(|(name, payload)| name == &gemini_channel && payload["type"] == "content_chunk")
-            .expect("content_chunk on gemini channel");
         let antigravity_channel = format!("agent:{}", antigravity_agent.id);
         let antigravity_text = events
             .iter()
@@ -9527,7 +9180,6 @@ mod tests {
             .expect("content_chunk on antigravity channel");
         assert_eq!(claude_text.1["text"], "from-claude-adapter");
         assert_eq!(codex_text.1["text"], "from-codex-adapter");
-        assert_eq!(gemini_text.1["text"], "from-gemini-adapter");
         assert_eq!(antigravity_text.1["text"], "from-antigravity-adapter");
     }
 
@@ -9576,7 +9228,6 @@ mod tests {
         ));
         let emitter = Arc::new(RecordingEmitter::new());
         let state = AppState::new(
-            Arc::clone(&failing),
             Arc::clone(&failing),
             Arc::clone(&failing),
             Arc::clone(&failing),
@@ -9673,7 +9324,6 @@ mod tests {
         });
         let emitter = Arc::new(RecordingEmitter::new());
         let state = AppState::new(
-            Arc::clone(&adapter),
             Arc::clone(&adapter),
             Arc::clone(&adapter),
             Arc::clone(&adapter),
@@ -9798,7 +9448,6 @@ mod tests {
         });
         let emitter = Arc::new(RecordingEmitter::new());
         let state = AppState::new(
-            Arc::clone(&adapter),
             Arc::clone(&adapter),
             Arc::clone(&adapter),
             Arc::clone(&adapter),
@@ -10020,7 +9669,6 @@ mod tests {
             Arc::clone(&mock),
             Arc::clone(&mock),
             Arc::clone(&mock),
-            Arc::clone(&mock),
             emitter as Arc<dyn EventEmitter>,
         );
         init_directory_impl(&state, tmp_workdir.path().to_str().unwrap())
@@ -10142,7 +9790,7 @@ mod tests {
     #[tokio::test]
     async fn attach_codex_accepts_non_uuid_thread_id() {
         // Codex thread-ids are arbitrary strings, not guaranteed UUIDs (unlike
-        // Claude/Gemini/Antigravity). Attach must use the raw string, not reject
+        // Claude/Antigravity). Attach must use the raw string, not reject
         // a valid session whose rollout filename ends in a non-UUID id.
         let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
         let thread_id = "thread-not-a-uuid";
@@ -10488,7 +10136,6 @@ mod tests {
                 Arc::clone(&mock),
                 Arc::clone(&mock),
                 Arc::clone(&mock),
-                Arc::clone(&mock),
                 emitter as Arc<dyn EventEmitter>,
             );
             init_directory_impl(&state_a, tmp_workdir.path().to_str().unwrap())
@@ -10514,7 +10161,6 @@ mod tests {
         let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
         let emitter = Arc::new(RecordingEmitter::new());
         let state_b = AppState::new(
-            Arc::clone(&mock),
             Arc::clone(&mock),
             Arc::clone(&mock),
             Arc::clone(&mock),
@@ -10562,7 +10208,6 @@ mod tests {
                 Arc::clone(&mock),
                 Arc::clone(&mock),
                 Arc::clone(&mock),
-                Arc::clone(&mock),
                 emitter as Arc<dyn EventEmitter>,
             );
             init_directory_impl(&state_a, tmp_workdir.path().to_str().unwrap())
@@ -10585,7 +10230,6 @@ mod tests {
         let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
         let emitter = Arc::new(RecordingEmitter::new());
         let state_b = AppState::new(
-            Arc::clone(&mock),
             Arc::clone(&mock),
             Arc::clone(&mock),
             Arc::clone(&mock),
@@ -10626,7 +10270,6 @@ mod tests {
             let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
             let emitter = Arc::new(RecordingEmitter::new());
             let state = AppState::new(
-                Arc::clone(&mock),
                 Arc::clone(&mock),
                 Arc::clone(&mock),
                 Arc::clone(&mock),
@@ -11702,410 +11345,11 @@ mod tests {
         assert!(result.meta.is_some());
     }
 
-    // -----------------------------------------------------------------
-    // Gemini attach tests
-    // -----------------------------------------------------------------
-
-    /// Stage `~/.gemini/projects.json` + a single Gemini session file
-    /// under `home/.gemini/tmp/<project>/chats/`. Returns the staged
-    /// path. The session file is a minimal `kind:"main"` header line so
-    /// `classify_candidate` returns `Unambiguous` for the target.
-    fn stage_gemini_session_file(home: &Path, cwd: &Path, session_id: &Uuid) -> PathBuf {
-        let canonical = cwd.canonicalize().unwrap();
-        let gemini = home.join(".gemini");
-        std::fs::create_dir_all(&gemini).unwrap();
-        let projects = serde_json::json!({
-            "projects": { canonical.to_str().unwrap(): "proj" }
-        });
-        std::fs::write(gemini.join("projects.json"), projects.to_string()).unwrap();
-        let chats = gemini.join("tmp").join("proj").join("chats");
-        std::fs::create_dir_all(&chats).unwrap();
-        let prefix = switchboard_harness::gemini_session_id_prefix(session_id);
-        let path = chats.join(format!("session-2026-05-18T00-00-{prefix}.jsonl"));
-        let header = format!(
-            r#"{{"sessionId":"{session_id}","projectHash":"x","startTime":"2026-05-18T00:00:00Z","lastUpdated":"2026-05-18T00:00:00Z","kind":"main"}}"#
-        );
-        std::fs::write(&path, format!("{header}\n")).unwrap();
-        path
-    }
-
-    #[tokio::test]
-    async fn attach_gemini_succeeds_when_session_file_exists() {
-        let (tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
-        let session_id = Uuid::new_v4();
-        stage_gemini_session_file(tmp_home.path(), tmp_workdir.path(), &session_id);
-
-        let record = attach_agent_impl(
-            &state,
-            "attached",
-            HarnessKind::Gemini,
-            &session_id.to_string(),
-            tmp_home.path(),
-            None,
-            None,
-        )
-        .unwrap();
-        assert_eq!(
-            record.session_locator,
-            Some(SessionLocator::Uuid(session_id))
-        );
-        assert_eq!(record.harness, HarnessKind::Gemini);
-        // Gemini follows the Claude pattern (caller-controlled session
-        // UUID); no sidecar, no needs_session_meta override.
-        assert!(
-            !lock(&state.needs_session_meta).contains(&record.id),
-            "Gemini attach must NOT populate needs_session_meta"
-        );
-    }
-
-    #[tokio::test]
-    async fn attach_gemini_rejects_missing_session_file_with_expected_path() {
-        let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
-        let session_id = Uuid::new_v4();
-        let err = attach_agent_impl(
-            &state,
-            "attached",
-            HarnessKind::Gemini,
-            &session_id.to_string(),
-            tmp_home.path(),
-            None,
-            None,
-        )
-        .unwrap_err();
-        match err {
-            AppError::SessionFileNotFound {
-                harness,
-                expected_path,
-            } => {
-                assert_eq!(harness, HarnessKind::Gemini);
-                assert!(expected_path.contains(".gemini"));
-            }
-            other => panic!("expected SessionFileNotFound, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn attach_gemini_multi_candidate_picks_full_uuid_match() {
-        // Two files sharing the 8-char prefix in their filename, different
-        // timestamps. Each file holds a different conversation's header.
-        // `classify_candidate` picks the unambiguous-target file; the other
-        // is `NoTarget` and skipped.
-        let (tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
-        let canonical = tmp_workdir.path().canonicalize().unwrap();
-        let gemini = tmp_home.path().join(".gemini");
-        std::fs::create_dir_all(&gemini).unwrap();
-        let projects = serde_json::json!({
-            "projects": { canonical.to_str().unwrap(): "proj" }
-        });
-        std::fs::write(gemini.join("projects.json"), projects.to_string()).unwrap();
-        let chats = gemini.join("tmp").join("proj").join("chats");
-        std::fs::create_dir_all(&chats).unwrap();
-
-        let id_a = Uuid::parse_str("00000000-0000-4000-8000-000000000010").unwrap();
-        let id_b = Uuid::parse_str("00000000-0000-4000-8000-000000000020").unwrap();
-        let prefix = switchboard_harness::gemini_session_id_prefix(&id_a);
-        assert_eq!(
-            prefix,
-            switchboard_harness::gemini_session_id_prefix(&id_b),
-            "test setup requires identical 8-char prefixes"
-        );
-        let header_a = format!(
-            r#"{{"sessionId":"{id_a}","projectHash":"x","startTime":"2026-05-18T00:00:00Z","lastUpdated":"2026-05-18T00:00:00Z","kind":"main"}}"#
-        );
-        let header_b = format!(
-            r#"{{"sessionId":"{id_b}","projectHash":"x","startTime":"2026-05-18T00:05:00Z","lastUpdated":"2026-05-18T00:05:00Z","kind":"main"}}"#
-        );
-        std::fs::write(
-            chats.join(format!("session-2026-05-18T00-00-{prefix}.jsonl")),
-            format!("{header_a}\n"),
-        )
-        .unwrap();
-        std::fs::write(
-            chats.join(format!("session-2026-05-18T00-05-{prefix}.jsonl")),
-            format!("{header_b}\n"),
-        )
-        .unwrap();
-
-        let record = attach_agent_impl(
-            &state,
-            "attached",
-            HarnessKind::Gemini,
-            &id_b.to_string(),
-            tmp_home.path(),
-            None,
-            None,
-        )
-        .unwrap();
-        assert_eq!(record.session_locator, Some(SessionLocator::Uuid(id_b)));
-    }
-
-    #[tokio::test]
-    async fn attach_gemini_multi_candidate_with_no_match_returns_not_found() {
-        // A candidate file exists at the prefix glob, but its sessionId is
-        // for a different UUID — must not be claimed silently as the
-        // user's target.
-        let (tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
-        let other = Uuid::parse_str("00000000-0000-4000-8000-000000000010").unwrap();
-        stage_gemini_session_file(tmp_home.path(), tmp_workdir.path(), &other);
-
-        let asked = Uuid::parse_str("00000000-0000-4000-8000-000000000099").unwrap();
-        assert_eq!(
-            switchboard_harness::gemini_session_id_prefix(&other),
-            switchboard_harness::gemini_session_id_prefix(&asked)
-        );
-        let err = attach_agent_impl(
-            &state,
-            "attached",
-            HarnessKind::Gemini,
-            &asked.to_string(),
-            tmp_home.path(),
-            None,
-            None,
-        )
-        .unwrap_err();
-        assert!(
-            matches!(err, AppError::SessionFileNotFound { harness, .. } if harness == HarnessKind::Gemini)
-        );
-    }
-
-    /// Pin the ambiguity invariant: an ambiguous candidate (one file,
-    /// multiple distinct session headers) must surface as
-    /// `AmbiguousSessionFile`, never as `SessionFileNotFound` or a
-    /// silent merge. UUID v4 makes this ~1/2^32; the test ensures the
-    /// code path is correctly wired if it ever fires.
-    #[tokio::test]
-    async fn attach_gemini_ambiguous_candidate_surfaces_ambiguous_error() {
-        let (tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
-        let canonical = tmp_workdir.path().canonicalize().unwrap();
-        let gemini = tmp_home.path().join(".gemini");
-        std::fs::create_dir_all(&gemini).unwrap();
-        let projects = serde_json::json!({
-            "projects": { canonical.to_str().unwrap(): "proj" }
-        });
-        std::fs::write(gemini.join("projects.json"), projects.to_string()).unwrap();
-        let chats = gemini.join("tmp").join("proj").join("chats");
-        std::fs::create_dir_all(&chats).unwrap();
-
-        let target = Uuid::parse_str("00000000-0000-4000-8000-000000000009").unwrap();
-        let other = Uuid::parse_str("00000000-0000-4000-8000-00000000000A").unwrap();
-        let prefix = switchboard_harness::gemini_session_id_prefix(&target);
-        let body = format!(
-            r#"{{"sessionId":"{target}","projectHash":"x","startTime":"2026-05-17T22:20:35.615Z","lastUpdated":"2026-05-17T22:20:35.615Z","kind":"main"}}
-{{"sessionId":"{other}","projectHash":"x","startTime":"2026-05-17T22:20:35.654Z","lastUpdated":"2026-05-17T22:20:35.654Z","kind":"main"}}
-"#
-        );
-        let staged = chats.join(format!("session-2026-05-17T22-20-{prefix}.jsonl"));
-        std::fs::write(&staged, body).unwrap();
-
-        let err = attach_agent_impl(
-            &state,
-            "attached",
-            HarnessKind::Gemini,
-            &target.to_string(),
-            tmp_home.path(),
-            None,
-            None,
-        )
-        .unwrap_err();
-        match err {
-            AppError::AmbiguousSessionFile {
-                harness,
-                session_id,
-                paths,
-            } => {
-                assert_eq!(harness, HarnessKind::Gemini);
-                assert_eq!(session_id, target.to_string());
-                assert_eq!(paths, vec![staged]);
-            }
-            other => panic!("expected AmbiguousSessionFile, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn attach_gemini_rejects_duplicate_name() {
-        let (tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
-        let session_id = Uuid::new_v4();
-        stage_gemini_session_file(tmp_home.path(), tmp_workdir.path(), &session_id);
-        attach_agent_impl(
-            &state,
-            "attached",
-            HarnessKind::Gemini,
-            &session_id.to_string(),
-            tmp_home.path(),
-            None,
-            None,
-        )
-        .unwrap();
-
-        // Reuse the same name; even with a different session UUID
-        // (which we'd have to stage too) the name-clash check fires
-        // first. We use the same name + same session for simplicity.
-        let other = Uuid::new_v4();
-        stage_gemini_session_file(tmp_home.path(), tmp_workdir.path(), &other);
-        let err = attach_agent_impl(
-            &state,
-            "attached",
-            HarnessKind::Gemini,
-            &other.to_string(),
-            tmp_home.path(),
-            None,
-            None,
-        )
-        .unwrap_err();
-        assert!(matches!(
-            err,
-            AppError::Core(switchboard_core::CoreError::DuplicateAgentName { .. })
-        ));
-    }
-
-    #[tokio::test]
-    async fn attach_gemini_rejects_same_project_session_id_collision() {
-        let (tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
-        let session_id = Uuid::new_v4();
-        stage_gemini_session_file(tmp_home.path(), tmp_workdir.path(), &session_id);
-        attach_agent_impl(
-            &state,
-            "first",
-            HarnessKind::Gemini,
-            &session_id.to_string(),
-            tmp_home.path(),
-            None,
-            None,
-        )
-        .unwrap();
-
-        let err = attach_agent_impl(
-            &state,
-            "second",
-            HarnessKind::Gemini,
-            &session_id.to_string(),
-            tmp_home.path(),
-            None,
-            None,
-        )
-        .unwrap_err();
-        match err {
-            AppError::SessionAlreadyAttached {
-                existing_agent_name,
-                ..
-            } => assert_eq!(existing_agent_name, "first"),
-            other => panic!("expected SessionAlreadyAttached, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn attach_gemini_rejects_cross_project_session_id_collision() {
-        let (tmp_workdir, tmp_home, state, _proj_a) =
-            fresh_state_with_active_project("alpha").await;
-        let session_id = Uuid::new_v4();
-        stage_gemini_session_file(tmp_home.path(), tmp_workdir.path(), &session_id);
-        attach_agent_impl(
-            &state,
-            "first",
-            HarnessKind::Gemini,
-            &session_id.to_string(),
-            tmp_home.path(),
-            None,
-            None,
-        )
-        .unwrap();
-
-        let proj_b = create_project_in_only_dir(&state, "beta");
-        set_active_project_impl(&state, proj_b.id).unwrap();
-        let err = attach_agent_impl(
-            &state,
-            "first-in-beta",
-            HarnessKind::Gemini,
-            &session_id.to_string(),
-            tmp_home.path(),
-            None,
-            None,
-        )
-        .unwrap_err();
-        match err {
-            AppError::SessionAlreadyAttached {
-                existing_project_name,
-                ..
-            } => assert_eq!(existing_project_name, "alpha"),
-            other => panic!("expected SessionAlreadyAttached, got {other:?}"),
-        }
-    }
-
-    /// I/O errors on a candidate file must surface as `AttachLookupFailed`
-    /// rather than silently routing to `SessionFileNotFound`. The user's
-    /// remediation differs (chmod / fs repair vs. verify UUID); the wrong
-    /// error sends them chasing red herrings. Unix-only because file-mode
-    /// 0o000 has no Windows analog.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn attach_gemini_propagates_io_error_for_unreadable_candidate() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let (tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
-        let session_id = Uuid::new_v4();
-        let path = stage_gemini_session_file(tmp_home.path(), tmp_workdir.path(), &session_id);
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
-
-        // Self-check for root-equivalent containers: if `chmod 000` doesn't
-        // actually block reads (root ignores file modes), the failure path
-        // we're trying to exercise won't fire. Restore mode and skip.
-        if std::fs::read(&path).is_ok() {
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-            return;
-        }
-
-        let err = attach_agent_impl(
-            &state,
-            "attached",
-            HarnessKind::Gemini,
-            &session_id.to_string(),
-            tmp_home.path(),
-            None,
-            None,
-        )
-        .unwrap_err();
-        // Restore mode **before** asserting so TempDir's Drop can rmdir
-        // even if the assertion fails on a future regression.
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-
-        match err {
-            AppError::AttachLookupFailed { message } => {
-                assert!(
-                    message.contains(path.to_str().unwrap()),
-                    "expected error to name the unreadable path, got: {message}"
-                );
-            }
-            other => panic!("expected AttachLookupFailed, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn attach_gemini_rejects_missing_projects_json_as_not_found() {
-        // No `~/.gemini/projects.json` at all → cwd resolution fails →
-        // candidate set is empty → SessionFileNotFound.
-        let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
-        let session_id = Uuid::new_v4();
-        let err = attach_agent_impl(
-            &state,
-            "attached",
-            HarnessKind::Gemini,
-            &session_id.to_string(),
-            tmp_home.path(),
-            None,
-            None,
-        )
-        .unwrap_err();
-        assert!(
-            matches!(err, AppError::SessionFileNotFound { harness, .. } if harness == HarnessKind::Gemini)
-        );
-    }
-
     // ---- project instance lock + register-cache ----
 
     fn mock_app_state() -> AppState {
         let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
         AppState::new(
-            Arc::clone(&mock),
             Arc::clone(&mock),
             Arc::clone(&mock),
             Arc::clone(&mock),
@@ -12571,36 +11815,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_agent_normalizes_blank_secondary_before_capability_checks() {
-        let (tmp, state, _) = fresh_state_with_mock();
-        init_directory_impl(&state, tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
-        let project = create_project_in_only_dir(&state, "alpha");
-        set_active_project_impl(&state, project.id).unwrap();
-
-        let agent = create_agent_with_profiles_impl(
-            &state,
-            "gemini",
-            HarnessKind::Gemini,
-            Some("auto".to_owned()),
-            None,
-            Some(AgentProfile {
-                model: Some("gemini-2.5-flash".to_owned()),
-                effort: Some("   ".to_owned()),
-            }),
-        )
-        .unwrap();
-        assert_eq!(
-            agent.profiles.secondary,
-            Some(AgentProfile {
-                model: Some("gemini-2.5-flash".to_owned()),
-                effort: None,
-            })
-        );
-    }
-
-    #[tokio::test]
     async fn create_agent_rejects_unsupported_selection_and_persists_nothing() {
         let (tmp, state, _) = fresh_state_with_mock();
         init_directory_impl(&state, tmp.path().to_str().unwrap())
@@ -12624,21 +11838,6 @@ mod tests {
             err,
             AppError::Core(CoreError::EffortWithoutModel {
                 harness: HarnessKind::Antigravity
-            })
-        ));
-        let err = create_agent_impl(
-            &state,
-            "g",
-            HarnessKind::Gemini,
-            None,
-            Some("high".to_owned()),
-        )
-        .unwrap_err();
-        assert!(matches!(
-            err,
-            AppError::Core(CoreError::SelectionUnsupported {
-                harness: HarnessKind::Gemini,
-                axis: SelectionAxis::Effort
             })
         ));
         // No partial agent landed in the registry or cache.
@@ -12690,7 +11889,6 @@ mod tests {
         });
         let emitter = Arc::new(RecordingEmitter::new());
         let state = AppState::new(
-            Arc::clone(&adapter),
             Arc::clone(&adapter),
             Arc::clone(&adapter),
             adapter,
@@ -12760,36 +11958,6 @@ mod tests {
         let stored = &reloaded.list_agents().unwrap()[0];
         assert_eq!(stored.model.as_deref(), Some("sonnet"));
         assert_eq!(stored.effort.as_deref(), Some("low"));
-    }
-
-    #[tokio::test]
-    async fn attach_rejects_unsupported_selection_before_session_lookup() {
-        let (_workdir, tmp_home, state, project) = fresh_state_with_active_project("alpha").await;
-
-        // A bogus session id with no staged file: if the capability check did
-        // NOT run first, attach would fail with SessionFileNotFound. Getting
-        // SelectionUnsupported instead proves the check precedes the lookup and
-        // the registry write.
-        let err = attach_agent_impl(
-            &state,
-            "g",
-            HarnessKind::Gemini,
-            &Uuid::now_v7().to_string(),
-            tmp_home.path(),
-            None,
-            Some("high".to_owned()),
-        )
-        .unwrap_err();
-        assert!(matches!(
-            err,
-            AppError::Core(CoreError::SelectionUnsupported {
-                harness: HarnessKind::Gemini,
-                axis: SelectionAxis::Effort
-            })
-        ));
-        // Nothing was registered.
-        let reloaded = lock(&state.projects).get(&project.id).cloned().unwrap();
-        assert!(reloaded.list_agents().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -14101,7 +13269,6 @@ mod tests {
             Arc::clone(&mock),
             Arc::clone(&mock),
             Arc::clone(&mock),
-            Arc::clone(&mock),
             emitter as Arc<dyn EventEmitter>,
         )
         .with_workspace(ws_path);
@@ -14290,7 +13457,6 @@ mod tests {
             Arc::clone(&mock),
             Arc::clone(&mock),
             Arc::clone(&mock),
-            Arc::clone(&mock),
             emitter as Arc<dyn EventEmitter>,
         )
         .with_workspace(ws_path.clone());
@@ -14324,7 +13490,6 @@ mod tests {
         let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
         let emitter = Arc::new(RecordingEmitter::new());
         let state = AppState::new(
-            Arc::clone(&mock),
             Arc::clone(&mock),
             Arc::clone(&mock),
             Arc::clone(&mock),
@@ -14365,7 +13530,6 @@ mod tests {
         let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
         let emitter = Arc::new(RecordingEmitter::new());
         let state = AppState::new(
-            Arc::clone(&mock),
             Arc::clone(&mock),
             Arc::clone(&mock),
             Arc::clone(&mock),
@@ -17927,7 +17091,7 @@ mod tests {
 
     /// An agent turn with an explicit status + a preceding shape — for the
     /// cancelled/failed-mid-turn fixtures where the harness persisted a partial
-    /// turn (`Streaming` for Claude, `Failed` for Codex/Gemini/Antigravity) or,
+    /// turn (`Streaming` for Claude, `Failed` for Codex/Antigravity) or,
     /// in the cancel-after-end race, a `Complete` one.
     fn agent_turn_status(
         turn_id: Uuid,
@@ -19863,7 +19027,6 @@ mod tests {
         let state = AppState::new(
             claude,
             codex,
-            Arc::clone(&mock),
             Arc::clone(&mock),
             emitter.clone() as Arc<dyn EventEmitter>,
         );

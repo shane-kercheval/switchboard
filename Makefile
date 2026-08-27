@@ -1,4 +1,4 @@
-.PHONY: dev build open run install-app uninstall-app debug-app uninstall-debug-app deploy test test-browser lint fmt check check-rust check-frontend clean clean-stale install test-live test-live-claude test-live-codex test-live-gemini test-live-antigravity
+.PHONY: dev build open run install-app uninstall-app debug-app uninstall-debug-app deploy test test-browser lint fmt check check-rust check-frontend clean clean-stale install test-live test-live-claude test-live-codex test-live-antigravity
 
 # Crates that carry live (`#[ignore]`-gated) harness tests.
 LIVE_PKGS := -p switchboard-harness -p switchboard-dispatcher -p switchboard-app
@@ -154,9 +154,6 @@ test-live-claude:
 
 test-live-codex:
 	cargo test --locked $(LIVE_PKGS) codex -- --ignored
-
-test-live-gemini:
-	cargo test --locked $(LIVE_PKGS) gemini -- --ignored
 
 test-live-antigravity:
 	cargo test --locked $(LIVE_PKGS) antigravity -- --ignored

@@ -281,7 +281,6 @@ const invokeMock = vi.fn(async (cmd: string, args?: Record<string, unknown>): Pr
     // can be simulated; default to authed + installed.
     case "check_claude_auth":
     case "check_codex_auth":
-    case "check_gemini_auth":
     case "check_antigravity_auth":
       if (backend.probeFailures.has(cmd)) throw new Error(`auth failed: ${cmd}`);
       return null;
@@ -607,10 +606,7 @@ describe("App", () => {
     await waitFor(() => {
       const authCalls = invokeMock.mock.calls.filter(
         ([c]) =>
-          c === "check_claude_auth" ||
-          c === "check_codex_auth" ||
-          c === "check_gemini_auth" ||
-          c === "check_antigravity_auth",
+          c === "check_claude_auth" || c === "check_codex_auth" || c === "check_antigravity_auth",
       );
       expect(authCalls.length).toBeGreaterThan(0);
     });
@@ -787,7 +783,7 @@ describe("App", () => {
     expect(createProjectCalls).toHaveLength(1);
     expect(createProjectCalls[0]?.[1]).toEqual({ name: "brand-new", directory: DIR_A });
 
-    // All four harnesses are installed, but Gemini is excluded from auto-seeding
+    // All harnesses are installed and every one is auto-seeded
     // (no longer on individual plans) → one agent each for Claude/Codex/
     // Antigravity, in HARNESSES order. Its two default profiles use the stable
     // harness name rather than naming only one of the configurations.
@@ -898,19 +894,7 @@ describe("App", () => {
     });
   });
 
-  it("new project: an installed but auto-seed-excluded harness (Gemini) is not seeded", async () => {
-    await mountApp();
-    await waitFor(() => expect(screen.getByTestId("welcome-add-project")).toBeInTheDocument());
-
-    await createNewProjectViaDialog("brand-new");
-
-    // Gemini is installed by default in the test backend, yet never seeded.
-    await waitFor(() => expect(createAgentCalls()).toHaveLength(3));
-    expect(createAgentCalls().some(({ harness }) => harness === "gemini")).toBe(false);
-  });
-
   it("new project: seeds agents only for installed harnesses", async () => {
-    backend.notInstalled.add("gemini");
     backend.notInstalled.add("antigravity");
     await mountApp();
     await waitFor(() => expect(screen.getByTestId("welcome-add-project")).toBeInTheDocument());

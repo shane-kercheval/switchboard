@@ -236,7 +236,7 @@ impl HarnessAdapter for AntigravityAdapter {
 
         // Resume target: the conversation UUID captured on a prior dispatch,
         // now carried on the agent's registry record (`session_locator`) and
-        // passed in as dispatch input — like Claude/Gemini. `None` is the
+        // passed in as dispatch input — like Claude. `None` is the
         // legitimate never-dispatched case; a `Codex` locator can't appear on
         // an Antigravity agent (the registry rejects the mismatch), so a
         // non-`Uuid` locator degrades to `None`.
@@ -328,7 +328,7 @@ fn resolve_home_dir(override_path: Option<&Path>) -> PathBuf {
 /// the cwd regardless, but that "project" is distinct from the active workspace
 /// the tools use — only `--add-dir` sets the latter.
 ///
-/// `--dangerously-skip-permissions` mirrors Gemini's `--yolo`: the bound cwd is
+/// `--dangerously-skip-permissions`: the bound cwd is
 /// the user's own workspace, so per-tool approval prompts (which would block a
 /// headless dispatch) must be auto-approved. Resume passes the captured UUID via
 /// `--conversation`; first turn omits it and lets `agy` mint a new one.
@@ -834,7 +834,7 @@ async fn run_producer(ctx: ProducerCtx) {
         // read from `agy`'s own log file, which lands in ~seconds independent of
         // server-response latency, so there is no slow-cold-start to race, and
         // the terminator is process exit (a real event) plus cancellation — the
-        // *same* terminators the Claude/Codex/Gemini producers use; none of them
+        // *same* terminators the Claude/Codex producers use; none of them
         // has a capture/run timeout and the dispatcher has no turn deadline, so
         // removing this one aligns Antigravity with that pattern (it was the odd
         // one out, and the old 5s deadline actively false-failed healthy ~10s
@@ -1756,7 +1756,8 @@ fn classify_outcome(
     // on that would mark every recovered tool failure as a failed turn, which
     // is ordinary agentic behavior, and the failure is already surfaced
     // precisely — as a failed *tool* row, from the same stream. So a terminal
-    // answer wins: same shape as Gemini's streamed-then-error rescue (G17),
+    // answer wins: same shape as the streamed-then-error rescue recorded as
+    // G17 in `harness-behavior.md` (observed on a since-removed harness),
     // and it leaves the no-answer cases (timeout, hard failure) failing as
     // they should. Residual risk mirrors G17's: a turn that genuinely failed
     // *after* answering renders as success.

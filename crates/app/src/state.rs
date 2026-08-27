@@ -181,8 +181,6 @@ pub struct AppState {
     pub claude_adapter: Arc<dyn HarnessAdapter>,
     /// Adapter for `HarnessKind::Codex` agents.
     pub codex_adapter: Arc<dyn HarnessAdapter>,
-    /// Adapter for `HarnessKind::Gemini` agents.
-    pub gemini_adapter: Arc<dyn HarnessAdapter>,
     /// Adapter for `HarnessKind::Antigravity` agents.
     pub antigravity_adapter: Arc<dyn HarnessAdapter>,
     pub emitter: Arc<dyn EventEmitter>,
@@ -342,7 +340,6 @@ impl AppState {
     pub fn new(
         claude_adapter: Arc<dyn HarnessAdapter>,
         codex_adapter: Arc<dyn HarnessAdapter>,
-        gemini_adapter: Arc<dyn HarnessAdapter>,
         antigravity_adapter: Arc<dyn HarnessAdapter>,
         emitter: Arc<dyn EventEmitter>,
     ) -> Self {
@@ -355,7 +352,6 @@ impl AppState {
             dispatcher: Arc::new(Dispatcher::new()),
             claude_adapter,
             codex_adapter,
-            gemini_adapter,
             antigravity_adapter,
             emitter,
             needs_session_meta: Arc::new(Mutex::new(HashSet::new())),
@@ -572,13 +568,7 @@ mod tests {
     fn mock_state() -> AppState {
         let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
         let emitter: Arc<dyn EventEmitter> = Arc::new(RecordingEmitter::new());
-        AppState::new(
-            Arc::clone(&mock),
-            Arc::clone(&mock),
-            Arc::clone(&mock),
-            mock,
-            emitter,
-        )
+        AppState::new(Arc::clone(&mock), Arc::clone(&mock), mock, emitter)
     }
 
     #[test]

@@ -13,7 +13,7 @@
 //! the result; user-only entries are appended. The merged surface is just
 //! the name list (the registry is display-only). Matches the
 //! more-specific-scope-wins convention used across every registry-style
-//! loader in Switchboard (Claude / Codex / Gemini MCP + skills) and the
+//! loader in Switchboard (Claude / Codex MCP + skills) and the
 //! broader ecosystem (git, npm, etc.).
 //!
 //! **Failure policy** mirrors the MCP loader: missing directory → empty list

@@ -714,7 +714,7 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
           // model to blank." Antigravity only reports a model when the
           // selection changed (first turn, or an explicit switch); on a
           // plain resume it sends "" and must not erase the model an earlier
-          // turn already showed. Claude/Codex/Gemini always send a non-empty
+          // turn already showed. Claude and Codex always send a non-empty
           // model, so this is a no-op for them.
           model: input.model !== "" ? input.model : (runtime.meta?.model ?? ""),
           harness_version: input.harness_version,

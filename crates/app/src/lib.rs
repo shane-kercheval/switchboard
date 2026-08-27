@@ -26,8 +26,7 @@ use std::sync::Arc;
 
 use switchboard_dispatcher::EventEmitter;
 use switchboard_harness::{
-    AntigravityAdapter, ClaudeCodeAdapter, CodexAdapter, GeminiAdapter, HarnessAdapter,
-    MockHarnessAdapter,
+    AntigravityAdapter, ClaudeCodeAdapter, CodexAdapter, HarnessAdapter, MockHarnessAdapter,
 };
 use tauri::{Emitter, Manager, State};
 
@@ -299,29 +298,28 @@ use crate::commands::{
     attach_agent_impl, cancel_agent_impl, cancel_forward_impl, cancel_send_impl, cancel_turn_impl,
     changed_files_impl, check_antigravity_auth_impl, check_antigravity_binary_impl,
     check_claude_auth_impl, check_claude_binary_impl, check_codex_auth_impl,
-    check_codex_binary_impl, check_gemini_auth_impl, check_gemini_binary_impl,
-    commit_changed_files_impl, commit_file_diff_impl, commit_ranges_impl, copy_builtin_prompt_impl,
-    create_agent_with_profiles_impl, create_project_impl, delete_project_impl, editor_open_argv,
-    existing_attachment_paths_impl, fetch_repo_impl, file_diff_impl, fork_agent_impl,
-    forward_message_impl, forward_prompt_impl, get_preferences_impl, get_prompt_source_impl,
-    harness_adapter_for, init_directory_impl, install_status_for_adapter, list_agents_impl,
-    list_mcp_providers_impl, list_message_pins_impl, list_projects_impl, list_prompts_impl,
-    list_tracked_repos_from_inputs, list_workspace_directories_impl,
-    load_project_conversation_impl, load_transcript_impl, migrate_message_pin_impl,
-    open_commit_file_difftool_impl, open_project_impl, open_worktree_file_difftool_impl,
-    parse_uuid, pick_directory_impl, project_session_fingerprints_impl,
-    read_tracked_repo_from_inputs, recheck_harness_installs_impl, remove_agent_impl,
-    remove_directory_impl, remove_mcp_provider_impl, remove_message_pins_impl,
-    remove_queued_message_impl, remove_tracked_repo_impl, rename_agent_impl, rename_project_impl,
-    render_prompt_impl, reorder_agents_impl, resolve_saved_prompt_fresh_impl,
-    resolve_saved_prompt_impl, resume_agent_in_terminal_impl, reveal_in_finder_argv,
-    search_project_files_in_root, search_project_files_root_impl, send_message_impl,
-    set_active_agent_profile_impl, set_active_project_impl, set_agent_profiles_impl,
-    set_message_pin_impl, set_preferences_impl, set_project_archived_impl,
-    set_visible_project_impl, sign_in_mcp_provider_impl, sign_out_mcp_provider_impl,
-    spawn_prompt_resolution_change_notifications, stage_attachment_impl, sync_prompts_and_notify,
-    terminal_open_argv, test_mcp_connection_impl, test_saved_mcp_provider_impl,
-    tracked_repos_inputs, tracked_roots, validate_external_url,
+    check_codex_binary_impl, commit_changed_files_impl, commit_file_diff_impl, commit_ranges_impl,
+    copy_builtin_prompt_impl, create_agent_with_profiles_impl, create_project_impl,
+    delete_project_impl, editor_open_argv, existing_attachment_paths_impl, fetch_repo_impl,
+    file_diff_impl, fork_agent_impl, forward_message_impl, forward_prompt_impl,
+    get_preferences_impl, get_prompt_source_impl, harness_adapter_for, init_directory_impl,
+    install_status_for_adapter, list_agents_impl, list_mcp_providers_impl, list_message_pins_impl,
+    list_projects_impl, list_prompts_impl, list_tracked_repos_from_inputs,
+    list_workspace_directories_impl, load_project_conversation_impl, load_transcript_impl,
+    migrate_message_pin_impl, open_commit_file_difftool_impl, open_project_impl,
+    open_worktree_file_difftool_impl, parse_uuid, pick_directory_impl,
+    project_session_fingerprints_impl, read_tracked_repo_from_inputs,
+    recheck_harness_installs_impl, remove_agent_impl, remove_directory_impl,
+    remove_mcp_provider_impl, remove_message_pins_impl, remove_queued_message_impl,
+    remove_tracked_repo_impl, rename_agent_impl, rename_project_impl, render_prompt_impl,
+    reorder_agents_impl, resolve_saved_prompt_fresh_impl, resolve_saved_prompt_impl,
+    resume_agent_in_terminal_impl, reveal_in_finder_argv, search_project_files_in_root,
+    search_project_files_root_impl, send_message_impl, set_active_agent_profile_impl,
+    set_active_project_impl, set_agent_profiles_impl, set_message_pin_impl, set_preferences_impl,
+    set_project_archived_impl, set_visible_project_impl, sign_in_mcp_provider_impl,
+    sign_out_mcp_provider_impl, spawn_prompt_resolution_change_notifications,
+    stage_attachment_impl, sync_prompts_and_notify, terminal_open_argv, test_mcp_connection_impl,
+    test_saved_mcp_provider_impl, tracked_repos_inputs, tracked_roots, validate_external_url,
 };
 use crate::error::AppError;
 use crate::preferences::Preferences;
@@ -423,19 +421,6 @@ async fn check_codex_auth() -> Result<(), String> {
         .map(std::path::PathBuf::from)
         .unwrap_or_default();
     check_codex_auth_impl(&home).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-async fn check_gemini_binary(state: State<'_, AppState>) -> Result<(), String> {
-    check_gemini_binary_impl(state.inner()).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-async fn check_gemini_auth() -> Result<(), String> {
-    let home = std::env::var_os("HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_default();
-    check_gemini_auth_impl(&home).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1684,12 +1669,12 @@ impl EventEmitter for AppHandleEmitter {
 /// - `"mock"` → all three adapters = `MockHarnessAdapter`.
 /// - Any other value → panic (silent fall-through to default would be a footgun).
 ///
-/// Returns `(claude_adapter, codex_adapter, gemini_adapter, antigravity_adapter)`.
+/// Returns `(claude_adapter, codex_adapter, antigravity_adapter)`.
 /// All are constructed under "claude"/unset because the `match agent.harness`
 /// routing in `send_message_impl` may dispatch to any at runtime; no
 /// adapter's constructor performs a binary check, so missing CLIs only
 /// surface at `check_*_binary` time, not at app startup.
-// A 4-tuple of the same trait object reads as "complex" to clippy, but a
+// A 3-tuple of the same trait object reads as "complex" to clippy, but a
 // named struct for a private one-call-site startup helper would be more
 // ceremony than it's worth — the tuple is destructured immediately at the
 // single call site in `run`.
@@ -1698,23 +1683,16 @@ fn build_adapters() -> (
     Arc<dyn HarnessAdapter>,
     Arc<dyn HarnessAdapter>,
     Arc<dyn HarnessAdapter>,
-    Arc<dyn HarnessAdapter>,
 ) {
     match std::env::var("SWITCHBOARD_HARNESS").as_deref() {
         Ok("mock") => {
             tracing::info!("SWITCHBOARD_HARNESS=mock — using MockHarnessAdapter for all harnesses");
             let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
-            (
-                Arc::clone(&mock),
-                Arc::clone(&mock),
-                Arc::clone(&mock),
-                mock,
-            )
+            (Arc::clone(&mock), Arc::clone(&mock), mock)
         }
         Ok("claude") | Err(_) => (
             Arc::new(ClaudeCodeAdapter::new()),
             Arc::new(CodexAdapter::new()),
-            Arc::new(GeminiAdapter::new()),
             Arc::new(AntigravityAdapter::new()),
         ),
         Ok(other) => panic!(
@@ -1998,7 +1976,7 @@ pub fn run() {
         let _ = build_log_subscriber(env_filter, std::io::stdout).try_init();
     }
 
-    let (claude_adapter, codex_adapter, gemini_adapter, antigravity_adapter) = build_adapters();
+    let (claude_adapter, codex_adapter, antigravity_adapter) = build_adapters();
 
     // In release builds, enforce single-instance: a second launch focuses the
     // existing window instead of spawning a rival process, keeping one
@@ -2066,7 +2044,6 @@ pub fn run() {
             let state = AppState::new(
                 Arc::clone(&claude_adapter),
                 Arc::clone(&codex_adapter),
-                Arc::clone(&gemini_adapter),
                 Arc::clone(&antigravity_adapter),
                 emitter,
             );
@@ -2149,8 +2126,6 @@ pub fn run() {
             check_claude_binary,
             check_codex_binary,
             check_codex_auth,
-            check_gemini_binary,
-            check_gemini_auth,
             check_antigravity_binary,
             check_antigravity_auth,
             check_claude_auth,

@@ -628,7 +628,7 @@
   /// so they render as `model (effort)` rather than two loose columns. Effort
   /// alone renders bare — a lone `(high)` reads as a fragment, and the pairing
   /// is only meaningful when there is a model to qualify. Harness-agnostic:
-  /// Codex and Claude both supply effort, Gemini/Antigravity never do.
+  /// Claude, Codex, and Antigravity all supply effort when one was selected.
   function modelWithEffort(model: string | undefined, effort: string | undefined): string {
     if (!model) return effort ?? "";
     return effort ? `${model} (${effort})` : model;
@@ -1964,7 +1964,7 @@
        authoritative for this turn's status, mirroring the fan-out column. When
        present, suppress the turn's own status chip and the live footer so a
        cancelled-mid turn doesn't reopen with a phantom spinner (Claude
-       `streaming`) or a contradictory `failed` chip (Codex/Gemini/Antigravity). -->
+       `streaming`) or a contradictory `failed` chip (Codex/Antigravity). -->
   {@const ownedByOutcome = hasOutcomeFor(turn)}
   <!-- Compact preview applies to any terminal response with content (complete,
        failed, cancelled, or dangling streaming-on-disk closed by a marker). Only

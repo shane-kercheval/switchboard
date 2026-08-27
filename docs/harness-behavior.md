@@ -1,10 +1,15 @@
 # Harness behavior & Switchboard handling — canonical reference
 
-The single lookup surface for **how each harness behaves in the scenarios Switchboard cares about, how our adapter/frontend currently handles it, and where the gaps are.** Built 2026-05-27 from a code+research audit of all four adapters and the frontend.
+The single lookup surface for **how each harness behaves in the scenarios Switchboard cares about, how our adapter/frontend currently handles it, and where the gaps are.** Built 2026-05-27 from a code+research audit of all adapters and the frontend.
 
 **How this relates to the other docs:**
 - **system-design §9** is the *design-level* capability matrix (native / derived / unavailable per capability) and the process model. It stays the canonical design statement; this doc is the *operational* companion (observed shapes → our handling → gaps).
 - **`docs/research/archive/<harness>-cli-observed.md`** are the *captured-in-time provenance* — the raw probes (actual strings, exit codes, fixtures) behind the cells here. They are frozen (no longer updated) and live under `research/archive/`; treat **this** doc as the lookup surface and the archived `-observed` files as the evidence it cites: [claude](research/archive/claude-code-cli-observed.md), [codex](research/archive/codex-cli-observed.md), [gemini](research/archive/gemini-cli-observed.md), [antigravity](research/archive/antigravity-cli-observed.md).
+
+>
+> **Gemini CLI support was removed on 2026-08-27.** Google withdrew Gemini CLI access for individual accounts (see **G26**), which made the adapter impossible to exercise — neither `make test-live-gemini` nor a manual check could run — so the adapter, its tests, and its frontend surface were deleted. Switchboard supports **three** harnesses: Claude Code, Codex, Antigravity.
+>
+> **Gemini rows, gaps, and sections below are retained as history, not as current behavior** — the same treatment this doc gives resolved gaps and superseded probes. Read any Gemini cell as "what was true when the adapter existed." Do not treat them as describing shipping code. If Gemini support is ever restored, two things are *unestablished* and must be probed first: its §3.7 out-of-cwd attachment behavior (never measured) and whether the `--skip-trust` the adapter passed still fully answers its workspace-trust gate (§5).
 
 **Legend:** ✅ handled correctly · ⚠️ partial / stale · ❌ gap. "Displayed where" distinguishes the **transcript** (per-turn) from the **sidebar** (per-agent) from a **project banner** (startup auth probe).
 
@@ -291,6 +296,21 @@ The adapter closes the live edit-content gap at turn end: the session-file enric
 
 ---
 
+### 3.7 Attachment staging location — can a harness read a file outside its cwd?
+
+> **Status: probed 2026-08-27. Claude, Codex, and Antigravity all read an attachment staged wholly outside the agent's working directory. Gemini indeterminate (auth-dead, G26).**
+
+Switchboard transports attachments by staging the file and appending its absolute path to the prompt (`docs/implementation_plans/2026-06-07-attachments.md`). That plan chose `<cwd>/.switchboard/projects/<id>/attachments/` on the reasoning that **inside `cwd` is the only location readable by all four harnesses** — a claim made before the current maximum-autonomy spawn flags settled, and never tested against an out-of-cwd path. It is the load-bearing constraint on where Switchboard may keep per-project state, so it was re-probed directly.
+
+| Harness | CLI @ probe | Inside cwd | Outside cwd | Notes |
+|---|---|---|---|---|
+| **Claude** | 2.1.247 | ✅ | ✅ | `--dangerously-skip-permissions`; no path scoping observed |
+| **Codex** | 0.149.0 | ✅ | ✅ | `--dangerously-bypass-approvals-and-sandbox`; sandbox off, so no workspace scoping |
+| **Antigravity** | 1.1.21 | ✅ | ✅ | **The predicted failure — it passes.** `--add-dir <cwd>` establishes the workspace for the model's file tools, so an out-of-workspace read was expected to fail. It does not: the file is read with **no** second `--add-dir`. Re-probe on `agy` bumps; this is the one result most likely to regress, since it depends on workspace scoping *not* gating reads. |
+| **Gemini** | 0.44.0 | ❌ | ❌ | **Indeterminate, not a failure of this property.** Both cases fail identically with an empty response because the CLI is auth-dead for individual accounts (G26) — the control fails too, so the probe cannot distinguish. Not a blocker: G26 already records that Gemini's live tests cannot run at all. |
+
+**Consequence.** The "inside cwd is the only universally readable location" constraint is **not true at current CLI versions**, so Switchboard's per-project state is free to live outside the user's working directories. Do not read this as "sandboxing is gone" — it holds *because* all four adapters spawn with sandboxing/permissions fully disabled. If any adapter ever re-enables a sandbox, this table must be re-probed before trusting an out-of-cwd path. Tests: `live_<harness>_attachment_outside_cwd_is_readable` (`crates/dispatcher/tests/live_end_to_end.rs`), alongside the original in-cwd cases.
+
 ## 4. Gap register (actionable)
 
 Grouped by theme; this is the candidate scope for the failure/metadata-surfacing milestone.
@@ -359,6 +379,7 @@ Grouped by theme; this is the candidate scope for the failure/metadata-surfacing
 ## 5. Open captures / unverified
 
 - **Codex `*** Move to:` patch sections (§3.6)** — now **represented**: the edit facet carries the destination on `EditedFile.moved_to` (populated from `*** Move to:` in patch text and `move_path` in structured change maps, both rollout generations) and the transcript renders `source → destination`. A *live* move remains unobserved — real renames are rare (one across 3,201 local file-change records) — so the field's shape rests on the captured `move_path` values and the documented patch grammar, not a live probe.
+- **Gemini trusted-folders gate (historical; superseded by removal).** A bare `gemini --yolo -p …` in an untrusted directory prints `Approval mode overridden to "default" because the current folder is not trusted`. **This was never a Switchboard defect:** the adapter passed `--skip-trust` on every dispatch precisely for this gate (its module doc said so), so the override never applied to our spawns — the probe that surfaced it invoked the CLI bare. Recorded because the gate's *scope* was never verified against a working dispatch (auth fails first, G26), so a restored adapter should confirm `--skip-trust` still fully answers it. Setting `GEMINI_CLI_TRUST_WORKSPACE=true` does **not** clear the tier error; the two are independent failures.
 - **Gemini `[Thought: true]` live-stream literal (§3.2)** — observed in-app inside a `message` stream-json event's `content`, under a newer/different model config than the original headless probe (which yielded `thoughts:[]` in the stream, never reasoning). Unknown whether it's a reasoning marker we should reclassify to `ContentKind::Thinking` (strip the prefix, emit the remainder) or plain model-authored text. Capture needs `gemini -p "<prompt>" --output-format stream-json` against that same config. Until captured, the live stream surfaces no Gemini reasoning and `[Thought: true]` falls through as `Text`.
 - **Gemini bad-token (401) auth shape** — never observed; our substring detector is a guess. Capture needs a *stale-but-present* token (a clean logout gives the exit-41 shape instead).
 - **Gemini hard quota wall** — none observed (it stalls/retries). Treated as "nothing to classify."

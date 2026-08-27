@@ -429,7 +429,7 @@ pub(crate) fn cap_content(s: &str) -> (String, bool) {
     (s[..end].to_owned(), true)
 }
 
-/// Split a Claude/Gemini-convention MCP tool name (`mcp__<server>__<tool>`)
+/// Split a Claude-convention MCP tool name (`mcp__<server>__<tool>`)
 /// into `(server, tool)`. `None` when the name doesn't carry both parts —
 /// callers fall back to [`ToolFacet::Other`] rather than guessing.
 pub(crate) fn split_mcp_name(name: &str) -> Option<(String, String)> {

@@ -33,7 +33,6 @@ let pathSource: "capturing" | "login_shell" | "fallback";
 const AUTH_CMD: Record<string, HarnessKind> = {
   check_claude_auth: "claude_code",
   check_codex_auth: "codex",
-  check_gemini_auth: "gemini",
   check_antigravity_auth: "antigravity",
 };
 
@@ -46,7 +45,6 @@ function setup(over?: Partial<Record<HarnessKind, Partial<HarnessState>>>): void
   state = {
     claude_code: { installed: true, version: "1.2.3", authed: true },
     codex: { installed: true, version: "0.9.0", authed: true },
-    gemini: { installed: true, version: "2.0.0", authed: true },
     antigravity: { installed: true, version: "0.1.0", authed: true },
   };
   for (const h of ALL) {
@@ -114,45 +112,25 @@ describe("HarnessStatusList", () => {
     expect(screen.getByTestId("harness-status")).not.toHaveTextContent("unsupported");
   });
 
-  it("lists Antigravity above Gemini, and Gemini carries the availability note", async () => {
-    // Display order deliberately deviates from ALL_HARNESSES here: Antigravity
-    // superseded Gemini for individual Google accounts, so Gemini sits last
-    // with a full-row note explaining who can still use it.
-    setup();
-    render(HarnessStatusList);
-    await waitFor(() => {
-      expect(screen.getByTestId("harness-row-gemini")).toBeInTheDocument();
-    });
-    const ids = screen.getAllByTestId(/^harness-row-/).map((el) => el.getAttribute("data-testid"));
-    expect(ids.indexOf("harness-row-antigravity")).toBeLessThan(ids.indexOf("harness-row-gemini"));
-    expect(ids).toHaveLength(ALL.length);
-
-    const note = screen.getByTestId("harness-note-gemini");
-    expect(note).toHaveTextContent(/no longer available on individual google accounts/i);
-    expect(note).toHaveTextContent(/organization plan/i);
-    // The note belongs to the Gemini row only.
-    expect(screen.getByTestId("harness-row-gemini")).toContainElement(note);
-  });
-
   it("separates the columns — a not-installed harness shows no auth status (auth is moot)", async () => {
-    setup({ gemini: { installed: false, version: null, authed: false } });
+    setup({ antigravity: { installed: false, version: null, authed: false } });
     render(HarnessStatusList);
     await waitFor(() => {
-      expect(screen.getByTestId("harness-install-gemini")).toHaveTextContent("Not installed");
+      expect(screen.getByTestId("harness-install-antigravity")).toHaveTextContent("Not installed");
     });
     // The auth column is present but carries no hint when the binary is missing.
-    expect(screen.getByTestId("harness-auth-gemini")).toBeEmptyDOMElement();
+    expect(screen.getByTestId("harness-auth-antigravity")).toBeEmptyDOMElement();
   });
 
   it("not-installed harness offers a setup-guide button (next to the install status) that opens the docs via the opener", async () => {
-    setup({ gemini: { installed: false, version: null } });
+    setup({ antigravity: { installed: false, version: null } });
     render(HarnessStatusList);
-    const button = await screen.findByTestId("harness-setup-gemini");
+    const button = await screen.findByTestId("harness-setup-antigravity");
     expect(button).toHaveTextContent("Setup guide");
 
     await fireEvent.click(button);
     expect(invokeMock).toHaveBeenCalledWith("open_external_url", {
-      url: HARNESS_SETUP_URL.gemini,
+      url: HARNESS_SETUP_URL.antigravity,
     });
   });
 
@@ -194,7 +172,6 @@ describe("HarnessStatusList", () => {
     setup({
       claude_code: { installed: false, version: null },
       codex: { installed: false, version: null },
-      gemini: { installed: false, version: null },
       antigravity: { installed: false, version: null },
     });
     render(HarnessStatusList);

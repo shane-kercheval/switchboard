@@ -4,7 +4,7 @@
 //!
 //! Antigravity is **single-file-per-conversation**: a resume appends to the
 //! same transcript pair (the conversation UUID lives in the directory name),
-//! so hydration reads one representation — there is no Gemini-style
+//! so hydration reads one representation — there is no split-source
 //! per-resume file fan-out to merge. The conversation UUID comes from the per-agent
 //! sidecar (server-assigned, never `AgentRecord.session_id`, which is always
 //! `None` for Antigravity).

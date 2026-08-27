@@ -12,7 +12,7 @@ fn main() {
     let source = sp::await_capture(sp::capture_attempt_budget());
     println!("capture:            {:?}  source={source:?}", t.elapsed());
 
-    for b in ["claude", "codex", "gemini", "agy"] {
+    for b in ["claude", "codex", "agy"] {
         let t = Instant::now();
         let ok = sp::probe_binary(Path::new(b)).is_ok();
         let probe = t.elapsed();

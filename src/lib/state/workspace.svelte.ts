@@ -232,7 +232,7 @@ function liveSliceSendIds(projectId: ProjectId): Set<SendId> {
 }
 
 /// Whether a session file changed between two fingerprints. Gated on
-/// `(source_path, modified_at, byte_len)` together — a moved file (Gemini's
+/// `(source_path, modified_at, byte_len)` together — a moved file (a harness's
 /// candidate selection), a touched mtime, or an appended byte length each count
 /// as changed; absence on one side but not the other (file appeared/vanished) is
 /// also a change.
@@ -438,7 +438,7 @@ export async function createProjectAndActivate(name: string, directory: string):
 
 /// Auto-populate a freshly created project with one agent per installed harness
 /// that opts into auto-seeding (`AUTO_SEED_ON_NEW_PROJECT`); excluded harnesses
-/// like Gemini stay dialog-only. New projects only — called solely from
+/// stay dialog-only. New projects only — called solely from
 /// `createProjectAndActivate`, never on activation of an existing project.
 ///
 /// Awaits a *settled* availability probe before reading `installed()`. Two races
@@ -475,9 +475,11 @@ async function seedAgentsForInstalledHarnesses(projectId: ProjectId): Promise<vo
   }
   for (const harness of harnessAvailability.installed()) {
     if (selection.activeProjectId !== projectId) break;
-    // Installed but auto-seed-excluded harnesses (e.g. Gemini) are still
-    // selectable in the create-agent dialog — they're just not born into a
-    // fresh project by default.
+    // Every harness is auto-seeded today, so this guard takes no branch; it is
+    // retained as the extension point for a harness that shouldn't be born into
+    // a fresh project (see the note above `SUPPORTS_MODEL_SELECTION` in
+    // `harnessDisplay.ts`). Such a harness stays selectable in the create-agent
+    // dialog — it is just not seeded automatically.
     if (!AUTO_SEED_ON_NEW_PROJECT[harness]) continue;
     try {
       // Every auto-created agent is born with a known, displayed model/effort

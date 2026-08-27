@@ -88,7 +88,7 @@ describe("validateAgentName — uniqueness", () => {
   });
 
   it("allows a non-colliding name", () => {
-    expect(validateAgentName("gemini", roster)).toEqual({ ok: true });
+    expect(validateAgentName("scout", roster)).toEqual({ ok: true });
   });
 });
 

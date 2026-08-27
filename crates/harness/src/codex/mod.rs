@@ -96,7 +96,7 @@ pub struct CodexAdapter {
     home_dir_override: Option<PathBuf>,
     /// Lazily-resolved `codex --version`, cached for the lifetime of the
     /// adapter. Empty string caches a failed/absent probe (version is
-    /// display-only). Mirrors the Gemini/Antigravity pattern.
+    /// display-only). Mirrors the Antigravity pattern.
     cached_version: OnceLock<String>,
 }
 
@@ -167,7 +167,7 @@ impl HarnessAdapter for CodexAdapter {
         let binary = crate::subprocess::resolve_binary(&self.codex_binary_path)?;
         // Resume locator: the `thread_id` + partition-date captured on a prior
         // dispatch, now carried on the agent's registry record (`session_locator`)
-        // and passed in as dispatch input — like Claude/Gemini. `None` is the
+        // and passed in as dispatch input — like Claude. `None` is the
         // first-dispatch case; the adapter captures it from the stream below.
         let prior = codex_locator(agent);
         let args = build_args(agent, prompt, prior.as_ref().map(|l| l.thread_id.as_str()));

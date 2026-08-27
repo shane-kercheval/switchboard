@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 /// Identifies which AI coding harness an agent is bound to.
 /// `#[non_exhaustive]` so further variants remain non-breaking.
 ///
-/// **Session-id asymmetry** (load-bearing): Claude Code and Gemini agents
-/// pre-generate `AgentRecord.session_locator` at registration time (passed via
+/// **Session-id asymmetry** (load-bearing): Claude Code agents pre-generate
+/// `AgentRecord.session_locator` at registration time (passed via
 /// `--session-id <uuid>` on first dispatch, `--resume <uuid>` thereafter);
 /// Codex and Antigravity agents leave it `None` and capture the locator
 /// post-spawn — Codex from the `thread.started` stream event on first dispatch,
@@ -14,27 +14,19 @@ use serde::{Deserialize, Serialize};
 /// for a new `~/.gemini/antigravity-cli/brain/<uuid>/` directory. The captured
 /// locator is emitted as a `SessionLocatorCaptured` event and persisted by the
 /// dispatcher onto the registry record (no sidecar).
-///
-/// **UUID-version asymmetry** (load-bearing): Claude Code uses UUID v7
-/// (time-ordered) like the rest of Switchboard; Gemini uses UUID v4
-/// (random) because Gemini's session-file naming uses the first 8 hex chars
-/// of the session ID as a filename component, and UUID v7s minted in the
-/// same millisecond share their first 8 chars, causing on-disk session-file
-/// interleave under concurrent dispatch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum HarnessKind {
     ClaudeCode,
     Codex,
-    Gemini,
     Antigravity,
 }
 
 impl HarnessKind {
     /// Whether Switchboard can set this harness's model per agent (via a
     /// per-invocation CLI flag). True for every harness: Claude (`--model`),
-    /// Codex (`-m`), Gemini (`-m`), Antigravity (`--model`).
+    /// Codex (`-m`), Antigravity (`--model`).
     ///
     /// Antigravity was false until `agy` 1.1.x made `--model` work headlessly
     /// without mutating the harness's own global config — the two facts that
@@ -49,14 +41,13 @@ impl HarnessKind {
     #[must_use]
     pub fn supports_model_selection(self) -> bool {
         match self {
-            Self::ClaudeCode | Self::Codex | Self::Gemini | Self::Antigravity => true,
+            Self::ClaudeCode | Self::Codex | Self::Antigravity => true,
         }
     }
 
     /// Whether Switchboard can set this harness's reasoning-effort level per
-    /// agent. True for Claude (`--effort`), Codex (`-c
-    /// model_reasoning_effort=`) and Antigravity (`--effort`); false for Gemini
-    /// (thinking is `settings.json` config-only, no CLI flag) — per
+    /// agent. True for every supported harness: Claude (`--effort`), Codex (`-c
+    /// model_reasoning_effort=`), Antigravity (`--effort`) — per
     /// `harness-behavior.md` §3.4.
     ///
     /// **Antigravity's levels are per-model and mandatory where they exist.**
@@ -68,14 +59,16 @@ impl HarnessKind {
     /// levels a given model accepts is the picker's business — see
     /// `effortOptionsFor` in `src/lib/agentSelection.ts`.
     ///
-    /// A *separate* axis from model selection with a *different* capability set
-    /// (Gemini has model but not effort), so it is its own gate. Same authority
-    /// role and exhaustiveness rationale as [`Self::supports_model_selection`].
+    /// A *separate* axis from model selection, kept as its own gate even though
+    /// every current harness supports both: the axes are independent (a harness
+    /// with model control but no effort control has existed here before), and
+    /// collapsing them would erase that distinction the next time one does.
+    /// Same authority role and exhaustiveness rationale as
+    /// [`Self::supports_model_selection`].
     #[must_use]
     pub fn supports_effort_selection(self) -> bool {
         match self {
             Self::ClaudeCode | Self::Codex | Self::Antigravity => true,
-            Self::Gemini => false,
         }
     }
 
@@ -85,8 +78,7 @@ impl HarnessKind {
     ///
     /// False for Claude and Codex: their effort flag is independent of the
     /// model flag, so "harness's own default model, at high effort" is a valid
-    /// configuration and both adapters emit the effort on its own. Gemini has
-    /// no effort axis at all, so the question does not arise.
+    /// configuration and both adapters emit the effort on its own.
     ///
     /// True for Antigravity, where the valid levels are a *property of the
     /// model*: `agy` decides them per model, offers none with no model
@@ -102,7 +94,7 @@ impl HarnessKind {
     pub fn effort_requires_model(self) -> bool {
         match self {
             Self::Antigravity => true,
-            Self::ClaudeCode | Self::Codex | Self::Gemini => false,
+            Self::ClaudeCode | Self::Codex => false,
         }
     }
 
@@ -118,15 +110,15 @@ impl HarnessKind {
     /// Claude is confirmed: the **first** assistant `message.id` round-trips
     /// live↔disk and is the dedup `hydration_key` — it is parse-invariant across
     /// a mid-flight vs completed read, unlike the final id (which the cost-join
-    /// `stable_message_id` uses). Codex/Gemini have a re-parse-stable disk key
-    /// but their live-stream parity is unprobed, so they stay once-per-session;
+    /// `stable_message_id` uses). Codex has a re-parse-stable disk key but its
+    /// live-stream parity is unprobed, so it stays once-per-session;
     /// Antigravity has no per-turn id at all. Same authority + exhaustiveness
     /// role as the two siblings above.
     #[must_use]
     pub fn supports_refresh(self) -> bool {
         match self {
             Self::ClaudeCode => true,
-            Self::Codex | Self::Gemini | Self::Antigravity => false,
+            Self::Codex | Self::Antigravity => false,
         }
     }
 
@@ -149,10 +141,8 @@ impl HarnessKind {
     /// provenance field to hold and would need its own registration path —
     /// flipping this arm to `true` is *necessary but not sufficient* for it,
     /// and doing only that would produce records
-    /// [`crate::project::Project::fork_agent`] cannot honor. Gemini's
-    /// `--session-file` import drops tool calls and ignores the caller's
-    /// session id; Antigravity forks only server-side, on its own initiative.
-    /// Per `harness-behavior.md` §3.5.
+    /// [`crate::project::Project::fork_agent`] cannot honor. Antigravity forks
+    /// only server-side, on its own initiative. Per `harness-behavior.md` §3.5.
     ///
     /// **Naming:** "session fork" here is Claude's `--fork-session`, which is
     /// the headless equivalent of its TUI `/branch`. Claude's TUI `/fork` is an
@@ -164,7 +154,7 @@ impl HarnessKind {
     pub fn supports_session_fork(self) -> bool {
         match self {
             Self::ClaudeCode => true,
-            Self::Codex | Self::Gemini | Self::Antigravity => false,
+            Self::Codex | Self::Antigravity => false,
         }
     }
 }
@@ -209,7 +199,6 @@ impl fmt::Display for HarnessKind {
         match self {
             Self::ClaudeCode => f.write_str("Claude Code"),
             Self::Codex => f.write_str("Codex"),
-            Self::Gemini => f.write_str("Gemini"),
             Self::Antigravity => f.write_str("Antigravity"),
         }
     }
@@ -244,18 +233,6 @@ mod tests {
     }
 
     #[test]
-    fn gemini_serializes_as_snake_case() {
-        let json = serde_json::to_string(&HarnessKind::Gemini).unwrap();
-        assert_eq!(json, "\"gemini\"");
-    }
-
-    #[test]
-    fn gemini_deserializes_from_snake_case() {
-        let parsed: HarnessKind = serde_json::from_str("\"gemini\"").unwrap();
-        assert_eq!(parsed, HarnessKind::Gemini);
-    }
-
-    #[test]
     fn antigravity_serializes_as_snake_case() {
         let json = serde_json::to_string(&HarnessKind::Antigravity).unwrap();
         assert_eq!(json, "\"antigravity\"");
@@ -271,7 +248,6 @@ mod tests {
     fn supports_model_selection_per_variant() {
         assert!(HarnessKind::ClaudeCode.supports_model_selection());
         assert!(HarnessKind::Codex.supports_model_selection());
-        assert!(HarnessKind::Gemini.supports_model_selection());
         assert!(HarnessKind::Antigravity.supports_model_selection());
     }
 
@@ -279,7 +255,6 @@ mod tests {
     fn supports_effort_selection_per_variant() {
         assert!(HarnessKind::ClaudeCode.supports_effort_selection());
         assert!(HarnessKind::Codex.supports_effort_selection());
-        assert!(!HarnessKind::Gemini.supports_effort_selection());
         assert!(HarnessKind::Antigravity.supports_effort_selection());
     }
 
@@ -290,25 +265,21 @@ mod tests {
         assert!(HarnessKind::Antigravity.effort_requires_model());
         assert!(!HarnessKind::ClaudeCode.effort_requires_model());
         assert!(!HarnessKind::Codex.effort_requires_model());
-        assert!(!HarnessKind::Gemini.effort_requires_model());
     }
 
     #[test]
     fn supports_refresh_is_claude_only() {
         assert!(HarnessKind::ClaudeCode.supports_refresh());
         assert!(!HarnessKind::Codex.supports_refresh());
-        assert!(!HarnessKind::Gemini.supports_refresh());
         assert!(!HarnessKind::Antigravity.supports_refresh());
     }
 
     #[test]
     fn supports_session_fork_is_claude_only() {
-        // Codex's app-server `thread/fork` and Gemini's lossy `--session-file`
-        // import exist but are deliberately unwired in v1 — this gate is what
-        // keeps the Fork action off those agents.
+        // Codex's app-server `thread/fork` exists but is deliberately unwired in
+        // v1 — this gate is what keeps the Fork action off those agents.
         assert!(HarnessKind::ClaudeCode.supports_session_fork());
         assert!(!HarnessKind::Codex.supports_session_fork());
-        assert!(!HarnessKind::Gemini.supports_session_fork());
         assert!(!HarnessKind::Antigravity.supports_session_fork());
     }
 
@@ -322,7 +293,6 @@ mod tests {
     fn display_uses_user_facing_names_with_space_for_claude() {
         assert_eq!(format!("{}", HarnessKind::ClaudeCode), "Claude Code");
         assert_eq!(format!("{}", HarnessKind::Codex), "Codex");
-        assert_eq!(format!("{}", HarnessKind::Gemini), "Gemini");
         assert_eq!(format!("{}", HarnessKind::Antigravity), "Antigravity");
     }
 }

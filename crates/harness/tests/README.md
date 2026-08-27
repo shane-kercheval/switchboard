@@ -1,7 +1,7 @@
 # Harness live tests
 
 The **live-harness test suite** — integration tests that spawn the real
-`claude`, `codex`, `gemini`, and `agy` (Antigravity) CLIs and assert on the
+`claude`, `codex`, and `agy` (Antigravity) CLIs and assert on the
 events the adapters emit. Developer-local; CI does not run them.
 
 Why they exist: adapter correctness depends on behavior we don't control —
@@ -21,14 +21,13 @@ real harnesses".
 ## How to run
 
 One-time: install and authenticate each harness with subscription credentials
-(no API keys) — `claude auth login`, `codex login`, an interactive `gemini`
+(no API keys) — `claude auth login`, `codex login`, an interactive `agy`
 sign-in, and the Antigravity desktop-app sign-in for `agy`.
 
 ```sh
 make test-live              # all harnesses
 make test-live-claude       # one harness — spend quota only on what you changed
 make test-live-codex        #   (e.g. after that harness ships a new version)
-make test-live-gemini
 make test-live-antigravity
 ```
 
@@ -39,7 +38,7 @@ per-test response size, not test count.
 ## Conventions
 
 - **Test naming is load-bearing.** Every live test name starts with
-  `live_<harness>_` (`claude` / `codex` / `gemini` / `antigravity`); the
+  `live_<harness>_` (`claude` / `codex` / `antigravity`); the
   per-harness `make` targets filter on it. See `AGENTS.md` for the rule. The
   authoritative inventory of what exists is
   `cargo test … -- --ignored --list`, **not this file** — so this file
@@ -73,14 +72,9 @@ per-test response size, not test count.
   auth file, or Keychain entry where the adapter expects them; drift-detection
   for a harness relocating its auth or renaming its binary.
 
-Two per-harness subtleties worth knowing (the _why_, since they aren't obvious
+One per-harness subtlety worth knowing (the _why_, since it isn't obvious
 from a test name):
 
-- **Gemini's live tool output is empty** for read-like tools
-  (`tool_result.output = ""`) — the real content lives in the session file. So
-  Gemini's tool-use live test pairs by id only, and the output-content
-  assertion lives in the hydration test instead. This is the "live =
-  best-effort, hydration = authoritative" contract.
 - **Antigravity has no structured stream** — answer text and tool lifecycle are
   tailed from `transcript.jsonl`, and a turn is `Completed` only when a terminal
   answer is read from it. Its tool-use live test therefore doubles as the guard
@@ -97,7 +91,7 @@ triggered reliably (or non-destructively) against a real CLI:
   subprocess failure, or auth failure from outside, and triggering an auth
   failure would break the developer's logged-in state. The parser side is
   covered by the fixture-driven adapter tests (`claude_adapter.rs`,
-  `codex_adapter.rs`, `gemini_adapter.rs`, `antigravity_adapter.rs`). If a
+  `codex_adapter.rs`, `antigravity_adapter.rs`). If a
   production user reports a misclassified failure, capture the payload and add
   a fixture test from it.
 - **Auth-failure stream/output shapes** — same reason (can't break OAuth /

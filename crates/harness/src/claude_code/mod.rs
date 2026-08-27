@@ -32,7 +32,7 @@ pub struct ClaudeCodeAdapter {
     claude_binary_path: PathBuf,
     /// Lazily-resolved `claude --version`, cached for the lifetime of the
     /// adapter. Empty string caches a failed/absent probe (version is
-    /// display-only). Mirrors the Gemini/Antigravity pattern.
+    /// display-only). Mirrors the Antigravity pattern.
     cached_version: OnceLock<String>,
 }
 
@@ -402,10 +402,10 @@ fn to_base36(mut value: u32) -> String {
     out.iter().rev().collect()
 }
 
-// Parallels the Codex / Gemini producers: a single per-line control-flow loop
+// Parallels the Codex producer: a single per-line control-flow loop
 // plus the cancel and post-loop terminal handling. Splitting it would fragment
 // that flow without improving readability.
-// Arg count matches the Codex/Gemini producers, which carry the same allow:
+// Arg count matches the Codex producer, which carries the same allow:
 // the params are independent handles (child, pipes, tx, ids, dispatched effort,
 // cancel token) with no meaningful grouping — bundling them into a struct here
 // would add a type without removing a decision.

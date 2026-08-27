@@ -85,11 +85,6 @@ export async function checkCodexAuth(): Promise<void> {
 }
 
 /// See `checkCodexAuth` — same retention rationale.
-export async function checkGeminiAuth(): Promise<void> {
-  await invoke<null>("check_gemini_auth");
-}
-
-/// See `checkCodexAuth` — same retention rationale.
 export async function checkAntigravityAuth(): Promise<void> {
   await invoke<null>("check_antigravity_auth");
 }

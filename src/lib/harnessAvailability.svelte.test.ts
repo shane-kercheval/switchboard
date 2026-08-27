@@ -138,16 +138,16 @@ describe("harnessAvailability store", () => {
     invokeMock.mockImplementation((_cmd: string, args?: Record<string, unknown>) => {
       const harness = args?.harness as HarnessKind;
       return Promise.resolve(
-        harness === "gemini"
+        harness === "antigravity"
           ? { installed: false, version: null, path_source: "login_shell" }
           : { installed: true, version: "1.0.0", path_source: "login_shell" },
       );
     });
     await refreshHarnessAvailability();
-    expect(harnessAvailability.availability("gemini").binary).toBe("missing");
+    expect(harnessAvailability.availability("antigravity").binary).toBe("missing");
     // Order is deterministic by `HARNESSES` construction, not coincidence —
     // auto-create relies on a stable iteration order.
-    expect(harnessAvailability.installed()).toEqual(["claude_code", "codex", "antigravity"]);
+    expect(harnessAvailability.installed()).toEqual(["claude_code", "codex"]);
   });
 
   it("records a rejected probe as couldn't-check, not as absent", async () => {
@@ -319,17 +319,19 @@ describe("harnessAvailability store", () => {
     let call = 0;
     invokeMock.mockImplementation(() => {
       call += 1;
-      // Calls 1-4: the awaited refresh's first attempt, held so the event can
-      // land mid-flight. Calls 5-8: the event handler's replacement refresh,
-      // held forever. Calls 9+: the awaited refresh's retry, resolving.
-      if (call <= 4) {
+      // First `ALL.length` calls: the awaited refresh's first attempt, held so
+      // the event can land mid-flight. Next `ALL.length`: the event handler's
+      // replacement refresh, held forever. The rest: the awaited refresh's
+      // retry, resolving. Derived from `ALL.length` rather than hardcoded — the
+      // literals silently mis-batched when the harness set changed size.
+      if (call <= ALL.length) {
         return new Promise((resolve) => {
           releaseStale.push(() =>
             resolve({ installed: false, version: null, path_source: "capturing" }),
           );
         });
       }
-      if (call <= 8) return new Promise(() => {});
+      if (call <= ALL.length * 2) return new Promise(() => {});
       return Promise.resolve({ installed: true, version: "9.9.9", path_source: "login_shell" });
     });
 
@@ -338,7 +340,7 @@ describe("harnessAvailability store", () => {
     await waitFor(() => expect(listener).toBeDefined());
 
     listener?.();
-    await waitFor(() => expect(invokeMock).toHaveBeenCalledTimes(8));
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledTimes(ALL.length * 2));
 
     for (const release of releaseStale) release();
     await awaited;

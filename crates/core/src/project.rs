@@ -144,12 +144,13 @@ impl Project {
     /// undo here (unlike `Directory::create_project`), so no rollback applies.
     ///
     /// `model` / `effort` are the user-selected per-agent settings (`None` =
-    /// harness default). A selection on a harness that can't apply it (a model
-    /// on Antigravity, an effort on Gemini/Antigravity) is rejected at the
-    /// persistence boundary — see `register_agent_inner`. This generic
-    /// create path can't constrain that in its signature the way the attach
-    /// variants do (Gemini takes no effort, Antigravity takes neither), so it
-    /// relies on that shared chokepoint. The commands layer also validates
+    /// harness default). Every supported harness drives both axes today, so the
+    /// capability gates in `register_agent_inner` reject nothing at present; they
+    /// remain as the forcing function for a harness that lacks an axis (see the
+    /// note at those gates). Antigravity does constrain the *pair* — an effort
+    /// with no model is rejected, since its valid levels are per-model.
+    /// This generic create path can't express that in its signature the way the
+    /// attach variants do, so it relies on that shared chokepoint. The commands layer also validates
     /// first to return a friendlier error, but `core` is the backstop that
     /// keeps an inapplicable selection out of the registry regardless of
     /// caller.
@@ -178,12 +179,6 @@ impl Project {
         // session locator at registration vs. learn it at runtime):
         // - Claude Code pre-generates a UUID v7 locator; passed via
         //   `--session-id`/`--resume`.
-        // - Gemini pre-generates a UUID **v4** locator. Gemini's session
-        //   filename embeds the first 8 hex chars of the session ID, and
-        //   UUID v7s minted in the same millisecond share their first 8
-        //   chars — concurrent Gemini dispatches in one cwd would interleave
-        //   on disk. v4's first 8 chars are random across 32 bits, so the
-        //   collision probability is ~1/2^32. Localized to Gemini.
         // - Codex and Antigravity leave it `None`: their session id is
         //   assigned by the harness at runtime (Codex's `thread_id` from
         //   `thread.started`; Antigravity's server-assigned conversation
@@ -192,7 +187,6 @@ impl Project {
         //   `session_locator` via `set_session_locator`.
         let session_locator = match harness {
             HarnessKind::ClaudeCode => Some(SessionLocator::Uuid(Uuid::now_v7())),
-            HarnessKind::Gemini => Some(SessionLocator::Uuid(Uuid::new_v4())),
             HarnessKind::Codex | HarnessKind::Antigravity => None,
         };
         self.register_agent_inner(NewAgent {
@@ -334,35 +328,8 @@ impl Project {
         })
     }
 
-    /// Register an attached **Gemini** agent — one that wraps an
-    /// already-existing Gemini session. Mirrors the Claude pattern
-    /// (caller-controlled session UUID), not the Codex sidecar pattern.
-    /// The provided `session_id` is the UUID embedded in the Gemini
-    /// session-file filename's id8 prefix; the commands layer validates
-    /// the file exists (and is unambiguous) before calling this method.
-    ///
-    /// Takes `model` but no `effort`: Gemini supports model selection but not
-    /// effort selection (`supports_effort_selection` is `false`), so the
-    /// capability invariant is encoded in the signature rather than asserted.
-    pub fn register_attached_gemini_agent(
-        &self,
-        name: &str,
-        session_id: Uuid,
-        model: Option<String>,
-    ) -> Result<AgentRecord> {
-        self.register_agent_inner(NewAgent {
-            name,
-            harness: HarnessKind::Gemini,
-            session_locator: Some(SessionLocator::Uuid(session_id)),
-            model,
-            effort: None,
-            profiles: AgentProfiles::default(),
-            forked_from_session: None,
-        })
-    }
-
     /// Register an attached **Antigravity** agent — one that wraps an existing
-    /// server-assigned conversation. Now mirrors the Claude/Gemini
+    /// server-assigned conversation. Now mirrors the Claude
     /// caller-controlled-UUID pattern: the conversation UUID is the agent's
     /// session locator and is written straight onto the record, so there is no
     /// sidecar and no pre-generated-id ordering dance. The commands layer
@@ -422,7 +389,7 @@ impl Project {
         validate_name(name)?;
         // Normalize **before** the capability check: a blank selection means
         // "unset," which is allowed on any harness — it must not trip the
-        // capability error (e.g. a whitespace effort on Gemini is "no effort,"
+        // capability error (e.g. a whitespace effort is "no effort,"
         // not an unsupported effort).
         let model = normalize_selection(model);
         let effort = normalize_selection(effort);
@@ -431,6 +398,15 @@ impl Project {
             secondary.model = normalize_selection(secondary.model.take());
             secondary.effort = normalize_selection(secondary.effort.take());
         }
+        // These four capability gates are currently unreachable: every supported
+        // harness drives both axes, so neither `supports_*_selection` returns
+        // false for any variant. They are retained deliberately, not left as dead
+        // code — they are the forcing function that makes the next harness's
+        // capabilities a decision rather than an accident, and the axes really are
+        // independent (a harness with model control but no effort control existed
+        // here until Gemini was removed). The tests that exercised the `Err` paths
+        // went with that harness; there is no way to fabricate an unsupporting
+        // variant, so the paths stay covered by construction rather than by test.
         if model.is_some() && !harness.supports_model_selection() {
             return Err(CoreError::SelectionUnsupported {
                 harness,
@@ -961,30 +937,6 @@ mod tests {
     }
 
     #[test]
-    fn register_gemini_agent_mints_uuid_v4_session_id() {
-        // Load-bearing: v7 caused the on-disk session-file interleave
-        // hazard against Gemini's 8-char-prefix filename. If a future
-        // refactor accidentally swaps this back to `Uuid::now_v7()`,
-        // concurrent dispatches in one cwd corrupt transcripts.
-        let (_tmp, project) = fresh_project();
-        let record = project
-            .register_agent("g", HarnessKind::Gemini, None, None)
-            .unwrap();
-        let SessionLocator::Uuid(session_id) = record
-            .session_locator
-            .expect("Gemini pre-generates a UUID locator")
-        else {
-            panic!("Gemini locator must be the Uuid variant");
-        };
-        assert_eq!(
-            session_id.get_version_num(),
-            4,
-            "Gemini session_id must be UUID v4, got: {session_id} (version {})",
-            session_id.get_version_num()
-        );
-    }
-
-    #[test]
     fn a_registry_record_contradicting_its_harness_fails_the_load() {
         // Serde checks fields in isolation, so a hand-edited or corrupted line
         // can pair fork provenance with a harness that cannot fork. That is not
@@ -1204,17 +1156,17 @@ mod tests {
     #[test]
     fn fork_agent_rejects_a_harness_that_cannot_branch() {
         let (_tmp, project) = fresh_project();
-        // Gemini pre-generates a locator, so this fails on the capability gate
-        // rather than on a missing session — the distinction the two error
+        // Antigravity pre-generates a locator, so this fails on the capability
+        // gate rather than on a missing session — the distinction the two error
         // variants exist to preserve.
         let source = project
-            .register_agent("g", HarnessKind::Gemini, None, None)
+            .register_agent("g", HarnessKind::Antigravity, None, None)
             .unwrap();
 
         let err = project.fork_agent(source.id).unwrap_err();
 
         assert!(
-            matches!(err, CoreError::SessionForkUnsupported { harness } if harness == HarnessKind::Gemini),
+            matches!(err, CoreError::SessionForkUnsupported { harness } if harness == HarnessKind::Antigravity),
             "got: {err:?}"
         );
         assert_eq!(project.list_agents().unwrap().len(), 1, "no record written");
@@ -1498,7 +1450,7 @@ mod tests {
             .register_agent("beta", HarnessKind::Codex, None, None)
             .unwrap();
         let c = project
-            .register_agent("gamma", HarnessKind::Gemini, None, None)
+            .register_agent("gamma", HarnessKind::Antigravity, None, None)
             .unwrap();
         assert!(b.session_locator.is_none());
 
@@ -1532,7 +1484,7 @@ mod tests {
             .register_agent("beta", HarnessKind::Codex, None, None)
             .unwrap();
         let c = project
-            .register_agent("gamma", HarnessKind::Gemini, None, None)
+            .register_agent("gamma", HarnessKind::Antigravity, None, None)
             .unwrap();
 
         let reordered = project.reorder_agents(&[c.id, a.id, b.id]).unwrap();
@@ -1803,22 +1755,6 @@ mod tests {
     }
 
     #[test]
-    fn register_attached_gemini_persists_model_with_no_effort() {
-        // Gemini supports model but not effort; the signature structurally
-        // forbids an effort, so the stored record always has `effort: None`.
-        let (_tmp, project) = fresh_project();
-        let record = project
-            .register_attached_gemini_agent(
-                "attached",
-                Uuid::now_v7(),
-                Some("gemini-2.5-pro".to_owned()),
-            )
-            .unwrap();
-        assert_eq!(record.model.as_deref(), Some("gemini-2.5-pro"));
-        assert_eq!(record.effort, None);
-    }
-
-    #[test]
     fn register_attached_antigravity_carries_no_model_or_effort() {
         // Antigravity supports neither axis; both are structurally None.
         let (_tmp, project) = fresh_project();
@@ -1969,50 +1905,6 @@ mod tests {
     }
 
     #[test]
-    fn register_agent_rejects_model_on_unsupporting_harness() {
-        // The generic create path is harness-agnostic, so the capability
-        // invariant is enforced at the persistence boundary (the single
-        // chokepoint), not just at the app layer. Gemini has no effort axis, so
-        // an effort never reaches the registry for one. (Antigravity used to be
-        // the model example here; `agy` 1.1.x made `--model` usable, so it now
-        // supports both axes.)
-        let (_tmp, project) = fresh_project();
-        let err = project
-            .register_agent(
-                "a",
-                HarnessKind::Gemini,
-                Some("gemini-3-pro-preview".to_owned()),
-                Some("high".to_owned()),
-            )
-            .unwrap_err();
-        assert!(matches!(
-            err,
-            CoreError::SelectionUnsupported {
-                harness: HarnessKind::Gemini,
-                axis: SelectionAxis::Effort
-            }
-        ));
-        // Rejected *before* the append — no orphan record.
-        assert!(project.list_agents().unwrap().is_empty());
-    }
-
-    #[test]
-    fn register_agent_rejects_effort_on_unsupporting_harness() {
-        let (_tmp, project) = fresh_project();
-        let err = project
-            .register_agent("g", HarnessKind::Gemini, None, Some("high".to_owned()))
-            .unwrap_err();
-        assert!(matches!(
-            err,
-            CoreError::SelectionUnsupported {
-                harness: HarnessKind::Gemini,
-                axis: SelectionAxis::Effort
-            }
-        ));
-        assert!(project.list_agents().unwrap().is_empty());
-    }
-
-    #[test]
     fn core_normalizes_blank_selection_regardless_of_caller() {
         // The persistence boundary, not just the IPC layer, drops a blank
         // selection — so a direct-core caller can't persist a dispatch-breaking
@@ -2042,25 +1934,6 @@ mod tests {
         let reloaded = &project.list_agents().unwrap()[0];
         assert_eq!(reloaded.model, None);
         assert_eq!(reloaded.effort, None);
-    }
-
-    #[test]
-    fn blank_selection_on_unsupporting_harness_is_unset_not_an_error() {
-        // Normalize-before-capability-check: a blank value means "clear the
-        // field," which is allowed on any harness. It must NOT surface as
-        // `SelectionUnsupported` just because the harness lacks that axis —
-        // clearing an effort on Gemini is "no effort," not "illegal effort."
-        let (_tmp, project) = fresh_project();
-        let updated = project
-            .register_agent("g", HarnessKind::Gemini, None, Some("   ".to_owned()))
-            .expect("blank effort on Gemini is a no-op clear, not an error");
-        assert_eq!(updated.effort, None);
-
-        // Same at registration: a blank effort on Gemini registers fine.
-        let agent = project
-            .register_agent("g2", HarnessKind::Gemini, None, Some("  ".to_owned()))
-            .expect("blank effort at registration is unset, not unsupported");
-        assert_eq!(agent.effort, None);
     }
 
     #[test]

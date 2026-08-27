@@ -42,7 +42,7 @@ const CAROL: AgentRecord = {
   id: "00000000-0000-7000-8000-000000000ccc",
   project_id: PROJECT_ID,
   name: "carol",
-  harness: "gemini",
+  harness: "antigravity",
   session_locator: null,
   created_at: "2026-05-16T00:00:02Z",
 };

@@ -42,16 +42,6 @@ export const MODEL_OPTIONS: Record<HarnessKind, SelectionOption[]> = {
     { label: "GPT-5.6 Luna", value: "gpt-5.6-luna" },
     { label: "GPT-5.5", value: "gpt-5.5" },
   ],
-  gemini: [
-    { label: "Auto", value: "auto" },
-    { label: "Gemini 2.5 Pro", value: "gemini-2.5-pro" },
-    { label: "Gemini 2.5 Flash", value: "gemini-2.5-flash" },
-    { label: "Gemini 2.5 Flash-Lite", value: "gemini-2.5-flash-lite" },
-    { label: "Gemini 3 Pro (preview)", value: "gemini-3-pro-preview" },
-    { label: "Gemini 3 Flash (preview)", value: "gemini-3-flash-preview" },
-    { label: "Gemini 3.1 Pro (preview)", value: "gemini-3.1-pro-preview" },
-    { label: "Gemini 3.1 Flash-Lite (preview)", value: "gemini-3.1-flash-lite-preview" },
-  ],
   /// Stable slugs from `agy models` (probed @ 1.1.19, 2026-08-25), with the
   /// harness's own display names. **Effort-bearing models are listed by their
   /// base slug**, not the effort-folded variant `agy models` also prints
@@ -73,8 +63,8 @@ export const MODEL_OPTIONS: Record<HarnessKind, SelectionOption[]> = {
   /// Together they took the longest entry from 28 characters to 10, which is
   /// what let this picker be a toggle instead of a dropdown.
   ///
-  /// The Gemini entries keep their prefix on purpose; that is not an
-  /// inconsistency. `3.7 Flash` and `3.1 Pro` are version numbers with no
+  /// The Gemini-branded Antigravity models keep their `Gemini` prefix on
+  /// purpose; that is not an inconsistency. `3.7 Flash` and `3.1 Pro` are version numbers with no
   /// product attached, while `Sonnet` and `Opus` are unambiguous on their own.
   ///
   /// The known cost of dropping `(Thinking)`: the turn footer shows agy's
@@ -115,15 +105,17 @@ export const MODEL_OPTIONS: Record<HarnessKind, SelectionOption[]> = {
 /// How the **model** picker renders per harness — the single source of truth
 /// both the create form and the sidebar change-model dialog read, so the two
 /// can't drift. Segmented (a toggle) for the short curated lists; a dropdown
-/// only for Gemini, whose list is long with labels long enough to truncate as
+/// only for a harness whose list is long with labels long enough to truncate as
 /// pills. Effort is always segmented (every effort set is short
 /// single words), so there is no `EFFORT_PRESENTATION`. The sidebar
 /// additionally falls back to a dropdown when it must show an off-catalog
 /// persisted value whose label length is unbounded (see `Sidebar.svelte`).
+/// Uniform today (every harness is `segmented`); retained per harness as an
+/// extension point — see the note above `SUPPORTS_MODEL_SELECTION` in
+/// `harnessDisplay.ts` for why these maps are not collapsed.
 export const MODEL_PRESENTATION: Record<HarnessKind, "segmented" | "dropdown"> = {
   claude_code: "segmented",
   codex: "segmented",
-  gemini: "dropdown",
   // Five entries after retiring the older Flash generations, longest label
   // "Gemini 3.7 Flash" at 16 characters — comparable to Codex's segmented row.
   // Both this and the `(Thinking)` drop above were judged against the running
@@ -131,7 +123,7 @@ export const MODEL_PRESENTATION: Record<HarnessKind, "segmented" | "dropdown"> =
   antigravity: "segmented",
 };
 
-/// Per-harness effort options. Empty for Gemini (config-only). Codex `none` is
+/// Per-harness effort options. Codex `none` is
 /// a *real* level (forces no extended reasoning), distinct from leaving effort
 /// unset. This is the **full** per-harness set; effort validity is additionally
 /// **per-model** for Codex *and* Antigravity (see `effortOptionsFor`), so a
@@ -156,7 +148,6 @@ export const EFFORT_OPTIONS: Record<HarnessKind, SelectionOption[]> = {
     { label: "Max", value: "max" },
     { label: "Ultra", value: "ultra" },
   ],
-  gemini: [],
   antigravity: [
     { label: "Low", value: "low" },
     { label: "Medium", value: "medium" },
@@ -256,10 +247,6 @@ export const DEFAULT_AGENT_PROFILES: Preferences["agent_defaults"] = {
     primary: { model: "gpt-5.6-sol", effort: "high" },
     secondary: { model: "gpt-5.6-terra", effort: "medium" },
   },
-  gemini: {
-    primary: { model: "auto", effort: null },
-    secondary: { model: "gemini-2.5-flash", effort: null },
-  },
   // Both carry explicit effort because `agy` rejects these effort-bearing
   // models when dispatched without one.
   antigravity: {
@@ -273,7 +260,6 @@ export const DEFAULT_AGENT_PROFILES: Preferences["agent_defaults"] = {
 export const SUGGESTED_SECONDARY_PROFILE: Record<HarnessKind, AgentProfile> = {
   claude_code: { model: "sonnet", effort: "medium" },
   codex: { model: "gpt-5.6-terra", effort: "medium" },
-  gemini: { model: "gemini-2.5-flash", effort: null },
   antigravity: { model: "gemini-3.7-flash", effort: "high" },
 };
 
@@ -284,7 +270,6 @@ export const SUGGESTED_SECONDARY_PROFILE: Record<HarnessKind, AgentProfile> = {
 const MULTI_PROFILE_AGENT_NAME: Record<HarnessKind, string> = {
   claude_code: "claude",
   codex: "codex",
-  gemini: "gemini",
   antigravity: "antigravity",
 };
 
@@ -309,7 +294,7 @@ export function activeProfile(agent: AgentRecord): AgentProfile {
 /// The model-derived agent name for a primary-only create, with effort appended
 /// where the harness has that axis (`opus-high`, `gpt-5-5-medium`, …).
 /// Harnesses with no concrete model to name after fall back to the bare harness
-/// name: Antigravity (model is harness-owned) and Gemini left on `auto` (it
+/// name: an agent created without a concrete model (it
 /// picks up whatever model was last used).
 ///
 /// The result is **guaranteed** to be a valid agent name. Model ids are
@@ -324,7 +309,7 @@ export function defaultAgentName(
   model: string | undefined,
   effort: string | undefined,
 ): string {
-  if (!model || model === "auto") return HARNESS_DEFAULT_AGENT_NAME[harness];
+  if (!model) return HARNESS_DEFAULT_AGENT_NAME[harness];
   const raw = effort ? `${model}-${effort}` : model;
   const slug = raw.replace(/[^A-Za-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "");
   return slug === "" ? HARNESS_DEFAULT_AGENT_NAME[harness] : slug;

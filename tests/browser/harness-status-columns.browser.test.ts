@@ -5,7 +5,6 @@ const browserState = vi.hoisted(() => ({
   versions: {
     claude_code: "1.2.3",
     codex: "1.2.3",
-    gemini: null,
     antigravity: null,
   } as Record<string, string | null>,
 }));
@@ -34,7 +33,6 @@ beforeEach(() => {
   availabilityTesting.reset();
   browserState.versions.claude_code = "1.2.3";
   browserState.versions.codex = "1.2.3";
-  browserState.versions.gemini = null;
   browserState.versions.antigravity = null;
 });
 

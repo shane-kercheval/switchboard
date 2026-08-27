@@ -20,13 +20,12 @@ use futures::StreamExt;
 use switchboard_core::{AgentRecord, HarnessKind, SessionLocator};
 use switchboard_harness::{
     AdapterEvent, AntigravityAdapter, ClaudeCodeAdapter, CodexAdapter, DispatchOptions,
-    GeminiAdapter, HarnessAdapter, Turn, TurnItem, TurnStatus, load_antigravity_transcript,
+    HarnessAdapter, Turn, TurnItem, TurnStatus, load_antigravity_transcript,
 };
 use uuid::Uuid;
 
 const CLAUDE_TOOL_TOKEN: &str = "SWITCHBOARD_TRANSCRIPT_TOOL_FA21E0";
 const CODEX_TOOL_TOKEN: &str = "SWITCHBOARD_TRANSCRIPT_TOOL_C0D3X1";
-const GEMINI_TOOL_TOKEN: &str = "SWITCHBOARD_TRANSCRIPT_TOOL_GEM1N1";
 
 fn real_home() -> PathBuf {
     std::env::var_os("HOME")
@@ -34,7 +33,7 @@ fn real_home() -> PathBuf {
         .expect("HOME must be set for live tests")
 }
 
-/// Extract the session UUID from a Claude/Gemini agent's locator (those
+/// Extract the session UUID from a Claude agent's locator (those
 /// harnesses always carry a `Uuid` variant). Panics on any other shape — a
 /// test setup error, not a runtime condition.
 fn uuid_locator(agent: &AgentRecord) -> Uuid {
@@ -436,7 +435,7 @@ async fn live_codex_transcript_load_hydrates_tool_items() {
     // reconstructed (a Codex CLI bump renaming `function_call` or its
     // `output` payload field). Hydration is sidecar-driven and
     // date-partition-dependent — structurally different from Claude's
-    // and Gemini's — so its tool-item path needs its own tripwire.
+    // — so its tool-item path needs its own tripwire.
     let tmp = tempfile::TempDir::new().expect("tempdir");
     std::fs::write(tmp.path().join("MARKER.txt"), CODEX_TOOL_TOKEN).expect("write marker");
 
@@ -624,180 +623,10 @@ fn assert_meta_structure(transcript: &switchboard_harness::LoadedTranscript) {
     let _: &Vec<_> = &meta.tools;
 }
 
-#[tokio::test]
-#[ignore = "requires gemini installed — run with: make test-live"]
-async fn live_gemini_transcript_load_via_session_file_round_trips() {
-    let tmp = tempfile::TempDir::new().expect("tempdir");
-    let adapter = GeminiAdapter::new();
-    let session_id = Uuid::new_v4();
-    let agent = AgentRecord {
-        model: None,
-        effort: None,
-        profiles: switchboard_core::AgentProfiles::default(),
-        forked_from_session: None,
-        id: Uuid::now_v7(),
-        project_id: Uuid::now_v7(),
-        name: "transcript-gemini".to_owned(),
-        harness: HarnessKind::Gemini,
-        session_locator: Some(SessionLocator::Uuid(session_id)),
-        created_at: chrono::Utc::now(),
-    };
-    let prompt = "Reply with only the single word 'ack' and nothing else.";
-    let turn_id = Uuid::now_v7();
-
-    let stream = adapter
-        .dispatch(
-            &agent,
-            tmp.path(),
-            prompt,
-            turn_id,
-            DispatchOptions::default(),
-        )
-        .await
-        .expect("dispatch should succeed with real gemini");
-    let live_events: Vec<AdapterEvent> = stream.collect().await;
-    let live_text = collect_text(&live_events);
-
-    let transcript = switchboard_harness::load_gemini_transcript(
-        &real_home(),
-        tmp.path(),
-        uuid_locator(&agent),
-        agent.id,
-    )
-    .expect("load_gemini_transcript must succeed");
-
-    assert!(
-        transcript.warnings.is_empty(),
-        "expected no parser warnings; got: {:?}",
-        transcript.warnings
-    );
-    assert_meta_structure(&transcript);
-
-    let (user, agent_turn) = first_user_and_agent(&transcript.turns);
-    assert_user(user, &agent.id, prompt);
-    assert_agent_completed(agent_turn, &agent.id, &live_text);
-    assert_gemini_agent_usage(agent_turn);
-    // Gemini's session file carries no rate-limit telemetry (unlike Codex).
-    assert!(
-        transcript.last_rate_limit.is_none(),
-        "Gemini hydration must leave last_rate_limit as None (no rate-limit field in session file)"
-    );
-}
-
-#[tokio::test]
-#[ignore = "requires gemini installed — run with: make test-live"]
-async fn live_gemini_transcript_load_hydrates_tool_items() {
-    // Where the sentinel-in-output assertion lives for Gemini. The live
-    // stream's `tool_result.output` is `""` for `read_file`, so
-    // `tool_use.rs` can only assert lifecycle. The session file carries
-    // the real `read_file` output, which hydration surfaces — this is
-    // the load-bearing test that the "live = best-effort, hydration =
-    // authoritative" contract holds for Gemini's read-like tools.
-    let tmp = tempfile::TempDir::new().expect("tempdir");
-    std::fs::write(tmp.path().join("MARKER.txt"), GEMINI_TOOL_TOKEN).expect("write marker");
-
-    let adapter = GeminiAdapter::new();
-    let session_id = Uuid::new_v4();
-    let agent = AgentRecord {
-        model: None,
-        effort: None,
-        profiles: switchboard_core::AgentProfiles::default(),
-        forked_from_session: None,
-        id: Uuid::now_v7(),
-        project_id: Uuid::now_v7(),
-        name: "transcript-gemini-tool".to_owned(),
-        harness: HarnessKind::Gemini,
-        session_locator: Some(SessionLocator::Uuid(session_id)),
-        created_at: chrono::Utc::now(),
-    };
-    let turn_id = Uuid::now_v7();
-    let stream = adapter
-        .dispatch(
-            &agent,
-            tmp.path(),
-            "Read the file MARKER.txt in the current directory and reply with only its contents.",
-            turn_id,
-            DispatchOptions::default(),
-        )
-        .await
-        .expect("dispatch should succeed with real gemini");
-    // Drain the stream to flush the subprocess; the session file isn't
-    // written until the stream completes. Dropping this line would
-    // race the hydration read against the subprocess.
-    let _events: Vec<AdapterEvent> = stream.collect().await;
-
-    let transcript = switchboard_harness::load_gemini_transcript(
-        &real_home(),
-        tmp.path(),
-        uuid_locator(&agent),
-        agent.id,
-    )
-    .expect("load_gemini_transcript must succeed");
-    assert!(
-        transcript.warnings.is_empty(),
-        "expected no parser warnings; got: {:?}",
-        transcript.warnings
-    );
-
-    let agent_turn = transcript
-        .turns
-        .iter()
-        .find(|t| matches!(t, Turn::Agent { .. }))
-        .expect("hydrated transcript must contain a Turn::Agent");
-    let Turn::Agent { items, .. } = agent_turn else {
-        unreachable!();
-    };
-
-    // Find the tool item whose output carries the staged sentinel rather
-    // than picking the first tool item — robust against Gemini emitting
-    // an additional preliminary tool before `read_file` (the harness
-    // suite is designed to catch upstream CLI drift without being
-    // brittle to harmless ordering changes).
-    let (is_error, name) = items
-        .iter()
-        .find_map(|item| match item {
-            TurnItem::Tool {
-                output: Some(output),
-                is_error,
-                name,
-                ..
-            } if output.contains(GEMINI_TOOL_TOKEN) => Some((is_error, name)),
-            _ => None,
-        })
-        .unwrap_or_else(|| {
-            panic!(
-                "hydrated agent turn must contain a TurnItem::Tool whose output carries \
-                 {GEMINI_TOOL_TOKEN:?}; items: {items:?}"
-            )
-        });
-    assert!(!name.is_empty(), "hydrated tool item must carry a name");
-    assert_eq!(
-        *is_error,
-        Some(false),
-        "hydrated tool item must record is_error: Some(false)"
-    );
-}
-
-/// Gemini's parser populates `usage` from the gemini record's `tokens`
-/// field but leaves `context_window` as `None` — Gemini's session file
-/// doesn't carry a context-window field analogous to Codex's
-/// `task_started.model_context_window`. The sidebar's context-utilization
-/// bar will not render for Gemini agents until upstream Gemini telemetry
-/// adds the field.
-fn assert_gemini_agent_usage(turn: &Turn) {
-    let Turn::Agent { usage, .. } = turn else {
-        unreachable!("caller already matched Turn::Agent");
-    };
-    let usage = usage
-        .as_ref()
-        .expect("Gemini hydration must carry usage for completed turns");
-    assert!(
-        usage.context_window.is_none(),
-        "Gemini hydrated usage.context_window must be None (no analog in session file); got: {:?}",
-        usage.context_window
-    );
-}
-
+/// Two dispatches against one Antigravity conversation must hydrate as two
+/// turns in dispatch order. Antigravity has no per-turn id, so ordering is the
+/// only correlation signal the loader has — a regression here surfaces as
+/// silently reordered or merged history rather than an error.
 #[tokio::test]
 #[ignore = "requires agy installed — run with: make test-live"]
 async fn live_antigravity_two_turns_hydrate_in_order() {

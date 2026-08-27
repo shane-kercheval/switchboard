@@ -34,7 +34,6 @@ type Slot = HarnessInstallStatus | HarnessProbeError | null;
 const status = $state<Record<HarnessKind, Slot>>({
   claude_code: null,
   codex: null,
-  gemini: null,
   antigravity: null,
 });
 

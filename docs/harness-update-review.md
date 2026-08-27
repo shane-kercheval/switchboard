@@ -1,6 +1,6 @@
 # Playbook: reviewing a harness CLI update
 
-**Use this when a harness CLI (Claude Code, Codex, Gemini, or Antigravity `agy`) ships a new version and we need to know whether it affects Switchboard** — before or after upgrading. You may have no prior context on this project; this playbook tells you what to read, what to check, and what to produce. Keep the review evidence-based: **verify claims against our actual code, don't trust the changelog's framing.**
+**Use this when a harness CLI (Claude Code, Codex, or Antigravity `agy`) ships a new version and we need to know whether it affects Switchboard** — before or after upgrading. You may have no prior context on this project; this playbook tells you what to read, what to check, and what to produce. Keep the review evidence-based: **verify claims against our actual code, don't trust the changelog's framing.**
 
 ## Last reviewed
 
@@ -10,7 +10,6 @@ Per-harness snapshot of the last version vetted and the one-line verdict. A harn
 |---|---|---|---|
 | Codex | `0.149.0` | 2026-08-22 | **BREAKING, fixed same-day** — `history_mode: paginated` rollouts (TUI 0.147.0, `exec` 0.148.0) dropped the `event_msg` prompt/answer/edit/MCP records the disk parser read. The adapter now reads the replacement `item_completed` channel in both file readers (**G30**, closed). Flags, live stream, and model ids unchanged. Live **13/13** post-fix. |
 | Claude Code | `2.1.241` | 2026-08-23 | No adapter-contract impact across 34 releases (2.1.205→241). Flags, stream vocabulary, cwd→projects-dir encoding, and cancel/exit semantics all unchanged; new `result`/`rate_limit_event`/`init` fields are additive and ignored. Two doc-staling changes, both recorded in `harness-behavior.md` §6: the **`opus` alias moved to Claude Opus 5** (no picker change — we ship aliases; Opus 5 re-probed as still redacting thinking), and **per-message `effort` now lands in the session file** (2.1.212), reversing §3.4's "not exposed". **G31** (opened and closed in this PR) wires that effort through both paths. Live **33/33**. |
-| Gemini | `0.42.0` | 2026-05-27 | Baseline probes from M3; logged-out auth shape captured. **Not re-probeable on a personal account** — individual-tier access moved to Antigravity (2026-06-18); live re-verification needs an org/team (Code Assist Standard/Enterprise) or API-key account. |
 | Antigravity (`agy`) | `1.1.20` | 2026-08-25 | **Breaking ×4, all fixed** (tool-record loss on disk → mitigated as G32; diagnostics moved to stderr + meaningful exit codes; print mode intercepts slash commands → `--disable-slash-commands`; exact-flag-name prompts rejected → space-prefix). **Capabilities adopted:** per-invocation `--model` + `--effort` (reverses the old "no usable model control" ceiling), and `stream-json` as the adapter's control channel. `/usage` quota was built, measured at 3.7–6.6s per turn, and **cut** (harness-behavior.md §5.1). |
 
 ## 1. Get context first (read in this order)
@@ -28,7 +27,6 @@ Prefer the changelog + commit diff over guessing. Per-harness sources:
 |---|---|---|
 | Codex | `openai/codex`, tags `rust-vX.Y.Z` | `gh release view rust-v<new> --repo openai/codex --json body -q .body`; `gh api repos/openai/codex/compare/rust-v<old>...rust-v<new> -q '.commits[].commit.message'` |
 | Claude Code | `anthropics/claude-code` (npm `@anthropic-ai/claude-code`) | `gh release view` / GitHub releases / npm changelog |
-| Gemini CLI | `google-gemini/gemini-cli` (npm `@google/gemini-cli`) | `gh release view` / GitHub releases |
 | Antigravity (`agy`) | Ships with the Antigravity desktop app and **auto-updates silently** — no GitHub repo, no release notes | **`agy changelog`** (added since this row said "no public changelog") prints per-version entries locally. Read it first, then **re-probe** (see §5) — the changelog is real but demonstrably incomplete. Always record the new version (`agy --version`); it may have moved since you last looked. |
 
 If a code-level look is needed, fetch the specific PRs (`gh pr view <n> --repo <repo>`).
@@ -73,11 +71,11 @@ After an `agy` version bump, re-verify: a normal turn still writes a parseable `
 - **Update the "Last reviewed" snapshot** at the top of this file: set the harness's row to the new version/date and a **one-line verdict**, and prepend a **one- or two-sentence entry to the Review history appendix** (bottom of this file). Keep both short — the snapshot is for scanning, not for the reasoning. Three homes for the detail, none of them a fat table cell: **durable adapter behavior → `harness-behavior.md`** (the single source of truth; don't restate it here), **the blow-by-blow reasoning → the review's PR description** (git owns chronology), and **open follow-ups → the verdict line** (so an action item isn't buried). Before condensing, make sure any durable fact you're dropping already lives in `harness-behavior.md`.
 - **Record in `docs/harness-behavior.md` *only if the update actually impacts Switchboard*.** §6 "Version notes" is for things that change what Switchboard does or documents — a contract that changed, a captured shape/string now stale, a behavior we depend on that shifted (e.g. a model-version bump that flips a behavior we track, like thinking redaction). A **no-impact review gets NO §6 entry** — the "Last reviewed" snapshot + Review history line above are its complete record. Do not add "reviewed X, nothing relevant" commentary or per-update changelog summaries; that bloats the single-source-of-truth doc. Also update any now-stale captured shape or cell. **Do not edit the archived `*-cli-observed.md` files** (frozen provenance).
 - **If a contract genuinely changed**, the fix goes in the **adapter** (never a `match harness {…}` in the dispatcher or `commands.rs`).
-- **Run the live tests** for any adapter-touching change: `make test-live-<harness>` (claude / codex / gemini / antigravity). These spawn the real CLI and are the project's drift-detection mechanism — they need the developer's logged-in session and cost a little quota (see AGENTS.md "Live testing"). The fixture/`make test` path won't catch CLI drift.
+- **Run the live tests** for any adapter-touching change: `make test-live-<harness>` (claude / codex / antigravity). These spawn the real CLI and are the project's drift-detection mechanism — they need the developer's logged-in session and cost a little quota (see AGENTS.md "Live testing"). The fixture/`make test` path won't catch CLI drift.
 
 ## 7. If you need a live capture
 
-Some shapes can't be read from a changelog (auth-failure output, quota messages, new event payloads). To capture: ask the developer to run the relevant CLI in the target state and share stdout/stderr/exit (e.g. logged-out: `gemini -p "hi" --output-format stream-json < /dev/null`; or a small headless turn with `--output-format stream-json` / `--json`). Quota/credit walls usually can't be forced on demand — record that as a known gap rather than guessing the string.
+Some shapes can't be read from a changelog (auth-failure output, quota messages, new event payloads). To capture: ask the developer to run the relevant CLI in the target state and share stdout/stderr/exit (e.g. a small headless turn with `--output-format stream-json` / `--json`). Quota/credit walls usually can't be forced on demand — record that as a known gap rather than guessing the string.
 
 ## Appendix: Review history
 

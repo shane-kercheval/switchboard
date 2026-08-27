@@ -43,7 +43,7 @@ export type ForwardOutcome =
 // ContentChunk.kind discriminates rendering. `thinking` carries model reasoning,
 // rendered distinct from (and subordinate to) the answer (the `ThinkingWidget`).
 // Emitted by Antigravity (live + on reopen) and Claude Sonnet 4.6 (live + on
-// reopen). Gemini's reasoning is disk-only and deliberately dropped
+// reopen). Reasoning that is disk-only is deliberately dropped
 // (stale-on-reopen UX). Claude's redaction is per-model: Opus 4.8 redacts the
 // text to empty, so its reasoning surfaces only as a non-rendering `liveness`
 // event. See docs/harness-behavior.md §3.2 for per-harness reality.
@@ -443,7 +443,7 @@ export type ReducerInput = NormalizedEvent | HeartbeatTimeout | Hydrate;
 // Internal state types (Turn, AgentRuntime, etc.) live in
 // `src/lib/state/types.ts`. This file is wire-format-only.
 
-export type HarnessKind = "claude_code" | "codex" | "gemini" | "antigravity";
+export type HarnessKind = "claude_code" | "codex" | "antigravity";
 
 /// State of the `which`-on-PATH binary probe for a single harness.
 /// - `"checking"`: probe in flight (the initial value at mount). Form
@@ -525,7 +525,7 @@ export type AgentProfiles = {
 
 // Mirror of `crates/core::AgentRecord`. `session_locator` is `null` for
 // harnesses that assign their own session id at runtime (Codex and Antigravity)
-// until the first dispatch captures it; for Claude Code and Gemini it's
+// until the first dispatch captures it; for Claude Code it's
 // pre-generated at registration time as a `{ uuid }` locator.
 export type AgentRecord = {
   id: AgentId;
@@ -535,8 +535,8 @@ export type AgentRecord = {
   session_locator: SessionLocator | null;
   created_at: string;
   // The user's selected model + reasoning effort (intent), shown in the sidebar.
-  // `null`/absent for a no-capability harness (Antigravity carries
-  // neither; Gemini carries no effort) or a pre-feature agent.
+  // `null`/absent when the user hasn't chosen one (the harness applies its own
+  // default) or for a pre-feature agent.
   model?: string | null;
   effort?: string | null;
   profiles?: AgentProfiles;

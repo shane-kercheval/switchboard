@@ -130,7 +130,7 @@ fn merge_scopes(user_names: Vec<String>, project_names: Vec<String>) -> Vec<McpS
     // that exposes per-entry detail would render the project version,
     // not the user version) and matches the more-specific-scope-wins
     // convention used across every registry-style loader in Switchboard
-    // (Claude / Codex / Gemini MCP + skills) and the broader ecosystem
+    // (Claude / Codex MCP + skills) and the broader ecosystem
     // (git, npm, etc.).
     let mut merged: Vec<McpServerStatus> = project_names
         .into_iter()

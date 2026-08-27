@@ -11,8 +11,8 @@
 //! reserved for it. See the "Known limitations" section of
 //! `docs/research/archive/antigravity-cli-observed.md`.
 //!
-//! Kept separate from `gemini/config.rs` rather than factored into a shared
-//! module: Antigravity and Gemini currently share the JSON shape but not the
+//! Kept separate from the other harnesses' config loaders rather than factored
+//! into a shared module: they currently share the JSON shape but not the
 //! path or scoping rules, so a shared loader would couple two contracts that
 //! are free to diverge. Two short loaders are simpler than one parameterized
 //! one until a stable shared contract exists.

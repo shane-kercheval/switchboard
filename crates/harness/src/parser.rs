@@ -311,7 +311,7 @@ pub fn parse_line(
     // here, not in the original 2026-05-24 probes).
     //
     // From the parent's view, a delegation is a single tool call. Matches
-    // Gemini's `invoke_agent` (already opaque) and Antigravity's
+    // Antigravity's
     // `invoke_subagent` (separate brain conversation we don't tail).
     if value
         .get("parent_tool_use_id")

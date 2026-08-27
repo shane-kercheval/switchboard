@@ -12,7 +12,7 @@
 //! is just the name list (the registry is display-only). Project entries
 //! seed the result; user-only entries are appended. Matches the
 //! more-specific-scope-wins convention used across every registry-style
-//! loader in Switchboard (Claude / Codex / Gemini MCP + skills) and the
+//! loader in Switchboard (Claude / Codex MCP + skills) and the
 //! broader ecosystem (git, npm, etc.).
 //!
 //! **Failure policy** mirrors the Codex skills loader (`codex/skills.rs`):

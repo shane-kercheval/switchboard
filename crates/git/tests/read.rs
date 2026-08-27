@@ -390,6 +390,164 @@ fn remote_branches_carry_merged_and_behind_base_only() {
     );
 }
 
+#[test]
+fn github_urls_follow_the_branch_remote_and_hide_a_deleted_upstream() {
+    let (_bare, clone) = cloned_repo();
+    git(clone.path(), &["checkout", "-q", "-b", "feature/slash"]);
+    git(
+        clone.path(),
+        &["push", "-q", "-u", "origin", "feature/slash"],
+    );
+    git(clone.path(), &["remote", "rename", "origin", "fork"]);
+    git(
+        clone.path(),
+        &[
+            "remote",
+            "set-url",
+            "fork",
+            "git@github.com:acme/widgets.git",
+        ],
+    );
+
+    let view = read_repo(clone.path()).unwrap();
+    let local = branch_view(&view, "feature/slash");
+    assert_eq!(local.upstream.as_deref(), Some("fork/feature/slash"));
+    assert_eq!(
+        local.github_url.as_deref(),
+        Some("https://github.com/acme/widgets/tree/feature/slash")
+    );
+    let remote = view
+        .remote_branches
+        .iter()
+        .find(|branch| branch.name == "fork/feature/slash")
+        .expect("fork/feature/slash should be listed");
+    assert_eq!(
+        remote.github_url.as_deref(),
+        Some("https://github.com/acme/widgets/tree/feature/slash")
+    );
+
+    git(
+        clone.path(),
+        &["update-ref", "-d", "refs/remotes/fork/feature/slash"],
+    );
+    let view = read_repo(clone.path()).unwrap();
+    let local = branch_view(&view, "feature/slash");
+    assert!(local.dangling);
+    assert_eq!(local.github_url, None);
+}
+
+#[test]
+fn local_github_url_uses_the_configured_upstream_branch_name() {
+    let (_bare, clone) = cloned_repo();
+    git(clone.path(), &["checkout", "-q", "-b", "published"]);
+    git(clone.path(), &["push", "-q", "origin", "published"]);
+    git(
+        clone.path(),
+        &["checkout", "-q", "-b", "local-name", "main"],
+    );
+    git(
+        clone.path(),
+        &[
+            "branch",
+            "--set-upstream-to",
+            "origin/published",
+            "local-name",
+        ],
+    );
+    git(
+        clone.path(),
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/acme/widgets.git",
+        ],
+    );
+
+    let view = read_repo(clone.path()).unwrap();
+    assert_eq!(
+        branch_view(&view, "local-name").github_url.as_deref(),
+        Some("https://github.com/acme/widgets/tree/published")
+    );
+}
+
+#[test]
+fn remote_github_urls_reverse_unique_fetch_mappings_and_hide_ambiguous_ones() {
+    let (_bare, clone) = cloned_repo();
+    git(
+        clone.path(),
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/acme/widgets.git",
+        ],
+    );
+    git(
+        clone.path(),
+        &["config", "--unset-all", "remote.origin.fetch"],
+    );
+    git(
+        clone.path(),
+        &[
+            "config",
+            "--add",
+            "remote.origin.fetch",
+            "+refs/heads/feature:refs/remotes/origin/review-feature",
+        ],
+    );
+    git(
+        clone.path(),
+        &["update-ref", "refs/remotes/origin/review-feature", "HEAD"],
+    );
+
+    let view = read_repo(clone.path()).unwrap();
+    let renamed = view
+        .remote_branches
+        .iter()
+        .find(|branch| branch.name == "origin/review-feature")
+        .expect("renamed tracking ref should be listed");
+    assert_eq!(
+        renamed.github_url.as_deref(),
+        Some("https://github.com/acme/widgets/tree/feature")
+    );
+
+    git(
+        clone.path(),
+        &["config", "--unset-all", "remote.origin.fetch"],
+    );
+    for refspec in [
+        "+refs/heads/*:refs/remotes/origin/*",
+        "+refs/pull/*/head:refs/remotes/origin/pr/*",
+    ] {
+        git(
+            clone.path(),
+            &["config", "--add", "remote.origin.fetch", refspec],
+        );
+    }
+    git(
+        clone.path(),
+        &["update-ref", "refs/remotes/origin/pr/123", "HEAD"],
+    );
+
+    let view = read_repo(clone.path()).unwrap();
+    let main = view
+        .remote_branches
+        .iter()
+        .find(|branch| branch.name == "origin/main")
+        .expect("ordinary remote branch should remain listed");
+    assert_eq!(
+        main.github_url.as_deref(),
+        Some("https://github.com/acme/widgets/tree/main")
+    );
+    let pull_request = view
+        .remote_branches
+        .iter()
+        .find(|branch| branch.name == "origin/pr/123")
+        .expect("pull-request tracking ref should be listed");
+    assert_eq!(pull_request.github_url, None);
+}
+
 // --- worktrees: dirty/untracked, detached, orphaned, prunable -------------
 
 #[test]

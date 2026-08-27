@@ -8,6 +8,7 @@
   import {
     Code2,
     Copy,
+    ExternalLink,
     FolderOpen,
     GitBranch,
     MoreHorizontal,
@@ -57,14 +58,14 @@
     nextCommitSelection,
     hoverSuppressed,
     hoverableClass,
-    setWorktreeMenuOpen,
-    anyWorktreeMenuOpen,
+    setBranchMenuOpen,
+    anyBranchMenuOpen,
     setViewMode,
   } from "$lib/state/gitView.svelte";
   import { activateProject } from "$lib/state/workspace.svelte";
   import { palette } from "$lib/state/commandPalette.svelte";
   import { isEditableShortcutTarget } from "$lib/keyboard";
-  import { openInEditor, openInTerminal, revealInFinder } from "$lib/api";
+  import { openExternalUrl, openInEditor, openInTerminal, revealInFinder } from "$lib/api";
   import { copyText } from "$lib/native";
 
   let {
@@ -86,7 +87,7 @@
   let busy = $state(false);
   let homePath = $state<string | null>(null);
   let actionError = $state<string | null>(null);
-  let openWorktreeActionsPath = $state<string | null>(null);
+  let openBranchActionsKey = $state<string | null>(null);
   let commitListEl = $state<HTMLDivElement | null>(null);
 
   const repo = $derived(listing.repo);
@@ -138,23 +139,29 @@
       });
   });
 
+  const branchActionKeys = $derived([
+    ...localBranches.map((branch) => `local:${branch.name}`),
+    ...visibleRemoteOnlyBranches.map((branch) => `remote:${branch.name}`),
+  ]);
+
   $effect(() => {
-    if (
-      openWorktreeActionsPath !== null &&
-      !localBranches.some((branch) => branch.worktree?.path === openWorktreeActionsPath)
-    ) {
-      openWorktreeActionsPath = null;
+    if (openBranchActionsKey !== null && !branchActionKeys.includes(openBranchActionsKey)) {
+      openBranchActionsKey = null;
     }
   });
 
   // Publish this node's open-menu state to the shared set so the commit
-  // navigator yields to a worktree-actions menu open in ANY repo node, not only
+  // navigator yields to a branch-actions menu open in ANY repo node, not only
   // this one. Self-healing: the cleanup clears this node's entry on close and on
   // unmount (idempotent, so order vs. a reset doesn't matter).
   $effect(() => {
-    setWorktreeMenuOpen(repo.root, openWorktreeActionsPath !== null);
-    return () => setWorktreeMenuOpen(repo.root, false);
+    setBranchMenuOpen(repo.root, openBranchActionsKey !== null);
+    return () => setBranchMenuOpen(repo.root, false);
   });
+
+  function setBranchActionsOpen(key: string, open: boolean): void {
+    openBranchActionsKey = open ? key : openBranchActionsKey === key ? null : openBranchActionsKey;
+  }
 
   function displayPath(path: string): string {
     return formatHomePath(path, homePath);
@@ -324,7 +331,7 @@
     if (navFocus.pane !== "commits") return;
     if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
     if (event.metaKey || event.ctrlKey || event.altKey) return;
-    if (event.defaultPrevented || palette.open || anyWorktreeMenuOpen()) return;
+    if (event.defaultPrevented || palette.open || anyBranchMenuOpen()) return;
     if (branchSelection.current?.repoRoot !== repo.root) return;
     if (isEditableShortcutTarget(event.target)) return;
     event.preventDefault();
@@ -576,8 +583,10 @@
         {#each localBranches as branch (branch.name)}
           {@const selected = isLocalSelected(branch.name)}
           {@const worktreePath = branch.worktree?.path ?? null}
+          {@const githubUrl = branch.github_url}
           {@const branchIndicators = localBranchIndicators(branch, repo.default_branch)}
-          {@const actionsOpen = worktreePath !== null && openWorktreeActionsPath === worktreePath}
+          {@const actionsKey = `local:${branch.name}`}
+          {@const actionsOpen = openBranchActionsKey === actionsKey}
           <div
             class={cn(
               "group flex min-h-8 items-center gap-2 rounded-md px-2 py-1.5 transition-colors",
@@ -607,34 +616,43 @@
               {/snippet}
               {@render gitRowTooltipContent([branch.name, worktreePath], branchIndicators)}
             </Tooltip>
-            {#if worktreePath !== null}
-              <DropdownMenu
-                open={actionsOpen}
-                onOpenChange={(open) => {
-                  openWorktreeActionsPath = open
-                    ? worktreePath
-                    : openWorktreeActionsPath === worktreePath
-                      ? null
-                      : openWorktreeActionsPath;
-                }}
-                triggerLabel={`Actions for ${branch.name}`}
-                triggerTestid="worktree-actions-trigger"
-                triggerClass={cn(
-                  ROW_ACTION_ICON_CLASS,
-                  "shrink-0 opacity-0 group-focus-within:opacity-100 data-[state=open]:opacity-100",
-                  triggerHoverReveal,
-                  // Standard control hover, overridden to the white `bg-raised` fill
-                  // on a selected (blue) row so it reads against the blue. Driven
-                  // off the row's `data-selected` (a `group-data-` CSS variant),
-                  // not a JS class — the trigger lives in a `{#snippet}` that
-                  // doesn't re-render when the row's selected state changes.
-                  actionsOpen && "opacity-100",
-                )}
-                contentTestid="worktree-actions-menu"
-              >
-                {#snippet trigger()}
-                  <MoreHorizontal size={14} strokeWidth={1.8} aria-hidden="true" />
-                {/snippet}
+            <DropdownMenu
+              open={actionsOpen}
+              onOpenChange={(open) => setBranchActionsOpen(actionsKey, open)}
+              triggerLabel={`Actions for ${branch.name}`}
+              triggerTestid="branch-actions-trigger"
+              triggerClass={cn(
+                ROW_ACTION_ICON_CLASS,
+                "shrink-0 opacity-0 group-focus-within:opacity-100 data-[state=open]:opacity-100",
+                triggerHoverReveal,
+                // Standard control hover, overridden to the white `bg-raised` fill
+                // on a selected (blue) row so it reads against the blue. Driven
+                // off the row's `data-selected` (a `group-data-` CSS variant),
+                // not a JS class — the trigger lives in a `{#snippet}` that
+                // doesn't re-render when the row's selected state changes.
+                actionsOpen && "opacity-100",
+              )}
+              contentTestid="branch-actions-menu"
+            >
+              {#snippet trigger()}
+                <MoreHorizontal size={14} strokeWidth={1.8} aria-hidden="true" />
+              {/snippet}
+              {#if githubUrl !== null}
+                <DropdownMenuItem
+                  onSelect={() => runAction(openExternalUrl(githubUrl))}
+                  class="gap-2"
+                  data-testid="branch-action-github"
+                >
+                  <ExternalLink
+                    size={14}
+                    strokeWidth={1.8}
+                    class="text-muted shrink-0"
+                    aria-hidden="true"
+                  />
+                  Open in GitHub
+                </DropdownMenuItem>
+              {/if}
+              {#if worktreePath !== null}
                 <DropdownMenuItem
                   onSelect={() => runAction(openInEditor(worktreePath))}
                   class="gap-2"
@@ -687,19 +705,21 @@
                   />
                   Copy path
                 </DropdownMenuItem>
-                <DropdownMenuItem
-                  onSelect={() => runAction(copyText(branch.name))}
-                  class="gap-2"
-                  data-testid="worktree-action-copy-branch"
-                >
-                  <GitBranch
-                    size={14}
-                    strokeWidth={1.8}
-                    class="text-muted shrink-0"
-                    aria-hidden="true"
-                  />
-                  Copy branch name
-                </DropdownMenuItem>
+              {/if}
+              <DropdownMenuItem
+                onSelect={() => runAction(copyText(branch.name))}
+                class="gap-2"
+                data-testid="branch-action-copy-branch"
+              >
+                <GitBranch
+                  size={14}
+                  strokeWidth={1.8}
+                  class="text-muted shrink-0"
+                  aria-hidden="true"
+                />
+                Copy branch name
+              </DropdownMenuItem>
+              {#if worktreePath !== null}
                 {#each linkedProjects(worktreePath) as project (project.id)}
                   <DropdownMenuItem
                     onSelect={() => runAction(openLinkedProject(project))}
@@ -716,8 +736,8 @@
                     <span class="min-w-0 truncate">Open Project: {project.name}</span>
                   </DropdownMenuItem>
                 {/each}
-              </DropdownMenu>
-            {/if}
+              {/if}
+            </DropdownMenu>
           </div>
           {#if selected}
             {@render commitList(branch.worktree?.path ?? null, branchHasChanges(branch))}
@@ -726,17 +746,22 @@
 
         {#each visibleRemoteOnlyBranches as branch (branch.name)}
           {@const selected = isRemoteSelected(branch.name)}
+          {@const githubUrl = branch.github_url}
+          {@const actionsKey = `remote:${branch.name}`}
+          {@const actionsOpen = openBranchActionsKey === actionsKey}
           {@const branchIndicators = [
             remoteOnlyIndicator(branch.name),
             ...remoteBranchIndicators(branch, repo.default_branch),
           ]}
           <div
             class={cn(
-              "flex min-h-8 items-center gap-2 rounded-md px-2 py-1.5 opacity-80 transition-colors",
-              selected ? "bg-selected" : hoverBg,
+              "group flex min-h-8 items-center gap-2 rounded-md px-2 py-1.5 opacity-80 transition-colors",
+              selected || actionsOpen ? "bg-selected" : hoverBg,
             )}
             data-testid="git-remote-branch"
             data-branch={branch.name}
+            data-selected={selected || actionsOpen}
+            data-actions-open={actionsOpen}
           >
             <Tooltip delayDuration={SUPPLEMENTAL_TOOLTIP_DELAY} openOnHover={false}>
               {#snippet trigger(props)}
@@ -753,6 +778,51 @@
               {/snippet}
               {@render gitRowTooltipContent([branch.name], branchIndicators)}
             </Tooltip>
+            <DropdownMenu
+              open={actionsOpen}
+              onOpenChange={(open) => setBranchActionsOpen(actionsKey, open)}
+              triggerLabel={`Actions for ${branch.name}`}
+              triggerTestid="branch-actions-trigger"
+              triggerClass={cn(
+                ROW_ACTION_ICON_CLASS,
+                "shrink-0 opacity-0 group-focus-within:opacity-100 data-[state=open]:opacity-100",
+                triggerHoverReveal,
+                actionsOpen && "opacity-100",
+              )}
+              contentTestid="branch-actions-menu"
+            >
+              {#snippet trigger()}
+                <MoreHorizontal size={14} strokeWidth={1.8} aria-hidden="true" />
+              {/snippet}
+              {#if githubUrl !== null}
+                <DropdownMenuItem
+                  onSelect={() => runAction(openExternalUrl(githubUrl))}
+                  class="gap-2"
+                  data-testid="branch-action-github"
+                >
+                  <ExternalLink
+                    size={14}
+                    strokeWidth={1.8}
+                    class="text-muted shrink-0"
+                    aria-hidden="true"
+                  />
+                  Open in GitHub
+                </DropdownMenuItem>
+              {/if}
+              <DropdownMenuItem
+                onSelect={() => runAction(copyText(branch.name))}
+                class="gap-2"
+                data-testid="branch-action-copy-branch"
+              >
+                <GitBranch
+                  size={14}
+                  strokeWidth={1.8}
+                  class="text-muted shrink-0"
+                  aria-hidden="true"
+                />
+                Copy branch name
+              </DropdownMenuItem>
+            </DropdownMenu>
           </div>
           {#if selected}
             {@render commitList(null, false)}

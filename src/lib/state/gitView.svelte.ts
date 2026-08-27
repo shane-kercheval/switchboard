@@ -149,24 +149,24 @@ export function hoverableClass(cls: string): string {
   return hoverSuppressed.value ? "" : cls;
 }
 
-/// Repo roots whose worktree-actions menu is currently open. The commit keyboard
+/// Repo roots whose branch-actions menu is currently open. The commit keyboard
 /// navigator bails while any is open so the arrows drive the menu, not the commit
 /// list — global (not node-local) so a menu open in one repo also yields the keys
 /// when the selected commit lives in a different repo node. A keyed set (not a
 /// counter) so it's idempotent: a stray double-close or a reset can't drive it
 /// negative. Read at event time, so plain (non-reactive) state is enough.
 // eslint-disable-next-line svelte/prefer-svelte-reactivity
-const openWorktreeMenuRoots = new Set<string>();
+const openBranchMenuRoots = new Set<string>();
 
-/// Mark (or clear) a repo node's worktree-actions menu as open. Idempotent.
-export function setWorktreeMenuOpen(repoRoot: string, open: boolean): void {
-  if (open) openWorktreeMenuRoots.add(repoRoot);
-  else openWorktreeMenuRoots.delete(repoRoot);
+/// Mark (or clear) a repo node's branch-actions menu as open. Idempotent.
+export function setBranchMenuOpen(repoRoot: string, open: boolean): void {
+  if (open) openBranchMenuRoots.add(repoRoot);
+  else openBranchMenuRoots.delete(repoRoot);
 }
 
-/// Whether any repo node has a worktree-actions menu open.
-export function anyWorktreeMenuOpen(): boolean {
-  return openWorktreeMenuRoots.size > 0;
+/// Whether any repo node has a branch-actions menu open.
+export function anyBranchMenuOpen(): boolean {
+  return openBranchMenuRoots.size > 0;
 }
 
 /// A navigable entry in the commit pane: the worktree's uncommitted row (shown
@@ -811,7 +811,7 @@ export const _testing = {
     diffTarget.current = null;
     navFocus.pane = null;
     hoverSuppressed.value = false;
-    openWorktreeMenuRoots.clear();
+    openBranchMenuRoots.clear();
     gitRefresh.revision = 0;
   },
   runtimeSize(): number {

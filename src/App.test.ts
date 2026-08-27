@@ -4250,6 +4250,7 @@ describe("App", () => {
               behind_base: null,
               merged: null,
               dangling: false,
+              github_url: null,
               worktree: {
                 path: DIR_A,
                 dirty: false,
@@ -4259,7 +4260,9 @@ describe("App", () => {
               },
             },
           ],
-          remote_branches: [{ name: "origin/main", merged: null, behind_base: null }],
+          remote_branches: [
+            { name: "origin/main", github_url: null, merged: null, behind_base: null },
+          ],
           detached_worktrees: [],
         },
         linked_projects: {
@@ -4311,6 +4314,7 @@ describe("App", () => {
               behind_base: null,
               merged: null,
               dangling: false,
+              github_url: null,
               worktree: {
                 path: DIR_A,
                 dirty: false,
@@ -4320,7 +4324,9 @@ describe("App", () => {
               },
             },
           ],
-          remote_branches: [{ name: "origin/main", merged: null, behind_base: null }],
+          remote_branches: [
+            { name: "origin/main", github_url: null, merged: null, behind_base: null },
+          ],
           detached_worktrees: [],
         },
         linked_projects: {

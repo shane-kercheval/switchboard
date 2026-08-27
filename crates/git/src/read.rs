@@ -5,11 +5,12 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use git2::{
-    Branch, BranchType, Diff, DiffFormat, DiffOptions, ErrorCode, Oid, Repository, Status,
-    StatusOptions,
+    Branch, BranchType, Diff, DiffFormat, DiffOptions, Direction, ErrorCode, Oid, Repository,
+    Status, StatusOptions,
 };
 
 use chrono::{FixedOffset, LocalResult, TimeZone};
+use url::Url;
 
 use crate::error::{GitError, Result};
 use crate::model::{
@@ -319,10 +320,13 @@ fn build_repo_view(repo: &Repository, root: PathBuf, name: String) -> Result<Rep
     // collect the prunable/orphaned warnings. Done once up front so branch
     // enumeration can attach worktrees without rescanning.
     let worktrees = collect_worktrees(repo).map_err(err)?;
+    let github_remotes = github_remote_urls(repo);
 
     let local_branches =
-        read_local_branches(repo, default_tip.as_ref(), &worktrees).map_err(err)?;
-    let remote_branches = read_remote_branches(repo, default_tip.as_ref()).map_err(err)?;
+        read_local_branches(repo, default_tip.as_ref(), &worktrees, &github_remotes)
+            .map_err(err)?;
+    let remote_branches =
+        read_remote_branches(repo, default_tip.as_ref(), &github_remotes).map_err(err)?;
     let detached_worktrees = worktrees.into_detached();
 
     Ok(RepoView {
@@ -378,6 +382,7 @@ fn read_local_branches(
     repo: &Repository,
     default_tip: Option<&Oid>,
     worktrees: &Worktrees,
+    github_remotes: &HashMap<String, Url>,
 ) -> std::result::Result<Vec<BranchView>, git2::Error> {
     let mut views = Vec::new();
     for branch in repo.branches(Some(BranchType::Local))? {
@@ -387,6 +392,11 @@ fn read_local_branches(
         };
         let tip = branch.get().target();
         let (upstream, sync, dangling) = upstream_status(repo, &branch, tip);
+        let github_url = if dangling {
+            None
+        } else {
+            local_branch_github_url(repo, github_remotes, &branch)
+        };
         let (merged, behind_base) = ancestry_signals(repo, tip, default_tip);
         let worktree = worktrees.for_branch(&name);
         views.push(BranchView {
@@ -396,6 +406,7 @@ fn read_local_branches(
             behind_base,
             merged,
             dangling,
+            github_url,
             worktree,
         });
     }
@@ -406,6 +417,7 @@ fn read_local_branches(
 fn read_remote_branches(
     repo: &Repository,
     default_tip: Option<&Oid>,
+    github_remotes: &HashMap<String, Url>,
 ) -> std::result::Result<Vec<RemoteBranchView>, git2::Error> {
     let mut views = Vec::new();
     for branch in repo.branches(Some(BranchType::Remote))? {
@@ -417,15 +429,138 @@ fn read_remote_branches(
         if name.ends_with("/HEAD") {
             continue;
         }
+        let github_url = remote_branch_github_url(repo, github_remotes, &branch);
         let (merged, behind_base) = ancestry_signals(repo, branch.get().target(), default_tip);
         views.push(RemoteBranchView {
             name,
+            github_url,
             merged,
             behind_base,
         });
     }
     views.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(views)
+}
+
+fn local_branch_github_url(
+    repo: &Repository,
+    github_remotes: &HashMap<String, Url>,
+    branch: &Branch<'_>,
+) -> Option<String> {
+    let refname = branch.get().name().ok()?;
+    let remote_name = repo.branch_upstream_remote(refname).ok()?;
+    let remote_name = remote_name.as_str().ok()?;
+    let merge_ref = repo.branch_upstream_merge(refname).ok()?;
+    let branch_name = merge_ref.as_str().ok()?.strip_prefix("refs/heads/")?;
+    github_branch_url(github_remotes, remote_name, branch_name)
+}
+
+fn remote_branch_github_url(
+    repo: &Repository,
+    github_remotes: &HashMap<String, Url>,
+    branch: &Branch<'_>,
+) -> Option<String> {
+    let refname = branch.get().name().ok()?;
+    let remote_name = repo.branch_remote_name(refname).ok()?;
+    let remote_name = remote_name.as_str().ok()?;
+    let branch_name = remote_branch_source_name(repo, remote_name, refname)?;
+    github_branch_url(github_remotes, remote_name, &branch_name)
+}
+
+fn remote_branch_source_name(
+    repo: &Repository,
+    remote_name: &str,
+    destination_ref: &str,
+) -> Option<String> {
+    let remote = repo.find_remote(remote_name).ok()?;
+    let mut source_ref = None;
+    for refspec in remote.refspecs() {
+        if refspec.direction() != Direction::Fetch || !refspec.dst_matches(destination_ref) {
+            continue;
+        }
+        let candidate = refspec.rtransform(destination_ref).ok()?;
+        let candidate = candidate.as_str().ok()?;
+        match source_ref.as_deref() {
+            None => source_ref = Some(candidate.to_owned()),
+            Some(existing) if existing == candidate => {}
+            Some(_) => return None,
+        }
+    }
+    source_ref?.strip_prefix("refs/heads/").map(str::to_owned)
+}
+
+fn github_branch_url(
+    github_remotes: &HashMap<String, Url>,
+    remote_name: &str,
+    branch_name: &str,
+) -> Option<String> {
+    let mut url = github_remotes.get(remote_name)?.clone();
+    {
+        let mut segments = url.path_segments_mut().ok()?;
+        segments.push("tree");
+        segments.extend(branch_name.split('/'));
+    }
+    Some(url.into())
+}
+
+fn github_remote_urls(repo: &Repository) -> HashMap<String, Url> {
+    let mut urls = HashMap::new();
+    let Ok(remote_names) = repo.remotes() else {
+        return urls;
+    };
+    for remote_name in remote_names.iter().filter_map(|name| name.ok().flatten()) {
+        let Ok(remote) = repo.find_remote(remote_name) else {
+            continue;
+        };
+        let Some(url) = remote.url().ok().and_then(github_repo_url) else {
+            continue;
+        };
+        urls.insert(remote_name.to_owned(), url);
+    }
+    urls
+}
+
+fn github_repo_url(remote_url: &str) -> Option<Url> {
+    let (owner, repo) = github_repo_coordinates(remote_url)?;
+    let mut url = Url::parse("https://github.com").ok()?;
+    {
+        let mut segments = url.path_segments_mut().ok()?;
+        segments.push(&owner).push(&repo);
+    }
+    Some(url)
+}
+
+fn github_repo_coordinates(remote_url: &str) -> Option<(String, String)> {
+    let path = if let Ok(parsed) = Url::parse(remote_url) {
+        if !matches!(parsed.scheme(), "http" | "https" | "ssh" | "git")
+            || !parsed.host_str().is_some_and(is_github_host)
+        {
+            return None;
+        }
+        parsed.path().to_owned()
+    } else {
+        let (authority, path) = remote_url.split_once(':')?;
+        let host = authority
+            .rsplit_once('@')
+            .map_or(authority, |(_, host)| host);
+        if !is_github_host(host) {
+            return None;
+        }
+        path.to_owned()
+    };
+
+    let mut segments = path.trim_matches('/').split('/');
+    let owner = segments.next()?.trim();
+    let repo_segment = segments.next()?.trim();
+    let repo = repo_segment.strip_suffix(".git").unwrap_or(repo_segment);
+    if owner.is_empty() || repo.is_empty() || segments.next().is_some() {
+        return None;
+    }
+    Some((owner.to_owned(), repo.to_owned()))
+}
+
+fn is_github_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("github.com") || host.eq_ignore_ascii_case("ssh.github.com")
 }
 
 /// A branch's position vs. its own upstream, plus whether that upstream is
@@ -1447,4 +1582,45 @@ fn clamp_u32(n: usize) -> u32 {
 
 fn is_not_found(e: &git2::Error) -> bool {
     e.code() == ErrorCode::NotFound
+}
+
+#[cfg(test)]
+mod tests {
+    use super::github_repo_coordinates;
+
+    #[test]
+    fn github_coordinates_accept_supported_git_transport_forms_on_github_hosts() {
+        for remote in [
+            "https://github.com/acme/widgets.git",
+            "http://github.com/acme/widgets.git",
+            "ssh://git@github.com/acme/widgets.git",
+            "ssh://git@github.com:2222/acme/widgets.git",
+            "ssh://git@ssh.github.com:443/acme/widgets.git",
+            "https://ssh.github.com:8443/acme/widgets.git",
+            "git@github.com:acme/widgets.git",
+            "git://github.com/acme/widgets",
+            "git://ssh.github.com/acme/widgets",
+        ] {
+            assert_eq!(
+                github_repo_coordinates(remote),
+                Some(("acme".to_owned(), "widgets".to_owned())),
+                "remote: {remote}"
+            );
+        }
+    }
+
+    #[test]
+    fn github_coordinates_reject_other_hosts_aliases_and_invalid_paths() {
+        for remote in [
+            "https://gitlab.com/acme/widgets.git",
+            "git@github-work:acme/widgets.git",
+            "https://github.com/acme",
+            "https://github.com/acme/widgets/extra",
+            "file:///acme/widgets.git",
+            "ftp://github.com/acme/widgets.git",
+            "https://github.com.evil.example/acme/widgets.git",
+        ] {
+            assert_eq!(github_repo_coordinates(remote), None, "remote: {remote}");
+        }
+    }
 }

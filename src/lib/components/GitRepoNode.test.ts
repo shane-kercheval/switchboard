@@ -6,11 +6,12 @@ import GitRepoNode from "./GitRepoNode.svelte";
 import type { GitCommitRange, GitCommitSummary, RepoListing } from "$lib/types";
 
 const invokeMock = vi.fn();
+const copyTextMock = vi.fn(async (_text: string): Promise<void> => undefined);
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: (cmd: string, args?: Record<string, unknown>) => invokeMock(cmd, args),
 }));
 vi.mock("@tauri-apps/api/path", () => ({ homeDir: async () => "/repos" }));
-vi.mock("$lib/native", () => ({ copyText: async (): Promise<void> => undefined }));
+vi.mock("$lib/native", () => ({ copyText: (text: string) => copyTextMock(text) }));
 
 const { branchSelection, branchCommits, diffTarget, selectCommit, _testing } =
   await import("$lib/state/gitView.svelte");
@@ -21,6 +22,7 @@ afterEach(() => {
   _testing.reset();
   paletteTesting.reset();
   invokeMock.mockReset();
+  copyTextMock.mockReset();
 });
 
 const commit = (oid: string, subject: string): GitCommitSummary => ({
@@ -61,6 +63,7 @@ function listing(root: string): RepoListing {
           behind_base: null,
           merged: null,
           dangling: false,
+          github_url: null,
           worktree: {
             path: `${root}/wt`,
             dirty: false,
@@ -113,12 +116,12 @@ describe("GitRepoNode commit keyboard navigation", () => {
     expect(diffTarget.current).toMatchObject({ kind: "commit", oid: "bbbbbbb0", repoRoot: "/a" });
   });
 
-  it("ignores arrows while this node's worktree-actions menu is open", async () => {
+  it("ignores arrows while this node's branch-actions menu is open", async () => {
     selectRepoA();
     render(GitRepoNode, { props: props("/a") });
     await tick();
 
-    await fireEvent.click(screen.getByTestId("worktree-actions-trigger"));
+    await fireEvent.click(screen.getByTestId("branch-actions-trigger"));
     await tick();
     expect(screen.getByTestId("git-branch")).toHaveAttribute("data-actions-open", "true");
 
@@ -127,7 +130,7 @@ describe("GitRepoNode commit keyboard navigation", () => {
     expect(diffTarget.current).toMatchObject({ oid: "aaaaaaa0" }); // unchanged
   });
 
-  it("ignores arrows while a worktree-actions menu is open in a different repo node", async () => {
+  it("ignores arrows while a branch-actions menu is open in a different repo node", async () => {
     selectRepoA(); // selection lives in /a
     render(GitRepoNode, { props: props("/a") });
     render(GitRepoNode, { props: props("/b") });
@@ -135,7 +138,7 @@ describe("GitRepoNode commit keyboard navigation", () => {
 
     // Open /b's menu — /a owns the selection, so this is the cross-node case.
     const bRow = screen.getAllByTestId("git-branch")[1]!;
-    await fireEvent.click(within(bRow).getByTestId("worktree-actions-trigger"));
+    await fireEvent.click(within(bRow).getByTestId("branch-actions-trigger"));
     await tick();
     expect(bRow).toHaveAttribute("data-actions-open", "true");
 
@@ -281,7 +284,7 @@ describe("GitRepoNode actions-trigger hover", () => {
 
     // The trigger carries the stronger row-action hover plus the selected-row white override;
     // CSS picks between them off the row's `data-selected`.
-    const trigger = within(rows[0]!).getByTestId("worktree-actions-trigger");
+    const trigger = within(rows[0]!).getByTestId("branch-actions-trigger");
     expect(trigger.className).toContain("hover:bg-active");
     expect(trigger.className).toContain("group-data-[selected=true]:hover:bg-raised");
   });
@@ -290,13 +293,91 @@ describe("GitRepoNode actions-trigger hover", () => {
     selectRepoA();
     render(GitRepoNode, { props: props("/a") });
     await tick();
-    const trigger = screen.getByTestId("worktree-actions-trigger");
+    const trigger = screen.getByTestId("branch-actions-trigger");
     expect(trigger.className).toContain("group-hover:opacity-100");
 
     // A keyboard move suppresses hover so the `…` doesn't linger under the cursor.
     await fireEvent.keyDown(window, { key: "ArrowDown" });
     await tick();
     expect(trigger.className).not.toContain("group-hover:opacity-100");
+  });
+});
+
+describe("GitRepoNode GitHub actions", () => {
+  it("opens a tracked folderless local branch in GitHub", async () => {
+    const componentProps = props("/a");
+    const branch = componentProps.listing.repo.local_branches[0]!;
+    branch.upstream = "fork/main";
+    branch.sync = { kind: "in_sync" };
+    branch.github_url = "https://github.com/acme/widgets/tree/main";
+    branch.worktree = null;
+    render(GitRepoNode, { props: componentProps });
+    await tick();
+
+    await fireEvent.click(screen.getByTestId("branch-actions-trigger"));
+    await tick();
+    await fireEvent.click(screen.getByTestId("branch-action-github"));
+
+    expect(invokeMock).toHaveBeenCalledWith("open_external_url", {
+      url: "https://github.com/acme/widgets/tree/main",
+    });
+  });
+
+  it("opens a remote-only branch in GitHub", async () => {
+    const componentProps = props("/a");
+    componentProps.listing.repo.remote_branches = [
+      {
+        name: "fork/feature",
+        github_url: "https://github.com/acme/widgets/tree/feature",
+        merged: false,
+        behind_base: 0,
+      },
+    ];
+    render(GitRepoNode, { props: { ...componentProps, branchFilter: "remote" } });
+    await tick();
+
+    const remote = screen.getByTestId("git-remote-branch");
+    await fireEvent.click(within(remote).getByTestId("branch-actions-trigger"));
+    await tick();
+    await fireEvent.click(screen.getByTestId("branch-action-github"));
+
+    expect(invokeMock).toHaveBeenCalledWith("open_external_url", {
+      url: "https://github.com/acme/widgets/tree/feature",
+    });
+  });
+
+  it("offers Copy for an unpushed folderless branch without offering GitHub", async () => {
+    const componentProps = props("/a");
+    componentProps.listing.repo.local_branches[0]!.worktree = null;
+    render(GitRepoNode, { props: componentProps });
+    await tick();
+
+    await fireEvent.click(screen.getByTestId("branch-actions-trigger"));
+    await tick();
+    expect(screen.queryByTestId("branch-action-github")).not.toBeInTheDocument();
+    await fireEvent.click(screen.getByTestId("branch-action-copy-branch"));
+    expect(copyTextMock).toHaveBeenCalledWith("main");
+  });
+
+  it("offers Copy for a non-GitHub remote branch without offering GitHub", async () => {
+    const componentProps = props("/a");
+    componentProps.listing.repo.remote_branches = [
+      {
+        name: "upstream/feature",
+        github_url: null,
+        merged: false,
+        behind_base: 0,
+      },
+    ];
+    render(GitRepoNode, { props: { ...componentProps, branchFilter: "remote" } });
+    await tick();
+
+    const remote = screen.getByTestId("git-remote-branch");
+    await fireEvent.click(within(remote).getByTestId("branch-actions-trigger"));
+    await tick();
+    expect(screen.queryByTestId("branch-action-github")).not.toBeInTheDocument();
+    await fireEvent.click(screen.getByTestId("branch-action-copy-branch"));
+    expect(copyTextMock).toHaveBeenCalledWith("upstream/feature");
   });
 });
 

@@ -62,6 +62,7 @@ const repo = (over: Partial<RepoListing["repo"]> = {}): RepoListing => ({
         behind_base: null,
         merged: null,
         dangling: false,
+        github_url: null,
         worktree: {
           path: "/repos/app",
           dirty: true,
@@ -77,12 +78,13 @@ const repo = (over: Partial<RepoListing["repo"]> = {}): RepoListing => ({
         behind_base: null,
         merged: true,
         dangling: false,
+        github_url: null,
         worktree: null, // inactive (no worktree)
       },
     ],
     remote_branches: [
-      { name: "origin/main", merged: null, behind_base: null },
-      { name: "origin/remote-only", merged: null, behind_base: null },
+      { name: "origin/main", github_url: null, merged: null, behind_base: null },
+      { name: "origin/remote-only", github_url: null, merged: null, behind_base: null },
     ],
     detached_worktrees: [],
     ...over,
@@ -155,10 +157,13 @@ describe("GitView", () => {
 
     await waitFor(() => expect(screen.getByTestId("git-repo")).toBeInTheDocument());
     // Active branch (has a worktree) shows; linked projects stay out of the row.
-    expect(document.querySelector('[data-testid="git-branch"][data-branch="main"]')).not.toBeNull();
+    const mainRow = document.querySelector(
+      '[data-testid="git-branch"][data-branch="main"]',
+    ) as HTMLElement;
+    expect(mainRow).not.toBeNull();
     expect(screen.queryByTestId("linked-project")).not.toBeInTheDocument();
     await waitFor(() => expect(screen.getAllByText("~/app").length).toBeGreaterThan(0));
-    await fireEvent.click(screen.getByTestId("worktree-actions-trigger"));
+    await fireEvent.click(within(mainRow).getByTestId("branch-actions-trigger"));
     expect(screen.getByTestId("worktree-action-open-project")).toHaveTextContent(
       "Open Project: app-proj",
     );
@@ -412,7 +417,7 @@ describe("GitView", () => {
     const mainRow = document.querySelector(
       '[data-testid="git-branch"][data-branch="main"]',
     ) as HTMLElement;
-    const trigger = within(mainRow).getByTestId("worktree-actions-trigger");
+    const trigger = within(mainRow).getByTestId("branch-actions-trigger");
 
     expect(mainRow).toHaveAttribute("data-actions-open", "false");
     await fireEvent.click(trigger);
@@ -426,7 +431,7 @@ describe("GitView", () => {
     await waitFor(() => expect(mainRow).toHaveAttribute("data-actions-open", "false"));
   });
 
-  it("does not restore a stale open worktree menu after worktree actions unmount", async () => {
+  it("does not restore a stale branch menu after its branch disappears", async () => {
     const withWorktree = repo();
     wire([withWorktree]);
     await refreshAll();
@@ -436,19 +441,19 @@ describe("GitView", () => {
     let mainRow = document.querySelector(
       '[data-testid="git-branch"][data-branch="main"]',
     ) as HTMLElement;
-    await fireEvent.click(within(mainRow).getByTestId("worktree-actions-trigger"));
+    await fireEvent.click(within(mainRow).getByTestId("branch-actions-trigger"));
     expect(mainRow).toHaveAttribute("data-actions-open", "true");
 
     wire([
       repo({
-        local_branches: withWorktree.repo.local_branches.map((branch) =>
-          branch.name === "main" ? { ...branch, worktree: null } : branch,
-        ),
+        local_branches: withWorktree.repo.local_branches.filter((branch) => branch.name !== "main"),
       }),
     ]);
     await refreshAll();
     await waitFor(() =>
-      expect(within(mainRow).queryByTestId("worktree-actions-trigger")).not.toBeInTheDocument(),
+      expect(
+        document.querySelector('[data-testid="git-branch"][data-branch="main"]'),
+      ).not.toBeInTheDocument(),
     );
 
     wire([withWorktree]);
@@ -457,7 +462,7 @@ describe("GitView", () => {
       document.querySelector('[data-testid="git-branch"][data-branch="main"]'),
     )) as HTMLElement;
 
-    expect(within(mainRow).getByTestId("worktree-actions-trigger")).toBeInTheDocument();
+    expect(within(mainRow).getByTestId("branch-actions-trigger")).toBeInTheDocument();
     expect(mainRow).toHaveAttribute("data-actions-open", "false");
   });
 
@@ -512,6 +517,7 @@ describe("GitView", () => {
             behind_base: null,
             merged: null,
             dangling: false,
+            github_url: null,
             worktree: {
               path: "/repos/app-feature",
               dirty: false,
@@ -527,6 +533,7 @@ describe("GitView", () => {
             behind_base: null,
             merged: null,
             dangling: false,
+            github_url: null,
             worktree: null,
           },
         ],

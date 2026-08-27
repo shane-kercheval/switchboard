@@ -69,6 +69,7 @@ const listingWithWorktree = (root: string, wtPath: string): RepoListing => {
       behind_base: null,
       merged: null,
       dangling: false,
+      github_url: null,
       worktree: { path: wtPath, dirty: true, untracked: false, detached_hash: null, warning: null },
     },
   ];
@@ -227,6 +228,7 @@ describe("gitView store", () => {
         behind_base: null,
         merged: null,
         dangling: false,
+        github_url: null,
         worktree: {
           path: "/a/wt",
           dirty: false,
@@ -350,6 +352,7 @@ describe("gitView store", () => {
           behind_base: null,
           merged: null,
           dangling: false,
+          github_url: null,
           worktree: null,
         },
       ];

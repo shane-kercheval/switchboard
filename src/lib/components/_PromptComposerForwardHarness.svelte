@@ -37,6 +37,7 @@
 </script>
 
 <PromptComposer
+  projectId="00000000-0000-7000-8000-0000000000ff"
   {prompt}
   bind:args
   bind:appendedText

@@ -43,6 +43,7 @@
 </script>
 
 <WorkflowComposer
+  projectId="00000000-0000-7000-8000-0000000000ff"
   {descriptor}
   {agents}
   {panes}

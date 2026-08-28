@@ -2,10 +2,11 @@
   import type { Snippet } from "svelte";
   import { tick } from "svelte";
   import * as api from "$lib/api";
-  import type { Prompt, AgentRecord, AgentId } from "$lib/types";
+  import type { Prompt, AgentRecord, AgentId, ProjectId } from "$lib/types";
   import type { TranscriptPane } from "$lib/state/transcriptPanes.svelte";
   import {
     forwardSourceKey,
+    isForeignSource,
     forwardSourceForAgent,
     forwardSourceAgentsForPane,
     type ForwardReadiness,
@@ -49,7 +50,14 @@
     recipients,
     focusFirstField = false,
     busy = false,
+    projectId,
+    crossProject,
   }: {
+    /// The project composing this send — qualifies foreign forward-source labels.
+    projectId: ProjectId;
+    /// Cross-project forward sourcing, passed straight to each per-field picker
+    /// so this surface offers the same Projects section as the compose bar.
+    crossProject?: import("$lib/components/ui/ForwardSourcePicker.svelte").CrossProjectConfig;
     prompt: Prompt;
     args: Record<string, string>;
     appendedText: string;
@@ -83,6 +91,11 @@
   /// What a source will contribute at dispatch. Absent the classifier (the
   /// component stands alone in tests), assume it resolves normally.
   function sourceReadiness(source: ForwardSource): ForwardReadiness {
+    // A foreign source's transcript isn't loaded in this project, so any
+    // classification would be a guess — and the guess `forwardReadiness` makes
+    // for a missing transcript is `"empty"`, which renders a false
+    // "blocks your send" warning. Say nothing instead.
+    if (isForeignSource(source, projectId)) return "unknown";
     return agentReadiness?.(source.id) ?? "ready";
   }
 
@@ -313,6 +326,7 @@
           {agents}
           {panes}
           onPickAgent={(agent) => onAdd(forwardSourceForAgent(agent))}
+          {crossProject}
           onPickPane={(pane) => {
             for (const source of forwardSourceAgentsForPane(pane, agents)) onAdd(source);
           }}
@@ -341,6 +355,7 @@
                 readiness={sourceReadiness(source)}
                 disabled={busy}
                 onRemove={() => onRemove(forwardSourceKey(source))}
+                currentProjectId={projectId}
               />
             {/each}
             {#if sources.length > 1}

@@ -15,7 +15,8 @@
 // resolves the composed body — so there is no per-agent pending entry to carry
 // it. The hold lives here instead.
 
-import type { AgentId, AgentRecord, ProjectId, SendId } from "$lib/types";
+import type { AgentId, AgentRecord, ForwardSourceRef, ProjectId, SendId } from "$lib/types";
+export type { ForwardSourceRef };
 import { answerTextOf } from "./unified";
 import type { Turn } from "$lib/state/types";
 import type { TranscriptPane } from "$lib/state/transcriptPanes.svelte";
@@ -25,7 +26,46 @@ import type { TranscriptPane } from "$lib/state/transcriptPanes.svelte";
 /// is a selection convenience that expands to one source per member agent at pick
 /// time (see `forwardSourceAgentsForPane`), so a pane is never stored or displayed
 /// as a chip. `name` drives the chip and the "waiting for {name}…" label.
-export type ForwardSource = { id: AgentId; name: string };
+/// A source may live in **another project**, so it carries its owner. `projectId`
+/// is what lets the backend resolve a source whose project this process never
+/// opened — an agent id alone names no project to open. `projectName` is display
+/// only: it qualifies the chip and the "waiting for …" row when the source is
+/// foreign, so two same-named agents in different projects stay distinguishable.
+///
+/// Both are optional for one reason: **persisted drafts written before this
+/// existed**. A restored draft with no `projectId` belongs to the draft's own
+/// project, and `upgradeForwardSource` fills it in before anything reaches IPC —
+/// the wire type itself requires the owner (see `ForwardSourceRef` in
+/// `commands.rs`), so the ambiguity is resolved at the edge and never travels.
+export type ForwardSource = {
+  id: AgentId;
+  name: string;
+  projectId?: ProjectId;
+  projectName?: string;
+};
+
+/// Fill in a legacy source's owner from the project whose draft it was restored
+/// from. Applied on restore so an un-upgraded source can never reach the wire.
+export function upgradeForwardSource(
+  source: ForwardSource,
+  draftProjectId: ProjectId,
+): ForwardSource {
+  return source.projectId ? source : { ...source, projectId: draftProjectId };
+}
+
+/// Whether this source belongs to a project other than the one composing the send
+/// — the condition for qualifying its label with the project name.
+export function isForeignSource(source: ForwardSource, currentProjectId: ProjectId): boolean {
+  return source.projectId !== undefined && source.projectId !== currentProjectId;
+}
+
+/// The chip / waiting-row label: bare agent name in-project, `agent · project`
+/// when foreign (falling back to the bare name if the project name is unknown).
+export function forwardSourceLabel(source: ForwardSource, currentProjectId: ProjectId): string {
+  return isForeignSource(source, currentProjectId) && source.projectName
+    ? `${source.name} · ${source.projectName}`
+    : source.name;
+}
 
 /// Stable identity for dedup / removal / list keys — the agent id.
 export function forwardSourceKey(source: ForwardSource): string {
@@ -34,8 +74,13 @@ export function forwardSourceKey(source: ForwardSource): string {
 
 /// Build an agent forward source. Shared by every forward surface so the shape
 /// has one definition.
-export function forwardSourceForAgent(agent: AgentRecord): ForwardSource {
-  return { id: agent.id, name: agent.name };
+export function forwardSourceForAgent(
+  agent: AgentRecord,
+  project?: { id: ProjectId; name: string },
+): ForwardSource {
+  return project
+    ? { id: agent.id, name: agent.name, projectId: project.id, projectName: project.name }
+    : { id: agent.id, name: agent.name, projectId: agent.project_id };
 }
 
 /// Expand a pane to one forward source per *currently-live* member agent, in pane
@@ -49,32 +94,80 @@ export function forwardSourceAgentsForPane(
   return pane.members
     .map((id) => agents.find((a) => a.id === id))
     .filter((a): a is AgentRecord => a !== undefined)
-    .map(forwardSourceForAgent);
+    .map((agent) => forwardSourceForAgent(agent));
 }
 
-/// The agent ids a set of sources forwards from, de-duplicated and in order. This
-/// is what the dispatch/backend sees.
-export function expandForwardSources(sources: ForwardSource[]): AgentId[] {
+/// The agent ids a set of sources covers — for **UI dedup only** (hiding an
+/// already-picked agent from a menu). The wire uses [`expandForwardSources`],
+/// which carries each source's owning project; the two are not interchangeable
+/// and confusing them is how a foreign source loses its project on the way out.
+export function forwardSourceIds(sources: readonly ForwardSource[]): AgentId[] {
   const ids: AgentId[] = [];
   for (const source of sources) if (!ids.includes(source.id)) ids.push(source.id);
   return ids;
 }
 
+/// The sources as the **backend receives them** — one ref per distinct agent,
+/// in declared order, each carrying its owning project.
+///
+/// `currentProjectId` is the fallback owner for a source that has none: a draft
+/// written before sources carried a project. Resolving that here, at the wire
+/// boundary, is what lets the backend's type require the owner unconditionally.
+export function expandForwardSources(
+  sources: ForwardSource[],
+  currentProjectId: ProjectId,
+): ForwardSourceRef[] {
+  const refs: ForwardSourceRef[] = [];
+  for (const source of sources) {
+    if (refs.some((r) => r.agent_id === source.id)) continue;
+    refs.push({ agent_id: source.id, project_id: source.projectId ?? currentProjectId });
+  }
+  return refs;
+}
+
 /// Reconcile persisted forward sources against the live roster, for restore.
 ///
-/// A source names an agent that may have been removed or renamed since the draft
-/// was written. Removed agents are dropped — forwarding from them would fail at
-/// dispatch. Survivors take the roster's *current* name, because the chip's `name`
-/// is display-only and a stale one would show the user an agent that no longer
-/// exists under that label.
+/// A **local** source names an agent that may have been removed or renamed since
+/// the draft was written. Removed local agents are dropped — forwarding from them
+/// would fail at dispatch. Survivors take the roster's *current* name, because
+/// the chip's `name` is display-only and a stale one would show the user an agent
+/// that no longer exists under that label.
+///
+/// A **foreign** source is kept as-is. `agents` is the *current project's* roster,
+/// so a foreign source is absent from it by definition — matching on it would
+/// delete every cross-project chip on each remount (a project switch, a Git-view
+/// toggle), which is exactly the silent-disappearance this restore path exists to
+/// prevent. Validation of foreign sources belongs to the backend, which opens the
+/// declared project and verifies ownership at dispatch; a genuinely deleted agent
+/// then fails the send with a clear message instead of vanishing beforehand.
+///
+/// `draftProjectId` is the project this draft belongs to: it identifies which
+/// sources are local and upgrades legacy sources that predate `projectId`.
 export function reconcileForwardSources(
   sources: readonly ForwardSource[],
   agents: readonly AgentRecord[],
+  draftProjectId: ProjectId,
+  foreignRoster?: (source: ForwardSource) => AgentRecord | undefined,
 ): ForwardSource[] {
   return sources
-    .map((source) => agents.find((agent) => agent.id === source.id))
-    .filter((agent): agent is AgentRecord => agent !== undefined)
-    .map(forwardSourceForAgent);
+    .map((source) => upgradeForwardSource(source, draftProjectId))
+    .filter((source) => {
+      if (isForeignSource(source, draftProjectId)) return true;
+      return agents.some((agent) => agent.id === source.id);
+    })
+    .map((source) => {
+      if (isForeignSource(source, draftProjectId)) {
+        // A foreign source's current name lives in *its* project's roster, which
+        // this call doesn't have. `foreignRoster` supplies it when the caller has
+        // already read that project (the picker caches per project); absent that,
+        // the stored name is retained rather than dropped — a possibly-stale
+        // label beats deleting the user's chip.
+        const fresh = foreignRoster?.(source)?.name;
+        return fresh !== undefined && fresh !== source.name ? { ...source, name: fresh } : source;
+      }
+      const agent = agents.find((a) => a.id === source.id);
+      return agent ? forwardSourceForAgent(agent) : source;
+    });
 }
 
 /// `reconcileForwardSources` across a per-field map, dropping fields left empty so
@@ -82,10 +175,11 @@ export function reconcileForwardSources(
 export function reconcileForwardSourceMap(
   map: Readonly<Record<string, ForwardSource[]>>,
   agents: readonly AgentRecord[],
+  draftProjectId: ProjectId,
 ): Record<string, ForwardSource[]> {
   const out: Record<string, ForwardSource[]> = {};
   for (const [field, sources] of Object.entries(map)) {
-    const kept = reconcileForwardSources(sources, agents);
+    const kept = reconcileForwardSources(sources, agents, draftProjectId);
     if (kept.length > 0) out[field] = kept;
   }
   return out;
@@ -98,7 +192,27 @@ export function reconcileForwardSourceMap(
 /// - `empty`   — the agent is idle with no forwardable text to contribute;
 ///               dispatching would **block the whole send** (any empty source
 ///               invalidates the forward), so the picker flags it first.
-export type ForwardReadiness = "ready" | "pending" | "empty";
+/// - `unknown` — not determinable here, so **render no marker at all**. This is
+///               the state for a source in another project: readiness is read
+///               from the current project's loaded transcripts, which by
+///               definition don't contain a foreign agent. An explicit member
+///               rather than reusing `ready` or `empty`, because both of those
+///               are claims — and `empty` in particular renders a "this will
+///               block your send" warning that is the *inverse* of the truth for
+///               a healthy foreign source.
+export type ForwardReadiness = "ready" | "pending" | "empty" | "unknown";
+
+/// Readiness for one source, given the project composing the send. A foreign
+/// source short-circuits to `unknown`: its transcript isn't loaded here, and
+/// guessing from an absent transcript yields `empty`, which is a false warning.
+export function sourceReadinessFor(
+  source: ForwardSource,
+  currentProjectId: ProjectId,
+  turnsFor: (id: AgentId) => readonly Turn[] | undefined,
+): ForwardReadiness {
+  if (isForeignSource(source, currentProjectId)) return "unknown";
+  return forwardReadiness(turnsFor(source.id));
+}
 
 /// Classify what a source will contribute, from that agent's turns.
 ///

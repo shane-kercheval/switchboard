@@ -16,6 +16,10 @@
     tooltip?: string;
     class?: string;
     children: Snippet;
+    /// Disclosure state for an item that expands in place (used with
+    /// `closeOnSelect={false}`), so a screen reader reports it as expandable
+    /// rather than as a plain action.
+    "aria-expanded"?: boolean;
     [key: `data-${string}`]: string | undefined;
   };
 

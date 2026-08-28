@@ -97,7 +97,11 @@
       data-testid={contentTestid}
       onCloseAutoFocus={tooltipLabel ? (e) => e.preventDefault() : undefined}
       class={cn(
-        "border-border/90 bg-raised z-50 min-w-44 rounded-lg border p-1 text-[13px] shadow-[0_10px_28px_rgba(0,0,0,0.10)] outline-none focus:outline-none",
+        // `max-h` + scroll: menu content is caller-supplied and unbounded (the forward
+        // picker lists every agent, every pane, and every other project), so without
+        // containment a long menu runs past the viewport and the clipped rows are
+        // unreachable — the same dead-end as a row that can't take focus.
+        "border-border/90 bg-raised z-50 max-h-[min(28rem,var(--bits-dropdown-menu-content-available-height,28rem))] min-w-44 overflow-y-auto rounded-lg border p-1 text-[13px] shadow-[0_10px_28px_rgba(0,0,0,0.10)] outline-none focus:outline-none",
         contentClass,
       )}
     >

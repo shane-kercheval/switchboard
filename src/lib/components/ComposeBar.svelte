@@ -16,6 +16,8 @@
     removeHeldForward,
     forwardSourceKey,
     expandForwardSources,
+    forwardSourceIds,
+    sourceReadinessFor,
     forwardSourceForAgent,
     forwardSourceAgentsForPane,
     forwardReadiness,
@@ -23,6 +25,7 @@
     reconcileForwardSourceMap,
     type ForwardReadiness,
     type ForwardSource,
+    type ForwardSourceRef,
   } from "$lib/state/heldForwards.svelte";
   import { buildLiveSendsMap } from "$lib/state/liveSends";
   import {
@@ -263,8 +266,37 @@
   // a missed dependency.
   const savedForwards = saved.forwards ?? emptyForwards();
   let forwardSources = $state<ForwardSource[]>(
-    untrack(() => reconcileForwardSources(savedForwards.message, agents)),
+    untrack(() => reconcileForwardSources(savedForwards.message, agents, projectId)),
   );
+
+  /// Other projects offered in the Forward picker's `Projects` section.
+  /// Restricted to **available** directories: an unavailable one can't have its
+  /// journal read or its agent dispatched against, so offering it would produce a
+  /// source that fails at send. (M2's central store lifts this — the journal
+  /// moves out of the working directory — but that is not this milestone.)
+  const otherForwardProjects = $derived(
+    projects.list
+      .filter((p) => p.id !== projectId && p.available && !p.archived)
+      .map((p) => ({ id: p.id, name: p.name })),
+  );
+
+  /// The cross-project config every forward picker gets — this bar's own and the
+  /// per-field ones inside the prompt/workflow composers, so the feature exists on
+  /// all three surfaces rather than only where it was wired first.
+  ///
+  /// `onPick` **opens the project before the chip is added**. Browsing is a read,
+  /// but committing has to prove the project is usable: otherwise one locked by
+  /// another window looks selectable and the user finds out only after composing
+  /// a whole message. The backend still opens at dispatch — that path serves
+  /// chips restored cold from a draft, which never passed through here.
+  const crossProjectForward = $derived({
+    projects: otherForwardProjects,
+    loadAgents: api.listProjectAgentsReadonly,
+    onPick: async (agent: AgentRecord, project: { id: ProjectId; name: string }) => {
+      await api.openProject(project.id);
+      addForwardSource(forwardSourceForAgent(agent, project));
+    },
+  });
 
   function addForwardSource(source: ForwardSource): void {
     if (forwardSources.some((s) => forwardSourceKey(s) === forwardSourceKey(source))) return;
@@ -292,6 +324,14 @@
   /// so they cannot disagree about the same agent.
   function agentReadiness(agentId: AgentId): ForwardReadiness {
     return forwardReadiness(transcripts[agentId]);
+  }
+
+  /// Readiness for a chip. Must go through the *source*, not the bare id:
+  /// `transcripts` holds only this project's agents, so a foreign id yields
+  /// `undefined`, and `forwardReadiness(undefined)` is `"empty"` — a "this will
+  /// block your send" warning that is false for a healthy foreign source.
+  function sourceReadiness(source: ForwardSource): ForwardReadiness {
+    return sourceReadinessFor(source, projectId, (id) => transcripts[id]);
   }
 
   /// The current chips as the `Attachment` wire shape (drops the local `id`),
@@ -379,12 +419,12 @@
   // prompt-mode send with any entry here — or in `promptAppendedSources` — routes
   // through the forward-prompt path.
   let promptArgSources = $state<Record<string, ForwardSource[]>>(
-    untrack(() => reconcileForwardSourceMap(savedForwards.promptArgs, agents)),
+    untrack(() => reconcileForwardSourceMap(savedForwards.promptArgs, agents, projectId)),
   );
   // Forward sources for the appended-text field (the appended text is just
   // another forwardable field; the backend composes it into the appended tail).
   let promptAppendedSources = $state<ForwardSource[]>(
-    untrack(() => reconcileForwardSources(savedForwards.promptAppended, agents)),
+    untrack(() => reconcileForwardSources(savedForwards.promptAppended, agents, projectId)),
   );
   let appendedText = $state<string>("");
   let promptMenuOpen = $state(false);
@@ -438,7 +478,7 @@
   // keyed by field name. Persisted with the other forward families; reset whenever
   // the workflow changes (a field name means nothing across workflows).
   let workflowForwardSources = $state<Record<string, ForwardSource[]>>(
-    untrack(() => reconcileForwardSourceMap(savedForwards.workflowFields, agents)),
+    untrack(() => reconcileForwardSourceMap(savedForwards.workflowFields, agents, projectId)),
   );
   let invokingWorkflow = $state(false);
   let workflowSigningInProvider = $state<string | null>(null);
@@ -1225,7 +1265,7 @@
     if (!menuOpen || agents.length <= 1 || mode !== "plain") return [];
     const q = menuQuery.toLowerCase();
     const items: ForwardMenuItem[] = [];
-    const alreadyForwarded = expandForwardSources(forwardSources);
+    const alreadyForwarded = forwardSourceIds(forwardSources);
     if (paneLayout.panes.length > 1) {
       for (const pane of paneLayout.panes) {
         if (!pane.name.toLowerCase().includes(q)) continue;
@@ -2048,11 +2088,12 @@
     invokingWorkflow = true;
     clearStatus();
     try {
-      // Pane-expand each field's sources to agent ids; omit empty fields so the
-      // map carries only fields the user actually attached a forward to.
-      const forwardSources: Record<string, AgentId[]> = {};
+      // Pane-expand each field's sources to wire refs (agent + owning project);
+      // omit empty fields so the map carries only fields the user actually
+      // attached a forward to.
+      const forwardSources: Record<string, ForwardSourceRef[]> = {};
       for (const [name, sources] of Object.entries(workflowForwardSources)) {
-        if (sources.length > 0) forwardSources[name] = expandForwardSources(sources);
+        if (sources.length > 0) forwardSources[name] = expandForwardSources(sources, projectId);
       }
       const runId = await api.invokeWorkflow(
         projectId,
@@ -2157,7 +2198,11 @@
     addHeldForward(forwardProjectId, { forwardId, sendId, body, sources, recipients });
     void (async () => {
       try {
-        const outcome = await api.forwardMessage(body, expandForwardSources(sources), forwardId);
+        const outcome = await api.forwardMessage(
+          body,
+          expandForwardSources(sources, projectId),
+          forwardId,
+        );
         removeHeldForward(forwardProjectId, forwardId);
         if (outcome.status === "resolved") {
           // Dispatch the composed body as a normal send under this forward's
@@ -2266,7 +2311,7 @@
       .filter((a) => (argSources[a.name]?.length ?? 0) > 0)
       .map((a) => ({
         name: a.name,
-        sources: expandForwardSources(argSources[a.name] ?? []),
+        sources: expandForwardSources(argSources[a.name] ?? [], projectId),
         required: a.required,
       }));
     void (async () => {
@@ -2281,7 +2326,7 @@
           buildRenderArgs(prompt, typedArgs),
           forwardArgs,
           appended,
-          expandForwardSources(appendedSources),
+          expandForwardSources(appendedSources, projectId),
           forwardId,
         );
         removeHeldForward(forwardProjectId, forwardId);
@@ -3432,9 +3477,10 @@
             {#each forwardSources as source (forwardSourceKey(source))}
               <ForwardSourceChip
                 {source}
-                readiness={agentReadiness(source.id)}
+                readiness={sourceReadiness(source)}
                 disabled={composerBusy}
                 onRemove={() => removeForwardSource(forwardSourceKey(source))}
+                currentProjectId={projectId}
               />
             {/each}
             {#if forwardSources.length > 1}
@@ -3713,6 +3759,8 @@
            bar's To field + message forwards are hidden (the workflow routes via
            its agent inputs); the run launches in the background. -->
         <WorkflowComposer
+          {projectId}
+          crossProject={crossProjectForward}
           descriptor={workflowForm}
           {agents}
           loading={workflowFormLoading}
@@ -3743,6 +3791,8 @@
            row sits just under it (handed in as a snippet), then the argument /
            appended boxes; the send button rides the composer's footer row. -->
         <PromptComposer
+          {projectId}
+          crossProject={crossProjectForward}
           prompt={selectedPrompt}
           bind:args={promptArgs}
           bind:appendedText
@@ -3788,6 +3838,7 @@
               panes={paneLayout.panes}
               onPickAgent={(agent) => addForwardSource(forwardSourceForAgent(agent))}
               onPickPane={(pane) => addPaneForwardSources(pane)}
+              crossProject={crossProjectForward}
               {agentReadiness}
               disabled={composerBusy}
               showPaneShortcuts

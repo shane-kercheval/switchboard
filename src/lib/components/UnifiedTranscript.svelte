@@ -51,6 +51,7 @@
     FORWARD_SENTINEL,
     heldForwardsFor,
     type HeldForward,
+    forwardSourceLabel,
   } from "$lib/state/heldForwards.svelte";
   import { cancelForward, openExternalUrl } from "$lib/api";
   import { agentCopy } from "$lib/agentCopy.svelte";
@@ -1927,7 +1928,7 @@
      compose bar's awaiting `forward_message` then resolves cancelled, removes
      this entry, and restores the composer (text + source chips). -->
 {#snippet heldForwardRow(held: HeldForward)}
-  {@const sourceNames = held.sources.map((s) => s.name).join(", ")}
+  {@const sourceNames = held.sources.map((s) => forwardSourceLabel(s, projectId)).join(", ")}
   <div class="group min-w-0 flex-1" data-testid="held-forward" data-forward-id={held.forwardId}>
     {#if held.promptName !== undefined}
       <div class="text-fg text-sm font-medium" data-testid="held-forward-prompt-name">

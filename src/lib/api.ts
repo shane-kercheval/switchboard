@@ -11,6 +11,7 @@ import type {
   AgentProfile,
   AgentProfileSlot,
   AgentRecord,
+  ForwardSourceRef,
   Attachment,
   BranchKind,
   ChangeKind,
@@ -467,6 +468,22 @@ export async function reorderAgents(
   return await invoke<AgentRecord[]>("reorder_agents", { projectId, agentIds });
 }
 
+/// List another project's agents **without loading or locking it** — the read
+/// side of the display/activation split. Pickers browse with this; picking calls
+/// the ordinary open path. Browsing must not take a project's `instance.lock`
+/// (which would outlive the menu and block other Switchboard instances), and a
+/// hover is no place to surface a lock conflict.
+export async function listProjectAgentsReadonly(projectId: ProjectId): Promise<AgentRecord[]> {
+  try {
+    return await invoke<AgentRecord[]>("list_project_agents_readonly", { projectId });
+  } catch (error) {
+    // The command returns the structured `ActivationCommandError`; Tauri rejects
+    // it as a plain object, so without this the picker's row would render
+    // `[object Object]` instead of the reason the project couldn't be read.
+    throw activationFailure(error);
+  }
+}
+
 export async function listAgents(projectId?: ProjectId): Promise<AgentRecord[]> {
   try {
     return await invoke<AgentRecord[]>("list_agents", { projectId });
@@ -535,18 +552,18 @@ export async function cancelSend(sendId: SendId, recipients: AgentId[]): Promise
 // later `cancelForward` with this in-flight hold.
 export async function forwardMessage(
   body: string,
-  sources: AgentId[],
+  sources: ForwardSourceRef[],
   forwardId: string,
 ): Promise<ForwardOutcome> {
   return await invoke<ForwardOutcome>("forward_message", { body, sources, forwardId });
 }
 
 // One prompt argument being forwarded into: its name, the (pane-expanded) source
-// agent ids, and whether the argument is required (the backend fails the forward
+// refs (agent + owning project), and whether the argument is required (the backend fails the forward
 // if a required arg resolves fully empty).
 export interface ForwardArg {
   name: string;
-  sources: AgentId[];
+  sources: ForwardSourceRef[];
   required: boolean;
 }
 
@@ -563,7 +580,7 @@ export async function forwardPrompt(
   typedArgs: Record<string, string>,
   forwardArgs: ForwardArg[],
   appendedText: string,
-  appendedSources: AgentId[],
+  appendedSources: ForwardSourceRef[],
   forwardId: string,
 ): Promise<ForwardOutcome> {
   return await invoke<ForwardOutcome>("forward_prompt", {
@@ -787,7 +804,7 @@ export async function validateWorkflowInvocation(
   name: string,
   isBuiltin: boolean,
   inputs: Record<string, WorkflowInputValue>,
-  forwardSources: Record<string, AgentId[]>,
+  forwardSources: Record<string, ForwardSourceRef[]>,
 ): Promise<void> {
   await invoke("validate_workflow_invocation", {
     projectId,
@@ -799,14 +816,14 @@ export async function validateWorkflowInvocation(
 }
 
 /// Validate + launch a workflow run on a background task; returns its run id.
-/// `forwardSources` maps a fillable field name → the (pane-expanded) agent ids
+/// `forwardSources` maps a fillable field name → the (pane-expanded) source refs
 /// whose completed output the backend composes into that field. Empty map = none.
 export async function invokeWorkflow(
   projectId: ProjectId,
   name: string,
   isBuiltin: boolean,
   inputs: Record<string, WorkflowInputValue>,
-  forwardSources: Record<string, AgentId[]>,
+  forwardSources: Record<string, ForwardSourceRef[]>,
 ): Promise<string> {
   return await invoke<string>("invoke_workflow", {
     projectId,

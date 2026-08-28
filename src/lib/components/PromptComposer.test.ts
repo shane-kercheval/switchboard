@@ -27,7 +27,14 @@ const PROMPT: Prompt = {
 function setup(args: Record<string, string>, appendedText = "", busy = false) {
   const onremove = vi.fn();
   render(PromptComposer, {
-    props: { prompt: PROMPT, args, appendedText, onremove, busy },
+    props: {
+      projectId: "00000000-0000-7000-8000-0000000000ff",
+      prompt: PROMPT,
+      args,
+      appendedText,
+      onremove,
+      busy,
+    },
   });
   return { onremove };
 }
@@ -98,6 +105,7 @@ describe("PromptComposer", () => {
   it("focuses the first prompt field when requested", async () => {
     render(PromptComposer, {
       props: {
+        projectId: "00000000-0000-7000-8000-0000000000ff",
         prompt: PROMPT,
         args: { focus: "", tone: "" },
         appendedText: "",

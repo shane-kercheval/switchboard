@@ -352,6 +352,46 @@ describe("composeStore v3: attachments, forwards, workflow mode", () => {
     expect(getCompose(P).forwards).toEqual(forwards);
   });
 
+  it("round-trips a cross-project source's owning project through storage", () => {
+    // The failure this pins: dropping `projectId` on parse makes a foreign source
+    // indistinguishable from a legacy local one, and the restore path then filters
+    // it out against the current project's roster — the chip is silently deleted
+    // on every launch. An in-memory remount cannot catch it; only a real reload can.
+    const foreign = {
+      id: "agent-z",
+      name: "oracle",
+      projectId: "00000000-0000-7000-8000-0000000000aa",
+      projectName: "backend",
+    };
+    setForwards(P, {
+      message: [foreign],
+      promptArgs: { focus: [foreign] },
+      promptAppended: [],
+      workflowFields: {},
+    });
+    flush();
+    _testing.reloadFromStorage();
+
+    expect(getCompose(P).forwards?.message).toEqual([foreign]);
+    expect(getCompose(P).forwards?.promptArgs.focus).toEqual([foreign]);
+  });
+
+  it("keeps a legacy source with no project intact rather than inventing one", () => {
+    // Drafts written before sources carried an owner. The parser must not guess —
+    // the restore path stamps the draft's own project, which is the only correct
+    // answer and one the parser doesn't have.
+    setForwards(P, {
+      message: [{ id: "agent-a", name: "alice" }],
+      promptArgs: {},
+      promptAppended: [],
+      workflowFields: {},
+    });
+    flush();
+    _testing.reloadFromStorage();
+
+    expect(getCompose(P).forwards?.message).toEqual([{ id: "agent-a", name: "alice" }]);
+  });
+
   it("omits the forwards key when every family is empty", () => {
     setForwards(P, { message: [SOURCE_A], promptArgs: {}, promptAppended: [], workflowFields: {} });
     setForwards(P, emptyForwards());

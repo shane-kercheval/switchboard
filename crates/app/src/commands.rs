@@ -2727,6 +2727,51 @@ pub fn list_agents_impl(
     Ok(agents)
 }
 
+/// List a project's agents **without loading or locking it** — the read side of
+/// the display/activation split.
+///
+/// Pickers that browse other projects call this; picking calls
+/// [`open_project_impl`]. The split matters because opening is not a cache fill:
+/// it takes the project's `instance.lock` for the app's remaining lifetime and
+/// can fail (`ProjectLocked`, `CorruptJsonl`). Browsing a menu must not lock
+/// projects the user never chooses, and a hover is no place to surface a lock
+/// conflict — so this path reads the registry through `Directory::open_project`,
+/// which is documented as a pure read that mutates no state (the same call
+/// `enumerate_all_projects` uses), and never touches `projects`,
+/// `agents_by_id`, or `project_locks`.
+///
+/// Errors are the caller's to render per row (an unreadable registry is an
+/// unpickable entry, not a thrown hover), so they propagate rather than
+/// degrading to an empty roster — an empty list must mean "no agents," never
+/// "couldn't read."
+pub fn list_project_agents_readonly_impl(
+    state: &AppState,
+    project_id: ProjectId,
+) -> Result<Vec<AgentRecord>, AppError> {
+    // Prefer an already-loaded project: same answer, no second disk read.
+    if let Some(loaded) = lock(&state.projects).get(&project_id).cloned() {
+        return loaded.list_agents().map_err(AppError::from);
+    }
+    let directories: Vec<Directory> = lock(&state.directories).values().cloned().collect();
+    for directory in directories {
+        // `open_project` performs the index lookup itself, so asking it directly
+        // avoids reading each index twice on a hit. `ProjectNotFound` means this
+        // directory simply doesn't own the project — keep looking. **Any other
+        // error is that directory's own failure and propagates**: a corrupt index
+        // must not be swallowed into "not loaded", which would report the wrong
+        // cause. (The previous shape scanned indexes and skipped unreadable ones,
+        // which could only ever blame an unrelated directory — it cannot know
+        // which directory *would* have owned the project.)
+        match directory.open_project(project_id) {
+            Ok(project) => return project.list_agents().map_err(AppError::from),
+            // This directory simply doesn't own the project — keep looking.
+            Err(CoreError::ProjectNotFound(_)) => {}
+            Err(e) => return Err(AppError::from(e)),
+        }
+    }
+    Err(AppError::ProjectNotLoaded(project_id))
+}
+
 pub fn search_project_files_root_impl(
     state: &AppState,
     project_id: ProjectId,
@@ -3193,15 +3238,21 @@ enum SourceResolution {
 pub async fn forward_message_impl(
     state: &AppState,
     body: String,
-    sources: Vec<AgentId>,
+    sources: Vec<ForwardSourceRef>,
     forward_id: Uuid,
     home_dir: &Path,
+    recipient_project: ProjectId,
 ) -> Result<ForwardOutcome, AppError> {
     // A forward with no sources is malformed (a frontend bug or a direct IPC
     // call) — there is nothing to forward. Reject at the boundary.
     if sources.is_empty() {
         return Err(AppError::NoForwardSources);
     }
+
+    // Open each source's declared project (idempotent) and verify ownership
+    // before the hold is registered — a bad reference must fail fast, not after
+    // the user waits out a hold.
+    let sources = resolve_source_refs(state, &sources)?;
 
     let token = CancellationToken::new();
     lock(&state.forwards).insert(forward_id, token.clone());
@@ -3212,7 +3263,7 @@ pub async fn forward_message_impl(
         forwards: &state.forwards,
         forward_id,
     };
-    forward_resolve(state, body, sources, &token, home_dir).await
+    forward_resolve(state, body, sources, &token, home_dir, recipient_project).await
 }
 
 /// Removes a held forward's cancel-token entry from [`AppState::forwards`] on
@@ -3240,6 +3291,7 @@ async fn forward_resolve(
     sources: Vec<AgentId>,
     token: &CancellationToken,
     home_dir: &Path,
+    recipient_project: ProjectId,
 ) -> Result<ForwardOutcome, AppError> {
     // Await every source's current turn, racing the hold's cancel token. The
     // wait is the long part; once we begin composing the forward is committed
@@ -3247,7 +3299,7 @@ async fn forward_resolve(
     let resolved = tokio::select! {
         biased;
         () = token.cancelled() => return Ok(ForwardOutcome::Cancelled),
-        result = resolve_all_sources(state, &sources, home_dir) => result?,
+        result = resolve_all_sources(state, &sources, home_dir, recipient_project) => result?,
     };
 
     // Invalidate on the first source whose turn failed/cancelled — never forward
@@ -3291,23 +3343,133 @@ async fn forward_resolve(
 /// `inputs` supplies each field's typed lead (its current string value); the
 /// composed result replaces it. Reuses the manual-forward composition helpers so
 /// a forwarded workflow field reads identically to a forwarded prompt argument.
+/// One forward source on the wire: **which agent, and which project owns it**.
+///
+/// The project id is not redundant with the agent id. A source may live in a
+/// project this process has never opened — a chip the user picked from another
+/// project's roster, or a draft restored after a restart — and for such a
+/// project `AppState::agents_by_id` holds nothing, so an agent id alone gives
+/// the backend no way to know *which* project to open. Carrying the owner makes
+/// cold resolution a direct open instead of a scan of every registry in every
+/// directory.
+///
+/// The declaration is **verified, not trusted**: [`resolve_source_ref`] checks
+/// the loaded record's own `project_id` against it. A mismatch means the draft
+/// names an agent that has since moved or been re-created, and is refused rather
+/// than silently resolved against the wrong project.
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct ForwardSourceRef {
+    pub agent_id: AgentId,
+    pub project_id: ProjectId,
+}
+
+/// Resolve one wire source to a loaded agent, opening its owning project if this
+/// process hasn't yet. **The single choke point for every path that can reach the
+/// backend with a foreign agent** — a chip picked this session, one restored
+/// after a restart, or a direct IPC call — so no frontend surface has to
+/// pre-open anything.
+fn resolve_source_ref(state: &AppState, source: ForwardSourceRef) -> Result<AgentId, AppError> {
+    // Idempotent: a no-op when already loaded, a real open (with its lock) when
+    // not. This is the *activation* path — deliberately distinct from the
+    // read-only roster read the pickers browse with.
+    open_project_impl(state, source.project_id)?;
+    let (project, _) = lookup_agent(state, source.agent_id)?;
+    if project.id != source.project_id {
+        return Err(AppError::ForwardSourceMoved {
+            agent_id: source.agent_id,
+            declared: source.project_id,
+            actual: project.id,
+        });
+    }
+    Ok(source.agent_id)
+}
+
+/// Resolve every wire source, preserving declared order.
+fn resolve_source_refs(
+    state: &AppState,
+    sources: &[ForwardSourceRef],
+) -> Result<Vec<AgentId>, AppError> {
+    sources
+        .iter()
+        .map(|&s| resolve_source_ref(state, s))
+        .collect()
+}
+
+/// The conversation journals backing a set of forward sources — **one read per
+/// distinct owning project**, keyed by `ProjectId`.
+///
+/// Forward sources may span projects (a source picked from another project's
+/// roster), and each source's failed/cancelled latest-turn note lives in *its
+/// own* project's journal. Reading a single journal and applying it to every
+/// source — which both resolvers did before this type existed — silently
+/// consults the wrong file for any source outside the first one's project, so
+/// [`latest_turn_failure_note`] finds no outcome record and the resolver
+/// forwards a *stale older* answer in place of the failure. That is precisely
+/// the substitution the note exists to prevent, and it is silent.
+///
+/// Reads are deduplicated by project, so N sources across M projects cost M
+/// reads, not N. Fail-loud on a corrupt journal, matching the reader's contract:
+/// a damaged file must not degrade into a silent stale forward.
+struct SourceJournals(std::collections::HashMap<ProjectId, Vec<switchboard_core::JournalRecord>>);
+
+impl SourceJournals {
+    /// Read the journal of every project owning one of `sources`, once each.
+    fn read(
+        state: &AppState,
+        sources: impl IntoIterator<Item = AgentId>,
+    ) -> Result<Self, AppError> {
+        let mut by_project = std::collections::HashMap::new();
+        for agent_id in sources {
+            let (project, _) = lookup_agent(state, agent_id)?;
+            if by_project.contains_key(&project.id) {
+                continue;
+            }
+            let records = switchboard_core::journal::read_records(&project.journal_path())?;
+            by_project.insert(project.id, records);
+        }
+        Ok(Self(by_project))
+    }
+
+    /// The records for `project_id`.
+    ///
+    /// **A miss is an error, never an empty slice.** An empty journal is not a
+    /// neutral default here: it is exactly the input that makes
+    /// [`latest_turn_failure_note`] return `None`, which makes the resolver
+    /// forward the stale older answer — the precise bug this type exists to
+    /// eliminate, reinstated as its own accessor's miss behavior. Unreachable
+    /// today (`read` and the resolvers key off the same `lookup_agent`), but the
+    /// previous author also believed one journal was always the right journal, so
+    /// a future divergence between the read set and the resolve set must fail
+    /// loudly rather than silently forward stale content. `debug_assert!` is not
+    /// enough — release builds would still forward it.
+    fn for_project(
+        &self,
+        project_id: ProjectId,
+    ) -> Result<&[switchboard_core::JournalRecord], AppError> {
+        self.0
+            .get(&project_id)
+            .map(Vec::as_slice)
+            .ok_or(AppError::ProjectNotLoaded(project_id))
+    }
+}
+
 pub(crate) async fn resolve_workflow_forwards(
     state: &AppState,
-    forward_sources: &std::collections::BTreeMap<String, Vec<AgentId>>,
+    forward_sources: &std::collections::BTreeMap<String, Vec<ForwardSourceRef>>,
     inputs: &std::collections::BTreeMap<String, switchboard_workflow::InputValue>,
     home_dir: &Path,
+    recipient_project: ProjectId,
 ) -> Result<std::collections::BTreeMap<String, String>, AppError> {
-    // Read the project journal once (the same file for every source of this
-    // invocation), mirroring `resolve_all_sources`. It supplies a failed/cancelled
-    // latest-turn note when the harness file didn't record it.
-    let journal = match forward_sources.values().flatten().next() {
-        Some(&first) => {
-            let (project, _) = lookup_agent(state, first)?;
-            switchboard_core::journal::read_records(&project.journal_path())?
-        }
-        None => Vec::new(),
-    };
-    let journal = journal.as_slice();
+    // Open every declared project and verify ownership up front, so a bad
+    // reference fails the invocation before any field composes.
+    let by_field: std::collections::BTreeMap<String, Vec<AgentId>> = forward_sources
+        .iter()
+        .map(|(field, refs)| Ok((field.clone(), resolve_source_refs(state, refs)?)))
+        .collect::<Result<_, AppError>>()?;
+    let forward_sources = &by_field;
+    // One journal read per distinct owning project across every field's sources
+    // — see [`SourceJournals`] for why a single shared journal is wrong here.
+    let journals = SourceJournals::read(state, forward_sources.values().flatten().copied())?;
 
     let mut resolved = std::collections::BTreeMap::new();
     for (field, sources) in forward_sources {
@@ -3316,8 +3478,16 @@ pub(crate) async fn resolve_workflow_forwards(
         }
         let mut resolutions = Vec::with_capacity(sources.len());
         for &source in sources {
-            resolutions
-                .push(resolve_source_completed_only(state, source, home_dir, journal).await?);
+            resolutions.push(
+                resolve_source_completed_only(
+                    state,
+                    source,
+                    home_dir,
+                    &journals,
+                    recipient_project,
+                )
+                .await?,
+            );
         }
         // Any-empty fails the invocation — same policy as the manual paths,
         // surfaced through the workflow error type so launch fails loudly
@@ -3354,9 +3524,15 @@ async fn resolve_source_completed_only(
     state: &AppState,
     agent_id: AgentId,
     home_dir: &Path,
-    journal: &[switchboard_core::JournalRecord],
+    journals: &SourceJournals,
+    recipient_project: ProjectId,
 ) -> Result<SourceResolution, AppError> {
     let (project, agent) = lookup_agent(state, agent_id)?;
+    let journal = journals.for_project(project.id)?;
+    let agent = AgentRecord {
+        name: qualified_source_name(&agent.name, &project, recipient_project),
+        ..agent
+    };
     if state.dispatcher.is_turn_running(agent_id).await {
         return Err(AppError::Workflow(
             switchboard_workflow::WorkflowError::Invocation {
@@ -3393,19 +3569,12 @@ async fn resolve_all_sources(
     state: &AppState,
     sources: &[AgentId],
     home_dir: &Path,
+    recipient_project: ProjectId,
 ) -> Result<Vec<SourceResolution>, AppError> {
-    // Read the project journal **once** (it's the same file for every source in a
-    // forward) rather than per source — `latest_turn_failure_note` consults it for
-    // each idle source. Fail-loud: a corrupt journal propagates here (matching the
-    // reader's contract) instead of being swallowed into a silent stale forward.
-    let journal = match sources.first() {
-        Some(&first) => {
-            let (project, _) = lookup_agent(state, first)?;
-            switchboard_core::journal::read_records(&project.journal_path())?
-        }
-        None => Vec::new(),
-    };
-    let journal = journal.as_slice();
+    // One journal read per distinct owning project — `latest_turn_failure_note`
+    // consults it for each idle source, and sources may span projects. See
+    // [`SourceJournals`].
+    let journals = SourceJournals::read(state, sources.iter().copied())?;
     // `try_join_all` polls every source on the first poll (so all waits register
     // up front, before any can settle) and preserves declared order; a source's
     // *turn* failing is an `Ok(Invalidated)` it collects, while a genuine error
@@ -3413,7 +3582,7 @@ async fn resolve_all_sources(
     futures::future::try_join_all(
         sources
             .iter()
-            .map(|&s| resolve_source(state, s, home_dir, journal)),
+            .map(|&s| resolve_source(state, s, home_dir, &journals, recipient_project)),
     )
     .await
 }
@@ -3504,9 +3673,15 @@ async fn resolve_source(
     state: &AppState,
     agent_id: AgentId,
     home_dir: &Path,
-    journal: &[switchboard_core::JournalRecord],
+    journals: &SourceJournals,
+    recipient_project: ProjectId,
 ) -> Result<SourceResolution, AppError> {
     let (project, agent) = lookup_agent(state, agent_id)?;
+    let journal = journals.for_project(project.id)?;
+    let agent = AgentRecord {
+        name: qualified_source_name(&agent.name, &project, recipient_project),
+        ..agent
+    };
     match state.dispatcher.wait_for_current_turn(agent_id).await {
         CurrentTurnWait::Terminal { outcome, .. } if !matches!(outcome, TurnOutcome::Completed) => {
             Ok(SourceResolution::Invalidated {
@@ -3551,7 +3726,7 @@ async fn resolve_source(
 #[derive(Debug, Clone, Deserialize)]
 pub struct ForwardArg {
     pub name: String,
-    pub sources: Vec<AgentId>,
+    pub sources: Vec<ForwardSourceRef>,
     pub required: bool,
 }
 
@@ -3576,9 +3751,10 @@ pub async fn forward_prompt_impl(
     typed_args: std::collections::BTreeMap<String, String>,
     forward_args: Vec<ForwardArg>,
     appended_text: String,
-    appended_sources: Vec<AgentId>,
+    appended_sources: Vec<ForwardSourceRef>,
     forward_id: Uuid,
     home_dir: &Path,
+    recipient_project: ProjectId,
 ) -> Result<ForwardOutcome, AppError> {
     let token = CancellationToken::new();
     lock(&state.forwards).insert(forward_id, token.clone());
@@ -3596,6 +3772,7 @@ pub async fn forward_prompt_impl(
         &appended_sources,
         &token,
         home_dir,
+        recipient_project,
     )
     .await
 }
@@ -3610,6 +3787,27 @@ pub async fn forward_prompt_impl(
 /// these names must stay neutral about the cause (see
 /// [`empty_sources_reason`]); a partially-parsed non-empty answer still
 /// passes, so this is a dispatch guard, not a data-loss detector.
+/// The name a source is known by **in the recipient's send**: bare for a
+/// same-project agent, `agent · project` for one forwarded in from elsewhere.
+///
+/// Qualification is not cosmetic. Same-named agents across projects are ordinary
+/// (`reviewer`, `planner`), and this name is what the user reads in an
+/// invalidation ("… 's turn failed before it could be forwarded") and what the
+/// receiving agent reads in a forwarded block header. Unqualified, neither says
+/// *which* `reviewer`. Derived from the loaded project record, never from the
+/// client's claim — the caller has already verified ownership.
+fn qualified_source_name(
+    agent_name: &str,
+    source_project: &Project,
+    recipient_project: ProjectId,
+) -> String {
+    if source_project.id == recipient_project {
+        agent_name.to_owned()
+    } else {
+        format!("{agent_name} · {}", source_project.name())
+    }
+}
+
 fn empty_source_names(resolutions: &[SourceResolution]) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
     for resolution in resolutions {
@@ -3666,23 +3864,26 @@ async fn forward_prompt_resolve(
     mut args: std::collections::BTreeMap<String, String>,
     forward_args: &[ForwardArg],
     appended_text: &str,
-    appended_sources: &[AgentId],
+    appended_sources: &[ForwardSourceRef],
     token: &CancellationToken,
     home_dir: &Path,
+    recipient_project: ProjectId,
 ) -> Result<ForwardOutcome, AppError> {
     // Flatten every argument's sources, then the appended text's, into one list so
     // all source waits register up front (concurrent) — preserving the
     // cross-source invalidation guarantee *across fields*, not just within one —
-    // then regroup per field below.
-    let flat: Vec<AgentId> = forward_args
+    // then regroup per field below. Each ref's declared project is opened and
+    // verified here, before any wait registers.
+    let flat_refs: Vec<ForwardSourceRef> = forward_args
         .iter()
         .flat_map(|a| a.sources.iter().copied())
         .chain(appended_sources.iter().copied())
         .collect();
+    let flat: Vec<AgentId> = resolve_source_refs(state, &flat_refs)?;
     let resolved = tokio::select! {
         biased;
         () = token.cancelled() => return Ok(ForwardOutcome::Cancelled),
-        result = resolve_all_sources(state, &flat, home_dir) => result?,
+        result = resolve_all_sources(state, &flat, home_dir, recipient_project) => result?,
     };
 
     // Invalidate on the first source whose turn failed/cancelled.
@@ -6428,6 +6629,25 @@ mod tests {
     /// canonical directory + the agent's session locator). `text == ""` stages a
     /// source with **no** forwardable output (an empty session file) — the
     /// empty-source case.
+    /// The project a test's send is composed in — the recipient, which is what
+    /// decides whether a source is local or foreign.
+    fn recipient(state: &AppState) -> ProjectId {
+        lock(&state.active_project_id).expect("a test must have an active project")
+    }
+
+    /// Build a wire source ref for a loaded agent — the shape the frontend sends.
+    /// Panics if the agent isn't loaded, which in a test means the fixture is wrong.
+    fn src(state: &AppState, agent_id: AgentId) -> ForwardSourceRef {
+        let project_id = lock(&state.agents_by_id)
+            .get(&agent_id)
+            .expect("agent must be loaded")
+            .project_id;
+        ForwardSourceRef {
+            agent_id,
+            project_id,
+        }
+    }
+
     fn seed_source(
         state: &AppState,
         home: &Path,
@@ -7175,6 +7395,292 @@ mod tests {
         gate.notify_waiters();
     }
 
+    /// Seed a second project in the same directory holding one agent whose
+    /// session file carries `text`. Returns `(project_id, agent_id)`.
+    fn second_project_with_source(
+        state: &AppState,
+        home: &Path,
+        name: &str,
+        agent_name: &str,
+        text: &str,
+    ) -> (ProjectId, AgentId) {
+        let project = create_project_in_only_dir(state, name);
+        open_project_impl(state, project.id).unwrap();
+        let active = lock(&state.active_project_id).expect("an active project");
+        set_active_project_impl(state, project.id).unwrap();
+        let agent = seed_source(state, home, project.id, agent_name, text);
+        // Restore the caller's active project — seeding must not move it.
+        set_active_project_impl(state, active).unwrap();
+        (project.id, agent)
+    }
+
+    /// Record a failed latest turn for `agent` in `project`'s journal.
+    fn journal_failed_turn(state: &AppState, project_id: ProjectId, agent: AgentId) {
+        use switchboard_core::JournalRecord;
+        let (send, turn) = (Uuid::now_v7(), Uuid::now_v7());
+        append_journal(
+            state,
+            project_id,
+            &JournalRecord::Send {
+                send_id: send,
+                turn_id: turn,
+                agent_id: agent,
+                prompt: "go".to_owned(),
+                attachments: Vec::new(),
+                at: journal_ts("2026-06-17T01:00:00Z"),
+            },
+        );
+        append_journal(
+            state,
+            project_id,
+            &JournalRecord::Outcome {
+                send_id: send,
+                turn_id: turn,
+                agent_id: agent,
+                outcome: serde_json::json!({
+                    "status": "failed",
+                    "kind": "harness_error",
+                    "message": "boom",
+                }),
+                started_at: journal_ts("2026-06-17T01:00:00Z"),
+                ended_at: journal_ts("2026-06-17T01:00:05Z"),
+            },
+        );
+    }
+
+    /// The read-only roster read must not load or lock the project it reads, and
+    /// must surface an unknown project as a typed error rather than an empty
+    /// roster — an empty list has to mean "no agents," never "couldn't read."
+    #[tokio::test]
+    async fn readonly_roster_reads_without_loading_and_errors_on_unknown_project() {
+        let (tmp, state, _emitter) = fresh_state_with_mock();
+        let home = TempDir::new().unwrap();
+        let (_recipient, _first) = project_with_agent(&state, &tmp).await;
+        let (other_project, other_agent) =
+            second_project_with_source(&state, home.path(), "other", "oracle", "ANSWER");
+        // Simulate "never opened": drop every trace of the load.
+        lock(&state.projects).remove(&other_project);
+        lock(&state.agents_by_id).remove(&other_agent);
+        lock(&state.project_locks).remove(&other_project);
+
+        let roster = list_project_agents_readonly_impl(&state, other_project).unwrap();
+        assert_eq!(roster.len(), 1, "the roster is readable without loading");
+        assert_eq!(roster[0].id, other_agent);
+        // The read is the whole point: browsing must leave no lock behind.
+        assert!(
+            !lock(&state.project_locks).contains_key(&other_project),
+            "a roster read must not take the project's instance.lock"
+        );
+        assert!(
+            !lock(&state.projects).contains_key(&other_project),
+            "a roster read must not load the project"
+        );
+
+        let err = list_project_agents_readonly_impl(&state, Uuid::now_v7()).unwrap_err();
+        assert!(matches!(err, AppError::ProjectNotLoaded(_)), "got: {err:?}");
+    }
+
+    /// Same-named agents in two projects must be distinguishable in everything
+    /// the user or the receiving agent reads. Unqualified, "reviewer's turn
+    /// failed" names neither of them.
+    #[tokio::test]
+    async fn forward_qualifies_a_foreign_source_name_with_its_project() {
+        let (tmp, state, _emitter) = fresh_state_with_mock();
+        let home = TempDir::new().unwrap();
+        let (_recipient, first_project) = project_with_agent(&state, &tmp).await;
+        let local = seed_source(
+            &state,
+            home.path(),
+            first_project,
+            "reviewer",
+            "LOCAL ANSWER",
+        );
+        // A *different* project with an agent of the same name.
+        let (other_project, foreign) =
+            second_project_with_source(&state, home.path(), "backend", "reviewer", "STALE");
+        journal_failed_turn(&state, other_project, foreign);
+
+        let outcome = forward_message_impl(
+            &state,
+            String::new(),
+            vec![src(&state, local), src(&state, foreign)],
+            Uuid::now_v7(),
+            home.path(),
+            first_project,
+        )
+        .await
+        .unwrap();
+
+        let ForwardOutcome::Resolved { body } = outcome else {
+            panic!("expected a resolved forward; got {outcome:?}");
+        };
+        assert!(
+            body.contains("reviewer · backend"),
+            "the foreign source must name its project; got: {body}"
+        );
+        // The local source of the same name stays bare — qualification marks the
+        // difference, it isn't noise applied to everything.
+        assert!(
+            body.contains("=== START forwarded from reviewer ===")
+                || body.contains("from reviewer\n"),
+            "the local source stays unqualified; got: {body}"
+        );
+    }
+
+    /// A source in a project this process never opened must still resolve: the
+    /// wire ref names its owner, so the backend opens it on demand. This is the
+    /// after-a-restart case — a persisted chip whose project was never activated
+    /// this session. With a bare agent id there is nothing to open and the send
+    /// fails `AgentNotFound`.
+    #[tokio::test]
+    async fn forward_resolves_a_source_whose_project_was_never_opened() {
+        let (tmp, state, _emitter) = fresh_state_with_mock();
+        let home = TempDir::new().unwrap();
+        let (_recipient, _first_project) = project_with_agent(&state, &tmp).await;
+        let (cold_project, cold) =
+            second_project_with_source(&state, home.path(), "cold", "oracle", "COLD ANSWER");
+        // Simulate "never opened this session": drop the loaded project and its
+        // agent cache, leaving only what the wire ref carries.
+        lock(&state.projects).remove(&cold_project);
+        lock(&state.agents_by_id).remove(&cold);
+        lock(&state.project_locks).remove(&cold_project);
+
+        let outcome = forward_message_impl(
+            &state,
+            String::new(),
+            vec![ForwardSourceRef {
+                agent_id: cold,
+                project_id: cold_project,
+            }],
+            Uuid::now_v7(),
+            home.path(),
+            recipient(&state),
+        )
+        .await
+        .unwrap();
+
+        let ForwardOutcome::Resolved { body } = outcome else {
+            panic!("a cold source must resolve; got {outcome:?}");
+        };
+        assert!(body.contains("COLD ANSWER"), "got: {body}");
+    }
+
+    /// A ref whose declared project no longer owns the agent is refused, not
+    /// quietly resolved against whichever project owns it now. Reachable from a
+    /// stale draft after the agent moved or was re-created elsewhere; silently
+    /// substituting a different context is the stale-forward class this path
+    /// exists to prevent.
+    #[tokio::test]
+    async fn forward_refuses_a_source_whose_declared_project_does_not_own_it() {
+        let (tmp, state, _emitter) = fresh_state_with_mock();
+        let home = TempDir::new().unwrap();
+        let (_recipient, first_project) = project_with_agent(&state, &tmp).await;
+        let source = seed_source(&state, home.path(), first_project, "alpha", "ANSWER");
+        let (other_project, _other) =
+            second_project_with_source(&state, home.path(), "other", "beta", "BETA");
+
+        let err = forward_message_impl(
+            &state,
+            String::new(),
+            vec![ForwardSourceRef {
+                agent_id: source,
+                project_id: other_project, // wrong owner
+            }],
+            Uuid::now_v7(),
+            home.path(),
+            recipient(&state),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(err, AppError::ForwardSourceMoved { agent_id, .. } if agent_id == source),
+            "got: {err:?}"
+        );
+    }
+
+    /// A forward whose sources span two projects must consult **each source's
+    /// own** journal. Before `SourceJournals`, one journal was read from the
+    /// first source's project and applied to every source, so a failure recorded
+    /// in the *second* project was invisible and its stale completed answer was
+    /// forwarded in place of the failure note. Fails against that code.
+    #[tokio::test]
+    async fn forward_reads_each_source_journal_from_its_own_project() {
+        let (tmp, state, _emitter) = fresh_state_with_mock();
+        let home = TempDir::new().unwrap();
+        let (_recipient, first_project) = project_with_agent(&state, &tmp).await;
+        let first = seed_source(&state, home.path(), first_project, "alpha", "ALPHA ANSWER");
+        let (second_project, second) =
+            second_project_with_source(&state, home.path(), "other", "beta", "STALE BETA");
+        // Only the *second* project's journal records the failure.
+        journal_failed_turn(&state, second_project, second);
+
+        let outcome = forward_message_impl(
+            &state,
+            String::new(),
+            vec![src(&state, first), src(&state, second)],
+            Uuid::now_v7(),
+            home.path(),
+            recipient(&state),
+        )
+        .await
+        .unwrap();
+
+        let ForwardOutcome::Resolved { body } = outcome else {
+            panic!("expected a resolved forward; got {outcome:?}");
+        };
+        assert!(
+            body.contains("beta · other's most recent turn failed"),
+            "the second source's own journal must supply its failure note; got: {body}"
+        );
+        assert!(
+            !body.contains("STALE BETA"),
+            "a failure must never be replaced by the stale completed answer; got: {body}"
+        );
+        assert!(
+            body.contains("ALPHA ANSWER"),
+            "the first source still forwards its completed output; got: {body}"
+        );
+    }
+
+    /// The workflow forward-field path had the identical single-journal defect
+    /// and is the surface where a silently-stale forward is hardest to notice.
+    #[tokio::test]
+    async fn workflow_forward_reads_each_source_journal_from_its_own_project() {
+        let (tmp, state, _emitter) = fresh_state_with_mock();
+        let home = TempDir::new().unwrap();
+        let (_recipient, first_project) = project_with_agent(&state, &tmp).await;
+        let first = seed_source(&state, home.path(), first_project, "alpha", "ALPHA ANSWER");
+        let (second_project, second) =
+            second_project_with_source(&state, home.path(), "other", "beta", "STALE BETA");
+        journal_failed_turn(&state, second_project, second);
+
+        let mut fields = std::collections::BTreeMap::new();
+        fields.insert(
+            "review".to_owned(),
+            vec![src(&state, first), src(&state, second)],
+        );
+        let resolved = resolve_workflow_forwards(
+            &state,
+            &fields,
+            &std::collections::BTreeMap::new(),
+            home.path(),
+            recipient(&state),
+        )
+        .await
+        .unwrap();
+
+        let body = resolved.get("review").expect("the field resolves");
+        assert!(
+            body.contains("beta · other's most recent turn failed"),
+            "workflow fields must read each source's own journal too; got: {body}"
+        );
+        assert!(
+            !body.contains("STALE BETA"),
+            "a failure must never be replaced by the stale completed answer; got: {body}"
+        );
+    }
+
     #[tokio::test]
     async fn forward_idle_source_with_failed_latest_turn_forwards_the_error() {
         use switchboard_core::JournalRecord;
@@ -7219,9 +7725,10 @@ mod tests {
         let outcome = forward_message_impl(
             &state,
             String::new(),
-            vec![source],
+            vec![src(&state, source)],
             Uuid::now_v7(),
             home.path(),
+            recipient(&state),
         )
         .await
         .unwrap();
@@ -7278,9 +7785,10 @@ mod tests {
         let outcome = forward_message_impl(
             &state,
             String::new(),
-            vec![source],
+            vec![src(&state, source)],
             Uuid::now_v7(),
             home.path(),
+            recipient(&state),
         )
         .await
         .unwrap();
@@ -7350,9 +7858,10 @@ mod tests {
         let outcome = forward_message_impl(
             &state,
             String::new(),
-            vec![source],
+            vec![src(&state, source)],
             Uuid::now_v7(),
             home.path(),
+            recipient(&state),
         )
         .await
         .unwrap();
@@ -7377,16 +7886,22 @@ mod tests {
         let source = seed_source(&state, home.path(), project_id, "scout", "FRESH ANSWER");
 
         let mut forward_sources = std::collections::BTreeMap::new();
-        forward_sources.insert("context".to_owned(), vec![source]);
+        forward_sources.insert("context".to_owned(), vec![src(&state, source)]);
         let mut inputs = std::collections::BTreeMap::new();
         inputs.insert(
             "context".to_owned(),
             switchboard_workflow::InputValue::Text("my lead".to_owned()),
         );
 
-        let resolved = resolve_workflow_forwards(&state, &forward_sources, &inputs, home.path())
-            .await
-            .unwrap();
+        let resolved = resolve_workflow_forwards(
+            &state,
+            &forward_sources,
+            &inputs,
+            home.path(),
+            recipient(&state),
+        )
+        .await
+        .unwrap();
         let body = resolved.get("context").expect("context resolved");
         assert!(body.contains("my lead"), "typed lead leads: {body}");
         assert!(
@@ -7411,12 +7926,13 @@ mod tests {
         let empty = seed_source(&state, home.path(), project_id, "reviewer-1", "");
 
         let mut forward_sources = std::collections::BTreeMap::new();
-        forward_sources.insert("context".to_owned(), vec![empty]);
+        forward_sources.insert("context".to_owned(), vec![src(&state, empty)]);
         let err = resolve_workflow_forwards(
             &state,
             &forward_sources,
             &std::collections::BTreeMap::new(),
             home.path(),
+            recipient(&state),
         )
         .await
         .unwrap_err();
@@ -7446,12 +7962,13 @@ mod tests {
         .await;
 
         let mut forward_sources = std::collections::BTreeMap::new();
-        forward_sources.insert("context".to_owned(), vec![source.id]);
+        forward_sources.insert("context".to_owned(), vec![src(&state, source.id)]);
         let err = resolve_workflow_forwards(
             &state,
             &forward_sources,
             &std::collections::BTreeMap::new(),
             home.path(),
+            recipient(&state),
         )
         .await
         .unwrap_err();
@@ -7475,9 +7992,10 @@ mod tests {
         let outcome = forward_message_impl(
             &state,
             String::new(),
-            vec![source],
+            vec![src(&state, source)],
             Uuid::now_v7(),
             home.path(),
+            recipient(&state),
         )
         .await
         .unwrap();
@@ -7498,9 +8016,10 @@ mod tests {
         let outcome = forward_message_impl(
             &state,
             "Please aggregate:".to_owned(),
-            vec![source],
+            vec![src(&state, source)],
             Uuid::now_v7(),
             home.path(),
+            recipient(&state),
         )
         .await
         .unwrap();
@@ -7534,9 +8053,10 @@ mod tests {
         let outcome = forward_message_impl(
             &state,
             String::new(),
-            vec![s1, s2],
+            vec![src(&state, s1), src(&state, s2)],
             Uuid::now_v7(),
             home.path(),
+            recipient(&state),
         )
         .await
         .unwrap();
@@ -7564,9 +8084,10 @@ mod tests {
         let outcome = forward_message_impl(
             &state,
             String::new(),
-            vec![s1, s2],
+            vec![src(&state, s1), src(&state, s2)],
             Uuid::now_v7(),
             home.path(),
+            recipient(&state),
         )
         .await
         .unwrap();
@@ -7600,9 +8121,10 @@ mod tests {
         let outcome = forward_message_impl(
             &state,
             String::new(),
-            vec![s1, s2],
+            vec![src(&state, s1), src(&state, s2)],
             Uuid::now_v7(),
             home.path(),
+            recipient(&state),
         )
         .await
         .unwrap();
@@ -7638,9 +8160,10 @@ mod tests {
             forward_message_impl(
                 &state,
                 String::new(),
-                vec![source.id],
+                vec![src(&state, source.id)],
                 Uuid::now_v7(),
-                home.path()
+                home.path(),
+                recipient(&state),
             ),
             async {
                 state.dispatcher.cancel(source.id, CancelSource::User);
@@ -7676,9 +8199,10 @@ mod tests {
             forward_message_impl(
                 &state,
                 String::new(),
-                vec![source.id],
+                vec![src(&state, source.id)],
                 forward_id,
-                home.path()
+                home.path(),
+                recipient(&state),
             ),
             async {
                 cancel_forward_impl(&state, forward_id);
@@ -7730,9 +8254,10 @@ mod tests {
             forward_message_impl(
                 &state,
                 String::new(),
-                vec![source],
+                vec![src(&state, source)],
                 Uuid::now_v7(),
-                home.path()
+                home.path(),
+                recipient(&state),
             ),
             async {
                 signal.notify_one();
@@ -8007,9 +8532,10 @@ mod tests {
         let held = forward_message_impl(
             &f.state,
             String::new(),
-            vec![planner.id],
+            vec![src(&f.state, planner.id)],
             held_id,
             f.home.path(),
+            recipient(&f.state),
         );
         tokio::pin!(held);
         assert!(
@@ -8031,9 +8557,10 @@ mod tests {
             forward_message_impl(
                 &f.state,
                 "ship it".to_owned(),
-                vec![reviewer],
+                vec![src(&f.state, reviewer)],
                 Uuid::now_v7(),
                 f.home.path(),
+                recipient(&f.state),
             ),
         )
         .await
@@ -8103,9 +8630,10 @@ mod tests {
         let outcome = forward_message_impl(
             &f.state,
             String::new(),
-            vec![reviewer],
+            vec![src(&f.state, reviewer)],
             Uuid::now_v7(),
             f.home.path(),
+            recipient(&f.state),
         )
         .await
         .unwrap();
@@ -8156,9 +8684,10 @@ mod tests {
         let outcome = forward_message_impl(
             &f.state,
             String::new(),
-            vec![source.id],
+            vec![src(&f.state, source.id)],
             Uuid::now_v7(),
             f.home.path(),
+            recipient(&f.state),
         );
         tokio::pin!(outcome);
         assert!(futures::poll!(outcome.as_mut()).is_pending());
@@ -8199,9 +8728,10 @@ mod tests {
         let outcome = forward_message_impl(
             &f.state,
             String::new(),
-            vec![source.id],
+            vec![src(&f.state, source.id)],
             Uuid::now_v7(),
             f.home.path(),
+            recipient(&f.state),
         );
         tokio::pin!(outcome);
         assert!(futures::poll!(outcome.as_mut()).is_pending());
@@ -8269,16 +8799,18 @@ mod tests {
         let alice_from_bob = forward_message_impl(
             &state,
             String::new(),
-            vec![bob.id],
+            vec![src(&state, bob.id)],
             Uuid::now_v7(),
             home.path(),
+            recipient(&state),
         );
         let bob_from_alice = forward_message_impl(
             &state,
             String::new(),
-            vec![alice.id],
+            vec![src(&state, alice.id)],
             Uuid::now_v7(),
             home.path(),
+            recipient(&state),
         );
         tokio::pin!(alice_from_bob, bob_from_alice);
         assert!(futures::poll!(alice_from_bob.as_mut()).is_pending());
@@ -8315,8 +8847,15 @@ mod tests {
         let home = TempDir::new().unwrap();
         let _ = project_with_agent(&state, &tmp).await;
 
-        let outcome =
-            forward_message_impl(&state, String::new(), vec![], Uuid::now_v7(), home.path()).await;
+        let outcome = forward_message_impl(
+            &state,
+            String::new(),
+            vec![],
+            Uuid::now_v7(),
+            home.path(),
+            recipient(&state),
+        )
+        .await;
         assert!(matches!(outcome, Err(AppError::NoForwardSources)));
     }
 
@@ -19066,13 +19605,14 @@ mod tests {
             std::collections::BTreeMap::from([("topic".to_owned(), "poems".to_owned())]),
             vec![ForwardArg {
                 name: "feedback".to_owned(),
-                sources: vec![source],
+                sources: vec![src(&state, source)],
                 required: true,
             }],
             String::new(),
             Vec::new(),
             Uuid::now_v7(),
             home.path(),
+            recipient(&state),
         )
         .await
         .unwrap();
@@ -19105,13 +19645,14 @@ mod tests {
             std::collections::BTreeMap::from([("topic".to_owned(), "poems".to_owned())]),
             vec![ForwardArg {
                 name: "feedback".to_owned(),
-                sources: vec![empty],
+                sources: vec![src(&state, empty)],
                 required: true,
             }],
             String::new(),
             Vec::new(),
             Uuid::now_v7(),
             home.path(),
+            recipient(&state),
         )
         .await
         .unwrap();
@@ -19138,13 +19679,14 @@ mod tests {
             std::collections::BTreeMap::new(),
             vec![ForwardArg {
                 name: "extra".to_owned(),
-                sources: vec![empty],
+                sources: vec![src(&state, empty)],
                 required: false,
             }],
             String::new(),
             Vec::new(),
             Uuid::now_v7(),
             home.path(),
+            recipient(&state),
         )
         .await
         .unwrap();
@@ -19170,12 +19712,12 @@ mod tests {
             vec![
                 ForwardArg {
                     name: "extra".to_owned(),
-                    sources: vec![empty],
+                    sources: vec![src(&state, empty)],
                     required: false,
                 },
                 ForwardArg {
                     name: "context".to_owned(),
-                    sources: vec![empty],
+                    sources: vec![src(&state, empty)],
                     required: false,
                 },
             ],
@@ -19183,6 +19725,7 @@ mod tests {
             Vec::new(),
             Uuid::now_v7(),
             home.path(),
+            recipient(&state),
         )
         .await
         .unwrap();
@@ -19214,9 +19757,10 @@ mod tests {
             std::collections::BTreeMap::new(),
             vec![],
             "see below:".to_owned(),
-            vec![empty],
+            vec![src(&state, empty)],
             Uuid::now_v7(),
             home.path(),
+            recipient(&state),
         )
         .await
         .unwrap();
@@ -19248,9 +19792,10 @@ mod tests {
             std::collections::BTreeMap::new(),
             vec![],
             "see below:".to_owned(),
-            vec![source],
+            vec![src(&state, source)],
             Uuid::now_v7(),
             home.path(),
+            recipient(&state),
         )
         .await
         .unwrap();
@@ -19282,13 +19827,14 @@ mod tests {
             ]),
             vec![ForwardArg {
                 name: "feedback".to_owned(),
-                sources: vec![source],
+                sources: vec![src(&state, source)],
                 required: true,
             }],
             String::new(),
             Vec::new(),
             Uuid::now_v7(),
             home.path(),
+            recipient(&state),
         )
         .await
         .unwrap();
@@ -19350,12 +19896,12 @@ mod tests {
                 vec![
                     ForwardArg {
                         name: "topic".to_owned(),
-                        sources: vec![topic_src.id],
+                        sources: vec![src(&state, topic_src.id)],
                         required: true,
                     },
                     ForwardArg {
                         name: "feedback".to_owned(),
-                        sources: vec![feedback_src.id],
+                        sources: vec![src(&state, feedback_src.id)],
                         required: true,
                     },
                 ],
@@ -19363,6 +19909,7 @@ mod tests {
                 Vec::new(),
                 Uuid::now_v7(),
                 home.path(),
+                recipient(&state),
             ),
             async {
                 state.dispatcher.cancel(feedback_src.id, CancelSource::User);

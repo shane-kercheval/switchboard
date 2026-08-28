@@ -443,6 +443,12 @@ export type ReducerInput = NormalizedEvent | HeartbeatTimeout | Hydrate;
 // Internal state types (Turn, AgentRuntime, etc.) live in
 // `src/lib/state/types.ts`. This file is wire-format-only.
 
+/// One forward source as the backend receives it — the agent plus the project
+/// that owns it. Mirrors `ForwardSourceRef` in `crates/app/src/commands.rs`.
+/// Lives here rather than in the held-forward UI store because it is a wire
+/// shape: `api.ts` must not import its request types from a UI module.
+export type ForwardSourceRef = { agent_id: AgentId; project_id: ProjectId };
+
 export type HarnessKind = "claude_code" | "codex" | "antigravity";
 
 /// State of the `which`-on-PATH binary probe for a single harness.

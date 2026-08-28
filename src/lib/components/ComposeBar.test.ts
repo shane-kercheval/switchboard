@@ -4324,6 +4324,238 @@ describe("ComposeBar prompt mode", () => {
     expect((state.transcripts[AGENT_B.id] ?? [])[0]).toMatchObject({ text: "DONE" });
   });
 
+  describe("cross-project forward sources", () => {
+    const OTHER_PROJECT = "00000000-0000-7000-8000-0000000000aa";
+    const FOREIGN_AGENT = {
+      id: "00000000-0000-7000-8000-0000000000bb",
+      project_id: OTHER_PROJECT,
+      name: "oracle",
+      harness: "claude_code" as const,
+      session_locator: null,
+      created_at: "2026-05-16T00:00:00Z",
+    };
+
+    async function withOtherProject() {
+      const ws = await loadWorkspace();
+      ws.projects.list = [
+        {
+          id: PROJECT_ID,
+          name: "here",
+          created_at: "2026-05-16T00:00:00Z",
+          directory: "/work/here",
+          available: true,
+          last_activity: "2026-05-16T00:00:00Z",
+          archived: false,
+        },
+        {
+          id: OTHER_PROJECT,
+          name: "backend",
+          created_at: "2026-05-16T00:00:00Z",
+          directory: "/work/backend",
+          available: true,
+          last_activity: "2026-05-16T00:00:00Z",
+          archived: false,
+        },
+      ];
+    }
+
+    it("browsing a project's roster neither loads nor locks it", async () => {
+      const state = await loadState();
+      await state.registerAgent(AGENT_A);
+      await withOtherProject();
+      invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+        if (cmd === "list_project_agents_readonly") return [FOREIGN_AGENT];
+        return undefined;
+      });
+      render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+
+      await fireEvent.click(screen.getByTestId("compose-forward-button"));
+      await fireEvent.click(
+        await screen.findByTestId(`forward-picker-project-toggle-${OTHER_PROJECT}`),
+      );
+      await screen.findByTestId(`forward-picker-foreign-agent-${FOREIGN_AGENT.id}`);
+
+      // The read-only command served the menu; the *activation* path — which
+      // takes the project's `instance.lock` for the app's lifetime — must not
+      // have run for a project the user has only hovered.
+      const commands = invokeMock.mock.calls.map((c) => c[0]);
+      expect(commands).toContain("list_project_agents_readonly");
+      expect(commands).not.toContain("open_project");
+    });
+
+    it("renders an unreadable project as an unpickable row, not a thrown error", async () => {
+      const state = await loadState();
+      await state.registerAgent(AGENT_A);
+      await withOtherProject();
+      invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+        if (cmd === "list_project_agents_readonly") throw new Error("project is locked");
+        return undefined;
+      });
+      render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+
+      await fireEvent.click(screen.getByTestId("compose-forward-button"));
+      await fireEvent.click(
+        await screen.findByTestId(`forward-picker-project-toggle-${OTHER_PROJECT}`),
+      );
+
+      const row = await screen.findByTestId(`forward-picker-project-error-${OTHER_PROJECT}`);
+      expect(row).toHaveTextContent("project is locked");
+    });
+
+    it("picking a foreign agent chips it with its project and sends its owner", async () => {
+      const state = await loadState();
+      await state.registerAgent(AGENT_A);
+      await withOtherProject();
+      invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+        if (cmd === "list_project_agents_readonly") return [FOREIGN_AGENT];
+        if (cmd === "open_project") return { id: OTHER_PROJECT, name: "backend" };
+        if (cmd === "forward_message") return { type: "resolved", body: "composed" };
+        if (cmd === "send_message") return "m1";
+        return undefined;
+      });
+      render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+
+      await fireEvent.click(screen.getByTestId("compose-forward-button"));
+      await fireEvent.click(
+        await screen.findByTestId(`forward-picker-project-toggle-${OTHER_PROJECT}`),
+      );
+      await fireEvent.click(
+        await screen.findByTestId(`forward-picker-foreign-agent-${FOREIGN_AGENT.id}`),
+      );
+
+      // The chip names the project, so a same-named local agent stays distinct.
+      const chip = await screen.findByTestId(`forward-source-chip-${FOREIGN_AGENT.name}`);
+      expect(chip).toHaveTextContent("oracle · backend");
+
+      await fireEvent.input(screen.getByTestId("compose-textarea"), {
+        target: { value: "please aggregate" },
+      });
+      await fireEvent.click(screen.getByTestId("compose-send"));
+
+      await waitFor(() => {
+        const call = invokeMock.mock.calls.find((c) => c[0] === "forward_message");
+        expect(call?.[1]).toMatchObject({
+          sources: [{ agent_id: FOREIGN_AGENT.id, project_id: OTHER_PROJECT }],
+        });
+      });
+    });
+
+    it("renders a foreign chip with no readiness warning", async () => {
+      // Readiness is read from the *current* project's transcripts, so a foreign
+      // agent is absent and the naive classification is `empty` — which renders a
+      // red "this will block your send" warning that is the inverse of the truth
+      // for a healthy foreign source. It must render no marker at all.
+      const state = await loadState();
+      await state.registerAgent(AGENT_A);
+      await withOtherProject();
+      invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+        if (cmd === "list_project_agents_readonly") return [FOREIGN_AGENT];
+        if (cmd === "open_project") return { id: OTHER_PROJECT, name: "backend" };
+        return undefined;
+      });
+      render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+
+      await fireEvent.click(screen.getByTestId("compose-forward-button"));
+      await fireEvent.click(
+        await screen.findByTestId(`forward-picker-project-toggle-${OTHER_PROJECT}`),
+      );
+      await fireEvent.click(
+        await screen.findByTestId(`forward-picker-foreign-agent-${FOREIGN_AGENT.id}`),
+      );
+
+      const chip = await screen.findByTestId(`forward-source-chip-${FOREIGN_AGENT.name}`);
+      expect(chip).toHaveAttribute("data-readiness", "unknown");
+      expect(chip).not.toHaveTextContent("no forwardable output");
+    });
+
+    it("picking opens the project and refuses at the pick site when it is locked", async () => {
+      const state = await loadState();
+      await state.registerAgent(AGENT_A);
+      await withOtherProject();
+      invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+        if (cmd === "list_project_agents_readonly") return [FOREIGN_AGENT];
+        // Tauri rejects a structured command error with a plain **object**, not an
+        // `Error`. Mocking an `Error` here would hide the `[object Object]` bug
+        // this assertion exists to catch.
+        if (cmd === "open_project")
+          throw { type: "project_locked", message: "project is open in another window" };
+        return undefined;
+      });
+      render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+
+      await fireEvent.click(screen.getByTestId("compose-forward-button"));
+      await fireEvent.click(
+        await screen.findByTestId(`forward-picker-project-toggle-${OTHER_PROJECT}`),
+      );
+      await fireEvent.click(
+        await screen.findByTestId(`forward-picker-foreign-agent-${FOREIGN_AGENT.id}`),
+      );
+
+      const err = await screen.findByTestId(`forward-picker-pick-error-${FOREIGN_AGENT.id}`);
+      expect(err).toHaveTextContent("project is open in another window");
+      // A refused pick must not leave a chip the user would then try to send.
+      expect(
+        screen.queryByTestId(`forward-source-chip-${FOREIGN_AGENT.name}`),
+      ).not.toBeInTheDocument();
+    });
+
+    it("retries a failed roster read when the project is selected again", async () => {
+      const state = await loadState();
+      await state.registerAgent(AGENT_A);
+      await withOtherProject();
+      let attempt = 0;
+      invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+        if (cmd === "list_project_agents_readonly") {
+          attempt += 1;
+          if (attempt === 1) throw { type: "other", message: "transient" };
+          return [FOREIGN_AGENT];
+        }
+        return undefined;
+      });
+      render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+
+      await fireEvent.click(screen.getByTestId("compose-forward-button"));
+      const toggle = await screen.findByTestId(`forward-picker-project-toggle-${OTHER_PROJECT}`);
+      await fireEvent.click(toggle);
+      await screen.findByTestId(`forward-picker-project-error-${OTHER_PROJECT}`);
+
+      // A transient read failure must not make the project permanently unpickable.
+      await fireEvent.click(toggle);
+      await screen.findByTestId(`forward-picker-foreign-agent-${FOREIGN_AGENT.id}`);
+    });
+
+    it("keeps a foreign chip across a remount", async () => {
+      const state = await loadState();
+      await state.registerAgent(AGENT_A);
+      await withOtherProject();
+      invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+        if (cmd === "list_project_agents_readonly") return [FOREIGN_AGENT];
+        if (cmd === "open_project") return { id: OTHER_PROJECT, name: "backend" };
+        return undefined;
+      });
+      const view = render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+
+      await fireEvent.click(screen.getByTestId("compose-forward-button"));
+      await fireEvent.click(
+        await screen.findByTestId(`forward-picker-project-toggle-${OTHER_PROJECT}`),
+      );
+      await fireEvent.click(
+        await screen.findByTestId(`forward-picker-foreign-agent-${FOREIGN_AGENT.id}`),
+      );
+      await screen.findByTestId(`forward-source-chip-${FOREIGN_AGENT.name}`);
+
+      // A project switch / Git-view toggle remounts the bar and restores the
+      // draft. A foreign source is absent from *this* project's roster, so a
+      // roster-match restore would silently delete it.
+      view.unmount();
+      render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+
+      expect(
+        await screen.findByTestId(`forward-source-chip-${FOREIGN_AGENT.name}`),
+      ).toHaveTextContent("oracle · backend");
+    });
+  });
+
   it("stamps project activity on a prompt send", async () => {
     const state = await loadState();
     const ws = await loadWorkspace();
@@ -5052,7 +5284,10 @@ describe("ComposeBar — cross-agent forward", () => {
     await waitFor(() => {
       const calls = invokeMock.mock.calls.filter(([c]) => c === "forward_message");
       expect(calls).toHaveLength(1);
-      expect(calls[0]?.[1]).toMatchObject({ sources: [AGENT_B.id], body: "please aggregate" });
+      expect(calls[0]?.[1]).toMatchObject({
+        sources: [{ agent_id: AGENT_B.id, project_id: PROJECT_ID }],
+        body: "please aggregate",
+      });
       expect(typeof (calls[0]?.[1] as { forwardId?: unknown }).forwardId).toBe("string");
     });
     // The frontend then dispatches the composed body to the recipient via the
@@ -5377,7 +5612,12 @@ describe("ComposeBar — cross-agent forward", () => {
     await waitFor(() => {
       const calls = invokeMock.mock.calls.filter(([c]) => c === "forward_message");
       expect(calls).toHaveLength(1);
-      expect(calls[0]?.[1]).toMatchObject({ sources: [AGENT_B.id, AGENT_C.id] });
+      expect(calls[0]?.[1]).toMatchObject({
+        sources: [
+          { agent_id: AGENT_B.id, project_id: PROJECT_ID },
+          { agent_id: AGENT_C.id, project_id: PROJECT_ID },
+        ],
+      });
     });
   });
 
@@ -5576,7 +5816,7 @@ describe("ComposeBar — cross-agent forward", () => {
     await waitFor(() => {
       const forwards = held.heldForwardsFor(PROJECT_ID);
       expect(forwards).toHaveLength(1);
-      expect(held.expandForwardSources(forwards[0]?.sources ?? [])).toEqual([AGENT_B.id]);
+      expect(held.forwardSourceIds(forwards[0]?.sources ?? [])).toEqual([AGENT_B.id]);
       expect(forwards[0]?.recipients).toEqual([AGENT_A.id]);
     });
     // While holding, no `send_message` is issued — the frontend dispatches only
@@ -5610,8 +5850,8 @@ describe("ComposeBar — cross-agent forward", () => {
       const forwards = held.heldForwardsFor(PROJECT_ID);
       expect(forwards).toHaveLength(1);
       expect(forwards[0]?.sources).toEqual([
-        { id: AGENT_A.id, name: "alice" },
-        { id: AGENT_B.id, name: "bob" },
+        { id: AGENT_A.id, name: "alice", projectId: PROJECT_ID },
+        { id: AGENT_B.id, name: "bob", projectId: PROJECT_ID },
       ]);
     });
   });
@@ -5789,7 +6029,12 @@ describe("ComposeBar — cross-agent forward", () => {
     await waitFor(() => {
       const calls = invokeMock.mock.calls.filter(([c]) => c === "forward_message");
       expect(calls).toHaveLength(1);
-      expect(calls[0]?.[1]).toMatchObject({ sources: [AGENT_A.id, AGENT_B.id] });
+      expect(calls[0]?.[1]).toMatchObject({
+        sources: [
+          { agent_id: AGENT_A.id, project_id: PROJECT_ID },
+          { agent_id: AGENT_B.id, project_id: PROJECT_ID },
+        ],
+      });
     });
   });
 
@@ -5885,7 +6130,10 @@ describe("ComposeBar — cross-agent forward", () => {
       const calls = invokeMock.mock.calls.filter(([c]) => c === "forward_prompt");
       expect(calls).toHaveLength(1);
       // No forwarded arguments; the appended text carries the source.
-      expect(calls[0]?.[1]).toMatchObject({ forwardArgs: [], appendedSources: [AGENT_B.id] });
+      expect(calls[0]?.[1]).toMatchObject({
+        forwardArgs: [],
+        appendedSources: [{ agent_id: AGENT_B.id, project_id: PROJECT_ID }],
+      });
     });
     // The backend-combined body dispatches verbatim (no client-side combine).
     await waitFor(() => {
@@ -5919,7 +6167,13 @@ describe("ComposeBar — cross-agent forward", () => {
         provider: "local",
         name: "review",
         typedArgs: {},
-        forwardArgs: [{ name: "focus", sources: [AGENT_B.id], required: true }],
+        forwardArgs: [
+          {
+            name: "focus",
+            sources: [{ agent_id: AGENT_B.id, project_id: PROJECT_ID }],
+            required: true,
+          },
+        ],
       });
       expect(typeof (calls[0]?.[1] as { forwardId?: unknown }).forwardId).toBe("string");
     });
@@ -5970,7 +6224,7 @@ describe("ComposeBar — cross-agent forward", () => {
     await waitFor(() => {
       const forwards = held.heldForwardsFor(PROJECT_ID);
       expect(forwards).toHaveLength(1);
-      expect(held.expandForwardSources(forwards[0]?.sources ?? [])).toEqual([AGENT_B.id]);
+      expect(held.forwardSourceIds(forwards[0]?.sources ?? [])).toEqual([AGENT_B.id]);
       expect(forwards[0]?.recipients).toEqual([AGENT_A.id]);
       // The prompt's body is never pre-composed (it renders server-side after
       // sources resolve), so the held entry carries the prompt's display name
@@ -6571,7 +6825,7 @@ describe("ComposeBar — cross-agent forward", () => {
     // The pane-expanded agent ids land under the field name.
     expect(call?.[1]).toMatchObject({
       name: "review-and-recommend",
-      forwardSources: { context: [AGENT_A.id] },
+      forwardSources: { context: [{ agent_id: AGENT_A.id, project_id: PROJECT_ID }] },
     });
   });
 

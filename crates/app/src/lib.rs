@@ -1049,6 +1049,16 @@ async fn reorder_agents(
 }
 
 #[tauri::command]
+async fn list_project_agents_readonly(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<Vec<AgentRecord>, ActivationCommandError> {
+    let pid = parse_uuid(&project_id).map_err(ActivationCommandError::from)?;
+    crate::commands::list_project_agents_readonly_impl(state.inner(), pid)
+        .map_err(ActivationCommandError::from)
+}
+
+#[tauri::command]
 async fn list_agents(
     state: State<'_, AppState>,
     project_id: Option<String>,
@@ -1204,15 +1214,12 @@ async fn cancel_send(
 async fn forward_message(
     state: State<'_, AppState>,
     body: String,
-    sources: Vec<String>,
+    sources: Vec<crate::commands::ForwardSourceRef>,
     forward_id: String,
+    project_id: String,
 ) -> Result<ForwardOutcome, String> {
-    let source_ids = sources
-        .iter()
-        .map(|s| parse_uuid(s))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e.to_string())?;
     let fid = parse_uuid(&forward_id).map_err(|e| e.to_string())?;
+    let recipient = parse_uuid(&project_id).map_err(|e| e.to_string())?;
     let home = std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_default();
@@ -1220,7 +1227,7 @@ async fn forward_message(
     // its sources to finish, then resolves the composed body (or invalidate /
     // cancel). The frontend dispatches the body; `cancel_forward` (below)
     // interrupts the wait out of band.
-    forward_message_impl(state.inner(), body, source_ids, fid, &home)
+    forward_message_impl(state.inner(), body, sources, fid, &home, recipient)
         .await
         .map_err(|e| e.to_string())
 }
@@ -1234,10 +1241,12 @@ async fn forward_prompt(
     typed_args: std::collections::BTreeMap<String, String>,
     forward_args: Vec<ForwardArg>,
     appended_text: String,
-    appended_sources: Vec<switchboard_core::AgentId>,
+    appended_sources: Vec<crate::commands::ForwardSourceRef>,
     forward_id: String,
+    project_id: String,
 ) -> Result<ForwardOutcome, String> {
     let fid = parse_uuid(&forward_id).map_err(|e| e.to_string())?;
+    let recipient = parse_uuid(&project_id).map_err(|e| e.to_string())?;
     let home = std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_default();
@@ -1255,6 +1264,7 @@ async fn forward_prompt(
         appended_sources,
         fid,
         &home,
+        recipient,
     )
     .await
     .map_err(|e| e.to_string())
@@ -1479,7 +1489,8 @@ async fn refresh_workflow_form_from_cache(
 async fn merge_workflow_forwards(
     state: &AppState,
     inputs: &std::collections::BTreeMap<String, InputValue>,
-    forward_sources: &std::collections::BTreeMap<String, Vec<switchboard_core::AgentId>>,
+    forward_sources: &std::collections::BTreeMap<String, Vec<crate::commands::ForwardSourceRef>>,
+    recipient_project: switchboard_core::ProjectId,
 ) -> Result<std::collections::BTreeMap<String, InputValue>, String> {
     if forward_sources.values().all(Vec::is_empty) {
         return Ok(inputs.clone());
@@ -1487,10 +1498,15 @@ async fn merge_workflow_forwards(
     let home = std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_default();
-    let resolved =
-        crate::commands::resolve_workflow_forwards(state, forward_sources, inputs, &home)
-            .await
-            .map_err(|e| e.to_string())?;
+    let resolved = crate::commands::resolve_workflow_forwards(
+        state,
+        forward_sources,
+        inputs,
+        &home,
+        recipient_project,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     let mut effective = inputs.clone();
     for (field, text) in resolved {
         effective.insert(field, InputValue::Text(text));
@@ -1507,9 +1523,10 @@ async fn validate_workflow_invocation(
     name: String,
     is_builtin: bool,
     inputs: std::collections::BTreeMap<String, InputValue>,
-    forward_sources: std::collections::BTreeMap<String, Vec<switchboard_core::AgentId>>,
+    forward_sources: std::collections::BTreeMap<String, Vec<crate::commands::ForwardSourceRef>>,
 ) -> Result<(), String> {
-    let effective = merge_workflow_forwards(state.inner(), &inputs, &forward_sources).await?;
+    let effective =
+        merge_workflow_forwards(state.inner(), &inputs, &forward_sources, project_id).await?;
     validate_workflow_invocation_impl(state.inner(), project_id, &name, is_builtin, &effective)
         .map_err(|e| e.to_string())
 }
@@ -1522,9 +1539,10 @@ async fn invoke_workflow(
     name: String,
     is_builtin: bool,
     inputs: std::collections::BTreeMap<String, InputValue>,
-    forward_sources: std::collections::BTreeMap<String, Vec<switchboard_core::AgentId>>,
+    forward_sources: std::collections::BTreeMap<String, Vec<crate::commands::ForwardSourceRef>>,
 ) -> Result<String, String> {
-    let effective = merge_workflow_forwards(state.inner(), &inputs, &forward_sources).await?;
+    let effective =
+        merge_workflow_forwards(state.inner(), &inputs, &forward_sources, project_id).await?;
     let home = std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_default();
@@ -2200,6 +2218,7 @@ pub fn run() {
             reorder_agents,
             attach_agent,
             list_agents,
+            list_project_agents_readonly,
             search_project_files,
             send_message,
             stage_attachment,

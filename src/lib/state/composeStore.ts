@@ -231,7 +231,18 @@ function parseForwardSources(value: unknown): ForwardSource[] {
     if (item === null || typeof item !== "object") continue;
     const s = item as Record<string, unknown>;
     if (typeof s.id === "string" && typeof s.name === "string") {
-      out.push({ id: s.id as AgentId, name: s.name });
+      // `projectId` / `projectName` must survive the round-trip. Dropping them
+      // makes a cross-project source indistinguishable from a legacy local one,
+      // which the restore path then stamps with the *current* project and
+      // filters out against the local roster — the chip is silently deleted on
+      // every launch. Optional (drafts written before sources carried an owner
+      // have neither), which is exactly why they can't be inferred later.
+      out.push({
+        id: s.id as AgentId,
+        name: s.name,
+        ...(typeof s.projectId === "string" ? { projectId: s.projectId as ProjectId } : {}),
+        ...(typeof s.projectName === "string" ? { projectName: s.projectName } : {}),
+      });
     }
   }
   return out;

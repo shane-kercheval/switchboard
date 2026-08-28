@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
+  expandForwardSources,
   forwardReadiness,
+  forwardSourceLabel,
   reconcileForwardSourceMap,
   reconcileForwardSources,
 } from "./heldForwards.svelte";
@@ -21,14 +23,79 @@ const ALICE = agent("agent-a", "alice");
 const BOB = agent("agent-b", "bob");
 const ROSTER = [ALICE, BOB];
 
-const source = (id: string, name: string): ForwardSource => ({ id, name });
+const PROJECT = "00000000-0000-7000-8000-0000000000ff";
+const source = (id: string, name: string): ForwardSource => ({ id, name, projectId: PROJECT });
+
+describe("cross-project forward sources", () => {
+  const OTHER = "00000000-0000-7000-8000-0000000000aa";
+
+  it("keeps a foreign source on restore instead of dropping it", () => {
+    // The current project's roster never contains a foreign agent, so matching
+    // on it would delete every cross-project chip on each remount.
+    const foreign: ForwardSource = {
+      id: "agent-z",
+      name: "oracle",
+      projectId: OTHER,
+      projectName: "backend",
+    };
+    expect(reconcileForwardSources([foreign], ROSTER, PROJECT)).toEqual([foreign]);
+  });
+
+  it("still drops a local source whose agent left the roster", () => {
+    const gone = source("agent-gone", "ghost");
+    expect(reconcileForwardSources([gone], ROSTER, PROJECT)).toEqual([]);
+  });
+
+  it("upgrades a legacy source with no project to the draft's own project", () => {
+    // Drafts persisted before sources carried an owner: the wire type requires
+    // one, so the ambiguity must be resolved here rather than travelling.
+    const legacy = { id: "agent-a", name: "alice" } as ForwardSource;
+    expect(reconcileForwardSources([legacy], ROSTER, PROJECT)).toEqual([
+      { id: "agent-a", name: "alice", projectId: PROJECT },
+    ]);
+  });
+
+  it("sends each source's own project on the wire", () => {
+    const local = source("agent-a", "alice");
+    const foreign: ForwardSource = { id: "agent-z", name: "oracle", projectId: OTHER };
+    expect(expandForwardSources([local, foreign], PROJECT)).toEqual([
+      { agent_id: "agent-a", project_id: PROJECT },
+      { agent_id: "agent-z", project_id: OTHER },
+    ]);
+  });
+
+  it("defaults a source with no project to the composing project", () => {
+    const legacy = { id: "agent-a", name: "alice" } as ForwardSource;
+    expect(expandForwardSources([legacy], PROJECT)).toEqual([
+      { agent_id: "agent-a", project_id: PROJECT },
+    ]);
+  });
+
+  it("qualifies only foreign labels with the project name", () => {
+    const local = source("agent-a", "alice");
+    const foreign: ForwardSource = {
+      id: "agent-z",
+      name: "alice",
+      projectId: OTHER,
+      projectName: "backend",
+    };
+    expect(forwardSourceLabel(local, PROJECT)).toBe("alice");
+    // Same agent name in two projects must stay distinguishable.
+    expect(forwardSourceLabel(foreign, PROJECT)).toBe("alice · backend");
+  });
+
+  it("falls back to the bare name when a foreign project's name is unknown", () => {
+    const foreign: ForwardSource = { id: "agent-z", name: "oracle", projectId: OTHER };
+    expect(forwardSourceLabel(foreign, PROJECT)).toBe("oracle");
+  });
+});
 
 describe("reconcileForwardSources", () => {
   it("keeps sources whose agent is still on the roster, in order", () => {
     const sources = [source("agent-b", "bob"), source("agent-a", "alice")];
-    expect(reconcileForwardSources(sources, ROSTER)).toEqual([
-      { id: "agent-b", name: "bob" },
-      { id: "agent-a", name: "alice" },
+    expect(reconcileForwardSources(sources, ROSTER, PROJECT)).toEqual([
+      { id: "agent-b", name: "bob", projectId: PROJECT },
+      { id: "agent-a", name: "alice", projectId: PROJECT },
     ]);
   });
 
@@ -36,22 +103,26 @@ describe("reconcileForwardSources", () => {
     // Forwarding from a removed agent would fail at dispatch, so a restored draft
     // must not carry the chip forward.
     const sources = [source("agent-a", "alice"), source("agent-gone", "ghost")];
-    expect(reconcileForwardSources(sources, ROSTER)).toEqual([{ id: "agent-a", name: "alice" }]);
+    expect(reconcileForwardSources(sources, ROSTER, PROJECT)).toEqual([
+      { id: "agent-a", name: "alice", projectId: PROJECT },
+    ]);
   });
 
   it("refreshes a renamed agent's display name from the roster", () => {
     // `name` is display-only. A stale one would label the chip with an agent name
     // that no longer exists anywhere in the UI.
     const sources = [source("agent-a", "old-name")];
-    expect(reconcileForwardSources(sources, ROSTER)).toEqual([{ id: "agent-a", name: "alice" }]);
+    expect(reconcileForwardSources(sources, ROSTER, PROJECT)).toEqual([
+      { id: "agent-a", name: "alice", projectId: PROJECT },
+    ]);
   });
 
   it("returns nothing when the roster is empty", () => {
-    expect(reconcileForwardSources([source("agent-a", "alice")], [])).toEqual([]);
+    expect(reconcileForwardSources([source("agent-a", "alice")], [], PROJECT)).toEqual([]);
   });
 
   it("returns nothing for no sources", () => {
-    expect(reconcileForwardSources([], ROSTER)).toEqual([]);
+    expect(reconcileForwardSources([], ROSTER, PROJECT)).toEqual([]);
   });
 });
 
@@ -61,11 +132,11 @@ describe("reconcileForwardSourceMap", () => {
       focus: [source("agent-a", "stale")],
       context: [source("agent-b", "bob"), source("agent-a", "alice")],
     };
-    expect(reconcileForwardSourceMap(map, ROSTER)).toEqual({
-      focus: [{ id: "agent-a", name: "alice" }],
+    expect(reconcileForwardSourceMap(map, ROSTER, PROJECT)).toEqual({
+      focus: [{ id: "agent-a", name: "alice", projectId: PROJECT }],
       context: [
-        { id: "agent-b", name: "bob" },
-        { id: "agent-a", name: "alice" },
+        { id: "agent-b", name: "bob", projectId: PROJECT },
+        { id: "agent-a", name: "alice", projectId: PROJECT },
       ],
     });
   });
@@ -77,20 +148,20 @@ describe("reconcileForwardSourceMap", () => {
       focus: [source("agent-gone", "ghost")],
       context: [source("agent-a", "alice")],
     };
-    const out = reconcileForwardSourceMap(map, ROSTER);
-    expect(out).toEqual({ context: [{ id: "agent-a", name: "alice" }] });
+    const out = reconcileForwardSourceMap(map, ROSTER, PROJECT);
+    expect(out).toEqual({ context: [{ id: "agent-a", name: "alice", projectId: PROJECT }] });
     expect("focus" in out).toBe(false);
   });
 
   it("keeps a field that partially survives", () => {
     const map = { focus: [source("agent-gone", "ghost"), source("agent-b", "bob")] };
-    expect(reconcileForwardSourceMap(map, ROSTER)).toEqual({
-      focus: [{ id: "agent-b", name: "bob" }],
+    expect(reconcileForwardSourceMap(map, ROSTER, PROJECT)).toEqual({
+      focus: [{ id: "agent-b", name: "bob", projectId: PROJECT }],
     });
   });
 
   it("returns an empty map for an empty map", () => {
-    expect(reconcileForwardSourceMap({}, ROSTER)).toEqual({});
+    expect(reconcileForwardSourceMap({}, ROSTER, PROJECT)).toEqual({});
   });
 });
 

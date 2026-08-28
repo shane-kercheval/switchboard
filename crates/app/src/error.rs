@@ -81,6 +81,22 @@ pub enum AppError {
     #[error("agent {0} not found in any loaded project")]
     AgentNotFound(AgentId),
 
+    /// A forward source named a project that does not own the agent. Reachable
+    /// from a persisted draft whose agent moved between projects, or was removed
+    /// and re-created elsewhere. Refused rather than resolved against whichever
+    /// project happens to own it now: the user picked a specific agent in a
+    /// specific project, and silently substituting a different context is the
+    /// stale-forward class this whole path exists to prevent.
+    #[error(
+        "forward source {agent_id} no longer belongs to the project it was picked from \
+         (declared {declared}, now in {actual}) — remove the chip and pick it again"
+    )]
+    ForwardSourceMoved {
+        agent_id: AgentId,
+        declared: ProjectId,
+        actual: ProjectId,
+    },
+
     #[error("invalid UUID {value:?}: {source}")]
     InvalidUuid {
         value: String,

@@ -1,6 +1,6 @@
 # Codex asynchronous tool hydration and transcript diagnostics
 
-**Status:** revised plan proposed; second implementation review incorporated · **Created:** 2026-08-27 · **Revised:** 2026-08-27
+**Status:** Milestone 1 implemented and live Codex acceptance passed; code review pending · **Created:** 2026-08-27 · **Revised:** 2026-08-27
 
 ## Problem
 
@@ -71,7 +71,7 @@ agent rose from a handful of late-item warnings to 194 warnings; a metadata-only
 replay of the subsequently grown rollout reproduced approximately 199 new
 outside-interval warnings versus approximately three under the old strict
 interval behavior. Some turns accumulated 37–40 warnings. The implementation
-is uncommitted and must be replaced, not patched around.
+was reverted before the replacement association design was implemented.
 
 There is a second product problem independent of Codex association. The
 frontend copies every `ParseWarning` into `AgentRuntime` and renders the
@@ -138,9 +138,8 @@ The implementing agent must read these sources before changing code:
   requirements, and the role of `docs/harness-behavior.md`.
 - `docs/system-design.md` §3, for the split transcript source of truth.
 - `docs/harness-behavior.md` §3.6 and G30, for Codex's persisted tool
-  generations, structured-result precedence, and wrapper collapse rules. Its
-  current turn-wide-ambiguity follow-up reflects the failed implementation and
-  must be corrected by this milestone.
+  generations, structured-result precedence, wrapper collapse rules, and the
+  corrected asynchronous-completion association contract.
 - `docs/ui-conventions.md`, for semantic warning/error tokens, icon treatment,
   tool-row primitives, and component conventions.
 - `docs/implementation_plans/2026-08-22-codex-paginated-rollout-hydration.md`,
@@ -148,9 +147,9 @@ The implementing agent must read these sources before changing code:
   historical record and must not be edited.
 - `crates/harness/src/transcript.rs`, especially `TurnItem`,
   `LoadedTranscript`, `ParseWarning`, and `LoadTranscriptError`.
-- `crates/harness/src/codex/session_file.rs`, including the current uncommitted
-  `WrapperAssociation` implementation, `decode_single_exec_wrapper`, wrapper
-  collapse, all structured item handlers, turn finalization, and their tests.
+- `crates/harness/src/codex/session_file.rs`, including the association
+  prepass, `decode_single_exec_wrapper`, wrapper collapse, all structured item
+  handlers, turn finalization, and their tests.
 - `crates/app/src/commands.rs` at the per-agent transcript response/merge path.
 - `src/lib/types.ts`, `src/lib/state/types.ts`, the hydrate reducer and state
   wrapper, `Sidebar.svelte`, and `ToolCallWidget.svelte` with their tests.
@@ -268,8 +267,15 @@ Once complete:
    Do not replace the established hydration key or expose `task_started` as a
    frontend identity. The contract is outcome-based: `task_complete` must not
    discard the association context required by a later event carrying a proven
-   producer id. Keep ordinary text/usage reconstruction streaming if that
-   remains simpler; do not turn this into a general two-pass transcript parser.
+   producer id. The association prepass must retain compact source locations
+   and indexed wrapper/completion facts, not a parsed JSON tree for every line;
+   large rollouts are a normal input. Precompute bounded post-output eligibility
+   while scanning instead of repeatedly rescanning record gaps. Enter that
+   prepass only when the initial nonblank `session_meta` record confirms
+   paginated history; legacy, missing, unknown, malformed, and unexpected
+   initial metadata retain direct streaming reconstruction. Keep ordinary
+   text/usage reconstruction streaming and do not turn this into a general
+   two-pass transcript parser.
 
 3. **Add exact command identity to the existing decoder seam.** Retain the
    canonical `exec_command` argument data already parsed by

@@ -163,7 +163,10 @@
   const renameSiblings = $derived(
     editingProject === null
       ? []
-      : projects.list.filter((p) => p.directory === editingProject.directory),
+      : // Group by the directory's stable id, not its path: `directory` is null
+        // for both corrupt states, so `null === null` made every project with a
+        // broken directory reference a naming sibling of every other one.
+        projects.list.filter((p) => p.directory_id === editingProject.directory_id),
   );
   const renameValidation = $derived<NameValidation>(
     editingProjectId === null

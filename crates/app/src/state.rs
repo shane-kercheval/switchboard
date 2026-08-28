@@ -267,6 +267,34 @@ pub struct AppState {
     /// is a no-op while this is `None`, so tests never touch user-global state.
     pub workspace_path: Option<PathBuf>,
 
+    /// Test-only pause point, awaited by the lifecycle operations immediately
+    /// after they evict and before they drain.
+    ///
+    /// The window between those two steps is what finding-1's race lives in, and
+    /// it closes too fast to observe by polling — the drain completes before a
+    /// test can look. Without a way to hold it open, the ordering could only be
+    /// argued, and this milestone has already shipped one test that looked like
+    /// coverage and wasn't. A barrier is the smaller price.
+    #[cfg(test)]
+    pub maintenance_barrier: Mutex<Option<Arc<tokio::sync::Notify>>>,
+
+    /// Projects currently mid-lifecycle-operation — a re-point or a delete has
+    /// evicted their routable state and has not finished rebuilding it.
+    ///
+    /// **A closed window, not a swept one.** These operations must evict before
+    /// they drain (or a send lands in the gap and spawns a fresh actor on the
+    /// old working directory), which leaves an interval where the project is
+    /// absent from every map but still exists. Without a gate, a user clicking a
+    /// *different* project in the same directory during that interval opens it
+    /// against the stale path, and a second drain would only catch that by
+    /// convergence argument. Refusing entry is the version that stays true when
+    /// the code around it changes.
+    ///
+    /// Read by `open_project_impl`, `create_project_impl`, and the dispatch
+    /// resolution path; set and cleared under `registry_write`, which is what
+    /// makes "evict and mark" atomic against those callers.
+    pub maintenance: Mutex<HashSet<ProjectId>>,
+
     /// The user-global project store — every project's index, catalog, and
     /// metadata root.
     ///
@@ -366,6 +394,9 @@ impl AppState {
     ) -> Self {
         Self {
             store,
+            maintenance: Mutex::new(HashSet::new()),
+            #[cfg(test)]
+            maintenance_barrier: Mutex::new(None),
             #[cfg(test)]
             store_tmp: None,
             directories: Mutex::new(HashMap::new()),

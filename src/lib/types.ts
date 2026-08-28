@@ -586,11 +586,16 @@ export type ProjectListing = {
   id: ProjectId;
   name: string;
   created_at: string;
+  // The working directory's stable identity — opaque, and present whatever
+  // `directory_status` says. Group siblings by this, never by `directory`:
+  // that is `null` for both corrupt states, so grouping on it treats every
+  // damaged project as sharing one directory.
+  directory_id: string;
   directory: string | null;
   directory_status: DirectoryStatus;
   last_activity: string;
-  /// User-global view-state (from `workspace.yaml`): the user archived this
-  /// project, hiding it from the default `Active` view. Not on-disk project state.
+  // User-global view-state (from `workspace.yaml`): the user archived this
+  // project, hiding it from the default `Active` view. Not on-disk project state.
   archived: boolean;
 };
 

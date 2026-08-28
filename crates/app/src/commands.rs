@@ -91,17 +91,232 @@ pub enum DirectoryStatus {
 /// the check lands before the feature that can produce it, rather than after.
 fn cache_agent(state: &AppState, record: AgentRecord) -> Result<(), AppError> {
     let mut cache = lock(&state.agents_by_id);
-    if let Some(existing) = cache.get(&record.id)
-        && existing.project_id != record.project_id
-    {
-        return Err(AppError::AgentProjectConflict {
-            agent_id: record.id,
-            existing_project_id: existing.project_id,
-            incoming_project_id: record.project_id,
-        });
+    conflicting_claim(&cache, &record).map_or_else(
+        || {
+            cache.insert(record.id, record);
+            Ok(())
+        },
+        Err,
+    )
+}
+
+/// Cache a whole roster **all-or-nothing**: every record is validated against
+/// the cache before any of them is written.
+///
+/// One-at-a-time insertion made the caller's commit sequence non-transactional.
+/// [`open_project_impl`] commits the project's `instance.lock` first, so a
+/// conflict partway through left the lock held, the project unloaded, and some
+/// agents cached — and every retry then failed `ProjectLocked` against this
+/// process's own handle, converting a corruption diagnosis into a false
+/// contention one. Validating first means a conflict returns before anything is
+/// committed, which is what the callers' "keep the handle local until every
+/// fallible step has succeeded" pattern requires.
+///
+/// **Not a serialization guarantee.** [`list_agents_impl`] calls this without
+/// holding `registry_write`, so a concurrent writer can still change the cache
+/// between validation and insertion. What this buys there is narrower and still
+/// worth having: a conflict cannot leave a partially-filled cache. The other
+/// two callers do hold the guard.
+fn cache_agents(state: &AppState, records: &[AgentRecord]) -> Result<(), AppError> {
+    let mut cache = lock(&state.agents_by_id);
+    for record in records {
+        if let Some(conflict) = conflicting_claim(&cache, record) {
+            return Err(conflict);
+        }
     }
-    cache.insert(record.id, record);
+    for record in records {
+        cache.insert(record.id, record.clone());
+    }
     Ok(())
+}
+
+/// The conflict a record would cause, if any: its `AgentId` is already mapped to
+/// a *different* project. Re-inserting the same agent (a rename, a profile
+/// switch, a post-turn locator write) is ordinary and returns `None`.
+fn conflicting_claim(
+    cache: &HashMap<AgentId, AgentRecord>,
+    record: &AgentRecord,
+) -> Option<AppError> {
+    let existing = cache.get(&record.id)?;
+    if existing.project_id == record.project_id {
+        return None;
+    }
+    Some(AppError::AgentProjectConflict {
+        agent_id: record.id,
+        existing_project_id: existing.project_id,
+        incoming_project_id: record.project_id,
+    })
+}
+
+/// The directory identity a project belongs to, from the store index.
+fn directory_id_of(state: &AppState, project_id: ProjectId) -> Option<DirectoryId> {
+    state
+        .store
+        .list_projects()
+        .ok()?
+        .into_iter()
+        .find(|entry| entry.id == project_id)
+        .map(|entry| entry.directory_id)
+}
+
+/// Hold the post-eviction, pre-drain window open when a test asks. No-op in
+/// release builds (the field does not exist) and when unset.
+#[cfg(test)]
+async fn wait_at_maintenance_barrier(state: &AppState) {
+    let barrier = lock(&state.maintenance_barrier).clone();
+    if let Some(barrier) = barrier {
+        barrier.notified().await;
+    }
+}
+
+#[cfg(not(test))]
+#[expect(clippy::unused_async, reason = "matches the cfg(test) signature")]
+async fn wait_at_maintenance_barrier(_state: &AppState) {}
+
+/// Refuse if `project_id` is mid-lifecycle-operation.
+///
+/// Called by every path that could otherwise enter the window a re-point or
+/// delete opens between evicting routable state and rebuilding it — opening,
+/// creating, and dispatching. See [`AppState::maintenance`].
+fn reject_if_under_maintenance(state: &AppState, project_id: ProjectId) -> Result<(), AppError> {
+    if lock(&state.maintenance).contains(&project_id) {
+        return Err(AppError::ProjectUnderMaintenance(project_id));
+    }
+    Ok(())
+}
+
+/// Take `registry_write`, mark `projects` under maintenance, and evict **all**
+/// of their routable state. Returns the subset that was actually loaded, which
+/// is the set a later restore may bring back.
+///
+/// **Everything routable goes together.** Evicting `state.projects` while
+/// leaving `agents_by_id` populated would make a cached agent resolve to a
+/// missing project — breaking the invariant `lookup_agent` documents, and doing
+/// it silently. The maintenance mark is what makes the interval unobservable
+/// rather than merely brief.
+fn begin_maintenance(
+    state: &AppState,
+    projects: &HashSet<ProjectId>,
+) -> (Vec<ProjectId>, Vec<AgentId>) {
+    let _write = lock(&state.registry_write);
+    lock(&state.maintenance).extend(projects.iter().copied());
+    let loaded: Vec<ProjectId> = {
+        let mut map = lock(&state.projects);
+        let loaded = map
+            .keys()
+            .filter(|id| projects.contains(id))
+            .copied()
+            .collect();
+        map.retain(|id, _| !projects.contains(id));
+        loaded
+    };
+    // Snapshot the agent ids on the way out: the drain needs them, and after
+    // this eviction the cache can no longer answer.
+    let evicted_agents: Vec<AgentId> = {
+        let mut cache = lock(&state.agents_by_id);
+        let ids: Vec<AgentId> = cache
+            .values()
+            .filter(|record| projects.contains(&record.project_id))
+            .map(|record| record.id)
+            .collect();
+        cache.retain(|_, record| !projects.contains(&record.project_id));
+        ids
+    };
+    lock(&state.needs_session_meta).retain(|id| !evicted_agents.contains(id));
+    {
+        let mut active = lock(&state.active_project_id);
+        if matches!(*active, Some(id) if projects.contains(&id)) {
+            *active = None;
+        }
+    }
+    (loaded, evicted_agents)
+}
+
+/// Load `project_id` into the routable maps, reusing an `instance.lock` this
+/// process already holds.
+///
+/// **The lock rule lives here, not at the call sites.** A re-point deliberately
+/// keeps `project_locks` across the whole operation — the lock file sits under
+/// the store root and does not move with the working directory — so a restore
+/// that re-acquired it would `flock` a file this process already holds through a
+/// second fd, which conflicts spuriously and would fail every previously-loaded
+/// project with `ProjectLocked`. Cold activation acquires; restoration reuses.
+///
+/// Fallible work completes before anything is committed, so a failure leaves no
+/// lock, no cached agents, and no map entry.
+fn activate_project(state: &AppState, project: Project) -> Result<(), AppError> {
+    let already_held = lock(&state.project_locks).contains_key(&project.id);
+    let lock_handle = if already_held {
+        None
+    } else {
+        Some(acquire_project_lock(project.id, &project.root)?)
+    };
+    let agents = project.list_agents()?;
+    cache_agents(state, &agents)?;
+    if let Some(handle) = lock_handle {
+        lock(&state.project_locks).insert(project.id, handle);
+    }
+    lock(&state.projects).insert(project.id, project);
+    Ok(())
+}
+
+/// Reload projects from the store and clear their maintenance marks.
+///
+/// **Takes no path, and cannot be given one.** The reload resolves each
+/// project's working directory through the catalog itself, so it depends on
+/// neither the caller's pre-operation assumption nor the path the caller
+/// happened to observe. That is what makes the re-point's uncertain-commit
+/// guarantee structural: a signature with no path parameter cannot reload from a
+/// stale one, where a comment asking future editors not to could.
+///
+/// A project that fails to reload is left unloaded with its routable state
+/// removed — the same refuse-rather-than-guess posture as leaving them all out.
+fn reload_projects(state: &AppState, project_ids: &[ProjectId]) {
+    for id in project_ids {
+        match state.store.open_project(*id) {
+            Ok(project) => {
+                if let Err(e) = activate_project(state, project) {
+                    tracing::warn!(
+                        project_id = %id,
+                        error = %e,
+                        "project could not be activated after a lifecycle operation — left unloaded"
+                    );
+                    discard_project_state(state, *id);
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    project_id = %id,
+                    error = %e,
+                    "project could not be reloaded after a lifecycle operation — left unloaded"
+                );
+                discard_project_state(state, *id);
+            }
+        }
+    }
+    lock(&state.maintenance).retain(|id| !project_ids.contains(id));
+}
+
+/// Drop every trace of a project that could not be brought back, so a retry
+/// isn't blocked by this process's own leftovers.
+fn discard_project_state(state: &AppState, project_id: ProjectId) {
+    lock(&state.project_locks).remove(&project_id);
+    lock(&state.projects).remove(&project_id);
+    let dropped: HashSet<AgentId> = {
+        let mut cache = lock(&state.agents_by_id);
+        let ids = cache
+            .values()
+            .filter(|record| record.project_id == project_id)
+            .map(|record| record.id)
+            .collect();
+        cache.retain(|_, record| record.project_id != project_id);
+        ids
+    };
+    lock(&state.needs_session_meta).retain(|id| !dropped.contains(id));
+    let mut active = lock(&state.active_project_id);
+    if *active == Some(project_id) {
+        *active = None;
+    }
 }
 
 /// One row of the flat cross-directory project list (`list_projects_impl`).
@@ -111,6 +326,16 @@ pub struct ProjectListing {
     pub id: ProjectId,
     pub name: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// The working directory's stable identity — an opaque id, present whatever
+    /// `directory_status` says.
+    ///
+    /// **This is what lets the frontend group siblings.** `directory` is `None`
+    /// for both corrupt states by construction, so grouping on it would treat
+    /// every damaged project as sharing one directory — which it did, making two
+    /// unrelated broken projects collide on name in the rename form. It is also
+    /// the only way to preview a repair's blast radius (every project carrying
+    /// this id moves), which the repair command requires the UI to show.
+    pub directory_id: DirectoryId,
     /// The resolved working directory, or `None` when the `directory_id` has no
     /// single catalog row (`CatalogMissing` / `CatalogAmbiguous`) — there is no
     /// path to report, and inventing one would be the guess the store refuses.
@@ -244,211 +469,108 @@ pub async fn init_directory_impl(state: &AppState, path: &str) -> Result<Directo
 /// *is* the handle. So removal cannot mean "forget"; it means "stop showing me
 /// this", which is view-state.
 ///
-/// What follows from that: the projects still exist, still list once unhidden,
-/// and are still deletable individually. Adding the directory back is the unhide
-/// gesture and is lossless.
+/// **Nothing is drained, and that is deliberate.** An earlier version kept the
+/// teardown this command used to perform — cancelling in-flight turns, releasing
+/// locks, unloading projects. The argument for it was real: an agent running in
+/// a directory the user has hidden burns subscription quota they can neither see
+/// nor stop, because a hidden directory's projects aren't navigable. It loses to
+/// a narrower one. The whole claim of the new semantics is that hiding is
+/// lossless and reversible — unhide restores everything — and a cancelled
+/// in-flight turn is the single part that isn't: the work is gone and unhiding
+/// will not bring it back. So the drain silently falsified the property the
+/// command now advertises, on a button whose label did not change. Keeping it
+/// would have required also dropping the losslessness claim and confirming with
+/// a count of running turns; a separate explicit "close and hide" is the right
+/// home for that if the quota cost proves to matter.
 ///
-/// Still drains: hiding a directory the user is done with should not leave its
-/// agents mid-turn, so in-flight turns are cancelled, project locks released,
-/// and loaded projects/agents dropped — exactly as before. Nothing on disk is
-/// touched, in the working directory or the store. Idempotent: hiding an absent
-/// or already-hidden directory is `Ok`.
-pub async fn remove_directory_impl(state: &AppState, path: &str) -> Result<(), AppError> {
+/// Nothing on disk is touched, in the working directory or the store.
+/// Idempotent: hiding an absent or already-hidden directory is `Ok`.
+pub fn remove_directory_impl(state: &AppState, path: &str) {
     let canonical = canonicalize_boundary(path);
-
-    // **Teardown ordering (load-bearing).** Remove every piece of *routable*
-    // in-memory state FIRST — atomically under `registry_write`, with no `.await`
-    // crossing the guard — then release the guard and drain the actors. Clearing
-    // the maps before releasing the guard closes the teardown race two ways:
-    //   - a racing `send` can no longer resolve the agent (it misses
-    //     `agents_by_id` → `AgentNotFound`), and a racing `create_*` /
-    //     `open_project` can no longer resolve the removed directory or its
-    //     now-cleared active project;
-    //   - the narrow window where a send already passed `lookup_agent` but
-    //     hasn't reached the dispatcher is closed by the dispatcher's own
-    //     `Closing` slot — the late `Enqueue` is rejected, not resurrected.
-    // So the actor drain (below) cannot be outrun by a new turn, and no orphan
-    // actor/subprocess survives.
-    //
-    // `registry_write` serializes us against `create_project` / `create_agent` /
-    // `attach` / first-open (all take it). It is `std::sync::Mutex` (its guard is
-    // `!Send`), so it must be released before the drain `.await`.
-    let agent_ids: Vec<AgentId>;
-    let project_ids: Vec<ProjectId>;
-    {
-        let write = lock(&state.registry_write);
-
-        let loaded = lock(&state.directories).contains_key(&canonical);
-        if !loaded {
-            // Not loaded — nothing routable to clear. Drop the guard, then fall
-            // through to the always-run workspace removal below.
-            drop(write);
-            lock(&state.workspace).set_hidden(&canonical, true);
-            persist_workspace(state);
-            return Ok(());
-        }
-
-        // Collect under brief, independent lock acquisitions, never nesting out
-        // of the documented lock order. Snapshot the agent ids BEFORE clearing
-        // `agents_by_id`.
-        let pids: Vec<ProjectId> = lock(&state.projects)
-            .values()
-            .filter(|p| p.directory == canonical)
-            .map(|p| p.id)
-            .collect();
-        let project_set: HashSet<ProjectId> = pids.iter().copied().collect();
-        let aids: Vec<AgentId> = lock(&state.agents_by_id)
-            .values()
-            .filter(|r| project_set.contains(&r.project_id))
-            .map(|r| r.id)
-            .collect();
-
-        // Clear routable state, each a brief independent acquisition, in the
-        // documented lock order (directories → projects → active_project_id →
-        // needs_session_meta → agents_by_id). **Do NOT touch `project_locks`
-        // here** — the drain helper releases those locks AFTER the turns drain.
-        lock(&state.directories).remove(&canonical);
-        {
-            let mut projects = lock(&state.projects);
-            projects.retain(|id, _| !project_set.contains(id));
-        }
-        {
-            let mut active = lock(&state.active_project_id);
-            if matches!(*active, Some(id) if project_set.contains(&id)) {
-                *active = None;
-            }
-        }
-        {
-            let mut needs = lock(&state.needs_session_meta);
-            needs.retain(|id| !aids.contains(id));
-        }
-        {
-            let mut agents = lock(&state.agents_by_id);
-            agents.retain(|_, r| !project_set.contains(&r.project_id));
-        }
-
-        agent_ids = aids;
-        project_ids = pids;
-        // `write` drops here — the guard is released BEFORE the drain `.await`.
-    }
-
-    // Cancel any workflow runs for the removed projects and let them settle to
-    // `cancelled` BEFORE draining agents. Cancel-runs-first is load-bearing: if
-    // agents drained first, a run would observe an out-of-band terminal and
-    // resolve `failed`/ambiguous instead of `cancelled`, and could write into a
-    // directory about to be deleted.
-    crate::workflow_commands::cancel_runs_for_projects(state, &project_ids).await;
-
-    // Shut down each agent's dispatcher actor (cancels + drains any live turn)
-    // and release the named project locks. Holds no other state lock across the
-    // await.
-    drain_agents_then_release_locks(state, &agent_ids, &project_ids, CancelSource::Shutdown).await;
-
-    // Final prune: a turn settling between the earlier map-clear and this drain
-    // (a workflow run cancelling, or a manual turn) can re-insert an agent into
-    // `agents_by_id` via the session-locator sink, which `insert`s unconditionally.
-    // Re-prune the removed projects' agents now that no actor remains to write.
-    {
-        let project_set: HashSet<ProjectId> = project_ids.iter().copied().collect();
-        lock(&state.agents_by_id).retain(|_, r| !project_set.contains(&r.project_id));
-        let removed: HashSet<AgentId> = agent_ids.iter().copied().collect();
-        lock(&state.needs_session_meta).retain(|id| !removed.contains(id));
-    }
-
-    // Always hide + persist (idempotent for absent or already-hidden dirs). The
-    // entry itself stays, so ordering and a later unhide survive.
     lock(&state.workspace).set_hidden(&canonical, true);
     persist_workspace(state);
-    Ok(())
 }
 
 /// Point a project's working directory at a new location — the repair for a
-/// moved or deleted checkout, and the only in-app exit from a duplicated
-/// directory identity.
+/// moved or deleted checkout, a duplicated directory identity, or a lost one.
 ///
 /// # Why this takes a project id
 ///
 /// The operation is on the *directory identity*, but the id is not something the
 /// user has: they are looking at a project row that says its folder is gone.
-/// Naming the directory by path would also fail in exactly the two states worth
-/// repairing — a duplicated identity has no single path, and neither does a
-/// missing one. So the caller names the project and the backend resolves the
-/// identity behind it.
+/// Naming the directory by path would also fail in exactly the states worth
+/// repairing — neither a duplicated identity nor a lost one has a single path.
+/// So the caller names the project and the backend resolves the identity behind
+/// it.
 ///
 /// **Every project sharing that identity moves**, not just the one named. That
 /// is the correct semantics — one folder holds them all — but it means the UI
-/// must say so before the user commits.
+/// must say so before the user commits, which is what `ProjectListing`'s
+/// `directory_id` is for.
 ///
-/// `CatalogMissing` is not repairable here. The project's `directory_id` has no
-/// catalog row, and minting one would be inventing an identity rather than
-/// repairing one; it surfaces as `DirectoryNotFound` and belongs to the
-/// migration tool's explicit repair.
+/// # Three states, two catalog operations
+///
+/// A resolvable or duplicated id is **re-pointed** (which collapses duplicates
+/// to one row). An id with no row at all is **bound**, restoring the mapping it
+/// lost. Binding does not mint an identity: the id already exists and is already
+/// referenced by these projects. Both refuse a path another identity holds.
 ///
 /// # Lifecycle, not a catalog write
 ///
 /// `Project.directory` is snapshotted at open and *is* the dispatch cwd, and a
-/// running actor owns its own frozen copy inside a `ProjectDispatchContextFactory`.
-/// Evicting `state.projects` alone would leave every in-flight and
-/// already-created actor dispatching into the old path. So: cancel the affected
-/// projects' workflow runs, shut down their agents (which drops the actors and
-/// their frozen factories), write the catalog, then reload.
+/// running actor owns its own frozen copy inside a
+/// `ProjectDispatchContextFactory`. So the projects are marked under maintenance
+/// and evicted **before** the drain, not after: draining first leaves a window
+/// where a send resolves the stale `Project` and spawns a fresh actor on the old
+/// path, which then survives the repair. The maintenance mark closes the other
+/// half of that window — a user opening a *different* project in the same
+/// directory mid-repair would otherwise load it against the stale path.
 ///
 /// Project locks are deliberately **not** released. `instance.lock` lives under
 /// the store root beside the project's other metadata, so it does not move with
-/// the working directory — dropping and re-acquiring it would open a window for
-/// another process to take it for no gain.
+/// the working directory; dropping and re-acquiring it would only open a window
+/// for another process. [`activate_project`] reuses the held handle.
 ///
 /// # Uncertain commit
 ///
 /// [`switchboard_core::Store::repoint_directory`] can return `Err` with the new
 /// catalog already on disk (`write_jsonl` fsyncs the parent *after* the rename).
-/// So the catalog is re-read on **both** outcomes and state is rebuilt from the
-/// path actually observed, never from the pre-call assumption — believing an
-/// `Err` is precisely what would leave the app dispatching into the old
-/// directory while the store resolves the new one.
-///
-/// If that re-read also fails, the affected projects are left unloaded and the
-/// error propagates. Dispatch then refuses (`ProjectNotLoaded`) rather than
-/// running against a path nothing has confirmed.
+/// So the catalog is re-read on **both** outcomes and state rebuilt from what it
+/// says. The write error still propagates: a failed parent-sync means the rename
+/// is *visible* but not *durable*, and reporting success would hide that — the
+/// user's retry is what actually establishes durability, not a wasted round
+/// trip. If the re-read also fails, the projects stay unloaded and dispatch
+/// refuses rather than running against a path nothing has confirmed.
 pub async fn repoint_project_directory_impl(
     state: &AppState,
     project_id: ProjectId,
     new_path: &str,
 ) -> Result<(), AppError> {
-    let directory_id = state
-        .store
-        .list_projects()?
-        .into_iter()
+    let indexed = state.store.list_projects()?;
+    let directory_id = indexed
+        .iter()
         .find(|entry| entry.id == project_id)
         .ok_or(CoreError::ProjectNotFound(project_id))?
         .directory_id;
-    // Everything sharing the identity, whether or not it is currently loaded —
-    // an unloaded project has no actor to drain but still needs its stale
-    // `state.projects` entry replaced if it gains one later.
-    let affected: Vec<ProjectId> = state
-        .store
-        .list_projects()?
-        .into_iter()
+    // Resolve **before** evicting or draining anything, so an unrepairable state
+    // cannot tear down every agent in the directory on its way to a
+    // predetermined error.
+    let existing_paths = state.store.directory_paths(directory_id)?;
+
+    let affected: HashSet<ProjectId> = indexed
+        .iter()
         .filter(|entry| entry.directory_id == directory_id)
         .map(|entry| entry.id)
         .collect();
-    // The path we are moving away from, for the workspace entry. `Err` here is
-    // the ambiguous/missing case: there is no single old path to retire, so the
-    // registry is left alone and the new path is added below.
-    let old_path = state.store.directory_path(directory_id).ok();
 
-    // Cancel runs before draining agents, for the same reason
-    // `remove_directory_impl` does: a run that observes an out-of-band terminal
-    // resolves `failed` rather than `cancelled`.
-    crate::workflow_commands::cancel_runs_for_projects(state, &affected).await;
-
-    let affected_set: HashSet<ProjectId> = affected.iter().copied().collect();
-    let agent_ids: Vec<AgentId> = lock(&state.agents_by_id)
-        .values()
-        .filter(|record| affected_set.contains(&record.project_id))
-        .map(|record| record.id)
-        .collect();
-    for &agent_id in &agent_ids {
+    let (loaded_before, agent_ids) = begin_maintenance(state, &affected);
+    wait_at_maintenance_barrier(state).await;
+    crate::workflow_commands::cancel_runs_for_projects(
+        state,
+        &affected.iter().copied().collect::<Vec<_>>(),
+    )
+    .await;
+    for agent_id in agent_ids {
         state
             .dispatcher
             .shutdown_agent(agent_id, CancelSource::Shutdown)
@@ -457,73 +579,90 @@ pub async fn repoint_project_directory_impl(
 
     // Synchronous from here — no `.await` while `registry_write` is held.
     let _write = lock(&state.registry_write);
-    {
-        let mut projects = lock(&state.projects);
-        projects.retain(|id, _| !affected_set.contains(id));
-    }
-
-    // Not pre-canonicalized here: `repoint_directory` canonicalizes and
-    // validates, and doing it twice would let the two disagree. The canonical
-    // path comes back from the re-read below.
-    let write_result = state
+    // Re-derive under the guard: `create_project` takes it too, so a sibling
+    // created during the drain window is absent from the pre-drain snapshot and
+    // would otherwise be left pointing at the old path.
+    let affected_now: Vec<ProjectId> = state
         .store
-        .repoint_directory(directory_id, Path::new(new_path));
+        .list_projects()?
+        .into_iter()
+        .filter(|entry| entry.directory_id == directory_id)
+        .map(|entry| entry.id)
+        .collect();
 
-    // Re-read on both outcomes: an `Err` above does not prove the catalog is
-    // unchanged, so the pre-call path is never a candidate for where to reload.
-    //
-    // **Enforced by construction, not by a test.** `old_path` is used only to
-    // retire the stale workspace entry and directory handle; nothing below can
-    // reach it to reload from. That matters because the case it guards — an
-    // `Err` returned after `write_jsonl`'s rename already landed, when its
-    // parent-directory fsync fails — cannot be staged portably, so no test here
-    // discriminates a correct implementation from one that trusts its own
-    // `Err`. Keep the reload reading `observed` and nothing else; if a future
-    // edit gives this block access to a pre-call path, the guarantee is gone and
-    // the suite will not say so.
+    let target = Path::new(new_path);
+    let write_result = if existing_paths.is_empty() {
+        state.store.bind_directory(directory_id, target).map(|_| ())
+    } else {
+        state
+            .store
+            .repoint_directory(directory_id, target)
+            .map(|_| ())
+    };
     let observed = state.store.directory_path(directory_id);
 
     if let Ok(path) = &observed {
-        {
-            let mut workspace = lock(&state.workspace);
-            match &old_path {
-                Some(old) => workspace.replace_path(old, path.clone()),
-                None => workspace.add(path.clone()),
-            }
-        }
-        persist_workspace(state);
-        {
-            let mut directories = lock(&state.directories);
-            if let Some(old) = &old_path {
-                directories.remove(old);
-            }
-            if let Ok(directory) = Directory::at(path) {
-                directories.insert(directory.path.clone(), directory);
-            }
-        }
-        // Reload against the observed path. A project that fails to reload stays
-        // out of `state.projects`, which is the same "refuse rather than guess"
-        // posture as leaving them all out when the re-read fails.
-        let mut projects = lock(&state.projects);
-        for id in &affected {
-            match state.store.open_project(*id) {
-                Ok(project) => {
-                    projects.insert(*id, project);
-                }
-                Err(e) => tracing::warn!(
-                    project_id = %id,
-                    error = %e,
-                    "project could not be reloaded after re-point — left unloaded"
-                ),
-            }
-        }
+        retire_and_register_directory(state, &existing_paths, path);
+        // Restore what was loaded before, plus anything that became loaded
+        // during the window — the latter took its own lock on the way in and
+        // must not be left holding the stale path.
+        let restore: Vec<ProjectId> = {
+            let currently = lock(&state.projects);
+            affected_now
+                .iter()
+                .filter(|id| loaded_before.contains(id) || currently.contains_key(id))
+                .copied()
+                .collect()
+        };
+        reload_projects(state, &restore);
     }
+    // Clear maintenance for everything marked, including ids deliberately left
+    // unloaded — the mark means "mid-operation", not "unavailable".
+    lock(&state.maintenance).retain(|id| !affected.contains(id) && !affected_now.contains(id));
 
-    // The write's own failure is the more specific diagnosis, so it wins; a
-    // failed re-read after a successful write is reported on its own.
+    // **The write error wins, deliberately.** When the rename lands and only the
+    // parent fsync fails, `observed` shows the new path and the state above is
+    // rebuilt correctly — so returning `Ok` looks tempting and is wrong: the
+    // change is *visible* but not *durable*, and suppressing that would weaken
+    // the crash-consistency posture to spare the user one retry. The retry is
+    // not wasted, either — it re-runs the write and its fsync, which is what
+    // actually establishes durability. A typed "applied, durability
+    // unconfirmed" outcome would say this better than an error does, but that is
+    // a wire variant and UI copy, so it waits for the milestone that owns them.
     write_result?;
     observed?;
     Ok(())
+}
+
+/// Retire every path the directory identity used to hold and register the one it
+/// holds now, preserving the entry's position and hidden flag.
+///
+/// **Plural `old`.** A duplicated identity holds more than one path, and an
+/// earlier version asked the catalog for a single one — which errors in exactly
+/// that case, so repairing from an ambiguous state left both stale rows in the
+/// workspace and appended the repaired directory at the bottom of the user's
+/// list.
+fn retire_and_register_directory(state: &AppState, old: &[PathBuf], new: &Path) {
+    {
+        let mut workspace = lock(&state.workspace);
+        match old.split_first() {
+            Some((first, rest)) => {
+                workspace.replace_path(first, new.to_path_buf());
+                for stale in rest {
+                    workspace.forget_path(stale);
+                }
+            }
+            None => workspace.add(new.to_path_buf()),
+        }
+    }
+    persist_workspace(state);
+    let mut directories = lock(&state.directories);
+    for stale in old {
+        directories.remove(stale);
+    }
+    if let Ok(directory) = Directory::at(new) {
+        directories.insert(directory.path.clone(), directory);
+    }
 }
 
 /// *The* directory-identity chokepoint. Every command that resolves a working
@@ -613,6 +752,7 @@ pub fn list_projects_impl(state: &AppState) -> Result<Vec<ProjectListing>, AppEr
             };
             ProjectListing {
                 id: entry.id,
+                directory_id: entry.directory_id,
                 name: entry.name.clone(),
                 created_at: entry.created_at,
                 directory,
@@ -1752,6 +1892,15 @@ pub fn create_project_impl(
         .find(|entry| entry.path == canonical)
         .map(|entry| entry.directory_id)
         .ok_or(AppError::NoDirectory)?;
+    // A project created into a directory mid-repair would be born on the stale
+    // path. The identity, not a project id, is what's under repair here, so the
+    // check is against any of its projects.
+    if lock(&state.maintenance)
+        .iter()
+        .any(|id| directory_id_of(state, *id) == Some(directory_id))
+    {
+        return Err(AppError::NoDirectory);
+    }
     let project = state.store.create_project(directory_id, name)?;
     let summary = ProjectSummary {
         id: project.id,
@@ -1773,12 +1922,17 @@ pub fn create_project_impl(
 /// Rename a project: validate + dual-write its identity (`config.yaml` +
 /// `projects.jsonl`) in core, then sync in-memory state. Synchronous under
 /// `registry_write` — rename never touches running agents, so no dispatcher
-/// drain (contrast delete). Resolves the project's owning directory from the
-/// loaded set; an unavailable (unloaded) directory can't be mutated, so this
-/// surfaces `ProjectNotLoaded` (the frontend gates Rename on availability — this
-/// is the defensive backstop). Format + per-directory uniqueness are
-/// re-validated in core; the frontend pre-checks, but the backend stays
-/// authoritative.
+/// drain (contrast delete).
+///
+/// **Needs no working directory.** Both files live under the store root, so a
+/// project whose directory is missing, ambiguous, or merely unmounted renames
+/// exactly like any other — nothing is resolved from the catalog to perform the
+/// write, and `ProjectNotLoaded` is not reachable here. The frontend need no
+/// longer gate Rename on availability; being able to name a broken project is
+/// part of being able to see and repair it.
+///
+/// Format + per-directory uniqueness are re-validated in core; the frontend
+/// pre-checks, but the backend stays authoritative.
 pub fn rename_project_impl(
     state: &AppState,
     project_id: ProjectId,
@@ -1805,11 +1959,18 @@ pub fn rename_project_impl(
             DirectoryStatus::ResolvedPathUnavailable,
         ),
         Err(CoreError::AmbiguousDirectory(_)) => (None, DirectoryStatus::CatalogAmbiguous),
-        Err(_) => (None, DirectoryStatus::CatalogMissing),
+        Err(CoreError::DirectoryNotFound(_)) => (None, DirectoryStatus::CatalogMissing),
+        // Match only the two resolution failures. A blanket arm reported a
+        // missing catalog file, a permission error, and a corrupt line as "this
+        // one row is dangling" — pointing the user at a repair that cannot help,
+        // while `list_projects_impl` correctly fails the whole read on the same
+        // conditions.
+        Err(other) => return Err(other.into()),
     };
     let archived = lock(&state.workspace).is_archived(entry.id);
     Ok(ProjectListing {
         directory,
+        directory_id: entry.directory_id,
         directory_status,
         last_activity: state
             .store
@@ -1976,22 +2137,18 @@ pub fn migrate_message_pin_impl(
 /// turns); a phase-(b) failure means work may have been cancelled even though
 /// the project remains. Same accepted trade-off as `remove_agent_impl`.
 pub async fn delete_project_impl(state: &AppState, project_id: ProjectId) -> Result<(), AppError> {
-    // Resolve the owning directory up front. If no loaded directory claims the
-    // id, there's nothing on disk we can reach — treat as already-gone and fall
-    // through to in-memory pruning.
+    // **Evict before draining, under maintenance.** Draining first leaves a
+    // window in which a racing send resolves the still-loaded project and spawns
+    // a fresh actor for a project being deleted, and a racing open loads it back
+    // in. Marking it under maintenance closes both; the mark is cleared on every
+    // exit below.
+    let scope: HashSet<ProjectId> = std::iter::once(project_id).collect();
+    let (_loaded_before, agent_ids) = begin_maintenance(state, &scope);
 
     // Cancel this project's workflow runs and let them settle to `cancelled`
-    // BEFORE draining agents (cancel-runs-first — see `remove_directory_impl`).
+    // BEFORE draining agents: a run that observes an out-of-band terminal
+    // resolves `failed`/ambiguous instead of `cancelled`.
     crate::workflow_commands::cancel_runs_for_projects(state, &[project_id]).await;
-
-    // Phase (a): drain this project's loaded agents (only loaded projects have
-    // cached agents, so an unopened/unavailable project drains nothing). No lock
-    // is held across the await.
-    let agent_ids: Vec<AgentId> = lock(&state.agents_by_id)
-        .values()
-        .filter(|r| r.project_id == project_id)
-        .map(|r| r.id)
-        .collect();
     for &agent_id in &agent_ids {
         state
             .dispatcher
@@ -1999,58 +2156,86 @@ pub async fn delete_project_impl(state: &AppState, project_id: ProjectId) -> Res
             .await;
     }
 
-    // Phase (b): synchronous under `registry_write`, no `.await`.
+    // Synchronous under `registry_write`, no `.await`.
     let _write = lock(&state.registry_write);
 
-    // Delete on disk first, *before* dropping the project's inter-process lock.
-    // `Store::delete_project` only returns `Err` when it couldn't change what
-    // lists (index read/rewrite failure) — i.e. nothing was removed; a
-    // best-effort directory-removal failure is folded into `Ok` (benign orphan).
-    // So on `Err` we keep both the row and the lock (project stays safely owned
-    // and the delete is retryable). On unix `remove_dir_all` unlinks the in-dir
-    // `instance.lock` despite our held handle, so holding the lock across the
-    // removal is fine; a future Windows target would instead need
-    // drop-before-removal + re-acquire-on-failure.
-    //
     // **The working directory is irrelevant here.** Everything being removed
     // lives under the store root, so a project whose checkout is gone deletes
     // exactly like any other — no "can we reach the directory" branch, and no
     // silently-skipped delete when we can't.
-    state.store.delete_project(project_id)?;
+    //
+    // On unix `remove_dir_all` unlinks the in-dir `instance.lock` despite our
+    // held handle, so holding the lock across the removal is fine; a future
+    // Windows target would instead need drop-before-removal +
+    // re-acquire-on-failure.
+    let delete_result = state.store.delete_project(project_id);
 
-    // Committed (or nothing was on disk to reach) — drop the now-stale lock and
-    // prune routable in-memory state, in the documented lock order.
-    lock(&state.project_locks).remove(&project_id);
-    lock(&state.projects).remove(&project_id);
-    {
-        let mut active = lock(&state.active_project_id);
-        if *active == Some(project_id) {
-            *active = None;
+    // **An `Err` does not prove nothing was removed.** `write_jsonl` fsyncs the
+    // parent *after* its rename, so the index row can already be gone when the
+    // call fails — the same contract `repoint_project_directory_impl` documents,
+    // and the reason this used to be wrong: it assumed `Err` meant the project
+    // was untouched, kept the lock and every agent live, and left the user
+    // dispatching into a project that would vanish at restart.
+    //
+    // So re-read membership and reconcile from what the index actually says.
+    let still_indexed = state
+        .store
+        .list_projects()
+        .map(|entries| entries.iter().any(|entry| entry.id == project_id));
+
+    match still_indexed {
+        // Committed (or was never there). Tear down regardless of what the
+        // delete returned.
+        Ok(false) => {
+            if delete_result.is_err() {
+                // `Store::delete_project` returns before its best-effort
+                // `remove_dir_all` when the index rewrite errors, so on this
+                // path the row is gone and the project root is orphaned. Finish
+                // the removal it skipped.
+                let _ = std::fs::remove_dir_all(state.store.project_root(project_id));
+            }
+            discard_project_state(state, project_id);
+            // Scrub the archived flag so a future project re-created with this
+            // id (ids are minted fresh, but be defensive) can't inherit stale
+            // archived state.
+            lock(&state.workspace).set_archived(project_id, false);
+            persist_workspace(state);
+            lock(&state.maintenance).remove(&project_id);
+            // The durability of the index rewrite is unconfirmed on this path;
+            // surface it rather than converting an unsynced write to a clean
+            // success. Nothing is left for the user to retry — the row is gone —
+            // so the error names what is uncertain, not what failed.
+            delete_result?;
+            Ok(())
+        }
+        // Nothing was removed. Restore the project so it stays usable and the
+        // delete stays retryable.
+        Ok(true) => {
+            reload_projects(state, &[project_id]);
+            lock(&state.maintenance).remove(&project_id);
+            delete_result?;
+            Ok(())
+        }
+        // The index itself is unreadable, so we cannot say what happened. Leave
+        // the project unloaded and dispatch refusing, and report the more
+        // specific of the two failures.
+        Err(read_error) => {
+            lock(&state.maintenance).remove(&project_id);
+            delete_result?;
+            Err(read_error.into())
         }
     }
-    {
-        let mut needs = lock(&state.needs_session_meta);
-        needs.retain(|id| !agent_ids.contains(id));
-    }
-    lock(&state.agents_by_id).retain(|_, r| r.project_id != project_id);
-    // Scrub the archived flag so a future project re-created with this id (ids
-    // are minted fresh, but be defensive) can't inherit a stale archived state.
-    lock(&state.workspace).set_archived(project_id, false);
-
-    // Nothing to prune: the flat list reads the store index, and
-    // `Store::delete_project` already removed the row. The workspace cache this
-    // used to reconcile is gone, and with it the failure it was patching — a
-    // deleted project resurrecting from a stale snapshot when its directory was
-    // unreachable. The store index is reachable regardless of any working
-    // directory's state, so the delete is simply durable.
-    persist_workspace(state);
-    Ok(())
 }
 
 pub fn open_project_impl(
     state: &AppState,
     project_id: ProjectId,
 ) -> Result<ProjectSummary, AppError> {
+    // Ahead of the lock-free fast path: a project mid-lifecycle-operation must
+    // not be handed out at all, loaded or not. The operations evict before they
+    // mark, so in practice the fast path would miss anyway — but a gate that
+    // depends on that ordering is one refactor away from being no gate.
+    reject_if_under_maintenance(state, project_id)?;
     // Fast path (lock-free): already loaded → intra-process re-open is a
     // no-op returning the existing handle, with no second lock acquisition
     // (`flock` is the inter-process guard only; a process re-locking its own
@@ -2071,6 +2256,9 @@ pub fn open_project_impl(
     // action. `registry_write` is the head of the lock order, so taking it
     // here is order-safe.
     let _open = lock(&state.registry_write);
+    // Refuse a project mid-lifecycle-operation. Without this, opening a cold
+    // sibling during a re-point would load it against the stale working
+    // directory and the repair would leave it there.
     // Re-check under the guard: another thread may have loaded it while we
     // waited → return the existing handle without re-locking.
     if let Some(loaded) = lock(&state.projects).get(&project_id) {
@@ -2093,11 +2281,14 @@ pub fn open_project_impl(
     // corruption it is rather than a misleading `ProjectLocked` on retry.
     let lock_handle = acquire_project_lock(project.id, &project.root)?;
     let agents = project.list_agents()?;
+    // Validate the roster *before* the commit block, not inside it. A
+    // cross-project conflict is a fallible step, so leaving it after the lock
+    // insert would strand the flock and turn a corruption diagnosis into a false
+    // `ProjectLocked` on every retry — the exact failure the local-handle
+    // pattern above exists to prevent.
+    cache_agents(state, &agents)?;
     // All fallible work done — commit the shared maps together.
     lock(&state.project_locks).insert(project.id, lock_handle);
-    for agent in agents {
-        cache_agent(state, agent)?;
-    }
     lock(&state.projects).insert(project.id, project);
     Ok(summary)
 }
@@ -2546,12 +2737,16 @@ pub fn reorder_agents_impl(
         .get(&project_id)
         .cloned()
         .ok_or(AppError::ProjectNotLoaded(project_id))?;
+    // Validate the current roster against the cache **before** rewriting the
+    // registry. Reorder doesn't change record identities, so a conflict is
+    // detectable up front — and validating afterwards would let a known conflict
+    // fail the command with the new order already committed to disk.
+    let existing = project.list_agents()?;
+    cache_agents(state, &existing)?;
     let agents = project.reorder_agents(agent_ids)?;
     // Record contents are unchanged by reorder; this keeps the cache consistent
     // with the list path (same contract as other mutations).
-    for agent in &agents {
-        cache_agent(state, agent.clone())?;
-    }
+    cache_agents(state, &agents)?;
     Ok(agents)
 }
 
@@ -2910,9 +3105,7 @@ pub fn list_agents_impl(
     // listing rather than being cached: an id in two registries is corruption
     // the user is looking straight at, and an empty-or-wrong roster is worse
     // than an error naming it.
-    for agent in &agents {
-        cache_agent(state, agent.clone())?;
-    }
+    cache_agents(state, &agents)?;
     Ok(agents)
 }
 
@@ -6292,16 +6485,21 @@ fn open_project_from_store(state: &AppState, project_id: ProjectId) -> Result<Pr
 }
 
 fn lookup_agent(state: &AppState, agent_id: AgentId) -> Result<(Project, AgentRecord), AppError> {
-    // Register-cache hit: the cached `AgentRecord` carries its
-    // `project_id`, so we resolve the owning project without scanning every
-    // loaded project's `registry.jsonl` from disk. The project is always
-    // loaded when its agents are cached (the cache is populated on open and
-    // cleared on rebind together with `projects`), so a missing project here
-    // is a genuine ProjectNotLoaded, not a stale-cache artifact.
+    // Register-cache hit: the cached `AgentRecord` carries its `project_id`, so
+    // we resolve the owning project without scanning every loaded project's
+    // `registry.jsonl` from disk. **The project is always loaded when its agents
+    // are cached** — the cache is populated on open and evicted together with
+    // `projects` by every path that unloads one, including the lifecycle
+    // operations, which also mark the project under maintenance so the interval
+    // is never observable here. So a missing project is a genuine
+    // `ProjectNotLoaded`, not a stale-cache artifact. Keep it that way: if a
+    // future path evicts one map without the other, this comment is where the
+    // regression will hide.
     let agent = lock(&state.agents_by_id)
         .get(&agent_id)
         .cloned()
         .ok_or(AppError::AgentNotFound(agent_id))?;
+    reject_if_under_maintenance(state, agent.project_id)?;
     let project = lock(&state.projects)
         .get(&agent.project_id)
         .cloned()
@@ -12172,12 +12370,14 @@ mod tests {
             "second process must be refused with ProjectLocked, got {err:?}"
         );
 
-        // state_a removes the directory → its lock `File` drops → released.
-        remove_directory_impl(&state_a, tmp_workdir.path().to_str().unwrap())
-            .await
-            .unwrap();
-        open_project_impl(&state_b, proj.id)
-            .expect("lock released on remove; second process can now open");
+        // state_a deletes the project → its lock `File` drops → released.
+        // Re-pointed from `remove_directory`, which no longer releases anything:
+        // hiding is view-state and deliberately leaves locks held.
+        delete_project_impl(&state_a, proj.id).await.unwrap();
+        assert!(
+            !lock(&state_a.project_locks).contains_key(&proj.id),
+            "the delete released state_a's lock"
+        );
     }
 
     #[tokio::test]
@@ -12195,8 +12395,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn register_cache_populates_clears_on_remove_and_repopulates_on_open() {
-        let (tmp_workdir, _home, state, proj) = fresh_state_with_active_project("alpha").await;
+    async fn register_cache_populates_clears_on_delete_and_repopulates_on_open() {
+        // Re-pointed from `remove_directory`: hiding a directory is view-state
+        // and deliberately clears nothing, so deleting the project is now the
+        // operation that prunes the cache.
+        let (_tmp_workdir, _home, state, proj) = fresh_state_with_active_project("alpha").await;
         let agent =
             create_agent_impl(&state, "assistant", HarnessKind::ClaudeCode, None, None).unwrap();
 
@@ -12207,26 +12410,40 @@ mod tests {
         assert_eq!(found.id, agent.id);
         assert_eq!(project.id, proj.id);
 
-        // Removing the directory prunes its cache entries; the stale agent no
-        // longer resolves.
-        remove_directory_impl(&state, tmp_workdir.path().to_str().unwrap())
-            .await
-            .unwrap();
+        delete_project_impl(&state, proj.id).await.unwrap();
         assert!(lock(&state.agents_by_id).is_empty());
         assert!(matches!(
             lookup_agent(&state, agent.id),
             Err(AppError::AgentNotFound(_))
         ));
+    }
 
-        // Re-init the same directory and open the project → cache repopulated
-        // from disk (the `.switchboard/` state was never deleted).
-        init_directory_impl(&state, tmp_workdir.path().to_str().unwrap())
-            .await
-            .unwrap();
-        open_project_impl(&state, proj.id).unwrap();
-        let (project2, found2) = lookup_agent(&state, agent.id).unwrap();
-        assert_eq!(found2.id, agent.id);
-        assert_eq!(project2.id, proj.id);
+    #[tokio::test]
+    async fn hiding_a_directory_leaves_every_routable_map_untouched() {
+        // Hiding is lossless and reversible, and cancelling an in-flight turn is
+        // the one part that would not be. So it drains nothing: the projects
+        // stay loaded, the agents stay cached, the locks stay held — only the
+        // listing changes.
+        let (tmp_workdir, _home, state, proj) = fresh_state_with_active_project("alpha").await;
+        let agent =
+            create_agent_impl(&state, "assistant", HarnessKind::ClaudeCode, None, None).unwrap();
+
+        remove_directory_impl(&state, tmp_workdir.path().to_str().unwrap());
+
+        assert!(lock(&state.agents_by_id).contains_key(&agent.id));
+        assert!(lock(&state.projects).contains_key(&proj.id));
+        assert!(lock(&state.project_locks).contains_key(&proj.id));
+        assert!(
+            lookup_agent(&state, agent.id).is_ok(),
+            "dispatch still works"
+        );
+        assert!(
+            list_projects_impl(&state)
+                .unwrap()
+                .iter()
+                .all(|row| row.id != proj.id),
+            "only the listing changes"
+        );
     }
 
     #[tokio::test]
@@ -13114,6 +13331,166 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_send_is_refused_for_the_whole_repair_window() {
+        // Finding 1 itself. The repair used to drain *before* evicting, and both
+        // drain steps await — so a send landing in that window resolved the
+        // still-loaded `Project`, built a factory on its stale `directory`, and
+        // the dispatcher created an actor that survived the repair.
+        //
+        // The discriminating observable is the *send's* outcome, not the final
+        // state: after the repair completes, the map holds the new path either
+        // way. So the window is held open with a parked turn, entered
+        // deterministically by waiting for the eviction, and the send inside it
+        // must be refused.
+        let (tmp, state, _emitter) = fresh_state_with_mock();
+        let (agent, project_id) = project_with_agent(&state, &tmp).await;
+        let state = Arc::new(state);
+
+        // Hold the post-eviction window open. Polling for it is not viable —
+        // the drain finishes before a test can look.
+        let barrier = Arc::new(tokio::sync::Notify::new());
+        *lock(&state.maintenance_barrier) = Some(Arc::clone(&barrier));
+
+        let moved = TempDir::new().unwrap();
+        let canonical = moved.path().canonicalize().unwrap();
+        let repoint_state = Arc::clone(&state);
+        let target = moved.path().to_str().unwrap().to_owned();
+        let repointer = tokio::spawn(async move {
+            repoint_project_directory_impl(&repoint_state, project_id, &target).await
+        });
+
+        // Let the repair reach the barrier. Under the old ordering the eviction
+        // sits *after* the drain, so at this point the project is still loaded
+        // and the send below resolves it — which is the failure.
+        let entered = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while lock(&state.projects).contains_key(&project_id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        // The send is attempted whatever happened above, so the assertions read
+        // in order — and the barrier is released on every path, so a failure
+        // reports rather than hanging the suite on a parked repair task.
+        let late = send_msg(&state, agent.id, "late").await;
+        barrier.notify_waiters();
+        let repaired = tokio::time::timeout(std::time::Duration::from_secs(10), repointer).await;
+
+        assert!(entered.is_ok(), "the repair must evict before it drains");
+        assert!(
+            matches!(
+                late,
+                Err(AppError::ProjectUnderMaintenance(_) | AppError::AgentNotFound(_))
+            ),
+            "a send inside the repair window must be refused, got: {late:?}"
+        );
+        repaired.expect("repair completed").unwrap().unwrap();
+        assert_eq!(
+            lock(&state.projects).get(&project_id).unwrap().directory,
+            canonical
+        );
+    }
+
+    #[tokio::test]
+    async fn a_project_under_maintenance_refuses_open_and_dispatch() {
+        // The gate that closes the window a repair opens between evicting
+        // routable state and rebuilding it. Without it, a user opening a cold
+        // sibling mid-repair loads it against the stale working directory and
+        // the repair leaves it there.
+        let (tmp, state, _) = fresh_state_with_mock();
+        let (agent, project_id) = project_with_agent(&state, &tmp).await;
+        lock(&state.maintenance).insert(project_id);
+
+        assert!(matches!(
+            open_project_impl(&state, project_id).unwrap_err(),
+            AppError::ProjectUnderMaintenance(_)
+        ));
+        assert!(matches!(
+            lookup_agent(&state, agent.id).unwrap_err(),
+            AppError::ProjectUnderMaintenance(_)
+        ));
+
+        lock(&state.maintenance).remove(&project_id);
+        open_project_impl(&state, project_id).unwrap();
+    }
+
+    #[tokio::test]
+    async fn repointing_evicts_agents_with_projects_so_a_cached_agent_never_outlives_its_project() {
+        // `lookup_agent` asserts a cached agent always has a loaded project.
+        // Evicting only `state.projects` would falsify that silently, so both
+        // maps go together and the maintenance mark makes the interval
+        // unobservable.
+        let (tmp, state, _) = fresh_state_with_mock();
+        let (agent, project_id) = project_with_agent(&state, &tmp).await;
+        let scope: HashSet<ProjectId> = std::iter::once(project_id).collect();
+
+        let (loaded, agents) = begin_maintenance(&state, &scope);
+        assert_eq!(loaded, vec![project_id]);
+        assert_eq!(agents, vec![agent.id]);
+        assert!(lock(&state.projects).is_empty());
+        assert!(
+            lock(&state.agents_by_id).is_empty(),
+            "the agent cache is evicted with the project, not after it"
+        );
+        assert!(
+            lock(&state.project_locks).contains_key(&project_id),
+            "the lock stays held — it does not move with the working directory"
+        );
+
+        reload_projects(&state, &loaded);
+        assert!(lock(&state.projects).contains_key(&project_id));
+        assert!(lock(&state.agents_by_id).contains_key(&agent.id));
+        assert!(lock(&state.maintenance).is_empty());
+    }
+
+    #[tokio::test]
+    async fn restoring_a_project_reuses_the_lock_this_process_already_holds() {
+        // A restore that re-acquired would `flock` a file this process holds via
+        // a second fd, which conflicts spuriously — so every previously-loaded
+        // project would fail to come back with `ProjectLocked`, creating the
+        // wedge the local-handle pattern exists to prevent.
+        let (tmp, state, _) = fresh_state_with_mock();
+        let (_agent, project_id) = project_with_agent(&state, &tmp).await;
+        let scope: HashSet<ProjectId> = std::iter::once(project_id).collect();
+
+        let (loaded, _) = begin_maintenance(&state, &scope);
+        reload_projects(&state, &loaded);
+
+        assert!(
+            lock(&state.projects).contains_key(&project_id),
+            "the project restores despite this process still holding its lock"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_with_a_conflicting_roster_leaves_no_lock_and_stays_retryable() {
+        // The wedge: a cross-project conflict used to fire after the lock was
+        // committed, so the retry reported `ProjectLocked` against this
+        // process's own handle and the project became permanently unopenable.
+        let (tmp, state, _) = fresh_state_with_mock();
+        let (agent, project_id) = project_with_agent(&state, &tmp).await;
+        lock(&state.projects).remove(&project_id);
+        lock(&state.project_locks).remove(&project_id);
+        // Stage the conflict: the cache claims this agent for another project.
+        let mut impostor = agent.clone();
+        impostor.project_id = Uuid::now_v7();
+        lock(&state.agents_by_id).insert(agent.id, impostor);
+
+        let err = open_project_impl(&state, project_id).unwrap_err();
+        assert!(
+            matches!(err, AppError::AgentProjectConflict { .. }),
+            "the corruption is reported as itself, got: {err:?}"
+        );
+        assert!(
+            !lock(&state.project_locks).contains_key(&project_id),
+            "a failed open must leave no lock behind"
+        );
+
+        // Clear the conflict; the project opens, proving nothing was wedged.
+        lock(&state.agents_by_id).remove(&agent.id);
+        open_project_impl(&state, project_id).unwrap();
+    }
+
+    #[tokio::test]
     async fn repointing_drains_an_in_flight_turn_before_moving_the_directory() {
         // The load-bearing half. A running actor owns a frozen `Project` inside
         // its dispatch-context factory, so evicting `state.projects` alone would
@@ -13231,20 +13608,64 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repointing_a_project_with_no_catalog_row_refuses_rather_than_inventing_one() {
-        // `CatalogMissing` has no in-app repair by design: minting a row for a
-        // dangling id would be inventing an identity, not repairing one. The
-        // refusal is what sends the user to the migration tool instead.
+    async fn repointing_a_project_whose_catalog_row_was_lost_rebinds_its_identity() {
+        // The third repairable state, and the one that was refused for two
+        // rounds on a rationale that turned out to be wrong: binding restores a
+        // mapping the catalog lost, it does not mint an identity — the id
+        // already exists and these projects already reference it. Migration
+        // validation can only stop the *tool* from producing this state; a
+        // partial restore or a sync conflict can produce it at any time.
         let (state, _cwd, project) = state_with_project("alpha").await;
         write_catalog(&state, &[]);
+        assert_eq!(
+            list_projects_impl(&state).unwrap()[0].directory_status,
+            DirectoryStatus::CatalogMissing
+        );
 
         let moved = TempDir::new().unwrap();
+        let canonical = moved.path().canonicalize().unwrap();
+        repoint_project_directory_impl(&state, project.id, moved.path().to_str().unwrap())
+            .await
+            .unwrap();
+
+        let row = &list_projects_impl(&state).unwrap()[0];
+        assert_eq!(row.directory_status, DirectoryStatus::ResolvedAvailable);
+        assert_eq!(
+            row.directory.as_deref(),
+            Some(canonical.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            lock(&state.projects).get(&project.id).unwrap().directory,
+            canonical
+        );
+    }
+
+    #[tokio::test]
+    async fn binding_refuses_a_path_another_directory_identity_already_holds() {
+        // The repair must not become a way around one-id-per-path: stealing
+        // another identity's path would split that directory's projects.
+        let (state, _cwd, project) = state_with_project("alpha").await;
+        let taken = TempDir::new().unwrap();
+        let other = state.store.add_directory(taken.path()).unwrap();
+        // Drop only *our* row, leaving the other identity's in place.
+        let kept: Vec<switchboard_core::DirectoryEntry> = state
+            .store
+            .list_directories()
+            .unwrap()
+            .into_iter()
+            .filter(|entry| entry.directory_id == other.directory_id)
+            .collect();
+        write_catalog(&state, &kept);
+
         let err =
-            repoint_project_directory_impl(&state, project.id, moved.path().to_str().unwrap())
+            repoint_project_directory_impl(&state, project.id, taken.path().to_str().unwrap())
                 .await
                 .unwrap_err();
         assert!(
-            matches!(err, AppError::Core(CoreError::DirectoryNotFound(_))),
+            matches!(
+                err,
+                AppError::Core(CoreError::DuplicateDirectoryPath { .. })
+            ),
             "got: {err:?}"
         );
     }
@@ -13287,32 +13708,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_repoint_whose_catalog_re_read_fails_leaves_the_project_unloaded() {
-        // The other half: if the post-write re-read also fails, there is no
-        // confirmed path, so the projects stay out of `state.projects` and
-        // dispatch refuses rather than running somewhere unverified.
+    async fn a_repoint_refuses_an_unreadable_catalog_without_tearing_anything_down() {
+        // The catalog is resolved before any eviction or drain, so a store we
+        // cannot read fails the command with the projects still loaded and their
+        // agents still running. Tearing down on the way to a guaranteed failure
+        // is pure destruction — the same reason the unrepairable states are
+        // rejected up front.
         let (state, _cwd, project) = state_with_project("alpha").await;
         let moved = TempDir::new().unwrap();
-
-        // Destroy the catalog so both the write and the re-read fail.
         std::fs::remove_file(state.store.root().join("directories.jsonl")).unwrap();
 
         let err =
             repoint_project_directory_impl(&state, project.id, moved.path().to_str().unwrap())
                 .await
                 .unwrap_err();
-        assert!(matches!(err, AppError::Core(_)), "got: {err:?}");
         assert!(
-            !lock(&state.projects).contains_key(&project.id),
-            "no confirmed path means the project stays unloaded"
+            matches!(err, AppError::Core(CoreError::MissingAppendOnlyFile { .. })),
+            "got: {err:?}"
         );
-        // Which is what makes dispatch refuse: every send path resolves its
-        // project through `state.projects` and fails `ProjectNotLoaded` without
-        // an entry there.
-        assert!(matches!(
-            set_active_project_impl(&state, project.id).unwrap_err(),
-            AppError::ProjectNotLoaded(_)
-        ));
+        assert!(
+            lock(&state.projects).contains_key(&project.id),
+            "a refused repair must not unload the project"
+        );
+        assert!(
+            lock(&state.maintenance).is_empty(),
+            "nor leave it marked under maintenance"
+        );
     }
 
     #[tokio::test]
@@ -14286,7 +14707,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remove_directory_drains_turns_releases_locks_and_preserves_disk() {
+    async fn hiding_a_directory_does_not_cancel_an_in_flight_turn() {
+        // Inverted from `remove_directory_drains_turns_releases_locks_and_preserves_disk`.
+        // Hiding claims to be lossless and reversible, and a cancelled turn is
+        // the one thing unhiding cannot restore — so the drain was the single
+        // operation that falsified the property the command advertises, on a
+        // button whose label did not change. The quota cost of an agent running
+        // in a hidden directory is real and is the argument that lost; if it
+        // needs answering it belongs in a separate, explicit "close and hide".
         let (tmp, state, emitter) =
             fresh_state_with_scenario(switchboard_harness::MockScenario::AwaitCancellation);
         let (agent, project_id) = project_with_agent(&state, &tmp).await;
@@ -14298,34 +14726,23 @@ mod tests {
             emitter.wait_for_type("turn_start", 1),
         )
         .await;
-        assert!(lock(&state.project_locks).contains_key(&project_id));
 
-        remove_directory_impl(&state, tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
+        remove_directory_impl(&state, tmp.path().to_str().unwrap());
 
-        // The in-flight turn was drained with source = shutdown, the lock
-        // released, and all in-memory state for the directory dropped.
         let channel = format!("agent:{}", agent.id);
         let cancelled = emitter.snapshot().into_iter().any(|(name, v)| {
-            name == channel
-                && v["type"] == "turn_end"
-                && v["outcome"]["status"] == "cancelled"
-                && v["outcome"]["source"] == "shutdown"
+            name == channel && v["type"] == "turn_end" && v["outcome"]["status"] == "cancelled"
         });
         assert!(
-            cancelled,
-            "remove drains the live turn with source = shutdown"
+            !cancelled,
+            "hiding must not cancel the user's in-flight turn"
         );
-        assert!(!lock(&state.project_locks).contains_key(&project_id));
-        assert!(lock(&state.projects).is_empty());
-        assert!(lock(&state.agents_by_id).is_empty());
-        assert!(lock(&state.directories).is_empty());
-        assert!(lock(&state.active_project_id).is_none());
+        assert!(lock(&state.project_locks).contains_key(&project_id));
+        assert!(lock(&state.projects).contains_key(&project_id));
+        assert!(!lock(&state.agents_by_id).is_empty());
 
         // Hidden, not forgotten: the entry survives so ordering and a later
-        // unhide do too, and the project itself is untouched — it just stops
-        // being listed.
+        // unhide do too, and nothing was written into the working directory.
         let canonical = tmp.path().canonicalize().unwrap();
         assert!(lock(&state.workspace).is_hidden(&canonical));
         assert!(lock(&state.workspace).contains(&canonical));
@@ -14333,20 +14750,8 @@ mod tests {
             list_projects_impl(&state)
                 .unwrap()
                 .iter()
-                .all(|p| p.id != project_id),
-            "a hidden directory's projects drop out of the list"
+                .all(|row| row.id != project_id)
         );
-        assert!(
-            state
-                .store
-                .list_projects()
-                .unwrap()
-                .iter()
-                .any(|p| p.id == project_id),
-            "but nothing is deleted"
-        );
-
-        // Nothing was written into the working directory to begin with.
         assert!(!tmp.path().join(".switchboard").exists());
 
         // Adding the directory back is the unhide gesture, and it is lossless.
@@ -14355,13 +14760,6 @@ mod tests {
             .unwrap();
         assert!(!lock(&state.workspace).is_hidden(&canonical));
         assert_eq!(info.projects.len(), 1);
-        assert_eq!(info.projects[0].id, project_id);
-
-        // Removing an absent/never-added directory is Ok (idempotent).
-        let absent = TempDir::new().unwrap();
-        remove_directory_impl(&state, absent.path().to_str().unwrap())
-            .await
-            .unwrap();
     }
 
     #[tokio::test]
@@ -14767,14 +15165,20 @@ mod tests {
     // ---- remove_directory teardown-race tests ----
 
     #[tokio::test]
-    async fn remove_directory_races_send_no_second_turn_and_no_orphan_actor() {
-        // (a) A `send` racing a `remove_directory` of its agent's directory must
-        // not produce a second `turn_start` after removal begins, and no orphan
+    async fn delete_project_races_send_no_second_turn_and_no_orphan_actor() {
+        // (a) A `send` racing a `delete_project` of its agent's project must not
+        // produce a second `turn_start` after the delete begins, and no orphan
         // dispatcher actor may survive. The first send parks a turn in flight;
-        // remove drains it while a concurrent late send is issued.
+        // the delete drains it while a concurrent late send is issued.
+        //
+        // Re-pointed from `remove_directory` when that became a view-state hide
+        // with no teardown. The race is unchanged and still real — delete
+        // performs exactly this teardown — so the coverage moves rather than
+        // being dropped, which matters most while the drain path is being
+        // rewritten.
         let (tmp, state, emitter) =
             fresh_state_with_scenario(switchboard_harness::MockScenario::AwaitCancellation);
-        let (agent, _project_id) = project_with_agent(&state, &tmp).await;
+        let (agent, project_id) = project_with_agent(&state, &tmp).await;
         let state = Arc::new(state);
 
         // First send starts + parks the turn.
@@ -14787,16 +15191,15 @@ mod tests {
         .await;
         assert_eq!(count_type(&emitter.snapshot(), "turn_start"), 1);
 
-        // Race: remove the directory concurrently with another send to the same
+        // Race: delete the project concurrently with another send to the same
         // agent. Whichever interleaving wins, the cleared `agents_by_id` +
         // dispatcher `Closing` slot guarantee the late send never yields a
         // second turn.
-        let path = tmp.path().to_str().unwrap().to_owned();
         let remove_state = Arc::clone(&state);
         let send_state = Arc::clone(&state);
         let agent_id = agent.id;
-        let remover =
-            tokio::spawn(async move { remove_directory_impl(&remove_state, &path).await });
+        let target = project_id;
+        let remover = tokio::spawn(async move { delete_project_impl(&remove_state, target).await });
         let sender = tokio::spawn(async move { send_msg(&send_state, agent_id, "late").await });
         remover.await.unwrap().unwrap();
         let _ = sender.await.unwrap();
@@ -14814,56 +15217,57 @@ mod tests {
         assert!(lock(&state.agents_by_id).is_empty());
         assert!(lock(&state.projects).is_empty());
         assert!(lock(&state.project_locks).is_empty());
-        assert!(lock(&state.directories).is_empty());
+        // The *directory* stays catalogued and loaded — deleting a project has
+        // never removed its directory, and hiding no longer removes anything.
+        assert_eq!(lock(&state.directories).len(), 1);
     }
 
     #[tokio::test]
-    async fn remove_directory_races_create_agent_and_create_project() {
-        // (b) create_agent / create_project racing a remove of the same
-        // directory must not strand state for a removed directory. After the
-        // race settles, the directory is gone and no project/agent for it
-        // survives in the routable maps.
+    async fn delete_project_races_create_agent_and_create_project() {
+        // (b) create_agent / create_project racing a delete of the same project
+        // must not strand state for it. Re-pointed from `remove_directory` when
+        // that became a view-state hide; the teardown race is unchanged and
+        // delete is the operation that still performs it.
         let (tmp, state, _emitter) = fresh_state_with_mock();
-        let (_agent, _project_id) = project_with_agent(&state, &tmp).await;
+        let (_agent, project_id) = project_with_agent(&state, &tmp).await;
         let state = Arc::new(state);
 
-        let path = tmp.path().to_str().unwrap().to_owned();
-        let dir_path = lock(&state.directories)
+        let dir_path: String = lock(&state.directories)
             .keys()
             .next()
             .unwrap()
             .to_string_lossy()
             .into_owned();
 
-        let remove_state = Arc::clone(&state);
+        let delete_state = Arc::clone(&state);
         let agent_state = Arc::clone(&state);
         let project_state = Arc::clone(&state);
-        let remove_path = path.clone();
-        let remover =
-            tokio::spawn(async move { remove_directory_impl(&remove_state, &remove_path).await });
+        let deleter =
+            tokio::spawn(async move { delete_project_impl(&delete_state, project_id).await });
         // create_agent / create_project are synchronous; run them on blocking
-        // tasks so they truly race the async remove.
+        // tasks so they truly race the async delete.
         let agent_h = tokio::task::spawn_blocking(move || {
             create_agent_impl(&agent_state, "racer", HarnessKind::ClaudeCode, None, None)
         });
         let project_h = tokio::task::spawn_blocking(move || {
             create_project_impl(&project_state, "racer-proj", &dir_path)
         });
-        remover.await.unwrap().unwrap();
+        deleter.await.unwrap().unwrap();
         let _ = agent_h.await.unwrap();
         let _ = project_h.await.unwrap();
 
-        // The directory is gone. `registry_write` serializes the racers against
-        // remove, so any create that happened to land BEFORE remove is torn
-        // down by it (its project lives under the removed directory), and any
-        // that landed AFTER could not resolve the directory/active project.
-        assert!(lock(&state.directories).is_empty());
-        let no_survivor_under_removed = lock(&state.projects)
-            .values()
-            .all(|p| p.directory.to_string_lossy() != *path);
+        // `registry_write` serializes the racers against the delete, and the
+        // maintenance mark refuses any that land inside its window — so the
+        // deleted project is gone from every routable map either way.
         assert!(
-            no_survivor_under_removed,
-            "no project for the removed directory survives in the routable map"
+            !lock(&state.projects).contains_key(&project_id),
+            "the deleted project does not survive in the routable map"
+        );
+        assert!(
+            lock(&state.agents_by_id)
+                .values()
+                .all(|record| record.project_id != project_id),
+            "nor do its agents"
         );
         assert!(
             state.dispatcher.agent_slot_count() == 0,
@@ -14872,46 +15276,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remove_directory_races_open_project() {
-        // (c) open_project of one of the removed directory's projects, racing
-        // the remove. Either the open wins (project loaded, then it is a
-        // distinct directory's state — but here it's the same directory, so
-        // remove tears it down) or remove wins (open fails to resolve). Either
-        // way no post-remove project/lock/actor survives for the directory.
+    async fn delete_project_races_open_project() {
+        // (c) `open_project` of a project racing its own delete. Either the open
+        // wins and the delete tears it back down, the delete wins and the open
+        // cannot resolve it, or the open lands inside the maintenance window and
+        // is refused. No post-delete project, lock, or actor survives.
+        //
+        // Re-pointed from `remove_directory`, which no longer tears anything
+        // down. The maintenance refusal is the arm that is new: before it, an
+        // open landing mid-teardown could load the project back in.
         let (tmp, state, _emitter) = fresh_state_with_mock();
         let (_agent, project_id) = project_with_agent(&state, &tmp).await;
-        // Evict the project from the loaded set so open takes the first-open
-        // (directory-scan) path and genuinely races the remove.
+        // Evict from the loaded set so the open takes the first-open path and
+        // genuinely races the delete.
         let state = Arc::new(state);
         {
             lock(&state.projects).remove(&project_id);
             lock(&state.project_locks).remove(&project_id);
         }
 
-        let path = tmp.path().to_str().unwrap().to_owned();
-        let remove_state = Arc::clone(&state);
+        let delete_state = Arc::clone(&state);
         let open_state = Arc::clone(&state);
-        let remover =
-            tokio::spawn(async move { remove_directory_impl(&remove_state, &path).await });
+        let deleter =
+            tokio::spawn(async move { delete_project_impl(&delete_state, project_id).await });
         let opener =
             tokio::task::spawn_blocking(move || open_project_impl(&open_state, project_id));
-        remover.await.unwrap().unwrap();
-        let _ = opener.await.unwrap();
+        deleter.await.unwrap().unwrap();
+        match opener.await.unwrap() {
+            Ok(_) | Err(AppError::ProjectUnderMaintenance(_) | AppError::Core(_)) => {}
+            Err(other) => panic!("unexpected open outcome: {other:?}"),
+        }
 
-        // The directory is removed; nothing routable for it survives.
-        assert!(lock(&state.directories).is_empty());
         assert!(
             !lock(&state.projects).contains_key(&project_id),
-            "no post-remove project survives for the removed directory"
+            "the deleted project does not survive in the routable map"
         );
-        assert!(
-            !lock(&state.project_locks).contains_key(&project_id),
-            "no post-remove lock survives"
-        );
-        assert!(
-            state.dispatcher.agent_slot_count() == 0,
-            "no orphan dispatcher actor survives the race"
-        );
+        assert!(!lock(&state.project_locks).contains_key(&project_id));
+        assert!(state.dispatcher.agent_slot_count() == 0);
     }
 
     // ---- load_project_conversation: pure-merge unit tests (system-design §7) ----
@@ -19285,9 +19686,7 @@ mod tests {
         let canonical = repo.path().canonicalize().unwrap();
         assert!(lock(&state.git_registry).contains(&canonical));
 
-        remove_directory_impl(&state, repo.path().to_str().unwrap())
-            .await
-            .unwrap();
+        remove_directory_impl(&state, repo.path().to_str().unwrap());
 
         assert!(
             lock(&state.git_registry).contains(&canonical),

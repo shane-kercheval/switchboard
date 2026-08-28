@@ -488,6 +488,62 @@ impl Store {
         Ok(updated)
     }
 
+    /// Bind a `directory_id` that has **lost** its catalog row to a path.
+    ///
+    /// The narrow repair for a project whose `directory_id` resolves to nothing.
+    /// It restores a mapping, it does not mint an identity: the id already
+    /// exists and is already referenced by the projects being repaired — what
+    /// was lost is only the row saying where it lives. (An earlier reading
+    /// called this "inventing an identity"; that was wrong, and it is why this
+    /// stayed unimplemented longer than it should have.)
+    ///
+    /// **Refuses an id that still has a row**, so it can never be a back door
+    /// around [`Self::repoint_directory`]'s collapse semantics, and refuses a
+    /// path another id holds, upholding the same one-id-per-canonical-path
+    /// invariant as the other two writers.
+    ///
+    /// The state this repairs cannot arise from ordinary use — the catalog never
+    /// deletes a row a project references — so the realistic sources are an
+    /// external edit, a partial restore, or a sync conflict. Those can happen at
+    /// any time, which is why an in-app repair is worth having and not merely a
+    /// migration-tool concern.
+    pub fn bind_directory(&self, id: DirectoryId, path: &Path) -> Result<DirectoryEntry> {
+        let canonical = std::fs::canonicalize(path).map_err(|e| CoreError::io(path, e))?;
+        if !canonical.is_dir() {
+            return Err(CoreError::NotADirectory { path: canonical });
+        }
+        let entries = self.list_directories()?;
+        if entries.iter().any(|e| e.directory_id == id) {
+            return Err(CoreError::DuplicateDirectoryId(id));
+        }
+        if let Some(other) = entries.iter().find(|e| e.path == canonical) {
+            return Err(CoreError::DuplicateDirectoryPath {
+                path: canonical,
+                existing: other.directory_id,
+            });
+        }
+        let entry = DirectoryEntry {
+            directory_id: id,
+            path: canonical,
+        };
+        append_jsonl(&self.catalog_path(), &entry)?;
+        Ok(entry)
+    }
+
+    /// Every path the catalog currently associates with `id`.
+    ///
+    /// Plural because a duplicated id has more than one, and the repair has to
+    /// retire **all** of them from view-state — [`Self::directory_path`] answers
+    /// `Err` there, which would leave stale rows behind.
+    pub fn directory_paths(&self, id: DirectoryId) -> Result<Vec<PathBuf>> {
+        Ok(self
+            .list_directories()?
+            .into_iter()
+            .filter(|entry| entry.directory_id == id)
+            .map(|entry| entry.path)
+            .collect())
+    }
+
     /// The path a `directory_id` currently resolves to.
     ///
     /// **Catalog entries are never deleted while any project references them.**
@@ -1519,6 +1575,85 @@ mod tests {
             canonical,
             "the repair must actually make the project dispatchable"
         );
+    }
+
+    #[test]
+    fn binding_restores_a_lost_mapping_without_minting_an_identity() {
+        // The repair for a catalog that lost a row. The id is unchanged — the
+        // projects referencing it resolve again — which is what distinguishes
+        // restoring a mapping from inventing an identity.
+        let (root, _cwd, store, id) = store_with_dir();
+        let project = store.create_project(id, "alpha").unwrap();
+        crate::io::write_jsonl::<DirectoryEntry>(&root.path().join(DIRECTORIES_CATALOG), &[])
+            .unwrap();
+        assert!(matches!(
+            store.directory_path(id).unwrap_err(),
+            CoreError::DirectoryNotFound(_)
+        ));
+
+        let home = TempDir::new().unwrap();
+        let canonical = std::fs::canonicalize(home.path()).unwrap();
+        assert_eq!(
+            store.bind_directory(id, home.path()).unwrap().path,
+            canonical
+        );
+
+        assert_eq!(store.directory_path(id).unwrap(), canonical);
+        assert_eq!(store.open_project(project.id).unwrap().directory, canonical);
+    }
+
+    #[test]
+    fn binding_an_id_that_still_has_a_row_is_refused() {
+        // Otherwise the repair for an ambiguous identity would be the thing that
+        // creates one. Re-pointing is the operation for an id that resolves.
+        let (_root, _cwd, store, id) = store_with_dir();
+        let elsewhere = TempDir::new().unwrap();
+        assert!(matches!(
+            store.bind_directory(id, elsewhere.path()).unwrap_err(),
+            CoreError::DuplicateDirectoryId(_)
+        ));
+    }
+
+    #[test]
+    fn binding_refuses_a_path_another_identity_holds() {
+        let (root, _cwd, store, id) = store_with_dir();
+        let taken = TempDir::new().unwrap();
+        let other = store.add_directory(taken.path()).unwrap();
+        let kept: Vec<DirectoryEntry> = store
+            .list_directories()
+            .unwrap()
+            .into_iter()
+            .filter(|entry| entry.directory_id == other.directory_id)
+            .collect();
+        crate::io::write_jsonl(&root.path().join(DIRECTORIES_CATALOG), &kept).unwrap();
+
+        assert!(matches!(
+            store.bind_directory(id, taken.path()).unwrap_err(),
+            CoreError::DuplicateDirectoryPath { existing, .. } if existing == other.directory_id
+        ));
+    }
+
+    #[test]
+    fn directory_paths_reports_every_row_for_an_ambiguous_id() {
+        // `directory_path` errors on ambiguity, so a repair that used it to find
+        // what to retire left the surplus rows behind.
+        let (root, cwd, store, id) = store_with_dir();
+        let extra = TempDir::new().unwrap();
+        let extra_path = std::fs::canonicalize(extra.path()).unwrap();
+        crate::io::append_jsonl(
+            &root.path().join(DIRECTORIES_CATALOG),
+            &DirectoryEntry {
+                directory_id: id,
+                path: extra_path.clone(),
+            },
+        )
+        .unwrap();
+
+        let mut paths = store.directory_paths(id).unwrap();
+        paths.sort();
+        let mut expected = vec![std::fs::canonicalize(cwd.path()).unwrap(), extra_path];
+        expected.sort();
+        assert_eq!(paths, expected);
     }
 
     #[test]

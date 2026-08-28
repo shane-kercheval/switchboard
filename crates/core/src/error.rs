@@ -35,6 +35,15 @@ pub enum CoreError {
     #[error("directory not found in the store catalog: {0}")]
     DirectoryNotFound(uuid::Uuid),
 
+    /// A bind would add a second catalog row for an id that already has one.
+    ///
+    /// `bind_directory` exists only to restore a *lost* mapping; letting it run
+    /// on a live id would produce the ambiguous state
+    /// [`Self::AmbiguousDirectory`] describes, by the very command meant to
+    /// repair it. Re-pointing is the operation for an id that still resolves.
+    #[error("directory {0} already has a catalog entry — re-point it instead of binding")]
+    DuplicateDirectoryId(uuid::Uuid),
+
     /// Two or more catalog entries claim the same `directory_id`, so the id
     /// resolves to no single path.
     ///

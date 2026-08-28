@@ -221,6 +221,7 @@ const invokeMock = vi.fn(async (cmd: string, args?: Record<string, unknown>): Pr
         name: args?.name as string,
         created_at: "2026-05-20T00:00:00Z",
         directory: args?.directory as string,
+        directory_id: `dir:${args?.directory as string}`,
         directory_status: "resolved_available",
         last_activity: "2026-05-20T00:00:00Z",
         archived: false,
@@ -398,6 +399,9 @@ function listing(
   return {
     name: "alpha",
     created_at: "2026-05-20T00:00:00Z",
+    // Fixtures group by directory path, so deriving the opaque id from it keeps
+    // siblings siblings without hard-coding a UUID per directory.
+    directory_id: `dir:${over.directory}`,
     directory_status: "resolved_available",
     last_activity: "2026-05-20T00:00:00Z",
     archived: false,

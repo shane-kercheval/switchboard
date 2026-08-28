@@ -61,6 +61,13 @@ pub enum AppError {
     #[error("project {0} is not loaded")]
     ProjectNotLoaded(ProjectId),
 
+    /// The project is mid-lifecycle-operation (a re-point or a delete has
+    /// evicted its routable state and is rebuilding it). Distinct from
+    /// [`Self::ProjectNotLoaded`]: the project exists and will be usable again
+    /// shortly, so the caller should retry rather than treat it as gone.
+    #[error("project {0} is being repaired — try again in a moment")]
+    ProjectUnderMaintenance(ProjectId),
+
     /// One `AgentId` is claimed by two projects' registries.
     ///
     /// Cannot happen from ordinary use — agent ids are minted fresh and an

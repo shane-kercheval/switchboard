@@ -105,6 +105,17 @@ impl Workspace {
         }
     }
 
+    /// Drop an entry entirely, with its hidden flag.
+    ///
+    /// Not the inverse of [`Self::add`] for user-facing purposes — "remove
+    /// directory" hides. This is for retiring a path that no longer names
+    /// anything: the surplus rows a duplicated directory identity left behind,
+    /// which would otherwise linger in the user's list pointing nowhere.
+    pub fn forget_path(&mut self, path: &Path) {
+        self.entries.retain(|entry| entry.path != path);
+        self.hidden.remove(path);
+    }
+
     /// Hide (or unhide) a directory. Returns whether the set changed.
     pub fn set_hidden(&mut self, path: &Path, hidden: bool) -> bool {
         if hidden {

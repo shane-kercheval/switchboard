@@ -490,9 +490,8 @@ async fn init_directory(state: State<'_, AppState>, path: String) -> Result<Dire
 
 #[tauri::command]
 async fn remove_directory(state: State<'_, AppState>, path: String) -> Result<(), String> {
-    remove_directory_impl(state.inner(), &path)
-        .await
-        .map_err(|e| e.to_string())
+    remove_directory_impl(state.inner(), &path);
+    Ok(())
 }
 
 /// Repair a project whose working directory moved, was deleted, or is claimed

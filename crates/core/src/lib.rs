@@ -26,7 +26,7 @@ pub use attachment::{
     Attachment, AttachmentKind, render_dispatched_prompt_with_attachments,
     render_prompt_with_attachments,
 };
-pub use directory::{Directory, DirectoryConfig};
+pub use directory::Directory;
 pub use error::{CoreError, Result};
 pub use harness::{HarnessKind, SelectionAxis};
 pub use ids::{DirectoryId, ProjectId};

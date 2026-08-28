@@ -175,7 +175,7 @@ const invokeMock = vi.fn(async (cmd: string, args?: Record<string, unknown>): Pr
     case "list_projects":
       // Only projects in registered directories surface (matches the real
       // backend: the workspace registry gates which projects are listed).
-      return backend.projects.filter((p) => backend.dirs.has(p.directory));
+      return backend.projects.filter((p) => p.directory !== null && backend.dirs.has(p.directory));
     case "pick_directory": {
       // Read-only probe: discovers projects on disk for the chosen folder
       // WITHOUT registering it (no mutation of `backend.dirs`). Mirrors the real
@@ -221,7 +221,7 @@ const invokeMock = vi.fn(async (cmd: string, args?: Record<string, unknown>): Pr
         name: args?.name as string,
         created_at: "2026-05-20T00:00:00Z",
         directory: args?.directory as string,
-        available: true,
+        directory_status: "resolved_available",
         last_activity: "2026-05-20T00:00:00Z",
         archived: false,
       };
@@ -398,7 +398,7 @@ function listing(
   return {
     name: "alpha",
     created_at: "2026-05-20T00:00:00Z",
-    available: true,
+    directory_status: "resolved_available",
     last_activity: "2026-05-20T00:00:00Z",
     archived: false,
     ...over,
@@ -433,7 +433,8 @@ function seedProject(opts: {
       id: opts.projectId,
       directory: dir,
       name: opts.name ?? "alpha",
-      available: opts.available ?? true,
+      directory_status:
+        (opts.available ?? true) ? "resolved_available" : "resolved_path_unavailable",
       last_activity: opts.lastActivity ?? "2026-05-20T00:00:00Z",
     }),
   );
@@ -1888,7 +1889,7 @@ describe("App", () => {
     });
     const lockedRow = backend.projects.find((project) => project.id === "p-a");
     if (lockedRow === undefined) throw new Error("expected seeded project");
-    lockedRow.available = false;
+    lockedRow.directory_status = "resolved_path_unavailable";
     await mountApp();
     await waitFor(() => expect(screen.getByTestId("project-row")).toBeInTheDocument());
 
@@ -1921,7 +1922,7 @@ describe("App", () => {
     seedProject({ projectId: "p-a", directory: DIR_A, name: "alpha", agents: [] });
     const row = backend.projects.find((project) => project.id === "p-a");
     if (row === undefined) throw new Error("expected seeded project");
-    row.available = false;
+    row.directory_status = "resolved_path_unavailable";
     backend.failOpenFor.set("p-a", { type: "other", message: "directory disappeared" });
     await mountApp();
 

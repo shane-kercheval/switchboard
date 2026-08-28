@@ -26,6 +26,7 @@
   import { revealProjectBranch } from "$lib/state/gitView.svelte";
   import { cancelSend } from "$lib/state/index.svelte";
   import type { ProjectId, ProjectListing } from "$lib/types";
+  import { projectIsAvailable } from "$lib/types";
   import { validateProjectName, normalizeProjectName } from "$lib/projectName";
   import type { NameValidation } from "$lib/nameValidation";
   import { basename, cn, relativeTime } from "$lib/utils";
@@ -121,7 +122,9 @@
     const q = searchQuery.trim().toLowerCase();
     if (q === "") return projectsInView;
     return projectsInView.filter(
-      (p) => p.name.toLowerCase().includes(q) || basename(p.directory).toLowerCase().includes(q),
+      (p) =>
+        p.name.toLowerCase().includes(q) ||
+        (p.directory !== null && basename(p.directory).toLowerCase().includes(q)),
     );
   });
   const segmentClass = (selected: boolean): string =>
@@ -171,6 +174,15 @@
     renameValidation.ok || renameValidation.reason === "empty" ? null : renameValidation.message,
   );
   const canSave = $derived(renameValidation.ok && !renaming);
+
+  /// A project's directory for display. `null` means its directory identity
+  /// resolves to no single path — corruption the user needs to see named, not a
+  /// blank where a path should be.
+  const UNRESOLVED_DIRECTORY = "working directory unresolved";
+  const directoryLabel = (project: ProjectListing): string =>
+    project.directory ?? UNRESOLVED_DIRECTORY;
+  const directoryBasename = (project: ProjectListing): string =>
+    project.directory === null ? UNRESOLVED_DIRECTORY : basename(project.directory);
 
   function startEdit(project: ProjectListing): void {
     pendingDelete = null;
@@ -356,6 +368,13 @@
     archiveError = null;
     gitRevealError = null;
     openActionError = null;
+    if (project.directory === null) {
+      gitRevealError = {
+        projectId: project.id,
+        message: "This project's working directory could not be resolved.",
+      };
+      return;
+    }
     const result = await revealProjectBranch(project.id, project.directory);
     if (result.kind === "unresolved") {
       gitRevealError = {
@@ -368,6 +387,30 @@
         message: result.message,
       };
     }
+  }
+
+  /// Run an action that needs the project's working directory path.
+  ///
+  /// `directory` is null when the project's directory identity resolves to no
+  /// single path (missing or duplicated catalog row). There is nothing to open,
+  /// and guessing a path is exactly what the backend refuses to do, so this
+  /// reports the condition in the same slot an action failure would use rather
+  /// than passing an empty string down to the OS.
+  function runProjectPathAction(
+    project: ProjectListing,
+    action: (directory: string) => Promise<void>,
+  ): void {
+    if (project.directory === null) {
+      archiveError = null;
+      gitRevealError = null;
+      openActionError = {
+        projectId: project.id,
+        message: "This project's working directory could not be resolved.",
+      };
+      return;
+    }
+    const directory = project.directory;
+    runProjectOpenAction(project, () => action(directory));
   }
 
   function runProjectOpenAction(project: ProjectListing, action: () => Promise<void>): void {
@@ -637,12 +680,12 @@
                 </div>
                 <div class="text-muted flex w-full items-center gap-1 text-xs leading-4">
                   <Tooltip
-                    label={project.directory}
+                    label={directoryLabel(project)}
                     delayDuration={SUPPLEMENTAL_TOOLTIP_DELAY}
                     side="right"
                   >
                     {#snippet trigger(props)}
-                      <span {...props} class="truncate">{basename(project.directory)}</span>
+                      <span {...props} class="truncate">{directoryBasename(project)}</span>
                     {/snippet}
                   </Tooltip>
                 </div>
@@ -658,7 +701,7 @@
               </div>
             {:else}
               <Tooltip
-                label={project.directory}
+                label={directoryLabel(project)}
                 delayDuration={SUPPLEMENTAL_TOOLTIP_DELAY}
                 side="right"
               >
@@ -679,14 +722,14 @@
                       <span class="text-fg truncate text-[13px] font-semibold">
                         {project.name}
                       </span>
-                      {#if !project.available}
+                      {#if !projectIsAvailable(project)}
                         <Badge class="ml-auto shrink-0" testid="project-unavailable"
                           >unavailable</Badge
                         >
                       {/if}
                     </div>
                     <div class="text-muted flex w-full items-center gap-1 text-xs leading-4">
-                      <span class="truncate">{basename(project.directory)}</span>
+                      <span class="truncate">{directoryBasename(project)}</span>
                       <span>·</span>
                       <span class="shrink-0"
                         >{relativeTime(project.last_activity, new Date(relativeNow))}</span
@@ -773,7 +816,7 @@
                         </DropdownMenuItem>
                         <DropdownMenuItem
                           onSelect={() =>
-                            runProjectOpenAction(project, () => openInEditor(project.directory))}
+                            runProjectPathAction(project, (directory) => openInEditor(directory))}
                           class="gap-2"
                           data-testid="project-action-editor"
                         >
@@ -787,7 +830,7 @@
                         </DropdownMenuItem>
                         <DropdownMenuItem
                           onSelect={() =>
-                            runProjectOpenAction(project, () => openInTerminal(project.directory))}
+                            runProjectPathAction(project, (directory) => openInTerminal(directory))}
                           class="gap-2"
                           data-testid="project-action-terminal"
                         >
@@ -801,7 +844,7 @@
                         </DropdownMenuItem>
                         <DropdownMenuItem
                           onSelect={() =>
-                            runProjectOpenAction(project, () => revealInFinder(project.directory))}
+                            runProjectPathAction(project, (directory) => revealInFinder(directory))}
                           class="gap-2"
                           data-testid="project-action-reveal"
                         >

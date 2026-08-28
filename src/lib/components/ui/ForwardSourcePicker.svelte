@@ -19,9 +19,9 @@
   /// how to read a roster, how to open and validate. Consumers spread this into
   /// their own [`CrossProjectConfig`] rather than passing it directly.
   export type CrossProjectBase = {
-    /// `directory` is the owner locator: the roster read targets exactly this
-    /// directory rather than scanning, so an unrelated corrupt one can't interfere.
-    projects: { id: ProjectId; name: string; directory: string }[];
+    /// No `directory`: it existed only to locate the roster read, which now
+    /// resolves from the project id alone.
+    projects: { id: ProjectId; name: string }[];
     /// Read a project's roster for **display**. Side-effect-free — no load, no lock.
     loadAgents: (projectId: ProjectId) => Promise<AgentRecord[]>;
     /// Open and validate the project. Shared so validation isn't reimplemented

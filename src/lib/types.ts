@@ -561,22 +561,46 @@ export type ProjectSummary = {
   created_at: string;
 };
 
+// Mirror of Rust `DirectoryStatus` — why a project's working directory is or
+// isn't usable. Four states rather than a boolean because the three failures
+// have different causes and different repairs:
+//   - `resolved_path_unavailable`: the ordinary moved/deleted/unmounted folder.
+//     Repairable by re-pointing the directory.
+//   - `catalog_ambiguous`: two catalog rows claim one directory identity.
+//     Corruption, also repaired by a re-point (which collapses them).
+//   - `catalog_missing`: no catalog row at all. Corruption with no in-app repair.
+// New variants land additively (the Rust enum is `#[non_exhaustive]`), so
+// consumers must degrade on an unknown value rather than assume exhaustiveness.
+export type DirectoryStatus =
+  | "resolved_available"
+  | "resolved_path_unavailable"
+  | "catalog_missing"
+  | "catalog_ambiguous";
+
 // Mirror of Rust `ProjectListing` (`crates/app/src/commands.rs`) — one row of
 // the flat cross-directory project list. `directory` is the owning directory's
-// path (label + spawn cwd); `available` is whether that directory is currently
-// loaded/readable; `last_activity` is the recency-ordering key (journal mtime
-// or `created_at`).
+// path (label + spawn cwd), `null` when the directory identity resolves to no
+// single path; `last_activity` is the recency-ordering key (journal mtime or
+// `created_at`).
 export type ProjectListing = {
   id: ProjectId;
   name: string;
   created_at: string;
-  directory: string;
-  available: boolean;
+  directory: string | null;
+  directory_status: DirectoryStatus;
   last_activity: string;
   /// User-global view-state (from `workspace.yaml`): the user archived this
   /// project, hiding it from the default `Active` view. Not on-disk project state.
   archived: boolean;
 };
+
+// Whether a project can be dispatched into. The one question most callers ask —
+// kept as a helper so each doesn't re-derive it, and so an added
+// `DirectoryStatus` variant defaults to "not available" rather than silently
+// reading as usable.
+export function projectIsAvailable(listing: { directory_status: DirectoryStatus }): boolean {
+  return listing.directory_status === "resolved_available";
+}
 
 // Mirror of Rust `WorkspaceDirectoryInfo` / `WorkspaceDirectories`. The
 // switcher renders directory rows independent of projects (so empty directories
@@ -587,6 +611,10 @@ export type ProjectListing = {
 export type WorkspaceDirectoryInfo = {
   path: string;
   available: boolean;
+  /// The user hid this directory ("remove directory"), so its projects are
+  /// omitted from the project list. The entry survives and adding the directory
+  /// back unhides it — nothing is deleted.
+  hidden: boolean;
 };
 
 export type WorkspaceDirectories = {

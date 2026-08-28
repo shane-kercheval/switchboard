@@ -29,7 +29,7 @@ beforeEach(() => {
       id: PROJECT_ID,
       name: "archived-project",
       directory: "/work/archived-project",
-      available: true,
+      directory_status: "resolved_available",
       archived: true,
       created_at: "2026-05-16T00:00:00Z",
       last_activity: "2026-05-16T00:00:00Z",

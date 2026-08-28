@@ -1148,7 +1148,7 @@ describe("ComposeBar", () => {
           name: "project",
           created_at: "2026-05-16T00:00:00Z",
           directory: "/work/project",
-          available: true,
+          directory_status: "resolved_available",
           last_activity: "2026-05-16T00:00:00Z",
           archived: false,
         },
@@ -4347,7 +4347,7 @@ describe("ComposeBar prompt mode", () => {
           name: "here",
           created_at: "2026-05-16T00:00:00Z",
           directory: "/work/here",
-          available: true,
+          directory_status: "resolved_available",
           last_activity: "2026-05-16T00:00:00Z",
           archived: false,
         },
@@ -4356,7 +4356,7 @@ describe("ComposeBar prompt mode", () => {
           name: "backend",
           created_at: "2026-05-16T00:00:00Z",
           directory: "/work/backend",
-          available: true,
+          directory_status: "resolved_available",
           last_activity: "2026-05-16T00:00:00Z",
           archived: false,
         },
@@ -4411,10 +4411,10 @@ describe("ComposeBar prompt mode", () => {
       const reads = () =>
         invokeMock.mock.calls.filter((c) => c[0] === "list_project_agents_readonly");
       expect(reads()).toHaveLength(1);
-      expect(reads()[0]?.[1]).toEqual({
-        projectId: OTHER_PROJECT,
-        directory: "/work/backend",
-      });
+      // Exact payload keys: the roster read resolves the registry from the
+      // project id alone, so a directory arriving here would mean a caller
+      // re-introduced the locator the store made redundant.
+      expect(reads()[0]?.[1]).toEqual({ projectId: OTHER_PROJECT });
     });
 
     it("keeps a restored chip's stored label when the refresh read fails", async () => {
@@ -4667,7 +4667,7 @@ describe("ComposeBar prompt mode", () => {
 
       await waitFor(() => {
         const call = invokeMock.mock.calls.find((c) => c[0] === "list_project_agents_readonly");
-        expect(call?.[1]).toEqual({ projectId: OTHER_PROJECT, directory: "/work/backend" });
+        expect(call?.[1]).toEqual({ projectId: OTHER_PROJECT });
       });
     });
 
@@ -4791,7 +4791,7 @@ describe("ComposeBar prompt mode", () => {
         name: "project",
         created_at: "2026-05-16T00:00:00Z",
         directory: "/work/project",
-        available: true,
+        directory_status: "resolved_available",
         last_activity: "2026-05-16T00:00:00Z",
         archived: false,
       },
@@ -6376,7 +6376,7 @@ describe("ComposeBar — cross-agent forward", () => {
           name: "here",
           created_at: "2026-05-16T00:00:00Z",
           directory: "/work/here",
-          available: true,
+          directory_status: "resolved_available",
           last_activity: "2026-05-16T00:00:00Z",
           archived: false,
         },
@@ -6385,7 +6385,7 @@ describe("ComposeBar — cross-agent forward", () => {
           name: "backend",
           created_at: "2026-05-16T00:00:00Z",
           directory: "/work/backend",
-          available: true,
+          directory_status: "resolved_available",
           last_activity: "2026-05-16T00:00:00Z",
           archived: false,
         },

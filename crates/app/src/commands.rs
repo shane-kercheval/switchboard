@@ -12,8 +12,8 @@ use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
 use switchboard_core::{
     AgentId, AgentProfile, AgentProfileSlot, AgentRecord, Attachment, CoreError, Directory,
-    HarnessKind, MessagePin, Project, ProjectId, ProjectSummary, SelectionAxis, SendId,
-    SessionLocator, normalize_selection,
+    DirectoryId, DirectoryResolution, HarnessKind, MessagePin, Project, ProjectEntry, ProjectId,
+    ProjectSummary, SelectionAxis, SendId, SessionLocator, normalize_selection,
 };
 use switchboard_dispatcher::{
     CancelOutcome, CurrentTurnWait, DispatchContextFactory, Dispatcher, EventEmitter, OnBusy,
@@ -35,62 +35,150 @@ use crate::state::{AppState, lock, persist_git_registry, persist_workspace};
 
 /// Returned by `init_directory_impl` — gives the caller everything it needs
 /// to render the directory header (path) and project list in one round trip.
+///
+/// No `has_switchboard`: nothing is created in the working directory any more,
+/// so "has this directory been initialized" is not a question with an answer.
+/// A directory the store has never seen simply has no projects.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DirectoryInfo {
     pub path: String,
-    pub has_switchboard: bool,
     pub projects: Vec<ProjectSummary>,
 }
 
+/// Why a project's working directory is or isn't usable — the shape the flat
+/// project list reports per row.
+///
+/// **Four states, not a boolean.** The three failures have different causes and
+/// different repairs, and this is the only place a human sees any of them:
+/// [`Self::ResolvedPathUnavailable`] is the ordinary moved-or-deleted checkout
+/// and [`Self::CatalogAmbiguous`] is corruption, both fixed by re-pointing the
+/// directory; [`Self::CatalogMissing`] has no in-app repair. Flattening them
+/// here would discard the distinction at the boundary and make recovering it a
+/// second backend-and-wire change later.
+///
+/// `#[non_exhaustive]` because it crosses IPC — the frontend's reducer degrades
+/// on an unknown discriminant rather than breaking.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum DirectoryStatus {
+    /// Catalogued and the path exists — the project can be dispatched into.
+    ResolvedAvailable,
+    /// Catalogued, but the path is gone (moved, deleted, unmounted). Repair is
+    /// re-pointing the directory at where the checkout lives now.
+    ResolvedPathUnavailable,
+    /// The project's `directory_id` has no catalog row. Corruption — the
+    /// catalog never deletes a row a project references.
+    CatalogMissing,
+    /// More than one catalog row claims the `directory_id`, so it resolves to no
+    /// single path. Repair is a re-point, which collapses the duplicates.
+    CatalogAmbiguous,
+}
+
+/// Insert an agent record into the id cache, refusing a cross-project claim.
+///
+/// The cache maps `AgentId -> AgentRecord` across every loaded project, and it
+/// used to insert last-wins. That silently shadowed: if two registries held the
+/// same id, whichever was read second won, and the agent dispatched into a
+/// project the user wasn't looking at with no signal anywhere. Re-inserting the
+/// *same* agent (a rename, a profile switch, a post-turn locator write) is
+/// ordinary and stays a plain overwrite — only a change of owning project is a
+/// conflict.
+///
+/// Unreachable today: ids are minted fresh and an agent lives in exactly one
+/// registry. It becomes reachable when agents can be moved between projects,
+/// where an interrupted move leaves the record in both — which is precisely why
+/// the check lands before the feature that can produce it, rather than after.
+fn cache_agent(state: &AppState, record: AgentRecord) -> Result<(), AppError> {
+    let mut cache = lock(&state.agents_by_id);
+    if let Some(existing) = cache.get(&record.id)
+        && existing.project_id != record.project_id
+    {
+        return Err(AppError::AgentProjectConflict {
+            agent_id: record.id,
+            existing_project_id: existing.project_id,
+            incoming_project_id: record.project_id,
+        });
+    }
+    cache.insert(record.id, record);
+    Ok(())
+}
+
 /// One row of the flat cross-directory project list (`list_projects_impl`).
-/// Carries the owning directory path and whether that directory is currently
-/// available (loaded + readable). Wire type — serialized to the frontend.
+/// Wire type — serialized to the frontend.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ProjectListing {
     pub id: ProjectId,
     pub name: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
-    pub directory: String,
-    pub available: bool,
+    /// The resolved working directory, or `None` when the `directory_id` has no
+    /// single catalog row (`CatalogMissing` / `CatalogAmbiguous`) — there is no
+    /// path to report, and inventing one would be the guess the store refuses.
+    pub directory: Option<String>,
+    pub directory_status: DirectoryStatus,
     /// Recency-ordering key for the flat project list: the later of the
     /// project's journal mtime and `created_at` (see
-    /// [`switchboard_core::Directory::project_last_activity`]). For an
-    /// unavailable directory (served from the cache) this is just `created_at`
-    /// — its journal can't be stat'd while the directory is unreadable.
+    /// [`switchboard_core::Store::project_last_activity`]). The journal lives
+    /// under the store root, so unlike the old directory-scoped layout this is
+    /// readable even when the working directory isn't.
     pub last_activity: chrono::DateTime<chrono::Utc>,
     /// Whether the user has archived this project (hidden from the default
     /// view). User-global view-state from `workspace.yaml`, not on-disk project
-    /// state — computed per row from the archived set, so it's reported even for
-    /// rows served from the cache while their directory is unavailable.
+    /// state.
     pub archived: bool,
 }
 
-/// Read-only inspection. Canonicalizes the path, checks whether
-/// `.switchboard/` already exists, and lists projects if it does. **Does
-/// not** create directories, write files, or modify `AppState` — the
-/// frontend uses this to show the appropriate post-folder-picker CTA
-/// (init / create-project / select-project) before committing.
-pub async fn pick_directory_impl(path: &str) -> Result<DirectoryInfo, AppError> {
+/// Read-only inspection: canonicalize the path and list whatever projects the
+/// store already holds for it. **Does not** create anything, write anything, or
+/// modify `AppState` — the frontend uses this to show the appropriate
+/// post-folder-picker CTA before committing.
+///
+/// Takes `state` now, because the answer lives in the store rather than in the
+/// directory. A directory that isn't catalogued yet lists no projects, which is
+/// the same answer the old `.switchboard`-presence check gave, arrived at
+/// without inspecting the user's folder.
+pub fn pick_directory_impl(state: &AppState, path: &str) -> Result<DirectoryInfo, AppError> {
     let directory = Directory::at(Path::new(path))?;
-    let has_switchboard = directory.has_switchboard();
-    let projects = if has_switchboard {
-        // Reject incompatible directory config versions before listing
-        // projects. The version field exists explicitly so a future v2
-        // schema can't be silently accepted by a v1 build.
-        directory.config()?;
-        directory.list_projects()?
-    } else {
-        Vec::new()
-    };
+    let projects = projects_in_directory(state, &directory.path)?;
     Ok(DirectoryInfo {
         path: directory.path.to_string_lossy().into_owned(),
-        has_switchboard,
         projects,
     })
 }
 
-/// Additive + idempotent: creates `.switchboard/` if missing and adds the
-/// directory to the multi-directory workspace. The directory is keyed by its
+/// Every project the store holds for a canonical working-directory path.
+///
+/// Empty for a path with no catalog row — a directory the user has never
+/// created a project in is indistinguishable from one they have never added,
+/// and both correctly list nothing.
+fn projects_in_directory(
+    state: &AppState,
+    canonical: &Path,
+) -> Result<Vec<ProjectSummary>, AppError> {
+    let Some(entry) = state
+        .store
+        .list_directories()?
+        .into_iter()
+        .find(|entry| entry.path == canonical)
+    else {
+        return Ok(Vec::new());
+    };
+    Ok(state
+        .store
+        .list_projects()?
+        .into_iter()
+        .filter(|project| project.directory_id == entry.directory_id)
+        .map(|project| ProjectSummary {
+            id: project.id,
+            name: project.name,
+            created_at: project.created_at,
+        })
+        .collect())
+}
+
+/// Additive + idempotent: registers the directory in the store's catalog and
+/// adds it to the workspace list. **Writes nothing into the directory itself.**
+/// The directory is keyed by its
 /// **canonical** path (`Directory::at` canonicalizes), so two spellings of the
 /// same directory collapse to one entry. Re-initializing an already-loaded
 /// directory just refreshes the handle and its cached project snapshot — it
@@ -101,21 +189,19 @@ pub async fn pick_directory_impl(path: &str) -> Result<DirectoryInfo, AppError> 
 /// (`workspace.yaml`) and refreshes that directory's cached project snapshot.
 pub async fn init_directory_impl(state: &AppState, path: &str) -> Result<DirectoryInfo, AppError> {
     // Serialize against concurrent registry writes (create_project,
-    // register_agent). init_directory creates `.switchboard/` structure
-    // and writes the directory's config.yaml — both modify the registry's
-    // on-disk shape.
+    // register_agent). init_directory appends a catalog row, which is a
+    // read-modify-write of a store file.
     let _write = lock(&state.registry_write);
     let directory = Directory::at(Path::new(path))?;
-    directory.init()?;
-    // Validate the directory's config version after init (init creates a
-    // fresh v1 config if missing; this catches the case where the user
-    // points at a directory with an incompatible existing config).
-    directory.config()?;
-    let projects = directory.list_projects()?;
     let canonical = directory.path.clone();
+    // Register in the store catalog. Idempotent by canonical path, so re-adding
+    // a directory the user already works in returns its existing id rather than
+    // minting a second one — which would split that directory's projects across
+    // two identities and make a later re-point fix only half of them.
+    state.store.add_directory(&canonical)?;
+    let projects = projects_in_directory(state, &canonical)?;
     let info = DirectoryInfo {
         path: canonical.to_string_lossy().into_owned(),
-        has_switchboard: directory.has_switchboard(),
         projects: projects.clone(),
     };
 
@@ -124,14 +210,11 @@ pub async fn init_directory_impl(state: &AppState, path: &str) -> Result<Directo
     // shared maps are untouched (the additive contract).
     lock(&state.directories).insert(canonical.clone(), directory);
 
-    // Register in the user-global workspace and refresh its cached snapshot.
-    // The registry compares paths as-given, so only ever feed it canonical
-    // paths (decision: "Directory identity is canonicalized at the boundary").
-    {
-        let mut workspace = lock(&state.workspace);
-        workspace.add(canonical.clone());
-        workspace.refresh_cache(&canonical, projects);
-    }
+    // Register in the user-global workspace (ordering + hidden view-state; no
+    // project cache — the store index is the record). The registry compares
+    // paths as-given, so only ever feed it canonical paths (decision:
+    // "Directory identity is canonicalized at the boundary").
+    lock(&state.workspace).add(canonical.clone());
     persist_workspace(state);
 
     // One-directional Git-view auto-sync: if this directory lives in a git repo,
@@ -152,11 +235,24 @@ pub async fn init_directory_impl(state: &AppState, path: &str) -> Result<Directo
     Ok(info)
 }
 
-/// Remove a directory from the workspace. Drains any in-flight turns on its
-/// agents, releases its project locks, drops its loaded projects/agents, and
-/// removes it from the workspace registry. **Never deletes `.switchboard/` on
-/// disk** — re-initializing the same path restores its projects. Idempotent:
-/// removing an absent/unavailable directory is `Ok`.
+/// Hide a directory from the user's list.
+///
+/// **"Remove" is now hide, and that is a real change.** A directory's catalog
+/// entry is referenced by the `directory_id` of every project in it, and the
+/// catalog never deletes a row a project still references — dropping one would
+/// leave those projects unresolvable with no handle to repair them, since the id
+/// *is* the handle. So removal cannot mean "forget"; it means "stop showing me
+/// this", which is view-state.
+///
+/// What follows from that: the projects still exist, still list once unhidden,
+/// and are still deletable individually. Adding the directory back is the unhide
+/// gesture and is lossless.
+///
+/// Still drains: hiding a directory the user is done with should not leave its
+/// agents mid-turn, so in-flight turns are cancelled, project locks released,
+/// and loaded projects/agents dropped — exactly as before. Nothing on disk is
+/// touched, in the working directory or the store. Idempotent: hiding an absent
+/// or already-hidden directory is `Ok`.
 pub async fn remove_directory_impl(state: &AppState, path: &str) -> Result<(), AppError> {
     let canonical = canonicalize_boundary(path);
 
@@ -187,7 +283,7 @@ pub async fn remove_directory_impl(state: &AppState, path: &str) -> Result<(), A
             // Not loaded — nothing routable to clear. Drop the guard, then fall
             // through to the always-run workspace removal below.
             drop(write);
-            lock(&state.workspace).remove(&canonical);
+            lock(&state.workspace).set_hidden(&canonical, true);
             persist_workspace(state);
             return Ok(());
         }
@@ -259,8 +355,9 @@ pub async fn remove_directory_impl(state: &AppState, path: &str) -> Result<(), A
         lock(&state.needs_session_meta).retain(|id| !removed.contains(id));
     }
 
-    // Always drop the workspace entry + persist (idempotent for absent dirs).
-    lock(&state.workspace).remove(&canonical);
+    // Always hide + persist (idempotent for absent or already-hidden dirs). The
+    // entry itself stays, so ordering and a later unhide survive.
+    lock(&state.workspace).set_hidden(&canonical, true);
     persist_workspace(state);
     Ok(())
 }
@@ -279,135 +376,92 @@ fn canonicalize_boundary(path: &str) -> PathBuf {
     std::fs::canonicalize(raw).unwrap_or_else(|_| raw.to_path_buf())
 }
 
-/// Flat cross-directory project list. Iterates the workspace registry in
-/// insertion order; for each entry, reads projects from disk if the directory
-/// is loaded (refreshing the cached snapshot, `available: true`), else falls
-/// back to the cached snapshot (`available: false`).
+/// Flat cross-directory project list — **one read of the store index**.
 ///
-/// **Persist-on-change only.** This is a hot read path (the UI hits it on every
-/// project switch), so it persists `workspace.yaml` iff at least one cached
-/// snapshot actually changed — avoiding a write storm of identical files.
+/// Every project in the store lists, whatever state its working directory is
+/// in. That is the shape change the store makes possible: the index and each
+/// project's journal live under the store root, so nothing here depends on a
+/// working directory being mounted, readable, or even present. The old
+/// implementation had to iterate the workspace registry, read each directory's
+/// own index, classify the read error, and fall back to a cached snapshot when
+/// it failed — all of which existed because the record of what projects existed
+/// lived inside the directories themselves. None of it is needed now, and the
+/// cache it maintained is gone along with the bug where a stale snapshot
+/// resurrected a deleted project.
 ///
-/// **Corrupt vs. unavailable.** A loaded directory whose `list_projects` read
-/// fails is *not* uniformly treated as "serve cache." A missing index / I/O
-/// error (`CoreError::Io` / `MissingAppendOnlyFile` — unmounted, transient)
-/// falls back to the cached snapshot as `available: false`. A *corruption*
-/// error (`CoreError::CorruptJsonl` / `CorruptYaml` / `UnsupportedConfigVersion`
-/// — a damaged Switchboard-owned file) is logged loudly and does **not** refresh
-/// or persist the cache from the bad read; it still degrades to `available:
-/// false` for now (the wire shape is unchanged — see below), but the read
-/// boundary no longer makes corruption silently indistinguishable from
-/// unmounted. One corrupt directory must never fail the whole aggregation — the
-/// other directories still list.
-//
-// `available: bool` is intentionally kept (no status enum / `errored` variant):
-// that is a frontend-facing wire change that lands additively with the switcher
-// UI. For now corruption is distinct only in the logs.
-//
-// Returns `Result` even though it never errors today: it is the
-// `#[tauri::command]` chokepoint for the cross-directory list. Keeping the
-// fallible shape avoids a breaking signature change at the IPC boundary.
-#[allow(clippy::unnecessary_wraps)]
+/// **A damaged catalog row degrades one row, never the call.** `directory: None`
+/// with a `CatalogMissing` / `CatalogAmbiguous` status is how a broken project
+/// surfaces: visible, nameable, and repairable, rather than hidden behind a
+/// failed aggregation.
+///
+/// Ordering follows the workspace registry's directory order, then the store
+/// index within each directory; projects whose directory is unresolvable sort
+/// last, since there is no directory to place them under. Hidden directories are
+/// omitted — that is what hiding means — but their projects are *not* deleted,
+/// so unhiding restores them.
+///
+/// Returns `Result` because reading the index or catalog can fail; unlike the
+/// old version, that failure means the store itself is unreadable, which is not
+/// something to paper over with a cached list.
 pub fn list_projects_impl(state: &AppState) -> Result<Vec<ProjectListing>, AppError> {
-    let entry_paths: Vec<PathBuf> = lock(&state.workspace)
-        .entries()
+    let resolved = state.store.list_projects_resolved()?;
+
+    // Directory order from the workspace registry (insertion order), with
+    // hidden directories dropped. A project whose directory resolves to a path
+    // the registry doesn't list still appears — the store, not the registry, is
+    // the record of what exists.
+    let order: Vec<PathBuf> = {
+        let workspace = lock(&state.workspace);
+        workspace
+            .entries()
+            .iter()
+            .filter(|entry| !workspace.is_hidden(&entry.path))
+            .map(|entry| entry.path.clone())
+            .collect()
+    };
+    let rank = |path: Option<&Path>| -> usize {
+        path.and_then(|p| order.iter().position(|known| known == p))
+            .unwrap_or(order.len())
+    };
+
+    let mut listings: Vec<ProjectListing> = resolved
         .iter()
-        .map(|e| e.path.clone())
+        .filter(|row| {
+            // A hidden directory's projects are omitted; an unresolvable row has
+            // no directory to have hidden, so it always lists.
+            row.directory()
+                .path()
+                .is_none_or(|path| !lock(&state.workspace).is_hidden(path))
+        })
+        .map(|row| {
+            let entry = row.entry();
+            let (directory, directory_status) = match row.directory() {
+                DirectoryResolution::Resolved(path) => {
+                    let status = if path.is_dir() {
+                        DirectoryStatus::ResolvedAvailable
+                    } else {
+                        DirectoryStatus::ResolvedPathUnavailable
+                    };
+                    (Some(path.to_string_lossy().into_owned()), status)
+                }
+                DirectoryResolution::Missing => (None, DirectoryStatus::CatalogMissing),
+                DirectoryResolution::Ambiguous => (None, DirectoryStatus::CatalogAmbiguous),
+            };
+            ProjectListing {
+                id: entry.id,
+                name: entry.name.clone(),
+                created_at: entry.created_at,
+                directory,
+                directory_status,
+                last_activity: state
+                    .store
+                    .project_last_activity(entry.id, entry.created_at),
+                archived: lock(&state.workspace).is_archived(entry.id),
+            }
+        })
         .collect();
 
-    let mut listings: Vec<ProjectListing> = Vec::new();
-    let mut cache_changed = false;
-    for path in &entry_paths {
-        let dir_str = path.to_string_lossy().into_owned();
-        let loaded = lock(&state.directories).get(path).cloned();
-
-        // Distinguish three outcomes for a loaded directory's read:
-        //   Some(summaries) → fresh read, refresh cache, available.
-        //   None            → not loaded OR a transient/unavailable read error
-        //                     (I/O, missing index) → serve cache, unavailable.
-        // A corruption error logs loudly and also serves cache without
-        // refreshing/persisting it (so the bad read can't overwrite the last
-        // good snapshot).
-        let fresh = match loaded
-            .as_ref()
-            .map(switchboard_core::Directory::list_projects)
-        {
-            Some(Ok(summaries)) => Some(summaries),
-            None | Some(Err(CoreError::Io { .. } | CoreError::MissingAppendOnlyFile { .. })) => {
-                None
-            }
-            Some(Err(
-                e @ (CoreError::CorruptJsonl { .. }
-                | CoreError::CorruptYaml { .. }
-                | CoreError::UnsupportedConfigVersion { .. }),
-            )) => {
-                tracing::error!(
-                    directory = %dir_str,
-                    error = %e,
-                    "directory registry is corrupt — listing its cached snapshot as unavailable; not refreshing cache from the bad read"
-                );
-                None
-            }
-            // Any other (future) CoreError variant: treat conservatively as
-            // unavailable rather than refreshing the cache from a read we can't
-            // classify. `CoreError` is `#[non_exhaustive]`.
-            Some(Err(e)) => {
-                tracing::warn!(
-                    directory = %dir_str,
-                    error = %e,
-                    "directory registry read failed with an unclassified error — serving cached snapshot as unavailable"
-                );
-                None
-            }
-        };
-
-        if let Some(summaries) = fresh {
-            if lock(&state.workspace).refresh_cache(path, summaries.clone()) {
-                cache_changed = true;
-            }
-            // `fresh` is `Some` only when the directory was loaded and read
-            // cleanly, so `loaded` is `Some` here — stat each project's journal
-            // for its recency key.
-            let directory = loaded.as_ref();
-            for s in summaries {
-                let last_activity = directory.map_or(s.created_at, |d| {
-                    d.project_last_activity(s.id, s.created_at)
-                });
-                let archived = lock(&state.workspace).is_archived(s.id);
-                listings.push(ProjectListing {
-                    id: s.id,
-                    name: s.name,
-                    created_at: s.created_at,
-                    directory: dir_str.clone(),
-                    available: true,
-                    last_activity,
-                    archived,
-                });
-            }
-        } else {
-            let cached: Vec<ProjectSummary> = lock(&state.workspace)
-                .entries()
-                .iter()
-                .find(|e| &e.path == path)
-                .map(|e| e.cached_projects.clone())
-                .unwrap_or_default();
-            for s in cached {
-                let archived = lock(&state.workspace).is_archived(s.id);
-                listings.push(ProjectListing {
-                    id: s.id,
-                    name: s.name,
-                    created_at: s.created_at,
-                    directory: dir_str.clone(),
-                    available: false,
-                    last_activity: s.created_at,
-                    archived,
-                });
-            }
-        }
-    }
-    if cache_changed {
-        persist_workspace(state);
-    }
+    listings.sort_by_key(|listing| rank(listing.directory.as_ref().map(Path::new)));
     Ok(listings)
 }
 
@@ -415,10 +469,14 @@ pub fn list_projects_impl(state: &AppState) -> Result<Vec<ProjectListing>, AppEr
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct WorkspaceDirectoryInfo {
     pub path: String,
-    /// Whether the directory is currently loaded (openable on disk). An
-    /// unavailable directory (unmounted/moved) still appears so the user can
-    /// see and remove its cached entry.
+    /// Whether the directory currently exists on disk. An unavailable
+    /// directory (unmounted/moved) still appears, so the user can see it and
+    /// re-point or hide it.
     pub available: bool,
+    /// Whether the user has hidden this directory. Hidden directories are
+    /// omitted from the project list but still listed here — the switcher is
+    /// where unhiding happens, so it must be able to show what is hidden.
+    pub hidden: bool,
 }
 
 /// The switcher's view of the workspace registry: every registered directory
@@ -446,11 +504,17 @@ pub fn list_workspace_directories_impl(state: &AppState) -> WorkspaceDirectories
         .map(|e| e.path.clone())
         .collect();
     let directories = {
-        let loaded = lock(&state.directories);
+        let workspace = lock(&state.workspace);
         entry_paths
             .into_iter()
             .map(|path| WorkspaceDirectoryInfo {
-                available: loaded.contains_key(&path),
+                // A path check, not a loaded-handle check: under the store a
+                // directory is nothing but a path in the catalog, so "does it
+                // exist" is the whole question. The old version reported a
+                // directory unavailable whenever its handle hadn't been opened,
+                // which conflated "not mounted" with "not visited yet".
+                available: path.is_dir(),
+                hidden: workspace.is_hidden(&path),
                 path: path.to_string_lossy().into_owned(),
             })
             .collect()
@@ -793,28 +857,31 @@ fn worktree_paths(repo: &switchboard_git::RepoView) -> Vec<PathBuf> {
 /// by canonicalized `PathBuf` so it matches `RepoView` worktree paths regardless
 /// of spelling.
 ///
-/// Reads the **in-memory** workspace cached snapshots, **not** `list_projects_impl`.
-/// The Git-view read is polled, so it must be side-effect-free: going
-/// through `list_projects_impl` would re-scan every directory from disk and could
-/// rewrite `workspace.yaml` as a cache-refresh side effect. The cached snapshot
-/// is the workspace registry's purpose and is kept current by project
-/// create/init/list, so linking stays accurate without that cost. (A brand-new
-/// project links on the next workspace refresh — but create already refreshes the
-/// cache, so in practice it's immediate.)
+/// Reads the store index and catalog once. The Git-view read is polled, so it
+/// must be side-effect-free — which this now is by construction: there is no
+/// cache to refresh and no `workspace.yaml` write, where the previous
+/// snapshot-based version existed specifically to avoid triggering one. A
+/// brand-new project links immediately, since the index is written before
+/// `create_project` returns.
+///
+/// A project whose directory doesn't resolve is skipped: this maps repo paths to
+/// projects, and a row with no path belongs to no repo.
 fn project_links_by_path(state: &AppState) -> HashMap<PathBuf, Vec<LinkedProject>> {
     let mut map: HashMap<PathBuf, Vec<LinkedProject>> = HashMap::new();
-    for entry in lock(&state.workspace).entries() {
-        let dir = entry.path.to_string_lossy().into_owned();
-        let canonical = canonicalize_boundary(&dir);
-        for s in &entry.cached_projects {
-            map.entry(canonical.clone())
-                .or_default()
-                .push(LinkedProject {
-                    id: s.id,
-                    name: s.name.clone(),
-                    directory: dir.clone(),
-                });
-        }
+    let Ok(rows) = state.store.list_projects_resolved() else {
+        return map;
+    };
+    for row in rows {
+        let Some(path) = row.directory().path() else {
+            continue;
+        };
+        map.entry(path.to_path_buf())
+            .or_default()
+            .push(LinkedProject {
+                id: row.entry().id,
+                name: row.entry().name.clone(),
+                directory: path.to_string_lossy().into_owned(),
+            });
     }
     map
 }
@@ -1511,11 +1578,17 @@ pub fn create_project_impl(
     // records (which write disk).
     let _write = lock(&state.registry_write);
     let canonical = canonicalize_boundary(directory_path);
-    let directory = lock(&state.directories)
-        .get(&canonical)
-        .cloned()
+    // The catalog, not `state.directories`, answers "is this a directory we can
+    // create in": the store owns directory identity now, and a project's owner
+    // is the `directory_id` it records, not a loaded handle.
+    let directory_id = state
+        .store
+        .list_directories()?
+        .into_iter()
+        .find(|entry| entry.path == canonical)
+        .map(|entry| entry.directory_id)
         .ok_or(AppError::NoDirectory)?;
-    let project = directory.create_project(name)?;
+    let project = state.store.create_project(directory_id, name)?;
     let summary = ProjectSummary {
         id: project.id,
         name: project.config.name.clone(),
@@ -1528,13 +1601,8 @@ pub fn create_project_impl(
     let lock_handle = acquire_project_lock(project.id, &project.root)?;
     lock(&state.project_locks).insert(project.id, lock_handle);
     lock(&state.projects).insert(project.id, project);
-
-    // Refresh the workspace cache for this directory so the flat list reflects
-    // the new project even before the next `list_projects` round-trip.
-    if let Ok(summaries) = directory.list_projects() {
-        lock(&state.workspace).refresh_cache(&canonical, summaries);
-        persist_workspace(state);
-    }
+    // No workspace refresh: the flat list reads the store index directly, so a
+    // freshly appended project is already visible to the next `list_projects`.
     Ok(summary)
 }
 
@@ -1553,29 +1621,38 @@ pub fn rename_project_impl(
     new_name: &str,
 ) -> Result<ProjectListing, AppError> {
     let _write = lock(&state.registry_write);
-    let directory = resolve_owning_directory(state, project_id)?;
-    let summary = directory.rename_project(project_id, new_name)?;
+    let entry = state.store.rename_project(project_id, new_name)?;
 
     // Sync the in-memory `Project` (canonical name) if the project is loaded.
     if let Some(project) = lock(&state.projects).get_mut(&project_id) {
-        summary.name.clone_into(&mut project.config.name);
+        entry.name.clone_into(&mut project.config.name);
     }
 
-    // Refresh the workspace cache for this directory so the flat list reflects
-    // the new name before the next `list_projects` round-trip.
-    if let Ok(summaries) = directory.list_projects() {
-        lock(&state.workspace).refresh_cache(&directory.path, summaries);
-        persist_workspace(state);
-    }
-
-    let archived = lock(&state.workspace).is_archived(summary.id);
+    // No workspace refresh — the flat list reads the index, which this just
+    // rewrote. Resolve the row's directory the same way `list_projects_impl`
+    // does so a rename can't report a status the list disagrees with.
+    let (directory, directory_status) = match state.store.directory_path(entry.directory_id) {
+        Ok(path) if path.is_dir() => (
+            Some(path.to_string_lossy().into_owned()),
+            DirectoryStatus::ResolvedAvailable,
+        ),
+        Ok(path) => (
+            Some(path.to_string_lossy().into_owned()),
+            DirectoryStatus::ResolvedPathUnavailable,
+        ),
+        Err(CoreError::AmbiguousDirectory(_)) => (None, DirectoryStatus::CatalogAmbiguous),
+        Err(_) => (None, DirectoryStatus::CatalogMissing),
+    };
+    let archived = lock(&state.workspace).is_archived(entry.id);
     Ok(ProjectListing {
-        directory: directory.path.to_string_lossy().into_owned(),
-        available: true,
-        last_activity: directory.project_last_activity(summary.id, summary.created_at),
-        id: summary.id,
-        name: summary.name,
-        created_at: summary.created_at,
+        directory,
+        directory_status,
+        last_activity: state
+            .store
+            .project_last_activity(entry.id, entry.created_at),
+        id: entry.id,
+        name: entry.name,
+        created_at: entry.created_at,
         archived,
     })
 }
@@ -1585,8 +1662,11 @@ pub fn rename_project_impl(
 /// the `workspace` lock, touches **no** on-disk project state, **no**
 /// `registry_write`, **no** directory resolution, and **no** dispatcher — so it
 /// works whether the project's directory is loaded, available, or offline, and
-/// never interrupts a running agent. Validates the id is one the workspace knows
-/// (present in some cached snapshot) so a bogus id can't accumulate in the set.
+/// never interrupts a running agent. Validates the id against the **store
+/// index** so a bogus id can't accumulate in the set — the index lists every
+/// project regardless of its directory's state, which is exactly the set archive
+/// must work for, and it replaces the cached-snapshot check that could only see
+/// projects some earlier read had happened to cache.
 /// Returns `()`; the frontend flips the row locally and the next `list_projects`
 /// confirms it from the persisted set.
 pub fn set_project_archived_impl(
@@ -1594,13 +1674,15 @@ pub fn set_project_archived_impl(
     project_id: ProjectId,
     archived: bool,
 ) -> Result<(), AppError> {
-    let changed = {
-        let mut workspace = lock(&state.workspace);
-        if !workspace.knows_project(project_id) {
-            return Err(AppError::ProjectNotLoaded(project_id));
-        }
-        workspace.set_archived(project_id, archived)
-    };
+    if !state
+        .store
+        .list_projects()?
+        .iter()
+        .any(|entry| entry.id == project_id)
+    {
+        return Err(AppError::ProjectNotLoaded(project_id));
+    }
+    let changed = lock(&state.workspace).set_archived(project_id, archived);
     if changed {
         persist_workspace(state);
     }
@@ -1733,11 +1815,6 @@ pub async fn delete_project_impl(state: &AppState, project_id: ProjectId) -> Res
     // Resolve the owning directory up front. If no loaded directory claims the
     // id, there's nothing on disk we can reach — treat as already-gone and fall
     // through to in-memory pruning.
-    let directory = match resolve_owning_directory(state, project_id) {
-        Ok(dir) => Some(dir),
-        Err(AppError::ProjectNotLoaded(_)) => None,
-        Err(e) => return Err(e),
-    };
 
     // Cancel this project's workflow runs and let them settle to `cancelled`
     // BEFORE draining agents (cancel-runs-first — see `remove_directory_impl`).
@@ -1762,17 +1839,20 @@ pub async fn delete_project_impl(state: &AppState, project_id: ProjectId) -> Res
     let _write = lock(&state.registry_write);
 
     // Delete on disk first, *before* dropping the project's inter-process lock.
-    // `Directory::delete_project` only returns `Err` when it couldn't change
-    // what lists (index read/rewrite failure) — i.e. nothing was removed; a
+    // `Store::delete_project` only returns `Err` when it couldn't change what
+    // lists (index read/rewrite failure) — i.e. nothing was removed; a
     // best-effort directory-removal failure is folded into `Ok` (benign orphan).
     // So on `Err` we keep both the row and the lock (project stays safely owned
     // and the delete is retryable). On unix `remove_dir_all` unlinks the in-dir
     // `instance.lock` despite our held handle, so holding the lock across the
     // removal is fine; a future Windows target would instead need
     // drop-before-removal + re-acquire-on-failure.
-    if let Some(directory) = &directory {
-        directory.delete_project(project_id)?;
-    }
+    //
+    // **The working directory is irrelevant here.** Everything being removed
+    // lives under the store root, so a project whose checkout is gone deletes
+    // exactly like any other — no "can we reach the directory" branch, and no
+    // silently-skipped delete when we can't.
+    state.store.delete_project(project_id)?;
 
     // Committed (or nothing was on disk to reach) — drop the now-stale lock and
     // prune routable in-memory state, in the documented lock order.
@@ -1793,30 +1873,12 @@ pub async fn delete_project_impl(state: &AppState, project_id: ProjectId) -> Res
     // are minted fresh, but be defensive) can't inherit a stale archived state.
     lock(&state.workspace).set_archived(project_id, false);
 
-    // Keep the workspace cache from resurrecting the deleted project: refresh
-    // from a fresh index read when available, else drop just the deleted id from
-    // the cached snapshot (the index read can fail in the same out-of-band cases
-    // the delete tolerated, and `list_projects_impl` serves the cache on those).
-    if let Some(directory) = &directory {
-        match directory.list_projects() {
-            Ok(summaries) => {
-                lock(&state.workspace).refresh_cache(&directory.path, summaries);
-            }
-            Err(_) => {
-                lock(&state.workspace).remove_cached_project(&directory.path, project_id);
-            }
-        }
-    } else {
-        // No reachable directory (its folder/volume is gone): the on-disk index
-        // can't be touched, so this prunes the project from the workspace
-        // *listing* only. Dropping its cached snapshot in `workspace.yaml` stops
-        // the row from resurrecting while the directory stays gone — which is the
-        // bug being fixed. Accepted limit: if that directory is later
-        // reconnected/re-added, its surviving on-disk index re-lists the project.
-        // That's an unavoidable consequence of deleting an offline project (we
-        // can't unlink files on an absent volume), not a leak this can close.
-        lock(&state.workspace).remove_cached_project_by_id(project_id);
-    }
+    // Nothing to prune: the flat list reads the store index, and
+    // `Store::delete_project` already removed the row. The workspace cache this
+    // used to reconcile is gone, and with it the failure it was patching — a
+    // deleted project resurrecting from a stale snapshot when its directory was
+    // unreachable. The store index is reachable regardless of any working
+    // directory's state, so the delete is simply durable.
     persist_workspace(state);
     Ok(())
 }
@@ -1854,7 +1916,7 @@ pub fn open_project_impl(
             created_at: loaded.config.created_at,
         });
     }
-    let project = find_project_in_directories(state, project_id)?;
+    let project = open_project_from_store(state, project_id)?;
     let summary = ProjectSummary {
         id: project.id,
         name: project.config.name.clone(),
@@ -1869,11 +1931,8 @@ pub fn open_project_impl(
     let agents = project.list_agents()?;
     // All fallible work done — commit the shared maps together.
     lock(&state.project_locks).insert(project.id, lock_handle);
-    {
-        let mut cache = lock(&state.agents_by_id);
-        for agent in agents {
-            cache.insert(agent.id, agent);
-        }
+    for agent in agents {
+        cache_agent(state, agent)?;
     }
     lock(&state.projects).insert(project.id, project);
     Ok(summary)
@@ -1943,7 +2002,7 @@ pub fn create_agent_with_profiles_impl(
         .cloned()
         .ok_or(AppError::ProjectNotLoaded(active))?;
     let record = project.register_agent_with_profiles(name, harness, model, effort, secondary)?;
-    lock(&state.agents_by_id).insert(record.id, record.clone());
+    cache_agent(state, record.clone())?;
     Ok(record)
 }
 
@@ -1990,7 +2049,7 @@ pub async fn fork_agent_impl(
         let _write = lock(&state.registry_write);
         project.fork_agent(source_agent_id)?
     };
-    lock(&state.agents_by_id).insert(record.id, record.clone());
+    cache_agent(state, record.clone())?;
     Ok(record)
 }
 
@@ -2249,7 +2308,7 @@ pub fn rename_agent_impl(
     let _write = lock(&state.registry_write);
     let (project, _) = lookup_agent(state, agent_id)?;
     let updated = project.rename_agent(agent_id, new_name)?;
-    lock(&state.agents_by_id).insert(agent_id, updated.clone());
+    cache_agent(state, updated.clone())?;
     Ok(updated)
 }
 
@@ -2274,7 +2333,7 @@ pub fn set_agent_session_locator_impl(
     let _write = lock(&state.registry_write);
     let (project, _) = lookup_agent(state, agent_id)?;
     let updated = project.set_session_locator(agent_id, locator)?;
-    lock(&state.agents_by_id).insert(agent_id, updated.clone());
+    cache_agent(state, updated.clone())?;
     Ok(updated)
 }
 
@@ -2288,7 +2347,7 @@ pub fn set_agent_profiles_impl(
     let _write = lock(&state.registry_write);
     let (project, _) = lookup_agent(state, agent_id)?;
     let updated = project.set_agent_profiles(agent_id, primary, secondary)?;
-    lock(&state.agents_by_id).insert(agent_id, updated.clone());
+    cache_agent(state, updated.clone())?;
     Ok(updated)
 }
 
@@ -2301,7 +2360,7 @@ pub fn set_active_agent_profile_impl(
     let _write = lock(&state.registry_write);
     let (project, _) = lookup_agent(state, agent_id)?;
     let updated = project.set_active_agent_profile(agent_id, active)?;
-    lock(&state.agents_by_id).insert(agent_id, updated.clone());
+    cache_agent(state, updated.clone())?;
     Ok(updated)
 }
 
@@ -2324,13 +2383,10 @@ pub fn reorder_agents_impl(
         .cloned()
         .ok_or(AppError::ProjectNotLoaded(project_id))?;
     let agents = project.reorder_agents(agent_ids)?;
-    {
-        // Record contents are unchanged by reorder; this keeps the cache
-        // consistent with the list path (same contract as other mutations).
-        let mut cache = lock(&state.agents_by_id);
-        for agent in &agents {
-            cache.insert(agent.id, agent.clone());
-        }
+    // Record contents are unchanged by reorder; this keeps the cache consistent
+    // with the list path (same contract as other mutations).
+    for agent in &agents {
+        cache_agent(state, agent.clone())?;
     }
     Ok(agents)
 }
@@ -2408,12 +2464,21 @@ pub fn attach_agent_impl(
         .get(&active)
         .cloned()
         .ok_or(AppError::ProjectNotLoaded(active))?;
-    // The active project's owning directory — the cwd that namespaces the
-    // harnesses' session files.
-    let directory = lock(&state.directories)
-        .get(&project.directory)
-        .cloned()
-        .ok_or(AppError::NoDirectory)?;
+    // The active project's index row, for its `directory_id`. The row is also
+    // the **eligibility check on the target**: attaching mutates this project
+    // and the agent must be dispatchable afterwards, so a target whose own
+    // directory is missing or ambiguous is refused here with the error naming
+    // the repair. Deliberately scoped to the target — an *unrelated* project's
+    // damaged catalog row must not block this attach, which is why the
+    // collision scans below never consult the catalog at all.
+    let entry = state
+        .store
+        .list_projects()?
+        .into_iter()
+        .find(|e| e.id == active)
+        .ok_or(AppError::ProjectNotLoaded(active))?;
+    let directory_path = state.store.directory_path(entry.directory_id)?;
+    let directory_id = entry.directory_id;
 
     // Claude/Antigravity identify a session by a UUID, parsed per-arm
     // below. Codex's thread-id is an arbitrary string (not guaranteed a UUID),
@@ -2424,7 +2489,7 @@ pub fn attach_agent_impl(
             let session_uuid = parse_uuid(existing_session_id)?;
             let expected = switchboard_harness::claude_session_file_path(
                 home_dir,
-                &directory.path,
+                &directory_path,
                 &session_uuid,
             );
             if !expected.exists() {
@@ -2433,7 +2498,7 @@ pub fn attach_agent_impl(
                     expected_path: expected.to_string_lossy().into_owned(),
                 });
             }
-            check_claude_session_id_unique(state, &directory, &session_uuid)?;
+            check_claude_session_id_unique(state, directory_id, &session_uuid)?;
             project.register_attached_claude_agent(name, session_uuid, model, effort)?
         }
         HarnessKind::Codex => {
@@ -2492,7 +2557,7 @@ pub fn attach_agent_impl(
     // Register-cache: the new attached agent's project is `active`,
     // which is loaded (resolved above), so a subsequent `lookup_agent` hits
     // the cache without a disk scan.
-    lock(&state.agents_by_id).insert(record.id, record.clone());
+    cache_agent(state, record.clone())?;
     Ok(record)
 }
 
@@ -2533,62 +2598,6 @@ fn map_codex_attach_lookup_error(
     }
 }
 
-/// Enumerate every project on disk across **all loaded directories**,
-/// preferring the in-memory `state.projects` entry for already-loaded projects
-/// (avoids a redundant disk read of the same `config.yaml`). Unloaded projects
-/// are constructed via `directory.open_project(id)`, a pure read that does
-/// **not** mutate `state.projects` or register any listeners.
-///
-/// Used by the Codex / Antigravity attach-flow collision scans, whose session
-/// ids are server-assigned and globally unique — a collision across *any* two
-/// loaded directories is a genuine same-session-parallel-invocation hazard, so
-/// the scan must span every directory the app holds.
-fn enumerate_all_projects(state: &AppState) -> Result<Vec<Project>, AppError> {
-    let directories: Vec<Directory> = lock(&state.directories).values().cloned().collect();
-    // Snapshot the loaded-project map under the lock, then release it before any
-    // disk I/O (`list_projects` / `open_project`). Holding `state.projects`
-    // across filesystem reads — now amplified across every directory and taken
-    // under `registry_write` — would serialize unrelated work behind disk
-    // latency. Same no-lock-across-I/O discipline as `persist_workspace`.
-    let loaded: HashMap<ProjectId, Project> = lock(&state.projects).clone();
-    let mut all: Vec<Project> = Vec::new();
-    for directory in directories {
-        for summary in directory.list_projects()? {
-            if let Some(p) = loaded.get(&summary.id) {
-                all.push(p.clone());
-            } else {
-                all.push(directory.open_project(summary.id)?);
-            }
-        }
-    }
-    Ok(all)
-}
-
-/// Enumerate every project on disk under a **single** directory, preferring
-/// the in-memory `state.projects` entry for already-loaded projects.
-///
-/// Used by the Claude attach-flow collision scan. That harness's
-/// session ids are caller-supplied and namespaced by cwd (the directory), so a
-/// scan must stay **per-directory** — widening it across directories would
-/// false-reject a legitimately-distinct same-id-different-cwd session.
-fn enumerate_directory_projects(
-    state: &AppState,
-    directory: &Directory,
-) -> Result<Vec<Project>, AppError> {
-    // Snapshot the loaded-project map under the lock, then release it before the
-    // disk reads below (see `enumerate_all_projects` for the rationale).
-    let loaded: HashMap<ProjectId, Project> = lock(&state.projects).clone();
-    let mut all: Vec<Project> = Vec::new();
-    for summary in directory.list_projects()? {
-        if let Some(p) = loaded.get(&summary.id) {
-            all.push(p.clone());
-        } else {
-            all.push(directory.open_project(summary.id)?);
-        }
-    }
-    Ok(all)
-}
-
 /// The UUID an agent's session locator carries, if it's the `Uuid` variant
 /// (Claude/Antigravity). `None` for a Codex locator (which has no single
 /// UUID) or an unset locator. Thin `agent`-level adapter over
@@ -2601,38 +2610,69 @@ fn locator_uuid(agent: &AgentRecord) -> Option<Uuid> {
         .and_then(SessionLocator::as_uuid)
 }
 
-/// Per-directory Claude session-id collision check. Walks every project on
-/// disk in the **attach's target directory** — not just `state.projects` —
-/// because an unloaded project's `AgentRecord` could still be opened later and
-/// dispatched concurrently, which is the same-session-parallel-invocation
-/// hazard the invariant is defending against. Scoped per-directory because
-/// Claude session ids are cwd-namespaced (the same id under a different cwd is
-/// a distinct session). Held under `registry_write` so it's atomic with the
-/// subsequent register.
+/// Every project in the store, as index rows — the input every session-id
+/// collision scan works from.
+///
+/// **Index only, never `list_projects_resolved`.** The scans need a registry
+/// and a display name; both come from the store root, so reading the catalog
+/// here would make a single damaged directory row fail every attach store-wide
+/// while adding nothing. Directory *identity* still scopes the Claude scan, but
+/// via `entry.directory_id`, which is on every index row whether or not it
+/// resolves to a path.
+fn indexed_projects(state: &AppState) -> Result<Vec<ProjectEntry>, AppError> {
+    state.store.list_projects().map_err(AppError::from)
+}
+
+/// Build the collision error for an agent already holding `candidate`.
+fn session_collision(entry: &ProjectEntry, agent: AgentRecord) -> AppError {
+    AppError::SessionAlreadyAttached {
+        existing_agent_id: agent.id,
+        existing_agent_name: agent.name,
+        existing_project_id: entry.id,
+        // The **index** name, not `config.yaml`'s: `rename_project` commits
+        // config-then-index, so after a partial failure the index is what the
+        // user sees in their project list, and the error must name the project
+        // they can actually find.
+        existing_project_name: entry.name.clone(),
+    }
+}
+
+/// Per-directory Claude session-id collision check. Walks every project in the
+/// attach target's **own directory** — not just loaded ones — because an
+/// unloaded project's `AgentRecord` could still be opened and dispatched
+/// concurrently later, which is the same-session-parallel-invocation hazard the
+/// invariant defends against. Scoped per-directory because Claude session ids
+/// are cwd-namespaced: the same id under a different cwd is a distinct session,
+/// so a widened scan would false-reject a legitimately-distinct one.
+///
+/// Scoped by `directory_id`, not by path. Directory identity *is* the id — that
+/// is the catalog's premise — and an index row carries it whether or not it
+/// resolves, so a damaged catalog row can't silently narrow this scan.
+///
+/// Held under `registry_write` so it's atomic with the subsequent register.
 fn check_claude_session_id_unique(
     state: &AppState,
-    directory: &Directory,
+    directory_id: DirectoryId,
     candidate: &Uuid,
 ) -> Result<(), AppError> {
-    for project in enumerate_directory_projects(state, directory)? {
-        for agent in project.list_agents()? {
+    for entry in indexed_projects(state)? {
+        if entry.directory_id != directory_id {
+            continue;
+        }
+        for agent in state.store.read_project_registry(&entry)? {
             if locator_uuid(&agent) == Some(*candidate) {
-                return Err(AppError::SessionAlreadyAttached {
-                    existing_agent_id: agent.id,
-                    existing_agent_name: agent.name,
-                    existing_project_id: project.id,
-                    existing_project_name: project.config.name.clone(),
-                });
+                return Err(session_collision(&entry, agent));
             }
         }
     }
     Ok(())
 }
 
-/// Cross-directory Codex session-id collision check. The `thread_id` now lives
-/// on the `AgentRecord` (`session_locator` → `Codex`), so the scan reads the
-/// record. Codex thread-ids are server-assigned and globally unique, so the
-/// scan spans **all loaded directories** (`enumerate_all_projects`).
+/// Cross-directory Codex session-id collision check. The `thread_id` lives on
+/// the `AgentRecord` (`session_locator` → `Codex`), so the scan reads the
+/// record. Codex thread-ids are server-assigned and globally unique, so the scan
+/// spans **every project in the store** — no directory scoping, and no
+/// dependence on which directories happen to be loaded.
 ///
 /// **Accepted migration-window gap:** a Codex agent created before the locator
 /// moved onto the record still carries its thread-id in an unmigrated
@@ -2641,8 +2681,8 @@ fn check_claude_session_id_unique(
 /// folds the sidecar into the record — the same dev-only window as the legacy
 /// `session_id` and Antigravity sidecar cases.
 fn check_codex_session_id_unique(state: &AppState, candidate: &str) -> Result<(), AppError> {
-    for project in enumerate_all_projects(state)? {
-        for agent in project.list_agents()? {
+    for entry in indexed_projects(state)? {
+        for agent in state.store.read_project_registry(&entry)? {
             if agent.harness != HarnessKind::Codex {
                 continue;
             }
@@ -2652,12 +2692,7 @@ fn check_codex_session_id_unique(state: &AppState, candidate: &str) -> Result<()
                 .and_then(SessionLocator::as_codex)
                 .is_some_and(|(thread_id, _)| thread_id == candidate)
             {
-                return Err(AppError::SessionAlreadyAttached {
-                    existing_agent_id: agent.id,
-                    existing_agent_name: agent.name,
-                    existing_project_id: project.id,
-                    existing_project_name: project.config.name.clone(),
-                });
+                return Err(session_collision(&entry, agent));
             }
         }
     }
@@ -2665,12 +2700,11 @@ fn check_codex_session_id_unique(state: &AppState, candidate: &str) -> Result<()
 }
 
 /// Reject attaching a conversation UUID already bound to another Antigravity
-/// agent across **all loaded directories**. The conversation id now lives on the
-/// `AgentRecord` (`session_locator`), so the scan reads the record — the same
-/// source Claude uses. Cross-directory because Antigravity conversation
-/// ids are server-assigned and globally unique: two agents resuming one
-/// `--conversation <uuid>` would interleave server-side
-/// (same-session-parallel-invocation).
+/// agent, across **every project in the store**. The conversation id lives on
+/// the `AgentRecord` (`session_locator`), the same source Claude uses.
+/// Cross-directory because Antigravity conversation ids are server-assigned and
+/// globally unique: two agents resuming one `--conversation <uuid>` would
+/// interleave server-side (same-session-parallel-invocation).
 ///
 /// **Accepted migration-window gap:** an Antigravity agent created before the
 /// locator moved onto the record still carries its conversation id in an
@@ -2681,18 +2715,13 @@ fn check_codex_session_id_unique(state: &AppState, candidate: &str) -> Result<()
 /// dev-only window before it runs (same accepted window as legacy `session_id`
 /// records).
 fn check_antigravity_session_id_unique(state: &AppState, candidate: Uuid) -> Result<(), AppError> {
-    for project in enumerate_all_projects(state)? {
-        for agent in project.list_agents()? {
+    for entry in indexed_projects(state)? {
+        for agent in state.store.read_project_registry(&entry)? {
             if agent.harness != HarnessKind::Antigravity {
                 continue;
             }
             if locator_uuid(&agent) == Some(candidate) {
-                return Err(AppError::SessionAlreadyAttached {
-                    existing_agent_id: agent.id,
-                    existing_agent_name: agent.name,
-                    existing_project_id: project.id,
-                    existing_project_name: project.config.name.clone(),
-                });
+                return Err(session_collision(&entry, agent));
             }
         }
     }
@@ -2712,13 +2741,13 @@ pub fn list_agents_impl(
         .cloned()
         .ok_or(AppError::ProjectNotLoaded(pid))?;
     let agents = project.list_agents()?;
-    // Keep the register-cache in sync with what's on disk for this
-    // project (insert-only — v1 has no agent deletion).
-    {
-        let mut cache = lock(&state.agents_by_id);
-        for agent in &agents {
-            cache.insert(agent.id, agent.clone());
-        }
+    // Keep the register-cache in sync with what's on disk for this project
+    // (insert-only — v1 has no agent deletion). A cross-project claim fails the
+    // listing rather than being cached: an id in two registries is corruption
+    // the user is looking straight at, and an empty-or-wrong roster is worse
+    // than an error naming it.
+    for agent in &agents {
+        cache_agent(state, agent.clone())?;
     }
     Ok(agents)
 }
@@ -2731,10 +2760,19 @@ pub fn list_agents_impl(
 /// it takes the project's `instance.lock` for the app's remaining lifetime and
 /// can fail (`ProjectLocked`, `CorruptJsonl`). Browsing a menu must not lock
 /// projects the user never chooses, and a hover is no place to surface a lock
-/// conflict — so this path reads the registry through `Directory::open_project`,
-/// which is documented as a pure read that mutates no state (the same call
-/// `enumerate_all_projects` uses), and never touches `projects`,
+/// conflict — so this reads the registry directly and never touches `projects`,
 /// `agents_by_id`, or `project_locks`.
+///
+/// **No directory parameter, and no working directory required.** The registry
+/// is at `<store-root>/projects/<id>/registry.jsonl`, resolved from the project
+/// id alone, so a directory locator would be worse than redundant: it would
+/// invite a caller to think the directory is authoritative for this read.
+/// `Store::list_project_agents` confirms the id is in the index — so a bogus id
+/// is still `ProjectNotFound`, the guarantee the old owner-validation gave —
+/// while dropping the cwd requirement. That last part is a **behavior change**:
+/// a project whose catalog row is damaged previously couldn't list its roster,
+/// because resolving the owner was part of the read. Browsing a roster genuinely
+/// needs no working directory, so it now succeeds.
 ///
 /// Errors are the caller's to render per row (an unreadable registry is an
 /// unpickable entry, not a thrown hover), so they propagate rather than
@@ -2743,45 +2781,17 @@ pub fn list_agents_impl(
 pub fn list_project_agents_readonly_impl(
     state: &AppState,
     project_id: ProjectId,
-    directory: &Path,
 ) -> Result<Vec<AgentRecord>, AppError> {
-    // Resolve and validate the owner **before** any fast path, so the guarantee
-    // below holds on every route rather than only the cold one. `ProjectNotLoaded`
-    // is deliberately reused for an unregistered directory: the caller named a
-    // locator that doesn't resolve, which is the same "can't get there from here"
-    // answer, and a dedicated variant would be churn ahead of the central store
-    // removing this path-based lookup entirely.
-    //
-    // Lock order is `directories` → `projects` (state.rs); this guard drops at the
-    // end of the statement, so the two are never held together.
-    let owner = lock(&state.directories)
-        .get(directory)
-        .cloned()
-        .ok_or(AppError::ProjectNotLoaded(project_id))?;
-    // Prefer an already-loaded project — but only once the caller's locator is
-    // confirmed to be the one that owns it. A stale locator, or a duplicate
-    // project id from a copied `.switchboard`, would otherwise be served a roster
-    // from a different directory than the one selected.
+    // Prefer an already-loaded project: same registry, already in hand. No owner
+    // check is needed to make that safe any more — both routes resolve the
+    // registry from the project id, so they cannot disagree about which one they
+    // read.
     if let Some(loaded) = lock(&state.projects).get(&project_id).cloned() {
-        if loaded.directory != owner.path {
-            return Err(AppError::ProjectNotLoaded(project_id));
-        }
         return loaded.list_agents().map_err(AppError::from);
     }
-    // **Read the one directory that owns the project, never a scan.** The caller
-    // knows the owner (every `ProjectListing` carries its directory), so there is
-    // no guessing. A scan cannot know which directory *would* have owned the
-    // project, so it could only ever propagate an unrelated directory's failure —
-    // and because `state.directories` iteration is unordered, that surfaced as an
-    // intermittent block on browsing a healthy project whenever any other
-    // directory on the machine had a damaged index.
-    //
-    // The path is validated against the registered set rather than trusted: it
-    // arrives from the frontend, and reading an arbitrary caller-supplied
-    // directory is not this command's business.
-    owner
-        .open_project(project_id)
-        .and_then(|project| project.list_agents())
+    state
+        .store
+        .list_project_agents(project_id)
         .map_err(AppError::from)
 }
 
@@ -2858,10 +2868,13 @@ pub fn search_project_files_in_root(
     // stop-at-`limit` browse behavior.
     let mut matches: Vec<(u8, String)> = Vec::new();
     for entry in builder
-        .filter_entry(|entry| {
-            entry.file_name() != std::ffi::OsStr::new(".git")
-                && entry.file_name() != std::ffi::OsStr::new(".switchboard")
-        })
+        // `.switchboard/` is no longer excluded: Switchboard's state lives in
+        // the user-global store now, so a `.switchboard/` still sitting in a
+        // working directory is either the user's un-migrated legacy state or
+        // something else entirely — in both cases the user's file, and hiding it
+        // from their own file search would be us claiming a directory we no
+        // longer write to.
+        .filter_entry(|entry| entry.file_name() != std::ffi::OsStr::new(".git"))
         .build()
     {
         let entry = match entry {
@@ -2984,7 +2997,7 @@ pub async fn stage_attachment_impl(
 ) -> Result<StagedAttachment, AppError> {
     let project = match lock(&state.projects).get(&project_id).cloned() {
         Some(loaded) => loaded,
-        None => find_project_in_directories(state, project_id)?,
+        None => open_project_from_store(state, project_id)?,
     };
     let attachments_dir = project.attachments_dir();
     let source_path = source_path.to_path_buf();
@@ -3024,7 +3037,7 @@ pub fn existing_attachment_paths_impl(
 ) -> Result<Vec<String>, AppError> {
     let project = match lock(&state.projects).get(&project_id).cloned() {
         Some(loaded) => loaded,
-        None => find_project_in_directories(state, project_id)?,
+        None => open_project_from_store(state, project_id)?,
     };
     let Ok(canonical_dir) = std::fs::canonicalize(project.attachments_dir()) else {
         return Ok(Vec::new());
@@ -4368,7 +4381,7 @@ pub fn project_session_fingerprints_impl(
 ) -> Result<Vec<AgentSessionFingerprint>, AppError> {
     let project = match lock(&state.projects).get(&project_id).cloned() {
         Some(loaded) => loaded,
-        None => find_project_in_directories(state, project_id)?,
+        None => open_project_from_store(state, project_id)?,
     };
     let directory = project.directory.clone();
     let agents = project.list_agents()?;
@@ -5754,7 +5767,7 @@ pub async fn load_project_conversation_impl(
     // the blocking pool — never on an async executor worker.
     let project = match lock(&state.projects).get(&project_id).cloned() {
         Some(loaded) => loaded,
-        None => find_project_in_directories(state, project_id)?,
+        None => open_project_from_store(state, project_id)?,
     };
     let journal = switchboard_core::journal::read_records(&project.journal_path())?;
 
@@ -6097,100 +6110,21 @@ pub fn install_status_for_adapter(adapter: Option<&dyn HarnessAdapter>) -> Harne
     )
 }
 
-/// Find a not-yet-loaded project's owning directory by searching every loaded
-/// directory for the one whose on-disk project list contains `project_id`, then
-/// read the project from it. Used by `open_project_impl` (lazy-lock-on-open):
-/// the directory is known to be loaded (the flat list only offers projects from
-/// loaded directories), but the project handle itself may not be in
-/// `state.projects` yet.
-/// Locate the project across every loaded directory, opening it from the
-/// directory that lists it.
+/// Open a project from the store by id, for a caller that needs a `Project`
+/// but hasn't got one loaded.
 ///
-/// **Resilience to an unrelated corrupt directory.** Iteration order over
-/// `state.directories` is a `HashMap`'s nondeterministic order, so a corrupt
-/// *unrelated* directory could be visited before the healthy one that owns the
-/// target. We therefore **skip-and-log** a directory whose `list_projects`
-/// errors and keep searching, rather than propagating mid-iteration and failing
-/// the open of a perfectly healthy project. Only when no directory yields the
-/// project do we return `ProjectNotLoaded`.
+/// Replaces a scan of every loaded directory's on-disk index. The store resolves
+/// a project from its id in one lookup, so there is no scan to skip-and-log
+/// past, no dependence on which directories happen to be loaded, and no way for
+/// an unrelated directory's unreadable index to masquerade as "project not
+/// found" — the failure that made the old version log rather than propagate.
 ///
-/// (Contrast `enumerate_all_projects`, the collision scan, which deliberately
-/// fails loud — a scan that can't read a directory must not let a possibly
-/// colliding attach through.)
-fn find_project_in_directories(
-    state: &AppState,
-    project_id: ProjectId,
-) -> Result<Project, AppError> {
-    let directories: Vec<Directory> = lock(&state.directories).values().cloned().collect();
-    for directory in directories {
-        let summaries = match directory.list_projects() {
-            Ok(summaries) => summaries,
-            Err(e) => {
-                tracing::warn!(
-                    directory = %directory.path.display(),
-                    error = %e,
-                    "skipping directory while locating project — its registry could not be read"
-                );
-                continue;
-            }
-        };
-        if summaries.iter().any(|s| s.id == project_id) {
-            return directory.open_project(project_id).map_err(AppError::from);
-        }
-    }
-    Err(AppError::ProjectNotLoaded(project_id))
-}
-
-/// Resolve the loaded `Directory` that owns `project_id` by scanning each
-/// loaded directory's on-disk index. Unlike [`find_project_in_directories`],
-/// this returns the owning `Directory` (not the loaded `Project`) and does not
-/// open/lock the project — used by metadata mutations (`rename`, `delete`) that
-/// rewrite the directory's files directly. A directory whose index can't be
-/// read is skipped with a warning. Returns `ProjectNotLoaded` if no loaded
-/// directory claims the id (e.g. its directory is currently unavailable).
-fn find_directory_for_project(
-    state: &AppState,
-    project_id: ProjectId,
-) -> Result<Directory, AppError> {
-    let directories: Vec<Directory> = lock(&state.directories).values().cloned().collect();
-    for directory in directories {
-        match directory.list_projects() {
-            Ok(summaries) if summaries.iter().any(|s| s.id == project_id) => {
-                return Ok(directory);
-            }
-            Ok(_) => {}
-            Err(e) => {
-                tracing::warn!(
-                    directory = %directory.path.display(),
-                    error = %e,
-                    "skipping directory while locating project's owning directory — its index could not be read"
-                );
-            }
-        }
-    }
-    Err(AppError::ProjectNotLoaded(project_id))
-}
-
-/// Resolve the owning `Directory` for `project_id`, preferring an in-memory
-/// lookup. A loaded project carries its canonical `directory` path, so we get
-/// the handle straight from `state.directories` without reading any index —
-/// which also means a transient index read error can't masquerade as "project
-/// not found" and ghost-delete a project whose files are actually present. Falls
-/// back to the on-disk index scan for an available-but-never-opened project.
-/// Returns `ProjectNotLoaded` only when no loaded directory claims the id.
-pub(crate) fn resolve_owning_directory(
-    state: &AppState,
-    project_id: ProjectId,
-) -> Result<Directory, AppError> {
-    let loaded_dir = lock(&state.projects)
-        .get(&project_id)
-        .map(|p| p.directory.clone());
-    if let Some(dir_path) = loaded_dir
-        && let Some(directory) = lock(&state.directories).get(&dir_path).cloned()
-    {
-        return Ok(directory);
-    }
-    find_directory_for_project(state, project_id)
+/// A project whose working directory doesn't resolve surfaces the store's
+/// typed error (`DirectoryNotFound` / `AmbiguousDirectory`) rather than
+/// `ProjectNotLoaded`: the project exists, and saying otherwise would point the
+/// user at the wrong repair.
+fn open_project_from_store(state: &AppState, project_id: ProjectId) -> Result<Project, AppError> {
+    state.store.open_project(project_id).map_err(AppError::from)
 }
 
 fn lookup_agent(state: &AppState, agent_id: AgentId) -> Result<(Project, AgentRecord), AppError> {
@@ -6280,6 +6214,42 @@ mod tests {
     /// Test convenience: create a project in the sole loaded directory. Most
     /// tests load exactly one directory, so this keeps their call sites terse
     /// while the production API requires an explicit directory path.
+    /// Overwrite the store's directory catalog. Staging a damaged catalog is the
+    /// only way to reach the degradation paths; `Store` has no API that produces
+    /// one, by design.
+    fn write_catalog(state: &AppState, entries: &[switchboard_core::DirectoryEntry]) {
+        let mut lines = String::new();
+        for entry in entries {
+            lines.push_str(&serde_json::to_string(entry).unwrap());
+            lines.push('\n');
+        }
+        std::fs::write(state.store.root().join("directories.jsonl"), lines).unwrap();
+    }
+
+    /// Point the store's single catalog row at `path`, without requiring the
+    /// path to exist.
+    ///
+    /// `repoint_directory` canonicalizes, so it can't target a directory that is
+    /// already gone — but "catalogued path no longer on disk" is exactly the
+    /// state several tests need. Writing the catalog directly is the only way to
+    /// stage it.
+    fn repoint_only_directory(state: &AppState, path: &Path) {
+        let mut entries = state.store.list_directories().unwrap();
+        assert_eq!(entries.len(), 1, "repoint_only_directory expects one row");
+        entries[0].path = path.to_path_buf();
+        write_catalog(state, &entries);
+    }
+
+    /// A state with one catalogued directory and one project in it.
+    async fn state_with_project(name: &str) -> (AppState, TempDir, ProjectSummary) {
+        let (tmp, state, _) = fresh_state_with_mock();
+        init_directory_impl(&state, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let project = create_project_in_only_dir(&state, name);
+        (state, tmp, project)
+    }
+
     fn create_project_in_only_dir(state: &AppState, name: &str) -> ProjectSummary {
         let path = {
             let dirs = lock(&state.directories);
@@ -6311,6 +6281,9 @@ mod tests {
         std::fs::write(tmp.path().join("ignored.log"), "ignored\n").unwrap();
         std::fs::write(tmp.path().join("ignored-dir/secret.rs"), "ignored\n").unwrap();
         std::fs::write(tmp.path().join(".git/config"), "ignored\n").unwrap();
+        // Legacy state a migration hasn't cleaned up yet — the user's file now.
+        std::fs::create_dir_all(tmp.path().join(".switchboard")).unwrap();
+        std::fs::write(tmp.path().join(".switchboard/projects.jsonl"), "\n").unwrap();
 
         let root = search_project_files_root_impl(&state, project.id).unwrap();
         let matches = search_project_files_in_root(&root, "", 20).unwrap();
@@ -6320,7 +6293,14 @@ mod tests {
         assert!(!matches.contains(&"ignored.log".to_owned()));
         assert!(!matches.contains(&"ignored-dir/secret.rs".to_owned()));
         assert!(!matches.contains(&".git/config".to_owned()));
-        assert!(!matches.iter().any(|path| path.starts_with(".switchboard/")));
+        // `.switchboard/` is no longer filtered out. Nothing writes it any more,
+        // so one sitting in a working directory is the user's own file — legacy
+        // state awaiting migration, or something unrelated — and hiding it from
+        // their file search would be us claiming a directory we don't own.
+        assert!(
+            matches.iter().any(|path| path.starts_with(".switchboard/")),
+            "a `.switchboard/` in the user's tree is searchable like any other file"
+        );
 
         let queried = search_project_files_in_root(&root, "readme", 20).unwrap();
         assert_eq!(queried, vec!["README.md"]);
@@ -6430,7 +6410,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
         let emitter = Arc::new(RecordingEmitter::new());
-        let state = AppState::new(
+        let state = AppState::new_for_test(
             Arc::clone(&mock),
             Arc::clone(&mock),
             Arc::clone(&mock),
@@ -6549,7 +6529,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::with_scenario(scenario));
         let emitter = Arc::new(RecordingEmitter::new());
-        let state = AppState::new(
+        let state = AppState::new_for_test(
             Arc::clone(&mock),
             Arc::clone(&mock),
             Arc::clone(&mock),
@@ -6857,7 +6837,7 @@ mod tests {
         let gate = Arc::new(tokio::sync::Notify::new());
         let (claude, _prompts) = gated_adapter(texts, &gate, 0);
         let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
-        let state = AppState::new(
+        let state = AppState::new_for_test(
             claude,
             Arc::clone(&mock),
             Arc::clone(&mock),
@@ -7103,7 +7083,7 @@ mod tests {
         );
         let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
         let emitter = Arc::new(RecordingEmitter::new());
-        let state = AppState::new(
+        let state = AppState::new_for_test(
             adapter,
             Arc::clone(&mock),
             Arc::clone(&mock),
@@ -7192,7 +7172,7 @@ mod tests {
         await_turn_running(&state, source_id).await;
 
         let factory = ProjectDispatchContextFactory::new(
-            find_project_in_directories(&state, project_id).unwrap(),
+            open_project_from_store(&state, project_id).unwrap(),
             state
                 .agents_by_id
                 .lock()
@@ -7252,7 +7232,7 @@ mod tests {
         await_turn_running(&state, source_id).await;
 
         let factory = ProjectDispatchContextFactory::new(
-            find_project_in_directories(&state, project_id).unwrap(),
+            open_project_from_store(&state, project_id).unwrap(),
             state
                 .agents_by_id
                 .lock()
@@ -7477,8 +7457,7 @@ mod tests {
         lock(&state.agents_by_id).remove(&other_agent);
         lock(&state.project_locks).remove(&other_project);
 
-        let dir = tmp.path().canonicalize().unwrap();
-        let roster = list_project_agents_readonly_impl(&state, other_project, &dir).unwrap();
+        let roster = list_project_agents_readonly_impl(&state, other_project).unwrap();
         assert_eq!(roster.len(), 1, "the roster is readable without loading");
         assert_eq!(roster[0].id, other_agent);
         // The read is the whole point: browsing must leave no lock behind.
@@ -7491,32 +7470,49 @@ mod tests {
             "a roster read must not load the project"
         );
 
-        // Unknown project inside a known directory: a real read that found nothing.
-        list_project_agents_readonly_impl(&state, Uuid::now_v7(), &dir).unwrap_err();
+        // An id no project owns is a typed error, not an empty roster. Without
+        // the index-membership check the registry path would simply not exist
+        // and read as "no agents".
+        let err = list_project_agents_readonly_impl(&state, Uuid::now_v7()).unwrap_err();
+        assert!(
+            matches!(err, AppError::Core(CoreError::ProjectNotFound(_))),
+            "got: {err:?}"
+        );
+    }
 
-        // A **loaded** project requested with a different registered directory is
-        // refused. The fast path used to return before validating, so the
-        // "locator is validated, not trusted" guarantee held only when the
-        // project was cold — reachable via a stale locator or a duplicate project
-        // id from a copied `.switchboard`.
-        open_project_impl(&state, other_project).unwrap();
-        let other_dir = TempDir::new().unwrap();
-        init_directory_impl(&state, other_dir.path().to_str().unwrap())
-            .await
-            .unwrap();
-        let wrong = other_dir.path().canonicalize().unwrap();
-        let err = list_project_agents_readonly_impl(&state, other_project, &wrong).unwrap_err();
-        assert!(matches!(err, AppError::ProjectNotLoaded(_)), "got: {err:?}");
+    /// A project whose catalog row is damaged can still have its roster browsed.
+    ///
+    /// This is a **behavior change**, not a port: the old path resolved the
+    /// owning directory as part of the read, so a project with an unresolvable
+    /// directory couldn't list its agents at all. The registry lives under the
+    /// store root and browsing needs no working directory, so it now succeeds —
+    /// which is what lets the user see what is in a broken project before
+    /// deciding how to repair it.
+    #[tokio::test]
+    async fn readonly_roster_survives_an_unresolvable_working_directory() {
+        let (tmp, state, _emitter) = fresh_state_with_mock();
+        let home = TempDir::new().unwrap();
+        let (_recipient, _first) = project_with_agent(&state, &tmp).await;
+        let (other_project, other_agent) =
+            second_project_with_source(&state, home.path(), "other", "oracle", "ANSWER");
+        lock(&state.projects).remove(&other_project);
+        lock(&state.agents_by_id).remove(&other_agent);
+        lock(&state.project_locks).remove(&other_project);
 
-        // An unregistered directory is refused rather than read. The path comes
-        // from the frontend, so reading whatever it names is not this command's
-        // business — and validating it is what lets the command target one
-        // directory instead of scanning (where an unrelated corrupt directory
-        // could intermittently block a healthy project).
-        let stranger = TempDir::new().unwrap();
-        let err =
-            list_project_agents_readonly_impl(&state, other_project, stranger.path()).unwrap_err();
-        assert!(matches!(err, AppError::ProjectNotLoaded(_)), "got: {err:?}");
+        // Break the catalog: every directory row gone, so no project resolves.
+        std::fs::write(state.store.root().join("directories.jsonl"), "").unwrap();
+
+        assert!(
+            state.store.open_project(other_project).is_err(),
+            "the project genuinely cannot resolve a working directory"
+        );
+        let roster = list_project_agents_readonly_impl(&state, other_project).unwrap();
+        assert_eq!(
+            roster.len(),
+            1,
+            "browsing a roster needs no working directory"
+        );
+        assert_eq!(roster[0].id, other_agent);
     }
 
     /// Same-named agents in two projects must be distinguishable in everything
@@ -8266,7 +8262,7 @@ mod tests {
         ));
         let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
         let emitter = Arc::new(RecordingEmitter::new());
-        let state = AppState::new(
+        let state = AppState::new_for_test(
             Arc::clone(&claude),
             Arc::clone(&mock),
             Arc::clone(&mock),
@@ -8509,7 +8505,7 @@ mod tests {
         let (claude, prompts) = gated_adapter(texts, &gate, park_at);
         let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
         let emitter = Arc::new(RecordingEmitter::new());
-        let state = AppState::new(
+        let state = AppState::new_for_test(
             claude,
             Arc::clone(&mock),
             Arc::clone(&mock),
@@ -8802,7 +8798,7 @@ mod tests {
         let (codex, _) = gated_adapter(&["BOB-LIVE"], &gate_bob, 0);
         let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
         let emitter = Arc::new(RecordingEmitter::new());
-        let state = AppState::new(
+        let state = AppState::new_for_test(
             claude,
             codex,
             Arc::clone(&mock),
@@ -8899,15 +8895,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn init_directory_creates_switchboard_layout() {
+    async fn init_directory_catalogs_the_path_and_writes_nothing_into_it() {
+        // The move's headline property: adding a working directory registers it
+        // in the store's catalog and leaves the user's folder untouched.
         let (tmp, state, _) = fresh_state_with_mock();
         let info = init_directory_impl(&state, tmp.path().to_str().unwrap())
             .await
             .unwrap();
-        assert!(info.has_switchboard);
         assert!(info.projects.is_empty());
-        assert!(tmp.path().join(".switchboard").is_dir());
-        assert!(tmp.path().join(".switchboard/config.yaml").is_file());
+        assert!(
+            !tmp.path().join(".switchboard").exists(),
+            "nothing is written into the working directory"
+        );
+
+        let canonical = tmp.path().canonicalize().unwrap();
+        let catalogued: Vec<_> = state
+            .store
+            .list_directories()
+            .unwrap()
+            .into_iter()
+            .filter(|entry| entry.path == canonical)
+            .collect();
+        assert_eq!(catalogued.len(), 1, "exactly one catalog row for the path");
+
+        // Idempotent by canonical path: a second add must reuse the id, or the
+        // directory's projects would split across two identities.
+        init_directory_impl(&state, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let after: Vec<_> = state
+            .store
+            .list_directories()
+            .unwrap()
+            .into_iter()
+            .filter(|entry| entry.path == canonical)
+            .collect();
+        assert_eq!(after, catalogued, "re-adding must not mint a second id");
     }
 
     #[tokio::test]
@@ -8920,7 +8943,7 @@ mod tests {
         let tmp_b = TempDir::new().unwrap();
         let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
         let emitter = Arc::new(RecordingEmitter::new());
-        let state = AppState::new(
+        let state = AppState::new_for_test(
             Arc::clone(&mock),
             Arc::clone(&mock),
             Arc::clone(&mock),
@@ -9071,29 +9094,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pick_directory_rejects_incompatible_config_version() {
-        // Set up a directory with a v99 config — `Directory::config()`
-        // returns UnsupportedConfigVersion which we want propagated up
-        // through pick_directory so the user can't proceed against a
-        // future-schema directory with an older Switchboard build.
-        let tmp = TempDir::new().unwrap();
-        let directory = Directory::at(tmp.path()).unwrap();
-        directory.init().unwrap();
-        std::fs::write(tmp.path().join(".switchboard/config.yaml"), "version: 99\n").unwrap();
-
-        let err = pick_directory_impl(tmp.path().to_str().unwrap())
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                AppError::Core(CoreError::UnsupportedConfigVersion { found: 99, .. })
-            ),
-            "expected UnsupportedConfigVersion(99), got: {err:?}"
-        );
-    }
-
-    #[tokio::test]
     async fn concurrent_create_project_same_name_serializes_via_registry_write_lock() {
         // TOCTOU regression: two concurrent IPC calls for create_project
         // with the same name must not both succeed. Without the
@@ -9103,7 +9103,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
         let emitter = Arc::new(RecordingEmitter::new());
-        let state = Arc::new(AppState::new(
+        let state = Arc::new(AppState::new_for_test(
             Arc::clone(&mock),
             Arc::clone(&mock),
             Arc::clone(&mock),
@@ -9173,7 +9173,8 @@ mod tests {
         let codex: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
         let emitter = Arc::new(RecordingEmitter::new());
         let antigravity: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
-        let state = AppState::new(claude, codex, antigravity, emitter as Arc<dyn EventEmitter>);
+        let state =
+            AppState::new_for_test(claude, codex, antigravity, emitter as Arc<dyn EventEmitter>);
         let err = check_claude_binary_impl(&state).unwrap_err();
         assert!(matches!(err, AppError::Probe(_)));
     }
@@ -9236,7 +9237,8 @@ mod tests {
             Arc::new(CodexAdapter::with_binary_path("/nonexistent/codex-xyz"));
         let emitter = Arc::new(RecordingEmitter::new());
         let antigravity: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
-        let state = AppState::new(claude, codex, antigravity, emitter as Arc<dyn EventEmitter>);
+        let state =
+            AppState::new_for_test(claude, codex, antigravity, emitter as Arc<dyn EventEmitter>);
         let err = check_codex_binary_impl(&state).unwrap_err();
         assert!(matches!(err, AppError::Probe(_)));
     }
@@ -9518,7 +9520,7 @@ mod tests {
         let codex: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
         let antigravity: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
         let emitter = Arc::new(RecordingEmitter::new());
-        let state = AppState::new(claude, codex, antigravity, emitter);
+        let state = AppState::new_for_test(claude, codex, antigravity, emitter);
 
         // Exercised the way the Tauri command composes them, so the routing
         // under test is the routing that ships.
@@ -9538,7 +9540,8 @@ mod tests {
         let codex: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
         let antigravity: Arc<dyn HarnessAdapter> = Arc::new(AntigravityAdapter::new());
         let emitter = Arc::new(RecordingEmitter::new());
-        let state = AppState::new(claude, codex, antigravity, emitter as Arc<dyn EventEmitter>);
+        let state =
+            AppState::new_for_test(claude, codex, antigravity, emitter as Arc<dyn EventEmitter>);
         check_antigravity_binary_impl(&state)
             .expect("agy binary must be on PATH; install from https://antigravity.google/download");
     }
@@ -9551,7 +9554,8 @@ mod tests {
         let antigravity: Arc<dyn HarnessAdapter> =
             Arc::new(AntigravityAdapter::with_binary_path("/nonexistent/agy-xyz"));
         let emitter = Arc::new(RecordingEmitter::new());
-        let state = AppState::new(claude, codex, antigravity, emitter as Arc<dyn EventEmitter>);
+        let state =
+            AppState::new_for_test(claude, codex, antigravity, emitter as Arc<dyn EventEmitter>);
         let err = check_antigravity_binary_impl(&state).unwrap_err();
         assert!(matches!(err, AppError::Probe(_)));
     }
@@ -9676,7 +9680,7 @@ mod tests {
             dispatch_count: antigravity_count.clone(),
         });
         let emitter = Arc::new(RecordingEmitter::new());
-        let state = AppState::new(
+        let state = AppState::new_for_test(
             claude,
             codex,
             antigravity,
@@ -9805,7 +9809,7 @@ mod tests {
             MockScenario::DispatchFails,
         ));
         let emitter = Arc::new(RecordingEmitter::new());
-        let state = AppState::new(
+        let state = AppState::new_for_test(
             Arc::clone(&failing),
             Arc::clone(&failing),
             Arc::clone(&failing),
@@ -9901,7 +9905,7 @@ mod tests {
             saw_flag: saw_flag.clone(),
         });
         let emitter = Arc::new(RecordingEmitter::new());
-        let state = AppState::new(
+        let state = AppState::new_for_test(
             Arc::clone(&adapter),
             Arc::clone(&adapter),
             Arc::clone(&adapter),
@@ -10025,7 +10029,7 @@ mod tests {
             emit_session_meta_at: 2, // 0-based: third dispatch emits SessionMeta
         });
         let emitter = Arc::new(RecordingEmitter::new());
-        let state = AppState::new(
+        let state = AppState::new_for_test(
             Arc::clone(&adapter),
             Arc::clone(&adapter),
             Arc::clone(&adapter),
@@ -10133,44 +10137,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pick_directory_does_not_create_switchboard_dir() {
-        let tmp = TempDir::new().unwrap();
-        let info = pick_directory_impl(tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
-        assert!(!info.has_switchboard);
+    async fn pick_directory_writes_nothing_and_lists_nothing_for_an_unknown_path() {
+        let (_tmp, state, _) = fresh_state_with_mock();
+        let dir = TempDir::new().unwrap();
+        let info = pick_directory_impl(&state, dir.path().to_str().unwrap()).unwrap();
         assert!(info.projects.is_empty());
         assert!(
-            !tmp.path().join(".switchboard").exists(),
+            !dir.path().join(".switchboard").exists(),
             "pick_directory must not write to disk"
         );
     }
 
     #[tokio::test]
-    async fn pick_directory_lists_projects_when_switchboard_exists() {
+    async fn pick_directory_lists_the_projects_the_store_holds_for_that_path() {
         let (tmp, state, _) = fresh_state_with_mock();
         init_directory_impl(&state, tmp.path().to_str().unwrap())
             .await
             .unwrap();
         create_project_in_only_dir(&state, "alpha");
 
-        // Use a fresh state with no directory bound — pick_directory is
-        // stateless, it just inspects the path.
-        let info = pick_directory_impl(tmp.path().to_str().unwrap())
+        // Scoped to the picked path: a project in another directory must not
+        // leak into the answer.
+        let other = TempDir::new().unwrap();
+        init_directory_impl(&state, other.path().to_str().unwrap())
             .await
             .unwrap();
-        assert!(info.has_switchboard);
+        let other_canonical = other.path().canonicalize().unwrap();
+        let other_id = state
+            .store
+            .list_directories()
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.path == other_canonical)
+            .unwrap()
+            .directory_id;
+        state.store.create_project(other_id, "beta").unwrap();
+
+        let info = pick_directory_impl(&state, tmp.path().to_str().unwrap()).unwrap();
         assert_eq!(info.projects.len(), 1);
         assert_eq!(info.projects[0].name, "alpha");
     }
 
     #[tokio::test]
     async fn pick_directory_rejects_missing_path() {
-        let tmp = TempDir::new().unwrap();
-        let missing = tmp.path().join("does-not-exist");
-        let err = pick_directory_impl(missing.to_str().unwrap())
-            .await
-            .unwrap_err();
+        let (_tmp, state, _) = fresh_state_with_mock();
+        let dir = TempDir::new().unwrap();
+        let missing = dir.path().join("does-not-exist");
+        let err = pick_directory_impl(&state, missing.to_str().unwrap()).unwrap_err();
         assert!(matches!(err, AppError::Core(_)));
     }
 
@@ -10243,7 +10256,7 @@ mod tests {
         let tmp_home = TempDir::new().unwrap();
         let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
         let emitter = Arc::new(RecordingEmitter::new());
-        let state = AppState::new(
+        let state = AppState::new_for_test(
             Arc::clone(&mock),
             Arc::clone(&mock),
             Arc::clone(&mock),
@@ -10702,6 +10715,9 @@ mod tests {
     #[tokio::test]
     async fn attach_claude_detects_collision_against_unloaded_project() {
         // Phase 1: create project A in a fresh AppState, attach session-id S.
+        // Both phases share one store root: the point of the test is that a
+        // project persisted by one `AppState` is visible to the next.
+        let store_root = TempDir::new().unwrap();
         let tmp_workdir = TempDir::new().unwrap();
         let tmp_home = TempDir::new().unwrap();
         let session_id = Uuid::now_v7();
@@ -10710,7 +10726,8 @@ mod tests {
         {
             let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
             let emitter = Arc::new(RecordingEmitter::new());
-            let state_a = AppState::new(
+            let state_a = AppState::new_for_test_at(
+                store_root.path(),
                 Arc::clone(&mock),
                 Arc::clone(&mock),
                 Arc::clone(&mock),
@@ -10738,7 +10755,8 @@ mod tests {
         // session-id in B → must detect the collision against A.
         let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
         let emitter = Arc::new(RecordingEmitter::new());
-        let state_b = AppState::new(
+        let state_b = AppState::new_for_test_at(
+            store_root.path(),
             Arc::clone(&mock),
             Arc::clone(&mock),
             Arc::clone(&mock),
@@ -10773,6 +10791,9 @@ mod tests {
 
     #[tokio::test]
     async fn attach_codex_detects_collision_against_unloaded_project() {
+        // Both phases share one store root: the point of the test is that a
+        // project persisted by one `AppState` is visible to the next.
+        let store_root = TempDir::new().unwrap();
         let tmp_workdir = TempDir::new().unwrap();
         let tmp_home = TempDir::new().unwrap();
         let session_id = Uuid::now_v7();
@@ -10782,7 +10803,8 @@ mod tests {
         {
             let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
             let emitter = Arc::new(RecordingEmitter::new());
-            let state_a = AppState::new(
+            let state_a = AppState::new_for_test_at(
+                store_root.path(),
                 Arc::clone(&mock),
                 Arc::clone(&mock),
                 Arc::clone(&mock),
@@ -10807,7 +10829,8 @@ mod tests {
 
         let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
         let emitter = Arc::new(RecordingEmitter::new());
-        let state_b = AppState::new(
+        let state_b = AppState::new_for_test_at(
+            store_root.path(),
             Arc::clone(&mock),
             Arc::clone(&mock),
             Arc::clone(&mock),
@@ -10847,7 +10870,7 @@ mod tests {
             let tmp_home = TempDir::new().unwrap();
             let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
             let emitter = Arc::new(RecordingEmitter::new());
-            let state = AppState::new(
+            let state = AppState::new_for_test(
                 Arc::clone(&mock),
                 Arc::clone(&mock),
                 Arc::clone(&mock),
@@ -11952,7 +11975,7 @@ mod tests {
 
     fn mock_app_state() -> AppState {
         let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
-        AppState::new(
+        AppState::new_for_test(
             Arc::clone(&mock),
             Arc::clone(&mock),
             Arc::clone(&mock),
@@ -11964,11 +11987,18 @@ mod tests {
     async fn project_lock_refuses_second_process_then_releases_on_remove() {
         let (tmp_workdir, _home, state_a, proj) = fresh_state_with_active_project("alpha").await;
 
-        // A second Switchboard "process" binds the same directory and opens
-        // the same project — refused while state_a holds the instance lock.
-        // (Independent `open()`s of the same lock file conflict under flock,
-        // even within one OS process, which is what lets this run in-process.)
-        let state_b = mock_app_state();
+        // A second Switchboard "process" opens the same project from the same
+        // store — refused while state_a holds the instance lock. (Independent
+        // `open()`s of the same lock file conflict under flock, even within one
+        // OS process, which is what lets this run in-process.)
+        let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
+        let state_b = AppState::new_for_test_at(
+            state_a.store.root(),
+            Arc::clone(&mock),
+            Arc::clone(&mock),
+            Arc::clone(&mock),
+            Arc::new(RecordingEmitter::new()) as Arc<dyn EventEmitter>,
+        );
         init_directory_impl(&state_b, tmp_workdir.path().to_str().unwrap())
             .await
             .unwrap();
@@ -12037,7 +12067,7 @@ mod tests {
 
     #[tokio::test]
     async fn open_with_corrupt_registry_errors_without_wedging_the_lock() {
-        let (tmp_workdir, _home, state, proj) = fresh_state_with_active_project("alpha").await;
+        let (_tmp_workdir, _home, state, proj) = fresh_state_with_active_project("alpha").await;
         let agent =
             create_agent_impl(&state, "assistant", HarnessKind::ClaudeCode, None, None).unwrap();
 
@@ -12048,12 +12078,7 @@ mod tests {
         lock(&state.agents_by_id).clear();
 
         // Corrupt the on-disk registry with a torn line after the valid record.
-        let registry = tmp_workdir
-            .path()
-            .join(".switchboard")
-            .join("projects")
-            .join(proj.id.to_string())
-            .join("registry.jsonl");
+        let registry = state.store.project_root(proj.id).join("registry.jsonl");
         let good_line = serde_json::to_string(&agent).unwrap();
         std::fs::write(&registry, format!("{good_line}\nthis is not json\n")).unwrap();
 
@@ -12505,7 +12530,7 @@ mod tests {
             dispatches: std::sync::atomic::AtomicUsize::new(0),
         });
         let emitter = Arc::new(RecordingEmitter::new());
-        let state = AppState::new(
+        let state = AppState::new_for_test(
             Arc::clone(&adapter),
             Arc::clone(&adapter),
             adapter,
@@ -12588,7 +12613,7 @@ mod tests {
         let listing = rename_project_impl(&state, project.id, "renamed").unwrap();
         assert_eq!(listing.name, "renamed");
         assert_eq!(listing.id, project.id);
-        assert!(listing.available);
+        assert_eq!(listing.directory_status, DirectoryStatus::ResolvedAvailable);
 
         // In-memory `Project` (canonical name) reflects the change.
         assert_eq!(
@@ -12631,12 +12656,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rename_project_unknown_id_errors_without_loaded_directory() {
+    async fn rename_project_unknown_id_errors() {
         let (_tmp, state, _) = fresh_state_with_mock();
-        // No loaded directory owns this id → resolution fails (the same path an
-        // unavailable directory takes).
+        // The store index answers directly — no directory has to be loaded, or
+        // even available, for the id to be recognized or rejected.
         let err = rename_project_impl(&state, Uuid::now_v7(), "x").unwrap_err();
-        assert!(matches!(err, AppError::ProjectNotLoaded(_)));
+        assert!(
+            matches!(err, AppError::Core(CoreError::ProjectNotFound(_))),
+            "got: {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -12874,9 +12902,9 @@ mod tests {
             .unwrap();
         let project = create_project_in_only_dir(&state, "alpha");
 
-        // Make `.switchboard/` read-only so `write_jsonl` (index rewrite) can't
+        // Make the store root read-only so `write_jsonl` (index rewrite) can't
         // create its tmp file → core delete fails before the commit.
-        let sb = tmp.path().join(".switchboard");
+        let sb = state.store.root().to_path_buf();
         std::fs::set_permissions(&sb, std::fs::Permissions::from_mode(0o555)).unwrap();
 
         let err = delete_project_impl(&state, project.id).await.unwrap_err();
@@ -12890,116 +12918,182 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_project_with_missing_index_removes_dir_and_does_not_resurrect_from_cache() {
-        // Out-of-band missing index: the fast-path still resolves the loaded
-        // project's directory (no ghosting), core removes the directory, and the
-        // deleted id is dropped from the workspace cache so a later list can't
-        // serve it back from the stale snapshot.
-        let (tmp, state, _) = fresh_state_with_mock();
-        init_directory_impl(&state, tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
-        let project = create_project_in_only_dir(&state, "alpha");
-        let root = lock(&state.projects)
-            .get(&project.id)
-            .map(|p| p.root.clone())
-            .unwrap();
-        // Prime the cache, then remove the index out-of-band.
-        let _ = list_projects_impl(&state).unwrap();
-        let canonical = tmp.path().canonicalize().unwrap();
-        std::fs::remove_file(canonical.join(".switchboard").join("projects.jsonl")).unwrap();
+    async fn an_ambiguous_directory_identity_reaches_the_wire_as_its_own_status() {
+        // The four-state status exists because the repairs differ. An ambiguous
+        // identity is fixed by a re-point (which collapses the duplicate rows);
+        // a missing one has no in-app repair. Reporting both as "unavailable"
+        // would point the user at the wrong action — or at no action.
+        let (state, cwd, project) = state_with_project("alpha").await;
+        let elsewhere = TempDir::new().unwrap();
+        let mut entries = state.store.list_directories().unwrap();
+        entries.push(switchboard_core::DirectoryEntry {
+            directory_id: entries[0].directory_id,
+            path: elsewhere.path().canonicalize().unwrap(),
+        });
+        write_catalog(&state, &entries);
 
-        delete_project_impl(&state, project.id).await.unwrap();
+        let listings = list_projects_impl(&state).unwrap();
+        let row = listings.iter().find(|l| l.id == project.id).unwrap();
+        assert_eq!(row.directory_status, DirectoryStatus::CatalogAmbiguous);
+        assert!(row.directory.is_none());
+        drop(cwd);
+    }
 
-        // The directory was actually removed (fast-path resolved it, not ghosted)…
-        assert!(!root.exists());
-        // …and the project does not reappear from the cached snapshot.
+    #[tokio::test]
+    async fn hiding_a_directory_omits_its_projects_without_deleting_them() {
+        // Hiding is view-state: the projects stay in the store and come back
+        // whole when the directory is added again. It is not a soft delete.
+        let (state, cwd, project) = state_with_project("alpha").await;
+        let canonical = cwd.path().canonicalize().unwrap();
+        assert_eq!(list_projects_impl(&state).unwrap().len(), 1);
+
+        lock(&state.workspace).set_hidden(&canonical, true);
         assert!(
-            list_projects_impl(&state)
+            list_projects_impl(&state).unwrap().is_empty(),
+            "a hidden directory's projects drop out of the list"
+        );
+        assert!(
+            state
+                .store
+                .list_projects()
                 .unwrap()
                 .iter()
-                .all(|p| p.id != project.id)
+                .any(|entry| entry.id == project.id),
+            "but the project itself is untouched"
+        );
+
+        lock(&state.workspace).set_hidden(&canonical, false);
+        assert_eq!(
+            list_projects_impl(&state).unwrap().len(),
+            1,
+            "unhiding is lossless"
         );
     }
 
     #[tokio::test]
-    async fn delete_project_removes_unavailable_project_and_does_not_resurrect_from_cache() {
-        // The user-facing bug: a project whose directory is gone shows as an
-        // unavailable cached row, and deleting it must drop it for good — both
-        // from the listing and from the persisted workspace cache that serves
-        // unavailable rows (otherwise it resurrects on the next list / restart).
+    async fn caching_an_agent_claimed_by_another_project_is_refused() {
+        // The id cache used to insert last-wins, so an agent id present in two
+        // registries silently resolved to whichever was read second — and
+        // dispatched into a project the user wasn't looking at. Unreachable
+        // today (ids are minted fresh, an agent lives in one registry); the
+        // check lands before the move feature that can produce the state.
         let (tmp, state, _) = fresh_state_with_mock();
-        init_directory_impl(&state, tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
-        let project = create_project_in_only_dir(&state, "alpha");
-        // Prime the workspace cache so the project can be served as a row.
-        let _ = list_projects_impl(&state).unwrap();
+        let (agent, project_id) = project_with_agent(&state, &tmp).await;
 
-        // Simulate the directory becoming unreachable (folder/volume gone): drop
-        // the loaded handle + lock and the loaded directory registry, leaving only
-        // the persisted cache — exactly how an unavailable row is served.
+        let mut impostor = agent.clone();
+        impostor.project_id = Uuid::now_v7();
+        let err = cache_agent(&state, impostor).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AppError::AgentProjectConflict { agent_id, existing_project_id, .. }
+                    if agent_id == agent.id && existing_project_id == project_id
+            ),
+            "got: {err:?}"
+        );
+        assert_eq!(
+            lock(&state.agents_by_id).get(&agent.id).unwrap().project_id,
+            project_id,
+            "the refused insert must not shadow the existing mapping"
+        );
+
+        // Re-inserting the *same* agent stays an ordinary overwrite — renames
+        // and locator writes go through this path on every turn.
+        cache_agent(&state, agent.clone()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_project_refuses_when_the_store_index_is_missing() {
+        // Inverted from the old directory-scoped behavior, which tolerated a
+        // missing index and removed the project directory anyway. The store
+        // refuses: a vanished index is damage the user has had no signal about,
+        // they are acting on a list loaded at startup, and the project
+        // directories are the material a repair would rebuild from. Deleting
+        // them would look like an ordinary delete while destroying that
+        // material.
+        let (state, _cwd, project) = state_with_project("alpha").await;
+        let root = state.store.project_root(project.id);
+        std::fs::remove_file(state.store.root().join("projects.jsonl")).unwrap();
+
+        let err = delete_project_impl(&state, project.id).await.unwrap_err();
+        assert!(
+            matches!(err, AppError::Core(CoreError::MissingAppendOnlyFile { .. })),
+            "got: {err:?}"
+        );
+        assert!(
+            root.exists(),
+            "a refused delete must leave the project's data intact"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_project_removes_a_project_whose_directory_is_gone() {
+        // The user-facing bug this used to be about: a project whose directory
+        // vanished showed as an unavailable *cached* row, and deleting it had to
+        // prune the cache too or it resurrected on the next list. There is no
+        // cache now — the row comes from the store index and the delete rewrites
+        // that index — so the resurrection path is structurally gone. What still
+        // needs proving is that the delete works at all with no reachable
+        // working directory, since everything being removed lives in the store.
+        let (state, _cwd, project) = state_with_project("alpha").await;
+        let missing = TempDir::new().unwrap();
+        let missing_path = missing.path().canonicalize().unwrap();
+        drop(missing);
+        repoint_only_directory(&state, &missing_path);
         lock(&state.projects).remove(&project.id);
         lock(&state.project_locks).remove(&project.id);
         lock(&state.directories).clear();
 
-        // Precondition: it lists as an unavailable row, so delete is meaningful.
+        // Precondition: it lists, and reports its directory as unavailable.
         let before = list_projects_impl(&state).unwrap();
         let row = before.iter().find(|p| p.id == project.id).unwrap();
-        assert!(!row.available, "expected an unavailable cached row");
-
-        delete_project_impl(&state, project.id).await.unwrap();
-
-        // Gone from the listing and from the workspace cache (no resurrection).
-        assert!(
-            list_projects_impl(&state)
-                .unwrap()
-                .iter()
-                .all(|p| p.id != project.id)
+        assert_eq!(
+            row.directory_status,
+            DirectoryStatus::ResolvedPathUnavailable,
+            "expected a catalogued directory whose path is gone"
         );
-        assert!(!lock(&state.workspace).knows_project(project.id));
-    }
-
-    #[tokio::test]
-    async fn deleting_an_offline_project_leaves_disk_so_reconnecting_relists_it() {
-        // Accepted best-effort limit (engineer-approved): deleting a project
-        // whose directory is offline removes the listing row but cannot delete
-        // the on-disk files. If that directory is reconnected (re-init reads the
-        // surviving index), the project legitimately reappears. Pinned here so
-        // the behavior is a conscious choice, not a silent surprise.
-        let (tmp, state, _) = fresh_state_with_mock();
-        init_directory_impl(&state, tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
-        let project = create_project_in_only_dir(&state, "alpha");
-        let _ = list_projects_impl(&state).unwrap();
-
-        // Go offline: drop the loaded handle/lock/registry, leaving the on-disk
-        // index intact.
-        lock(&state.projects).remove(&project.id);
-        lock(&state.project_locks).remove(&project.id);
-        lock(&state.directories).clear();
 
         delete_project_impl(&state, project.id).await.unwrap();
+
         assert!(
             list_projects_impl(&state)
                 .unwrap()
                 .iter()
                 .all(|p| p.id != project.id),
-            "delete clears the offline listing row"
+            "the delete is durable with no reachable working directory"
         );
+        assert!(
+            !state.store.project_root(project.id).exists(),
+            "and it removes the project's metadata root"
+        );
+    }
 
-        // Reconnect: re-init the same on-disk directory. Its index still lists the
-        // project (delete never reached disk), so it comes back as available.
+    #[tokio::test]
+    async fn deleting_a_project_whose_directory_is_offline_is_permanent() {
+        // This used to be an accepted limitation: a project deleted while its
+        // directory was offline lost only its listing row, because the index
+        // lived inside that directory and couldn't be rewritten — so
+        // reconnecting resurrected it. The index is in the store now, so the
+        // delete is real, and reconnecting the directory brings back nothing.
+        let (state, tmp, project) = state_with_project("alpha").await;
+
+        // Go offline: drop the loaded handle/lock/registry.
+        lock(&state.projects).remove(&project.id);
+        lock(&state.project_locks).remove(&project.id);
+        lock(&state.directories).clear();
+
+        delete_project_impl(&state, project.id).await.unwrap();
+
         init_directory_impl(&state, tmp.path().to_str().unwrap())
             .await
             .unwrap();
-        let row = list_projects_impl(&state)
-            .unwrap()
-            .into_iter()
-            .find(|p| p.id == project.id)
-            .expect("offline-deleted project relists after the directory reconnects");
-        assert!(row.available);
+        assert!(
+            list_projects_impl(&state)
+                .unwrap()
+                .iter()
+                .all(|p| p.id != project.id),
+            "reconnecting the directory must not resurrect a deleted project"
+        );
     }
 
     #[tokio::test]
@@ -13787,7 +13881,10 @@ mod tests {
         let listings = list_projects_impl(&state).unwrap();
         assert_eq!(listings.len(), 1, "the project lists exactly once");
         assert_eq!(listings[0].id, project.id);
-        assert!(listings[0].available);
+        assert_eq!(
+            listings[0].directory_status,
+            DirectoryStatus::ResolvedAvailable
+        );
     }
 
     #[tokio::test]
@@ -13826,14 +13923,39 @@ mod tests {
         assert!(lock(&state.projects).is_empty());
         assert!(lock(&state.agents_by_id).is_empty());
         assert!(lock(&state.directories).is_empty());
-        assert!(lock(&state.workspace).entries().is_empty());
         assert!(lock(&state.active_project_id).is_none());
 
-        // `.switchboard/` was never deleted — re-init restores the project.
-        assert!(tmp.path().join(".switchboard").is_dir());
+        // Hidden, not forgotten: the entry survives so ordering and a later
+        // unhide do too, and the project itself is untouched — it just stops
+        // being listed.
+        let canonical = tmp.path().canonicalize().unwrap();
+        assert!(lock(&state.workspace).is_hidden(&canonical));
+        assert!(lock(&state.workspace).contains(&canonical));
+        assert!(
+            list_projects_impl(&state)
+                .unwrap()
+                .iter()
+                .all(|p| p.id != project_id),
+            "a hidden directory's projects drop out of the list"
+        );
+        assert!(
+            state
+                .store
+                .list_projects()
+                .unwrap()
+                .iter()
+                .any(|p| p.id == project_id),
+            "but nothing is deleted"
+        );
+
+        // Nothing was written into the working directory to begin with.
+        assert!(!tmp.path().join(".switchboard").exists());
+
+        // Adding the directory back is the unhide gesture, and it is lossless.
         let info = init_directory_impl(&state, tmp.path().to_str().unwrap())
             .await
             .unwrap();
+        assert!(!lock(&state.workspace).is_hidden(&canonical));
         assert_eq!(info.projects.len(), 1);
         assert_eq!(info.projects[0].id, project_id);
 
@@ -13871,9 +13993,16 @@ mod tests {
 
         let alpha_row = listings.iter().find(|l| l.id == alpha.id).unwrap();
         let beta_row = listings.iter().find(|l| l.id == beta.id).unwrap();
-        assert_eq!(alpha_row.directory, dir_a);
-        assert_eq!(beta_row.directory, dir_b);
-        assert!(alpha_row.available && beta_row.available);
+        assert_eq!(alpha_row.directory.as_deref(), Some(dir_a.as_str()));
+        assert_eq!(beta_row.directory.as_deref(), Some(dir_b.as_str()));
+        assert_eq!(
+            alpha_row.directory_status,
+            DirectoryStatus::ResolvedAvailable
+        );
+        assert_eq!(
+            beta_row.directory_status,
+            DirectoryStatus::ResolvedAvailable
+        );
     }
 
     #[tokio::test]
@@ -13883,7 +14012,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
         let emitter = Arc::new(RecordingEmitter::new());
-        let state = AppState::new(
+        let state = AppState::new_for_test(
             Arc::clone(&mock),
             Arc::clone(&mock),
             Arc::clone(&mock),
@@ -14071,7 +14200,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
         let emitter = Arc::new(RecordingEmitter::new());
-        let state = AppState::new(
+        let state = AppState::new_for_test(
             Arc::clone(&mock),
             Arc::clone(&mock),
             Arc::clone(&mock),
@@ -14099,62 +14228,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_projects_unmounted_directory_falls_back_to_cache_without_write() {
-        // A directory present in the workspace but not loaded (unmounted) serves
-        // its cached snapshot as unavailable, and produces no write.
+    async fn list_projects_reports_a_vanished_directory_without_rewriting_workspace_yaml() {
+        // Two properties that used to belong to the cache path. First: a project
+        // whose directory is gone still lists — it just reports the directory as
+        // unavailable, with the path it *should* be at, which is what the
+        // re-point repair needs. Second: listing is a hot read and must not
+        // write `workspace.yaml`; that is now structural (there is no cache to
+        // refresh) rather than a persist-on-change optimization.
         let dir = TempDir::new().unwrap();
         let ws_path = dir.path().join("workspace.yaml");
-        let tmp = TempDir::new().unwrap();
-        let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
-        let emitter = Arc::new(RecordingEmitter::new());
-        let state = AppState::new(
-            Arc::clone(&mock),
-            Arc::clone(&mock),
-            Arc::clone(&mock),
-            emitter as Arc<dyn EventEmitter>,
-        )
-        .with_workspace(ws_path.clone());
-
+        let (tmp, state, _) = fresh_state_with_mock();
+        let state = state.with_workspace(ws_path.clone());
         init_directory_impl(&state, tmp.path().to_str().unwrap())
             .await
             .unwrap();
         let proj = create_project_in_only_dir(&state, "alpha");
-        // Prime the cache + persist.
         list_projects_impl(&state).unwrap();
 
-        // Simulate the directory becoming unavailable: drop the loaded handle.
-        let key = lock(&state.projects)
-            .get(&proj.id)
-            .map(|p| p.directory.clone())
-            .unwrap();
-        lock(&state.directories).remove(&key);
+        let missing = TempDir::new().unwrap();
+        let missing_path = missing.path().canonicalize().unwrap();
+        drop(missing);
+        repoint_only_directory(&state, &missing_path);
+        lock(&state.directories).clear();
         let before = std::fs::metadata(&ws_path).unwrap().modified().unwrap();
 
         let listings = list_projects_impl(&state).unwrap();
-        assert_eq!(listings.len(), 1, "cached snapshot still lists the project");
-        assert!(!listings[0].available, "unloaded directory is unavailable");
+        assert_eq!(listings.len(), 1, "the project still lists");
+        assert_eq!(listings[0].id, proj.id);
+        assert_eq!(
+            listings[0].directory_status,
+            DirectoryStatus::ResolvedPathUnavailable
+        );
+        assert_eq!(
+            listings[0].directory.as_deref(),
+            Some(missing_path.to_string_lossy().as_ref()),
+            "the catalogued path is reported so the user can re-point it"
+        );
+
         let after = std::fs::metadata(&ws_path).unwrap().modified().unwrap();
-        assert_eq!(before, after, "cache-fallback path must not rewrite");
+        assert_eq!(before, after, "listing must not rewrite workspace.yaml");
     }
 
     #[tokio::test]
-    async fn list_projects_corrupt_directory_does_not_fail_others_or_refresh_cache() {
-        // A corrupt registry in directory A must not refresh/persist A's cache
-        // and must not fail the listing of healthy directory B.
-        let dir = TempDir::new().unwrap();
-        let ws_path = dir.path().join("workspace.yaml");
-        let tmp_a = TempDir::new().unwrap();
+    async fn list_projects_degrades_one_damaged_row_without_hiding_the_healthy_ones() {
+        // The old shape of this test was "a corrupt directory index must not
+        // fail the other directories' listings". Per-directory indexes are gone,
+        // so the equivalent hazard is a damaged *catalog row*: one project whose
+        // `directory_id` resolves to nothing must degrade to an unresolved row
+        // while every healthy project still lists. Whole-read failure here would
+        // hide every project behind one broken reference.
+        let (tmp_a, state, _) = fresh_state_with_mock();
         let tmp_b = TempDir::new().unwrap();
-        let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
-        let emitter = Arc::new(RecordingEmitter::new());
-        let state = AppState::new(
-            Arc::clone(&mock),
-            Arc::clone(&mock),
-            Arc::clone(&mock),
-            emitter as Arc<dyn EventEmitter>,
-        )
-        .with_workspace(ws_path.clone());
-
         let info_a = init_directory_impl(&state, tmp_a.path().to_str().unwrap())
             .await
             .unwrap();
@@ -14163,75 +14287,82 @@ mod tests {
             .await
             .unwrap();
         let beta = create_project_impl(&state, "beta", &info_b.path).unwrap();
-        // Prime caches for both.
-        list_projects_impl(&state).unwrap();
-        let cached_a_before: Vec<ProjectSummary> = lock(&state.workspace)
-            .entries()
-            .iter()
-            .find(|e| e.path == tmp_a.path().canonicalize().unwrap())
-            .map(|e| e.cached_projects.clone())
-            .unwrap();
 
-        // Corrupt A's projects index (Switchboard-owned JSONL).
-        let index_a = tmp_a.path().join(".switchboard").join("projects.jsonl");
-        std::fs::write(&index_a, "{ this is not valid json\n").unwrap();
+        // Drop A's catalog row, leaving alpha's `directory_id` dangling.
+        let canonical_a = tmp_a.path().canonicalize().unwrap();
+        let kept: Vec<switchboard_core::DirectoryEntry> = state
+            .store
+            .list_directories()
+            .unwrap()
+            .into_iter()
+            .filter(|entry| entry.path != canonical_a)
+            .collect();
+        write_catalog(&state, &kept);
 
         let listings = list_projects_impl(&state).unwrap();
-        // B still lists; A degrades to its cached snapshot as unavailable.
         let beta_row = listings
             .iter()
             .find(|l| l.id == beta.id)
-            .expect("healthy directory B still lists");
-        assert!(beta_row.available);
+            .expect("a healthy project still lists");
+        assert_eq!(
+            beta_row.directory_status,
+            DirectoryStatus::ResolvedAvailable
+        );
+
         let alpha_row = listings
             .iter()
             .find(|l| l.id == alpha.id)
-            .expect("corrupt directory A still lists from cache");
-        assert!(
-            !alpha_row.available,
-            "corrupt directory degrades to unavailable"
-        );
-
-        // A's cache was NOT refreshed from the corrupt read.
-        let cached_a_after: Vec<ProjectSummary> = lock(&state.workspace)
-            .entries()
-            .iter()
-            .find(|e| e.path == tmp_a.path().canonicalize().unwrap())
-            .map(|e| e.cached_projects.clone())
-            .unwrap();
+            .expect("a project with a damaged catalog row still lists");
         assert_eq!(
-            cached_a_before, cached_a_after,
-            "corrupt read must not overwrite the last-good cached snapshot"
+            alpha_row.directory_status,
+            DirectoryStatus::CatalogMissing,
+            "the cause must reach the wire — its repair differs from a moved folder"
+        );
+        assert!(
+            alpha_row.directory.is_none(),
+            "there is no path to report, and guessing one is what the store refuses"
         );
     }
 
     #[tokio::test]
-    async fn open_project_skips_corrupt_unrelated_directory() {
-        // find_project_in_directories must skip-and-log a corrupt unrelated
-        // directory (A) and still open a healthy project in directory B.
+    async fn open_project_resolves_directly_and_cannot_be_blocked_by_another_project() {
+        // The failure this replaces: opening a project used to scan every loaded
+        // directory's index, so an unrelated directory with a damaged index
+        // could — depending on unordered map iteration — intermittently block
+        // opening a perfectly healthy project. The store resolves a project from
+        // its id in one lookup, so there is no scan to be caught by. Staged with
+        // an *unrelated* damaged catalog row, the closest remaining analogue.
         let (tmp_a, state, _) = fresh_state_with_mock();
         let tmp_b = TempDir::new().unwrap();
         let info_a = init_directory_impl(&state, tmp_a.path().to_str().unwrap())
             .await
             .unwrap();
-        // A has a project so its (now-corrupt) index would otherwise be read.
         create_project_impl(&state, "alpha", &info_a.path).unwrap();
         let info_b = init_directory_impl(&state, tmp_b.path().to_str().unwrap())
             .await
             .unwrap();
         let beta = create_project_impl(&state, "beta", &info_b.path).unwrap();
 
-        // Evict B from the loaded set so open must locate it via directory scan.
+        // Evict B from the loaded set so the open must go to disk.
         lock(&state.projects).remove(&beta.id);
         lock(&state.project_locks).remove(&beta.id);
 
-        // Corrupt A's registry. HashMap iteration order is nondeterministic, so
-        // A may be visited before B.
-        let index_a = tmp_a.path().join(".switchboard").join("projects.jsonl");
-        std::fs::write(&index_a, "{ corrupt\n").unwrap();
+        // Duplicate A's catalog row, making *A's* directory id ambiguous.
+        let canonical_a = tmp_a.path().canonicalize().unwrap();
+        let mut entries = state.store.list_directories().unwrap();
+        let row_a = entries
+            .iter()
+            .find(|entry| entry.path == canonical_a)
+            .unwrap()
+            .clone();
+        entries.push(switchboard_core::DirectoryEntry {
+            directory_id: row_a.directory_id,
+            path: tmp_b.path().canonicalize().unwrap(),
+        });
+        write_catalog(&state, &entries);
 
         let reopened = open_project_impl(&state, beta.id)
-            .expect("open of a healthy project succeeds despite an unrelated corrupt directory");
+            .expect("a healthy project opens despite another project's damaged catalog row");
         assert_eq!(reopened.id, beta.id);
     }
 
@@ -18765,8 +18896,8 @@ mod tests {
             "removing a working directory must leave the repo tracked in the git view"
         );
         assert!(
-            !lock(&state.workspace).contains(&canonical),
-            "but it is removed from the workspace"
+            lock(&state.workspace).is_hidden(&canonical),
+            "but it is hidden in the workspace"
         );
     }
 
@@ -19704,7 +19835,7 @@ mod tests {
         let home = TempDir::new().unwrap();
         let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
         let emitter = Arc::new(RecordingEmitter::new());
-        let state = AppState::new(
+        let state = AppState::new_for_test(
             claude,
             codex,
             Arc::clone(&mock),

@@ -262,7 +262,7 @@ describe("PromptComposer per-argument forwarding", () => {
       { focus: "", tone: "" },
       {
         crossProject: {
-          projects: [{ id: FOREIGN_PROJECT, name: "backend", directory: "/work/backend" }],
+          projects: [{ id: FOREIGN_PROJECT, name: "backend" }],
           loadAgents: async () => [FOREIGN_AGENT],
           activate: async () => {},
         },

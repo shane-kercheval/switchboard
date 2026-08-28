@@ -81,6 +81,7 @@
     WorkflowInputValue,
     WorkflowListing,
   } from "$lib/types";
+  import { projectIsAvailable } from "$lib/types";
   import { classifyKind, nextLabel } from "$lib/attachments";
   import { registerSend } from "$lib/state/sendCompletion";
   import { getCurrentWebview } from "@tauri-apps/api/webview";
@@ -277,8 +278,8 @@
   /// moves out of the working directory — but that is not this milestone.)
   const otherForwardProjects = $derived(
     projects.list
-      .filter((p) => p.id !== projectId && p.available && !p.archived)
-      .map((p) => ({ id: p.id, name: p.name, directory: p.directory })),
+      .filter((p) => p.id !== projectId && projectIsAvailable(p) && !p.archived)
+      .map((p) => ({ id: p.id, name: p.name })),
   );
 
   /// The **shared half** of cross-project sourcing: what to browse, how to read a
@@ -294,11 +295,7 @@
   /// restored cold from a draft, which never passed through here.
   const crossProjectBase = $derived({
     projects: otherForwardProjects,
-    loadAgents: (id: ProjectId) =>
-      api.listProjectAgentsReadonly(
-        id,
-        otherForwardProjects.find((p) => p.id === id)?.directory ?? "",
-      ),
+    loadAgents: (id: ProjectId) => api.listProjectAgentsReadonly(id),
     activate: async (id: ProjectId) => {
       await api.openProject(id);
     },
@@ -524,10 +521,11 @@
   /// isn't on screen. Failures keep the stored label rather than mutating or
   /// dropping the chip.
   onMount(() => {
-    // A plain record, not a Map: local bookkeeping, never rendered — the same
-    // reasoning as `seenSendSeq` in the transcript, and why the reactive-Map lint
-    // doesn't apply.
-    const foreign: Record<ProjectId, string> = {};
+    // A plain record used as a set, not a `Set`: local bookkeeping, never
+    // rendered — the same reasoning as `seenSendSeq` in the transcript, and the
+    // shape the reactivity lint expects here. Only ids are collected now; the
+    // roster read no longer takes a directory.
+    const foreign: Record<ProjectId, true> = {};
     for (const family of [
       forwardSources,
       promptAppendedSources,
@@ -536,17 +534,16 @@
     ]) {
       for (const source of family) {
         if (source.projectId !== undefined && source.projectId !== projectId) {
-          const dir = projects.list.find((p) => p.id === source.projectId)?.directory;
-          if (dir !== undefined) foreign[source.projectId] = dir;
+          foreign[source.projectId] = true;
         }
       }
     }
-    const pending = Object.entries(foreign);
+    const pending = Object.keys(foreign);
     if (pending.length === 0) return;
     let cancelled = false;
-    for (const [id, dir] of pending) {
+    for (const id of pending) {
       void api
-        .listProjectAgentsReadonly(id, dir)
+        .listProjectAgentsReadonly(id)
         .then((roster) => {
           if (cancelled) return;
           const name = projects.list.find((p) => p.id === id)?.name;

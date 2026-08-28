@@ -2,7 +2,7 @@
 //! `agy`.
 //!
 //! Exercises the **full backend vertical slice** that a user actually
-//! triggers: `Directory::init` → `create_project` → `register_agent` →
+//! triggers: `Store::add_directory` → `create_project` → `register_agent` →
 //! `Dispatcher::send_message` → real subprocess → events streamed back
 //! through the `EventEmitter`. Uses realistic on-disk paths so any
 //! path-encoding rule or cwd-semantic decision is exercised against the
@@ -41,7 +41,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use switchboard_core::{AgentRecord, Attachment, AttachmentKind, Directory, HarnessKind, SendId};
+use switchboard_core::{
+    AgentRecord, Attachment, AttachmentKind, HarnessKind, Project, SendId, Store,
+};
 use switchboard_dispatcher::{
     ConversationJournal, DispatchContext, DispatchContextFactory, Dispatcher, EventEmitter,
     NoopJournal, NoopMetadataCache, NoopSessionLocatorSink, OnBusy, RecordingEmitter, SendOutcome,
@@ -205,6 +207,23 @@ fn assert_ordering_contract(kinds: &[String]) {
     );
 }
 
+/// A project in a fresh temp store, rooted at `working_directory`.
+///
+/// The store root is its own `TempDir` and is returned so the caller keeps it
+/// alive — nothing Switchboard-owned is written into the working directory any
+/// more, so the project's files would vanish the moment the root dropped.
+fn temp_project(working_directory: &std::path::Path, name: &str) -> (TempDir, Project) {
+    let store_root = TempDir::new().expect("store root");
+    let store = Store::open(store_root.path()).expect("open store");
+    let directory = store
+        .add_directory(working_directory)
+        .expect("add_directory");
+    let project = store
+        .create_project(directory.directory_id, name)
+        .expect("create_project");
+    (store_root, project)
+}
+
 #[tokio::test]
 #[ignore = "requires claude installed and authenticated — run with: make test-live"]
 async fn live_claude_full_stack_two_consecutive_turns_succeed() {
@@ -214,11 +233,7 @@ async fn live_claude_full_stack_two_consecutive_turns_succeed() {
     // path-encoding bug surfaces as the second turn failing with "Session ID …
     // is already in use". The two turns chain through the actor's FIFO backlog.
     let tmp = TempDir::new().expect("tempdir");
-    let directory = Directory::at(tmp.path()).expect("Directory::at");
-    directory.init().expect("init .switchboard/");
-    let project = directory
-        .create_project("integration-test")
-        .expect("create_project");
+    let (_store_root, project) = temp_project(tmp.path(), "integration-test");
     let agent = project
         .register_agent("assistant", HarnessKind::ClaudeCode, None, None)
         .expect("register_agent");
@@ -286,9 +301,7 @@ async fn live_claude_full_stack_two_consecutive_turns_succeed() {
 #[ignore = "requires claude installed and authenticated — run with: make test-live"]
 async fn live_claude_full_stack_emits_turn_start_then_content_then_turn_end() {
     let tmp = TempDir::new().expect("tempdir");
-    let directory = Directory::at(tmp.path()).expect("Directory::at");
-    directory.init().expect("init");
-    let project = directory.create_project("order-test").expect("project");
+    let (_store_root, project) = temp_project(tmp.path(), "order-test");
     let agent = project
         .register_agent("assistant", HarnessKind::ClaudeCode, None, None)
         .expect("agent");
@@ -332,9 +345,7 @@ async fn live_claude_full_stack_paths_with_dot_components_resolve_correctly() {
     let tmp = TempDir::new().expect("tempdir");
     let working_dir = tmp.path().join(".config").join("my.app");
     std::fs::create_dir_all(&working_dir).expect("create working dir");
-    let directory = Directory::at(&working_dir).expect("Directory::at");
-    directory.init().expect("init");
-    let project = directory.create_project("dot-path-test").expect("project");
+    let (_store_root, project) = temp_project(&working_dir, "dot-path-test");
     let agent = project
         .register_agent("assistant", HarnessKind::ClaudeCode, None, None)
         .expect("agent");
@@ -389,9 +400,7 @@ async fn live_claude_full_stack_sees_files_in_cwd() {
     let token = "SWITCHBOARD_LIVE_TEST_TOKEN_F8A23E";
     std::fs::write(tmp.path().join("MARKER.txt"), token).expect("write marker");
 
-    let directory = Directory::at(tmp.path()).expect("Directory::at");
-    directory.init().expect("init");
-    let project = directory.create_project("cwd-test").expect("project");
+    let (_store_root, project) = temp_project(tmp.path(), "cwd-test");
     let agent = project
         .register_agent("assistant", HarnessKind::ClaudeCode, None, None)
         .expect("agent");
@@ -437,11 +446,7 @@ async fn live_codex_full_stack_emits_turn_start_then_content_then_turn_end() {
     // captured at runtime and persisted to the registry record); the dispatcher
     // must not depend on `agent.session_locator.is_some()` to function.
     let tmp = TempDir::new().expect("tempdir");
-    let directory = Directory::at(tmp.path()).expect("Directory::at");
-    directory.init().expect("init");
-    let project = directory
-        .create_project("codex-order-test")
-        .expect("project");
+    let (_store_root, project) = temp_project(tmp.path(), "codex-order-test");
     let agent = project
         .register_agent("assistant", HarnessKind::Codex, None, None)
         .expect("agent");
@@ -489,11 +494,7 @@ async fn live_antigravity_full_stack_two_turns_resume_through_dispatcher() {
     // persists it to the registry record; turn 2 must resume via the
     // registry-stored locator (`--conversation <uuid>`).
     let tmp = TempDir::new().expect("tempdir");
-    let directory = Directory::at(tmp.path()).expect("Directory::at");
-    directory.init().expect("init");
-    let project = directory
-        .create_project("antigravity-e2e")
-        .expect("project");
+    let (_store_root, project) = temp_project(tmp.path(), "antigravity-e2e");
     let agent = project
         .register_agent("assistant", HarnessKind::Antigravity, None, None)
         .expect("agent");
@@ -589,11 +590,7 @@ fn cancelled_source(emitter: &Arc<RecordingEmitter>, channel: &str) -> Option<St
 
 async fn live_cancel_case(harness: HarnessKind, adapter: Arc<dyn HarnessAdapter>) {
     let tmp = TempDir::new().expect("tempdir");
-    let directory = Directory::at(tmp.path()).expect("Directory::at");
-    directory.init().expect("init .switchboard/");
-    let project = directory
-        .create_project("cancel-test")
-        .expect("create_project");
+    let (_store_root, project) = temp_project(tmp.path(), "cancel-test");
     let agent = project
         .register_agent("assistant", harness, None, None)
         .expect("register_agent");
@@ -712,11 +709,7 @@ async fn live_attachment_case(
     staging: AttachmentStaging,
 ) {
     let tmp = TempDir::new().expect("tempdir");
-    let directory = Directory::at(tmp.path()).expect("Directory::at");
-    directory.init().expect("init .switchboard/");
-    let project = directory
-        .create_project("attachment-test")
-        .expect("create_project");
+    let (_store_root, project) = temp_project(tmp.path(), "attachment-test");
     let agent = project
         .register_agent("assistant", harness, None, None)
         .expect("register_agent");

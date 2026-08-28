@@ -1,31 +1,40 @@
-//! User-global workspace registry — the ordered set of working directories the
-//! app knows about, plus a cached snapshot of each directory's projects.
+//! User-global workspace **view-state** — how the user has arranged the
+//! directories and projects the store holds.
 //!
-//! This is the source for the flat cross-directory project list. The cached
-//! snapshot lets the UI list projects from a directory that is currently
-//! unavailable (unmounted, on a disconnected volume) without reading its
-//! `.switchboard/` state. It persists to a user-global `workspace.yaml`
-//! resolved via the `directories` crate.
+//! Three things live here and nothing else: the ordered set of known directory
+//! paths, which of those the user has hidden, and which projects they have
+//! archived. All three are presentation choices with no on-disk counterpart,
+//! which is why they are user-global rather than stored beside the data.
 //!
-//! The registry is **convenience state, not load-bearing**: directory-local
-//! `.switchboard/` state remains the source of truth for what projects exist.
-//! A missing or corrupt `workspace.yaml` degrades to an empty registry rather
-//! than failing app startup.
+//! **Nothing here is load-bearing, and that is what makes best-effort loading
+//! safe.** The store's `projects.jsonl` and `directories.jsonl` are the record
+//! of what exists; a missing or corrupt `workspace.yaml` costs the user their
+//! ordering and their hidden/archived choices, never a project. This file used
+//! to also cache each directory's project list so an unavailable directory
+//! could still be listed — the store makes that redundant, because the index
+//! lives under the store root and is readable whether or not any working
+//! directory is. Removing the cache removes the one thing in here that *was*
+//! load-bearing, and with it the class of bug where a stale snapshot
+//! resurrected a deleted project.
+//!
+//! `serde` ignores the removed `cached_projects` key, so an existing
+//! `workspace.yaml` loads unchanged.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use switchboard_core::{CoreError, ProjectId, ProjectSummary};
+use switchboard_core::{CoreError, ProjectId};
 
 use crate::error::AppError;
 
-/// One known working directory plus the last-seen snapshot of its projects.
-/// This is exactly the shape that persists to `workspace.yaml`.
+/// One known working directory, as `workspace.yaml` persists it.
+///
+/// Path only. The projects that live in it come from the store index, keyed by
+/// `directory_id`, not from anything recorded here.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DirectoryEntry {
     pub path: PathBuf,
-    pub cached_projects: Vec<ProjectSummary>,
 }
 
 /// The ordered set of known directories. Order is insertion order — the UI
@@ -41,13 +50,26 @@ pub struct Workspace {
     /// the field loads as "nothing archived" — no migration.
     #[serde(default)]
     archived: BTreeSet<ProjectId>,
+    /// Directories the user has hidden from their list.
+    ///
+    /// **Hiding is what "remove directory" now does.** Under the store, a
+    /// directory's catalog entry is referenced by every project in it and can
+    /// never be deleted while any of them exists, so "remove" cannot mean
+    /// "forget" without orphaning those projects. It means "stop showing me
+    /// this", which is view-state and belongs here. Hiding stops nothing:
+    /// projects in a hidden directory keep running, and unhiding is lossless.
+    ///
+    /// Keyed by path so the entry and its hidden flag share one key.
+    /// `#[serde(default)]` so an older file loads as "nothing hidden".
+    #[serde(default)]
+    hidden: BTreeSet<PathBuf>,
 }
 
 impl Workspace {
     /// Add a directory to the registry. Idempotent: a second add of an
     /// already-known path is a no-op that preserves the existing entry's
-    /// position and `cached_projects`. New entries start with no cached
-    /// projects (populated later via `refresh_cache`).
+    /// position. Adding a hidden directory unhides it — the user asking for it
+    /// again is the same gesture as unhiding.
     ///
     /// Paths are compared as-given. Callers that want canonicalized identity
     /// (matching `Directory::at`) should canonicalize before adding; we do not
@@ -55,68 +77,24 @@ impl Workspace {
     /// disk and the registry must be able to hold currently-unavailable
     /// directories.
     pub fn add(&mut self, path: PathBuf) {
+        self.hidden.remove(&path);
         if self.contains(&path) {
             return;
         }
-        self.entries.push(DirectoryEntry {
-            path,
-            cached_projects: Vec::new(),
-        });
+        self.entries.push(DirectoryEntry { path });
     }
 
-    /// Drop the entry for `path`. Returns whether an entry was removed.
-    pub fn remove(&mut self, path: &Path) -> bool {
-        let before = self.entries.len();
-        self.entries.retain(|entry| entry.path != path);
-        self.entries.len() != before
-    }
-
-    /// Replace the cached project snapshot for `path`. No-op if `path` is not a
-    /// known entry (we only cache projects for directories the user added).
-    /// Returns whether the snapshot actually changed — callers on hot read
-    /// paths (`list_projects`) use this to persist `workspace.yaml` only when
-    /// something changed, avoiding a write storm on every project switch.
-    pub fn refresh_cache(&mut self, path: &Path, projects: Vec<ProjectSummary>) -> bool {
-        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.path == path) {
-            if entry.cached_projects == projects {
-                return false;
-            }
-            entry.cached_projects = projects;
-            return true;
+    /// Hide (or unhide) a directory. Returns whether the set changed.
+    pub fn set_hidden(&mut self, path: &Path, hidden: bool) -> bool {
+        if hidden {
+            self.hidden.insert(path.to_path_buf())
+        } else {
+            self.hidden.remove(path)
         }
-        false
     }
 
-    /// Drop a single project id from `path`'s cached snapshot. Used on a delete
-    /// whose post-delete index re-read isn't available (e.g. the index file
-    /// vanished out-of-band), so the deleted project can't resurrect as a stale
-    /// cached row the next time `list_projects` falls back to the cache. No-op
-    /// (returns `false`) if `path` is unknown or the id wasn't cached. This is the
-    /// targeted form for when the owning directory is known; use
-    /// [`Workspace::remove_cached_project_by_id`] when it can't be resolved.
-    pub fn remove_cached_project(&mut self, path: &Path, id: ProjectId) -> bool {
-        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.path == path) {
-            let before = entry.cached_projects.len();
-            entry.cached_projects.retain(|p| p.id != id);
-            return entry.cached_projects.len() != before;
-        }
-        false
-    }
-
-    /// Drop a project id from whichever directory entry caches it, without
-    /// needing to know the owning path. Used when deleting a project whose
-    /// directory is unreachable (its folder/volume is gone): the persisted
-    /// `workspace.yaml` cache is then the only remaining reference, so it must be
-    /// pruned by id alone or the unavailable row resurrects on the next list /
-    /// restart. Returns whether anything changed.
-    pub fn remove_cached_project_by_id(&mut self, id: ProjectId) -> bool {
-        let mut changed = false;
-        for entry in &mut self.entries {
-            let before = entry.cached_projects.len();
-            entry.cached_projects.retain(|p| p.id != id);
-            changed |= entry.cached_projects.len() != before;
-        }
-        changed
+    pub fn is_hidden(&self, path: &Path) -> bool {
+        self.hidden.contains(path)
     }
 
     pub fn entries(&self) -> &[DirectoryEntry] {
@@ -140,19 +118,6 @@ impl Workspace {
 
     pub fn is_archived(&self, id: ProjectId) -> bool {
         self.archived.contains(&id)
-    }
-
-    /// Whether any known directory's cached snapshot lists this project — i.e.
-    /// the project is one the workspace actually knows about. Used to reject
-    /// archiving a bogus/typo'd id so it can't accumulate junk in the archived
-    /// set. Every project a UI row can target is in a cached snapshot
-    /// (`list_projects` / `create_project` refresh it), including projects whose
-    /// directory is currently unavailable — which is exactly the set archive
-    /// must still work for.
-    pub fn knows_project(&self, id: ProjectId) -> bool {
-        self.entries
-            .iter()
-            .any(|entry| entry.cached_projects.iter().any(|p| p.id == id))
     }
 }
 
@@ -235,19 +200,10 @@ pub fn save(path: &Path, workspace: &Workspace) -> Result<(), AppError> {
 
 #[cfg(test)]
 mod tests {
-    use chrono::Utc;
     use tempfile::tempdir;
     use uuid::Uuid;
 
     use super::*;
-
-    fn summary(name: &str) -> ProjectSummary {
-        ProjectSummary {
-            id: Uuid::new_v4(),
-            name: name.to_owned(),
-            created_at: Utc::now(),
-        }
-    }
 
     #[test]
     fn load_missing_file_returns_empty_and_persistable() {
@@ -266,7 +222,6 @@ mod tests {
         let mut workspace = Workspace::default();
         workspace.add(PathBuf::from("/a"));
         workspace.add(PathBuf::from("/b"));
-        workspace.refresh_cache(Path::new("/a"), vec![summary("alpha"), summary("beta")]);
 
         save(&path, &workspace).unwrap();
         let outcome = load(&path);
@@ -275,11 +230,10 @@ mod tests {
     }
 
     #[test]
-    fn add_is_idempotent_and_preserves_order_and_cache() {
+    fn add_is_idempotent_and_preserves_order() {
         let mut workspace = Workspace::default();
         workspace.add(PathBuf::from("/a"));
         workspace.add(PathBuf::from("/b"));
-        workspace.refresh_cache(Path::new("/a"), vec![summary("alpha")]);
 
         workspace.add(PathBuf::from("/a"));
 
@@ -289,91 +243,6 @@ mod tests {
             .map(|e| e.path.as_path())
             .collect();
         assert_eq!(paths, vec![Path::new("/a"), Path::new("/b")]);
-        assert_eq!(workspace.entries()[0].cached_projects.len(), 1);
-    }
-
-    #[test]
-    fn remove_drops_entry_and_reports() {
-        let mut workspace = Workspace::default();
-        workspace.add(PathBuf::from("/a"));
-
-        assert!(workspace.remove(Path::new("/a")));
-        assert!(!workspace.contains(Path::new("/a")));
-        assert!(!workspace.remove(Path::new("/a")));
-    }
-
-    #[test]
-    fn refresh_cache_replaces_and_is_noop_for_unknown() {
-        let mut workspace = Workspace::default();
-        workspace.add(PathBuf::from("/a"));
-
-        workspace.refresh_cache(Path::new("/a"), vec![summary("one")]);
-        workspace.refresh_cache(Path::new("/a"), vec![summary("two"), summary("three")]);
-        assert_eq!(workspace.entries()[0].cached_projects.len(), 2);
-
-        workspace.refresh_cache(Path::new("/unknown"), vec![summary("x")]);
-        assert_eq!(workspace.entries().len(), 1);
-    }
-
-    #[test]
-    fn refresh_cache_reports_whether_snapshot_changed() {
-        let mut workspace = Workspace::default();
-        workspace.add(PathBuf::from("/a"));
-
-        let one = summary("one");
-        assert!(
-            workspace.refresh_cache(Path::new("/a"), vec![one.clone()]),
-            "first non-empty snapshot is a change"
-        );
-        assert!(
-            !workspace.refresh_cache(Path::new("/a"), vec![one.clone()]),
-            "an identical snapshot is not a change"
-        );
-        assert!(
-            workspace.refresh_cache(Path::new("/a"), vec![one, summary("two")]),
-            "a differing snapshot is a change"
-        );
-        assert!(
-            !workspace.refresh_cache(Path::new("/unknown"), vec![summary("x")]),
-            "an unknown path is never a change"
-        );
-    }
-
-    #[test]
-    fn remove_cached_project_drops_one_id() {
-        let mut workspace = Workspace::default();
-        workspace.add(PathBuf::from("/a"));
-        let keep = summary("keep");
-        let drop = summary("drop");
-        workspace.refresh_cache(Path::new("/a"), vec![keep.clone(), drop.clone()]);
-
-        assert!(workspace.remove_cached_project(Path::new("/a"), drop.id));
-        assert_eq!(workspace.entries()[0].cached_projects, vec![keep]);
-        // Removing an absent id, or operating on an unknown path, is a no-op.
-        assert!(!workspace.remove_cached_project(Path::new("/a"), drop.id));
-        assert!(!workspace.remove_cached_project(Path::new("/unknown"), keep_id(&workspace)));
-    }
-
-    fn keep_id(workspace: &Workspace) -> uuid::Uuid {
-        workspace.entries()[0].cached_projects[0].id
-    }
-
-    #[test]
-    fn remove_cached_project_by_id_drops_it_from_any_entry() {
-        let mut workspace = Workspace::default();
-        workspace.add(PathBuf::from("/a"));
-        workspace.add(PathBuf::from("/b"));
-        let keep = summary("keep");
-        let drop = summary("drop");
-        workspace.refresh_cache(Path::new("/a"), vec![keep.clone()]);
-        workspace.refresh_cache(Path::new("/b"), vec![drop.clone()]);
-
-        // Removes the id without being told which directory holds it.
-        assert!(workspace.remove_cached_project_by_id(drop.id));
-        assert!(!workspace.knows_project(drop.id));
-        assert!(workspace.knows_project(keep.id));
-        // A second removal of the now-absent id is a no-op.
-        assert!(!workspace.remove_cached_project_by_id(drop.id));
     }
 
     #[test]
@@ -421,14 +290,49 @@ mod tests {
     }
 
     #[test]
-    fn knows_project_checks_cached_snapshots() {
+    fn hiding_a_directory_keeps_its_entry_and_adding_it_back_unhides() {
+        // "Remove directory" is a view-state gesture now: the catalog entry is
+        // referenced by every project in the directory and cannot be dropped, so
+        // hiding must be lossless and reversible by the ordinary add path.
         let mut workspace = Workspace::default();
         workspace.add(PathBuf::from("/a"));
-        let known = summary("known");
-        workspace.refresh_cache(Path::new("/a"), vec![known.clone()]);
 
-        assert!(workspace.knows_project(known.id));
-        assert!(!workspace.knows_project(Uuid::new_v4()));
+        assert!(workspace.set_hidden(Path::new("/a"), true));
+        assert!(workspace.is_hidden(Path::new("/a")));
+        assert!(
+            workspace.contains(Path::new("/a")),
+            "hiding must not drop the entry"
+        );
+        assert!(!workspace.set_hidden(Path::new("/a"), true));
+
+        workspace.add(PathBuf::from("/a"));
+        assert!(!workspace.is_hidden(Path::new("/a")));
+        assert_eq!(workspace.entries().len(), 1, "unhiding is not a second add");
+    }
+
+    #[test]
+    fn hidden_defaults_empty_for_an_older_workspace_yaml() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("workspace.yaml");
+        std::fs::write(&path, "entries: []\n").unwrap();
+
+        assert!(!load(&path).workspace.is_hidden(Path::new("/a")));
+    }
+
+    #[test]
+    fn a_workspace_yaml_holding_the_removed_project_cache_still_loads() {
+        // The cache key is gone from the struct; serde must ignore it rather
+        // than fail, or an existing install loses its directory list.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("workspace.yaml");
+        std::fs::write(
+            &path,
+            "entries:\n- path: /a\n  cached_projects:\n  - id: 0192f0c0-0000-7000-8000-000000000000\n    name: alpha\n    created_at: 2026-01-01T00:00:00Z\n",
+        )
+        .unwrap();
+
+        let workspace = load(&path).workspace;
+        assert!(workspace.contains(Path::new("/a")));
     }
 
     #[test]

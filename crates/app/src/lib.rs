@@ -476,8 +476,8 @@ async fn recheck_harness_installs() -> Result<PathSource, String> {
 }
 
 #[tauri::command]
-async fn pick_directory(path: String) -> Result<DirectoryInfo, String> {
-    pick_directory_impl(&path).await.map_err(|e| e.to_string())
+async fn pick_directory(state: State<'_, AppState>, path: String) -> Result<DirectoryInfo, String> {
+    pick_directory_impl(state.inner(), &path).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1052,15 +1052,10 @@ async fn reorder_agents(
 async fn list_project_agents_readonly(
     state: State<'_, AppState>,
     project_id: String,
-    directory: String,
 ) -> Result<Vec<AgentRecord>, ActivationCommandError> {
     let pid = parse_uuid(&project_id).map_err(ActivationCommandError::from)?;
-    crate::commands::list_project_agents_readonly_impl(
-        state.inner(),
-        pid,
-        std::path::Path::new(&directory),
-    )
-    .map_err(ActivationCommandError::from)
+    crate::commands::list_project_agents_readonly_impl(state.inner(), pid)
+        .map_err(ActivationCommandError::from)
 }
 
 #[tauri::command]
@@ -1767,6 +1762,19 @@ fn workspace_config_path() -> Option<std::path::PathBuf> {
     config_dir().map(|dir| dir.join("workspace.yaml"))
 }
 
+/// Root of the user-global project store (`<config-dir>/store/`).
+///
+/// A **subdirectory** rather than the config dir itself: the store owns its
+/// root — it inspects it to decide whether a missing version marker means a
+/// fresh install or a damaged store — and sharing that root with `config.yaml`,
+/// `workspace.yaml`, and `git-view.yaml` would put unrelated files inside the
+/// thing it reasons about. Follows the same `config_dir()` resolution as its
+/// siblings, so the debug `SWITCHBOARD_CONFIG_DIR` override relocates the store
+/// along with everything else and a dev build never touches the release store.
+fn store_root_path() -> Option<std::path::PathBuf> {
+    config_dir().map(|dir| dir.join("store"))
+}
+
 /// The Git-view tracked-repo registry (`git-view.yaml`) — a sibling of
 /// `workspace.yaml` in the same user-global config dir, so both move together
 /// (the debug `SWITCHBOARD_CONFIG_DIR` override relocates both at once).
@@ -2064,11 +2072,19 @@ pub fn run() {
                 base_emitter,
                 wake_lock::KeepAwakeInhibitor::new(),
             ));
+            // The store is required, so both failures abort startup rather than
+            // degrading: with no store the app would accept project creation
+            // and silently lose it. Contrast the `Option<PathBuf>` persistence
+            // paths below, which guard convenience state.
+            let store_root = store_root_path()
+                .ok_or("no config directory resolved — cannot locate the project store")?;
+            let store = switchboard_core::Store::open(&store_root)?;
             let state = AppState::new(
                 Arc::clone(&claude_adapter),
                 Arc::clone(&codex_adapter),
                 Arc::clone(&antigravity_adapter),
                 emitter,
+                store,
             );
             // Attach all user-global persistence locations (workspace.yaml,
             // git-view.yaml, config.yaml) — see `with_persistence_paths`.

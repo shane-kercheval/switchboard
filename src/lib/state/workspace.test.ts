@@ -46,7 +46,7 @@ function project(id: string, lastActivity: string): ProjectListing {
     name: `proj-${id.slice(-2)}`,
     created_at: "2026-05-16T00:00:00Z",
     directory: `/work/${id.slice(-2)}`,
-    available: true,
+    directory_status: "resolved_available",
     last_activity: lastActivity,
     archived: false,
   };
@@ -393,7 +393,7 @@ describe("workspace project activity", () => {
       return undefined;
     });
 
-    await ws.removeDirectory(busyProject.directory);
+    await ws.removeDirectory(busyProject.directory ?? "");
     await tick();
 
     expect(ws.backgroundCompletedProjectIds[PROJECT_1]).toBeUndefined();

@@ -473,12 +473,12 @@ export async function reorderAgents(
 /// the ordinary open path. Browsing must not take a project's `instance.lock`
 /// (which would outlive the menu and block other Switchboard instances), and a
 /// hover is no place to surface a lock conflict.
-export async function listProjectAgentsReadonly(
-  projectId: ProjectId,
-  directory: string,
-): Promise<AgentRecord[]> {
+/// No directory argument: the registry resolves from the project id alone
+/// (`<store-root>/projects/<id>/registry.jsonl`), so passing one would invite a
+/// caller to think the directory is authoritative for this read.
+export async function listProjectAgentsReadonly(projectId: ProjectId): Promise<AgentRecord[]> {
   try {
-    return await invoke<AgentRecord[]>("list_project_agents_readonly", { projectId, directory });
+    return await invoke<AgentRecord[]>("list_project_agents_readonly", { projectId });
   } catch (error) {
     // The command returns the structured `ActivationCommandError`; Tauri rejects
     // it as a plain object, so without this the picker's row would render

@@ -61,6 +61,24 @@ pub enum AppError {
     #[error("project {0} is not loaded")]
     ProjectNotLoaded(ProjectId),
 
+    /// One `AgentId` is claimed by two projects' registries.
+    ///
+    /// Cannot happen from ordinary use — agent ids are minted fresh and an
+    /// agent lives in exactly one registry. It becomes reachable once agents can
+    /// be *moved* between projects, where an interrupted move leaves the record
+    /// in both the source and the target. Surfacing it here is what makes that
+    /// anomaly visible and fixable instead of silent: the id cache used to
+    /// insert last-wins, so whichever registry was read second quietly won and
+    /// the agent dispatched into a project the user wasn't looking at.
+    #[error(
+        "agent {agent_id} is claimed by two projects ({existing_project_id} and {incoming_project_id}) — its registry record exists in both"
+    )]
+    AgentProjectConflict {
+        agent_id: AgentId,
+        existing_project_id: ProjectId,
+        incoming_project_id: ProjectId,
+    },
+
     /// The project's `instance.lock` is held by another Switchboard process.
     /// Inter-process guard: one Switchboard process per project. The
     /// frontend surfaces this as "This project is already open in another

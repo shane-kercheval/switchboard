@@ -6,7 +6,7 @@ use std::fs::File;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use switchboard_core::{AgentId, AgentRecord, Directory, Project, ProjectId};
+use switchboard_core::{AgentId, AgentRecord, Directory, Project, ProjectId, Store};
 use switchboard_dispatcher::{Dispatcher, EventEmitter};
 use switchboard_harness::HarnessAdapter;
 use switchboard_prompts::PromptService;
@@ -267,6 +267,26 @@ pub struct AppState {
     /// is a no-op while this is `None`, so tests never touch user-global state.
     pub workspace_path: Option<PathBuf>,
 
+    /// The user-global project store — every project's index, catalog, and
+    /// metadata root.
+    ///
+    /// **Required, unlike the `Option<PathBuf>` paths above.** Those guard
+    /// user-global *convenience* state that degrades to a no-op when
+    /// unresolvable; project persistence cannot. A `None` store would mean
+    /// creating a project silently succeeds and vanishes, so the root is
+    /// injected at construction and its absence is a startup failure, not a
+    /// degraded mode.
+    ///
+    /// Holds no cached state (see [`Store`]), so it needs no lock: every method
+    /// reads or rewrites files, serialized by [`Self::registry_write`] where
+    /// mutation requires it.
+    pub store: Store,
+
+    /// Keeps a test's temp store root alive for the state's lifetime. See
+    /// [`Self::new_for_test`].
+    #[cfg(test)]
+    store_tmp: Option<tempfile::TempDir>,
+
     /// User-global Git-view tracked-repo registry — the ordered set of repo roots
     /// the Git view shows (see `crate::git_registry`). A superset of the
     /// directories that host projects: stores paths only, never git state.
@@ -342,8 +362,12 @@ impl AppState {
         codex_adapter: Arc<dyn HarnessAdapter>,
         antigravity_adapter: Arc<dyn HarnessAdapter>,
         emitter: Arc<dyn EventEmitter>,
+        store: Store,
     ) -> Self {
         Self {
+            store,
+            #[cfg(test)]
+            store_tmp: None,
             directories: Mutex::new(HashMap::new()),
             projects: Mutex::new(HashMap::new()),
             active_project_id: Mutex::new(None),
@@ -372,6 +396,56 @@ impl AppState {
             ))),
             workflows_dir: None,
         }
+    }
+
+    /// Construct a state whose store lives in a temp directory the state itself
+    /// owns.
+    ///
+    /// The store root is required, so without this every one of the ~125 test
+    /// fixtures would have to create a second `TempDir` and thread it through
+    /// its return tuple purely to keep the root alive — churn that obscures what
+    /// each test is actually about. Owning the `TempDir` here ties the store's
+    /// lifetime to the state's, which is exactly the intended scope. Reach for
+    /// `state.store.root()` when a test needs to inspect on-disk layout.
+    #[cfg(test)]
+    pub fn new_for_test(
+        claude_adapter: Arc<dyn HarnessAdapter>,
+        codex_adapter: Arc<dyn HarnessAdapter>,
+        antigravity_adapter: Arc<dyn HarnessAdapter>,
+        emitter: Arc<dyn EventEmitter>,
+    ) -> Self {
+        let root = tempfile::TempDir::new().expect("temp store root");
+        let store = Store::open(root.path()).expect("open temp store");
+        let mut state = Self::new(
+            claude_adapter,
+            codex_adapter,
+            antigravity_adapter,
+            emitter,
+            store,
+        );
+        state.store_tmp = Some(root);
+        state
+    }
+
+    /// Construct a test state over an **existing** store root, for tests that
+    /// need two `AppState`s to see the same store — a restart, or a second
+    /// process's view. The caller owns the root and must keep it alive.
+    #[cfg(test)]
+    pub fn new_for_test_at(
+        root: &std::path::Path,
+        claude_adapter: Arc<dyn HarnessAdapter>,
+        codex_adapter: Arc<dyn HarnessAdapter>,
+        antigravity_adapter: Arc<dyn HarnessAdapter>,
+        emitter: Arc<dyn EventEmitter>,
+    ) -> Self {
+        let store = Store::open(root).expect("open temp store");
+        Self::new(
+            claude_adapter,
+            codex_adapter,
+            antigravity_adapter,
+            emitter,
+            store,
+        )
     }
 
     /// Builder step that injects the production notifier. Production calls this
@@ -568,7 +642,7 @@ mod tests {
     fn mock_state() -> AppState {
         let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
         let emitter: Arc<dyn EventEmitter> = Arc::new(RecordingEmitter::new());
-        AppState::new(Arc::clone(&mock), Arc::clone(&mock), mock, emitter)
+        AppState::new_for_test(Arc::clone(&mock), Arc::clone(&mock), mock, emitter)
     }
 
     #[test]

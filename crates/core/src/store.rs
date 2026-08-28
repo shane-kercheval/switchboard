@@ -113,10 +113,21 @@ pub struct ProjectEntry {
     pub directory_id: DirectoryId,
 }
 
-/// One project as the listing sees it: its index entry plus the working
-/// directory it resolves to.
+/// One project paired with the working directory it resolves to — a **snapshot**
+/// taken during one read of the store.
+///
+/// Deliberately not named `ProjectListing`: the app already owns that name for
+/// the enriched wire row it sends the frontend (availability, archived-ness,
+/// recency). This is the layer below — index entry plus resolved path, nothing
+/// derived.
+///
+/// Valid only within the caller's read. Holding one across a mutation (a
+/// re-point, a create) leaves a stale path; the enumerate/scan sites are safe
+/// because they already hold `registry_write` across snapshot **and** scan,
+/// which is what makes the uniqueness checks atomic with the register that
+/// follows them.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProjectListing {
+pub struct ResolvedProject {
     pub entry: ProjectEntry,
     /// `None` when the entry's `directory_id` has no catalog row — corruption,
     /// since the catalog has no delete API. The project still lists so it can be
@@ -144,8 +155,8 @@ impl Store {
     /// Fails loud on a version mismatch, and — for an already-initialized store —
     /// on a missing index or catalog.
     ///
-    /// **An initialized store never has its index or catalog recreated.** They
-    /// are the record of what exists; recreating a lost one turns "this store is
+    /// **Nothing here is ever recreated over data.** The index and catalog are
+    /// the record of what exists; recreating a lost one turns "this store is
     /// damaged" into "you have no projects", which is both false (every
     /// project's data is still under `projects/`) and self-worsening, because
     /// ordinary use then appends to the empty file while the real entries sit
@@ -153,18 +164,25 @@ impl Store {
     /// and [`Self::list_directories`] only mean anything if this method leaves
     /// the absence intact for them to find.
     ///
+    /// That guarantee needs **two** gates, because the marker and the files it
+    /// describes are lost by the same events. With a marker present, a missing
+    /// index is refused outright. With the marker *also* gone, the layout is
+    /// completed only when [`Self::holds_data`] proves there is nothing to
+    /// destroy — an interrupted first launch heals, a store whose root-level
+    /// files were taken together does not.
+    ///
     /// **`store.yaml` is written last**, as the initialization commit. A crash
     /// between the two would otherwise leave a valid version marker over a store
     /// with no index — indistinguishable, on the next launch, from a healthy
-    /// empty one.
+    /// empty one. And stamping a marker over surviving data would be wrong even
+    /// if the index were intact: [`STORE_VERSION`] exists to be bumped, so
+    /// "whatever version is running" is not a safe answer to "what layout is
+    /// this data in".
     pub fn open(root: &Path) -> Result<Store> {
         create_dir_all(root).map_err(|e| CoreError::io(root, e))?;
         let store = Store {
             root: root.to_path_buf(),
         };
-        create_dir_all(store.projects_dir()).map_err(|e| CoreError::io(store.projects_dir(), e))?;
-        create_dir_all(store.attachments_dir())
-            .map_err(|e| CoreError::io(store.attachments_dir(), e))?;
 
         let config_path = store.config_path();
         if config_path.exists() {
@@ -181,30 +199,74 @@ impl Store {
                     return Err(CoreError::MissingAppendOnlyFile { path });
                 }
             }
-            return Ok(store);
+        } else if store.holds_data()? {
+            return Err(CoreError::StoreDataWithoutVersionMarker {
+                root: store.root.clone(),
+                marker: config_path,
+            });
+        } else {
+            // Nothing but empty scaffolding: a first launch, or an
+            // initialization interrupted before its commit. Complete it.
+            for path in [store.projects_index_path(), store.catalog_path()] {
+                if !path.exists() {
+                    std::fs::write(&path, "").map_err(|e| CoreError::io(&path, e))?;
+                }
+            }
+            write_yaml(
+                &config_path,
+                &StoreConfig {
+                    version: STORE_VERSION,
+                },
+            )?;
         }
 
-        // No marker: a first launch, or an initialization interrupted before the
-        // commit. Create whatever is missing and stamp the marker last.
-        //
-        // A marker-less root that *does* hold data is completed the same way
-        // rather than refused. Refusing would mean guarding against one specific
-        // small file vanishing while both larger ones survive — and the guard
-        // itself would brick a fresh install force-quit mid-setup, which is the
-        // likelier event of the two. The version we would stamp is also the only
-        // version that has ever existed.
-        for path in [store.projects_index_path(), store.catalog_path()] {
-            if !path.exists() {
-                std::fs::write(&path, "").map_err(|e| CoreError::io(&path, e))?;
+        // Below both refusals, so neither leaves a trace in a root it declined
+        // to open. Both success paths still need them.
+        create_dir_all(store.projects_dir()).map_err(|e| CoreError::io(store.projects_dir(), e))?;
+        create_dir_all(store.attachments_dir())
+            .map_err(|e| CoreError::io(store.attachments_dir(), e))?;
+        Ok(store)
+    }
+
+    /// Whether the root holds anything a legitimate pre-marker state could not.
+    ///
+    /// Nothing can write to the store before [`Self::open`] returns, so an
+    /// interrupted initialization has empty scaffolding and nothing else. Any
+    /// record in either index, or any project directory, therefore means the
+    /// marker was lost from an initialized store rather than never written.
+    ///
+    /// Emptiness is judged by **content, not file size**: `read_jsonl` skips
+    /// blank lines, so a file holding a stray newline is logically empty and a
+    /// length check would refuse on it. A corrupt line surfaces as
+    /// `CorruptJsonl` rather than the marker error — data with no marker
+    /// either way, and the more specific diagnosis is the more useful one.
+    ///
+    /// `projects/` is the load-bearing half: it is a subdirectory while the
+    /// three files are siblings at the root, so it is what survives the events
+    /// that take the marker and the index together. **Revisit this predicate
+    /// whenever the store gains another owned location** (locks, migration
+    /// records) — each one is another way for data to outlive the marker.
+    fn holds_data(&self) -> Result<bool> {
+        if !read_jsonl::<ProjectEntry>(&self.projects_index_path())?.is_empty()
+            || !read_jsonl::<DirectoryEntry>(&self.catalog_path())?.is_empty()
+        {
+            return Ok(true);
+        }
+        // Runs before `projects/` is created, so absence is the fresh-root case
+        // and must read as "no projects" — propagating it would refuse every
+        // first launch, the exact failure this predicate exists to avoid.
+        let entries = match std::fs::read_dir(self.projects_dir()) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(CoreError::io(self.projects_dir(), e)),
+        };
+        for entry in entries {
+            let entry = entry.map_err(|e| CoreError::io(self.projects_dir(), e))?;
+            if entry.path().is_dir() {
+                return Ok(true);
             }
         }
-        write_yaml(
-            &config_path,
-            &StoreConfig {
-                version: STORE_VERSION,
-            },
-        )?;
-        Ok(store)
+        Ok(false)
     }
 
     /// The store root, for callers that need to site something beside it (the
@@ -320,10 +382,12 @@ impl Store {
     /// "the user is done with this directory" is expressed by hiding it in
     /// view-state, never by dropping the catalog row.
     pub fn directory_path(&self, id: DirectoryId) -> Result<PathBuf> {
-        self.list_directories()?
-            .into_iter()
-            .find(|e| e.directory_id == id)
-            .map(|e| e.path)
+        // Through `directory_map` so this and the listing cannot diverge on a
+        // duplicated id: both see it as unresolvable, and this side turns that
+        // into a refusal rather than a guessed path.
+        self.directory_map()?
+            .remove(&id)
+            .flatten()
             .ok_or(CoreError::DirectoryNotFound(id))
     }
 
@@ -359,20 +423,69 @@ impl Store {
     /// so the user can see which project is broken and repair or delete it.
     /// Returning `Result<Vec<(ProjectEntry, PathBuf)>>` would hide every healthy
     /// project behind one damaged reference.
-    pub fn list_projects_resolved(&self) -> Result<Vec<ProjectListing>> {
-        let directories: HashMap<DirectoryId, PathBuf> = self
-            .list_directories()?
+    pub fn list_projects_resolved(&self) -> Result<Vec<ResolvedProject>> {
+        // **Index before catalog.** A project entry can only be appended after
+        // its catalog row exists — `create_project` resolves the directory
+        // first and fails without it — so reading in this order yields a
+        // catalog at least as new as the index. The reverse can read an old
+        // catalog and then a new index, reporting a freshly created project as
+        // having a dangling directory.
+        let projects = self.list_projects()?;
+        let directories = self.directory_map()?;
+        Ok(projects
             .into_iter()
-            .map(|e| (e.directory_id, e.path))
-            .collect();
-        Ok(self
-            .list_projects()?
-            .into_iter()
-            .map(|entry| ProjectListing {
-                directory: directories.get(&entry.directory_id).cloned(),
+            .map(|entry| ResolvedProject {
+                directory: directories.get(&entry.directory_id).and_then(Clone::clone),
                 entry,
             })
             .collect())
+    }
+
+    /// Open a project from a row [`Self::list_projects_resolved`] already
+    /// resolved, without re-reading either file.
+    ///
+    /// The reason the batch read is worth having. Every caller that needs
+    /// [`Project::list_agents`] — the enumerations behind the session-id
+    /// collision scans, which run on **every attach** — would otherwise have to
+    /// discard the resolved row and call [`Self::open_project`], which parses
+    /// the whole index and the whole catalog again for one project. Without
+    /// this, N projects still cost N full parses of each file and the batch
+    /// method sits beside the loop instead of replacing it.
+    pub fn open_resolved(&self, resolved: &ResolvedProject) -> Result<Project> {
+        let directory = resolved
+            .directory
+            .as_deref()
+            .ok_or(CoreError::DirectoryNotFound(resolved.entry.directory_id))?;
+        project::load(
+            directory,
+            resolved.entry.id,
+            self.project_root(resolved.entry.id),
+        )
+    }
+
+    /// The catalog as a lookup, with an **ambiguous id mapped to `None`**.
+    ///
+    /// One definition shared by every resolution path. Built ad-hoc, the two
+    /// disagreed: a `HashMap` collect is last-wins and a linear `find` is
+    /// first-wins, so a duplicated `directory_id` made the project list show one
+    /// working directory while dispatch ran the agent in another — the stable-id
+    /// design failing at the one thing it exists to do.
+    ///
+    /// A duplicate is treated like an absent row rather than failing the whole
+    /// read. The file parses; every other row is exactly as trustworthy as
+    /// before; so the "nothing can be trusted" case that justifies whole-read
+    /// failure doesn't apply, and failing here would hide every healthy project
+    /// behind one ambiguous one. Instead the affected projects list as
+    /// unresolved (visible, repairable) while anything that would *run* an agent
+    /// refuses — a refusal beats a guessed working directory.
+    fn directory_map(&self) -> Result<HashMap<DirectoryId, Option<PathBuf>>> {
+        let mut map: HashMap<DirectoryId, Option<PathBuf>> = HashMap::new();
+        for entry in self.list_directories()? {
+            map.entry(entry.directory_id)
+                .and_modify(|slot| *slot = None)
+                .or_insert(Some(entry.path));
+        }
+        Ok(map)
     }
 
     /// Create a project owned by `directory_id`.
@@ -560,14 +673,30 @@ impl Store {
     /// A missing project is a benign no-op: if `id` isn't in the index the
     /// rewrite is skipped, and a missing directory is ignored. A double-delete
     /// (or deleting a project removed out-of-band) returns `Ok(())`.
+    ///
+    /// # A missing index refuses — a declared divergence from `Directory`
+    ///
+    /// `Directory::delete_project` tolerated a missing `projects.jsonl`: there
+    /// was no entry to drop, so it skipped the rewrite and removed the
+    /// directory anyway. This does not.
+    ///
+    /// [`Self::open`] makes the condition reachable only when the index vanishes
+    /// **after** the store was opened, in a live session — and there the user is
+    /// acting on a list loaded at startup, with no signal that anything is
+    /// wrong. "They named this project explicitly" is not informed consent when
+    /// they have not been told the store is damaged, and the project
+    /// directories are the material a lost index would be rebuilt from. An
+    /// error tells them the truth; proceeding destroys recoverable state while
+    /// looking like an ordinary delete.
+    ///
+    /// Only genuine absence reaches this — an unreadable-but-present index
+    /// surfaces as `CoreError::Io` and propagates regardless. Deliberate
+    /// orphan cleanup belongs to an explicit repair operation, not to this one.
     pub fn delete_project(&self, id: ProjectId) -> Result<()> {
-        // A genuine read failure (I/O, corruption) propagates — we must not
-        // rewrite an index we couldn't read, or we'd lose sibling entries.
-        let mut entries = match self.list_projects() {
-            Ok(entries) => entries,
-            Err(CoreError::MissingAppendOnlyFile { .. }) => Vec::new(),
-            Err(e) => return Err(e),
-        };
+        // Any read failure propagates, absence included — we must not rewrite an
+        // index we couldn't read (losing sibling entries), nor remove a project
+        // root on the authority of a source of truth we couldn't consult.
+        let mut entries = self.list_projects()?;
         let before = entries.len();
         entries.retain(|e| e.id != id);
         // Rewrite only when an entry was actually dropped — a double-delete must
@@ -717,18 +846,93 @@ mod tests {
     }
 
     #[test]
-    fn an_initialization_interrupted_before_the_marker_completes_on_the_next_open() {
-        // `store.yaml` is written last, so a crash mid-setup leaves indexes with
-        // no marker. That must heal — force-quitting a fresh install is far
-        // likelier than losing the marker alone, and refusing would wedge the
-        // app on a store with nothing in it.
-        let root = TempDir::new().unwrap();
-        Store::open(root.path()).unwrap();
-        std::fs::remove_file(root.path().join(STORE_CONFIG_FILE)).unwrap();
+    fn an_interrupted_initialization_completes_on_the_next_open() {
+        // `store.yaml` is written last, so a crash mid-setup leaves empty
+        // scaffolding and no marker. Nothing can write to the store before
+        // `open` returns, so that state provably holds no data and must heal —
+        // refusing would wedge a fresh install that was force-quit.
+        for pre_created in [
+            vec![],
+            vec![PROJECTS_INDEX],
+            vec![PROJECTS_INDEX, DIRECTORIES_CATALOG],
+        ] {
+            let root = TempDir::new().unwrap();
+            for name in &pre_created {
+                std::fs::write(root.path().join(name), "").unwrap();
+            }
+            // A stray newline is logically empty: `read_jsonl` skips blank
+            // lines, so a byte-length test would refuse here.
+            if pre_created.contains(&PROJECTS_INDEX) {
+                std::fs::write(root.path().join(PROJECTS_INDEX), "\n").unwrap();
+            }
 
-        let store = Store::open(root.path()).unwrap();
-        assert!(root.path().join(STORE_CONFIG_FILE).exists());
-        assert!(store.list_projects().unwrap().is_empty());
+            let store = Store::open(root.path()).unwrap();
+            assert!(root.path().join(STORE_CONFIG_FILE).exists());
+            assert!(store.list_projects().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn a_markerless_store_that_holds_data_refuses_instead_of_being_blessed() {
+        // The marker, the index, and the catalog are siblings at the root while
+        // project data is a subdirectory — a selective restore or a sync
+        // conflict takes the files together and leaves the data. Completing
+        // initialization there would recreate the index empty and present a
+        // store full of projects as empty, which is the failure this whole
+        // guard exists to prevent. It is also how a future schema version would
+        // silently stamp its marker over another version's data.
+        let (root, cwd, store, id) = store_with_dir();
+        store.create_project(id, "alpha").unwrap();
+        let project_dirs = || {
+            std::fs::read_dir(root.path().join(PROJECTS_DIR))
+                .unwrap()
+                .count()
+        };
+        assert_eq!(project_dirs(), 1);
+
+        // Marker and both indexes taken together; only `projects/` survives.
+        for name in [STORE_CONFIG_FILE, PROJECTS_INDEX, DIRECTORIES_CATALOG] {
+            std::fs::remove_file(root.path().join(name)).unwrap();
+        }
+        let err = Store::open(root.path()).unwrap_err();
+        assert!(
+            matches!(err, CoreError::StoreDataWithoutVersionMarker { .. }),
+            "expected StoreDataWithoutVersionMarker, got {err:?}"
+        );
+        assert!(
+            !root.path().join(STORE_CONFIG_FILE).exists(),
+            "a refusal must not stamp a marker"
+        );
+        assert!(
+            !root.path().join(PROJECTS_INDEX).exists(),
+            "a refusal must not recreate the index"
+        );
+        assert_eq!(project_dirs(), 1, "the surviving data is untouched");
+        drop(cwd);
+    }
+
+    #[test]
+    fn a_markerless_store_refuses_on_a_surviving_index_or_catalog_too() {
+        // `projects/` is the signal that survives losing both files, but either
+        // index holding a record is equally proof the marker was lost from an
+        // initialized store rather than never written.
+        for keep in [PROJECTS_INDEX, DIRECTORIES_CATALOG] {
+            let (root, _cwd, store, id) = store_with_dir();
+            store.create_project(id, "alpha").unwrap();
+            std::fs::remove_dir_all(root.path().join(PROJECTS_DIR)).unwrap();
+            std::fs::remove_file(root.path().join(STORE_CONFIG_FILE)).unwrap();
+            for name in [PROJECTS_INDEX, DIRECTORIES_CATALOG] {
+                if name != keep {
+                    std::fs::remove_file(root.path().join(name)).unwrap();
+                }
+            }
+
+            let err = Store::open(root.path()).unwrap_err();
+            assert!(
+                matches!(err, CoreError::StoreDataWithoutVersionMarker { .. }),
+                "expected refusal with {keep} surviving, got {err:?}"
+            );
+        }
     }
 
     #[test]
@@ -756,6 +960,11 @@ mod tests {
         // Corruption in the marker is not "no marker" — it must not fall through
         // to the initialize path and stamp a fresh one over a live store.
         assert!(Store::open(root.path()).is_err());
+        assert_eq!(
+            std::fs::read_to_string(root.path().join(STORE_CONFIG_FILE)).unwrap(),
+            "{{{ not yaml",
+            "the damaged marker must survive, not be overwritten"
+        );
     }
 
     #[test]
@@ -880,7 +1089,7 @@ mod tests {
     }
 
     #[test]
-    fn resolved_listing_reads_each_file_once_and_keeps_broken_rows() {
+    fn resolved_listing_agrees_with_per_id_resolution_and_keeps_broken_rows() {
         let root = TempDir::new().unwrap();
         let one = TempDir::new().unwrap();
         let two = TempDir::new().unwrap();
@@ -924,6 +1133,101 @@ mod tests {
             beta.directory.is_none(),
             "a dangling id is one unresolved row"
         );
+    }
+
+    #[test]
+    fn a_duplicated_directory_id_is_unresolvable_everywhere_rather_than_guessed() {
+        // Built ad-hoc, the two resolution paths disagreed — a map collect is
+        // last-wins and a linear find is first-wins — so the list showed one
+        // working directory while dispatch used another. Both now see it as
+        // unresolvable: the project still lists (visible, repairable) and
+        // anything that would run an agent refuses.
+        let (root, _cwd, store, id) = store_with_dir();
+        let project = store.create_project(id, "alpha").unwrap();
+        let elsewhere = TempDir::new().unwrap();
+        let dup = DirectoryEntry {
+            directory_id: id,
+            path: std::fs::canonicalize(elsewhere.path()).unwrap(),
+        };
+        crate::io::append_jsonl(&root.path().join(DIRECTORIES_CATALOG), &dup).unwrap();
+
+        assert!(matches!(
+            store.directory_path(id).unwrap_err(),
+            CoreError::DirectoryNotFound(_)
+        ));
+        assert!(matches!(
+            store.open_project(project.id).unwrap_err(),
+            CoreError::DirectoryNotFound(_)
+        ));
+        let listed = store.list_projects_resolved().unwrap();
+        assert_eq!(listed.len(), 1, "the project still lists");
+        assert!(listed[0].directory.is_none());
+    }
+
+    #[test]
+    fn a_duplicated_id_does_not_hide_healthy_projects() {
+        let root = TempDir::new().unwrap();
+        let one = TempDir::new().unwrap();
+        let two = TempDir::new().unwrap();
+        let store = Store::open(root.path()).unwrap();
+        let a = store.add_directory(one.path()).unwrap().directory_id;
+        let b = store.add_directory(two.path()).unwrap().directory_id;
+        let healthy = store.create_project(b, "beta").unwrap();
+        store.create_project(a, "alpha").unwrap();
+        let elsewhere = TempDir::new().unwrap();
+        crate::io::append_jsonl(
+            &root.path().join(DIRECTORIES_CATALOG),
+            &DirectoryEntry {
+                directory_id: a,
+                path: std::fs::canonicalize(elsewhere.path()).unwrap(),
+            },
+        )
+        .unwrap();
+
+        // Whole-read failure would hide `beta` behind `alpha`'s ambiguity, and
+        // the user's only recovery would be hand-editing a JSONL file.
+        let listed = store.list_projects_resolved().unwrap();
+        assert_eq!(listed.len(), 2);
+        assert!(
+            listed
+                .iter()
+                .find(|l| l.entry.id == healthy.id)
+                .unwrap()
+                .directory
+                .is_some()
+        );
+        store.open_project(healthy.id).unwrap();
+    }
+
+    #[test]
+    fn open_resolved_matches_open_project_without_re_reading() {
+        let (_root, _cwd, store, id) = store_with_dir();
+        let created = store.create_project(id, "alpha").unwrap();
+
+        let listed = store.list_projects_resolved().unwrap();
+        let opened = store.open_resolved(&listed[0]).unwrap();
+        assert_eq!(opened.id, created.id);
+        assert_eq!(opened.root, store.open_project(created.id).unwrap().root);
+        assert_eq!(opened.directory, created.directory);
+    }
+
+    #[test]
+    fn open_resolved_refuses_a_row_whose_directory_never_resolved() {
+        let (_root, _cwd, store, id) = store_with_dir();
+        let entry = ProjectEntry {
+            id: Uuid::now_v7(),
+            name: "alpha".to_owned(),
+            created_at: Utc::now(),
+            directory_id: id,
+        };
+        let unresolved = ResolvedProject {
+            entry,
+            directory: None,
+        };
+        assert!(matches!(
+            store.open_resolved(&unresolved).unwrap_err(),
+            CoreError::DirectoryNotFound(_)
+        ));
     }
 
     #[test]
@@ -1174,14 +1478,24 @@ mod tests {
     }
 
     #[test]
-    fn delete_with_a_missing_index_still_removes_the_directory() {
+    fn delete_refuses_while_the_index_is_missing() {
+        // Declared divergence from `Directory`, which removed the directory
+        // anyway. Reachable only when the index vanishes mid-session, where the
+        // user is acting on a list loaded at startup and has no idea the store
+        // is damaged — and the project directories are what a lost index would
+        // be rebuilt from.
         let (root, _cwd, store, id) = store_with_dir();
         let a = store.create_project(id, "alpha").unwrap();
         std::fs::remove_file(root.path().join(PROJECTS_INDEX)).unwrap();
 
-        // No entry to drop, but the project directory must still go.
-        store.delete_project(a.id).unwrap();
-        assert!(!a.root.exists());
+        assert!(matches!(
+            store.delete_project(a.id).unwrap_err(),
+            CoreError::MissingAppendOnlyFile { .. }
+        ));
+        assert!(
+            a.root.exists(),
+            "recoverable state must survive the refusal"
+        );
     }
 
     // Unix-only, same rationale as the other permission-driven tests.

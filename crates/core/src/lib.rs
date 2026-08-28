@@ -33,5 +33,5 @@ pub use journal::{JournalRecord, SendId};
 pub use pins::MessagePin;
 pub use project::{Project, ProjectConfig, ProjectId, ProjectSummary};
 pub use store::{
-    DirectoryEntry, DirectoryId, ProjectEntry, ProjectListing, STORE_VERSION, Store, StoreConfig,
+    DirectoryEntry, DirectoryId, ProjectEntry, ResolvedProject, STORE_VERSION, Store, StoreConfig,
 };

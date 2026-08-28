@@ -35,6 +35,20 @@ pub enum CoreError {
     #[error("directory not found in the store catalog: {0}")]
     DirectoryNotFound(uuid::Uuid),
 
+    /// The store root holds data but no `store.yaml`. Distinct from
+    /// [`Self::MissingAppendOnlyFile`] ("a file that should exist doesn't"):
+    /// here the schema marker is what's absent, so nothing establishes which
+    /// layout the surviving data is in.
+    ///
+    /// Reached by the events that lose the marker in the first place. It, the
+    /// index, and the catalog are siblings at the store root while project data
+    /// is a subdirectory, so a selective restore, a sync conflict, or a filtered
+    /// copy takes them together and leaves the data — and stamping a fresh
+    /// marker there would bless an unknown layout and, on the recreate path,
+    /// present a store full of projects as empty.
+    #[error("store at {root} holds data but no version marker ({marker} is missing)")]
+    StoreDataWithoutVersionMarker { root: PathBuf, marker: PathBuf },
+
     /// A catalog write would leave two entries pointing at the same working
     /// directory. One canonical path must map to exactly one `DirectoryId`:
     /// per-directory scopes (project-name uniqueness, and the Claude

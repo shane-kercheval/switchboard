@@ -2747,29 +2747,46 @@ pub fn list_agents_impl(
 pub fn list_project_agents_readonly_impl(
     state: &AppState,
     project_id: ProjectId,
+    directory: &Path,
 ) -> Result<Vec<AgentRecord>, AppError> {
-    // Prefer an already-loaded project: same answer, no second disk read.
+    // Resolve and validate the owner **before** any fast path, so the guarantee
+    // below holds on every route rather than only the cold one. `ProjectNotLoaded`
+    // is deliberately reused for an unregistered directory: the caller named a
+    // locator that doesn't resolve, which is the same "can't get there from here"
+    // answer, and a dedicated variant would be churn ahead of the central store
+    // removing this path-based lookup entirely.
+    //
+    // Lock order is `directories` → `projects` (state.rs); this guard drops at the
+    // end of the statement, so the two are never held together.
+    let owner = lock(&state.directories)
+        .get(directory)
+        .cloned()
+        .ok_or(AppError::ProjectNotLoaded(project_id))?;
+    // Prefer an already-loaded project — but only once the caller's locator is
+    // confirmed to be the one that owns it. A stale locator, or a duplicate
+    // project id from a copied `.switchboard`, would otherwise be served a roster
+    // from a different directory than the one selected.
     if let Some(loaded) = lock(&state.projects).get(&project_id).cloned() {
+        if loaded.directory != owner.path {
+            return Err(AppError::ProjectNotLoaded(project_id));
+        }
         return loaded.list_agents().map_err(AppError::from);
     }
-    let directories: Vec<Directory> = lock(&state.directories).values().cloned().collect();
-    for directory in directories {
-        // `open_project` performs the index lookup itself, so asking it directly
-        // avoids reading each index twice on a hit. `ProjectNotFound` means this
-        // directory simply doesn't own the project — keep looking. **Any other
-        // error is that directory's own failure and propagates**: a corrupt index
-        // must not be swallowed into "not loaded", which would report the wrong
-        // cause. (The previous shape scanned indexes and skipped unreadable ones,
-        // which could only ever blame an unrelated directory — it cannot know
-        // which directory *would* have owned the project.)
-        match directory.open_project(project_id) {
-            Ok(project) => return project.list_agents().map_err(AppError::from),
-            // This directory simply doesn't own the project — keep looking.
-            Err(CoreError::ProjectNotFound(_)) => {}
-            Err(e) => return Err(AppError::from(e)),
-        }
-    }
-    Err(AppError::ProjectNotLoaded(project_id))
+    // **Read the one directory that owns the project, never a scan.** The caller
+    // knows the owner (every `ProjectListing` carries its directory), so there is
+    // no guessing. A scan cannot know which directory *would* have owned the
+    // project, so it could only ever propagate an unrelated directory's failure —
+    // and because `state.directories` iteration is unordered, that surfaced as an
+    // intermittent block on browsing a healthy project whenever any other
+    // directory on the machine had a damaged index.
+    //
+    // The path is validated against the registered set rather than trusted: it
+    // arrives from the frontend, and reading an arbitrary caller-supplied
+    // directory is not this command's business.
+    owner
+        .open_project(project_id)
+        .and_then(|project| project.list_agents())
+        .map_err(AppError::from)
 }
 
 pub fn search_project_files_root_impl(
@@ -3449,7 +3466,7 @@ impl SourceJournals {
         self.0
             .get(&project_id)
             .map(Vec::as_slice)
-            .ok_or(AppError::ProjectNotLoaded(project_id))
+            .ok_or(AppError::ForwardJournalMissing(project_id))
     }
 }
 
@@ -7463,7 +7480,8 @@ mod tests {
         lock(&state.agents_by_id).remove(&other_agent);
         lock(&state.project_locks).remove(&other_project);
 
-        let roster = list_project_agents_readonly_impl(&state, other_project).unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        let roster = list_project_agents_readonly_impl(&state, other_project, &dir).unwrap();
         assert_eq!(roster.len(), 1, "the roster is readable without loading");
         assert_eq!(roster[0].id, other_agent);
         // The read is the whole point: browsing must leave no lock behind.
@@ -7476,7 +7494,31 @@ mod tests {
             "a roster read must not load the project"
         );
 
-        let err = list_project_agents_readonly_impl(&state, Uuid::now_v7()).unwrap_err();
+        // Unknown project inside a known directory: a real read that found nothing.
+        list_project_agents_readonly_impl(&state, Uuid::now_v7(), &dir).unwrap_err();
+
+        // A **loaded** project requested with a different registered directory is
+        // refused. The fast path used to return before validating, so the
+        // "locator is validated, not trusted" guarantee held only when the
+        // project was cold — reachable via a stale locator or a duplicate project
+        // id from a copied `.switchboard`.
+        open_project_impl(&state, other_project).unwrap();
+        let other_dir = TempDir::new().unwrap();
+        init_directory_impl(&state, other_dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let wrong = other_dir.path().canonicalize().unwrap();
+        let err = list_project_agents_readonly_impl(&state, other_project, &wrong).unwrap_err();
+        assert!(matches!(err, AppError::ProjectNotLoaded(_)), "got: {err:?}");
+
+        // An unregistered directory is refused rather than read. The path comes
+        // from the frontend, so reading whatever it names is not this command's
+        // business — and validating it is what lets the command target one
+        // directory instead of scanning (where an unrelated corrupt directory
+        // could intermittently block a healthy project).
+        let stranger = TempDir::new().unwrap();
+        let err =
+            list_project_agents_readonly_impl(&state, other_project, stranger.path()).unwrap_err();
         assert!(matches!(err, AppError::ProjectNotLoaded(_)), "got: {err:?}");
     }
 

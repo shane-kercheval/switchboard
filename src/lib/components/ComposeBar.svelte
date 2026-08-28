@@ -17,6 +17,7 @@
     forwardSourceKey,
     expandForwardSources,
     forwardSourceIds,
+    refreshForeignSourceLabels,
     sourceReadinessFor,
     forwardSourceForAgent,
     forwardSourceAgentsForPane,
@@ -277,24 +278,29 @@
   const otherForwardProjects = $derived(
     projects.list
       .filter((p) => p.id !== projectId && p.available && !p.archived)
-      .map((p) => ({ id: p.id, name: p.name })),
+      .map((p) => ({ id: p.id, name: p.name, directory: p.directory })),
   );
 
-  /// The cross-project config every forward picker gets — this bar's own and the
-  /// per-field ones inside the prompt/workflow composers, so the feature exists on
-  /// all three surfaces rather than only where it was wired first.
+  /// The **shared half** of cross-project sourcing: what to browse, how to read a
+  /// roster, how to open and validate. Each consumer spreads this and adds its own
+  /// `onPickForeign`, which `CrossProjectConfig` requires — where a picked source
+  /// lands differs per surface, and one shared commit closure is exactly how
+  /// prompt- and workflow-field picks once landed in this bar's plain-message list.
   ///
-  /// `onPick` **opens the project before the chip is added**. Browsing is a read,
+  /// `activate` **opens the project before any chip is added**. Browsing is a read,
   /// but committing has to prove the project is usable: otherwise one locked by
-  /// another window looks selectable and the user finds out only after composing
-  /// a whole message. The backend still opens at dispatch — that path serves
-  /// chips restored cold from a draft, which never passed through here.
-  const crossProjectForward = $derived({
+  /// another window looks selectable and the user finds out only after composing a
+  /// whole message. The backend still opens at dispatch — that path serves chips
+  /// restored cold from a draft, which never passed through here.
+  const crossProjectBase = $derived({
     projects: otherForwardProjects,
-    loadAgents: api.listProjectAgentsReadonly,
-    onPick: async (agent: AgentRecord, project: { id: ProjectId; name: string }) => {
-      await api.openProject(project.id);
-      addForwardSource(forwardSourceForAgent(agent, project));
+    loadAgents: (id: ProjectId) =>
+      api.listProjectAgentsReadonly(
+        id,
+        otherForwardProjects.find((p) => p.id === id)?.directory ?? "",
+      ),
+    activate: async (id: ProjectId) => {
+      await api.openProject(id);
     },
   });
 
@@ -480,6 +486,77 @@
   let workflowForwardSources = $state<Record<string, ForwardSource[]>>(
     untrack(() => reconcileForwardSourceMap(savedForwards.workflowFields, agents, projectId)),
   );
+
+  /// Refresh restored foreign chips' display names — **once per mount**.
+  ///
+  /// `onMount`, not `$effect`, and the distinction is load-bearing: the body reads
+  /// all four source families and writes them back, so as an effect every chip add
+  /// and removal would re-run it and re-read each referenced project's registry.
+  /// (It wouldn't loop — `refreshForeignSourceLabels` returns the same array
+  /// reference when nothing changed — but the reads were unbounded behind a
+  /// comment claiming a bound.)
+  ///
+  /// Once-per-mount is the right scope because `App.svelte` wraps this component
+  /// in `{#key selection.activeProjectId}`, so a project switch remounts it and
+  /// gets a fresh pass. **If that key is ever removed, this stops refreshing on a
+  /// project switch and must become an effect keyed on `projectId`.**
+  ///
+  /// Bounded by what the draft references — the distinct *foreign* projects named
+  /// by saved chips, which is none in the common case. Read-only roster calls (no
+  /// load, no lock), so the browse/activate split holds. This is the only place
+  /// the refresh can happen: restore is synchronous, and the picker's cache is
+  /// empty until the user browses that project — the one path where a stale name
+  /// isn't on screen. Failures keep the stored label rather than mutating or
+  /// dropping the chip.
+  onMount(() => {
+    // A plain record, not a Map: local bookkeeping, never rendered — the same
+    // reasoning as `seenSendSeq` in the transcript, and why the reactive-Map lint
+    // doesn't apply.
+    const foreign: Record<ProjectId, string> = {};
+    for (const family of [
+      forwardSources,
+      promptAppendedSources,
+      ...Object.values(promptArgSources),
+      ...Object.values(workflowForwardSources),
+    ]) {
+      for (const source of family) {
+        if (source.projectId !== undefined && source.projectId !== projectId) {
+          const dir = projects.list.find((p) => p.id === source.projectId)?.directory;
+          if (dir !== undefined) foreign[source.projectId] = dir;
+        }
+      }
+    }
+    const pending = Object.entries(foreign);
+    if (pending.length === 0) return;
+    let cancelled = false;
+    for (const [id, dir] of pending) {
+      void api
+        .listProjectAgentsReadonly(id, dir)
+        .then((roster) => {
+          if (cancelled) return;
+          const name = projects.list.find((p) => p.id === id)?.name;
+          forwardSources = refreshForeignSourceLabels(forwardSources, id, roster, name);
+          promptAppendedSources = refreshForeignSourceLabels(
+            promptAppendedSources,
+            id,
+            roster,
+            name,
+          );
+          for (const [field, list] of Object.entries(promptArgSources)) {
+            promptArgSources[field] = refreshForeignSourceLabels(list, id, roster, name);
+          }
+          for (const [field, list] of Object.entries(workflowForwardSources)) {
+            workflowForwardSources[field] = refreshForeignSourceLabels(list, id, roster, name);
+          }
+        })
+        .catch(() => {
+          // Unreadable project: keep the stored labels.
+        });
+    }
+    return () => {
+      cancelled = true;
+    };
+  });
   let invokingWorkflow = $state(false);
   let workflowSigningInProvider = $state<string | null>(null);
   let workflowSignInGen = 0;
@@ -2202,6 +2279,7 @@
           body,
           expandForwardSources(sources, projectId),
           forwardId,
+          forwardProjectId,
         );
         removeHeldForward(forwardProjectId, forwardId);
         if (outcome.status === "resolved") {
@@ -2328,6 +2406,7 @@
           appended,
           expandForwardSources(appendedSources, projectId),
           forwardId,
+          forwardProjectId,
         );
         removeHeldForward(forwardProjectId, forwardId);
         if (outcome.status === "resolved") {
@@ -3760,7 +3839,7 @@
            its agent inputs); the run launches in the background. -->
         <WorkflowComposer
           {projectId}
-          crossProject={crossProjectForward}
+          {crossProjectBase}
           descriptor={workflowForm}
           {agents}
           loading={workflowFormLoading}
@@ -3792,7 +3871,7 @@
            appended boxes; the send button rides the composer's footer row. -->
         <PromptComposer
           {projectId}
-          crossProject={crossProjectForward}
+          {crossProjectBase}
           prompt={selectedPrompt}
           bind:args={promptArgs}
           bind:appendedText
@@ -3838,7 +3917,11 @@
               panes={paneLayout.panes}
               onPickAgent={(agent) => addForwardSource(forwardSourceForAgent(agent))}
               onPickPane={(pane) => addPaneForwardSources(pane)}
-              crossProject={crossProjectForward}
+              crossProject={{
+                ...crossProjectBase,
+                onPickForeign: (agent, project) =>
+                  addForwardSource(forwardSourceForAgent(agent, project)),
+              }}
               {agentReadiness}
               disabled={composerBusy}
               showPaneShortcuts

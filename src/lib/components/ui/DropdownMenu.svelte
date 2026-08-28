@@ -97,6 +97,12 @@
       data-testid={contentTestid}
       onCloseAutoFocus={tooltipLabel ? (e) => e.preventDefault() : undefined}
       class={cn(
+        // NOTE: the `var(…, 28rem)` fallback covers bits-ui *removing* the
+        // variable, not it emitting a bad value — on the first positioning pass
+        // the property is defined as the literal `undefinedpx`, which makes the
+        // whole declaration invalid and drops `max-height` rather than falling
+        // back. Harmless (content is parked off-screen while measuring), but the
+        // fallback is not the safety net it looks like.
         // `max-h` + scroll: menu content is caller-supplied and unbounded (the forward
         // picker lists every agent, every pane, and every other project), so without
         // containment a long menu runs past the viewport and the clipped rows are

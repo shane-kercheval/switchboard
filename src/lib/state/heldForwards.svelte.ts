@@ -147,7 +147,6 @@ export function reconcileForwardSources(
   sources: readonly ForwardSource[],
   agents: readonly AgentRecord[],
   draftProjectId: ProjectId,
-  foreignRoster?: (source: ForwardSource) => AgentRecord | undefined,
 ): ForwardSource[] {
   return sources
     .map((source) => upgradeForwardSource(source, draftProjectId))
@@ -156,18 +155,42 @@ export function reconcileForwardSources(
       return agents.some((agent) => agent.id === source.id);
     })
     .map((source) => {
-      if (isForeignSource(source, draftProjectId)) {
-        // A foreign source's current name lives in *its* project's roster, which
-        // this call doesn't have. `foreignRoster` supplies it when the caller has
-        // already read that project (the picker caches per project); absent that,
-        // the stored name is retained rather than dropped — a possibly-stale
-        // label beats deleting the user's chip.
-        const fresh = foreignRoster?.(source)?.name;
-        return fresh !== undefined && fresh !== source.name ? { ...source, name: fresh } : source;
-      }
+      // A foreign source keeps its stored labels here: this runs synchronously at
+      // composer construction, and its project's roster is an async read. Names are
+      // refreshed afterwards by [`refreshForeignSourceLabels`].
+      if (isForeignSource(source, draftProjectId)) return source;
       const agent = agents.find((a) => a.id === source.id);
       return agent ? forwardSourceForAgent(agent) : source;
     });
+}
+
+/// Apply a freshly-read roster to already-restored sources: update the agent
+/// name and project name for any source owned by `projectId`, leave everything
+/// else untouched. Pure, so the caller decides when a read has landed.
+///
+/// Split from [`reconcileForwardSources`] because restore is synchronous and a
+/// roster read is async IPC — the refresh cannot happen during reconciliation,
+/// which is the one path where a stale name is actually on screen. Returns the
+/// same array reference when nothing changed, so a caller can skip a write.
+export function refreshForeignSourceLabels(
+  sources: readonly ForwardSource[],
+  projectId: ProjectId,
+  roster: readonly AgentRecord[],
+  projectName?: string,
+): ForwardSource[] {
+  let changed = false;
+  const next = sources.map((source) => {
+    if (source.projectId !== projectId) return source;
+    const agent = roster.find((a) => a.id === source.id);
+    // A source whose agent is gone keeps its stored label: the backend refuses
+    // the send with a clear error, which beats a chip mutating under the user.
+    const name = agent?.name ?? source.name;
+    const nextName = projectName ?? source.projectName;
+    if (name === source.name && nextName === source.projectName) return source;
+    changed = true;
+    return { ...source, name, projectName: nextName };
+  });
+  return changed ? next : (sources as ForwardSource[]);
 }
 
 /// `reconcileForwardSources` across a per-field map, dropping fields left empty so

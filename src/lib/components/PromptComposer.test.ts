@@ -216,10 +216,12 @@ function setupForward(
     argSources?: Record<string, ForwardSource[]>;
     panes?: TranscriptPane[];
     agentReadiness?: (id: string) => "ready" | "pending" | "empty";
+    crossProject?: import("$lib/components/ui/ForwardSourcePicker.svelte").CrossProjectBase;
   } = {},
 ): void {
   render(ForwardHarness, {
     props: {
+      crossProject: opts.crossProject,
       prompt: PROMPT,
       initialArgs: args,
       initialArgSources: opts.argSources ?? {},
@@ -240,6 +242,46 @@ describe("PromptComposer per-argument forwarding", () => {
   it("omits the forward picker when there are no agents to forward from", () => {
     setup({ focus: "", tone: "" });
     expect(screen.queryByTestId("prompt-arg-forward-focus")).toBeNull();
+  });
+
+  it("a foreign pick lands in the argument, not the message list", async () => {
+    // The shared cross-project config must not carry the commit step: one shared
+    // closure previously wrote every surface's foreign picks into the compose
+    // bar's plain-message list, where they were invisible here and changed a
+    // later send.
+    const FOREIGN_PROJECT = "00000000-0000-7000-8000-0000000000aa";
+    const FOREIGN_AGENT = {
+      id: "00000000-0000-7000-8000-0000000000bb",
+      project_id: FOREIGN_PROJECT,
+      name: "oracle",
+      harness: "claude_code" as const,
+      session_locator: null,
+      created_at: "2026-05-16T00:00:00Z",
+    };
+    setupForward(
+      { focus: "", tone: "" },
+      {
+        crossProject: {
+          projects: [{ id: FOREIGN_PROJECT, name: "backend", directory: "/work/backend" }],
+          loadAgents: async () => [FOREIGN_AGENT],
+          activate: async () => {},
+        },
+      },
+    );
+
+    await fireEvent.click(screen.getByTestId("prompt-arg-forward-focus"));
+    await fireEvent.click(
+      await screen.findByTestId(`forward-picker-project-toggle-${FOREIGN_PROJECT}`),
+    );
+    await fireEvent.click(
+      await screen.findByTestId(`forward-picker-foreign-agent-${FOREIGN_AGENT.id}`),
+    );
+
+    const sources = await screen.findByTestId("prompt-arg-sources-focus");
+    // Qualified label, so a same-named local agent stays distinguishable.
+    expect(within(sources).getByTestId("forward-source-chip-oracle")).toHaveTextContent(
+      "oracle · backend",
+    );
   });
 
   it("adds a source chip under the argument when an agent is picked", async () => {

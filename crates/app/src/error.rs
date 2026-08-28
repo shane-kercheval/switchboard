@@ -81,6 +81,17 @@ pub enum AppError {
     #[error("agent {0} not found in any loaded project")]
     AgentNotFound(AgentId),
 
+    /// A forward source resolved to a project the journal read pass never
+    /// covered — the read set and the resolve set diverged. Distinct from
+    /// `ProjectNotLoaded` on purpose: the project *is* loaded, so "open it"
+    /// is the wrong recovery, and the honest diagnosis is an internal invariant
+    /// break in the forward resolver rather than anything the user can act on.
+    #[error(
+        "internal: forward source resolved to project {0}, which the journal read \
+         pass did not cover — the read set and resolve set have diverged"
+    )]
+    ForwardJournalMissing(ProjectId),
+
     /// A forward source named a project that does not own the agent. Reachable
     /// from a persisted draft whose agent moved between projects, or was removed
     /// and re-created elsewhere. Refused rather than resolved against whichever

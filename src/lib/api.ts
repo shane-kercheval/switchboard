@@ -473,9 +473,12 @@ export async function reorderAgents(
 /// the ordinary open path. Browsing must not take a project's `instance.lock`
 /// (which would outlive the menu and block other Switchboard instances), and a
 /// hover is no place to surface a lock conflict.
-export async function listProjectAgentsReadonly(projectId: ProjectId): Promise<AgentRecord[]> {
+export async function listProjectAgentsReadonly(
+  projectId: ProjectId,
+  directory: string,
+): Promise<AgentRecord[]> {
   try {
-    return await invoke<AgentRecord[]>("list_project_agents_readonly", { projectId });
+    return await invoke<AgentRecord[]>("list_project_agents_readonly", { projectId, directory });
   } catch (error) {
     // The command returns the structured `ActivationCommandError`; Tauri rejects
     // it as a plain object, so without this the picker's row would render
@@ -554,8 +557,9 @@ export async function forwardMessage(
   body: string,
   sources: ForwardSourceRef[],
   forwardId: string,
+  projectId: ProjectId,
 ): Promise<ForwardOutcome> {
-  return await invoke<ForwardOutcome>("forward_message", { body, sources, forwardId });
+  return await invoke<ForwardOutcome>("forward_message", { body, sources, forwardId, projectId });
 }
 
 // One prompt argument being forwarded into: its name, the (pane-expanded) source
@@ -582,6 +586,7 @@ export async function forwardPrompt(
   appendedText: string,
   appendedSources: ForwardSourceRef[],
   forwardId: string,
+  projectId: ProjectId,
 ): Promise<ForwardOutcome> {
   return await invoke<ForwardOutcome>("forward_prompt", {
     provider,
@@ -591,6 +596,7 @@ export async function forwardPrompt(
     appendedText,
     appendedSources,
     forwardId,
+    projectId,
   });
 }
 

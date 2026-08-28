@@ -14,12 +14,36 @@
   import HarnessIcon from "$lib/components/ui/HarnessIcon.svelte";
   import { shortcut } from "$lib/platform";
 
-  /// Cross-project sourcing config. Exported so the three consumers name one
-  /// type rather than restating the shape.
-  export type CrossProjectConfig = {
-    projects: { id: ProjectId; name: string }[];
+  /// The parts of cross-project sourcing every picker shares: what to browse,
+  /// how to read a roster, how to open and validate. Consumers spread this into
+  /// their own [`CrossProjectConfig`] rather than passing it directly.
+  export type CrossProjectBase = {
+    /// `directory` is the owner locator: the roster read targets exactly this
+    /// directory rather than scanning, so an unrelated corrupt one can't interfere.
+    projects: { id: ProjectId; name: string; directory: string }[];
+    /// Read a project's roster for **display**. Side-effect-free — no load, no lock.
     loadAgents: (projectId: ProjectId) => Promise<AgentRecord[]>;
-    onPick: (agent: AgentRecord, project: { id: ProjectId; name: string }) => Promise<void>;
+    /// Open and validate the project. Shared so validation isn't reimplemented
+    /// per consumer; rejects when the project can't be activated.
+    activate: (projectId: ProjectId) => Promise<void>;
+  };
+
+  /// Cross-project sourcing as a picker receives it: the shared base **plus a
+  /// required commit step**.
+  ///
+  /// `onPickForeign` is required by the *type*, not by a comment. Where a picked
+  /// source lands differs per consumer, and a shared commit closure is precisely
+  /// how prompt-field and workflow-field picks once landed in the compose bar's
+  /// plain-message list instead of the field — visible in workflow mode only
+  /// after leaving it, and persisted. Making it optional would leave the same
+  /// silent-nothing failure one prop narrower: rows render, `activate` takes the
+  /// project's lock, the menu closes, no source is added. A missing commit step
+  /// must be a compile error.
+  export type CrossProjectConfig = CrossProjectBase & {
+    /// Commit a foreign pick into **this consumer's** target (the compose set,
+    /// one prompt argument, one workflow field). Called only after `activate`
+    /// resolves.
+    onPickForeign: (agent: AgentRecord, project: { id: ProjectId; name: string }) => void;
   };
 
   let {
@@ -75,18 +99,43 @@
     | { status: "loading" }
     | { status: "ready"; agents: AgentRecord[] }
     | { status: "error"; message: string };
+  /// Bound so a *successful* pick can dismiss the menu. The rows carry
+  /// `closeOnSelect={false}` so expanding a project keeps the menu open; that
+  /// same flag would otherwise leave it open after a completed pick too.
+  let menuOpen = $state(false);
+  $effect(() => {
+    // A closed menu keeps no failure state — see the collapse path above.
+    if (!menuOpen) pickErrors.clear();
+  });
+  /// The one expanded project, or `null`. **Separate from `rosters`** — using
+  /// "do I have roster data?" as "is this expanded?" made a loaded project
+  /// impossible to collapse and reported the wrong `aria-expanded` for a project
+  /// showing its error row. One at a time, matching the accordion behavior; the
+  /// cache survives collapse so re-expanding doesn't re-read the registry.
+  let expandedProjectId = $state<ProjectId | null>(null);
   const rosters = new SvelteMap<ProjectId, RosterState>();
   /// Per-agent pick failure (a locked or unreadable project), rendered at the row
   /// the user clicked — the error's home is the pick, not the hover.
   const pickErrors = new SvelteMap<string, string>();
 
-  async function expandProject(projectId: ProjectId): Promise<void> {
+  async function toggleProject(projectId: ProjectId): Promise<void> {
     if (!crossProject) return;
-    // Re-expanding after a failure must retry. Guarding on mere presence would
-    // strand a project on its error row for the component's lifetime, turning a
-    // transient read failure into permanent unpickability.
-    const current = rosters.get(projectId);
-    if (current !== undefined && current.status !== "error") return;
+    const existing = rosters.get(projectId);
+    // Selecting an errored project **retries** rather than collapsing — the row
+    // says "select again to retry", and collapsing there would make that copy a
+    // lie and put the retry two clicks away.
+    if (expandedProjectId === projectId && existing?.status !== "error") {
+      expandedProjectId = null;
+      // Pick failures are scoped to the expansion that produced them. Clearing on
+      // collapse *and* on close (below) keeps one rule; clearing on close alone
+      // would leave a stale message reappearing on collapse/re-expand.
+      pickErrors.clear();
+      return;
+    }
+    expandedProjectId = projectId;
+    // Cached roster: show it, no re-read. An *errored* entry re-reads, so a
+    // transient failure doesn't make the project permanently unpickable.
+    if (existing !== undefined && existing.status !== "error") return;
     rosters.set(projectId, { status: "loading" });
     try {
       rosters.set(projectId, { status: "ready", agents: await crossProject.loadAgents(projectId) });
@@ -102,10 +151,14 @@
     if (!crossProject) return;
     pickErrors.delete(agent.id);
     try {
-      await crossProject.onPick(agent, project);
+      await crossProject.activate(project.id);
     } catch (e) {
       pickErrors.set(agent.id, errorText(e));
+      return;
     }
+    // Only after the project is proven usable does the source land anywhere.
+    crossProject.onPickForeign(agent, project);
+    menuOpen = false;
   }
 
   /// Tauri rejects a structured command error with a **plain object**, so
@@ -140,6 +193,7 @@
 </script>
 
 <DropdownMenu
+  bind:open={menuOpen}
   {triggerClass}
   {triggerTestid}
   {triggerLabel}
@@ -233,26 +287,26 @@
       {@const roster = rosters.get(project.id)}
       <div data-testid={`forward-picker-project-${project.id}`}>
         <DropdownMenuItem
-          onSelect={() => void expandProject(project.id)}
+          onSelect={() => void toggleProject(project.id)}
           closeOnSelect={false}
           class="gap-2"
           data-testid={`forward-picker-project-toggle-${project.id}`}
-          aria-expanded={roster?.status === "ready"}
+          aria-expanded={expandedProjectId === project.id}
           {disabled}
         >
           <span class="min-w-0 truncate">{project.name}</span>
-          {#if roster?.status === "loading"}
+          {#if expandedProjectId === project.id && roster?.status === "loading"}
             <span class="text-muted ml-auto text-[11px] italic">loading…</span>
           {/if}
         </DropdownMenuItem>
-        {#if roster?.status === "error"}
+        {#if expandedProjectId === project.id && roster?.status === "error"}
           <p
             class="text-muted px-2 pb-1 pl-6 text-[11px] italic"
             data-testid={`forward-picker-project-error-${project.id}`}
           >
             can't read this project — {roster.message} (select again to retry)
           </p>
-        {:else if roster?.status === "ready"}
+        {:else if expandedProjectId === project.id && roster?.status === "ready"}
           {#if roster.agents.length === 0}
             <p class="text-muted px-2 pb-1 pl-6 text-[11px] italic">no agents</p>
           {/if}

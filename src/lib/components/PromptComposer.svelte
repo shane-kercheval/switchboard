@@ -51,13 +51,15 @@
     focusFirstField = false,
     busy = false,
     projectId,
-    crossProject,
+    crossProjectBase,
   }: {
     /// The project composing this send — qualifies foreign forward-source labels.
     projectId: ProjectId;
     /// Cross-project forward sourcing, passed straight to each per-field picker
     /// so this surface offers the same Projects section as the compose bar.
-    crossProject?: import("$lib/components/ui/ForwardSourcePicker.svelte").CrossProjectConfig;
+    /// Shared cross-project sourcing. This component adds the field-scoped
+    /// commit step itself — the picker's config requires one.
+    crossProjectBase?: import("$lib/components/ui/ForwardSourcePicker.svelte").CrossProjectBase;
     prompt: Prompt;
     args: Record<string, string>;
     appendedText: string;
@@ -326,7 +328,11 @@
           {agents}
           {panes}
           onPickAgent={(agent) => onAdd(forwardSourceForAgent(agent))}
-          {crossProject}
+          crossProject={crossProjectBase && {
+            ...crossProjectBase,
+            onPickForeign: (agent: AgentRecord, project: { id: ProjectId; name: string }) =>
+              onAdd(forwardSourceForAgent(agent, project)),
+          }}
           onPickPane={(pane) => {
             for (const source of forwardSourceAgentsForPane(pane, agents)) onAdd(source);
           }}

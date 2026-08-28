@@ -84,15 +84,35 @@ function setup(
 // in-component mutation, which requires a reactive `$bindable` proxy — so they go
 // through a harness that owns `$state`, mirroring how `ComposeBar` drives it in
 // production (see `_WorkflowComposerForwardHarness.svelte`).
+const FOREIGN_PROJECT = "00000000-0000-7000-8000-0000000000aa";
+const FOREIGN_AGENT: AgentRecord = {
+  id: "00000000-0000-7000-8000-0000000000bb",
+  project_id: FOREIGN_PROJECT,
+  name: "oracle",
+  harness: "claude_code",
+  session_locator: null,
+  created_at: "2026-05-16T00:00:00Z",
+};
+/// Shared browsing/activation only — the *commit* is per consumer, which is the
+/// distinction that broke: one shared commit closure wrote every surface's foreign
+/// picks into the compose bar's plain-message list.
+const CROSS_PROJECT = {
+  projects: [{ id: FOREIGN_PROJECT, name: "backend", directory: "/work/backend" }],
+  loadAgents: async () => [FOREIGN_AGENT],
+  activate: async () => {},
+};
+
 function setupForward(
   desc: WorkflowFormDescriptor,
   inputs: Record<string, string | string[]> = {},
   initialForwardSources: Record<string, ForwardSource[]> = {},
   panes: TranscriptPane[] = [],
+  crossProject?: typeof CROSS_PROJECT,
 ) {
   let latest: Record<string, ForwardSource[]> = initialForwardSources;
   render(ForwardHarness, {
     props: {
+      crossProject,
       descriptor: desc,
       agents: AGENTS,
       panes,
@@ -528,5 +548,34 @@ describe("WorkflowComposer", () => {
     expect(screen.getByTestId("workflow-resolving")).toBeInTheDocument();
     // Fields are withheld until resolution settles.
     expect(screen.queryByTestId("workflow-agent-worker-primary")).toBeNull();
+  });
+
+  it("a foreign pick lands in the workflow field, not the message list", async () => {
+    const { sources } = setupForward(
+      descriptor([], [arg({ name: "context" })]),
+      {},
+      {},
+      [],
+      CROSS_PROJECT,
+    );
+
+    await fireEvent.click(screen.getByTestId("workflow-forward-picker-context"));
+    await fireEvent.click(
+      await screen.findByTestId(`forward-picker-project-toggle-${FOREIGN_PROJECT}`),
+    );
+    await fireEvent.click(
+      await screen.findByTestId(`forward-picker-foreign-agent-${FOREIGN_AGENT.id}`),
+    );
+
+    await waitFor(() => {
+      expect(sources().context).toEqual([
+        {
+          id: FOREIGN_AGENT.id,
+          name: "oracle",
+          projectId: FOREIGN_PROJECT,
+          projectName: "backend",
+        },
+      ]);
+    });
   });
 });

@@ -18,7 +18,9 @@
     agentReadiness,
     initialArgs,
     initialArgSources = {},
+    crossProject,
   }: {
+    crossProject?: import("$lib/components/ui/ForwardSourcePicker.svelte").CrossProjectBase;
     prompt: Prompt;
     agents: AgentRecord[];
     panes?: TranscriptPane[];
@@ -38,6 +40,7 @@
 
 <PromptComposer
   projectId="00000000-0000-7000-8000-0000000000ff"
+  crossProjectBase={crossProject}
   {prompt}
   bind:args
   bind:appendedText

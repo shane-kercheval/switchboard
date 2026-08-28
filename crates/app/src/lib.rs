@@ -1052,10 +1052,15 @@ async fn reorder_agents(
 async fn list_project_agents_readonly(
     state: State<'_, AppState>,
     project_id: String,
+    directory: String,
 ) -> Result<Vec<AgentRecord>, ActivationCommandError> {
     let pid = parse_uuid(&project_id).map_err(ActivationCommandError::from)?;
-    crate::commands::list_project_agents_readonly_impl(state.inner(), pid)
-        .map_err(ActivationCommandError::from)
+    crate::commands::list_project_agents_readonly_impl(
+        state.inner(),
+        pid,
+        std::path::Path::new(&directory),
+    )
+    .map_err(ActivationCommandError::from)
 }
 
 #[tauri::command]

@@ -84,6 +84,27 @@ impl Workspace {
         self.entries.push(DirectoryEntry { path });
     }
 
+    /// Move a known entry to a new path, keeping its position and hidden flag.
+    ///
+    /// The directory's *identity* is unchanged — only where it lives — so its
+    /// place in the user's ordering and their choice to hide it must survive.
+    /// Remove-then-add would silently send it to the end of the list. No-op if
+    /// `old` isn't known; collapses onto the existing entry if `new` already is.
+    pub fn replace_path(&mut self, old: &Path, new: PathBuf) {
+        let Some(index) = self.entries.iter().position(|entry| entry.path == old) else {
+            return;
+        };
+        let was_hidden = self.hidden.remove(old);
+        if self.entries.iter().any(|entry| entry.path == new) {
+            self.entries.remove(index);
+        } else {
+            self.entries[index].path.clone_from(&new);
+        }
+        if was_hidden {
+            self.hidden.insert(new);
+        }
+    }
+
     /// Hide (or unhide) a directory. Returns whether the set changed.
     pub fn set_hidden(&mut self, path: &Path, hidden: bool) -> bool {
         if hidden {

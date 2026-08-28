@@ -468,6 +468,23 @@ export async function reorderAgents(
   return await invoke<AgentRecord[]>("reorder_agents", { projectId, agentIds });
 }
 
+/// Repair a project whose working directory moved, was deleted, or ended up
+/// claimed by two catalog rows.
+///
+/// **Moves every project that shares that directory, not just this one.** The
+/// repair is on the directory identity — one folder holds them all — so the
+/// caller must tell the user that before confirming.
+///
+/// Rejects a project with no catalog row at all: there is no identity to
+/// re-point, and minting one would be inventing rather than repairing. That
+/// case belongs to the migration tool.
+export async function repointProjectDirectory(
+  projectId: ProjectId,
+  newPath: string,
+): Promise<void> {
+  await invoke<void>("repoint_project_directory", { projectId, newPath });
+}
+
 /// List another project's agents **without loading or locking it** — the read
 /// side of the display/activation split. Pickers browse with this; picking calls
 /// the ordinary open path. Browsing must not take a project's `instance.lock`

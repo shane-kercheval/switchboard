@@ -362,6 +362,170 @@ pub async fn remove_directory_impl(state: &AppState, path: &str) -> Result<(), A
     Ok(())
 }
 
+/// Point a project's working directory at a new location — the repair for a
+/// moved or deleted checkout, and the only in-app exit from a duplicated
+/// directory identity.
+///
+/// # Why this takes a project id
+///
+/// The operation is on the *directory identity*, but the id is not something the
+/// user has: they are looking at a project row that says its folder is gone.
+/// Naming the directory by path would also fail in exactly the two states worth
+/// repairing — a duplicated identity has no single path, and neither does a
+/// missing one. So the caller names the project and the backend resolves the
+/// identity behind it.
+///
+/// **Every project sharing that identity moves**, not just the one named. That
+/// is the correct semantics — one folder holds them all — but it means the UI
+/// must say so before the user commits.
+///
+/// `CatalogMissing` is not repairable here. The project's `directory_id` has no
+/// catalog row, and minting one would be inventing an identity rather than
+/// repairing one; it surfaces as `DirectoryNotFound` and belongs to the
+/// migration tool's explicit repair.
+///
+/// # Lifecycle, not a catalog write
+///
+/// `Project.directory` is snapshotted at open and *is* the dispatch cwd, and a
+/// running actor owns its own frozen copy inside a `ProjectDispatchContextFactory`.
+/// Evicting `state.projects` alone would leave every in-flight and
+/// already-created actor dispatching into the old path. So: cancel the affected
+/// projects' workflow runs, shut down their agents (which drops the actors and
+/// their frozen factories), write the catalog, then reload.
+///
+/// Project locks are deliberately **not** released. `instance.lock` lives under
+/// the store root beside the project's other metadata, so it does not move with
+/// the working directory — dropping and re-acquiring it would open a window for
+/// another process to take it for no gain.
+///
+/// # Uncertain commit
+///
+/// [`switchboard_core::Store::repoint_directory`] can return `Err` with the new
+/// catalog already on disk (`write_jsonl` fsyncs the parent *after* the rename).
+/// So the catalog is re-read on **both** outcomes and state is rebuilt from the
+/// path actually observed, never from the pre-call assumption — believing an
+/// `Err` is precisely what would leave the app dispatching into the old
+/// directory while the store resolves the new one.
+///
+/// If that re-read also fails, the affected projects are left unloaded and the
+/// error propagates. Dispatch then refuses (`ProjectNotLoaded`) rather than
+/// running against a path nothing has confirmed.
+pub async fn repoint_project_directory_impl(
+    state: &AppState,
+    project_id: ProjectId,
+    new_path: &str,
+) -> Result<(), AppError> {
+    let directory_id = state
+        .store
+        .list_projects()?
+        .into_iter()
+        .find(|entry| entry.id == project_id)
+        .ok_or(CoreError::ProjectNotFound(project_id))?
+        .directory_id;
+    // Everything sharing the identity, whether or not it is currently loaded —
+    // an unloaded project has no actor to drain but still needs its stale
+    // `state.projects` entry replaced if it gains one later.
+    let affected: Vec<ProjectId> = state
+        .store
+        .list_projects()?
+        .into_iter()
+        .filter(|entry| entry.directory_id == directory_id)
+        .map(|entry| entry.id)
+        .collect();
+    // The path we are moving away from, for the workspace entry. `Err` here is
+    // the ambiguous/missing case: there is no single old path to retire, so the
+    // registry is left alone and the new path is added below.
+    let old_path = state.store.directory_path(directory_id).ok();
+
+    // Cancel runs before draining agents, for the same reason
+    // `remove_directory_impl` does: a run that observes an out-of-band terminal
+    // resolves `failed` rather than `cancelled`.
+    crate::workflow_commands::cancel_runs_for_projects(state, &affected).await;
+
+    let affected_set: HashSet<ProjectId> = affected.iter().copied().collect();
+    let agent_ids: Vec<AgentId> = lock(&state.agents_by_id)
+        .values()
+        .filter(|record| affected_set.contains(&record.project_id))
+        .map(|record| record.id)
+        .collect();
+    for &agent_id in &agent_ids {
+        state
+            .dispatcher
+            .shutdown_agent(agent_id, CancelSource::Shutdown)
+            .await;
+    }
+
+    // Synchronous from here — no `.await` while `registry_write` is held.
+    let _write = lock(&state.registry_write);
+    {
+        let mut projects = lock(&state.projects);
+        projects.retain(|id, _| !affected_set.contains(id));
+    }
+
+    // Not pre-canonicalized here: `repoint_directory` canonicalizes and
+    // validates, and doing it twice would let the two disagree. The canonical
+    // path comes back from the re-read below.
+    let write_result = state
+        .store
+        .repoint_directory(directory_id, Path::new(new_path));
+
+    // Re-read on both outcomes: an `Err` above does not prove the catalog is
+    // unchanged, so the pre-call path is never a candidate for where to reload.
+    //
+    // **Enforced by construction, not by a test.** `old_path` is used only to
+    // retire the stale workspace entry and directory handle; nothing below can
+    // reach it to reload from. That matters because the case it guards — an
+    // `Err` returned after `write_jsonl`'s rename already landed, when its
+    // parent-directory fsync fails — cannot be staged portably, so no test here
+    // discriminates a correct implementation from one that trusts its own
+    // `Err`. Keep the reload reading `observed` and nothing else; if a future
+    // edit gives this block access to a pre-call path, the guarantee is gone and
+    // the suite will not say so.
+    let observed = state.store.directory_path(directory_id);
+
+    if let Ok(path) = &observed {
+        {
+            let mut workspace = lock(&state.workspace);
+            match &old_path {
+                Some(old) => workspace.replace_path(old, path.clone()),
+                None => workspace.add(path.clone()),
+            }
+        }
+        persist_workspace(state);
+        {
+            let mut directories = lock(&state.directories);
+            if let Some(old) = &old_path {
+                directories.remove(old);
+            }
+            if let Ok(directory) = Directory::at(path) {
+                directories.insert(directory.path.clone(), directory);
+            }
+        }
+        // Reload against the observed path. A project that fails to reload stays
+        // out of `state.projects`, which is the same "refuse rather than guess"
+        // posture as leaving them all out when the re-read fails.
+        let mut projects = lock(&state.projects);
+        for id in &affected {
+            match state.store.open_project(*id) {
+                Ok(project) => {
+                    projects.insert(*id, project);
+                }
+                Err(e) => tracing::warn!(
+                    project_id = %id,
+                    error = %e,
+                    "project could not be reloaded after re-point — left unloaded"
+                ),
+            }
+        }
+    }
+
+    // The write's own failure is the more specific diagnosis, so it wins; a
+    // failed re-read after a successful write is reported on its own.
+    write_result?;
+    observed?;
+    Ok(())
+}
+
 /// *The* directory-identity chokepoint. Every command that resolves a working
 /// directory to its canonical key — `init_directory_impl`, `create_project_impl`,
 /// `remove_directory_impl` — funnels through here so a directory is identified
@@ -12915,6 +13079,240 @@ mod tests {
         // Row kept, and crucially the lock is retained.
         assert!(lock(&state.projects).get(&project.id).is_some());
         assert!(lock(&state.project_locks).get(&project.id).is_some());
+    }
+
+    #[tokio::test]
+    async fn repointing_moves_every_project_in_the_directory_and_reloads_their_cwd() {
+        // The repair is on the directory identity, so the blast radius is every
+        // project sharing it — and the reload is what makes it real, because
+        // `Project.directory` is the dispatch cwd and is snapshotted at open.
+        let (tmp, state, _) = fresh_state_with_mock();
+        init_directory_impl(&state, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let alpha = create_project_in_only_dir(&state, "alpha");
+        let beta = create_project_in_only_dir(&state, "beta");
+        let moved = TempDir::new().unwrap();
+        let canonical = moved.path().canonicalize().unwrap();
+
+        repoint_project_directory_impl(&state, alpha.id, moved.path().to_str().unwrap())
+            .await
+            .unwrap();
+
+        for id in [alpha.id, beta.id] {
+            assert_eq!(
+                lock(&state.projects).get(&id).unwrap().directory,
+                canonical,
+                "every project sharing the identity moves, and is reloaded against the new path"
+            );
+        }
+        let listings = list_projects_impl(&state).unwrap();
+        assert!(listings.iter().all(|row| {
+            row.directory.as_deref() == Some(canonical.to_string_lossy().as_ref())
+                && row.directory_status == DirectoryStatus::ResolvedAvailable
+        }));
+    }
+
+    #[tokio::test]
+    async fn repointing_drains_an_in_flight_turn_before_moving_the_directory() {
+        // The load-bearing half. A running actor owns a frozen `Project` inside
+        // its dispatch-context factory, so evicting `state.projects` alone would
+        // leave the live turn — and every turn the actor served afterwards —
+        // running against the old path. Draining is what drops that factory.
+        let (tmp, state, emitter) =
+            fresh_state_with_scenario(switchboard_harness::MockScenario::AwaitCancellation);
+        let (agent, project_id) = project_with_agent(&state, &tmp).await;
+        send_msg(&state, agent.id, "long task").await.unwrap();
+        within(
+            &emitter,
+            "turn_start",
+            emitter.wait_for_type("turn_start", 1),
+        )
+        .await;
+
+        let moved = TempDir::new().unwrap();
+        repoint_project_directory_impl(&state, project_id, moved.path().to_str().unwrap())
+            .await
+            .unwrap();
+
+        let channel = format!("agent:{}", agent.id);
+        let cancelled = emitter.snapshot().into_iter().any(|(name, v)| {
+            name == channel
+                && v["type"] == "turn_end"
+                && v["outcome"]["status"] == "cancelled"
+                && v["outcome"]["source"] == "shutdown"
+        });
+        assert!(cancelled, "the in-flight turn is drained before the move");
+        assert_eq!(
+            lock(&state.projects).get(&project_id).unwrap().directory,
+            moved.path().canonicalize().unwrap()
+        );
+        // The lock stays held throughout: `instance.lock` lives under the store
+        // root, so it does not move with the working directory and dropping it
+        // would only open a window for another process.
+        assert!(lock(&state.project_locks).contains_key(&project_id));
+    }
+
+    #[tokio::test]
+    async fn repointing_keeps_the_workspace_entry_in_place_rather_than_re_adding_it() {
+        // The directory's identity didn't change, only its location — so its
+        // position in the user's ordering must survive. Remove-then-add would
+        // silently send it to the end of the list.
+        let (first, state, _) = fresh_state_with_mock();
+        let second = TempDir::new().unwrap();
+        init_directory_impl(&state, first.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let project = create_project_in_only_dir(&state, "alpha");
+        init_directory_impl(&state, second.path().to_str().unwrap())
+            .await
+            .unwrap();
+
+        let moved = TempDir::new().unwrap();
+        repoint_project_directory_impl(&state, project.id, moved.path().to_str().unwrap())
+            .await
+            .unwrap();
+
+        let paths: Vec<PathBuf> = lock(&state.workspace)
+            .entries()
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                moved.path().canonicalize().unwrap(),
+                second.path().canonicalize().unwrap()
+            ],
+            "the moved directory keeps its position"
+        );
+    }
+
+    #[tokio::test]
+    async fn repointing_repairs_a_duplicated_directory_identity() {
+        // The only in-app exit from an ambiguous identity. Before the fix in
+        // core this returned Ok and changed nothing, leaving the user with a
+        // repair that reported success and did not work.
+        let (tmp, state, _) = fresh_state_with_mock();
+        init_directory_impl(&state, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let project = create_project_in_only_dir(&state, "alpha");
+        let duplicate_row_path = TempDir::new().unwrap();
+        let mut entries = state.store.list_directories().unwrap();
+        entries.push(switchboard_core::DirectoryEntry {
+            directory_id: entries[0].directory_id,
+            path: duplicate_row_path.path().canonicalize().unwrap(),
+        });
+        write_catalog(&state, &entries);
+        assert_eq!(
+            list_projects_impl(&state).unwrap()[0].directory_status,
+            DirectoryStatus::CatalogAmbiguous
+        );
+
+        let moved = TempDir::new().unwrap();
+        repoint_project_directory_impl(&state, project.id, moved.path().to_str().unwrap())
+            .await
+            .unwrap();
+
+        let row = &list_projects_impl(&state).unwrap()[0];
+        assert_eq!(row.directory_status, DirectoryStatus::ResolvedAvailable);
+        assert_eq!(
+            row.directory.as_deref(),
+            Some(
+                moved
+                    .path()
+                    .canonicalize()
+                    .unwrap()
+                    .to_string_lossy()
+                    .as_ref()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn repointing_a_project_with_no_catalog_row_refuses_rather_than_inventing_one() {
+        // `CatalogMissing` has no in-app repair by design: minting a row for a
+        // dangling id would be inventing an identity, not repairing one. The
+        // refusal is what sends the user to the migration tool instead.
+        let (state, _cwd, project) = state_with_project("alpha").await;
+        write_catalog(&state, &[]);
+
+        let moved = TempDir::new().unwrap();
+        let err =
+            repoint_project_directory_impl(&state, project.id, moved.path().to_str().unwrap())
+                .await
+                .unwrap_err();
+        assert!(
+            matches!(err, AppError::Core(CoreError::DirectoryNotFound(_))),
+            "got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_repoint_still_reloads_the_project_from_the_catalog() {
+        // A failure must not leave the projects evicted: they were dropped from
+        // `state.projects` before the write, so an early return would strand
+        // them unloaded even though nothing changed.
+        //
+        // **This does not prove the uncertain-commit half.** That case — an
+        // `Err` returned with the new catalog already on disk, when
+        // `write_jsonl`'s parent fsync fails after its rename — cannot be staged
+        // portably, and the pre-call path is read from the same catalog the
+        // re-read consults, so no arrangement here tells a correct
+        // implementation from one that trusts its own `Err`. That guarantee is
+        // structural instead: see the note at the re-read in
+        // `repoint_project_directory_impl`.
+        let (state, cwd, project) = state_with_project("alpha").await;
+        let elsewhere = TempDir::new().unwrap();
+        let observed_path = elsewhere.path().canonicalize().unwrap();
+        repoint_only_directory(&state, &observed_path);
+
+        let gone = TempDir::new().unwrap();
+        let missing = gone.path().join("not-here");
+        let err = repoint_project_directory_impl(&state, project.id, missing.to_str().unwrap())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Core(_)), "got: {err:?}");
+
+        assert_eq!(
+            lock(&state.projects).get(&project.id).unwrap().directory,
+            observed_path,
+            "the project is reloaded from the catalog after a failed re-point"
+        );
+        assert_ne!(
+            lock(&state.projects).get(&project.id).unwrap().directory,
+            cwd.path().canonicalize().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_repoint_whose_catalog_re_read_fails_leaves_the_project_unloaded() {
+        // The other half: if the post-write re-read also fails, there is no
+        // confirmed path, so the projects stay out of `state.projects` and
+        // dispatch refuses rather than running somewhere unverified.
+        let (state, _cwd, project) = state_with_project("alpha").await;
+        let moved = TempDir::new().unwrap();
+
+        // Destroy the catalog so both the write and the re-read fail.
+        std::fs::remove_file(state.store.root().join("directories.jsonl")).unwrap();
+
+        let err =
+            repoint_project_directory_impl(&state, project.id, moved.path().to_str().unwrap())
+                .await
+                .unwrap_err();
+        assert!(matches!(err, AppError::Core(_)), "got: {err:?}");
+        assert!(
+            !lock(&state.projects).contains_key(&project.id),
+            "no confirmed path means the project stays unloaded"
+        );
+        // Which is what makes dispatch refuse: every send path resolves its
+        // project through `state.projects` and fails `ProjectNotLoaded` without
+        // an entry there.
+        assert!(matches!(
+            set_active_project_impl(&state, project.id).unwrap_err(),
+            AppError::ProjectNotLoaded(_)
+        ));
     }
 
     #[tokio::test]

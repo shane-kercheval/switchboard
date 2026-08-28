@@ -9,6 +9,7 @@ pub mod attachment;
 pub mod directory;
 pub mod error;
 pub mod harness;
+pub mod ids;
 mod io;
 pub mod journal;
 pub mod name;
@@ -28,10 +29,12 @@ pub use attachment::{
 pub use directory::{Directory, DirectoryConfig};
 pub use error::{CoreError, Result};
 pub use harness::{HarnessKind, SelectionAxis};
+pub use ids::{DirectoryId, ProjectId};
 pub use io::{append_jsonl, edit_yaml_mapping, read_jsonl, read_yaml, write_yaml};
 pub use journal::{JournalRecord, SendId};
 pub use pins::MessagePin;
-pub use project::{Project, ProjectConfig, ProjectId, ProjectSummary};
+pub use project::{Project, ProjectConfig, ProjectSummary};
 pub use store::{
-    DirectoryEntry, DirectoryId, ProjectEntry, ResolvedProject, STORE_VERSION, Store, StoreConfig,
+    DirectoryEntry, DirectoryResolution, ProjectEntry, ResolvedProject, STORE_VERSION, Store,
+    StoreConfig,
 };

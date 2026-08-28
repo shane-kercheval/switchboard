@@ -5,11 +5,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{CoreError, Result};
+use crate::ids::ProjectId;
 use crate::io::{append_jsonl, read_jsonl, read_yaml, write_jsonl, write_yaml};
 use crate::name::{canonicalize_for_uniqueness, validate_name};
-use crate::project::{
-    self, PROJECT_CONFIG_VERSION, Project, ProjectConfig, ProjectId, ProjectSummary,
-};
+use crate::project::{self, PROJECT_CONFIG_VERSION, Project, ProjectConfig, ProjectSummary};
 
 use crate::paths::{CONFIG_FILE, JOURNAL_FILE, PROJECTS_DIR, PROJECTS_INDEX, SWITCHBOARD_DIR};
 
@@ -125,7 +124,7 @@ impl Directory {
         }
 
         let projects_dir = self.projects_dir();
-        let (summary, project) = project::create_on_disk(&self.path, &projects_dir, name)?;
+        let (summary, project) = project::create_on_disk(&self.path, None, &projects_dir, name)?;
         // No destructive rollback on append failure — see "Atomicity" above.
         // The directory stays; an orphan (no index entry) is benign.
         append_jsonl(&self.projects_index_path(), &summary)?;
@@ -204,14 +203,17 @@ impl Directory {
         // (the commit). Build the config directly rather than reading it back:
         // `version` is the current constant and `created_at` already lives in
         // the index summary, so a read would only add a disk round-trip and a
-        // late failure window *after* uniqueness already passed. (If
-        // `ProjectConfig` ever gains a field a rename must preserve, switch back
-        // to read-then-mutate here.)
+        // late failure window *after* uniqueness already passed. **This shortcut
+        // holds only while every `ProjectConfig` field is recoverable from the
+        // index summary** — a field that isn't forces read-then-mutate here, or
+        // a rename silently drops it. `directory_id` is always `None` in this
+        // layout (the owning directory is the path), so it stays recoverable.
         let config_path = self.projects_dir().join(id.to_string()).join(CONFIG_FILE);
         let config = ProjectConfig {
             version: PROJECT_CONFIG_VERSION,
             name: new_name.to_owned(),
             created_at: summaries[idx].created_at,
+            directory_id: None,
         };
         write_yaml(&config_path, &config)?;
 

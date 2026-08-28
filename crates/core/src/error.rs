@@ -35,6 +35,22 @@ pub enum CoreError {
     #[error("directory not found in the store catalog: {0}")]
     DirectoryNotFound(uuid::Uuid),
 
+    /// Two or more catalog entries claim the same `directory_id`, so the id
+    /// resolves to no single path.
+    ///
+    /// Deliberately distinct from [`Self::DirectoryNotFound`]: the repair is the
+    /// opposite one. A missing row means the id was never (or is no longer)
+    /// registered; an ambiguous one means it is registered twice, and pointing
+    /// the user at "register this directory" would mint a *third* identity that
+    /// no project references. `Store::repoint_directory` collapses the
+    /// duplicates, which is the only in-app exit from this state.
+    ///
+    /// Not reachable from ordinary use — ids are minted fresh and re-points
+    /// preserve them — so the realistic source is an external edit or a bulk
+    /// catalog write.
+    #[error("directory {0} has more than one catalog entry")]
+    AmbiguousDirectory(uuid::Uuid),
+
     /// The store root holds data but no `store.yaml`. Distinct from
     /// [`Self::MissingAppendOnlyFile`] ("a file that should exist doesn't"):
     /// here the schema marker is what's absent, so nothing establishes which

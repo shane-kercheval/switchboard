@@ -11,13 +11,12 @@ use crate::agent::{
 };
 use crate::error::{CoreError, Result};
 use crate::harness::{HarnessKind, SelectionAxis};
+use crate::ids::{DirectoryId, ProjectId};
 use crate::io::{append_jsonl, read_jsonl, read_yaml, write_jsonl, write_yaml};
 use crate::name::{canonicalize_for_uniqueness, validate_name};
 use crate::paths::{
     ATTACHMENTS_DIR, CONFIG_FILE, JOURNAL_FILE, PINS_FILE, REGISTRY_FILE, RUNS_DIR,
 };
-
-pub type ProjectId = Uuid;
 
 /// `pub(crate)` so `Directory::rename_project` can stamp the current version
 /// when rewriting `config.yaml` without a redundant read-back.
@@ -35,14 +34,56 @@ pub struct ProjectSummary {
     pub created_at: DateTime<Utc>,
 }
 
-/// On-disk shape of `<directory>/.switchboard/projects/<id>/config.yaml`. This
-/// is the canonical source of truth for a project's identity; the matching
-/// entry in `projects.jsonl` is denormalized for fast listing.
+/// On-disk shape of a project's `config.yaml`.
+///
+/// **Authority is per field, not per file.** Stating it once for the whole
+/// struct is what produced a field documented by analogy to a neighbour whose
+/// contract ran the other way, so each field below says which copy wins and
+/// why. Note the id is *not* among them: it is the enclosing directory's name
+/// (`projects/<id>/`), never written into this file.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProjectConfig {
     pub version: u32,
+    /// **Config is canonical; the index copy is what renders.** Not a
+    /// contradiction — they answer different questions. `rename_project` writes
+    /// this file first and the index second as the commit, so after a partial
+    /// failure this is ahead and the index is behind; correctness and recovery
+    /// take this one, while anything the user reads (the project list, a
+    /// collision error naming another project) quotes the index, because that is
+    /// what they are looking at. Quoting this file in a user-facing string would
+    /// name a project by a name nothing on screen shows.
     pub name: String,
+    /// Same contract as `name`: canonical here, denormalized into the index
+    /// entry, and never independently mutated — only `create_on_disk` writes it,
+    /// and `rename_project` carries the index entry's value back unchanged.
     pub created_at: DateTime<Utc>,
+    /// The working directory this project belongs to — **a recovery record,
+    /// never read at runtime.**
+    ///
+    /// **`projects.jsonl` is authoritative; this copy is never read at
+    /// runtime.** Deliberately stated on its own rather than by analogy to
+    /// `name`, whose contract runs the other way. Nothing resolves a dispatch
+    /// cwd from here: [`load`] must not populate [`Project::directory`] from it,
+    /// because doing so would bypass the catalog — the only place that can
+    /// detect a duplicated or missing directory id — in favour of a copy with no
+    /// such checks.
+    ///
+    /// It exists so the project tree is self-describing. Without it, losing
+    /// `projects.jsonl` and `directories.jsonl` together leaves every project's
+    /// data intact with no record of which directory any of it belongs to. With
+    /// it, a repair tool can rebuild the index and see which projects share a
+    /// directory identity. It does **not** recover the catalog's
+    /// `directory_id -> path` mapping, which still needs migration records or
+    /// the user re-pointing each id.
+    ///
+    /// `None` means the project predates the user-global store (the legacy
+    /// `<directory>/.switchboard/` layout, whose owning directory was implied by
+    /// the path). Every project created in or migrated into the store carries
+    /// `Some`. **Any future writer that can change a project's owning directory
+    /// must update this alongside the index** — today the only writers are
+    /// creation and rename, and both stamp it from the index entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directory_id: Option<DirectoryId>,
 }
 
 /// The per-caller inputs to [`Project::register_agent_inner`].
@@ -487,21 +528,7 @@ impl Project {
     /// yielding a partially-trustworthy roster — matching how a corrupt JSONL
     /// line is already treated.
     pub fn list_agents(&self) -> Result<Vec<AgentRecord>> {
-        let agents: Vec<AgentRecord> = read_jsonl(&self.registry_path)?;
-        for agent in &agents {
-            agent.validate()?;
-            if agent.project_id != self.id {
-                return Err(CoreError::AgentProjectMismatch {
-                    registry: self.registry_path.clone(),
-                    agent_id: agent.id,
-                    claimed: agent.project_id,
-                    actual: self.id,
-                });
-            }
-        }
-        reject_duplicate_identities(&agents, &self.registry_path)?;
-        reject_fork_provenance_cycles(&agents)?;
-        Ok(agents)
+        read_registry(&self.registry_path, self.id)
     }
 
     /// Remove an agent from the registry by id, rewriting `registry.jsonl`
@@ -783,6 +810,51 @@ pub(crate) fn load(directory: &Path, id: ProjectId, root: PathBuf) -> Result<Pro
     })
 }
 
+/// Read and validate a project's agent registry from its path alone.
+///
+/// **Deliberately independent of the working directory.** `registry.jsonl`
+/// lives under the store root, keyed by project id, so a project whose catalog
+/// entry is missing or ambiguous still has a readable roster. That is what lets
+/// the session-uniqueness scans stay whole when one catalog row is damaged:
+/// they need the registry and a display name, never a cwd. Routing them through
+/// a `Project` would manufacture a dependency on resolution that the read does
+/// not have.
+///
+/// **A missing `registry.jsonl` is corruption, not an empty roster.**
+/// `create_on_disk` creates it with `create_new`, so every project that exists
+/// has one; `read_jsonl` would otherwise map its absence to `Ok(vec![])` and the
+/// session-id uniqueness scans — the whole reason this read is catalog-free —
+/// would silently pass over a project whose agents they could not see. Same
+/// posture the store already takes on `projects.jsonl` and `directories.jsonl`.
+///
+/// Shared with [`Project::list_agents`] so both paths apply the same
+/// cross-field validation rather than one of them growing a laxer copy.
+pub(crate) fn read_registry(
+    registry_path: &Path,
+    project_id: ProjectId,
+) -> Result<Vec<AgentRecord>> {
+    if !registry_path.exists() {
+        return Err(CoreError::MissingAppendOnlyFile {
+            path: registry_path.to_path_buf(),
+        });
+    }
+    let agents: Vec<AgentRecord> = read_jsonl(registry_path)?;
+    for agent in &agents {
+        agent.validate()?;
+        if agent.project_id != project_id {
+            return Err(CoreError::AgentProjectMismatch {
+                registry: registry_path.to_path_buf(),
+                agent_id: agent.id,
+                claimed: agent.project_id,
+                actual: project_id,
+            });
+        }
+    }
+    reject_duplicate_identities(&agents, registry_path)?;
+    reject_fork_provenance_cycles(&agents)?;
+    Ok(agents)
+}
+
 /// Reject a registry containing two records that share an identity.
 ///
 /// Runs **before** the provenance walk, which builds a session-keyed map: with
@@ -862,10 +934,15 @@ fn reject_fork_provenance_cycles(agents: &[AgentRecord]) -> Result<()> {
 }
 
 /// Create a new project's on-disk artifacts (config.yaml + empty registry.jsonl).
-/// The caller (`Directory`) is responsible for appending the `ProjectSummary` to
-/// projects.jsonl — and for rolling back the directory if that append fails.
+/// The caller is responsible for appending the index entry — and, under the
+/// legacy `Directory` layout, for rolling back the directory if that append
+/// fails.
+///
+/// `directory_id` is `None` only for the legacy layout, where the owning
+/// directory was implied by the path; see [`ProjectConfig::directory_id`].
 pub(crate) fn create_on_disk(
     directory: &Path,
+    directory_id: Option<DirectoryId>,
     projects_dir: &Path,
     name: &str,
 ) -> Result<(ProjectSummary, Project)> {
@@ -878,6 +955,7 @@ pub(crate) fn create_on_disk(
         version: PROJECT_CONFIG_VERSION,
         name: name.to_owned(),
         created_at,
+        directory_id,
     };
     write_yaml(&root.join(CONFIG_FILE), &config)?;
 
@@ -921,7 +999,7 @@ mod tests {
         let projects_dir = tmp.path().join("projects");
         create_dir_all(&projects_dir).unwrap();
         let (_summary, project) =
-            create_on_disk(tmp.path(), &projects_dir, "test-project").unwrap();
+            create_on_disk(tmp.path(), None, &projects_dir, "test-project").unwrap();
         (tmp, project)
     }
 

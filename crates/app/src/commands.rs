@@ -2227,11 +2227,7 @@ pub async fn remove_agent_impl(state: &AppState, agent_id: AgentId) -> Result<()
 /// harmless, a tiny stale file; whether it's reclaimed is up to the migration's
 /// cleanup.)
 fn delete_agent_sidecars(project: &Project, agent_id: AgentId) {
-    let path = switchboard_harness::meta_sidecar::meta_sidecar_path(
-        project.directory.as_path(),
-        project.id,
-        agent_id,
-    );
+    let path = switchboard_harness::meta_sidecar::meta_sidecar_path(&project.root, agent_id);
     match std::fs::remove_file(&path) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -4073,11 +4069,8 @@ fn load_agent_transcript(
     // funnel through — rather than in the per-harness loaders, which have no
     // `project_id` and don't know the sidecar layout. Best-effort: a
     // missing/corrupt sidecar reads as absent and the overlay is a no-op.
-    let sidecar_path = switchboard_harness::meta_sidecar::meta_sidecar_path(
-        &project.directory,
-        project.id,
-        agent.id,
-    );
+    let sidecar_path =
+        switchboard_harness::meta_sidecar::meta_sidecar_path(&project.root, agent.id);
     apply_meta_sidecar_overlay(
         &mut transcript,
         switchboard_harness::meta_sidecar::read(&sidecar_path),
@@ -4086,11 +4079,8 @@ fn load_agent_transcript(
     // sidecar's records onto the hydrated turns by `stable_message_id`. Same
     // best-effort posture: a missing/corrupt log reads as empty and the join is
     // a no-op (turns render no cost/overage — the no-backfill case).
-    let turnmeta_path = switchboard_harness::turnmeta_sidecar::turnmeta_sidecar_path(
-        &project.directory,
-        project.id,
-        agent.id,
-    );
+    let turnmeta_path =
+        switchboard_harness::turnmeta_sidecar::turnmeta_sidecar_path(&project.root, agent.id);
     apply_turnmeta_overlay(
         &mut transcript,
         &switchboard_harness::turnmeta_sidecar::read(&turnmeta_path),
@@ -4865,7 +4855,10 @@ fn classify_turns_by_provenance(
 /// imported (a visible duplicate) and never mis-pairs — but it is a real
 /// coupling, so a footer change should come with a look at this function.
 /// Pre-attachments journal lines deserialize to an empty attachment list and
-/// reconstruct unchanged.
+/// reconstruct unchanged. Attachment paths are read through
+/// [`switchboard_core::Attachment::sent_path`], so a send whose staged
+/// file was relocated by a migration still reconstructs the text it was
+/// actually dispatched with.
 ///
 /// **Disjoint windows are what make assignment exclusive** — not the `floor`,
 /// and not uniqueness. Windows partition the timeline and candidates are in
@@ -4927,7 +4920,11 @@ fn align_surplus_candidates(
             );
         }
         previous_send_at = Some(send_at);
-        let dispatched = switchboard_core::render_prompt_with_attachments(prompt, attachments);
+        // The *dispatched* form, not the live one: a migration can rewrite an
+        // attachment's `path` after the fact, and this match is
+        // character-for-character against text the harness already recorded.
+        let dispatched =
+            switchboard_core::render_dispatched_prompt_with_attachments(prompt, attachments);
         let transported = switchboard_harness::claude_transport_prompt(&dispatched);
         // Matching text is not enough: a prompt recorded *before* this send
         // cannot be its echo, and treating it as one presents an older reply as
@@ -11486,8 +11483,7 @@ mod tests {
         .unwrap();
 
         let turnmeta_path = switchboard_harness::turnmeta_sidecar::turnmeta_sidecar_path(
-            tmp_workdir.path(),
-            proj.id,
+            &project_root(&state, proj.id),
             record.id,
         );
         switchboard_harness::turnmeta_sidecar::append(
@@ -11613,8 +11609,7 @@ mod tests {
             .unwrap()
             .with_timezone(&chrono::Utc);
         let sidecar_path = switchboard_harness::meta_sidecar::meta_sidecar_path(
-            tmp_workdir.path(),
-            proj.id,
+            &project_root(&state, proj.id),
             record.id,
         );
         switchboard_harness::meta_sidecar::write_rate_limit(
@@ -12192,8 +12187,22 @@ mod tests {
     // Fixture-level only — no live test: these commands don't change how we talk
     // to a real CLI, just registry/sidecar/in-memory state.
 
-    fn meta_sidecar(tmp: &TempDir, project_id: ProjectId, agent_id: AgentId) -> PathBuf {
-        switchboard_harness::meta_sidecar::meta_sidecar_path(tmp.path(), project_id, agent_id)
+    /// The loaded project's metadata root. Read from the `Project` handle rather
+    /// than rebuilt from the working directory, so these tests carry no copy of
+    /// the on-disk layout.
+    fn project_root(state: &AppState, project_id: ProjectId) -> PathBuf {
+        lock(&state.projects)
+            .get(&project_id)
+            .expect("project is loaded")
+            .root
+            .clone()
+    }
+
+    fn meta_sidecar(state: &AppState, project_id: ProjectId, agent_id: AgentId) -> PathBuf {
+        switchboard_harness::meta_sidecar::meta_sidecar_path(
+            &project_root(state, project_id),
+            agent_id,
+        )
     }
 
     fn write_dummy(path: &Path) {
@@ -12220,7 +12229,7 @@ mod tests {
         let (agent, project_id) = project_with_agent(&state, &tmp).await;
         // Only the meta sidecar exists; the codex/antigravity ones don't —
         // removal must delete the present one and not fail on the absent ones.
-        let sidecar = meta_sidecar(&tmp, project_id, agent.id);
+        let sidecar = meta_sidecar(&state, project_id, agent.id);
         write_dummy(&sidecar);
 
         remove_agent_impl(&state, agent.id).await.unwrap();
@@ -12237,8 +12246,8 @@ mod tests {
         let (tmp, state, _) = fresh_state_with_mock();
         let (a, project_id) = project_with_agent(&state, &tmp).await;
         let b = create_agent_impl(&state, "second", HarnessKind::ClaudeCode, None, None).unwrap();
-        let sidecar_a = meta_sidecar(&tmp, project_id, a.id);
-        let sidecar_b = meta_sidecar(&tmp, project_id, b.id);
+        let sidecar_a = meta_sidecar(&state, project_id, a.id);
+        let sidecar_b = meta_sidecar(&state, project_id, b.id);
         write_dummy(&sidecar_a);
         write_dummy(&sidecar_b);
 
@@ -13323,6 +13332,7 @@ mod tests {
             kind,
             path: path.to_owned(),
             original_name: "orig".to_owned(),
+            dispatched_path: None,
         }
     }
 
@@ -14971,6 +14981,7 @@ mod tests {
             kind: switchboard_core::AttachmentKind::Image,
             path: "/abs/attachments/u__shared.png".to_owned(),
             original_name: "shared.png".to_owned(),
+            dispatched_path: None,
         };
         let send = |agent: AgentId| JournalRecord::Send {
             send_id,
@@ -15795,6 +15806,7 @@ mod tests {
             kind: switchboard_core::AttachmentKind::Image,
             path: "/tmp/staged/a.png".to_owned(),
             original_name: "a.png".to_owned(),
+            dispatched_path: None,
         };
         let dispatched =
             switchboard_core::render_prompt_with_attachments("", std::slice::from_ref(&attachment));

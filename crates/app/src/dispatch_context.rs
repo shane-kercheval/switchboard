@@ -185,14 +185,10 @@ impl DispatchContextFactory for ProjectDispatchContextFactory {
         ));
         let journal: Arc<dyn ConversationJournal> =
             Arc::new(ProjectJournal::new(self.project.journal_path(), send_id));
-        let sidecar_path = switchboard_harness::meta_sidecar::meta_sidecar_path(
-            &self.project.directory,
-            self.project.id,
-            agent_id,
-        );
+        let sidecar_path =
+            switchboard_harness::meta_sidecar::meta_sidecar_path(&self.project.root, agent_id);
         let turnmeta_path = switchboard_harness::turnmeta_sidecar::turnmeta_sidecar_path(
-            &self.project.directory,
-            self.project.id,
+            &self.project.root,
             agent_id,
         );
         let metadata: Arc<dyn MetadataCache> = Arc::new(ProjectMetadataCache::new(

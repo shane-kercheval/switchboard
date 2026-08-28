@@ -41,7 +41,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use switchboard_core::{AgentId, ProjectId};
+use switchboard_core::AgentId;
 
 /// Current on-disk schema version. Bumped only on a breaking shape change;
 /// an unrecognized version reads as empty (best-effort, forward-compatible).
@@ -110,16 +110,19 @@ impl Default for MetaSidecar {
     }
 }
 
-/// Canonical metadata-sidecar path:
-/// `<directory>/.switchboard/projects/<project-id>/sessions/<agent-id>.meta.json`.
+/// Canonical metadata-sidecar path: `<project-root>/sessions/<agent-id>.meta.json`.
 /// Shares the per-agent `sessions/` directory with the registry's metadata
 /// cache, but is a distinct filename and concern.
+///
+/// **Takes the project root, not the working directory.** This used to re-derive
+/// `<dir>/.switchboard/projects/<id>` here — filesystem-layout knowledge that
+/// belongs to `switchboard_core`, and that a harness adapter has no business
+/// knowing. Owning a copy of the layout meant this crate silently pointed at the
+/// wrong place the moment the layout changed; taking the root makes that
+/// impossible and leaves exactly one definition of where a project lives.
 #[must_use]
-pub fn meta_sidecar_path(directory: &Path, project_id: ProjectId, agent_id: AgentId) -> PathBuf {
-    directory
-        .join(".switchboard")
-        .join("projects")
-        .join(project_id.to_string())
+pub fn meta_sidecar_path(project_root: &Path, agent_id: AgentId) -> PathBuf {
+    project_root
         .join("sessions")
         .join(format!("{agent_id}.meta.json"))
 }
@@ -261,12 +264,13 @@ mod tests {
 
     #[test]
     fn meta_sidecar_path_matches_canonical_layout() {
-        let directory = Path::new("/Users/x/workspace");
-        let project_id = Uuid::nil();
+        // The caller supplies the project root; this crate only knows the
+        // per-agent filename under it.
+        let project_root = Path::new("/store/projects/proj-1");
         let agent_id = Uuid::nil();
-        let path = meta_sidecar_path(directory, project_id, agent_id);
+        let path = meta_sidecar_path(project_root, agent_id);
         let expected = PathBuf::from(format!(
-            "/Users/x/workspace/.switchboard/projects/{project_id}/sessions/{agent_id}.meta.json"
+            "/store/projects/proj-1/sessions/{agent_id}.meta.json"
         ));
         assert_eq!(path, expected);
     }

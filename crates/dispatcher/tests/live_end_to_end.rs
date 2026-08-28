@@ -738,6 +738,7 @@ async fn live_attachment_case(
         kind: AttachmentKind::Text,
         path: staged.to_string_lossy().into_owned(),
         original_name: "note.txt".to_owned(),
+        dispatched_path: None,
     };
 
     let dispatcher = Arc::new(Dispatcher::new());

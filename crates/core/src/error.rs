@@ -27,6 +27,14 @@ pub enum CoreError {
     #[error("project not found: {0}")]
     ProjectNotFound(uuid::Uuid),
 
+    /// A `directory_id` referenced by a project index entry has no catalog
+    /// entry. The catalog never deletes an entry a project still references, so
+    /// this is corruption (a hand-edited or truncated `directories.jsonl`), not
+    /// an ordinary "the user removed that directory" state — a removed working
+    /// *directory* keeps its catalog entry with a path that no longer resolves.
+    #[error("directory not found in the store catalog: {0}")]
+    DirectoryNotFound(uuid::Uuid),
+
     #[error("agent not found: {0}")]
     AgentNotFound(uuid::Uuid),
 

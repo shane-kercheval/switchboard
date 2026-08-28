@@ -48,10 +48,43 @@ pub struct Attachment {
     /// inline `@`-menu token and the agent-facing footer use this same label.
     pub label: String,
     pub kind: AttachmentKind,
-    /// Absolute path to the staged file under the project's `attachments/` dir.
+    /// Absolute path to the staged file under the store's `attachments/` dir.
+    /// **The live location** — where the file is now, so this is what rendering
+    /// and the reference-GC use.
     pub path: String,
+    /// The path this attachment was **dispatched under**, when that differs from
+    /// where the file lives today. `None` (the common case, and what records
+    /// written before this field existed deserialize to) means "same as `path`".
+    ///
+    /// It exists because a journal entry has two jobs that pull apart the moment
+    /// a file moves. Reading it back to *find the file* wants the current path;
+    /// reconstructing *what was sent* wants the original. The surplus-case
+    /// send↔turn correlation (`align_surplus_candidates` in `crates/app/src/commands.rs`)
+    /// re-renders the exact prompt text the harness recorded and matches it
+    /// character-for-character — so if a migration rewrote `path`, every
+    /// attachment-bearing send before the move would stop reconstructing and its
+    /// reply would render as an unattributed duplicate.
+    ///
+    /// Read it through [`Self::sent_path`], never directly, so the fallback
+    /// lives in one place. **Migration is the only writer of a divergent
+    /// value**: nothing in normal operation moves a staged file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatched_path: Option<String>,
     /// The dropped file's basename, for display.
     pub original_name: String,
+}
+
+impl Attachment {
+    /// The path this attachment was dispatched under — `dispatched_path` when a
+    /// migration recorded one, else the live `path`.
+    ///
+    /// **Only prompt reconstruction wants this.** Anything that needs to *touch*
+    /// the file (rendering a thumbnail, staging, the reference-GC's liveness
+    /// check) wants `path`, because that is where the bytes are.
+    #[must_use]
+    pub fn sent_path(&self) -> &str {
+        self.dispatched_path.as_deref().unwrap_or(&self.path)
+    }
 }
 
 /// Build the agent-facing prompt: the clean prompt followed by a footer listing
@@ -74,6 +107,30 @@ pub struct Attachment {
 /// separator).
 #[must_use]
 pub fn render_prompt_with_attachments(prompt: &str, attachments: &[Attachment]) -> String {
+    render_footer(prompt, attachments, |a| &a.path)
+}
+
+/// Reconstruct the prompt text a send was **dispatched with**, for matching
+/// against what the harness recorded.
+///
+/// Identical to [`render_prompt_with_attachments`] except that it reads each
+/// attachment's [`Attachment::dispatched_path`]. Separate functions rather than
+/// a bool parameter: the two have different *callers* rather than different
+/// modes — one builds text to hand a live agent, the other rebuilds text that
+/// was already sent — and a bool at a call site reads as neither.
+#[must_use]
+pub fn render_dispatched_prompt_with_attachments(
+    prompt: &str,
+    attachments: &[Attachment],
+) -> String {
+    render_footer(prompt, attachments, Attachment::sent_path)
+}
+
+fn render_footer<'a>(
+    prompt: &str,
+    attachments: &'a [Attachment],
+    path_of: impl Fn(&'a Attachment) -> &'a str,
+) -> String {
     if attachments.is_empty() {
         return prompt.to_owned();
     }
@@ -83,7 +140,7 @@ pub fn render_prompt_with_attachments(prompt: &str, attachments: &[Attachment]) 
         out.push('\n');
         out.push_str(&attachment.label);
         out.push_str(": ");
-        out.push_str(&attachment.path);
+        out.push_str(path_of(attachment));
     }
     out
 }
@@ -97,6 +154,7 @@ mod tests {
             label: label.to_owned(),
             kind,
             path: path.to_owned(),
+            dispatched_path: None,
             original_name: name.to_owned(),
         }
     }

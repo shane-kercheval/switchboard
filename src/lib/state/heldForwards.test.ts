@@ -191,32 +191,61 @@ const userTurn = (at: string): Turn => ({
 });
 
 describe("agentReadinessFor", () => {
+  const rt = (
+    run_status: "idle" | "starting" | "processing",
+    hydration_status: "pending" | "loading" | "complete" | "failed",
+  ) => ({ run_status, hydration_status });
+
   it("reports unknown, not empty, while the agent's history is still unread", () => {
     // Every agent is seeded with an empty transcript at registration, and a
     // failed read leaves it that way until the user retries hydration. Callers
     // *disable* on `empty`, so answering `empty` here makes an agent with months
     // of history unpickable — while asserting it has no output.
-    expect(agentReadinessFor([], false)).toBe("unknown");
-    expect(agentReadinessFor(undefined, false)).toBe("unknown");
+    expect(agentReadinessFor([], rt("idle", "loading"))).toBe("unknown");
+    expect(agentReadinessFor(undefined, rt("idle", "failed"))).toBe("unknown");
   });
 
   it("still reports pending for a streaming turn the history read hasn't covered", () => {
     // A streaming turn arrives on the live event channel, not from disk, so it is
     // known regardless of hydration. Checking hydration first would hide an agent
     // that is visibly generating right now.
-    expect(agentReadinessFor([agentTurn("streaming", "1")], false)).toBe("pending");
+    expect(agentReadinessFor([agentTurn("streaming", "1")], rt("processing", "loading"))).toBe(
+      "pending",
+    );
+  });
+
+  it("reports pending, not empty, for a just-dispatched agent with no prior output", () => {
+    // The just-sent window: run_status is `starting` but the first streamed
+    // token hasn't reached the transcript. Deriving from turns alone reads
+    // "no output" — a *disable* built on a false claim, at the exact moment a
+    // user chains "send to A, forward A's reply to B".
+    expect(agentReadinessFor([], rt("starting", "complete"))).toBe("pending");
+  });
+
+  it("reports pending, not ready, for a just-dispatched agent with an older answer", () => {
+    // The backend holds for the new turn and forwards *its* output, so "ready"
+    // (implying the old answer would be forwarded now) is the wrong promise.
+    expect(agentReadinessFor([agentTurn("complete", "1")], rt("starting", "complete"))).toBe(
+      "pending",
+    );
   });
 
   it("withholds a stale ready verdict too, not just a stale empty one", () => {
     // A partially-read transcript can look ready while the newest turn is still
     // missing, so an incomplete read yields no verdict in either direction.
-    expect(agentReadinessFor([agentTurn("complete", "1")], false)).toBe("unknown");
+    expect(agentReadinessFor([agentTurn("complete", "1")], rt("idle", "loading"))).toBe("unknown");
+  });
+
+  it("treats a missing runtime as untrusted, not as idle-and-hydrated", () => {
+    expect(agentReadinessFor([agentTurn("complete", "1")], undefined)).toBe("unknown");
   });
 
   it("passes the derivation straight through once the history is read", () => {
-    expect(agentReadinessFor([], true)).toBe("empty");
-    expect(agentReadinessFor([agentTurn("complete", "1")], true)).toBe("ready");
-    expect(agentReadinessFor([agentTurn("streaming", "1")], true)).toBe("pending");
+    expect(agentReadinessFor([], rt("idle", "complete"))).toBe("empty");
+    expect(agentReadinessFor([agentTurn("complete", "1")], rt("idle", "complete"))).toBe("ready");
+    expect(agentReadinessFor([agentTurn("streaming", "1")], rt("processing", "complete"))).toBe(
+      "pending",
+    );
   });
 });
 

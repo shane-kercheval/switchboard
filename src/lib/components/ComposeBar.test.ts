@@ -5775,6 +5775,27 @@ describe("ComposeBar — cross-agent forward", () => {
     },
   );
 
+  it("keeps a just-sent agent pickable as pending, not disabled as spent", async () => {
+    // Send to bob, then immediately open the forward menu to chain his reply
+    // onward — the core workflow. Between pressing send and the first streamed
+    // token, bob's transcript shows no new agent turn; deriving readiness from
+    // turns alone would disable his row as "no output" for the whole spawn
+    // window, right when the user is looking at it.
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    state.runtimes[AGENT_B.id] = { ...state.runtimes[AGENT_B.id]!, run_status: "starting" };
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    await fireEvent.input(textarea, { target: { value: "@" } });
+
+    const row = await screen.findByTestId(`forward-option-forward-agent:${AGENT_B.id}`);
+    expect(row).not.toBeDisabled();
+    expect(row).not.toHaveTextContent("no output");
+    expect(row).toHaveTextContent("still generating");
+  });
+
   it("still reports a streaming turn while the history read is in flight", async () => {
     // A streaming turn arrives on the live event channel, not from disk, so
     // withholding it behind hydration would hide an agent that is visibly working.

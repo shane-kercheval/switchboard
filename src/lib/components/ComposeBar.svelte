@@ -339,7 +339,7 @@
   /// `@`-menu rows, and the per-field pickers in the prompt/workflow composers —
   /// so they cannot disagree about the same agent.
   function agentReadiness(agentId: AgentId): ForwardReadiness {
-    return agentReadinessFor(transcripts[agentId], isHydrated(agentId));
+    return agentReadinessFor(transcripts[agentId], runtimes[agentId]);
   }
 
   /// Readiness for a chip. Must go through the *source*, not the bare id:
@@ -347,7 +347,12 @@
   /// `undefined`, and `forwardReadiness(undefined)` is `"empty"` — a "this will
   /// block your send" warning that is false for a healthy foreign source.
   function sourceReadiness(source: ForwardSource): ForwardReadiness {
-    return sourceReadinessFor(source, projectId, (id) => transcripts[id], isHydrated);
+    return sourceReadinessFor(
+      source,
+      projectId,
+      (id) => transcripts[id],
+      (id) => runtimes[id],
+    );
   }
 
   /// The current chips as the `Attachment` wire shape (drops the local `id`),
@@ -1371,11 +1376,15 @@
     return items;
   });
   /// Forward entries that would resolve to nothing. Rendered (with the reason)
-  /// but **not selectable**: picking one can only end in the backend refusing the
-  /// whole send, so the menu declines the choice instead of describing a
-  /// consequence the user has to avoid. Keeping them out of `menuItems` — the
-  /// list arrow keys walk and Enter picks from — is what makes that true for the
-  /// keyboard as well as the mouse.
+  /// but **not selectable**. The rule is scoped to *direct leaf rows*: a row
+  /// maps one-to-one to a known-empty source, so it is disabled outright.
+  /// **Panes are deliberately different** — a pane is a bulk shortcut and stays
+  /// selectable even when a member is empty; its expansion produces one chip
+  /// per member, and the empty member's chip carries the warning before the
+  /// user submits. Each route intervenes at the point where it has a surface
+  /// to say why. Keeping disabled rows out of `menuItems` — the list arrow
+  /// keys walk and Enter picks from — is what makes the direct rule hold for
+  /// the keyboard as well as the mouse.
   const emptyForwardKeys = $derived(
     new Set(
       forwardItems

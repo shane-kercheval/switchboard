@@ -126,7 +126,7 @@
   /// *errored* entry does re-read, which makes reopening the submenu the retry
   /// path and stops a transient failure from making a project permanently
   /// unpickable.
-  async function openProject(projectId: ProjectId): Promise<void> {
+  async function loadRoster(projectId: ProjectId): Promise<void> {
     if (!crossProject) return;
     const existing = rosters.get(projectId);
     if (existing !== undefined && existing.status !== "error") return;
@@ -297,7 +297,7 @@
           contentTestid={`forward-picker-project-menu-${project.id}`}
           data-testid={`forward-picker-project-toggle-${project.id}`}
           onOpenChange={(open) => {
-            if (open) void openProject(project.id);
+            if (open) void loadRoster(project.id);
             // Pick failures are scoped to the expansion that produced them, so a
             // stale message can't reappear on reopen.
             else pickErrors.clear();

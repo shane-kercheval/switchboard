@@ -41,7 +41,7 @@
     disabled?: boolean;
     onRemove: () => void;
     /// The project composing this send. A source from any *other* project is
-    /// labelled `agent · project`, so two same-named agents in different projects
+    /// labelled `project · agent`, so two same-named agents in different projects
     /// stay distinguishable on the chip.
     currentProjectId: ProjectId;
   } = $props();

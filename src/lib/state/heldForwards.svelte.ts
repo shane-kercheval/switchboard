@@ -18,7 +18,7 @@
 import type { AgentId, AgentRecord, ForwardSourceRef, ProjectId, SendId } from "$lib/types";
 export type { ForwardSourceRef };
 import { answerTextOf } from "./unified";
-import type { Turn } from "$lib/state/types";
+import type { AgentRuntime, Turn } from "$lib/state/types";
 import type { TranscriptPane } from "$lib/state/transcriptPanes.svelte";
 
 /// One forward source the user picked: always a single agent whose latest output
@@ -220,57 +220,76 @@ export function reconcileForwardSourceMap(
 /// - `pending` — the agent has a turn in flight; the send **holds** for it.
 /// - `empty`   — the agent is idle with no forwardable text to contribute;
 ///               dispatching would **block the whole send** (any empty source
-///               invalidates the forward), so the picker flags it first.
-/// - `unknown` — not determinable here, so **render no marker at all**. This is
-///               the state for a source in another project: readiness is read
-///               from the current project's loaded transcripts, which by
-///               definition don't contain a foreign agent. An explicit member
-///               rather than reusing `ready` or `empty`, because both of those
-///               are claims — and `empty` in particular renders a "this will
-///               block your send" warning that is the *inverse* of the truth for
-///               a healthy foreign source.
+///               invalidates the forward), so the pickers **disable** the row
+///               (a chip that *becomes* empty after pick renders the warning
+///               instead — the menus only prevent picking one that already is).
+/// - `unknown` — not determinable here, so **render no marker and don't
+///               disable**. Two routes in: a source in **another project**
+///               (readiness is read from the current project's loaded
+///               transcripts, which by definition don't contain a foreign
+///               agent), and a **local** agent whose transcript can't yet be
+///               trusted (its on-disk history is unread or failed to read). An
+///               explicit member rather than reusing `ready` or `empty`,
+///               because both of those are claims — and `empty` in particular
+///               now disables, which is the *inverse* of right for a healthy
+///               source that merely can't be classified from here.
 export type ForwardReadiness = "ready" | "pending" | "empty" | "unknown";
 
-/// Readiness for one **local** agent, given whether its on-disk history has
-/// finished loading.
+/// Readiness for one **local** agent, from its turns and its runtime.
 ///
-/// `hydrated` gates only the disk-derived half. A streaming turn is observed
-/// *live* — the event reducer writes it into `transcripts` whether or not the
-/// history read has finished — so `pending` survives an incomplete load.
-/// Checking hydration first would hide an agent that is visibly generating.
+/// Two rules govern this, stated once here because every branch serves one of
+/// them:
 ///
-/// Everything else collapses to `unknown` until the load completes, because
-/// before then an empty transcript means "not read yet" or "the read failed",
-/// not "this agent has said nothing": every agent is seeded with an empty
-/// transcript at registration, and a failed read leaves it that way until the
-/// user retries. Callers *disable* on `empty`, so conflating the two makes an
-/// agent with months of history unpickable for as long as its history is
-/// missing — while asserting it has no output.
+/// - **`pending` means the backend will hold this send before resolving.** The
+///   backend's `wait_for_current_turn` holds for the agent's *current* turn —
+///   so `pending` is exactly "a turn is in flight or starting"
+///   (`run_status !== "idle"`), whether or not its first output has reached the
+///   transcript yet. The `run_status` check covers the just-dispatched window:
+///   between pressing send and the first streamed token, the transcript shows
+///   nothing new, and deriving from it alone reads "no output" for an agent
+///   that is spawning a reply — a disable built on a false claim, landing at
+///   the exact moment a user chains "send to A, forward A's reply to B".
+///   (Deliberately not the broader `agentIsWorking`: that is also true for a
+///   *queued* send behind a drained turn, which the backend does **not** hold
+///   for — it would resolve immediately from the latest completed output, so
+///   labelling it "still generating" would promise a hold that never happens.)
+///
+/// - **Hydration gates disk-derived evidence only.** An empty transcript means
+///   "no output" only once the on-disk history has actually been read: every
+///   agent is seeded with an empty transcript at registration, and a failed
+///   read leaves it that way until the user retries. Callers *disable* on
+///   `empty`, so conflating the two makes an agent with months of history
+///   unpickable while asserting it has none. Until hydration completes, the
+///   verdict is `unknown` — withheld in *both* directions, since a
+///   partially-read transcript can look `ready` while its newest turn is still
+///   missing. A streaming turn is outside this gate's subject matter entirely:
+///   it arrived on the live event channel, not from disk.
 export function agentReadinessFor(
   turns: readonly Turn[] | undefined,
-  hydrated: boolean,
+  runtime: Pick<AgentRuntime, "run_status" | "hydration_status"> | undefined,
 ): ForwardReadiness {
+  if (runtime !== undefined && runtime.run_status !== "idle") return "pending";
   const readiness = forwardReadiness(turns);
   if (readiness === "pending") return readiness;
-  return hydrated ? readiness : "unknown";
+  return runtime?.hydration_status === "complete" ? readiness : "unknown";
 }
 
 /// Readiness for one source, given the project composing the send. A foreign
 /// source short-circuits to `unknown`: its transcript isn't loaded here, and
 /// guessing from an absent transcript yields `empty`, which is a false warning.
 ///
-/// `isHydrated` is required rather than optional. The same absent-transcript
+/// `runtimeFor` is required rather than optional. The same absent-transcript
 /// ambiguity that makes a foreign source `unknown` applies to a local agent
-/// whose history hasn't loaded, and a caller that omitted the check would get
+/// whose history hasn't loaded, and a caller that omitted the runtime would get
 /// the confident-but-wrong answer silently.
 export function sourceReadinessFor(
   source: ForwardSource,
   currentProjectId: ProjectId,
   turnsFor: (id: AgentId) => readonly Turn[] | undefined,
-  isHydrated: (id: AgentId) => boolean,
+  runtimeFor: (id: AgentId) => AgentRuntime | undefined,
 ): ForwardReadiness {
   if (isForeignSource(source, currentProjectId)) return "unknown";
-  return agentReadinessFor(turnsFor(source.id), isHydrated(source.id));
+  return agentReadinessFor(turnsFor(source.id), runtimeFor(source.id));
 }
 
 /// Classify what a source will contribute, from that agent's turns.

@@ -185,6 +185,12 @@ export type Attachment = {
   label: string;
   kind: AttachmentKind;
   path: string;
+  /// Where the file was when this send was dispatched, if that differs from
+  /// where it lives now. **Persisted metadata the frontend never sets** — only
+  /// a migration writes it, and only the backend's send/turn correlation reads
+  /// it. Present here because this type claims to mirror the Rust wire shape,
+  /// and dropping the field on a round-trip would silently discard it.
+  dispatched_path?: string;
   original_name: string;
 };
 

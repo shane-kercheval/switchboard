@@ -96,10 +96,13 @@ impl Project {
     }
 
     /// Directory holding this project's staged attachment files
-    /// (`projects/<id>/attachments/`). Sited inside the per-project metadata dir
-    /// so a staged file resolves under every harness's sandbox (the dir is under
-    /// the user's working tree). Runtime data; `.gitignore`d like the rest of
-    /// `projects/`. Created lazily on first stage; absent until then.
+    /// (`projects/<id>/attachments/`), and the current staging target.
+    ///
+    /// Attachments are handed to agents as absolute paths in the prompt footer
+    /// (see [`crate::render_prompt_with_attachments`]), which is what every
+    /// harness can read regardless of sandbox — the location itself carries no
+    /// requirement. [`crate::Store::attachments_dir`] is the store-wide
+    /// equivalent; the two coexist until staging moves onto it.
     pub fn attachments_dir(&self) -> PathBuf {
         self.root.join(ATTACHMENTS_DIR)
     }

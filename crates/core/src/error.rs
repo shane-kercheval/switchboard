@@ -35,6 +35,16 @@ pub enum CoreError {
     #[error("directory not found in the store catalog: {0}")]
     DirectoryNotFound(uuid::Uuid),
 
+    /// A catalog write would leave two entries pointing at the same working
+    /// directory. One canonical path must map to exactly one `DirectoryId`:
+    /// per-directory scopes (project-name uniqueness, and the Claude
+    /// session-id collision scan, which is per-directory precisely because
+    /// Claude session ids are cwd-namespaced) are evaluated by id, so a split
+    /// identity silently narrows them to half the agents that share the
+    /// namespace.
+    #[error("working directory {path} is already registered as {existing}")]
+    DuplicateDirectoryPath { path: PathBuf, existing: uuid::Uuid },
+
     #[error("agent not found: {0}")]
     AgentNotFound(uuid::Uuid),
 

@@ -15852,6 +15852,66 @@ mod tests {
     }
 
     #[test]
+    fn merge_surplus_pairs_a_relocated_attachment_through_its_dispatched_path() {
+        // A migration moves staged files and rewrites `path`, recording the
+        // original in `dispatched_path`. The harness recorded the *original* text
+        // months ago and it never changes, so reconstruction has to render the
+        // old path — matching on the live one silently stops pairing every
+        // pre-migration attachment-bearing send, and its reply renders as an
+        // unattributed duplicate.
+        let fork = Uuid::now_v7();
+        let send = Uuid::now_v7();
+        let attachment = Attachment {
+            label: "image-1".to_owned(),
+            kind: switchboard_core::AttachmentKind::Image,
+            // Where the file lives now…
+            path: "/store/attachments/a.png".to_owned(),
+            // …and where it lived when this send went out.
+            dispatched_path: Some("/old/project/attachments/a.png".to_owned()),
+            original_name: "a.png".to_owned(),
+        };
+        let recorded = switchboard_core::render_dispatched_prompt_with_attachments(
+            "",
+            std::slice::from_ref(&attachment),
+        );
+        assert!(
+            recorded.contains("/old/project/attachments/a.png"),
+            "the fixture must carry the pre-migration text the harness saw"
+        );
+        let journal = vec![JournalRecord::Send {
+            send_id: send,
+            turn_id: Uuid::now_v7(),
+            agent_id: fork,
+            prompt: String::new(),
+            attachments: vec![attachment],
+            at: at(10),
+        }];
+
+        let merged = merge_project_conversation(
+            journal,
+            vec![(
+                fork,
+                transcript_of(surplus_shape(
+                    fork,
+                    "the parent's in-flight prompt",
+                    &recorded,
+                )),
+                None,
+            )],
+        );
+
+        let grouped: Vec<Option<SendId>> = rendered_prompts(&merged)
+            .into_iter()
+            .map(|(_, send_id)| send_id)
+            .collect();
+        assert_eq!(
+            grouped,
+            vec![None, Some(send), None],
+            "a relocated attachment still pairs with the echo the harness recorded"
+        );
+    }
+
+    #[test]
     fn merge_surplus_does_not_pair_a_prompt_that_merely_starts_with_the_send() {
         // Prefix matching is not an identity test: an inherited prompt that begins
         // with a later send's text must not be mistaken for that send's echo.

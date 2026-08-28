@@ -68,6 +68,13 @@ pub struct Attachment {
     /// Read it through [`Self::sent_path`], never directly, so the fallback
     /// lives in one place. **Migration is the only writer of a divergent
     /// value**: nothing in normal operation moves a staged file.
+    ///
+    /// **Write it only when it is currently `None`.** Migration must be
+    /// re-runnable, and a second pass that sets this to the *already-relocated*
+    /// `path` destroys the original with no way to recover it — the record of
+    /// where the file was when it was sent exists nowhere else. The damage is
+    /// also silent: nothing fails, and the consequence surfaces months later as
+    /// a duplicated entry in a transcript.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatched_path: Option<String>,
     /// The dropped file's basename, for display.
@@ -157,6 +164,41 @@ mod tests {
             dispatched_path: None,
             original_name: name.to_owned(),
         }
+    }
+
+    #[test]
+    fn sent_path_prefers_the_recorded_dispatch_location() {
+        let mut a = attachment("image-1", AttachmentKind::Image, "/new/img.png", "img.png");
+        assert_eq!(a.sent_path(), "/new/img.png", "absent means same as path");
+        a.dispatched_path = Some("/old/img.png".to_owned());
+        assert_eq!(a.sent_path(), "/old/img.png");
+    }
+
+    #[test]
+    fn the_two_renderers_diverge_once_a_file_has_been_relocated() {
+        // The one behavior this field exists for. Without this test, an accessor
+        // that ignored `dispatched_path` entirely would still serialize,
+        // deserialize, and pass the whole suite — while every pre-migration
+        // attachment-bearing send silently stopped correlating.
+        let mut a = attachment("image-1", AttachmentKind::Image, "/new/img.png", "img.png");
+        a.dispatched_path = Some("/old/img.png".to_owned());
+        let live = render_prompt_with_attachments("hi", std::slice::from_ref(&a));
+        let reconstructed =
+            render_dispatched_prompt_with_attachments("hi", std::slice::from_ref(&a));
+
+        assert!(live.contains("/new/img.png") && !live.contains("/old/img.png"));
+        assert!(reconstructed.contains("/old/img.png") && !reconstructed.contains("/new/img.png"));
+    }
+
+    #[test]
+    fn a_record_written_before_the_field_existed_deserializes_to_none() {
+        // Asserted directly rather than relied on incidentally: the serde default
+        // is what makes every pre-existing journal line still readable.
+        let json =
+            r#"{"label":"image-1","kind":"image","path":"/p/img.png","original_name":"img.png"}"#;
+        let a: Attachment = serde_json::from_str(json).unwrap();
+        assert_eq!(a.dispatched_path, None);
+        assert_eq!(a.sent_path(), "/p/img.png");
     }
 
     #[test]

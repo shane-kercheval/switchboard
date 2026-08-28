@@ -4025,12 +4025,11 @@ pub async fn drain_agents_then_release_locks(
 /// `LoadedTranscript`. The frontend feeds the result through the reducer's
 /// `hydrate` input to populate the unified-view transcript.
 ///
-/// **Error scope.** `Err(AppError::LoadTranscript)` is reserved for
-/// lookup-mechanism failures (I/O on a file that exists). Per-line parse
-/// damage degrades silently to `LoadedTranscript.warnings`; missing files
-/// degrade to `LoadedTranscript::default()`. Stale Codex sidecars (file at
-/// recorded path no longer exists) surface as a warning inside an
-/// otherwise-empty `Ok` result.
+/// **Error scope.** `Err(AppError::LoadTranscript)` covers lookup failures and
+/// cases where recorded history cannot be recovered safely. Per-line parse
+/// damage remains a successful best-effort load in
+/// `LoadedTranscript.warnings`; never-dispatched sessions remain legitimately
+/// empty.
 ///
 /// `home_dir` is passed in (not resolved here) so tests can stage a temp
 /// directory without mutating process-wide `$HOME`. The Tauri command shim
@@ -4057,8 +4056,9 @@ pub fn load_transcript_impl(
 
 /// Load one agent's prior conversation from its harness session file. The
 /// harness-dispatch body factored out of [`load_transcript_impl`] so the
-/// project-level conversation loader can reuse it per agent. Error scope:
-/// lookup-I/O surfaces; per-harness defaults degrade to an empty transcript.
+/// project-level conversation loader can reuse it per agent. Lookup failures
+/// and recorded history that cannot be recovered safely surface as errors;
+/// genuinely absent or never-started sessions remain successful empty loads.
 /// Session identity is read from the agent's registry record (`session_locator`),
 /// so there's no per-agent session-link sidecar to corrupt.
 fn load_agent_transcript(
@@ -10897,6 +10897,33 @@ mod tests {
         // No metadata sidecar staged → both rate-limit fields stay None.
         assert!(result.last_rate_limit.is_none());
         assert!(result.last_rate_limit_as_of.is_none());
+    }
+
+    #[tokio::test]
+    async fn load_transcript_for_stale_codex_locator_is_a_hydration_error() {
+        let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
+        let session_id = Uuid::now_v7();
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 5, 10).unwrap();
+        let path = stage_codex_session_file(tmp_home.path(), date, &session_id.to_string());
+        let record = attach_agent_impl(
+            &state,
+            "codex",
+            HarnessKind::Codex,
+            &session_id.to_string(),
+            tmp_home.path(),
+            None,
+            None,
+        )
+        .unwrap();
+        std::fs::remove_file(path).unwrap();
+
+        let error = load_transcript_impl(&state, record.id, tmp_home.path()).unwrap_err();
+        assert!(matches!(
+            error,
+            AppError::LoadTranscript(
+                switchboard_harness::LoadTranscriptError::RecordedSessionUnavailable
+            )
+        ));
     }
 
     #[tokio::test]

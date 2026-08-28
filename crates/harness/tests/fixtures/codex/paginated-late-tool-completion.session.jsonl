@@ -1,0 +1,17 @@
+{"type":"session_meta","timestamp":"2026-08-27T12:00:00Z","payload":{"cli_version":"0.149.0","history_mode":"paginated"}}
+{"type":"event_msg","timestamp":"2026-08-27T12:00:01Z","payload":{"type":"task_started","turn_id":"turn-command"}}
+{"type":"turn_context","timestamp":"2026-08-27T12:00:02Z","payload":{"turn_id":"turn-command","cwd":"/tmp/sanitized","model":"codex-test","effort":"medium"}}
+{"type":"response_item","timestamp":"2026-08-27T12:00:03Z","payload":{"type":"custom_tool_call","id":"wrapper-command","status":"completed","call_id":"call-command","name":"exec","input":"const r = await tools.exec_command({\"cmd\":\"printf sanitized\",\"workdir\":\"/tmp/sanitized\"});\ntext(r.output);\n"}}
+{"type":"response_item","timestamp":"2026-08-27T12:00:04Z","payload":{"type":"custom_tool_call_output","id":"wrapper-command-output","call_id":"call-command","output":[{"type":"input_text","text":"wrapper command output"}]}}
+{"type":"event_msg","timestamp":"2026-08-27T12:00:05Z","payload":{"type":"token_count","info":null}}
+{"type":"event_msg","timestamp":"2026-08-27T12:00:06Z","payload":{"type":"item_completed","turn_id":"turn-command","item":{"type":"Reasoning","id":"reason-command"}}}
+{"type":"response_item","timestamp":"2026-08-27T12:00:07Z","payload":{"type":"reasoning","id":"reason-command"}}
+{"type":"event_msg","timestamp":"2026-08-27T12:00:08Z","payload":{"type":"item_completed","turn_id":"turn-command","item":{"type":"CommandExecution","id":"completion-command","command":["/bin/zsh","-lc","printf sanitized"],"cwd":"file:///tmp/sanitized","status":"completed","exit_code":0,"aggregated_output":"structured command output"}}}
+{"type":"event_msg","timestamp":"2026-08-27T12:00:09Z","payload":{"type":"task_complete","turn_id":"turn-command"}}
+{"type":"event_msg","timestamp":"2026-08-27T12:00:10Z","payload":{"type":"task_started","turn_id":"turn-mcp"}}
+{"type":"turn_context","timestamp":"2026-08-27T12:00:11Z","payload":{"turn_id":"turn-mcp","cwd":"/tmp/sanitized","model":"codex-test","effort":"medium"}}
+{"type":"response_item","timestamp":"2026-08-27T12:00:12Z","payload":{"type":"custom_tool_call","id":"wrapper-mcp","status":"completed","call_id":"call-mcp","name":"exec","input":"dynamic code mode wrapper"}}
+{"type":"response_item","timestamp":"2026-08-27T12:00:13Z","payload":{"type":"custom_tool_call_output","id":"wrapper-mcp-output","call_id":"call-mcp","output":[{"type":"input_text","text":"cell still running"}]}}
+{"type":"event_msg","timestamp":"2026-08-27T12:00:14Z","payload":{"type":"token_count","info":null}}
+{"type":"event_msg","timestamp":"2026-08-27T12:00:15Z","payload":{"type":"item_completed","turn_id":"turn-mcp","item":{"type":"McpToolCall","id":"completion-mcp","server":"sanitized","tool":"lookup","arguments":{"key":"value"},"status":"completed","result":{"content":[{"type":"text","text":"structured MCP output"}],"isError":false}}}}
+{"type":"event_msg","timestamp":"2026-08-27T12:00:16Z","payload":{"type":"task_complete","turn_id":"turn-mcp"}}

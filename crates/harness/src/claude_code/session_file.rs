@@ -903,6 +903,7 @@ impl ReconstructionState {
                         input,
                         output,
                         is_error,
+                        warnings: Vec::new(),
                         started_at: timestamp,
                         completed_at,
                     });

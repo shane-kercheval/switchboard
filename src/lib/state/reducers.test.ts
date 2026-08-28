@@ -1318,6 +1318,63 @@ describe("transcriptReducer", () => {
       if (ended?.role === "agent") expect(ended.status).toBe("complete");
     });
 
+    it("a losing hydrate cannot replace live tool output with disk warnings", () => {
+      let turns = reduce([], turnStart(TURN_1));
+      turns = reduce(turns, identity(TURN_1, "msg_x"));
+      turns = reduce(turns, {
+        type: "tool_started",
+        turn_id: TURN_1,
+        tool_use_id: "tool-1",
+        kind: "builtin",
+        name: "Bash",
+        input: {},
+        facet: { facet_kind: "other" },
+      });
+      turns = reduce(turns, {
+        type: "tool_completed",
+        turn_id: TURN_1,
+        tool_use_id: "tool-1",
+        output: "live output",
+        is_error: false,
+      });
+      const disk: ReducerInput = {
+        type: "hydrate",
+        agent_id: AGENT_A,
+        turns: [
+          {
+            role: "agent",
+            turn_id: TURN_2,
+            agent_id: AGENT_A,
+            started_at: "2026-05-14T00:00:02Z",
+            status: "complete",
+            hydration_key: "msg_x",
+            items: [
+              {
+                item_kind: "tool",
+                tool_use_id: "tool-1",
+                kind: "builtin",
+                name: "Bash",
+                input: {},
+                facet: { facet_kind: "other" },
+                output: "disk output",
+                warnings: [{ line_number: 42, reason: "disk warning" }],
+                started_at: "2026-05-14T00:00:02Z",
+              },
+            ],
+          },
+        ],
+      };
+      turns = reduce(turns, disk, AGENT_A, TURN_1);
+
+      const turn = turns[0];
+      if (turn?.role !== "agent") throw new Error("agent turn missing");
+      const tool = turn.items.find(
+        (item): item is ToolCall => item.item_kind === "tool" && item.tool_use_id === "tool-1",
+      );
+      expect(tool?.output).toBe("live output");
+      expect(tool?.warnings).toBeUndefined();
+    });
+
     it("re-delivered turn_identity is a no-op (idempotent)", () => {
       let turns = reduce([], turnStart(TURN_1));
       turns = reduce(turns, identity(TURN_1, "msg_x"));
@@ -1859,23 +1916,44 @@ describe("runtimeReducer", () => {
     expect(r.hydration_status).toBe("complete");
   });
 
-  it("hydrate threads warnings into parse_warnings", () => {
-    const r = runtimeReducer(fresh(), {
-      type: "hydrate",
-      agent_id: AGENT_A,
-      turns: [],
-      warnings: [
-        { line_number: 0, reason: "session file no longer at recorded path" },
-        { line_number: 42, reason: "malformed JSON: expected `,`" },
-      ],
-    });
-    expect(r.parse_warnings).toHaveLength(2);
-    expect(r.parse_warnings?.[0]?.reason).toBe("session file no longer at recorded path");
-  });
-
-  it("hydrate without warnings leaves parse_warnings undefined", () => {
-    const r = runtimeReducer(fresh(), { type: "hydrate", agent_id: AGENT_A, turns: [] });
-    expect(r.parse_warnings).toBeUndefined();
+  it("hydrate maps warnings onto their owning tool row", () => {
+    const turns = transcriptReducer(
+      [],
+      {
+        type: "hydrate",
+        agent_id: AGENT_A,
+        turns: [
+          {
+            role: "agent",
+            turn_id: "disk-turn",
+            agent_id: AGENT_A,
+            started_at: "2026-05-16T00:00:00Z",
+            ended_at: "2026-05-16T00:00:01Z",
+            status: "complete",
+            items: [
+              {
+                item_kind: "tool",
+                tool_use_id: "tool-1",
+                kind: "builtin",
+                name: "exec_command",
+                input: { cmd: "x" },
+                facet: { facet_kind: "other" },
+                warnings: [{ line_number: 42, reason: "status was unreadable" }],
+                started_at: "2026-05-16T00:00:00Z",
+                completed_at: "2026-05-16T00:00:01Z",
+              },
+            ],
+          },
+        ],
+      },
+      AGENT_A,
+      RECEIVED_AT,
+    );
+    const turn = turns[0];
+    if (turn?.role !== "agent") throw new Error("agent turn missing");
+    const tool = turn.items[0];
+    if (tool?.item_kind !== "tool") throw new Error("tool missing");
+    expect(tool.warnings).toEqual([{ line_number: 42, reason: "status was unreadable" }]);
   });
 });
 

@@ -239,6 +239,12 @@ pub enum TurnItem {
         facet: crate::facets::ToolFacet,
         output: Option<String>,
         is_error: Option<bool>,
+        /// Parser diagnostics that belong to this specific operation. Kept
+        /// separate from [`LoadedTranscript::warnings`], which also contains
+        /// unowned file-level salvage diagnostics that are not actionable in
+        /// the UI.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        warnings: Vec<ParseWarning>,
         started_at: DateTime<Utc>,
         completed_at: Option<DateTime<Utc>>,
     },
@@ -287,8 +293,8 @@ pub struct SessionMetaInfo {
 /// One per-line parse issue inside an otherwise-readable session file.
 ///
 /// `line_number` is 1-based to match editor / tail-output conventions.
-/// `reason` is human-readable so the UI banner can surface it verbatim
-/// when the user investigates.
+/// `reason` is human-readable for developer diagnostics and, when the parser
+/// can prove ownership, the affected tool row's expandable details.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ParseWarning {
     pub line_number: usize,
@@ -296,9 +302,9 @@ pub struct ParseWarning {
 }
 
 /// Errors returned by `load_*_transcript`. Reserved for lookup-mechanism
-/// failures — I/O on a file that exists. **Not** raised for missing files
-/// or per-line parse damage; those degrade silently to empty results /
-/// warnings inside `LoadedTranscript`.
+/// failures and cases where a recorded session cannot be recovered at all.
+/// Per-line parse damage still degrades to warnings inside
+/// [`LoadedTranscript`].
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum LoadTranscriptError {
@@ -313,17 +319,14 @@ pub enum LoadTranscriptError {
         #[source]
         source: std::io::Error,
     },
-}
-
-/// Build a `ParseWarning` for a stale-sidecar case (sidecar exists, session
-/// file at recorded path doesn't). Centralized so frontend / tests can
-/// match the reason string exactly.
-#[must_use]
-pub fn stale_sidecar_warning() -> ParseWarning {
-    ParseWarning {
-        line_number: 0,
-        reason: "session file no longer at recorded path".to_owned(),
-    }
+    /// A durable locator names a session, but its file can no longer be found.
+    /// This is not an empty transcript: previously available history is gone.
+    #[error("recorded session file is no longer available")]
+    RecordedSessionUnavailable,
+    /// One file contains multiple sessions and no safe ownership decision can
+    /// be made, so returning an empty transcript would hide lost history.
+    #[error("session file contains multiple sessions; transcript cannot be hydrated safely")]
+    AmbiguousSessionFile,
 }
 
 /// Compose a `SessionMetaInfo` from parser-extracted fields (`model`,
@@ -416,6 +419,10 @@ mod tests {
                     input: json!({"command": "ls"}),
                     output: Some("a\nb\n".to_owned()),
                     is_error: Some(false),
+                    warnings: vec![ParseWarning {
+                        line_number: 42,
+                        reason: "status was unreadable".to_owned(),
+                    }],
                     started_at,
                     completed_at: Some(started_at),
                 },
@@ -447,6 +454,24 @@ mod tests {
     }
 
     #[test]
+    fn tool_warning_field_defaults_when_absent_on_the_wire() {
+        let item: TurnItem = serde_json::from_value(json!({
+            "item_kind": "tool",
+            "tool_use_id": "tool_1",
+            "kind": "builtin",
+            "name": "Bash",
+            "input": {"command": "ls"},
+            "facet": {"facet_kind": "other"},
+            "output": null,
+            "is_error": null,
+            "started_at": "2026-05-14T19:33:22Z",
+            "completed_at": null
+        }))
+        .unwrap();
+        assert!(matches!(item, TurnItem::Tool { warnings, .. } if warnings.is_empty()));
+    }
+
+    #[test]
     fn loaded_transcript_default_is_empty_and_serializable() {
         let loaded = LoadedTranscript::default();
         let value = serde_json::to_value(&loaded).unwrap();
@@ -474,10 +499,15 @@ mod tests {
     }
 
     #[test]
-    fn stale_sidecar_warning_has_stable_reason() {
-        let w = stale_sidecar_warning();
-        assert_eq!(w.line_number, 0);
-        assert_eq!(w.reason, "session file no longer at recorded path");
+    fn unrecoverable_session_errors_are_path_safe() {
+        assert_eq!(
+            LoadTranscriptError::RecordedSessionUnavailable.to_string(),
+            "recorded session file is no longer available"
+        );
+        assert_eq!(
+            LoadTranscriptError::AmbiguousSessionFile.to_string(),
+            "session file contains multiple sessions; transcript cannot be hydrated safely"
+        );
     }
 
     #[test]

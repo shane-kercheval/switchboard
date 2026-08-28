@@ -16,7 +16,7 @@
 //!   `--session-id` vs `--resume` (`session_file_exists_for`).
 //! - Transcript hydration (`load_gemini_transcript`) with two-layer
 //!   collision defense: path-layer demix for separate files sharing the
-//!   8-char prefix, content-layer ambiguity warning for files that
+//!   8-char prefix, content-layer hydration error for files that
 //!   accumulated headers from more than one session.
 
 use std::path::{Path, PathBuf};
@@ -154,13 +154,12 @@ pub fn session_file_exists_for(home_dir: &Path, cwd: &Path, session_id: &Uuid) -
 ///   record matches the full target UUID (filename-level prefix collision
 ///   resolved at the path layer).
 ///
-/// Returns `Ok(LoadedTranscript { turns: vec![], warnings: [collision] })`
-/// when the matched file contains multiple distinct `kind:"main"` session
-/// headers (intra-file prefix collision — two sessions appended to the
-/// same file with colliding 8-char prefixes in the same minute). Under
-/// UUID v4 (the Gemini policy), the probability is ~1/2^32; the defense
-/// exists so the rare case fails loudly instead of silently merging
-/// transcripts.
+/// Returns `Err(LoadTranscriptError::AmbiguousSessionFile)` when the matched
+/// file contains multiple distinct `kind:"main"` session headers (intra-file
+/// prefix collision — two sessions appended to the same file with colliding
+/// 8-char prefixes in the same minute). Under UUID v4 (the Gemini policy), the
+/// probability is ~1/2^32; the defense exists so the rare case fails loudly
+/// instead of silently merging transcripts.
 ///
 /// `home_dir` is injected for testability.
 pub fn load_gemini_transcript(
@@ -217,14 +216,14 @@ pub fn load_gemini_transcript(
     //
     // Ambiguity in any single candidate aborts the whole merge — even
     // when prior candidates were clean. The clean files' content is
-    // discarded; the user sees the ambiguity warning + empty turns.
+    // discarded; the user sees a hydration error instead of partial turns.
     // Rationale: an ambiguous file (one file, multiple distinct
     // sessions) means a different session wrote into this UUID's
     // filename-prefix namespace. The clean files might still be
     // correctly attributed, but we no longer trust our enumeration of
-    // "which files belong to this session" — surfacing partial content
-    // under an ambiguity warning would mislead the user about what's
-    // reliable. Under UUID v4 the probability is ~1/2^32 ×
+    // "which files belong to this session" — surfacing partial content as a
+    // successful load would mislead the user about what's reliable. Under
+    // UUID v4 the probability is ~1/2^32 ×
     // resume-invocation count, so the conservative bail rarely loses
     // anything real.
     let mut merged = String::new();
@@ -235,7 +234,7 @@ pub fn load_gemini_transcript(
         })?;
         match classify_candidate(&content, session_id) {
             CandidateMatch::NoTarget => {}
-            CandidateMatch::Ambiguous => return Ok(ambiguous_session_warning()),
+            CandidateMatch::Ambiguous => return Err(LoadTranscriptError::AmbiguousSessionFile),
             CandidateMatch::Unambiguous => {
                 merged.push_str(&content);
                 if !merged.ends_with('\n') {
@@ -278,8 +277,8 @@ pub enum CandidateMatch {
     /// The target is present in this file *and* the file contains records
     /// from more than one session (more than one distinct header
     /// `sessionId` observed). Cannot safely demix from file content alone;
-    /// the loader surfaces an ambiguity warning and the attach flow
-    /// rejects with `AmbiguousSessionFile`.
+    /// transcript loading rejects with `LoadTranscriptError::AmbiguousSessionFile`,
+    /// and the attach flow rejects with `AppError::AmbiguousSessionFile`.
     Ambiguous,
     /// The target is the file's only session. Safe to hydrate / attach.
     Unambiguous,
@@ -317,21 +316,6 @@ pub fn classify_candidate(content: &str, target: Uuid) -> CandidateMatch {
         (false, _) => CandidateMatch::NoTarget,
         (true, 1) => CandidateMatch::Unambiguous,
         (true, _) => CandidateMatch::Ambiguous,
-    }
-}
-
-fn ambiguous_session_warning() -> LoadedTranscript {
-    LoadedTranscript {
-        turns: Vec::new(),
-        meta: None,
-        last_rate_limit: None,
-        last_rate_limit_as_of: None,
-        warnings: vec![ParseWarning {
-            line_number: 0,
-            reason:
-                "session-file contains records from multiple sessions; ambiguous, transcript not hydrated"
-                    .to_owned(),
-        }],
     }
 }
 
@@ -535,6 +519,7 @@ impl GeminiReconstruction {
                     input: tc.args.clone(),
                     output: tc.output.clone(),
                     is_error: Some(tc.is_error),
+                    warnings: Vec::new(),
                     started_at: tc_ts,
                     completed_at: Some(tc_ts),
                 });
@@ -1670,12 +1655,12 @@ mod tests {
     }
 
     #[test]
-    fn load_gemini_transcript_returns_collision_warning_on_multi_header_file_for_either_target() {
+    fn load_gemini_transcript_fails_on_multi_header_file_for_either_target() {
         // The captured worst-case fixture: one file, two distinct
         // sessionId headers, events interleaved. Both targets must
-        // surface the ambiguity warning — silently empty for one and
-        // warning for the other would mean one of two collided agents
-        // looks "never dispatched" instead of "blocked on ambiguity."
+        // surface the ambiguity error — silently empty for either would
+        // make a collided agent look "never dispatched" instead of
+        // "blocked on ambiguity."
         let target_a = Uuid::parse_str("00000000-0000-4000-8000-000000000009").unwrap();
         let target_b = Uuid::parse_str("00000000-0000-4000-8000-00000000000A").unwrap();
         for target in [target_a, target_b] {
@@ -1690,22 +1675,9 @@ mod tests {
                 INTERLEAVED_FIXTURE,
             );
 
-            let t = load_gemini_transcript(home.path(), cwd.path(), target, agent_id()).unwrap();
-            assert!(
-                t.turns.is_empty(),
-                "ambiguous file must hydrate no turns (target {target}); got {:?}",
-                t.turns
-            );
-            assert_eq!(
-                t.warnings.len(),
-                1,
-                "exactly one warning expected for target {target}"
-            );
-            assert!(
-                t.warnings[0].reason.contains("multiple sessions"),
-                "warning must surface the ambiguity for target {target}: {:?}",
-                t.warnings[0]
-            );
+            let error =
+                load_gemini_transcript(home.path(), cwd.path(), target, agent_id()).unwrap_err();
+            assert!(matches!(error, LoadTranscriptError::AmbiguousSessionFile));
         }
     }
 }

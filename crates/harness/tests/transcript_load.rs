@@ -14,7 +14,8 @@
 //!
 //! Run with: `make test-live`.
 
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use futures::StreamExt;
 use switchboard_core::{AgentRecord, HarnessKind, SessionLocator};
@@ -61,6 +62,150 @@ fn captured_codex_locator(events: &[AdapterEvent]) -> (String, chrono::NaiveDate
             _ => None,
         })
         .expect("a first Codex dispatch must emit a captured Codex locator")
+}
+
+fn captured_codex_rollout_records(
+    home_dir: &Path,
+    partition_date: chrono::NaiveDate,
+    thread_id: &str,
+) -> Vec<serde_json::Value> {
+    let rollout_dir = home_dir
+        .join(".codex/sessions")
+        .join(partition_date.format("%Y/%m/%d").to_string());
+    let rollout = std::fs::read_dir(&rollout_dir)
+        .expect("session partition dir")
+        .filter_map(Result::ok)
+        .find(|entry| entry.file_name().to_string_lossy().contains(thread_id))
+        .expect("rollout file for the captured thread");
+    let content = std::fs::read_to_string(rollout.path()).expect("read captured rollout");
+    content
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("captured rollout line parses"))
+        .collect()
+}
+
+fn assert_paginated_history_mode(records: &[serde_json::Value]) {
+    let history_mode = records.iter().find_map(|record| {
+        (record["type"] == "session_meta").then(|| record["payload"]["history_mode"].as_str())
+    });
+    assert_eq!(
+        history_mode.flatten(),
+        Some("paginated"),
+        "this CLI wrote a non-paginated rollout — the paginated hydration path is no longer exercised by this test"
+    );
+}
+
+/// Assert the persisted Codex contract that the paginated transcript parser
+/// relies on, and report whether this particular capture exercised a tool
+/// completion outside the old call-to-output interval.
+fn assert_paginated_codex_rollout_contract(
+    home_dir: &Path,
+    partition_date: chrono::NaiveDate,
+    thread_id: &str,
+) -> bool {
+    let records = captured_codex_rollout_records(home_dir, partition_date, thread_id);
+    assert_paginated_history_mode(&records);
+    let mut task_context_ids = HashMap::<String, Option<String>>::new();
+    let mut current_task_id = None;
+    let mut open_exec_call = None;
+    let mut saw_late_tool_completion = false;
+    for record in &records {
+        let record_type = record.get("type").and_then(serde_json::Value::as_str);
+        let payload = record.get("payload");
+        let payload_type = payload
+            .and_then(|value| value.get("type"))
+            .and_then(serde_json::Value::as_str);
+
+        if record_type == Some("event_msg") && payload_type == Some("task_started") {
+            let task_id = payload
+                .and_then(|value| value.get("turn_id"))
+                .and_then(serde_json::Value::as_str)
+                .expect("task_started must carry turn_id")
+                .to_owned();
+            assert!(
+                task_context_ids.insert(task_id.clone(), None).is_none(),
+                "task_started.turn_id must be unique within one rollout"
+            );
+            current_task_id = Some(task_id);
+            open_exec_call = None;
+            continue;
+        }
+        if record_type == Some("event_msg") && payload_type == Some("task_complete") {
+            current_task_id = None;
+            open_exec_call = None;
+            continue;
+        }
+        if record_type == Some("turn_context") {
+            if let Some(task_id) = current_task_id.as_ref() {
+                let context_id = payload
+                    .and_then(|value| value.get("turn_id"))
+                    .and_then(serde_json::Value::as_str)
+                    .expect("turn_context must carry turn_id");
+                assert_eq!(
+                    context_id, task_id,
+                    "turn_context.turn_id must agree with task_started.turn_id"
+                );
+                task_context_ids.insert(task_id.clone(), Some(context_id.to_owned()));
+            }
+            continue;
+        }
+        if record_type == Some("response_item")
+            && payload_type == Some("custom_tool_call")
+            && payload
+                .and_then(|value| value.get("name"))
+                .and_then(serde_json::Value::as_str)
+                == Some("exec")
+        {
+            open_exec_call = payload
+                .and_then(|value| value.get("call_id"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
+            continue;
+        }
+        if record_type == Some("response_item")
+            && matches!(
+                payload_type,
+                Some("custom_tool_call_output" | "function_call_output")
+            )
+        {
+            let output_call_id = payload
+                .and_then(|value| value.get("call_id"))
+                .and_then(serde_json::Value::as_str);
+            if open_exec_call.as_deref() == output_call_id {
+                open_exec_call = None;
+            }
+            continue;
+        }
+        if record_type == Some("event_msg") && payload_type == Some("item_completed") {
+            let producer_id = payload
+                .and_then(|value| value.get("turn_id"))
+                .and_then(serde_json::Value::as_str)
+                .expect("item_completed must carry producer turn_id");
+            let context_id = task_context_ids.get(producer_id).unwrap_or_else(|| {
+                panic!("item_completed turn_id {producer_id:?} must name one task")
+            });
+            if let Some(context_id) = context_id {
+                assert_eq!(
+                    producer_id, context_id,
+                    "item_completed.turn_id must agree with turn_context.turn_id when present"
+                );
+            }
+            let item_type = payload
+                .and_then(|value| value.get("item"))
+                .and_then(|item| item.get("type"))
+                .and_then(serde_json::Value::as_str);
+            if matches!(
+                item_type,
+                Some("CommandExecution" | "FileChange" | "McpToolCall")
+            ) && open_exec_call.is_none()
+            {
+                saw_late_tool_completion = true;
+            }
+        }
+    }
+
+    saw_late_tool_completion
 }
 
 fn collect_text(events: &[AdapterEvent]) -> String {
@@ -371,32 +516,9 @@ async fn live_codex_transcript_load_via_captured_locator_round_trips() {
 
     let (thread_id, partition_date) = captured_codex_locator(&live_events);
 
-    // Guard the guard: assert the rollout this run wrote is actually
-    // `history_mode: paginated` — otherwise a future upstream legacy-fallback
-    // (both callers retry with `history_mode: None` when the store rejects
-    // pagination) would let this test pass without exercising the paginated
-    // hydration path it exists to protect.
-    let rollout_dir = real_home()
-        .join(".codex/sessions")
-        .join(partition_date.format("%Y/%m/%d").to_string());
-    let rollout = std::fs::read_dir(&rollout_dir)
-        .expect("session partition dir")
-        .filter_map(Result::ok)
-        .find(|e| e.file_name().to_string_lossy().contains(&thread_id))
-        .expect("rollout file for the captured thread");
-    let first_line = std::io::BufRead::lines(std::io::BufReader::new(
-        std::fs::File::open(rollout.path()).expect("open rollout"),
-    ))
-    .next()
-    .expect("rollout first line")
-    .expect("readable first line");
-    let session_meta: serde_json::Value =
-        serde_json::from_str(&first_line).expect("session_meta parses");
-    assert_eq!(
-        session_meta["payload"]["history_mode"], "paginated",
-        "this CLI wrote a non-paginated rollout — the paginated hydration path \
-         is no longer exercised by this test"
-    );
+    let saw_late =
+        assert_paginated_codex_rollout_contract(&real_home(), partition_date, &thread_id);
+    eprintln!("captured Codex rollout exercised late tool completion: {saw_late}");
 
     let transcript = switchboard_harness::load_codex_transcript(
         &real_home(),
@@ -471,6 +593,9 @@ async fn live_codex_transcript_load_hydrates_tool_items() {
     let events: Vec<AdapterEvent> = stream.collect().await;
 
     let (thread_id, partition_date) = captured_codex_locator(&events);
+    let saw_late =
+        assert_paginated_codex_rollout_contract(&real_home(), partition_date, &thread_id);
+    eprintln!("captured Codex rollout exercised late tool completion: {saw_late}");
 
     let transcript = switchboard_harness::load_codex_transcript(
         &real_home(),

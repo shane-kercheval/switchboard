@@ -562,6 +562,7 @@ function loadedItemToItem(item: LoadedTurnItem): TurnItem {
     facet: item.facet,
     output: item.output ?? undefined,
     is_error: item.is_error ?? undefined,
+    warnings: item.warnings?.length ? item.warnings : undefined,
     started_at: item.started_at,
     completed_at: item.completed_at ?? undefined,
   };
@@ -759,9 +760,6 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
         // live value + its null `as_of` stay in place.
         next.last_rate_limit = input.last_rate_limit;
         next.last_rate_limit_as_of = input.last_rate_limit_as_of ?? null;
-      }
-      if (input.warnings !== undefined && input.warnings.length > 0) {
-        next.parse_warnings = input.warnings;
       }
       return next;
     }

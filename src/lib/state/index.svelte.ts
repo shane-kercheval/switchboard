@@ -236,9 +236,10 @@ const hydrationAttempted = new Set<AgentId>();
 /// mint fresh `turn_id`s at parse time. The set is authoritative; the
 /// status field is presentational.
 ///
-/// **Failure scope**: only lookup-mechanism failures (IPC reject) land
-/// in `hydration_status: "failed"`. Per-line parse warnings flow through
-/// as `LoadedTranscript.warnings` inside an otherwise-`complete` result.
+/// **Failure scope**: lookup failures and cases where recorded history cannot
+/// be recovered land in `hydration_status: "failed"`. Per-line parse damage
+/// remains a successful best-effort load; only diagnostics owned by a tool row
+/// cross the UI boundary on that row.
 export async function hydrateAgent(agentId: AgentId): Promise<void> {
   const current = runtimes[agentId];
   if (current === undefined) {
@@ -321,7 +322,6 @@ export function applyAgentHydrate(
     meta?: Hydrate["meta"];
     last_rate_limit?: Hydrate["last_rate_limit"];
     last_rate_limit_as_of?: Hydrate["last_rate_limit_as_of"];
-    warnings?: Hydrate["warnings"];
   },
 ): void {
   const hydrate: Hydrate = {
@@ -331,7 +331,6 @@ export function applyAgentHydrate(
     meta: loaded.meta ?? null,
     last_rate_limit: loaded.last_rate_limit ?? null,
     last_rate_limit_as_of: loaded.last_rate_limit_as_of ?? null,
-    warnings: loaded.warnings,
   };
   const priorTurns = transcripts[agentId] ?? [];
   // Pass the in-flight turn_id so a refresh re-read can't supersede an

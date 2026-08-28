@@ -1305,18 +1305,21 @@ describe("hydrateAgent", () => {
     expect(state.transcripts[AGENT_A]).toHaveLength(1);
   });
 
-  it("surfaces ParseWarning entries onto runtime.parse_warnings", async () => {
+  it("does not promote aggregate parse warnings onto agent runtime", async () => {
     const state = await loadState();
     await state.registerAgent(agentRecord(AGENT_A));
     invokeMock.mockResolvedValueOnce({
       turns: [],
       meta: null,
       last_rate_limit: null,
-      warnings: [{ line_number: 0, reason: "session file no longer at recorded path" }],
+      warnings: Array.from({ length: 500 }, (_, index) => ({
+        line_number: index + 1,
+        reason: `aggregate warning ${index + 1}`,
+      })),
     });
     await state.hydrateAgent(AGENT_A);
-    expect(state.runtimes[AGENT_A]?.parse_warnings).toHaveLength(1);
     expect(state.runtimes[AGENT_A]?.hydration_status).toBe("complete");
+    expect(state.runtimes[AGENT_A]).not.toHaveProperty("parse_warnings");
   });
 
   it("self-flips hydration_status from any starting state — no manual pre-flip needed", async () => {

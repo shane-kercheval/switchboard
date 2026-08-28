@@ -61,7 +61,7 @@
     toolVerb,
   } from "$lib/toolRow";
   import { cn } from "$lib/utils";
-  import { CircleCheck, CircleDotDashed, Circle, Copy } from "@lucide/svelte";
+  import { CircleCheck, CircleDotDashed, Circle, Copy, TriangleAlert } from "@lucide/svelte";
 
   let { tool, turnSettled = true }: { tool: ToolCall; turnSettled?: boolean } = $props();
 
@@ -84,6 +84,9 @@
   const failed = $derived(rowState === "failed");
   const cancelled = $derived(rowState === "cancelled");
   const interrupted = $derived(failed || cancelled);
+  const warned = $derived(
+    !interrupted && rowState !== "running" && (tool.warnings?.length ?? 0) > 0,
+  );
   const fileContentFacet = $derived(facet.facet_kind === "edit" || facet.facet_kind === "write");
   const inlineContentFacet = $derived(
     fileContentFacet || facet.facet_kind === "read" || mutation !== undefined,
@@ -366,6 +369,13 @@
         <path d="M12 8v4.5" />
         <path d="M12 16h.01" />
       </svg>
+    {:else if warned}
+      <TriangleAlert
+        class="text-warning h-4 w-4 shrink-0"
+        role="img"
+        aria-label="completed with warning"
+        data-testid="tool-warning"
+      />
     {:else}
       <svg
         viewBox="0 0 24 24"
@@ -630,6 +640,20 @@
         >
           {statusPreview}
         </p>
+      {/if}
+
+      {#if open && tool.warnings && tool.warnings.length > 0}
+        <section class="space-y-1" aria-label="Tool warnings" data-testid="tool-warnings">
+          <div class="text-warning text-[10px] font-semibold tracking-wide uppercase">Warning</div>
+          <ul class="text-muted space-y-1 text-[11px]">
+            {#each tool.warnings as warning (warning.line_number + ":" + warning.reason)}
+              <li>
+                <span class="font-mono">line {warning.line_number}:</span>
+                {warning.reason}
+              </li>
+            {/each}
+          </ul>
+        </section>
       {/if}
 
       {#if open && hasOutput}

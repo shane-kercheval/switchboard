@@ -26,11 +26,11 @@
 //!
 //! Switchboard `TurnId` is dispatcher-local (UUID v7 we generate). Codex
 //! session-file `turn_id` is harness-local (UUID v7 Codex generates). The two
-//! **never** match by design. Per-turn selection is by **last-record-in-file
-//! at terminal-event time**, not by id — Codex writes the session file
-//! synchronously, so by the time `turn.completed` arrives, the last
-//! `task_started` is the current turn's. A future cleanup that "matches by
-//! `turn_id`" would silently match nothing.
+//! **never** match by design. Live post-turn enrichment still selects the
+//! latest file turn rather than comparing either id space. Transcript
+//! reconstruction separately uses Codex's file-local relation between
+//! `item_completed.turn_id` and `task_started.turn_id` to route asynchronous
+//! tool detail; that relation never becomes a frontend or dispatcher identity.
 //!
 //! ## Path resolution
 //!
@@ -55,7 +55,7 @@
 //! field of `base_instructions` to a sentinel; preserve the rest of the
 //! envelope verbatim so the surrounding shape stays observable.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -67,7 +67,7 @@ use uuid::Uuid;
 use crate::events::{ContentKind, McpServerStatus, ToolKind, TurnId, TurnUsage};
 use crate::transcript::{
     LoadTranscriptError, LoadedTranscript, ParseWarning, SessionMetaInfo, Turn, TurnItem,
-    TurnStatus, merge_meta_with_loaders, stale_sidecar_warning,
+    TurnStatus, merge_meta_with_loaders,
 };
 
 use super::config::load_mcp_servers;
@@ -921,15 +921,7 @@ pub fn load_codex_transcript(
     };
 
     let Some(path) = locate_session_file(home_dir, date, session_id) else {
-        return Ok(LoadedTranscript {
-            meta: Some(merge_meta_with_loaders(
-                None,
-                load_mcp_servers(home_dir, cwd),
-                load_skills(home_dir, cwd),
-            )),
-            warnings: vec![stale_sidecar_warning()],
-            ..LoadedTranscript::default()
-        });
+        return Err(LoadTranscriptError::RecordedSessionUnavailable);
     };
 
     let content =
@@ -945,21 +937,28 @@ pub fn load_codex_transcript(
 }
 
 /// Parse Codex session-file content into a `LoadedTranscript` (no FS access).
+///
+/// Paginated tool completions are associated in a file-local prepass, then
+/// replayed beside their canonical wrapper call. This keeps wrapper rows as
+/// the audit record while letting the existing interval handlers apply richer
+/// status/output even when Codex persisted that detail late. Unprovable
+/// ownership is warned and omitted rather than guessed.
+/// The prepass retains only source-line slices and compact association facts;
+/// large rollouts are never held as a second in-memory JSON document tree.
+///
 /// Exposed `pub(crate)` for unit tests that want to drive the parser without
 /// staging a temp file.
 pub(crate) fn parse_codex_transcript_content(content: &str, agent_id: AgentId) -> LoadedTranscript {
     let mut state = CodexReconstruction::new(agent_id);
-    for (idx, line) in content.lines().enumerate() {
-        let line_number = idx + 1;
-        if line.trim().is_empty() {
-            continue;
-        }
-        match serde_json::from_str::<Value>(line) {
-            Ok(record) => state.ingest(line_number, &record),
-            Err(e) => state.warn(line_number, format!("malformed JSON: {e}")),
-        }
+    if initial_session_is_paginated(content) {
+        ingest_paginated_content(content, &mut state);
+    } else {
+        ingest_streaming_content(content, &mut state);
     }
     let mut t = state.finalize();
+    // Associated completions are dispatched beside their canonical wrapper,
+    // but warnings retain source-file order for stable diagnostics.
+    t.warnings.sort_by_key(|warning| warning.line_number);
     // Use the existing enrichment parser to extract model/cli_version/last
     // rate_limits, then merge into our LoadedTranscript shape. Single source
     // of truth for meta fields.
@@ -973,6 +972,550 @@ pub(crate) fn parse_codex_transcript_content(content: &str, agent_id: AgentId) -
         skills: vec![],
     });
     t
+}
+
+/// Codex writes `session_meta` first. Only a confirmed paginated first record
+/// pays for the association prepass; every other shape keeps the established
+/// streaming fallback and lets reconstruction report malformed or unknown
+/// metadata normally.
+fn initial_session_is_paginated(content: &str) -> bool {
+    let Some(first_record) = content.lines().find(|line| !line.trim().is_empty()) else {
+        return false;
+    };
+    let Ok(record) = serde_json::from_str::<Value>(first_record) else {
+        return false;
+    };
+    record.get("type").and_then(Value::as_str) == Some("session_meta")
+        && record
+            .get("payload")
+            .and_then(|payload| payload.get("history_mode"))
+            .and_then(Value::as_str)
+            == Some("paginated")
+}
+
+fn ingest_streaming_content(content: &str, state: &mut CodexReconstruction) {
+    for (idx, line) in content.lines().enumerate() {
+        let line_number = idx + 1;
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<Value>(line) {
+            Ok(record) => state.ingest(line_number, &record),
+            Err(error) => state.warn(line_number, format!("malformed JSON: {error}")),
+        }
+    }
+}
+
+fn ingest_paginated_content(content: &str, state: &mut CodexReconstruction) {
+    let lines: Vec<SessionLine<'_>> = content
+        .lines()
+        .enumerate()
+        .filter_map(|(idx, line)| {
+            let line_number = idx + 1;
+            (!line.trim().is_empty()).then_some(SessionLine {
+                line_number,
+                source: line,
+            })
+        })
+        .collect();
+    let dispatch = ToolCompletionDispatch::build(&lines);
+
+    for (record_index, line) in lines.iter().enumerate() {
+        if let Some(disposition) = dispatch.completions.get(&record_index) {
+            match disposition {
+                ToolCompletionDisposition::Assigned => continue,
+                ToolCompletionDisposition::Unowned(item_type) => {
+                    state.warn(
+                        line.line_number,
+                        format!("{item_type} item outside any exec wrapper interval"),
+                    );
+                    continue;
+                }
+            }
+        }
+        let record = match line.parse() {
+            Ok(record) => record,
+            Err(error) => {
+                state.warn(line.line_number, format!("malformed JSON: {error}"));
+                continue;
+            }
+        };
+        state.ingest(line.line_number, &record);
+        if let Some(completions) = dispatch.after_wrapper_call.get(&record_index) {
+            for &completion_index in completions {
+                let completion_line = &lines[completion_index];
+                if let Ok(completion) = completion_line.parse() {
+                    state.ingest(completion_line.line_number, &completion);
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SessionLine<'a> {
+    line_number: usize,
+    source: &'a str,
+}
+
+impl SessionLine<'_> {
+    fn parse(&self) -> serde_json::Result<Value> {
+        serde_json::from_str(self.source)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StructuredToolKind {
+    CommandExecution,
+    FileChange,
+    McpToolCall,
+}
+
+impl StructuredToolKind {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::CommandExecution => "CommandExecution",
+            Self::FileChange => "FileChange",
+            Self::McpToolCall => "McpToolCall",
+        }
+    }
+
+    const fn admits_post_output_fallback(self) -> bool {
+        matches!(self, Self::CommandExecution | Self::McpToolCall)
+    }
+}
+
+struct AssociationTurn {
+    task_id: Option<String>,
+    context_id: Option<String>,
+    context_conflict: bool,
+}
+
+struct AssociationWrapper {
+    record_index: usize,
+    turn_index: usize,
+    command_signature: Option<CommandSignature>,
+    /// Planning-time slot state only. Replay still passes through
+    /// `OpenWrapper::command_slot_taken`, whose mutation-time check remains
+    /// authoritative and must not be merged with this prepass approximation.
+    command_slot_taken: bool,
+    attached_children: usize,
+}
+
+struct AssociationCompletion {
+    record_index: usize,
+    active_turn: Option<usize>,
+    physical_wrapper: Option<usize>,
+    positional_wrapper: Option<usize>,
+    producer_turn_id: Option<String>,
+    item_id: Option<String>,
+    kind: StructuredToolKind,
+    command_signature: Option<CommandSignature>,
+}
+
+struct AssociationFacts {
+    turns: Vec<AssociationTurn>,
+    wrappers: Vec<AssociationWrapper>,
+    completions: Vec<AssociationCompletion>,
+}
+
+impl AssociationFacts {
+    fn collect(lines: &[SessionLine<'_>]) -> Self {
+        let mut turns = Vec::<AssociationTurn>::new();
+        let mut wrappers = Vec::<AssociationWrapper>::new();
+        let mut completions = Vec::<AssociationCompletion>::new();
+        let mut wrapper_by_call_id = HashMap::<String, usize>::new();
+        let mut current_turn = None;
+        let mut physical_wrapper = None;
+        let mut positional_wrapper = None;
+
+        for (record_index, line) in lines.iter().enumerate() {
+            let Ok(record) = line.parse() else {
+                positional_wrapper = None;
+                continue;
+            };
+            if is_task_started(&record) {
+                turns.push(association_turn(&record));
+                current_turn = Some(turns.len() - 1);
+                physical_wrapper = None;
+                positional_wrapper = None;
+                continue;
+            }
+            if is_task_complete(&record) {
+                current_turn = None;
+                physical_wrapper = None;
+                positional_wrapper = None;
+                continue;
+            }
+            if let Some(context_id) = record_turn_context_id(&record) {
+                if let Some(turn_index) = current_turn {
+                    let turn = &mut turns[turn_index];
+                    if turn
+                        .context_id
+                        .as_ref()
+                        .is_some_and(|existing| existing != context_id)
+                    {
+                        turn.context_conflict = true;
+                    } else {
+                        turn.context_id = Some(context_id.to_owned());
+                    }
+                }
+                positional_wrapper = None;
+                continue;
+            }
+            if let Some((call_id, input)) = exec_wrapper_call(&record) {
+                positional_wrapper = None;
+                let Some(turn_index) = current_turn else {
+                    physical_wrapper = None;
+                    continue;
+                };
+                let command_signature =
+                    decode_single_exec_wrapper(input).map(|decoded| decoded.command_signature);
+                wrappers.push(AssociationWrapper {
+                    record_index,
+                    turn_index,
+                    command_signature,
+                    command_slot_taken: false,
+                    attached_children: 0,
+                });
+                let wrapper_index = wrappers.len() - 1;
+                wrapper_by_call_id.insert(call_id.to_owned(), wrapper_index);
+                physical_wrapper = Some(wrapper_index);
+                continue;
+            }
+            if let Some(call_id) = wrapper_output_call_id(&record) {
+                positional_wrapper = wrapper_by_call_id.get(call_id).copied();
+                if let Some(wrapper_index) = positional_wrapper
+                    && physical_wrapper == Some(wrapper_index)
+                {
+                    physical_wrapper = None;
+                }
+                continue;
+            }
+            if let Some((kind, payload, item)) = structured_tool_completion(&record) {
+                completions.push(AssociationCompletion {
+                    record_index,
+                    active_turn: current_turn,
+                    physical_wrapper,
+                    positional_wrapper,
+                    producer_turn_id: payload
+                        .get("turn_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    item_id: item.get("id").and_then(Value::as_str).map(str::to_owned),
+                    command_signature: (kind == StructuredToolKind::CommandExecution)
+                        .then(|| command_execution_signature(item))
+                        .flatten(),
+                    kind,
+                });
+                positional_wrapper = None;
+                continue;
+            }
+            if !record_allows_post_output_candidate(&record) {
+                positional_wrapper = None;
+            }
+        }
+
+        Self {
+            turns,
+            wrappers,
+            completions,
+        }
+    }
+}
+
+fn association_turn(record: &Value) -> AssociationTurn {
+    AssociationTurn {
+        task_id: record
+            .get("payload")
+            .and_then(|payload| payload.get("turn_id"))
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        context_id: None,
+        context_conflict: false,
+    }
+}
+
+enum ToolCompletionDisposition {
+    Assigned,
+    Unowned(&'static str),
+}
+
+#[derive(Default)]
+struct ToolCompletionDispatch {
+    after_wrapper_call: HashMap<usize, Vec<usize>>,
+    completions: HashMap<usize, ToolCompletionDisposition>,
+}
+
+impl ToolCompletionDispatch {
+    /// Associate paginated structured tool completions before reconstruction.
+    ///
+    /// Codex persists wrapper rows and structured results on asynchronous
+    /// channels, so file order alone is not an ownership key. The resolver is
+    /// deliberately file-local and fail-closed: producer turn ids must select
+    /// one lifecycle, command identity is exact (never fuzzy), and unsupported
+    /// ambiguity leaves the canonical wrapper untouched. Assigned completions
+    /// are replayed immediately after their wrapper call so the existing
+    /// `WrapperSlot` and structured-result handlers remain the only row
+    /// mutation path.
+    fn build(lines: &[SessionLine<'_>]) -> Self {
+        let AssociationFacts {
+            turns,
+            mut wrappers,
+            completions,
+        } = AssociationFacts::collect(lines);
+
+        let mut wrappers_by_command = HashMap::<(usize, String), Vec<usize>>::new();
+        for (wrapper_index, wrapper) in wrappers.iter().enumerate() {
+            if let Some(signature) = wrapper.command_signature.as_ref() {
+                wrappers_by_command
+                    .entry((wrapper.turn_index, signature.command.clone()))
+                    .or_default()
+                    .push(wrapper_index);
+            }
+        }
+
+        let mut task_id_counts = HashMap::<&str, usize>::new();
+        for turn in &turns {
+            if let Some(task_id) = turn.task_id.as_deref() {
+                *task_id_counts.entry(task_id).or_default() += 1;
+            }
+        }
+        let mut turn_by_task_id = HashMap::<&str, usize>::new();
+        for (turn_index, turn) in turns.iter().enumerate() {
+            let Some(task_id) = turn.task_id.as_deref() else {
+                continue;
+            };
+            if task_id_counts.get(task_id) == Some(&1)
+                && !turn.context_conflict
+                && turn
+                    .context_id
+                    .as_deref()
+                    .is_none_or(|context_id| context_id == task_id)
+            {
+                turn_by_task_id.insert(task_id, turn_index);
+            }
+        }
+
+        let mut dispatch = Self::default();
+        let mut seen_completion_ids = HashSet::<String>::new();
+        for completion in completions {
+            let duplicate = completion
+                .item_id
+                .as_ref()
+                .is_some_and(|item_id| !seen_completion_ids.insert(item_id.clone()));
+            let target_turn = if duplicate {
+                None
+            } else if let Some(producer_turn_id) = completion.producer_turn_id.as_deref() {
+                turn_by_task_id.get(producer_turn_id).copied()
+            } else {
+                completion.active_turn
+            };
+
+            let selected = target_turn.and_then(|turn_index| {
+                select_completion_wrapper(&completion, turn_index, &wrappers, &wrappers_by_command)
+            });
+            let disposition = if let Some(wrapper_index) = selected {
+                let wrapper = &mut wrappers[wrapper_index];
+                wrapper.attached_children += 1;
+                if completion.kind == StructuredToolKind::CommandExecution
+                    && wrapper.command_signature.is_some()
+                    && !wrapper.command_slot_taken
+                {
+                    wrapper.command_slot_taken = true;
+                }
+                dispatch
+                    .after_wrapper_call
+                    .entry(wrapper.record_index)
+                    .or_default()
+                    .push(completion.record_index);
+                ToolCompletionDisposition::Assigned
+            } else {
+                ToolCompletionDisposition::Unowned(completion.kind.label())
+            };
+            dispatch
+                .completions
+                .insert(completion.record_index, disposition);
+        }
+        dispatch
+    }
+}
+
+fn select_completion_wrapper(
+    completion: &AssociationCompletion,
+    turn_index: usize,
+    wrappers: &[AssociationWrapper],
+    wrappers_by_command: &HashMap<(usize, String), Vec<usize>>,
+) -> Option<usize> {
+    let mut semantic_ambiguity = false;
+    if let Some(signature) = completion.command_signature.as_ref() {
+        let exact: Vec<usize> = wrappers_by_command
+            .get(&(turn_index, signature.command.clone()))
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|&wrapper_index| {
+                let wrapper = &wrappers[wrapper_index];
+                wrapper.record_index < completion.record_index
+                    && !wrapper.command_slot_taken
+                    && wrapper
+                        .command_signature
+                        .as_ref()
+                        .is_some_and(|candidate| command_signatures_match(candidate, signature))
+            })
+            .collect();
+        if exact.len() == 1 {
+            return exact.first().copied();
+        }
+        semantic_ambiguity = exact.len() > 1;
+    }
+
+    if let Some(wrapper_index) = completion.physical_wrapper {
+        let wrapper = &wrappers[wrapper_index];
+        let semantic_mismatch = completion
+            .command_signature
+            .as_ref()
+            .is_some_and(|signature| {
+                wrapper
+                    .command_signature
+                    .as_ref()
+                    .is_some_and(|candidate| !command_signatures_match(candidate, signature))
+            });
+        let command_slot_unavailable = completion.kind == StructuredToolKind::CommandExecution
+            && wrapper.command_signature.is_some()
+            && wrapper.command_slot_taken;
+        if wrapper.turn_index == turn_index
+            && !semantic_ambiguity
+            && !semantic_mismatch
+            && !command_slot_unavailable
+        {
+            return Some(wrapper_index);
+        }
+    }
+
+    if !completion.kind.admits_post_output_fallback() {
+        return None;
+    }
+    // Once two wrappers expose the same exact command identity, neither an
+    // open interval nor recency after output can prove which asynchronous
+    // completion this is.
+    if semantic_ambiguity {
+        return None;
+    }
+    let wrapper_index = completion.positional_wrapper?;
+    let wrapper = &wrappers[wrapper_index];
+    let semantic_mismatch = completion
+        .command_signature
+        .as_ref()
+        .is_some_and(|signature| {
+            wrapper
+                .command_signature
+                .as_ref()
+                .is_some_and(|candidate| !command_signatures_match(candidate, signature))
+        });
+    let command_slot_unavailable = completion.kind == StructuredToolKind::CommandExecution
+        && wrapper.command_signature.is_some()
+        && wrapper.command_slot_taken;
+    (wrapper.turn_index == turn_index
+        && wrapper.attached_children == 0
+        && !semantic_mismatch
+        && !command_slot_unavailable)
+        .then_some(wrapper_index)
+}
+
+fn is_task_started(record: &Value) -> bool {
+    record.get("type").and_then(Value::as_str) == Some("event_msg")
+        && record
+            .get("payload")
+            .and_then(|payload| payload.get("type"))
+            .and_then(Value::as_str)
+            == Some("task_started")
+}
+
+fn is_task_complete(record: &Value) -> bool {
+    record.get("type").and_then(Value::as_str) == Some("event_msg")
+        && record
+            .get("payload")
+            .and_then(|payload| payload.get("type"))
+            .and_then(Value::as_str)
+            == Some("task_complete")
+}
+
+fn record_turn_context_id(record: &Value) -> Option<&str> {
+    (record.get("type").and_then(Value::as_str) == Some("turn_context"))
+        .then(|| record.get("payload")?.get("turn_id")?.as_str())
+        .flatten()
+}
+
+fn exec_wrapper_call(record: &Value) -> Option<(&str, &str)> {
+    let payload = record.get("payload")?;
+    (record.get("type")?.as_str()? == "response_item"
+        && payload.get("type")?.as_str()? == "custom_tool_call"
+        && payload.get("name")?.as_str()? == "exec")
+        .then(|| {
+            Some((
+                payload.get("call_id")?.as_str()?,
+                payload.get("input")?.as_str()?,
+            ))
+        })
+        .flatten()
+}
+
+fn wrapper_output_call_id(record: &Value) -> Option<&str> {
+    let payload = record.get("payload")?;
+    let item_type = payload.get("type")?.as_str()?;
+    (record.get("type")?.as_str()? == "response_item"
+        && matches!(
+            item_type,
+            "function_call_output" | "custom_tool_call_output"
+        ))
+    .then(|| payload.get("call_id")?.as_str())
+    .flatten()
+}
+
+fn structured_tool_completion(record: &Value) -> Option<(StructuredToolKind, &Value, &Value)> {
+    let payload = record.get("payload")?;
+    if record.get("type")?.as_str()? != "event_msg"
+        || payload.get("type")?.as_str()? != "item_completed"
+    {
+        return None;
+    }
+    let item = payload.get("item")?;
+    let kind = match item.get("type")?.as_str()? {
+        "CommandExecution" => StructuredToolKind::CommandExecution,
+        "FileChange" => StructuredToolKind::FileChange,
+        "McpToolCall" => StructuredToolKind::McpToolCall,
+        _ => return None,
+    };
+    Some((kind, payload, item))
+}
+
+fn record_allows_post_output_candidate(record: &Value) -> bool {
+    let record_type = record.get("type").and_then(Value::as_str);
+    let payload = record.get("payload");
+    match record_type {
+        Some("event_msg") => match payload
+            .and_then(|value| value.get("type"))
+            .and_then(Value::as_str)
+        {
+            Some("token_count") => true,
+            Some("item_completed") => {
+                payload
+                    .and_then(|value| value.get("item"))
+                    .and_then(|item| item.get("type"))
+                    .and_then(Value::as_str)
+                    == Some("Reasoning")
+            }
+            _ => false,
+        },
+        Some("response_item") => {
+            payload
+                .and_then(|value| value.get("type"))
+                .and_then(Value::as_str)
+                == Some("reasoning")
+        }
+        _ => false,
+    }
 }
 
 /// In-progress reconstruction state. Walks records in order, opening agent
@@ -999,14 +1542,14 @@ struct CodexReconstruction {
     /// `session_meta` at all keeps the `Missing` default and reads as legacy.
     history_mode: HistoryMode,
     /// The `exec` wrapper whose `custom_tool_call → custom_tool_call_output`
-    /// interval the parser is currently inside (paginated files only). A
-    /// paginated tool `item_completed` (`CommandExecution` / `FileChange` /
-    /// `McpToolCall`) belongs to this wrapper — file-order adjacency puts a
-    /// tool's items strictly between its wrapper's call and output records —
-    /// and cannot be joined any other way: the items carry synthetic
-    /// `exec-<uuid>` ids matching neither the wrapper's record id nor its
-    /// `call_id`. Cleared when the wrapper's output record arrives, and
-    /// defensively whenever a turn closes.
+    /// interval the reconstruction replay is currently inside (paginated
+    /// files only). The association prepass routes structured completions by a
+    /// validated producer turn, exact command identity where available, and a
+    /// narrow observed positional fallback. It then replays every owned item
+    /// inside this interval so row mutation and collapse remain single-sourced.
+    /// The structured item's synthetic id still matches neither wrapper id;
+    /// unresolved ownership therefore keeps the canonical wrapper and never
+    /// reaches this state through a guessed association.
     ///
     /// Only `exec`-named wrappers open an interval — deliberate: if a future
     /// paginated Codex emits standalone tool shapes (a bare `apply_patch`
@@ -1055,7 +1598,9 @@ enum WrapperSlot {
     /// `Some(index)` supersedes the wrapper row; `None` leaves it alone because
     /// it has itself become an operation row (enriched in place).
     OwnRow(Option<usize>),
-    /// No wrapper interval open; warned and dropped.
+    /// No wrapper interval open; warned and dropped. The association prepass
+    /// normally filters this case before replay; this remains a defensive
+    /// boundary for malformed or future shapes.
     Orphaned,
 }
 
@@ -1216,13 +1761,12 @@ impl CodexReconstruction {
             // (verified @ 0.137.0). Codex currently always writes both, but
             // absence must mean `None`, not stale.
             //
-            // `turn_context.turn_id` is the per-turn id (the observed shape
-            // annotates it the turn UUID); it is the stable hydration key,
-            // captured onto *this turn's* builder rather than from
-            // `task_started.turn_id`, whose per-turn-uniqueness is unconfirmed —
-            // a non-unique dedup key drops new turns silently (see the builder
-            // field). Whether the *live* stream carries the same id (refresh
-            // eligibility) is still unprobed.
+            // `turn_context.turn_id` remains the stable hydration key exposed
+            // to the frontend. The association prepass may validate the
+            // separate, file-local `task_started.turn_id` namespace against it
+            // to route persisted tool detail, but never promotes that routing
+            // id into frontend identity. A non-unique hydration key would
+            // silently drop a new turn during merge (see the builder field).
             "turn_context" => {
                 if let Some(p) = payload {
                     self.current_model = p.get("model").and_then(Value::as_str).map(str::to_owned);
@@ -1410,12 +1954,13 @@ impl CodexReconstruction {
     /// of the legacy record it supersedes so both generations hydrate
     /// identically.
     ///
-    /// Tool variants attach to the open `exec` wrapper interval (see
-    /// [`OpenWrapper`]) — they *enrich or extend* the tool rows, they do not
-    /// replace them: rows come from `response_item`, the only complete record
-    /// of tool activity, since a failed call can emit no `item_completed` at
-    /// all. Unknown variants fall through silently, matching the parser's
-    /// existing posture toward record types it does not consume.
+    /// Tool variants arrive here inside the wrapper interval selected by the
+    /// association prepass (see [`OpenWrapper`]). They *enrich or extend* the
+    /// tool rows, they do not replace them: rows come from `response_item`, the
+    /// only complete record of tool activity, since a failed call can emit no
+    /// `item_completed` at all. Unknown variants fall through silently,
+    /// matching the parser's existing posture toward record types it does not
+    /// consume.
     fn handle_item_completed(
         &mut self,
         line_number: usize,
@@ -1568,6 +2113,7 @@ impl CodexReconstruction {
         item: &Value,
         timestamp: Option<DateTime<Utc>>,
     ) {
+        let warning_start = self.warnings.len();
         let slot = self.claim_wrapper_slot(line_number, "CommandExecution");
         if matches!(slot, WrapperSlot::Orphaned) {
             return;
@@ -1590,6 +2136,7 @@ impl CodexReconstruction {
             (!structured_output.is_empty()).then_some(structured_output)
         };
         let row_id = self.item_row_id(line_number, item, "command");
+        let owned_warnings = self.warnings[warning_start..].to_vec();
         let Some(builder) = self.current_agent.as_mut() else {
             return;
         };
@@ -1599,6 +2146,7 @@ impl CodexReconstruction {
                 facet: row_facet,
                 is_error: row_error,
                 output: row_output,
+                warnings: row_warnings,
                 completed_at,
                 ..
             }) = builder.items.get_mut(row_index)
@@ -1610,6 +2158,7 @@ impl CodexReconstruction {
                 if let Some(text) = output {
                     *row_output = Some(text);
                 }
+                row_warnings.extend(owned_warnings);
                 *completed_at = timestamp;
             }
             builder.keep_wrapper_row(row_index);
@@ -1630,6 +2179,7 @@ impl CodexReconstruction {
             // the failure/unknown cases above.
             output,
             is_error,
+            warnings: owned_warnings,
             started_at: timestamp.unwrap_or(builder.last_seen_at),
             completed_at: timestamp,
         });
@@ -1751,6 +2301,7 @@ impl CodexReconstruction {
         item: &Value,
         timestamp: Option<DateTime<Utc>>,
     ) {
+        let warning_start = self.warnings.len();
         let slot = self.claim_wrapper_slot(line_number, "FileChange");
         if matches!(slot, WrapperSlot::Orphaned) {
             return;
@@ -1789,6 +2340,7 @@ impl CodexReconstruction {
         };
         let output = patch_apply_end_output(item);
         let row_id = self.item_row_id(line_number, item, "file-change");
+        let owned_warnings = self.warnings[warning_start..].to_vec();
         let Some(builder) = self.current_agent.as_mut() else {
             return;
         };
@@ -1803,6 +2355,7 @@ impl CodexReconstruction {
             input: item.get("changes").cloned().unwrap_or(Value::Null),
             output: Some(output),
             is_error,
+            warnings: owned_warnings,
             started_at: timestamp.unwrap_or(builder.last_seen_at),
             completed_at: timestamp,
         });
@@ -1821,6 +2374,7 @@ impl CodexReconstruction {
         item: &Value,
         timestamp: Option<DateTime<Utc>>,
     ) {
+        let warning_start = self.warnings.len();
         let slot = self.claim_wrapper_slot(line_number, "McpToolCall");
         if matches!(slot, WrapperSlot::Orphaned) {
             return;
@@ -1877,6 +2431,7 @@ impl CodexReconstruction {
         let output = super::parser::extract_mcp_output(result, error);
         let facet = crate::facets::classify_mcp_tool_facet(server, tool, &arguments);
         let row_id = self.item_row_id(line_number, item, "mcp");
+        let owned_warnings = self.warnings[warning_start..].to_vec();
         let Some(builder) = self.current_agent.as_mut() else {
             return;
         };
@@ -1891,6 +2446,7 @@ impl CodexReconstruction {
             input: arguments,
             output: Some(output),
             is_error,
+            warnings: owned_warnings,
             started_at: timestamp.unwrap_or(builder.last_seen_at),
             completed_at: timestamp,
         });
@@ -1939,6 +2495,7 @@ impl CodexReconstruction {
                     input: arguments,
                     output: None,
                     is_error: None,
+                    warnings: Vec::new(),
                     started_at,
                     completed_at: None,
                 };
@@ -2059,6 +2616,7 @@ impl CodexReconstruction {
             input: Value::String(input.to_owned()),
             output: None,
             is_error: None,
+            warnings: Vec::new(),
             started_at,
             completed_at: None,
         });
@@ -2120,17 +2678,17 @@ impl CodexReconstruction {
             input: payload.get("changes").cloned().unwrap_or(Value::Null),
             output: Some(output),
             is_error: Some(is_error),
+            warnings: Vec::new(),
             started_at: timestamp.unwrap_or(builder.last_seen_at),
             completed_at: timestamp,
         });
     }
 
     fn close_current_agent(&mut self, status: TurnStatus) {
-        // A wrapper interval cannot outlive its turn: without this, a truncated
-        // file (wrapper output never written) followed by a stray item after
-        // `task_complete` would claim the stale slot and then vanish at the
-        // no-builder check — a silent drop. The `task_started` clear restates
-        // the same invariant from the other side.
+        // A replay interval cannot outlive its turn. Post-turn completions are
+        // routed and replayed into their producer turn by the prepass; leaving
+        // this slot open would only let malformed future input claim stale
+        // reconstruction state.
         self.open_wrapper = None;
         let Some(builder) = self.current_agent.take() else {
             return;
@@ -2225,6 +2783,10 @@ fn command_execution_item_facet(item: &Value) -> crate::facets::ToolFacet {
     crate::facets::ToolFacet::Shell { command, cwd }
 }
 
+fn command_execution_signature(item: &Value) -> Option<CommandSignature> {
+    CommandSignature::from_facet(&command_execution_item_facet(item))
+}
+
 /// Decode a **legacy** `mcp_tool_call_end.result` envelope:
 /// - `{"Ok": {"content": [...], "isError": false}}`
 /// - `{"Err": "error message"}`
@@ -2283,8 +2845,41 @@ fn patch_apply_end_output(payload: &Value) -> String {
         .join("\n")
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CommandSignature {
+    command: String,
+    cwd: Option<String>,
+}
+
+impl CommandSignature {
+    fn from_facet(facet: &crate::facets::ToolFacet) -> Option<Self> {
+        let crate::facets::ToolFacet::Shell { command, cwd } = facet else {
+            return None;
+        };
+        Some(Self {
+            command: command.clone(),
+            cwd: cwd.clone(),
+        })
+    }
+}
+
+/// Exact semantic compatibility for one canonical command.
+///
+/// Command text is never normalized fuzzily. A cwd rejects a match only when
+/// both records supply directly comparable values; if one side omits it, the
+/// command may still identify one wrapper, while multiple compatible wrappers
+/// remain ambiguous in the resolver.
+fn command_signatures_match(left: &CommandSignature, right: &CommandSignature) -> bool {
+    left.command == right.command
+        && match (&left.cwd, &right.cwd) {
+            (Some(left), Some(right)) => left == right,
+            _ => true,
+        }
+}
+
 struct DecodedExecWrapper {
     facet: crate::facets::ToolFacet,
+    command_signature: CommandSignature,
     emits_full_result: bool,
 }
 
@@ -2327,11 +2922,10 @@ fn decode_single_exec_wrapper(script: &str) -> Option<DecodedExecWrapper> {
     };
 
     let facet = super::facets::exec_command_facet(&arguments);
-    if !matches!(facet, crate::facets::ToolFacet::Shell { .. }) {
-        return None;
-    }
+    let command_signature = CommandSignature::from_facet(&facet)?;
     Some(DecodedExecWrapper {
         facet,
+        command_signature,
         emits_full_result,
     })
 }
@@ -2616,6 +3210,7 @@ fn apply_mcp_result(items: &mut [TurnItem], call_id: &str, result: &McpResult) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::facets::ToolFacet;
     use chrono::NaiveDate;
     use std::sync::Mutex;
     use tempfile::TempDir;
@@ -3342,25 +3937,23 @@ not valid json
     }
 
     #[test]
-    fn load_codex_transcript_with_missing_file_emits_stale_sidecar_warning() {
+    fn load_codex_transcript_with_missing_recorded_file_fails_hydration() {
         let home = TempDir::new().unwrap();
         let cwd = TempDir::new().unwrap();
         let agent_id = Uuid::now_v7();
         let date = NaiveDate::from_ymd_opt(2026, 5, 14).unwrap();
-        let result = load_codex_transcript(
+        let error = load_codex_transcript(
             home.path(),
             cwd.path(),
             "no-such-session-id",
             Some(date),
             agent_id,
         )
-        .unwrap();
-        assert!(result.turns.is_empty());
-        assert_eq!(result.warnings.len(), 1);
-        assert_eq!(
-            result.warnings[0].reason,
-            "session file no longer at recorded path"
-        );
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            LoadTranscriptError::RecordedSessionUnavailable
+        ));
     }
 
     fn write_session_at(home: &Path, date: NaiveDate, session_id: &str, content: &str) -> PathBuf {
@@ -4631,6 +5224,36 @@ not valid json
     }
 
     #[test]
+    fn only_initial_paginated_session_metadata_enables_association() {
+        let paginated = serde_json::json!({
+            "type":"session_meta","payload":{"history_mode":"paginated"}
+        });
+        let legacy = serde_json::json!({
+            "type":"session_meta","payload":{"history_mode":"legacy"}
+        });
+        let unknown = serde_json::json!({
+            "type":"session_meta","payload":{"history_mode":"future"}
+        });
+        let missing = serde_json::json!({
+            "type":"session_meta","payload":{"cli_version":"0.146.0"}
+        });
+        let unrelated = serde_json::json!({
+            "type":"event_msg","payload":{"type":"task_started","turn_id":"t-1"}
+        });
+
+        assert!(initial_session_is_paginated(&format!("\n{paginated}\n")));
+        for content in [
+            legacy.to_string(),
+            unknown.to_string(),
+            missing.to_string(),
+            "not json".to_owned(),
+            format!("{unrelated}\n{paginated}"),
+        ] {
+            assert!(!initial_session_is_paginated(&content), "{content}");
+        }
+    }
+
+    #[test]
     fn legacy_rollout_with_explicit_mode_still_reads_legacy_records() {
         let content =
             std::fs::read_to_string(fixture_path("legacy-explicit-mode.session.jsonl")).unwrap();
@@ -5127,6 +5750,652 @@ not valid json
         );
     }
 
+    fn association_exec_call(call_id: &str, command: &str, cwd: Option<&str>) -> Value {
+        let mut arguments = serde_json::json!({"cmd": command});
+        if let Some(cwd) = cwd {
+            arguments["workdir"] = Value::String(cwd.to_owned());
+        }
+        let input = format!(
+            "const r = await tools.exec_command({});\ntext(r.output);\n",
+            serde_json::to_string(&arguments).expect("arguments serialize")
+        );
+        serde_json::json!({
+            "type":"response_item",
+            "payload":{
+                "type":"custom_tool_call","id":format!("ctc-{call_id}"),
+                "status":"completed","call_id":call_id,"name":"exec","input":input
+            }
+        })
+    }
+
+    fn association_exec_output(call_id: &str, output: &str) -> Value {
+        serde_json::json!({
+            "type":"response_item",
+            "payload":{
+                "type":"custom_tool_call_output","id":format!("ctco-{call_id}"),
+                "call_id":call_id,
+                "output":[{"type":"input_text","text":output}]
+            }
+        })
+    }
+
+    fn association_command_completion(
+        producer_turn_id: Option<&str>,
+        item_id: &str,
+        command: &str,
+        cwd: Option<&str>,
+        output: &str,
+    ) -> Value {
+        let cwd = cwd.map(|path| format!("file://{path}"));
+        let mut payload = serde_json::json!({
+            "type":"item_completed",
+            "item":{
+                "type":"CommandExecution","id":item_id,
+                "command":["/bin/zsh","-lc",command],"cwd":cwd,
+                "status":"completed","exit_code":0,"aggregated_output":output
+            }
+        });
+        if let Some(turn_id) = producer_turn_id {
+            payload["turn_id"] = Value::String(turn_id.to_owned());
+        }
+        serde_json::json!({"type":"event_msg","payload":payload})
+    }
+
+    fn paginated_association_header() -> Value {
+        serde_json::json!({
+            "type":"session_meta",
+            "payload":{"cli_version":"0.149.0","history_mode":"paginated"}
+        })
+    }
+
+    fn association_task_started(turn_id: &str) -> Value {
+        serde_json::json!({
+            "type":"event_msg",
+            "payload":{"type":"task_started","turn_id":turn_id}
+        })
+    }
+
+    fn association_turn_context(turn_id: &str) -> Value {
+        serde_json::json!({
+            "type":"turn_context",
+            "payload":{"turn_id":turn_id,"model":"gpt-5.5"}
+        })
+    }
+
+    fn association_task_complete(turn_id: &str) -> Value {
+        serde_json::json!({
+            "type":"event_msg",
+            "payload":{"type":"task_complete","turn_id":turn_id}
+        })
+    }
+
+    #[test]
+    fn late_commands_cross_only_the_observed_bookkeeping_sequences() {
+        for includes_reasoning_pair in [false, true] {
+            let mut records = vec![
+                paginated_association_header(),
+                association_task_started("turn-a"),
+                association_turn_context("turn-a"),
+                association_exec_call("call-a", "printf late", Some("/tmp/a")),
+                association_exec_output("call-a", "wrapper output"),
+                serde_json::json!({"type":"event_msg","payload":{"type":"token_count","info":null}}),
+            ];
+            if includes_reasoning_pair {
+                records.push(serde_json::json!({
+                    "type":"event_msg","payload":{
+                        "type":"item_completed","turn_id":"turn-a",
+                        "item":{"type":"Reasoning","id":"reason-a"}
+                    }
+                }));
+                records.push(serde_json::json!({
+                    "type":"response_item","payload":{"type":"reasoning","id":"reason-a"}
+                }));
+            }
+            records.push(association_command_completion(
+                Some("turn-a"),
+                "exec-a",
+                "printf late",
+                Some("/tmp/a"),
+                "late structured output",
+            ));
+            records.push(association_task_complete("turn-a"));
+
+            let result = parse_codex_transcript_content(&jsonl_lines(&records), Uuid::now_v7());
+            let rows = tool_rows(&result.turns);
+            assert_eq!(rows.len(), 1, "{rows:?}");
+            assert_eq!(rows[0].output.as_deref(), Some("late structured output"));
+            assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        }
+    }
+
+    #[test]
+    fn late_command_failure_overrides_successful_wrapper_text() {
+        let content = jsonl_lines(&[
+            paginated_association_header(),
+            association_task_started("turn-a"),
+            association_turn_context("turn-a"),
+            association_exec_call("call-a", "exit 7", None),
+            association_exec_output("call-a", "Script completed"),
+            serde_json::json!({"type":"event_msg","payload":{"type":"token_count","info":null}}),
+            serde_json::json!({
+                "type":"event_msg","payload":{
+                    "type":"item_completed","turn_id":"turn-a","item":{
+                        "type":"CommandExecution","id":"exec-a",
+                        "command":["/bin/zsh","-lc","exit 7"],"status":"failed",
+                        "exit_code":7,"aggregated_output":"structured failure"
+                    }
+                }
+            }),
+            association_task_complete("turn-a"),
+        ]);
+        let result = parse_codex_transcript_content(&content, Uuid::now_v7());
+        let rows = tool_rows(&result.turns);
+
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].output.as_deref(), Some("structured failure"));
+        assert_eq!(rows[0].is_error, Some(true));
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    }
+
+    #[test]
+    fn late_mcp_completion_uses_the_observed_bounded_fallback() {
+        let content = jsonl_lines(&[
+            paginated_association_header(),
+            association_task_started("turn-a"),
+            association_turn_context("turn-a"),
+            serde_json::json!({
+                "type":"response_item","payload":{
+                    "type":"custom_tool_call","id":"ctc-a","status":"completed",
+                    "call_id":"call-a","name":"exec","input":"dynamic code mode wrapper"
+                }
+            }),
+            association_exec_output("call-a", "cell still running"),
+            serde_json::json!({"type":"event_msg","payload":{"type":"token_count","info":null}}),
+            serde_json::json!({
+                "type":"event_msg","payload":{
+                    "type":"item_completed","turn_id":"turn-a","item":{
+                        "type":"McpToolCall","id":"mcp-a","server":"srv","tool":"lookup",
+                        "arguments":{"id":"x"},"status":"completed",
+                        "result":{"content":[{"type":"text","text":"found"}],"isError":false}
+                    }
+                }
+            }),
+            association_task_complete("turn-a"),
+        ]);
+        let result = parse_codex_transcript_content(&content, Uuid::now_v7());
+        let rows = tool_rows(&result.turns);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].name, "srv.lookup");
+        assert_eq!(rows[0].output.as_deref(), Some("found"));
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    }
+
+    #[test]
+    fn sanitized_late_completion_fixture_recovers_command_and_mcp() {
+        let content =
+            std::fs::read_to_string(fixture_path("paginated-late-tool-completion.session.jsonl"))
+                .expect("sanitized late-completion fixture");
+        let result = parse_codex_transcript_content(&content, Uuid::now_v7());
+        let rows = hydrated_tool_snapshots(&content);
+
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert!(
+            rows.iter()
+                .any(|row| row.output.as_deref() == Some("structured command output"))
+        );
+        assert!(rows.iter().any(|row| {
+            row.name == "sanitized.lookup" && row.output.as_deref() == Some("structured MCP output")
+        }));
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    }
+
+    fn cross_wrapper_completion_order(a_before_b_output: bool) -> LoadedTranscript {
+        let mut records = vec![
+            paginated_association_header(),
+            association_task_started("turn-a"),
+            association_turn_context("turn-a"),
+            association_exec_call("call-a", "printf a", None),
+            association_exec_output("call-a", "wrapper a"),
+            association_exec_call("call-b", "printf b", None),
+        ];
+        if a_before_b_output {
+            records.push(association_command_completion(
+                Some("turn-a"),
+                "exec-a",
+                "printf a",
+                None,
+                "structured a",
+            ));
+        }
+        records.push(association_exec_output("call-b", "wrapper b"));
+        if !a_before_b_output {
+            records.push(association_command_completion(
+                Some("turn-a"),
+                "exec-a",
+                "printf a",
+                None,
+                "structured a",
+            ));
+        }
+        records.push(association_command_completion(
+            Some("turn-a"),
+            "exec-b",
+            "printf b",
+            None,
+            "structured b",
+        ));
+        records.push(association_task_complete("turn-a"));
+        parse_codex_transcript_content(&jsonl_lines(&records), Uuid::now_v7())
+    }
+
+    #[test]
+    fn exact_identity_recovers_cross_wrapper_completions_in_both_orders() {
+        for a_before_b_output in [false, true] {
+            let result = cross_wrapper_completion_order(a_before_b_output);
+            let rows = tool_rows(&result.turns);
+            assert_eq!(rows.len(), 2, "{rows:?}");
+            assert!(rows.iter().any(|row| {
+                row.output.as_deref() == Some("structured a")
+                    && matches!(&row.facet, ToolFacet::Shell { command, .. } if command == "printf a")
+            }));
+            assert!(rows.iter().any(|row| {
+                row.output.as_deref() == Some("structured b")
+                    && matches!(&row.facet, ToolFacet::Shell { command, .. } if command == "printf b")
+            }));
+            assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        }
+    }
+
+    #[test]
+    fn repeated_command_after_two_outputs_is_left_unowned() {
+        let content = jsonl_lines(&[
+            paginated_association_header(),
+            association_task_started("turn-a"),
+            association_turn_context("turn-a"),
+            association_exec_call("call-a", "same", None),
+            association_exec_output("call-a", "wrapper a"),
+            association_exec_call("call-b", "same", None),
+            association_exec_output("call-b", "wrapper b"),
+            association_command_completion(
+                Some("turn-a"),
+                "exec-a",
+                "same",
+                None,
+                "must not be guessed",
+            ),
+            association_task_complete("turn-a"),
+        ]);
+        let result = parse_codex_transcript_content(&content, Uuid::now_v7());
+        let rows = tool_rows(&result.turns);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert!(
+            rows.iter()
+                .all(|row| row.output.as_deref() != Some("must not be guessed"))
+        );
+        assert_eq!(result.warnings.len(), 1, "{:?}", result.warnings);
+    }
+
+    #[test]
+    fn post_task_completion_enriches_the_original_turn() {
+        let content = jsonl_lines(&[
+            paginated_association_header(),
+            association_task_started("turn-a"),
+            association_turn_context("turn-a"),
+            association_exec_call("call-a", "printf a", None),
+            association_exec_output("call-a", "wrapper a"),
+            association_task_complete("turn-a"),
+            association_command_completion(
+                Some("turn-a"),
+                "exec-a",
+                "printf a",
+                None,
+                "post-turn a",
+            ),
+        ]);
+        let result = parse_codex_transcript_content(&content, Uuid::now_v7());
+        let rows = tool_rows(&result.turns);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].output.as_deref(), Some("post-turn a"));
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    }
+
+    #[test]
+    fn prior_turn_completion_does_not_touch_the_new_turn() {
+        let content = jsonl_lines(&[
+            paginated_association_header(),
+            association_task_started("turn-a"),
+            association_turn_context("turn-a"),
+            association_exec_call("call-a", "printf a", None),
+            association_exec_output("call-a", "wrapper a"),
+            association_task_complete("turn-a"),
+            association_task_started("turn-b"),
+            association_turn_context("turn-b"),
+            association_exec_call("call-b", "printf b", None),
+            association_command_completion(
+                Some("turn-a"),
+                "exec-a",
+                "printf a",
+                None,
+                "cross-turn a",
+            ),
+            association_command_completion(Some("turn-b"), "exec-b", "printf b", None, "current b"),
+            association_exec_output("call-b", "wrapper b"),
+            association_task_complete("turn-b"),
+        ]);
+        let result = parse_codex_transcript_content(&content, Uuid::now_v7());
+        let agent_rows: Vec<Vec<ToolSnapshot>> = result
+            .turns
+            .iter()
+            .filter_map(|turn| match turn {
+                Turn::Agent { items, .. } => Some(
+                    items
+                        .iter()
+                        .filter_map(|item| match item {
+                            TurnItem::Tool {
+                                tool_use_id,
+                                name,
+                                input,
+                                facet,
+                                output,
+                                is_error,
+                                ..
+                            } => Some(ToolSnapshot {
+                                tool_use_id: tool_use_id.clone(),
+                                name: name.clone(),
+                                input: input.clone(),
+                                facet: facet.clone(),
+                                output: output.clone(),
+                                is_error: *is_error,
+                            }),
+                            _ => None,
+                        })
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(agent_rows.len(), 2, "{agent_rows:?}");
+        assert_eq!(agent_rows[0][0].output.as_deref(), Some("cross-turn a"));
+        assert_eq!(agent_rows[1][0].output.as_deref(), Some("current b"));
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    }
+
+    #[test]
+    fn invalid_producer_turn_relations_never_associate() {
+        let cases = [
+            jsonl_lines(&[
+                paginated_association_header(),
+                association_task_started("turn-a"),
+                association_turn_context("turn-a"),
+                association_exec_call("call-a", "x", None),
+                association_command_completion(Some("unknown"), "exec-a", "x", None, "wrong"),
+                association_exec_output("call-a", "wrapper"),
+                association_task_complete("turn-a"),
+            ]),
+            jsonl_lines(&[
+                paginated_association_header(),
+                association_task_started("turn-a"),
+                association_turn_context("different-context"),
+                association_exec_call("call-a", "x", None),
+                association_command_completion(Some("turn-a"), "exec-a", "x", None, "wrong"),
+                association_exec_output("call-a", "wrapper"),
+                association_task_complete("turn-a"),
+            ]),
+            jsonl_lines(&[
+                paginated_association_header(),
+                association_task_started("turn-a"),
+                association_exec_call("call-a", "x", None),
+                association_exec_output("call-a", "wrapper"),
+                association_task_complete("turn-a"),
+                association_command_completion(None, "exec-a", "x", None, "wrong"),
+            ]),
+            jsonl_lines(&[
+                paginated_association_header(),
+                association_task_started("duplicate"),
+                association_task_complete("duplicate"),
+                association_task_started("duplicate"),
+                association_exec_call("call-a", "x", None),
+                association_command_completion(Some("duplicate"), "exec-a", "x", None, "wrong"),
+                association_exec_output("call-a", "wrapper"),
+                association_task_complete("duplicate"),
+            ]),
+        ];
+        for content in cases {
+            let result = parse_codex_transcript_content(&content, Uuid::now_v7());
+            assert!(
+                tool_rows(&result.turns)
+                    .iter()
+                    .all(|row| row.output.as_deref() != Some("wrong")),
+                "{:?}",
+                result.turns
+            );
+            assert_eq!(result.warnings.len(), 1, "{:?}", result.warnings);
+        }
+    }
+
+    #[test]
+    fn duplicate_completion_record_is_single_use() {
+        let completion =
+            association_command_completion(Some("turn-a"), "same-item", "x", None, "structured");
+        let content = jsonl_lines(&[
+            paginated_association_header(),
+            association_task_started("turn-a"),
+            association_turn_context("turn-a"),
+            association_exec_call("call-a", "x", None),
+            association_exec_output("call-a", "wrapper"),
+            completion.clone(),
+            completion,
+            association_task_complete("turn-a"),
+        ]);
+        let result = parse_codex_transcript_content(&content, Uuid::now_v7());
+        let rows = tool_rows(&result.turns);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].output.as_deref(), Some("structured"));
+        assert_eq!(result.warnings.len(), 1, "{:?}", result.warnings);
+    }
+
+    #[test]
+    fn distinct_command_completions_cannot_reuse_a_single_command_slot() {
+        let content = jsonl_lines(&[
+            paginated_association_header(),
+            association_task_started("turn-a"),
+            association_turn_context("turn-a"),
+            association_exec_call("call-a", "printf once", None),
+            association_command_completion(
+                Some("turn-a"),
+                "exec-a-1",
+                "printf once",
+                None,
+                "first result",
+            ),
+            association_command_completion(
+                Some("turn-a"),
+                "exec-a-2",
+                "printf once",
+                None,
+                "invented duplicate",
+            ),
+            association_exec_output("call-a", "wrapper output"),
+            association_task_complete("turn-a"),
+        ]);
+        let result = parse_codex_transcript_content(&content, Uuid::now_v7());
+        let rows = tool_rows(&result.turns);
+
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].output.as_deref(), Some("first result"));
+        assert!(
+            rows.iter()
+                .all(|row| row.output.as_deref() != Some("invented duplicate"))
+        );
+        assert_eq!(result.warnings.len(), 1, "{:?}", result.warnings);
+    }
+
+    #[test]
+    fn identical_pending_commands_make_physical_adjacency_ambiguous_only_locally() {
+        let content = jsonl_lines(&[
+            paginated_association_header(),
+            association_task_started("turn-a"),
+            association_turn_context("turn-a"),
+            association_exec_call("call-a", "same", None),
+            association_exec_output("call-a", "wrapper a"),
+            association_exec_call("call-b", "same", None),
+            association_command_completion(
+                Some("turn-a"),
+                "exec-ambiguous",
+                "same",
+                None,
+                "must not attach",
+            ),
+            association_exec_output("call-b", "wrapper b"),
+            association_exec_call("call-c", "distinct", None),
+            association_command_completion(
+                Some("turn-a"),
+                "exec-c",
+                "distinct",
+                None,
+                "structured c",
+            ),
+            association_exec_output("call-c", "wrapper c"),
+            association_task_complete("turn-a"),
+        ]);
+        let result = parse_codex_transcript_content(&content, Uuid::now_v7());
+        let rows = tool_rows(&result.turns);
+
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        assert!(
+            rows.iter()
+                .any(|row| row.output.as_deref() == Some("wrapper a"))
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.output.as_deref() == Some("wrapper b"))
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.output.as_deref() == Some("structured c"))
+        );
+        assert!(
+            rows.iter()
+                .all(|row| row.output.as_deref() != Some("must not attach"))
+        );
+        assert_eq!(result.warnings.len(), 1, "{:?}", result.warnings);
+    }
+
+    #[test]
+    fn childless_wrapper_does_not_disable_later_tools() {
+        let content = jsonl_lines(&[
+            paginated_association_header(),
+            association_task_started("turn-a"),
+            association_turn_context("turn-a"),
+            serde_json::json!({
+                "type":"response_item","payload":{
+                    "type":"custom_tool_call","id":"ctc-childless","status":"completed",
+                    "call_id":"childless","name":"exec","input":"dynamic childless wrapper"
+                }
+            }),
+            association_exec_output("childless", "declined before execution"),
+            association_exec_call("call-b", "printf b", None),
+            association_command_completion(
+                Some("turn-a"),
+                "exec-b",
+                "printf b",
+                None,
+                "structured b",
+            ),
+            association_exec_output("call-b", "wrapper b"),
+            serde_json::json!({
+                "type":"response_item","payload":{
+                    "type":"custom_tool_call","id":"ctc-edit","status":"completed",
+                    "call_id":"call-edit","name":"exec","input":"dynamic edit wrapper"
+                }
+            }),
+            serde_json::json!({
+                "type":"event_msg","payload":{
+                    "type":"item_completed","turn_id":"turn-a","item":{
+                        "type":"FileChange","id":"edit-a","status":"completed",
+                        "changes":{"/tmp/a.txt":{
+                            "type":"update","unified_diff":"@@ -1 +1 @@\n-a\n+b\n","move_path":null
+                        }}
+                    }
+                }
+            }),
+            association_exec_output("call-edit", "edit wrapper"),
+            association_task_complete("turn-a"),
+        ]);
+        let result = parse_codex_transcript_content(&content, Uuid::now_v7());
+        let rows = tool_rows(&result.turns);
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        assert!(
+            rows.iter()
+                .any(|row| row.output.as_deref() == Some("structured b"))
+        );
+        assert!(rows.iter().any(|row| row.name == "apply_patch"));
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    }
+
+    #[test]
+    fn late_file_change_is_not_positionally_attached() {
+        let content = jsonl_lines(&[
+            paginated_association_header(),
+            association_task_started("turn-a"),
+            association_turn_context("turn-a"),
+            serde_json::json!({
+                "type":"response_item","payload":{
+                    "type":"custom_tool_call","id":"ctc-edit","status":"completed",
+                    "call_id":"call-edit","name":"exec","input":"dynamic edit wrapper"
+                }
+            }),
+            association_exec_output("call-edit", "canonical wrapper"),
+            serde_json::json!({"type":"event_msg","payload":{"type":"token_count","info":null}}),
+            serde_json::json!({
+                "type":"event_msg","payload":{
+                    "type":"item_completed","turn_id":"turn-a","item":{
+                        "type":"FileChange","id":"edit-a","status":"completed",
+                        "changes":{"/tmp/a.txt":{
+                            "type":"update","unified_diff":"@@ -1 +1 @@\n-a\n+b\n","move_path":null
+                        }}
+                    }
+                }
+            }),
+            association_task_complete("turn-a"),
+        ]);
+        let result = parse_codex_transcript_content(&content, Uuid::now_v7());
+        let rows = tool_rows(&result.turns);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].output.as_deref(), Some("canonical wrapper"));
+        assert_eq!(result.warnings.len(), 1, "{:?}", result.warnings);
+    }
+
+    #[test]
+    fn command_signature_matching_is_exact_and_cwd_aware() {
+        let wrapper = decode_single_exec_wrapper(
+            "const r = await tools.exec_command({\"cmd\":\"pwd\",\"workdir\":\"/tmp/a\"});\ntext(r.output);\n",
+        )
+        .expect("canonical wrapper")
+        .command_signature;
+        let same = CommandSignature {
+            command: "pwd".to_owned(),
+            cwd: Some("/tmp/a".to_owned()),
+        };
+        let different_command = CommandSignature {
+            command: "pwd -P".to_owned(),
+            cwd: Some("/tmp/a".to_owned()),
+        };
+        let different_cwd = CommandSignature {
+            command: "pwd".to_owned(),
+            cwd: Some("/tmp/b".to_owned()),
+        };
+        let missing_cwd = CommandSignature {
+            command: "pwd".to_owned(),
+            cwd: None,
+        };
+        assert!(command_signatures_match(&wrapper, &same));
+        assert!(!command_signatures_match(&wrapper, &different_command));
+        assert!(!command_signatures_match(&wrapper, &different_cwd));
+        assert!(command_signatures_match(&wrapper, &missing_cwd));
+        assert!(decode_single_exec_wrapper("dynamic").is_none());
+    }
+
     #[test]
     fn paginated_malformed_tool_items_degrade_without_panicking_or_misreading() {
         // Adversarial shapes: non-numeric exit_code must not read as success
@@ -5166,6 +6435,18 @@ not valid json
             "a present-but-unreadable exit_code is contract drift and must warn: {:?}",
             result.warnings
         );
+        let owned_warning = result.turns.iter().any(|turn| match turn {
+            Turn::Agent { items, .. } => items.iter().any(|item| {
+                matches!(
+                    item,
+                    TurnItem::Tool { name, warnings, .. }
+                        if name == "exec_command"
+                            && warnings.iter().any(|warning| warning.reason.contains("exit_code is not numeric"))
+                )
+            }),
+            _ => false,
+        });
+        assert!(owned_warning, "the warning must travel with its tool row");
         assert!(
             result.warnings.iter().any(|w| w
                 .reason
@@ -5304,7 +6585,7 @@ not valid json
         // Success with genuinely empty output: blank is the true output; the
         // wrapper's "Script completed / Wall time…" noise must not replace it.
         let content = paginated_shell_lines(&serde_json::json!({
-            "type":"CommandExecution","id":"exec-f","command":["/bin/zsh","-lc","true"],
+            "type":"CommandExecution","id":"exec-f","command":["/bin/zsh","-lc","x"],
             "status":"completed","exit_code":0,"aggregated_output":""}));
         let result = parse_codex_transcript_content(&content, Uuid::now_v7());
         assert_eq!(tool_rows(&result.turns)[0].output.as_deref(), Some(""));
@@ -5420,26 +6701,32 @@ not valid json
     }
 
     #[test]
-    fn second_command_item_keeps_both_rows_and_warns() {
+    fn second_command_item_is_left_unowned_and_warns() {
         // A repeated command record contradicts the wrapper's single-call
-        // proof. The extra row is kept — it may carry real work, and this
-        // project drops content only when there is nowhere truthful to put it
-        // — but the anomaly leaves a trace.
+        // proof. It cannot become a standalone row because there is no
+        // canonical wrapper proving that a second operation ran.
         let result = single_command_wrapper_then_sibling(&serde_json::json!({
             "type":"CommandExecution","id":"exec-cmd-duplicate","command":["/bin/zsh","-lc","apply_patch <<EOF"],
             "status":"completed","exit_code":0,"aggregated_output":"Done again!"
         }));
 
         let rows = tool_rows(&result.turns);
-        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows.len(), 1, "{rows:?}");
         let enriched = rows
             .iter()
             .find(|r| r.name == "exec")
             .expect("enriched row");
         assert_eq!(enriched.output.as_deref(), Some("Done!"));
+        assert!(
+            rows.iter()
+                .all(|row| row.output.as_deref() != Some("Done again!")),
+            "{rows:?}"
+        );
         assert_eq!(result.warnings.len(), 1, "{:?}", result.warnings);
         assert!(
-            result.warnings[0].reason.contains("single command"),
+            result.warnings[0]
+                .reason
+                .contains("outside any exec wrapper interval"),
             "{:?}",
             result.warnings[0]
         );

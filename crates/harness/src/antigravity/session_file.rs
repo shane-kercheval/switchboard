@@ -352,6 +352,7 @@ impl Reconstruction {
                         input: call.args.clone(),
                         output: result.as_ref().map(|r| r.output.clone()),
                         is_error: result.as_ref().map(|r| r.is_error),
+                        warnings: Vec::new(),
                         started_at: ts,
                         completed_at: result.as_ref().map(|r| r.completed_at),
                     });

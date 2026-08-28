@@ -412,6 +412,7 @@ export type LoadedTurnItem =
       facet: ToolFacet;
       output?: string | null;
       is_error?: boolean | null;
+      warnings?: ParseWarning[];
       started_at: string;
       completed_at?: string | null;
     };
@@ -420,11 +421,6 @@ export type LoadedTurnItem =
 // IPC reply lands. Per-agent scope. Non-destructive: existing in-flight
 // turns + already-populated runtime metadata are preserved (live > disk).
 //
-// `warnings` carries `ParseWarning` entries surfaced by the per-harness
-// parser (stale Codex sidecar, malformed JSONL line, etc.) — non-blocking;
-// the hydration still succeeds with whatever could be salvaged. The
-// runtime reducer copies them onto `AgentRuntime.parse_warnings` for the
-// sidebar to render as a non-blocking indicator.
 export type Hydrate = {
   type: "hydrate";
   agent_id: AgentId;
@@ -435,7 +431,6 @@ export type Hydrate = {
   /// `LoadedTranscript.last_rate_limit_as_of`). `null` when the value is
   /// live or class-B.
   last_rate_limit_as_of?: string | null;
-  warnings?: ParseWarning[];
 };
 
 export type ReducerInput = NormalizedEvent | HeartbeatTimeout | Hydrate;

@@ -919,7 +919,6 @@ export async function hydrateProject(
         meta: meta?.meta ?? null,
         last_rate_limit: meta?.last_rate_limit ?? null,
         last_rate_limit_as_of: meta?.last_rate_limit_as_of ?? null,
-        warnings: meta?.warnings,
       });
     }
 

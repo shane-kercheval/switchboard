@@ -164,6 +164,7 @@ mod tests {
             input: serde_json::json!({"cmd": "ls"}),
             output: Some("file output that must not be forwarded".to_owned()),
             is_error: Some(false),
+            warnings: Vec::new(),
             started_at: Utc::now(),
             completed_at: Some(Utc::now()),
         }

@@ -1,6 +1,6 @@
 # Codex asynchronous tool hydration and transcript diagnostics
 
-**Status:** Milestones 1–2 implemented; Milestone 2 review and manual acceptance pending · **Created:** 2026-08-27 · **Revised:** 2026-08-27
+**Status:** Complete · **Created:** 2026-08-27 · **Revised:** 2026-08-27
 
 ## Problem
 
@@ -486,6 +486,20 @@ Implementation is complete only after all of the following:
 - Manual acceptance also loads a sanitized tool-local degradation fixture (or
   an equivalent deterministic test surface) and confirms the warning is inside
   the affected tool row, not the agent card.
+
+### Completion evidence (2026-08-27)
+
+- `make test-live-codex` passed against the installed Codex CLI during
+  Milestone 1 acceptance. The captured rollout was paginated and satisfied the
+  producer-id relation; sanitized fixtures remained the deterministic proof of
+  late ordering.
+- `make check` passed after Milestone 2, including Rust, jsdom, and WebKit
+  suites. Parser and component tests exercised the deterministic tool-local
+  warning surface and status precedence.
+- Manual acceptance under `make dev` reloaded the real `switchboard` project.
+  The previously affected `coder` agent and the Codex `reviewer-2` agent showed
+  no agent-card transcript-warning counts, while inspected tool rows retained
+  their completed status and output. No regression was observed.
 
 ## Known limitation retained deliberately
 

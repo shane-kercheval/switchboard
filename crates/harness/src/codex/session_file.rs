@@ -67,7 +67,7 @@ use uuid::Uuid;
 use crate::events::{ContentKind, McpServerStatus, ToolKind, TurnId, TurnUsage};
 use crate::transcript::{
     LoadTranscriptError, LoadedTranscript, ParseWarning, SessionMetaInfo, Turn, TurnItem,
-    TurnStatus, merge_meta_with_loaders, stale_sidecar_warning,
+    TurnStatus, merge_meta_with_loaders,
 };
 
 use super::config::load_mcp_servers;
@@ -921,15 +921,7 @@ pub fn load_codex_transcript(
     };
 
     let Some(path) = locate_session_file(home_dir, date, session_id) else {
-        return Ok(LoadedTranscript {
-            meta: Some(merge_meta_with_loaders(
-                None,
-                load_mcp_servers(home_dir, cwd),
-                load_skills(home_dir, cwd),
-            )),
-            warnings: vec![stale_sidecar_warning()],
-            ..LoadedTranscript::default()
-        });
+        return Err(LoadTranscriptError::RecordedSessionUnavailable);
     };
 
     let content =
@@ -2121,6 +2113,7 @@ impl CodexReconstruction {
         item: &Value,
         timestamp: Option<DateTime<Utc>>,
     ) {
+        let warning_start = self.warnings.len();
         let slot = self.claim_wrapper_slot(line_number, "CommandExecution");
         if matches!(slot, WrapperSlot::Orphaned) {
             return;
@@ -2143,6 +2136,7 @@ impl CodexReconstruction {
             (!structured_output.is_empty()).then_some(structured_output)
         };
         let row_id = self.item_row_id(line_number, item, "command");
+        let owned_warnings = self.warnings[warning_start..].to_vec();
         let Some(builder) = self.current_agent.as_mut() else {
             return;
         };
@@ -2152,6 +2146,7 @@ impl CodexReconstruction {
                 facet: row_facet,
                 is_error: row_error,
                 output: row_output,
+                warnings: row_warnings,
                 completed_at,
                 ..
             }) = builder.items.get_mut(row_index)
@@ -2163,6 +2158,7 @@ impl CodexReconstruction {
                 if let Some(text) = output {
                     *row_output = Some(text);
                 }
+                row_warnings.extend(owned_warnings);
                 *completed_at = timestamp;
             }
             builder.keep_wrapper_row(row_index);
@@ -2183,6 +2179,7 @@ impl CodexReconstruction {
             // the failure/unknown cases above.
             output,
             is_error,
+            warnings: owned_warnings,
             started_at: timestamp.unwrap_or(builder.last_seen_at),
             completed_at: timestamp,
         });
@@ -2304,6 +2301,7 @@ impl CodexReconstruction {
         item: &Value,
         timestamp: Option<DateTime<Utc>>,
     ) {
+        let warning_start = self.warnings.len();
         let slot = self.claim_wrapper_slot(line_number, "FileChange");
         if matches!(slot, WrapperSlot::Orphaned) {
             return;
@@ -2342,6 +2340,7 @@ impl CodexReconstruction {
         };
         let output = patch_apply_end_output(item);
         let row_id = self.item_row_id(line_number, item, "file-change");
+        let owned_warnings = self.warnings[warning_start..].to_vec();
         let Some(builder) = self.current_agent.as_mut() else {
             return;
         };
@@ -2356,6 +2355,7 @@ impl CodexReconstruction {
             input: item.get("changes").cloned().unwrap_or(Value::Null),
             output: Some(output),
             is_error,
+            warnings: owned_warnings,
             started_at: timestamp.unwrap_or(builder.last_seen_at),
             completed_at: timestamp,
         });
@@ -2374,6 +2374,7 @@ impl CodexReconstruction {
         item: &Value,
         timestamp: Option<DateTime<Utc>>,
     ) {
+        let warning_start = self.warnings.len();
         let slot = self.claim_wrapper_slot(line_number, "McpToolCall");
         if matches!(slot, WrapperSlot::Orphaned) {
             return;
@@ -2430,6 +2431,7 @@ impl CodexReconstruction {
         let output = super::parser::extract_mcp_output(result, error);
         let facet = crate::facets::classify_mcp_tool_facet(server, tool, &arguments);
         let row_id = self.item_row_id(line_number, item, "mcp");
+        let owned_warnings = self.warnings[warning_start..].to_vec();
         let Some(builder) = self.current_agent.as_mut() else {
             return;
         };
@@ -2444,6 +2446,7 @@ impl CodexReconstruction {
             input: arguments,
             output: Some(output),
             is_error,
+            warnings: owned_warnings,
             started_at: timestamp.unwrap_or(builder.last_seen_at),
             completed_at: timestamp,
         });
@@ -2492,6 +2495,7 @@ impl CodexReconstruction {
                     input: arguments,
                     output: None,
                     is_error: None,
+                    warnings: Vec::new(),
                     started_at,
                     completed_at: None,
                 };
@@ -2612,6 +2616,7 @@ impl CodexReconstruction {
             input: Value::String(input.to_owned()),
             output: None,
             is_error: None,
+            warnings: Vec::new(),
             started_at,
             completed_at: None,
         });
@@ -2673,6 +2678,7 @@ impl CodexReconstruction {
             input: payload.get("changes").cloned().unwrap_or(Value::Null),
             output: Some(output),
             is_error: Some(is_error),
+            warnings: Vec::new(),
             started_at: timestamp.unwrap_or(builder.last_seen_at),
             completed_at: timestamp,
         });
@@ -3931,25 +3937,23 @@ not valid json
     }
 
     #[test]
-    fn load_codex_transcript_with_missing_file_emits_stale_sidecar_warning() {
+    fn load_codex_transcript_with_missing_recorded_file_fails_hydration() {
         let home = TempDir::new().unwrap();
         let cwd = TempDir::new().unwrap();
         let agent_id = Uuid::now_v7();
         let date = NaiveDate::from_ymd_opt(2026, 5, 14).unwrap();
-        let result = load_codex_transcript(
+        let error = load_codex_transcript(
             home.path(),
             cwd.path(),
             "no-such-session-id",
             Some(date),
             agent_id,
         )
-        .unwrap();
-        assert!(result.turns.is_empty());
-        assert_eq!(result.warnings.len(), 1);
-        assert_eq!(
-            result.warnings[0].reason,
-            "session file no longer at recorded path"
-        );
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            LoadTranscriptError::RecordedSessionUnavailable
+        ));
     }
 
     fn write_session_at(home: &Path, date: NaiveDate, session_id: &str, content: &str) -> PathBuf {
@@ -6431,6 +6435,18 @@ not valid json
             "a present-but-unreadable exit_code is contract drift and must warn: {:?}",
             result.warnings
         );
+        let owned_warning = result.turns.iter().any(|turn| match turn {
+            Turn::Agent { items, .. } => items.iter().any(|item| {
+                matches!(
+                    item,
+                    TurnItem::Tool { name, warnings, .. }
+                        if name == "exec_command"
+                            && warnings.iter().any(|warning| warning.reason.contains("exit_code is not numeric"))
+                )
+            }),
+            _ => false,
+        });
+        assert!(owned_warning, "the warning must travel with its tool row");
         assert!(
             result.warnings.iter().any(|w| w
                 .reason

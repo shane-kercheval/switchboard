@@ -269,9 +269,15 @@ describe("ToolCallWidget collapsed row", () => {
 
 describe("ToolCallWidget status glyphs", () => {
   it("shows a spinner while running", () => {
-    const { getByTestId, queryByTestId } = render(ToolCallWidget, { tool: running });
+    const { getByTestId, queryByTestId } = render(ToolCallWidget, {
+      tool: {
+        ...running,
+        warnings: [{ line_number: 42, reason: "stale disk diagnostic" }],
+      },
+    });
     expect(getByTestId("tool-running")).toBeInTheDocument();
     expect(queryByTestId("tool-done")).toBeNull();
+    expect(queryByTestId("tool-warning")).toBeNull();
   });
 
   it("shows the failed glyph for an is_error completion", () => {
@@ -281,12 +287,31 @@ describe("ToolCallWidget status glyphs", () => {
     expect(getByTestId("tool-error")).toBeInTheDocument();
   });
 
+  it("shows a warning glyph only for a terminal non-failed tool with owned warnings", async () => {
+    const warned = {
+      ...done,
+      warnings: [{ line_number: 42, reason: "status was unreadable" }],
+    };
+    const { getByTestId, queryByTestId, rerender } = render(ToolCallWidget, { tool: warned });
+    expect(getByTestId("tool-warning")).toHaveAttribute("aria-label", "completed with warning");
+    expect(queryByTestId("tool-done")).toBeNull();
+
+    await rerender({ tool: { ...warned, is_error: true } });
+    expect(getByTestId("tool-error")).toBeInTheDocument();
+    expect(queryByTestId("tool-warning")).toBeNull();
+  });
+
   it("renders a cancelled tool with the in-progress verb and cancelled glyph", () => {
     const { getByTestId, queryByTestId } = render(ToolCallWidget, {
-      tool: { ...cancelled, facet: { facet_kind: "shell", command: "ls", cwd: null } },
+      tool: {
+        ...cancelled,
+        facet: { facet_kind: "shell", command: "ls", cwd: null },
+        warnings: [{ line_number: 42, reason: "stale disk diagnostic" }],
+      },
     });
     expect(queryByTestId("tool-running")).toBeNull();
     expect(getByTestId("tool-cancelled")).toBeInTheDocument();
+    expect(queryByTestId("tool-warning")).toBeNull();
     // The label is state-invariant; the cancelled glyph carries the outcome.
     expect(getByTestId("tool-verb")).toHaveTextContent("Command");
   });
@@ -426,6 +451,19 @@ describe("ToolCallWidget failed and cancelled output", () => {
 });
 
 describe("ToolCallWidget expansion", () => {
+  it("reveals owned warning details only when expanded", async () => {
+    const { getByTestId, queryByTestId } = render(ToolCallWidget, {
+      tool: {
+        ...done,
+        warnings: [{ line_number: 42, reason: "status was unreadable" }],
+      },
+    });
+    expect(queryByTestId("tool-warnings")).toBeNull();
+    await fireEvent.click(getByTestId("tool-row"));
+    expect(getByTestId("tool-warnings")).toHaveTextContent("line 42:");
+    expect(getByTestId("tool-warnings")).toHaveTextContent("status was unreadable");
+  });
+
   it("starts collapsed with no body and stays collapsed across completion", async () => {
     const { getByTestId, queryByTestId, rerender } = render(ToolCallWidget, { tool: running });
     expect(queryByTestId("tool-body")).toBeNull();

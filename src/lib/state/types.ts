@@ -155,6 +155,9 @@ export type ToolCall = {
   facet: ToolFacet;
   output?: string;
   is_error?: boolean;
+  /// Hydration-only diagnostics proven to belong to this operation. Live
+  /// tools omit the field because stream events carry no parser warnings.
+  warnings?: ParseWarning[];
   started_at: string;
   completed_at?: string;
   stopped_at?: string;
@@ -324,11 +327,6 @@ export type AgentRuntime = {
   /// means the record is real but nothing it says will arrive until the
   /// subscription is retried. Cleared by a successful re-subscription.
   listener_error?: string;
-  /// Non-blocking parser warnings surfaced by `load_transcript` — stale
-  /// Codex sidecar, malformed JSONL lines, etc. Empty / undefined when no
-  /// warnings landed. Display-only; never gates sendability or hydration
-  /// success.
-  parse_warnings?: ParseWarning[];
 };
 
 export type AgentMeta = {

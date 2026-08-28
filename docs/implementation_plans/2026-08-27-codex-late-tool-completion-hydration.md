@@ -1,6 +1,6 @@
 # Codex asynchronous tool hydration and transcript diagnostics
 
-**Status:** Milestone 1 implemented and live Codex acceptance passed; code review pending · **Created:** 2026-08-27 · **Revised:** 2026-08-27
+**Status:** Milestones 1–2 implemented; Milestone 2 review and manual acceptance pending · **Created:** 2026-08-27 · **Revised:** 2026-08-27
 
 ## Problem
 

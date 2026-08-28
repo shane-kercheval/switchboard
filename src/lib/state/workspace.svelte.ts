@@ -377,14 +377,18 @@ export async function addDirectory(path: string): Promise<void> {
   await loadWorkspace();
 }
 
-/// Remove a working directory: drains its projects' in-flight turns and
-/// releases their locks on the backend (leaving `.switchboard/` on disk), and
-/// performs the matching **frontend lifecycle teardown** so a remove-then-re-add
-/// of the same project ids (ids are persisted on disk and survive removal)
-/// starts clean. Without the teardown, the stale memoized `loadStarted` promise
-/// would make re-activation skip `open_project`/`list_agents` and leave the
-/// backend with an unloaded "active" project, and the removed agents' listeners
-/// would leak.
+/// Hide a working directory. **"Remove" no longer deletes anything.**
+///
+/// A directory's catalog entry is referenced by every project in it and cannot
+/// be dropped while any of them exists, so removal means "stop showing me this":
+/// the entry survives, its projects survive, and adding the directory back
+/// unhides it. The backend still drains the projects' in-flight turns.
+///
+/// The **frontend lifecycle teardown** below is unchanged and still required —
+/// hide-then-re-add lands on the same project ids, so without it the stale
+/// memoized `loadStarted` promise would make re-activation skip
+/// `open_project`/`list_agents` and leave the backend with an unloaded "active"
+/// project, and the hidden agents' listeners would leak.
 export async function removeDirectory(path: string): Promise<void> {
   // Snapshot the affected project + agent ids BEFORE the await — `loadWorkspace`
   // (below) will drop these projects from the list, so capture them now.

@@ -338,8 +338,11 @@ export async function migrateMessagePin(
   return await invoke<MessagePin[]>("migrate_message_pin", { projectId, fromKey, toKey });
 }
 
-// Removes a directory from the workspace: drains its projects' in-flight turns,
-// releases their locks, and drops the entry — leaving `.switchboard/` on disk.
+// Hides a directory: drains its projects' in-flight turns and releases their
+// locks, then marks it hidden. Nothing is deleted — the entry, its projects, and
+// their history all survive, and adding the directory back unhides it. A catalog
+// entry is referenced by every project in the directory, so it cannot be dropped
+// without orphaning them; "remove" is view-state.
 export async function removeDirectory(path: string): Promise<void> {
   await invoke<null>("remove_directory", { path });
 }

@@ -7,6 +7,7 @@
   import type { Snippet } from "svelte";
   import { DropdownMenu as Bits } from "bits-ui";
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
+  import { MENU_ITEM_CLASS } from "$lib/components/ui/menuStyles";
   import { cn } from "$lib/utils";
 
   type Props = {
@@ -16,10 +17,6 @@
     tooltip?: string;
     class?: string;
     children: Snippet;
-    /// Disclosure state for an item that expands in place (used with
-    /// `closeOnSelect={false}`), so a screen reader reports it as expandable
-    /// rather than as a plain action.
-    "aria-expanded"?: boolean;
     [key: `data-${string}`]: string | undefined;
   };
 
@@ -40,12 +37,7 @@
     {onSelect}
     {disabled}
     {closeOnSelect}
-    class={cn(
-      "text-fg flex w-full items-center rounded-md px-2.5 py-1.5 text-left leading-5 outline-none select-none",
-      "data-highlighted:bg-hover cursor-pointer",
-      "data-disabled:text-muted/50 data-disabled:cursor-not-allowed",
-      className,
-    )}
+    class={cn(MENU_ITEM_CLASS, className)}
     {...rest}
   >
     {@render children()}

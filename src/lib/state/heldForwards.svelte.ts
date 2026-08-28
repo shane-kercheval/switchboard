@@ -59,11 +59,17 @@ export function isForeignSource(source: ForwardSource, currentProjectId: Project
   return source.projectId !== undefined && source.projectId !== currentProjectId;
 }
 
-/// The chip / waiting-row label: bare agent name in-project, `agent · project`
+/// The chip / waiting-row label: bare agent name in-project, `project · agent`
 /// when foreign (falling back to the bare name if the project name is unknown).
+///
+/// Project first, matching [`qualified_source_name`] in `crates/app/src/commands.rs`
+/// — the two must read the same, because a chip the user picked and the backend's
+/// invalidation copy about that same source appear a few lines apart. Widest scope
+/// first also lets a column of chips be scanned by project, and puts the part that
+/// makes two same-named `reviewer`s distinguishable where the eye lands first.
 export function forwardSourceLabel(source: ForwardSource, currentProjectId: ProjectId): string {
   return isForeignSource(source, currentProjectId) && source.projectName
-    ? `${source.name} · ${source.projectName}`
+    ? `${source.projectName} · ${source.name}`
     : source.name;
 }
 
@@ -225,16 +231,46 @@ export function reconcileForwardSourceMap(
 ///               a healthy foreign source.
 export type ForwardReadiness = "ready" | "pending" | "empty" | "unknown";
 
+/// Readiness for one **local** agent, given whether its on-disk history has
+/// finished loading.
+///
+/// `hydrated` gates only the disk-derived half. A streaming turn is observed
+/// *live* — the event reducer writes it into `transcripts` whether or not the
+/// history read has finished — so `pending` survives an incomplete load.
+/// Checking hydration first would hide an agent that is visibly generating.
+///
+/// Everything else collapses to `unknown` until the load completes, because
+/// before then an empty transcript means "not read yet" or "the read failed",
+/// not "this agent has said nothing": every agent is seeded with an empty
+/// transcript at registration, and a failed read leaves it that way until the
+/// user retries. Callers *disable* on `empty`, so conflating the two makes an
+/// agent with months of history unpickable for as long as its history is
+/// missing — while asserting it has no output.
+export function agentReadinessFor(
+  turns: readonly Turn[] | undefined,
+  hydrated: boolean,
+): ForwardReadiness {
+  const readiness = forwardReadiness(turns);
+  if (readiness === "pending") return readiness;
+  return hydrated ? readiness : "unknown";
+}
+
 /// Readiness for one source, given the project composing the send. A foreign
 /// source short-circuits to `unknown`: its transcript isn't loaded here, and
 /// guessing from an absent transcript yields `empty`, which is a false warning.
+///
+/// `isHydrated` is required rather than optional. The same absent-transcript
+/// ambiguity that makes a foreign source `unknown` applies to a local agent
+/// whose history hasn't loaded, and a caller that omitted the check would get
+/// the confident-but-wrong answer silently.
 export function sourceReadinessFor(
   source: ForwardSource,
   currentProjectId: ProjectId,
   turnsFor: (id: AgentId) => readonly Turn[] | undefined,
+  isHydrated: (id: AgentId) => boolean,
 ): ForwardReadiness {
   if (isForeignSource(source, currentProjectId)) return "unknown";
-  return forwardReadiness(turnsFor(source.id));
+  return agentReadinessFor(turnsFor(source.id), isHydrated(source.id));
 }
 
 /// Classify what a source will contribute, from that agent's turns.

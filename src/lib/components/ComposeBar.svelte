@@ -21,7 +21,7 @@
     sourceReadinessFor,
     forwardSourceForAgent,
     forwardSourceAgentsForPane,
-    forwardReadiness,
+    agentReadinessFor,
     reconcileForwardSources,
     reconcileForwardSourceMap,
     type ForwardReadiness,
@@ -324,12 +324,22 @@
     forwardSources = forwardSources.filter((s) => forwardSourceKey(s) !== key);
   }
 
+  /// Whether an agent's on-disk history has been read into `transcripts`.
+  ///
+  /// Load-bearing wherever an *absent* transcript is read as evidence: every
+  /// agent is seeded with an empty one at registration, and a failed read leaves
+  /// it empty until the user retries hydration — so before this holds, "empty"
+  /// and "has months of history" are indistinguishable.
+  function isHydrated(agentId: AgentId): boolean {
+    return runtimes[agentId]?.hydration_status === "complete";
+  }
+
   /// What an agent would contribute if forwarded from right now. The single source
   /// of truth for every surface that flags a forward source — the chips, the
   /// `@`-menu rows, and the per-field pickers in the prompt/workflow composers —
   /// so they cannot disagree about the same agent.
   function agentReadiness(agentId: AgentId): ForwardReadiness {
-    return forwardReadiness(transcripts[agentId]);
+    return agentReadinessFor(transcripts[agentId], isHydrated(agentId));
   }
 
   /// Readiness for a chip. Must go through the *source*, not the bare id:
@@ -337,7 +347,7 @@
   /// `undefined`, and `forwardReadiness(undefined)` is `"empty"` — a "this will
   /// block your send" warning that is false for a healthy foreign source.
   function sourceReadiness(source: ForwardSource): ForwardReadiness {
-    return sourceReadinessFor(source, projectId, (id) => transcripts[id]);
+    return sourceReadinessFor(source, projectId, (id) => transcripts[id], isHydrated);
   }
 
   /// The current chips as the `Attachment` wire shape (drops the local `id`),
@@ -1121,10 +1131,10 @@
   /// cannot happen.
   function looksLikeItHasASession(agentId: AgentId): boolean {
     // An empty transcript is evidence only once hydration has *completed*.
-    // While loading, and permanently after a failure, it is empty for an agent
-    // that may have a long history — and "send it a message first" is then not
-    // merely unhelpful but false.
-    if (runtimes[agentId]?.hydration_status !== "complete") return true;
+    // While loading, and after a failure until the user retries, it is empty for
+    // an agent that may have a long history — and "send it a message first" is
+    // then not merely unhelpful but false.
+    if (!isHydrated(agentId)) return true;
     return (transcripts[agentId] ?? []).length > 0;
   }
 
@@ -1360,9 +1370,29 @@
     }
     return items;
   });
+  /// Forward entries that would resolve to nothing. Rendered (with the reason)
+  /// but **not selectable**: picking one can only end in the backend refusing the
+  /// whole send, so the menu declines the choice instead of describing a
+  /// consequence the user has to avoid. Keeping them out of `menuItems` — the
+  /// list arrow keys walk and Enter picks from — is what makes that true for the
+  /// keyboard as well as the mouse.
+  const emptyForwardKeys = $derived(
+    new Set(
+      forwardItems
+        .filter(
+          (item) => item.kind === "forward-agent" && agentReadiness(item.agent.id) === "empty",
+        )
+        .map((item) => item.key),
+    ),
+  );
   const menuItems = $derived.by<MenuItem[]>(() => {
     if (!menuOpen) return [];
-    return [...fileItems, ...attachmentItems, ...recipientItems, ...forwardItems];
+    return [
+      ...fileItems,
+      ...attachmentItems,
+      ...recipientItems,
+      ...forwardItems.filter((item) => !emptyForwardKeys.has(item.key)),
+    ];
   });
   const fileStatusText = $derived.by<string | null>(() => {
     if (fileItems.length > 0) return null;
@@ -1372,7 +1402,11 @@
     return null;
   });
   const showFileSection = $derived(fileItems.length > 0 || fileStatusText !== null);
-  const hasMenuContent = $derived(menuItems.length > 0 || showFileSection);
+  // `forwardItems` separately, because an unselectable forward row is still a row:
+  // a query that matches only spent agents must show them, not close the menu.
+  const hasMenuContent = $derived(
+    menuItems.length > 0 || forwardItems.length > 0 || showFileSection,
+  );
 
   // Every recipient's history loaded — the precondition for a send (independent
   // of run_status: a busy recipient's message queues).
@@ -3489,14 +3523,21 @@
           {/if}
           {#each forwardItems as item (item.key)}
             {@const i = menuItems.findIndex((candidate) => candidate.key === item.key)}
+            {@const spent = emptyForwardKeys.has(item.key)}
             <button
               type="button"
-              class={"hover:bg-hover flex w-full cursor-pointer items-center gap-2 rounded-md px-2.5 py-1 text-left leading-5 outline-none select-none " +
+              class={"flex w-full items-center gap-2 rounded-md px-2.5 py-1 text-left leading-5 outline-none select-none " +
+                (spent ? "cursor-not-allowed" : "hover:bg-hover cursor-pointer ") +
                 (i === highlighted ? "bg-hover" : "")}
               data-testid={`forward-option-${item.key}`}
               role="option"
+              disabled={spent}
               aria-selected={i === highlighted}
-              onclick={() => pickItem(item)}
+              onclick={() => {
+                // Guarded as well as `disabled`, so the refusal doesn't rest on
+                // the browser suppressing clicks on a disabled control.
+                if (!spent) pickItem(item);
+              }}
             >
               <!-- ↪ forward glyph, shared by both forward entry kinds. -->
               <svg
@@ -3529,11 +3570,9 @@
                 {/if}
               {:else}
                 <HarnessIcon harness={item.agent.harness} size="sm" class="h-4 w-4" />
-                <span class="text-fg">{item.agent.name}</span>
-                {#if agentReadiness(item.agent.id) === "empty"}
-                  <span class="text-muted ml-auto text-[11px] italic"
-                    >no output — blocks the send</span
-                  >
+                <span class={spent ? "text-muted/50" : "text-fg"}>{item.agent.name}</span>
+                {#if spent}
+                  <span class="text-muted ml-auto text-[11px] italic">no output</span>
                 {:else if agentReadiness(item.agent.id) === "pending"}
                   <span class="text-muted ml-auto text-[11px] italic">still generating</span>
                 {/if}

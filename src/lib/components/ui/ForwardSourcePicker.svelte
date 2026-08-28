@@ -11,6 +11,7 @@
   import type { TranscriptPane } from "$lib/state/transcriptPanes.svelte";
   import DropdownMenu from "$lib/components/ui/DropdownMenu.svelte";
   import DropdownMenuItem from "$lib/components/ui/DropdownMenuItem.svelte";
+  import DropdownMenuSub from "$lib/components/ui/DropdownMenuSub.svelte";
   import HarnessIcon from "$lib/components/ui/HarnessIcon.svelte";
   import { shortcut } from "$lib/platform";
 
@@ -67,9 +68,14 @@
     onPickAgent: (agent: AgentRecord) => void;
     onPickPane: (pane: TranscriptPane) => void;
     disabled?: boolean;
-    /// Optional: classify what each agent would contribute, so the user sees
-    /// before picking that an empty source would block the send. Only `empty` is flagged —
-    /// a `pending` agent is still generating and will be waited for.
+    /// Optional: classify what each agent would contribute. An `empty` agent is
+    /// annotated *and disabled* — it has nothing to forward, so picking it could
+    /// only end in the backend refusing the send. A `pending` agent stays
+    /// pickable: it is still generating, and the send waits for it.
+    ///
+    /// Foreign agents (under `Projects`) are never classified — their transcripts
+    /// aren't loaded here, so their rows carry no readiness at all rather than a
+    /// guess. See `sourceReadinessFor`.
     agentReadiness?: (id: AgentId) => ForwardReadiness;
     triggerClass?: string;
     triggerTestid?: string;
@@ -99,42 +105,30 @@
     | { status: "loading" }
     | { status: "ready"; agents: AgentRecord[] }
     | { status: "error"; message: string };
-  /// Bound so a *successful* pick can dismiss the menu. The rows carry
-  /// `closeOnSelect={false}` so expanding a project keeps the menu open; that
-  /// same flag would otherwise leave it open after a completed pick too.
+  /// Bound so a *successful* pick can dismiss the menu. A foreign-agent row
+  /// carries `closeOnSelect={false}` because its pick is async and may fail into
+  /// an inline error; dismissal is this flag, set once the pick has committed.
   let menuOpen = $state(false);
   $effect(() => {
-    // A closed menu keeps no failure state — see the collapse path above.
+    // A closed menu keeps no failure state.
     if (!menuOpen) pickErrors.clear();
   });
-  /// The one expanded project, or `null`. **Separate from `rosters`** — using
-  /// "do I have roster data?" as "is this expanded?" made a loaded project
-  /// impossible to collapse and reported the wrong `aria-expanded` for a project
-  /// showing its error row. One at a time, matching the accordion behavior; the
-  /// cache survives collapse so re-expanding doesn't re-read the registry.
-  let expandedProjectId = $state<ProjectId | null>(null);
   const rosters = new SvelteMap<ProjectId, RosterState>();
   /// Per-agent pick failure (a locked or unreadable project), rendered at the row
   /// the user clicked — the error's home is the pick, not the hover.
   const pickErrors = new SvelteMap<string, string>();
 
-  async function toggleProject(projectId: ProjectId): Promise<void> {
+  /// Read a project's roster when its submenu opens. bits-ui mounts sub-content
+  /// on demand, so this is the moment the rows first need data — and browsing a
+  /// project the user never opens costs nothing.
+  ///
+  /// The cache survives a close, so reopening doesn't re-read the registry; an
+  /// *errored* entry does re-read, which makes reopening the submenu the retry
+  /// path and stops a transient failure from making a project permanently
+  /// unpickable.
+  async function openProject(projectId: ProjectId): Promise<void> {
     if (!crossProject) return;
     const existing = rosters.get(projectId);
-    // Selecting an errored project **retries** rather than collapsing — the row
-    // says "select again to retry", and collapsing there would make that copy a
-    // lie and put the retry two clicks away.
-    if (expandedProjectId === projectId && existing?.status !== "error") {
-      expandedProjectId = null;
-      // Pick failures are scoped to the expansion that produced them. Clearing on
-      // collapse *and* on close (below) keeps one rule; clearing on close alone
-      // would leave a stale message reappearing on collapse/re-expand.
-      pickErrors.clear();
-      return;
-    }
-    expandedProjectId = projectId;
-    // Cached roster: show it, no re-read. An *errored* entry re-reads, so a
-    // transient failure doesn't make the project permanently unpickable.
     if (existing !== undefined && existing.status !== "error") return;
     rosters.set(projectId, { status: "loading" });
     try {
@@ -254,84 +248,101 @@
     {/each}
   {/if}
   {#each agents as agent (agent.id)}
+    {@const readiness = agentReadiness?.(agent.id)}
+    {@const rowDisabled = disabled || readiness === "empty"}
+    <!-- An `empty` agent is unpickable, not merely annotated: picking it can only
+         end in the backend refusing the whole send, so the row states the fact
+         ("no output") and the menu declines the choice rather than explaining a
+         consequence the user then has to avoid. `pending` stays pickable — the
+         send waits for that agent's in-flight turn. -->
     <DropdownMenuItem
       onSelect={() => onPickAgent(agent)}
       class="gap-2"
       data-testid={`forward-picker-agent-${agent.id}`}
-      {disabled}
+      disabled={rowDisabled}
     >
       <HarnessIcon harness={agent.harness} size="sm" class="h-4 w-4 shrink-0" />
-      <span class="text-fg">{agent.name}</span>
-      {#if agentReadiness?.(agent.id) === "empty"}
-        <span class="text-muted ml-auto text-[11px] italic">no output — blocks the send</span>
-      {:else if agentReadiness?.(agent.id) === "pending"}
+      <span class={rowDisabled ? "text-muted/50" : "text-fg"}>{agent.name}</span>
+      {#if readiness === "empty"}
+        <span class="text-muted ml-auto text-[11px] italic">no output</span>
+      {:else if readiness === "pending"}
         <span class="text-muted ml-auto text-[11px] italic">still generating</span>
       {/if}
     </DropdownMenuItem>
   {/each}
   {#if crossProject && crossProject.projects.length > 0}
-    <!-- Cross-project sources. Expanding a project only *reads* its roster; the
-         project is opened and validated when the user actually picks an agent.
-         Every row is a `DropdownMenuItem`, including the expand toggle: bits-ui's
-         roving focus and typeahead track registered menu items only, so a raw
-         `<button>` here would be unreachable by keyboard and carry no disclosure
-         semantics — the whole section would be mouse-only. `closeOnSelect={false}`
-         is what lets a menu item expand in place instead of dismissing. -->
-    <div
-      class="text-muted border-border mt-1 border-t px-2 pt-2 pb-1 text-[11px] font-medium"
-      data-testid="forward-picker-projects-heading"
+    <!-- Cross-project sources, behind one `Projects` row rather than listed
+         inline. Nested submenus, not in-place expansion: the project list is
+         unbounded, and expanding it inside the parent menu pushes the local
+         agents the user came for off the bottom of a scrolling popover. Each
+         level is its own bits-ui menu, so arrow keys, typeahead, and escape scope
+         to the level you are in.
+
+         Opening a project's submenu only *reads* its roster; the project is
+         opened and validated when the user actually picks an agent. -->
+    <DropdownMenuSub
+      side="left"
+      class="border-border mt-1 border-t"
+      contentTestid="forward-picker-projects-menu"
+      data-testid="forward-picker-projects-trigger"
+      {disabled}
     >
-      Projects
-    </div>
-    {#each crossProject.projects as project (project.id)}
-      {@const roster = rosters.get(project.id)}
-      <div data-testid={`forward-picker-project-${project.id}`}>
-        <DropdownMenuItem
-          onSelect={() => void toggleProject(project.id)}
-          closeOnSelect={false}
-          class="gap-2"
+      {#snippet trigger()}
+        <span>Projects</span>
+      {/snippet}
+      {#each crossProject.projects as project (project.id)}
+        {@const roster = rosters.get(project.id)}
+        <DropdownMenuSub
+          side="left"
+          contentTestid={`forward-picker-project-menu-${project.id}`}
           data-testid={`forward-picker-project-toggle-${project.id}`}
-          aria-expanded={expandedProjectId === project.id}
+          onOpenChange={(open) => {
+            if (open) void openProject(project.id);
+            // Pick failures are scoped to the expansion that produced them, so a
+            // stale message can't reappear on reopen.
+            else pickErrors.clear();
+          }}
           {disabled}
         >
-          <span class="min-w-0 truncate">{project.name}</span>
-          {#if expandedProjectId === project.id && roster?.status === "loading"}
-            <span class="text-muted ml-auto text-[11px] italic">loading…</span>
-          {/if}
-        </DropdownMenuItem>
-        {#if expandedProjectId === project.id && roster?.status === "error"}
-          <p
-            class="text-muted px-2 pb-1 pl-6 text-[11px] italic"
-            data-testid={`forward-picker-project-error-${project.id}`}
-          >
-            can't read this project — {roster.message} (select again to retry)
-          </p>
-        {:else if expandedProjectId === project.id && roster?.status === "ready"}
-          {#if roster.agents.length === 0}
-            <p class="text-muted px-2 pb-1 pl-6 text-[11px] italic">no agents</p>
-          {/if}
-          {#each roster.agents as agent (agent.id)}
-            <DropdownMenuItem
-              onSelect={() => void pickForeign(agent, project)}
-              closeOnSelect={false}
-              class="gap-2 pl-6"
-              data-testid={`forward-picker-foreign-agent-${agent.id}`}
-              {disabled}
+          {#snippet trigger()}
+            <span class="min-w-0 truncate">{project.name}</span>
+          {/snippet}
+          {#if roster === undefined || roster.status === "loading"}
+            <p class="text-muted px-2.5 py-1.5 text-[11px] italic">loading…</p>
+          {:else if roster.status === "error"}
+            <p
+              class="text-muted max-w-64 px-2.5 py-1.5 text-[11px] italic"
+              data-testid={`forward-picker-project-error-${project.id}`}
             >
-              <HarnessIcon harness={agent.harness} size="sm" class="h-4 w-4 shrink-0" />
-              <span class="text-fg">{agent.name}</span>
-            </DropdownMenuItem>
-            {#if pickErrors.has(agent.id)}
-              <p
-                class="text-status-failed px-2 pb-1 pl-6 text-[11px]"
-                data-testid={`forward-picker-pick-error-${agent.id}`}
-              >
-                {pickErrors.get(agent.id)}
-              </p>
+              can't read this project — {roster.message} (reopen to retry)
+            </p>
+          {:else}
+            {#if roster.agents.length === 0}
+              <p class="text-muted px-2.5 py-1.5 text-[11px] italic">no agents</p>
             {/if}
-          {/each}
-        {/if}
-      </div>
-    {/each}
+            {#each roster.agents as agent (agent.id)}
+              <DropdownMenuItem
+                onSelect={() => void pickForeign(agent, project)}
+                closeOnSelect={false}
+                class="gap-2"
+                data-testid={`forward-picker-foreign-agent-${agent.id}`}
+                {disabled}
+              >
+                <HarnessIcon harness={agent.harness} size="sm" class="h-4 w-4 shrink-0" />
+                <span class="text-fg">{agent.name}</span>
+              </DropdownMenuItem>
+              {#if pickErrors.has(agent.id)}
+                <p
+                  class="text-status-failed max-w-64 px-2.5 pb-1 text-[11px]"
+                  data-testid={`forward-picker-pick-error-${agent.id}`}
+                >
+                  {pickErrors.get(agent.id)}
+                </p>
+              {/if}
+            {/each}
+          {/if}
+        </DropdownMenuSub>
+      {/each}
+    </DropdownMenuSub>
   {/if}
 </DropdownMenu>

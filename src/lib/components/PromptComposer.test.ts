@@ -270,6 +270,7 @@ describe("PromptComposer per-argument forwarding", () => {
     );
 
     await fireEvent.click(screen.getByTestId("prompt-arg-forward-focus"));
+    await fireEvent.click(await screen.findByTestId("forward-picker-projects-trigger"));
     await fireEvent.click(
       await screen.findByTestId(`forward-picker-project-toggle-${FOREIGN_PROJECT}`),
     );
@@ -280,7 +281,7 @@ describe("PromptComposer per-argument forwarding", () => {
     const sources = await screen.findByTestId("prompt-arg-sources-focus");
     // Qualified label, so a same-named local agent stays distinguishable.
     expect(within(sources).getByTestId("forward-source-chip-oracle")).toHaveTextContent(
-      "oracle · backend",
+      "backend · oracle",
     );
   });
 

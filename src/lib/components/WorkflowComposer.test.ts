@@ -560,6 +560,7 @@ describe("WorkflowComposer", () => {
     );
 
     await fireEvent.click(screen.getByTestId("workflow-forward-picker-context"));
+    await fireEvent.click(await screen.findByTestId("forward-picker-projects-trigger"));
     await fireEvent.click(
       await screen.findByTestId(`forward-picker-project-toggle-${FOREIGN_PROJECT}`),
     );

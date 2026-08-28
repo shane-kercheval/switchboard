@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  agentReadinessFor,
   expandForwardSources,
   forwardReadiness,
   forwardSourceLabel,
@@ -81,7 +82,7 @@ describe("cross-project forward sources", () => {
     };
     expect(forwardSourceLabel(local, PROJECT)).toBe("alice");
     // Same agent name in two projects must stay distinguishable.
-    expect(forwardSourceLabel(foreign, PROJECT)).toBe("alice · backend");
+    expect(forwardSourceLabel(foreign, PROJECT)).toBe("backend · alice");
   });
 
   it("falls back to the bare name when a foreign project's name is unknown", () => {
@@ -187,6 +188,36 @@ const userTurn = (at: string): Turn => ({
   agent_id: "agent-a",
   started_at: at,
   text: "hi",
+});
+
+describe("agentReadinessFor", () => {
+  it("reports unknown, not empty, while the agent's history is still unread", () => {
+    // Every agent is seeded with an empty transcript at registration, and a
+    // failed read leaves it that way until the user retries hydration. Callers
+    // *disable* on `empty`, so answering `empty` here makes an agent with months
+    // of history unpickable — while asserting it has no output.
+    expect(agentReadinessFor([], false)).toBe("unknown");
+    expect(agentReadinessFor(undefined, false)).toBe("unknown");
+  });
+
+  it("still reports pending for a streaming turn the history read hasn't covered", () => {
+    // A streaming turn arrives on the live event channel, not from disk, so it is
+    // known regardless of hydration. Checking hydration first would hide an agent
+    // that is visibly generating right now.
+    expect(agentReadinessFor([agentTurn("streaming", "1")], false)).toBe("pending");
+  });
+
+  it("withholds a stale ready verdict too, not just a stale empty one", () => {
+    // A partially-read transcript can look ready while the newest turn is still
+    // missing, so an incomplete read yields no verdict in either direction.
+    expect(agentReadinessFor([agentTurn("complete", "1")], false)).toBe("unknown");
+  });
+
+  it("passes the derivation straight through once the history is read", () => {
+    expect(agentReadinessFor([], true)).toBe("empty");
+    expect(agentReadinessFor([agentTurn("complete", "1")], true)).toBe("ready");
+    expect(agentReadinessFor([agentTurn("streaming", "1")], true)).toBe("pending");
+  });
 });
 
 describe("forwardReadiness", () => {

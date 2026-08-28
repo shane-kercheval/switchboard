@@ -3805,7 +3805,7 @@ pub async fn forward_prompt_impl(
 /// [`empty_sources_reason`]); a partially-parsed non-empty answer still
 /// passes, so this is a dispatch guard, not a data-loss detector.
 /// The name a source is known by **in the recipient's send**: bare for a
-/// same-project agent, `agent · project` for one forwarded in from elsewhere.
+/// same-project agent, `project · agent` for one forwarded in from elsewhere.
 ///
 /// Qualification is not cosmetic. Same-named agents across projects are ordinary
 /// (`reviewer`, `planner`), and this name is what the user reads in an
@@ -3821,7 +3821,7 @@ fn qualified_source_name(
     if source_project.id == recipient_project {
         agent_name.to_owned()
     } else {
-        format!("{agent_name} · {}", source_project.name())
+        format!("{} · {agent_name}", source_project.name())
     }
 }
 
@@ -7557,7 +7557,7 @@ mod tests {
             panic!("expected a resolved forward; got {outcome:?}");
         };
         assert!(
-            body.contains("reviewer · backend"),
+            body.contains("backend · reviewer"),
             "the foreign source must name its project; got: {body}"
         );
         // The local source of the same name stays bare — qualification marks the
@@ -7672,7 +7672,7 @@ mod tests {
             panic!("expected a resolved forward; got {outcome:?}");
         };
         assert!(
-            body.contains("beta · other's most recent turn failed"),
+            body.contains("other · beta's most recent turn failed"),
             "the second source's own journal must supply its failure note; got: {body}"
         );
         assert!(
@@ -7714,7 +7714,7 @@ mod tests {
 
         let body = resolved.get("review").expect("the field resolves");
         assert!(
-            body.contains("beta · other's most recent turn failed"),
+            body.contains("other · beta's most recent turn failed"),
             "workflow fields must read each source's own journal too; got: {body}"
         );
         assert!(

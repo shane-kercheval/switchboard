@@ -63,14 +63,13 @@ steps:
 
         Assume the human has read NOTHING else: not the reviews, not your analysis, not the reviewers' responses. This section is the only thing they will read, and it must stand alone.
 
-        - Lead with the bottom line: what you will do, what you won't, and what (if anything) you need from them. If nothing needs their input, say so in the first sentence.
-        - Then one short paragraph per issue that changes something they'd notice: what happens in system or user behavior, why it matters, and what you're doing about it. Complete sentences. Never compress by dropping the "why it matters" — that's the one part the reader cannot reconstruct on their own.
-        - Issues that are internal-only (renames, comment wording, doc sync, added tests) get one combined sentence total, not a paragraph each.
-        - Every decision the human must make gets: the question, your recommendation, and what happens if they defer — in plain language.
-        - If your position changed during the debate, say so plainly: "I originally said X; that was wrong because Y." Report the cumulative outcome, not this round's delta.
-        - Scale with substance, not a word count: many real issues deserve many paragraphs, but each must earn its place — would the human notice it in the running system, or must they decide something? If neither, it belongs in the record below, not here.
-        - Never refer backwards ("finding #3", "the hydration issue") as if the reader knows the label — re-state what it is in half a sentence each time.
-        - No code identifiers (function names, file paths, type names) unless the human needs them to act; describe the behavior instead.
+        Format: bullet points, grouped by issue. Depth is your judgment, calibrated per issue by one question — what does this change in the running system, and what does it ask of the reader? An issue that changes observable behavior or needs a decision gets enough bullets to cover what happens, why it matters, and what you're doing or asking. An obviously-correct fix nobody disputed gets one bullet naming it. Depth tracks substance, in both directions — never a template, never a fixed length.
+
+        - Open with the bottom line: what you will do, what you won't, and what you need from them — or that you need nothing.
+        - For every decision they must make: the question, your recommendation, and what happens if they defer.
+        - If your position changed during the debate, say so plainly and why. Report the cumulative outcome across rounds, not this round's delta.
+        - Write for someone who wasn't there: never refer to "finding #3" or "the hydration issue" as if they know the label — re-state what it is. No code identifiers unless they need them to act; describe the behavior instead.
+        - If you bold a lead sentence, it must be a complete plain-language statement of the point — the reader should understand the issue from that sentence alone. Never a slogan or theme label ("Depth tracks substance", "Proportionality") that names a topic without saying anything about it.
 
         ## Full record — for the reviewers and for implementation
 

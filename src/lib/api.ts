@@ -12,6 +12,7 @@ import type {
   AgentProfileSlot,
   AgentRecord,
   Attachment,
+  BranchComparison,
   BranchKind,
   ChangeKind,
   ChangedFile,
@@ -226,6 +227,39 @@ export async function commitFileDiff(
   return await invoke<FileDiff>("commit_file_diff", { repoRoot, oid, file });
 }
 
+export async function branchComparison(
+  repoRoot: string,
+  kind: BranchKind,
+  name: string,
+  base: { kind: BranchKind; name: string } | null,
+  worktreePath: string | null,
+): Promise<BranchComparison | null> {
+  return await invoke<BranchComparison | null>("branch_comparison", {
+    repoRoot,
+    kind,
+    name,
+    baseKind: base?.kind ?? null,
+    baseName: base?.name ?? null,
+    worktreePath,
+  });
+}
+
+export async function branchComparisonFileDiff(
+  repoRoot: string,
+  mergeBaseOid: string,
+  headOid: string,
+  worktreePath: string | null,
+  file: string,
+): Promise<FileDiff> {
+  return await invoke<FileDiff>("branch_comparison_file_diff", {
+    repoRoot,
+    mergeBaseOid,
+    headOid,
+    worktreePath,
+    file,
+  });
+}
+
 // Open a worktree folder in the user's configured editor (`editor_command`), or
 // the OS folder-open when no editor command is set. Rejects with the opener's
 // error on failure.
@@ -257,6 +291,24 @@ export async function openCommitFileDifftool(
   file: string,
 ): Promise<void> {
   await invoke("open_commit_file_difftool", { repoRoot, oid, file });
+}
+
+export async function openBranchComparisonFileDifftool(
+  repoRoot: string,
+  worktreePath: string | null,
+  mergeBaseOid: string,
+  headOid: string,
+  file: string,
+  change: ChangeKind,
+): Promise<void> {
+  await invoke("open_branch_comparison_file_difftool", {
+    repoRoot,
+    worktreePath,
+    mergeBaseOid,
+    headOid,
+    file,
+    change,
+  });
 }
 
 // Backend-owned personal preferences (`config.yaml`). `getPreferences` always

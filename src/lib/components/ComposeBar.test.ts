@@ -4970,6 +4970,58 @@ describe("ComposeBar — cross-agent forward", () => {
     await resetHeldForwards();
   });
 
+  it("keeps pending forward chips and the waiting row in agent-card order", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    await state.registerAgent(AGENT_C);
+    await seedStreamingTurn(AGENT_B.id);
+    await seedStreamingTurn(AGENT_C.id);
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "forward_message") return new Promise(() => {});
+      return null;
+    });
+
+    render(ComposeBar, {
+      props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B, AGENT_C] },
+    });
+    // Pick in the opposite order from the sidebar cards.
+    await pickForwardSource(AGENT_C.id);
+    await pickForwardSource(AGENT_B.id);
+
+    const chipRow = screen.getByTestId("forward-source-chips");
+    expect(
+      Array.from(chipRow.querySelectorAll('[data-testid^="forward-source-chip-"]')).map((chip) =>
+        chip.getAttribute("data-testid"),
+      ),
+    ).toEqual(["forward-source-chip-bob", "forward-source-chip-carol"]);
+    expect(screen.getByTestId("forward-source-chip-bob")).toHaveAttribute(
+      "data-readiness",
+      "pending",
+    );
+    expect(screen.getByTestId("forward-source-chip-carol")).toHaveAttribute(
+      "data-readiness",
+      "pending",
+    );
+
+    await fireEvent.click(screen.getByTestId("compose-send"));
+    const held = await import("$lib/state/heldForwards.svelte");
+    await waitFor(() =>
+      expect(held.heldForwardsFor(PROJECT_ID)[0]?.sources).toEqual([
+        { id: AGENT_B.id, name: "bob" },
+        { id: AGENT_C.id, name: "carol" },
+      ]),
+    );
+
+    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B, AGENT_C] },
+    });
+    expect(await screen.findByTestId("held-forward-waiting")).toHaveTextContent(
+      "waiting for bob, carol",
+    );
+  });
+
   it("@ menu pane row adds missing members, dedups, and disappears once all are attached", async () => {
     const panes = await import("$lib/state/transcriptPanes.svelte");
     const state = await loadState();
@@ -5576,7 +5628,9 @@ describe("ComposeBar — cross-agent forward", () => {
     await waitFor(() => {
       const forwards = held.heldForwardsFor(PROJECT_ID);
       expect(forwards).toHaveLength(1);
-      expect(held.expandForwardSources(forwards[0]?.sources ?? [])).toEqual([AGENT_B.id]);
+      expect(held.expandForwardSources(forwards[0]?.sources ?? [], [AGENT_A, AGENT_B])).toEqual([
+        AGENT_B.id,
+      ]);
       expect(forwards[0]?.recipients).toEqual([AGENT_A.id]);
     });
     // While holding, no `send_message` is issued — the frontend dispatches only
@@ -5970,7 +6024,9 @@ describe("ComposeBar — cross-agent forward", () => {
     await waitFor(() => {
       const forwards = held.heldForwardsFor(PROJECT_ID);
       expect(forwards).toHaveLength(1);
-      expect(held.expandForwardSources(forwards[0]?.sources ?? [])).toEqual([AGENT_B.id]);
+      expect(held.expandForwardSources(forwards[0]?.sources ?? [], [AGENT_A, AGENT_B])).toEqual([
+        AGENT_B.id,
+      ]);
       expect(forwards[0]?.recipients).toEqual([AGENT_A.id]);
       // The prompt's body is never pre-composed (it renders server-side after
       // sources resolve), so the held entry carries the prompt's display name
@@ -6512,10 +6568,11 @@ describe("ComposeBar — cross-agent forward", () => {
     workflowsTesting.reset();
   });
 
-  it("invokes a workflow with a forward source attached to a derived field", async () => {
+  it("invokes a workflow with field sources in agent-card order", async () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);
     await state.registerAgent(AGENT_B);
+    await state.registerAgent(AGENT_C);
     const WORKFLOW = {
       name: "review-and-recommend",
       is_builtin: true,
@@ -6549,7 +6606,9 @@ describe("ComposeBar — cross-agent forward", () => {
       return null;
     });
 
-    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    render(ComposeBar, {
+      props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B, AGENT_C] },
+    });
 
     await fireEvent.click(screen.getByTestId("compose-workflow-button"));
     await waitFor(() => screen.getByTestId("workflow-option-builtin:review-and-recommend"));
@@ -6558,20 +6617,22 @@ describe("ComposeBar — cross-agent forward", () => {
     await waitFor(() => screen.getByTestId("workflow-arg-input-context"));
     await fireEvent.click(screen.getByTestId("workflow-agent-worker-alice"));
 
-    // Forward alice's output into the derived `context` field (in place of typing).
+    // Attach carol, then bob — the opposite of their agent-card order.
     await fireEvent.click(screen.getByTestId("workflow-forward-picker-context"));
-    await fireEvent.click(await screen.findByTestId(`forward-picker-agent-${AGENT_A.id}`));
-    await waitFor(() => screen.getByTestId("forward-source-chip-alice"));
+    await fireEvent.click(await screen.findByTestId(`forward-picker-agent-${AGENT_C.id}`));
+    await fireEvent.click(screen.getByTestId("workflow-forward-picker-context"));
+    await fireEvent.click(await screen.findByTestId(`forward-picker-agent-${AGENT_B.id}`));
+    await waitFor(() => screen.getByTestId("forward-source-chip-bob"));
 
     await fireEvent.click(screen.getByTestId("workflow-invoke-button"));
     await waitFor(() => {
       expect(invokeMock.mock.calls.some(([c]) => c === "invoke_workflow")).toBe(true);
     });
     const call = invokeMock.mock.calls.find(([c]) => c === "invoke_workflow");
-    // The pane-expanded agent ids land under the field name.
+    // The wire payload follows the visible card/chip order, not click order.
     expect(call?.[1]).toMatchObject({
       name: "review-and-recommend",
-      forwardSources: { context: [AGENT_A.id] },
+      forwardSources: { context: [AGENT_B.id, AGENT_C.id] },
     });
   });
 

@@ -87,12 +87,10 @@ export function getTranscriptRevision(): number {
   return transcriptRevision;
 }
 
-/// The most recent local send, PROJECT-SCOPED. Sending a message is the
-/// user's explicit request to see the response, so the transcript force-pins
-/// on it — wherever they had scrolled — and auto-follow engages before the
-/// first chunk. Without it, a user who scrolled up to read and then sent
-/// watched the response stream in below the fold (the position-hold contract
-/// doing its job one send too long).
+/// Local sends, PROJECT-SCOPED and RECIPIENT-AWARE. Sending a message is the
+/// user's explicit request to see the response, so each transcript containing
+/// a recipient force-pins — wherever the user had scrolled — and auto-follow
+/// engages before the first chunk. Other panes must keep their reading place.
 ///
 /// Scoped, not global: a forward dispatches from a closure that can outlive a
 /// project switch (see `dispatchToRecipients`, which takes its project
@@ -103,21 +101,31 @@ export function getTranscriptRevision(): number {
 ///
 /// The state layer reports the domain fact; the transcript owns the decision
 /// to force-pin.
-/// KEYED by project rather than a single latest-send slot: two send actions in
-/// one synchronous block (held forwards flushing together) would otherwise
-/// leave only the last one visible, and a transcript whose own send was
-/// overwritten never follows its response. Same-project sends may safely
-/// coalesce — both ask for the same final state.
-const localSends = $state<Record<ProjectId, { sendId: SendId; seq: number }>>({});
+/// Each recipient retains the sequence of its latest send. That preserves two
+/// same-project sends coalesced into one reactive flush (held forwards can do
+/// this): panes containing recipients of either send still see a sequence newer
+/// than their last observation. A single latest-recipient list would lose the
+/// earlier pane.
+type LocalSend = {
+  sendId: SendId;
+  seq: number;
+  recipientSeqs: Record<AgentId, number>;
+};
 
-export function getLocalSend(projectId: ProjectId): { sendId: SendId; seq: number } | undefined {
+const localSends = $state<Record<ProjectId, LocalSend>>({});
+
+export function getLocalSend(projectId: ProjectId): LocalSend | undefined {
   return localSends[projectId];
 }
 
 /// Announce a local send action. Called once per send by the compose path,
 /// before it dispatches to the recipients.
-export function noteLocalSend(projectId: ProjectId, sendId: SendId): void {
-  localSends[projectId] = { sendId, seq: (localSends[projectId]?.seq ?? 0) + 1 };
+export function noteLocalSend(projectId: ProjectId, sendId: SendId, recipientIds: AgentId[]): void {
+  const previous = localSends[projectId];
+  const seq = (previous?.seq ?? 0) + 1;
+  const recipientSeqs = { ...(previous?.recipientSeqs ?? {}) };
+  for (const recipientId of recipientIds) recipientSeqs[recipientId] = seq;
+  localSends[projectId] = { sendId, seq, recipientSeqs };
 }
 
 export function setTranscript(agentId: AgentId, turns: Turn[]): void {

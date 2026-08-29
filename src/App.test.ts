@@ -2341,7 +2341,7 @@ describe("App", () => {
     expect(screen.queryByTestId("app-pane-tab")).not.toBeInTheDocument();
   });
 
-  it("keeps unavailable pins reachable and removable after the last agent is gone", async () => {
+  it("automatically removes unavailable pins after the last agent is gone", async () => {
     seedProject({ projectId: "p-a", name: "alpha", agents: [] });
     backend.pins.set("p-a", [
       { key: "agent:hydration:removed-agent:old-message", pinned_at: "2026-08-07T12:00:00Z" },
@@ -2353,10 +2353,8 @@ describe("App", () => {
     expect(agentsMode).toHaveAttribute("aria-disabled", "true");
     await fireEvent.click(screen.getByTestId("right-sidebar-mode-pins"));
     await waitFor(() => expect(screen.getByTestId("pins-sidebar")).toBeInTheDocument());
-    expect(screen.getByTestId("pinned-missing")).toHaveTextContent("Message unavailable");
-
-    await fireEvent.click(screen.getByTestId("pinned-message-unpin"));
     await waitFor(() => expect(backend.pins.get("p-a")).toEqual([]));
+    expect(screen.queryByTestId("pinned-missing")).not.toBeInTheDocument();
     expect(screen.getByTestId("pins-empty")).toBeInTheDocument();
     expect(screen.getByTestId("right-sidebar-mode-pins")).toBeInTheDocument();
     expect(screen.getByTestId("agents-sidebar-toggle")).toBeInTheDocument();

@@ -8,6 +8,7 @@
     forwardSourceKey,
     forwardSourceForAgent,
     forwardSourceAgentsForPane,
+    orderForwardSources,
     type ForwardReadiness,
     type ForwardSource,
   } from "$lib/state/heldForwards.svelte";
@@ -136,7 +137,9 @@
   /// after any typed lead text — the preview conveys structure, not final content.
   function withPlaceholders(typed: string, sources: ForwardSource[]): string {
     const lead = typed.trim();
-    const placeholders = sources.map((s) => `«forwarding from ${s.name}…»`).join("\n\n");
+    const placeholders = orderForwardSources(sources, agents)
+      .map((s) => `«forwarding from ${s.name}…»`)
+      .join("\n\n");
     return lead === "" ? placeholders : `${lead}\n\n${placeholders}`;
   }
 
@@ -333,9 +336,10 @@
         onClear: () => void,
         testid: string,
       )}
-        {#if sources.length > 0}
+        {@const orderedSources = orderForwardSources(sources, agents)}
+        {#if orderedSources.length > 0}
           <div class="flex flex-wrap items-center gap-1.5" data-testid={testid}>
-            {#each sources as source (forwardSourceKey(source))}
+            {#each orderedSources as source (forwardSourceKey(source))}
               <ForwardSourceChip
                 {source}
                 readiness={sourceReadiness(source)}
@@ -343,7 +347,7 @@
                 onRemove={() => onRemove(forwardSourceKey(source))}
               />
             {/each}
-            {#if sources.length > 1}
+            {#if orderedSources.length > 1}
               <!-- Each chip carries its own ✕; the bulk clear (same ⊘ glyph as
                    "Clear recipients") only earns its place once there are several
                    to drop at once. -->

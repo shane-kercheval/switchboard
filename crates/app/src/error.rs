@@ -267,6 +267,11 @@ pub enum AppError {
     #[error("failed to read git changes for {path}: {message}")]
     GitRead { path: String, message: String },
 
+    /// A branch-comparison follow-up no longer matches the repository/HEAD
+    /// endpoint that produced its file list. Distinct from an empty file diff.
+    #[error("Branch comparison is out of date. Refresh the Git view and try again.")]
+    BranchComparisonStale,
+
     /// Staging a dropped attachment failed — creating the project's
     /// `attachments/` dir, or copying the source file into it (the dropped file
     /// is gone, unreadable, or the metadata dir is unwritable). Carries the

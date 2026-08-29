@@ -10,8 +10,8 @@ use std::process::Command;
 
 use switchboard_git::{
     BranchKind, ChangeKind, CommitRangeKind, DiffLineKind, SyncState, WorktreeWarning,
-    changed_files, commit_changed_files, commit_file_diff, commit_ranges, file_diff, read_repo,
-    resolve_repo_root,
+    branch_comparison, branch_comparison_file_diff, changed_files, commit_changed_files,
+    commit_file_diff, commit_ranges, file_diff, read_repo, resolve_repo_root,
 };
 use tempfile::TempDir;
 
@@ -1676,6 +1676,330 @@ fn commit_summary_carries_identity_and_authorship() {
 }
 
 // --- commit changed-files & diff -------------------------------------------
+
+#[test]
+fn branch_comparison_combines_committed_staged_unstaged_and_untracked_changes() {
+    let dir = repo_with_main();
+    let merge_base = git(dir.path(), &["rev-parse", "HEAD"]);
+    git(dir.path(), &["switch", "-q", "-c", "feature"]);
+
+    write(dir.path(), "committed.txt", "committed\n");
+    commit_all(dir.path(), "feature commit");
+    let head = git(dir.path(), &["rev-parse", "HEAD"]);
+    write(dir.path(), "staged.txt", "staged\n");
+    git(dir.path(), &["add", "staged.txt"]);
+    write(dir.path(), "README.md", "hello\nunstaged\n");
+    write(dir.path(), "untracked.txt", "untracked\n");
+
+    let comparison = branch_comparison(
+        dir.path(),
+        BranchKind::Local,
+        "feature",
+        None,
+        None,
+        Some(dir.path()),
+    )
+    .unwrap()
+    .expect("main and feature have a merge base");
+
+    assert_eq!(comparison.base_name, "main");
+    assert_eq!(comparison.base_label, "main");
+    assert_eq!(comparison.merge_base_oid, merge_base);
+    assert_eq!(comparison.head_oid, head);
+    assert!(comparison.includes_worktree);
+    let kind = |name: &str| {
+        comparison
+            .files
+            .iter()
+            .find(|file| file.path == name)
+            .map(|file| file.change)
+    };
+    assert_eq!(kind("committed.txt"), Some(ChangeKind::Added));
+    assert_eq!(kind("staged.txt"), Some(ChangeKind::Added));
+    assert_eq!(kind("README.md"), Some(ChangeKind::Modified));
+    assert_eq!(kind("untracked.txt"), Some(ChangeKind::Untracked));
+
+    let committed_diff = branch_comparison_file_diff(
+        dir.path(),
+        &comparison.merge_base_oid,
+        &comparison.head_oid,
+        Some(dir.path()),
+        "committed.txt",
+    )
+    .unwrap();
+    assert!(committed_diff.hunks.iter().any(|hunk| {
+        hunk.lines
+            .iter()
+            .any(|line| line.origin == DiffLineKind::Added && line.content == "committed")
+    }));
+
+    let untracked_diff = branch_comparison_file_diff(
+        dir.path(),
+        &comparison.merge_base_oid,
+        &comparison.head_oid,
+        Some(dir.path()),
+        "untracked.txt",
+    )
+    .unwrap();
+    assert!(untracked_diff.hunks.iter().any(|hunk| {
+        hunk.lines
+            .iter()
+            .any(|line| line.origin == DiffLineKind::Added && line.content == "untracked")
+    }));
+}
+
+#[test]
+fn branch_comparison_followups_reject_stale_and_foreign_worktree_endpoints() {
+    let dir = repo_with_main();
+    git(dir.path(), &["switch", "-q", "-c", "feature"]);
+    write(dir.path(), "feature.txt", "feature\n");
+    commit_all(dir.path(), "feature");
+    let comparison = branch_comparison(
+        dir.path(),
+        BranchKind::Local,
+        "feature",
+        None,
+        None,
+        Some(dir.path()),
+    )
+    .unwrap()
+    .unwrap();
+
+    write(dir.path(), "later.txt", "later\n");
+    commit_all(dir.path(), "advance feature");
+    let stale = branch_comparison_file_diff(
+        dir.path(),
+        &comparison.merge_base_oid,
+        &comparison.head_oid,
+        Some(dir.path()),
+        "feature.txt",
+    )
+    .unwrap_err();
+    assert!(matches!(
+        stale,
+        switchboard_git::GitError::ComparisonStale { .. }
+    ));
+
+    let missing = branch_comparison_file_diff(
+        dir.path(),
+        "0000000000000000000000000000000000000000",
+        &git(dir.path(), &["rev-parse", "HEAD"]),
+        Some(dir.path()),
+        "feature.txt",
+    )
+    .unwrap_err();
+    assert!(matches!(
+        missing,
+        switchboard_git::GitError::ComparisonStale { .. }
+    ));
+
+    let clone = TempDir::new().unwrap();
+    let source = dir.path().to_str().unwrap();
+    git(
+        clone.path(),
+        &[
+            "clone",
+            "-q",
+            source,
+            clone.path().join("copy").to_str().unwrap(),
+        ],
+    );
+    let foreign = clone.path().join("copy");
+    let head = git(dir.path(), &["rev-parse", "HEAD"]);
+    let foreign_endpoint = branch_comparison_file_diff(
+        dir.path(),
+        &comparison.merge_base_oid,
+        &head,
+        Some(&foreign),
+        "feature.txt",
+    )
+    .unwrap_err();
+    assert!(matches!(
+        foreign_endpoint,
+        switchboard_git::GitError::ComparisonStale { .. }
+    ));
+}
+
+#[test]
+fn branch_comparison_rejects_a_worktree_checked_out_at_another_head() {
+    let dir = repo_with_main();
+    git(dir.path(), &["switch", "-q", "-c", "feature"]);
+    write(dir.path(), "feature.txt", "feature\n");
+    commit_all(dir.path(), "feature");
+    git(dir.path(), &["switch", "-q", "main"]);
+
+    let comparison = branch_comparison(
+        dir.path(),
+        BranchKind::Local,
+        "feature",
+        None,
+        None,
+        Some(dir.path()),
+    )
+    .unwrap();
+
+    assert!(comparison.is_none());
+}
+
+#[test]
+fn branch_comparison_file_diff_preserves_binary_rename_and_truncation_behavior() {
+    let dir = repo_with_main();
+    write(dir.path(), "rename-me.txt", "same\n");
+    commit_all(dir.path(), "add rename source");
+    git(dir.path(), &["switch", "-q", "-c", "feature"]);
+    git(dir.path(), &["mv", "rename-me.txt", "renamed.txt"]);
+    std::fs::write(dir.path().join("binary.dat"), [0, 1, 2, 0, 3]).unwrap();
+    write(
+        dir.path(),
+        "long.txt",
+        &format!("{}\n", "x".repeat(2_000_000)),
+    );
+
+    let comparison = branch_comparison(
+        dir.path(),
+        BranchKind::Local,
+        "feature",
+        None,
+        None,
+        Some(dir.path()),
+    )
+    .unwrap()
+    .unwrap();
+    let read = |file: &str| {
+        branch_comparison_file_diff(
+            dir.path(),
+            &comparison.merge_base_oid,
+            &comparison.head_oid,
+            Some(dir.path()),
+            file,
+        )
+        .unwrap()
+    };
+
+    let renamed = read("renamed.txt");
+    assert!(renamed.hunks.is_empty());
+    let binary = read("binary.dat");
+    assert!(binary.binary && binary.hunks.is_empty());
+    let long = read("long.txt");
+    assert!(long.truncated);
+    assert!(!long.hunks.is_empty());
+}
+
+#[test]
+fn branch_comparison_uses_latest_merged_base_and_supports_an_explicit_base() {
+    let dir = repo_with_main();
+    git(dir.path(), &["switch", "-q", "-c", "feature"]);
+    write(dir.path(), "feature.txt", "feature\n");
+    commit_all(dir.path(), "feature");
+
+    git(dir.path(), &["switch", "-q", "main"]);
+    write(dir.path(), "main-only.txt", "main\n");
+    commit_all(dir.path(), "advance main");
+    let main_tip = git(dir.path(), &["rev-parse", "HEAD"]);
+    git(dir.path(), &["switch", "-q", "feature"]);
+    git(dir.path(), &["merge", "-q", "--no-edit", "main"]);
+    git(dir.path(), &["branch", "stack-base"]);
+    write(dir.path(), "child.txt", "child\n");
+    commit_all(dir.path(), "stacked child");
+
+    let against_default = branch_comparison(
+        dir.path(),
+        BranchKind::Local,
+        "feature",
+        None,
+        None,
+        Some(dir.path()),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(against_default.merge_base_oid, main_tip);
+    assert!(
+        against_default
+            .files
+            .iter()
+            .any(|file| file.path == "feature.txt")
+    );
+    assert!(
+        !against_default
+            .files
+            .iter()
+            .any(|file| file.path == "main-only.txt"),
+        "changes merged from the base are not branch work"
+    );
+
+    let against_stack_base = branch_comparison(
+        dir.path(),
+        BranchKind::Local,
+        "feature",
+        Some(BranchKind::Local),
+        Some("stack-base"),
+        None,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(against_stack_base.base_name, "stack-base");
+    assert!(!against_stack_base.includes_worktree);
+    assert_eq!(against_stack_base.files.len(), 1);
+    assert_eq!(against_stack_base.files[0].path, "child.txt");
+}
+
+#[test]
+fn branch_comparison_is_unavailable_without_a_common_ancestor() {
+    let dir = repo_with_main();
+    git(dir.path(), &["switch", "-q", "--orphan", "unrelated"]);
+    let _ = std::fs::remove_file(dir.path().join("README.md"));
+    write(dir.path(), "unrelated.txt", "unrelated\n");
+    commit_all(dir.path(), "unrelated root");
+
+    let comparison = branch_comparison(
+        dir.path(),
+        BranchKind::Local,
+        "unrelated",
+        Some(BranchKind::Local),
+        Some("main"),
+        Some(dir.path()),
+    )
+    .unwrap();
+    assert!(comparison.is_none());
+}
+
+#[test]
+fn branch_comparison_does_not_silently_drop_an_unmerged_file() {
+    let dir = repo_with_main();
+    write(dir.path(), "conflict.txt", "base\n");
+    commit_all(dir.path(), "add conflict base");
+    git(dir.path(), &["switch", "-q", "-c", "feature"]);
+    write(dir.path(), "conflict.txt", "feature\n");
+    commit_all(dir.path(), "feature edit");
+    git(dir.path(), &["switch", "-q", "main"]);
+    write(dir.path(), "conflict.txt", "main\n");
+    commit_all(dir.path(), "main edit");
+    git(dir.path(), &["switch", "-q", "feature"]);
+
+    let output = Command::new("git")
+        .args(["merge", "--no-edit", "main"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "fixture merge must conflict");
+
+    let comparison = branch_comparison(
+        dir.path(),
+        BranchKind::Local,
+        "feature",
+        None,
+        None,
+        Some(dir.path()),
+    )
+    .unwrap()
+    .unwrap();
+    let conflict = comparison
+        .files
+        .iter()
+        .find(|file| file.path == "conflict.txt")
+        .expect("an unresolved conflict must remain visible");
+    assert_eq!(conflict.change, ChangeKind::Modified);
+}
 
 #[test]
 fn commit_changed_files_lists_files_against_first_parent() {

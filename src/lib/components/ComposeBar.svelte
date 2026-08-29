@@ -19,6 +19,7 @@
     forwardSourceForAgent,
     forwardSourceAgentsForPane,
     forwardReadiness,
+    orderForwardSources,
     reconcileForwardSources,
     reconcileForwardSourceMap,
     type ForwardReadiness,
@@ -265,6 +266,7 @@
   let forwardSources = $state<ForwardSource[]>(
     untrack(() => reconcileForwardSources(savedForwards.message, agents)),
   );
+  const orderedForwardSources = $derived(orderForwardSources(forwardSources, agents));
 
   function addForwardSource(source: ForwardSource): void {
     if (forwardSources.some((s) => forwardSourceKey(s) === forwardSourceKey(source))) return;
@@ -747,11 +749,16 @@
   /// live `$state`, or it would keep mutating after this bar is gone.
   function currentForwards(): ComposeForwards {
     const copyMap = (map: Record<string, ForwardSource[]>): Record<string, ForwardSource[]> =>
-      Object.fromEntries(Object.entries(map).map(([field, sources]) => [field, [...sources]]));
+      Object.fromEntries(
+        Object.entries(map).map(([field, sources]) => [
+          field,
+          orderForwardSources(sources, agents),
+        ]),
+      );
     return {
-      message: [...forwardSources],
+      message: [...orderedForwardSources],
       promptArgs: copyMap(promptArgSources),
-      promptAppended: [...promptAppendedSources],
+      promptAppended: orderForwardSources(promptAppendedSources, agents),
       workflowFields: copyMap(workflowForwardSources),
     };
   }
@@ -1225,7 +1232,7 @@
     if (!menuOpen || agents.length <= 1 || mode !== "plain") return [];
     const q = menuQuery.toLowerCase();
     const items: ForwardMenuItem[] = [];
-    const alreadyForwarded = expandForwardSources(forwardSources);
+    const alreadyForwarded = expandForwardSources(forwardSources, agents);
     if (paneLayout.panes.length > 1) {
       for (const pane of paneLayout.panes) {
         if (!pane.name.toLowerCase().includes(q)) continue;
@@ -2052,7 +2059,7 @@
       // map carries only fields the user actually attached a forward to.
       const forwardSources: Record<string, AgentId[]> = {};
       for (const [name, sources] of Object.entries(workflowForwardSources)) {
-        if (sources.length > 0) forwardSources[name] = expandForwardSources(sources);
+        if (sources.length > 0) forwardSources[name] = expandForwardSources(sources, agents);
       }
       const runId = await api.invokeWorkflow(
         projectId,
@@ -2146,6 +2153,7 @@
     const forwardId = crypto.randomUUID();
     const sendId = crypto.randomUUID();
     const recipients = targets.map((t) => t.id);
+    const orderedSources = orderForwardSources(sources, agents);
     // Capture the project id for the held-forward store calls: the hold can
     // outlive this ComposeBar instance (the user navigates to another project
     // while it waits — the compose bar is `{#key projectId}`-remounted, so this
@@ -2154,10 +2162,20 @@
     // `projectId` prop, which no longer resolves to it once the instance is gone
     // — otherwise the held entry is never removed and the "waiting…" row sticks.
     const forwardProjectId = projectId;
-    addHeldForward(forwardProjectId, { forwardId, sendId, body, sources, recipients });
+    addHeldForward(forwardProjectId, {
+      forwardId,
+      sendId,
+      body,
+      sources: orderedSources,
+      recipients,
+    });
     void (async () => {
       try {
-        const outcome = await api.forwardMessage(body, expandForwardSources(sources), forwardId);
+        const outcome = await api.forwardMessage(
+          body,
+          expandForwardSources(orderedSources, agents),
+          forwardId,
+        );
         removeHeldForward(forwardProjectId, forwardId);
         if (outcome.status === "resolved") {
           // Dispatch the composed body as a normal send under this forward's
@@ -2170,13 +2188,13 @@
         } else {
           // invalidated (a source failed/cancelled, or any source resolved with
           // no forwardable text) or the user cancelled — restore the composer.
-          restoreForward(body, sources, attachments);
+          restoreForward(body, orderedSources, attachments);
           if (outcome.status === "invalidated") showError(`Forward not sent: ${outcome.reason}`);
         }
       } catch (err) {
         removeHeldForward(forwardProjectId, forwardId);
         showError(`Forward failed: ${err instanceof Error ? err.message : String(err)}`);
-        restoreForward(body, sources, attachments);
+        restoreForward(body, orderedSources, attachments);
       }
     })();
   }
@@ -2246,6 +2264,7 @@
         allSources.push(source);
       }
     }
+    const orderedSources = orderForwardSources(allSources, agents);
     // Capture the project id for the held-forward store calls — see
     // `dispatchForward`: this hold can outlive the `{#key projectId}`-remounted
     // ComposeBar instance, so the cleanup must key the global store by *this*
@@ -2258,7 +2277,7 @@
       forwardId,
       sendId,
       body: "",
-      sources: allSources,
+      sources: orderedSources,
       recipients,
       promptName: promptDisplayName(prompt),
     });
@@ -2266,7 +2285,7 @@
       .filter((a) => (argSources[a.name]?.length ?? 0) > 0)
       .map((a) => ({
         name: a.name,
-        sources: expandForwardSources(argSources[a.name] ?? []),
+        sources: expandForwardSources(argSources[a.name] ?? [], agents),
         required: a.required,
       }));
     void (async () => {
@@ -2281,7 +2300,7 @@
           buildRenderArgs(prompt, typedArgs),
           forwardArgs,
           appended,
-          expandForwardSources(appendedSources),
+          expandForwardSources(appendedSources, agents),
           forwardId,
         );
         removeHeldForward(forwardProjectId, forwardId);
@@ -2360,9 +2379,13 @@
     // Bump this project's local last-activity so it sorts/reads as active right
     // away, before any turn event round-trips. Once per send action.
     recordProjectsActivityLocally([dispatchProjectId], currentIsoTimestamp());
-    // Announce the send to this project's transcript so it follows the
-    // response, once per send action rather than per recipient.
-    noteLocalSend(dispatchProjectId, sendId);
+    // Announce the send so transcripts containing its recipients follow the
+    // response, once per send action rather than once per recipient.
+    noteLocalSend(
+      dispatchProjectId,
+      sendId,
+      targets.map((target) => target.id),
+    );
     // Register the whole recipient set *before* any IPC call, so one recipient's
     // rejection can't erase an agent that was supposed to be in the send — and so
     // the completion tracker can join sends queued onto the same busy agents into
@@ -3429,7 +3452,7 @@
             data-testid="forward-source-chips"
           >
             <span class="text-muted text-xs">Forwarding from</span>
-            {#each forwardSources as source (forwardSourceKey(source))}
+            {#each orderedForwardSources as source (forwardSourceKey(source))}
               <ForwardSourceChip
                 {source}
                 readiness={agentReadiness(source.id)}

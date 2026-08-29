@@ -11,8 +11,8 @@ vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(async (cmd: string) => {
     if (cmd === "changed_files")
       return [
-        { path: "a.ts", change: "modified" },
-        { path: "b.ts", change: "modified" },
+        { path: "a.ts", change: "modified", additions: 12, deletions: 3 },
+        { path: "b.ts", change: "modified", additions: 4, deletions: 1 },
       ];
     if (cmd === "file_diff")
       return {
@@ -49,6 +49,30 @@ const DARK_ACTIVE = "rgb(48, 48, 54)";
 const TRANSPARENT = "rgba(0, 0, 0, 0)"; // no background at all
 
 afterEach(() => document.documentElement.classList.remove("dark"));
+
+test("a root changed-file row keeps stable geometry while its actions appear", async () => {
+  mountDiffPanel({ target: TARGET });
+
+  const rows = page.getByTestId("changed-file");
+  await expect.element(rows.nth(1)).toBeInTheDocument();
+  const first = rows.nth(0).element() as HTMLElement;
+  const second = rows.nth(1).element() as HTMLElement;
+  const initialHeight = first.getBoundingClientRect().height;
+  const initialSecondTop = second.getBoundingClientRect().top;
+
+  await rows.nth(0).hover();
+  const samples: Array<{ height: number; secondTop: number }> = [];
+  for (let frame = 0; frame < 12; frame += 1) {
+    await new Promise(requestAnimationFrame);
+    samples.push({
+      height: first.getBoundingClientRect().height,
+      secondTop: second.getBoundingClientRect().top,
+    });
+  }
+
+  expect(samples.map((sample) => sample.height)).toEqual(samples.map(() => initialHeight));
+  expect(samples.map((sample) => sample.secondTop)).toEqual(samples.map(() => initialSecondTop));
+});
 
 test("a selected row's action icon hovers white; an unselected row's is stronger than its row hover", async () => {
   mountDiffPanel({ target: TARGET });

@@ -11,6 +11,7 @@
     forwardSourceKey,
     forwardSourceForAgent,
     forwardSourceAgentsForPane,
+    orderForwardSources,
     type ForwardReadiness,
     type ForwardSource,
   } from "$lib/state/heldForwards.svelte";
@@ -526,7 +527,7 @@
   {/snippet}
 
   {#snippet forwardChips(name: string)}
-    {@const sources = forwardSources[name] ?? []}
+    {@const sources = orderForwardSources(forwardSources[name] ?? [], agents)}
     {#if sources.length > 0}
       <div
         class="flex flex-wrap items-center gap-1.5"

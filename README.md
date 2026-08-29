@@ -14,7 +14,7 @@ It's built for anyone who wants explicit, human-in-the-loop control over multi-a
 
 ![Git view](docs/images/git-view.png)
 
-Switchboard also has a **Git view** for reviewing repositories, changed files, diffs, and commit history without leaving the app. It is deliberately read-only: Switchboard does not stage files, create commits, or replace a full Git client.
+Switchboard also has a **Git view** for reviewing repositories, complete branch changes against a comparison base, uncommitted changes, individual commits, and file diffs without leaving the app. It is deliberately read-only: Switchboard does not stage files, create commits, or replace a full Git client.
 
 ## Features
 

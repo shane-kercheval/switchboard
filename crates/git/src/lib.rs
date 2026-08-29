@@ -2,8 +2,8 @@
 //!
 //! Given a path on disk, this crate produces the full read-model the Git view
 //! needs: a repo's branches (local and remote), the worktrees its branches are
-//! checked out in, per-branch and per-worktree status, and the changed-files +
-//! diff text for a single worktree.
+//! checked out in, per-branch and per-worktree status, and structured file diffs
+//! for worktrees, commits, and PR-style branch comparisons.
 //!
 //! # `git2` reads, shell-out writes
 //!
@@ -49,11 +49,12 @@ mod read;
 
 pub use error::{GitError, Result};
 pub use model::{
-    BranchView, ChangeKind, ChangedFile, CommitChanges, CommitRangeKind, DiffHunk, DiffLine,
-    DiffLineKind, FileDiff, GitCommitRange, GitCommitSummary, RemoteBranchView, RepoView,
-    SyncState, WorktreeView, WorktreeWarning,
+    BranchComparison, BranchView, ChangeKind, ChangedFile, CommitChanges, CommitRangeKind,
+    DiffHunk, DiffLine, DiffLineKind, FileDiff, GitCommitRange, GitCommitSummary, RemoteBranchView,
+    RepoView, SyncState, WorktreeView, WorktreeWarning,
 };
 pub use read::{
-    BranchKind, changed_files, commit_changed_files, commit_file_diff, commit_ranges, file_diff,
-    read_repo, resolve_repo_root,
+    BranchKind, branch_comparison, branch_comparison_file_diff, changed_files,
+    commit_changed_files, commit_file_diff, commit_ranges, file_diff, read_repo, resolve_repo_root,
+    validate_branch_comparison_endpoint,
 };

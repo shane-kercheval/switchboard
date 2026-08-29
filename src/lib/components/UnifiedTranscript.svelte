@@ -1074,13 +1074,12 @@
     captureAnchor();
   }
 
-  /// A local send force-pins: submitting a message is the user's explicit
-  /// request to see the response, wherever they had scrolled. Runs before the
-  /// first chunk arrives (the send appends the user turn synchronously), so
-  /// auto-follow is engaged when streaming starts. Only THIS project's sends
-  /// count — a forward can dispatch into another project from a closure that
-  /// outlived a project switch. Seeded with the current sequence so a mount
-  /// does not replay the previous send.
+  /// A local send force-pins this transcript only when one of its visible agents
+  /// is a recipient. Submitting is the user's explicit request to see that
+  /// response, wherever they had scrolled, but unrelated panes must keep their
+  /// reading place. Runs before the first chunk arrives, so auto-follow is
+  /// engaged when streaming starts. Seeded with the current project sequence so
+  /// a mount does not replay an earlier send.
   // Keyed by project and seeded on first sighting rather than at mount: the
   // instance is remounted per project today, but reading `projectId` outside
   // the effect would silently capture the mount-time value if that ever
@@ -1092,12 +1091,17 @@
   $effect(() => {
     // `?? 0` so "no send yet" is a value: without it the first real send is
     // indistinguishable from the first sighting and gets adopted as history.
-    const seq = getLocalSend(projectId)?.seq ?? 0;
+    const localSend = getLocalSend(projectId);
+    const seq = localSend?.seq ?? 0;
     const seen = seenSendSeq[projectId];
     seenSendSeq[projectId] = seq;
     // A send that predates this transcript's first sighting is history, not a
     // request: adopt the sequence without following.
     if (seen === undefined || seq === seen) return;
+    const targetsThisTranscript = agents.some(
+      (agent) => (localSend?.recipientSeqs[agent.id] ?? 0) > seen,
+    );
+    if (!targetsThisTranscript) return;
     if (!container) return;
     debugNote("outer", "local send force-pin", seq);
     outerPin.setPinned(true, geometryOf(container));

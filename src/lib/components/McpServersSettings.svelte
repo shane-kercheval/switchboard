@@ -27,7 +27,7 @@
   let url = $state("");
   // Widened to string for SegmentedSelect's bindable value; only "bearer" and
   // "oauth" are ever assigned.
-  let authMode = $state("bearer");
+  let authMode = $state("oauth");
   let bearer = $state("");
   let adding = $state(false);
   let addError = $state<string | null>(null);
@@ -124,7 +124,7 @@
     name = "";
     url = "";
     bearer = "";
-    authMode = "bearer";
+    authMode = "oauth";
     testResult = null;
     addError = null;
   }
@@ -519,8 +519,8 @@
       <SegmentedSelect
         bind:value={authMode}
         options={[
-          { label: "Bearer token", value: "bearer" },
           { label: "OAuth sign-in", value: "oauth" },
+          { label: "Bearer token", value: "bearer" },
         ]}
         ariaLabel="Authentication mode"
         testid="mcp-auth-mode"

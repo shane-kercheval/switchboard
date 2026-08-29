@@ -245,6 +245,27 @@ describe("PromptComposer per-argument forwarding", () => {
     expect(screen.queryByTestId("prompt-arg-sources-tone")).toBeNull();
   });
 
+  it("renders field forward chips in agent-card order", () => {
+    setupForward(
+      { focus: "", tone: "" },
+      {
+        argSources: {
+          focus: [
+            { id: CAROL.id, name: "carol" },
+            { id: BOB.id, name: "bob" },
+          ],
+        },
+      },
+    );
+
+    const sources = screen.getByTestId("prompt-arg-sources-focus");
+    expect(
+      Array.from(sources.querySelectorAll('[data-testid^="forward-source-chip-"]')).map((chip) =>
+        chip.getAttribute("data-testid"),
+      ),
+    ).toEqual(["forward-source-chip-bob", "forward-source-chip-carol"]);
+  });
+
   it("removes a source chip via its remove control", async () => {
     setupForward({ focus: "", tone: "" }, { argSources: { focus: [{ id: BOB.id, name: "bob" }] } });
     expect(screen.getByTestId("forward-source-chip-bob")).toBeInTheDocument();

@@ -1921,10 +1921,12 @@ describe("UnifiedTranscript — markdown rendering", () => {
     container.scrollTop = 200;
     await fireEvent.scroll(container);
 
-    // They send a new message: the compose path announces the send for this
-    // project, then dispatches the user turn.
+    // They send a new message, immediately followed by a coalesced send to a
+    // different pane. This transcript must still observe its earlier recipient
+    // sequence even though the project's latest send targets someone else.
     Object.defineProperty(container, "scrollHeight", { configurable: true, value: 1100 });
-    state.noteLocalSend(PROJECT_ID, "send-new");
+    state.noteLocalSend(PROJECT_ID, "send-new", [CLAUDE_AGENT.id]);
+    state.noteLocalSend(PROJECT_ID, "send-other-pane", [CODEX_AGENT.id]);
     state.dispatchUserTurn(
       CLAUDE_AGENT.id,
       "user-new",
@@ -1985,7 +1987,44 @@ describe("UnifiedTranscript — markdown rendering", () => {
     container.scrollTop = 200;
     await fireEvent.scroll(container);
 
-    state.noteLocalSend("some-other-project", "send-elsewhere");
+    state.noteLocalSend("some-other-project", "send-elsewhere", [CLAUDE_AGENT.id]);
+    await tick();
+
+    expect(container.scrollTop).toBe(200);
+  });
+
+  it("a same-project send to another transcript does not move this transcript", async () => {
+    const state = await loadState();
+    await state.registerAgent(CODEX_AGENT);
+
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CODEX_AGENT] } });
+
+    const container = screen.getByTestId("unified-transcript");
+    Object.defineProperty(container, "scrollHeight", { configurable: true, value: 1000 });
+    Object.defineProperty(container, "clientHeight", { configurable: true, value: 500 });
+
+    // Establish a rendered conversation and let the local-send effect adopt
+    // the project's initial sequence before exercising recipient exclusion.
+    fireTo(`agent:${CODEX_AGENT.id}`, {
+      type: "turn_start",
+      turn_id: "turn-1",
+      message_id: "msg-1",
+      send_id: "msg-1",
+      started_at: "2026-05-16T00:00:00Z",
+    });
+    fireTo(`agent:${CODEX_AGENT.id}`, {
+      type: "content_chunk",
+      turn_id: "turn-1",
+      kind: "text",
+      text: "first",
+    });
+    await waitFor(() => expect(container.scrollTop).toBe(1000));
+
+    await fireEvent.wheel(container, { deltaY: -300 });
+    container.scrollTop = 200;
+    await fireEvent.scroll(container);
+
+    state.noteLocalSend(PROJECT_ID, "send-other-pane", [CLAUDE_AGENT.id]);
     await tick();
 
     expect(container.scrollTop).toBe(200);

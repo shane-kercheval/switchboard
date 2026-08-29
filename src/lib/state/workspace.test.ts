@@ -394,7 +394,7 @@ describe("workspace project activity", () => {
       return undefined;
     });
 
-    await ws.removeDirectory(busyProject.directory ?? "");
+    await ws.hideDirectory(busyProject.directory ?? "");
     await tick();
 
     expect(ws.backgroundCompletedProjectIds[PROJECT_1]).toBeUndefined();

@@ -512,6 +512,14 @@ impl Store {
         if !canonical.is_dir() {
             return Err(CoreError::NotADirectory { path: canonical });
         }
+        // Enforce the premise the method's whole justification rests on: this
+        // restores a mapping for an identity that already exists *because
+        // projects reference it*. Unenforced, a repair path could mint a row for
+        // an id nothing points at — manufacturing the orphan state it was built
+        // to fix.
+        if !self.list_projects()?.iter().any(|p| p.directory_id == id) {
+            return Err(CoreError::DirectoryNotFound(id));
+        }
         let entries = self.list_directories()?;
         if entries.iter().any(|e| e.directory_id == id) {
             return Err(CoreError::DuplicateDirectoryId(id));
@@ -1603,10 +1611,28 @@ mod tests {
     }
 
     #[test]
+    fn binding_an_id_no_project_references_is_refused() {
+        // The method's justification is that binding restores a mapping for an
+        // identity projects already reference. Unenforced, a repair path could
+        // mint a row for an id nothing points at — manufacturing the orphan
+        // state it exists to fix.
+        let (root, _cwd, store, id) = store_with_dir();
+        crate::io::write_jsonl::<DirectoryEntry>(&root.path().join(DIRECTORIES_CATALOG), &[])
+            .unwrap();
+        let elsewhere = TempDir::new().unwrap();
+
+        assert!(matches!(
+            store.bind_directory(id, elsewhere.path()).unwrap_err(),
+            CoreError::DirectoryNotFound(_)
+        ));
+    }
+
+    #[test]
     fn binding_an_id_that_still_has_a_row_is_refused() {
         // Otherwise the repair for an ambiguous identity would be the thing that
         // creates one. Re-pointing is the operation for an id that resolves.
         let (_root, _cwd, store, id) = store_with_dir();
+        store.create_project(id, "alpha").unwrap();
         let elsewhere = TempDir::new().unwrap();
         assert!(matches!(
             store.bind_directory(id, elsewhere.path()).unwrap_err(),
@@ -1617,6 +1643,7 @@ mod tests {
     #[test]
     fn binding_refuses_a_path_another_identity_holds() {
         let (root, _cwd, store, id) = store_with_dir();
+        store.create_project(id, "alpha").unwrap();
         let taken = TempDir::new().unwrap();
         let other = store.add_directory(taken.path()).unwrap();
         let kept: Vec<DirectoryEntry> = store

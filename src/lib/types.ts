@@ -568,7 +568,9 @@ export type ProjectSummary = {
 //     Repairable by re-pointing the directory.
 //   - `catalog_ambiguous`: two catalog rows claim one directory identity.
 //     Corruption, also repaired by a re-point (which collapses them).
-//   - `catalog_missing`: no catalog row at all. Corruption with no in-app repair.
+//   - `catalog_missing`: no catalog row at all. Corruption, repaired by
+//     re-binding the identity to a user-chosen folder — the same affordance as
+//     the other two, a different operation underneath.
 // New variants land additively (the Rust enum is `#[non_exhaustive]`), so
 // consumers must degrade on an unknown value rather than assume exhaustiveness.
 export type DirectoryStatus =

@@ -84,36 +84,63 @@ impl Workspace {
         self.entries.push(DirectoryEntry { path });
     }
 
-    /// Move a known entry to a new path, keeping its position and hidden flag.
+    /// Retire every path a directory identity used to hold and register the one
+    /// it holds now, keeping the entry's position and visibility.
     ///
-    /// The directory's *identity* is unchanged — only where it lives — so its
-    /// place in the user's ordering and their choice to hide it must survive.
-    /// Remove-then-add would silently send it to the end of the list. No-op if
-    /// `old` isn't known; collapses onto the existing entry if `new` already is.
-    pub fn replace_path(&mut self, old: &Path, new: PathBuf) {
-        let Some(index) = self.entries.iter().position(|entry| entry.path == old) else {
-            return;
-        };
-        let was_hidden = self.hidden.remove(old);
-        if self.entries.iter().any(|entry| entry.path == new) {
-            self.entries.remove(index);
-        } else {
-            self.entries[index].path.clone_from(&new);
+    /// **Plural, and chosen by what this registry knows.** A duplicated identity
+    /// holds more than one catalog path, and catalog order has no relationship
+    /// to the order the user arranged their directories in — the surplus row
+    /// typically arrives from outside (a partial restore, a bulk write) and is
+    /// not an entry here at all. Picking `old[0]` therefore updated nothing and
+    /// retired the legitimate row, leaving the repaired directory with **no
+    /// entry**: gone from the list, its position and hidden flag lost, while the
+    /// repair reported success. So: keep the earliest old path this registry
+    /// actually tracks, retire the rest, and fall back to appending when it
+    /// tracks none of them.
+    ///
+    /// Conflicting hidden flags collapse toward **visible** — if any retired row
+    /// was visible the repaired directory stays visible, which is the less
+    /// surprising outcome for a user who just fixed it.
+    pub fn replace_paths(&mut self, old: &[PathBuf], new: PathBuf) {
+        let anchor = old
+            .iter()
+            .filter_map(|path| {
+                self.entries
+                    .iter()
+                    .position(|entry| entry.path == *path)
+                    .map(|index| (index, path))
+            })
+            .min_by_key(|(index, _)| *index);
+        // Visible unless every tracked old path was hidden. `old` being empty is
+        // the bind case — the identity held no path at all — and a repaired
+        // directory the registry has never seen must not arrive hidden.
+        let visible = old.is_empty()
+            || !old.iter().any(|path| self.contains(path))
+            || old
+                .iter()
+                .any(|path| self.contains(path) && !self.is_hidden(path));
+        for path in old {
+            self.hidden.remove(path);
         }
-        if was_hidden {
+        if let Some((index, keep)) = anchor {
+            let keep = keep.clone();
+            self.entries
+                .retain(|entry| entry.path == keep || !old.contains(&entry.path));
+            let index = index.min(self.entries.len().saturating_sub(1));
+            if self.entries.iter().any(|entry| entry.path == new) {
+                // The destination is already tracked; retiring the anchor
+                // collapses onto it rather than creating a duplicate row.
+                self.entries.retain(|entry| entry.path != keep);
+            } else {
+                self.entries[index].path.clone_from(&new);
+            }
+        } else {
+            self.entries.retain(|entry| !old.contains(&entry.path));
+            self.add(new.clone());
+        }
+        if !visible {
             self.hidden.insert(new);
         }
-    }
-
-    /// Drop an entry entirely, with its hidden flag.
-    ///
-    /// Not the inverse of [`Self::add`] for user-facing purposes — "remove
-    /// directory" hides. This is for retiring a path that no longer names
-    /// anything: the surplus rows a duplicated directory identity left behind,
-    /// which would otherwise linger in the user's list pointing nowhere.
-    pub fn forget_path(&mut self, path: &Path) {
-        self.entries.retain(|entry| entry.path != path);
-        self.hidden.remove(path);
     }
 
     /// Hide (or unhide) a directory. Returns whether the set changed.

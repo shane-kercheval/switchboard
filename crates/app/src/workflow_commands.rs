@@ -1157,6 +1157,26 @@ pub fn validate_workflow_invocation_impl(
 
 // --- invoke ------------------------------------------------------------------
 
+/// Register a live run before its task is spawned, so cancel/list see it
+/// immediately.
+///
+/// Enforces one run per project **atomically** under the registry lock: the
+/// existing-run check and the insert happen under one acquisition, so two
+/// concurrent invokes cannot both pass.
+fn register_live_run(
+    state: &AppState,
+    project_id: ProjectId,
+    run_id: uuid::Uuid,
+    run: ActiveRun,
+) -> Result<(), AppError> {
+    let mut runs = lock(&state.workflow_runs);
+    if runs.values().any(|r| r.project_id == project_id) {
+        return Err(AppError::WorkflowAlreadyRunning { project_id });
+    }
+    runs.insert(run_id, run);
+    Ok(())
+}
+
 /// Validate, bind, snapshot, and launch a workflow run on a background task,
 /// returning its `run_id` immediately. The interpreter dispatches every step
 /// backend-side; there is no per-step frontend round-trip.
@@ -1177,6 +1197,7 @@ pub fn invoke_workflow_impl(
         .get(&project_id)
         .cloned()
         .ok_or(AppError::ProjectNotLoaded(project_id))?;
+    let generation = crate::commands::project_generation(state, project_id);
     let roster = roster_for_project(state, project_id);
     let names: Vec<String> = roster.iter().map(|r| r.name.clone()).collect();
 
@@ -1239,30 +1260,25 @@ pub fn invoke_workflow_impl(
         return Err(AppError::WorkflowRunRequiresDismissal { project_id });
     }
 
-    // Register the live run before spawning so cancel/list see it immediately.
-    // Enforce one run per project **atomically** under the registry lock: check for
-    // an existing active run for this project and insert under the same acquisition,
-    // so two concurrent invokes can't both pass. The task is spawned only after.
-    {
-        let mut runs = lock(&state.workflow_runs);
-        if runs.values().any(|r| r.project_id == project_id) {
-            return Err(AppError::WorkflowAlreadyRunning { project_id });
-        }
-        runs.insert(
-            run_id,
-            ActiveRun {
-                cancel: cancel.clone(),
-                project_id,
-                workflow: workflow_name.clone(),
-                snapshot: RunSnapshot {
-                    total_steps,
-                    current_step: 0,
-                },
-                steps: resolved_steps,
-                done: Arc::clone(&done),
+    // `project` was captured well above; a lifecycle operation can complete in
+    // between (see `reject_if_generation_changed`).
+    crate::commands::reject_if_generation_changed(state, project_id, generation)?;
+    register_live_run(
+        state,
+        project_id,
+        run_id,
+        ActiveRun {
+            cancel: cancel.clone(),
+            project_id,
+            workflow: workflow_name.clone(),
+            snapshot: RunSnapshot {
+                total_steps,
+                current_step: 0,
             },
-        );
-    }
+            steps: resolved_steps,
+            done: Arc::clone(&done),
+        },
+    )?;
 
     let run = WorkflowRun {
         mcp_prompt_arg_names: form.mcp_prompt_arg_names,

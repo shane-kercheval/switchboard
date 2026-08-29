@@ -338,12 +338,12 @@ export async function migrateMessagePin(
   return await invoke<MessagePin[]>("migrate_message_pin", { projectId, fromKey, toKey });
 }
 
-// Hides a directory: drains its projects' in-flight turns and releases their
-// locks, then marks it hidden. Nothing is deleted — the entry, its projects, and
-// their history all survive, and adding the directory back unhides it. A catalog
-// entry is referenced by every project in the directory, so it cannot be dropped
-// without orphaning them; "remove" is view-state.
-export async function removeDirectory(path: string): Promise<void> {
+// Hides a directory. Nothing is deleted and nothing is stopped: the entry, its
+// projects, their history, and any in-flight turns all survive, and adding the
+// directory back unhides it. A catalog entry is referenced by every project in
+// the directory, so it cannot be dropped without orphaning them — hiding is
+// view-state, which is why it drains nothing.
+export async function hideDirectory(path: string): Promise<void> {
   await invoke<null>("remove_directory", { path });
 }
 

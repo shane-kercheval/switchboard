@@ -84,6 +84,20 @@ impl VisibleProject {
     }
 }
 
+/// Two-way handshake for the post-eviction pause point.
+///
+/// **`entered` is not decoration.** A one-way barrier can be deleted from the
+/// operation and the test still passes, having silently stopped testing the
+/// ordering — which is exactly how the first two attempts at that test failed.
+/// With the handshake, the test blocks on `entered`, so removing the pause makes
+/// it time out rather than pass.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub struct MaintenanceBarrier {
+    pub entered: tokio::sync::Notify,
+    pub release: tokio::sync::Notify,
+}
+
 /// The single piece of state managed by Tauri. Multi-project and
 /// multi-directory (per system-design §3): the app holds N working directories
 /// concurrently, each hosting N projects. `directories` keys every loaded
@@ -267,6 +281,29 @@ pub struct AppState {
     /// is a no-op while this is `None`, so tests never touch user-global state.
     pub workspace_path: Option<PathBuf>,
 
+    /// Per-project counter, bumped by every lifecycle operation.
+    ///
+    /// **Closes the admitted-then-suspended send.** The maintenance mark stops
+    /// *new* work entering the window, but a send that resolved its `Project` a
+    /// moment earlier already holds a snapshot of where the project used to
+    /// live, and nothing bounds how long it can sit between that lookup and the
+    /// dispatcher enqueue — `ensure_materializing_fork_may_dispatch` awaits a
+    /// reply from an actor that may itself be mid-turn. Re-draining after the
+    /// write does not help: a send suspended past the drain still enqueues its
+    /// stale factory.
+    ///
+    /// So the send captures the generation at lookup and re-verifies it
+    /// immediately before handing off. Anything whose view predates a lifecycle
+    /// operation is refused, however long it waited.
+    ///
+    /// **What this does not cover**, stated rather than glossed: the interval
+    /// between that final check and the dispatcher actually creating the actor.
+    /// Closing it needs `DispatchContextFactory::build` to be able to refuse,
+    /// which it currently cannot — it returns a `DispatchContext`, not a
+    /// `Result` — and making it fallible is a cross-crate change to the same
+    /// trait M2.3 revises for its session lock. Recorded there as a requirement.
+    pub project_generation: Mutex<HashMap<ProjectId, u64>>,
+
     /// Test-only pause point, awaited by the lifecycle operations immediately
     /// after they evict and before they drain.
     ///
@@ -276,7 +313,7 @@ pub struct AppState {
     /// argued, and this milestone has already shipped one test that looked like
     /// coverage and wasn't. A barrier is the smaller price.
     #[cfg(test)]
-    pub maintenance_barrier: Mutex<Option<Arc<tokio::sync::Notify>>>,
+    pub maintenance_barrier: Mutex<Option<Arc<MaintenanceBarrier>>>,
 
     /// Projects currently mid-lifecycle-operation — a re-point or a delete has
     /// evicted their routable state and has not finished rebuilding it.
@@ -395,6 +432,7 @@ impl AppState {
         Self {
             store,
             maintenance: Mutex::new(HashSet::new()),
+            project_generation: Mutex::new(HashMap::new()),
             #[cfg(test)]
             maintenance_barrier: Mutex::new(None),
             #[cfg(test)]

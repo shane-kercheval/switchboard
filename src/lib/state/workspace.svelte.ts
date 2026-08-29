@@ -377,49 +377,34 @@ export async function addDirectory(path: string): Promise<void> {
   await loadWorkspace();
 }
 
-/// Hide a working directory. **"Remove" no longer deletes anything.**
+/// Hide a working directory. **Nothing is deleted, and nothing is torn down.**
 ///
 /// A directory's catalog entry is referenced by every project in it and cannot
-/// be dropped while any of them exists, so removal means "stop showing me this":
-/// the entry survives, its projects survive, and adding the directory back
-/// unhides it. The backend still drains the projects' in-flight turns.
+/// be dropped while any of them exists, so hiding means "stop showing me this":
+/// the entry survives, its projects survive, their agents keep running, and
+/// adding the directory back restores the list.
 ///
-/// The **frontend lifecycle teardown** below is unchanged and still required —
-/// hide-then-re-add lands on the same project ids, so without it the stale
-/// memoized `loadStarted` promise would make re-activation skip
-/// `open_project`/`list_agents` and leave the backend with an unloaded "active"
-/// project, and the hidden agents' listeners would leak.
-export async function removeDirectory(path: string): Promise<void> {
-  // Snapshot the affected project + agent ids BEFORE the await — `loadWorkspace`
-  // (below) will drop these projects from the list, so capture them now.
-  const removedProjectIds = projects.list.filter((p) => p.directory === path).map((p) => p.id);
-  const removedAgentIds = removedProjectIds.flatMap((id) =>
-    (agentsByProject[id] ?? []).map((a) => a.id),
-  );
-  const activeRemoved = removedProjectIds.includes(selection.activeProjectId ?? "");
+/// **This function used to tear down the frontend** — unsubscribing agent and
+/// workflow listeners, deleting transcripts, clearing the memoized load state.
+/// That was correct when the backend drained the directory's agents. It stopped
+/// draining, and this was left behind, so hiding would have kept the work
+/// running with nothing listening to it: quota spent invisibly, and a mid-turn
+/// reconnect on unhide that never saw the turn start. The teardown is gone.
+///
+/// The visible selection is cleared when the hidden directory owns it, because
+/// `activeProject` is derived from the filtered project list — leaving the id
+/// set would render a project the list no longer contains, giving a blank title
+/// and disabled actions over a live transcript. The work itself continues in the
+/// background and is reachable again by unhiding.
+export async function hideDirectory(path: string): Promise<void> {
+  const hiddenProjectIds = projects.list.filter((p) => p.directory === path).map((p) => p.id);
+  const wasActive = hiddenProjectIds.includes(selection.activeProjectId ?? "");
 
-  await api.removeDirectory(path);
+  await api.hideDirectory(path);
 
-  // Backend drop succeeded — tear down the matching frontend state.
-  unregisterAgents(removedAgentIds);
-  unsubscribeProjectWorkflows(removedProjectIds);
-  for (const id of removedProjectIds) {
-    delete agentsByProject[id];
-    delete conversations[id];
-    delete backgroundCompletedProjectIds[id];
-    delete projectActivityOverrides[id];
-    loadStarted.delete(id);
-    hydrationStarted.delete(id);
-    sessionFingerprintBaseline.delete(id);
-    refreshInFlight.delete(id);
-  }
-  previousLiveProjectSendPairs = previousLiveProjectSendPairs.filter(
-    (pair) => !removedProjectIds.includes(pair.projectId),
-  );
-  if (activeRemoved) {
+  if (wasActive) {
     selection.activeProjectId = null;
     selection.activationFailure = null;
-    selection.loadingProjectId = null;
   }
   await loadWorkspace();
 }

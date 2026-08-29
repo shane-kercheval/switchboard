@@ -63,6 +63,7 @@ const openDialogMock = vi.fn(async (_options: unknown): Promise<string | null> =
 type Backend = {
   persistable: boolean;
   dirs: Map<string, { available: boolean }>;
+  hiddenDirs: Set<string>;
   projects: ProjectListing[];
   rosters: Map<string, AgentRecord[]>;
   conversations: Map<string, ProjectConversation>;
@@ -118,6 +119,7 @@ function freshBackend(): Backend {
   return {
     persistable: true,
     dirs: new Map(),
+    hiddenDirs: new Set<string>(),
     projects: [],
     rosters: new Map(),
     conversations: new Map(),
@@ -173,9 +175,14 @@ const invokeMock = vi.fn(async (cmd: string, args?: Record<string, unknown>): Pr
         persistable: backend.persistable,
       };
     case "list_projects":
-      // Only projects in registered directories surface (matches the real
-      // backend: the workspace registry gates which projects are listed).
-      return backend.projects.filter((p) => p.directory !== null && backend.dirs.has(p.directory));
+      // Only projects in registered, unhidden directories surface (matches the
+      // real backend: the workspace registry gates which projects are listed).
+      return backend.projects.filter(
+        (p) =>
+          p.directory !== null &&
+          backend.dirs.has(p.directory) &&
+          !backend.hiddenDirs.has(p.directory),
+      );
     case "pick_directory": {
       // Read-only probe: discovers projects on disk for the chosen folder
       // WITHOUT registering it (no mutation of `backend.dirs`). Mirrors the real
@@ -195,9 +202,9 @@ const invokeMock = vi.fn(async (cmd: string, args?: Record<string, unknown>): Pr
       return { path, has_switchboard: true, projects: [] };
     }
     case "remove_directory": {
-      const path = args?.path as string;
-      backend.dirs.delete(path);
-      backend.projects = backend.projects.filter((p) => p.directory !== path);
+      // Hides. Nothing is deleted and nothing is stopped — the entry, its
+      // projects, and their running turns all survive.
+      backend.hiddenDirs.add(args?.path as string);
       return null;
     }
     case "delete_project": {
@@ -375,6 +382,10 @@ const invokeMock = vi.fn(async (cmd: string, args?: Record<string, unknown>): Pr
       if (backend.openEditorQueue.length > 0) return await backend.openEditorQueue.shift();
       if (backend.openEditorFailure !== null) throw new Error(backend.openEditorFailure);
       return null;
+    case "project_session_fingerprints":
+      // Reached once hiding stopped tearing the project down: it stays loaded,
+      // so its periodic transcript-freshness check keeps running.
+      return [];
     default:
       throw new Error(`unexpected invoke call: ${cmd}`);
   }
@@ -1811,10 +1822,13 @@ describe("App", () => {
     expect(screen.queryByTestId(/^banner-auth_missing-/)).not.toBeInTheDocument();
   });
 
-  // --- directory removal lifecycle (store-level: the `removeDirectory` +
-  // teardown primitive; there is no directory-removal UI yet) ---
+  // --- directory hiding (store-level primitive; there is no UI for it yet) ---
 
-  it("removeDirectory drops the directory's projects and tears down its agents' listeners", async () => {
+  it("hideDirectory removes the row without tearing down the project behind it", async () => {
+    // Inverted from the version that asserted teardown. Hiding is a view filter:
+    // the backend stops nothing, so unsubscribing here would leave the work
+    // running with nothing listening — quota spent invisibly, and a mid-turn
+    // reconnect on unhide that never saw the turn start.
     seedProject({
       projectId: "p-a",
       directory: DIR_A,
@@ -1825,28 +1839,31 @@ describe("App", () => {
     await mountApp();
     await waitFor(() => expect(screen.getAllByTestId("project-row").length).toBe(2));
 
-    // Activate p-a so ag-1's listener is registered, then remove its directory.
     await fireEvent.click(screen.getByText("alpha"));
     await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
     expect(listenCallbacks.has("agent:ag-1")).toBe(true);
 
     const ws = await import("$lib/state/workspace.svelte");
-    await ws.removeDirectory(DIR_A);
+    await ws.hideDirectory(DIR_A);
 
     await waitFor(() => {
       const names = screen.getAllByTestId("project-row").map((r) => r.textContent);
       expect(names.some((n) => n?.includes("beta"))).toBe(true);
       expect(names.some((n) => n?.includes("alpha"))).toBe(false);
     });
-    // Teardown: the removed agent's listener is gone (no leak), and the backend
-    // drain command fired.
-    expect(listenCallbacks.has("agent:ag-1")).toBe(false);
+    expect(
+      listenCallbacks.has("agent:ag-1"),
+      "the hidden project's agent keeps its listener — its work is still running",
+    ).toBe(true);
     expect(
       invokeMock.mock.calls.some(([c, a]) => c === "remove_directory" && a?.path === DIR_A),
     ).toBe(true);
   });
 
-  it("remove-then-re-add reuses no stale state: re-activation re-opens the project", async () => {
+  it("hiding the directory you are working in clears the view", async () => {
+    // `activeProject` is derived from the filtered list, so leaving the id set
+    // would render a project the list no longer contains: blank title, disabled
+    // actions, over a live transcript.
     seedProject({
       projectId: "p-a",
       directory: DIR_A,
@@ -1859,25 +1876,41 @@ describe("App", () => {
     await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
 
     const ws = await import("$lib/state/workspace.svelte");
-    await ws.removeDirectory(DIR_A);
-    await waitFor(() => expect(screen.queryByTestId("project-row")).not.toBeInTheDocument());
+    await ws.hideDirectory(DIR_A);
 
-    // Re-add the same directory + project id (ids persist on disk). The stale
-    // memoized load must NOT be reused: re-activation re-opens the project.
-    const openCallsBefore = invokeMock.mock.calls.filter(([c]) => c === "open_project").length;
+    await waitFor(() => expect(screen.queryByTestId("compose-textarea")).not.toBeInTheDocument());
+  });
+
+  it("hide-then-unhide restores the project without re-opening it", async () => {
+    // Inverted: the previous version asserted a re-open, because the teardown
+    // invalidated the memoized load. Nothing is invalidated now, so returning to
+    // the project reuses what is already loaded — which is what makes hiding
+    // lossless rather than a soft close.
     seedProject({
       projectId: "p-a",
       directory: DIR_A,
       name: "alpha",
       agents: [agent({ id: "ag-1", project_id: "p-a", name: "assistant" })],
     });
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("project-row")).toBeInTheDocument());
+    await fireEvent.click(screen.getByText("alpha"));
+    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
+
+    const ws = await import("$lib/state/workspace.svelte");
+    await ws.hideDirectory(DIR_A);
+    await waitFor(() => expect(screen.queryByTestId("project-row")).not.toBeInTheDocument());
+
+    const openCallsBefore = invokeMock.mock.calls.filter(([c]) => c === "open_project").length;
+    backend.hiddenDirs.delete(DIR_A);
     await ws.loadWorkspace();
 
     await waitFor(() => expect(screen.getByTestId("project-row")).toBeInTheDocument());
     await fireEvent.click(screen.getByText("alpha"));
     await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
-    const openCallsAfter = invokeMock.mock.calls.filter(([c]) => c === "open_project").length;
-    expect(openCallsAfter).toBeGreaterThan(openCallsBefore);
+    expect(invokeMock.mock.calls.filter(([c]) => c === "open_project").length).toBe(
+      openCallsBefore,
+    );
   });
 
   it("a failed activation shows a center error + retry, not an endless loading state", async () => {

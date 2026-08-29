@@ -49,6 +49,7 @@
     overlay?: ConversationItem[];
   } = $props();
 
+  let queryInput = $state("");
   let query = $state("");
   let role = $state<string>("all");
   /// Newest-first by default: the common use is "jump to something recent," so
@@ -61,9 +62,12 @@
   /// a short debounce so running the cursor down the list doesn't flash panels.
   let previewKey = $state<string | null>(null);
   let hoverTimer: ReturnType<typeof setTimeout> | null = null;
+  let queryTimer: ReturnType<typeof setTimeout> | null = null;
   let searchEl = $state<HTMLInputElement | null>(null);
   let listEl = $state<HTMLElement | null>(null);
   let previewEl = $state<HTMLElement | null>(null);
+  let listScrollTop = $state(0);
+  let listViewportHeight = $state(0);
   let entries = $state<NavigatorEntry[]>([]);
   let indexStatus = $state<"idle" | "loading" | "ready">("idle");
   let indexedProjectId = $state<ProjectId | null>(null);
@@ -178,7 +182,48 @@
     untrack(() => scheduleIndex(source));
   });
 
-  onDestroy(cancelScheduledIndex);
+  const QUERY_DEBOUNCE_MS = 180;
+  const NAVIGATOR_ROW_HEIGHT = 28;
+  const NAVIGATOR_OVERSCAN = 8;
+
+  function clearQueryTimer(): void {
+    if (queryTimer === null) return;
+    clearTimeout(queryTimer);
+    queryTimer = null;
+  }
+
+  function resetFilteredPosition(): void {
+    highlighted = 0;
+    listScrollTop = 0;
+    if (listEl !== null) listEl.scrollTop = 0;
+    void tick().then(() => {
+      if (listEl !== null) updateScrollFade(listEl);
+    });
+  }
+
+  function applyQuery(): void {
+    clearQueryTimer();
+    if (query === queryInput) return;
+    query = queryInput;
+    resetFilteredPosition();
+  }
+
+  function scheduleQuery(value: string): void {
+    queryInput = value;
+    clearQueryTimer();
+    queryTimer = setTimeout(() => {
+      queryTimer = null;
+      if (query === queryInput) return;
+      query = queryInput;
+      resetFilteredPosition();
+    }, QUERY_DEBOUNCE_MS);
+  }
+
+  onDestroy(() => {
+    cancelScheduledIndex();
+    clearQueryTimer();
+    if (hoverTimer !== null) clearTimeout(hoverTimer);
+  });
 
   const filtered = $derived.by(() => {
     const matched = filterEntries(entries, query, role as NavigatorRoleFilter).filter(
@@ -190,6 +235,24 @@
     // The index is chronological (oldest first); descending shows newest first.
     return descending ? [...matched].reverse() : matched;
   });
+  const virtualStart = $derived(
+    Math.min(
+      Math.max(0, filtered.length - 1),
+      Math.max(0, Math.floor(listScrollTop / NAVIGATOR_ROW_HEIGHT) - NAVIGATOR_OVERSCAN),
+    ),
+  );
+  const virtualEnd = $derived(
+    Math.min(
+      filtered.length,
+      Math.ceil((listScrollTop + listViewportHeight) / NAVIGATOR_ROW_HEIGHT) + NAVIGATOR_OVERSCAN,
+    ),
+  );
+  const virtualEntries = $derived(
+    filtered.slice(virtualStart, virtualEnd).map((entry, offset) => ({
+      entry,
+      index: virtualStart + offset,
+    })),
+  );
 
   /// Entries whose message renders in no visible pane (agent unassigned or
   /// eye-hidden) can't be jumped to; they render disabled with a tooltip.
@@ -217,6 +280,8 @@
   });
 
   function onOpen(): void {
+    clearQueryTimer();
+    queryInput = "";
     query = "";
     role = "all";
     descending = true;
@@ -229,6 +294,7 @@
 
   function close(): void {
     navigatorState.open = false;
+    clearQueryTimer();
     if (hoverTimer !== null) clearTimeout(hoverTimer);
   }
 
@@ -236,16 +302,15 @@
     if (filtered.length === 0) return;
     highlighted = Math.max(0, Math.min(filtered.length - 1, index));
     previewKey = filtered[highlighted]?.rowKey ?? null;
-    void tick().then(() => {
-      const node = listEl;
-      if (node === null) return;
-      const row = node.querySelector<HTMLElement>(`[data-navigator-index="${highlighted}"]`);
-      if (row === null) return;
-      const listRect = node.getBoundingClientRect();
-      const rowRect = row.getBoundingClientRect();
-      if (rowRect.top < listRect.top) node.scrollTop -= listRect.top - rowRect.top;
-      else if (rowRect.bottom > listRect.bottom) node.scrollTop += rowRect.bottom - listRect.bottom;
-    });
+    const node = listEl;
+    if (node === null) return;
+    const rowTop = highlighted * NAVIGATOR_ROW_HEIGHT;
+    const rowBottom = rowTop + NAVIGATOR_ROW_HEIGHT;
+    if (rowTop < node.scrollTop) node.scrollTop = rowTop;
+    else if (rowBottom > node.scrollTop + node.clientHeight) {
+      node.scrollTop = rowBottom - node.clientHeight;
+    }
+    listScrollTop = node.scrollTop;
   }
 
   function hoverEntry(index: number): void {
@@ -264,6 +329,9 @@
   }
 
   function onSearchKeydown(event: KeyboardEvent): void {
+    if (event.key === "ArrowDown" || event.key === "ArrowUp" || event.key === "Enter") {
+      applyQuery();
+    }
     if (event.key === "ArrowDown") {
       event.preventDefault();
       setHighlighted(highlighted + 1);
@@ -280,16 +348,12 @@
     // Escape is handled by the Dialog (focus-trapped) — no branch here.
   }
 
-  // Filter/sort changes invalidate the highlight (the list under it moved).
+  // Non-query filter/sort changes invalidate the highlight (the list under it moved).
   $effect(() => {
-    void query;
     void role;
     void descending;
     void pinnedOnly;
-    highlighted = 0;
-    void tick().then(() => {
-      if (listEl !== null) listEl.scrollTop = 0;
-    });
+    resetFilteredPosition();
   });
 
   /// Toggle top/bottom fade masks by scroll position, so a scrollable region
@@ -305,6 +369,24 @@
 
   function scrollFade(node: HTMLElement): { destroy: () => void } {
     const update = () => updateScrollFade(node);
+    node.addEventListener("scroll", update, { passive: true });
+    const ro = new ResizeObserver(update);
+    ro.observe(node);
+    update();
+    return {
+      destroy() {
+        node.removeEventListener("scroll", update);
+        ro.disconnect();
+      },
+    };
+  }
+
+  function navigatorList(node: HTMLElement): { destroy: () => void } {
+    const update = (): void => {
+      listScrollTop = node.scrollTop;
+      listViewportHeight = node.clientHeight;
+      updateScrollFade(node);
+    };
     node.addEventListener("scroll", update, { passive: true });
     const ro = new ResizeObserver(update);
     ro.observe(node);
@@ -364,7 +446,8 @@
   <div data-testid="transcript-navigator">
     <input
       bind:this={searchEl}
-      bind:value={query}
+      value={queryInput}
+      oninput={(event) => scheduleQuery(event.currentTarget.value)}
       onkeydown={onSearchKeydown}
       type="text"
       autocorrect="off"
@@ -452,13 +535,18 @@
       <div class="mt-2 flex h-[70vh] gap-3" data-testid="navigator-ready">
         <div
           bind:this={listEl}
-          use:scrollFade
+          use:navigatorList
           class="navigator-fade w-2/5 shrink-0 overflow-y-auto pr-1"
           role="listbox"
           aria-label="Messages"
           data-testid="navigator-list"
         >
-          {#each filtered as entry, index (entry.rowKey)}
+          {#if virtualStart > 0}
+            <div style:height={`${virtualStart * NAVIGATOR_ROW_HEIGHT}px`} aria-hidden="true"></div>
+          {/if}
+          {#each virtualEntries as item (item.entry.rowKey)}
+            {@const entry = item.entry}
+            {@const index = item.index}
             {@const disabled = !canJump(entry)}
             {@const pinnableIdentity =
               entry.messageIdentity.kind === "pinnable" ? entry.messageIdentity : undefined}
@@ -499,7 +587,8 @@
               </button>
             {/snippet}
             <div
-              class={cn("flex h-7 items-center rounded-md", index === highlighted && "bg-hover")}
+              class={cn("flex items-center rounded-md", index === highlighted && "bg-hover")}
+              style:height={`${NAVIGATOR_ROW_HEIGHT}px`}
               data-navigator-index={index}
             >
               {#if disabled}
@@ -559,6 +648,12 @@
               {/if}
             </div>
           {/each}
+          {#if virtualEnd < filtered.length}
+            <div
+              style:height={`${(filtered.length - virtualEnd) * NAVIGATOR_ROW_HEIGHT}px`}
+              aria-hidden="true"
+            ></div>
+          {/if}
           {#if filtered.length === 0}
             <div class="text-muted px-2.5 py-3 text-sm select-none" data-testid="navigator-empty">
               {entries.length === 0 ? "No messages yet." : "No matches."}

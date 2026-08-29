@@ -377,10 +377,18 @@ describe("TranscriptNavigator", () => {
     await seed();
     render(TranscriptNavigator, { props: props() });
     await openNavigator();
+    vi.useFakeTimers();
 
-    await fireEvent.input(screen.getByTestId("navigator-search"), {
+    const search = screen.getByTestId("navigator-search");
+    await fireEvent.input(search, {
       target: { value: "  FIX  " },
     });
+    expect(search).toHaveValue("  FIX  ");
+    expect(screen.getAllByTestId("navigator-entry")).toHaveLength(3);
+    vi.advanceTimersByTime(179);
+    expect(screen.getAllByTestId("navigator-entry")).toHaveLength(3);
+    vi.advanceTimersByTime(1);
+    await tick();
     expect(screen.getAllByTestId("navigator-entry")).toHaveLength(2);
 
     await fireEvent.click(screen.getByText("Agents"));
@@ -388,12 +396,44 @@ describe("TranscriptNavigator", () => {
     expect(entries).toHaveLength(1);
     expect(entries[0]).toHaveTextContent("alice");
 
-    await fireEvent.input(screen.getByTestId("navigator-search"), {
+    await fireEvent.input(search, {
       target: { value: "zzz" },
     });
+    vi.advanceTimersByTime(180);
+    await tick();
     expect(screen.queryAllByTestId("navigator-entry")).toHaveLength(0);
     expect(screen.getByTestId("navigator-empty")).toHaveTextContent("No matches.");
   });
+
+  it("flushes pending type-ahead before Enter jumps", async () => {
+    await seed();
+    render(TranscriptNavigator, { props: props() });
+    await openNavigator();
+
+    const search = screen.getByTestId("navigator-search");
+    await fireEvent.input(search, { target: { value: "reviewing" } });
+    await fireEvent.keyDown(search, { key: "Enter" });
+
+    expect(jump.jumpRequest.rowKey).toBe("a:turn-b");
+    expect(screen.queryByTestId("transcript-navigator")).toBeNull();
+  });
+
+  it.each(["ArrowDown", "ArrowUp"] as const)(
+    "flushes pending type-ahead before %s navigates",
+    async (key) => {
+      await seed();
+      render(TranscriptNavigator, { props: props() });
+      await openNavigator();
+
+      const search = screen.getByTestId("navigator-search");
+      await fireEvent.input(search, { target: { value: "reviewing" } });
+      await fireEvent.keyDown(search, { key });
+
+      const entries = screen.getAllByTestId("navigator-entry");
+      expect(entries).toHaveLength(1);
+      expect(entries[0]).toHaveTextContent("reviewing the change");
+    },
+  );
 
   it("↑/↓ move the highlight with the preview following; ↵ jumps and closes", async () => {
     await seed();

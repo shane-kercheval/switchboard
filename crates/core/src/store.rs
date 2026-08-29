@@ -29,7 +29,6 @@
 //!   store.yaml            schema version (fail-loud)
 //!   projects.jsonl        the global project index
 //!   directories.jsonl     the catalog: directory_id -> path
-//!   attachments/          store-wide staged attachment files
 //!   projects/<id>/        config.yaml, registry.jsonl, journal.jsonl, pins.jsonl, sessions/, runs/
 //! ```
 //!
@@ -55,8 +54,8 @@ use crate::ids::{DirectoryId, ProjectId};
 use crate::io::{append_jsonl, read_jsonl, read_yaml, write_jsonl, write_yaml};
 use crate::name::{canonicalize_for_uniqueness, validate_name};
 use crate::paths::{
-    ATTACHMENTS_DIR, CONFIG_FILE, DIRECTORIES_CATALOG, JOURNAL_FILE, PROJECTS_DIR, PROJECTS_INDEX,
-    REGISTRY_FILE, STORE_CONFIG_FILE,
+    CONFIG_FILE, DIRECTORIES_CATALOG, JOURNAL_FILE, PROJECTS_DIR, PROJECTS_INDEX, REGISTRY_FILE,
+    STORE_CONFIG_FILE,
 };
 use crate::project::{self, PROJECT_CONFIG_VERSION, Project, ProjectConfig};
 
@@ -234,8 +233,8 @@ impl Store {
     /// bumped, so "whatever version is running" is not a safe answer to "what
     /// layout is this data in".
     ///
-    /// `projects/` and `attachments/` are created *after* the marker, and their
-    /// absence is neither checked nor refused. That is not a hole in the commit
+    /// `projects/` is created *after* the marker, and its absence is neither
+    /// checked nor refused. That is not a hole in the commit
     /// ordering: a missing `projects/` may well represent real data loss, but
     /// recreating the empty container cannot worsen it, because a directory
     /// holds no record that later writes append to. That is exactly what
@@ -289,8 +288,6 @@ impl Store {
         // Below both refusals, so neither leaves a trace in a root it declined
         // to open. Both success paths still need them.
         create_dir_all(store.projects_dir()).map_err(|e| CoreError::io(store.projects_dir(), e))?;
-        create_dir_all(store.attachments_dir())
-            .map_err(|e| CoreError::io(store.attachments_dir(), e))?;
         Ok(store)
     }
 
@@ -313,17 +310,13 @@ impl Store {
     /// scan is load-bearing too — a `.DS_Store` dropped in by Finder would
     /// otherwise read as data and refuse a legitimate first launch.
     ///
-    /// **`attachments/` is deliberately excluded**, not overlooked. A staged
-    /// attachment is an anonymous copy of a user file whose meaning comes
-    /// entirely from the journal entry referencing it; with no projects there is
-    /// no such entry, so what remains is orphans the reference-GC exists to
-    /// reclaim. Counting them would refuse to open a store that genuinely holds
-    /// nothing — the state left behind by deleting every project.
-    ///
     /// **Revisit this predicate whenever the store gains another owned
     /// location** (locks, migration records), asking the same question of each:
     /// can anything under it still be attributed to a project once the indexes
-    /// are gone? If not, it belongs out here with `attachments/`.
+    /// are gone? If not, it does not belong in the predicate. Attachments raised
+    /// exactly this question and no longer do: they stage per-project, inside
+    /// `projects/<id>/`, so the `projects/` scan already covers them and they
+    /// need no clause of their own.
     fn holds_data(&self) -> Result<bool> {
         if !read_jsonl::<ProjectEntry>(&self.projects_index_path())?.is_empty()
             || !read_jsonl::<DirectoryEntry>(&self.catalog_path())?.is_empty()
@@ -352,17 +345,6 @@ impl Store {
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
-    }
-
-    /// Store-wide staging for attachment files.
-    ///
-    /// **Store-wide, not per-project**: the same file is routinely dropped into
-    /// sends in more than one project, and a per-project copy would duplicate it
-    /// per project while making cross-project reference counting impossible for
-    /// the GC. Reference-GC is what makes one shared directory safe.
-    #[must_use]
-    pub fn attachments_dir(&self) -> PathBuf {
-        self.root.join(ATTACHMENTS_DIR)
     }
 
     // ---- catalog -------------------------------------------------------
@@ -1189,8 +1171,7 @@ mod tests {
 
     #[test]
     fn a_refusal_leaves_no_trace_in_the_root_it_declined() {
-        // `create_dir_all` for `projects/` and `attachments/` sits below both
-        // refusal branches so a declined root is left exactly as found. Nothing
+        // `create_dir_all` for `projects/` sits below both refusal branches so a declined root is left exactly as found. Nothing
         // else pins that placement: moving those calls above the branch would
         // otherwise pass every test while stamping our layout onto a store we
         // just refused to open.
@@ -1202,10 +1183,6 @@ mod tests {
         assert!(
             matches!(err, CoreError::StoreDataWithoutVersionMarker { .. }),
             "expected StoreDataWithoutVersionMarker, got {err:?}"
-        );
-        assert!(
-            !root.path().join(ATTACHMENTS_DIR).exists(),
-            "a refusal must not create the attachments dir"
         );
         let created: Vec<_> = std::fs::read_dir(root.path())
             .unwrap()
@@ -2140,13 +2117,5 @@ mod tests {
             store.project_last_activity(project.id, old_fallback) > old_fallback,
             "a journal written now must beat a day-old fallback"
         );
-    }
-
-    #[test]
-    fn the_attachments_dir_is_one_shared_directory_at_the_store_root() {
-        let (root, _cwd, store, _id) = store_with_dir();
-        // One shared directory is what will let the same dropped file be
-        // referenced from sends in two projects without a per-project copy.
-        assert_eq!(store.attachments_dir(), root.path().join(ATTACHMENTS_DIR));
     }
 }

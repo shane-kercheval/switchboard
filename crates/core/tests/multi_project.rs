@@ -136,7 +136,6 @@ fn assert_layout(store_root: &Path, working_directory: &Path, project_ids: &[Pro
         "projects.jsonl",
         "directories.jsonl",
         "projects",
-        "attachments",
     ] {
         assert!(
             store_root.join(relative).exists(),
@@ -144,6 +143,14 @@ fn assert_layout(store_root: &Path, working_directory: &Path, project_ids: &[Pro
         );
     }
     assert!(store_root.join("projects").is_dir());
+    // No store-wide `attachments/`: staging is per-project, inside
+    // `projects/<id>/attachments/`, so project delete reclaims it with a plain
+    // directory removal instead of an all-projects reference sweep.
+    assert!(
+        !store_root.join("attachments").exists(),
+        "attachments stage per-project; a store-root attachments dir means the \
+         store-wide design crept back in"
+    );
 
     // Prompts and workflows are user-global siblings of the store, not inside
     // it (system-design §3/§6).

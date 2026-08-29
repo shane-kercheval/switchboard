@@ -183,6 +183,63 @@ async fn wait_at_maintenance_barrier(state: &AppState) {
 #[expect(clippy::unused_async, reason = "matches the cfg(test) signature")]
 async fn wait_at_maintenance_barrier(_state: &AppState) {}
 
+/// Hold [`capture_dispatch_snapshot`] open **inside** its `registry_write`
+/// guard when a test asks. See [`AppState::capture_barrier`].
+#[cfg(test)]
+fn wait_at_capture_barrier(state: &AppState) {
+    let barrier = lock(&state.capture_barrier).clone();
+    if let Some(barrier) = barrier {
+        barrier.entered.notify_waiters();
+        // Blocking, not `await`: the capture is synchronous and holds a `std`
+        // mutex, which must never be held across an await point. The test drives
+        // it from `spawn_blocking` for the same reason.
+        futures::executor::block_on(barrier.release.notified());
+    }
+}
+
+#[cfg(not(test))]
+fn wait_at_capture_barrier(_state: &AppState) {}
+
+/// Everything a dispatch needs about its project, taken at one instant.
+///
+/// **One `registry_write` acquisition, three values out, and that is the whole
+/// point.** The generation exists to detect that the `Project` beside it has
+/// gone stale, so the two must describe the same moment. Read separately they do
+/// not: [`begin_maintenance`] holds `registry_write` across mark → evict → bump,
+/// so a capture that reads the project *before* the eviction and the generation
+/// *after* the bump yields a stale project paired with a post-bump counter — and
+/// then every downstream check compares that counter against itself and passes.
+/// The turn dispatches into the directory the project no longer uses.
+///
+/// That is not hypothetical and not confined to the re-point path, which has no
+/// caller yet. A send in that state passes both generation checks and reaches
+/// `Dispatcher::send_message`, which **creates an actor**. `delete_project_impl`
+/// drains from `guard.evicted_agents` — a list snapshotted when maintenance
+/// began — so an actor created after that agent's `shutdown_agent` returned is
+/// one the drain cannot reach, and it journals and spawns while the delete
+/// proceeds to `remove_dir_all`.
+///
+/// **Returning all three together is the guard, not the lock alone.** A caller
+/// holding one value and reaching for the others has nothing to reach for. This
+/// is the same shape as [`reload_projects`] taking no path parameter: a
+/// signature that cannot express the wrong thing beats a comment asking for the
+/// right one.
+///
+/// Deliberately **not** folded into [`lookup_agent`]: four of its callers
+/// (`rename_agent_impl`, `set_agent_session_locator_impl`,
+/// `set_agent_profiles_impl`, `set_active_agent_profile_impl`) already hold
+/// `registry_write` when they call it, and `std::sync::Mutex` is not reentrant.
+pub(crate) fn capture_dispatch_snapshot(
+    state: &AppState,
+    agent_id: AgentId,
+) -> Result<(Project, AgentRecord, u64), AppError> {
+    let _write = lock(&state.registry_write);
+    wait_at_capture_barrier(state);
+    let (project, agent) = lookup_agent(state, agent_id)?;
+    let generation = project_generation(state, project.id);
+    Ok((project, agent, generation))
+}
+
 /// The project's current lifecycle generation. Absent means never operated on,
 /// which is generation zero.
 pub(crate) fn project_generation(state: &AppState, project_id: ProjectId) -> u64 {
@@ -205,11 +262,46 @@ pub(crate) fn project_generation(state: &AppState, project_id: ProjectId) -> u64
 /// Both dispatch entry points capture at resolution and verify here: the manual
 /// send, and workflow invocation before it registers a run.
 ///
-/// **Residual, stated rather than glossed:** the interval between this check and
-/// the dispatcher creating the actor. Closing it needs
-/// `DispatchContextFactory::build` to be able to refuse, which it cannot today —
-/// it returns a `DispatchContext`, not a `Result`. Making it fallible is a
-/// cross-crate change to the trait M2.3 already revises, and is recorded there.
+/// **This is the early, friendly refusal, not the last one.** The interval
+/// between it and the dispatcher actually creating the actor is closed
+/// separately, by `ProjectDispatchContextFactory::preflight` re-comparing the
+/// generation at the instant the turn starts — which also covers the case this
+/// check structurally cannot, a send that queues behind another turn and pops
+/// long afterwards. Keep both: refusing here means the user finds out at the
+/// send rather than watching a turn start and immediately fail.
+///
+/// **The residual, stated precisely rather than waved at.** Neither check covers
+/// the span between `preflight`'s comparison and the subprocess existing — lock
+/// acquisition, the journal write, and the adapter's `dispatch`. A lifecycle
+/// operation landing inside that span is not observed by the turn.
+///
+/// **What this span costs is now small, and only because the capture is
+/// atomic.** With [`capture_dispatch_snapshot`] holding one lock, a turn cannot
+/// carry a stale project past this check at all: an operation before the capture
+/// evicts the project (so the lookup fails) and one after it moves the counter
+/// (so the comparison fails). What remains is a turn admitted at generation N,
+/// with the operation starting after this check and before
+/// `Dispatcher::send_message` creates the actor. That actor is one
+/// `delete_project_impl`'s drain cannot reach, since it iterates a list
+/// snapshotted at `begin_maintenance` — but `preflight` re-compares the
+/// generation at turn start and refuses, so the turn writes nothing and spawns
+/// nothing. The cost is a leaked idle actor slot until the process exits.
+///
+/// **Before the capture was made atomic this was materially worse, and the
+/// difference is worth recording** because the reasoning that made it look
+/// benign was wrong twice. A project read before the eviction paired with a
+/// counter read after the bump passed *both* checks, so such a turn reached
+/// `send_message`, created that unreachable actor, and then journaled and
+/// spawned while the delete proceeded to `remove_dir_all`. "Delete drains before
+/// it removes anything" was true and did not bound it, because the drain cannot
+/// stop what is created after it.
+///
+/// Closing the remaining span properly needs a project-scoped admission claim
+/// that turns hold from admission through spawn and that lifecycle operations
+/// wait behind. That is required before a re-point becomes reachable from the
+/// UI — for re-point the leak would instead be a dispatch into the directory the
+/// project no longer uses. Do not delete this paragraph when that lands —
+/// implement it.
 pub(crate) fn reject_if_generation_changed(
     state: &AppState,
     project_id: ProjectId,
@@ -218,7 +310,7 @@ pub(crate) fn reject_if_generation_changed(
     if project_generation(state, project_id) == captured {
         return Ok(());
     }
-    Err(AppError::ProjectNotLoaded(project_id))
+    Err(AppError::ProjectViewStale(project_id))
 }
 
 /// Refuse if `project_id` is mid-lifecycle-operation.
@@ -2582,14 +2674,24 @@ pub async fn fork_agent_impl(
 /// queued: waiting would hand the branch the answer to the very turn the user is
 /// branching away from.
 ///
-/// **A look, not a lock.** `is_turn_running` is a non-blocking peek at the
-/// agent's actor (the dispatcher has no status flag by design — one turn in
-/// flight is structural), so a parent turn can still start between this reply
-/// and claude reading the file, and an external `claude` process is invisible to
-/// us entirely. Both residuals are accepted: the outcome is the stub above, not
-/// corruption. Holding a reservation across the fork's snapshot was rejected —
-/// no clean release point, and it trades a millisecond window for permanent
-/// cross-agent coupling in a dispatcher built to avoid it.
+/// **A look, not a lock — but no longer only a look.** `is_turn_running` is a
+/// non-blocking peek at the agent's actor (the dispatcher has no status flag by
+/// design — one turn in flight is structural), so on its own it leaves two
+/// windows: a parent turn starting between this reply and claude reading the
+/// file, and an external writer we cannot see at all. The first is now closed by
+/// the session lock — a materializing branch holds its parent's key for its
+/// whole first turn, so the parent cannot start one — and this check survives as
+/// the *friendly* refusal, run first so the common case names the busy parent
+/// instead of reporting generic contention. The second residual stands: a bare
+/// `claude` invocation or a third-party automation takes no lock, and the
+/// outcome there is the stub above, not corruption.
+///
+/// **This supersedes an earlier decision recorded here**, that holding a
+/// reservation across the fork's snapshot was rejected for having no clean
+/// release point. It has one: the turn permit `preflight` returns, which the
+/// dispatcher binds for the turn and drops on every exit path. The cross-agent
+/// coupling that reasoning feared is real and is the accepted cost — see
+/// `crate::session_lock`.
 async fn ensure_fork_source_free(state: &AppState, source: &AgentRecord) -> Result<(), AppError> {
     if state.dispatcher.is_turn_running(source.id).await {
         return Err(AppError::ForkSourceBusy {
@@ -3609,11 +3711,11 @@ pub async fn send_message_impl(
     send_id: SendId,
     home_dir: &Path,
 ) -> Result<MessageId, AppError> {
-    let (project, agent) = lookup_agent(state, agent_id)?;
-    // Captured here, verified immediately before the hand-off below. Everything
-    // between is `await`, and a lifecycle operation can complete inside it.
+    // Project, agent, and generation from one instant — see
+    // `capture_dispatch_snapshot`. Read separately they can straddle a lifecycle
+    // operation, and the generation then validates itself.
+    let (project, agent, generation) = capture_dispatch_snapshot(state, agent_id)?;
     let project_id = project.id;
-    let generation = project_generation(state, project_id);
     // Authoritative mid-turn fork gate. **Dispatch entry points are enumerated,
     // not assumed**: this function and the workflow step dispatch (via
     // `DispatchFactoryProvider::preflight`) are the two places a turn starts, and
@@ -3656,6 +3758,9 @@ pub async fn send_message_impl(
             registry_write: Arc::clone(&state.registry_write),
             dispatcher: Arc::downgrade(&state.dispatcher),
             home_dir: home_dir.to_path_buf(),
+            lock_root: state.lock_root.clone(),
+            project_generation: Arc::clone(&state.project_generation),
+            generation_at_capture: generation,
         },
     ));
     // Last point before the hand-off: refuse if the project moved under us while
@@ -6711,8 +6816,6 @@ const INSTANCE_LOCK_FILE: &str = "instance.lock";
 /// unlock. Contention (another process holds it) maps to `ProjectLocked`; any
 /// other I/O failure to `ProjectLockIo`.
 fn acquire_project_lock(project_id: ProjectId, root: &Path) -> Result<File, AppError> {
-    // Backoff schedule for retrying a transient `WouldBlock` (see the loop below).
-    const RETRY_BACKOFF_MS: [u64; 5] = [5, 10, 20, 40, 80];
     let lock_path = root.join(INSTANCE_LOCK_FILE);
     let file = OpenOptions::new()
         .create(true)
@@ -6722,30 +6825,16 @@ fn acquire_project_lock(project_id: ProjectId, root: &Path) -> Result<File, AppE
         .truncate(false)
         .open(&lock_path)
         .map_err(|source| AppError::ProjectLockIo { project_id, source })?;
-    // Retry a transient `WouldBlock` briefly before concluding another live
-    // process holds the lock. `flock` is released on the holder's last `close`,
-    // but the kernel can finalize that release *asynchronously* — so a lock that
-    // was just dropped (a prior handle in this process, or another instance that
-    // exited / restarted moments ago) can spuriously report `WouldBlock` for a
-    // few milliseconds on a loaded host. A genuinely live holder keeps the lock
-    // through the whole window, so real contention still surfaces as
-    // `ProjectLocked` (just ~150 ms later); only the false positive is absorbed.
-    // The uncontended path locks on the first try with no delay.
-    let mut attempt = 0usize;
-    loop {
-        match file.try_lock() {
-            Ok(()) => return Ok(file),
-            Err(std::fs::TryLockError::WouldBlock) => {
-                let Some(&backoff) = RETRY_BACKOFF_MS.get(attempt) else {
-                    return Err(AppError::ProjectLocked(project_id));
-                };
-                std::thread::sleep(std::time::Duration::from_millis(backoff));
-                attempt += 1;
-            }
-            Err(std::fs::TryLockError::Error(source)) => {
-                return Err(AppError::ProjectLockIo { project_id, source });
-            }
+    // Retry a transient `WouldBlock` before concluding another live process holds
+    // the lock — see `session_lock::try_lock_with_backoff` for why that retry
+    // exists. Shared with the session locks rather than copied: it is one
+    // decision about kernel behaviour, and two copies of a timing loop drift.
+    match crate::session_lock::try_lock_with_backoff(&file) {
+        Ok(()) => Ok(file),
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            Err(AppError::ProjectLocked(project_id))
         }
+        Err(source) => Err(AppError::ProjectLockIo { project_id, source }),
     }
 }
 
@@ -7605,29 +7694,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_queued_send_that_would_fork_a_now_busy_parent_is_refused_when_it_pops() {
-        // The composed race — the one the layer-isolated tests do not reach, and
-        // the reason the check moved into the dispatcher at all. Every step is a
-        // real dispatch through `send_message_impl`:
+    async fn a_branch_being_created_holds_its_parents_session_against_a_real_dispatch() {
+        // **This test used to pin a race the session lock now prevents from
+        // arising, and it is rewritten rather than deleted because the machinery
+        // it exercises is still the machinery worth exercising.** It previously
+        // composed: park the fork's first turn, queue B behind it, then make
+        // alice busy, then release the fork's turn so B popped against a
+        // now-busy parent and had to be refused by the start-moment check. Step
+        // three is no longer reachable — an unmaterialized branch holds its
+        // parent's session key for its whole first turn, so the send to alice is
+        // refused *before* alice can become busy. The composed race is closed one
+        // step earlier than the check that used to catch it. (The start-moment
+        // fork check itself is still live and still pinned, directly, by
+        // `the_start_moment_check_refuses_a_materializing_fork_against_a_busy_parent`.)
+        //
+        // So this now pins the rule that replaced it, at the same composed level
+        // — every step a real dispatch through `send_message_impl`, refused by
+        // the dispatcher rather than at the command boundary:
         //
         //   1. `alice-fork` exists, unmaterialized.
-        //   2. Send A to the fork. It parks, so the fork's actor is busy.
-        //   3. Send B to the fork. Alice is idle, so the enqueue-time gate passes
-        //      and B lands in the fork's backlog.
-        //   4. Send C to alice. It parks too — alice is now mid-turn.
-        //   5. Release A, which **fails**. The branch still has no session file,
-        //      so B inherits the job of creating it — and by then the answer step
-        //      3 relied on is stale.
+        //   2. Send A to the fork. It parks, so the branch's turn is live and
+        //      holding both its own key and alice's.
+        //   3. Send C to alice. The command boundary allows it — alice is idle,
+        //      and nothing there knows about the lock — so it enqueues, starts,
+        //      and is refused at its own start moment.
+        //   4. C never reaches the adapter.
         //
-        // A must fail rather than complete: a real Claude turn that completes has
-        // written its session file, so a completed A would make B an ordinary
-        // resume and never reach this gate at all. "Completed but no file" is a
-        // mock artifact, not a reachable state.
-        //
-        // B must be refused before it reaches the adapter. Prior to the
-        // start-moment check it would have dispatched and copied alice's session
-        // file mid-write, giving the branch a permanent "No response requested."
-        // stub in place of alice's real answer.
+        // The direction matters: the pre-existing in-process gate only refuses a
+        // *fork* against a busy parent. Nothing refused a parent against a
+        // materializing fork, and the file hazard is the same one.
         let fork_gate = Arc::new(tokio::sync::Notify::new());
         let parent_gate = Arc::new(tokio::sync::Notify::new());
         let (adapter, dispatched_prompts) = gated_adapter_two_parks(
@@ -7662,18 +7757,11 @@ mod tests {
             .unwrap();
         await_turn_running(&state, fork.id).await;
 
-        // Queued behind A, while alice is still idle.
-        send_msg_with_home(&state, fork.id, "B", home.path())
-            .await
-            .expect("queuing behind the fork's own turn is allowed while the parent is idle");
-
+        // Accepted at the boundary — the lock is not consulted there — and
+        // refused when the turn starts.
         send_msg_with_home(&state, source_id, "C", home.path())
             .await
-            .unwrap();
-        await_turn_running(&state, source_id).await;
-
-        // Release only the fork's turn, so B pops while alice is still parked.
-        fork_gate.notify_waiters();
+            .expect("the command boundary does not know about session locks");
         within(
             &emitter,
             "message_failed",
@@ -7685,20 +7773,113 @@ mod tests {
             e["type"] == "message_failed"
                 && e["error"]
                     .as_str()
-                    .is_some_and(|msg| msg.contains("is working"))
+                    .is_some_and(|msg| msg.contains("already in use by a running turn"))
         });
         assert!(
             refused,
-            "the queued send must be refused when it pops against a now-busy parent"
+            "a send to a parent whose branch is materializing must be refused: {:?}",
+            emitter.snapshot()
         );
-        // Refused before the adapter: B's prompt never reached a subprocess.
         assert!(
-            !lock(&dispatched_prompts).iter().any(|p| p == "B"),
+            !lock(&dispatched_prompts).iter().any(|p| p == "C"),
             "a refused turn must not reach the adapter: {:?}",
             lock(&dispatched_prompts)
         );
 
+        fork_gate.notify_waiters();
         parent_gate.notify_waiters();
+    }
+
+    /// Build the dispatch factory the actor would own for `agent_id`, exactly as
+    /// `send_message_impl` does. Tests call `preflight` on it directly because
+    /// that is the only hook that runs at the instant a turn starts.
+    fn factory_for_at_generation(
+        state: &AppState,
+        project_id: ProjectId,
+        agent_id: AgentId,
+        home: &Path,
+        generation: u64,
+    ) -> ProjectDispatchContextFactory {
+        // One clone, bound first. Two `lock(&agents_by_id)` calls inside a single
+        // argument list would keep the first guard alive across the second —
+        // temporaries live to the end of the *statement* — and `std::sync::Mutex`
+        // is not reentrant, so it deadlocks the test process rather than failing
+        // it. It did.
+        let agent = lock(&state.agents_by_id).get(&agent_id).cloned().unwrap();
+        ProjectDispatchContextFactory::new(
+            open_project_from_store(state, project_id).unwrap(),
+            agent.clone(),
+            adapter_for(state, &agent).unwrap(),
+            crate::dispatch_context::DispatchDeps {
+                base_emitter: Arc::clone(&state.emitter),
+                needs_session_meta: Arc::clone(&state.needs_session_meta),
+                agents_by_id: Arc::clone(&state.agents_by_id),
+                registry_write: Arc::clone(&state.registry_write),
+                dispatcher: Arc::downgrade(&state.dispatcher),
+                home_dir: home.to_path_buf(),
+                lock_root: state.lock_root.clone(),
+                project_generation: Arc::clone(&state.project_generation),
+                generation_at_capture: generation,
+            },
+        )
+    }
+
+    /// As [`factory_for`], with the capture-time generation the caller chooses —
+    /// the only way to reproduce production's ordering, where the project is read
+    /// and *then* a lifecycle operation lands before the factory is built.
+    fn factory_for(
+        state: &AppState,
+        project_id: ProjectId,
+        agent_id: AgentId,
+        home: &Path,
+    ) -> ProjectDispatchContextFactory {
+        factory_for_at_generation(
+            state,
+            project_id,
+            agent_id,
+            home,
+            project_generation(state, project_id),
+        )
+    }
+
+    /// Run `agent_id`'s start-moment admission the way `run_turn` does: build the
+    /// context first, then authorize **that** context's record. Tests must not
+    /// hand `preflight` a record they looked up separately — doing so would
+    /// bypass the very coupling the parameter exists to enforce.
+    async fn preflight_for(
+        state: &AppState,
+        project_id: ProjectId,
+        agent_id: AgentId,
+        home: &Path,
+    ) -> Result<switchboard_dispatcher::TurnPermit, String> {
+        let factory = factory_for(state, project_id, agent_id, home);
+        let context = factory.build(SendId::now_v7());
+        factory.preflight(&context.agent).await
+    }
+
+    /// The session-lock key for an agent's own session, as the other
+    /// Switchboard instance would compute it.
+    fn own_session_key(state: &AppState, project_id: ProjectId, agent_id: AgentId) -> String {
+        let agent = lock(&state.agents_by_id).get(&agent_id).cloned().unwrap();
+        let directory = open_project_from_store(state, project_id)
+            .unwrap()
+            .directory
+            .clone();
+        crate::session_lock::session_lock_key(
+            agent.harness,
+            agent.session_locator.as_ref().unwrap(),
+            &directory,
+        )
+        .unwrap()
+    }
+
+    /// Stand in for the other instance holding `key`.
+    fn held_by_another_instance(
+        state: &AppState,
+        key: String,
+    ) -> switchboard_dispatcher::TurnPermit {
+        crate::session_lock::acquire_session_locks(&state.lock_root, &[key].into_iter().collect())
+            .expect("the other instance acquires first")
     }
 
     #[tokio::test]
@@ -7726,30 +7907,590 @@ mod tests {
             .unwrap();
         await_turn_running(&state, source_id).await;
 
-        let factory = ProjectDispatchContextFactory::new(
-            open_project_from_store(&state, project_id).unwrap(),
-            state
-                .agents_by_id
-                .lock()
-                .unwrap()
-                .get(&fork.id)
-                .cloned()
-                .unwrap(),
-            adapter_for(&state, &fork).unwrap(),
-            crate::dispatch_context::DispatchDeps {
-                base_emitter: Arc::clone(&state.emitter),
-                needs_session_meta: Arc::clone(&state.needs_session_meta),
-                agents_by_id: Arc::clone(&state.agents_by_id),
-                registry_write: Arc::clone(&state.registry_write),
-                dispatcher: Arc::downgrade(&state.dispatcher),
-                home_dir: home.path().to_path_buf(),
-            },
-        );
-        let refusal = factory
-            .preflight()
+        let refusal = preflight_for(&state, project_id, fork.id, home.path())
             .await
             .expect_err("a turn that would fork a busy parent must be refused at its start");
         assert!(refusal.contains("is working"), "got: {refusal}");
+
+        gate.notify_waiters();
+    }
+
+    /// As [`state_for_permit_release`], but the parked dispatch stays alive
+    /// through a teardown grace after cancellation — the window where the harness
+    /// is dying and the session lock must still be held.
+    async fn state_for_cancellation_teardown() -> (
+        TempDir,
+        TempDir,
+        AppState,
+        Arc<RecordingEmitter>,
+        Arc<crate::state::MaintenanceBarrier>,
+        ProjectId,
+    ) {
+        let teardown = Arc::new(crate::state::MaintenanceBarrier::default());
+        let adapter: Arc<dyn HarnessAdapter> = Arc::new(GatedRecordingAdapter {
+            prompts: Arc::new(Mutex::new(Vec::new())),
+            profiles: None,
+            texts: vec!["parked".to_owned()],
+            gate: Arc::new(tokio::sync::Notify::new()),
+            park_at: 0,
+            extra_parks: Vec::new(),
+            fail_at: Vec::new(),
+            teardown: Some(Arc::clone(&teardown)),
+            dispatches: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
+        let emitter = Arc::new(RecordingEmitter::new());
+        let state = AppState::new_for_test(
+            adapter,
+            Arc::clone(&mock),
+            Arc::clone(&mock),
+            emitter.clone() as Arc<dyn EventEmitter>,
+        );
+        let tmp = TempDir::new().unwrap();
+        init_directory_impl(&state, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let project = create_project_in_only_dir(&state, "proj");
+        set_active_project_impl(&state, project.id).unwrap();
+        (
+            tmp,
+            TempDir::new().unwrap(),
+            state,
+            emitter,
+            teardown,
+            project.id,
+        )
+    }
+
+    /// State whose Claude adapter parks its first turn on the returned gate, with
+    /// the emitter exposed so a test can wait for `agent_idle`.
+    ///
+    /// **`agent_idle` is the only correct signal for these tests.** It is emitted
+    /// after `run_turn` returns and the backlog empties, which is the moment the
+    /// permit drops. The obvious alternative — awaiting the send's completion —
+    /// fires *inside* `drain_turn`, before `run_turn` returns and before the
+    /// permit is released, so a test built on it would race and pass or fail on
+    /// scheduling. Relying on the acquisition's own 155 ms retry to paper over
+    /// that gap would be worse: the test would pass for a reason unrelated to
+    /// what it claims to check.
+    async fn state_for_permit_release(
+        texts: &[&str],
+        fail_at: &[usize],
+    ) -> (
+        TempDir,
+        TempDir,
+        AppState,
+        Arc<RecordingEmitter>,
+        Arc<tokio::sync::Notify>,
+        ProjectId,
+    ) {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        // A second park index that no dispatch ever reaches — this fixture needs
+        // only one gate, but the two-park constructor is the one that takes
+        // `fail_at`.
+        let never = Arc::new(tokio::sync::Notify::new());
+        let (claude, _prompts) =
+            gated_adapter_two_parks(texts, (&gate, 0), (&never, usize::MAX), fail_at);
+        let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
+        let emitter = Arc::new(RecordingEmitter::new());
+        let state = AppState::new_for_test(
+            claude,
+            Arc::clone(&mock),
+            Arc::clone(&mock),
+            emitter.clone() as Arc<dyn EventEmitter>,
+        );
+        let tmp = TempDir::new().unwrap();
+        init_directory_impl(&state, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let project = create_project_in_only_dir(&state, "proj");
+        set_active_project_impl(&state, project.id).unwrap();
+        (
+            tmp,
+            TempDir::new().unwrap(),
+            state,
+            emitter,
+            gate,
+            project.id,
+        )
+    }
+
+    /// Assert `agent_id`'s session key is acquirable — i.e. the turn that just
+    /// ended gave its permit back.
+    fn assert_session_key_free(
+        state: &AppState,
+        project_id: ProjectId,
+        agent_id: AgentId,
+        after: &str,
+    ) {
+        let keys = [own_session_key(state, project_id, agent_id)]
+            .into_iter()
+            .collect();
+        assert!(
+            crate::session_lock::acquire_session_locks(&state.lock_root, &keys).is_ok(),
+            "the session lock must be released after a {after} turn — a permit that outlives \
+             its turn locks the user out of their own conversation until the app restarts"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lifecycle_operation_cannot_interleave_a_dispatch_capture() {
+        // **The invariant `capture_dispatch_snapshot` exists for, and the only
+        // test shape that can see it.** Read separately, the project and the
+        // generation can straddle `begin_maintenance`: project from before the
+        // eviction, counter from after the bump — and every downstream check then
+        // compares that counter against itself and passes.
+        //
+        // A test cannot observe "one lock acquisition" from outside, and the
+        // existing `maintenance_barrier` cannot stage the interleaving either: it
+        // pauses *after* `begin_maintenance` has returned and dropped its guard.
+        // So the seam is inside the capture, immediately after it takes
+        // `registry_write`, and the assertion is that a lifecycle operation
+        // **cannot complete** while the capture is paused there.
+        let (_tmp, home, state, _gate, project_id) = state_with_parked_claude(&[]).await;
+        let agent_id = seed_source(&state, home.path(), project_id, "alice", "hello");
+        let before = project_generation(&state, project_id);
+
+        let barrier = Arc::new(crate::state::MaintenanceBarrier::default());
+        *lock(&state.capture_barrier) = Some(Arc::clone(&barrier));
+        let entered = barrier.entered.notified();
+        tokio::pin!(entered);
+        entered.as_mut().enable();
+
+        let state = Arc::new(state);
+        let capture_state = Arc::clone(&state);
+        // `spawn_blocking`: the capture is synchronous and parks holding a `std`
+        // mutex, which must not occupy an async worker.
+        let capture = tokio::task::spawn_blocking(move || {
+            capture_dispatch_snapshot(&capture_state, agent_id)
+        });
+        entered.await;
+
+        // The capture is now parked *inside* its `registry_write` guard. A
+        // lifecycle operation must not be able to get through.
+        let maintenance_state = Arc::clone(&state);
+        let scope: HashSet<ProjectId> = std::iter::once(project_id).collect();
+        let maintenance = tokio::task::spawn_blocking(move || {
+            begin_maintenance(&maintenance_state, &scope).is_ok()
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let interleaved = maintenance.is_finished();
+
+        // **Release before asserting, always.** A `spawn_blocking` task cannot be
+        // aborted, so a panic here with the capture still parked leaves a thread
+        // blocked forever and the test *hangs* instead of failing. The first
+        // version of this test did exactly that under falsification — the broken
+        // implementation produced a timeout, not a red test, which is the worst
+        // of both outcomes. Collect the verdicts, unblock everything, then assert.
+        barrier.release.notify_waiters();
+        let captured = capture.await.unwrap();
+        let _ = maintenance.await;
+
+        assert!(
+            !interleaved,
+            "a lifecycle operation completed while a dispatch capture held the write lock — \
+             the capture is not excluding maintenance, so its project and generation can straddle it"
+        );
+        let (project, _agent, generation) = captured.expect("capture succeeds");
+        assert_eq!(project.id, project_id);
+        assert_eq!(
+            generation, before,
+            "the capture must return the generation that belongs to the project it read"
+        );
+    }
+
+    #[tokio::test]
+    async fn preflight_refuses_on_the_generation_it_was_given_not_one_it_reads() {
+        // **Named for what it proves, which is narrower than it first appears.**
+        // It stages a *fresh* project against a stale generation — the mirror of
+        // the production failure, which is a stale project against a fresh
+        // generation. So it establishes that `preflight` compares the value it was
+        // handed and refuses on a mismatch, and nothing about whether callers hand
+        // it the right one. That property lives in
+        // `a_lifecycle_operation_cannot_interleave_a_dispatch_capture`, which is
+        // the test that can see it.
+        let (_tmp, home, state, _gate, project_id) = state_with_parked_claude(&[]).await;
+        let agent_id = seed_source(&state, home.path(), project_id, "alice", "hello");
+        let captured = project_generation(&state, project_id);
+
+        // What a lifecycle operation does, landing inside the await.
+        *lock(&state.project_generation)
+            .entry(project_id)
+            .or_insert(0) += 1;
+
+        let factory =
+            factory_for_at_generation(&state, project_id, agent_id, home.path(), captured);
+        let context = factory.build(SendId::now_v7());
+        let refusal = factory
+            .preflight(&context.agent)
+            .await
+            .expect_err("a project that moved between the read and the build must not dispatch");
+        assert!(
+            refusal.contains("changed before the turn could start"),
+            "got: {refusal}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_lock_guards_the_session_the_context_was_built_with() {
+        // `build` snapshots the agent record — including the session locator the
+        // adapter will resume — and `preflight` must authorize *that* record. When
+        // it re-read the registry cache instead, the two could disagree: the turn
+        // would hold a lock on one conversation while dispatching another, which
+        // is worse than holding no lock at all, because it also blocks the wrong
+        // session.
+        //
+        // The locator is swapped after `build` to force the disagreement. A
+        // mid-turn capture by the locator sink, or an attach, writes that cache
+        // the same way.
+        let (_tmp, home, state, _gate, project_id) = state_with_parked_claude(&[]).await;
+        let agent_id = seed_source(&state, home.path(), project_id, "alice", "hello");
+        let factory = factory_for(&state, project_id, agent_id, home.path());
+        let context = factory.build(SendId::now_v7());
+        let built_locator = context
+            .agent
+            .session_locator
+            .clone()
+            .expect("a Claude agent carries a locator from creation");
+
+        {
+            let mut cache = lock(&state.agents_by_id);
+            let mut record = cache.get(&agent_id).cloned().unwrap();
+            record.session_locator = Some(SessionLocator::Uuid(Uuid::now_v7()));
+            cache.insert(agent_id, record);
+        }
+
+        let _permit = factory
+            .preflight(&context.agent)
+            .await
+            .expect("nothing is contending; this must be admitted");
+
+        let directory = open_project_from_store(&state, project_id)
+            .unwrap()
+            .directory
+            .clone();
+        let built_key = crate::session_lock::session_lock_key(
+            context.agent.harness,
+            &built_locator,
+            &directory,
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                crate::session_lock::acquire_session_locks(
+                    &state.lock_root,
+                    &[built_key].into_iter().collect()
+                ),
+                Err(AppError::SessionInUse)
+            ),
+            "the turn must hold the session it is about to dispatch, not one re-read after"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_turn_holds_its_session_lock_until_the_harness_stops() {
+        // **The assertion the four release tests cannot make.** They all prove the
+        // permit drops when `run_turn` returns; none proves *when* `run_turn`
+        // returns. Make `drain_turn`'s cancel arm return early and every one of
+        // them still passes — while the lock is released over a live subprocess,
+        // which is exactly the window this module exists to close and exactly what
+        // `run_turn`'s comment asks someone to protect.
+        //
+        // The real shape being modelled: the Claude producer breaks out of its
+        // read loop on the token, then runs `terminate_then_kill` (SIGTERM,
+        // `TERMINATE_GRACE`, SIGKILL) before its stream ends. The harness is alive
+        // for that whole grace and may still be writing its session file, so the
+        // lock has to outlive the cancel *request*, not end with it.
+        let (_tmp, home, state, emitter, teardown, project_id) =
+            state_for_cancellation_teardown().await;
+        let agent_id = seed_source(&state, home.path(), project_id, "alice", "hello");
+        let key = own_session_key(&state, project_id, agent_id);
+        send_msg_with_home(&state, agent_id, "go", home.path())
+            .await
+            .unwrap();
+        await_turn_running(&state, agent_id).await;
+
+        let entered = teardown.entered.notified();
+        tokio::pin!(entered);
+        entered.as_mut().enable();
+        state.dispatcher.cancel_agent(agent_id, CancelSource::User);
+        // Synchronise on the adapter observing the cancel, not on a sleep.
+        entered.await;
+
+        let contended = crate::session_lock::acquire_session_locks(
+            &state.lock_root,
+            &[key].into_iter().collect(),
+        );
+        // Release before asserting: the adapter is parked in its teardown grace,
+        // and a panic here would strand it and hang the suite instead of failing
+        // it. (The capture-interleave test learned this the hard way.)
+        teardown.release.notify_waiters();
+        assert!(
+            matches!(contended, Err(AppError::SessionInUse)),
+            "the session must stay locked while the harness is still terminating"
+        );
+
+        within(
+            &emitter,
+            "agent_idle",
+            emitter.wait_for_type("agent_idle", 1),
+        )
+        .await;
+        assert_session_key_free(&state, project_id, agent_id, "cancelled-and-torn-down");
+    }
+
+    #[tokio::test]
+    async fn a_completed_turn_releases_its_session_lock() {
+        let (_tmp, home, state, emitter, gate, project_id) =
+            state_for_permit_release(&["done"], &[]).await;
+        let agent_id = seed_source(&state, home.path(), project_id, "alice", "hello");
+        send_msg_with_home(&state, agent_id, "go", home.path())
+            .await
+            .unwrap();
+        await_turn_running(&state, agent_id).await;
+        gate.notify_waiters();
+        within(
+            &emitter,
+            "agent_idle",
+            emitter.wait_for_type("agent_idle", 1),
+        )
+        .await;
+
+        assert_session_key_free(&state, project_id, agent_id, "completed");
+    }
+
+    #[tokio::test]
+    async fn a_failed_turn_releases_its_session_lock() {
+        let (_tmp, home, state, emitter, gate, project_id) =
+            state_for_permit_release(&["boom"], &[0]).await;
+        let agent_id = seed_source(&state, home.path(), project_id, "alice", "hello");
+        send_msg_with_home(&state, agent_id, "go", home.path())
+            .await
+            .unwrap();
+        await_turn_running(&state, agent_id).await;
+        gate.notify_waiters();
+        within(
+            &emitter,
+            "agent_idle",
+            emitter.wait_for_type("agent_idle", 1),
+        )
+        .await;
+
+        assert_session_key_free(&state, project_id, agent_id, "failed");
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_turn_releases_its_session_lock() {
+        let (_tmp, home, state, emitter, _gate, project_id) =
+            state_for_permit_release(&["parked"], &[]).await;
+        let agent_id = seed_source(&state, home.path(), project_id, "alice", "hello");
+        send_msg_with_home(&state, agent_id, "go", home.path())
+            .await
+            .unwrap();
+        await_turn_running(&state, agent_id).await;
+        // **The cancel alone ends this turn.** The mock `select!`s the turn's
+        // token the way the real producer does, so nothing here is driven by the
+        // gate. That is load-bearing: while the gate drove it, this test and the
+        // three beside it all proved one gate release and none of them proved
+        // anything about cancellation.
+        state.dispatcher.cancel_agent(agent_id, CancelSource::User);
+        within(
+            &emitter,
+            "agent_idle",
+            emitter.wait_for_type("agent_idle", 1),
+        )
+        .await;
+
+        assert_session_key_free(&state, project_id, agent_id, "cancelled");
+    }
+
+    #[tokio::test]
+    async fn a_drained_backlog_releases_the_session_lock() {
+        let (_tmp, home, state, emitter, _gate, project_id) =
+            state_for_permit_release(&["parked"], &[]).await;
+        let agent_id = seed_source(&state, home.path(), project_id, "alice", "hello");
+        send_msg_with_home(&state, agent_id, "first", home.path())
+            .await
+            .unwrap();
+        await_turn_running(&state, agent_id).await;
+        // Queued behind the parked turn, then dropped with it: the actor
+        // discards its backlog and parks idle without ever building a second
+        // context, so the running turn's permit is the only one outstanding.
+        send_msg_with_home(&state, agent_id, "second", home.path())
+            .await
+            .unwrap();
+        state.dispatcher.cancel_agent(agent_id, CancelSource::User);
+        within(
+            &emitter,
+            "agent_idle",
+            emitter.wait_for_type("agent_idle", 1),
+        )
+        .await;
+
+        assert_session_key_free(&state, project_id, agent_id, "drained");
+    }
+
+    #[tokio::test]
+    async fn another_instance_holding_the_session_refuses_the_turn() {
+        // The cross-build hazard this module exists for: a dev build and the
+        // installed app have separate stores but share the harness's session
+        // files, so nothing in the store stops them both driving one session.
+        //
+        // The "other instance" here is a lock taken directly under **this
+        // state's** lock root — so a factory that derived a different root, or
+        // skipped acquisition, fails this. What it does not attempt to prove is
+        // that two processes derive the same key from the same inputs; the key
+        // is a pure function of `(harness, locator, cwd)` and the tests in
+        // `session_lock` pin what goes into it.
+        let (_tmp, home, state, _gate, project_id) = state_with_parked_claude(&[]).await;
+        let agent_id = seed_source(&state, home.path(), project_id, "alice", "hello");
+        let _other =
+            held_by_another_instance(&state, own_session_key(&state, project_id, agent_id));
+
+        let refusal = preflight_for(&state, project_id, agent_id, home.path())
+            .await
+            .expect_err("a session another instance is driving must not start a turn here");
+        assert!(
+            refusal.contains("already in use by a running turn"),
+            "the refusal has to name the cause, since the fix is to wait: {refusal}"
+        );
+    }
+
+    #[tokio::test]
+    async fn releasing_the_other_instances_lock_lets_the_turn_start() {
+        // The contention above must be a wait, not a wedge: the same agent has
+        // to become dispatchable the moment the other instance finishes. Without
+        // this, a lock leaked anywhere would read as correct in the test above.
+        let (_tmp, home, state, _gate, project_id) = state_with_parked_claude(&[]).await;
+        let agent_id = seed_source(&state, home.path(), project_id, "alice", "hello");
+        let other = held_by_another_instance(&state, own_session_key(&state, project_id, agent_id));
+        drop(other);
+
+        preflight_for(&state, project_id, agent_id, home.path())
+            .await
+            .expect("the session is free again");
+    }
+
+    #[tokio::test]
+    async fn an_unmaterialized_fork_locks_its_parents_session_too() {
+        // A fork's first dispatch reads the **parent's** session file to branch
+        // from it, while carrying its own fresh uuid. Keying only on the
+        // dispatching agent would lock a file nobody contends on and leave the
+        // contended one open — `harness-behavior.md` §3.5's exact hazard, with
+        // the lock in place and pointed at the wrong file.
+        let (_tmp, home, state, _gate, project_id) = state_with_parked_claude(&[]).await;
+        let source_id = seed_source(&state, home.path(), project_id, "alice", "hello");
+        let fork = fork_agent_impl(&state, source_id, home.path())
+            .await
+            .unwrap();
+        // The parent is idle in this process — so the in-process fork gate
+        // allows, and only the lock can refuse.
+        let _other =
+            held_by_another_instance(&state, own_session_key(&state, project_id, source_id));
+
+        let refusal = preflight_for(&state, project_id, fork.id, home.path())
+            .await
+            .expect_err("a fork must not copy a session file another instance is writing");
+        assert!(
+            refusal.contains("already in use by a running turn"),
+            "got: {refusal}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_materialized_fork_does_not_lock_its_parents_session() {
+        // The other half of the rule, and the one that makes it a scalpel rather
+        // than a blanket: once the branch has its own session file it never
+        // reads the parent's again. Locking the parent forever would stop a
+        // perfectly safe pair of turns — the parent's and the branch's — from
+        // running at the same time, in both instances.
+        let (_tmp, home, state, _gate, project_id) = state_with_parked_claude(&[]).await;
+        let source_id = seed_source(&state, home.path(), project_id, "alice", "hello");
+        let fork = fork_agent_impl(&state, source_id, home.path())
+            .await
+            .unwrap();
+        {
+            let directory = lock(&state.projects)
+                .get(&project_id)
+                .unwrap()
+                .directory
+                .clone();
+            let uuid = fork
+                .session_locator
+                .as_ref()
+                .and_then(SessionLocator::as_uuid)
+                .unwrap();
+            let path =
+                switchboard_harness::claude_session_file_path(home.path(), &directory, &uuid);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, claude_session_jsonl("branched")).unwrap();
+        }
+        let _other =
+            held_by_another_instance(&state, own_session_key(&state, project_id, source_id));
+
+        preflight_for(&state, project_id, fork.id, home.path())
+            .await
+            .expect("a materialized branch does not read its parent's file");
+    }
+
+    #[tokio::test]
+    async fn a_lifecycle_operation_refuses_a_turn_whose_factory_predates_it() {
+        // The factory freezes its `Project` — and
+        // with it the working directory every dispatch uses as cwd — when the
+        // actor is created. A re-point completing afterwards makes that snapshot
+        // name a directory the project no longer uses, and a queued send resumes
+        // past both the pre-enqueue check and the maintenance mark still carrying
+        // it. Only a comparison at turn start catches that.
+        let (_tmp, home, state, _gate, project_id) = state_with_parked_claude(&[]).await;
+        let agent_id = seed_source(&state, home.path(), project_id, "alice", "hello");
+        // **One factory, reused.** Rebuilding it between the two calls would
+        // resample `generation_at_capture` from the bumped counter and the
+        // second check would trivially pass — the test would assert nothing.
+        let factory = factory_for(&state, project_id, agent_id, home.path());
+        let context = factory.build(SendId::now_v7());
+        factory
+            .preflight(&context.agent)
+            .await
+            .expect("nothing has happened to the project yet");
+
+        // What every lifecycle operation does on the way in.
+        *lock(&state.project_generation)
+            .entry(project_id)
+            .or_insert(0) += 1;
+
+        let refusal = factory
+            .preflight(&context.agent)
+            .await
+            .expect_err("a factory built before the operation must not dispatch after it");
+        assert!(
+            refusal.contains("changed before the turn could start"),
+            "got: {refusal}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_running_turn_holds_its_session_lock_until_it_ends() {
+        // The permit is only worth returning if the turn loop *binds* it: bound
+        // to `_`, it would drop at the end of the preflight statement and the
+        // session would be unlocked for the entire subprocess run — the exact
+        // window the lock exists to cover, with every test above still passing.
+        // So assert from outside a live turn.
+        let (_tmp, home, state, gate, project_id) = state_with_parked_claude(&["parked"]).await;
+        let agent_id = seed_source(&state, home.path(), project_id, "alice", "hello");
+        let key = own_session_key(&state, project_id, agent_id);
+        send_msg_with_home(&state, agent_id, "long one", home.path())
+            .await
+            .unwrap();
+        await_turn_running(&state, agent_id).await;
+
+        let contended = crate::session_lock::acquire_session_locks(
+            &state.lock_root,
+            &[key].into_iter().collect(),
+        );
+        assert!(
+            matches!(contended, Err(AppError::SessionInUse)),
+            "the session must stay locked for as long as the turn runs"
+        );
 
         gate.notify_waiters();
     }
@@ -7786,27 +8527,7 @@ mod tests {
             .unwrap();
         await_turn_running(&state, source_id).await;
 
-        let factory = ProjectDispatchContextFactory::new(
-            open_project_from_store(&state, project_id).unwrap(),
-            state
-                .agents_by_id
-                .lock()
-                .unwrap()
-                .get(&fork.id)
-                .cloned()
-                .unwrap(),
-            adapter_for(&state, &fork).unwrap(),
-            crate::dispatch_context::DispatchDeps {
-                base_emitter: Arc::clone(&state.emitter),
-                needs_session_meta: Arc::clone(&state.needs_session_meta),
-                agents_by_id: Arc::clone(&state.agents_by_id),
-                registry_write: Arc::clone(&state.registry_write),
-                dispatcher: Arc::downgrade(&state.dispatcher),
-                home_dir: home.path().to_path_buf(),
-            },
-        );
-        factory
-            .preflight()
+        preflight_for(&state, project_id, fork.id, home.path())
             .await
             .expect("a materialized fork is not gated by its parent's state");
 
@@ -8893,6 +9614,13 @@ mod tests {
         /// from — so "completed but no file" is not a state production can reach.
         /// A test that needs an agent to stay unmaterialized must fail the turn.
         fail_at: Vec<usize>,
+        /// When set, a **cancelled** parked dispatch signals `observed` and then
+        /// waits for `release` before ending its stream — modelling the real
+        /// producer's `terminate_then_kill` grace, which is the window in which
+        /// the harness is still alive and the turn's session lock must still be
+        /// held. Without it a test cannot distinguish "released at turn end" from
+        /// "released the instant cancel was requested."
+        teardown: Option<Arc<crate::state::MaintenanceBarrier>>,
         dispatches: std::sync::atomic::AtomicUsize,
     }
 
@@ -8910,8 +9638,15 @@ mod tests {
             _cwd: &Path,
             prompt: &str,
             turn_id: switchboard_harness::TurnId,
-            _options: switchboard_harness::DispatchOptions,
+            options: switchboard_harness::DispatchOptions,
         ) -> Result<switchboard_harness::EventStream, switchboard_harness::DispatchError> {
+            // **The token from `options`, not one captured earlier.** `build`
+            // constructs `DispatchOptions` with `..Default::default()` and the
+            // dispatcher overwrites `cancel_token` with the turn's own token, so
+            // any other handle is one nobody cancels — selecting on it makes a
+            // cancellation test hang rather than fail.
+            let cancel_token = options.cancel_token.clone();
+            let teardown = self.teardown.clone();
             let index = self
                 .dispatches
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -8942,8 +9677,28 @@ mod tests {
                 }
                 // Park mid-turn (before the terminal) so a `wait_for_current_turn`
                 // registers against this turn, and a send to this agent enqueues.
+                //
+                // **Cancellable, like a real adapter.** The Claude producer
+                // `select!`s its read against the cancel token; a mock that only
+                // waits on its gate cannot end a turn the way cancellation
+                // actually ends one, and every test built on it silently proves
+                // the gate release rather than the cancel.
                 if park {
-                    gate.notified().await;
+                    let cancelled = tokio::select! {
+                        () = gate.notified() => false,
+                        () = cancel_token.cancelled() => true,
+                    };
+                    if cancelled {
+                        // Optionally stay alive through a teardown grace, then end
+                        // the stream with **no terminal** — the real producer's
+                        // cancellation shape; the dispatcher synthesizes
+                        // `Cancelled`.
+                        if let Some(teardown) = teardown {
+                            teardown.entered.notify_waiters();
+                            teardown.release.notified().await;
+                        }
+                        return;
+                    }
                 }
                 let _ = tx.send(switchboard_harness::AdapterEvent::TurnEnd {
                     turn_id,
@@ -9011,6 +9766,7 @@ mod tests {
             park_at,
             extra_parks: Vec::new(),
             fail_at: Vec::new(),
+            teardown: None,
             dispatches: std::sync::atomic::AtomicUsize::new(0),
         });
         (adapter, prompts)
@@ -9034,6 +9790,7 @@ mod tests {
             park_at: first.1,
             extra_parks: vec![(second.1, Arc::clone(second.0))],
             fail_at: fail_at.to_vec(),
+            teardown: None,
             dispatches: std::sync::atomic::AtomicUsize::new(0),
         });
         (adapter, prompts)
@@ -13101,6 +13858,7 @@ mod tests {
             park_at: 0,
             extra_parks: Vec::new(),
             fail_at: Vec::new(),
+            teardown: None,
             dispatches: std::sync::atomic::AtomicUsize::new(0),
         });
         let emitter = Arc::new(RecordingEmitter::new());

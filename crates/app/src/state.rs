@@ -296,13 +296,36 @@ pub struct AppState {
     /// immediately before handing off. Anything whose view predates a lifecycle
     /// operation is refused, however long it waited.
     ///
-    /// **What this does not cover**, stated rather than glossed: the interval
-    /// between that final check and the dispatcher actually creating the actor.
-    /// Closing it needs `DispatchContextFactory::build` to be able to refuse,
-    /// which it currently cannot — it returns a `DispatchContext`, not a
-    /// `Result` — and making it fallible is a cross-crate change to the same
-    /// trait M2.3 revises for its session lock. Recorded there as a requirement.
-    pub project_generation: Mutex<HashMap<ProjectId, u64>>,
+    /// **The interval past that check is covered too**, by the same counter read
+    /// a second time. `ProjectDispatchContextFactory` captures this value when it
+    /// is built and re-compares it in `preflight`, which the dispatcher runs at
+    /// the instant the turn actually starts. That is what makes the factory's
+    /// frozen `Project` — and the working directory every dispatch takes from it
+    /// — safe to hold for the actor's whole lifetime, and it is also the only
+    /// check reached by a send that queued behind another turn and popped long
+    /// after every command-boundary gate had passed.
+    ///
+    /// `Arc` for exactly that: the factory holds a clone. The factory is *given*
+    /// its comparison value rather than reading one — see
+    /// `ProjectDispatchContextFactory::generation_at_capture` for why sampling it
+    /// at construction pairs a stale project with a fresh counter.
+    ///
+    /// The span this still does not cover — admission to spawn — is described at
+    /// [`crate::commands::reject_if_generation_changed`], including why delete
+    /// bounds it and re-point would not.
+    pub project_generation: Arc<Mutex<HashMap<ProjectId, u64>>>,
+
+    /// Root under which cross-**process** harness session locks live
+    /// (`<lock_root>/locks/<key>.lock`).
+    ///
+    /// **Required, and deliberately not `config_dir()`.** Every other
+    /// user-global path is dev-isolated so a debug build never touches installed
+    /// state; this one must be the *opposite*, because its entire purpose is to
+    /// make a dev build and the installed app contend on one file. Injected
+    /// rather than resolved here so tests take real locks under a `TempDir`
+    /// instead of the developer's live lock directory, where they would contend
+    /// with a running app. See `crate::session_lock_root`.
+    pub lock_root: PathBuf,
 
     /// Test-only pause point, awaited by the lifecycle operations immediately
     /// after they evict and before they drain.
@@ -314,6 +337,23 @@ pub struct AppState {
     /// coverage and wasn't. A barrier is the smaller price.
     #[cfg(test)]
     pub maintenance_barrier: Mutex<Option<Arc<MaintenanceBarrier>>>,
+
+    /// Two-way handshake inside `capture_dispatch_snapshot`, taken **while it
+    /// holds `registry_write`**.
+    ///
+    /// **The second such seam, added deliberately rather than by momentum.** The
+    /// property it exists for — that a dispatch's project, agent, roster, and
+    /// lifecycle generation come from one instant — is enforced by holding a
+    /// single lock, and a test cannot observe "one lock" from outside. Every
+    /// version that tried timed out to be indistinguishable from the broken form:
+    /// `maintenance_barrier` pauses *after* `begin_maintenance` has returned and
+    /// released its guard, so it cannot stage the interleaving at all. Pausing
+    /// mid-capture is the only way a test can prove maintenance is excluded.
+    ///
+    /// A third seam should prompt generalizing this into one mechanism rather
+    /// than a third field.
+    #[cfg(test)]
+    pub capture_barrier: Mutex<Option<Arc<MaintenanceBarrier>>>,
 
     /// Projects currently mid-lifecycle-operation — a re-point or a delete has
     /// evicted their routable state and has not finished rebuilding it.
@@ -351,6 +391,12 @@ pub struct AppState {
     /// [`Self::new_for_test`].
     #[cfg(test)]
     store_tmp: Option<tempfile::TempDir>,
+
+    /// Keeps a test's temp lock root alive, for the same reason as `store_tmp`:
+    /// the root is required, and a test taking real locks under the developer's
+    /// live lock directory would contend with a running app.
+    #[cfg(test)]
+    lock_tmp: Option<tempfile::TempDir>,
 
     /// User-global Git-view tracked-repo registry — the ordered set of repo roots
     /// the Git view shows (see `crate::git_registry`). A superset of the
@@ -428,15 +474,21 @@ impl AppState {
         antigravity_adapter: Arc<dyn HarnessAdapter>,
         emitter: Arc<dyn EventEmitter>,
         store: Store,
+        lock_root: PathBuf,
     ) -> Self {
         Self {
             store,
             maintenance: Mutex::new(HashSet::new()),
-            project_generation: Mutex::new(HashMap::new()),
+            project_generation: Arc::new(Mutex::new(HashMap::new())),
+            lock_root,
             #[cfg(test)]
             maintenance_barrier: Mutex::new(None),
             #[cfg(test)]
+            capture_barrier: Mutex::new(None),
+            #[cfg(test)]
             store_tmp: None,
+            #[cfg(test)]
+            lock_tmp: None,
             directories: Mutex::new(HashMap::new()),
             projects: Mutex::new(HashMap::new()),
             active_project_id: Mutex::new(None),
@@ -484,6 +536,7 @@ impl AppState {
         emitter: Arc<dyn EventEmitter>,
     ) -> Self {
         let root = tempfile::TempDir::new().expect("temp store root");
+        let locks = tempfile::TempDir::new().expect("temp lock root");
         let store = Store::open(root.path()).expect("open temp store");
         let mut state = Self::new(
             claude_adapter,
@@ -491,8 +544,10 @@ impl AppState {
             antigravity_adapter,
             emitter,
             store,
+            locks.path().to_path_buf(),
         );
         state.store_tmp = Some(root);
+        state.lock_tmp = Some(locks);
         state
     }
 
@@ -508,13 +563,17 @@ impl AppState {
         emitter: Arc<dyn EventEmitter>,
     ) -> Self {
         let store = Store::open(root).expect("open temp store");
-        Self::new(
+        let locks = tempfile::TempDir::new().expect("temp lock root");
+        let mut state = Self::new(
             claude_adapter,
             codex_adapter,
             antigravity_adapter,
             emitter,
             store,
-        )
+            locks.path().to_path_buf(),
+        );
+        state.lock_tmp = Some(locks);
+        state
     }
 
     /// Builder step that injects the production notifier. Production calls this

@@ -68,6 +68,25 @@ pub enum AppError {
     #[error("project {0} is being repaired — try again in a moment")]
     ProjectUnderMaintenance(ProjectId),
 
+    /// A turn was prepared against a view of the project that a lifecycle
+    /// operation has since invalidated — the working directory moved, or the
+    /// project was deleted, between resolving it and starting the turn.
+    ///
+    /// **Its own variant because both neighbours misdescribe it.**
+    /// [`Self::ProjectUnderMaintenance`] says a repair is in progress, which may
+    /// have finished; [`Self::ProjectNotLoaded`] says the project is absent, which
+    /// it may not be. Both were returned for this condition, so the user was told
+    /// one of two untrue things depending on which gate caught it. Collapsing a
+    /// distinct condition onto a neighbouring error at the point of use is the
+    /// habit this variant exists to stop — do not fold it back.
+    ///
+    /// The message avoids "resend": a workflow turn has no sender to retry it,
+    /// and a deleted project cannot be retried at all.
+    #[error(
+        "project {0} changed before the turn could start — reload the project and try again if it still exists"
+    )]
+    ProjectViewStale(ProjectId),
+
     /// One `AgentId` is claimed by two projects' registries.
     ///
     /// Cannot happen from ordinary use — agent ids are minted fresh and an
@@ -99,6 +118,34 @@ pub enum AppError {
     #[error("failed to acquire instance lock for project {project_id}: {source}")]
     ProjectLockIo {
         project_id: ProjectId,
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// The advisory lock on this turn's harness session file is already held.
+    ///
+    /// **The message names both causes, because the lock cannot tell them
+    /// apart.** The one it exists for is another Switchboard instance — a dev
+    /// build and the installed app have separate stores, so nothing else stops
+    /// them driving one session. But an unmaterialized branch holds its
+    /// *parent's* key for its whole first turn, so the same refusal reaches a
+    /// user who sent to that parent from this window. `flock` reports contention,
+    /// not who holds it, so claiming "another instance" would be a guess that is
+    /// sometimes simply false — and the two causes have the same fix anyway.
+    ///
+    /// Phrased for the user: a refused turn surfaces this string verbatim as the
+    /// dispatch failure.
+    #[error(
+        "this conversation is already in use by a running turn — in another Switchboard window, or by a branch being created from it here. Wait for that turn to finish, then resend."
+    )]
+    SessionInUse,
+
+    /// Failed to open or `flock` a session lock for a reason other than
+    /// contention (e.g. the lock directory is unwritable). Refuses the turn
+    /// exactly as contention does — see `session_lock::acquire_session_locks`
+    /// for why this is fail-closed rather than warn-and-proceed.
+    #[error("failed to acquire the session lock for this turn: {source}")]
+    SessionLockIo {
         #[source]
         source: std::io::Error,
     },

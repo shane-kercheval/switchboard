@@ -15,6 +15,7 @@ mod metadata;
 mod notification;
 mod preferences;
 mod secret_store;
+mod session_lock;
 mod state;
 mod wake_lock;
 pub mod workflow;
@@ -1790,6 +1791,28 @@ fn store_root_path() -> Option<std::path::PathBuf> {
     config_dir().map(|dir| dir.join("store"))
 }
 
+/// Root for the cross-**process** harness session locks
+/// (`<lock-root>/locks/<key>.lock`).
+///
+/// **Deliberately not `config_dir()`, and not `cfg`-split.** Every sibling path
+/// above resolves through `config_dir()`, which a debug build redirects so dev
+/// runs never touch installed state — the right default for anything Switchboard
+/// owns. These locks are the one exception: their whole purpose is to stop a dev
+/// build and the installed app driving the *same harness session* concurrently,
+/// and the harness's session files are shared between them whatever Switchboard's
+/// config dir says. Inheriting dev isolation here would give both builds their
+/// own lock directory, so neither would ever see the other's lock and the guard
+/// would silently protect nothing. So: resolve the release location
+/// unconditionally, in both build profiles.
+///
+/// Tests never call this — they inject a `TempDir` through `AppState`, because a
+/// test that took a real lock here would contend with the developer's running
+/// app.
+fn session_lock_root() -> Option<std::path::PathBuf> {
+    directories::ProjectDirs::from("", "", "switchboard")
+        .map(|dirs| dirs.config_dir().to_path_buf())
+}
+
 /// The Git-view tracked-repo registry (`git-view.yaml`) — a sibling of
 /// `workspace.yaml` in the same user-global config dir, so both move together
 /// (the debug `SWITCHBOARD_CONFIG_DIR` override relocates both at once).
@@ -2094,12 +2117,18 @@ pub fn run() {
             let store_root = store_root_path()
                 .ok_or("no config directory resolved — cannot locate the project store")?;
             let store = switchboard_core::Store::open(&store_root)?;
+            // Also required, and aborts for the same reason: without a lock root
+            // every turn would refuse (fail-closed), which is worse than not
+            // starting and much harder to diagnose.
+            let lock_root = session_lock_root()
+                .ok_or("no config directory resolved — cannot locate the session lock root")?;
             let state = AppState::new(
                 Arc::clone(&claude_adapter),
                 Arc::clone(&codex_adapter),
                 Arc::clone(&antigravity_adapter),
                 emitter,
                 store,
+                lock_root,
             );
             // Attach all user-global persistence locations (workspace.yaml,
             // git-view.yaml, config.yaml) — see `with_persistence_paths`.
@@ -2292,11 +2321,33 @@ pub fn run() {
 mod tests {
     use super::{
         ActivationCommandError, build_debug_secret_store, build_release_secret_store,
-        debug_config_dir, run_open_argv,
+        debug_config_dir, run_open_argv, session_lock_root,
     };
     use crate::error::AppError;
     use std::path::PathBuf;
     use uuid::Uuid;
+
+    #[test]
+    fn the_session_lock_root_resolves_to_the_release_location_in_a_debug_build() {
+        // The one user-global path deliberately *inconsistent* with its siblings:
+        // every other one is dev-isolated so a debug build never touches the
+        // installed app's state, and this one must be the opposite or a dev build
+        // and the installed app get separate lock directories and neither ever
+        // sees the other's lock. This test runs in a debug build, so if anyone
+        // routes it through `config_dir()` for consistency it fails here.
+        //
+        // Pinned to the expected value rather than merely asserted different from
+        // `config_dir()`: inequality would also hold if the root drifted somewhere
+        // else entirely, and it would break spuriously if a developer pointed
+        // `SWITCHBOARD_CONFIG_DIR` at the release directory.
+        let expected = directories::ProjectDirs::from("", "", "switchboard")
+            .map(|dirs| dirs.config_dir().to_path_buf());
+        assert_eq!(
+            session_lock_root(),
+            expected,
+            "the session lock root must resolve to the release config path in every build profile"
+        );
+    }
 
     #[test]
     fn activation_command_errors_serialize_kind_separately_from_message() {

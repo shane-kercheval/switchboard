@@ -38,26 +38,36 @@ export function forwardSourceForAgent(agent: AgentRecord): ForwardSource {
   return { id: agent.id, name: agent.name };
 }
 
-/// Expand a pane to one forward source per *currently-live* member agent, in pane
-/// member order (a member removed before pick simply drops out). This is the only
+/// Put sources in the live roster's order — the same order as the agent cards —
+/// while dropping removed agents, de-duplicating ids, and refreshing display names.
+export function orderForwardSources(
+  sources: readonly ForwardSource[],
+  agents: readonly AgentRecord[],
+): ForwardSource[] {
+  const sourceIds = new Set(sources.map((source) => source.id));
+  return agents.filter((agent) => sourceIds.has(agent.id)).map(forwardSourceForAgent);
+}
+
+/// Expand a pane to one forward source per *currently-live* member agent, in live
+/// roster order (a member removed before pick simply drops out). This is the only
 /// place a pane meets forwarding: callers add the returned sources individually
 /// (deduped against what's already attached), so no pane entity is ever stored.
 export function forwardSourceAgentsForPane(
   pane: TranscriptPane,
   agents: AgentRecord[],
 ): ForwardSource[] {
-  return pane.members
-    .map((id) => agents.find((a) => a.id === id))
-    .filter((a): a is AgentRecord => a !== undefined)
-    .map(forwardSourceForAgent);
+  const memberIds = new Set(pane.members);
+  return agents.filter((agent) => memberIds.has(agent.id)).map(forwardSourceForAgent);
 }
 
-/// The agent ids a set of sources forwards from, de-duplicated and in order. This
-/// is what the dispatch/backend sees.
-export function expandForwardSources(sources: ForwardSource[]): AgentId[] {
-  const ids: AgentId[] = [];
-  for (const source of sources) if (!ids.includes(source.id)) ids.push(source.id);
-  return ids;
+/// Convert sources to the agent ids the backend sees, in live roster order. A
+/// source whose agent was removed before submission is intentionally omitted,
+/// matching draft reconciliation and pane expansion.
+export function expandForwardSources(
+  sources: readonly ForwardSource[],
+  agents: readonly AgentRecord[],
+): AgentId[] {
+  return orderForwardSources(sources, agents).map((source) => source.id);
 }
 
 /// Reconcile persisted forward sources against the live roster, for restore.
@@ -71,10 +81,7 @@ export function reconcileForwardSources(
   sources: readonly ForwardSource[],
   agents: readonly AgentRecord[],
 ): ForwardSource[] {
-  return sources
-    .map((source) => agents.find((agent) => agent.id === source.id))
-    .filter((agent): agent is AgentRecord => agent !== undefined)
-    .map(forwardSourceForAgent);
+  return orderForwardSources(sources, agents);
 }
 
 /// `reconcileForwardSources` across a per-field map, dropping fields left empty so

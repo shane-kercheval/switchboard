@@ -1,12 +1,16 @@
 import { describe, expect, it } from "vitest";
 import {
+  expandForwardSources,
+  forwardSourceAgentsForPane,
   forwardReadiness,
+  orderForwardSources,
   reconcileForwardSourceMap,
   reconcileForwardSources,
 } from "./heldForwards.svelte";
 import type { ForwardSource } from "./heldForwards.svelte";
 import type { Turn, TurnItem } from "./types";
 import type { AgentRecord } from "$lib/types";
+import type { TranscriptPane } from "$lib/state/transcriptPanes.svelte";
 
 const agent = (id: string, name: string): AgentRecord => ({
   id,
@@ -23,12 +27,48 @@ const ROSTER = [ALICE, BOB];
 
 const source = (id: string, name: string): ForwardSource => ({ id, name });
 
+describe("orderForwardSources", () => {
+  it("matches the agent-card roster order regardless of selection order", () => {
+    expect(
+      orderForwardSources(
+        [source("agent-b", "stale-bob"), source("agent-a", "stale-alice")],
+        ROSTER,
+      ),
+    ).toEqual([
+      { id: "agent-a", name: "alice" },
+      { id: "agent-b", name: "bob" },
+    ]);
+  });
+
+  it("converts to ordered backend ids and omits a removed source", () => {
+    expect(
+      expandForwardSources(
+        [source("agent-b", "bob"), source("agent-gone", "ghost"), source("agent-a", "alice")],
+        ROSTER,
+      ),
+    ).toEqual([ALICE.id, BOB.id]);
+  });
+
+  it("expands pane members in agent-card order rather than pane insertion order", () => {
+    const pane: TranscriptPane = {
+      id: "pane-1",
+      name: "reviewers",
+      members: [BOB.id, ALICE.id],
+      hidden: [],
+    };
+    expect(forwardSourceAgentsForPane(pane, ROSTER)).toEqual([
+      { id: "agent-a", name: "alice" },
+      { id: "agent-b", name: "bob" },
+    ]);
+  });
+});
+
 describe("reconcileForwardSources", () => {
-  it("keeps sources whose agent is still on the roster, in order", () => {
+  it("keeps surviving sources in the current roster order", () => {
     const sources = [source("agent-b", "bob"), source("agent-a", "alice")];
     expect(reconcileForwardSources(sources, ROSTER)).toEqual([
-      { id: "agent-b", name: "bob" },
       { id: "agent-a", name: "alice" },
+      { id: "agent-b", name: "bob" },
     ]);
   });
 
@@ -64,8 +104,8 @@ describe("reconcileForwardSourceMap", () => {
     expect(reconcileForwardSourceMap(map, ROSTER)).toEqual({
       focus: [{ id: "agent-a", name: "alice" }],
       context: [
-        { id: "agent-b", name: "bob" },
         { id: "agent-a", name: "alice" },
+        { id: "agent-b", name: "bob" },
       ],
     });
   });

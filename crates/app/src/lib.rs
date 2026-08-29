@@ -2324,10 +2324,26 @@ pub fn run() {
 ///
 /// These tests close that: they build an attachment path the way production
 /// does and match it against the glob the shipped config actually contains.
+///
+/// **They match the glob, not the whole production predicate.** Tauri's
+/// `is_allowed` canonicalizes (resolving symlinks) before matching and denies
+/// outright if that fails — so these synthetic paths, which do not exist, would
+/// be rejected by the real check regardless of the pattern. That is the right
+/// scope for what is being pinned here (does the shipped glob describe the
+/// shipped layout), but it is not end-to-end coverage of the asset protocol.
+///
+/// A consequence of that canonicalization worth stating where the scope is
+/// chosen: matching happens on the *canonical* path, so a store root that
+/// canonicalizes to a location without a matching component — the config or
+/// store directory itself symlinked into a differently-named path — loses
+/// thumbnails, in any build profile. (An earlier note called this
+/// developer-only, which understated it, and a proposed correction blamed a
+/// symlinked home, which is wrong: that changes the prefix, which the leading
+/// `**` absorbs, and leaves the named component intact.)
 #[cfg(test)]
 mod asset_scope_tests {
     use glob::Pattern;
-    use switchboard_core::{ProjectId, Store};
+    use switchboard_core::Store;
     use tempfile::TempDir;
 
     /// The `scope` array from the config the app ships with.
@@ -2374,17 +2390,21 @@ mod asset_scope_tests {
     /// live reaches this test instead of only reaching users.
     fn attachment_below(store_root: &std::path::Path) -> std::path::PathBuf {
         let tmp = TempDir::new().expect("temp store");
+        let cwd = TempDir::new().expect("temp working directory");
         let probe = Store::open(tmp.path()).expect("open temp store");
-        let id = ProjectId::now_v7();
-        let relative = probe
-            .project_root(id)
+        let directory = probe.add_directory(cwd.path()).expect("bind a directory");
+        let project = probe
+            .create_project(directory.directory_id, "probe")
+            .expect("create a project");
+        // Through `Project::attachments_dir()` rather than a literal: renaming
+        // the layout constant must reach this test, since that rename breaks
+        // thumbnails and nothing else would notice.
+        let relative = project
+            .attachments_dir()
             .strip_prefix(tmp.path())
-            .expect("project root is below the store root")
+            .expect("attachments live below the store root")
             .to_path_buf();
-        store_root
-            .join(relative)
-            .join("attachments")
-            .join("shot.png")
+        store_root.join(relative).join("shot.png")
     }
 
     #[test]
@@ -2423,6 +2443,31 @@ mod asset_scope_tests {
     }
 
     #[test]
+    fn the_asset_scope_matching_requires_literal_separators() {
+        // **Pins the option, not the glob.** Every other case here behaves
+        // identically under Tauri's strict options and `glob`'s loose defaults,
+        // because each is missing a *literal* segment no wildcard can supply. So
+        // the setting the module depends on — and whose absence let a wrong glob
+        // pass in the first place — was itself unenforced.
+        //
+        // These two are the exception: each needs a wildcard to swallow a `/`.
+        // Strict rejects them; loose accepts them. Swap `tauri_match_options()`
+        // for `MatchOptions::default()` and only these fail.
+        for path in [
+            // `switchboard-dev*` would have to span two components.
+            "/Users/x/Library/Application Support/switchboard-dev/other/store/projects/abc/attachments/shot.png",
+            // The project-id `*` would have to span two components.
+            "/Users/x/Library/Application Support/switchboard/store/projects/a/b/attachments/shot.png",
+        ] {
+            assert!(
+                !is_allowed(std::path::Path::new(path)),
+                "a wildcard crossed a path separator — the match options are no \
+                 longer Tauri's, and the scope is looser than it reads: {path}"
+            );
+        }
+    }
+
+    #[test]
     fn the_asset_scope_does_not_authorize_unrelated_files() {
         // The glob leads with `**`, so it is worth pinning that it still requires
         // the whole `switchboard*/store/projects/*/attachments/` shape rather
@@ -2431,6 +2476,10 @@ mod asset_scope_tests {
             "/Users/someone/Documents/taxes.pdf",
             "/Users/someone/Library/Application Support/switchboard/store/store.yaml",
             "/Users/someone/Library/Application Support/switchboard/store/projects/abc/journal.jsonl",
+            // Prefix-adjacent roots the old `switchboard*` glob authorized.
+            "/Users/someone/Library/Application Support/switchboard-backup/store/projects/abc/attachments/shot.png",
+            "/Users/someone/Library/Application Support/switchboard-demo/store/projects/abc/attachments/shot.png",
+            "/Users/someone/Library/Application Support/switchboard-dev-backup/store/projects/abc/attachments/shot.png",
         ] {
             assert!(
                 !is_allowed(std::path::Path::new(path)),

@@ -173,8 +173,14 @@ async fn wait_at_maintenance_barrier(state: &AppState) {
     if let Some(barrier) = barrier {
         // Signal arrival *before* waiting, so a test can block on reaching this
         // point rather than guessing at it — and so deleting this call makes the
-        // test time out instead of quietly passing.
-        barrier.entered.notify_waiters();
+        // test fail rather than quietly pass.
+        //
+        // `notify_one`, not `notify_waiters`, on both sides: `notify_waiters`
+        // wakes only waiters already registered and stores nothing, so either
+        // half of this handshake losing the race to register is a lost wakeup and
+        // a hung test. `notify_one` stores a permit, which makes a single-waiter
+        // handshake ordering-independent instead of merely currently-correct.
+        barrier.entered.notify_one();
         barrier.release.notified().await;
     }
 }
@@ -183,13 +189,31 @@ async fn wait_at_maintenance_barrier(state: &AppState) {
 #[expect(clippy::unused_async, reason = "matches the cfg(test) signature")]
 async fn wait_at_maintenance_barrier(_state: &AppState) {}
 
-/// Hold [`capture_dispatch_snapshot`] open **inside** its `registry_write`
-/// guard when a test asks. See [`AppState::capture_barrier`].
+/// Hold [`capture_dispatch_snapshot`] open **between its two reads**, inside the
+/// `registry_write` guard, when a test asks. See [`AppState::capture_barrier`].
+///
+/// **Taking the already-read `Project` is what fixes the call site, and it is
+/// load-bearing rather than decorative.**
+/// `a_lifecycle_operation_cannot_interleave_a_dispatch_capture` discriminates
+/// only while this sits after the project read and before the generation read.
+/// Moved above `lookup_agent` — the obvious place, and where it originally lived
+/// — a regression narrowing the guard to cover just the first read still pauses
+/// while holding the lock, so the test goes on passing against the exact race the
+/// capture exists to prevent. That is not hypothetical: it is what the first
+/// version of this seam did, and a review round confirmed the test
+/// "discriminates" before it was checked by breaking the code on purpose.
+///
+/// The parameter is unused. It exists so that call site cannot be written: above
+/// `lookup_agent` there is no `Project` in scope, so relocating this call is a
+/// compile error rather than a silent weakening of the test. Same discipline as
+/// [`reload_projects`] taking no path — a signature that cannot express the wrong
+/// thing beats a comment asking for the right one.
 #[cfg(test)]
-fn wait_at_capture_barrier(state: &AppState) {
+fn wait_between_project_and_generation_reads(state: &AppState, _project: &Project) {
     let barrier = lock(&state.capture_barrier).clone();
     if let Some(barrier) = barrier {
-        barrier.entered.notify_waiters();
+        // `notify_one` on both sides — see `wait_at_maintenance_barrier`.
+        barrier.entered.notify_one();
         // Blocking, not `await`: the capture is synchronous and holds a `std`
         // mutex, which must never be held across an await point. The test drives
         // it from `spawn_blocking` for the same reason.
@@ -198,7 +222,7 @@ fn wait_at_capture_barrier(state: &AppState) {
 }
 
 #[cfg(not(test))]
-fn wait_at_capture_barrier(_state: &AppState) {}
+fn wait_between_project_and_generation_reads(_state: &AppState, _project: &Project) {}
 
 /// Everything a dispatch needs about its project, taken at one instant.
 ///
@@ -234,8 +258,10 @@ pub(crate) fn capture_dispatch_snapshot(
     agent_id: AgentId,
 ) -> Result<(Project, AgentRecord, u64), AppError> {
     let _write = lock(&state.registry_write);
-    wait_at_capture_barrier(state);
     let (project, agent) = lookup_agent(state, agent_id)?;
+    // Between the two reads on purpose; the `&project` argument is what makes
+    // any other position fail to compile.
+    wait_between_project_and_generation_reads(state, &project);
     let generation = project_generation(state, project.id);
     Ok((project, agent, generation))
 }
@@ -8035,18 +8061,28 @@ mod tests {
 
     #[tokio::test]
     async fn a_lifecycle_operation_cannot_interleave_a_dispatch_capture() {
-        // **The invariant `capture_dispatch_snapshot` exists for, and the only
-        // test shape that can see it.** Read separately, the project and the
-        // generation can straddle `begin_maintenance`: project from before the
-        // eviction, counter from after the bump — and every downstream check then
-        // compares that counter against itself and passes.
+        // **The invariant is "one acquisition spanning both reads," not "an
+        // acquisition exists," and the difference is the whole test.** Read
+        // separately, the project and the generation can straddle
+        // `begin_maintenance`: project from before the eviction, counter from
+        // after the bump — and every downstream check then compares that counter
+        // against itself and passes.
         //
-        // A test cannot observe "one lock acquisition" from outside, and the
-        // existing `maintenance_barrier` cannot stage the interleaving either: it
-        // pauses *after* `begin_maintenance` has returned and dropped its guard.
-        // So the seam is inside the capture, immediately after it takes
-        // `registry_write`, and the assertion is that a lifecycle operation
-        // **cannot complete** while the capture is paused there.
+        // An earlier version of this test paused *before* `lookup_agent` and
+        // asserted that `begin_maintenance` had not finished. It passed against a
+        // regression that narrowed the guard to cover only the first read: the
+        // capture still paused holding the lock, so maintenance was still
+        // blocked, and on release the capture won the race to read the counter
+        // before the woken maintenance thread could bump it. Two green signals,
+        // race intact. A review round confirmed that test discriminated; it did
+        // not, and only breaking the code on purpose showed it.
+        //
+        // So the assertion is now `try_lock` from the test thread while the
+        // capture is paused **between** its two reads. No timing, no scheduler
+        // dependence: either the guard spans this point or it does not. And the
+        // seam takes the already-read `Project`, so the one refactor that would
+        // quietly weaken this test again — moving the pause back above the
+        // project read — does not compile.
         let (_tmp, home, state, _gate, project_id) = state_with_parked_claude(&[]).await;
         let agent_id = seed_source(&state, home.path(), project_id, "alice", "hello");
         let before = project_generation(&state, project_id);
@@ -8064,32 +8100,49 @@ mod tests {
         let capture = tokio::task::spawn_blocking(move || {
             capture_dispatch_snapshot(&capture_state, agent_id)
         });
-        entered.await;
+        // Bounded: removing the seam must fail this test, not stall the suite.
+        tokio::time::timeout(WAIT, entered)
+            .await
+            .expect("the capture never reached the seam");
 
-        // The capture is now parked *inside* its `registry_write` guard. A
-        // lifecycle operation must not be able to get through.
+        // The capture is parked between its two reads. If the guard does not
+        // span this point, the interleaving is possible.
+        let held = matches!(
+            state.registry_write.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        );
+
+        // A racer on the real lifecycle path. It carries no assertion of its own:
+        // "maintenance is blocked" is a negative liveness property with no
+        // deterministic form, and the sleep-and-check version of it failed *open*
+        // — passing under load exactly when it should not — which is the shape of
+        // false coverage this milestone spent three rounds removing. It stays
+        // because it exercises genuine contention, so a missing guard also tends
+        // to show up in the generation assertion below.
+        //
+        // **Not pinned here, and it cannot be:** that `begin_maintenance` takes
+        // *this same* lock. `try_lock` proves the capture holds `registry_write`,
+        // not that anything else contends for it. See `begin_maintenance`, which
+        // documents holding it across mark → evict → bump.
         let maintenance_state = Arc::clone(&state);
         let scope: HashSet<ProjectId> = std::iter::once(project_id).collect();
         let maintenance = tokio::task::spawn_blocking(move || {
             begin_maintenance(&maintenance_state, &scope).is_ok()
         });
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let interleaved = maintenance.is_finished();
 
-        // **Release before asserting, always.** A `spawn_blocking` task cannot be
+        // Release before asserting, always. A `spawn_blocking` task cannot be
         // aborted, so a panic here with the capture still parked leaves a thread
-        // blocked forever and the test *hangs* instead of failing. The first
-        // version of this test did exactly that under falsification — the broken
-        // implementation produced a timeout, not a red test, which is the worst
-        // of both outcomes. Collect the verdicts, unblock everything, then assert.
-        barrier.release.notify_waiters();
+        // blocked forever and the suite *hangs* instead of failing — which an
+        // earlier version of this test did under falsification.
+        barrier.release.notify_one();
         let captured = capture.await.unwrap();
         let _ = maintenance.await;
 
         assert!(
-            !interleaved,
-            "a lifecycle operation completed while a dispatch capture held the write lock — \
-             the capture is not excluding maintenance, so its project and generation can straddle it"
+            held,
+            "`registry_write` was not held between the project read and the \
+             generation read — the capture can straddle a lifecycle operation, \
+             pairing a stale project with a counter that then validates itself"
         );
         let (project, _agent, generation) = captured.expect("capture succeeds");
         assert_eq!(project.id, project_id);
@@ -8215,7 +8268,10 @@ mod tests {
         entered.as_mut().enable();
         state.dispatcher.cancel_agent(agent_id, CancelSource::User);
         // Synchronise on the adapter observing the cancel, not on a sleep.
-        entered.await;
+        // Bounded: deleting the seam must fail this test, not stall the suite.
+        tokio::time::timeout(WAIT, entered)
+            .await
+            .expect("the adapter never observed the cancel");
 
         let contended = crate::session_lock::acquire_session_locks(
             &state.lock_root,
@@ -8224,7 +8280,7 @@ mod tests {
         // Release before asserting: the adapter is parked in its teardown grace,
         // and a panic here would strand it and hang the suite instead of failing
         // it. (The capture-interleave test learned this the hard way.)
-        teardown.release.notify_waiters();
+        teardown.release.notify_one();
         assert!(
             matches!(contended, Err(AppError::SessionInUse)),
             "the session must stay locked while the harness is still terminating"
@@ -9694,7 +9750,11 @@ mod tests {
                         // cancellation shape; the dispatcher synthesizes
                         // `Cancelled`.
                         if let Some(teardown) = teardown {
-                            teardown.entered.notify_waiters();
+                            // `notify_one` on both sides — see
+                            // `wait_at_maintenance_barrier` for why a
+                            // `notify_waiters` handshake is a lost wakeup waiting
+                            // to happen.
+                            teardown.entered.notify_one();
                             teardown.release.notified().await;
                         }
                         return;
@@ -14509,8 +14569,9 @@ mod tests {
         // the drain finishes before a test can look.
         let barrier = Arc::new(crate::state::MaintenanceBarrier::default());
         *lock(&state.maintenance_barrier) = Some(Arc::clone(&barrier));
-        // Subscribe before spawning: `notify_waiters` wakes only current
-        // waiters, so a late subscription would miss the signal and hang.
+        // Subscribe before spawning. The seam now uses `notify_one`, which
+        // stores a permit and makes the ordering irrelevant — but subscribing
+        // first is still the honest shape, and this line predates that change.
         let entered = barrier.entered.notified();
         tokio::pin!(entered);
 
@@ -14533,7 +14594,7 @@ mod tests {
         // in order — and the barrier is released on every path, so a failure
         // reports rather than hanging the suite on a parked repair task.
         let late = send_msg(&state, agent.id, "late").await;
-        barrier.release.notify_waiters();
+        barrier.release.notify_one();
         let repaired = tokio::time::timeout(std::time::Duration::from_secs(10), repointer).await;
 
         assert!(

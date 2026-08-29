@@ -71,7 +71,8 @@
     soloAgent,
     toggleAgentHidden,
   } from "$lib/state/transcriptPanes.svelte";
-  import { selectAgent } from "$lib/state/recipientSelection.svelte";
+  import { selectAgent, selectionFor } from "$lib/state/recipientSelection.svelte";
+  import { workflowRuns } from "$lib/state/workflows.svelte";
   import HarnessIcon from "$lib/components/ui/HarnessIcon.svelte";
   import PlusIcon from "$lib/components/ui/PlusIcon.svelte";
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
@@ -107,6 +108,8 @@
   const rosterIds = $derived(agents.map((a) => a.id));
   const paneLayout = $derived(layoutFor(projectId, rosterIds));
   const hiddenAgentCount = $derived(hiddenCount(projectId, rosterIds));
+  const recipientSelection = $derived(selectionFor(projectId));
+  const workflowActive = $derived((workflowRuns[projectId]?.length ?? 0) > 0);
 
   /// Eye toggle: plain click hides/shows the agent within its pane; Alt-click
   /// solos it (show only this agent in its pane; Alt-click again restores) —
@@ -985,6 +988,7 @@
         {@const overageAsOf = runtime?.last_rate_limit_as_of}
         {@const isCollapsed = collapsed[agent.id] ?? false}
         {@const active = isActive(agent.id)}
+        {@const recipientSelected = !workflowActive && recipientSelection.includes(agent.id)}
         {@const sessionInfo = sessionInfoByAgent[agent.id]}
         {@const confirmingRemove = removeConfirmAgentId === agent.id}
         <!-- A native button cannot contain the card's controls. The focusable
@@ -994,6 +998,7 @@
         <div
           class={cn(
             "group bg-raised hover:ring-active focus-visible:ring-focus cursor-pointer rounded-md px-2.5 py-2 transition-shadow hover:shadow-sm hover:ring-1 focus-visible:ring-1 focus-visible:outline-none",
+            recipientSelected && "ring-accent hover:ring-accent ring-1",
             dragState?.started === true &&
               dragState.agentId === agent.id &&
               "ring-accent/60 relative z-10 shadow-lg ring-1",
@@ -1001,6 +1006,7 @@
           data-testid="sidebar-agent"
           data-agent-id={agent.id}
           data-collapsed={isCollapsed}
+          data-recipient-selected={recipientSelected}
           tabindex="0"
           aria-label={`${agent.name}, ${isCollapsed ? "collapsed" : "expanded"}. Press Enter or Space to toggle details.`}
           use:agentRowPointerActions={agent.id}

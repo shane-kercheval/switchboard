@@ -188,6 +188,25 @@ describe("Sidebar", () => {
     expect(icons[1]).toHaveAttribute("alt", "Codex");
   });
 
+  it("outlines only the agents selected to receive the draft", async () => {
+    const selection = await import("$lib/state/recipientSelection.svelte");
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT, CODEX_AGENT] } });
+
+    const cards = screen.getAllByTestId("sidebar-agent");
+    expect(cards[0]).toHaveAttribute("data-recipient-selected", "false");
+    expect(cards[1]).toHaveAttribute("data-recipient-selected", "false");
+
+    selection.setRecipients(PROJECT_ID, [CLAUDE_AGENT.id]);
+    await waitFor(() => expect(cards[0]).toHaveAttribute("data-recipient-selected", "true"));
+    expect(cards[0]).toHaveClass("ring-accent", "ring-1", "hover:ring-accent");
+    expect(cards[1]).toHaveAttribute("data-recipient-selected", "false");
+    expect(cards[1]).not.toHaveClass("ring-accent");
+
+    selection.setRecipients(PROJECT_ID, [CODEX_AGENT.id]);
+    await waitFor(() => expect(cards[1]).toHaveAttribute("data-recipient-selected", "true"));
+    expect(cards[0]).toHaveAttribute("data-recipient-selected", "false");
+  });
+
   it("renders empty-state message when no agents", async () => {
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [] } });
     expect(screen.queryAllByTestId("sidebar-agent")).toHaveLength(0);

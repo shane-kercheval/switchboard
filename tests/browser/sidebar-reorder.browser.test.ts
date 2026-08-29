@@ -26,6 +26,7 @@ vi.mock("$lib/state/workspace.svelte", () => ({
 import { render } from "vitest-browser-svelte";
 import SidebarHost from "./SidebarHost.svelte";
 import { PROJECT_ID, ALICE } from "./fixtures";
+import { setRecipients, _testing as selectionState } from "$lib/state/recipientSelection.svelte";
 import type { AgentRecord } from "$lib/types";
 
 // Two extra agents to give the roster a real layout to measure against.
@@ -52,6 +53,28 @@ const THREE_AGENTS = [ALICE, BOB, CAROL];
 beforeEach(() => {
   reorderAgentsMock.mockReset();
   reorderAgentsMock.mockResolvedValue(undefined);
+  selectionState.reset();
+});
+
+test("selected recipients keep a thin accent outline at rest and on hover", async () => {
+  setRecipients(PROJECT_ID, [ALICE.id]);
+  render(SidebarHost, { projectId: PROJECT_ID, agents: THREE_AGENTS });
+
+  const selected = page.getByTestId("sidebar-agent").nth(0);
+  const unselected = page.getByTestId("sidebar-agent").nth(1);
+  const swatch = document.createElement("div");
+  swatch.style.color = "var(--accent)";
+  document.body.append(swatch);
+  const accent = getComputedStyle(swatch).color;
+  swatch.remove();
+
+  expect(selected.element()).toHaveAttribute("data-recipient-selected", "true");
+  expect(unselected.element()).toHaveAttribute("data-recipient-selected", "false");
+  expect(getComputedStyle(selected.element()).boxShadow).toContain(accent);
+  expect(getComputedStyle(unselected.element()).boxShadow).not.toContain(accent);
+
+  await selected.hover();
+  await expect.poll(() => getComputedStyle(selected.element()).boxShadow).toContain(accent);
 });
 
 test("the clickable card surface gains an outline and icon controls retain distinct hovers", async () => {

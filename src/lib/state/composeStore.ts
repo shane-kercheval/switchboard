@@ -7,7 +7,7 @@
 /// preference, *not* conversation history. A draft is earlier than even a
 /// queued send, which system-design §3 already classes as live-UI-only. It
 /// therefore lives in machine-local localStorage rather than the git-tracked
-/// `.switchboard/` project state: a half-typed message must not sync to a
+/// durable project state: a half-typed message must not sync to a
 /// teammate. localStorage is also origin-scoped, so `make dev DEV_PORT=…`
 /// instances get isolated drafts for free.
 ///

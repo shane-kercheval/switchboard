@@ -297,7 +297,7 @@ export async function renameProject(
 
 /// Permanently delete one project's Switchboard state: drains its agents and
 /// removes its index entry, then best-effort removes
-/// `<directory>/.switchboard/projects/<id>/`. The working directory and each
+/// `<store>/projects/<id>/`. The working directory and each
 /// agent's own harness session files are kept. "Already gone" is benign
 /// success; failures that prevent removing the project from the listing reject.
 export async function deleteProject(projectId: ProjectId): Promise<void> {
@@ -550,7 +550,7 @@ export async function stageAttachment(
 
 // Narrow staged paths to those that still exist under this project's attachments
 // dir. A restored draft prunes its chips through this, so a chip whose file was
-// removed out-of-band (a cleaned `.switchboard/`) doesn't dangle in the composer.
+// removed out-of-band (a manual delete, an interrupted GC) doesn't dangle in the composer.
 export async function existingAttachmentPaths(
   projectId: ProjectId,
   paths: string[],

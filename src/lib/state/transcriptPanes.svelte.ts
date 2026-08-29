@@ -20,7 +20,7 @@
 // **Device-local, persisted.** Pane arrangement is a personal, per-device
 // preference (like compose drafts — see composeStore's module comment), so it
 // lives in localStorage under a versioned envelope, never in the git-tracked
-// `.switchboard/` state. Per-pane hidden sets persist with the layout
+// project state in the store. Per-pane hidden sets persist with the layout
 // deliberately: hiding is curation, like membership, and the sidebar's
 // "N hidden · Show all" reset keeps a restored hide discoverable.
 

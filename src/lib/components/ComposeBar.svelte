@@ -234,8 +234,8 @@
     commitChips(attachmentChips.filter((chip) => chip.id !== id));
   }
 
-  /// Drop restored chips whose staged file no longer exists (a cleaned
-  /// `.switchboard/`, or an older build's GC). Only the *restored* paths are
+  /// Drop restored chips whose staged file no longer exists (a manual delete,
+  /// an interrupted GC, a migration). Only the *restored* paths are
   /// candidates — a file attached while this check was in flight was never at risk
   /// and must not be pruned by a stale answer.
   async function pruneMissingAttachments(restored: Attachment[]): Promise<void> {

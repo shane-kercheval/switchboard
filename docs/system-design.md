@@ -22,7 +22,7 @@ This orchestration model has a useful side effect for prompt management. Because
 - **Configurable prompt providers.** Apply prompt templates from one or more configured prompt providers during routing, with parameterized substitution. Providers include a built-in local file store (prompts authored as files in the user's Switchboard config directory or a personal prompt-library directory) and any MCP server that exposes prompts (for example [Tiddly](https://tiddly.me)). Provider configuration is centralized in Switchboard, so a user's prompt library works identically across Claude Code, Codex, and future agent backends without per-agent MCP setup. Does not extend to MCP *tools* or to model-discovered *skills*, which remain per-agent concerns.
 - **Zero-setup onboarding.** Switchboard ships with example prompts and example workflows in the local store so a new user can invoke a useful workflow within minutes of installation, without configuring an MCP server.
 - **Full access to the underlying harness.** Switchboard drives Claude Code, Codex, and Antigravity; it doesn't replace them.
-- **Shareable, versioned configuration.** Workflows and project configuration are file-based and live inside the project's `.switchboard/` directory, so they version, diff, review, and share via the user's normal git workflow. Local prompts are likewise file-based and git-friendly, but live in user-global directories (e.g. a personal `~/repos/my-prompts/` library) rather than per-project — see §6.
+- **Shareable, versioned configuration.** Workflows and project configuration are file-based and human-readable (YAML/JSONL), so they diff and review rather than hiding in a database. Local prompts are likewise file-based and git-friendly, but live in user-global directories (e.g. a personal `~/repos/my-prompts/` library) rather than per-project — see §6.
 
 ### Non-goals
 
@@ -44,8 +44,8 @@ This orchestration model has a useful side effect for prompt management. Because
 
 | Concept | Definition |
 |---|---|
-| **Working directory** | An on-disk directory (typically a git repo) where Switchboard does its work. Identified by canonicalized path. One Switchboard-managed `.switchboard/` lives at the directory root and contains zero or more **projects**. |
-| **Project** | A named, task-scoped grouping of agents + workflow runs + runtime state, hosted within a working directory. (Workflow *definitions* are **user-global** — one set shared across every project; projects own workflow *runs* — the in-flight invocations against their agents.) Each project has a UUID (`ProjectId`) and a user-supplied name (unique within its directory; can collide across directories). Multiple projects can coexist in the same working directory, allowing the user to run separate workstreams (backend / frontend / planning / etc.) on the same repo simultaneously. Project-specific state lives at `<directory>/.switchboard/projects/<project-id>/` (see directory layout below). |
+| **Working directory** | An on-disk directory (typically a git repo) where Switchboard does its work — the agent's spawn cwd. Recorded in the store's catalog under a stable `directory_id`; **Switchboard writes nothing into it.** Zero or more **projects** reference it. |
+| **Project** | A named, task-scoped grouping of agents + workflow runs + runtime state, hosted within a working directory. (Workflow *definitions* are **user-global** — one set shared across every project; projects own workflow *runs* — the in-flight invocations against their agents.) Each project has a UUID (`ProjectId`) and a user-supplied name (unique within its directory; can collide across directories). Multiple projects can coexist in the same working directory, allowing the user to run separate workstreams (backend / frontend / planning / etc.) on the same repo simultaneously. Project-specific state lives at `<store>/projects/<project-id>/` (see directory layout below). |
 | **Agent** | A Claude Code, Codex, or Antigravity session within a project, with a user-assigned name. Each agent has a persistent harness session under the hood, identified by a `session_locator` on its registry record (a UUID for Claude/Antigravity; a thread-id + partition-date for Codex). All three harnesses keep their locator wholly on the record — pre-generated at creation (Claude) or captured at runtime (Codex/Antigravity). Agents are bound to their project, not directly to the directory. |
 | **Primitive** | An atomic operation Switchboard provides for a workflow to compose: spawn agent, send message, auto-forward output, fan-in with template, pause for user input, iterate over a list. Six exist in v1; see §4. (Saving and invoking a reusable workflow is the composition layer over these primitives, not itself a primitive — see §5.) |
 | **Workflow** | A named, parameterized composition of primitives — for example "fan-out review and aggregate." Defined as a YAML file in the **user-global** workflows folder (`<config-dir>/workflows/`); workflows are reusable templates shared across every project, like prompts (rationale below). Invoked by name with arguments against a specific project (its `agent` inputs bind to that project's agents). |
@@ -62,59 +62,65 @@ A single working directory (a git repo) often hosts multiple in-flight workstrea
 
 ### Directory layout
 
-Switchboard-managed state lives in a `.switchboard/` directory at the working directory's root. The shape (illustrative):
+**Switchboard writes nothing into a working directory.** All Switchboard-owned state is user-global, under the OS config dir. A working directory holds the user's code and nothing else of ours, so deleting a worktree, moving a checkout, or `rm -rf`-ing a clone costs no project state — the conversations survive and the project simply reports its directory as unavailable until it is re-pointed.
+
+This replaces an earlier design in which each directory owned its projects under `<directory>/.switchboard/`. That layout made a directory self-contained and portable, which sounded right and cost more than it returned: deleting a worktree silently destroyed its conversation history, and cross-project features had to open N directories to answer one question. The old layout is gone — no code reads it, `switchboard_core::paths` deliberately holds no constant for it, and a one-off tool (`crates/migrate`) is the only thing that knows its shape.
+
+The shape (illustrative):
 
 ```
-<directory>/
-└── .switchboard/
-    ├── config.yaml             # directory-level config (placeholder in v1; mostly empty)
-    ├── projects.jsonl          # index of projects: { id, name, created_at } — appended on
-    │                           #   create, rewritten in place on rename/delete
-    │                           #   (like registry.jsonl)
-    └── projects/
-        └── <project-id>/       # per-project state (one subdirectory per project)
-            ├── config.yaml     # per-project config
-            ├── instance.lock   # M4+ flock — one Switchboard process per project at a time
-            ├── registry.jsonl  # agent registry for this project (appended on
-            │                   #   register, rewritten on rename/remove)
-            ├── journal.jsonl   # append-only user sends, outcomes, and durable turn links
-            ├── pins.jsonl      # mutable message-pin identities + pin timestamps; no message content
-            ├── sessions/       # per-agent stream-only-metadata: a last-write-wins
-            │                   #   snapshot (<agent-id>.meta.json) + an append-log
-            │                   #   of per-turn cost/overage (<agent-id>.turnmeta.jsonl)
-            │                   #   — both for restart continuity. All harnesses'
-            │                   #   session identity lives on the registry record
-            │                   #   (session_locator); session-link sidecars removed.
-            ├── attachments/    # files dropped onto a send, staged here (inside cwd
-            │                   #   so they resolve under every harness sandbox) and
-            │                   #   referenced by absolute path; reference-GC'd on load
-            └── runs/           # M6+ — workflow-run checkpoints
-
-~/.config/switchboard/          # user-global config (illustrative Linux/XDG path; resolved via the `directories` crate —
-│                               #   on macOS this is ~/Library/Application Support/switchboard/)
-├── config.yaml                 # personal preferences + prompt providers (local_prompt_dirs, mcp_providers — see §6)
-├── prompts/                    # default local prompt store (user's own prompts; built-ins are baked-in read-only, not written here — see §6)
+~/.config/switchboard/          # user-global (illustrative Linux/XDG path; resolved via the `directories`
+│                               #   crate — on macOS ~/Library/Application Support/switchboard/)
+├── config.yaml                 # personal preferences + prompt providers (local_prompt_dirs, mcp_providers — §6)
+├── prompts/                    # default local prompt store (built-ins are baked-in read-only — §6)
 ├── workflows/                  # user-global workflow definitions (YAML), shared across every project
-└── workspace.yaml              # app-managed: the working directories the user works across,
-                                #   each with a cached snapshot of its projects, plus the
-                                #   user-global set of archived project ids (view-state)
+├── workspace.yaml              # app-managed **view-state only**: the working directories the user works
+│                               #   across (ordering), which are hidden, and which projects are archived.
+│                               #   Nothing here is load-bearing — losing it costs arrangement, never a project.
+├── locks/                      # cross-process harness session locks, one file per (harness, session, cwd).
+│                               #   Deliberately NOT dev-isolated: a dev build and the installed app must
+│                               #   contend on the same file or neither sees the other (see session_lock.rs)
+└── store/                      # the project store — the source of truth for what exists
+    ├── store.yaml              # schema marker, checked fail-loud
+    ├── projects.jsonl          # global index: { id, name, created_at, directory_id } — one file for
+    │                           #   every project across every directory
+    ├── directories.jsonl       # the catalog: { directory_id, path }. Entries are never deleted while
+    │                           #   any project references them — deleting the mapping would strand
+    │                           #   every project under it with no cwd to dispatch into
+    └── projects/
+        └── <project-id>/
+            ├── config.yaml     # per-project config, incl. a directory_id recovery copy (never read at runtime)
+            ├── instance.lock   # flock — one Switchboard process per project at a time
+            ├── registry.jsonl  # agent registry (appended on register, rewritten on rename/remove)
+            ├── journal.jsonl   # append-only user sends, outcomes, and durable turn links
+            ├── pins.jsonl      # mutable message-pin identities; no message content
+            ├── sessions/       # per-agent stream-only metadata: a last-write-wins snapshot
+            │                   #   (<agent-id>.meta.json) + a per-turn cost/overage append-log
+            │                   #   (<agent-id>.turnmeta.jsonl). Session identity itself lives on the
+            │                   #   registry record (session_locator); link sidecars are gone.
+            ├── attachments/    # files dropped onto a send, staged here and referenced by absolute
+            │                   #   path; reference-GC'd on load. Per-project so project delete
+            │                   #   reclaims them with a plain directory removal
+            └── runs/           # workflow-run records
 ```
+
+**A project's working directory is resolved, not stored.** Each project row carries a `directory_id`; the catalog maps that id to a path. This indirection is what makes a moved directory a one-line repair (re-point the id) instead of a rewrite of every project that shares it, and it is why the wire type reports a structured directory status — resolved-and-available, resolved-but-path-unavailable, catalog-missing, catalog-ambiguous — rather than a boolean: the three failures have different causes and different repairs.
+
+Everything under the config dir is local-machine runtime data. It is outside any repo, so there is nothing to `.gitignore`.
 
 Switchboard is **single-instance**: launching it again focuses the running window rather than starting a second process, so there is exactly one writer of `workspace.yaml`. The per-project `instance.lock` (below) remains as defense-in-depth for the pathological case of two processes (e.g. a dev build alongside the bundled app); multi-window is out of scope for v1.
 
 **What's project-scoped vs user-global:** agents, runtime state, workflow runs, and harness session links are project-scoped — each project has its own. Workflow *definitions* and prompt providers (local directories + MCP servers) are **user-global** — defined once at the user level and available in every project regardless of directory (see §6). Rationale: agents and runtime state are about *the work in progress*; they belong to the project. Workflow and prompt libraries are personal, portable, parameterized templates — a workflow's `agent` slots bind to whatever project it runs against — so one definition serves every project; they belong to the user.
 
-Everything under `<directory>/.switchboard/` — `projects.jsonl`, the entire `projects/` tree (including per-project `config.yaml`, `registry.jsonl`, `journal.jsonl`, `pins.jsonl`, `sessions/`, `attachments/`, `runs/`), and lock files — is local-machine runtime data and should be `.gitignore`d. (Workflow definitions and local prompts are user-global, not per-directory — they live in the OS config dir, not the repo; see §6.)
-
 ### Working directories and the workspace
 
-Each working directory owns its projects: the source of truth for a directory's projects and their state is that directory's own `.switchboard/`, so a directory is self-contained and travels with its git repo. Switchboard tracks the set of working directories the user works across in a user-global `workspace.yaml` and presents the projects from all of them as a single flat list — the user opens Switchboard and sees every project across every directory at once, each labelled with its directory, without choosing a directory first.
+The store owns every project; a working directory is one of the store's own records, not a place state is kept. Switchboard presents every project across every directory as a single flat list — the user opens Switchboard and sees all of them at once, each labelled with its directory, without choosing a directory first. That list comes straight from the store index, so it renders identically whether or not any directory currently resolves.
 
-`workspace.yaml` records, per directory, its path and a cached snapshot of its projects (each the project's `{ id, name, created_at }`, so an unavailable directory's rows keep their identity and ordering). The cache lets the flat list render even when a directory is temporarily unavailable (unmounted, moved, or deleted): its projects appear marked unavailable with a remove action, rather than silently vanishing. The cache is refreshed from a directory's `.switchboard/` whenever that directory is read successfully **and** after any project create/rename/delete in it — the directory's own state always wins, and the cache is consulted only when the directory can't be read. Projects are addressed by their globally-unique `ProjectId`; each carries its owning directory for routing (the agent spawn cwd) and labelling.
+**A project whose directory is gone still lists, renames, archives, and deletes.** Only *dispatch* needs a working directory (it is the agent's spawn cwd), so everything else works on a project whose checkout was deleted — the row shows why it can't run and offers the repair, instead of vanishing. This is the concrete payoff of the move: under the old layout, deleting a worktree deleted its history.
 
-`workspace.yaml` also holds a user-global **set of archived project ids** — *view-state* (which projects are hidden from the default list), deliberately kept here rather than on the project's own files. Because it lives in user-global state, archiving works even when the project's directory is offline (it never writes the directory) and never interferes with a running agent; the trade-off is that archived-ness is per-install rather than travelling with the project (acceptable — the project's runtime state is `.gitignore`d anyway).
+`workspace.yaml` is **view-state only**: the directory ordering, which directories are hidden, and the set of archived project ids. Nothing in it is load-bearing — the store records what exists, so a lost or corrupt `workspace.yaml` costs the user their arrangement and never a project. That is precisely what makes best-effort loading safe. Archived-ness and hidden-ness are per-install rather than travelling with the project, which is the accepted trade for their working when a directory is offline.
 
-Adding a directory appends it to `workspace.yaml`; removing one drops its entry and leaves the directory's on-disk `.switchboard/` untouched (re-adding the directory restores its projects — removing from the workspace is not deletion). Re-pointing a moved directory to a new path is a planned affordance.
+Adding a directory records it in the catalog and the workspace list. **"Remove directory" is now *hide*** — a catalog entry is referenced by every project in it and can never be deleted while any of them exists, so "remove" cannot mean "forget" without orphaning those projects. Hiding stops nothing: the projects keep running, and unhiding is lossless. Cleanup happens through the project archive/delete affordances. Re-pointing a moved directory — one edit to the catalog, moving every project that shares the identity — is a planned affordance.
 
 **Conversation source of truth — a split.** Switchboard stores no agent content **as transcript history** — the unified transcript's agent side always comes from the harness session files (one scoped exception below). But the harness session files do not hold *everything* either: they cannot faithfully represent the user's side of a multi-agent conversation — a fan-out replicates the user's prompt across every recipient's file, and an instantly-cancelled send is written to none. So the model is a split:
 
@@ -135,7 +141,7 @@ The two sources **partition** by turn outcome (a completed turn's content comes 
 
 - **Rename** changes the display name in place (same per-directory uniqueness rules as agent names), dual-writing the canonical `config.yaml` and the `projects.jsonl` index entry.
 - **Archive/unarchive** flips the user-global view-state above; it is display-only — it never stops a running agent or touches the project's files, and works for offline directories.
-- **Delete** is hard and irreversible: it drains the project's agents, then removes `<directory>/.switchboard/projects/<id>/` (config, registry, journal, sessions, runs) and its `projects.jsonl` entry. It **never** touches the working directory, `.switchboard/` itself, sibling projects, or harness-native session files (`~/.claude/…`, `~/.codex/…`) — so each agent's own session history survives; only the journal's failed/cancelled outcome markers are genuinely lost. The index-entry removal is the commit (the project stops listing); the directory removal is best-effort, leaving a benign unreachable orphan on the rare failure rather than surfacing an error.
+- **Delete** is hard and irreversible: it drains the project's agents, then removes `<store>/projects/<id>/` (config, registry, journal, sessions, attachments, runs) and its `projects.jsonl` index entry. It **never** touches the working directory, sibling projects, or harness-native session files (`~/.claude/…`, `~/.codex/…`) — so each agent's own session history survives; only the journal's failed/cancelled outcome markers are genuinely lost. The index-entry removal is the commit (the project stops listing); the directory removal is best-effort, leaving a benign unreachable orphan on the rare failure rather than surfacing an error.
 
 Agent-level deletion (remove/reset from the agent sidebar row) is the shipped `remove_agent`; broader history-retention/tombstone semantics remain unspecified and out of scope.
 
@@ -946,7 +952,7 @@ Aggregated from inline flags above, plus a few additional:
 - ~~**6.1** MiniJinja subset and template-available variables.~~ **Resolved in `docs/workflow-spec.md` §Templating** (supported / unsupported MiniJinja features, available variable scopes, built-in template functions).
 - ~~**10.1** What does Switchboard do when an agent's "next assistant response" is a tool call rather than text?~~ **Resolved by hands-on probe:** the structured-stream harnesses run the model → tool_use → tool_result → model loop internally and emit a single terminal event per user-initiated turn (Claude Code: `result`; Codex: `turn.completed` / `turn.failed`). Switchboard always sees a complete turn — there is no "tool-call-only response" to handle. (Antigravity, added later, had no structured stream at the time this question was resolved and used process exit as its turn terminator. **Updated 2026-08-25 (agy 1.1.20):** it now emits a terminal `result` event on its `--output-format stream-json` control channel, which supplies the verdict; process exit remains the terminator. See §9 "Process model".)
 - ~~**10.2** When two workflows reference the same agent, what happens? Disallow concurrent use? Queue? Refuse?~~ **Resolved by hands-on probe:** Switchboard enforces one in-flight turn per agent at the application layer. Manual compose-bar sends to a busy agent are queued (per-agent FIFO, in-memory; revised in M4); workflow-step collisions are refused with a clear error. Cross-agent dependency chaining stays out of v1. See §7 "Agent contention" and [docs/research/same-session-parallel-invocation.md](research/same-session-parallel-invocation.md). The harnesses themselves do not error on same-session parallel invocation — they silently corrupt (Claude Code: orphan branch in session tree) or conflate (Codex: interleaved transcript) — so this enforcement must live in Switchboard.
-- **10.3 (partially resolved)** Persistence schema. **Resolved for what's shipped:** the project/agent registry is append-only JSONL under `<directory>/.switchboard/{projects.jsonl, projects/<project-id>/registry.jsonl}`, and every harness's session locator lives on its `AgentRecord` (`session_locator`) — no per-agent session-link sidecar. `sessions/` holds the per-agent stream-only-metadata cache (`<agent-id>.meta.json` snapshot + `<agent-id>.turnmeta.jsonl` per-turn cost/overage append-log); the legacy `<agent-id>.jsonl` / `.antigravity.jsonl` session-link sidecars (and their modules) have been fully removed, their identity folded onto `session_locator` by a one-time migration. Switchboard-owned JSONL fails loud on corruption (see AGENTS.md). **Still open:** workflow-run checkpoints (M6+ work) — the on-disk shape for in-flight workflow state, atomicity guarantees on concurrent agent-spawn-during-write under that load, and the eventual pruning story. Mid-step recovery (resuming an interrupted in-flight turn) remains out of scope.
+- **10.3 (partially resolved)** Persistence schema. **Resolved for what's shipped:** the project/agent registry is append-only JSONL under `<store>/{projects.jsonl, projects/<project-id>/registry.jsonl}`, and every harness's session locator lives on its `AgentRecord` (`session_locator`) — no per-agent session-link sidecar. `sessions/` holds the per-agent stream-only-metadata cache (`<agent-id>.meta.json` snapshot + `<agent-id>.turnmeta.jsonl` per-turn cost/overage append-log); the legacy `<agent-id>.jsonl` / `.antigravity.jsonl` session-link sidecars (and their modules) have been fully removed, their identity folded onto `session_locator` by a one-time migration. Switchboard-owned JSONL fails loud on corruption (see AGENTS.md). **Still open:** workflow-run checkpoints (M6+ work) — the on-disk shape for in-flight workflow state, atomicity guarantees on concurrent agent-spawn-during-write under that load, and the eventual pruning story. Mid-step recovery (resuming an interrupted in-flight turn) remains out of scope.
 - ~~**10.4** Workflow versioning.~~ **Resolved (commitment).** Workflow runs execute against an immutable snapshot of the workflow file and its bound inputs, captured at invocation. Prompt resolution still happens at each step's dispatch (per §6 prompt resolution rules) — edits to a referenced prompt take effect on the next workflow invocation, not the in-flight run. Edits to the workflow file on disk after invocation do not affect the in-flight run or retries; the snapshot is what executes. Rationale: deterministic execution and deterministic retry; reload-on-retry would create incoherent "same run, different program" behavior given step-index checkpointing.
 - ~~**10.5** Notifications when a workflow completes — terminal bell? OS notification? Just visible state in the UI?~~ **Resolved by §10 form factor commitment:** OS-native notifications via Tauri's notification plugin. See §7 "Watching a workflow run" for when notifications fire. Remaining UX details (which events notify, user opt-out controls) are implementation choices, not plan-level questions.
 - **10.6** Multi-machine workflows (running Switchboard on a remote dev machine over SSH). Out of scope for v1, but the architecture should not fight it.

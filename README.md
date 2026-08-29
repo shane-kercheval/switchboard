@@ -121,6 +121,20 @@ The layout (panes, names, widths, hidden agents) is remembered per project on th
 - Cross-session persistent agent memory. Possibly a future addition; not in scope for v1.
 - A hosted / SaaS service. Switchboard runs locally on your machine. A future hosted service may exist for cross-machine sync of workflows and prompts; that is not v1.
 
+## Upgrading from a pre-store version
+
+Switchboard used to keep each project's state inside your working directory, in a `.switchboard/` folder. It now keeps everything in one place under `~/Library/Application Support/switchboard/`, so deleting or moving a checkout no longer takes its conversation history with it.
+
+If you used Switchboard before that change, your old projects will not appear until you migrate them. Nothing is lost in the meantime — the old folders are untouched. Run, from a checkout:
+
+```
+cargo run -p switchboard-migrate
+```
+
+It reads the directory list from your existing configuration, copies each directory's projects into the new location, and prints a report. **It never modifies or deletes your originals**, so if the result looks wrong you can delete the new store and run it again. Directories that are unavailable (a deleted worktree, an unplugged disk) are reported and skipped.
+
+Run it **before** launching the new version, which rewrites the configuration file the tool reads.
+
 ## Agent CLI support and limitations
 
 Switchboard drives each agent through its own CLI, so it inherits that CLI's capabilities — and a few CLI-specific limitations are worth knowing up front:

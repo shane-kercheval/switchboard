@@ -340,8 +340,9 @@
               {#snippet trigger(props)}
                 <span {...props} class="font-mono">{addFolder}</span>
               {/snippet}</Tooltip
-            >. Either it has never held one, or this is a different path than before — a moved or
-            renamed folder counts as different. Switch to "New project" to create one here.
+            >. If you moved or renamed this folder, its projects still exist under the old path —
+            they'll come back if the folder is restored there. If this folder has simply never held
+            a project, switch to "New project" to create one.
           </p>
         {/if}
       {/if}

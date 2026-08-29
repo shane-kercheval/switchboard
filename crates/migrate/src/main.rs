@@ -31,9 +31,14 @@ BEHAVIOR:
     checkout) are reported and skipped; re-running after they return means
     deleting the target and migrating everything again.
 
+    Attachment paths inside the migrated journals point at the target location
+    permanently; the store must stay at the path it was written to.
+
     Run this BEFORE launching the new app: the app rewrites workspace.yaml into
     a shape that drops the legacy project cache, and (once running) may create
-    an empty store at the default target.";
+    an empty store at the default target. If you have already launched it, a
+    copy of the old workspace.yaml (or --workspace-yaml pointing at a backup)
+    is the supported way to supply the directory list.";
 
 fn main() -> ExitCode {
     let mut workspace_yaml: Option<PathBuf> = None;
@@ -77,7 +82,11 @@ fn main() -> ExitCode {
     println!("Reading directories from: {}", workspace_yaml.display());
     println!("Writing the store to:     {}", target_root.display());
     println!("Directories to scan:      {}", directories.len());
-    println!("Originals are not modified. To re-run, delete the target first.\n");
+    println!("Originals are not modified. To re-run, delete the target first.");
+    println!(
+        "NOTE: attachment paths inside the migrated journals will point at the target\n\
+         location permanently — moving the store somewhere else afterwards breaks them.\n"
+    );
 
     if !assume_yes {
         print!("Proceed? [y/N] ");
@@ -131,8 +140,20 @@ fn print_report(report: &MigrationReport) {
                 "s"
             }
         );
-        for name in &migrated.projects {
+        for (_, name) in &migrated.projects {
             println!("          - {name}");
+        }
+        println!(
+            "          attachments: {} path(s) rewritten{}",
+            migrated.attachments_rewritten,
+            if migrated.attachments_left.is_empty() {
+                String::new()
+            } else {
+                format!(", {} left untouched", migrated.attachments_left.len())
+            }
+        );
+        for left in &migrated.attachments_left {
+            println!("          ! not rewritten (outside this directory's legacy root): {left}");
         }
     }
     for (path, reason) in &report.skipped {

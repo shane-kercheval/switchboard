@@ -1101,10 +1101,12 @@ describe("ProjectsSidebar — workflow run state (M5)", () => {
     expect(screen.queryByTestId("project-workflow-failed")).toBeNull();
   });
 
-  it("disables archive and delete while a workflow runs with no live send", async () => {
-    // The gap this closes: the archived view's quick-delete already refused a
-    // project with a running workflow, while the dropdown's Archive/Delete
-    // permitted it — and deleting cancels the run before irreversible teardown.
+  it("blocks archive but keeps delete available while a workflow runs", async () => {
+    // Archive is guarded because hiding a working project is confusing, and it is
+    // reversible either way. Delete must NOT be guarded: `delete_project` cancels
+    // the run under a deadline and proceeds, and Stop only *requests* cancellation
+    // — so gating delete on the run stopping leaves a wedged run with no disposal
+    // path at all (there is no directory-removal affordance in the UI).
     await seedProject(PROJECT_1);
     workflowRuns[PROJECT_1] = [wfRun()];
     render(ProjectsSidebar, { props: noopProps });
@@ -1113,7 +1115,32 @@ describe("ProjectsSidebar — workflow run state (M5)", () => {
     await openProjectActions();
 
     expect(screen.getByTestId("project-action-archive")).toHaveAttribute("aria-disabled", "true");
-    expect(screen.getByTestId("project-action-delete")).toHaveAttribute("aria-disabled", "true");
+    expect(screen.getByTestId("project-action-delete")).not.toHaveAttribute(
+      "aria-disabled",
+      "true",
+    );
+  });
+
+  it("surfaces a failed workflow stop inline and clears it when the run ends", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "cancel_workflow_run") throw new Error("backend gone");
+      return undefined;
+    });
+    await seedProject(PROJECT_1);
+    workflowRuns[PROJECT_1] = [wfRun()];
+    render(ProjectsSidebar, { props: noopProps });
+    await tick();
+
+    await fireEvent.click(screen.getByTestId("project-cancel"));
+    const row = await screen.findByTestId("project-workflow-stop-error");
+    expect(row).toHaveTextContent("backend gone");
+
+    // The error must not outlive the run: once it terminalizes on its own, the row
+    // is idle and a stale "couldn't stop" line would sit under a finished project.
+    workflowRuns[PROJECT_1] = [];
+    await tick();
+
+    expect(screen.queryByTestId("project-workflow-stop-error")).toBeNull();
   });
 
   it("keeps the actions menu open for a completed project whose workflow restarted", async () => {
@@ -1152,7 +1179,8 @@ describe("ProjectsSidebar — workflow run state (M5)", () => {
   });
 
   it("catches a failed workflow-run cancel (no unhandled rejection)", async () => {
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const unhandled = vi.fn();
+    process.on("unhandledRejection", unhandled);
     invokeMock.mockImplementation(async (cmd: string) => {
       if (cmd === "cancel_workflow_run") throw new Error("backend gone");
       return undefined;
@@ -1163,7 +1191,9 @@ describe("ProjectsSidebar — workflow run state (M5)", () => {
     await tick();
 
     await fireEvent.click(screen.getByTestId("project-cancel"));
-    await vi.waitFor(() => expect(warn).toHaveBeenCalled());
-    warn.mockRestore();
+    await screen.findByTestId("project-workflow-stop-error");
+
+    expect(unhandled).not.toHaveBeenCalled();
+    process.off("unhandledRejection", unhandled);
   });
 });

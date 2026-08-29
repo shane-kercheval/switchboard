@@ -184,6 +184,28 @@ Leave the observer's `id !== selection.activeProjectId` guard exactly as-is (dec
 - Existing `ProjectsSidebar` component tests still pass unchanged; add one asserting the
   spinner shows for a workflow between steps with no live sends.
 
+### Known limitation recorded during M1
+
+**A wedged workflow run leaves its project marked busy until the app restarts.**
+`cancel_workflow_run` only *requests* cancellation — it fires the run's token and returns
+`Ok` without waiting — so a run that never honours the request keeps a `running` entry in
+`workflowRuns` indefinitely, and the row keeps spinning with no error to surface (Stop
+genuinely succeeded). Restarting clears it: the interpreter is an in-process task, so the
+run file loses its live registry entry and `classify_run_file` reclassifies it as
+`interrupted`, which is not `running`.
+
+This is why **Delete is deliberately not gated on the idle predicate** while Archive is.
+`delete_project` cancels the project's runs under `RUN_TEARDOWN_DEADLINE` and proceeds
+regardless, so deleting a project with a stuck run is a supported backend operation;
+gating the UI on it made the app stricter than its own guarantee and — since there is no
+directory-removal affordance anywhere in the UI — left such a project with no disposal
+path at all. An earlier revision of M1 did gate it, on the reasoning that stopping the
+run first is one click away; that reasoning fails precisely when Stop cannot help.
+
+Not closed further (e.g. a force-delete affordance surfaced after a pending cancellation):
+an ordinary confirmed delete already performs the operation correctly, so the extra
+surface would buy nothing but an alarming control for a case most users never hit.
+
 ---
 
 ## M2 — Notification at project scope

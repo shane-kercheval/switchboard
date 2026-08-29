@@ -83,13 +83,20 @@
     }
   }
 
-  // The row's stop is a convenience control; a failed cancel is logged rather than
-  // surfaced (the run's own live view, opened from the row, owns visible feedback).
-  // Catching also avoids an unhandled rejection from the fire-and-forget click.
-  function stopWorkflowRun(runId: string): void {
-    cancelRun(runId).catch((e: unknown) =>
-      console.warn("[switchboard] failed to cancel workflow run", e),
-    );
+  // A failed Stop is surfaced inline, matching how `ComposeBar` already treats the
+  // same action on the run's own live view — without it this is a silent dead
+  // button. Note what this does *not* cover: `cancel_workflow_run` only requests
+  // cancellation and never waits, so a run that ignores the request reports success
+  // here and keeps the row spinning. That case has no error to show, which is why
+  // Delete stays available during a running workflow rather than relying on Stop.
+  function stopWorkflowRun(projectId: ProjectId, runId: string): void {
+    workflowStopError = null;
+    cancelRun(runId).catch((e: unknown) => {
+      workflowStopError = {
+        projectId,
+        message: `Couldn't stop the workflow: ${e instanceof Error ? e.message : String(e)}`,
+      };
+    });
   }
 
   /// Live width during a resize drag; the store commits on pointer-up.
@@ -99,6 +106,7 @@
   let archiveError = $state<{ projectId: ProjectId; message: string } | null>(null);
   let gitRevealError = $state<{ projectId: ProjectId; message: string } | null>(null);
   let openActionError = $state<{ projectId: ProjectId; message: string } | null>(null);
+  let workflowStopError = $state<{ projectId: ProjectId; message: string } | null>(null);
   let openProjectActionsId = $state<ProjectId | null>(null);
   let openActionSeq = 0;
   let relativeNow = $state(Date.now());
@@ -272,6 +280,16 @@
       !visibleProjects.some((project) => project.id === gitRevealError?.projectId)
     ) {
       gitRevealError = null;
+    }
+    // A stop failure must not outlive the run it describes: if the run terminalizes
+    // on its own afterwards, the row goes idle and a stale "couldn't stop" line
+    // would sit under a project that has finished.
+    if (
+      workflowStopError !== null &&
+      (!visibleProjects.some((project) => project.id === workflowStopError?.projectId) ||
+        projectIsIdle(workflowStopError.projectId))
+    ) {
+      workflowStopError = null;
     }
   });
 
@@ -536,21 +554,33 @@
     <div class="flex flex-col gap-0.5 px-2 pb-2">
       {#each visibleProjects as project (project.id)}
         {@const liveSends = liveProjectSends(project.id)}
-        <!-- Every "has this project finished" judgment on this row — the spinner,
-             the checkmark, and the archive/delete guards — routes through the one
-             shared predicate, so the row cannot drift from the
-             background-completed observer. `liveSends` is passed through rather
-             than recomputed inside it: that scan walks every streaming agent's
-             transcript and this runs on the streaming hot path. -->
+        {@const busy = liveSends.size > 0}
+        <!-- "Has this project finished" — the spinner, the checkmark, and the
+             archive guard — routes through the one shared predicate, so the row
+             cannot drift from the background-completed observer. `liveSends` is
+             passed through rather than recomputed inside it: that scan walks every
+             streaming agent's transcript and this runs on the streaming hot path.
+
+             Delete deliberately does NOT use it. `delete_project` cancels the
+             project's runs under a deadline and proceeds regardless, so deletion
+             with a stuck run is a supported operation; gating it on `idle` made the
+             UI stricter than that guarantee and — since Stop only *requests*
+             cancellation and never waits — left a wedged run with no disposal path
+             at all (there is no directory-removal affordance in the UI). Archive
+             keeps the guard: it is reversible, and hiding a working project is
+             merely confusing rather than a dead end. -->
         {@const idle = projectIsIdle(project.id, liveSends)}
         {@const completed = idle && project.id in backgroundCompletedProjectIds}
-        <!-- Workflow state is derived from `workflowRuns`, NOT `busy`: a workflow
-             between steps, before its first dispatch, or in the failed-held state
-             has no live send and would otherwise look idle. The *running* run is
-             selected explicitly (not `[0]`) so this row agrees with the predicate
-             by construction: a retained failed run can transiently sort ahead of
-             a newly-started one, and picking the first would show the failed badge
-             for a project that is actually working. -->
+        <!-- Workflow state comes from `workflowRuns`, not from send liveness: a
+             workflow between steps, before its first dispatch, or in the
+             failed-held state has no live send and would otherwise look idle.
+
+             The running run is selected explicitly rather than taken as `[0]` so
+             this row tracks the predicate structurally instead of depending on the
+             backend invariant holding forever. That invariant — a `running` run
+             never coexists with a held failed/interrupted one — is enforced at the
+             invoke guard, which rejects both a second active run and a launch while
+             a held run awaits dismissal. -->
         {@const projectRuns = workflowRuns[project.id] ?? []}
         {@const workflowRun =
           projectRuns.find((run) => run.status === "running") ?? projectRuns[0] ?? null}
@@ -853,10 +883,10 @@
                         <DropdownMenuItem
                           onSelect={() => startDelete(project)}
                           closeOnSelect={false}
-                          disabled={!idle || projectDeleting}
+                          disabled={busy || projectDeleting}
                           class="text-status-failed gap-2"
                           data-testid="project-action-delete"
-                          tooltip={`${PROJECT_DELETE_TOOLTIP} Works even if the project's folder no longer exists.`}
+                          tooltip={`${PROJECT_DELETE_TOOLTIP} Works even if the project's folder no longer exists.${workflowRunning ? " The running workflow is cancelled first." : ""}`}
                         >
                           <Trash2 size={14} strokeWidth={1.8} class="shrink-0" aria-hidden="true" />
                           Delete project
@@ -903,7 +933,11 @@
                           {/snippet}
                         </Tooltip>
                       {:else}
-                        <Tooltip label={PROJECT_DELETE_TOOLTIP} side="bottom" reopen="fresh-hover">
+                        <Tooltip
+                          label={`${PROJECT_DELETE_TOOLTIP}${workflowRunning ? " The running workflow is cancelled first." : ""}`}
+                          side="bottom"
+                          reopen="fresh-hover"
+                        >
                           {#snippet trigger(props)}
                             <button
                               {...props}
@@ -914,7 +948,7 @@
                               )}
                               aria-label={`Delete ${project.name}`}
                               data-testid="project-quick-delete"
-                              disabled={!idle || projectDeleting}
+                              disabled={busy || projectDeleting}
                               onclick={() => startQuickDelete(project)}
                             >
                               <Trash2 size={14} strokeWidth={1.8} aria-hidden="true" />
@@ -948,7 +982,7 @@
                     data-testid="project-cancel"
                     onclick={() =>
                       workflowRunning && workflowRun !== null
-                        ? stopWorkflowRun(workflowRun.run_id)
+                        ? stopWorkflowRun(project.id, workflowRun.run_id)
                         : cancelAllForProject(project.id)}
                   >
                     <Spinner
@@ -991,6 +1025,14 @@
           {#if openActionError?.projectId === project.id}
             <div class="text-status-failed px-2.5 pb-2 text-xs" data-testid="project-open-error">
               Couldn't open project: {openActionError.message}
+            </div>
+          {/if}
+          {#if workflowStopError?.projectId === project.id}
+            <div
+              class="text-status-failed px-2.5 pb-2 text-xs"
+              data-testid="project-workflow-stop-error"
+            >
+              {workflowStopError.message}
             </div>
           {/if}
         </div>

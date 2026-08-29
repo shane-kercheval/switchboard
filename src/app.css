@@ -264,6 +264,14 @@ body,
   margin: 0;
 }
 
+/* The document root controls the WKWebView viewport. The app owns scrolling
+   through explicit inner regions (transcript, sidebars, settings, Git), so a
+   trackpad gesture reaching an edge must never shift the desktop shell. */
+html {
+  overflow: hidden;
+  overscroll-behavior: none;
+}
+
 body {
   background-color: var(--surface);
   color: var(--fg);

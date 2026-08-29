@@ -1,11 +1,9 @@
 <script lang="ts">
   /// The right-hand diff panel: the changed files + read-only diff for the
-  /// selected [`DiffTarget`] — either a worktree's uncommitted changes or one
-  /// commit's diff (vs. its first parent). One panel serves both because a commit
-  /// diff needs no worktree, so a branch with no local folder (or a remote-only
-  /// ref) still shows real content. Loads are guarded against target/file races
-  /// (a newer selection's result always wins).
-  import { tick, untrack } from "svelte";
+  /// selected [`DiffTarget`] — a PR-style branch comparison, a worktree's
+  /// uncommitted changes, or one commit's diff. One panel serves all three, and
+  /// loads are guarded against target/file races (a newer result always wins).
+  import { onDestroy, tick, untrack } from "svelte";
   import {
     Code2,
     Copy,
@@ -36,8 +34,10 @@
     fileDiff,
     commitChangedFiles,
     commitFileDiff,
+    branchComparisonFileDiff,
     openInEditor,
     openCommitFileDifftool,
+    openBranchComparisonFileDifftool,
     openWorktreeFileDifftool,
     revealInFinder,
   } from "$lib/api";
@@ -90,22 +90,51 @@
   // resolved) is discarded rather than clobbering the current selection.
   let filesToken = 0;
   let diffToken = 0;
-  let filesKey: string | null = null;
-  let diffKey: string | null = null;
+  let filesKey = $state<string | null>(null);
+  let diffKey = $state<string | null>(null);
   /// Live width during a resize drag; the layout store commits on pointer-up.
   let draftFileListWidth = $state<number | null>(null);
   const fileListWidth = $derived(draftFileListWidth ?? layout.diffFileListWidth);
+
+  onDestroy(() => {
+    filesToken += 1;
+    diffToken += 1;
+  });
 
   // Stable identity for the selected target — changes when the user picks a
   // different commit or worktree, the signal the load effects key on.
   const targetKey = $derived(
     target.kind === "uncommitted"
       ? `wt:${target.worktreePath}`
-      : `c:${target.repoRoot}:${target.oid}`,
+      : target.kind === "comparison"
+        ? `compare:${target.repoRoot}:${target.comparison.merge_base_oid}:${target.comparison.head_oid}:${target.worktreePath ?? "tree"}`
+        : `c:${target.repoRoot}:${target.oid}`,
+  );
+  const targetWorktreePath = $derived(
+    target.kind === "uncommitted"
+      ? target.worktreePath
+      : target.kind === "comparison"
+        ? target.worktreePath
+        : null,
+  );
+  const filesPending = $derived(filesKey !== targetKey);
+  const expectedDiffKey = $derived(selectedFile === null ? null : `${targetKey}::${selectedFile}`);
+  const diffPending = $derived(
+    !filesPending &&
+      expectedDiffKey !== null &&
+      diffError === null &&
+      (diffLoading || diffKey !== expectedDiffKey),
   );
   const visibleCommitBody = $derived(
-    commitBody !== null && commitBody.trim().length > 0 ? commitBody.trim() : null,
+    !filesPending && commitBody !== null && commitBody.trim().length > 0 ? commitBody.trim() : null,
   );
+
+  function afterLoadingPaint(): Promise<void> {
+    if (typeof requestAnimationFrame !== "function") return Promise.resolve();
+    return new Promise((resolve) => {
+      requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+    });
+  }
 
   // Normalized to `{ found, files }` for both target kinds: a worktree read
   // always "found" (its absence is handled upstream by reconciliation), a commit
@@ -113,15 +142,27 @@
   function loadFiles(
     t: DiffTarget,
   ): Promise<{ found: boolean; body: string | null; files: ChangedFile[] }> {
-    return t.kind === "uncommitted"
-      ? changedFiles(t.worktreePath).then((files) => ({ found: true, body: null, files }))
-      : commitChangedFiles(t.repoRoot, t.oid);
+    if (t.kind === "uncommitted") {
+      return changedFiles(t.worktreePath).then((files) => ({ found: true, body: null, files }));
+    }
+    if (t.kind === "comparison") {
+      return Promise.resolve({ found: true, body: null, files: t.comparison.files });
+    }
+    return commitChangedFiles(t.repoRoot, t.oid);
   }
 
   function loadDiff(t: DiffTarget, file: string): Promise<FileDiff> {
-    return t.kind === "uncommitted"
-      ? fileDiff(t.worktreePath, file)
-      : commitFileDiff(t.repoRoot, t.oid, file);
+    if (t.kind === "uncommitted") return fileDiff(t.worktreePath, file);
+    if (t.kind === "comparison") {
+      return branchComparisonFileDiff(
+        t.repoRoot,
+        t.comparison.merge_base_oid,
+        t.comparison.head_oid,
+        t.worktreePath,
+        file,
+      );
+    }
+    return commitFileDiff(t.repoRoot, t.oid, file);
   }
 
   // (Re)load the file list whenever the target or refresh revision changes. A
@@ -133,18 +174,18 @@
     const key = targetKey;
     const revision = refreshRevision;
     const previousFile = untrack(() => selectedFile);
-    if (filesKey !== key) {
-      files = null;
-      selectedFile = null;
-      diff = null;
+    const targetChanged = untrack(() => filesKey) !== key;
+    if (targetChanged) {
       commitFound = true;
       commitBody = null;
       commitMessageOpen = false;
       commitMessageTooltipOpen = false;
     }
     filesError = null;
-    void loadFiles(t)
-      .then((result) => {
+    const read = loadFiles(t);
+    const paint = targetChanged ? afterLoadingPaint() : Promise.resolve();
+    void Promise.all([read, paint])
+      .then(([result]) => {
         if (token !== filesToken || revision !== refreshRevision) return;
         filesKey = key;
         commitFound = result.found;
@@ -173,20 +214,29 @@
     const t = target;
     const key = targetKey;
     const revision = refreshRevision;
-    if (file === null) {
-      diff = null;
+    const token = ++diffToken;
+    if (filesKey !== key) {
+      diffError = null;
       return;
     }
-    const token = ++diffToken;
-    const sameTarget = diffKey === `${key}::${file}` && diff !== null;
+    if (file === null) {
+      diff = null;
+      diffKey = null;
+      diffLoading = false;
+      return;
+    }
+    const expectedKey = `${key}::${file}`;
+    const sameTarget = untrack(() => diffKey) === expectedKey && diff !== null;
     if (!sameTarget) {
       diffLoading = true;
     }
     diffError = null;
-    void loadDiff(t, file)
-      .then((result) => {
+    const read = loadDiff(t, file);
+    const paint = sameTarget ? Promise.resolve() : afterLoadingPaint();
+    void Promise.all([read, paint])
+      .then(([result]) => {
         if (token !== diffToken || revision !== refreshRevision) return;
-        diffKey = `${key}::${file}`;
+        diffKey = expectedKey;
         diff = result;
         diffLoading = false;
       })
@@ -226,13 +276,13 @@
   );
   const countsHoverHide = $derived(hoverableClass("group-hover:hidden"));
   const padFocus = $derived(
-    target.kind === "uncommitted"
+    targetWorktreePath !== null
       ? "group-focus-within:pr-[5.75rem]"
       : "group-focus-within:pr-[3.75rem]",
   );
   const padHoverReveal = $derived(
     hoverableClass(
-      target.kind === "uncommitted" ? "group-hover:pr-[5.75rem]" : "group-hover:pr-[3.75rem]",
+      targetWorktreePath !== null ? "group-hover:pr-[5.75rem]" : "group-hover:pr-[3.75rem]",
     ),
   );
 
@@ -265,13 +315,13 @@
   }
 
   function canOpenFileInEditor(file: ChangedFile): boolean {
-    return target.kind === "uncommitted" && file.change !== "deleted";
+    return targetWorktreePath !== null && file.change !== "deleted";
   }
 
   // Only a worktree path is revealable in Finder; a commit has no folder.
   function revealTarget(): void {
-    if (target.kind !== "uncommitted") return;
-    const path = target.worktreePath;
+    if (targetWorktreePath === null) return;
+    const path = targetWorktreePath;
     void revealInFinder(path).catch((e: unknown) => {
       console.error("[switchboard] reveal worktree failed", e);
     });
@@ -284,21 +334,32 @@
 
   function openFileDifftool(file: ChangedFile): Promise<void> {
     externalActionError = null;
-    return target.kind === "uncommitted"
-      ? openWorktreeFileDifftool(target.worktreePath, file.path, file.change)
-      : openCommitFileDifftool(target.repoRoot, target.oid, file.path);
+    if (target.kind === "uncommitted") {
+      return openWorktreeFileDifftool(target.worktreePath, file.path, file.change);
+    }
+    if (target.kind === "comparison") {
+      return openBranchComparisonFileDifftool(
+        target.repoRoot,
+        target.worktreePath,
+        target.comparison.merge_base_oid,
+        target.comparison.head_oid,
+        file.path,
+        file.change,
+      );
+    }
+    return openCommitFileDifftool(target.repoRoot, target.oid, file.path);
   }
 
   function copyFilePath(file: ChangedFile): Promise<void> {
     externalActionError = null;
-    const root = target.kind === "uncommitted" ? target.worktreePath : target.repoRoot;
+    const root = targetWorktreePath ?? target.repoRoot;
     return copyText(worktreeFilePath(root, file.path));
   }
 
   function openFileInEditor(file: ChangedFile): Promise<void> {
-    if (target.kind !== "uncommitted" || !canOpenFileInEditor(file)) return Promise.resolve();
+    if (targetWorktreePath === null || !canOpenFileInEditor(file)) return Promise.resolve();
     externalActionError = null;
-    return openInEditor(worktreeFilePath(target.worktreePath, file.path));
+    return openInEditor(worktreeFilePath(targetWorktreePath, file.path));
   }
 
   function onWindowPointerMove(): void {
@@ -375,7 +436,7 @@
           </Tooltip>
         {/if}
       </div>
-      {#if target.kind === "uncommitted"}
+      {#if targetWorktreePath !== null}
         <Tooltip label="Reveal in Finder" side="bottom">
           {#snippet trigger(props)}
             <button
@@ -495,228 +556,296 @@
   {/if}
 
   <!-- Body: file list + diff -->
-  {#if files === null}
-    <EmptyState testid="detail-loading" title="Loading changes…" />
-  {:else if filesError !== null}
-    <EmptyState
-      testid="detail-files-error"
-      tone="error"
-      title="Couldn't read changes."
-      description={filesError}
-    />
-  {:else if !commitFound}
-    <EmptyState
-      testid="detail-commit-missing"
-      title="This commit is no longer available."
-      description="It may have been garbage-collected or the branch was updated. Refresh the branch."
-    />
-  {:else if files.length === 0}
-    {#if target.kind === "uncommitted"}
-      <EmptyState
-        testid="detail-no-changes"
-        title="No uncommitted changes."
-        description="This folder matches its last commit."
-      />
-    {:else}
-      <EmptyState testid="detail-no-changes" title="This commit changed no files." />
-    {/if}
-  {:else}
-    <div class="flex min-h-0 flex-1 overflow-hidden">
-      <!-- Changed-files list. Raised like the diff it belongs to — the border
-           carries the column boundary, so the pane isn't a gray column with a
-           grayer header inside a white drawer. -->
-      <div
-        class="border-border/60 bg-raised shrink-0 overflow-hidden border-r"
-        style={`width: ${fileListWidth}px`}
-        data-testid="changed-files-list"
-      >
-        <div class="border-border/60 flex h-8 items-center justify-between border-b px-2">
-          <span class="text-muted text-[11px] font-semibold tracking-wide uppercase">
-            Changed files
-          </span>
-          <span class="text-muted font-mono text-[11px]">{files.length}</span>
-        </div>
-        <ul
-          bind:this={filesListEl}
-          class="h-[calc(100%-2rem)] overflow-y-auto py-1"
-          data-testid="changed-files"
-        >
-          {#each files as file (file.path)}
-            {@const badge = changeBadge(file.change)}
-            {@const directory = directoryLabel(file.path)}
-            {@const isSelected = file.path === selectedFile}
-            <li>
-              <!-- `data-selected` drives the action-icons' hover color via the
-                   shared `ROW_ACTION_ICON_CLASS` `group-data-` variant: the
-                   icons hover a stronger gray by default and white (`bg-raised`) on a
-                   selected (blue) row so they read against the blue. CSS (not a
-                   JS class) because the buttons live inside Tooltip `{#snippet}`s,
-                   which don't re-render when `selectedFile` changes. -->
-              <div
-                data-selected={isSelected}
-                class={cn(
-                  "group relative flex w-full items-stretch rounded-none text-xs transition-colors",
-                  isSelected ? "bg-selected text-fg" : cn("text-muted", hoverBg),
-                )}
-              >
-                <!-- The padding lives on the button (not the row) so the click
-                     target fills the whole hover area — otherwise the top/bottom
-                     (and left) padding band highlights but swallows the click. -->
-                <button
-                  type="button"
-                  class={cn(
-                    "flex min-w-0 flex-1 items-start gap-2 px-2 py-1.5 pr-2 text-left transition-[padding]",
-                    padFocus,
-                    padHoverReveal,
-                  )}
-                  data-testid="changed-file"
-                  data-selected={file.path === selectedFile}
-                  onclick={() => {
-                    selectedFile = file.path;
-                    navFocus.pane = "files";
-                  }}
-                >
-                  <span
-                    class={cn("mt-0.5 w-4 shrink-0 text-center font-mono text-[11px]", badge.class)}
-                    >{badge.letter}</span
+  <div class="relative flex min-h-0 flex-1">
+    <div
+      class={cn("flex min-h-0 flex-1", filesPending && "pointer-events-none invisible")}
+      inert={filesPending}
+      aria-hidden={filesPending}
+    >
+      {#if files === null}
+        <EmptyState title="Loading changes…" />
+      {:else if filesError !== null}
+        <EmptyState
+          testid="detail-files-error"
+          tone="error"
+          title="Couldn't read changes."
+          description={filesError}
+        />
+      {:else if !commitFound}
+        <EmptyState
+          testid="detail-commit-missing"
+          title="This commit is no longer available."
+          description="It may have been garbage-collected or the branch was updated. Refresh the branch."
+        />
+      {:else if files.length === 0}
+        {#if target.kind === "uncommitted"}
+          <EmptyState
+            testid="detail-no-changes"
+            title="No uncommitted changes."
+            description="This folder matches its last commit."
+          />
+        {:else if target.kind === "comparison"}
+          <EmptyState
+            testid="detail-no-changes"
+            title={`No changes from ${target.comparison.base_label}.`}
+          />
+        {:else}
+          <EmptyState testid="detail-no-changes" title="This commit changed no files." />
+        {/if}
+      {:else}
+        <div class="flex min-h-0 flex-1 overflow-hidden">
+          <!-- Changed-files list. Raised like the diff it belongs to — the border
+               carries the column boundary, so the pane isn't a gray column with a
+               grayer header inside a white drawer. -->
+          <div
+            class="border-border/60 bg-raised shrink-0 overflow-hidden border-r"
+            style={`width: ${fileListWidth}px`}
+            data-testid="changed-files-list"
+          >
+            <div class="border-border/60 flex h-8 items-center justify-between border-b px-2">
+              <span class="text-muted text-[11px] font-semibold tracking-wide uppercase">
+                Changed files
+              </span>
+              <span class="text-muted font-mono text-[11px]">{files.length}</span>
+            </div>
+            <ul
+              bind:this={filesListEl}
+              class="h-[calc(100%-2rem)] overflow-y-auto py-1"
+              data-testid="changed-files"
+            >
+              {#each files as file (file.path)}
+                {@const badge = changeBadge(file.change)}
+                {@const directory = directoryLabel(file.path)}
+                {@const isSelected = file.path === selectedFile}
+                <li>
+                  <!-- `data-selected` drives the action-icons' hover color via the
+                       shared `ROW_ACTION_ICON_CLASS` `group-data-` variant: the
+                       icons hover a stronger gray by default and white (`bg-raised`) on a
+                       selected (blue) row so they read against the blue. CSS (not a
+                       JS class) because the buttons live inside Tooltip `{#snippet}`s,
+                       which don't re-render when `selectedFile` changes. -->
+                  <div
+                    data-selected={isSelected}
+                    class={cn(
+                      "group relative flex w-full items-stretch rounded-none text-xs transition-colors",
+                      isSelected ? "bg-selected text-fg" : cn("text-muted", hoverBg),
+                    )}
                   >
-                  <span class="min-w-0 flex-1">
-                    <Tooltip
-                      label={file.path}
-                      delayDuration={SUPPLEMENTAL_TOOLTIP_DELAY}
-                      focusable={false}
-                    >
-                      {#snippet trigger(props)}
-                        <span {...props} class="block truncate">{basename(file.path)}</span>
-                      {/snippet}
-                    </Tooltip>
-                    {#if directory}
-                      <span class="text-muted/60 block truncate font-mono text-[10px] leading-4">
-                        {directory}
-                      </span>
-                    {/if}
-                  </span>
-                  <!-- +n/−n magnitude, quiet mono like the commit timestamps.
-                       Absent for binary/oversized content (counts are null, not
-                       0) and for a pure rename (0/0 — the R badge already says
-                       everything). Hover/focus replaces it with the row actions
-                       instead of shifting it left beside them. -->
-                  {#if file.additions !== null && file.deletions !== null && file.additions + file.deletions > 0}
-                    <span
+                    <!-- The padding lives on the button (not the row) so the click
+                         target fills the whole hover area — otherwise the top/bottom
+                         (and left) padding band highlights but swallows the click. -->
+                    <button
+                      type="button"
                       class={cn(
-                        "mt-0.5 ml-auto shrink-0 pl-2 font-mono text-[10px] leading-4 group-focus-within:hidden",
-                        countsHoverHide,
+                        "flex min-w-0 flex-1 items-start gap-2 px-2 py-1.5 pr-2 text-left transition-[padding]",
+                        padFocus,
+                        padHoverReveal,
                       )}
-                      data-testid="changed-file-counts"
+                      data-testid="changed-file"
+                      data-selected={file.path === selectedFile}
+                      onclick={() => {
+                        selectedFile = file.path;
+                        navFocus.pane = "files";
+                      }}
                     >
-                      <span class="text-diff-added">+{file.additions}</span>
-                      <span class="text-diff-removed">−{file.deletions}</span>
-                    </span>
-                  {/if}
-                </button>
-                <div
-                  class={cn(
-                    "pointer-events-none absolute top-1/2 right-2 flex -translate-y-1/2 items-center gap-0.5 opacity-0 transition-opacity group-focus-within:pointer-events-auto group-focus-within:opacity-100",
-                    iconsHoverReveal,
-                  )}
-                >
-                  <Tooltip label="Copy path" side="top">
-                    {#snippet trigger(props)}
-                      <AsyncIconButton
-                        {...props}
-                        class={cn(ROW_ACTION_ICON_CLASS, "h-6 w-6 shrink-0")}
-                        label={`Copy path for ${file.path}`}
-                        testid="changed-file-copy-path"
-                        action={() => copyFilePath(file)}
-                        onError={(error) =>
-                          onExternalActionError("[switchboard] copy file path failed", error)}
+                      <span
+                        class={cn(
+                          "mt-0.5 w-4 shrink-0 text-center font-mono text-[11px]",
+                          badge.class,
+                        )}>{badge.letter}</span
                       >
-                        <Copy size={14} strokeWidth={1.8} aria-hidden="true" />
-                      </AsyncIconButton>
-                    {/snippet}
-                  </Tooltip>
-                  {#if target.kind === "uncommitted" && canOpenFileInEditor(file)}
-                    <Tooltip label="Open in editor" side="top">
-                      {#snippet trigger(props)}
-                        <AsyncIconButton
-                          {...props}
-                          class={cn(ROW_ACTION_ICON_CLASS, "h-6 w-6 shrink-0")}
-                          label={`Open ${file.path} in editor`}
-                          testid="changed-file-editor"
-                          completeAfterMs={700}
-                          action={() => openFileInEditor(file)}
-                          onError={(error) =>
-                            onExternalActionError(
-                              "[switchboard] open file in editor failed",
-                              error,
-                            )}
+                      <span class="min-w-0 flex-1">
+                        <Tooltip
+                          label={file.path}
+                          delayDuration={SUPPLEMENTAL_TOOLTIP_DELAY}
+                          focusable={false}
                         >
-                          <Code2 size={14} strokeWidth={1.8} aria-hidden="true" />
-                        </AsyncIconButton>
-                      {/snippet}
-                    </Tooltip>
-                  {/if}
-                  <Tooltip label="Open in difftool" side="top">
-                    {#snippet trigger(props)}
-                      <AsyncIconButton
-                        {...props}
-                        class={cn(ROW_ACTION_ICON_CLASS, "h-6 w-6 shrink-0")}
-                        label={`Open ${file.path} in difftool`}
-                        testid="changed-file-difftool"
-                        completeAfterMs={700}
-                        action={() => openFileDifftool(file)}
-                        onError={(error) =>
-                          onExternalActionError("[switchboard] git difftool failed", error)}
-                      >
-                        <ExternalLink size={14} strokeWidth={1.8} aria-hidden="true" />
-                      </AsyncIconButton>
-                    {/snippet}
-                  </Tooltip>
-                </div>
+                          {#snippet trigger(props)}
+                            <span {...props} class="block truncate">{basename(file.path)}</span>
+                          {/snippet}
+                        </Tooltip>
+                        {#if directory}
+                          <span
+                            class="text-muted/60 block truncate font-mono text-[10px] leading-4"
+                          >
+                            {directory}
+                          </span>
+                        {/if}
+                      </span>
+                      <!-- +n/−n magnitude, quiet mono like the commit timestamps.
+                           Absent for binary/oversized content (counts are null, not
+                           0) and for a pure rename (0/0 — the R badge already says
+                           everything). Hover/focus replaces it with the row actions
+                           instead of shifting it left beside them. -->
+                      {#if file.additions !== null && file.deletions !== null && file.additions + file.deletions > 0}
+                        <span
+                          class={cn(
+                            "ml-auto shrink-0 pl-2 font-mono text-[10px] leading-4 group-focus-within:hidden",
+                            countsHoverHide,
+                          )}
+                          data-testid="changed-file-counts"
+                        >
+                          <span class="text-diff-added">+{file.additions}</span>
+                          <span class="text-diff-removed">−{file.deletions}</span>
+                        </span>
+                      {/if}
+                    </button>
+                    <div
+                      class={cn(
+                        "pointer-events-none absolute top-1/2 right-2 flex -translate-y-1/2 items-center gap-0.5 opacity-0 transition-opacity group-focus-within:pointer-events-auto group-focus-within:opacity-100",
+                        iconsHoverReveal,
+                      )}
+                    >
+                      <Tooltip label="Copy path" side="top">
+                        {#snippet trigger(props)}
+                          <AsyncIconButton
+                            {...props}
+                            class={cn(ROW_ACTION_ICON_CLASS, "h-6 w-6 shrink-0")}
+                            label={`Copy path for ${file.path}`}
+                            testid="changed-file-copy-path"
+                            action={() => copyFilePath(file)}
+                            onError={(error) =>
+                              onExternalActionError("[switchboard] copy file path failed", error)}
+                          >
+                            <Copy size={14} strokeWidth={1.8} aria-hidden="true" />
+                          </AsyncIconButton>
+                        {/snippet}
+                      </Tooltip>
+                      {#if targetWorktreePath !== null && canOpenFileInEditor(file)}
+                        <Tooltip label="Open in editor" side="top">
+                          {#snippet trigger(props)}
+                            <AsyncIconButton
+                              {...props}
+                              class={cn(ROW_ACTION_ICON_CLASS, "h-6 w-6 shrink-0")}
+                              label={`Open ${file.path} in editor`}
+                              testid="changed-file-editor"
+                              completeAfterMs={700}
+                              action={() => openFileInEditor(file)}
+                              onError={(error) =>
+                                onExternalActionError(
+                                  "[switchboard] open file in editor failed",
+                                  error,
+                                )}
+                            >
+                              <Code2 size={14} strokeWidth={1.8} aria-hidden="true" />
+                            </AsyncIconButton>
+                          {/snippet}
+                        </Tooltip>
+                      {/if}
+                      <Tooltip label="Open in difftool" side="top">
+                        {#snippet trigger(props)}
+                          <AsyncIconButton
+                            {...props}
+                            class={cn(ROW_ACTION_ICON_CLASS, "h-6 w-6 shrink-0")}
+                            label={`Open ${file.path} in difftool`}
+                            testid="changed-file-difftool"
+                            completeAfterMs={700}
+                            action={() => openFileDifftool(file)}
+                            onError={(error) =>
+                              onExternalActionError("[switchboard] git difftool failed", error)}
+                          >
+                            <ExternalLink size={14} strokeWidth={1.8} aria-hidden="true" />
+                          </AsyncIconButton>
+                        {/snippet}
+                      </Tooltip>
+                    </div>
+                  </div>
+                </li>
+              {/each}
+            </ul>
+          </div>
+
+          {@render fileListResizeHandle()}
+
+          <!-- Diff -->
+          <div class="bg-raised relative min-w-0 flex-1 overflow-hidden">
+            <div
+              class={cn("h-full overflow-auto", diffPending && "pointer-events-none invisible")}
+              data-testid="diff-scroll"
+              inert={diffPending}
+              aria-hidden={diffPending}
+            >
+              {#if diffError !== null}
+                <EmptyState
+                  testid="diff-error"
+                  tone="error"
+                  title="Couldn't read this file's diff."
+                  description={diffError}
+                />
+              {:else if diff !== null}
+                <DiffView {diff} style={preferences.diff_style} {language} />
+              {/if}
+            </div>
+            {#if diffPending}
+              <div
+                class="bg-raised absolute inset-0 flex items-center justify-center"
+                data-testid="diff-loading"
+                role="status"
+                aria-label="Loading file diff"
+              >
+                <Spinner class="h-4 w-4" />
               </div>
-            </li>
-          {/each}
-        </ul>
-      </div>
+            {/if}
+          </div>
+        </div>
+      {/if}
+    </div>
 
-      <ResizeHandle
-        value={() => fileListWidth}
-        min={DIFF_FILE_LIST_MIN_WIDTH}
-        max={() => DIFF_FILE_LIST_MAX_WIDTH}
-        label="Resize changed files list"
-        testid="changed-files-resizer"
-        class="border-border/60 bg-panel hover:bg-focus w-1.5 border-r transition-colors"
-        onDraft={(px) => (draftFileListWidth = px)}
-        onCommit={(px) => {
-          layout.diffFileListWidth = px;
-          draftFileListWidth = null;
-        }}
-        onReset={() => {
-          layout.diffFileListWidth = DIFF_FILE_LIST_DEFAULT_WIDTH;
-          draftFileListWidth = null;
-        }}
-      />
-
-      <!-- Diff -->
-      <div class="bg-raised min-w-0 flex-1 overflow-auto" data-testid="diff-scroll">
-        {#if diffLoading}
-          <div class="flex items-center justify-center py-6">
+    {#if filesPending}
+      <div
+        class="bg-raised absolute inset-0 flex min-h-0 overflow-hidden"
+        data-testid="detail-loading"
+        role="status"
+        aria-label="Loading changes"
+      >
+        <div
+          class="border-border/60 bg-raised shrink-0 overflow-hidden border-r"
+          style={`width: ${fileListWidth}px`}
+          data-testid="changed-files-loading"
+        >
+          <div class="border-border/60 flex h-8 items-center justify-between border-b px-2">
+            <span class="text-muted text-[11px] font-semibold tracking-wide uppercase">
+              Changed files
+            </span>
+            <span class="text-muted font-mono text-[11px]">—</span>
+          </div>
+          <div class="flex h-[calc(100%-2rem)] items-center justify-center">
             <Spinner class="h-4 w-4" />
           </div>
-        {:else if diffError !== null}
-          <EmptyState
-            testid="diff-error"
-            tone="error"
-            title="Couldn't read this file's diff."
-            description={diffError}
-          />
-        {:else if diff !== null}
-          <DiffView {diff} style={preferences.diff_style} {language} />
-        {/if}
+        </div>
+
+        <div class="border-border/60 bg-panel w-1.5 shrink-0 border-r" aria-hidden="true"></div>
+
+        <div
+          class="bg-raised flex min-w-0 flex-1 items-center justify-center"
+          data-testid="diff-loading"
+        >
+          <Spinner class="h-4 w-4" />
+        </div>
       </div>
-    </div>
-  {/if}
+    {/if}
+  </div>
 </div>
+
+{#snippet fileListResizeHandle()}
+  <ResizeHandle
+    value={() => fileListWidth}
+    min={DIFF_FILE_LIST_MIN_WIDTH}
+    max={() => DIFF_FILE_LIST_MAX_WIDTH}
+    label="Resize changed files list"
+    testid="changed-files-resizer"
+    class="border-border/60 bg-panel hover:bg-focus w-1.5 border-r transition-colors"
+    onDraft={(px) => (draftFileListWidth = px)}
+    onCommit={(px) => {
+      layout.diffFileListWidth = px;
+      draftFileListWidth = null;
+    }}
+    onReset={() => {
+      layout.diffFileListWidth = DIFF_FILE_LIST_DEFAULT_WIDTH;
+      draftFileListWidth = null;
+    }}
+  />
+{/snippet}
 
 <!-- Keyboard navigation suppresses hover highlights; any pointer motion restores them. -->
 <svelte:window onpointermove={onWindowPointerMove} />

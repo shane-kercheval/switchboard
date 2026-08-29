@@ -186,6 +186,23 @@ pub struct CommitChanges {
     pub files: Vec<ChangedFile>,
 }
 
+/// One PR-style branch comparison: the selected branch's merge base with a
+/// chosen base ref, through either the branch tip or its live working tree.
+/// The OIDs make later per-file reads use the same comparison snapshot as the
+/// file list even if refs move between clicks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BranchComparison {
+    /// Exact resolved ref shorthand (`origin/main`, `release`, ...).
+    pub base_name: String,
+    /// Compact user-facing base label. Automatic default-branch resolution
+    /// drops the remote prefix (`main`); an explicit base keeps its exact name.
+    pub base_label: String,
+    pub merge_base_oid: String,
+    pub head_oid: String,
+    pub includes_worktree: bool,
+    pub files: Vec<ChangedFile>,
+}
+
 impl CommitChanges {
     /// The "this commit no longer resolves" result — `found: false`, no files.
     #[must_use]

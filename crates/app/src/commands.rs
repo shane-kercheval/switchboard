@@ -723,6 +723,95 @@ pub fn commit_file_diff_impl(
     })
 }
 
+/// Resolve one branch's PR-style comparison against an explicit base ref, or
+/// the repository default when no base is supplied. The optional worktree adds
+/// staged, unstaged, and untracked content to the branch's committed changes.
+pub fn branch_comparison_impl(
+    roots: &[PathBuf],
+    repo_root: &str,
+    kind: switchboard_git::BranchKind,
+    name: &str,
+    base_kind: Option<switchboard_git::BranchKind>,
+    base_name: Option<&str>,
+    worktree_path: Option<&str>,
+) -> Result<Option<switchboard_git::BranchComparison>, AppError> {
+    if !is_tracked_repo(roots, repo_root) {
+        return Err(AppError::RepoNotTracked {
+            root: repo_root.to_owned(),
+        });
+    }
+    validate_comparison_worktree_boundary(roots, repo_root, worktree_path)?;
+    switchboard_git::branch_comparison(
+        Path::new(repo_root),
+        kind,
+        name,
+        base_kind,
+        base_name,
+        worktree_path.map(Path::new),
+    )
+    .map_err(|e| AppError::GitRead {
+        path: repo_root.to_owned(),
+        message: e.to_string(),
+    })
+}
+
+/// One file from a previously resolved branch comparison. An expired endpoint
+/// is surfaced distinctly so the panel can request a refresh rather than
+/// presenting a misleading empty diff.
+pub fn branch_comparison_file_diff_impl(
+    roots: &[PathBuf],
+    repo_root: &str,
+    merge_base_oid: &str,
+    head_oid: &str,
+    worktree_path: Option<&str>,
+    file: &str,
+) -> Result<switchboard_git::FileDiff, AppError> {
+    if !is_tracked_repo(roots, repo_root) {
+        return Err(AppError::RepoNotTracked {
+            root: repo_root.to_owned(),
+        });
+    }
+    validate_comparison_worktree_boundary(roots, repo_root, worktree_path)?;
+    switchboard_git::branch_comparison_file_diff(
+        Path::new(repo_root),
+        merge_base_oid,
+        head_oid,
+        worktree_path.map(Path::new),
+        file,
+    )
+    .map_err(|e| branch_comparison_read_error(repo_root, e))
+}
+
+fn validate_comparison_worktree_boundary(
+    roots: &[PathBuf],
+    repo_root: &str,
+    worktree_path: Option<&str>,
+) -> Result<(), AppError> {
+    let Some(worktree_path) = worktree_path else {
+        return Ok(());
+    };
+    let expected = switchboard_git::resolve_repo_root(Path::new(repo_root))
+        .unwrap_or_else(|| canonicalize_boundary(repo_root));
+    let actual = switchboard_git::resolve_repo_root(Path::new(worktree_path))
+        .unwrap_or_else(|| canonicalize_boundary(worktree_path));
+    if expected != actual || !roots.iter().any(|root| root == &actual) {
+        return Err(AppError::RepoNotTracked {
+            root: actual.to_string_lossy().into_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn branch_comparison_read_error(repo_root: &str, error: switchboard_git::GitError) -> AppError {
+    match error {
+        switchboard_git::GitError::ComparisonStale { .. } => AppError::BranchComparisonStale,
+        other => AppError::GitRead {
+            path: repo_root.to_owned(),
+            message: other.to_string(),
+        },
+    }
+}
+
 /// The `AppState`-derived inputs a Git-view read needs, snapshotted so the
 /// `git2` work can move onto a blocking thread. Cheap to build (registry paths +
 /// the flat project list); the expensive part is the git reads that consume it.
@@ -910,6 +999,39 @@ pub fn commit_difftool_argv(repo_root: &str, base_oid: &str, oid: &str, file: &s
     ]
 }
 
+#[must_use]
+pub fn branch_comparison_difftool_argv(
+    repo_root: &str,
+    worktree_path: Option<&str>,
+    merge_base_oid: &str,
+    head_oid: &str,
+    file: &str,
+    change: switchboard_git::ChangeKind,
+) -> Vec<String> {
+    match (worktree_path, change) {
+        (Some(worktree_path), switchboard_git::ChangeKind::Untracked) => vec![
+            "-C".to_owned(),
+            worktree_path.to_owned(),
+            "difftool".to_owned(),
+            "--no-prompt".to_owned(),
+            "--no-index".to_owned(),
+            "--".to_owned(),
+            "/dev/null".to_owned(),
+            file.to_owned(),
+        ],
+        (Some(worktree_path), _) => vec![
+            "-C".to_owned(),
+            worktree_path.to_owned(),
+            "difftool".to_owned(),
+            "--no-prompt".to_owned(),
+            merge_base_oid.to_owned(),
+            "--".to_owned(),
+            file.to_owned(),
+        ],
+        (None, _) => commit_difftool_argv(repo_root, merge_base_oid, head_oid, file),
+    }
+}
+
 fn git_output_message(output: &std::process::Output) -> String {
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
     if stderr.is_empty() {
@@ -1006,6 +1128,45 @@ pub async fn open_commit_file_difftool_impl(
     run_git_difftool(
         &root,
         commit_difftool_argv(&root.to_string_lossy(), &base_oid, oid, file),
+    )
+    .await
+}
+
+pub async fn open_branch_comparison_file_difftool_impl(
+    state: &AppState,
+    repo_root: &str,
+    worktree_path: Option<&str>,
+    merge_base_oid: &str,
+    head_oid: &str,
+    file: &str,
+    change: switchboard_git::ChangeKind,
+) -> Result<(), AppError> {
+    let root = switchboard_git::resolve_repo_root(Path::new(repo_root))
+        .unwrap_or_else(|| canonicalize_boundary(repo_root));
+    if !lock(&state.git_registry).contains(&root) {
+        return Err(AppError::RepoNotTracked {
+            root: root.to_string_lossy().into_owned(),
+        });
+    }
+    let roots = lock(&state.git_registry).roots().to_vec();
+    validate_comparison_worktree_boundary(&roots, repo_root, worktree_path)?;
+    switchboard_git::validate_branch_comparison_endpoint(
+        &root,
+        merge_base_oid,
+        head_oid,
+        worktree_path.map(Path::new),
+    )
+    .map_err(|e| branch_comparison_read_error(repo_root, e))?;
+    run_git_difftool(
+        &root,
+        branch_comparison_difftool_argv(
+            repo_root,
+            worktree_path,
+            merge_base_oid,
+            head_oid,
+            file,
+            change,
+        ),
     )
     .await
 }
@@ -19090,6 +19251,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn branch_comparison_difftool_argv_supports_worktree_and_tree_endpoints() {
+        assert_eq!(
+            branch_comparison_difftool_argv(
+                "/repo",
+                Some("/repo/wt"),
+                "base",
+                "head",
+                "src/main.rs",
+                switchboard_git::ChangeKind::Modified,
+            ),
+            vec![
+                "-C",
+                "/repo/wt",
+                "difftool",
+                "--no-prompt",
+                "base",
+                "--",
+                "src/main.rs",
+            ]
+        );
+        assert_eq!(
+            branch_comparison_difftool_argv(
+                "/repo",
+                None,
+                "base",
+                "head",
+                "src/main.rs",
+                switchboard_git::ChangeKind::Modified,
+            ),
+            commit_difftool_argv("/repo", "base", "head", "src/main.rs")
+        );
+    }
+
     #[tokio::test]
     async fn difftool_refuses_untracked_paths_before_running_git() {
         let (_cfg, state) = state_with_registries();
@@ -19116,6 +19311,19 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(commit_err, AppError::RepoNotTracked { .. }));
+
+        let comparison_err = open_branch_comparison_file_difftool_impl(
+            &state,
+            repo.path().to_str().unwrap(),
+            Some(repo.path().to_str().unwrap()),
+            &oid,
+            &oid,
+            "README.md",
+            switchboard_git::ChangeKind::Modified,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(comparison_err, AppError::RepoNotTracked { .. }));
     }
 
     #[tokio::test]
@@ -19265,6 +19473,177 @@ mod tests {
             .map(|c| c.subject.as_str())
             .collect();
         assert_eq!(subjects, vec!["second", "init"]);
+    }
+
+    #[test]
+    fn branch_comparison_and_file_diff_cross_the_command_layer() {
+        let repo = TempDir::new().unwrap();
+        init_git_repo(repo.path());
+        git(repo.path(), &["switch", "-q", "-c", "feature"]);
+        std::fs::write(repo.path().join("feature.txt"), "feature\n").unwrap();
+        git(repo.path(), &["add", "-A"]);
+        git(repo.path(), &["commit", "-q", "-m", "feature"]);
+        std::fs::write(repo.path().join("working.txt"), "working\n").unwrap();
+
+        let root = repo.path().to_str().unwrap();
+        let comparison = branch_comparison_impl(
+            &roots_of(&repo),
+            root,
+            switchboard_git::BranchKind::Local,
+            "feature",
+            None,
+            None,
+            Some(root),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            comparison
+                .files
+                .iter()
+                .any(|file| file.path == "feature.txt")
+        );
+        assert!(
+            comparison
+                .files
+                .iter()
+                .any(|file| file.path == "working.txt")
+        );
+
+        let diff = branch_comparison_file_diff_impl(
+            &roots_of(&repo),
+            root,
+            &comparison.merge_base_oid,
+            &comparison.head_oid,
+            Some(root),
+            "working.txt",
+        )
+        .unwrap();
+        assert!(
+            diff.hunks
+                .iter()
+                .any(|hunk| hunk.lines.iter().any(|line| line.content == "working"))
+        );
+
+        let err = branch_comparison_impl(
+            &[],
+            root,
+            switchboard_git::BranchKind::Local,
+            "feature",
+            None,
+            None,
+            Some(root),
+        )
+        .unwrap_err();
+        assert!(matches!(err, AppError::RepoNotTracked { .. }));
+    }
+
+    #[test]
+    fn branch_comparison_followups_reject_stale_and_foreign_worktrees() {
+        let repo = TempDir::new().unwrap();
+        init_git_repo(repo.path());
+        git(repo.path(), &["switch", "-q", "-c", "feature"]);
+        std::fs::write(repo.path().join("feature.txt"), "feature\n").unwrap();
+        git(repo.path(), &["add", "-A"]);
+        git(repo.path(), &["commit", "-q", "-m", "feature"]);
+        let root = repo.path().to_str().unwrap();
+        let comparison = branch_comparison_impl(
+            &roots_of(&repo),
+            root,
+            switchboard_git::BranchKind::Local,
+            "feature",
+            None,
+            None,
+            Some(root),
+        )
+        .unwrap()
+        .unwrap();
+
+        std::fs::write(repo.path().join("later.txt"), "later\n").unwrap();
+        git(repo.path(), &["add", "-A"]);
+        git(repo.path(), &["commit", "-q", "-m", "advance"]);
+        let stale = branch_comparison_file_diff_impl(
+            &roots_of(&repo),
+            root,
+            &comparison.merge_base_oid,
+            &comparison.head_oid,
+            Some(root),
+            "feature.txt",
+        )
+        .unwrap_err();
+        assert!(matches!(stale, AppError::BranchComparisonStale));
+
+        let foreign = TempDir::new().unwrap();
+        init_git_repo(foreign.path());
+        let roots = vec![
+            repo.path().canonicalize().unwrap(),
+            foreign.path().canonicalize().unwrap(),
+        ];
+        let mismatched = branch_comparison_impl(
+            &roots,
+            root,
+            switchboard_git::BranchKind::Local,
+            "feature",
+            None,
+            None,
+            Some(foreign.path().to_str().unwrap()),
+        )
+        .unwrap_err();
+        assert!(matches!(mismatched, AppError::RepoNotTracked { .. }));
+
+        let mismatched_file = branch_comparison_file_diff_impl(
+            &roots,
+            root,
+            &comparison.merge_base_oid,
+            &comparison.head_oid,
+            Some(foreign.path().to_str().unwrap()),
+            "feature.txt",
+        )
+        .unwrap_err();
+        assert!(matches!(mismatched_file, AppError::RepoNotTracked { .. }));
+    }
+
+    #[tokio::test]
+    async fn branch_comparison_difftool_rejects_a_stale_head_before_launch() {
+        let (_cfg, state) = state_with_registries();
+        let repo = TempDir::new().unwrap();
+        init_git_repo(repo.path());
+        lock(&state.git_registry).add(repo.path().canonicalize().unwrap());
+        let old_head = head_oid(repo.path());
+        std::fs::write(repo.path().join("later.txt"), "later\n").unwrap();
+        git(repo.path(), &["add", "-A"]);
+        git(repo.path(), &["commit", "-q", "-m", "advance"]);
+
+        let error = open_branch_comparison_file_difftool_impl(
+            &state,
+            repo.path().to_str().unwrap(),
+            Some(repo.path().to_str().unwrap()),
+            &old_head,
+            &old_head,
+            "README.md",
+            switchboard_git::ChangeKind::Modified,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, AppError::BranchComparisonStale));
+
+        let foreign = TempDir::new().unwrap();
+        init_git_repo(foreign.path());
+        lock(&state.git_registry).add(foreign.path().canonicalize().unwrap());
+        let current_head = head_oid(repo.path());
+        let foreign_error = open_branch_comparison_file_difftool_impl(
+            &state,
+            repo.path().to_str().unwrap(),
+            Some(foreign.path().to_str().unwrap()),
+            &current_head,
+            &current_head,
+            "README.md",
+            switchboard_git::ChangeKind::Modified,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(foreign_error, AppError::RepoNotTracked { .. }));
     }
 
     #[test]

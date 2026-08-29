@@ -71,7 +71,7 @@
   // palette already do — never a silent `console.warn`.
   let commandError = $state<string | null>(null);
 
-  // The open diff target (a commit or a worktree's uncommitted changes), or null.
+  // The open comparison, commit, or worktree diff target, or null.
   // Drives the right inspector.
   const panel = $derived(diffTarget.current);
   /// Live width during a resize drag; the layout store commits on pointer-up.
@@ -592,7 +592,7 @@
         <EmptyState
           testid="git-detail-empty"
           title="Select a commit"
-          description="Choose a branch, commit, or uncommitted changes to inspect the diff."
+          description="Choose branch changes, a commit, or uncommitted changes to inspect the diff."
         />
       {/if}
     </aside>

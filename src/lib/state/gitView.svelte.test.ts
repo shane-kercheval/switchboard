@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { GitCommitSummary, RepoListing } from "$lib/types";
+import type { BranchComparison, GitCommitRange, GitCommitSummary, RepoListing } from "$lib/types";
 import type { CommitNavItem } from "./gitView.svelte";
 
 const invokeMock = vi.fn();
@@ -20,12 +20,15 @@ const {
   addRepo,
   removeRepo,
   selectBranch,
+  selectBranchComparison,
   selectCommit,
   selectUncommitted,
   clearBranchSelection,
   selectedWorktreePathForEditor,
   branchSelection,
   branchCommits,
+  branchComparison,
+  compareSelectedBranchAgainst,
   diffTarget,
   navFocus,
   nextIndex,
@@ -121,6 +124,15 @@ function wire(opts: { list?: RepoListing[]; fetchRejects?: boolean } = {}) {
 const mainRef = (root = "/a") => ({ repoRoot: root, kind: "local" as const, name: "main" });
 const dirtyOpts = { worktreePath: "/a/wt", hasChanges: true, worktreeSubtitle: "~/wt" };
 
+const comparison = (baseLabel = "main"): BranchComparison => ({
+  base_name: baseLabel === "main" ? "origin/main" : baseLabel,
+  base_label: baseLabel,
+  merge_base_oid: "1111111111111111111111111111111111111111",
+  head_oid: "2222222222222222222222222222222222222222",
+  includes_worktree: true,
+  files: [{ path: "src/feature.ts", change: "modified", additions: 3, deletions: 1 }],
+});
+
 function deferred<T>(): {
   promise: Promise<T>;
   resolve: (value: T | PromiseLike<T>) => void;
@@ -195,6 +207,167 @@ describe("gitView store", () => {
     await refreshAll();
     await selectBranch(mainRef(), dirtyOpts);
     expect(diffTarget.current).toMatchObject({ kind: "uncommitted", worktreePath: "/a/wt" });
+  });
+
+  it("selectBranch defaults to the aggregate comparison and supports an explicit base", async () => {
+    wire({ list: [listingWithWorktree("/a", "/a/wt")] });
+    invokeMock.mockImplementation((cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "list_tracked_repos")
+        return Promise.resolve([listingWithWorktree("/a", "/a/wt")]);
+      if (cmd === "branch_commits") return Promise.resolve([]);
+      if (cmd === "branch_comparison") {
+        if (args?.baseName === "missing") return Promise.resolve(null);
+        return Promise.resolve(comparison(args?.baseName === "release" ? "release" : "main"));
+      }
+      return Promise.resolve(null);
+    });
+    await refreshAll();
+    await selectBranch(mainRef(), dirtyOpts);
+
+    expect(branchComparison.result?.base_label).toBe("main");
+    expect(diffTarget.current).toMatchObject({
+      kind: "comparison",
+      branchName: "main",
+      worktreePath: "/a/wt",
+    });
+    expect(selectedWorktreePathForEditor()).toBe("/a/wt");
+
+    await compareSelectedBranchAgainst({ kind: "local", name: "release" });
+    expect(branchComparison.base).toEqual({ kind: "local", name: "release" });
+    expect(diffTarget.current).toMatchObject({
+      kind: "comparison",
+      comparison: { base_label: "release" },
+    });
+    expect(invokeMock).toHaveBeenLastCalledWith("branch_comparison", {
+      repoRoot: "/a",
+      kind: "local",
+      name: "main",
+      baseKind: "local",
+      baseName: "release",
+      worktreePath: "/a/wt",
+    });
+
+    await compareSelectedBranchAgainst({ kind: "local", name: "missing" });
+    expect(branchComparison.result).toBeNull();
+    expect(diffTarget.current).toBeNull();
+  });
+
+  it("publishes commits without waiting for the branch comparison", async () => {
+    const comparisonRead = deferred<BranchComparison | null>();
+    const commitsRead = deferred<GitCommitRange[]>();
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "branch_comparison") return comparisonRead.promise;
+      if (cmd === "branch_commits") return commitsRead.promise;
+      return Promise.resolve(null);
+    });
+
+    const selecting = selectBranch(mainRef(), dirtyOpts);
+    commitsRead.resolve([
+      {
+        kind: "recent",
+        label: "Recent commits",
+        truncated: false,
+        commits: [
+          {
+            oid: "abc123def456",
+            short_oid: "abc123d",
+            subject: "ready first",
+            author_name: "T",
+            author_email: null,
+            authored_at: null,
+            branch_work: true,
+            unpushed: false,
+          },
+        ],
+      },
+    ]);
+    await Promise.resolve();
+
+    expect(branchCommits.status).toBe("loaded");
+    expect(branchCommits.ranges[0]?.commits[0]?.subject).toBe("ready first");
+    expect(branchComparison.status).toBe("loading");
+
+    comparisonRead.resolve(null);
+    await selecting;
+  });
+
+  it("does not let a collapsed and re-expanded branch publish its earlier reads", async () => {
+    const comparisonReads = [
+      deferred<BranchComparison | null>(),
+      deferred<BranchComparison | null>(),
+    ];
+    const commitReads = [deferred<GitCommitRange[]>(), deferred<GitCommitRange[]>()];
+    let comparisonIndex = 0;
+    let commitIndex = 0;
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "branch_comparison") return comparisonReads[comparisonIndex++]!.promise;
+      if (cmd === "branch_commits") return commitReads[commitIndex++]!.promise;
+      return Promise.resolve(null);
+    });
+
+    const first = selectBranch(mainRef(), dirtyOpts);
+    await selectBranch(mainRef(), dirtyOpts);
+    const latest = selectBranch(mainRef(), dirtyOpts);
+
+    comparisonReads[1]!.resolve(comparison("latest"));
+    commitReads[1]!.resolve([]);
+    await latest;
+    expect(branchComparison.result?.base_label).toBe("latest");
+
+    comparisonReads[0]!.resolve(comparison("stale"));
+    commitReads[0]!.resolve([]);
+    await first;
+    expect(branchComparison.result?.base_label).toBe("latest");
+  });
+
+  it("keeps the last successful comparison when a base change fails", async () => {
+    invokeMock.mockImplementation((cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "branch_commits") return Promise.resolve([]);
+      if (cmd === "branch_comparison" && args?.baseName === "release") {
+        return Promise.reject(new Error("read failed"));
+      }
+      if (cmd === "branch_comparison") return Promise.resolve(comparison("main"));
+      return Promise.resolve(null);
+    });
+    await selectBranch(mainRef(), dirtyOpts);
+    const previousTarget = diffTarget.current;
+
+    await compareSelectedBranchAgainst({ kind: "local", name: "release" });
+
+    expect(branchComparison.status).toBe("failed");
+    expect(branchComparison.base).toBeNull();
+    expect(branchComparison.result?.base_label).toBe("main");
+    expect(branchComparison.error).toContain("Kept the previous comparison");
+    expect(diffTarget.current).toBe(previousTarget);
+  });
+
+  it("rejects stale base results across an A-to-B-to-A request sequence", async () => {
+    const reads = [
+      deferred<BranchComparison | null>(),
+      deferred<BranchComparison | null>(),
+      deferred<BranchComparison | null>(),
+      deferred<BranchComparison | null>(),
+    ];
+    let readIndex = 0;
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "branch_commits") return Promise.resolve([]);
+      if (cmd === "branch_comparison") return reads[readIndex++]!.promise;
+      return Promise.resolve(null);
+    });
+    const initial = selectBranch(mainRef(), dirtyOpts);
+    reads[0]!.resolve(comparison("main"));
+    await initial;
+
+    const firstA = compareSelectedBranchAgainst({ kind: "local", name: "release" });
+    const middleB = compareSelectedBranchAgainst({ kind: "local", name: "hotfix" });
+    const latestA = compareSelectedBranchAgainst({ kind: "local", name: "release" });
+    reads[3]!.resolve(comparison("release-latest"));
+    await latestA;
+    reads[1]!.resolve(comparison("release-stale"));
+    reads[2]!.resolve(comparison("hotfix-stale"));
+    await Promise.all([firstA, middleB]);
+
+    expect(branchComparison.result?.base_label).toBe("release-latest");
   });
 
   it("selectedWorktreePathForEditor prefers the open uncommitted target", async () => {
@@ -922,6 +1095,25 @@ describe("nextCommitSelection", () => {
 
     selectUncommitted("/a", "/wt", "~/wt");
     expect(nextCommitSelection(items, diffTarget.current, -1)).toEqual(items[0]); // clamp top
+  });
+
+  it("treats the aggregate comparison as the entry above uncommitted changes", () => {
+    const aggregate = comparison();
+    const items: CommitNavItem[] = [
+      {
+        kind: "comparison",
+        branchName: "feature",
+        worktreePath: "/wt",
+        comparison: aggregate,
+      },
+      { kind: "uncommitted", worktreePath: "/wt" },
+      { kind: "commit", commit: commitFixture("aaaaaaa0", "a") },
+    ];
+    selectBranchComparison("/a", "feature", aggregate, "/wt");
+    expect(nextCommitSelection(items, diffTarget.current, 1)).toEqual(items[1]);
+
+    selectUncommitted("/a", "/wt", "~/wt");
+    expect(nextCommitSelection(items, diffTarget.current, -1)).toEqual(items[0]);
   });
 });
 

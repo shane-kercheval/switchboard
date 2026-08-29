@@ -14,6 +14,13 @@ pub type Result<T> = std::result::Result<T, GitError>;
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum GitError {
+    /// A follow-up read no longer addresses the repository/HEAD endpoint that
+    /// produced the branch-comparison file list. Keep this distinct from an
+    /// empty diff so callers can ask the user to refresh instead of claiming
+    /// the selected file has no changes.
+    #[error("branch comparison is out of date for {root}")]
+    ComparisonStale { root: PathBuf },
+
     /// A `libgit2` operation failed partway through reading a repo we had
     /// already opened — e.g. a corrupt object, a broken ref, an I/O error mid
     /// walk. Carries the repo root for context.
@@ -26,6 +33,10 @@ pub enum GitError {
 }
 
 impl GitError {
+    pub(crate) fn comparison_stale(root: impl Into<PathBuf>) -> Self {
+        Self::ComparisonStale { root: root.into() }
+    }
+
     pub(crate) fn read(root: impl Into<PathBuf>, source: git2::Error) -> Self {
         Self::Read {
             root: root.into(),

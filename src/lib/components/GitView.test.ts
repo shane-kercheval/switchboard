@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/svelte";
 import GitView from "./GitView.svelte";
-import type { RepoListing } from "$lib/types";
+import type { BranchComparison, RepoListing } from "$lib/types";
 
 const invokeMock = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({
@@ -38,6 +38,7 @@ function gitCommand(id: string) {
 }
 
 afterEach(() => {
+  vi.useRealTimers();
   _testing.reset();
   paletteTesting.reset();
   invokeMock.mockReset();
@@ -93,7 +94,11 @@ const repo = (over: Partial<RepoListing["repo"]> = {}): RepoListing => ({
   linked_projects: { "/repos/app": [{ id: "p1", name: "app-proj", directory: "/repos/app" }] },
 });
 
-function wire(list: RepoListing[]) {
+function wire(
+  list: RepoListing[],
+  comparison: BranchComparison | null = null,
+  opts: { rejectBase?: string } = {},
+) {
   invokeMock.mockImplementation((cmd: string, args?: Record<string, unknown>) => {
     if (cmd === "list_tracked_repos") return Promise.resolve(list);
     if (cmd === "changed_files") return Promise.resolve([]);
@@ -145,10 +150,40 @@ function wire(list: RepoListing[]) {
           ],
         },
       ]);
+    if (cmd === "branch_comparison") {
+      if (args?.baseName === opts.rejectBase) return Promise.reject(new Error("comparison failed"));
+      return Promise.resolve(comparison);
+    }
+    if (cmd === "branch_comparison_file_diff")
+      return Promise.resolve({
+        path: String(args?.file ?? ""),
+        binary: false,
+        truncated: false,
+        too_large: false,
+        too_large_bytes: null,
+        hunks: [
+          {
+            header: "@@ -1 +1 @@",
+            lines: [
+              { origin: "removed", old_lineno: 1, new_lineno: null, content: "old" },
+              { origin: "added", old_lineno: null, new_lineno: 1, content: "new" },
+            ],
+          },
+        ],
+      });
     if (cmd === "read_tracked_repo") return Promise.resolve(list[0] ?? repo());
     return Promise.resolve(null); // fetch_repo
   });
 }
+
+const aggregateComparison: BranchComparison = {
+  base_name: "origin/main",
+  base_label: "main",
+  merge_base_oid: "1111111111111111111111111111111111111111",
+  head_oid: "2222222222222222222222222222222222222222",
+  includes_worktree: true,
+  files: [{ path: "src/feature.ts", change: "modified", additions: 2, deletions: 1 }],
+};
 
 describe("GitView", () => {
   it("renders tracked repos with their active branches and linked project actions", async () => {
@@ -797,6 +832,86 @@ describe("GitView", () => {
     await waitFor(() => expect(screen.queryByTestId("diff-panel")).not.toBeInTheDocument());
     expect(screen.getByTestId("git-detail-sidebar")).toBeInTheDocument();
     expect(screen.getByTestId("git-detail-empty")).toHaveTextContent("Select a commit");
+  });
+
+  it("shows branch changes above uncommitted changes and opens the aggregate diff by default", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    wire([repo()], aggregateComparison);
+    await refreshAll();
+    render(GitView);
+    await waitFor(() => expect(screen.getByTestId("git-repo")).toBeInTheDocument());
+
+    const mainRow = document.querySelector(
+      '[data-testid="git-branch"][data-branch="main"]',
+    ) as HTMLElement;
+    await fireEvent.click(within(mainRow).getByTestId("branch-select"));
+
+    const aggregateRow = await screen.findByTestId("branch-comparison-row");
+    const uncommittedRow = screen.getByTestId("uncommitted-row");
+    expect(
+      aggregateRow.compareDocumentPosition(uncommittedRow) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(aggregateRow).toHaveTextContent("Branch changes");
+    expect(aggregateRow).toHaveTextContent("vs main");
+    expect(aggregateRow).not.toHaveTextContent("includes uncommitted");
+
+    await fireEvent.pointerEnter(screen.getByTestId("branch-comparison-select"));
+    await vi.advanceTimersByTimeAsync(1100);
+    expect(screen.getByTestId("tooltip-content")).toHaveTextContent(
+      "Includes committed and uncommitted changes compared with main.",
+    );
+    expect(screen.getByTestId("detail-title")).toHaveTextContent("Branch changes");
+    expect(screen.getByTestId("detail-subtitle")).toHaveTextContent(
+      "main · compared with main · includes uncommitted changes",
+    );
+
+    const file = await screen.findByTestId("changed-file");
+    expect(file).toHaveTextContent("feature.ts");
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("branch_comparison_file_diff", {
+        repoRoot: "/repos/app",
+        mergeBaseOid: aggregateComparison.merge_base_oid,
+        headOid: aggregateComparison.head_oid,
+        worktreePath: "/repos/app",
+        file: "src/feature.ts",
+      }),
+    );
+
+    await fireEvent.click(screen.getByTestId("comparison-base-trigger"));
+    const menu = await screen.findByTestId("comparison-base-menu");
+    await fireEvent.click(within(menu).getByText("old-feature"));
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("branch_comparison", {
+        repoRoot: "/repos/app",
+        kind: "local",
+        name: "main",
+        baseKind: "local",
+        baseName: "old-feature",
+        worktreePath: "/repos/app",
+      }),
+    );
+  });
+
+  it("keeps the successful comparison visible when changing its base fails", async () => {
+    wire([repo()], aggregateComparison, { rejectBase: "old-feature" });
+    await refreshAll();
+    render(GitView);
+    const mainRow = (await screen.findByTestId("git-repo")).querySelector(
+      '[data-testid="git-branch"][data-branch="main"]',
+    ) as HTMLElement;
+    await fireEvent.click(within(mainRow).getByTestId("branch-select"));
+    await screen.findByTestId("branch-comparison-row");
+
+    await fireEvent.click(screen.getByTestId("comparison-base-trigger"));
+    await fireEvent.click(
+      within(await screen.findByTestId("comparison-base-menu")).getByText("old-feature"),
+    );
+
+    expect(await screen.findByTestId("branch-comparison-error")).toHaveTextContent(
+      "Kept the previous comparison",
+    );
+    expect(screen.getByTestId("branch-comparison-row")).toHaveTextContent("vs main");
+    expect(screen.getByTestId("detail-title")).toHaveTextContent("Branch changes");
   });
 
   it("clicking a remote-only branch opens the panel on its latest commit (no worktree)", async () => {

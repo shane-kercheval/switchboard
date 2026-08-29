@@ -16,6 +16,7 @@
 // it. The hold lives here instead.
 
 import type { AgentId, AgentRecord, ProjectId, SendId } from "$lib/types";
+import { SvelteSet } from "svelte/reactivity";
 import { answerTextOf } from "./unified";
 import type { Turn } from "$lib/state/types";
 import type { TranscriptPane } from "$lib/state/transcriptPanes.svelte";
@@ -44,7 +45,7 @@ export function orderForwardSources(
   sources: readonly ForwardSource[],
   agents: readonly AgentRecord[],
 ): ForwardSource[] {
-  const sourceIds = new Set(sources.map((source) => source.id));
+  const sourceIds = new SvelteSet(sources.map((source) => source.id));
   return agents.filter((agent) => sourceIds.has(agent.id)).map(forwardSourceForAgent);
 }
 
@@ -56,7 +57,7 @@ export function forwardSourceAgentsForPane(
   pane: TranscriptPane,
   agents: AgentRecord[],
 ): ForwardSource[] {
-  const memberIds = new Set(pane.members);
+  const memberIds = new SvelteSet(pane.members);
   return agents.filter((agent) => memberIds.has(agent.id)).map(forwardSourceForAgent);
 }
 

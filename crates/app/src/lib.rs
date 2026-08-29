@@ -2315,6 +2315,131 @@ pub fn run() {
     builder.run(|_, _| {});
 }
 
+/// The webview's asset-protocol allowlist is a JSON string in `tauri.conf.json`
+/// with no compile-time relationship to the paths it is supposed to authorize.
+/// When the store layout moved, the glob kept pointing at the old per-directory
+/// path and every attachment thumbnail rendered broken — with nothing failing,
+/// because every frontend test mocks `convertFileSrc` and the Rust live tests
+/// prove the *agent* can read the file, not the webview.
+///
+/// These tests close that: they build an attachment path the way production
+/// does and match it against the glob the shipped config actually contains.
+#[cfg(test)]
+mod asset_scope_tests {
+    use glob::Pattern;
+    use switchboard_core::{ProjectId, Store};
+    use tempfile::TempDir;
+
+    /// The `scope` array from the config the app ships with.
+    fn shipped_scope() -> Vec<String> {
+        let raw = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tauri.conf.json"))
+            .expect("tauri.conf.json is next to Cargo.toml");
+        let conf: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+        conf["app"]["security"]["assetProtocol"]["scope"]
+            .as_array()
+            .expect("assetProtocol.scope is an array")
+            .iter()
+            .map(|v| v.as_str().expect("scope entries are strings").to_owned())
+            .collect()
+    }
+
+    /// **Tauri's match options, not the crate defaults.** `glob`'s default
+    /// `require_literal_separator` is `false`, which lets `*` cross path
+    /// separators — so matching with the defaults tests looser semantics than the
+    /// webview actually enforces, and a test that does is worse than none: it
+    /// reports safe for a scope that is not, and misses layout drift the shipped
+    /// matcher would catch. Tauri sets `require_literal_separator: true`
+    /// deliberately, under a security advisory (GHSA-6mv3-wm7j-h4w5), and
+    /// `require_literal_leading_dot: true` on unix so dotfiles are not exposed by
+    /// default. Mirror both. Re-check this against `tauri::scope::fs` on a Tauri
+    /// major bump.
+    fn tauri_match_options() -> glob::MatchOptions {
+        glob::MatchOptions {
+            require_literal_separator: true,
+            require_literal_leading_dot: cfg!(unix),
+            ..glob::MatchOptions::default()
+        }
+    }
+
+    fn is_allowed(path: &std::path::Path) -> bool {
+        shipped_scope().iter().any(|p| {
+            Pattern::new(p)
+                .expect("valid glob")
+                .matches_path_with(path, tauri_match_options())
+        })
+    }
+
+    /// The store-relative shape of an attachment path, derived from the real
+    /// layout code rather than written out — so a change to where attachments
+    /// live reaches this test instead of only reaching users.
+    fn attachment_below(store_root: &std::path::Path) -> std::path::PathBuf {
+        let tmp = TempDir::new().expect("temp store");
+        let probe = Store::open(tmp.path()).expect("open temp store");
+        let id = ProjectId::now_v7();
+        let relative = probe
+            .project_root(id)
+            .strip_prefix(tmp.path())
+            .expect("project root is below the store root")
+            .to_path_buf();
+        store_root
+            .join(relative)
+            .join("attachments")
+            .join("shot.png")
+    }
+
+    #[test]
+    fn the_asset_scope_authorizes_release_attachment_paths() {
+        let config = directories::ProjectDirs::from("", "", "switchboard")
+            .expect("a config dir resolves on any supported host");
+        let path = attachment_below(&config.config_dir().join("store"));
+        assert!(
+            is_allowed(&path),
+            "the shipped asset scope does not authorize {}, so every attachment \
+             thumbnail renders broken in the installed app",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn the_asset_scope_authorizes_dev_attachment_paths() {
+        // `make dev` points `SWITCHBOARD_CONFIG_DIR` at
+        // `<app support>/switchboard-dev[-<port>]`, and a bare `cargo run` falls
+        // back to `switchboard-dev`. Both must be authorized or thumbnails break
+        // for every developer while working in the installed app.
+        let base = directories::ProjectDirs::from("", "", "switchboard")
+            .expect("a config dir resolves on any supported host")
+            .config_dir()
+            .parent()
+            .expect("the config dir has a parent")
+            .to_path_buf();
+        for name in ["switchboard-dev", "switchboard-dev-1420"] {
+            let path = attachment_below(&base.join(name).join("store"));
+            assert!(
+                is_allowed(&path),
+                "the shipped asset scope does not authorize the {name} dev root: {}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn the_asset_scope_does_not_authorize_unrelated_files() {
+        // The glob leads with `**`, so it is worth pinning that it still requires
+        // the whole `switchboard*/store/projects/*/attachments/` shape rather
+        // than matching anything that merely ends in a file.
+        for path in [
+            "/Users/someone/Documents/taxes.pdf",
+            "/Users/someone/Library/Application Support/switchboard/store/store.yaml",
+            "/Users/someone/Library/Application Support/switchboard/store/projects/abc/journal.jsonl",
+        ] {
+            assert!(
+                !is_allowed(std::path::Path::new(path)),
+                "the asset scope must not authorize {path}"
+            );
+        }
+    }
+}
+
 // Gated on `debug_assertions` because `debug_config_dir` exists only in debug
 // builds; `cargo test --release` turns those off and the symbol away.
 #[cfg(all(test, debug_assertions))]

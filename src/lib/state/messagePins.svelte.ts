@@ -392,6 +392,16 @@ export function setStoredPinPinned(projectId: ProjectId, key: string, pinned: bo
   else queueRemove(projectId, [key]);
 }
 
+export function removeStoredMessagePins(projectId: ProjectId, keys: string[]): void {
+  const state = ensureState(projectId);
+  if (state.authority !== "trusted") return;
+  const present = pinsFor(projectId).map((pin) => pin.key);
+  const removals = keys.filter(
+    (key, index) => keys.indexOf(key) === index && present.includes(key),
+  );
+  if (removals.length > 0) queueRemove(projectId, removals);
+}
+
 export function toggleMessagePin(projectId: ProjectId, identity: PinnableMessageIdentity): void {
   setMessagePinned(projectId, identity, !isMessagePinned(projectId, identity));
 }

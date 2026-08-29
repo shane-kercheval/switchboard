@@ -14,7 +14,7 @@
   </div>
   <div style="display: flex; min-height: 0; flex: 1;">
     {#if mode === "pins"}
-      <PinsSidebar {projectId} {agents} />
+      <PinsSidebar {projectId} {agents} rosterLoaded={true} />
     {:else}
       <aside data-testid="agents-placeholder">Agents</aside>
     {/if}

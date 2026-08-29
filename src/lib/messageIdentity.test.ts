@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { messageIdentityForRow } from "./messageIdentity";
+import { agentIdForMessageKey, messageIdentityForRow } from "./messageIdentity";
 import type { UnifiedRow } from "./state/unified";
 
 const AGENT = "agent-a";
@@ -103,5 +103,19 @@ describe("messageIdentityForRow", () => {
     };
     expect(messageIdentityForRow(imported).kind).toBe("unsupported");
     expect(messageIdentityForRow(agentRow(), "antigravity").kind).toBe("unsupported");
+  });
+});
+
+describe("agentIdForMessageKey", () => {
+  it("extracts the owning agent from durable and temporary agent keys", () => {
+    expect(agentIdForMessageKey("agent:hydration:agent%3Aone:message%2Fone")).toBe("agent:one");
+    expect(agentIdForMessageKey("agent:send:send%3Aone:agent%3Aone")).toBe("agent:one");
+  });
+
+  it("does not assign user, unknown, or malformed keys to an agent", () => {
+    expect(agentIdForMessageKey("user:send:send-a")).toBeUndefined();
+    expect(agentIdForMessageKey("agent:future:agent-a:value")).toBeUndefined();
+    expect(agentIdForMessageKey("agent:hydration:%E0%A4%A:value")).toBeUndefined();
+    expect(agentIdForMessageKey("agent:hydration::value")).toBeUndefined();
   });
 });

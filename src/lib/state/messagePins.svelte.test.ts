@@ -80,6 +80,23 @@ beforeEach(() => {
 });
 
 describe("message pins state", () => {
+  it("removes a batch of stored pins once without touching other pins", async () => {
+    persisted = [
+      { key: "message-a", pinned_at: "2026-08-07T12:00:00Z" },
+      { key: "message-b", pinned_at: "2026-08-07T12:01:00Z" },
+    ];
+    await pins.loadMessagePins(PROJECT);
+
+    pins.removeStoredMessagePins(PROJECT, ["message-a", "message-a", "missing"]);
+
+    expect(pins.pinsFor(PROJECT).map((pin) => pin.key)).toEqual(["message-b"]);
+    await waitFor(() => expect(persisted.map((pin) => pin.key)).toEqual(["message-b"]));
+    expect(invokeMock).toHaveBeenCalledWith("remove_message_pins", {
+      projectId: PROJECT,
+      keys: ["message-a"],
+    });
+  });
+
   it("does not interpret a click as a toggle before the initial state is known", async () => {
     let resolveLoad!: (value: MessagePin[]) => void;
     deferredLoad = new Promise((resolve) => (resolveLoad = resolve));

@@ -5,6 +5,15 @@ function part(value: string): string {
   return encodeURIComponent(value);
 }
 
+function decodedPart(value: string | undefined): string | undefined {
+  if (value === undefined || value.length === 0) return undefined;
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return undefined;
+  }
+}
+
 export type PinnableMessageIdentity = {
   kind: "pinnable";
   key: string;
@@ -84,4 +93,12 @@ export function messageIdentityForRow(
 
 export function identityKeys(identity: PinnableMessageIdentity): string[] {
   return [identity.key, ...identity.aliases];
+}
+
+export function agentIdForMessageKey(key: string): string | undefined {
+  const parts = key.split(":");
+  if (parts.length !== 4 || parts[0] !== "agent") return undefined;
+  if (parts[1] === "hydration") return decodedPart(parts[2]);
+  if (parts[1] === "send") return decodedPart(parts[3]);
+  return undefined;
 }

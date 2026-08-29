@@ -1615,6 +1615,7 @@
               <PinsSidebar
                 projectId={selection.activeProjectId!}
                 agents={activeAgents}
+                {rosterLoaded}
                 overlay={activeConvo?.items ?? []}
               />
             {/if}
@@ -1662,6 +1663,7 @@
                 <PinsSidebar
                   projectId={selection.activeProjectId!}
                   agents={activeAgents}
+                  {rosterLoaded}
                   overlay={activeConvo?.items ?? []}
                 />
               {:else}

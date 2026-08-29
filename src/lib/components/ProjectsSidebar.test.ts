@@ -1101,6 +1101,56 @@ describe("ProjectsSidebar — workflow run state (M5)", () => {
     expect(screen.queryByTestId("project-workflow-failed")).toBeNull();
   });
 
+  it("disables archive and delete while a workflow runs with no live send", async () => {
+    // The gap this closes: the archived view's quick-delete already refused a
+    // project with a running workflow, while the dropdown's Archive/Delete
+    // permitted it — and deleting cancels the run before irreversible teardown.
+    await seedProject(PROJECT_1);
+    workflowRuns[PROJECT_1] = [wfRun()];
+    render(ProjectsSidebar, { props: noopProps });
+    await tick();
+
+    await openProjectActions();
+
+    expect(screen.getByTestId("project-action-archive")).toHaveAttribute("aria-disabled", "true");
+    expect(screen.getByTestId("project-action-delete")).toHaveAttribute("aria-disabled", "true");
+  });
+
+  it("keeps the actions menu open for a completed project whose workflow restarted", async () => {
+    // The menu auto-closes when the project finishes. A background-completed
+    // project that has since started a workflow has *not* finished.
+    await seedProject(PROJECT_1);
+    const ws = await loadWorkspace();
+    ws.backgroundCompletedProjectIds[PROJECT_1] = true;
+    workflowRuns[PROJECT_1] = [wfRun()];
+    render(ProjectsSidebar, { props: noopProps });
+    await tick();
+
+    await openProjectActions();
+    await tick();
+
+    expect(screen.getByTestId("project-actions-menu")).toBeInTheDocument();
+  });
+
+  it("shows the spinner when a retained failed run sorts ahead of a running one", async () => {
+    // `handleProgress` appends an unknown running run after a retained failed one
+    // until the refresh re-sorts. Selecting the running run explicitly keeps the
+    // row agreeing with the idle predicate instead of flashing the failed badge.
+    await seedProject(PROJECT_1);
+    workflowRuns[PROJECT_1] = [
+      wfRun({ run_id: "run-old", status: "failed", reason: "boom" }),
+      wfRun({ run_id: "run-new", status: "running" }),
+    ];
+    render(ProjectsSidebar, { props: noopProps });
+    await tick();
+
+    expect(screen.getByTestId("project-cancel")).toBeInTheDocument();
+    expect(screen.queryByTestId("project-workflow-failed")).toBeNull();
+
+    await fireEvent.click(screen.getByTestId("project-cancel"));
+    expect(invokeMock).toHaveBeenCalledWith("cancel_workflow_run", { runId: "run-new" });
+  });
+
   it("catches a failed workflow-run cancel (no unhandled rejection)", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     invokeMock.mockImplementation(async (cmd: string) => {

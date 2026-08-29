@@ -70,6 +70,7 @@ import {
 import {
   subscribeProjectWorkflows,
   unsubscribeProjectWorkflows,
+  workflowRuns,
 } from "$lib/state/workflows.svelte";
 import {
   assignAgentToFirstVisibleEmptyPane,
@@ -288,6 +289,35 @@ export function liveProjectSends(projectId: ProjectId): Map<SendId, AgentId[]> {
   return buildLiveSendsMap(agentsByProject[projectId] ?? [], runtimes, transcripts);
 }
 
+/// Whether a project has nothing left running — the single definition of "this
+/// project finished", shared by the projects-sidebar row, the
+/// background-completed observer, and the completion-notification boundary.
+/// One predicate so those consumers cannot drift apart, which they had.
+///
+/// **Both clauses are required.** `liveProjectSends` alone is not enough: a
+/// workflow between steps, before its first dispatch, or held in the
+/// failed/interrupted state has no live send and would read as idle. A
+/// *held* failed run is genuinely idle (nothing is executing; it waits on the
+/// user to dismiss it), which is why only `running` counts.
+///
+/// **This is a frontend-session observation, not backend-authoritative state.**
+/// It answers "nothing running that this session knows about" — a project whose
+/// roster this session never loaded reports idle regardless of what the backend
+/// is doing. Fine for the loaded-project UI that consumes it; do not treat it as
+/// a truth claim about an arbitrary project id.
+///
+/// `liveSends` lets a caller that already computed the map for this project pass
+/// it in rather than paying a second scan — it must be *that caller's current
+/// reactive snapshot*, not a cached one, since `buildLiveSendsMap` walks the
+/// transcript of every streaming agent and is re-derived on every chunk.
+export function projectIsIdle(
+  projectId: ProjectId,
+  liveSends: Map<SendId, AgentId[]> = liveProjectSends(projectId),
+): boolean {
+  if (liveSends.size > 0) return false;
+  return !(workflowRuns[projectId] ?? []).some((run) => run.status === "running");
+}
+
 type LiveProjectSendPair = {
   key: string;
   projectId: ProjectId;
@@ -296,26 +326,34 @@ type LiveProjectSendPair = {
 };
 
 let previousLiveProjectSendPairs: LiveProjectSendPair[] = [];
+let previousNonIdleProjectIds: ProjectId[] = [];
 let activationSeq = 0;
 
-function liveProjectSendPairs(): LiveProjectSendPair[] {
+/// One pass producing both of the observer's inputs, because both derive from
+/// the same per-project live-send map and `buildLiveSendsMap` walks the full
+/// transcript of every streaming agent — computing it twice doubles the cost of
+/// the app's hottest reactive path (the effect re-runs on every streamed chunk).
+///
+/// The idle judgment is **delegated to [`projectIsIdle`]**, never re-expressed
+/// here. Inlining the workflow clause to save the call would put a second copy
+/// of the rule inside the very function that exists to unify it.
+///
+/// Candidates are the union of loaded rosters and projects with workflow runs,
+/// matching the two maps the predicate itself reads.
+function projectActivitySnapshot(): { pairs: LiveProjectSendPair[]; nonIdle: ProjectId[] } {
   const pairs: LiveProjectSendPair[] = [];
-  for (const projectId of Object.keys(agentsByProject)) {
-    for (const [sendId, agentIds] of liveProjectSends(projectId)) {
+  const nonIdle: ProjectId[] = [];
+  const candidates = new Set([...Object.keys(agentsByProject), ...Object.keys(workflowRuns)]);
+  for (const projectId of candidates) {
+    const sends = liveProjectSends(projectId);
+    for (const [sendId, agentIds] of sends) {
       for (const agentId of agentIds) {
         pairs.push({ key: `${projectId}:${sendId}:${agentId}`, projectId, sendId, agentId });
       }
     }
+    if (!projectIsIdle(projectId, sends)) nonIdle.push(projectId);
   }
-  return pairs;
-}
-
-function projectIdsInPairs(pairs: LiveProjectSendPair[]): ProjectId[] {
-  const projectIds: ProjectId[] = [];
-  for (const pair of pairs) {
-    if (!projectIds.includes(pair.projectId)) projectIds.push(pair.projectId);
-  }
-  return projectIds;
+  return { pairs, nonIdle };
 }
 
 async function afterNextPaint(): Promise<void> {
@@ -331,25 +369,39 @@ async function afterNextPaint(): Promise<void> {
   });
 }
 
+/// Watches two *different* transitions, deliberately kept apart:
+///
+///  - **Per-send-pair disappearance** → stamps `last_activity` locally, so a
+///    project that is still busy elsewhere still sorts as recently active.
+///  - **Whole-project not-idle → idle** ([`projectIsIdle`]) → marks the project
+///    background-completed for the sidebar checkmark.
+///
+/// Collapsing them would be wrong in both directions: the first must fire while
+/// the project is still busy, the second only when everything has stopped.
+///
+/// **Edge-triggered, and deliberately so** — do not harmonize this with the
+/// level-checked completion-notification flush. This answers "did this project
+/// just finish while you weren't looking", which is inherently an event, and it
+/// never inspects per-turn outcomes, so the late-settlement hazard that forces
+/// the notification flush to be level-checked does not apply here.
 export function startProjectActivityObserver(
   getNow: () => string = currentIsoTimestamp,
 ): () => void {
   return $effect.root(() => {
     $effect(() => {
-      const nowLivePairs = liveProjectSendPairs();
-      const previousBusy = projectIdsInPairs(previousLiveProjectSendPairs);
-      const nowBusy = projectIdsInPairs(nowLivePairs);
+      const { pairs: nowLivePairs, nonIdle: nowNonIdle } = projectActivitySnapshot();
       const completed: ProjectId[] = [];
       const backgroundCompleted: ProjectId[] = [];
       for (const pair of previousLiveProjectSendPairs) {
         if (nowLivePairs.some((nowPair) => nowPair.key === pair.key)) continue;
         if (!completed.includes(pair.projectId)) completed.push(pair.projectId);
       }
-      for (const id of previousBusy) {
-        if (nowBusy.includes(id)) continue;
+      for (const id of previousNonIdleProjectIds) {
+        if (nowNonIdle.includes(id)) continue;
         if (id !== selection.activeProjectId) backgroundCompleted.push(id);
       }
       previousLiveProjectSendPairs = nowLivePairs;
+      previousNonIdleProjectIds = nowNonIdle;
       untrack(() => {
         if (completed.length > 0) recordProjectsActivityLocally(completed, getNow());
         for (const id of backgroundCompleted) backgroundCompletedProjectIds[id] = true;
@@ -411,6 +463,9 @@ export async function removeDirectory(path: string): Promise<void> {
   }
   previousLiveProjectSendPairs = previousLiveProjectSendPairs.filter(
     (pair) => !removedProjectIds.includes(pair.projectId),
+  );
+  previousNonIdleProjectIds = previousNonIdleProjectIds.filter(
+    (id) => !removedProjectIds.includes(id),
   );
   if (activeRemoved) {
     selection.activeProjectId = null;
@@ -675,6 +730,7 @@ async function deleteProjectOnce(projectId: ProjectId): Promise<void> {
   previousLiveProjectSendPairs = previousLiveProjectSendPairs.filter(
     (pair) => pair.projectId !== projectId,
   );
+  previousNonIdleProjectIds = previousNonIdleProjectIds.filter((id) => id !== projectId);
   if (selection.activeProjectId === projectId) {
     selection.activeProjectId = null;
     selection.activationFailure = null;
@@ -1252,6 +1308,7 @@ export const _testing = {
     selection.activationFailure = null;
     selection.loadingProjectId = null;
     previousLiveProjectSendPairs = [];
+    previousNonIdleProjectIds = [];
     activationSeq = 0;
     loadStarted.clear();
     hydrationStarted.clear();

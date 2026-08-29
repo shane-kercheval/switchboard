@@ -15,6 +15,7 @@
     activateProject,
     backgroundCompletedProjectIds,
     liveProjectSends,
+    projectIsIdle,
     projects,
     projectDeletions,
     deleteProject,
@@ -247,7 +248,7 @@
       const openProject = visibleProjects.find((project) => project.id === openProjectActionsId);
       const openProjectCompleted =
         openProject !== undefined &&
-        liveProjectSends(openProject.id).size === 0 &&
+        projectIsIdle(openProject.id) &&
         openProject.id in backgroundCompletedProjectIds;
       if (openProject === undefined || (openProjectCompleted && archivedView !== "archived")) {
         openProjectActionsId = null;
@@ -535,12 +536,24 @@
     <div class="flex flex-col gap-0.5 px-2 pb-2">
       {#each visibleProjects as project (project.id)}
         {@const liveSends = liveProjectSends(project.id)}
-        {@const busy = liveSends.size > 0}
-        {@const completed = !busy && project.id in backgroundCompletedProjectIds}
+        <!-- Every "has this project finished" judgment on this row — the spinner,
+             the checkmark, and the archive/delete guards — routes through the one
+             shared predicate, so the row cannot drift from the
+             background-completed observer. `liveSends` is passed through rather
+             than recomputed inside it: that scan walks every streaming agent's
+             transcript and this runs on the streaming hot path. -->
+        {@const idle = projectIsIdle(project.id, liveSends)}
+        {@const completed = idle && project.id in backgroundCompletedProjectIds}
         <!-- Workflow state is derived from `workflowRuns`, NOT `busy`: a workflow
              between steps, before its first dispatch, or in the failed-held state
-             has no live send and would otherwise look idle. -->
-        {@const workflowRun = workflowRuns[project.id]?.[0] ?? null}
+             has no live send and would otherwise look idle. The *running* run is
+             selected explicitly (not `[0]`) so this row agrees with the predicate
+             by construction: a retained failed run can transiently sort ahead of
+             a newly-started one, and picking the first would show the failed badge
+             for a project that is actually working. -->
+        {@const projectRuns = workflowRuns[project.id] ?? []}
+        {@const workflowRun =
+          projectRuns.find((run) => run.status === "running") ?? projectRuns[0] ?? null}
         {@const workflowRunning = workflowRun?.status === "running"}
         {@const workflowFailedOrInterrupted =
           workflowRun !== null &&
@@ -815,7 +828,7 @@
                         </DropdownMenuItem>
                         <DropdownMenuItem
                           onSelect={() => void toggleArchive(project)}
-                          disabled={busy}
+                          disabled={!idle}
                           class="gap-2"
                           data-testid="project-action-archive"
                         >
@@ -840,7 +853,7 @@
                         <DropdownMenuItem
                           onSelect={() => startDelete(project)}
                           closeOnSelect={false}
-                          disabled={busy || projectDeleting}
+                          disabled={!idle || projectDeleting}
                           class="text-status-failed gap-2"
                           data-testid="project-action-delete"
                           tooltip={`${PROJECT_DELETE_TOOLTIP} Works even if the project's folder no longer exists.`}
@@ -901,7 +914,7 @@
                               )}
                               aria-label={`Delete ${project.name}`}
                               data-testid="project-quick-delete"
-                              disabled={busy || workflowRunning || projectDeleting}
+                              disabled={!idle || projectDeleting}
                               onclick={() => startQuickDelete(project)}
                             >
                               <Trash2 size={14} strokeWidth={1.8} aria-hidden="true" />
@@ -927,7 +940,7 @@
                       class="h-2 w-2"
                     />
                   </div>
-                {:else if busy || workflowRunning}
+                {:else if !idle}
                   <button
                     type="button"
                     class="group/cancel text-muted hover:bg-status-failed-soft/70 hover:text-status-failed focus-visible:ring-focus focus-visible:bg-status-failed-soft/70 focus-visible:text-status-failed inline-flex h-[26px] w-[26px] items-center justify-center rounded-full transition-colors focus-visible:ring-1 focus-visible:outline-none"

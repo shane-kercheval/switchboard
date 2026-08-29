@@ -87,6 +87,8 @@ afterEach(async () => {
   layoutStore._testing.reset();
   const prefs = await import("$lib/preferences.svelte");
   prefs._testing.reset();
+  const workflows = await import("$lib/state/workflows.svelte");
+  workflows._testing.reset();
 });
 
 describe("workspace project activity", () => {
@@ -1456,5 +1458,242 @@ describe("forked-agent inherited-history refresh", () => {
     fireTurnEnd(AGENT_1, "completed");
     await settle();
     expect(loads()).toBe(before);
+  });
+});
+
+describe("project idle predicate", () => {
+  async function loadWorkflowState() {
+    return await import("$lib/state/workflows.svelte");
+  }
+
+  function runningRun(over: Partial<import("$lib/types").WorkflowRunInfo> = {}) {
+    return {
+      run_id: "run-1",
+      workflow: "review-and-recommend",
+      step: 0,
+      total: 3,
+      status: "running" as const,
+      reason: null,
+      steps: [],
+      ...over,
+    };
+  }
+
+  it("treats a project with a running workflow and no live sends as busy", async () => {
+    // The clause `liveProjectSends` alone gets wrong: a workflow between steps
+    // dispatches nothing, so send liveness reads empty while work continues.
+    const ws = await loadWorkspaceState();
+    const wf = await loadWorkflowState();
+    ws.agentsByProject[PROJECT_1] = [agent(AGENT_1, PROJECT_1)];
+    wf.workflowRuns[PROJECT_1] = [runningRun()];
+
+    expect(ws.liveProjectSends(PROJECT_1).size).toBe(0);
+    expect(ws.projectIsIdle(PROJECT_1)).toBe(false);
+  });
+
+  it("treats a held failed workflow run as idle", async () => {
+    // A failed run is retained until the user dismisses it, but nothing is
+    // executing — the project is genuinely quiet.
+    const ws = await loadWorkspaceState();
+    const wf = await loadWorkflowState();
+    ws.agentsByProject[PROJECT_1] = [agent(AGENT_1, PROJECT_1)];
+    wf.workflowRuns[PROJECT_1] = [runningRun({ status: "failed", reason: "boom" })];
+
+    expect(ws.projectIsIdle(PROJECT_1)).toBe(true);
+  });
+
+  it("treats a project with a live send as busy", async () => {
+    const state = await loadAgentState();
+    const ws = await loadWorkspaceState();
+    const a = agent(AGENT_1, PROJECT_1);
+    ws.agentsByProject[PROJECT_1] = [a];
+    await state.registerAgent(a);
+    state.dispatchUserTurn(AGENT_1, "user-1", "go", [], "send-1", "2026-05-16T00:00:00Z");
+
+    expect(ws.projectIsIdle(PROJECT_1)).toBe(false);
+  });
+
+  it("marks a background project completed when its last live send drains", async () => {
+    const state = await loadAgentState();
+    const ws = await loadWorkspaceState();
+    const p = project(PROJECT_1, "2026-05-16T00:00:00Z");
+    ws.projects.list = [p];
+    const a = agent(AGENT_1, PROJECT_1);
+    ws.agentsByProject[PROJECT_1] = [a];
+    await state.registerAgent(a);
+    state.dispatchUserTurn(AGENT_1, "user-1", "go", [], "send-1", p.last_activity);
+    observerStops.push(ws.startProjectActivityObserver(() => "2026-05-25T12:00:00.000Z"));
+    await tick();
+
+    const rt = state.runtimes[AGENT_1];
+    if (rt === undefined) throw new Error("unreachable");
+    state.runtimes[AGENT_1] = { ...rt, run_status: "idle", pending_sends: undefined };
+    await tick();
+
+    expect(ws.backgroundCompletedProjectIds[PROJECT_1]).toBe(true);
+  });
+
+  it("marks a background project completed when its workflow terminalizes with no live sends", async () => {
+    // The transition the old send-pair-only observer could not see at all.
+    const ws = await loadWorkspaceState();
+    const wf = await loadWorkflowState();
+    ws.projects.list = [project(PROJECT_1, "2026-05-16T00:00:00Z")];
+    ws.agentsByProject[PROJECT_1] = [agent(AGENT_1, PROJECT_1)];
+    wf.workflowRuns[PROJECT_1] = [runningRun()];
+    observerStops.push(ws.startProjectActivityObserver(() => "2026-05-25T12:00:00.000Z"));
+    await tick();
+
+    wf.workflowRuns[PROJECT_1] = [];
+    await tick();
+
+    expect(ws.backgroundCompletedProjectIds[PROJECT_1]).toBe(true);
+  });
+
+  it("does not mark completed while a workflow still runs after the last send drains", async () => {
+    const state = await loadAgentState();
+    const ws = await loadWorkspaceState();
+    const wf = await loadWorkflowState();
+    const p = project(PROJECT_1, "2026-05-16T00:00:00Z");
+    ws.projects.list = [p];
+    const a = agent(AGENT_1, PROJECT_1);
+    ws.agentsByProject[PROJECT_1] = [a];
+    wf.workflowRuns[PROJECT_1] = [runningRun()];
+    await state.registerAgent(a);
+    state.dispatchUserTurn(AGENT_1, "user-1", "go", [], "send-1", p.last_activity);
+    observerStops.push(ws.startProjectActivityObserver(() => "2026-05-25T12:00:00.000Z"));
+    await tick();
+
+    const rt = state.runtimes[AGENT_1];
+    if (rt === undefined) throw new Error("unreachable");
+    state.runtimes[AGENT_1] = { ...rt, run_status: "idle", pending_sends: undefined };
+    await tick();
+
+    expect(ws.backgroundCompletedProjectIds[PROJECT_1]).toBeUndefined();
+
+    // …and the second half: once the workflow ends too, the mark appears. The
+    // negative alone would also pass against a predicate that never fires.
+    wf.workflowRuns[PROJECT_1] = [];
+    await tick();
+
+    expect(ws.backgroundCompletedProjectIds[PROJECT_1]).toBe(true);
+  });
+
+  it("does not mark completed while sends are live after the workflow terminalizes", async () => {
+    const state = await loadAgentState();
+    const ws = await loadWorkspaceState();
+    const wf = await loadWorkflowState();
+    const p = project(PROJECT_1, "2026-05-16T00:00:00Z");
+    ws.projects.list = [p];
+    const a = agent(AGENT_1, PROJECT_1);
+    ws.agentsByProject[PROJECT_1] = [a];
+    wf.workflowRuns[PROJECT_1] = [runningRun()];
+    await state.registerAgent(a);
+    state.dispatchUserTurn(AGENT_1, "user-1", "go", [], "send-1", p.last_activity);
+    observerStops.push(ws.startProjectActivityObserver(() => "2026-05-25T12:00:00.000Z"));
+    await tick();
+
+    wf.workflowRuns[PROJECT_1] = [];
+    await tick();
+
+    expect(ws.backgroundCompletedProjectIds[PROJECT_1]).toBeUndefined();
+
+    // …and the second half: once the send drains too, the mark appears.
+    const rt = state.runtimes[AGENT_1];
+    if (rt === undefined) throw new Error("unreachable");
+    state.runtimes[AGENT_1] = { ...rt, run_status: "idle", pending_sends: undefined };
+    await tick();
+
+    expect(ws.backgroundCompletedProjectIds[PROJECT_1]).toBe(true);
+  });
+
+  it("keeps last-activity stamping on send pairs, not on the idle transition", async () => {
+    // The observer's two jobs must stay separate: `last_activity` tracks
+    // individual send completions (and must fire while the project is still
+    // busy), while background-completed tracks the whole project going quiet.
+    // Collapsing them onto one loop breaks one direction or the other.
+    const ws = await loadWorkspaceState();
+    const wf = await loadWorkflowState();
+    ws.projects.list = [project(PROJECT_1, "2026-05-16T00:00:00Z")];
+    ws.agentsByProject[PROJECT_1] = [agent(AGENT_1, PROJECT_1)];
+    wf.workflowRuns[PROJECT_1] = [runningRun()];
+    observerStops.push(ws.startProjectActivityObserver(() => "2026-05-25T12:00:00.000Z"));
+    await tick();
+
+    wf.workflowRuns[PROJECT_1] = [];
+    await tick();
+
+    expect(ws.backgroundCompletedProjectIds[PROJECT_1]).toBe(true);
+    expect(ws.projectActivityOverrides[PROJECT_1]).toBeUndefined();
+  });
+
+  it("sees a project that has workflow runs but no roster entry", async () => {
+    // The union in the activity snapshot exists for this candidate. It is not
+    // reachable through today's load path (`ensureProjectLoaded` assigns the
+    // roster before it subscribes to workflows), so this pins the union's intent
+    // rather than a current occurrence: a plausible refactor — subscribing
+    // earlier so no progress events are missed — makes it reachable, and without
+    // the union the project would silently drop out of the observer.
+    const ws = await loadWorkspaceState();
+    const wf = await loadWorkflowState();
+    ws.projects.list = [project(PROJECT_1, "2026-05-16T00:00:00Z")];
+    wf.workflowRuns[PROJECT_1] = [runningRun()];
+
+    expect(ws.agentsByProject[PROJECT_1]).toBeUndefined();
+    expect(ws.projectIsIdle(PROJECT_1)).toBe(false);
+
+    observerStops.push(ws.startProjectActivityObserver(() => "2026-05-25T12:00:00.000Z"));
+    await tick();
+    wf.workflowRuns[PROJECT_1] = [];
+    await tick();
+
+    expect(ws.backgroundCompletedProjectIds[PROJECT_1]).toBe(true);
+  });
+
+  it("removing a workflow-only-busy project clears the observer's non-idle memory", async () => {
+    // Mirrors the send-busy removal test for the case the non-idle snapshot was
+    // added for. Without the teardown filter, dropping the project from the
+    // candidate set reads as a not-idle -> idle transition and re-marks it
+    // completed after the teardown already cleared the flag — and because ids are
+    // persisted on disk and survive removal, a re-add would show a green
+    // "finished" checkmark on a project that never ran anything.
+    const ws = await loadWorkspaceState();
+    const wf = await loadWorkflowState();
+    const p = project(PROJECT_1, "2026-05-16T00:00:00Z");
+    ws.projects.list = [p];
+    ws.agentsByProject[PROJECT_1] = [agent(AGENT_1, PROJECT_1)];
+    wf.workflowRuns[PROJECT_1] = [runningRun()];
+    observerStops.push(ws.startProjectActivityObserver(() => "2026-05-25T12:00:00.000Z"));
+    await tick();
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "list_workspace_directories") {
+        return { directories: [], persistable: true };
+      }
+      if (cmd === "list_projects") {
+        return [];
+      }
+      return undefined;
+    });
+
+    await ws.removeDirectory(p.directory);
+    await tick();
+
+    expect(ws.backgroundCompletedProjectIds[PROJECT_1]).toBeUndefined();
+    expect(ws.projects.list).toEqual([]);
+  });
+
+  it("never marks the project the user is looking at", async () => {
+    const ws = await loadWorkspaceState();
+    const wf = await loadWorkflowState();
+    ws.projects.list = [project(PROJECT_1, "2026-05-16T00:00:00Z")];
+    ws.agentsByProject[PROJECT_1] = [agent(AGENT_1, PROJECT_1)];
+    ws.selection.activeProjectId = PROJECT_1;
+    wf.workflowRuns[PROJECT_1] = [runningRun()];
+    observerStops.push(ws.startProjectActivityObserver(() => "2026-05-25T12:00:00.000Z"));
+    await tick();
+
+    wf.workflowRuns[PROJECT_1] = [];
+    await tick();
+
+    expect(ws.backgroundCompletedProjectIds[PROJECT_1]).toBeUndefined();
   });
 });

@@ -217,6 +217,21 @@ makes connectivity trivial — one accumulator per project — so that machinery
   watching `buildLiveSendsMap` is the wrong trigger; that reasoning survives the rescope
   intact and must survive into the rewritten doc.
 
+**`sendCompletion` stays a leaf module.** It imports only `$lib/api` and types today, which
+is what lets its tests exercise it through a bare `await import("./sendCompletion")` with no
+workspace graph behind it. Preserve that: **it must not import workspace state**, and in
+particular must not import `projectIsIdle` — dynamically or otherwise. That direction is
+also a cycle (`workspace` → `index` → `sendCompletion`), but the cycle is the symptom; the
+leaf property is the rule, and stating it the other way invites someone to "fix" it with a
+dynamic import while keeping the wrong dependency direction.
+
+Both of the flush's triggers therefore arrive from outside. Settlement events already come
+in from `index` below. The predicate-transition trigger is **pushed in from above** — the
+activity observer (or a thin coordinator alongside it) calls an exported entry point on
+`sendCompletion` when a project's idle state changes. M1 shaped `projectIsIdle` to make this
+easy: it takes an optional pre-computed live-send map, so the observer's existing single
+pass can supply the transition without a second scan.
+
 **The flush is level-checked, not edge-triggered.** This is the single most important
 contract in the milestone and the easiest to get wrong. The flush condition is:
 

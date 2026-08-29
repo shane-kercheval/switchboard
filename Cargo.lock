@@ -4314,6 +4314,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "switchboard-migrate"
+version = "0.0.1"
+dependencies = [
+ "chrono",
+ "directories",
+ "serde",
+ "serde_json",
+ "serde_norway",
+ "switchboard-core",
+ "tempfile",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
 name = "switchboard-prompts"
 version = "0.0.1"
 dependencies = [

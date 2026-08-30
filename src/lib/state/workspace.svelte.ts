@@ -67,7 +67,13 @@ import {
   transcripts,
   unregisterAgents,
 } from "./index.svelte";
-import { forgetProjects, noteProjectStates } from "./sendCompletion";
+import {
+  forgetProjects,
+  hasTrackedActivity,
+  isFlushing,
+  noteProjectStates,
+} from "./sendCompletion";
+import { clearReadingMode, forgetReadingMode, isReadingMode } from "./readingMode.svelte";
 import {
   subscribeProjectWorkflows,
   unsubscribeProjectWorkflows,
@@ -376,12 +382,41 @@ async function afterNextPaint(): Promise<void> {
   });
 }
 
+/// The reading-mode **fallback**, for a project that goes idle with nothing the
+/// completion tracker knows about — e.g. turns observed after a webview reload,
+/// which were never registered. Without it, reading mode on such a project would
+/// never turn itself off, because the flush that owns clearing never runs.
+///
+/// **Deliberately edge-triggered, unlike the level-checked flush**, and the
+/// difference is not an inconsistency to be tidied away. The flush asks "is
+/// everything settled yet?", which becomes true when the last piece of
+/// information arrives. This asks "did something I wasn't tracking just finish?",
+/// which is an event. A level-checked version would see "idle and nothing
+/// tracked" the instant reading mode is enabled on a quiet project and clear it
+/// immediately — a click that visibly does nothing.
+///
+/// **Both guards are required.** `isFlushing` is what stops this branch
+/// recreating the suppression race the flush's ordering exists to prevent: when
+/// the last outcome settles, the flush starts and awaits `notify`, and this edge
+/// then fires on the next effect run with the accumulator already drained.
+/// Gating on emptiness alone would make correctness depend on whether the flush
+/// clears its state before or after that await; the marker makes it
+/// order-independent. Neither guard is redundant.
+function clearReadingModeForUntrackedWork(wentIdle: ProjectId[]): void {
+  for (const projectId of wentIdle) {
+    if (!isReadingMode(projectId)) continue;
+    if (hasTrackedActivity(projectId) || isFlushing(projectId)) continue;
+    clearReadingMode(projectId);
+  }
+}
+
 /// Watches two *different* transitions, deliberately kept apart:
 ///
 ///  - **Per-send-pair disappearance** → stamps `last_activity` locally, so a
 ///    project that is still busy elsewhere still sorts as recently active.
 ///  - **Whole-project not-idle → idle** ([`projectIsIdle`]) → marks the project
-///    background-completed for the sidebar checkmark.
+///    background-completed for the sidebar checkmark, and — unfiltered by which
+///    project is active — drives the reading-mode fallback above.
 ///
 /// Collapsing them would be wrong in both directions: the first must fire while
 /// the project is still busy, the second only when everything has stopped.
@@ -403,8 +438,10 @@ export function startProjectActivityObserver(
         if (nowLivePairs.some((nowPair) => nowPair.key === pair.key)) continue;
         if (!completed.includes(pair.projectId)) completed.push(pair.projectId);
       }
+      const wentIdle: ProjectId[] = [];
       for (const id of previousNonIdleProjectIds) {
         if (nowNonIdle.includes(id)) continue;
+        wentIdle.push(id);
         if (id !== selection.activeProjectId) backgroundCompleted.push(id);
       }
       const candidates = allCandidateProjectIds();
@@ -424,6 +461,7 @@ export function startProjectActivityObserver(
             busy: nowNonIdle.includes(projectId),
           })),
         );
+        clearReadingModeForUntrackedWork(wentIdle);
       });
     });
   });
@@ -472,6 +510,7 @@ export async function removeDirectory(path: string): Promise<void> {
   // teardown-settled outcomes could classify and flush a notification for a
   // project that is being removed.
   forgetProjects(removedProjectIds);
+  forgetReadingMode(removedProjectIds);
   unregisterAgents(removedAgentIds);
   unsubscribeProjectWorkflows(removedProjectIds);
   for (const id of removedProjectIds) {
@@ -741,6 +780,7 @@ async function deleteProjectOnce(projectId: ProjectId): Promise<void> {
   layout.removeProjectPreferences(projectId);
   // Before `unregisterAgents`, for the reason given in `removeDirectory`.
   forgetProjects([projectId]);
+  forgetReadingMode([projectId]);
   unregisterAgents(removedAgentIds);
   unsubscribeProjectWorkflows([projectId]);
   projects.list = projects.list.filter((p) => p.id !== projectId);

@@ -31,7 +31,7 @@
   import { SUPPLEMENTAL_TOOLTIP_DELAY } from "$lib/components/ui/tooltip";
   import ExpandCollapseIcon from "$lib/components/ui/ExpandCollapseIcon.svelte";
   import { ICON_BUTTON_CLASS, ICON_SIZE } from "$lib/components/ui/iconButton";
-  import { FolderOpen, GitBranch, Pin, Plus, UsersRound } from "@lucide/svelte";
+  import { BookOpen, FolderOpen, GitBranch, Pin, Plus, UsersRound } from "@lucide/svelte";
   import {
     hasOverrides,
     normalizeProjectCompact,
@@ -102,7 +102,8 @@
   import type { AgentRecord, HarnessAvailability, HarnessKind, ProjectId } from "$lib/types";
   import { ALL_HARNESSES, HARNESS_LABEL } from "$lib/harnessDisplay";
   import { harnessAvailability, refreshHarnessAvailability } from "$lib/harnessAvailability.svelte";
-  import { loadPreferences } from "$lib/preferences.svelte";
+  import { loadPreferences, preferences } from "$lib/preferences.svelte";
+  import { isReadingMode, toggleReadingMode } from "$lib/state/readingMode.svelte";
   import GitView from "$lib/components/GitView.svelte";
   import {
     view,
@@ -271,6 +272,15 @@
     } else if (key === "e" && event.shiftKey) {
       event.preventDefault();
       void openSelectionInEditor();
+    } else if (key === "r" && event.shiftKey) {
+      // ⌘⇧R toggles reading mode. Shifted deliberately: bare ⌘R is the Git
+      // view's refresh, and it is also the universal reload chord. Stays live
+      // *while reading mode is on* — with the compose box gone, this is the
+      // fastest way back out, so it must not be gated on the composer existing.
+      if (readingModeAvailable) {
+        event.preventDefault();
+        toggleReadingModeForActiveProject();
+      }
     } else if (key === "b" && event.shiftKey) {
       event.preventDefault();
       layout.rightSidebarOpen = !layout.rightSidebarOpen;
@@ -581,6 +591,45 @@
   const showPaneHeaderControls = $derived(
     !settingsOpen && view.mode !== "git" && selection.activeProjectId !== null && rosterLoaded,
   );
+  const readingModeActive = $derived(
+    selection.activeProjectId !== null && isReadingMode(selection.activeProjectId),
+  );
+  // One predicate for the header toggle, the palette entry, and the ⌘⇧R chord,
+  // so the three can't disagree about whether the mode is available.
+  //
+  // **This gates the way *out* of reading mode as well as the way in, so every
+  // condition in it must be transient-by-navigation.** A persistent one strands
+  // the user in a mode with no exit: `readingModeActive` has no matching
+  // condition, so it survives whatever turns this false. Settings, the Git view
+  // and a mid-load roster all qualify — each resolves by navigating back. An
+  // earlier `activeAgents.length > 0` clause did not, and stranded the mode when
+  // a quiet project's last agent was removed. Adding a clause here without that
+  // property reproduces the bug and no existing test will catch it.
+  const readingModeAvailable = $derived(showPaneHeaderControls);
+  const readingModeLabel = $derived(
+    readingModeActive
+      ? "Turn off reading mode"
+      : "Reading mode: hide the compose box and stay notified about this project",
+  );
+  function toggleReadingModeForActiveProject(): void {
+    if (selection.activeProjectId === null) return;
+    toggleReadingMode(selection.activeProjectId);
+  }
+  // Reading mode's whole point is being notified about the project you're
+  // watching, and that rides on a preference which defaults *off* — so a user on
+  // defaults who turns reading mode on would get nothing and reasonably conclude
+  // it is broken. Say which setting is in the way, where they just acted.
+  // Deliberately **not** an override: silently ignoring a setting the user chose
+  // is worse than explaining it.
+  const readingModeNotifyHint = $derived(
+    !readingModeActive
+      ? null
+      : !preferences.notify_on_completion
+        ? "Notifications are turned off, so nothing will alert you while you read. Turn them on in Settings."
+        : !preferences.notify_while_focused
+          ? "To be alerted about this project while you read it, turn on “Also notify me about other projects while I'm using Switchboard” in Settings."
+          : null,
+  );
   // What the notification gate treats as "already on screen". Derived, not
   // mirrored: any future navigation path that changes one of these inputs flows
   // through automatically, whereas pushing from each navigation handler would be
@@ -588,10 +637,28 @@
   //
   // `rosterLoaded` matters — a project mid-activation is not yet readable, so its
   // completion should still notify.
+  //
+  // Reading mode is the whole of its notification behavior: reporting the project
+  // as not-on-screen makes the Rust gate fall through to its
+  // "different project finished" branch, which is exactly the requested
+  // semantics. The gate is untouched, and there is no second gate here.
   const visibleProjectId = $derived(
-    settingsOpen || view.mode === "git" || !rosterLoaded ? null : selection.activeProjectId,
+    settingsOpen || view.mode === "git" || !rosterLoaded || readingModeActive
+      ? null
+      : selection.activeProjectId,
   );
   // Monotonic so a slow IPC write can't land after a newer view and overwrite it.
+  //
+  // **Known limitation — the entry race, and it predates reading mode.** This
+  // push is fire-and-forget, so a completion landing inside the single IPC
+  // round-trip is gated against the *previous* view. The identical window exists
+  // on every navigation into and out of a project; `seq` orders visibility writes
+  // against each other, not against `notify`. Reading mode inherits it rather
+  // than introducing it, and an arming protocol for reading mode alone would fix
+  // one instance and leave the rest — if it is ever worth closing, the fix
+  // belongs here, for all navigation paths. Cost is near zero in practice: the
+  // user is holding the pointer and the result is on screen. (The *exit* side is
+  // ordered — see `sendCompletion.ts`, which awaits `notify` before clearing.)
   let visibleProjectSeq = 0;
   $effect(() => {
     const id = visibleProjectId;
@@ -1058,6 +1125,18 @@
         disabled: !canCyclePanes,
         run: () => cyclePane(-1),
       });
+      // Titled by current state, not by the action alone: reading mode can outlive
+      // the work that prompted it, so the way out has to be findable without
+      // remembering what was turned on.
+      cmds.push({
+        id: "project.reading-mode",
+        title: readingModeActive ? "Turn off reading mode" : "Turn on reading mode",
+        group: "Project",
+        shortcut: ["mod", "shift", "R"],
+        keywords: "read watch hide compose notify focus",
+        disabled: !readingModeAvailable,
+        run: () => toggleReadingModeForActiveProject(),
+      });
       cmds.push({
         id: "project.add-agent",
         title: "Add agent",
@@ -1237,6 +1316,43 @@
                   onclick={addEmptyPane}
                 >
                   <Plus size={ICON_SIZE} aria-hidden="true" />
+                </button>
+              {/snippet}
+            </Tooltip>
+            <!-- Latched on-state is load-bearing, not decoration: reading mode
+                 is allowed to stay on after the project goes quiet, so this is
+                 the only thing distinguishing a deliberate mode from a lost
+                 compose box.
+                 `warning`, not `accent` or `status-failed`: the mode takes a
+                 capability away, so it needs the caution role rather than the
+                 green `accent` (which means *finished* here, the very thing
+                 reading mode reports on) — and it is a state the user chose,
+                 not an error, so the red failure vocabulary would be wrong.
+                 Sized below `ICON_SIZE`: the book is a closed shape spanning
+                 its full viewBox, so at 18 it reads visibly heavier than the
+                 thin-stroke glyphs beside it. -->
+            <Tooltip
+              label={readingModeLabel}
+              shortcut={shortcut("mod", "shift", "R")}
+              side="bottom"
+              reopen="fresh-hover"
+            >
+              {#snippet trigger(props)}
+                <button
+                  {...props}
+                  type="button"
+                  onclick={toggleReadingModeForActiveProject}
+                  aria-label={readingModeLabel}
+                  aria-pressed={readingModeActive}
+                  data-testid="reading-mode-toggle"
+                  data-tauri-no-drag
+                  class={cn(
+                    ICON_BUTTON_CLASS,
+                    "shrink-0",
+                    readingModeActive && "text-warning bg-warning-soft",
+                  )}
+                >
+                  <BookOpen size={15} aria-hidden="true" />
                 </button>
               {/snippet}
             </Tooltip>
@@ -1657,6 +1773,23 @@
                   onConfigurePrompts={openPromptSettings}
                 />
               {/key}
+              {#if readingModeNotifyHint !== null}
+                <!-- Sits where the compose box was, because that is where the
+                     user just acted. Reading mode's payoff is the alert; without
+                     it the feature looks broken rather than misconfigured. -->
+                <div class="bg-raised px-4 pb-3">
+                  <p class="text-muted text-xs leading-relaxed" data-testid="reading-mode-hint">
+                    {readingModeNotifyHint}
+                    <button
+                      type="button"
+                      class="text-accent hover:underline"
+                      onclick={openSettings}
+                    >
+                      Open settings
+                    </button>
+                  </p>
+                </div>
+              {/if}
             </div>
             {#if layout.rightSidebarOpen}
               {#if activeRightSidebarMode === "pins"}

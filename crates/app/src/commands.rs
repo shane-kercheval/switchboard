@@ -2049,9 +2049,10 @@ pub fn set_active_project_impl(state: &AppState, project_id: ProjectId) -> Resul
 }
 
 /// Record what the user is looking at. Display-only, and deliberately distinct
-/// from `set_active_project`: this goes `None` for Settings, the Git view, and a
-/// project that is still loading, none of which change which project backend
-/// actions target.
+/// from `set_active_project`: this goes `None` for Settings, the Git view, a
+/// project that is still loading, and a project whose reading mode is on (the
+/// user asked to be treated as absent from it) — none of which change which
+/// project backend actions target.
 ///
 /// Unvalidated on purpose — it is a rendering fact, not an assertion that the
 /// project is loaded, and a project can legitimately be on screen mid-load.

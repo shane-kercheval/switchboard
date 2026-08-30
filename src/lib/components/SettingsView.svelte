@@ -79,6 +79,7 @@
     { action: "Add project", keys: ["⌘", "N"], note: "Projects view" },
     { action: "Add repository", keys: ["⌘", "N"], note: "Git view" },
     { action: "Add agent", keys: ["⌘", "⇧", "N"], note: "Projects view" },
+    { action: "Toggle reading mode", keys: ["⌘", "⇧", "R"], note: "Projects view" },
     { action: "Refresh all repositories", keys: ["⌘", "R"], note: "Git view" },
     { action: "Jump to next unread project", keys: ["⌘", "G"] },
     { action: "Toggle Projects / Git view", keys: ["⌘", "⇧", "G"] },
@@ -495,6 +496,13 @@
           <p class="text-muted mt-0.5 text-xs leading-relaxed">
             The projects sidebar shows a checkmark when a project finishes in the background. Turn
             this on to get a notification too.
+          </p>
+          <p class="text-muted mt-1 text-xs leading-relaxed">
+            This also covers the project you're looking at while <span class="text-fg"
+              >reading mode</span
+            >
+            is on for it — reading mode asks Switchboard to treat you as though you weren't there, so
+            its completion notification follows this setting instead of being skipped.
           </p>
         </div>
         <button

@@ -89,6 +89,10 @@ afterEach(async () => {
   prefs._testing.reset();
   const workflows = await import("$lib/state/workflows.svelte");
   workflows._testing.reset();
+  const tracker = await import("./sendCompletion");
+  tracker._testing.reset();
+  const reading = await import("./readingMode.svelte");
+  reading._testing.reset();
 });
 
 describe("workspace project activity", () => {
@@ -1743,5 +1747,195 @@ describe("project idle predicate", () => {
     await tick();
 
     expect(ws.backgroundCompletedProjectIds[PROJECT_1]).toBeUndefined();
+  });
+});
+
+describe("reading mode fallback", () => {
+  // Reading mode's auto-off is normally owned by the completion flush. This is
+  // the narrow fallback for a project that goes idle with **nothing tracked** —
+  // turns observed after a webview reload were never registered, so no flush
+  // will ever run for them and the mode would stay on forever.
+
+  async function loadWorkflowState() {
+    return await import("$lib/state/workflows.svelte");
+  }
+
+  async function loadReadingMode() {
+    return await import("./readingMode.svelte");
+  }
+
+  function runningRun() {
+    return {
+      run_id: "run-1",
+      workflow: "review-and-recommend",
+      step: 0,
+      total: 3,
+      status: "running" as const,
+      reason: null,
+      steps: [],
+    };
+  }
+
+  it("clears reading mode when untracked work goes idle", async () => {
+    const state = await loadAgentState();
+    const ws = await loadWorkspaceState();
+    const reading = await loadReadingMode();
+    const p = project(PROJECT_1, "2026-05-16T00:00:00Z");
+    ws.projects.list = [p];
+    const a = agent(AGENT_1, PROJECT_1);
+    ws.agentsByProject[PROJECT_1] = [a];
+    await state.registerAgent(a);
+    // Dispatched without `registerSend` — the shape of a turn the completion
+    // tracker never saw.
+    state.dispatchUserTurn(AGENT_1, "user-1", "go", [], "send-1", p.last_activity);
+    reading.toggleReadingMode(PROJECT_1);
+    observerStops.push(ws.startProjectActivityObserver(() => "2026-05-25T12:00:00.000Z"));
+    await tick();
+    expect(reading.isReadingMode(PROJECT_1)).toBe(true);
+
+    const rt = state.runtimes[AGENT_1];
+    if (rt === undefined) throw new Error("unreachable");
+    state.runtimes[AGENT_1] = { ...rt, run_status: "idle", pending_sends: undefined };
+    await tick();
+
+    expect(reading.isReadingMode(PROJECT_1)).toBe(false);
+  });
+
+  it("stays on for an already-quiet project, because it is edge-triggered", async () => {
+    // The reason this fallback is edge-triggered and the flush is level-checked.
+    // A level-checked version would see "idle and nothing tracked" the moment
+    // reading mode is switched on here and clear it immediately — a click that
+    // visibly does nothing.
+    const ws = await loadWorkspaceState();
+    const reading = await loadReadingMode();
+    ws.projects.list = [project(PROJECT_1, "2026-05-16T00:00:00Z")];
+    ws.agentsByProject[PROJECT_1] = [agent(AGENT_1, PROJECT_1)];
+    observerStops.push(ws.startProjectActivityObserver(() => "2026-05-25T12:00:00.000Z"));
+    await tick();
+
+    reading.toggleReadingMode(PROJECT_1);
+    // Re-run the observer via an unrelated change (another project's roster
+    // loading). The effect re-runs constantly in production — on every streamed
+    // chunk — so "nothing has re-evaluated yet" is not what keeps reading mode
+    // on here; being edge-triggered is.
+    ws.agentsByProject[PROJECT_2] = [agent(AGENT_2, PROJECT_2)];
+    await tick();
+    await tick();
+
+    expect(reading.isReadingMode(PROJECT_1)).toBe(true);
+  });
+
+  it("stays out of the way while a notification is still in flight", async () => {
+    // Without the in-flight guard this branch recreates the suppression race the
+    // flush's ordering exists to prevent: the flush has already drained the
+    // accumulator by the time the idle edge fires, so an emptiness-only guard
+    // would clear reading mode — restoring the project's visibility — while the
+    // notification is still travelling to the gate.
+    const state = await loadAgentState();
+    const ws = await loadWorkspaceState();
+    const reading = await loadReadingMode();
+    const tracker = await import("./sendCompletion");
+    const p = project(PROJECT_1, "2026-05-16T00:00:00Z");
+    ws.projects.list = [p];
+    const a = agent(AGENT_1, PROJECT_1);
+    ws.agentsByProject[PROJECT_1] = [a];
+    await state.registerAgent(a);
+
+    let release: () => void = () => {};
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "notify") return await new Promise<void>((resolve) => (release = resolve));
+      return undefined;
+    });
+
+    tracker.registerSend("send-1", PROJECT_1, p.name, [{ id: AGENT_1, name: "claude" }]);
+    state.dispatchUserTurn(AGENT_1, "user-1", "go", [], "send-1", p.last_activity);
+    reading.toggleReadingMode(PROJECT_1);
+    observerStops.push(ws.startProjectActivityObserver(() => "2026-05-25T12:00:00.000Z"));
+    await tick();
+
+    tracker.settleRecipient("send-1", AGENT_1, "completed");
+    const rt = state.runtimes[AGENT_1];
+    if (rt === undefined) throw new Error("unreachable");
+    state.runtimes[AGENT_1] = { ...rt, run_status: "idle", pending_sends: undefined };
+    await tick();
+
+    expect(tracker.isFlushing(PROJECT_1)).toBe(true);
+    expect(reading.isReadingMode(PROJECT_1)).toBe(true);
+
+    release();
+    await vi.waitFor(() => expect(reading.isReadingMode(PROJECT_1)).toBe(false));
+  });
+
+  it("stays out of the way while tracked work has not settled", async () => {
+    // The other guard: a cancelled queued send leaves liveness before its
+    // outcome arrives, so the project looks idle with the flush still pending.
+    const state = await loadAgentState();
+    const ws = await loadWorkspaceState();
+    const reading = await loadReadingMode();
+    const tracker = await import("./sendCompletion");
+    const p = project(PROJECT_1, "2026-05-16T00:00:00Z");
+    ws.projects.list = [p];
+    const a = agent(AGENT_1, PROJECT_1);
+    ws.agentsByProject[PROJECT_1] = [a];
+    await state.registerAgent(a);
+
+    tracker.registerSend("send-1", PROJECT_1, p.name, [{ id: AGENT_1, name: "claude" }]);
+    state.dispatchUserTurn(AGENT_1, "user-1", "go", [], "send-1", p.last_activity);
+    reading.toggleReadingMode(PROJECT_1);
+    observerStops.push(ws.startProjectActivityObserver(() => "2026-05-25T12:00:00.000Z"));
+    await tick();
+
+    const rt = state.runtimes[AGENT_1];
+    if (rt === undefined) throw new Error("unreachable");
+    state.runtimes[AGENT_1] = { ...rt, run_status: "idle", pending_sends: undefined };
+    await tick();
+
+    expect(tracker.isFlushing(PROJECT_1)).toBe(false);
+    expect(reading.isReadingMode(PROJECT_1)).toBe(true);
+
+    // …and the second half: once the outcome lands, the flush runs and owns the
+    // clear. The negative alone would pass against a fallback that never fires.
+    tracker.settleRecipient("send-1", AGENT_1, "cancelled");
+    await tick();
+    expect(reading.isReadingMode(PROJECT_1)).toBe(false);
+  });
+
+  it("clears reading mode for the project the user is looking at", async () => {
+    // Unlike the sidebar checkmark, this is not filtered by the active project —
+    // reading mode only ever applies to a project the user *is* looking at.
+    const ws = await loadWorkspaceState();
+    const wf = await loadWorkflowState();
+    const reading = await loadReadingMode();
+    ws.projects.list = [project(PROJECT_1, "2026-05-16T00:00:00Z")];
+    ws.agentsByProject[PROJECT_1] = [agent(AGENT_1, PROJECT_1)];
+    ws.selection.activeProjectId = PROJECT_1;
+    wf.workflowRuns[PROJECT_1] = [runningRun()];
+    reading.toggleReadingMode(PROJECT_1);
+    observerStops.push(ws.startProjectActivityObserver(() => "2026-05-25T12:00:00.000Z"));
+    await tick();
+
+    wf.workflowRuns[PROJECT_1] = [];
+    await tick();
+
+    expect(ws.backgroundCompletedProjectIds[PROJECT_1]).toBeUndefined();
+    expect(reading.isReadingMode(PROJECT_1)).toBe(false);
+  });
+
+  it("drops reading mode when the project is removed", async () => {
+    const ws = await loadWorkspaceState();
+    const reading = await loadReadingMode();
+    const p = project(PROJECT_1, "2026-05-16T00:00:00Z");
+    ws.projects.list = [p];
+    ws.agentsByProject[PROJECT_1] = [agent(AGENT_1, PROJECT_1)];
+    reading.toggleReadingMode(PROJECT_1);
+
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "list_workspace_directories") return { directories: [], persistable: true };
+      if (cmd === "list_projects") return [];
+      return undefined;
+    });
+    await ws.removeDirectory(p.directory);
+
+    expect(reading.isReadingMode(PROJECT_1)).toBe(false);
   });
 });

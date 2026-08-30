@@ -100,6 +100,7 @@
   import WorkflowComposer from "$lib/components/WorkflowComposer.svelte";
   import WorkflowSteps from "$lib/components/WorkflowSteps.svelte";
   import { workflowRuns, cancelRun, abandonRun, refreshRuns } from "$lib/state/workflows.svelte";
+  import { isReadingMode } from "$lib/state/readingMode.svelte";
   import Button from "$lib/components/ui/Button.svelte";
   import ForwardSourceChip from "$lib/components/ui/ForwardSourceChip.svelte";
   import ForwardSourcePicker from "$lib/components/ui/ForwardSourcePicker.svelte";
@@ -868,6 +869,12 @@
   // Escape is left alone for whatever else owns it.
   $effect(() => {
     function onKeydown(e: KeyboardEvent): void {
+      // Reading mode removes the compose box entirely, so every chord below has
+      // no target: ⌘K would focus a textarea that isn't rendered, and ⌘1-9 /
+      // ⇧A / ⌘⏎ would mutate or dispatch from compose state the user cannot
+      // see. Inert the whole handler rather than letting each branch fail
+      // silently on an undefined element.
+      if (readingMode) return;
       const mod = e.metaKey || e.ctrlKey;
       if (mod && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "k") {
         if (hasOpenDialog()) return;
@@ -2026,6 +2033,9 @@
   // compose box with the live progress view: a `running` run shows progress; a
   // `failed`/`interrupted` run is held (failed step + reason) until dismissed.
   const activeWorkflowRun = $derived(workflowRuns[projectId]?.[0] ?? null);
+  /// Reading mode hides the compose box (see the template) — the user asked to
+  /// be treated as not present in this project.
+  const readingMode = $derived(isReadingMode(projectId));
   // A Stop/Dismiss failure, surfaced inline in the held panel — without this a
   // failed Dismiss is a silent dead button (the run stays held with no feedback).
   let workflowRunError = $state<string | null>(null);
@@ -3089,239 +3099,323 @@
   </svg>
 {/snippet}
 
-<div class="bg-raised px-4 pt-2 pb-4" bind:this={composeEl}>
-  {#if activeWorkflowRun}
-    <!-- A workflow occupies this project: the live progress view *replaces* the
+<!-- Reading mode removes the compose *box*, not this strip's whole slot: a
+     running workflow's progress view lives in it too and must survive (the user
+     turned reading mode on precisely to watch that run). The condition sits
+     outside the padded wrapper so nothing is left behind but the transcript
+     growing into the space. `ComposeBar` itself stays mounted either way —
+     unmounting it would take the progress view with it and push the draft through
+     the `onDestroy` flush for no reason. -->
+{#if activeWorkflowRun || !readingMode}
+  <div class="bg-raised px-4 pt-2 pb-4" data-testid="compose-strip" bind:this={composeEl}>
+    {#if activeWorkflowRun}
+      <!-- A workflow occupies this project: the live progress view *replaces* the
          compose box (not merely disables it), so queueing a message mid-run is
          structurally impossible. A `running` run shows progress with a Stop; a
          `failed`/`interrupted` run is held with a Dismiss until abandoned. -->
-    <div
-      class="border-border bg-raised rounded-xl border p-3 shadow-[0_10px_32px_rgba(0,0,0,0.08)]"
-      data-testid="workflow-run-live"
-      data-run-status={activeWorkflowRun.status}
-    >
-      <div class="mb-2 flex items-center justify-between gap-2">
-        <span class="text-fg min-w-0 truncate text-sm font-semibold"
-          >{activeWorkflowRun.workflow}</span
-        >
-        {#if activeWorkflowRun.status === "running"}
-          <button
-            type="button"
-            data-testid="workflow-run-stop"
-            onclick={() => void stopWorkflowRun()}
-            aria-label="Stop workflow"
-            class="text-muted hover:bg-status-failed-soft/70 hover:text-status-failed focus-visible:ring-focus inline-flex h-7 shrink-0 items-center gap-1 rounded-full px-2 text-xs transition-colors focus-visible:ring-1 focus-visible:outline-none"
+      <div
+        class="border-border bg-raised rounded-xl border p-3 shadow-[0_10px_32px_rgba(0,0,0,0.08)]"
+        data-testid="workflow-run-live"
+        data-run-status={activeWorkflowRun.status}
+      >
+        <div class="mb-2 flex items-center justify-between gap-2">
+          <span class="text-fg min-w-0 truncate text-sm font-semibold"
+            >{activeWorkflowRun.workflow}</span
           >
-            <StopIcon class="size-4" />
-            Stop
-          </button>
+          {#if activeWorkflowRun.status === "running"}
+            <button
+              type="button"
+              data-testid="workflow-run-stop"
+              onclick={() => void stopWorkflowRun()}
+              aria-label="Stop workflow"
+              class="text-muted hover:bg-status-failed-soft/70 hover:text-status-failed focus-visible:ring-focus inline-flex h-7 shrink-0 items-center gap-1 rounded-full px-2 text-xs transition-colors focus-visible:ring-1 focus-visible:outline-none"
+            >
+              <StopIcon class="size-4" />
+              Stop
+            </button>
+          {:else}
+            <button
+              type="button"
+              data-testid="workflow-run-dismiss"
+              onclick={() => void dismissWorkflowRun()}
+              class="text-muted hover:bg-panel hover:text-fg focus-visible:ring-focus inline-flex h-7 shrink-0 items-center rounded-full px-2.5 text-xs transition-colors focus-visible:ring-1 focus-visible:outline-none"
+            >
+              Dismiss
+            </button>
+          {/if}
+        </div>
+        {#if activeWorkflowRun.steps.length > 0}
+          <WorkflowSteps
+            steps={activeWorkflowRun.steps}
+            mode="live"
+            current={activeWorkflowRun.step}
+            status={activeWorkflowRun.status}
+            reason={activeWorkflowRun.reason}
+          />
         {:else}
-          <button
-            type="button"
-            data-testid="workflow-run-dismiss"
-            onclick={() => void dismissWorkflowRun()}
-            class="text-muted hover:bg-panel hover:text-fg focus-visible:ring-focus inline-flex h-7 shrink-0 items-center rounded-full px-2.5 text-xs transition-colors focus-visible:ring-1 focus-visible:outline-none"
-          >
-            Dismiss
-          </button>
+          <!-- Steps absent (legacy run file, or a brief pre-refresh window): fall back
+             to a count line so the view is never empty. -->
+          <p class="text-muted text-sm" data-testid="workflow-run-fallback">
+            Step {activeWorkflowRun.step + 1} of {activeWorkflowRun.total}{#if activeWorkflowRun.status !== "running"}
+              · {activeWorkflowRun.status}{/if}
+          </p>
+          {#if activeWorkflowRun.reason}
+            <p class="text-status-failed mt-1 text-xs">{activeWorkflowRun.reason}</p>
+          {/if}
+        {/if}
+        {#if workflowRunError}
+          <p class="text-status-failed mt-2 text-xs" data-testid="workflow-run-error">
+            {workflowRunError}
+          </p>
         {/if}
       </div>
-      {#if activeWorkflowRun.steps.length > 0}
-        <WorkflowSteps
-          steps={activeWorkflowRun.steps}
-          mode="live"
-          current={activeWorkflowRun.step}
-          status={activeWorkflowRun.status}
-          reason={activeWorkflowRun.reason}
-        />
-      {:else}
-        <!-- Steps absent (legacy run file, or a brief pre-refresh window): fall back
-             to a count line so the view is never empty. -->
-        <p class="text-muted text-sm" data-testid="workflow-run-fallback">
-          Step {activeWorkflowRun.step + 1} of {activeWorkflowRun.total}{#if activeWorkflowRun.status !== "running"}
-            · {activeWorkflowRun.status}{/if}
-        </p>
-        {#if activeWorkflowRun.reason}
-          <p class="text-status-failed mt-1 text-xs">{activeWorkflowRun.reason}</p>
-        {/if}
-      {/if}
-      {#if workflowRunError}
-        <p class="text-status-failed mt-2 text-xs" data-testid="workflow-run-error">
-          {workflowRunError}
-        </p>
-      {/if}
-    </div>
-  {:else}
-    <div
-      class={cn(
-        "border-border bg-raised relative rounded-xl border p-2.5 shadow-[0_10px_32px_rgba(0,0,0,0.08)] transition-colors",
-        dragOver ? "border-accent" : composeFocused ? "border-focus" : "",
-      )}
-      data-testid="compose-box"
-      data-drag-over={dragOver}
-      onfocusin={() => (composeFocused = true)}
-      onfocusout={(e) => {
-        // Keep the ring while focus moves *between* children of the box (field →
-        // button → chip); only clear when it genuinely leaves the container.
-        if (!e.currentTarget.contains(e.relatedTarget as Node | null)) composeFocused = false;
-      }}
-    >
-      {#if promptMenuOpen}
-        <!-- Full compose-box width, floating just above the box (anchored to its
+    {:else}
+      <div
+        class={cn(
+          "border-border bg-raised relative rounded-xl border p-2.5 shadow-[0_10px_32px_rgba(0,0,0,0.08)] transition-colors",
+          dragOver ? "border-accent" : composeFocused ? "border-focus" : "",
+        )}
+        data-testid="compose-box"
+        data-drag-over={dragOver}
+        onfocusin={() => (composeFocused = true)}
+        onfocusout={(e) => {
+          // Keep the ring while focus moves *between* children of the box (field →
+          // button → chip); only clear when it genuinely leaves the container.
+          if (!e.currentTarget.contains(e.relatedTarget as Node | null)) composeFocused = false;
+        }}
+      >
+        {#if promptMenuOpen}
+          <!-- Full compose-box width, floating just above the box (anchored to its
            top edge, opening upward so a long list is never cut off). -->
-        <PromptMenu
-          {prompts}
-          loading={!promptsLoaded}
-          onpick={pickPrompt}
-          oninsert={promptMenuAllowsLiteralInsert ? setEmptyDraftFromPromptSearch : undefined}
-          oncopy={copyPrompt}
-          onsync={() => void syncPromptMenu()}
-          syncing={promptMenuSyncing}
-          onconfigure={onConfigurePrompts ? configurePrompts : undefined}
-          onopenfolder={openPromptsFolder}
-          onclose={() => (promptMenuOpen = false)}
-        />
-      {/if}
-      {#if workflowMenuOpen}
-        <WorkflowMenu
-          {workflows}
-          loading={!workflowsLoaded}
-          onpick={pickWorkflow}
-          oncopy={copyWorkflow}
-          oncopyauthoringprompt={copyWorkflowAuthoringPrompt}
-          onopenfolder={openWorkflowsFolder}
-          onclose={() => (workflowMenuOpen = false)}
-        />
-      {/if}
-      {#if menuOpen && hasMenuContent}
-        <!-- Full compose-box width, matching the prompt menu's placement. The
+          <PromptMenu
+            {prompts}
+            loading={!promptsLoaded}
+            onpick={pickPrompt}
+            oninsert={promptMenuAllowsLiteralInsert ? setEmptyDraftFromPromptSearch : undefined}
+            oncopy={copyPrompt}
+            onsync={() => void syncPromptMenu()}
+            syncing={promptMenuSyncing}
+            onconfigure={onConfigurePrompts ? configurePrompts : undefined}
+            onopenfolder={openPromptsFolder}
+            onclose={() => (promptMenuOpen = false)}
+          />
+        {/if}
+        {#if workflowMenuOpen}
+          <WorkflowMenu
+            {workflows}
+            loading={!workflowsLoaded}
+            onpick={pickWorkflow}
+            oncopy={copyWorkflow}
+            oncopyauthoringprompt={copyWorkflowAuthoringPrompt}
+            onopenfolder={openWorkflowsFolder}
+            onclose={() => (workflowMenuOpen = false)}
+          />
+        {/if}
+        {#if menuOpen && hasMenuContent}
+          <!-- Full compose-box width, matching the prompt menu's placement. The
            menu opens upward from the compose box instead of following the @
            caret, which keeps file paths readable without side tooltips. -->
-        <div
-          class="border-border/90 bg-raised absolute inset-x-0 bottom-full z-20 mb-1 overflow-hidden rounded-lg border p-1 text-[13px] shadow-[0_10px_28px_rgba(0,0,0,0.10)]"
-          data-testid="recipient-menu"
-          role="listbox"
-          bind:this={menuEl}
-        >
-          {#if showFileSection}
-            <div
-              class="text-muted px-2.5 py-0.5 text-[11px] font-medium tracking-wide uppercase select-none"
-            >
-              Files
-            </div>
-          {/if}
-          <div class="max-h-48 overflow-y-auto" data-testid="file-options-scroll">
-            {#each fileItems as item (item.key)}
-              {@const i = menuItems.findIndex((candidate) => candidate.key === item.key)}
-              <button
-                type="button"
-                class={"hover:bg-hover flex w-full cursor-pointer items-start gap-2 rounded-md px-2.5 py-1.5 text-left leading-5 outline-none select-none " +
-                  (i === highlighted ? "bg-hover" : "")}
-                data-testid={`file-option-${item.path}`}
-                role="option"
-                aria-selected={i === highlighted}
-                onclick={() => pickItem(item)}
-              >
-                <svg
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  stroke-width="1.8"
-                  stroke-linecap="round"
-                  stroke-linejoin="round"
-                  class="text-muted h-4 w-4 shrink-0"
-                  aria-hidden="true"
-                >
-                  <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z" />
-                  <path d="M14 3v5h5" />
-                </svg>
-                <span class="flex min-w-0 flex-col">
-                  <span
-                    class="text-fg min-w-0 truncate text-left text-xs font-medium"
-                    data-testid="file-option-label">{item.label}</span
-                  >
-                  {#if item.parent !== null}
-                    <span
-                      class="text-muted truncate text-left text-[11px]"
-                      data-testid="file-option-path"
-                    >
-                      {item.parent}
-                    </span>
-                  {/if}
-                </span>
-              </button>
-            {/each}
-            {#if fileStatusText !== null}
+          <div
+            class="border-border/90 bg-raised absolute inset-x-0 bottom-full z-20 mb-1 overflow-hidden rounded-lg border p-1 text-[13px] shadow-[0_10px_28px_rgba(0,0,0,0.10)]"
+            data-testid="recipient-menu"
+            role="listbox"
+            bind:this={menuEl}
+          >
+            {#if showFileSection}
               <div
-                class="text-muted flex min-h-7 items-center px-2.5 py-1 text-left leading-5 select-none"
-                data-testid="file-options-status"
+                class="text-muted px-2.5 py-0.5 text-[11px] font-medium tracking-wide uppercase select-none"
               >
-                {fileStatusText}
+                Files
               </div>
             {/if}
-          </div>
-
-          {#if attachmentItems.length > 0}
-            <div
-              class={cn(
-                "text-muted px-2.5 py-0.5 text-[11px] font-medium tracking-wide uppercase select-none",
-                fileItems.length > 0 ? "mt-1" : "",
-              )}
-            >
-              Attachments
+            <div class="max-h-48 overflow-y-auto" data-testid="file-options-scroll">
+              {#each fileItems as item (item.key)}
+                {@const i = menuItems.findIndex((candidate) => candidate.key === item.key)}
+                <button
+                  type="button"
+                  class={"hover:bg-hover flex w-full cursor-pointer items-start gap-2 rounded-md px-2.5 py-1.5 text-left leading-5 outline-none select-none " +
+                    (i === highlighted ? "bg-hover" : "")}
+                  data-testid={`file-option-${item.path}`}
+                  role="option"
+                  aria-selected={i === highlighted}
+                  onclick={() => pickItem(item)}
+                >
+                  <svg
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="1.8"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    class="text-muted h-4 w-4 shrink-0"
+                    aria-hidden="true"
+                  >
+                    <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z" />
+                    <path d="M14 3v5h5" />
+                  </svg>
+                  <span class="flex min-w-0 flex-col">
+                    <span
+                      class="text-fg min-w-0 truncate text-left text-xs font-medium"
+                      data-testid="file-option-label">{item.label}</span
+                    >
+                    {#if item.parent !== null}
+                      <span
+                        class="text-muted truncate text-left text-[11px]"
+                        data-testid="file-option-path"
+                      >
+                        {item.parent}
+                      </span>
+                    {/if}
+                  </span>
+                </button>
+              {/each}
+              {#if fileStatusText !== null}
+                <div
+                  class="text-muted flex min-h-7 items-center px-2.5 py-1 text-left leading-5 select-none"
+                  data-testid="file-options-status"
+                >
+                  {fileStatusText}
+                </div>
+              {/if}
             </div>
-            {#each attachmentItems as item (item.key)}
+
+            {#if attachmentItems.length > 0}
+              <div
+                class={cn(
+                  "text-muted px-2.5 py-0.5 text-[11px] font-medium tracking-wide uppercase select-none",
+                  fileItems.length > 0 ? "mt-1" : "",
+                )}
+              >
+                Attachments
+              </div>
+              {#each attachmentItems as item (item.key)}
+                {@const i = menuItems.findIndex((candidate) => candidate.key === item.key)}
+                <button
+                  type="button"
+                  class={"hover:bg-hover flex w-full cursor-pointer items-center gap-2 rounded-md px-2.5 py-1 text-left leading-5 outline-none select-none " +
+                    (i === highlighted ? "bg-hover" : "")}
+                  data-testid={`attachment-option-${item.label}`}
+                  role="option"
+                  aria-selected={i === highlighted}
+                  onclick={() => pickItem(item)}
+                >
+                  <svg
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="1.8"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    class="text-muted h-4 w-4 shrink-0"
+                    aria-hidden="true"
+                  >
+                    <path
+                      d="M21.44 11.05 12 20.5a5.5 5.5 0 0 1-7.78-7.78l8.49-8.49a3.5 3.5 0 1 1 4.95 4.95l-8.49 8.49a1.5 1.5 0 0 1-2.12-2.12l7.78-7.78"
+                    />
+                  </svg>
+                  <span class="text-fg font-mono text-xs">{item.label}</span>
+                </button>
+              {/each}
+            {/if}
+
+            {#if recipientItems.length > 0}
+              <div
+                class={cn(
+                  "text-muted px-2.5 py-0.5 text-[11px] font-medium tracking-wide uppercase select-none",
+                  fileItems.length > 0 || attachmentItems.length > 0 ? "mt-1" : "",
+                )}
+              >
+                Send to
+              </div>
+            {/if}
+            {#each recipientItems as item (item.key)}
               {@const i = menuItems.findIndex((candidate) => candidate.key === item.key)}
               <button
                 type="button"
                 class={"hover:bg-hover flex w-full cursor-pointer items-center gap-2 rounded-md px-2.5 py-1 text-left leading-5 outline-none select-none " +
                   (i === highlighted ? "bg-hover" : "")}
-                data-testid={`attachment-option-${item.label}`}
+                data-testid={`recipient-option-${item.key}`}
                 role="option"
                 aria-selected={i === highlighted}
                 onclick={() => pickItem(item)}
               >
-                <svg
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  stroke-width="1.8"
-                  stroke-linecap="round"
-                  stroke-linejoin="round"
-                  class="text-muted h-4 w-4 shrink-0"
-                  aria-hidden="true"
-                >
-                  <path
-                    d="M21.44 11.05 12 20.5a5.5 5.5 0 0 1-7.78-7.78l8.49-8.49a3.5 3.5 0 1 1 4.95 4.95l-8.49 8.49a1.5 1.5 0 0 1-2.12-2.12l7.78-7.78"
-                  />
-                </svg>
-                <span class="text-fg font-mono text-xs">{item.label}</span>
+                {#if item.kind === "all"}
+                  <svg
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    class="text-accent h-4 w-4"
+                    aria-hidden="true"
+                  >
+                    <circle cx="12" cy="12" r="9" />
+                    <path d="m8.5 12 2.5 2.5 4.5-5" />
+                  </svg>
+                  <span class="text-fg">All agents</span>
+                  <span class="text-muted ml-auto font-mono text-[13px]">
+                    {shortcut("mod", "shift", "A")}
+                  </span>
+                {:else if item.kind === "clear"}
+                  <ClearIcon class="text-muted" />
+                  <span class="text-fg">Clear</span>
+                  <span class="text-muted ml-auto font-mono text-[13px]">{shortcut("esc")}</span>
+                {:else if item.kind === "pane"}
+                  {@render paneGlyph()}
+                  <span class="text-fg shrink-0">{item.pane.name}</span>
+                  <!-- Member names in roster order (matching chip/pane-column
+                   order); the menu spans the compose box, so names fit —
+                   truncate is just the degenerate-case guard. -->
+                  <span
+                    class="text-muted min-w-0 truncate text-[11px]"
+                    data-testid="pane-option-members"
+                  >
+                    {agents
+                      .filter((a) => item.pane.members.includes(a.id))
+                      .map((a) => a.name)
+                      .join(", ")}
+                  </span>
+                  {#if item.index < 9}
+                    <span class="text-muted ml-auto font-mono text-[13px]">
+                      {shortcut("mod", "alt", String(item.index + 1))}
+                    </span>
+                  {/if}
+                {:else if item.kind === "agent"}
+                  {@const agentIndex = agents.findIndex((a) => a.id === item.agent.id)}
+                  <HarnessIcon harness={item.agent.harness} size="sm" class="h-4 w-4" />
+                  <span class="text-fg">{item.agent.name}</span>
+                  {#if agentIndex >= 0 && agentIndex < 9}
+                    <span class="text-muted ml-auto font-mono text-[13px]">
+                      {shortcut("mod", String(agentIndex + 1))}
+                    </span>
+                  {/if}
+                {/if}
               </button>
             {/each}
-          {/if}
 
-          {#if recipientItems.length > 0}
-            <div
-              class={cn(
-                "text-muted px-2.5 py-0.5 text-[11px] font-medium tracking-wide uppercase select-none",
-                fileItems.length > 0 || attachmentItems.length > 0 ? "mt-1" : "",
-              )}
-            >
-              Send to
-            </div>
-          {/if}
-          {#each recipientItems as item (item.key)}
-            {@const i = menuItems.findIndex((candidate) => candidate.key === item.key)}
-            <button
-              type="button"
-              class={"hover:bg-hover flex w-full cursor-pointer items-center gap-2 rounded-md px-2.5 py-1 text-left leading-5 outline-none select-none " +
-                (i === highlighted ? "bg-hover" : "")}
-              data-testid={`recipient-option-${item.key}`}
-              role="option"
-              aria-selected={i === highlighted}
-              onclick={() => pickItem(item)}
-            >
-              {#if item.kind === "all"}
+            {#if forwardItems.length > 0}
+              <div
+                class={cn(
+                  "text-muted px-2.5 py-0.5 text-[11px] font-medium tracking-wide uppercase select-none",
+                  "mt-1",
+                )}
+              >
+                Forward from
+              </div>
+            {/if}
+            {#each forwardItems as item (item.key)}
+              {@const i = menuItems.findIndex((candidate) => candidate.key === item.key)}
+              <button
+                type="button"
+                class={"hover:bg-hover flex w-full cursor-pointer items-center gap-2 rounded-md px-2.5 py-1 text-left leading-5 outline-none select-none " +
+                  (i === highlighted ? "bg-hover" : "")}
+                data-testid={`forward-option-${item.key}`}
+                role="option"
+                aria-selected={i === highlighted}
+                onclick={() => pickItem(item)}
+              >
+                <!-- ↪ forward glyph, shared by both forward entry kinds. -->
                 <svg
                   viewBox="0 0 24 24"
                   fill="none"
@@ -3332,635 +3426,560 @@
                   class="text-accent h-4 w-4"
                   aria-hidden="true"
                 >
-                  <circle cx="12" cy="12" r="9" />
-                  <path d="m8.5 12 2.5 2.5 4.5-5" />
+                  <polyline points="15 17 20 12 15 7" />
+                  <path d="M4 18v-2a4 4 0 0 1 4-4h12" />
                 </svg>
-                <span class="text-fg">All agents</span>
-                <span class="text-muted ml-auto font-mono text-[13px]">
-                  {shortcut("mod", "shift", "A")}
-                </span>
-              {:else if item.kind === "clear"}
-                <ClearIcon class="text-muted" />
-                <span class="text-fg">Clear</span>
-                <span class="text-muted ml-auto font-mono text-[13px]">{shortcut("esc")}</span>
-              {:else if item.kind === "pane"}
-                {@render paneGlyph()}
-                <span class="text-fg shrink-0">{item.pane.name}</span>
-                <!-- Member names in roster order (matching chip/pane-column
-                   order); the menu spans the compose box, so names fit —
-                   truncate is just the degenerate-case guard. -->
-                <span
-                  class="text-muted min-w-0 truncate text-[11px]"
-                  data-testid="pane-option-members"
-                >
-                  {agents
-                    .filter((a) => item.pane.members.includes(a.id))
-                    .map((a) => a.name)
-                    .join(", ")}
-                </span>
-                {#if item.index < 9}
-                  <span class="text-muted ml-auto font-mono text-[13px]">
-                    {shortcut("mod", "alt", String(item.index + 1))}
+                {#if item.kind === "forward-pane"}
+                  {@const paneIndex = paneLayout.panes.findIndex((p) => p.id === item.pane.id)}
+                  {@render paneGlyph()}
+                  <span class="text-fg shrink-0">{item.pane.name}</span>
+                  <span class="text-muted min-w-0 truncate text-[11px]">
+                    {agents
+                      .filter((a) => item.pane.members.includes(a.id))
+                      .map((a) => a.name)
+                      .join(", ")}
                   </span>
+                  {#if paneIndex >= 0 && paneIndex < 9}
+                    <span class="text-muted ml-auto shrink-0 pl-2 font-mono text-[11px]"
+                      >{shortcut("mod", "ctrl", String(paneIndex + 1))}</span
+                    >
+                  {/if}
+                {:else}
+                  <HarnessIcon harness={item.agent.harness} size="sm" class="h-4 w-4" />
+                  <span class="text-fg">{item.agent.name}</span>
+                  {#if agentReadiness(item.agent.id) === "empty"}
+                    <span class="text-muted ml-auto text-[11px] italic"
+                      >no output — blocks the send</span
+                    >
+                  {:else if agentReadiness(item.agent.id) === "pending"}
+                    <span class="text-muted ml-auto text-[11px] italic">still generating</span>
+                  {/if}
                 {/if}
-              {:else if item.kind === "agent"}
-                {@const agentIndex = agents.findIndex((a) => a.id === item.agent.id)}
-                <HarnessIcon harness={item.agent.harness} size="sm" class="h-4 w-4" />
-                <span class="text-fg">{item.agent.name}</span>
-                {#if agentIndex >= 0 && agentIndex < 9}
-                  <span class="text-muted ml-auto font-mono text-[13px]">
-                    {shortcut("mod", String(agentIndex + 1))}
-                  </span>
-                {/if}
-              {/if}
-            </button>
-          {/each}
-
-          {#if forwardItems.length > 0}
-            <div
-              class={cn(
-                "text-muted px-2.5 py-0.5 text-[11px] font-medium tracking-wide uppercase select-none",
-                "mt-1",
-              )}
-            >
-              Forward from
-            </div>
-          {/if}
-          {#each forwardItems as item (item.key)}
-            {@const i = menuItems.findIndex((candidate) => candidate.key === item.key)}
-            <button
-              type="button"
-              class={"hover:bg-hover flex w-full cursor-pointer items-center gap-2 rounded-md px-2.5 py-1 text-left leading-5 outline-none select-none " +
-                (i === highlighted ? "bg-hover" : "")}
-              data-testid={`forward-option-${item.key}`}
-              role="option"
-              aria-selected={i === highlighted}
-              onclick={() => pickItem(item)}
-            >
-              <!-- ↪ forward glyph, shared by both forward entry kinds. -->
-              <svg
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                stroke-width="2"
-                stroke-linecap="round"
-                stroke-linejoin="round"
-                class="text-accent h-4 w-4"
-                aria-hidden="true"
-              >
-                <polyline points="15 17 20 12 15 7" />
-                <path d="M4 18v-2a4 4 0 0 1 4-4h12" />
-              </svg>
-              {#if item.kind === "forward-pane"}
-                {@const paneIndex = paneLayout.panes.findIndex((p) => p.id === item.pane.id)}
-                {@render paneGlyph()}
-                <span class="text-fg shrink-0">{item.pane.name}</span>
-                <span class="text-muted min-w-0 truncate text-[11px]">
-                  {agents
-                    .filter((a) => item.pane.members.includes(a.id))
-                    .map((a) => a.name)
-                    .join(", ")}
-                </span>
-                {#if paneIndex >= 0 && paneIndex < 9}
-                  <span class="text-muted ml-auto shrink-0 pl-2 font-mono text-[11px]"
-                    >{shortcut("mod", "ctrl", String(paneIndex + 1))}</span
-                  >
-                {/if}
-              {:else}
-                <HarnessIcon harness={item.agent.harness} size="sm" class="h-4 w-4" />
-                <span class="text-fg">{item.agent.name}</span>
-                {#if agentReadiness(item.agent.id) === "empty"}
-                  <span class="text-muted ml-auto text-[11px] italic"
-                    >no output — blocks the send</span
-                  >
-                {:else if agentReadiness(item.agent.id) === "pending"}
-                  <span class="text-muted ml-auto text-[11px] italic">still generating</span>
-                {/if}
-              {/if}
-            </button>
-          {/each}
-        </div>
-      {/if}
-      {#snippet forwardSourceChips()}
-        {#if forwardSources.length > 0}
-          <!-- Plain-mode only: prompt mode forwards per-field, and workflow mode
+              </button>
+            {/each}
+          </div>
+        {/if}
+        {#snippet forwardSourceChips()}
+          {#if forwardSources.length > 0}
+            <!-- Plain-mode only: prompt mode forwards per-field, and workflow mode
              routes via its agent inputs, so the message-level forward set doesn't
              apply and is hidden in both (its state is preserved for restore when
              the prompt/workflow is removed). -->
-          <div
-            class="mb-1.5 flex flex-wrap items-center gap-1.5"
-            data-testid="forward-source-chips"
-          >
-            <span class="text-muted text-xs">Forwarding from</span>
-            {#each orderedForwardSources as source (forwardSourceKey(source))}
-              <ForwardSourceChip
-                {source}
-                readiness={agentReadiness(source.id)}
-                disabled={composerBusy}
-                onRemove={() => removeForwardSource(forwardSourceKey(source))}
-              />
-            {/each}
-            {#if forwardSources.length > 1}
-              <!-- Each chip carries its own ✕; the bulk clear (same ⊘ glyph as
+            <div
+              class="mb-1.5 flex flex-wrap items-center gap-1.5"
+              data-testid="forward-source-chips"
+            >
+              <span class="text-muted text-xs">Forwarding from</span>
+              {#each orderedForwardSources as source (forwardSourceKey(source))}
+                <ForwardSourceChip
+                  {source}
+                  readiness={agentReadiness(source.id)}
+                  disabled={composerBusy}
+                  onRemove={() => removeForwardSource(forwardSourceKey(source))}
+                />
+              {/each}
+              {#if forwardSources.length > 1}
+                <!-- Each chip carries its own ✕; the bulk clear (same ⊘ glyph as
                    "Clear recipients") only earns its place once there are several to
                    drop at once. -->
-              <Tooltip label="Clear forward sources">
-                {#snippet trigger(props)}
-                  <button
-                    {...props}
-                    type="button"
-                    class={cn(ICON_BUTTON_CLASS, "ml-0.5 shrink-0 disabled:opacity-50")}
-                    data-testid="forward-sources-clear"
-                    aria-label="Clear forward sources"
-                    disabled={composerBusy}
-                    onclick={() => {
-                      if (!composerBusy) forwardSources = [];
-                    }}
-                  >
-                    <ClearIcon />
-                  </button>
-                {/snippet}
-              </Tooltip>
-            {/if}
-          </div>
-        {/if}
-      {/snippet}
-      {#snippet recipientChips()}
-        {#if agents.length > 1}
-          <div class="flex flex-wrap items-center gap-1.5 text-xs" data-testid="recipient-field">
-            <span class="text-muted">To</span>
-            {#each agents as agent, i (agent.id)}
-              {@const selected = selectedIds.includes(agent.id)}
-              <!-- Targeted ∧ hidden — the cue exists for one hazard: sending to
-                 an agent whose replies you've hidden. A hidden-but-unselected
-                 chip carries no hazard, so it gets no warning. -->
-              {@const chipHidden = selected && isAgentHidden(projectId, rosterIds, agent.id)}
-              <Tooltip
-                label={chipHidden
-                  ? `${agent.name} is hidden in its pane — replies won't be visible`
-                  : selected
-                    ? `Drop ${agent.name}`
-                    : `Add ${agent.name}`}
-                shortcut={i < 9 ? shortcut("mod", String(i + 1)) : undefined}
-                delayDuration={chipHidden ? 300 : 1000}
-                reopen="fresh-hover"
-              >
-                {#snippet trigger(props)}
-                  <button
-                    {...props}
-                    type="button"
-                    class={cn(
-                      "focus-visible:ring-focus inline-flex h-6 items-center gap-1 rounded-full border px-2 text-xs transition-colors focus-visible:ring-1 focus-visible:outline-none",
-                      selected
-                        ? "bg-accent-soft text-fg border-transparent"
-                        : "border-panel bg-panel text-muted hover:bg-raised hover:text-fg",
-                      composerBusy ? "cursor-not-allowed opacity-60" : "",
-                    )}
-                    data-testid={`recipient-chip-${agent.id}`}
-                    data-selected={selected}
-                    data-hidden-recipient={chipHidden || undefined}
-                    aria-pressed={selected}
-                    disabled={composerBusy}
-                    onclick={() => toggleRecipient(agent.id)}
-                  >
-                    {#if i < 9}
-                      <!-- Leading position number makes the ⌘1–9 toggle shortcut
-                         discoverable at a glance (it maps to chip position, not a
-                         fixed agent). -->
-                      <span
-                        class="text-muted/80 font-mono text-[10px] tabular-nums"
-                        aria-hidden="true"
-                      >
-                        {i + 1}
-                      </span>
-                    {/if}
-                    <HarnessIcon harness={agent.harness} size="sm" class="h-3.5 w-3.5" />
-                    {agent.name}
-                    {#if chipHidden}
-                      <!-- Targeted-but-hidden cue: without it a user sends to a
-                         hidden agent and never sees the reply appear. -->
-                      <svg
-                        viewBox="0 0 24 24"
-                        fill="none"
-                        stroke="currentColor"
-                        stroke-width="2"
-                        stroke-linecap="round"
-                        stroke-linejoin="round"
-                        class="text-warning h-3 w-3 shrink-0"
-                        data-testid={`recipient-hidden-cue-${agent.id}`}
-                        aria-hidden="true"
-                      >
-                        <path
-                          d="M10.7 5.1a9.6 9.6 0 0 1 1.3-.1c7 0 10 7 10 7a13.2 13.2 0 0 1-1.7 2.5"
-                        />
-                        <path d="M6.6 6.6A13.5 13.5 0 0 0 2 12s3 7 10 7a9.7 9.7 0 0 0 5.4-1.6" />
-                        <path d="m2 2 20 20" />
-                      </svg>
-                    {/if}
-                  </button>
-                {/snippet}
-              </Tooltip>
-            {/each}
-            {#if selectedIds.length > 0}
-              <Tooltip label="Clear recipients" shortcut={shortcut("esc")}>
-                {#snippet trigger(props)}
-                  <button
-                    {...props}
-                    type="button"
-                    class={cn(ICON_BUTTON_CLASS, "ml-0.5")}
-                    data-testid="recipient-clear"
-                    aria-label="Clear recipients"
-                    disabled={composerBusy}
-                    onclick={() => {
-                      if (!composerBusy) setSelectedIds([]);
-                    }}
-                  >
-                    <ClearIcon />
-                  </button>
-                {/snippet}
-              </Tooltip>
-            {/if}
-          </div>
-        {/if}
-      {/snippet}
-
-      {#snippet attachmentChipRow()}
-        {#if attachmentChips.length > 0}
-          <div class="mb-1.5 flex flex-wrap gap-1.5" data-testid="attachment-chips">
-            {#each attachmentChips as chip (chip.id)}
-              <span
-                class="border-border bg-panel text-fg inline-flex max-w-[14rem] items-center gap-1.5 rounded-full border py-px pr-1 pl-2 text-xs"
-                data-testid={`attachment-chip-${chip.label}`}
-                data-kind={chip.kind}
-              >
-                <span
-                  class="text-muted shrink-0 font-mono text-[10px] whitespace-nowrap"
-                  aria-hidden="true">{chip.label}</span
-                >
-                <Tooltip
-                  label={chip.original_name}
-                  delayDuration={SUPPLEMENTAL_TOOLTIP_DELAY}
-                  focusable={false}
-                >
+                <Tooltip label="Clear forward sources">
                   {#snippet trigger(props)}
-                    <span {...props} class="truncate">{chip.original_name}</span>
+                    <button
+                      {...props}
+                      type="button"
+                      class={cn(ICON_BUTTON_CLASS, "ml-0.5 shrink-0 disabled:opacity-50")}
+                      data-testid="forward-sources-clear"
+                      aria-label="Clear forward sources"
+                      disabled={composerBusy}
+                      onclick={() => {
+                        if (!composerBusy) forwardSources = [];
+                      }}
+                    >
+                      <ClearIcon />
+                    </button>
                   {/snippet}
                 </Tooltip>
-                <button
-                  type="button"
-                  class="text-muted hover:text-fg hover:bg-control-hover flex h-4 w-4 shrink-0 items-center justify-center rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-50"
-                  data-testid={`attachment-chip-remove-${chip.label}`}
-                  aria-label={`Remove ${chip.original_name}`}
-                  disabled={composerBusy}
-                  onclick={() => removeAttachmentChip(chip.id)}
-                >
-                  <svg
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    stroke-width="2"
-                    stroke-linecap="round"
-                    class="h-3 w-3"
-                    aria-hidden="true"
-                  >
-                    <path d="m6 6 12 12M18 6 6 18" />
-                  </svg>
-                </button>
-              </span>
-            {/each}
-          </div>
-        {/if}
-      {/snippet}
-
-      {#if mode !== "plain"}
-        {@render attachmentChipRow()}
-      {/if}
-
-      {#if restoring && promptRestoreIssue !== null}
-        <div
-          class="flex h-16 items-center gap-3 px-1 text-sm"
-          data-testid="compose-prompt-restore-failed"
-        >
-          <span class="text-muted">{promptRestoreMessage()}</span>
-          <Button
-            size="sm"
-            variant="secondary"
-            onclick={retryPromptRestore}
-            data-testid="prompt-restore-retry"
-          >
-            Check again
-          </Button>
-          <Button
-            size="sm"
-            variant="ghost"
-            onclick={discardPromptRestore}
-            data-testid="prompt-restore-discard"
-          >
-            Start over
-          </Button>
-        </div>
-      {:else if restoring && workflowRestoreFailed}
-        <!-- The workflow list failed to load, so we can't tell whether the saved
-           workflow still exists. The snapshot is held (not discarded) until the
-           user retries or explicitly starts over — a transient error must not
-           destroy a half-filled invocation. -->
-        <div
-          class="flex h-16 items-center gap-3 px-1 text-sm"
-          data-testid="compose-workflow-restore-failed"
-        >
-          <span class="text-muted">Couldn't load your saved workflow.</span>
-          <Button
-            size="sm"
-            variant="secondary"
-            onclick={retryWorkflowRestore}
-            data-testid="workflow-restore-retry"
-          >
-            Retry
-          </Button>
-          <Button
-            size="sm"
-            variant="ghost"
-            onclick={discardWorkflowRestore}
-            data-testid="workflow-restore-discard"
-          >
-            Start over
-          </Button>
-        </div>
-      {:else if restoring}
-        <!-- A saved prompt- or workflow-mode draft is still resolving against its
-           source (a possibly cold prompt cache; the local workflow list). Show a
-           neutral placeholder rather than the plain textarea so the box doesn't
-           flash empty and look like the draft was lost. -->
-        <div
-          class="text-muted flex h-16 items-center gap-2 px-1 text-sm"
-          data-testid="compose-restoring"
-        >
-          <Spinner class="h-4 w-4" />
-          Restoring {pendingWorkflowRestore !== null ? "workflow" : "prompt"}…
-        </div>
-      {:else if mode === "workflow" && workflowForm === null}
-        <div
-          class="flex min-h-16 items-center gap-3 px-1 text-sm"
-          data-testid={workflowFormError === null
-            ? "compose-workflow-loading"
-            : "compose-workflow-load-failed"}
-        >
-          {#if workflowFormError === null}
-            <Spinner class="h-4 w-4 shrink-0" />
-            <span class="text-muted">Loading {selectedWorkflow?.name ?? "workflow"}…</span>
-          {:else}
-            <div class="min-w-0 flex-1">
-              <p class="text-fg">Couldn't load {selectedWorkflow?.name ?? "the workflow"}.</p>
-              <p class="text-status-failed mt-0.5 truncate text-xs">{workflowFormError}</p>
+              {/if}
             </div>
+          {/if}
+        {/snippet}
+        {#snippet recipientChips()}
+          {#if agents.length > 1}
+            <div class="flex flex-wrap items-center gap-1.5 text-xs" data-testid="recipient-field">
+              <span class="text-muted">To</span>
+              {#each agents as agent, i (agent.id)}
+                {@const selected = selectedIds.includes(agent.id)}
+                <!-- Targeted ∧ hidden — the cue exists for one hazard: sending to
+                 an agent whose replies you've hidden. A hidden-but-unselected
+                 chip carries no hazard, so it gets no warning. -->
+                {@const chipHidden = selected && isAgentHidden(projectId, rosterIds, agent.id)}
+                <Tooltip
+                  label={chipHidden
+                    ? `${agent.name} is hidden in its pane — replies won't be visible`
+                    : selected
+                      ? `Drop ${agent.name}`
+                      : `Add ${agent.name}`}
+                  shortcut={i < 9 ? shortcut("mod", String(i + 1)) : undefined}
+                  delayDuration={chipHidden ? 300 : 1000}
+                  reopen="fresh-hover"
+                >
+                  {#snippet trigger(props)}
+                    <button
+                      {...props}
+                      type="button"
+                      class={cn(
+                        "focus-visible:ring-focus inline-flex h-6 items-center gap-1 rounded-full border px-2 text-xs transition-colors focus-visible:ring-1 focus-visible:outline-none",
+                        selected
+                          ? "bg-accent-soft text-fg border-transparent"
+                          : "border-panel bg-panel text-muted hover:bg-raised hover:text-fg",
+                        composerBusy ? "cursor-not-allowed opacity-60" : "",
+                      )}
+                      data-testid={`recipient-chip-${agent.id}`}
+                      data-selected={selected}
+                      data-hidden-recipient={chipHidden || undefined}
+                      aria-pressed={selected}
+                      disabled={composerBusy}
+                      onclick={() => toggleRecipient(agent.id)}
+                    >
+                      {#if i < 9}
+                        <!-- Leading position number makes the ⌘1–9 toggle shortcut
+                         discoverable at a glance (it maps to chip position, not a
+                         fixed agent). -->
+                        <span
+                          class="text-muted/80 font-mono text-[10px] tabular-nums"
+                          aria-hidden="true"
+                        >
+                          {i + 1}
+                        </span>
+                      {/if}
+                      <HarnessIcon harness={agent.harness} size="sm" class="h-3.5 w-3.5" />
+                      {agent.name}
+                      {#if chipHidden}
+                        <!-- Targeted-but-hidden cue: without it a user sends to a
+                         hidden agent and never sees the reply appear. -->
+                        <svg
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          stroke-width="2"
+                          stroke-linecap="round"
+                          stroke-linejoin="round"
+                          class="text-warning h-3 w-3 shrink-0"
+                          data-testid={`recipient-hidden-cue-${agent.id}`}
+                          aria-hidden="true"
+                        >
+                          <path
+                            d="M10.7 5.1a9.6 9.6 0 0 1 1.3-.1c7 0 10 7 10 7a13.2 13.2 0 0 1-1.7 2.5"
+                          />
+                          <path d="M6.6 6.6A13.5 13.5 0 0 0 2 12s3 7 10 7a9.7 9.7 0 0 0 5.4-1.6" />
+                          <path d="m2 2 20 20" />
+                        </svg>
+                      {/if}
+                    </button>
+                  {/snippet}
+                </Tooltip>
+              {/each}
+              {#if selectedIds.length > 0}
+                <Tooltip label="Clear recipients" shortcut={shortcut("esc")}>
+                  {#snippet trigger(props)}
+                    <button
+                      {...props}
+                      type="button"
+                      class={cn(ICON_BUTTON_CLASS, "ml-0.5")}
+                      data-testid="recipient-clear"
+                      aria-label="Clear recipients"
+                      disabled={composerBusy}
+                      onclick={() => {
+                        if (!composerBusy) setSelectedIds([]);
+                      }}
+                    >
+                      <ClearIcon />
+                    </button>
+                  {/snippet}
+                </Tooltip>
+              {/if}
+            </div>
+          {/if}
+        {/snippet}
+
+        {#snippet attachmentChipRow()}
+          {#if attachmentChips.length > 0}
+            <div class="mb-1.5 flex flex-wrap gap-1.5" data-testid="attachment-chips">
+              {#each attachmentChips as chip (chip.id)}
+                <span
+                  class="border-border bg-panel text-fg inline-flex max-w-[14rem] items-center gap-1.5 rounded-full border py-px pr-1 pl-2 text-xs"
+                  data-testid={`attachment-chip-${chip.label}`}
+                  data-kind={chip.kind}
+                >
+                  <span
+                    class="text-muted shrink-0 font-mono text-[10px] whitespace-nowrap"
+                    aria-hidden="true">{chip.label}</span
+                  >
+                  <Tooltip
+                    label={chip.original_name}
+                    delayDuration={SUPPLEMENTAL_TOOLTIP_DELAY}
+                    focusable={false}
+                  >
+                    {#snippet trigger(props)}
+                      <span {...props} class="truncate">{chip.original_name}</span>
+                    {/snippet}
+                  </Tooltip>
+                  <button
+                    type="button"
+                    class="text-muted hover:text-fg hover:bg-control-hover flex h-4 w-4 shrink-0 items-center justify-center rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-50"
+                    data-testid={`attachment-chip-remove-${chip.label}`}
+                    aria-label={`Remove ${chip.original_name}`}
+                    disabled={composerBusy}
+                    onclick={() => removeAttachmentChip(chip.id)}
+                  >
+                    <svg
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="2"
+                      stroke-linecap="round"
+                      class="h-3 w-3"
+                      aria-hidden="true"
+                    >
+                      <path d="m6 6 12 12M18 6 6 18" />
+                    </svg>
+                  </button>
+                </span>
+              {/each}
+            </div>
+          {/if}
+        {/snippet}
+
+        {#if mode !== "plain"}
+          {@render attachmentChipRow()}
+        {/if}
+
+        {#if restoring && promptRestoreIssue !== null}
+          <div
+            class="flex h-16 items-center gap-3 px-1 text-sm"
+            data-testid="compose-prompt-restore-failed"
+          >
+            <span class="text-muted">{promptRestoreMessage()}</span>
             <Button
               size="sm"
               variant="secondary"
-              data-testid="workflow-form-retry"
-              onclick={retryWorkflowForm}
+              onclick={retryPromptRestore}
+              data-testid="prompt-restore-retry"
+            >
+              Check again
+            </Button>
+            <Button
+              size="sm"
+              variant="ghost"
+              onclick={discardPromptRestore}
+              data-testid="prompt-restore-discard"
+            >
+              Start over
+            </Button>
+          </div>
+        {:else if restoring && workflowRestoreFailed}
+          <!-- The workflow list failed to load, so we can't tell whether the saved
+           workflow still exists. The snapshot is held (not discarded) until the
+           user retries or explicitly starts over — a transient error must not
+           destroy a half-filled invocation. -->
+          <div
+            class="flex h-16 items-center gap-3 px-1 text-sm"
+            data-testid="compose-workflow-restore-failed"
+          >
+            <span class="text-muted">Couldn't load your saved workflow.</span>
+            <Button
+              size="sm"
+              variant="secondary"
+              onclick={retryWorkflowRestore}
+              data-testid="workflow-restore-retry"
             >
               Retry
             </Button>
             <Button
               size="sm"
               variant="ghost"
-              data-testid="workflow-form-start-over"
-              onclick={removeWorkflow}
+              onclick={discardWorkflowRestore}
+              data-testid="workflow-restore-discard"
             >
               Start over
             </Button>
-          {/if}
-        </div>
-      {:else if mode === "workflow" && workflowForm !== null}
-        <!-- Workflow mode: the invocation form spans the compose area. The compose
+          </div>
+        {:else if restoring}
+          <!-- A saved prompt- or workflow-mode draft is still resolving against its
+           source (a possibly cold prompt cache; the local workflow list). Show a
+           neutral placeholder rather than the plain textarea so the box doesn't
+           flash empty and look like the draft was lost. -->
+          <div
+            class="text-muted flex h-16 items-center gap-2 px-1 text-sm"
+            data-testid="compose-restoring"
+          >
+            <Spinner class="h-4 w-4" />
+            Restoring {pendingWorkflowRestore !== null ? "workflow" : "prompt"}…
+          </div>
+        {:else if mode === "workflow" && workflowForm === null}
+          <div
+            class="flex min-h-16 items-center gap-3 px-1 text-sm"
+            data-testid={workflowFormError === null
+              ? "compose-workflow-loading"
+              : "compose-workflow-load-failed"}
+          >
+            {#if workflowFormError === null}
+              <Spinner class="h-4 w-4 shrink-0" />
+              <span class="text-muted">Loading {selectedWorkflow?.name ?? "workflow"}…</span>
+            {:else}
+              <div class="min-w-0 flex-1">
+                <p class="text-fg">Couldn't load {selectedWorkflow?.name ?? "the workflow"}.</p>
+                <p class="text-status-failed mt-0.5 truncate text-xs">{workflowFormError}</p>
+              </div>
+              <Button
+                size="sm"
+                variant="secondary"
+                data-testid="workflow-form-retry"
+                onclick={retryWorkflowForm}
+              >
+                Retry
+              </Button>
+              <Button
+                size="sm"
+                variant="ghost"
+                data-testid="workflow-form-start-over"
+                onclick={removeWorkflow}
+              >
+                Start over
+              </Button>
+            {/if}
+          </div>
+        {:else if mode === "workflow" && workflowForm !== null}
+          <!-- Workflow mode: the invocation form spans the compose area. The compose
            bar's To field + message forwards are hidden (the workflow routes via
            its agent inputs); the run launches in the background. -->
-        <WorkflowComposer
-          descriptor={workflowForm}
-          {agents}
-          loading={workflowFormLoading}
-          {agentReadiness}
-          panes={paneLayout.panes}
-          bind:inputs={workflowInputs}
-          bind:forwardSources={workflowForwardSources}
-          onremove={removeWorkflow}
-          onretry={retryWorkflowForm}
-          onsignin={(provider) => void signInWorkflowProvider(provider)}
-          signingInProvider={workflowSigningInProvider}
-          onconfigure={onConfigurePrompts ? configurePrompts : undefined}
-        >
-          {#snippet invoke()}
-            <Button
-              variant="primary"
-              size="sm"
-              data-testid="workflow-invoke-button"
-              disabled={!workflowRunnable || invokingWorkflow}
-              onclick={() => void invokeWorkflowAction()}
-            >
-              {invokingWorkflow ? "Starting…" : "Run workflow"}
-            </Button>
-          {/snippet}
-        </WorkflowComposer>
-      {:else if mode === "prompt" && selectedPrompt !== null}
-        <!-- Prompt mode stacks full-width: the prompt name titles the area, the To
+          <WorkflowComposer
+            descriptor={workflowForm}
+            {agents}
+            loading={workflowFormLoading}
+            {agentReadiness}
+            panes={paneLayout.panes}
+            bind:inputs={workflowInputs}
+            bind:forwardSources={workflowForwardSources}
+            onremove={removeWorkflow}
+            onretry={retryWorkflowForm}
+            onsignin={(provider) => void signInWorkflowProvider(provider)}
+            signingInProvider={workflowSigningInProvider}
+            onconfigure={onConfigurePrompts ? configurePrompts : undefined}
+          >
+            {#snippet invoke()}
+              <Button
+                variant="primary"
+                size="sm"
+                data-testid="workflow-invoke-button"
+                disabled={!workflowRunnable || invokingWorkflow}
+                onclick={() => void invokeWorkflowAction()}
+              >
+                {invokingWorkflow ? "Starting…" : "Run workflow"}
+              </Button>
+            {/snippet}
+          </WorkflowComposer>
+        {:else if mode === "prompt" && selectedPrompt !== null}
+          <!-- Prompt mode stacks full-width: the prompt name titles the area, the To
            row sits just under it (handed in as a snippet), then the argument /
            appended boxes; the send button rides the composer's footer row. -->
-        <PromptComposer
-          prompt={selectedPrompt}
-          bind:args={promptArgs}
-          bind:appendedText
-          bind:argSources={promptArgSources}
-          bind:appendedSources={promptAppendedSources}
-          {agents}
-          panes={paneLayout.panes}
-          {agentReadiness}
-          focusFirstField={focusPromptFieldOnMount}
-          onremove={removePrompt}
-          recipients={recipientChips}
-          busy={composerBusy}
-          send={sendButton}
-        />
-      {:else if mode === "plain"}
-        <div class="relative flex items-stretch gap-2">
-          <div class="min-w-0 flex-1">
-            {@render forwardSourceChips()}
-            <!-- Plain mode owns the To row + the message-level entry points. In
+          <PromptComposer
+            prompt={selectedPrompt}
+            bind:args={promptArgs}
+            bind:appendedText
+            bind:argSources={promptArgSources}
+            bind:appendedSources={promptAppendedSources}
+            {agents}
+            panes={paneLayout.panes}
+            {agentReadiness}
+            focusFirstField={focusPromptFieldOnMount}
+            onremove={removePrompt}
+            recipients={recipientChips}
+            busy={composerBusy}
+            send={sendButton}
+          />
+        {:else if mode === "plain"}
+          <div class="relative flex items-stretch gap-2">
+            <div class="min-w-0 flex-1">
+              {@render forwardSourceChips()}
+              <!-- Plain mode owns the To row + the message-level entry points. In
                  prompt mode the To row is handed to the composer; workflow mode
                  routes through its own agent inputs. -->
-            <div class="mb-1.5 min-w-0">{@render recipientChips()}</div>
-            {@render attachmentChipRow()}
-            <Textarea
-              autosize
-              data-testid="compose-textarea"
-              data-shortcut-scope="composer"
-              placeholder="Type a message…  (⌘+Enter to send, @ to add a recipient or forward source, / for a prompt)"
-              rows={3}
-              bind:ref={textareaEl}
-              bind:value={draft}
-              oninput={onInput}
-              onkeydown={handleKey}
-              class="max-h-48 min-h-16 border-0 bg-transparent p-1 shadow-none focus-visible:ring-0"
-            />
-          </div>
-          <div
-            class="-mt-0.5 flex shrink-0 flex-col items-end gap-0.5"
-            data-testid="compose-action-rail"
-          >
-            <ForwardSourcePicker
-              {agents}
-              panes={paneLayout.panes}
-              onPickAgent={(agent) => addForwardSource(forwardSourceForAgent(agent))}
-              onPickPane={(pane) => addPaneForwardSources(pane)}
-              {agentReadiness}
-              disabled={composerBusy}
-              showPaneShortcuts
-              triggerTestid="compose-forward-button"
-              triggerLabel="Forward an agent's output"
-              tooltipLabel="Forward an agent's output"
-              tooltipDisableHoverableContent
-              triggerClass={cn(
-                COMPOSER_ACTION_BUTTON_CLASS,
-                composerBusy ? "cursor-not-allowed opacity-60" : "",
-              )}
-            />
-            <Tooltip label="Insert a prompt" shortcut={shortcut("/")} disableHoverableContent>
-              {#snippet trigger(props)}
-                <button
-                  {...props}
-                  type="button"
-                  class={cn(
-                    COMPOSER_ACTION_BUTTON_CLASS,
-                    composerBusy ? "cursor-not-allowed opacity-60" : "",
-                  )}
-                  data-testid="compose-prompt-button"
-                  aria-label="Insert a prompt"
-                  disabled={composerBusy}
-                  onclick={() => {
-                    if (composerBusy) return;
-                    if (promptMenuOpen) {
-                      promptMenuOpen = false;
-                    } else {
-                      openPromptMenu();
-                    }
-                  }}
-                >
-                  <svg
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    stroke-width="1.8"
-                    stroke-linecap="round"
-                    stroke-linejoin="round"
-                    class="h-4 w-4"
-                    aria-hidden="true"
+              <div class="mb-1.5 min-w-0">{@render recipientChips()}</div>
+              {@render attachmentChipRow()}
+              <Textarea
+                autosize
+                data-testid="compose-textarea"
+                data-shortcut-scope="composer"
+                placeholder="Type a message…  (⌘+Enter to send, @ to add a recipient or forward source, / for a prompt)"
+                rows={3}
+                bind:ref={textareaEl}
+                bind:value={draft}
+                oninput={onInput}
+                onkeydown={handleKey}
+                class="max-h-48 min-h-16 border-0 bg-transparent p-1 shadow-none focus-visible:ring-0"
+              />
+            </div>
+            <div
+              class="-mt-0.5 flex shrink-0 flex-col items-end gap-0.5"
+              data-testid="compose-action-rail"
+            >
+              <ForwardSourcePicker
+                {agents}
+                panes={paneLayout.panes}
+                onPickAgent={(agent) => addForwardSource(forwardSourceForAgent(agent))}
+                onPickPane={(pane) => addPaneForwardSources(pane)}
+                {agentReadiness}
+                disabled={composerBusy}
+                showPaneShortcuts
+                triggerTestid="compose-forward-button"
+                triggerLabel="Forward an agent's output"
+                tooltipLabel="Forward an agent's output"
+                tooltipDisableHoverableContent
+                triggerClass={cn(
+                  COMPOSER_ACTION_BUTTON_CLASS,
+                  composerBusy ? "cursor-not-allowed opacity-60" : "",
+                )}
+              />
+              <Tooltip label="Insert a prompt" shortcut={shortcut("/")} disableHoverableContent>
+                {#snippet trigger(props)}
+                  <button
+                    {...props}
+                    type="button"
+                    class={cn(
+                      COMPOSER_ACTION_BUTTON_CLASS,
+                      composerBusy ? "cursor-not-allowed opacity-60" : "",
+                    )}
+                    data-testid="compose-prompt-button"
+                    aria-label="Insert a prompt"
+                    disabled={composerBusy}
+                    onclick={() => {
+                      if (composerBusy) return;
+                      if (promptMenuOpen) {
+                        promptMenuOpen = false;
+                      } else {
+                        openPromptMenu();
+                      }
+                    }}
                   >
-                    <path d="M6 3h9l3 3v15H6z" />
-                    <path d="M15 3v4h4" />
-                    <path d="M9 11h6M9 15h6" />
-                  </svg>
-                </button>
-              {/snippet}
-            </Tooltip>
-            <Tooltip label="Run a workflow" disableHoverableContent>
-              {#snippet trigger(props)}
-                <button
-                  {...props}
-                  type="button"
-                  class={cn(
-                    COMPOSER_ACTION_BUTTON_CLASS,
-                    composerBusy ? "cursor-not-allowed opacity-60" : "",
-                  )}
-                  data-testid="compose-workflow-button"
-                  aria-label="Run a workflow"
-                  disabled={composerBusy}
-                  onclick={() => {
-                    if (composerBusy) return;
-                    if (workflowMenuOpen) {
-                      workflowMenuOpen = false;
-                    } else {
-                      openWorkflowMenu();
-                    }
-                  }}
-                >
-                  <svg
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    stroke-width="1.8"
-                    stroke-linecap="round"
-                    stroke-linejoin="round"
-                    class="h-4 w-4"
-                    aria-hidden="true"
+                    <svg
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="1.8"
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                      class="h-4 w-4"
+                      aria-hidden="true"
+                    >
+                      <path d="M6 3h9l3 3v15H6z" />
+                      <path d="M15 3v4h4" />
+                      <path d="M9 11h6M9 15h6" />
+                    </svg>
+                  </button>
+                {/snippet}
+              </Tooltip>
+              <Tooltip label="Run a workflow" disableHoverableContent>
+                {#snippet trigger(props)}
+                  <button
+                    {...props}
+                    type="button"
+                    class={cn(
+                      COMPOSER_ACTION_BUTTON_CLASS,
+                      composerBusy ? "cursor-not-allowed opacity-60" : "",
+                    )}
+                    data-testid="compose-workflow-button"
+                    aria-label="Run a workflow"
+                    disabled={composerBusy}
+                    onclick={() => {
+                      if (composerBusy) return;
+                      if (workflowMenuOpen) {
+                        workflowMenuOpen = false;
+                      } else {
+                        openWorkflowMenu();
+                      }
+                    }}
                   >
-                    <circle cx="6" cy="6" r="2" />
-                    <circle cx="18" cy="6" r="2" />
-                    <circle cx="18" cy="18" r="2" />
-                    <path d="M8 6h5a5 5 0 0 1 5 5v5" />
-                  </svg>
-                </button>
-              {/snippet}
-            </Tooltip>
-            <div class="mt-auto">{@render sendButton()}</div>
+                    <svg
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="1.8"
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                      class="h-4 w-4"
+                      aria-hidden="true"
+                    >
+                      <circle cx="6" cy="6" r="2" />
+                      <circle cx="18" cy="6" r="2" />
+                      <circle cx="18" cy="18" r="2" />
+                      <path d="M8 6h5a5 5 0 0 1 5 5v5" />
+                    </svg>
+                  </button>
+                {/snippet}
+              </Tooltip>
+              <div class="mt-auto">{@render sendButton()}</div>
+            </div>
           </div>
-        </div>
-      {/if}
-    </div>
-    {#if abandonableOperation !== undefined}
-      <p class="text-muted mt-2 flex items-center gap-2 text-xs" data-testid="compose-signing-in">
-        <span>Waiting for browser sign-in to {abandonableOperation.provider}…</span>
-        <!-- **"Stop waiting", not "Cancel".** The sign-in keeps running and may
+        {/if}
+      </div>
+      {#if abandonableOperation !== undefined}
+        <p class="text-muted mt-2 flex items-center gap-2 text-xs" data-testid="compose-signing-in">
+          <span>Waiting for browser sign-in to {abandonableOperation.provider}…</span>
+          <!-- **"Stop waiting", not "Cancel".** The sign-in keeps running and may
                still succeed — its final step is deliberately un-timed so it can
                never report a failure it didn't have. What this stops is the
                *composer* waiting, so one stuck sign-in can't hold the project
                until the app restarts. -->
-        <Button
-          size="sm"
-          variant="ghost"
-          data-testid="compose-abandon-wait"
-          onclick={() => {
-            const op = abandonableOperation;
-            if (op === undefined) return;
-            abandonAwaitingUserOperation(projectId, op.id, {
-              message:
-                "Stopped waiting for the sign-in. It may still finish in the background; your message is still here.",
-              tone: "notice",
-            });
-          }}
-        >
-          Stop waiting
-        </Button>
-      </p>
-    {/if}
-    {#if sendNotice}
-      <!-- Announced for the same reason as the error above: a fork refused
+          <Button
+            size="sm"
+            variant="ghost"
+            data-testid="compose-abandon-wait"
+            onclick={() => {
+              const op = abandonableOperation;
+              if (op === undefined) return;
+              abandonAwaitingUserOperation(projectId, op.id, {
+                message:
+                  "Stopped waiting for the sign-in. It may still finish in the background; your message is still here.",
+                tone: "notice",
+              });
+            }}
+          >
+            Stop waiting
+          </Button>
+        </p>
+      {/if}
+      {#if sendNotice}
+        <!-- Announced for the same reason as the error above: a fork refused
            after the composer moved on is explained here, and a keyboard user
            invoking the shortcut has no other signal. -->
-      <p
-        class="text-muted mt-2 text-xs"
-        data-testid="compose-send-notice"
-        role="status"
-        aria-live="polite"
-      >
-        {sendNotice}
-      </p>
-    {/if}
-    {#if sendError}
-      <!-- Announced, not just shown. Hiding the fork control when unavailable
+        <p
+          class="text-muted mt-2 text-xs"
+          data-testid="compose-send-notice"
+          role="status"
+          aria-live="polite"
+        >
+          {sendNotice}
+        </p>
+      {/if}
+      {#if sendError}
+        <!-- Announced, not just shown. Hiding the fork control when unavailable
            rests on the shortcut still explaining itself, and an explanation a
            screen reader never speaks is no explanation. `polite` rather than
            `alert`: this same element also carries background send failures from
            other agents, which should not interrupt mid-utterance. -->
-      <p
-        class="text-status-failed mt-2 text-xs"
-        data-testid="compose-send-error"
-        role="status"
-        aria-live="polite"
-      >
-        {sendError}
-      </p>
+        <p
+          class="text-status-failed mt-2 text-xs"
+          data-testid="compose-send-error"
+          role="status"
+          aria-live="polite"
+        >
+          {sendError}
+        </p>
+      {/if}
     {/if}
-  {/if}
-</div>
+  </div>
+{/if}
 
 <!-- Send, optionally split with Fork.
      Fork is a *variant of sending*, not a compose mode — the branch comes into

@@ -24,8 +24,11 @@ const {
   settleTurn,
   forgetProjects,
   isFlushing,
+  hasTrackedActivity,
   _testing,
 } = await import("./sendCompletion");
+
+const readingMode = await import("./readingMode.svelte");
 
 const PROJECT = "p-1" as ProjectId;
 const OTHER_PROJECT = "p-2" as ProjectId;
@@ -81,6 +84,7 @@ beforeEach(() => {
 
 afterEach(() => {
   _testing.reset();
+  readingMode._testing.reset();
 });
 
 describe("project-completion tracker", () => {
@@ -709,5 +713,90 @@ describe("project teardown", () => {
 
     release();
     await vi.waitFor(() => expect(isFlushing(PROJECT)).toBe(false));
+  });
+});
+
+describe("reading mode auto-off", () => {
+  // The flush is the sole owner of clearing reading mode. These exercise it in
+  // isolation — no activity observer, so nothing else could be doing the work.
+
+  it("clears reading mode on the silent path, where nothing is worth notifying", () => {
+    readingMode.toggleReadingMode(PROJECT);
+    register();
+    markRecipientStarted(SEND, A);
+    settleRecipient(SEND, A, "cancelled");
+    settleAgentIdle(A);
+
+    // A wholly-cancelled project stays silent, but it *did* go quiet, so the
+    // user is back in charge and the compose box has to come back.
+    expect(notifyMock).not.toHaveBeenCalled();
+    expect(readingMode.isReadingMode(PROJECT)).toBe(false);
+  });
+
+  it("holds reading mode on until the notification has been delivered", async () => {
+    let release: () => void = () => {};
+    notifyMock.mockImplementationOnce(
+      async () =>
+        await new Promise<void>((resolve) => {
+          release = resolve;
+        }),
+    );
+    readingMode.toggleReadingMode(PROJECT);
+    register();
+    markRecipientStarted(SEND, A);
+    settleRecipient(SEND, A, "completed");
+    settleAgentIdle(A);
+
+    // Clearing restores the project's visibility to the gate, which would
+    // suppress this very notification — so it must wait for delivery.
+    expect(notifyMock).toHaveBeenCalledOnce();
+    expect(readingMode.isReadingMode(PROJECT)).toBe(true);
+
+    release();
+    await vi.waitFor(() => expect(readingMode.isReadingMode(PROJECT)).toBe(false));
+  });
+
+  it("clears reading mode even when the notification fails to deliver", async () => {
+    notifyMock.mockRejectedValueOnce(new Error("no notification permission"));
+    readingMode.toggleReadingMode(PROJECT);
+    register();
+    markRecipientStarted(SEND, A);
+    settleRecipient(SEND, A, "completed");
+    settleAgentIdle(A);
+
+    // A failed notify still leaves the project quiet; stranding the user with a
+    // hidden compose box is the worse outcome.
+    await vi.waitFor(() => expect(readingMode.isReadingMode(PROJECT)).toBe(false));
+  });
+
+  it("leaves other projects' reading mode alone", async () => {
+    readingMode.toggleReadingMode(PROJECT);
+    readingMode.toggleReadingMode(OTHER_PROJECT);
+    register();
+    markRecipientStarted(SEND, A);
+    settleRecipient(SEND, A, "completed");
+    settleAgentIdle(A);
+
+    await vi.waitFor(() => expect(readingMode.isReadingMode(PROJECT)).toBe(false));
+    expect(readingMode.isReadingMode(OTHER_PROJECT)).toBe(true);
+  });
+
+  it("reports tracked activity while a flush is still pending", () => {
+    // The other half of the fallback's guard: with something tracked, the flush
+    // will run and own the clear, so the fallback has to stay out of the way.
+    expect(hasTrackedActivity(PROJECT)).toBe(false);
+    register();
+    markRecipientStarted(SEND, A);
+    expect(hasTrackedActivity(PROJECT)).toBe(true);
+
+    settleRecipient(SEND, A, "completed");
+    settleAgentIdle(A);
+    expect(hasTrackedActivity(PROJECT)).toBe(false);
+  });
+
+  it("reports tracked activity for a workflow terminal held back by a busy project", () => {
+    pushBusy(true);
+    recordWorkflowTerminal(PROJECT, "review", "complete");
+    expect(hasTrackedActivity(PROJECT)).toBe(true);
   });
 });

@@ -506,10 +506,17 @@ the Settings text should *explain* the case, not merely get shorter.
 - State tests: reading mode is per-project (enabling for A does not affect B); cleared on
   project removal; not restored after a simulated reload.
 - Ordering test — the one that matters most: with reading mode on and the app focused, a
-  project going idle **delivers** the notification and *then* clears reading mode. Assert
-  the observed **sequence** — that the `notify` IPC is issued before the
-  `set_visible_project` write restoring the real id. A test that only asserts both happened
-  passes against the broken ordering and is worthless here.
+  project going idle **delivers** the notification and *then* clears reading mode.
+
+  Amended during M3: asserting the observed **call sequence** is *also* insufficient, so
+  do not stop there. The broken clear-then-notify implementation still issues `notify`
+  first, because the visibility write reaches IPC through Svelte's asynchronous effect
+  flush while the notify call is synchronous — a sequence assertion passes against it.
+  (Verified: the sequence-only test was written, and it passed against the deliberately
+  broken version.) The property that actually separates correct from broken is that the
+  restore **waits for `notify` to resolve**. Park the notification in flight (a gated
+  `notify` in the fake backend), assert that nothing has restored the real project id
+  while it is parked, then release it and assert the restore follows.
 - Auto-off on the silent path: an all-cancelled project (no notification) still clears
   reading mode, via the flush rather than the fallback.
 - Auto-off via the fallback: a project whose only activity was never registered (simulating

@@ -43,13 +43,20 @@
 // outcome, and an IPC-rejected send never makes the project busy at all. Those
 // are hazards three and two above.
 //
-// **This module is a leaf.** It imports only `$lib/api` and types, which is what
-// lets its tests exercise it through a bare dynamic import with no workspace
-// graph behind it. It must not import workspace state — in particular not
-// `projectIsIdle`, dynamically or otherwise. Both triggers therefore arrive from
-// outside: settlement events come in from `./index.svelte` below, and the
-// idle-state trigger is *pushed in* from above by the activity observer via
-// `noteProjectStates`.
+// **This module is a leaf.** It imports `$lib/api`, types, and `./readingMode`
+// (itself a leaf), which is what lets its tests exercise it through a bare
+// dynamic import with no workspace graph behind it. It must not import workspace
+// state — in particular not `projectIsIdle`, dynamically or otherwise. Both
+// triggers therefore arrive from outside: settlement events come in from
+// `./index.svelte` below, and the idle-state trigger is *pushed in* from above by
+// the activity observer via `noteProjectStates`.
+//
+// **The flush owns turning reading mode off.** A project going quiet is exactly
+// when the user has something to act on, so it is also when reading mode has done
+// its job. Clearing lives here rather than in a watcher because the two actions
+// must be *ordered*: clearing restores the project's real visibility to the gate,
+// which would suppress the very notification that ended the mode. See
+// `flushIfReady`.
 //
 // **Workflow runs are folded in, but workflow *steps* are still excluded
 // structurally.** Only sends the frontend dispatches are ever registered, so a
@@ -73,6 +80,7 @@
 
 import * as api from "$lib/api";
 import type { AgentId, ProjectId, SendId, TurnId } from "$lib/types";
+import { clearReadingMode } from "./readingMode.svelte";
 
 /// How one recipient's turn ended. `cancelled` is the only outcome that argues
 /// *against* notifying — the user asked for it and was present to ask.
@@ -357,6 +365,16 @@ export function isFlushing(projectId: ProjectId): boolean {
   return (flushing.get(projectId) ?? 0) > 0;
 }
 
+/// Whether this module is tracking anything for `projectId` that could still
+/// produce a notification. The other half of the reading-mode fallback's guard:
+/// with something tracked, the flush will run and own the clear, so the fallback
+/// must stay out of the way.
+export function hasTrackedActivity(projectId: ProjectId): boolean {
+  const project = activity.get(projectId);
+  if (project === undefined) return false;
+  return project.sends.size > 0 || project.workflows.length > 0;
+}
+
 /// The whole flush condition, re-evaluated from scratch on every trigger. Level-
 /// checked by construction: it never asks "did something just change", only
 /// "is everything done now".
@@ -385,15 +403,37 @@ function flushIfReady(projectId: ProjectId): void {
   for (const sendId of project.sends) tracked.delete(sendId);
   activity.delete(projectId);
 
-  if (message === null) return;
+  if (message === null) {
+    // Nothing to say (a wholly-cancelled project), but the project *did* go
+    // quiet, so reading mode is still done. Safe to clear immediately here —
+    // with no notification travelling to the gate there is nothing for the
+    // restored visibility to suppress.
+    clearReadingMode(projectId);
+    return;
+  }
   flushing.set(projectId, (flushing.get(projectId) ?? 0) + 1);
   void api
     .notify(projectId, message.title, message.body)
     .catch((e: unknown) => console.error("[switchboard] notify failed", e))
     .finally(() => {
-      // Floors at zero rather than trusting the key to exist: a `finally` can
-      // land after `_testing.reset`, and a decrement must never leave a negative
-      // count that would pin `isFlushing` true forever.
+      // **Clear reading mode only after `notify` has resolved.** Clearing makes
+      // the project visible again, and `set_visible_project` and `notify` are
+      // independent IPC calls — restoring visibility first would let the gate see
+      // the project as on screen and suppress this very notification. Awaiting is
+      // a genuine happens-before: the gate decides synchronously inside the Rust
+      // command handler, before it returns. The natural implementation — an
+      // effect watching idle state — gets this wrong intermittently, and worst
+      // under real IPC latency, so a jsdom test with a mocked `invoke` can pass
+      // while production loses the notification.
+      //
+      // Runs on rejection too: a failed notify still leaves the project quiet,
+      // and stranding the user with a hidden compose box is the worse outcome.
+      clearReadingMode(projectId);
+      // Released last, so the reading-mode fallback (which reads `isFlushing`)
+      // can never observe "nothing in flight" while this delivery is still
+      // deciding. Floors at zero rather than trusting the key to exist: a
+      // `finally` can land after `_testing.reset`, and a decrement must never
+      // leave a negative count that would pin `isFlushing` true forever.
       const remaining = (flushing.get(projectId) ?? 1) - 1;
       if (remaining > 0) flushing.set(projectId, remaining);
       else flushing.delete(projectId);

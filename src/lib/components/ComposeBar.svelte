@@ -2405,7 +2405,11 @@
     registerSend(
       sendId,
       dispatchProjectId,
-      projects.list.find((p) => p.id === dispatchProjectId)?.name ?? "Switchboard",
+      // Empty, not a placeholder: an unknown name is the tracker's to interpret,
+      // and it drops the body's project prefix rather than inventing one. A
+      // literal app name here would read "Switchboard: alice" — the app name is
+      // already on the notification.
+      projects.list.find((p) => p.id === dispatchProjectId)?.name ?? "",
       targets.map((a) => ({ id: a.id, name: a.name })),
     );
     for (const agent of targets) {

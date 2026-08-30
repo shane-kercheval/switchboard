@@ -716,6 +716,32 @@ describe("project teardown", () => {
   });
 });
 
+describe("project name in the notification body", () => {
+  it("keeps a name already learned when a send registers without one", () => {
+    // Both writers record only names they actually have, so neither can clobber
+    // the other. Without the guard, whether the body named its project would
+    // depend on which writer arrived last.
+    pushBusy(false);
+    registerSend(SEND, PROJECT, "", [{ id: A, name: "claude" }]);
+    markRecipientStarted(SEND, A);
+    settleRecipient(SEND, A, "completed");
+    settleAgentIdle(A);
+
+    const [, , body] = lastCall();
+    expect(body).toBe("switchboard: claude");
+  });
+
+  it("drops the prefix when no writer ever supplied a name", () => {
+    registerSend(SEND, PROJECT, "", [{ id: A, name: "claude" }]);
+    markRecipientStarted(SEND, A);
+    settleRecipient(SEND, A, "completed");
+    settleAgentIdle(A);
+
+    const [, , body] = lastCall();
+    expect(body).toBe("claude");
+  });
+});
+
 describe("reading mode auto-off", () => {
   // The flush is the sole owner of clearing reading mode. These exercise it in
   // isolation — no activity observer, so nothing else could be doing the work.

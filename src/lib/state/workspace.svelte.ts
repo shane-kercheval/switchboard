@@ -336,6 +336,12 @@ let previousLiveProjectSendPairs: LiveProjectSendPair[] = [];
 let previousNonIdleProjectIds: ProjectId[] = [];
 let activationSeq = 0;
 
+/// The projects the observer evaluates: the union of loaded rosters and projects
+/// with workflow runs, matching the two maps [`projectIsIdle`] itself reads.
+function allCandidateProjectIds(): ProjectId[] {
+  return [...new Set([...Object.keys(agentsByProject), ...Object.keys(workflowRuns)])];
+}
+
 /// One pass producing both of the observer's inputs, because both derive from
 /// the same per-project live-send map and `buildLiveSendsMap` walks the full
 /// transcript of every streaming agent — computing it twice doubles the cost of
@@ -344,15 +350,6 @@ let activationSeq = 0;
 /// The idle judgment is **delegated to [`projectIsIdle`]**, never re-expressed
 /// here. Inlining the workflow clause to save the call would put a second copy
 /// of the rule inside the very function that exists to unify it.
-///
-/// Candidates are the union of loaded rosters and projects with workflow runs,
-/// matching the two maps the predicate itself reads.
-/// The projects the observer evaluates: the union of loaded rosters and projects
-/// with workflow runs, matching the two maps [`projectIsIdle`] itself reads.
-function allCandidateProjectIds(): ProjectId[] {
-  return [...new Set([...Object.keys(agentsByProject), ...Object.keys(workflowRuns)])];
-}
-
 function projectActivitySnapshot(): { pairs: LiveProjectSendPair[]; nonIdle: ProjectId[] } {
   const pairs: LiveProjectSendPair[] = [];
   const nonIdle: ProjectId[] = [];

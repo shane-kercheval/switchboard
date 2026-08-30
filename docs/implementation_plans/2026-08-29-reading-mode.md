@@ -557,7 +557,12 @@ Named so they are not quietly absorbed:
   painful — deliberately not pre-built).
 - Closing the visibility-sync entry race generally (see M3's known limitations). It is a
   property of `visible_project`'s fire-and-forget push, not of reading mode.
-- Persisting reading mode, and any keyboard shortcut beyond the command-palette entry.
+- Persisting reading mode.
+- ~~Any keyboard shortcut beyond the command-palette entry.~~ **Amended during M3** at the
+  engineer's request: ⌘⇧R toggles reading mode, wired through the same availability
+  predicate as the header toggle and the palette entry. Shifted deliberately — bare ⌘R is
+  the Git view's refresh and the universal reload chord — and it stays live *while reading
+  mode is on*, because with the compose box hidden it is the fastest way back out.
 - Anything touching macOS delivery, signing, or the authorization gate.
 
 ## Verification

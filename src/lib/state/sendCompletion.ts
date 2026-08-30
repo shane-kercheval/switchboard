@@ -163,6 +163,13 @@ function ensureActivity(projectId: ProjectId): ProjectActivity {
 
 /// Register a send the frontend is dispatching. `recipients` must be the full
 /// target set, captured before the per-recipient IPC calls begin.
+///
+/// An empty `projectName` is "I don't know it", not a name — so it never
+/// overwrites one already learned, matching `noteProjectStates`. Both writers
+/// record only names they actually have; `describe` is the single place that
+/// decides what an absent one means (it drops the body's prefix). Without this
+/// guard the two writers would race, and whether the notification named its
+/// project would depend on which arrived last.
 export function registerSend(
   sendId: SendId,
   projectId: ProjectId,
@@ -170,7 +177,7 @@ export function registerSend(
   recipients: { id: AgentId; name: string }[],
 ): void {
   if (recipients.length === 0) return;
-  projectNames.set(projectId, projectName);
+  if (projectName !== "") projectNames.set(projectId, projectName);
   const project = ensureActivity(projectId);
   tracked.set(sendId, {
     projectId,

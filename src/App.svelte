@@ -1330,7 +1330,9 @@
                  not an error, so the red failure vocabulary would be wrong.
                  Sized below `ICON_SIZE`: the book is a closed shape spanning
                  its full viewBox, so at 18 it reads visibly heavier than the
-                 thin-stroke glyphs beside it. -->
+                 thin-stroke glyphs beside it. **Even**, because the 26px button
+                 centres by flex — an odd size leaves a half pixel on each side,
+                 which is a whole device pixel at 2x and reads as off-centre. -->
             <Tooltip
               label={readingModeLabel}
               shortcut={shortcut("mod", "shift", "R")}
@@ -1352,7 +1354,7 @@
                     readingModeActive && "text-warning bg-warning-soft",
                   )}
                 >
-                  <BookOpen size={15} aria-hidden="true" />
+                  <BookOpen size={14} aria-hidden="true" />
                 </button>
               {/snippet}
             </Tooltip>

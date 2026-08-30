@@ -10,20 +10,26 @@ vi.mock("$lib/api", () => ({
   notify: (projectId: ProjectId, title: string, body: string) => notifyMock(projectId, title, body),
 }));
 
+// A bare dynamic import with no workspace graph behind it — the leaf property
+// this module is required to keep. If this ever needs more mocks to load, the
+// module has grown a dependency it shouldn't have.
 const {
   registerSend,
   markRecipientStarted: recordStartedRecipient,
+  noteProjectStates,
+  recordWorkflowTerminal,
   settleRecipient,
   settleAgentIdle,
   settleAgentsRemoved,
   settleTurn,
+  isFlushing,
   _testing,
 } = await import("./sendCompletion");
 
 const PROJECT = "p-1" as ProjectId;
+const OTHER_PROJECT = "p-2" as ProjectId;
 const SEND = "s-1" as SendId;
 const SECOND_SEND = "s-2" as SendId;
-const THIRD_SEND = "s-3" as SendId;
 const A = "ag-a" as AgentId;
 const B = "ag-b" as AgentId;
 const TURN = "turn-1" as TurnId;
@@ -44,6 +50,14 @@ const both = [
   { id: B, name: "codex" },
 ];
 
+/// The observer's push. Absence of a project from `busyProjects` means idle, so
+/// tests that never call this run against an idle project — which is what makes
+/// the `waitingForIdle` guard, not the pushed flag, the thing holding back a
+/// flush while sends are in flight.
+function pushBusy(busy: boolean, projectId: ProjectId = PROJECT): void {
+  noteProjectStates([{ projectId, projectName: "switchboard", busy }]);
+}
+
 /// The single notification the test expects, with presence asserted once rather
 /// than at every index.
 function lastCall(): [ProjectId, string, string] {
@@ -54,8 +68,7 @@ function lastCall(): [ProjectId, string, string] {
 
 function expectTrackerEmpty(): void {
   expect(_testing.size()).toBe(0);
-  expect(_testing.batchCount()).toBe(0);
-  expect(_testing.activeAgentCount()).toBe(0);
+  expect(_testing.projectCount()).toBe(0);
   expect(_testing.startedTurnCount()).toBe(0);
 }
 
@@ -69,7 +82,7 @@ afterEach(() => {
   _testing.reset();
 });
 
-describe("send-completion tracker", () => {
+describe("project-completion tracker", () => {
   it("notifies once when a single-agent send completes", async () => {
     register();
     recordStartedRecipient(SEND, A, TURN);
@@ -104,6 +117,8 @@ describe("send-completion tracker", () => {
   });
 
   it("notifies only after the final turn in one agent's queued activity", async () => {
+    // The regression `7fe9b23` fixed: a second send queued onto a busy agent must
+    // not produce a notification between the two turns.
     register();
     markRecipientStarted(SEND, A);
     register([{ id: A, name: "claude" }], SECOND_SEND);
@@ -117,43 +132,60 @@ describe("send-completion tracker", () => {
 
     settleAgentIdle(A);
     expect(notifyMock).toHaveBeenCalledOnce();
-    expect(lastCall()[1]).toBe("Agent finished");
-    expect(lastCall()[2]).toBe("switchboard: claude");
+    expectTrackerEmpty();
   });
 
-  it("retains an intermediate failure in the queue-drained notification", async () => {
-    register();
-    markRecipientStarted(SEND, A);
-    register([{ id: A, name: "claude" }], SECOND_SEND);
-
-    settleRecipient(SEND, A, "failed");
-    markRecipientStarted(SECOND_SEND, A);
-    settleRecipient(SECOND_SEND, A, "completed");
-    settleAgentIdle(A);
-
-    expect(notifyMock).toHaveBeenCalledOnce();
-    expect(lastCall()[1]).toBe("Agent finished, some work failed");
-  });
-
-  it("merges independently busy agents when a later fan-out connects their queues", async () => {
+  it("notifies once for two sends to disjoint agents in one project", async () => {
+    // The behaviour change this milestone exists for. These sends share no
+    // recipient, so the previous connected-batch model treated them as unrelated
+    // and notified for the first while the second agent was still working.
     register([{ id: A, name: "claude" }], SEND);
     markRecipientStarted(SEND, A);
     register([{ id: B, name: "codex" }], SECOND_SEND);
     markRecipientStarted(SECOND_SEND, B);
-    register(both, THIRD_SEND);
 
     settleRecipient(SEND, A, "completed");
-    settleRecipient(SECOND_SEND, B, "completed");
-    markRecipientStarted(THIRD_SEND, A);
-    markRecipientStarted(THIRD_SEND, B);
-    settleRecipient(THIRD_SEND, A, "completed");
-    settleRecipient(THIRD_SEND, B, "completed");
     settleAgentIdle(A);
     expect(notifyMock).not.toHaveBeenCalled();
-    settleAgentIdle(B);
 
+    settleRecipient(SECOND_SEND, B, "completed");
+    settleAgentIdle(B);
     expect(notifyMock).toHaveBeenCalledOnce();
-    expect(lastCall()[1]).toBe("Agents finished");
+    expect(lastCall()[2]).toBe("switchboard: claude, codex");
+    expectTrackerEmpty();
+  });
+
+  it("keeps projects independent of each other", async () => {
+    register([{ id: A, name: "claude" }], SEND);
+    markRecipientStarted(SEND, A);
+    registerSend(SECOND_SEND, OTHER_PROJECT, "other", [{ id: B, name: "codex" }]);
+    markRecipientStarted(SECOND_SEND, B);
+
+    settleRecipient(SECOND_SEND, B, "completed");
+    settleAgentIdle(B);
+    expect(notifyMock).toHaveBeenCalledOnce();
+    expect(lastCall()[0]).toBe(OTHER_PROJECT);
+
+    settleRecipient(SEND, A, "completed");
+    settleAgentIdle(A);
+    expect(notifyMock).toHaveBeenCalledTimes(2);
+    expect(lastCall()[0]).toBe(PROJECT);
+    expectTrackerEmpty();
+  });
+
+  it("waits for a still-working agent before reporting another send's failure", async () => {
+    register(both);
+    markRecipientStarted(SEND, B);
+    settleRecipient(SEND, A, "failed");
+
+    register([{ id: A, name: "claude" }], SECOND_SEND);
+    settleRecipient(SECOND_SEND, A, "failed");
+    expect(notifyMock).not.toHaveBeenCalled();
+
+    settleRecipient(SEND, B, "completed");
+    settleAgentIdle(B);
+    expect(notifyMock).toHaveBeenCalledOnce();
+    expect(lastCall()[1]).toBe("Agents finished, some failed");
     expect(lastCall()[2]).toBe("switchboard: claude, codex");
     expectTrackerEmpty();
   });
@@ -183,64 +215,6 @@ describe("send-completion tracker", () => {
     warn.mockRestore();
   });
 
-  it("abandons every tracker reference when a turn starts against a missing batch", () => {
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    register();
-    _testing.dropBatchForSend(SEND);
-
-    recordStartedRecipient(SEND, A, TURN);
-
-    expect(notifyMock).not.toHaveBeenCalled();
-    expectTrackerEmpty();
-    expect(warn).toHaveBeenCalledWith(
-      expect.stringContaining("abandoning damaged activity batch"),
-      expect.objectContaining({ reason: expect.stringContaining("started turn") }),
-    );
-    warn.mockRestore();
-  });
-
-  it("abandons every tracker reference when a terminal settles against a missing batch", () => {
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    register();
-    recordStartedRecipient(SEND, A, TURN);
-    _testing.dropBatchForSend(SEND);
-
-    settleTurn(TURN, A, "completed");
-
-    expect(notifyMock).not.toHaveBeenCalled();
-    expectTrackerEmpty();
-
-    register([{ id: A, name: "claude" }], SECOND_SEND);
-    recordStartedRecipient(SECOND_SEND, A, SECOND_TURN);
-    settleTurn(SECOND_TURN, A, "completed");
-    settleAgentIdle(A);
-    expect(notifyMock).toHaveBeenCalledOnce();
-    expectTrackerEmpty();
-    warn.mockRestore();
-  });
-
-  it("abandons every connected batch when a merge encounters damaged state", () => {
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    register([{ id: A, name: "claude" }], SEND);
-    markRecipientStarted(SEND, A);
-    register([{ id: B, name: "codex" }], SECOND_SEND);
-    markRecipientStarted(SECOND_SEND, B);
-    _testing.dropBatchForSend(SECOND_SEND);
-
-    register(both, THIRD_SEND);
-
-    expect(_testing.size()).toBe(1);
-    expect(_testing.batchCount()).toBe(1);
-    expect(_testing.activeAgentCount()).toBe(2);
-    expect(_testing.startedTurnCount()).toBe(0);
-    settleRecipient(THIRD_SEND, A, "failed");
-    settleRecipient(THIRD_SEND, B, "failed");
-    expect(notifyMock).toHaveBeenCalledOnce();
-    expect(lastCall()[1]).toBe("Agents failed");
-    expectTrackerEmpty();
-    warn.mockRestore();
-  });
-
   it("keeps registered but unstarted work pending through an idle event", async () => {
     register();
 
@@ -248,8 +222,7 @@ describe("send-completion tracker", () => {
 
     expect(notifyMock).not.toHaveBeenCalled();
     expect(_testing.size()).toBe(1);
-    expect(_testing.batchCount()).toBe(1);
-    expect(_testing.activeAgentCount()).toBe(1);
+    expect(_testing.projectCount()).toBe(1);
     expect(_testing.startedTurnCount()).toBe(0);
 
     recordStartedRecipient(SEND, A, TURN);
@@ -259,7 +232,7 @@ describe("send-completion tracker", () => {
     expectTrackerEmpty();
   });
 
-  it("uses the latest project name when later work joins an activity batch", async () => {
+  it("uses the latest project name when later work joins the project", async () => {
     register();
     markRecipientStarted(SEND, A);
     registerSend(SECOND_SEND, PROJECT, "renamed switchboard", [{ id: A, name: "claude" }]);
@@ -291,7 +264,7 @@ describe("send-completion tracker", () => {
     expect(lastCall()[1]).toBe("Agents finished, some failed");
   });
 
-  it("stays silent when the user cancelled the whole send", async () => {
+  it("stays silent when the user cancelled everything", async () => {
     // The user did this deliberately and was present to do it.
     register(both);
     markRecipientStarted(SEND, A);
@@ -301,9 +274,10 @@ describe("send-completion tracker", () => {
     settleAgentIdle(A);
     settleAgentIdle(B);
     expect(notifyMock).not.toHaveBeenCalled();
+    expectTrackerEmpty();
   });
 
-  it("still notifies about the survivors of a partially cancelled send", async () => {
+  it("still notifies about the survivors of a partial cancel", async () => {
     // Cancelling one of two agents doesn't make the other's result uninteresting,
     // and the cancelled one is left out of the text rather than reported as done.
     register(both);
@@ -317,31 +291,55 @@ describe("send-completion tracker", () => {
   });
 
   it("notifies a send whose IPC was rejected for every recipient", async () => {
-    // The regression test for this whole design. A pre-dispatch rejection emits
-    // no agent event at all, so a liveness-derived implementation would watch the
-    // send disappear and never notify — silently losing the failure the user most
-    // wants to hear about.
+    // The regression test for this whole design, and the "no edge" case for the
+    // level-checked flush: a pre-dispatch rejection emits no agent event at all
+    // and never makes the project busy, so neither a liveness-derived
+    // implementation nor an edge-triggered flush would ever fire.
     register(both);
     settleRecipient(SEND, A, "failed");
     settleRecipient(SEND, B, "failed");
     expect(notifyMock).toHaveBeenCalledOnce();
     expect(lastCall()[1]).toBe("Agents failed");
+    expectTrackerEmpty();
   });
 
-  it("does not chain later work onto a recipient that failed before starting", async () => {
+  it("notifies survivors when the last outcomes settle after the project looks idle", async () => {
+    // The level-check regression guard. Cancelling a queued send removes it from
+    // send liveness *before* `message_cancelled` carries the outcome, so the
+    // project reads idle while outcomes are still missing. An edge-triggered
+    // flush fires there, correctly declines, and then never gets another edge —
+    // swallowing the survivor's notification for good.
     register(both);
-    markRecipientStarted(SEND, B);
-    settleRecipient(SEND, A, "failed");
+    markRecipientStarted(SEND, A);
+    settleRecipient(SEND, A, "completed");
+    settleAgentIdle(A);
+    expect(notifyMock).not.toHaveBeenCalled();
 
-    register([{ id: A, name: "claude" }], SECOND_SEND);
-    settleRecipient(SECOND_SEND, A, "failed");
+    // The project goes idle (B's queued send was cancelled and has dropped out of
+    // liveness) while B's outcome is still unknown.
+    pushBusy(false);
+    expect(notifyMock).not.toHaveBeenCalled();
+
+    // The backend's cancellation finally lands, with no further idle transition.
+    settleRecipient(SEND, B, "cancelled");
     expect(notifyMock).toHaveBeenCalledOnce();
     expect(lastCall()[2]).toBe("switchboard: claude");
+    expectTrackerEmpty();
+  });
 
-    settleRecipient(SEND, B, "completed");
-    settleAgentIdle(B);
-    expect(notifyMock).toHaveBeenCalledTimes(2);
-    expect(lastCall()[2]).toBe("switchboard: claude, codex");
+  it("holds the notification while the pushed state says the project is busy", async () => {
+    // What a workflow between steps looks like to this module: no live send, no
+    // pending outcome, but the project is not finished.
+    register();
+    markRecipientStarted(SEND, A);
+    pushBusy(true);
+    settleRecipient(SEND, A, "completed");
+    settleAgentIdle(A);
+    expect(notifyMock).not.toHaveBeenCalled();
+
+    pushBusy(false);
+    expect(notifyMock).toHaveBeenCalledOnce();
+    expectTrackerEmpty();
   });
 
   it("ignores a repeat signal for a recipient that already settled", async () => {
@@ -362,19 +360,20 @@ describe("send-completion tracker", () => {
     expect(lastCall()[1]).toBe("Agents finished, some failed");
   });
 
-  it("never notifies again after a send has completed", async () => {
+  it("never notifies again after a project has settled", async () => {
     register();
     markRecipientStarted(SEND, A);
     settleRecipient(SEND, A, "completed");
     settleAgentIdle(A);
     settleRecipient(SEND, A, "completed");
     settleAgentIdle(A);
+    pushBusy(false);
     expect(notifyMock).toHaveBeenCalledOnce();
     expectTrackerEmpty();
   });
 
   it("ignores sends it never registered", async () => {
-    // How workflow steps are excluded: the backend dispatches them, so they are
+    // How workflow *steps* are excluded: the backend dispatches them, so they are
     // never registered here and cannot notify individually. No detection needed.
     settleRecipient("s-workflow" as SendId, A, "completed");
     settleRecipient(undefined, A, "completed");
@@ -404,7 +403,7 @@ describe("send-completion tracker", () => {
     expectTrackerEmpty();
   });
 
-  it("stays silent and drops the send when every recipient is removed", async () => {
+  it("stays silent and drops the work when every recipient is removed", async () => {
     register(both);
     markRecipientStarted(SEND, A);
     markRecipientStarted(SEND, B);
@@ -432,13 +431,162 @@ describe("send-completion tracker", () => {
     settleAgentsRemoved([B]);
     expect(notifyMock).not.toHaveBeenCalled();
     expect(_testing.size()).toBe(1);
-    expect(_testing.batchCount()).toBe(1);
-    expect(_testing.activeAgentCount()).toBe(1);
+    expect(_testing.projectCount()).toBe(1);
     expect(_testing.startedTurnCount()).toBe(0);
   });
 
   it("registers nothing for an empty recipient set", async () => {
     registerSend(SEND, PROJECT, "switchboard", []);
+    expectTrackerEmpty();
+  });
+
+  it("never flushes an empty accumulator", async () => {
+    // Load-bearing for reading mode: an idle project with nothing tracked must
+    // produce no flush at all, or enabling the mode on a quiet project would
+    // immediately switch itself back off.
+    pushBusy(false);
+    expect(notifyMock).not.toHaveBeenCalled();
+    expect(_testing.projectCount()).toBe(0);
+  });
+});
+
+describe("workflow run terminals", () => {
+  it("reports a workflow that finishes into a quiet project", async () => {
+    // The "workflow-only edge": the condition becomes true with no send event to
+    // re-evaluate it, so a settlement-only trigger would never fire.
+    recordWorkflowTerminal(PROJECT, "review-and-recommend", "complete");
+    expect(notifyMock).toHaveBeenCalledOnce();
+    expect(lastCall()[1]).toBe("Workflow finished");
+    expect(lastCall()[2]).toBe("review-and-recommend");
+    expectTrackerEmpty();
+  });
+
+  it("uses the project name once the observer has pushed it", async () => {
+    pushBusy(true);
+    recordWorkflowTerminal(PROJECT, "review-and-recommend", "complete");
+    expect(notifyMock).not.toHaveBeenCalled();
+    pushBusy(false);
+    expect(lastCall()[2]).toBe("switchboard: review-and-recommend");
+  });
+
+  it("says so when the workflow failed", async () => {
+    recordWorkflowTerminal(PROJECT, "review-and-recommend", "failed");
+    expect(lastCall()[1]).toBe("Workflow failed");
+  });
+
+  it("stays silent for a cancelled run", async () => {
+    // The user asked for it and was present to ask — the same rule the deleted
+    // backend notification applied, and the same rule sends already follow.
+    recordWorkflowTerminal(PROJECT, "review-and-recommend", "cancelled");
+    expect(notifyMock).not.toHaveBeenCalled();
+    expectTrackerEmpty();
+  });
+
+  it("waits for live sends before reporting a workflow terminal", async () => {
+    // One notification for the whole project, not one for the run and another for
+    // the sends — the two-notification case that motivated deleting the backend's
+    // run-terminal notification.
+    register();
+    markRecipientStarted(SEND, A);
+    recordWorkflowTerminal(PROJECT, "review-and-recommend", "complete");
+    expect(notifyMock).not.toHaveBeenCalled();
+
+    settleRecipient(SEND, A, "completed");
+    settleAgentIdle(A);
+    expect(notifyMock).toHaveBeenCalledOnce();
+    expect(lastCall()[1]).toBe("Work finished");
+    expect(lastCall()[2]).toBe("switchboard: claude, review-and-recommend");
+    expectTrackerEmpty();
+  });
+
+  it("reports a mixed quiet-down with one failure among several subjects", async () => {
+    register(both);
+    markRecipientStarted(SEND, A);
+    markRecipientStarted(SEND, B);
+    recordWorkflowTerminal(PROJECT, "review-and-recommend", "failed");
+    settleRecipient(SEND, A, "completed");
+    settleRecipient(SEND, B, "completed");
+    settleAgentIdle(A);
+    settleAgentIdle(B);
+
+    expect(notifyMock).toHaveBeenCalledOnce();
+    expect(lastCall()[1]).toBe("Work finished, some failed");
+    expect(lastCall()[2]).toBe("switchboard: claude, codex, review-and-recommend");
+  });
+
+  it("records a terminal for a run this session never held", async () => {
+    // A background-started run terminalizes without ever appearing in
+    // `workflowRuns`, so the payload is treated as self-contained.
+    pushBusy(true);
+    register();
+    markRecipientStarted(SEND, A);
+    recordWorkflowTerminal(PROJECT, "never-seen", "complete");
+    settleRecipient(SEND, A, "completed");
+    settleAgentIdle(A);
+    pushBusy(false);
+
+    expect(notifyMock).toHaveBeenCalledOnce();
+    expect(lastCall()[2]).toBe("switchboard: claude, never-seen");
+  });
+});
+
+describe("flush re-entrancy marker", () => {
+  it("marks a project while its notification is in flight and clears after", async () => {
+    // Reading mode's fallback reads this: clearing the mode restores the
+    // project's visibility, which would suppress a notification still on its way
+    // to the gate.
+    let release: () => void = () => {};
+    notifyMock.mockImplementationOnce(
+      async () =>
+        await new Promise<void>((resolve) => {
+          release = resolve;
+        }),
+    );
+    register();
+    markRecipientStarted(SEND, A);
+    settleRecipient(SEND, A, "completed");
+    settleAgentIdle(A);
+
+    expect(isFlushing(PROJECT)).toBe(true);
+    release();
+    await vi.waitFor(() => expect(isFlushing(PROJECT)).toBe(false));
+  });
+
+  it("does not mark a project whose flush was silent", async () => {
+    register();
+    markRecipientStarted(SEND, A);
+    settleRecipient(SEND, A, "cancelled");
+    settleAgentIdle(A);
+
+    expect(notifyMock).not.toHaveBeenCalled();
+    expect(isFlushing(PROJECT)).toBe(false);
+  });
+});
+
+describe("consecutive quiet-downs", () => {
+  it("notifies a second quiet-down while the first notification is still in flight", async () => {
+    // The in-flight marker must not double as a flush guard: nothing retries once
+    // the promise settles, so suppressing here would drop the notification.
+    let release: () => void = () => {};
+    notifyMock.mockImplementationOnce(
+      async () =>
+        await new Promise<void>((resolve) => {
+          release = resolve;
+        }),
+    );
+    register();
+    markRecipientStarted(SEND, A);
+    settleRecipient(SEND, A, "completed");
+    settleAgentIdle(A);
+    expect(isFlushing(PROJECT)).toBe(true);
+
+    register([{ id: A, name: "claude" }], SECOND_SEND);
+    markRecipientStarted(SECOND_SEND, A);
+    settleRecipient(SECOND_SEND, A, "completed");
+    settleAgentIdle(A);
+
+    expect(notifyMock).toHaveBeenCalledTimes(2);
+    release();
     expectTrackerEmpty();
   });
 });

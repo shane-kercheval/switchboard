@@ -915,8 +915,7 @@ describe("stopAgent", () => {
     expect(state.runtimes[AGENT_A]?.pending_sends).toBeUndefined();
     expect(cancelledSendIds(state, AGENT_A)).toEqual(["send-2", "send-1"]);
     expect(tracker._testing.size()).toBe(0);
-    expect(tracker._testing.batchCount()).toBe(0);
-    expect(tracker._testing.activeAgentCount()).toBe(0);
+    expect(tracker._testing.projectCount()).toBe(0);
     expect(tracker._testing.startedTurnCount()).toBe(0);
 
     invokeMock.mockClear();

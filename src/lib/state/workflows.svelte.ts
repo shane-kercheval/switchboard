@@ -7,6 +7,7 @@
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import * as api from "$lib/api";
 import type { ProjectId, WorkflowProgressPayload, WorkflowRunInfo } from "$lib/types";
+import { recordWorkflowTerminal } from "./sendCompletion";
 
 /// Runs per project, keyed by project id — the source for the run indicator.
 export const workflowRuns = $state<Record<ProjectId, WorkflowRunInfo[]>>({});
@@ -105,6 +106,14 @@ export async function refreshRuns(projectId: ProjectId): Promise<void> {
 /// seed-on-subscribe query.
 function handleProgress(projectId: ProjectId, payload: WorkflowProgressPayload): void {
   const current = workflowRuns[projectId] ?? [];
+  if (payload.status !== "running") {
+    // Record the run's outcome for the project's completion notification. Order
+    // matters: dropping the run below is the mutation that flips the project idle,
+    // so recording after it leaves a window in which the flush can run without
+    // this outcome and silently omit it. A `failed` run is *retained* rather than
+    // dropped, but it has still terminalized, so it is recorded here either way.
+    recordWorkflowTerminal(projectId, payload.workflow, payload.status);
+  }
   if (payload.status === "complete" || payload.status === "cancelled") {
     workflowRuns[projectId] = current.filter((r) => r.run_id !== payload.run_id);
     return;

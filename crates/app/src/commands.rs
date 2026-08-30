@@ -22436,61 +22436,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn notification_fires_on_completion() {
-        let (tmp, state) = state_with_prompts();
-        let rec = Arc::new(RecordingNotifier::default());
-        let state = state.with_notifier(Arc::clone(&rec) as Arc<dyn crate::notification::Notifier>);
-        init_directory_impl(&state, tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
-        let project = create_project_in_only_dir(&state, "proj");
-        set_active_project_impl(&state, project.id).unwrap();
-        for name in ["primary", "reviewer-1"] {
-            create_agent_impl(&state, name, HarnessKind::ClaudeCode, None, None).unwrap();
-        }
-        state.prompts.sync().await;
-
-        let run_id = invoke_workflow_impl(
-            &state,
-            project.id,
-            "review-and-recommend",
-            true,
-            &inputs(vec![
-                ("worker", text("primary")),
-                ("reviewers", list(&["reviewer-1"])),
-            ]),
-            Path::new("/nonexistent-home"),
-        )
-        .unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            loop {
-                if !lock(&state.workflow_runs).contains_key(&run_id) {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("run did not terminalize");
-        // Give the spawned task a beat to fire the notification after terminal.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        let calls = rec.calls.lock().unwrap();
-        assert_eq!(calls.len(), 1, "exactly one completion notification");
-        assert_eq!(calls[0].0, "Workflow complete");
-        // Every notification names its project: one can arrive while the user is
-        // working in a different project, so "which one?" must not require
-        // guessing.
-        assert_eq!(calls[0].1, "proj: review-and-recommend");
-    }
-
-    #[tokio::test]
-    async fn workflow_terminal_is_silent_when_the_preference_is_off() {
-        // The behavior change this preference introduces: the workflow notification
-        // used to be unconditional. Exercised end-to-end through a real run rather
-        // than against the gate in isolation, because the regression that matters
-        // is a notify path that bypasses the notifier — which a unit test of the
-        // gate could not see.
+    async fn a_workflow_terminal_does_not_notify_from_the_backend() {
+        // The run-terminal notification used to fire here, unconditionally and
+        // immediately on terminal — which meant a run finishing while the user's
+        // own sends were still in flight produced two notifications for one
+        // quiet-down. Reporting the run's outcome is now the frontend completion
+        // tracker's job, at the project-idle boundary, and it learns the outcome
+        // from the progress event this run already emits.
+        //
+        // Asserted with the preference *on* and the window unfocused — the
+        // configuration under which the old path was loudest — so this fails if a
+        // backend notify is ever reintroduced here.
         let (tmp, state) = state_with_prompts();
         let rec = Arc::new(RecordingNotifier::default());
         let gated = Arc::new(crate::notification::GatedNotifier::new(
@@ -22498,7 +22454,7 @@ mod tests {
             Arc::new(|| Some(false)),
             Arc::new(|| None),
             Arc::new(|| crate::notification::NotifyPrefs {
-                enabled: false,
+                enabled: true,
                 while_focused: true,
             }),
         ));
@@ -22535,11 +22491,12 @@ mod tests {
         })
         .await
         .expect("run did not terminalize");
+        // Give a would-be notification the same beat the old test gave it.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         assert!(
             rec.calls.lock().unwrap().is_empty(),
-            "the preference governs workflow terminals, not just send completions"
+            "a workflow terminal must not notify from the backend"
         );
     }
 

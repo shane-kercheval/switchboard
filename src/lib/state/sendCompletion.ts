@@ -1,8 +1,15 @@
-// Notify the user when manually-dispatched activity finishes. A compose submit
-// still groups all of its recipients, but additional sends queued onto the same
-// busy agent join the same activity batch. The batch finishes only after every
-// outcome is known and the dispatcher confirms each started agent's backlog is
-// drained with `agent_idle`.
+// Notify the user when a **project** goes quiet — one notification per project,
+// describing everything that happened, delivered when nothing is left running in
+// it. Not per send, and not per workflow run.
+//
+// **Why project scope.** This started per-send, then widened to "connected"
+// sends (those sharing a recipient) to stop a notification firing between two
+// queued turns on one agent. Both were narrower than the question the user is
+// actually asking, which is "can I proceed?" — answerable only when the whole
+// project is idle. Two sends to *disjoint* agents used to produce two
+// notifications, one of them while the other agent was still working. Project
+// scope also makes connectivity trivial, which is why the transitive
+// batch-merging machinery this module used to carry is gone rather than adapted.
 //
 // **Why an explicit lifecycle rather than watching liveness.** The obvious
 // approach is to diff `buildLiveSendsMap` and notify when a send drops out of it.
@@ -20,18 +27,49 @@
 //     the cancellation, so liveness disappears ahead of the information needed to
 //     classify it.
 //
-// So a send is registered with its full recipient set at dispatch, overlapping
-// sends are merged through their busy recipients, each outcome is retained, and
-// delivery waits for the authoritative queue-drained boundary. This merge is
-// intentionally transitive: overlapping recipient sets form one connected
-// activity batch, because notifying for one part while a connected queued turn
-// remains live would recreate the intermediate notification this module avoids.
+// So settlement stays **event-driven**: a send is registered with its full
+// recipient set before any IPC call, each outcome is retained, and delivery waits
+// for the dispatcher's authoritative queue-drained `agent_idle`. Project scope
+// changed *what* accumulates and *when the accumulation is complete* — it did not
+// change what triggers settlement. Do not reintroduce a liveness diff.
 //
-// **Workflow steps are excluded structurally.** Only sends the frontend
-// dispatches are ever registered; a workflow's sends originate in the backend and
-// are merely observed here, so they cannot notify per step. The whole-run
-// notification is the backend's (`workflow_commands.rs`). Nothing needs to detect
-// or filter them.
+// **The flush is level-checked, not edge-triggered.** `flushIfReady` re-evaluates
+// the whole condition on *both* every settlement event and every pushed
+// idle-state change, because neither trigger alone is sufficient: settlement-only
+// misses a workflow terminalizing as the last activity (the condition becomes
+// true with no send event to re-check it), and transition-only misses every
+// outcome that settles *after* the project already looks idle — cancelling a
+// queued send clears it from liveness before `message_cancelled` carries the
+// outcome, and an IPC-rejected send never makes the project busy at all. Those
+// are hazards three and two above.
+//
+// **This module is a leaf.** It imports only `$lib/api` and types, which is what
+// lets its tests exercise it through a bare dynamic import with no workspace
+// graph behind it. It must not import workspace state — in particular not
+// `projectIsIdle`, dynamically or otherwise. Both triggers therefore arrive from
+// outside: settlement events come in from `./index.svelte` below, and the
+// idle-state trigger is *pushed in* from above by the activity observer via
+// `noteProjectStates`.
+//
+// **Workflow runs are folded in, but workflow *steps* are still excluded
+// structurally.** Only sends the frontend dispatches are ever registered, so a
+// workflow's per-step sends (which the backend originates) cannot notify. What
+// this module does own is the run's *terminal*, reported through
+// `recordWorkflowTerminal` — previously a separate backend notification that
+// fired at run-end regardless of whether the project was still busy, producing
+// two notifications where the user wanted one.
+//
+// **Known limitation — the starvation tradeoff.** A long-running agent now delays
+// notification of a quick answer from an unrelated agent in the same project.
+// Accepted deliberately: the contract is "the project is quiet, come back," which
+// is the question being answered. If it proves painful the fix is a separate
+// per-agent notification option, **not** a revert to batch scope.
+//
+// **Known limitation — webview lifetime.** With the backend's run-terminal
+// notification deleted, a webview crash during a long unattended run loses that
+// run's notification. Accepted because manual-send notifications already have
+// exactly this exposure; this removed an accidental asymmetry rather than
+// introducing a new failure class.
 
 import * as api from "$lib/api";
 import type { AgentId, ProjectId, SendId, TurnId } from "$lib/types";
@@ -40,130 +78,65 @@ import type { AgentId, ProjectId, SendId, TurnId } from "$lib/types";
 /// *against* notifying — the user asked for it and was present to ask.
 export type RecipientOutcome = "completed" | "failed" | "cancelled";
 
+/// How a workflow run ended, as the progress channel reports it. `interrupted`
+/// is absent by construction: a crashed run has no live process to emit a
+/// terminal event, so it surfaces only through the seed-on-subscribe query and
+/// never reaches this module. Don't add an event path for it.
+export type WorkflowTerminalStatus = "complete" | "failed" | "cancelled";
+
 type TrackedSend = {
-  batchId: number;
+  projectId: ProjectId;
   /// Every recipient the send was dispatched to, captured before any IPC call so
   /// a rejection cannot erase one that was supposed to be there.
   recipients: Map<AgentId, string>;
   outcomes: Map<AgentId, RecipientOutcome>;
 };
 
-type ActivityBatch = {
-  id: number;
-  projectId: ProjectId;
-  projectName: string;
+type ProjectActivity = {
   sends: Set<SendId>;
   recipients: Map<AgentId, string>;
   /// Agents with a turn that started and have not yet emitted the dispatcher's
   /// authoritative queue-drained `agent_idle` event.
   waitingForIdle: Set<AgentId>;
+  workflows: { workflow: string; status: WorkflowTerminalStatus }[];
 };
 
 const tracked = new Map<SendId, TrackedSend>();
-const batches = new Map<number, ActivityBatch>();
-const activeBatchByAgent = new Map<AgentId, number>();
+const activity = new Map<ProjectId, ProjectActivity>();
 const startedByTurn = new Map<TurnId, { sendId: SendId; agentId: AgentId }>();
-let nextBatchId = 1;
+/// Display names, learned from either `registerSend` or the observer's push, and
+/// read when composing the notification body. Kept separately from
+/// `ProjectActivity` so a name known before any activity exists still applies.
+const projectNames = new Map<ProjectId, string>();
+/// Projects the observer currently reports as *not* idle. Absence means idle:
+/// a project the observer has never evaluated has nothing running that it knows
+/// about, and the in-flight case is covered independently by `waitingForIdle`.
+const busyProjects = new Set<ProjectId>();
+/// Projects whose flush has delivered a notification that is still in flight —
+/// the marker M3's reading-mode fallback reads, so it cannot clear the mode (and
+/// with it restore the project's visibility) while the notification that clearing
+/// would suppress is still travelling to the gate.
+///
+/// Deliberately **not** a re-entrancy guard on `flushIfReady`. Re-entrancy is
+/// already impossible structurally: the flush deletes the project's accumulator
+/// synchronously *before* the delivery promise, so a second call finds nothing to
+/// flush. Using this as a guard as well would be actively wrong — activity
+/// registered and completed while a previous notification is still in flight is a
+/// genuinely new quiet-down, and suppressing it would drop that notification
+/// entirely, since nothing would retry once the promise settled.
+const flushing = new Set<ProjectId>();
 
-function createBatch(projectId: ProjectId, projectName: string): ActivityBatch {
-  const batch: ActivityBatch = {
-    id: nextBatchId,
-    projectId,
-    projectName,
+function ensureActivity(projectId: ProjectId): ProjectActivity {
+  const existing = activity.get(projectId);
+  if (existing !== undefined) return existing;
+  const created: ProjectActivity = {
     sends: new Set(),
     recipients: new Map(),
     waitingForIdle: new Set(),
+    workflows: [],
   };
-  nextBatchId += 1;
-  batches.set(batch.id, batch);
-  return batch;
-}
-
-function abandonBatch(batchId: number, reason: string): void {
-  console.warn("[switchboard] abandoning damaged activity batch", { batchId, reason });
-  const abandonedSendIds = new Set<SendId>();
-  for (const [sendId, send] of tracked) {
-    if (send.batchId !== batchId) continue;
-    abandonedSendIds.add(sendId);
-    tracked.delete(sendId);
-  }
-  for (const [turnId, started] of startedByTurn) {
-    if (abandonedSendIds.has(started.sendId) || !tracked.has(started.sendId)) {
-      startedByTurn.delete(turnId);
-    }
-  }
-  for (const [agentId, activeBatchId] of activeBatchByAgent) {
-    if (activeBatchId === batchId) activeBatchByAgent.delete(agentId);
-  }
-  batches.delete(batchId);
-}
-
-function mergeBatches(batchIds: number[]): ActivityBatch | undefined {
-  const uniqueBatchIds = [...new Set(batchIds)];
-  const existing: ActivityBatch[] = [];
-  let damaged = false;
-  for (const batchId of uniqueBatchIds) {
-    const batch = batches.get(batchId);
-    if (batch === undefined) {
-      abandonBatch(batchId, "active reference pointed to a missing batch during merge");
-      damaged = true;
-      continue;
-    }
-    if ([...batch.sends].some((sendId) => !tracked.has(sendId))) {
-      abandonBatch(batchId, "batch referenced an unknown send during merge");
-      damaged = true;
-      continue;
-    }
-    existing.push(batch);
-  }
-  if (damaged) {
-    for (const batch of existing) {
-      abandonBatch(batch.id, "connected merge included a damaged batch");
-    }
-    return undefined;
-  }
-  const primary = existing[0];
-  if (primary === undefined) return undefined;
-
-  for (const batch of existing.slice(1)) {
-    for (const sendId of batch.sends) {
-      const send = tracked.get(sendId)!;
-      primary.sends.add(sendId);
-      send.batchId = primary.id;
-    }
-    for (const [agentId, name] of batch.recipients) primary.recipients.set(agentId, name);
-    for (const agentId of batch.waitingForIdle) primary.waitingForIdle.add(agentId);
-    for (const [agentId, batchId] of activeBatchByAgent) {
-      if (batchId === batch.id) activeBatchByAgent.set(agentId, primary.id);
-    }
-    batches.delete(batch.id);
-  }
-  return primary;
-}
-
-function batchForRecipients(
-  recipients: { id: AgentId; name: string }[],
-  projectId: ProjectId,
-  projectName: string,
-): ActivityBatch {
-  const activeBatchIds = [
-    ...new Set(
-      recipients
-        .map((recipient) => activeBatchByAgent.get(recipient.id))
-        .filter((batchId): batchId is number => batchId !== undefined),
-    ),
-  ];
-  if (activeBatchIds.length === 0) return createBatch(projectId, projectName);
-  const merged = mergeBatches(activeBatchIds);
-  if (merged !== undefined) return merged;
-  console.warn(
-    "[switchboard] active agents referenced no live activity batch; starting a new one",
-    {
-      projectId,
-      activeBatchIds,
-    },
-  );
-  return createBatch(projectId, projectName);
+  activity.set(projectId, created);
+  return created;
 }
 
 /// Register a send the frontend is dispatching. `recipients` must be the full
@@ -175,23 +148,21 @@ export function registerSend(
   recipients: { id: AgentId; name: string }[],
 ): void {
   if (recipients.length === 0) return;
-  const batch = batchForRecipients(recipients, projectId, projectName);
-  batch.projectName = projectName;
+  projectNames.set(projectId, projectName);
+  const project = ensureActivity(projectId);
   tracked.set(sendId, {
-    batchId: batch.id,
+    projectId,
     recipients: new Map(recipients.map((r) => [r.id, r.name])),
     outcomes: new Map(),
   });
-  batch.sends.add(sendId);
-  for (const recipient of recipients) {
-    batch.recipients.set(recipient.id, recipient.name);
-    activeBatchByAgent.set(recipient.id, batch.id);
-  }
+  project.sends.add(sendId);
+  for (const recipient of recipients) project.recipients.set(recipient.id, recipient.name);
 }
 
-/// Record that a recipient's turn actually started. Completion notifications
-/// for its whole overlapping activity batch now wait for `agent_idle`, which the
-/// dispatcher emits only after that agent's queued backlog drains.
+/// Record that a recipient's turn actually started. The project's notification
+/// now waits for `agent_idle`, which the dispatcher emits only after that agent's
+/// queued backlog drains — a terminal turn alone is insufficient, since another
+/// queued turn can start immediately after it with no idle event in between.
 export function markRecipientStarted(
   sendId: SendId | undefined,
   agentId: AgentId,
@@ -200,21 +171,10 @@ export function markRecipientStarted(
   if (sendId === undefined) return;
   const send = tracked.get(sendId);
   if (send === undefined || !send.recipients.has(agentId)) return;
-
-  const activeBatchId = activeBatchByAgent.get(agentId);
-  const batch =
-    activeBatchId !== undefined && activeBatchId !== send.batchId
-      ? mergeBatches([send.batchId, activeBatchId])
-      : batches.get(send.batchId);
-  if (batch === undefined) {
-    if (tracked.has(sendId)) {
-      abandonBatch(send.batchId, "started turn referenced no live activity batch");
-    }
-    return;
-  }
+  const project = activity.get(send.projectId);
+  if (project === undefined) return;
   startedByTurn.set(turnId, { sendId, agentId });
-  batch.waitingForIdle.add(agentId);
-  activeBatchByAgent.set(agentId, batch.id);
+  project.waitingForIdle.add(agentId);
 }
 
 /// Settle a started recipient through the turn id supplied by the dispatcher.
@@ -235,9 +195,8 @@ export function settleTurn(turnId: TurnId, agentId: AgentId, outcome: RecipientO
   settleRecipient(started.sendId, agentId, outcome);
 }
 
-/// Record one recipient's terminal outcome. The containing activity batch can
-/// notify only after all of its recipients settle and every started agent's
-/// queue drains.
+/// Record one recipient's terminal outcome, then re-check the project's flush
+/// condition.
 ///
 /// Ignores unknown sends (a workflow's, or one already notified) and repeat
 /// signals for a recipient that already settled — both are normal: an agent can
@@ -251,99 +210,31 @@ export function settleRecipient(
   const send = tracked.get(sendId);
   if (send === undefined) return;
   if (!send.recipients.has(agentId) || send.outcomes.has(agentId)) return;
-
-  const batch = batches.get(send.batchId);
-  if (batch === undefined) {
-    abandonBatch(send.batchId, "recipient outcome referenced no live activity batch");
-    return;
-  }
   send.outcomes.set(agentId, outcome);
-  if (
-    !batch.waitingForIdle.has(agentId) &&
-    !hasUnsettledRecipient(batch, agentId) &&
-    activeBatchByAgent.get(agentId) === batch.id
-  ) {
-    activeBatchByAgent.delete(agentId);
-  }
-  finishBatchIfReady(send.batchId);
+  flushIfReady(send.projectId);
 }
 
-/// Record the authoritative queue-drained boundary for one agent. A terminal
-/// turn alone is insufficient: another queued turn can start immediately after
-/// it with no idle event in between.
+/// Record the authoritative queue-drained boundary for one agent.
 export function settleAgentIdle(agentId: AgentId): void {
-  const affectedBatchIds = new Set<number>();
-  const activeBatchId = activeBatchByAgent.get(agentId);
-  if (activeBatchId !== undefined) affectedBatchIds.add(activeBatchId);
+  const affected = new Set<ProjectId>();
 
   for (const [turnId, started] of [...startedByTurn.entries()]) {
     if (started.agentId !== agentId) continue;
     startedByTurn.delete(turnId);
     const send = tracked.get(started.sendId);
     if (send === undefined || send.outcomes.has(agentId)) continue;
-    affectedBatchIds.add(send.batchId);
     console.warn(
       "[switchboard] agent became idle without a terminal outcome; treating the turn as failed",
-      {
-        turnId,
-        sendId: started.sendId,
-        agentId,
-      },
+      { turnId, sendId: started.sendId, agentId },
     );
     settleRecipient(started.sendId, agentId, "failed");
   }
 
-  for (const batchId of affectedBatchIds) {
-    const batch = batches.get(batchId);
-    if (batch === undefined) continue;
-    batch.waitingForIdle.delete(agentId);
-    if (!hasUnsettledRecipient(batch, agentId) && activeBatchByAgent.get(agentId) === batch.id) {
-      activeBatchByAgent.delete(agentId);
-    }
-    finishBatchIfReady(batch.id);
+  for (const [projectId, project] of activity) {
+    if (!project.waitingForIdle.delete(agentId)) continue;
+    affected.add(projectId);
   }
-
-  if (activeBatchId !== undefined && !batches.has(activeBatchId)) {
-    activeBatchByAgent.delete(agentId);
-  }
-}
-
-function hasUnsettledRecipient(batch: ActivityBatch, agentId: AgentId): boolean {
-  for (const sendId of batch.sends) {
-    const send = tracked.get(sendId);
-    if (send?.recipients.has(agentId) && !send.outcomes.has(agentId)) return true;
-  }
-  return false;
-}
-
-function finishBatchIfReady(batchId: number): void {
-  const batch = batches.get(batchId);
-  if (batch === undefined || batch.waitingForIdle.size > 0) return;
-  const sends: TrackedSend[] = [];
-  for (const sendId of batch.sends) {
-    const send = tracked.get(sendId);
-    if (send === undefined) {
-      abandonBatch(batchId, "batch referenced an unknown send during completion");
-      return;
-    }
-    if (send.outcomes.size < send.recipients.size) return;
-    sends.push(send);
-  }
-
-  const message = describe(batch, sends);
-  for (const [turnId, started] of startedByTurn) {
-    if (batch.sends.has(started.sendId)) startedByTurn.delete(turnId);
-  }
-  for (const sendId of batch.sends) tracked.delete(sendId);
-  batches.delete(batch.id);
-  for (const [agentId, activeBatchId] of activeBatchByAgent) {
-    if (activeBatchId === batch.id) activeBatchByAgent.delete(agentId);
-  }
-
-  if (message === null) return;
-  void api
-    .notify(batch.projectId, message.title, message.body)
-    .catch((e: unknown) => console.error("[switchboard] notify failed", e));
+  for (const projectId of affected) flushIfReady(projectId);
 }
 
 /// Settle every tracked recipient in `agentIds` as cancelled, because those
@@ -366,45 +257,146 @@ export function settleAgentsRemoved(agentIds: AgentId[]): void {
       if (send.recipients.has(agentId)) settleRecipient(sendId, agentId, "cancelled");
     }
   }
-  for (const agentId of agentIds) {
-    const batchId = activeBatchByAgent.get(agentId);
-    const batch = batchId === undefined ? undefined : batches.get(batchId);
-    batch?.waitingForIdle.delete(agentId);
-    activeBatchByAgent.delete(agentId);
-    if (batch !== undefined) finishBatchIfReady(batch.id);
+  const affected = new Set<ProjectId>();
+  for (const [projectId, project] of activity) {
+    for (const agentId of agentIds) {
+      if (project.waitingForIdle.delete(agentId)) affected.add(projectId);
+    }
   }
+  for (const projectId of affected) flushIfReady(projectId);
 }
 
-/// What to say, or `null` for a send that shouldn't notify.
+/// Record a workflow run reaching its terminal. Called from the progress-channel
+/// handler **before** it drops the run from `workflowRuns` — that drop is the
+/// mutation that flips the project idle, so recording after it leaves a window
+/// where the flush can run without this outcome and silently omit it.
 ///
-/// A send whose recipients were *all* cancelled is silent: the user did that
-/// deliberately and was present to do it. One survivor is enough to notify —
-/// cancelling three of four agents still leaves a result worth hearing about.
+/// The run need not have been previously known: a terminal can arrive for a run
+/// this session never held (a background start), so the payload is treated as
+/// self-contained.
+export function recordWorkflowTerminal(
+  projectId: ProjectId,
+  workflow: string,
+  status: WorkflowTerminalStatus,
+): void {
+  ensureActivity(projectId).workflows.push({ workflow, status });
+  flushIfReady(projectId);
+}
+
+/// Push the projects the activity observer currently sees as busy, with their
+/// display names. This is the **idle-state trigger** — the second of the flush's
+/// two inputs, and the reason this module never has to read workspace state.
+/// Called on every observer evaluation, not only on transitions, so the flush
+/// stays level-checked.
+export function noteProjectStates(
+  states: { projectId: ProjectId; projectName: string; busy: boolean }[],
+): void {
+  for (const { projectId, projectName, busy } of states) {
+    if (projectName !== "") projectNames.set(projectId, projectName);
+    if (busy) busyProjects.add(projectId);
+    else busyProjects.delete(projectId);
+  }
+  for (const projectId of [...activity.keys()]) flushIfReady(projectId);
+}
+
+/// Whether a notification for `projectId` is currently in flight. Read by M3's
+/// reading-mode fallback so it cannot clear the mode — and with it restore the
+/// project's visibility — while the notification that clearing would suppress is
+/// still travelling to the gate.
+export function isFlushing(projectId: ProjectId): boolean {
+  return flushing.has(projectId);
+}
+
+/// The whole flush condition, re-evaluated from scratch on every trigger. Level-
+/// checked by construction: it never asks "did something just change", only
+/// "is everything done now".
+function flushIfReady(projectId: ProjectId): void {
+  const project = activity.get(projectId);
+  if (project === undefined) return;
+  // Never flush an empty accumulator: it has nothing to report, and M3 depends on
+  // this — without it, enabling reading mode on a quiet project would trigger a
+  // silent flush that immediately switched the mode back off.
+  if (project.sends.size === 0 && project.workflows.length === 0) return;
+  if (busyProjects.has(projectId)) return;
+  if (project.waitingForIdle.size > 0) return;
+
+  const sends: TrackedSend[] = [];
+  for (const sendId of project.sends) {
+    const send = tracked.get(sendId);
+    if (send === undefined) continue;
+    if (send.outcomes.size < send.recipients.size) return;
+    sends.push(send);
+  }
+
+  const message = describe(projectId, project, sends);
+  for (const [turnId, started] of startedByTurn) {
+    if (project.sends.has(started.sendId)) startedByTurn.delete(turnId);
+  }
+  for (const sendId of project.sends) tracked.delete(sendId);
+  activity.delete(projectId);
+
+  if (message === null) return;
+  flushing.add(projectId);
+  void api
+    .notify(projectId, message.title, message.body)
+    .catch((e: unknown) => console.error("[switchboard] notify failed", e))
+    .finally(() => flushing.delete(projectId));
+}
+
+/// What to say, or `null` when nothing is worth reporting.
+///
+/// Cancelled outcomes are dropped on both sides: a wholly-cancelled project is
+/// silent because the user did that deliberately and was present to do it, and a
+/// cancelled workflow run is silent for the same reason (the rule the deleted
+/// backend notification applied). One survivor is enough to notify — cancelling
+/// three of four agents still leaves a result worth hearing about.
 function describe(
-  batch: ActivityBatch,
+  projectId: ProjectId,
+  project: ProjectActivity,
   sends: TrackedSend[],
 ): { title: string; body: string } | null {
   const settled = sends
     .flatMap((send) => [...send.outcomes.entries()])
     .filter(([, outcome]) => outcome !== "cancelled");
-  if (settled.length === 0) return null;
+  const runs = project.workflows.filter((run) => run.status !== "cancelled");
+  if (settled.length === 0 && runs.length === 0) return null;
 
   const agentIds = [...new Set(settled.map(([id]) => id))];
-  const names = agentIds.map((id) => batch.recipients.get(id) ?? "agent");
-  const failed = settled.filter(([, o]) => o === "failed").length;
-  const title =
-    failed === settled.length
-      ? agentIds.length === 1
-        ? "Agent failed"
-        : "Agents failed"
-      : failed > 0
-        ? agentIds.length === 1
-          ? "Agent finished, some work failed"
-          : "Agents finished, some failed"
+  const agentFailed = agentIds.filter((id) =>
+    settled.some(([settledId, outcome]) => settledId === id && outcome === "failed"),
+  ).length;
+  const runsFailed = runs.filter((run) => run.status === "failed").length;
+  const subjects = agentIds.length + runs.length;
+  const failed = agentFailed + runsFailed;
+
+  // The noun follows what actually finished, so the title stays specific in the
+  // common single-kind cases and degrades to "Work" only when both mix.
+  const noun =
+    agentIds.length > 0 && runs.length > 0
+      ? "Work"
+      : runs.length > 0
+        ? runs.length === 1
+          ? "Workflow"
+          : "Workflows"
         : agentIds.length === 1
-          ? "Agent finished"
-          : "Agents finished";
-  return { title, body: `${batch.projectName}: ${names.join(", ")}` };
+          ? "Agent"
+          : "Agents";
+  const title =
+    failed === subjects
+      ? `${noun} failed`
+      : failed > 0
+        ? `${noun} finished, some failed`
+        : `${noun} finished`;
+
+  const names = [
+    ...agentIds.map((id) => project.recipients.get(id) ?? "agent"),
+    ...runs.map((run) => run.workflow),
+  ];
+  const projectName = projectNames.get(projectId) ?? "";
+  return {
+    title,
+    body: projectName === "" ? names.join(", ") : `${projectName}: ${names.join(", ")}`,
+  };
 }
 
 /// Test-only reset — the tracker is module state that would otherwise leak
@@ -412,25 +404,19 @@ function describe(
 export const _testing = {
   reset(): void {
     tracked.clear();
-    batches.clear();
-    activeBatchByAgent.clear();
+    activity.clear();
     startedByTurn.clear();
-    nextBatchId = 1;
+    projectNames.clear();
+    busyProjects.clear();
+    flushing.clear();
   },
   size(): number {
     return tracked.size;
   },
-  batchCount(): number {
-    return batches.size;
-  },
-  activeAgentCount(): number {
-    return activeBatchByAgent.size;
+  projectCount(): number {
+    return activity.size;
   },
   startedTurnCount(): number {
     return startedByTurn.size;
-  },
-  dropBatchForSend(sendId: SendId): void {
-    const batchId = tracked.get(sendId)?.batchId;
-    if (batchId !== undefined) batches.delete(batchId);
   },
 };

@@ -67,6 +67,7 @@ import {
   transcripts,
   unregisterAgents,
 } from "./index.svelte";
+import { noteProjectStates } from "./sendCompletion";
 import {
   subscribeProjectWorkflows,
   unsubscribeProjectWorkflows,
@@ -340,10 +341,16 @@ let activationSeq = 0;
 ///
 /// Candidates are the union of loaded rosters and projects with workflow runs,
 /// matching the two maps the predicate itself reads.
+/// The projects the observer evaluates: the union of loaded rosters and projects
+/// with workflow runs, matching the two maps [`projectIsIdle`] itself reads.
+function allCandidateProjectIds(): ProjectId[] {
+  return [...new Set([...Object.keys(agentsByProject), ...Object.keys(workflowRuns)])];
+}
+
 function projectActivitySnapshot(): { pairs: LiveProjectSendPair[]; nonIdle: ProjectId[] } {
   const pairs: LiveProjectSendPair[] = [];
   const nonIdle: ProjectId[] = [];
-  const candidates = new Set([...Object.keys(agentsByProject), ...Object.keys(workflowRuns)]);
+  const candidates = allCandidateProjectIds();
   for (const projectId of candidates) {
     const sends = liveProjectSends(projectId);
     for (const [sendId, agentIds] of sends) {
@@ -400,11 +407,23 @@ export function startProjectActivityObserver(
         if (nowNonIdle.includes(id)) continue;
         if (id !== selection.activeProjectId) backgroundCompleted.push(id);
       }
+      const candidates = allCandidateProjectIds();
       previousLiveProjectSendPairs = nowLivePairs;
       previousNonIdleProjectIds = nowNonIdle;
       untrack(() => {
         if (completed.length > 0) recordProjectsActivityLocally(completed, getNow());
         for (const id of backgroundCompleted) backgroundCompletedProjectIds[id] = true;
+        // The completion tracker's second trigger. Pushed rather than pulled: that
+        // module is a leaf and must not read workspace state (see its module doc),
+        // so the idle judgment it needs is delivered here. Sent on every
+        // evaluation, not only on transitions, because its flush is level-checked.
+        noteProjectStates(
+          candidates.map((projectId) => ({
+            projectId,
+            projectName: projects.list.find((p) => p.id === projectId)?.name ?? "",
+            busy: nowNonIdle.includes(projectId),
+          })),
+        );
       });
     });
   });

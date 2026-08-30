@@ -281,10 +281,17 @@ Two rules that fall out and must be stated in the code:
 - **Never flush an empty accumulator.** A flush with nothing tracked has nothing to report,
   and this property is load-bearing for M3 (decision 7) — without it, enabling reading mode
   on a quiet project would immediately silent-flush and clear itself.
-- **Guard re-entrancy with a per-project in-flight marker.** The flush now awaits `notify`
-  (a deliberate change from today's fire-and-forget), so it must not be re-entered for the
-  same project while pending. M3's fallback watcher reads this same marker — one flag, two
-  consumers; do not introduce a second piece of bookkeeping for it.
+- **Keep a per-project in-flight marker — as a signal, never as a guard.** *(Corrected
+  during M2 implementation; the original text here required guarding flush re-entrancy with
+  it, and that was wrong.)* Re-entrancy needs no guard: the flush deletes the project's
+  accumulator synchronously *before* the delivery promise, so a second evaluation finds
+  nothing to flush — the guarantee is structural. Using the marker as a guard is actively
+  harmful: activity registered and completed while a previous notification is still in
+  flight is a genuinely new quiet-down, and suppressing it drops that notification
+  permanently, since nothing retries once the promise settles (a test pins this case).
+  The marker survives for exactly one consumer: M3's fallback watcher reads it so it
+  cannot clear reading mode — and with it restore the project's visibility — while the
+  notification that clearing would suppress is still travelling to the gate.
 
 **Fold the workflow run terminal into the accumulator.** Delete `notify_run_terminal` and
 its call site in `crates/app/src/workflow_commands.rs`. The frontend already receives the

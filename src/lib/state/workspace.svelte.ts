@@ -68,8 +68,16 @@ import {
   unregisterAgents,
 } from "./index.svelte";
 import {
+  forgetProjects,
+  hasTrackedActivity,
+  isFlushing,
+  noteProjectStates,
+} from "./sendCompletion";
+import { clearReadingMode, forgetReadingMode, isReadingMode } from "./readingMode.svelte";
+import {
   subscribeProjectWorkflows,
   unsubscribeProjectWorkflows,
+  workflowRuns,
 } from "$lib/state/workflows.svelte";
 import {
   assignAgentToFirstVisibleEmptyPane,
@@ -288,6 +296,35 @@ export function liveProjectSends(projectId: ProjectId): Map<SendId, AgentId[]> {
   return buildLiveSendsMap(agentsByProject[projectId] ?? [], runtimes, transcripts);
 }
 
+/// Whether a project has nothing left running — the single definition of "this
+/// project finished", shared by the projects-sidebar row, the
+/// background-completed observer, and the completion-notification boundary.
+/// One predicate so those consumers cannot drift apart, which they had.
+///
+/// **Both clauses are required.** `liveProjectSends` alone is not enough: a
+/// workflow between steps, before its first dispatch, or held in the
+/// failed/interrupted state has no live send and would read as idle. A
+/// *held* failed run is genuinely idle (nothing is executing; it waits on the
+/// user to dismiss it), which is why only `running` counts.
+///
+/// **This is a frontend-session observation, not backend-authoritative state.**
+/// It answers "nothing running that this session knows about" — a project whose
+/// roster this session never loaded reports idle regardless of what the backend
+/// is doing. Fine for the loaded-project UI that consumes it; do not treat it as
+/// a truth claim about an arbitrary project id.
+///
+/// `liveSends` lets a caller that already computed the map for this project pass
+/// it in rather than paying a second scan — it must be *that caller's current
+/// reactive snapshot*, not a cached one, since `buildLiveSendsMap` walks the
+/// transcript of every streaming agent and is re-derived on every chunk.
+export function projectIsIdle(
+  projectId: ProjectId,
+  liveSends: Map<SendId, AgentId[]> = liveProjectSends(projectId),
+): boolean {
+  if (liveSends.size > 0) return false;
+  return !(workflowRuns[projectId] ?? []).some((run) => run.status === "running");
+}
+
 type LiveProjectSendPair = {
   key: string;
   projectId: ProjectId;
@@ -296,26 +333,37 @@ type LiveProjectSendPair = {
 };
 
 let previousLiveProjectSendPairs: LiveProjectSendPair[] = [];
+let previousNonIdleProjectIds: ProjectId[] = [];
 let activationSeq = 0;
 
-function liveProjectSendPairs(): LiveProjectSendPair[] {
+/// The projects the observer evaluates: the union of loaded rosters and projects
+/// with workflow runs, matching the two maps [`projectIsIdle`] itself reads.
+function allCandidateProjectIds(): ProjectId[] {
+  return [...new Set([...Object.keys(agentsByProject), ...Object.keys(workflowRuns)])];
+}
+
+/// One pass producing both of the observer's inputs, because both derive from
+/// the same per-project live-send map and `buildLiveSendsMap` walks the full
+/// transcript of every streaming agent — computing it twice doubles the cost of
+/// the app's hottest reactive path (the effect re-runs on every streamed chunk).
+///
+/// The idle judgment is **delegated to [`projectIsIdle`]**, never re-expressed
+/// here. Inlining the workflow clause to save the call would put a second copy
+/// of the rule inside the very function that exists to unify it.
+function projectActivitySnapshot(): { pairs: LiveProjectSendPair[]; nonIdle: ProjectId[] } {
   const pairs: LiveProjectSendPair[] = [];
-  for (const projectId of Object.keys(agentsByProject)) {
-    for (const [sendId, agentIds] of liveProjectSends(projectId)) {
+  const nonIdle: ProjectId[] = [];
+  const candidates = allCandidateProjectIds();
+  for (const projectId of candidates) {
+    const sends = liveProjectSends(projectId);
+    for (const [sendId, agentIds] of sends) {
       for (const agentId of agentIds) {
         pairs.push({ key: `${projectId}:${sendId}:${agentId}`, projectId, sendId, agentId });
       }
     }
+    if (!projectIsIdle(projectId, sends)) nonIdle.push(projectId);
   }
-  return pairs;
-}
-
-function projectIdsInPairs(pairs: LiveProjectSendPair[]): ProjectId[] {
-  const projectIds: ProjectId[] = [];
-  for (const pair of pairs) {
-    if (!projectIds.includes(pair.projectId)) projectIds.push(pair.projectId);
-  }
-  return projectIds;
+  return { pairs, nonIdle };
 }
 
 async function afterNextPaint(): Promise<void> {
@@ -331,28 +379,86 @@ async function afterNextPaint(): Promise<void> {
   });
 }
 
+/// The reading-mode **fallback**, for a project that goes idle with nothing the
+/// completion tracker knows about — e.g. turns observed after a webview reload,
+/// which were never registered. Without it, reading mode on such a project would
+/// never turn itself off, because the flush that owns clearing never runs.
+///
+/// **Deliberately edge-triggered, unlike the level-checked flush**, and the
+/// difference is not an inconsistency to be tidied away. The flush asks "is
+/// everything settled yet?", which becomes true when the last piece of
+/// information arrives. This asks "did something I wasn't tracking just finish?",
+/// which is an event. A level-checked version would see "idle and nothing
+/// tracked" the instant reading mode is enabled on a quiet project and clear it
+/// immediately — a click that visibly does nothing.
+///
+/// **Both guards are required.** `isFlushing` is what stops this branch
+/// recreating the suppression race the flush's ordering exists to prevent: when
+/// the last outcome settles, the flush starts and awaits `notify`, and this edge
+/// then fires on the next effect run with the accumulator already drained.
+/// Gating on emptiness alone would make correctness depend on whether the flush
+/// clears its state before or after that await; the marker makes it
+/// order-independent. Neither guard is redundant.
+function clearReadingModeForUntrackedWork(wentIdle: ProjectId[]): void {
+  for (const projectId of wentIdle) {
+    if (!isReadingMode(projectId)) continue;
+    if (hasTrackedActivity(projectId) || isFlushing(projectId)) continue;
+    clearReadingMode(projectId);
+  }
+}
+
+/// Watches two *different* transitions, deliberately kept apart:
+///
+///  - **Per-send-pair disappearance** → stamps `last_activity` locally, so a
+///    project that is still busy elsewhere still sorts as recently active.
+///  - **Whole-project not-idle → idle** ([`projectIsIdle`]) → marks the project
+///    background-completed for the sidebar checkmark, and — unfiltered by which
+///    project is active — drives the reading-mode fallback above.
+///
+/// Collapsing them would be wrong in both directions: the first must fire while
+/// the project is still busy, the second only when everything has stopped.
+///
+/// **Edge-triggered, and deliberately so** — do not harmonize this with the
+/// level-checked completion-notification flush. This answers "did this project
+/// just finish while you weren't looking", which is inherently an event, and it
+/// never inspects per-turn outcomes, so the late-settlement hazard that forces
+/// the notification flush to be level-checked does not apply here.
 export function startProjectActivityObserver(
   getNow: () => string = currentIsoTimestamp,
 ): () => void {
   return $effect.root(() => {
     $effect(() => {
-      const nowLivePairs = liveProjectSendPairs();
-      const previousBusy = projectIdsInPairs(previousLiveProjectSendPairs);
-      const nowBusy = projectIdsInPairs(nowLivePairs);
+      const { pairs: nowLivePairs, nonIdle: nowNonIdle } = projectActivitySnapshot();
       const completed: ProjectId[] = [];
       const backgroundCompleted: ProjectId[] = [];
       for (const pair of previousLiveProjectSendPairs) {
         if (nowLivePairs.some((nowPair) => nowPair.key === pair.key)) continue;
         if (!completed.includes(pair.projectId)) completed.push(pair.projectId);
       }
-      for (const id of previousBusy) {
-        if (nowBusy.includes(id)) continue;
+      const wentIdle: ProjectId[] = [];
+      for (const id of previousNonIdleProjectIds) {
+        if (nowNonIdle.includes(id)) continue;
+        wentIdle.push(id);
         if (id !== selection.activeProjectId) backgroundCompleted.push(id);
       }
+      const candidates = allCandidateProjectIds();
       previousLiveProjectSendPairs = nowLivePairs;
+      previousNonIdleProjectIds = nowNonIdle;
       untrack(() => {
         if (completed.length > 0) recordProjectsActivityLocally(completed, getNow());
         for (const id of backgroundCompleted) backgroundCompletedProjectIds[id] = true;
+        // The completion tracker's second trigger. Pushed rather than pulled: that
+        // module is a leaf and must not read workspace state (see its module doc),
+        // so the idle judgment it needs is delivered here. Sent on every
+        // evaluation, not only on transitions, because its flush is level-checked.
+        noteProjectStates(
+          candidates.map((projectId) => ({
+            projectId,
+            projectName: projects.list.find((p) => p.id === projectId)?.name ?? "",
+            busy: nowNonIdle.includes(projectId),
+          })),
+        );
+        clearReadingModeForUntrackedWork(wentIdle);
       });
     });
   });
@@ -396,7 +502,12 @@ export async function removeDirectory(path: string): Promise<void> {
 
   await api.removeDirectory(path);
 
-  // Backend drop succeeded — tear down the matching frontend state.
+  // Backend drop succeeded — tear down the matching frontend state. The
+  // completion tracker goes *first*: run after `unregisterAgents`, its
+  // teardown-settled outcomes could classify and flush a notification for a
+  // project that is being removed.
+  forgetProjects(removedProjectIds);
+  forgetReadingMode(removedProjectIds);
   unregisterAgents(removedAgentIds);
   unsubscribeProjectWorkflows(removedProjectIds);
   for (const id of removedProjectIds) {
@@ -411,6 +522,9 @@ export async function removeDirectory(path: string): Promise<void> {
   }
   previousLiveProjectSendPairs = previousLiveProjectSendPairs.filter(
     (pair) => !removedProjectIds.includes(pair.projectId),
+  );
+  previousNonIdleProjectIds = previousNonIdleProjectIds.filter(
+    (id) => !removedProjectIds.includes(id),
   );
   if (activeRemoved) {
     selection.activeProjectId = null;
@@ -661,6 +775,9 @@ async function deleteProjectOnce(projectId: ProjectId): Promise<void> {
   await api.deleteProject(projectId);
 
   layout.removeProjectPreferences(projectId);
+  // Before `unregisterAgents`, for the reason given in `removeDirectory`.
+  forgetProjects([projectId]);
+  forgetReadingMode([projectId]);
   unregisterAgents(removedAgentIds);
   unsubscribeProjectWorkflows([projectId]);
   projects.list = projects.list.filter((p) => p.id !== projectId);
@@ -675,6 +792,7 @@ async function deleteProjectOnce(projectId: ProjectId): Promise<void> {
   previousLiveProjectSendPairs = previousLiveProjectSendPairs.filter(
     (pair) => pair.projectId !== projectId,
   );
+  previousNonIdleProjectIds = previousNonIdleProjectIds.filter((id) => id !== projectId);
   if (selection.activeProjectId === projectId) {
     selection.activeProjectId = null;
     selection.activationFailure = null;
@@ -1252,6 +1370,7 @@ export const _testing = {
     selection.activationFailure = null;
     selection.loadingProjectId = null;
     previousLiveProjectSendPairs = [];
+    previousNonIdleProjectIds = [];
     activationSeq = 0;
     loadStarted.clear();
     hydrationStarted.clear();

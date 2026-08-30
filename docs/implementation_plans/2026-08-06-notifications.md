@@ -119,6 +119,8 @@ The send-completion trigger must not fire per workflow step. The exclusion is **
 
 An event-based discriminator also exists and is worth knowing as a cross-check, but is **not** the mechanism: `Dispatcher` carries an `emit_user_message: bool` per queued send, set `true` only by `send_workflow_message_awaiting_completion` and `false` by both `send_message` and `send_message_awaiting_completion` (`crates/dispatcher/src/lib.rs`). So a `user_message` event does imply a backend-originated send. Do not build on it — structural exclusion is stronger, because it cannot be defeated by a future backend send path that forgets to set the flag.
 
+> **Amended 2026-08-29 — see `2026-08-29-reading-mode.md` (M2).** The structural exclusion of workflow *steps* still holds exactly as written above. What changed is the last sentence of the first paragraph: the whole-**run** notification no longer fires from `workflow_commands.rs`. `notify_run_terminal` is deleted, and the run's terminal is reported by the frontend completion tracker at the project-idle boundary alongside manual sends. Reason: firing at run-terminal produced two notifications when a run finished while the user's own sends were still in flight, and only the frontend can see every outcome (a pre-dispatch IPC rejection never reaches the backend event stream at all).
+
 ### D5. Notification-authorization request moves to first send
 
 The modern API has a real authorization prompt (the legacy one had none — `isPermissionGranted`/`requestPermission` in `ComposeBar.svelte` are effectively no-ops today and get deleted).

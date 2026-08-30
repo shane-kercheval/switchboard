@@ -251,9 +251,11 @@ pub struct GatedNotifier {
 pub struct NotifyPrefs {
     /// Master switch. Off means no notifications at all, sound included.
     pub enabled: bool,
-    /// Whether a *different* project finishing should still notify while the user
-    /// is working in Switchboard. The project on screen never notifies while it
-    /// is on screen, regardless of this.
+    /// Whether a project the user is not viewing should still notify while they
+    /// are working in Switchboard. The project reported as on screen never
+    /// notifies while it is, regardless of this — but "on screen" is the
+    /// frontend's judgment, and it deliberately reports the viewed project as
+    /// *not* on screen while that project's reading mode is on.
     pub while_focused: bool,
 }
 
@@ -294,8 +296,10 @@ fn should_deliver(focused: Option<bool>, is_viewed_project: bool, prefs: NotifyP
         // The app is in the background: nothing about it is visible.
         return true;
     }
-    // The app is in front. The project on screen is never worth a banner — the
-    // transcript is right there. Anything else is the user's call.
+    // The app is in front. The project reported as on screen is never worth a
+    // banner — the transcript is right there. Anything else is the user's call.
+    // The frontend, not this gate, decides what counts as on screen; reading mode
+    // works by reporting the viewed project as absent so it lands in this branch.
     !is_viewed_project && prefs.while_focused
 }
 

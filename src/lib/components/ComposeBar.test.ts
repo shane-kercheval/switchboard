@@ -7513,3 +7513,86 @@ describe("ComposeBar — workflow run live view (swap / hold / stop)", () => {
     expect(screen.getByTestId("workflow-run-live")).toBeInTheDocument();
   });
 });
+
+describe("ComposeBar — reading mode", () => {
+  beforeEach(async () => {
+    workflowsTesting.reset();
+    (await import("$lib/state/readingMode.svelte"))._testing.reset();
+  });
+  afterEach(async () => {
+    workflowsTesting.reset();
+    (await import("$lib/state/readingMode.svelte"))._testing.reset();
+  });
+
+  async function enableReadingMode(): Promise<void> {
+    const { toggleReadingMode } = await import("$lib/state/readingMode.svelte");
+    toggleReadingMode(PROJECT_ID);
+    await tick();
+  }
+
+  function runInfo(): WorkflowRunInfo {
+    return {
+      run_id: "run-rm",
+      workflow: "review",
+      step: 0,
+      total: 1,
+      status: "running",
+      reason: null,
+      steps: [],
+    };
+  }
+
+  it("hides the compose box, leaving no padded strip behind", async () => {
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    expect(screen.getByTestId("compose-box")).toBeInTheDocument();
+
+    await enableReadingMode();
+
+    expect(screen.queryByTestId("compose-box")).toBeNull();
+    expect(screen.queryByTestId("compose-textarea")).toBeNull();
+    expect(screen.queryByTestId("compose-send")).toBeNull();
+    // The wrapper carries its own padding, so gating only the inner box would
+    // leave a bare `bg-raised` band where the composer used to be.
+    expect(screen.queryByTestId("compose-strip")).toBeNull();
+  });
+
+  it("restores the compose box when reading mode turns off", async () => {
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await enableReadingMode();
+    expect(screen.queryByTestId("compose-box")).toBeNull();
+
+    await enableReadingMode(); // toggles back off
+    expect(screen.getByTestId("compose-box")).toBeInTheDocument();
+  });
+
+  it("keeps the live workflow progress view, which is what the user turned reading mode on to watch", async () => {
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    workflowRuns[PROJECT_ID] = [runInfo()];
+    await enableReadingMode();
+
+    expect(screen.getByTestId("workflow-run-live")).toBeInTheDocument();
+    expect(screen.getByTestId("workflow-run-stop")).toBeInTheDocument();
+    expect(screen.queryByTestId("compose-box")).toBeNull();
+  });
+
+  it("inerts the window compose chords while the box is hidden", async () => {
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    // Establish a known recipient set with the box visible: ⌘1 toggles alice off.
+    await fireEvent.keyDown(window, { key: "1", metaKey: true });
+    await tick();
+    const recipients = await import("$lib/state/recipientSelection.svelte");
+    const before = [...recipients.selectionFor(PROJECT_ID)];
+
+    await enableReadingMode();
+
+    // ⌘1 (toggle recipient), ⇧⌘A (select all) and ⌘Enter (send) all target
+    // compose state the user can no longer see.
+    await fireEvent.keyDown(window, { key: "1", metaKey: true });
+    await fireEvent.keyDown(window, { key: "a", metaKey: true, shiftKey: true });
+    await fireEvent.keyDown(window, { key: "Enter", metaKey: true });
+    await tick();
+
+    expect([...recipients.selectionFor(PROJECT_ID)]).toEqual(before);
+    expect(invokeMock.mock.calls.some(([c]) => c === "send_message")).toBe(false);
+  });
+});

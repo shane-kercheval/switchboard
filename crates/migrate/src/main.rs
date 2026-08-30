@@ -53,8 +53,21 @@ fn main() -> ExitCode {
                 return ExitCode::SUCCESS;
             }
             "--yes" => assume_yes = true,
-            "--workspace-yaml" => workspace_yaml = args.next().map(PathBuf::from),
-            "--target-root" => target_root = args.next().map(PathBuf::from),
+            // A flag with no value is a usage error, never a silent fallback:
+            // the documented recovery route is `--workspace-yaml <a preserved
+            // copy>`, and falling back to the installed app's (possibly already
+            // rewritten) file is the single worst thing to do with that input.
+            "--workspace-yaml" | "--target-root" => {
+                let Some(value) = args.next() else {
+                    eprintln!("{arg} requires a path\n\n{USAGE}");
+                    return ExitCode::FAILURE;
+                };
+                if arg == "--workspace-yaml" {
+                    workspace_yaml = Some(PathBuf::from(value));
+                } else {
+                    target_root = Some(PathBuf::from(value));
+                }
+            }
             other => {
                 eprintln!("unrecognized argument: {other}\n\n{USAGE}");
                 return ExitCode::FAILURE;
@@ -102,11 +115,17 @@ fn main() -> ExitCode {
     match migrate(&directories, &target_root) {
         Ok(report) => {
             print_report(&report);
-            if report.skipped.is_empty() {
+            let left = report
+                .migrated
+                .iter()
+                .any(|m| !m.attachments_left.is_empty());
+            if report.skipped.is_empty() && !left {
                 ExitCode::SUCCESS
             } else {
-                // Partial success: everything available migrated, but the exit
-                // code says "look at the report" rather than reading as clean.
+                // Partial success. Exit 2 for a skipped directory *and* for an
+                // attachment left behind — the latter is a file the app will
+                // delete on first open, so a clean exit would be the same silent
+                // loss this tool exists to make loud.
                 ExitCode::from(2)
             }
         }
@@ -140,7 +159,7 @@ fn print_report(report: &MigrationReport) {
                 "s"
             }
         );
-        for (_, name) in &migrated.projects {
+        for (_, name, _) in &migrated.projects {
             println!("          - {name}");
         }
         println!(
@@ -153,7 +172,11 @@ fn print_report(report: &MigrationReport) {
             }
         );
         for left in &migrated.attachments_left {
-            println!("          ! not rewritten (outside this directory's legacy root): {left}");
+            println!(
+                "          ! NOT MIGRATED — this file will be removed the first time the \n\
+                 \x20           project is opened, because the journal still points at the \n\
+                 \x20           old location: {left}"
+            );
         }
     }
     for (path, reason) in &report.skipped {

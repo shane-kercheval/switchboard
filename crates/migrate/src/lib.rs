@@ -92,7 +92,7 @@ pub struct MigratedDirectory {
     pub directory_id: DirectoryId,
     /// `(id, name)` — the id is what validation compares against the written
     /// index, so a report that only carried names could not detect a wrong row.
-    pub projects: Vec<(ProjectId, String)>,
+    pub projects: Vec<(ProjectId, String, chrono::DateTime<chrono::Utc>)>,
     /// Attachment paths rewritten into the store. **Per directory, not
     /// aggregate**: a single total can be non-zero while one directory silently
     /// contributed nothing, which is exactly the per-directory spelling
@@ -329,7 +329,9 @@ fn migrate_directory(
     };
     for entry in &source.entries {
         copy_project(store, source, directory_id, entry, &mut migrated)?;
-        migrated.projects.push((entry.id, entry.name.clone()));
+        migrated
+            .projects
+            .push((entry.id, entry.name.clone(), entry.created_at));
     }
     report.migrated.push(migrated);
     Ok(())
@@ -504,10 +506,11 @@ fn rewrite_attachment(
 /// `directory_id`, cardinality). A count can match while a duplicated or wrong
 /// row hides inside it.
 fn validate(store: &Store, report: &MigrationReport) -> Result<(), MigrateError> {
-    let mut expected: HashMap<ProjectId, (&str, DirectoryId)> = HashMap::new();
+    let mut expected: HashMap<ProjectId, (&str, DirectoryId, chrono::DateTime<chrono::Utc>)> =
+        HashMap::new();
     for migrated in &report.migrated {
-        for (id, name) in &migrated.projects {
-            expected.insert(*id, (name.as_str(), migrated.directory_id));
+        for (id, name, created_at) in &migrated.projects {
+            expected.insert(*id, (name.as_str(), migrated.directory_id, *created_at));
         }
     }
 
@@ -523,17 +526,26 @@ fn validate(store: &Store, report: &MigrationReport) -> Result<(), MigrateError>
     // register cache enforces; a store that violates it fails on open there.
     let mut agent_ids: HashSet<AgentId> = HashSet::new();
     for entry in &indexed {
-        let Some(&(name, directory_id)) = expected.get(&entry.id) else {
+        let Some(&(name, directory_id, created_at)) = expected.get(&entry.id) else {
             return Err(MigrateError::Validation(format!(
                 "index lists project {} that the migration never wrote",
                 entry.id
             )));
         };
-        if entry.name != name || entry.directory_id != directory_id {
+        if entry.name != name
+            || entry.directory_id != directory_id
+            || entry.created_at != created_at
+        {
             return Err(MigrateError::Validation(format!(
                 "index row for {} disagrees with what was migrated \
-                 (name {:?} vs {:?}, directory {} vs {})",
-                entry.id, entry.name, name, entry.directory_id, directory_id
+                 (name {:?} vs {:?}, directory {} vs {}, created {} vs {})",
+                entry.id,
+                entry.name,
+                name,
+                entry.directory_id,
+                directory_id,
+                entry.created_at,
+                created_at
             )));
         }
         let project = store.open_project(entry.id)?;

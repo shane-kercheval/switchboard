@@ -2200,7 +2200,6 @@ pub fn run() {
             // restored directories report `available: true` and participate in
             // the cross-harness session-id collision scan. Unopenable
             // directories (unmounted/moved) are skipped and stay unavailable.
-            crate::state::eager_load_directories(&state);
             app.manage(crate::lifecycle::QuitCoordinator::new());
             app.manage(state);
             Ok(())

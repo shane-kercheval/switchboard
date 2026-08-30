@@ -110,10 +110,9 @@ fn migrates_a_directory_end_to_end_and_the_app_code_reads_it_back() {
     let report =
         switchboard_migrate::migrate(&[legacy.path().to_path_buf()], target.path()).unwrap();
     assert_eq!(report.migrated.len(), 1);
-    assert_eq!(
-        report.migrated[0].projects,
-        vec![(project_id, "alpha".to_owned())]
-    );
+    assert_eq!(report.migrated[0].projects.len(), 1);
+    assert_eq!(report.migrated[0].projects[0].0, project_id);
+    assert_eq!(report.migrated[0].projects[0].1, "alpha");
     assert_eq!(
         report.migrated[0].attachments_rewritten, 1,
         "a clean exit is not evidence the rewrite fired; this count is"
@@ -161,6 +160,12 @@ fn migrates_a_directory_end_to_end_and_the_app_code_reads_it_back() {
         !project.root.join("instance.lock").exists(),
         "a dead process's lock token must not be copied"
     );
+    assert_eq!(
+        indexed[0].created_at.to_rfc3339(),
+        "2026-08-23T15:39:44.709696+00:00",
+        "creation timestamps must survive the migration — the project list orders by them"
+    );
+
     assert!(
         legacy.path().join(".switchboard").exists(),
         "originals untouched"

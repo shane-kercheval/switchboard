@@ -48,7 +48,8 @@ pub struct Attachment {
     /// inline `@`-menu token and the agent-facing footer use this same label.
     pub label: String,
     pub kind: AttachmentKind,
-    /// Absolute path to the staged file under the store's `attachments/` dir.
+    /// Absolute path to the staged file under the project's `attachments/` dir
+    /// (`<store>/projects/<id>/attachments/`).
     /// **The live location** — where the file is now, so this is what rendering
     /// and the reference-GC use.
     pub path: String,

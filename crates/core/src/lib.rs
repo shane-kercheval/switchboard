@@ -1,8 +1,11 @@
 //! Switchboard core — pure-Rust persistence and registry types. No Tauri, no async.
 //!
-//! The on-disk layout under `<directory>/.switchboard/` is the single source of
-//! truth for what projects exist and what agents live in them. See
-//! `docs/system-design.md` §3 for the canonical spec.
+//! The user-global store (`<config-dir>/store/`) is the single source of truth
+//! for what projects exist and what agents live in them. **Switchboard writes
+//! nothing into a working directory** — a directory is referenced by a stable
+//! `directory_id` the store's catalog maps to a path, so deleting or moving a
+//! checkout costs no project state. See `docs/system-design.md` §3 for the
+//! canonical spec.
 
 pub mod agent;
 pub mod attachment;

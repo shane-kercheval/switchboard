@@ -6,7 +6,7 @@ use std::fs::File;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use switchboard_core::{AgentId, AgentRecord, Directory, Project, ProjectId, Store};
+use switchboard_core::{AgentId, AgentRecord, Project, ProjectId, Store};
 use switchboard_dispatcher::{Dispatcher, EventEmitter};
 use switchboard_harness::HarnessAdapter;
 use switchboard_prompts::PromptService;
@@ -105,8 +105,14 @@ pub struct MaintenanceBarrier {
 ///
 /// **Lock-order convention** (when more than one of these mutexes is held
 /// at the same time): `workspace` → `registry_write` → `git_registry` →
-/// `directories` → `projects` → `active_project_id` → `needs_session_meta` →
-/// `project_locks` → `agents_by_id`. Always acquire in this order. `workspace`
+/// `maintenance` → `project_generation` → `projects` → `active_project_id` →
+/// `needs_session_meta` → `project_locks` → `agents_by_id`. Always acquire in
+/// this order.
+///
+/// `maintenance` and `project_generation` sit directly under `registry_write`
+/// because `begin_maintenance` takes all three in that order — the write lock
+/// first (so a claim's membership is derived and marked atomically against
+/// `create_project`), then the marks, then the generations. `workspace`
 /// is at the head because it is the app-owned user-global registry that sits
 /// above any single directory's state; in practice it is taken either standalone
 /// (`list_projects`, the workspace switcher) or nested *under* `registry_write`
@@ -116,9 +122,7 @@ pub struct MaintenanceBarrier {
 /// `registry_write` during `init_directory`'s auto-sync hook — so it sorts after
 /// `registry_write` here. **No path may acquire `registry_write` while holding
 /// `git_registry`** (the inverse order is the deadlock this convention forbids).
-/// `directories` holds every loaded directory keyed by canonical path; it sits
-/// below the registries and above the per-project maps. Violating the order can
-/// deadlock under concurrent access. Single-lock acquisitions (which most
+/// Violating the order can deadlock under concurrent access. Single-lock acquisitions (which most
 /// callers do) are unaffected — the convention only matters when nesting.
 /// `needs_session_meta` is the tail because both `attach_agent_impl` (under
 /// `registry_write`) and `send_message_impl` (no other locks held) acquire
@@ -152,20 +156,6 @@ pub struct MaintenanceBarrier {
 /// that window inside one process; cross-process serialization is future
 /// work (an `instance.lock` per directory).
 pub struct AppState {
-    /// Every loaded working directory, keyed by its **canonical** path
-    /// (`Directory::at` canonicalizes, so `Directory.path` is the key). The
-    /// app holds N directories concurrently; commands resolve the directory
-    /// that owns a project from the project's own `directory` field, not a
-    /// single bound handle.
-    ///
-    /// **Session-id uniqueness contract.** Cross-harness session-id uniqueness
-    /// (the same-session-parallel-invocation guard) is enforced across all
-    /// *loaded/available* directories — those present in this map. At startup
-    /// `eager_load_directories` opens a handle for every available workspace
-    /// directory, so "loaded == available" and the Codex/Antigravity collision
-    /// scan is workspace-wide. An unavailable directory (absent from this map)
-    /// cannot collide because it cannot be dispatched into while unavailable.
-    pub directories: Mutex<HashMap<PathBuf, Directory>>,
     pub projects: Mutex<HashMap<ProjectId, Project>>,
     pub active_project_id: Mutex<Option<ProjectId>>,
     /// The project whose transcript is **rendered on screen right now**, or
@@ -489,7 +479,6 @@ impl AppState {
             store_tmp: None,
             #[cfg(test)]
             lock_tmp: None,
-            directories: Mutex::new(HashMap::new()),
             projects: Mutex::new(HashMap::new()),
             active_project_id: Mutex::new(None),
             visible_project: Mutex::new(VisibleProject::default()),
@@ -639,48 +628,6 @@ impl AppState {
     }
 }
 
-/// Eager-load every workspace directory's `Directory` handle into
-/// `state.directories` at startup. `with_workspace` only loads the workspace
-/// registry (paths + cached snapshots); without this, nothing populates
-/// `directories` on a cold start (its only other writer is `init_directory`), so
-/// every directory would report `available: false` until re-initialized and the
-/// cross-harness session-id collision scan would cover no directories.
-///
-/// For each workspace entry we attempt `Directory::at` — a pure on-disk read
-/// that canonicalizes and validates the path is a directory. **No per-project
-/// `instance.lock` is taken here**: locks stay lazy, acquired on project
-/// activation (open/create), not at startup. A directory that fails to open
-/// (unmounted, moved, permissions) is skipped with a `warn` and stays absent
-/// from `directories` → it naturally reports `available: false` and cannot be
-/// dispatched into. Startup never aborts on a bad directory.
-///
-/// Contract this establishes: after eager-load, "loaded == every available
-/// workspace directory," which is what makes the Codex/Antigravity session-id
-/// collision scan (`enumerate_all_projects` over `state.directories`)
-/// workspace-wide for all available directories.
-pub(crate) fn eager_load_directories(state: &AppState) {
-    let paths: Vec<PathBuf> = lock(&state.workspace)
-        .entries()
-        .iter()
-        .map(|e| e.path.clone())
-        .collect();
-    let mut directories = lock(&state.directories);
-    for path in paths {
-        match Directory::at(&path) {
-            Ok(directory) => {
-                directories.insert(directory.path.clone(), directory);
-            }
-            Err(e) => {
-                tracing::warn!(
-                    path = %path.display(),
-                    error = %e,
-                    "workspace directory could not be opened at startup — marking unavailable"
-                );
-            }
-        }
-    }
-}
-
 /// Persist the workspace registry to disk if a `workspace_path` is configured.
 /// Best-effort: a `None` path is a no-op (tests), and a save failure is logged
 /// rather than propagated — the registry is convenience state, like the cached
@@ -783,47 +730,6 @@ mod tests {
         persist_workspace(&state);
 
         assert!(!path.exists());
-    }
-
-    #[test]
-    fn eager_load_opens_every_available_workspace_directory() {
-        // Given a workspace with two real directories, after eager-load both are
-        // present in `state.directories` (keyed by their canonical paths).
-        let dir_a = tempdir().unwrap();
-        let dir_b = tempdir().unwrap();
-        let state = mock_state();
-        {
-            let mut ws = lock(&state.workspace);
-            ws.add(dir_a.path().to_path_buf());
-            ws.add(dir_b.path().to_path_buf());
-        }
-
-        eager_load_directories(&state);
-
-        let dirs = lock(&state.directories);
-        assert_eq!(dirs.len(), 2, "both available directories loaded");
-        assert!(dirs.contains_key(&dir_a.path().canonicalize().unwrap()));
-        assert!(dirs.contains_key(&dir_b.path().canonicalize().unwrap()));
-    }
-
-    #[test]
-    fn eager_load_skips_unavailable_directory() {
-        // A workspace entry whose path no longer exists is skipped (stays
-        // absent → available:false), and does not abort the load of the rest.
-        let dir_a = tempdir().unwrap();
-        let missing = dir_a.path().join("gone");
-        let state = mock_state();
-        {
-            let mut ws = lock(&state.workspace);
-            ws.add(dir_a.path().to_path_buf());
-            ws.add(missing);
-        }
-
-        eager_load_directories(&state);
-
-        let dirs = lock(&state.directories);
-        assert_eq!(dirs.len(), 1, "only the available directory loaded");
-        assert!(dirs.contains_key(&dir_a.path().canonicalize().unwrap()));
     }
 
     #[test]

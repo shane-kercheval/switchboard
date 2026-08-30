@@ -454,11 +454,53 @@ impl Drop for MaintenanceGuard<'_> {
 /// dispatch flag, not routable state, and an agent may legitimately emit its
 /// metadata *during* the drain, so snapshotting and restoring it would resurrect
 /// a flag that was correctly cleared.
+/// What a lifecycle operation is claiming.
+///
+/// **`Directory` exists so the claim's membership is derived under the same
+/// lock that marks it.** Delete knows its one project up front; a re-point
+/// claims *every* project sharing a directory identity, and that set has to be
+/// read from the index — a read that must not happen before the marks exist.
+///
+/// It did, and the gap was real: `repoint_project_directory_impl` listed the
+/// siblings, and only afterwards called this function, which takes
+/// `registry_write` itself. A `create_project` landing in between took that lock
+/// first, found no marks (none were set yet), and committed a sibling into
+/// `state.projects` carrying the pre-repoint path. Never marked, never evicted,
+/// absent from `loaded_before`, so the restore filtered it out — and with no
+/// mark and no generation bump it passed every dispatch gate, dispatching into
+/// the retired directory until the app restarted. Re-deriving the set later
+/// (which the code did, with a comment claiming it closed this) could not help:
+/// the project was already loaded and stale by then.
+///
+/// Deriving here closes it, and closes it *structurally* — a caller cannot
+/// reintroduce the gap without reintroducing the parameter.
+enum MaintenanceScope {
+    /// Exactly these projects (delete: one known id).
+    Projects(HashSet<ProjectId>),
+    /// Every project the index currently attributes to this directory identity.
+    Directory(DirectoryId),
+}
+
 fn begin_maintenance<'a>(
     state: &'a AppState,
-    projects: &HashSet<ProjectId>,
+    scope: &MaintenanceScope,
 ) -> Result<MaintenanceGuard<'a>, AppError> {
     let _write = lock(&state.registry_write);
+    // Under the guard, before any mark: a `Directory` claim's membership is
+    // whatever the index says *now*, and once marked it cannot change —
+    // `create_project` refuses while any sibling is marked, and a concurrent
+    // delete's own `begin_maintenance` refuses the overlapping claim.
+    let projects: HashSet<ProjectId> = match scope {
+        MaintenanceScope::Projects(ids) => ids.clone(),
+        MaintenanceScope::Directory(directory_id) => state
+            .store
+            .list_projects()?
+            .into_iter()
+            .filter(|entry| entry.directory_id == *directory_id)
+            .map(|entry| entry.id)
+            .collect(),
+    };
+    let projects = &projects;
     {
         let mut marks = lock(&state.maintenance);
         if let Some(busy) = projects.iter().find(|id| marks.contains(id)) {
@@ -704,7 +746,6 @@ pub async fn init_directory_impl(state: &AppState, path: &str) -> Result<Directo
     // Insert (or refresh) the handle. Re-init of an already-loaded canonical
     // path replaces only its own handle — every other loaded directory and all
     // shared maps are untouched (the additive contract).
-    lock(&state.directories).insert(canonical.clone(), directory);
 
     // Register in the user-global workspace (ordering + hidden view-state; no
     // project cache — the store index is the record). The registry compares
@@ -828,20 +869,15 @@ pub async fn repoint_project_directory_impl(
     // predetermined error.
     let existing_paths = state.store.directory_paths(directory_id)?;
 
-    let affected: HashSet<ProjectId> = indexed
-        .iter()
-        .filter(|entry| entry.directory_id == directory_id)
-        .map(|entry| entry.id)
-        .collect();
-
-    let guard = begin_maintenance(state, &affected)?;
+    // **Claim by identity, not by a set read beforehand.** The membership is
+    // derived inside `begin_maintenance`'s own lock — see `MaintenanceScope` for
+    // the race that a pre-read set left open, and why re-deriving it afterwards
+    // could not close it.
+    let guard = begin_maintenance(state, &MaintenanceScope::Directory(directory_id))?;
+    let affected: Vec<ProjectId> = guard.marked.iter().copied().collect();
     wait_at_maintenance_barrier(state).await;
     let agent_ids = guard.evicted_agents.clone();
-    crate::workflow_commands::cancel_runs_for_projects(
-        state,
-        &affected.iter().copied().collect::<Vec<_>>(),
-    )
-    .await;
+    crate::workflow_commands::cancel_runs_for_projects(state, &affected).await;
     for agent_id in agent_ids {
         state
             .dispatcher
@@ -851,17 +887,9 @@ pub async fn repoint_project_directory_impl(
 
     // Synchronous from here — no `.await` while `registry_write` is held.
     let _write = lock(&state.registry_write);
-    // Re-derive under the guard: `create_project` takes it too, so a sibling
-    // created during the drain window is absent from the pre-drain snapshot and
-    // would otherwise be left pointing at the old path.
-    let affected_now: Vec<ProjectId> = state
-        .store
-        .list_projects()?
-        .into_iter()
-        .filter(|entry| entry.directory_id == directory_id)
-        .map(|entry| entry.id)
-        .collect();
-
+    // No re-derivation: the claim's membership was fixed under the mark and
+    // cannot have changed (`create_project` refuses while a sibling is marked;
+    // a concurrent delete's own claim would have been refused as overlapping).
     let target = Path::new(new_path);
     let write_result = if existing_paths.is_empty() {
         state.store.bind_directory(directory_id, target).map(|_| ())
@@ -877,7 +905,7 @@ pub async fn repoint_project_directory_impl(
         // `observed` is only consulted as a gate; the restore resolves each
         // project's directory through the catalog itself (see `reload_projects`).
         retire_and_register_directory(state, &existing_paths, &observed);
-        guard.finish_restored(&affected_now);
+        guard.finish_restored(&affected);
     } else {
         // No confirmed path. Leave them unloaded — but discarded, not marked, so
         // dispatch refuses with `ProjectNotLoaded` and a retry is not blocked by
@@ -915,13 +943,6 @@ fn retire_and_register_directory(
     let Ok(new) = new else { return };
     lock(&state.workspace).replace_paths(old, new.clone());
     persist_workspace(state);
-    let mut directories = lock(&state.directories);
-    for stale in old {
-        directories.remove(stale);
-    }
-    if let Ok(directory) = Directory::at(new) {
-        directories.insert(directory.path.clone(), directory);
-    }
 }
 
 /// *The* directory-identity chokepoint. Every command that resolves a working
@@ -2141,9 +2162,8 @@ pub fn create_project_impl(
     // records (which write disk).
     let _write = lock(&state.registry_write);
     let canonical = canonicalize_boundary(directory_path);
-    // The catalog, not `state.directories`, answers "is this a directory we can
-    // create in": the store owns directory identity now, and a project's owner
-    // is the `directory_id` it records, not a loaded handle.
+    // The catalog answers "is this a directory we can create in": the store owns
+    // directory identity, and a project's owner is the `directory_id` it records.
     let directory_id = state
         .store
         .list_directories()?
@@ -2394,7 +2414,7 @@ pub fn migrate_message_pin_impl(
 ///
 /// **Error policy (engineer-approved).** "Already gone" is benign success:
 /// - the project isn't resolvable in any loaded directory (`ProjectNotLoaded`
-///   from `find_directory_for_project`) → nothing on disk we can reach;
+///   the catalog has no row for its `directory_id`) → nothing on disk we can reach;
 /// - the directory's index file vanished out-of-band (`MissingAppendOnlyFile`)
 ///   → the entry is effectively gone.
 ///
@@ -2414,7 +2434,7 @@ pub async fn delete_project_impl(state: &AppState, project_id: ProjectId) -> Res
     // a fresh actor for a project being deleted, and a racing open loads it back
     // in. Marking it under maintenance closes both; the mark is cleared on every
     // exit below.
-    let scope: HashSet<ProjectId> = std::iter::once(project_id).collect();
+    let scope = MaintenanceScope::Projects(std::iter::once(project_id).collect());
     let guard = begin_maintenance(state, &scope)?;
     let agent_ids = guard.evicted_agents.clone();
 
@@ -3066,7 +3086,7 @@ pub fn reorder_agents_impl(
 ///    their session ids are caller-controlled and cwd-namespaced, so a widened
 ///    scan would false-reject a legitimately-distinct same-id-different-cwd
 ///    session. Codex and Antigravity scan **all loaded directories**
-///    (`enumerate_all_projects`) because their ids are server-assigned and
+///    (the whole store index) because their ids are server-assigned and
 ///    globally unique. Every harness scans `AgentRecord.session_locator` (the
 ///    locator — UUID, or Codex's thread-id — lives on the record; no sidecar).
 ///    Two `AgentRecord`s pointing at the same harness session is the
@@ -6922,13 +6942,13 @@ mod tests {
 
     fn create_project_in_only_dir(state: &AppState, name: &str) -> ProjectSummary {
         let path = {
-            let dirs = lock(&state.directories);
+            let catalog = state.store.list_directories().unwrap();
             assert_eq!(
-                dirs.len(),
+                catalog.len(),
                 1,
-                "create_project_in_only_dir requires exactly one loaded directory"
+                "create_project_in_only_dir requires exactly one catalogued directory"
             );
-            dirs.keys().next().unwrap().to_string_lossy().into_owned()
+            catalog[0].path.to_string_lossy().into_owned()
         };
         create_project_impl(state, name, &path).unwrap()
     }
@@ -8127,7 +8147,11 @@ mod tests {
         let maintenance_state = Arc::clone(&state);
         let scope: HashSet<ProjectId> = std::iter::once(project_id).collect();
         let maintenance = tokio::task::spawn_blocking(move || {
-            begin_maintenance(&maintenance_state, &scope).is_ok()
+            begin_maintenance(
+                &maintenance_state,
+                &MaintenanceScope::Projects(scope.clone()),
+            )
+            .is_ok()
         });
 
         // Release before asserting, always. A `spawn_blocking` task cannot be
@@ -8451,6 +8475,76 @@ mod tests {
             refusal.contains("already in use by a running turn"),
             "got: {refusal}"
         );
+    }
+
+    #[tokio::test]
+    async fn an_unmaterialized_fork_locks_a_deleted_parents_session() {
+        // The second blind spot in `busy_fork_source`: it reports "safe" when the
+        // parent is *gone*, because nothing of ours is writing that session. True
+        // for the in-process gate, false for the file — the parent's session file
+        // is still on disk, the fork still reads it, and another instance may
+        // still be writing it. Deriving the key from the fork's own
+        // `forked_from_session` is what survives the deletion; a lookup of the
+        // parent agent would not.
+        let (_tmp, home, state, _gate, project_id) = state_with_parked_claude(&[]).await;
+        let source_id = seed_source(&state, home.path(), project_id, "alice", "hello");
+        let parent_key = own_session_key(&state, project_id, source_id);
+        let fork = fork_agent_impl(&state, source_id, home.path())
+            .await
+            .unwrap();
+
+        remove_agent_impl(&state, source_id).await.unwrap();
+        let _other = held_by_another_instance(&state, parent_key);
+
+        let refusal = preflight_for(&state, project_id, fork.id, home.path())
+            .await
+            .expect_err("a deleted parent's session file is still the file the fork reads");
+        assert!(
+            refusal.contains("already in use by a running turn"),
+            "got: {refusal}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_materializing_forks_turn_releases_both_keys() {
+        // Two keys held, two released. A release path that dropped only the
+        // agent's own key would leave the parent's held for the process's
+        // lifetime, locking the parent out of every later turn with no way back
+        // short of a restart.
+        let (_tmp, home, state, gate, project_id) = state_with_parked_claude(&["done"]).await;
+        let source_id = seed_source(&state, home.path(), project_id, "alice", "hello");
+        let parent_key = own_session_key(&state, project_id, source_id);
+        let fork = fork_agent_impl(&state, source_id, home.path())
+            .await
+            .unwrap();
+        let fork_key = own_session_key(&state, project_id, fork.id);
+
+        {
+            let _permit = preflight_for(&state, project_id, fork.id, home.path())
+                .await
+                .expect("nothing is contending");
+            for (label, key) in [("its own", &fork_key), ("its parent's", &parent_key)] {
+                assert!(
+                    matches!(
+                        crate::session_lock::acquire_session_locks(
+                            &state.lock_root,
+                            &[key.clone()].into_iter().collect()
+                        ),
+                        Err(AppError::SessionInUse)
+                    ),
+                    "a materializing fork must hold {label} key"
+                );
+            }
+        }
+
+        for (label, key) in [("its own", fork_key), ("its parent's", parent_key)] {
+            crate::session_lock::acquire_session_locks(
+                &state.lock_root,
+                &[key].into_iter().collect(),
+            )
+            .unwrap_or_else(|e| panic!("{label} key must be released with the permit: {e}"));
+        }
+        gate.notify_waiters();
     }
 
     #[tokio::test]
@@ -10337,7 +10431,11 @@ mod tests {
         assert_eq!(info_b.projects.len(), 0);
 
         // The first directory's state is fully intact.
-        assert_eq!(lock(&state.directories).len(), 2, "both directories loaded");
+        assert_eq!(
+            state.store.list_directories().unwrap().len(),
+            2,
+            "both directories catalogued"
+        );
         assert!(lock(&state.projects).contains_key(&proj.id));
         assert!(lock(&state.project_locks).contains_key(&proj.id));
         assert!(lock(&state.agents_by_id).contains_key(&agent.id));
@@ -14237,9 +14335,6 @@ mod tests {
             .await
             .unwrap();
         let project = create_project_in_only_dir(&state, "alpha");
-        // Simulate the directory going unavailable: drop the loaded handle but
-        // keep the workspace cache (which is how an unavailable row is served).
-        lock(&state.directories).clear();
 
         set_project_archived_impl(&state, project.id, true).unwrap();
         assert!(lock(&state.workspace).is_archived(project.id));
@@ -14416,7 +14511,8 @@ mod tests {
         let scope: HashSet<ProjectId> = std::iter::once(project_id).collect();
 
         {
-            let _guard = begin_maintenance(&state, &scope).unwrap();
+            let _guard =
+                begin_maintenance(&state, &MaintenanceScope::Projects(scope.clone())).unwrap();
             assert!(lock(&state.maintenance).contains(&project_id));
         } // dropped without finishing — the early-return shape
 
@@ -14433,8 +14529,8 @@ mod tests {
         let (_agent, project_id) = project_with_agent(&state, &tmp).await;
         let scope: HashSet<ProjectId> = std::iter::once(project_id).collect();
 
-        let _first = begin_maintenance(&state, &scope).unwrap();
-        let second = begin_maintenance(&state, &scope);
+        let _first = begin_maintenance(&state, &MaintenanceScope::Projects(scope.clone())).unwrap();
+        let second = begin_maintenance(&state, &MaintenanceScope::Projects(scope.clone()));
         assert!(
             matches!(second, Err(AppError::ProjectUnderMaintenance(_))),
             "an overlapping claim must be refused"
@@ -14453,7 +14549,7 @@ mod tests {
         let captured = project_generation(&state, project_id);
 
         let scope: HashSet<ProjectId> = std::iter::once(project_id).collect();
-        begin_maintenance(&state, &scope)
+        begin_maintenance(&state, &MaintenanceScope::Projects(scope.clone()))
             .unwrap()
             .finish_restored(&[project_id]);
 
@@ -14648,7 +14744,7 @@ mod tests {
         let (agent, project_id) = project_with_agent(&state, &tmp).await;
         let scope: HashSet<ProjectId> = std::iter::once(project_id).collect();
 
-        let guard = begin_maintenance(&state, &scope).unwrap();
+        let guard = begin_maintenance(&state, &MaintenanceScope::Projects(scope.clone())).unwrap();
         assert_eq!(guard.loaded_before, vec![project_id]);
         assert_eq!(guard.evicted_agents, vec![agent.id]);
         assert!(lock(&state.projects).is_empty());
@@ -14677,7 +14773,7 @@ mod tests {
         let (_agent, project_id) = project_with_agent(&state, &tmp).await;
         let scope: HashSet<ProjectId> = std::iter::once(project_id).collect();
 
-        let guard = begin_maintenance(&state, &scope).unwrap();
+        let guard = begin_maintenance(&state, &MaintenanceScope::Projects(scope.clone())).unwrap();
         guard.finish_restored(&[project_id]);
 
         assert!(
@@ -14933,6 +15029,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn every_project_sharing_the_repaired_directory_moves_with_it() {
+        // The product property: one folder holds them all, so repairing it moves
+        // every project that references the identity — not just the named one.
+        // (This does **not** discriminate the pre-read race fixed alongside it:
+        // a sibling created before the command starts is in the index either
+        // way. It was written as a race test, survived falsification against the
+        // broken shape, and is kept under an honest name because the property is
+        // real and was otherwise untested.)
+        let (state, cwd, project) = state_with_project("alpha").await;
+        let sibling = create_project_in_only_dir(&state, "beta");
+        assert_eq!(
+            lock(&state.projects).get(&sibling.id).unwrap().directory,
+            cwd.path().canonicalize().unwrap()
+        );
+
+        let moved = TempDir::new().unwrap();
+        repoint_project_directory_impl(&state, project.id, moved.path().to_str().unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            lock(&state.projects).get(&sibling.id).unwrap().directory,
+            moved.path().canonicalize().unwrap(),
+            "a sibling sharing the repaired directory must move with it, or it \
+             dispatches into the retired directory"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_directory_claim_derives_its_membership_when_it_marks() {
+        // The substantive half of the race fix: the claim's membership is read
+        // from the index *inside* `begin_maintenance`, so a caller cannot hand it
+        // a set read earlier. Pins that `Directory` sees what the index says at
+        // mark time — including a project the caller never knew about.
+        //
+        // **What this does not pin, and cannot from outside:** that the
+        // derivation happens under the same `registry_write` acquisition as the
+        // marking. That guarantee is mutual exclusion against
+        // `create_project_impl`, which takes the same lock before it commits —
+        // structural, unobservable without a third test seam, and stated at
+        // `MaintenanceScope` rather than asserted here.
+        let (state, _cwd, project) = state_with_project("alpha").await;
+        let directory_id = state
+            .store
+            .list_projects()
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.id == project.id)
+            .unwrap()
+            .directory_id;
+        let sibling = create_project_in_only_dir(&state, "beta");
+
+        let guard = begin_maintenance(&state, &MaintenanceScope::Directory(directory_id)).unwrap();
+        assert!(
+            guard.marked.contains(&project.id) && guard.marked.contains(&sibling.id),
+            "a directory claim must cover every project the index attributes to it, \
+             got {:?}",
+            guard.marked
+        );
+        guard.finish_discarded();
+    }
+
+    #[tokio::test]
     async fn a_repoint_refuses_an_unreadable_catalog_without_tearing_anything_down() {
         // The catalog is resolved before any eviction or drain, so a store we
         // cannot read fails the command with the projects still loaded and their
@@ -15086,7 +15245,6 @@ mod tests {
         repoint_only_directory(&state, &missing_path);
         lock(&state.projects).remove(&project.id);
         lock(&state.project_locks).remove(&project.id);
-        lock(&state.directories).clear();
 
         // Precondition: it lists, and reports its directory as unavailable.
         let before = list_projects_impl(&state).unwrap();
@@ -15124,7 +15282,6 @@ mod tests {
         // Go offline: drop the loaded handle/lock/registry.
         lock(&state.projects).remove(&project.id);
         lock(&state.project_locks).remove(&project.id);
-        lock(&state.directories).clear();
 
         delete_project_impl(&state, project.id).await.unwrap();
 
@@ -15913,9 +16070,9 @@ mod tests {
         init_directory_impl(&state, &dotted).await.unwrap();
 
         assert_eq!(
-            lock(&state.directories).len(),
+            state.store.list_directories().unwrap().len(),
             1,
-            "two spellings must collapse to one loaded directory"
+            "two spellings must collapse to one catalogued directory"
         );
         assert_eq!(
             lock(&state.workspace).entries().len(),
@@ -15995,8 +16152,12 @@ mod tests {
         init_directory_impl(&state, tmp_a.path().to_str().unwrap())
             .await
             .unwrap();
-        let dir_a = lock(&state.directories)
-            .keys()
+        let dir_a = state
+            .store
+            .list_directories()
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.path)
             .next()
             .unwrap()
             .to_string_lossy()
@@ -16066,8 +16227,8 @@ mod tests {
         // `fresh_state_with_mock` builds state with no `workspace_path`, the
         // not-persistable case (an unreadable existing workspace.yaml).
         let (_tmp, state, _) = fresh_state_with_mock();
-        // Register a directory in the registry without loading it into
-        // `state.directories` — as if it were unmounted at startup.
+        // Register a directory in the workspace list whose path does not exist —
+        // as if it were unmounted at startup.
         let phantom = PathBuf::from("/definitely/not/mounted");
         lock(&state.workspace).add(phantom.clone());
 
@@ -16195,7 +16356,7 @@ mod tests {
         init_directory_impl(&state, tmp.path().to_str().unwrap())
             .await
             .unwrap();
-        let stored_key = lock(&state.directories).keys().next().unwrap().clone();
+        let stored_key = state.store.list_directories().unwrap()[0].path.clone();
 
         let noisy = format!("{}/./", tmp.path().to_str().unwrap());
         let summary = create_project_impl(&state, "alpha", &noisy).unwrap();
@@ -16206,7 +16367,7 @@ mod tests {
             "create_project must resolve to the same canonical key init stored"
         );
         assert_eq!(
-            lock(&state.directories).len(),
+            state.store.list_directories().unwrap().len(),
             1,
             "no second directory entry was created"
         );
@@ -16270,7 +16431,6 @@ mod tests {
         let missing_path = missing.path().canonicalize().unwrap();
         drop(missing);
         repoint_only_directory(&state, &missing_path);
-        lock(&state.directories).clear();
         let before = std::fs::metadata(&ws_path).unwrap().modified().unwrap();
 
         let listings = list_projects_impl(&state).unwrap();
@@ -16444,7 +16604,7 @@ mod tests {
         assert!(lock(&state.project_locks).is_empty());
         // The *directory* stays catalogued and loaded — deleting a project has
         // never removed its directory, and hiding no longer removes anything.
-        assert_eq!(lock(&state.directories).len(), 1);
+        assert_eq!(state.store.list_directories().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -16457,10 +16617,8 @@ mod tests {
         let (_agent, project_id) = project_with_agent(&state, &tmp).await;
         let state = Arc::new(state);
 
-        let dir_path: String = lock(&state.directories)
-            .keys()
-            .next()
-            .unwrap()
+        let dir_path: String = state.store.list_directories().unwrap()[0]
+            .path
             .to_string_lossy()
             .into_owned();
 

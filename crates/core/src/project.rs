@@ -142,8 +142,14 @@ impl Project {
     /// Attachments are handed to agents as absolute paths in the prompt footer
     /// (see [`crate::render_prompt_with_attachments`]), which is what every
     /// harness can read regardless of sandbox — the location itself carries no
-    /// requirement. [`crate::Store::attachments_dir`] is the store-wide
-    /// equivalent; the two coexist until staging moves onto it.
+    /// requirement.
+    ///
+    /// **Per-project, and staying that way.** A store-wide `attachments/` was
+    /// designed and reversed: it would have turned project delete from a plain
+    /// directory removal into an all-projects reference sweep, moving a GC bug's
+    /// blast radius from one project to every project. Keeping them here means
+    /// delete reclaims them by removing the project root. Do not reintroduce a
+    /// store-level equivalent.
     pub fn attachments_dir(&self) -> PathBuf {
         self.root.join(ATTACHMENTS_DIR)
     }

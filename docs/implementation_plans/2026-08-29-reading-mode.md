@@ -325,10 +325,14 @@ Two ordering constraints on that hook, both load-bearing:
   that automatically.
 
 **Notification text.** The existing shape — a title classifying the outcome mix, a body
-leading with the project name — is right and should be preserved; the body has to say
-*which* project, since one can arrive while the user is in another. Widening the scope
-means one notification may now describe both agent outcomes and a workflow outcome. Keep
-it terse and outcome-first; do not enumerate every agent when the list is long.
+leading with the project name — is right and should be preserved; the body says *which*
+project whenever that name is available, since one notification can arrive while the user
+is in another. (It is a graceful fallback, not a guarantee: the tracker learns names from
+`registerSend` and the observer's push, so a notification composed before either has run
+drops the prefix rather than being suppressed. Narrow — a startup race — but real, and
+closing it would require the import cycle the leaf rule forbids.) Widening the scope means
+one notification may now describe both agent outcomes and a workflow outcome. Keep it
+terse and outcome-first; do not enumerate every agent when the list is long.
 
 **Keep the gate untouched.** `should_deliver` in `crates/app/src/notification.rs` and the
 `visible_project` mechanism are not modified by this milestone.

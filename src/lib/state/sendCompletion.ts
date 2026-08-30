@@ -457,6 +457,12 @@ function describe(
     names.length > SUBJECTS_NAMED_IN_BODY
       ? `${names.slice(0, SUBJECTS_NAMED_IN_BODY).join(", ")} and ${names.length - SUBJECTS_NAMED_IN_BODY} more`
       : names.join(", ");
+  // A graceful fallback, not dead code: names arrive from `registerSend` and the
+  // observer's push, and a project with a live workflow subscription is already an
+  // observer candidate (its roster key is set before the subscription), so an
+  // absent name is a startup race only. Sourcing it here instead would need
+  // `workflows` → `workspace`, the cycle this module's leaf rule forbids — so the
+  // body drops the prefix rather than the notification.
   const projectName = projectNames.get(projectId) ?? "";
   return { title, body: projectName === "" ? listed : `${projectName}: ${listed}` };
 }

@@ -1645,11 +1645,11 @@ describe("project idle predicate", () => {
     await state.registerAgent(agentB);
 
     // One recipient completed, the other still running when the directory goes.
-    tracker.registerSend("send-1" as never, PROJECT_1 as never, p.name, [
-      { id: AGENT_1 as never, name: "claude" },
-      { id: AGENT_2 as never, name: "codex" },
+    tracker.registerSend("send-1", PROJECT_1, p.name, [
+      { id: AGENT_1, name: "claude" },
+      { id: AGENT_2, name: "codex" },
     ]);
-    tracker.settleRecipient("send-1" as never, AGENT_1 as never, "completed");
+    tracker.settleRecipient("send-1", AGENT_1, "completed");
     observerStops.push(ws.startProjectActivityObserver(() => "2026-05-25T12:00:00.000Z"));
     await tick();
 

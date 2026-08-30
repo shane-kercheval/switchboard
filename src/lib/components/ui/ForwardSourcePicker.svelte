@@ -44,7 +44,14 @@
     /// Commit a foreign pick into **this consumer's** target (the compose set,
     /// one prompt argument, one workflow field). Called only after `activate`
     /// resolves.
-    onPickForeign: (agent: AgentRecord, project: { id: ProjectId; name: string }) => void;
+    /// `rosterIndex` is the agent's position in the project's roster as listed
+    /// here — the only place it is known, and what orders foreign chips within
+    /// their project.
+    onPickForeign: (
+      agent: AgentRecord,
+      project: { id: ProjectId; name: string },
+      rosterIndex: number,
+    ) => void;
   };
 
   let {
@@ -141,6 +148,7 @@
   async function pickForeign(
     agent: AgentRecord,
     project: { id: ProjectId; name: string },
+    rosterIndex: number,
   ): Promise<void> {
     if (!crossProject) return;
     pickErrors.delete(agent.id);
@@ -151,7 +159,7 @@
       return;
     }
     // Only after the project is proven usable does the source land anywhere.
-    crossProject.onPickForeign(agent, project);
+    crossProject.onPickForeign(agent, project, rosterIndex);
     menuOpen = false;
   }
 
@@ -320,9 +328,9 @@
             {#if roster.agents.length === 0}
               <p class="text-muted px-2.5 py-1.5 text-[11px] italic">no agents</p>
             {/if}
-            {#each roster.agents as agent (agent.id)}
+            {#each roster.agents as agent, rosterIndex (agent.id)}
               <DropdownMenuItem
-                onSelect={() => void pickForeign(agent, project)}
+                onSelect={() => void pickForeign(agent, project, rosterIndex)}
                 closeOnSelect={false}
                 class="gap-2"
                 data-testid={`forward-picker-foreign-agent-${agent.id}`}

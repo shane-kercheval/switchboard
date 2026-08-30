@@ -29,7 +29,6 @@ const ROSTER = [ALICE, BOB];
 
 const PROJECT = "00000000-0000-7000-8000-0000000000ff";
 const source = (id: string, name: string): ForwardSource => ({ id, name, projectId: PROJECT });
-const OTHER_PROJECT = "00000000-0000-7000-8000-0000000000aa";
 
 describe("cross-project forward sources", () => {
   const OTHER = "00000000-0000-7000-8000-0000000000aa";
@@ -122,15 +121,78 @@ describe("orderForwardSources", () => {
     ]);
   });
 
-  it("keeps foreign sources, in declared order, after the roster-ordered locals", () => {
+  it("groups foreign sources after the locals, by project name then card order", () => {
     // A foreign agent is absent from the current project's roster by definition,
     // so a roster-membership pass alone would delete every cross-project chip.
-    const far: ForwardSource = { id: "agent-z", name: "oracle", projectId: OTHER_PROJECT };
-    const near: ForwardSource = { id: "agent-y", name: "scribe", projectId: OTHER_PROJECT };
-    expect(orderForwardSources([far, source("agent-b", "bob"), near], ROSTER, PROJECT)).toEqual([
-      { id: "agent-b", name: "bob", projectId: PROJECT },
-      far,
-      near,
+    // They group instead: locals first in this roster's card order, then each
+    // foreign project alphabetically, each in *its own* card order.
+    const foreign = (
+      id: string,
+      name: string,
+      projectId: string,
+      projectName: string,
+      rosterIndex: number,
+    ): ForwardSource => ({ id, name, projectId, projectName, rosterIndex });
+    // Declared in an order that fights the expected one on every axis: a
+    // later-carded local first, project Z before project X, and each project's
+    // second agent before its first.
+    // Ids deliberately sort *opposite* to the names, so an implementation that
+    // fell back to id order would fail rather than coincidentally agree.
+    const picked = [
+      foreign("z-2", "zeta-two", "p-aaa", "Zebra", 1),
+      source("agent-b", "bob"),
+      foreign("x-2", "xray-two", "p-zzz", "Xylo", 1),
+      foreign("z-1", "zeta-one", "p-aaa", "Zebra", 0),
+      source("agent-a", "alice"),
+      foreign("x-1", "xray-one", "p-zzz", "Xylo", 0),
+    ];
+    expect(orderForwardSources(picked, ROSTER, PROJECT).map((s) => s.id)).toEqual([
+      "agent-a",
+      "agent-b",
+      "x-1",
+      "x-2",
+      "z-1",
+      "z-2",
+    ]);
+  });
+
+  it("keeps two same-named projects from interleaving", () => {
+    // Project names are user text and need not be unique; without a tiebreak
+    // their agents would shuffle together under one apparent heading.
+    const mk = (id: string, projectId: string, rosterIndex: number): ForwardSource => ({
+      id,
+      name: id,
+      projectId,
+      projectName: "Duplicate",
+      rosterIndex,
+    });
+    const picked = [mk("b-1", "p-bbb", 0), mk("a-1", "p-aaa", 0), mk("b-0", "p-bbb", 1)];
+    expect(orderForwardSources(picked, ROSTER, PROJECT).map((s) => s.id)).toEqual([
+      "a-1",
+      "b-1",
+      "b-0",
+    ]);
+  });
+
+  it("sorts a foreign agent with no known card position last within its project", () => {
+    // A draft written before positions were captured, or one whose roster read
+    // failed: it still renders, at the end of its own project's group.
+    const known: ForwardSource = {
+      id: "x-1",
+      name: "xray-one",
+      projectId: "p-xxx",
+      projectName: "Xylo",
+      rosterIndex: 0,
+    };
+    const unknown: ForwardSource = {
+      id: "x-9",
+      name: "xray-nine",
+      projectId: "p-xxx",
+      projectName: "Xylo",
+    };
+    expect(orderForwardSources([unknown, known], ROSTER, PROJECT).map((s) => s.id)).toEqual([
+      "x-1",
+      "x-9",
     ]);
   });
 

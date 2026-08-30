@@ -535,8 +535,11 @@
         onPickAgent={(agent) => addArgSource(name, forwardSourceForAgent(agent))}
         crossProject={crossProjectBase && {
           ...crossProjectBase,
-          onPickForeign: (agent: AgentRecord, project: { id: ProjectId; name: string }) =>
-            addArgSource(name, forwardSourceForAgent(agent, project)),
+          onPickForeign: (
+            agent: AgentRecord,
+            project: { id: ProjectId; name: string },
+            rosterIndex: number,
+          ) => addArgSource(name, forwardSourceForAgent(agent, { project, rosterIndex })),
         }}
         onPickPane={(pane) => {
           for (const source of forwardSourceAgentsForPane(pane, agents)) addArgSource(name, source);

@@ -595,6 +595,10 @@ describe("WorkflowComposer", () => {
           name: "oracle",
           projectId: FOREIGN_PROJECT,
           projectName: "backend",
+          // Its position in the foreign project's roster, captured at pick time
+          // — the only place it is knowable — so the chip can sort by that
+          // project's card order rather than by click order.
+          rosterIndex: 0,
         },
       ]);
     });

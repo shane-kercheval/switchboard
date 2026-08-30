@@ -4013,8 +4013,8 @@
                 onPickPane={(pane) => addPaneForwardSources(pane)}
                 crossProject={{
                   ...crossProjectBase,
-                  onPickForeign: (agent, project) =>
-                    addForwardSource(forwardSourceForAgent(agent, project)),
+                  onPickForeign: (agent, project, rosterIndex) =>
+                    addForwardSource(forwardSourceForAgent(agent, { project, rosterIndex })),
                 }}
                 {agentReadiness}
                 disabled={composerBusy}

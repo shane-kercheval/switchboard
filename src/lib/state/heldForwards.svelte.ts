@@ -43,6 +43,16 @@ export type ForwardSource = {
   name: string;
   projectId?: ProjectId;
   projectName?: string;
+  /// The agent's position in **its own** project's roster, for foreign sources.
+  ///
+  /// A local source needs none — the live roster is right there to order by.
+  /// A foreign one has no such handle at render time (`agents` is the current
+  /// project's roster), so the position is captured when the source is picked,
+  /// from the same roster the picker listed, and refreshed by
+  /// [`refreshForeignSourceLabels`]. Absent on a draft written before this or
+  /// where the read failed: those sort last within their project, keeping the
+  /// order they were declared in rather than jumping around.
+  rosterIndex?: number;
 };
 
 /// Fill in a legacy source's owner from the project whose draft it was restored
@@ -83,23 +93,37 @@ export function forwardSourceKey(source: ForwardSource): string {
 /// has one definition.
 export function forwardSourceForAgent(
   agent: AgentRecord,
-  project?: { id: ProjectId; name: string },
+  foreign?: { project: { id: ProjectId; name: string }; rosterIndex: number },
 ): ForwardSource {
-  return project
-    ? { id: agent.id, name: agent.name, projectId: project.id, projectName: project.name }
+  return foreign
+    ? {
+        id: agent.id,
+        name: agent.name,
+        projectId: foreign.project.id,
+        projectName: foreign.project.name,
+        rosterIndex: foreign.rosterIndex,
+      }
     : { id: agent.id, name: agent.name, projectId: agent.project_id };
 }
 
 /// Put sources in the live roster's order — the same order as the agent cards —
 /// while dropping removed agents, de-duplicating ids, and refreshing display names.
 ///
-/// **Foreign sources are exempt from the roster pass, and kept.** `agents` is the
-/// current project's roster, so a cross-project source is absent from it by
-/// definition; ordering by roster membership alone would silently delete every
-/// foreign chip on each remount. They hold their declared order and follow the
-/// local ones — a foreign chip carries its project name, so grouping reads more
-/// clearly than interleaving against a roster they were never in. Their labels
-/// are refreshed by [`refreshForeignSourceLabels`], not here.
+/// **Foreign sources are grouped after the local ones, never dropped.** `agents`
+/// is the current project's roster, so a cross-project source is absent from it
+/// by definition; ordering by roster membership alone would silently delete
+/// every foreign chip on each remount. Instead they follow the locals, their
+/// projects in alphabetical order, and within each project in *that* project's
+/// own card order (see `rosterIndex`). The full shape:
+///
+/// ```text
+/// current project — agent A, B, C   (this roster's card order)
+/// project X       — agent 1, 2, 3   (project X's card order)
+/// project Y       — agent 1, 2, 3
+/// ```
+///
+/// Pick order never survives, deliberately: what the user sees, what the chips
+/// read, and what the backend composes into the prompt are one order.
 ///
 /// Roster membership alone cannot stand in for `currentProjectId`: a *removed*
 /// local agent is also absent from `agents`, and it must be dropped rather than
@@ -112,15 +136,29 @@ export function orderForwardSources(
   const localIds = new SvelteSet(
     sources.filter((source) => !isForeignSource(source, currentProjectId)).map((s) => s.id),
   );
-  const ordered = agents
+  const local = agents
     .filter((agent) => localIds.has(agent.id))
     .map((agent) => forwardSourceForAgent(agent));
+
+  const seen = new SvelteSet(local.map((source) => source.id));
+  const foreign: ForwardSource[] = [];
   for (const source of sources) {
     if (!isForeignSource(source, currentProjectId)) continue;
-    if (ordered.some((existing) => existing.id === source.id)) continue;
-    ordered.push(source);
+    if (seen.has(source.id)) continue;
+    seen.add(source.id);
+    foreign.push(source);
   }
-  return ordered;
+  // Stable, so sources whose project name and roster position are both unknown
+  // keep the order they were declared in rather than shuffling per render.
+  foreign.sort((a, b) => {
+    const byProject = (a.projectName ?? "").localeCompare(b.projectName ?? "");
+    if (byProject !== 0) return byProject;
+    // Same display name in two projects would otherwise interleave them.
+    const byProjectId = (a.projectId ?? "").localeCompare(b.projectId ?? "");
+    if (byProjectId !== 0) return byProjectId;
+    return (a.rosterIndex ?? Number.MAX_SAFE_INTEGER) - (b.rosterIndex ?? Number.MAX_SAFE_INTEGER);
+  });
+  return [...local, ...foreign];
 }
 
 /// Expand a pane to one forward source per *currently-live* member agent, in live
@@ -215,14 +253,24 @@ export function refreshForeignSourceLabels(
   let changed = false;
   const next = sources.map((source) => {
     if (source.projectId !== projectId) return source;
-    const agent = roster.find((a) => a.id === source.id);
+    const index = roster.findIndex((a) => a.id === source.id);
+    const agent = index === -1 ? undefined : roster[index];
     // A source whose agent is gone keeps its stored label: the backend refuses
     // the send with a clear error, which beats a chip mutating under the user.
     const name = agent?.name ?? source.name;
     const nextName = projectName ?? source.projectName;
-    if (name === source.name && nextName === source.projectName) return source;
+    // Its project may have been re-arranged since the draft was written, and
+    // this read is the only chance to notice.
+    const rosterIndex = agent === undefined ? source.rosterIndex : index;
+    if (
+      name === source.name &&
+      nextName === source.projectName &&
+      rosterIndex === source.rosterIndex
+    ) {
+      return source;
+    }
     changed = true;
-    return { ...source, name, projectName: nextName };
+    return { ...source, name, projectName: nextName, rosterIndex };
   });
   return changed ? next : (sources as ForwardSource[]);
 }

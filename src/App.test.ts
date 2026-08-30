@@ -82,6 +82,10 @@ type Backend = {
   // resolving — lets a test hold the probe "pending" to exercise the
   // auto-create race guard (await a fresh probe before reading installed()).
   installGate: Promise<void> | null;
+  // When set, `notify` parks on this gate. Lets a test hold a completion
+  // notification "in flight" and check that nothing restores the project's
+  // visibility to the gate while it is.
+  notifyGate: Promise<void> | null;
   // When set, `await_harness_path` waits on this gate — models a PATH capture
   // that settles during seeding. Unset means the wait returns immediately with
   // whatever `pathSource` says, modelling an expired budget.
@@ -129,6 +133,7 @@ function freshBackend(): Backend {
     createAgentFailFor: new Set(),
     pathSource: "login_shell",
     installGate: null,
+    notifyGate: null,
     awaitPathGate: null,
     createAgentGate: null,
     openProjectGates: new Map(),
@@ -386,6 +391,15 @@ const invokeMock = vi.fn(async (cmd: string, args?: Record<string, unknown>): Pr
       // Reached once hiding stopped tearing the project down: it stays loaded,
       // so its periodic transcript-freshness check keeps running.
       return [];
+    // Fire-and-forget display/notification writes. Recorded (order matters to the
+    // reading-mode tests) but otherwise inert — the suppression policy they feed
+    // lives in Rust and is tested there.
+    case "remove_agent":
+    case "set_visible_project":
+      return null;
+    case "notify":
+      if (backend.notifyGate !== null) await backend.notifyGate;
+      return null;
     default:
       throw new Error(`unexpected invoke call: ${cmd}`);
   }
@@ -568,6 +582,10 @@ describe("App", () => {
     pins._testing.reset();
     const prefs = await import("$lib/preferences.svelte");
     prefs._testing.reset();
+    const reading = await import("$lib/state/readingMode.svelte");
+    reading._testing.reset();
+    const completion = await import("$lib/state/sendCompletion");
+    completion._testing.reset();
   });
 
   // --- harness availability banners (workspace empty → welcome) ---
@@ -2363,7 +2381,7 @@ describe("App", () => {
     expect(screen.queryByTestId("app-pane-tab")).not.toBeInTheDocument();
   });
 
-  it("keeps unavailable pins reachable and removable after the last agent is gone", async () => {
+  it("automatically removes unavailable pins after the last agent is gone", async () => {
     seedProject({ projectId: "p-a", name: "alpha", agents: [] });
     backend.pins.set("p-a", [
       { key: "agent:hydration:removed-agent:old-message", pinned_at: "2026-08-07T12:00:00Z" },
@@ -2375,10 +2393,8 @@ describe("App", () => {
     expect(agentsMode).toHaveAttribute("aria-disabled", "true");
     await fireEvent.click(screen.getByTestId("right-sidebar-mode-pins"));
     await waitFor(() => expect(screen.getByTestId("pins-sidebar")).toBeInTheDocument());
-    expect(screen.getByTestId("pinned-missing")).toHaveTextContent("Message unavailable");
-
-    await fireEvent.click(screen.getByTestId("pinned-message-unpin"));
     await waitFor(() => expect(backend.pins.get("p-a")).toEqual([]));
+    expect(screen.queryByTestId("pinned-missing")).not.toBeInTheDocument();
     expect(screen.getByTestId("pins-empty")).toBeInTheDocument();
     expect(screen.getByTestId("right-sidebar-mode-pins")).toBeInTheDocument();
     expect(screen.getByTestId("agents-sidebar-toggle")).toBeInTheDocument();
@@ -4436,5 +4452,229 @@ describe("App", () => {
     await fireEvent.keyDown(window, { key: "E", code: "KeyE", metaKey: true, shiftKey: true });
 
     expect(invokeMock).toHaveBeenCalledWith("open_in_editor", { path: detachedPath });
+  });
+
+  // --- reading mode ---
+  //
+  // Reading mode's notification half is one clause in `visibleProjectId`: the
+  // project reports as *not* on screen, so the Rust gate treats its completion
+  // like a background project's. These tests own the frontend end of that — the
+  // gate itself is tested in `crates/app`.
+
+  async function openProjectAlpha(): Promise<void> {
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [agent({ id: "ag-1", project_id: "p-a", name: "assistant" })],
+    });
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("project-row")).toBeInTheDocument());
+    await fireEvent.click(screen.getByText("alpha"));
+    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
+  }
+
+  /// Index of the last `set_visible_project` write carrying `projectId`.
+  function lastVisibilityWrite(projectId: string | null): number {
+    let found = -1;
+    invokeMock.mock.calls.forEach(([cmd, args], i) => {
+      if (cmd === "set_visible_project" && (args?.projectId ?? null) === projectId) found = i;
+    });
+    return found;
+  }
+
+  it("reports the project as not on screen while reading mode is on", async () => {
+    await openProjectAlpha();
+    await waitFor(() => expect(lastVisibilityWrite("p-a")).toBeGreaterThanOrEqual(0));
+
+    await fireEvent.click(screen.getByTestId("reading-mode-toggle"));
+
+    // Null visibility is the whole mechanism: `should_deliver` then falls through
+    // to its "a different project finished" branch.
+    await waitFor(() =>
+      expect(lastVisibilityWrite(null)).toBeGreaterThan(lastVisibilityWrite("p-a")),
+    );
+    expect(screen.getByTestId("reading-mode-toggle")).toHaveAttribute("aria-pressed", "true");
+    expect(screen.queryByTestId("compose-box")).toBeNull();
+  });
+
+  it("holds the project's visibility restore until the notification has been delivered", async () => {
+    // The defect this guards: clearing reading mode restores `visible_project`,
+    // and if that write reaches the gate while `notify` is still travelling, the
+    // gate sees the project as on screen and suppresses the very notification
+    // that ended the mode.
+    //
+    // Call *order* alone cannot catch this — a clear-then-notify implementation
+    // still issues `notify` first, because the visibility write goes through
+    // Svelte's (asynchronous) effect flush. What distinguishes correct from
+    // broken is whether the restore waits for `notify` to **resolve**, so the
+    // test parks the notification in flight and asserts nothing has restored
+    // visibility yet.
+    const notifyGate = deferred<void>();
+    backend.notifyGate = notifyGate.promise;
+    await openProjectAlpha();
+
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    await fireEvent.input(textarea, { target: { value: "hi" } });
+    await fireEvent.click(screen.getByTestId("compose-send"));
+    await waitFor(() =>
+      expect(invokeMock.mock.calls.some(([c]) => c === "send_message")).toBe(true),
+    );
+
+    await fireEvent.click(screen.getByTestId("reading-mode-toggle"));
+    await waitFor(() => expect(screen.queryByTestId("compose-box")).toBeNull());
+    const enabledAt = invokeMock.mock.calls.length;
+
+    const turnId = "99999999-9999-7000-8000-999999999999";
+    const channel = "agent:ag-1";
+    fireTo(channel, {
+      type: "turn_start",
+      turn_id: turnId,
+      message_id: backend.sendMessageId,
+      send_id: backend.sendMessageId,
+      started_at: "2026-05-20T00:00:00Z",
+    });
+    fireTo(channel, {
+      type: "turn_end",
+      turn_id: turnId,
+      outcome: { status: "completed" },
+      ended_at: "2026-05-20T00:00:01Z",
+      usage: null,
+    });
+    fireTo(channel, { type: "agent_idle", agent_id: "ag-1" });
+
+    await waitFor(() =>
+      expect(invokeMock.mock.calls.slice(enabledAt).some(([c]) => c === "notify")).toBe(true),
+    );
+
+    // The notification is in flight. Reading mode must still be on, and no
+    // visibility write may have restored the real project id.
+    await tick();
+    await tick();
+    expect(screen.queryByTestId("compose-box")).toBeNull();
+    expect(
+      invokeMock.mock.calls
+        .slice(enabledAt)
+        .some(([c, a]) => c === "set_visible_project" && a?.projectId === "p-a"),
+    ).toBe(false);
+
+    notifyGate.resolve();
+
+    // Delivered — reading mode turns itself off, and the compose box coming back
+    // is the user-visible half of the same event.
+    await waitFor(() => expect(screen.getByTestId("compose-box")).toBeInTheDocument());
+    const after = invokeMock.mock.calls.slice(enabledAt);
+    const notifyIdx = after.findIndex(([c]) => c === "notify");
+    const restoreIdx = after.findIndex(
+      ([c, a]) => c === "set_visible_project" && a?.projectId === "p-a",
+    );
+    expect(notifyIdx).toBeGreaterThanOrEqual(0);
+    expect(restoreIdx).toBeGreaterThan(notifyIdx);
+  });
+
+  it("clears reading mode on the silent path, where a cancelled project never notifies", async () => {
+    await openProjectAlpha();
+
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    await fireEvent.input(textarea, { target: { value: "hi" } });
+    await fireEvent.click(screen.getByTestId("compose-send"));
+    await waitFor(() =>
+      expect(invokeMock.mock.calls.some(([c]) => c === "send_message")).toBe(true),
+    );
+
+    await fireEvent.click(screen.getByTestId("reading-mode-toggle"));
+    await waitFor(() => expect(screen.queryByTestId("compose-box")).toBeNull());
+    const enabledAt = invokeMock.mock.calls.length;
+
+    const turnId = "99999999-9999-7000-8000-99999999999a";
+    const channel = "agent:ag-1";
+    fireTo(channel, {
+      type: "turn_start",
+      turn_id: turnId,
+      message_id: backend.sendMessageId,
+      send_id: backend.sendMessageId,
+      started_at: "2026-05-20T00:00:00Z",
+    });
+    fireTo(channel, {
+      type: "turn_end",
+      turn_id: turnId,
+      outcome: { status: "cancelled", source: "user" },
+      ended_at: "2026-05-20T00:00:01Z",
+      usage: null,
+    });
+    fireTo(channel, { type: "agent_idle", agent_id: "ag-1" });
+
+    await waitFor(() => expect(screen.getByTestId("compose-box")).toBeInTheDocument());
+    // The flush ran and cleared, but stayed silent — a cancel is something the
+    // user did while present.
+    expect(invokeMock.mock.calls.slice(enabledAt).some(([c]) => c === "notify")).toBe(false);
+  });
+
+  it("stays on for a project that is already quiet", async () => {
+    // Deliberate: reading a finished transcript without the compose box in the
+    // way is a legitimate use, so nothing self-clears until later work settles.
+    // A level-checked auto-off would clear this on the very next tick.
+    await openProjectAlpha();
+    await fireEvent.click(screen.getByTestId("reading-mode-toggle"));
+    await waitFor(() => expect(screen.queryByTestId("compose-box")).toBeNull());
+
+    await tick();
+    await tick();
+
+    expect(screen.queryByTestId("compose-box")).toBeNull();
+    expect(screen.getByTestId("reading-mode-toggle")).toHaveAttribute("aria-pressed", "true");
+  });
+
+  it("toggles reading mode with the keyboard, including back out of it", async () => {
+    // The way out matters more than the way in: with the compose box hidden the
+    // chord has to keep working, so it must not be gated on the composer.
+    await openProjectAlpha();
+
+    await fireEvent.keyDown(window, { key: "R", code: "KeyR", metaKey: true, shiftKey: true });
+    await waitFor(() => expect(screen.queryByTestId("compose-box")).toBeNull());
+    expect(screen.getByTestId("reading-mode-toggle")).toHaveAttribute("aria-pressed", "true");
+
+    await fireEvent.keyDown(window, { key: "R", code: "KeyR", metaKey: true, shiftKey: true });
+    await waitFor(() => expect(screen.getByTestId("compose-box")).toBeInTheDocument());
+    expect(screen.getByTestId("reading-mode-toggle")).toHaveAttribute("aria-pressed", "false");
+  });
+
+  it("keeps the way out of reading mode when the project's last agent is removed", async () => {
+    // The mode outlives the roster, so anything gating its exit must be
+    // transient-by-navigation. A roster condition is not: with reading mode on
+    // for a quiet project, removing the last agent left the toggle unrendered,
+    // the chord inert and the palette entry disabled, with nothing to clear the
+    // mode — a quiet project produces no idle transition for the fallback and no
+    // tracked outcome for the flush.
+    await openProjectAlpha();
+    await fireEvent.click(screen.getByTestId("reading-mode-toggle"));
+    await waitFor(() => expect(screen.queryByTestId("compose-box")).toBeNull());
+
+    const ws = await import("$lib/state/workspace.svelte");
+    await ws.removeAgent("ag-1");
+    // Zero agents: the center pane becomes the create-agent form.
+    await waitFor(() => expect(screen.getByTestId("mode-toggle")).toBeInTheDocument());
+
+    // Still on, and still escapable by both routes.
+    expect(screen.getByTestId("reading-mode-toggle")).toHaveAttribute("aria-pressed", "true");
+    await fireEvent.keyDown(window, { key: "R", code: "KeyR", metaKey: true, shiftKey: true });
+    await waitFor(() =>
+      expect(screen.getByTestId("reading-mode-toggle")).toHaveAttribute("aria-pressed", "false"),
+    );
+  });
+
+  it("explains the preference reading mode depends on, instead of overriding it", async () => {
+    // `notify_while_focused` defaults off, so a user on defaults who turns
+    // reading mode on gets nothing. Silently ignoring their setting would be
+    // worse than saying which one is in the way.
+    await openProjectAlpha();
+    expect(screen.queryByTestId("reading-mode-hint")).toBeNull();
+
+    await fireEvent.click(screen.getByTestId("reading-mode-toggle"));
+    await waitFor(() =>
+      expect(screen.getByTestId("reading-mode-hint")).toHaveTextContent(
+        /Also notify me about other projects/,
+      ),
+    );
   });
 });

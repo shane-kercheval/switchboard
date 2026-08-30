@@ -40,7 +40,6 @@ export const MODEL_OPTIONS: Record<HarnessKind, SelectionOption[]> = {
     { label: "GPT-5.6 Sol", value: "gpt-5.6-sol" },
     { label: "GPT-5.6 Terra", value: "gpt-5.6-terra" },
     { label: "GPT-5.6 Luna", value: "gpt-5.6-luna" },
-    { label: "GPT-5.5", value: "gpt-5.5" },
   ],
   /// Stable slugs from `agy models` (probed @ 1.1.19, 2026-08-25), with the
   /// harness's own display names. **Effort-bearing models are listed by their
@@ -126,10 +125,10 @@ export const MODEL_PRESENTATION: Record<HarnessKind, "segmented" | "dropdown"> =
 /// Per-harness effort options. Codex `none` is
 /// a *real* level (forces no extended reasoning), distinct from leaving effort
 /// unset. This is the **full** per-harness set; effort validity is additionally
-/// **per-model** for Codex *and* Antigravity (see `effortOptionsFor`), so a
-/// form scoped to a chosen model must derive its options through that helper
-/// rather than reading this map directly — for Antigravity especially, where
-/// several models have no effort axis at all.
+/// **per-model** for Antigravity (see `effortOptionsFor`), so a form scoped to a
+/// chosen model must derive its options through that helper rather than reading
+/// this map directly — several Antigravity models have no effort axis at all,
+/// and the helper is what hides the control for them.
 export const EFFORT_OPTIONS: Record<HarnessKind, SelectionOption[]> = {
   claude_code: [
     { label: "Low", value: "low" },
@@ -175,33 +174,14 @@ const ANTIGRAVITY_MODEL_EFFORTS: Record<string, readonly string[]> = {
   "gpt-oss-120b": ["medium"],
 };
 
-/// Codex effort levels only the GPT-5.6 model family accepts. Earlier Codex
-/// models 400 on these — verified live @ codex 0.144.1: `gpt-5.5 + max` is
-/// rejected with the server enumerating `none…xhigh`, while Sol/Terra/Luna
-/// accept every level (incl. `ultra`). A Codex model not in
-/// `CODEX_MAX_ULTRA_MODELS` is offered the list minus these levels.
-const CODEX_HIGH_TIER_EFFORTS: ReadonlySet<string> = new Set(["max", "ultra"]);
-
-/// Codex models that accept `max`/`ultra`. **When adding a Codex model that
-/// supports them, add it here** (the "Model catalog" step in
-/// `docs/harness-update-review.md`), else the picker silently withholds those
-/// levels for it.
-const CODEX_MAX_ULTRA_MODELS: ReadonlySet<string> = new Set([
-  "gpt-5.6-sol",
-  "gpt-5.6-terra",
-  "gpt-5.6-luna",
-]);
-
-/// The effort options valid for a given harness **and model**. Only Codex is
-/// model-dependent: `max`/`ultra` are withheld from **curated** Codex models
-/// known to reject them (`gpt-5.5`) rather than offered as a first-class picker
-/// state that fails at turn time. A null/unset or **off-catalog** model (e.g. an
-/// attached session running an id we don't curate) stays permissive — its
-/// validity is unknown, so we keep it reactive, matching the model picker's own
-/// "curated suggestions, not a validated allow-list" policy. A new curated
-/// Codex model is treated as legacy until added to `CODEX_MAX_ULTRA_MODELS`
-/// (fail-safe: withhold the risky levels until confirmed). Account/plan gating
-/// remains reactive for every harness.
+/// The effort options valid for a given harness **and model**. Only Antigravity
+/// is model-dependent, because only there does a mismatch **fail the dispatch**:
+/// its levels differ per model and several models have no axis at all. Every
+/// other harness gets its full list, and an invalid level is discovered
+/// reactively at dispatch — Claude silently runs a lower level, Codex fails the
+/// turn with the server's own "Supported values are …" enumeration. That matches
+/// the model picker's own "curated suggestions, not a validated allow-list"
+/// policy, under which account/plan gating is already reactive everywhere.
 export function effortOptionsFor(
   harness: HarnessKind,
   model: string | undefined,
@@ -219,10 +199,7 @@ export function effortOptionsFor(
     if (levels === undefined) return [];
     return base.filter((option) => levels.includes(option.value));
   }
-  if (harness !== "codex" || unset) return base;
-  const isCuratedLegacy =
-    MODEL_OPTIONS.codex.some((o) => o.value === model) && !CODEX_MAX_ULTRA_MODELS.has(model);
-  return isCuratedLegacy ? base.filter((o) => !CODEX_HIGH_TIER_EFFORTS.has(o.value)) : base;
+  return base;
 }
 
 /// Whether this harness/model pair **requires** an effort to dispatch.

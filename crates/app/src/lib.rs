@@ -296,18 +296,19 @@ use crate::commands::{
     AUTOCREATE_PATH_WAIT, AgentSessionFingerprint, AgentSessionInfo, DirectoryInfo, ForwardArg,
     ForwardOutcome, HarnessInstallStatus, ProjectListing, RepoListing, StagedAttachment,
     WorkspaceDirectories, add_mcp_provider_impl, add_tracked_repo_impl, agent_session_info_impl,
-    attach_agent_impl, cancel_agent_impl, cancel_forward_impl, cancel_send_impl, cancel_turn_impl,
-    changed_files_impl, check_antigravity_auth_impl, check_antigravity_binary_impl,
-    check_claude_auth_impl, check_claude_binary_impl, check_codex_auth_impl,
-    check_codex_binary_impl, commit_changed_files_impl, commit_file_diff_impl, commit_ranges_impl,
-    copy_builtin_prompt_impl, create_agent_with_profiles_impl, create_project_impl,
-    delete_project_impl, editor_open_argv, existing_attachment_paths_impl, fetch_repo_impl,
-    file_diff_impl, fork_agent_impl, forward_message_impl, forward_prompt_impl,
-    get_preferences_impl, get_prompt_source_impl, harness_adapter_for, init_directory_impl,
-    install_status_for_adapter, list_agents_impl, list_mcp_providers_impl, list_message_pins_impl,
-    list_projects_impl, list_prompts_impl, list_tracked_repos_from_inputs,
-    list_workspace_directories_impl, load_project_conversation_impl, load_transcript_impl,
-    migrate_message_pin_impl, open_commit_file_difftool_impl, open_project_impl,
+    attach_agent_impl, branch_comparison_file_diff_impl, branch_comparison_impl, cancel_agent_impl,
+    cancel_forward_impl, cancel_send_impl, cancel_turn_impl, changed_files_impl,
+    check_antigravity_auth_impl, check_antigravity_binary_impl, check_claude_auth_impl,
+    check_claude_binary_impl, check_codex_auth_impl, check_codex_binary_impl,
+    commit_changed_files_impl, commit_file_diff_impl, commit_ranges_impl, copy_builtin_prompt_impl,
+    create_agent_with_profiles_impl, create_project_impl, delete_project_impl, editor_open_argv,
+    existing_attachment_paths_impl, fetch_repo_impl, file_diff_impl, fork_agent_impl,
+    forward_message_impl, forward_prompt_impl, get_preferences_impl, get_prompt_source_impl,
+    harness_adapter_for, init_directory_impl, install_status_for_adapter, list_agents_impl,
+    list_mcp_providers_impl, list_message_pins_impl, list_projects_impl, list_prompts_impl,
+    list_tracked_repos_from_inputs, list_workspace_directories_impl,
+    load_project_conversation_impl, load_transcript_impl, migrate_message_pin_impl,
+    open_branch_comparison_file_difftool_impl, open_commit_file_difftool_impl, open_project_impl,
     open_worktree_file_difftool_impl, parse_uuid, pick_directory_impl,
     project_session_fingerprints_impl, read_tracked_repo_from_inputs,
     recheck_harness_installs_impl, remove_agent_impl, remove_directory_impl,
@@ -337,7 +338,7 @@ use switchboard_core::{
     AgentRecord, Attachment, HarnessKind, MessagePin, ProjectId, ProjectSummary,
 };
 use switchboard_git::{
-    BranchKind, ChangeKind, ChangedFile, CommitChanges, FileDiff, GitCommitRange,
+    BranchComparison, BranchKind, ChangeKind, ChangedFile, CommitChanges, FileDiff, GitCommitRange,
 };
 use switchboard_harness::subprocess::PathSource;
 use switchboard_prompts::{McpProviderInfo, Prompt, PromptSource};
@@ -816,6 +817,58 @@ async fn commit_file_diff(
     let roots = tracked_roots(state.inner());
     tauri::async_runtime::spawn_blocking(move || {
         commit_file_diff_impl(&roots, &repo_root, &oid, &file)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn branch_comparison(
+    state: State<'_, AppState>,
+    repo_root: String,
+    kind: BranchKind,
+    name: String,
+    base_kind: Option<BranchKind>,
+    base_name: Option<String>,
+    worktree_path: Option<String>,
+) -> Result<Option<BranchComparison>, String> {
+    let roots = tracked_roots(state.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        branch_comparison_impl(
+            &roots,
+            &repo_root,
+            kind,
+            &name,
+            base_kind,
+            base_name.as_deref(),
+            worktree_path.as_deref(),
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn branch_comparison_file_diff(
+    state: State<'_, AppState>,
+    repo_root: String,
+    merge_base_oid: String,
+    head_oid: String,
+    worktree_path: Option<String>,
+    file: String,
+) -> Result<FileDiff, String> {
+    let roots = tracked_roots(state.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        branch_comparison_file_diff_impl(
+            &roots,
+            &repo_root,
+            &merge_base_oid,
+            &head_oid,
+            worktree_path.as_deref(),
+            &file,
+        )
     })
     .await
     .map_err(|e| e.to_string())?
@@ -1652,6 +1705,29 @@ async fn open_commit_file_difftool(
 }
 
 #[tauri::command]
+async fn open_branch_comparison_file_difftool(
+    state: State<'_, AppState>,
+    repo_root: String,
+    worktree_path: Option<String>,
+    merge_base_oid: String,
+    head_oid: String,
+    file: String,
+    change: ChangeKind,
+) -> Result<(), String> {
+    open_branch_comparison_file_difftool_impl(
+        state.inner(),
+        &repo_root,
+        worktree_path.as_deref(),
+        &merge_base_oid,
+        &head_oid,
+        &file,
+        change,
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 async fn load_project_conversation(
     state: State<'_, AppState>,
     project_id: String,
@@ -2234,8 +2310,11 @@ pub fn run() {
             branch_commits,
             commit_changed_files,
             commit_file_diff,
+            branch_comparison,
+            branch_comparison_file_diff,
             open_worktree_file_difftool,
             open_commit_file_difftool,
+            open_branch_comparison_file_difftool,
             get_preferences,
             set_preferences,
             notification_availability,

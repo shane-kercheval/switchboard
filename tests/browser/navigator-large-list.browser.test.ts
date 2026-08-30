@@ -38,6 +38,7 @@ test("distant results remain reachable and keyboard selection stays visible", as
 
   const list = page.getByTestId("navigator-list").element() as HTMLElement;
   expect(list.scrollHeight).toBeGreaterThan(list.clientHeight);
+  expect(list.querySelectorAll('[data-testid="navigator-entry"]').length).toBeLessThan(80);
 
   list.scrollTop = list.scrollHeight;
   list.dispatchEvent(new Event("scroll"));

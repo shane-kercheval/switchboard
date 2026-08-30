@@ -92,6 +92,24 @@ describe("registerAgent", () => {
   });
 });
 
+describe("local send tracking", () => {
+  it("preserves recipients from coalesced same-project sends", async () => {
+    const state = await loadState();
+
+    state.noteLocalSend("project-a", "send-a", [AGENT_A]);
+    state.noteLocalSend("project-a", "send-b", [AGENT_B]);
+
+    expect(state.getLocalSend("project-a")).toEqual({
+      sendId: "send-b",
+      seq: 2,
+      recipientSeqs: {
+        [AGENT_A]: 1,
+        [AGENT_B]: 2,
+      },
+    });
+  });
+});
+
 describe("event routing", () => {
   it("turn_start populates the agent's transcript with a streaming turn", async () => {
     const state = await loadState();
@@ -897,8 +915,7 @@ describe("stopAgent", () => {
     expect(state.runtimes[AGENT_A]?.pending_sends).toBeUndefined();
     expect(cancelledSendIds(state, AGENT_A)).toEqual(["send-2", "send-1"]);
     expect(tracker._testing.size()).toBe(0);
-    expect(tracker._testing.batchCount()).toBe(0);
-    expect(tracker._testing.activeAgentCount()).toBe(0);
+    expect(tracker._testing.projectCount()).toBe(0);
     expect(tracker._testing.startedTurnCount()).toBe(0);
 
     invokeMock.mockClear();

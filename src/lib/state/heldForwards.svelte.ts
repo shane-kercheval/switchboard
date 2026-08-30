@@ -17,6 +17,7 @@
 
 import type { AgentId, AgentRecord, ForwardSourceRef, ProjectId, SendId } from "$lib/types";
 export type { ForwardSourceRef };
+import { SvelteSet } from "svelte/reactivity";
 import { answerTextOf } from "./unified";
 import type { AgentRuntime, Turn } from "$lib/state/types";
 import type { TranscriptPane } from "$lib/state/transcriptPanes.svelte";
@@ -89,17 +90,50 @@ export function forwardSourceForAgent(
     : { id: agent.id, name: agent.name, projectId: agent.project_id };
 }
 
-/// Expand a pane to one forward source per *currently-live* member agent, in pane
-/// member order (a member removed before pick simply drops out). This is the only
+/// Put sources in the live roster's order — the same order as the agent cards —
+/// while dropping removed agents, de-duplicating ids, and refreshing display names.
+///
+/// **Foreign sources are exempt from the roster pass, and kept.** `agents` is the
+/// current project's roster, so a cross-project source is absent from it by
+/// definition; ordering by roster membership alone would silently delete every
+/// foreign chip on each remount. They hold their declared order and follow the
+/// local ones — a foreign chip carries its project name, so grouping reads more
+/// clearly than interleaving against a roster they were never in. Their labels
+/// are refreshed by [`refreshForeignSourceLabels`], not here.
+///
+/// Roster membership alone cannot stand in for `currentProjectId`: a *removed*
+/// local agent is also absent from `agents`, and it must be dropped rather than
+/// mistaken for a foreign source and kept.
+export function orderForwardSources(
+  sources: readonly ForwardSource[],
+  agents: readonly AgentRecord[],
+  currentProjectId: ProjectId,
+): ForwardSource[] {
+  const localIds = new SvelteSet(
+    sources.filter((source) => !isForeignSource(source, currentProjectId)).map((s) => s.id),
+  );
+  const ordered = agents
+    .filter((agent) => localIds.has(agent.id))
+    .map((agent) => forwardSourceForAgent(agent));
+  for (const source of sources) {
+    if (!isForeignSource(source, currentProjectId)) continue;
+    if (ordered.some((existing) => existing.id === source.id)) continue;
+    ordered.push(source);
+  }
+  return ordered;
+}
+
+/// Expand a pane to one forward source per *currently-live* member agent, in live
+/// roster order (a member removed before pick simply drops out). This is the only
 /// place a pane meets forwarding: callers add the returned sources individually
 /// (deduped against what's already attached), so no pane entity is ever stored.
 export function forwardSourceAgentsForPane(
   pane: TranscriptPane,
   agents: AgentRecord[],
 ): ForwardSource[] {
-  return pane.members
-    .map((id) => agents.find((a) => a.id === id))
-    .filter((a): a is AgentRecord => a !== undefined)
+  const memberIds = new SvelteSet(pane.members);
+  return agents
+    .filter((agent) => memberIds.has(agent.id))
     .map((agent) => forwardSourceForAgent(agent));
 }
 
@@ -149,25 +183,19 @@ export function expandForwardSources(
 ///
 /// `draftProjectId` is the project this draft belongs to: it identifies which
 /// sources are local and upgrades legacy sources that predate `projectId`.
+///
+/// Survivors come back in live roster order, foreign sources last in declared
+/// order — see [`orderForwardSources`], which this delegates the ordering to.
 export function reconcileForwardSources(
   sources: readonly ForwardSource[],
   agents: readonly AgentRecord[],
   draftProjectId: ProjectId,
 ): ForwardSource[] {
-  return sources
-    .map((source) => upgradeForwardSource(source, draftProjectId))
-    .filter((source) => {
-      if (isForeignSource(source, draftProjectId)) return true;
-      return agents.some((agent) => agent.id === source.id);
-    })
-    .map((source) => {
-      // A foreign source keeps its stored labels here: this runs synchronously at
-      // composer construction, and its project's roster is an async read. Names are
-      // refreshed afterwards by [`refreshForeignSourceLabels`].
-      if (isForeignSource(source, draftProjectId)) return source;
-      const agent = agents.find((a) => a.id === source.id);
-      return agent ? forwardSourceForAgent(agent) : source;
-    });
+  return orderForwardSources(
+    sources.map((source) => upgradeForwardSource(source, draftProjectId)),
+    agents,
+    draftProjectId,
+  );
 }
 
 /// Apply a freshly-read roster to already-restored sources: update the agent

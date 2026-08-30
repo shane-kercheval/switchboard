@@ -728,6 +728,17 @@ export type CommitChanges = {
   files: ChangedFile[];
 };
 
+// Mirror of Rust `BranchComparison` — the stable baseline and file list for a
+// PR-style comparison from a merge base through a branch tip or live worktree.
+export type BranchComparison = {
+  base_name: string;
+  base_label: string;
+  merge_base_oid: string;
+  head_oid: string;
+  includes_worktree: boolean;
+  files: ChangedFile[];
+};
+
 // Mirror of Rust `FileDiff` / `DiffHunk` / `DiffLine` / `DiffLineKind` — a file's
 // working-tree diff as structured hunks (built from libgit2's structured diff, not
 // parsed from unified text). The frontend renders rows directly from this.

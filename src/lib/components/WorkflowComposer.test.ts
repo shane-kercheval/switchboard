@@ -432,6 +432,26 @@ describe("WorkflowComposer", () => {
     expect(sources().context).toEqual([]);
   });
 
+  it("renders field forward chips in agent-card order", () => {
+    setupForward(
+      descriptor([], [arg({ name: "context" })]),
+      { context: "" },
+      {
+        context: [
+          { id: AGENTS[1]!.id, name: AGENTS[1]!.name },
+          { id: AGENTS[0]!.id, name: AGENTS[0]!.name },
+        ],
+      },
+    );
+
+    const sources = screen.getByTestId("workflow-forward-sources-context");
+    expect(
+      Array.from(sources.querySelectorAll('[data-testid^="forward-source-chip-"]')).map((chip) =>
+        chip.getAttribute("data-testid"),
+      ),
+    ).toEqual(["forward-source-chip-primary", "forward-source-chip-reviewer-1"]);
+  });
+
   it("forwards a pane into the focused field via the ⌘⌃N chord (as member agents)", async () => {
     const { sources } = setupForward(
       descriptor([], [arg({ name: "context" })]),

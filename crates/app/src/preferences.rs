@@ -164,9 +164,11 @@ pub struct Preferences {
     pub notify_on_completion: bool,
 
     /// Whether a project finishing should still notify while the user is working
-    /// in Switchboard. Only ever applies to a project *other* than the one on
-    /// screen — the project you are looking at never notifies while you are
-    /// looking at it.
+    /// in Switchboard. Applies to any project the user is not treated as looking
+    /// at — normally that means a project other than the one on screen, but the
+    /// frontend also reports the *viewed* project as not-on-screen while its
+    /// reading mode is on (the user has explicitly asked to be treated as absent
+    /// from it), so this preference governs that case too.
     ///
     /// Defaults off. The projects sidebar already marks a background project as
     /// finished, so for someone working in the app the information is on screen,

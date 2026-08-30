@@ -14,7 +14,7 @@ It's built for anyone who wants explicit, human-in-the-loop control over multi-a
 
 ![Git view](docs/images/git-view.png)
 
-Switchboard also has a **Git view** for reviewing repositories, changed files, diffs, and commit history without leaving the app. It is deliberately read-only: Switchboard does not stage files, create commits, or replace a full Git client.
+Switchboard also has a **Git view** for reviewing repositories, complete branch changes against a comparison base, uncommitted changes, individual commits, and file diffs without leaving the app. It is deliberately read-only: Switchboard does not stage files, create commits, or replace a full Git client.
 
 ## Features
 
@@ -142,7 +142,6 @@ Switchboard drives each agent through its own CLI, so it inherits that CLI's cap
 - **Model profiles.** Every agent — Claude Code, Codex, and Antigravity — can have a Primary model/effort setup plus an optional Secondary setup for quick switching. Set per-agent-type defaults in Settings; Add Agent and new projects use them automatically. The transcript records the model each past turn actually ran on.
 - **Reasoning effort.** Every supported agent CLI lets Switchboard set the reasoning-effort level per agent (alongside the model). **Antigravity's effort options depend on the model you pick,** and some of its models have no effort setting at all — the picker only offers the levels that model accepts, and hides the control entirely for models that don't have one.
 - **Codex models depend on your plan.** When you sign in to Codex with a ChatGPT subscription, only the models your plan includes are available; choosing one your plan doesn't cover fails the turn with Codex's own error.
-- **The highest Codex effort levels need a GPT-5.6 model.** The `Max` and `Ultra` reasoning-effort levels work on the GPT-5.6 family (Sol, Terra, Luna); older models such as GPT-5.5 top out at `XHigh`. Selecting a higher level on an older model fails the turn with Codex's own message listing the levels that model supports — switch the model or lower the effort and resend.
 - **Gemini is no longer supported.** Google withdrew Gemini CLI access for individual accounts, which left it impossible to test or use here, so support was removed. Use Antigravity — Google's replacement for individual plans — instead.
 - **Antigravity forgets failed tool calls when you reopen a conversation.** While an Antigravity agent is running you'll see a tool that failed along with Antigravity's reason for it. If you close the project and reopen it later, that tool still appears but its result reads "Antigravity did not record a result for this tool call." Antigravity writes nothing to its own transcript file for a rejected tool call, so the reason genuinely isn't there to recover. Nothing else about the conversation is affected.
 - **Some messages can't be pinned.** Switchboard disables Pin when a message has no identity that survives reopening rather than risk attaching the pin to a different message. This includes some imported history and every Antigravity reply. User messages sent through Switchboard can still be pinned.

@@ -90,7 +90,9 @@ describe("PinsSidebar", () => {
         ],
       },
     ];
-    const view = render(PinsSidebar, { props: { projectId: PROJECT, agents: [AGENT] } });
+    const view = render(PinsSidebar, {
+      props: { projectId: PROJECT, agents: [AGENT], rosterLoaded: true },
+    });
 
     const item = await screen.findByTestId("pinned-message");
     expect(item).toHaveTextContent("alice");
@@ -107,7 +109,9 @@ describe("PinsSidebar", () => {
     expect(screen.getByTestId("pinned-message-preview")).toHaveTextContent("first paragraph");
 
     view.unmount();
-    render(PinsSidebar, { props: { projectId: PROJECT, agents: [AGENT] } });
+    render(PinsSidebar, {
+      props: { projectId: PROJECT, agents: [AGENT], rosterLoaded: true },
+    });
     expect(screen.queryByTestId("pinned-message-body")).not.toBeInTheDocument();
     await fireEvent.click(screen.getByTestId("pinned-message-toggle"));
     expect(screen.getByTestId("pinned-message-body")).toHaveTextContent("important answer");
@@ -145,7 +149,7 @@ describe("PinsSidebar", () => {
     ];
 
     const firstProject = render(PinsSidebar, {
-      props: { projectId: PROJECT, agents: [AGENT] },
+      props: { projectId: PROJECT, agents: [AGENT], rosterLoaded: true },
     });
     await screen.findByTestId("pinned-message-body");
     const firstScroller = screen.getByTestId("pins-scroll");
@@ -154,13 +158,15 @@ describe("PinsSidebar", () => {
     firstProject.unmount();
 
     const otherProject = render(PinsSidebar, {
-      props: { projectId: OTHER_PROJECT, agents: [AGENT] },
+      props: { projectId: OTHER_PROJECT, agents: [AGENT], rosterLoaded: true },
     });
     await screen.findByTestId("pinned-message-body");
     await waitFor(() => expect(screen.getByTestId("pins-scroll").scrollTop).toBe(0));
     otherProject.unmount();
 
-    render(PinsSidebar, { props: { projectId: PROJECT, agents: [AGENT] } });
+    render(PinsSidebar, {
+      props: { projectId: PROJECT, agents: [AGENT], rosterLoaded: true },
+    });
     await screen.findByTestId("pinned-message-body");
     await waitFor(() => expect(screen.getByTestId("pins-scroll").scrollTop).toBe(173));
   });
@@ -187,7 +193,9 @@ describe("PinsSidebar", () => {
       },
     ];
 
-    render(PinsSidebar, { props: { projectId: PROJECT, agents: [AGENT] } });
+    render(PinsSidebar, {
+      props: { projectId: PROJECT, agents: [AGENT], rosterLoaded: true },
+    });
     await screen.findByTestId("pinned-message-body");
     const scroller = screen.getByTestId("pins-scroll");
     scroller.scrollTop = 173;
@@ -221,7 +229,9 @@ describe("PinsSidebar", () => {
         items: [{ item_kind: "text", kind: "text", text: "important answer" }],
       },
     ];
-    render(PinsSidebar, { props: { projectId: PROJECT, agents: [AGENT] } });
+    render(PinsSidebar, {
+      props: { projectId: PROJECT, agents: [AGENT], rosterLoaded: true },
+    });
     const toggle = await screen.findByTestId("pinned-message-toggle");
 
     vi.useFakeTimers({ shouldAdvanceTime: true });
@@ -270,7 +280,9 @@ describe("PinsSidebar", () => {
       },
     ];
 
-    render(PinsSidebar, { props: { projectId: PROJECT, agents: [AGENT] } });
+    render(PinsSidebar, {
+      props: { projectId: PROJECT, agents: [AGENT], rosterLoaded: true },
+    });
 
     const toggleAll = await screen.findByTestId("pins-toggle-all");
     expect(toggleAll).toHaveAccessibleName("Collapse all pinned messages");
@@ -315,7 +327,9 @@ describe("PinsSidebar", () => {
       },
     ];
 
-    render(PinsSidebar, { props: { projectId: PROJECT, agents: [AGENT] } });
+    render(PinsSidebar, {
+      props: { projectId: PROJECT, agents: [AGENT], rosterLoaded: true },
+    });
 
     await screen.findByTestId("pins-sort");
     const cardKeys = (): (string | null)[] =>
@@ -331,6 +345,60 @@ describe("PinsSidebar", () => {
     expect(layoutStore.layout.pinsSortModeFor(PROJECT)).toBe("message_at");
     expect(layoutStore.layout.pinsSortModeFor("another-project")).toBe("pinned_at");
     expect(cardKeys()).toEqual([secondKey, PIN_KEY, unavailableKey]);
+  });
+
+  it("removes unavailable pins owned by deleted agents and preserves live-agent pins", async () => {
+    const removedAgentId = "00000000-0000-7000-8000-000000000bbb";
+    const removedHydrationKey = `agent:hydration:${removedAgentId}:missing-hydration`;
+    const removedSendKey = `agent:send:missing-send:${removedAgentId}`;
+    const liveUnavailableKey = `agent:hydration:${AGENT.id}:missing-hydration`;
+    persistedPins = [
+      { key: removedHydrationKey, pinned_at: "2026-08-07T12:03:00Z" },
+      { key: removedSendKey, pinned_at: "2026-08-07T12:02:00Z" },
+      { key: liveUnavailableKey, pinned_at: "2026-08-07T12:01:00Z" },
+    ];
+
+    render(PinsSidebar, {
+      props: { projectId: PROJECT, agents: [AGENT], rosterLoaded: true },
+    });
+
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("remove_message_pins", {
+        projectId: PROJECT,
+        keys: [removedHydrationKey, removedSendKey],
+      }),
+    );
+    expect(persistedPins).toEqual([{ key: liveUnavailableKey, pinned_at: "2026-08-07T12:01:00Z" }]);
+    expect(screen.getAllByTestId("pinned-message-card")).toHaveLength(1);
+    expect(screen.getByTestId("pinned-message-card")).toHaveAttribute(
+      "data-message-key",
+      liveUnavailableKey,
+    );
+    expect(screen.getByTestId("pinned-missing")).toHaveTextContent("Message unavailable");
+  });
+
+  it("waits for an authoritative empty roster before removing agent pins", async () => {
+    const orphanedKey = "agent:hydration:removed-agent:missing-hydration";
+    persistedPins = [{ key: orphanedKey, pinned_at: "2026-08-07T12:01:00Z" }];
+    const view = render(PinsSidebar, {
+      props: { projectId: PROJECT, agents: [], rosterLoaded: false },
+    });
+
+    await screen.findByTestId("pinned-missing");
+    expect(
+      invokeMock.mock.calls.filter(([command]) => command === "remove_message_pins"),
+    ).toHaveLength(0);
+    expect(persistedPins).toEqual([{ key: orphanedKey, pinned_at: "2026-08-07T12:01:00Z" }]);
+
+    await view.rerender({ projectId: PROJECT, agents: [], rosterLoaded: true });
+
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("remove_message_pins", {
+        projectId: PROJECT,
+        keys: [orphanedKey],
+      }),
+    );
+    expect(screen.getByTestId("pins-empty")).toBeInTheDocument();
   });
 
   it("restores each project's Pins ordering when one mounted sidebar changes projects", async () => {
@@ -360,7 +428,9 @@ describe("PinsSidebar", () => {
         items: [{ item_kind: "text", kind: "text", text: "newer message" }],
       },
     ];
-    const view = render(PinsSidebar, { props: { projectId: PROJECT, agents: [AGENT] } });
+    const view = render(PinsSidebar, {
+      props: { projectId: PROJECT, agents: [AGENT], rosterLoaded: true },
+    });
     const cardKeys = (): (string | null)[] =>
       screen
         .getAllByTestId("pinned-message-card")
@@ -369,7 +439,7 @@ describe("PinsSidebar", () => {
     await fireEvent.click(await screen.findByTestId("pins-sort-message"));
     expect(cardKeys()).toEqual([secondKey, PIN_KEY]);
 
-    await view.rerender({ projectId: OTHER_PROJECT, agents: [AGENT] });
+    await view.rerender({ projectId: OTHER_PROJECT, agents: [AGENT], rosterLoaded: true });
     await waitFor(() =>
       expect(screen.getByTestId("pins-sort-pinned")).toHaveAttribute("aria-checked", "true"),
     );
@@ -379,7 +449,7 @@ describe("PinsSidebar", () => {
     await fireEvent.click(screen.getByTestId("pins-sort-pinned"));
     expect(layoutStore.layout.pinsSortModeFor(OTHER_PROJECT)).toBe("pinned_at");
 
-    await view.rerender({ projectId: PROJECT, agents: [AGENT] });
+    await view.rerender({ projectId: PROJECT, agents: [AGENT], rosterLoaded: true });
     await waitFor(() =>
       expect(screen.getByTestId("pins-sort-message")).toHaveAttribute("aria-checked", "true"),
     );
@@ -425,7 +495,9 @@ describe("PinsSidebar", () => {
       },
     ];
 
-    render(PinsSidebar, { props: { projectId: PROJECT, agents: [AGENT] } });
+    render(PinsSidebar, {
+      props: { projectId: PROJECT, agents: [AGENT], rosterLoaded: true },
+    });
     await fireEvent.click(await screen.findByTestId("pins-sort-message"));
 
     expect(
@@ -441,7 +513,9 @@ describe("PinsSidebar", () => {
       { key: `agent:hydration:${AGENT.id}:missing-2`, pinned_at: "2026-08-07T12:02:00Z" },
     ];
 
-    render(PinsSidebar, { props: { projectId: PROJECT, agents: [AGENT] } });
+    render(PinsSidebar, {
+      props: { projectId: PROJECT, agents: [AGENT], rosterLoaded: true },
+    });
 
     await screen.findAllByTestId("pinned-missing");
     expect(screen.queryByTestId("pins-sort")).not.toBeInTheDocument();
@@ -475,7 +549,9 @@ describe("PinsSidebar", () => {
       },
     ];
 
-    render(PinsSidebar, { props: { projectId: PROJECT, agents: [AGENT] } });
+    render(PinsSidebar, {
+      props: { projectId: PROJECT, agents: [AGENT], rosterLoaded: true },
+    });
     await fireEvent.click(await screen.findByTestId("pins-sort-message"));
 
     expect(
@@ -509,7 +585,9 @@ describe("PinsSidebar", () => {
       },
     ];
 
-    render(PinsSidebar, { props: { projectId: PROJECT, agents: [AGENT] } });
+    render(PinsSidebar, {
+      props: { projectId: PROJECT, agents: [AGENT], rosterLoaded: true },
+    });
 
     const body = await screen.findByTestId("pinned-message-body");
     expect(screen.getAllByTestId("pinned-message-card")).toHaveLength(1);
@@ -532,7 +610,9 @@ describe("PinsSidebar", () => {
         items: [{ item_kind: "text", kind: "text", text: "before compaction" }],
       },
     ];
-    render(PinsSidebar, { props: { projectId: PROJECT, agents: [AGENT] } });
+    render(PinsSidebar, {
+      props: { projectId: PROJECT, agents: [AGENT], rosterLoaded: true },
+    });
     await waitFor(() => expect(pins.pinsLoaded(PROJECT)).toBe(true));
     const alias = `agent:send:send-1:${AGENT.id}`;
     const canonical = `agent:hydration:${AGENT.id}:message-1`;
@@ -611,7 +691,9 @@ describe("PinsSidebar", () => {
       },
     ];
 
-    render(PinsSidebar, { props: { projectId: PROJECT, agents: [AGENT] } });
+    render(PinsSidebar, {
+      props: { projectId: PROJECT, agents: [AGENT], rosterLoaded: true },
+    });
 
     const body = await screen.findByTestId("pinned-message-body");
     expect(body).toHaveTextContent("unambiguous root");

@@ -14,6 +14,7 @@ import * as api from "$lib/api";
 import { SvelteMap, SvelteSet } from "svelte/reactivity";
 import { compareIsoTimestampsDescending } from "$lib/utils";
 import type {
+  BranchComparison,
   BranchKind,
   BranchView,
   GitCommitRange,
@@ -100,12 +101,21 @@ export type SelectedRef = {
   name: string;
 };
 
-/// What the right-hand panel shows: either a worktree's *uncommitted* changes
-/// (needs a checked-out folder) or one *commit's* diff (committed history; no
-/// folder required, so it serves branches with no folder and remote-only refs).
+/// What the right-hand panel shows: a branch comparison, a worktree's
+/// *uncommitted* changes, or one *commit's* diff. Comparisons and commits need no
+/// folder, so branches without a worktree and remote-only refs remain inspectable.
 /// `title`/`subtitle` are the panel header text, resolved at selection time so the
 /// panel is pure presentation.
 export type DiffTarget =
+  | {
+      kind: "comparison";
+      repoRoot: string;
+      branchName: string;
+      worktreePath: string | null;
+      comparison: BranchComparison;
+      title: string;
+      subtitle: string;
+    }
   | {
       kind: "uncommitted";
       repoRoot: string;
@@ -134,6 +144,37 @@ export const branchCommits = $state<{
   status: "loading" | "loaded" | "failed";
   ranges: GitCommitRange[];
 }>({ ref: null, status: "loaded", ranges: [] });
+
+export type ComparisonBase = { kind: BranchKind; name: string };
+
+/// The aggregate branch comparison for the expanded branch. Loaded on demand
+/// beside its commit ranges; `base === null` means automatic default-branch
+/// resolution, while a value records the user's session-only override.
+export const branchComparison = $state<{
+  ref: SelectedRef | null;
+  status: "loading" | "loaded" | "failed";
+  result: BranchComparison | null;
+  base: ComparisonBase | null;
+  pendingBase: ComparisonBase | null | undefined;
+  error: string | null;
+  worktreePath: string | null;
+}>({
+  ref: null,
+  status: "loaded",
+  result: null,
+  base: null,
+  pendingBase: undefined,
+  error: null,
+  worktreePath: null,
+});
+
+let branchSelectionEpoch = 0;
+let branchCommitsRequestId = 0;
+let branchComparisonRequestId = 0;
+
+function comparisonBasesEqual(a: ComparisonBase | null, b: ComparisonBase | null): boolean {
+  return a === null ? b === null : b !== null && a.kind === b.kind && a.name === b.name;
+}
 
 /// The diff shown in the right panel, or `null` when nothing is selected.
 export const diffTarget = $state<{ current: DiffTarget | null }>({ current: null });
@@ -177,10 +218,16 @@ export function anyBranchMenuOpen(): boolean {
   return openBranchMenuRoots.size > 0;
 }
 
-/// A navigable entry in the commit pane: the worktree's uncommitted row (shown
-/// above the commits when the worktree is dirty) or one commit. Built by the
-/// component from the live data; consumed by [`nextCommitSelection`].
+/// A navigable entry in the commit pane: the aggregate branch comparison, the
+/// worktree's uncommitted row, or one commit. Built by the component from live
+/// data; consumed by [`nextCommitSelection`].
 export type CommitNavItem =
+  | {
+      kind: "comparison";
+      branchName: string;
+      worktreePath: string | null;
+      comparison: BranchComparison;
+    }
   | { kind: "uncommitted"; worktreePath: string }
   | { kind: "commit"; commit: GitCommitSummary };
 
@@ -205,9 +252,13 @@ export function nextCommitSelection(
   const idx = items.findIndex((item) =>
     current === null
       ? false
-      : item.kind === "uncommitted"
-        ? current.kind === "uncommitted" && current.worktreePath === item.worktreePath
-        : current.kind === "commit" && current.oid === item.commit.oid,
+      : item.kind === "comparison"
+        ? current.kind === "comparison" &&
+          current.comparison.merge_base_oid === item.comparison.merge_base_oid &&
+          current.comparison.head_oid === item.comparison.head_oid
+        : item.kind === "uncommitted"
+          ? current.kind === "uncommitted" && current.worktreePath === item.worktreePath
+          : current.kind === "commit" && current.oid === item.commit.oid,
   );
   const next = nextIndex(items.length, idx, delta);
   return next === null ? null : items[next]!;
@@ -252,9 +303,9 @@ function readableCommitTimestamp(iso: string | null): string | null {
   });
 }
 
-/// Select (and expand) a branch: load its commits and pick a default diff target
-/// — its uncommitted changes when the worktree is dirty, otherwise its latest
-/// commit once the list loads. Re-selecting the same branch collapses it.
+/// Select (and expand) a branch: load its aggregate comparison and commits, then
+/// default to the comparison. If no base/common ancestor resolves, fall back to
+/// uncommitted changes or the latest commit. Re-selecting collapses the branch.
 export async function selectBranch(
   ref: SelectedRef,
   opts: { worktreePath: string | null; hasChanges: boolean; worktreeSubtitle: string },
@@ -263,40 +314,154 @@ export async function selectBranch(
     clearBranchSelection();
     return;
   }
+  const selectionEpoch = ++branchSelectionEpoch;
+  const commitsRequestId = ++branchCommitsRequestId;
+  const comparisonRequestId = ++branchComparisonRequestId;
   branchSelection.current = ref;
   branchCommits.ref = ref;
   branchCommits.status = "loading";
   branchCommits.ranges = [];
-
-  // Default target: uncommitted-if-dirty now; otherwise the latest commit, once
-  // the commit list resolves below.
-  diffTarget.current =
-    opts.worktreePath !== null && opts.hasChanges
-      ? {
-          kind: "uncommitted",
-          repoRoot: ref.repoRoot,
-          worktreePath: opts.worktreePath,
-          title: "Uncommitted changes",
-          subtitle: opts.worktreeSubtitle,
-        }
-      : null;
-  // Selecting a branch makes its commit list the arrow-key target, whether the
-  // default lands on the uncommitted row or (once loaded) the latest commit.
+  branchComparison.ref = ref;
+  branchComparison.status = "loading";
+  branchComparison.result = null;
+  branchComparison.base = null;
+  branchComparison.pendingBase = undefined;
+  branchComparison.error = null;
+  branchComparison.worktreePath = opts.worktreePath;
+  diffTarget.current = null;
+  // Selecting a branch makes its commit list the arrow-key target regardless of
+  // which aggregate/uncommitted/commit fallback becomes the default.
   navFocus.pane = "commits";
 
+  const comparisonRead = api
+    .branchComparison(ref.repoRoot, ref.kind, ref.name, null, opts.worktreePath)
+    .then(
+      (result) => {
+        if (
+          branchSelectionEpoch === selectionEpoch &&
+          branchComparisonRequestId === comparisonRequestId &&
+          refsEqual(branchSelection.current, ref)
+        ) {
+          branchComparison.result = result;
+          branchComparison.status = "loaded";
+        }
+        return result;
+      },
+      (error: unknown) => {
+        console.warn("[switchboard] git view branch comparison failed", { ref, error });
+        if (
+          branchSelectionEpoch === selectionEpoch &&
+          branchComparisonRequestId === comparisonRequestId &&
+          refsEqual(branchSelection.current, ref)
+        ) {
+          branchComparison.status = "failed";
+          branchComparison.error = "Couldn't load branch changes.";
+        }
+        return null;
+      },
+    );
+  const commitsRead = api.branchCommits(ref.repoRoot, ref.kind, ref.name).then(
+    (ranges) => {
+      if (
+        branchSelectionEpoch === selectionEpoch &&
+        branchCommitsRequestId === commitsRequestId &&
+        refsEqual(branchSelection.current, ref)
+      ) {
+        branchCommits.ranges = ranges;
+        branchCommits.status = "loaded";
+      }
+      return ranges;
+    },
+    (error: unknown) => {
+      console.warn("[switchboard] git view branch commits failed", { ref, error });
+      if (
+        branchSelectionEpoch === selectionEpoch &&
+        branchCommitsRequestId === commitsRequestId &&
+        refsEqual(branchSelection.current, ref)
+      ) {
+        branchCommits.status = "failed";
+      }
+      return [];
+    },
+  );
+
+  await Promise.all([comparisonRead, commitsRead]);
+  if (branchSelectionEpoch !== selectionEpoch || !refsEqual(branchSelection.current, ref)) return;
+
+  if (diffTarget.current !== null) return;
+  if (branchComparison.result !== null) {
+    selectBranchComparison(ref.repoRoot, ref.name, branchComparison.result, opts.worktreePath);
+  } else if (opts.worktreePath !== null && opts.hasChanges) {
+    selectUncommitted(ref.repoRoot, opts.worktreePath, opts.worktreeSubtitle);
+  } else {
+    const first = firstCommit(branchCommits.ranges);
+    if (first !== undefined) selectCommit(ref.repoRoot, first);
+  }
+}
+
+export function selectBranchComparison(
+  repoRoot: string,
+  branchName: string,
+  comparison: BranchComparison,
+  worktreePath: string | null,
+): void {
+  diffTarget.current = {
+    kind: "comparison",
+    repoRoot,
+    branchName,
+    worktreePath,
+    comparison,
+    title: "Branch changes",
+    subtitle: `${branchName} · compared with ${comparison.base_label}${comparison.includes_worktree ? " · includes uncommitted changes" : ""}`,
+  };
+  navFocus.pane = "commits";
+}
+
+export async function compareSelectedBranchAgainst(base: ComparisonBase | null): Promise<void> {
+  const ref = branchSelection.current;
+  if (ref === null) return;
+  const selectionEpoch = branchSelectionEpoch;
+  const requestId = ++branchComparisonRequestId;
+  const worktreePath = branchComparison.worktreePath;
+  branchComparison.status = "loading";
+  branchComparison.pendingBase = base;
+  branchComparison.error = null;
   try {
-    const ranges = await api.branchCommits(ref.repoRoot, ref.kind, ref.name);
-    if (!refsEqual(branchCommits.ref, ref)) return; // selection moved on while loading
-    branchCommits.ranges = ranges;
-    branchCommits.status = "loaded";
-    if (diffTarget.current === null) {
-      const first = firstCommit(ranges);
-      if (first !== undefined) selectCommit(ref.repoRoot, first);
+    const result = await api.branchComparison(ref.repoRoot, ref.kind, ref.name, base, worktreePath);
+    if (
+      branchSelectionEpoch !== selectionEpoch ||
+      branchComparisonRequestId !== requestId ||
+      !refsEqual(branchSelection.current, ref) ||
+      branchComparison.pendingBase === undefined ||
+      !comparisonBasesEqual(branchComparison.pendingBase, base)
+    )
+      return;
+    branchComparison.pendingBase = undefined;
+    branchComparison.base = base;
+    branchComparison.result = result;
+    branchComparison.status = "loaded";
+    if (result !== null) {
+      selectBranchComparison(ref.repoRoot, ref.name, result, worktreePath);
+    } else if (diffTarget.current?.kind === "comparison") {
+      diffTarget.current = null;
     }
   } catch (e) {
-    if (!refsEqual(branchCommits.ref, ref)) return;
-    console.warn("[switchboard] git view branch commits failed", { ref, error: e });
-    branchCommits.status = "failed";
+    if (
+      branchSelectionEpoch !== selectionEpoch ||
+      branchComparisonRequestId !== requestId ||
+      !refsEqual(branchSelection.current, ref) ||
+      branchComparison.pendingBase === undefined ||
+      !comparisonBasesEqual(branchComparison.pendingBase, base)
+    )
+      return;
+    console.warn("[switchboard] git view comparison-base change failed", { ref, base, error: e });
+    branchComparison.pendingBase = undefined;
+    branchComparison.status = "failed";
+    const baseLabel = base?.name ?? "the default branch";
+    branchComparison.error =
+      branchComparison.result === null
+        ? `Couldn't compare with ${baseLabel}.`
+        : `Couldn't compare with ${baseLabel}. Kept the previous comparison.`;
   }
 }
 
@@ -328,6 +493,7 @@ export function selectUncommitted(repoRoot: string, worktreePath: string, subtit
 export function selectedWorktreePathForEditor(): string | null {
   const target = diffTarget.current;
   if (target?.kind === "uncommitted") return target.worktreePath;
+  if (target?.kind === "comparison" && target.worktreePath !== null) return target.worktreePath;
 
   const selected = branchSelection.current;
   if (selected === null || selected.kind !== "local") return null;
@@ -338,10 +504,20 @@ export function selectedWorktreePathForEditor(): string | null {
 
 /// Collapse the selected branch and close the right panel.
 export function clearBranchSelection(): void {
+  branchSelectionEpoch += 1;
+  branchCommitsRequestId += 1;
+  branchComparisonRequestId += 1;
   branchSelection.current = null;
   branchCommits.ref = null;
   branchCommits.ranges = [];
   branchCommits.status = "loaded";
+  branchComparison.ref = null;
+  branchComparison.status = "loaded";
+  branchComparison.result = null;
+  branchComparison.base = null;
+  branchComparison.pendingBase = undefined;
+  branchComparison.error = null;
+  branchComparison.worktreePath = null;
   diffTarget.current = null;
   navFocus.pane = null;
 }
@@ -352,13 +528,49 @@ export function clearBranchSelection(): void {
 async function reloadSelectedCommits(): Promise<void> {
   const ref = branchSelection.current;
   if (ref === null) return;
+  const selectionEpoch = branchSelectionEpoch;
+  const requestId = ++branchCommitsRequestId;
   try {
     const ranges = await api.branchCommits(ref.repoRoot, ref.kind, ref.name);
-    if (!refsEqual(branchSelection.current, ref)) return;
+    if (
+      branchSelectionEpoch !== selectionEpoch ||
+      branchCommitsRequestId !== requestId ||
+      !refsEqual(branchSelection.current, ref)
+    )
+      return;
     branchCommits.ranges = ranges;
     branchCommits.status = "loaded";
   } catch (e) {
     console.warn("[switchboard] git view commit reload failed", { ref, error: e });
+  }
+}
+
+async function reloadSelectedComparison(): Promise<void> {
+  const ref = branchSelection.current;
+  if (ref === null || !refsEqual(branchComparison.ref, ref)) return;
+  const base = branchComparison.base;
+  const worktreePath = branchComparison.worktreePath;
+  const selectionEpoch = branchSelectionEpoch;
+  const requestId = ++branchComparisonRequestId;
+  try {
+    const result = await api.branchComparison(ref.repoRoot, ref.kind, ref.name, base, worktreePath);
+    if (
+      branchSelectionEpoch !== selectionEpoch ||
+      branchComparisonRequestId !== requestId ||
+      !refsEqual(branchSelection.current, ref) ||
+      !comparisonBasesEqual(branchComparison.base, base)
+    )
+      return;
+    branchComparison.result = result;
+    branchComparison.status = "loaded";
+    branchComparison.error = null;
+    if (diffTarget.current?.kind === "comparison") {
+      if (result === null) diffTarget.current = null;
+      else selectBranchComparison(ref.repoRoot, ref.name, result, worktreePath);
+      gitRefresh.revision += 1;
+    }
+  } catch (e) {
+    console.warn("[switchboard] git view comparison reload failed", { ref, base, error: e });
   }
 }
 
@@ -761,7 +973,13 @@ function afterRefresh(repos: RepoListing[], fullList: boolean): void {
       clearBranchSelection();
     } else if (listing !== undefined) {
       // The selected branch's repo was re-read — its history may have changed.
+      branchComparison.worktreePath =
+        sel.kind === "local"
+          ? (listing.repo.local_branches.find((branch) => branch.name === sel.name)?.worktree
+              ?.path ?? null)
+          : null;
       void reloadSelectedCommits();
+      void reloadSelectedComparison();
     }
   }
   // Reconcile an open uncommitted diff target against the refreshed repo. (A
@@ -864,9 +1082,19 @@ export const _testing = {
     gitRevealSeq = 0;
     for (const k of Object.keys(fetchStates)) delete fetchStates[k];
     branchSelection.current = null;
+    branchSelectionEpoch += 1;
+    branchCommitsRequestId += 1;
+    branchComparisonRequestId += 1;
     branchCommits.ref = null;
     branchCommits.ranges = [];
     branchCommits.status = "loaded";
+    branchComparison.ref = null;
+    branchComparison.status = "loaded";
+    branchComparison.result = null;
+    branchComparison.base = null;
+    branchComparison.pendingBase = undefined;
+    branchComparison.error = null;
+    branchComparison.worktreePath = null;
     diffTarget.current = null;
     navFocus.pane = null;
     hoverSuppressed.value = false;

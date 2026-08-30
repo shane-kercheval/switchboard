@@ -158,8 +158,10 @@ pub struct MaintenanceBarrier {
 pub struct AppState {
     pub projects: Mutex<HashMap<ProjectId, Project>>,
     pub active_project_id: Mutex<Option<ProjectId>>,
-    /// The project whose transcript is **rendered on screen right now**, or
-    /// `None` when nothing is (Settings, the Git view, a project still loading).
+    /// The project the user is to be treated as **looking at right now**, or
+    /// `None` when there is none (Settings, the Git view, a project still
+    /// loading, or a project whose reading mode is on — the user watching a run
+    /// asked to be notified about it as though they weren't there).
     ///
     /// Deliberately separate from [`Self::active_project_id`], which answers a
     /// different question — "which project would a backend action target" — and

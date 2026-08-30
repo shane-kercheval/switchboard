@@ -3,13 +3,16 @@ import {
   agentReadinessFor,
   expandForwardSources,
   forwardReadiness,
+  forwardSourceAgentsForPane,
   forwardSourceLabel,
+  orderForwardSources,
   reconcileForwardSourceMap,
   reconcileForwardSources,
 } from "./heldForwards.svelte";
 import type { ForwardSource } from "./heldForwards.svelte";
 import type { Turn, TurnItem } from "./types";
 import type { AgentRecord } from "$lib/types";
+import type { TranscriptPane } from "$lib/state/transcriptPanes.svelte";
 
 const agent = (id: string, name: string): AgentRecord => ({
   id,
@@ -26,6 +29,7 @@ const ROSTER = [ALICE, BOB];
 
 const PROJECT = "00000000-0000-7000-8000-0000000000ff";
 const source = (id: string, name: string): ForwardSource => ({ id, name, projectId: PROJECT });
+const OTHER_PROJECT = "00000000-0000-7000-8000-0000000000aa";
 
 describe("cross-project forward sources", () => {
   const OTHER = "00000000-0000-7000-8000-0000000000aa";
@@ -91,12 +95,65 @@ describe("cross-project forward sources", () => {
   });
 });
 
+describe("orderForwardSources", () => {
+  it("matches the agent-card roster order regardless of selection order", () => {
+    expect(
+      orderForwardSources(
+        [source("agent-b", "stale-bob"), source("agent-a", "stale-alice")],
+        ROSTER,
+        PROJECT,
+      ),
+    ).toEqual([
+      { id: "agent-a", name: "alice", projectId: PROJECT },
+      { id: "agent-b", name: "bob", projectId: PROJECT },
+    ]);
+  });
+
+  it("omits a local source whose agent left the roster", () => {
+    expect(
+      orderForwardSources(
+        [source("agent-b", "bob"), source("agent-gone", "ghost"), source("agent-a", "alice")],
+        ROSTER,
+        PROJECT,
+      ),
+    ).toEqual([
+      { id: "agent-a", name: "alice", projectId: PROJECT },
+      { id: "agent-b", name: "bob", projectId: PROJECT },
+    ]);
+  });
+
+  it("keeps foreign sources, in declared order, after the roster-ordered locals", () => {
+    // A foreign agent is absent from the current project's roster by definition,
+    // so a roster-membership pass alone would delete every cross-project chip.
+    const far: ForwardSource = { id: "agent-z", name: "oracle", projectId: OTHER_PROJECT };
+    const near: ForwardSource = { id: "agent-y", name: "scribe", projectId: OTHER_PROJECT };
+    expect(orderForwardSources([far, source("agent-b", "bob"), near], ROSTER, PROJECT)).toEqual([
+      { id: "agent-b", name: "bob", projectId: PROJECT },
+      far,
+      near,
+    ]);
+  });
+
+  it("expands pane members in agent-card order rather than pane insertion order", () => {
+    const pane: TranscriptPane = {
+      id: "pane-1",
+      name: "reviewers",
+      members: [BOB.id, ALICE.id],
+      hidden: [],
+    };
+    expect(forwardSourceAgentsForPane(pane, ROSTER)).toEqual([
+      { id: "agent-a", name: "alice", projectId: PROJECT },
+      { id: "agent-b", name: "bob", projectId: PROJECT },
+    ]);
+  });
+});
+
 describe("reconcileForwardSources", () => {
-  it("keeps sources whose agent is still on the roster, in order", () => {
+  it("keeps surviving sources in the current roster order", () => {
     const sources = [source("agent-b", "bob"), source("agent-a", "alice")];
     expect(reconcileForwardSources(sources, ROSTER, PROJECT)).toEqual([
-      { id: "agent-b", name: "bob", projectId: PROJECT },
       { id: "agent-a", name: "alice", projectId: PROJECT },
+      { id: "agent-b", name: "bob", projectId: PROJECT },
     ]);
   });
 
@@ -136,8 +193,8 @@ describe("reconcileForwardSourceMap", () => {
     expect(reconcileForwardSourceMap(map, ROSTER, PROJECT)).toEqual({
       focus: [{ id: "agent-a", name: "alice", projectId: PROJECT }],
       context: [
-        { id: "agent-b", name: "bob", projectId: PROJECT },
         { id: "agent-a", name: "alice", projectId: PROJECT },
+        { id: "agent-b", name: "bob", projectId: PROJECT },
       ],
     });
   });

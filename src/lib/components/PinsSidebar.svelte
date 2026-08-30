@@ -8,6 +8,7 @@
   import { buildUnifiedRows, copyTextOf, type UnifiedRow } from "$lib/state/unified";
   import { navigatorEntryForRow, type NavigatorEntry } from "$lib/transcriptIndex";
   import {
+    agentIdForMessageKey,
     identityKeys,
     messageIdentityForRow,
     type PinnableMessageIdentity,
@@ -19,6 +20,7 @@
     pinsLoaded,
     pinsFor,
     pinsUnavailableReason,
+    removeStoredMessagePins,
     setPinsCollapsed,
     setPinsScrollTop,
     setStoredPinPinned,
@@ -56,10 +58,12 @@
   let {
     projectId,
     agents,
+    rosterLoaded,
     overlay = [],
   }: {
     projectId: ProjectId;
     agents: AgentRecord[];
+    rosterLoaded: boolean;
     overlay?: ConversationItem[];
   } = $props();
 
@@ -189,6 +193,17 @@
 
   $effect(() => {
     void loadMessagePins(projectId);
+  });
+
+  $effect(() => {
+    if (!rosterLoaded || !pinsLoaded(projectId)) return;
+    const orphanedKeys = pinsFor(projectId)
+      .map((pin) => pin.key)
+      .filter((key) => {
+        const agentId = agentIdForMessageKey(key);
+        return agentId !== undefined && !rosterIds.includes(agentId);
+      });
+    removeStoredMessagePins(projectId, orphanedKeys);
   });
 
   $effect(() => {

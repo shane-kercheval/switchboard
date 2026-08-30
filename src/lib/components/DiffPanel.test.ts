@@ -72,6 +72,26 @@ const commitTarget = (over: Partial<Extract<DiffTarget, { kind: "commit" }>> = {
   ...over,
 });
 
+const comparisonTarget = (
+  over: Partial<Extract<DiffTarget, { kind: "comparison" }>> = {},
+): Extract<DiffTarget, { kind: "comparison" }> => ({
+  kind: "comparison",
+  repoRoot: "/repo",
+  branchName: "feature",
+  worktreePath: "/wt",
+  comparison: {
+    base_name: "origin/main",
+    base_label: "main",
+    merge_base_oid: "1111111111111111111111111111111111111111",
+    head_oid: "2222222222222222222222222222222222222222",
+    includes_worktree: true,
+    files: [changedFile("code.ts")],
+  },
+  title: "Branch changes",
+  subtitle: "feature · compared with main · includes uncommitted changes",
+  ...over,
+});
+
 // ChangedFile rows in these tests default to countless entries; tests that
 // assert the counts column pass explicit values.
 function changedFile(path: string, change: ChangedFile["change"] = "modified"): ChangedFile {
@@ -99,7 +119,7 @@ function wire(
         body: opts.commitBody ?? null,
         files,
       });
-    if (cmd === "file_diff" || cmd === "commit_file_diff")
+    if (cmd === "file_diff" || cmd === "commit_file_diff" || cmd === "branch_comparison_file_diff")
       return Promise.resolve(opts.diff ?? diffFixture({ path: String(args?.file) }));
     if (cmd === "set_preferences") return Promise.resolve(null);
     if (cmd === "reveal_in_finder") return Promise.resolve(null);
@@ -108,6 +128,14 @@ function wire(
 }
 
 const noop = (): void => {};
+
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((settle) => {
+    resolve = settle;
+  });
+  return { promise, resolve };
+}
 
 describe("DiffPanel (uncommitted target)", () => {
   it("auto-selects the first changed file and renders its diff", async () => {
@@ -373,6 +401,147 @@ describe("DiffPanel (uncommitted target)", () => {
     );
   });
 
+  it("shows the new target and separate loading panes before publishing its files and diff", async () => {
+    wire({
+      files: [changedFile("old.ts")],
+      diff: diffFixture({ path: "old.ts" }),
+    });
+    const { rerender } = render(DiffPanel, {
+      props: { target: wtTarget(), onClose: noop },
+    });
+    await waitFor(() => expect(screen.getByTestId("diff-view")).toBeInTheDocument());
+
+    const comparisonDiff = deferred<FileDiff>();
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "branch_comparison_file_diff") return comparisonDiff.promise;
+      return Promise.resolve(null);
+    });
+    const nextTarget = comparisonTarget({
+      comparison: {
+        ...comparisonTarget().comparison,
+        files: [changedFile("branch.ts", "added")],
+      },
+    });
+
+    await rerender({ target: nextTarget, onClose: noop });
+
+    expect(screen.getByTestId("detail-title")).toHaveTextContent("Branch changes");
+    expect(screen.getByTestId("detail-loading")).toBeVisible();
+    expect(screen.getByTestId("changed-files-loading")).toBeVisible();
+    expect(screen.getByTestId("diff-loading")).toBeVisible();
+    expect(screen.getByText("old.ts").closest('[aria-hidden="true"]')).not.toBeNull();
+    expect(screen.getByTestId("diff-view").closest('[aria-hidden="true"]')).not.toBeNull();
+
+    await waitFor(() => expect(screen.getByText("branch.ts")).toBeVisible());
+    expect(screen.queryByTestId("detail-loading")).not.toBeInTheDocument();
+    expect(screen.getByTestId("diff-loading")).toBeVisible();
+
+    comparisonDiff.resolve(
+      diffFixture({
+        path: "branch.ts",
+        hunks: [
+          {
+            header: "@@ -0,0 +1 @@",
+            lines: [
+              {
+                origin: "added",
+                old_lineno: null,
+                new_lineno: 1,
+                content: "const branch = true;",
+              },
+            ],
+          },
+        ],
+      }),
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId("diff-view")).toHaveTextContent("const branch = true;"),
+    );
+    expect(screen.queryByTestId("diff-loading")).not.toBeInTheDocument();
+  });
+
+  it("ignores a previous target's diff when it resolves after a newer selection", async () => {
+    wire();
+    const { rerender } = render(DiffPanel, {
+      props: { target: wtTarget(), onClose: noop },
+    });
+    await waitFor(() => expect(screen.getByTestId("diff-view")).toBeInTheDocument());
+
+    const previousDiff = deferred<FileDiff>();
+    invokeMock.mockImplementation((cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "changed_files") {
+        const path = String(args?.path);
+        return Promise.resolve([
+          changedFile(path === "/wt-next" ? "next.ts" : "previous.ts", "added"),
+        ]);
+      }
+      if (cmd === "file_diff") {
+        if (args?.path === "/wt-previous") {
+          return previousDiff.promise;
+        }
+        return Promise.resolve(
+          diffFixture({
+            path: String(args?.file),
+            hunks: [
+              {
+                header: "@@ -0,0 +1 @@",
+                lines: [
+                  {
+                    origin: "added",
+                    old_lineno: null,
+                    new_lineno: 1,
+                    content: "const newest = true;",
+                  },
+                ],
+              },
+            ],
+          }),
+        );
+      }
+      return Promise.resolve(null);
+    });
+
+    await rerender({
+      target: wtTarget({ worktreePath: "/wt-previous", title: "Previous target" }),
+      onClose: noop,
+    });
+    await waitFor(() => expect(screen.getByText("previous.ts")).toBeInTheDocument());
+    expect(screen.getByTestId("diff-loading")).toBeVisible();
+
+    await rerender({
+      target: wtTarget({ worktreePath: "/wt-next", title: "Newest target" }),
+      onClose: noop,
+    });
+    await waitFor(() =>
+      expect(screen.getByTestId("diff-view")).toHaveTextContent("const newest = true;"),
+    );
+
+    previousDiff.resolve(
+      diffFixture({
+        path: "previous.ts",
+        hunks: [
+          {
+            header: "@@ -0,0 +1 @@",
+            lines: [
+              {
+                origin: "added",
+                old_lineno: null,
+                new_lineno: 1,
+                content: "const stale = true;",
+              },
+            ],
+          },
+        ],
+      }),
+    );
+    await tick();
+    await Promise.resolve();
+
+    expect(screen.getByTestId("detail-title")).toHaveTextContent("Newest target");
+    expect(screen.getByTestId("diff-view")).toHaveTextContent("const newest = true;");
+    expect(screen.getByTestId("diff-view")).not.toHaveTextContent("const stale = true;");
+  });
+
   it("refreshes the selected file in place when the refresh revision changes", async () => {
     let body = "initial";
     let changedFilesResolve: ((files: ChangedFile[]) => void) | undefined;
@@ -549,6 +718,38 @@ describe("DiffPanel (uncommitted target)", () => {
     await fireEvent.keyDown(window, { key: "ArrowDown" });
     await tick();
     expect(fileEls()[0]).toHaveAttribute("data-selected", "true"); // unchanged
+  });
+});
+
+describe("DiffPanel (branch comparison target)", () => {
+  it("uses the stable comparison baseline and keeps worktree file actions", async () => {
+    wire();
+    const target = comparisonTarget();
+    render(DiffPanel, { props: { target, onClose: noop } });
+
+    await waitFor(() => expect(screen.getByTestId("diff-view")).toBeInTheDocument());
+    expect(screen.getByTestId("detail-title")).toHaveTextContent("Branch changes");
+    expect(screen.getByTestId("detail-subtitle")).toHaveTextContent("compared with main");
+    expect(invokeMock).toHaveBeenCalledWith("branch_comparison_file_diff", {
+      repoRoot: "/repo",
+      mergeBaseOid: target.comparison.merge_base_oid,
+      headOid: target.comparison.head_oid,
+      worktreePath: "/wt",
+      file: "code.ts",
+    });
+    expect(invokeMock.mock.calls.some((call) => call[0] === "changed_files")).toBe(false);
+    expect(invokeMock.mock.calls.some((call) => call[0] === "commit_changed_files")).toBe(false);
+
+    await fireEvent.click(screen.getByLabelText("Open code.ts in difftool"));
+    expect(invokeMock).toHaveBeenCalledWith("open_branch_comparison_file_difftool", {
+      repoRoot: "/repo",
+      worktreePath: "/wt",
+      mergeBaseOid: target.comparison.merge_base_oid,
+      headOid: target.comparison.head_oid,
+      file: "code.ts",
+      change: "modified",
+    });
+    expect(screen.getByLabelText("Open code.ts in editor")).toBeInTheDocument();
   });
 });
 

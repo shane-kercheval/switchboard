@@ -53,6 +53,7 @@
     clearBranchSelection,
     branchSelection,
     branchCommits,
+    branchComparison,
     diffTarget,
     navFocus,
     nextCommitSelection,
@@ -62,6 +63,8 @@
     anyBranchMenuOpen,
     setViewMode,
     snapshotRepoSort,
+    selectBranchComparison,
+    compareSelectedBranchAgainst,
   } from "$lib/state/gitView.svelte";
   import { activateProject } from "$lib/state/workspace.svelte";
   import { palette } from "$lib/state/commandPalette.svelte";
@@ -89,6 +92,7 @@
   let homePath = $state<string | null>(null);
   let actionError = $state<string | null>(null);
   let openBranchActionsKey = $state<string | null>(null);
+  let comparisonMenuOpen = $state(false);
   let commitListEl = $state<HTMLDivElement | null>(null);
 
   const repo = $derived(listing.repo);
@@ -156,7 +160,7 @@
   // this one. Self-healing: the cleanup clears this node's entry on close and on
   // unmount (idempotent, so order vs. a reset doesn't matter).
   $effect(() => {
-    setBranchMenuOpen(repo.root, openBranchActionsKey !== null);
+    setBranchMenuOpen(repo.root, openBranchActionsKey !== null || comparisonMenuOpen);
     return () => setBranchMenuOpen(repo.root, false);
   });
 
@@ -222,6 +226,10 @@
   function isUncommittedSelected(path: string): boolean {
     const t = diffTarget.current;
     return t !== null && t.kind === "uncommitted" && t.worktreePath === path;
+  }
+  function isComparisonSelected(): boolean {
+    const t = diffTarget.current;
+    return t !== null && t.kind === "comparison" && t.repoRoot === repo.root;
   }
 
   function onSelectLocal(branch: BranchView): void {
@@ -292,13 +300,20 @@
     });
   });
 
-  // The commit pane's navigable entries in display order: the uncommitted row
-  // (when the selected branch's worktree is dirty) above the commits, matching
-  // what `commitList` renders — including the preview cap, so arrow keys never
-  // land on a commit the list isn't showing.
+  // The commit pane's navigable entries in display order: aggregate comparison,
+  // uncommitted row (when dirty), then commits. This matches `commitList`,
+  // including its preview cap, so arrows never land on a hidden commit.
   function commitNavItems(): CommitNavItem[] {
     const items: CommitNavItem[] = [];
     const branch = selectedLocalBranch();
+    if (branchComparison.result !== null) {
+      items.push({
+        kind: "comparison",
+        branchName: branchSelection.current?.name ?? "",
+        worktreePath: branch?.worktree?.path ?? null,
+        comparison: branchComparison.result,
+      });
+    }
     if (branch?.worktree != null && branchHasChanges(branch)) {
       items.push({ kind: "uncommitted", worktreePath: branch.worktree.path });
     }
@@ -311,7 +326,9 @@
   function moveCommitSelection(delta: number): void {
     const next = nextCommitSelection(commitNavItems(), diffTarget.current, delta);
     if (next === null) return;
-    if (next.kind === "uncommitted") {
+    if (next.kind === "comparison") {
+      selectBranchComparison(repo.root, next.branchName, next.comparison, next.worktreePath);
+    } else if (next.kind === "uncommitted") {
       selectUncommitted(repo.root, next.worktreePath, displayPath(next.worktreePath));
     } else {
       selectCommit(repo.root, next.commit);
@@ -899,6 +916,73 @@
     class="border-border mt-1 mb-1 ml-4 border-l pl-2"
     data-testid="commit-list"
   >
+    {#if branchComparison.result !== null}
+      {@const comparison = branchComparison.result}
+      {@const comparisonSelected = isComparisonSelected()}
+      <div
+        class={cn(
+          "group flex w-full items-center rounded-md transition-colors",
+          comparisonSelected ? "bg-selected text-fg" : cn("text-muted", hoverBg),
+        )}
+        data-testid="branch-comparison-row"
+        data-selected={comparisonSelected}
+      >
+        <Tooltip
+          label={comparison.includes_worktree
+            ? `Includes committed and uncommitted changes compared with ${comparison.base_label}.`
+            : `Includes all committed changes compared with ${comparison.base_label}.`}
+          delayDuration={SUPPLEMENTAL_TOOLTIP_DELAY}
+        >
+          {#snippet trigger(props)}
+            <button
+              {...props}
+              type="button"
+              class="flex min-w-0 flex-1 items-center gap-2 px-2 py-1 text-left text-xs"
+              data-testid="branch-comparison-select"
+              onclick={() =>
+                selectBranchComparison(
+                  repo.root,
+                  branchSelection.current?.name ?? "",
+                  comparison,
+                  worktreePath,
+                )}
+            >
+              <span class="text-primary shrink-0" aria-hidden="true">◆</span>
+              <span class="text-fg min-w-0 flex-1 truncate">Branch changes</span>
+              {#if branchComparison.status === "loading"}
+                <Spinner class="h-3 w-3 shrink-0" />
+              {/if}
+              <span class="text-muted shrink-0 truncate font-mono text-[10px]">
+                vs {comparison.base_label}
+              </span>
+            </button>
+          {/snippet}
+        </Tooltip>
+        {@render comparisonBaseMenu()}
+      </div>
+      {#if branchComparison.status === "failed" && branchComparison.error !== null}
+        <div class="text-status-failed px-2 py-1 text-[11px]" data-testid="branch-comparison-error">
+          {branchComparison.error}
+        </div>
+      {/if}
+    {:else if branchComparison.status === "loading"}
+      <div class="text-muted flex items-center gap-2 px-2 py-1.5 text-xs">
+        <Spinner class="h-3.5 w-3.5" /> Loading branch changes…
+      </div>
+    {:else}
+      <div
+        class="group text-muted flex items-center rounded-md pl-2 text-xs"
+        data-testid="branch-comparison-unavailable"
+      >
+        <span class="min-w-0 flex-1 truncate">
+          {branchComparison.status === "failed"
+            ? (branchComparison.error ?? "Couldn't load branch changes.")
+            : "Branch comparison unavailable."}
+        </span>
+        {@render comparisonBaseMenu()}
+      </div>
+    {/if}
+
     {#if worktreePath !== null && hasChanges}
       {@const uSel = isUncommittedSelected(worktreePath)}
       <button
@@ -1016,6 +1100,53 @@
       {/each}
     {/if}
   </div>
+{/snippet}
+
+{#snippet comparisonBaseMenu()}
+  <DropdownMenu
+    bind:open={comparisonMenuOpen}
+    triggerLabel="Change comparison base"
+    triggerTestid="comparison-base-trigger"
+    triggerClass={cn(
+      ROW_ACTION_ICON_CLASS,
+      "mr-1 h-5 w-5 shrink-0 opacity-0 group-focus-within:opacity-100 group-hover:opacity-100 data-[state=open]:opacity-100",
+    )}
+    contentTestid="comparison-base-menu"
+  >
+    {#snippet trigger()}
+      <MoreHorizontal size={12} strokeWidth={1.8} aria-hidden="true" />
+    {/snippet}
+    {#if repo.default_branch !== null}
+      <DropdownMenuItem
+        onSelect={() => void compareSelectedBranchAgainst(null)}
+        data-testid="comparison-base-default"
+      >
+        Default branch ({repo.default_branch})
+      </DropdownMenuItem>
+    {/if}
+    {#each repo.local_branches as candidate (candidate.name)}
+      {#if branchSelection.current?.kind !== "local" || branchSelection.current.name !== candidate.name}
+        <DropdownMenuItem
+          onSelect={() =>
+            void compareSelectedBranchAgainst({ kind: "local", name: candidate.name })}
+          data-testid="comparison-base-option"
+        >
+          {candidate.name} <span class="text-muted ml-auto text-[10px]">local</span>
+        </DropdownMenuItem>
+      {/if}
+    {/each}
+    {#each repo.remote_branches as candidate (candidate.name)}
+      {#if branchSelection.current?.kind !== "remote" || branchSelection.current.name !== candidate.name}
+        <DropdownMenuItem
+          onSelect={() =>
+            void compareSelectedBranchAgainst({ kind: "remote", name: candidate.name })}
+          data-testid="comparison-base-option"
+        >
+          {candidate.name} <span class="text-muted ml-auto text-[10px]">remote</span>
+        </DropdownMenuItem>
+      {/if}
+    {/each}
+  </DropdownMenu>
 {/snippet}
 
 {#snippet commitDot(unpushed: boolean, branchWork: boolean)}

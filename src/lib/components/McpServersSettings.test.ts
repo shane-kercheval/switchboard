@@ -45,6 +45,10 @@ function oauthProvider(overrides: Partial<McpProviderInfo> = {}): McpProviderInf
   };
 }
 
+async function chooseBearerAuth(): Promise<void> {
+  await fireEvent.click(screen.getByTestId("mcp-auth-mode-option-bearer"));
+}
+
 beforeEach(() => {
   providers = [];
   signInImpl = async (name: string) => {
@@ -175,6 +179,7 @@ describe("McpServersSettings", () => {
   it("adds a provider (bearer null when blank) and refreshes the list", async () => {
     render(McpServersSettings);
     await waitFor(() => expect(screen.getByTestId("mcp-empty")).toBeInTheDocument());
+    await chooseBearerAuth();
     await fireEvent.input(screen.getByTestId("mcp-name"), { target: { value: "team" } });
     await fireEvent.input(screen.getByTestId("mcp-url"), { target: { value: "https://x/mcp" } });
     await fireEvent.click(screen.getByTestId("mcp-add"));
@@ -186,6 +191,7 @@ describe("McpServersSettings", () => {
   it("sends the bearer when provided", async () => {
     render(McpServersSettings);
     await waitFor(() => expect(screen.getByTestId("mcp-empty")).toBeInTheDocument());
+    await chooseBearerAuth();
     await fireEvent.input(screen.getByTestId("mcp-name"), { target: { value: "team" } });
     await fireEvent.input(screen.getByTestId("mcp-url"), { target: { value: "https://x" } });
     await fireEvent.input(screen.getByTestId("mcp-bearer"), { target: { value: "tok" } });
@@ -247,6 +253,7 @@ describe("McpServersSettings", () => {
   it("test connection reports the prompt count", async () => {
     render(McpServersSettings);
     await waitFor(() => expect(screen.getByTestId("mcp-empty")).toBeInTheDocument());
+    await chooseBearerAuth();
     await fireEvent.input(screen.getByTestId("mcp-url"), { target: { value: "https://x/mcp" } });
     await fireEvent.click(screen.getByTestId("mcp-test"));
     await waitFor(() =>
@@ -256,12 +263,16 @@ describe("McpServersSettings", () => {
 });
 
 describe("McpServersSettings — OAuth", () => {
-  it("selecting OAuth hides the bearer field and adds with the oauth mode", async () => {
+  it("defaults to OAuth first and adds with the oauth mode", async () => {
     render(McpServersSettings);
     await waitFor(() => expect(screen.getByTestId("mcp-empty")).toBeInTheDocument());
 
-    expect(screen.getByTestId("mcp-bearer")).toBeInTheDocument();
-    await fireEvent.click(screen.getByTestId("mcp-auth-mode-option-oauth"));
+    const authOptions = screen.getAllByRole("radio");
+    expect(authOptions.map((option) => option.textContent)).toEqual([
+      "OAuth sign-in",
+      "Bearer token",
+    ]);
+    expect(authOptions[0]).toHaveAttribute("aria-checked", "true");
     expect(screen.queryByTestId("mcp-bearer")).not.toBeInTheDocument();
     // The pre-save Test cannot authenticate an OAuth server: the button is
     // replaced by the add → sign in → test guidance.
@@ -279,6 +290,7 @@ describe("McpServersSettings — OAuth", () => {
       auth: { type: "oauth" },
       bearer: null,
     });
+    expect(screen.getByTestId("mcp-auth-mode")).toHaveAttribute("data-value", "oauth");
   });
 
   it("renders needs_auth as its own status with the sign-in affordance", async () => {
@@ -558,6 +570,7 @@ describe("McpServersSettings — OAuth delta hardening", () => {
   it("a bearer test verdict disappears when the form switches to OAuth", async () => {
     render(McpServersSettings);
     await waitFor(() => expect(screen.getByTestId("mcp-empty")).toBeInTheDocument());
+    await chooseBearerAuth();
     await fireEvent.input(screen.getByTestId("mcp-url"), { target: { value: "https://x/mcp" } });
     await fireEvent.click(screen.getByTestId("mcp-test"));
     await waitFor(() =>
@@ -587,6 +600,7 @@ describe("McpServersSettings — OAuth delta hardening", () => {
     });
     render(McpServersSettings);
     await waitFor(() => expect(screen.getByTestId("mcp-empty")).toBeInTheDocument());
+    await chooseBearerAuth();
     await fireEvent.input(screen.getByTestId("mcp-url"), { target: { value: "https://x/mcp" } });
     await fireEvent.click(screen.getByTestId("mcp-test"));
 

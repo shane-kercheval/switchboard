@@ -5432,6 +5432,58 @@ describe("ComposeBar — cross-agent forward", () => {
     await resetHeldForwards();
   });
 
+  it("keeps pending forward chips and the waiting row in agent-card order", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    await state.registerAgent(AGENT_C);
+    await seedStreamingTurn(AGENT_B.id);
+    await seedStreamingTurn(AGENT_C.id);
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "forward_message") return new Promise(() => {});
+      return null;
+    });
+
+    render(ComposeBar, {
+      props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B, AGENT_C] },
+    });
+    // Pick in the opposite order from the sidebar cards.
+    await pickForwardSource(AGENT_C.id);
+    await pickForwardSource(AGENT_B.id);
+
+    const chipRow = screen.getByTestId("forward-source-chips");
+    expect(
+      Array.from(chipRow.querySelectorAll('[data-testid^="forward-source-chip-"]')).map((chip) =>
+        chip.getAttribute("data-testid"),
+      ),
+    ).toEqual(["forward-source-chip-bob", "forward-source-chip-carol"]);
+    expect(screen.getByTestId("forward-source-chip-bob")).toHaveAttribute(
+      "data-readiness",
+      "pending",
+    );
+    expect(screen.getByTestId("forward-source-chip-carol")).toHaveAttribute(
+      "data-readiness",
+      "pending",
+    );
+
+    await fireEvent.click(screen.getByTestId("compose-send"));
+    const held = await import("$lib/state/heldForwards.svelte");
+    await waitFor(() =>
+      expect(held.heldForwardsFor(PROJECT_ID)[0]?.sources).toEqual([
+        { id: AGENT_B.id, name: "bob", projectId: PROJECT_ID },
+        { id: AGENT_C.id, name: "carol", projectId: PROJECT_ID },
+      ]),
+    );
+
+    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B, AGENT_C] },
+    });
+    expect(await screen.findByTestId("held-forward-waiting")).toHaveTextContent(
+      "waiting for bob, carol",
+    );
+  });
+
   it("@ menu pane row adds missing members, dedups, and disappears once all are attached", async () => {
     const panes = await import("$lib/state/transcriptPanes.svelte");
     const state = await loadState();
@@ -7376,6 +7428,83 @@ describe("ComposeBar — cross-agent forward", () => {
     });
   });
 
+  it("invokes a workflow with field sources in agent-card order", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    await state.registerAgent(AGENT_C);
+    // Both forward sources need output: an agent with nothing to forward is an
+    // unpickable row, so without this the picks are silent no-ops.
+    await seedCompletedTurn(AGENT_B.id);
+    await seedCompletedTurn(AGENT_C.id);
+    const WORKFLOW = {
+      name: "review-and-recommend",
+      is_builtin: true,
+      description: "d",
+      inputs: [{ name: "worker", ty: "agent", optional: false, description: null }],
+      invocable: true,
+      parse_error: null,
+    };
+    const DESCRIPTOR = {
+      name: "review-and-recommend",
+      description: "d",
+      is_builtin: true,
+      invocable: true,
+      inputs: WORKFLOW.inputs,
+      steps: [],
+      derived_args: [
+        {
+          name: "context",
+          required: false,
+          description: "Optional background",
+          prompts: ["builtin:code-review"],
+        },
+      ],
+      compatibility: { state: "ok" },
+    };
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "list_workflows") return [WORKFLOW];
+      if (cmd === "describe_workflow_form") return DESCRIPTOR;
+      if (cmd === "list_prompts") return [];
+      if (cmd === "invoke_workflow") return "run-1";
+      return null;
+    });
+
+    render(ComposeBar, {
+      props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B, AGENT_C] },
+    });
+
+    await fireEvent.click(screen.getByTestId("compose-workflow-button"));
+    await waitFor(() => screen.getByTestId("workflow-option-builtin:review-and-recommend"));
+    await fireEvent.click(screen.getByTestId("workflow-option-builtin:review-and-recommend"));
+
+    await waitFor(() => screen.getByTestId("workflow-arg-input-context"));
+    await fireEvent.click(screen.getByTestId("workflow-agent-worker-alice"));
+
+    // Attach carol, then bob — the opposite of their agent-card order.
+    await fireEvent.click(screen.getByTestId("workflow-forward-picker-context"));
+    await fireEvent.click(await screen.findByTestId(`forward-picker-agent-${AGENT_C.id}`));
+    await fireEvent.click(screen.getByTestId("workflow-forward-picker-context"));
+    await fireEvent.click(await screen.findByTestId(`forward-picker-agent-${AGENT_B.id}`));
+    await waitFor(() => screen.getByTestId("forward-source-chip-bob"));
+
+    await fireEvent.click(screen.getByTestId("workflow-invoke-button"));
+    await waitFor(() => {
+      expect(invokeMock.mock.calls.some(([c]) => c === "invoke_workflow")).toBe(true);
+    });
+    const call = invokeMock.mock.calls.find(([c]) => c === "invoke_workflow");
+    // The wire payload follows the visible card/chip order, not click order.
+    expect(call?.[1]).toMatchObject({
+      name: "review-and-recommend",
+      forwardSources: {
+        context: [
+          { agent_id: AGENT_B.id, project_id: PROJECT_ID },
+          { agent_id: AGENT_C.id, project_id: PROJECT_ID },
+        ],
+      },
+    });
+  });
+
   it("uses the authoritative workflow-form reply without waiting for prompts:synced", async () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);
@@ -8253,5 +8382,88 @@ describe("ComposeBar — workflow run live view (swap / hold / stop)", () => {
     );
     // Still live — the run wasn't cleared.
     expect(screen.getByTestId("workflow-run-live")).toBeInTheDocument();
+  });
+});
+
+describe("ComposeBar — reading mode", () => {
+  beforeEach(async () => {
+    workflowsTesting.reset();
+    (await import("$lib/state/readingMode.svelte"))._testing.reset();
+  });
+  afterEach(async () => {
+    workflowsTesting.reset();
+    (await import("$lib/state/readingMode.svelte"))._testing.reset();
+  });
+
+  async function enableReadingMode(): Promise<void> {
+    const { toggleReadingMode } = await import("$lib/state/readingMode.svelte");
+    toggleReadingMode(PROJECT_ID);
+    await tick();
+  }
+
+  function runInfo(): WorkflowRunInfo {
+    return {
+      run_id: "run-rm",
+      workflow: "review",
+      step: 0,
+      total: 1,
+      status: "running",
+      reason: null,
+      steps: [],
+    };
+  }
+
+  it("hides the compose box, leaving no padded strip behind", async () => {
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    expect(screen.getByTestId("compose-box")).toBeInTheDocument();
+
+    await enableReadingMode();
+
+    expect(screen.queryByTestId("compose-box")).toBeNull();
+    expect(screen.queryByTestId("compose-textarea")).toBeNull();
+    expect(screen.queryByTestId("compose-send")).toBeNull();
+    // The wrapper carries its own padding, so gating only the inner box would
+    // leave a bare `bg-raised` band where the composer used to be.
+    expect(screen.queryByTestId("compose-strip")).toBeNull();
+  });
+
+  it("restores the compose box when reading mode turns off", async () => {
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await enableReadingMode();
+    expect(screen.queryByTestId("compose-box")).toBeNull();
+
+    await enableReadingMode(); // toggles back off
+    expect(screen.getByTestId("compose-box")).toBeInTheDocument();
+  });
+
+  it("keeps the live workflow progress view, which is what the user turned reading mode on to watch", async () => {
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    workflowRuns[PROJECT_ID] = [runInfo()];
+    await enableReadingMode();
+
+    expect(screen.getByTestId("workflow-run-live")).toBeInTheDocument();
+    expect(screen.getByTestId("workflow-run-stop")).toBeInTheDocument();
+    expect(screen.queryByTestId("compose-box")).toBeNull();
+  });
+
+  it("inerts the window compose chords while the box is hidden", async () => {
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    // Establish a known recipient set with the box visible: ⌘1 toggles alice off.
+    await fireEvent.keyDown(window, { key: "1", metaKey: true });
+    await tick();
+    const recipients = await import("$lib/state/recipientSelection.svelte");
+    const before = [...recipients.selectionFor(PROJECT_ID)];
+
+    await enableReadingMode();
+
+    // ⌘1 (toggle recipient), ⇧⌘A (select all) and ⌘Enter (send) all target
+    // compose state the user can no longer see.
+    await fireEvent.keyDown(window, { key: "1", metaKey: true });
+    await fireEvent.keyDown(window, { key: "a", metaKey: true, shiftKey: true });
+    await fireEvent.keyDown(window, { key: "Enter", metaKey: true });
+    await tick();
+
+    expect([...recipients.selectionFor(PROJECT_ID)]).toEqual(before);
+    expect(invokeMock.mock.calls.some(([c]) => c === "send_message")).toBe(false);
   });
 });

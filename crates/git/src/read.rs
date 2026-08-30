@@ -5,8 +5,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use git2::{
-    Branch, BranchType, Diff, DiffFormat, DiffOptions, Direction, ErrorCode, Oid, Repository,
-    Status, StatusOptions,
+    Branch, BranchType, Diff, DiffFormat, DiffOptions, Direction, ErrorCode, Oid, Patch,
+    Repository, Status, StatusOptions,
 };
 
 use chrono::{DateTime, FixedOffset, LocalResult, TimeZone};
@@ -14,9 +14,9 @@ use url::Url;
 
 use crate::error::{GitError, Result};
 use crate::model::{
-    BranchView, ChangeKind, ChangedFile, CommitChanges, CommitRangeKind, DiffHunk, DiffLine,
-    DiffLineKind, FileDiff, GitCommitRange, GitCommitSummary, RemoteBranchView, RepoView,
-    SyncState, WorktreeView, WorktreeWarning,
+    BranchComparison, BranchView, ChangeKind, ChangedFile, CommitChanges, CommitRangeKind,
+    DiffHunk, DiffLine, DiffLineKind, FileDiff, GitCommitRange, GitCommitSummary, RemoteBranchView,
+    RepoView, SyncState, WorktreeView, WorktreeWarning,
 };
 
 /// Resolve any path inside (or at) a git repo to the canonical **main-worktree /
@@ -275,7 +275,268 @@ pub fn commit_file_diff(path: &Path, oid: &str, file: &str) -> Result<FileDiff> 
     collect_file_diff(&diff, file, true).map_err(|e| GitError::read(path, e))
 }
 
+/// The selected branch's net changes from its merge base with a chosen base ref.
+/// With a worktree, the endpoint is the live index + working directory, so the
+/// result includes committed, staged, unstaged, and untracked changes in one
+/// PR-style view. Without one, the endpoint is the selected branch tip.
+///
+/// `base_kind` + `base_name` choose an explicit comparison base. When either is
+/// absent, the repository's resolved default branch is used. A missing branch,
+/// default, worktree, or common ancestor is an unavailable comparison (`None`),
+/// not a repository read failure.
+pub fn branch_comparison(
+    path: &Path,
+    kind: BranchKind,
+    name: &str,
+    base_kind: Option<BranchKind>,
+    base_name: Option<&str>,
+    worktree_path: Option<&Path>,
+) -> Result<Option<BranchComparison>> {
+    let repo = match Repository::open(path) {
+        Ok(repo) => repo,
+        Err(e) if is_not_found(&e) => return Ok(None),
+        Err(e) => return Err(GitError::read(path, e)),
+    };
+    let Some(head_oid) = branch_tip(&repo, kind, name).map_err(|e| GitError::read(path, e))? else {
+        return Ok(None);
+    };
+    let Some((resolved_base_name, base_label, base_oid)) =
+        comparison_base(&repo, base_kind, base_name).map_err(|e| GitError::read(path, e))?
+    else {
+        return Ok(None);
+    };
+    let merge_base_oid = match repo.merge_base(head_oid, base_oid) {
+        Ok(oid) => oid,
+        Err(e) if is_not_found(&e) => return Ok(None),
+        Err(e) => return Err(GitError::read(path, e)),
+    };
+
+    let includes_worktree = worktree_path.is_some();
+    let files = if let Some(worktree_path) = worktree_path {
+        let worktree = match Repository::open(worktree_path) {
+            Ok(repo) => repo,
+            Err(e) if is_not_found(&e) => return Ok(None),
+            Err(e) => return Err(GitError::read(worktree_path, e)),
+        };
+        if repo_root(&worktree) != repo_root(&repo)
+            || worktree.head().ok().and_then(|head| head.target()) != Some(head_oid)
+        {
+            return Ok(None);
+        }
+        let merge_tree = worktree
+            .find_commit(merge_base_oid)
+            .and_then(|commit| commit.tree())
+            .map_err(|e| GitError::read(worktree_path, e))?;
+        let mut opts = comparison_diff_options(true);
+        let mut diff = worktree
+            .diff_tree_to_workdir_with_index(Some(&merge_tree), Some(&mut opts))
+            .map_err(|e| GitError::read(worktree_path, e))?;
+        diff.find_similar(None)
+            .map_err(|e| GitError::read(worktree_path, e))?;
+        comparison_changed_files(&diff)
+    } else {
+        let merge_tree = repo
+            .find_commit(merge_base_oid)
+            .and_then(|commit| commit.tree())
+            .map_err(|e| GitError::read(path, e))?;
+        let head_tree = repo
+            .find_commit(head_oid)
+            .and_then(|commit| commit.tree())
+            .map_err(|e| GitError::read(path, e))?;
+        let mut opts = comparison_diff_options(false);
+        let mut diff = repo
+            .diff_tree_to_tree(Some(&merge_tree), Some(&head_tree), Some(&mut opts))
+            .map_err(|e| GitError::read(path, e))?;
+        diff.find_similar(None)
+            .map_err(|e| GitError::read(path, e))?;
+        comparison_changed_files(&diff)
+    };
+
+    Ok(Some(BranchComparison {
+        base_name: resolved_base_name,
+        base_label,
+        merge_base_oid: merge_base_oid.to_string(),
+        head_oid: head_oid.to_string(),
+        includes_worktree,
+        files,
+    }))
+}
+
+/// One file from a previously-resolved [`branch_comparison`]. The merge-base
+/// and head OIDs keep the committed endpoints stable across the list→file click.
+/// A live worktree is accepted only while it remains on the same head; an
+/// expired or mismatched endpoint returns [`GitError::ComparisonStale`].
+pub fn branch_comparison_file_diff(
+    path: &Path,
+    merge_base_oid: &str,
+    head_oid: &str,
+    worktree_path: Option<&Path>,
+    file: &str,
+) -> Result<FileDiff> {
+    let (repo, merge_base_oid, head_oid) =
+        comparison_endpoint_repo(path, merge_base_oid, head_oid, worktree_path)?;
+    let repo_path = worktree_path.unwrap_or(path);
+    let merge_tree = match repo
+        .find_commit(merge_base_oid)
+        .and_then(|commit| commit.tree())
+    {
+        Ok(tree) => tree,
+        Err(e) if is_not_found(&e) => return Ok(FileDiff::empty(file)),
+        Err(e) => return Err(GitError::read(repo_path, e)),
+    };
+    let mut opts = comparison_diff_options(worktree_path.is_some());
+    let mut diff = if worktree_path.is_some() {
+        repo.diff_tree_to_workdir_with_index(Some(&merge_tree), Some(&mut opts))
+    } else {
+        let head_tree = match repo.find_commit(head_oid).and_then(|commit| commit.tree()) {
+            Ok(tree) => tree,
+            Err(e) if is_not_found(&e) => return Ok(FileDiff::empty(file)),
+            Err(e) => return Err(GitError::read(repo_path, e)),
+        };
+        repo.diff_tree_to_tree(Some(&merge_tree), Some(&head_tree), Some(&mut opts))
+    }
+    .map_err(|e| GitError::read(repo_path, e))?;
+    diff.find_similar(None)
+        .map_err(|e| GitError::read(repo_path, e))?;
+    if let Some(size) = diff_target_too_large(&repo, &diff, Path::new(file), true) {
+        return Ok(FileDiff::too_large(file, size));
+    }
+    let Some(idx) = diff_delta_index(&diff, Path::new(file)) else {
+        return Ok(FileDiff::empty(file));
+    };
+    collect_file_patch(&diff, idx, file).map_err(|e| GitError::read(repo_path, e))
+}
+
+/// Validate the committed endpoints and repository identity behind a resolved
+/// branch comparison. A supplied worktree remains a live overlay, but it must
+/// still belong to `path` and remain checked out at `head_oid`.
+pub fn validate_branch_comparison_endpoint(
+    path: &Path,
+    merge_base_oid: &str,
+    head_oid: &str,
+    worktree_path: Option<&Path>,
+) -> Result<()> {
+    comparison_endpoint_repo(path, merge_base_oid, head_oid, worktree_path).map(|_| ())
+}
+
+fn comparison_endpoint_repo(
+    path: &Path,
+    merge_base_oid: &str,
+    head_oid: &str,
+    worktree_path: Option<&Path>,
+) -> Result<(Repository, Oid, Oid)> {
+    let stale = || GitError::comparison_stale(path);
+    let merge_base_oid = Oid::from_str(merge_base_oid).map_err(|_| stale())?;
+    let head_oid = Oid::from_str(head_oid).map_err(|_| stale())?;
+    let canonical = Repository::open(path).map_err(|e| {
+        if is_not_found(&e) {
+            stale()
+        } else {
+            GitError::read(path, e)
+        }
+    })?;
+    let repo_path = worktree_path.unwrap_or(path);
+    let repo = Repository::open(repo_path).map_err(|e| {
+        if is_not_found(&e) {
+            stale()
+        } else {
+            GitError::read(repo_path, e)
+        }
+    })?;
+    if repo_root(&repo) != repo_root(&canonical)
+        || worktree_path.is_some()
+            && repo.head().ok().and_then(|head| head.target()) != Some(head_oid)
+    {
+        return Err(stale());
+    }
+    for oid in [merge_base_oid, head_oid] {
+        match repo.find_commit(oid) {
+            Ok(_) => {}
+            Err(e) if is_not_found(&e) => return Err(stale()),
+            Err(e) => return Err(GitError::read(repo_path, e)),
+        }
+    }
+    Ok((repo, merge_base_oid, head_oid))
+}
+
 // --- internals -------------------------------------------------------------
+
+fn branch_tip(
+    repo: &Repository,
+    kind: BranchKind,
+    name: &str,
+) -> std::result::Result<Option<Oid>, git2::Error> {
+    let branch_type = match kind {
+        BranchKind::Local => BranchType::Local,
+        BranchKind::Remote => BranchType::Remote,
+    };
+    match repo.find_branch(name, branch_type) {
+        Ok(branch) => Ok(branch.get().target()),
+        Err(e) if is_not_found(&e) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+fn comparison_base(
+    repo: &Repository,
+    kind: Option<BranchKind>,
+    name: Option<&str>,
+) -> std::result::Result<Option<(String, String, Oid)>, git2::Error> {
+    if let (Some(kind), Some(name)) = (kind, name) {
+        return branch_tip(repo, kind, name)
+            .map(|tip| tip.map(|oid| (name.to_owned(), name.to_owned(), oid)));
+    }
+    let Some(default) = resolve_default_branch(repo) else {
+        return Ok(None);
+    };
+    let remote_name = format!("origin/{default}");
+    if let Some(oid) = branch_tip(repo, BranchKind::Remote, &remote_name)? {
+        return Ok(Some((remote_name, default, oid)));
+    }
+    branch_tip(repo, BranchKind::Local, &default)
+        .map(|tip| tip.map(|oid| (default.clone(), default.clone(), oid)))
+}
+
+fn comparison_diff_options(include_worktree: bool) -> DiffOptions {
+    let mut opts = DiffOptions::new();
+    opts.max_size(i64::try_from(TOO_LARGE_TO_DIFF_BYTES).unwrap_or(i64::MAX));
+    if include_worktree {
+        opts.include_untracked(true)
+            .recurse_untracked_dirs(true)
+            .show_untracked_content(true);
+    }
+    opts
+}
+
+fn comparison_changed_files(diff: &Diff<'_>) -> Vec<ChangedFile> {
+    let mut files = Vec::new();
+    for (idx, delta) in diff.deltas().enumerate() {
+        let change = match delta.status() {
+            git2::Delta::Untracked => Some(ChangeKind::Untracked),
+            git2::Delta::Conflicted => Some(ChangeKind::Modified),
+            status => classify_delta(status),
+        };
+        let Some(change) = change else {
+            continue;
+        };
+        let file_path = delta
+            .new_file()
+            .path()
+            .or_else(|| delta.old_file().path())
+            .map(|p| p.to_string_lossy().into_owned());
+        if let Some(file_path) = file_path {
+            let (additions, deletions) = delta_line_counts(diff, idx);
+            files.push(ChangedFile {
+                path: file_path,
+                change,
+                additions,
+                deletions,
+            });
+        }
+    }
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    files
+}
 
 /// The canonical root we key a repo on: the **main** worktree, regardless of
 /// which worktree (or subdirectory) we discovered from. `commondir()` always
@@ -1204,6 +1465,111 @@ fn collect_file_diff(
     Ok(FileDiff {
         path: file.to_owned(),
         binary,
+        truncated,
+        too_large: false,
+        too_large_bytes: None,
+        hunks,
+    })
+}
+
+fn diff_delta_index(diff: &Diff<'_>, target: &Path) -> Option<usize> {
+    diff.deltas().enumerate().find_map(|(idx, delta)| {
+        let path = delta.new_file().path().or_else(|| delta.old_file().path());
+        (path == Some(target)).then_some(idx)
+    })
+}
+
+/// Materialize and collect only the selected delta after rename detection has
+/// run across the complete comparison. The comparison size gate runs before
+/// this, so `Patch::from_diff` never materializes content past the inline cap.
+fn collect_file_patch(
+    diff: &Diff<'_>,
+    idx: usize,
+    file: &str,
+) -> std::result::Result<FileDiff, git2::Error> {
+    let Some(patch) = Patch::from_diff(diff, idx)? else {
+        let binary = diff
+            .get_delta(idx)
+            .is_some_and(|delta| delta.flags().is_binary());
+        return Ok(FileDiff {
+            path: file.to_owned(),
+            binary,
+            truncated: false,
+            too_large: false,
+            too_large_bytes: None,
+            hunks: Vec::new(),
+        });
+    };
+    if patch.delta().flags().is_binary() {
+        return Ok(FileDiff {
+            path: file.to_owned(),
+            binary: true,
+            truncated: false,
+            too_large: false,
+            too_large_bytes: None,
+            hunks: Vec::new(),
+        });
+    }
+
+    let mut hunks = Vec::new();
+    let mut truncated = false;
+    let mut lines = 0usize;
+    let mut bytes = 0usize;
+    'hunks: for hunk_idx in 0..patch.num_hunks() {
+        let (hunk, line_count) = patch.hunk(hunk_idx)?;
+        let mut collected = DiffHunk {
+            header: String::from_utf8_lossy(hunk.header()).trim_end().to_owned(),
+            lines: Vec::new(),
+        };
+        for line_idx in 0..line_count {
+            let line = patch.line_in_hunk(hunk_idx, line_idx)?;
+            let origin = line.origin();
+            if !matches!(origin, ' ' | '=' | '+' | '-') {
+                continue;
+            }
+            if lines >= MAX_DIFF_LINES || bytes >= MAX_DIFF_BYTES {
+                truncated = true;
+                break 'hunks;
+            }
+            lines += 1;
+            let kind = match origin {
+                '+' => DiffLineKind::Added,
+                '-' => DiffLineKind::Removed,
+                _ => DiffLineKind::Context,
+            };
+            let raw_bytes = line.content();
+            if raw_bytes.len() > MAX_DIFF_LINE_BYTES {
+                truncated = true;
+            }
+            let clamped = &raw_bytes[..raw_bytes.len().min(MAX_DIFF_LINE_BYTES)];
+            let raw = String::from_utf8_lossy(clamped);
+            let content = match raw.strip_suffix('\n') {
+                Some(without_lf) => without_lf.strip_suffix('\r').unwrap_or(without_lf),
+                None => &raw,
+            }
+            .to_owned();
+            bytes += content.len();
+            collected.lines.push(DiffLine {
+                origin: kind,
+                old_lineno: line.old_lineno(),
+                new_lineno: line.new_lineno(),
+                content,
+            });
+            if truncated {
+                break;
+            }
+        }
+        if !collected.lines.is_empty() {
+            hunks.push(collected);
+        }
+        if truncated {
+            break;
+        }
+    }
+
+    Ok(FileDiff {
+        path: file.to_owned(),
+        binary: false,
         truncated,
         too_large: false,
         too_large_bytes: None,

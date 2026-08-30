@@ -566,6 +566,32 @@ describe("CreateAgentForm", () => {
     expect(screen.queryByTestId("effort-select-option-no-override")).toBeNull();
   });
 
+  it("create + Antigravity: switching to a narrower model clamps the effort", async () => {
+    // `agy` fails the turn when the level isn't in the model's own set, so an
+    // effort left over from the previous model has to be brought back into
+    // range at selection time rather than discovered at dispatch. 3.7 Flash
+    // takes low/medium/high; 3.1 Pro only low/high.
+    const { onSubmit } = renderForm();
+    await fireEvent.click(screen.getByTestId("harness-antigravity"));
+    await choosePicker("model-select", "gemini-3.7-flash");
+    await choosePicker("effort-select", "medium");
+    expect(pickerValue("effort-select")).toBe("medium");
+
+    await choosePicker("model-select", "gemini-3.1-pro");
+
+    expect(pickerValue("effort-select")).toBe("low");
+    // Pinned at the wire too: a clamp the picker shows but the payload drops
+    // would still fail the turn.
+    await fireEvent.click(screen.getByTestId("confirm-create-agent"));
+    expect(onSubmit).toHaveBeenCalledExactlyOnceWith({
+      mode: "create",
+      name: "antigravity",
+      harness: "antigravity",
+      primary: { model: "gemini-3.1-pro", effort: "low" },
+      secondary: { model: "gemini-3.7-flash", effort: "high" },
+    } satisfies AgentFormSubmit);
+  });
+
   it("changing the model and effort pickers submits the chosen values", async () => {
     const { onSubmit } = renderForm();
     await choosePicker("model-select", "sonnet");

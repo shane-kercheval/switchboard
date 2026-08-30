@@ -330,9 +330,9 @@ export function noteProjectStates(
 
 /// Discard everything tracked for these projects **silently** — never flushing.
 ///
-/// Called from the workspace teardown paths (directory removal, project delete),
-/// alongside the cleanup every other per-project store already gets. Two rules,
-/// both load-bearing:
+/// Called from project deletion — the one workspace teardown path that drops a
+/// project — alongside the cleanup every other per-project store already gets.
+/// Two rules, both load-bearing:
 ///
 ///   - **Silent.** A deleted project must not notify. Without this the removal
 ///     path is genuinely notifiable, not merely leaky: `settleAgentsRemoved`
@@ -340,9 +340,9 @@ export function noteProjectStates(
 ///     outcome beats a teardown guess), so the accumulator can be complete and
 ///     worth reporting. It cannot flush at teardown because the stale
 ///     `busyProjects` entry blocks it, and the project then drops out of the
-///     observer's candidate set so nothing clears that entry — until the same
-///     directory is re-added, whose first idle push releases a notification about
-///     work that finished before the removal.
+///     observer's candidate set so nothing clears that entry — until a project
+///     re-enters the list under that id, whose first idle push releases a
+///     notification about work that finished before the deletion.
 ///   - **Call before agent teardown.** Run after `unregisterAgents` and
 ///     `settleAgentsRemoved` can classify the teardown outcomes and flush first;
 ///     running before leaves it a no-op on an already-empty tracker.

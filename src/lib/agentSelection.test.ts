@@ -64,29 +64,16 @@ describe("effortOptionsFor", () => {
   const values = (harness: Parameters<typeof effortOptionsFor>[0], model: string | undefined) =>
     effortOptionsFor(harness, model).map((o) => o.value);
 
-  it("withholds max/ultra for pre-5.6 Codex models (they 400 on those levels)", () => {
-    const v = values("codex", "gpt-5.5");
-    expect(v).not.toContain("max");
-    expect(v).not.toContain("ultra");
-    // The lower levels are untouched.
-    expect(v).toEqual(["none", "minimal", "low", "medium", "high", "xhigh"]);
-  });
-
-  it("offers the full list for the GPT-5.6 family", () => {
-    for (const model of ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]) {
-      expect(values("codex", model)).toEqual(EFFORT_OPTIONS.codex.map((o) => o.value));
+  it("offers every Codex level regardless of model, curated or not", () => {
+    // Codex effort validity is server-enforced and self-describing, so the
+    // picker stays permissive and lets an invalid level fail the turn.
+    const all = EFFORT_OPTIONS.codex.map((o) => o.value);
+    for (const model of ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", undefined]) {
+      expect(values("codex", model)).toEqual(all);
     }
   });
 
-  it("is permissive for an unknown/off-catalog or unset Codex model", () => {
-    // Unknown validity stays reactive rather than pre-filtered.
-    expect(values("codex", "gpt-9.9-experimental")).toEqual(
-      EFFORT_OPTIONS.codex.map((o) => o.value),
-    );
-    expect(values("codex", undefined)).toEqual(EFFORT_OPTIONS.codex.map((o) => o.value));
-  });
-
-  it("returns the harness list unchanged for non-Codex harnesses", () => {
+  it("returns the harness list unchanged for non-model-dependent harnesses", () => {
     expect(effortOptionsFor("claude_code", "opus")).toEqual(EFFORT_OPTIONS.claude_code);
   });
 

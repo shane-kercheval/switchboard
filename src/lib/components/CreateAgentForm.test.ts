@@ -572,49 +572,6 @@ describe("CreateAgentForm", () => {
     expect(pickerValue("effort-select")).toBe("high");
   });
 
-  it("create + Codex: selecting gpt-5.5 withholds max/ultra from the effort picker", async () => {
-    renderForm();
-    await fireEvent.click(screen.getByTestId("harness-codex"));
-    // Default terra offers the top levels…
-    expect(screen.getByTestId("effort-select-option-ultra")).toBeInTheDocument();
-    await choosePicker("model-select", "gpt-5.5");
-    // …but gpt-5.5 rejects them at turn time, so the picker doesn't offer them.
-    expect(screen.queryByTestId("effort-select-option-max")).not.toBeInTheDocument();
-    expect(screen.queryByTestId("effort-select-option-ultra")).not.toBeInTheDocument();
-    expect(screen.getByTestId("effort-select-option-xhigh")).toBeInTheDocument();
-  });
-
-  it("create + Codex: switching to gpt-5.5 while on ultra resets effort to the default", async () => {
-    const { onSubmit } = renderForm();
-    await fireEvent.click(screen.getByTestId("harness-codex"));
-    await choosePicker("effort-select", "ultra");
-    expect(pickerValue("effort-select")).toBe("ultra");
-    // Switching to a model that can't run ultra clamps effort to the Codex
-    // default (medium) rather than leaving an invalid selection.
-    await choosePicker("model-select", "gpt-5.5");
-    expect(pickerValue("effort-select")).toBe("medium");
-    await fireEvent.click(screen.getByTestId("confirm-create-agent"));
-    expect(onSubmit).toHaveBeenCalledExactlyOnceWith({
-      mode: "create",
-      name: "codex",
-      harness: "codex",
-      primary: { model: "gpt-5.5", effort: "medium" },
-      secondary: { model: "gpt-5.6-terra", effort: "medium" },
-    } satisfies AgentFormSubmit);
-  });
-
-  it("create + Codex: switching back to a 5.6 model keeps a still-valid effort", async () => {
-    renderForm();
-    await fireEvent.click(screen.getByTestId("harness-codex"));
-    await choosePicker("effort-select", "high");
-    await choosePicker("model-select", "gpt-5.5");
-    // `high` is valid on 5.5, so it survives the switch (no needless reset).
-    expect(pickerValue("effort-select")).toBe("high");
-    await choosePicker("model-select", "gpt-5.6-sol");
-    expect(pickerValue("effort-select")).toBe("high");
-    expect(screen.getByTestId("effort-select-option-ultra")).toBeInTheDocument();
-  });
-
   it("create + Gemini: model picker present (auto), effort replaced by a note", async () => {
     renderForm();
     await fireEvent.click(screen.getByTestId("harness-gemini"));

@@ -1,15 +1,15 @@
 //! User-global workspace **view-state** — how the user has arranged the
 //! directories and projects the store holds.
 //!
-//! Three things live here and nothing else: the ordered set of known directory
-//! paths, which of those the user has hidden, and which projects they have
-//! archived. All three are presentation choices with no on-disk counterpart,
-//! which is why they are user-global rather than stored beside the data.
+//! Two things live here and nothing else: the ordered set of known directory
+//! paths, and which projects the user has archived. Both are presentation
+//! choices with no on-disk counterpart, which is why they are user-global
+//! rather than stored beside the data.
 //!
 //! **Nothing here is load-bearing, and that is what makes best-effort loading
 //! safe.** The store's `projects.jsonl` and `directories.jsonl` are the record
 //! of what exists; a missing or corrupt `workspace.yaml` costs the user their
-//! ordering and their hidden/archived choices, never a project. This file used
+//! ordering and their archived choices, never a project. This file used
 //! to also cache each directory's project list so an unavailable directory
 //! could still be listed — the store makes that redundant, because the index
 //! lives under the store root and is readable whether or not any working
@@ -50,26 +50,12 @@ pub struct Workspace {
     /// the field loads as "nothing archived" — no migration.
     #[serde(default)]
     archived: BTreeSet<ProjectId>,
-    /// Directories the user has hidden from their list.
-    ///
-    /// **Hiding is what "remove directory" now does.** Under the store, a
-    /// directory's catalog entry is referenced by every project in it and can
-    /// never be deleted while any of them exists, so "remove" cannot mean
-    /// "forget" without orphaning those projects. It means "stop showing me
-    /// this", which is view-state and belongs here. Hiding stops nothing:
-    /// projects in a hidden directory keep running, and unhiding is lossless.
-    ///
-    /// Keyed by path so the entry and its hidden flag share one key.
-    /// `#[serde(default)]` so an older file loads as "nothing hidden".
-    #[serde(default)]
-    hidden: BTreeSet<PathBuf>,
 }
 
 impl Workspace {
     /// Add a directory to the registry. Idempotent: a second add of an
     /// already-known path is a no-op that preserves the existing entry's
-    /// position. Adding a hidden directory unhides it — the user asking for it
-    /// again is the same gesture as unhiding.
+    /// position.
     ///
     /// Paths are compared as-given. Callers that want canonicalized identity
     /// (matching `Directory::at`) should canonicalize before adding; we do not
@@ -77,7 +63,6 @@ impl Workspace {
     /// disk and the registry must be able to hold currently-unavailable
     /// directories.
     pub fn add(&mut self, path: PathBuf) {
-        self.hidden.remove(&path);
         if self.contains(&path) {
             return;
         }
@@ -85,7 +70,7 @@ impl Workspace {
     }
 
     /// Retire every path a directory identity used to hold and register the one
-    /// it holds now, keeping the entry's position and visibility.
+    /// it holds now, keeping the entry's position.
     ///
     /// **Plural, and chosen by what this registry knows.** A duplicated identity
     /// holds more than one catalog path, and catalog order has no relationship
@@ -93,14 +78,10 @@ impl Workspace {
     /// typically arrives from outside (a partial restore, a bulk write) and is
     /// not an entry here at all. Picking `old[0]` therefore updated nothing and
     /// retired the legitimate row, leaving the repaired directory with **no
-    /// entry**: gone from the list, its position and hidden flag lost, while the
+    /// entry**: gone from the list and its position lost, while the
     /// repair reported success. So: keep the earliest old path this registry
     /// actually tracks, retire the rest, and fall back to appending when it
     /// tracks none of them.
-    ///
-    /// Conflicting hidden flags collapse toward **visible** — if any retired row
-    /// was visible the repaired directory stays visible, which is the less
-    /// surprising outcome for a user who just fixed it.
     pub fn replace_paths(&mut self, old: &[PathBuf], new: PathBuf) {
         let anchor = old
             .iter()
@@ -111,17 +92,6 @@ impl Workspace {
                     .map(|index| (index, path))
             })
             .min_by_key(|(index, _)| *index);
-        // Visible unless every tracked old path was hidden. `old` being empty is
-        // the bind case — the identity held no path at all — and a repaired
-        // directory the registry has never seen must not arrive hidden.
-        let visible = old.is_empty()
-            || !old.iter().any(|path| self.contains(path))
-            || old
-                .iter()
-                .any(|path| self.contains(path) && !self.is_hidden(path));
-        for path in old {
-            self.hidden.remove(path);
-        }
         if let Some((index, keep)) = anchor {
             let keep = keep.clone();
             self.entries
@@ -136,24 +106,8 @@ impl Workspace {
             }
         } else {
             self.entries.retain(|entry| !old.contains(&entry.path));
-            self.add(new.clone());
+            self.add(new);
         }
-        if !visible {
-            self.hidden.insert(new);
-        }
-    }
-
-    /// Hide (or unhide) a directory. Returns whether the set changed.
-    pub fn set_hidden(&mut self, path: &Path, hidden: bool) -> bool {
-        if hidden {
-            self.hidden.insert(path.to_path_buf())
-        } else {
-            self.hidden.remove(path)
-        }
-    }
-
-    pub fn is_hidden(&self, path: &Path) -> bool {
-        self.hidden.contains(path)
     }
 
     pub fn entries(&self) -> &[DirectoryEntry] {
@@ -349,33 +303,18 @@ mod tests {
     }
 
     #[test]
-    fn hiding_a_directory_keeps_its_entry_and_adding_it_back_unhides() {
-        // "Remove directory" is a view-state gesture now: the catalog entry is
-        // referenced by every project in the directory and cannot be dropped, so
-        // hiding must be lossless and reversible by the ordinary add path.
-        let mut workspace = Workspace::default();
-        workspace.add(PathBuf::from("/a"));
-
-        assert!(workspace.set_hidden(Path::new("/a"), true));
-        assert!(workspace.is_hidden(Path::new("/a")));
-        assert!(
-            workspace.contains(Path::new("/a")),
-            "hiding must not drop the entry"
-        );
-        assert!(!workspace.set_hidden(Path::new("/a"), true));
-
-        workspace.add(PathBuf::from("/a"));
-        assert!(!workspace.is_hidden(Path::new("/a")));
-        assert_eq!(workspace.entries().len(), 1, "unhiding is not a second add");
-    }
-
-    #[test]
-    fn hidden_defaults_empty_for_an_older_workspace_yaml() {
+    fn a_workspace_yaml_carrying_the_retired_hidden_key_still_loads() {
+        // Directory hiding was removed after shipping, so a real file can still
+        // carry the key. The struct does not deny unknown fields, so it is
+        // ignored and dropped on the next write — a stale key must never cost
+        // the user their arrangement.
         let dir = tempdir().unwrap();
         let path = dir.path().join("workspace.yaml");
-        std::fs::write(&path, "entries: []\n").unwrap();
+        std::fs::write(&path, "entries:\n- path: /a\nhidden:\n- /a\narchived: []\n").unwrap();
 
-        assert!(!load(&path).workspace.is_hidden(Path::new("/a")));
+        let loaded = load(&path).workspace;
+        assert!(loaded.contains(Path::new("/a")));
+        assert_eq!(loaded.entries().len(), 1);
     }
 
     #[test]

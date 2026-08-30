@@ -134,7 +134,7 @@ pub struct MaintenanceBarrier {
 ///
 /// `forwards` and `workflow_runs` are **tail-leaf** maps (acquired alone, last,
 /// briefly, never across an `.await`): they sort after `agents_by_id`. Teardown
-/// (`remove_directory` / `delete_project`) collects the affected runs' cancel
+/// (`delete_project`) collects the affected runs' cancel
 /// tokens under the `workflow_runs` lock, releases it, then fires them and awaits
 /// the runs reaching terminal **before** draining agents — so no cancel token is
 /// fired while the lock is held, and the order keeps a run resolving `cancelled`
@@ -223,9 +223,9 @@ pub struct AppState {
     /// **Wrapped in `Arc<Mutex<…>>`** so the emitter decorator can hold a
     /// clone for the lifetime of the dispatcher's `'static` drain task.
     ///
-    /// **Removal clearing.** `remove_directory_impl` drops the entries for the
-    /// removed directory's agents alongside the matching `projects` and
-    /// `agents_by_id` entries — a stale `agent_id` from a removed directory's
+    /// **Deletion clearing.** `delete_project_impl` drops the entries for the
+    /// deleted project's agents alongside the matching `projects` and
+    /// `agents_by_id` entries — a stale `agent_id` from a deleted project's
     /// attach must not leak forward.
     pub needs_session_meta: Arc<Mutex<HashSet<AgentId>>>,
 
@@ -248,9 +248,9 @@ pub struct AppState {
     /// every loaded project's `registry.jsonl` from disk (the prior
     /// `lookup_agent` hot path). Populated on project open, agent
     /// register/attach, and `list_agents`; the removed directory's entries are
-    /// dropped on `remove_directory`. v1 has no agent/project deletion, so
-    /// invalidation is insert-only within a session plus a targeted prune when
-    /// a directory is removed. An `AgentRecord` is otherwise immutable after
+    /// dropped by `delete_project_impl`, and a removed agent's by
+    /// `remove_agent_impl`, so invalidation is insert-only within a session
+    /// plus those targeted prunes. An `AgentRecord` is otherwise immutable after
     /// registration, with one exception: `rename_agent_impl` and
     /// `set_agent_session_locator_impl` (the runtime session-locator capture)
     /// mutate a record in place and re-insert the updated copy here in the same

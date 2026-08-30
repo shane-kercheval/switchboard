@@ -390,15 +390,6 @@ export async function migrateMessagePin(
   return await invoke<MessagePin[]>("migrate_message_pin", { projectId, fromKey, toKey });
 }
 
-// Hides a directory. Nothing is deleted and nothing is stopped: the entry, its
-// projects, their history, and any in-flight turns all survive, and adding the
-// directory back unhides it. A catalog entry is referenced by every project in
-// the directory, so it cannot be dropped without orphaning them — hiding is
-// view-state, which is why it drains nothing.
-export async function hideDirectory(path: string): Promise<void> {
-  await invoke<null>("remove_directory", { path });
-}
-
 // The merged post-restart conversation for a project (journal user-messages +
 // harness agent content + journal outcome markers). Replaces per-agent
 // `loadTranscript` for the unified view.

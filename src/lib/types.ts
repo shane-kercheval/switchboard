@@ -618,10 +618,6 @@ export function projectIsAvailable(listing: { directory_status: DirectoryStatus 
 export type WorkspaceDirectoryInfo = {
   path: string;
   available: boolean;
-  /// The user hid this directory ("remove directory"), so its projects are
-  /// omitted from the project list. The entry survives and adding the directory
-  /// back unhides it — nothing is deleted.
-  hidden: boolean;
 };
 
 export type WorkspaceDirectories = {

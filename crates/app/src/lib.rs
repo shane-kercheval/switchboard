@@ -311,18 +311,17 @@ use crate::commands::{
     open_branch_comparison_file_difftool_impl, open_commit_file_difftool_impl, open_project_impl,
     open_worktree_file_difftool_impl, parse_uuid, pick_directory_impl,
     project_session_fingerprints_impl, read_tracked_repo_from_inputs,
-    recheck_harness_installs_impl, remove_agent_impl, remove_directory_impl,
-    remove_mcp_provider_impl, remove_message_pins_impl, remove_queued_message_impl,
-    remove_tracked_repo_impl, rename_agent_impl, rename_project_impl, render_prompt_impl,
-    reorder_agents_impl, repoint_project_directory_impl, resolve_saved_prompt_fresh_impl,
-    resolve_saved_prompt_impl, resume_agent_in_terminal_impl, reveal_in_finder_argv,
-    search_project_files_in_root, search_project_files_root_impl, send_message_impl,
-    set_active_agent_profile_impl, set_active_project_impl, set_agent_profiles_impl,
-    set_message_pin_impl, set_preferences_impl, set_project_archived_impl,
-    set_visible_project_impl, sign_in_mcp_provider_impl, sign_out_mcp_provider_impl,
-    spawn_prompt_resolution_change_notifications, stage_attachment_impl, sync_prompts_and_notify,
-    terminal_open_argv, test_mcp_connection_impl, test_saved_mcp_provider_impl,
-    tracked_repos_inputs, tracked_roots, validate_external_url,
+    recheck_harness_installs_impl, remove_agent_impl, remove_mcp_provider_impl,
+    remove_message_pins_impl, remove_queued_message_impl, remove_tracked_repo_impl,
+    rename_agent_impl, rename_project_impl, render_prompt_impl, reorder_agents_impl,
+    repoint_project_directory_impl, resolve_saved_prompt_fresh_impl, resolve_saved_prompt_impl,
+    resume_agent_in_terminal_impl, reveal_in_finder_argv, search_project_files_in_root,
+    search_project_files_root_impl, send_message_impl, set_active_agent_profile_impl,
+    set_active_project_impl, set_agent_profiles_impl, set_message_pin_impl, set_preferences_impl,
+    set_project_archived_impl, set_visible_project_impl, sign_in_mcp_provider_impl,
+    sign_out_mcp_provider_impl, spawn_prompt_resolution_change_notifications,
+    stage_attachment_impl, sync_prompts_and_notify, terminal_open_argv, test_mcp_connection_impl,
+    test_saved_mcp_provider_impl, tracked_repos_inputs, tracked_roots, validate_external_url,
 };
 use crate::error::AppError;
 use crate::preferences::Preferences;
@@ -488,12 +487,6 @@ async fn init_directory(state: State<'_, AppState>, path: String) -> Result<Dire
     init_directory_impl(state.inner(), &path)
         .await
         .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-async fn remove_directory(state: State<'_, AppState>, path: String) -> Result<(), String> {
-    remove_directory_impl(state.inner(), &path);
-    Ok(())
 }
 
 /// Repair a project whose working directory moved, was deleted, or is claimed
@@ -2292,7 +2285,6 @@ pub fn run() {
             await_harness_path,
             pick_directory,
             init_directory,
-            remove_directory,
             repoint_project_directory,
             list_projects,
             list_message_pins,

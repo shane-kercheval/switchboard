@@ -483,38 +483,6 @@ export async function addDirectory(path: string): Promise<void> {
   await loadWorkspace();
 }
 
-/// Hide a working directory. **Nothing is deleted, and nothing is torn down.**
-///
-/// A directory's catalog entry is referenced by every project in it and cannot
-/// be dropped while any of them exists, so hiding means "stop showing me this":
-/// the entry survives, its projects survive, their agents keep running, and
-/// adding the directory back restores the list.
-///
-/// **This function used to tear down the frontend** — unsubscribing agent and
-/// workflow listeners, deleting transcripts, clearing the memoized load state.
-/// That was correct when the backend drained the directory's agents. It stopped
-/// draining, and this was left behind, so hiding would have kept the work
-/// running with nothing listening to it: quota spent invisibly, and a mid-turn
-/// reconnect on unhide that never saw the turn start. The teardown is gone.
-///
-/// The visible selection is cleared when the hidden directory owns it, because
-/// `activeProject` is derived from the filtered project list — leaving the id
-/// set would render a project the list no longer contains, giving a blank title
-/// and disabled actions over a live transcript. The work itself continues in the
-/// background and is reachable again by unhiding.
-export async function hideDirectory(path: string): Promise<void> {
-  const hiddenProjectIds = projects.list.filter((p) => p.directory === path).map((p) => p.id);
-  const wasActive = hiddenProjectIds.includes(selection.activeProjectId ?? "");
-
-  await api.hideDirectory(path);
-
-  if (wasActive) {
-    selection.activeProjectId = null;
-    selection.activationFailure = null;
-  }
-  await loadWorkspace();
-}
-
 /// Create a project in `directory`, refresh the registry, and activate it.
 /// Registers the folder first (idempotent `init_directory`): `create_project`
 /// requires its target directory to already be a loaded workspace directory, so

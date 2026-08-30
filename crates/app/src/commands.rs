@@ -772,37 +772,6 @@ pub async fn init_directory_impl(state: &AppState, path: &str) -> Result<Directo
     Ok(info)
 }
 
-/// Hide a directory from the user's list.
-///
-/// **"Remove" is now hide, and that is a real change.** A directory's catalog
-/// entry is referenced by the `directory_id` of every project in it, and the
-/// catalog never deletes a row a project still references — dropping one would
-/// leave those projects unresolvable with no handle to repair them, since the id
-/// *is* the handle. So removal cannot mean "forget"; it means "stop showing me
-/// this", which is view-state.
-///
-/// **Nothing is drained, and that is deliberate.** An earlier version kept the
-/// teardown this command used to perform — cancelling in-flight turns, releasing
-/// locks, unloading projects. The argument for it was real: an agent running in
-/// a directory the user has hidden burns subscription quota they can neither see
-/// nor stop, because a hidden directory's projects aren't navigable. It loses to
-/// a narrower one. The whole claim of the new semantics is that hiding is
-/// lossless and reversible — unhide restores everything — and a cancelled
-/// in-flight turn is the single part that isn't: the work is gone and unhiding
-/// will not bring it back. So the drain silently falsified the property the
-/// command now advertises, on a button whose label did not change. Keeping it
-/// would have required also dropping the losslessness claim and confirming with
-/// a count of running turns; a separate explicit "close and hide" is the right
-/// home for that if the quota cost proves to matter.
-///
-/// Nothing on disk is touched, in the working directory or the store.
-/// Idempotent: hiding an absent or already-hidden directory is `Ok`.
-pub fn remove_directory_impl(state: &AppState, path: &str) {
-    let canonical = canonicalize_boundary(path);
-    lock(&state.workspace).set_hidden(&canonical, true);
-    persist_workspace(state);
-}
-
 /// Point a project's working directory at a new location — the repair for a
 /// moved or deleted checkout, a duplicated directory identity, or a lost one.
 ///
@@ -947,8 +916,8 @@ fn retire_and_register_directory(
 
 /// *The* directory-identity chokepoint. Every command that resolves a working
 /// directory to its canonical key — `init_directory_impl`, `create_project_impl`,
-/// `remove_directory_impl` — funnels through here so a directory is identified
-/// the same way on the way in (init/create) and on the way out (remove).
+/// `repoint_project_directory_impl` — funnels through here so a directory is
+/// identified the same way however it is reached.
 ///
 /// Canonicalizes via `std::fs::canonicalize` when the path exists on disk
 /// (matching `Directory::at`, which is how loaded directories were keyed), and
@@ -989,16 +958,14 @@ fn canonicalize_boundary(path: &str) -> PathBuf {
 pub fn list_projects_impl(state: &AppState) -> Result<Vec<ProjectListing>, AppError> {
     let resolved = state.store.list_projects_resolved()?;
 
-    // Directory order from the workspace registry (insertion order), with
-    // hidden directories dropped. A project whose directory resolves to a path
-    // the registry doesn't list still appears — the store, not the registry, is
-    // the record of what exists.
+    // Directory order from the workspace registry (insertion order). A project
+    // whose directory resolves to a path the registry doesn't list still
+    // appears — the store, not the registry, is the record of what exists.
     let order: Vec<PathBuf> = {
         let workspace = lock(&state.workspace);
         workspace
             .entries()
             .iter()
-            .filter(|entry| !workspace.is_hidden(&entry.path))
             .map(|entry| entry.path.clone())
             .collect()
     };
@@ -1009,13 +976,6 @@ pub fn list_projects_impl(state: &AppState) -> Result<Vec<ProjectListing>, AppEr
 
     let mut listings: Vec<ProjectListing> = resolved
         .iter()
-        .filter(|row| {
-            // A hidden directory's projects are omitted; an unresolvable row has
-            // no directory to have hidden, so it always lists.
-            row.directory()
-                .path()
-                .is_none_or(|path| !lock(&state.workspace).is_hidden(path))
-        })
         .map(|row| {
             let entry = row.entry();
             let (directory, directory_status) = match row.directory() {
@@ -1055,12 +1015,8 @@ pub struct WorkspaceDirectoryInfo {
     pub path: String,
     /// Whether the directory currently exists on disk. An unavailable
     /// directory (unmounted/moved) still appears, so the user can see it and
-    /// re-point or hide it.
+    /// re-point it.
     pub available: bool,
-    /// Whether the user has hidden this directory. Hidden directories are
-    /// omitted from the project list but still listed here — the switcher is
-    /// where unhiding happens, so it must be able to show what is hidden.
-    pub hidden: bool,
 }
 
 /// The switcher's view of the workspace registry: every registered directory
@@ -1087,22 +1043,20 @@ pub fn list_workspace_directories_impl(state: &AppState) -> WorkspaceDirectories
         .iter()
         .map(|e| e.path.clone())
         .collect();
-    let directories = {
-        let workspace = lock(&state.workspace);
-        entry_paths
-            .into_iter()
-            .map(|path| WorkspaceDirectoryInfo {
-                // A path check, not a loaded-handle check: under the store a
-                // directory is nothing but a path in the catalog, so "does it
-                // exist" is the whole question. The old version reported a
-                // directory unavailable whenever its handle hadn't been opened,
-                // which conflated "not mounted" with "not visited yet".
-                available: path.is_dir(),
-                hidden: workspace.is_hidden(&path),
-                path: path.to_string_lossy().into_owned(),
-            })
-            .collect()
-    };
+    // Built after the lock is dropped: `is_dir` is a syscall per entry, and the
+    // workspace mutex is on the project-list read path.
+    let directories = entry_paths
+        .into_iter()
+        .map(|path| WorkspaceDirectoryInfo {
+            // A path check, not a loaded-handle check: under the store a
+            // directory is nothing but a path in the catalog, so "does it
+            // exist" is the whole question. The old version reported a
+            // directory unavailable whenever its handle hadn't been opened,
+            // which conflated "not mounted" with "not visited yet".
+            available: path.is_dir(),
+            path: path.to_string_lossy().into_owned(),
+        })
+        .collect();
     WorkspaceDirectories {
         directories,
         persistable: state.workspace_path.is_some(),
@@ -2560,8 +2514,7 @@ pub fn migrate_message_pin_impl(
     Ok(pins)
 }
 
-/// Permanently delete one project's Switchboard state. Mirrors
-/// `remove_directory_impl`'s two phases, scoped to a single project:
+/// Permanently delete one project's Switchboard state, in two phases:
 ///
 /// **(a)** With no locks held, drain every loaded agent in the project
 /// (`shutdown_agent` cancels any in-flight turn and waits) so no orphaned
@@ -13689,34 +13642,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hiding_a_directory_leaves_every_routable_map_untouched() {
-        // Hiding is lossless and reversible, and cancelling an in-flight turn is
-        // the one part that would not be. So it drains nothing: the projects
-        // stay loaded, the agents stay cached, the locks stay held — only the
-        // listing changes.
-        let (tmp_workdir, _home, state, proj) = fresh_state_with_active_project("alpha").await;
-        let agent =
-            create_agent_impl(&state, "assistant", HarnessKind::ClaudeCode, None, None).unwrap();
-
-        remove_directory_impl(&state, tmp_workdir.path().to_str().unwrap());
-
-        assert!(lock(&state.agents_by_id).contains_key(&agent.id));
-        assert!(lock(&state.projects).contains_key(&proj.id));
-        assert!(lock(&state.project_locks).contains_key(&proj.id));
-        assert!(
-            lookup_agent(&state, agent.id).is_ok(),
-            "dispatch still works"
-        );
-        assert!(
-            list_projects_impl(&state)
-                .unwrap()
-                .iter()
-                .all(|row| row.id != proj.id),
-            "only the listing changes"
-        );
-    }
-
-    #[tokio::test]
     async fn open_with_corrupt_registry_errors_without_wedging_the_lock() {
         let (_tmp_workdir, _home, state, proj) = fresh_state_with_active_project("alpha").await;
         let agent =
@@ -15305,37 +15230,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hiding_a_directory_omits_its_projects_without_deleting_them() {
-        // Hiding is view-state: the projects stay in the store and come back
-        // whole when the directory is added again. It is not a soft delete.
-        let (state, cwd, project) = state_with_project("alpha").await;
-        let canonical = cwd.path().canonicalize().unwrap();
-        assert_eq!(list_projects_impl(&state).unwrap().len(), 1);
-
-        lock(&state.workspace).set_hidden(&canonical, true);
-        assert!(
-            list_projects_impl(&state).unwrap().is_empty(),
-            "a hidden directory's projects drop out of the list"
-        );
-        assert!(
-            state
-                .store
-                .list_projects()
-                .unwrap()
-                .iter()
-                .any(|entry| entry.id == project.id),
-            "but the project itself is untouched"
-        );
-
-        lock(&state.workspace).set_hidden(&canonical, false);
-        assert_eq!(
-            list_projects_impl(&state).unwrap().len(),
-            1,
-            "unhiding is lossless"
-        );
-    }
-
-    #[tokio::test]
     async fn caching_an_agent_claimed_by_another_project_is_refused() {
         // The id cache used to insert last-wins, so an agent id present in two
         // registries silently resolved to whichever was read second — and
@@ -16248,62 +16142,6 @@ mod tests {
             listings[0].directory_status,
             DirectoryStatus::ResolvedAvailable
         );
-    }
-
-    #[tokio::test]
-    async fn hiding_a_directory_does_not_cancel_an_in_flight_turn() {
-        // Inverted from `remove_directory_drains_turns_releases_locks_and_preserves_disk`.
-        // Hiding claims to be lossless and reversible, and a cancelled turn is
-        // the one thing unhiding cannot restore — so the drain was the single
-        // operation that falsified the property the command advertises, on a
-        // button whose label did not change. The quota cost of an agent running
-        // in a hidden directory is real and is the argument that lost; if it
-        // needs answering it belongs in a separate, explicit "close and hide".
-        let (tmp, state, emitter) =
-            fresh_state_with_scenario(switchboard_harness::MockScenario::AwaitCancellation);
-        let (agent, project_id) = project_with_agent(&state, &tmp).await;
-
-        send_msg(&state, agent.id, "long task").await.unwrap();
-        within(
-            &emitter,
-            "turn_start",
-            emitter.wait_for_type("turn_start", 1),
-        )
-        .await;
-
-        remove_directory_impl(&state, tmp.path().to_str().unwrap());
-
-        let channel = format!("agent:{}", agent.id);
-        let cancelled = emitter.snapshot().into_iter().any(|(name, v)| {
-            name == channel && v["type"] == "turn_end" && v["outcome"]["status"] == "cancelled"
-        });
-        assert!(
-            !cancelled,
-            "hiding must not cancel the user's in-flight turn"
-        );
-        assert!(lock(&state.project_locks).contains_key(&project_id));
-        assert!(lock(&state.projects).contains_key(&project_id));
-        assert!(!lock(&state.agents_by_id).is_empty());
-
-        // Hidden, not forgotten: the entry survives so ordering and a later
-        // unhide do too, and nothing was written into the working directory.
-        let canonical = tmp.path().canonicalize().unwrap();
-        assert!(lock(&state.workspace).is_hidden(&canonical));
-        assert!(lock(&state.workspace).contains(&canonical));
-        assert!(
-            list_projects_impl(&state)
-                .unwrap()
-                .iter()
-                .all(|row| row.id != project_id)
-        );
-        assert!(!tmp.path().join(".switchboard").exists());
-
-        // Adding the directory back is the unhide gesture, and it is lossless.
-        let info = init_directory_impl(&state, tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
-        assert!(!lock(&state.workspace).is_hidden(&canonical));
-        assert_eq!(info.projects.len(), 1);
     }
 
     #[tokio::test]
@@ -21216,31 +21054,6 @@ mod tests {
         let plain = TempDir::new().unwrap();
         let err = add_tracked_repo_impl(&state, plain.path().to_str().unwrap()).unwrap_err();
         assert!(matches!(err, AppError::NotAGitRepo { .. }));
-    }
-
-    #[tokio::test]
-    async fn remove_directory_leaves_repo_tracked_in_git_view() {
-        // Decision 5: the git view is a superset — removing a working directory
-        // does NOT untrack its repo.
-        let (_cfg, state) = state_with_registries();
-        let repo = TempDir::new().unwrap();
-        init_git_repo(repo.path());
-        init_directory_impl(&state, repo.path().to_str().unwrap())
-            .await
-            .unwrap();
-        let canonical = repo.path().canonicalize().unwrap();
-        assert!(lock(&state.git_registry).contains(&canonical));
-
-        remove_directory_impl(&state, repo.path().to_str().unwrap());
-
-        assert!(
-            lock(&state.git_registry).contains(&canonical),
-            "removing a working directory must leave the repo tracked in the git view"
-        );
-        assert!(
-            lock(&state.workspace).is_hidden(&canonical),
-            "but it is hidden in the workspace"
-        );
     }
 
     #[test]

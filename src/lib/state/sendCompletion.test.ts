@@ -22,6 +22,7 @@ const {
   settleAgentIdle,
   settleAgentsRemoved,
   settleTurn,
+  forgetProjects,
   isFlushing,
   _testing,
 } = await import("./sendCompletion");
@@ -262,6 +263,37 @@ describe("project-completion tracker", () => {
     settleAgentIdle(A);
     settleAgentIdle(B);
     expect(lastCall()[1]).toBe("Agents finished, some failed");
+  });
+
+  it("reports mixed queued work on one agent as a partial failure", async () => {
+    // Counting failures per *agent* rather than per outcome collapses this into
+    // "Agent failed" — telling the user their agent failed when half its work
+    // succeeded. This is the queued-messages flow, so it is a common case.
+    register();
+    markRecipientStarted(SEND, A);
+    register([{ id: A, name: "claude" }], SECOND_SEND);
+    markRecipientStarted(SECOND_SEND, A);
+
+    settleRecipient(SEND, A, "completed");
+    settleRecipient(SECOND_SEND, A, "failed");
+    settleAgentIdle(A);
+
+    expect(lastCall()[1]).toBe("Agent finished, some failed");
+    expect(lastCall()[2]).toBe("switchboard: claude");
+  });
+
+  it("summarizes the tail rather than naming every subject", async () => {
+    // macOS truncates a long body mid-name; an explicit remainder still tells the
+    // user how much finished.
+    const many = ["one", "two", "three", "four", "five"].map((name, i) => ({
+      id: `ag-${i}` as AgentId,
+      name,
+    }));
+    registerSend(SEND, PROJECT, "switchboard", many);
+    for (const agent of many) settleRecipient(SEND, agent.id, "completed");
+
+    expect(lastCall()[1]).toBe("Agents finished");
+    expect(lastCall()[2]).toBe("switchboard: one, two, three and 2 more");
   });
 
   it("stays silent when the user cancelled everything", async () => {
@@ -564,9 +596,101 @@ describe("flush re-entrancy marker", () => {
 });
 
 describe("consecutive quiet-downs", () => {
+  /// A delivery whose promise the test controls, so overlapping deliveries can be
+  /// resolved out of order.
+  function deferNotify(): () => void {
+    let release: () => void = () => {};
+    notifyMock.mockImplementationOnce(
+      async () =>
+        await new Promise<void>((resolve) => {
+          release = resolve;
+        }),
+    );
+    return () => release();
+  }
+
+  function completeOnce(sendId: SendId): void {
+    registerSend(sendId, PROJECT, "switchboard", [{ id: A, name: "claude" }]);
+    markRecipientStarted(sendId, A);
+    settleRecipient(sendId, A, "completed");
+    settleAgentIdle(A);
+  }
+
   it("notifies a second quiet-down while the first notification is still in flight", async () => {
     // The in-flight marker must not double as a flush guard: nothing retries once
     // the promise settles, so suppressing here would drop the notification.
+    const releaseFirst = deferNotify();
+    completeOnce(SEND);
+    expect(isFlushing(PROJECT)).toBe(true);
+
+    completeOnce(SECOND_SEND);
+
+    expect(notifyMock).toHaveBeenCalledTimes(2);
+    releaseFirst();
+    expectTrackerEmpty();
+  });
+
+  it("stays flushing until every overlapping delivery settles", async () => {
+    // A Set here would report "nothing in flight" as soon as *either* delivery
+    // resolved. M3's fallback reads this to decide whether clearing reading mode
+    // could suppress a notification still travelling to the gate, so an early
+    // `false` reintroduces exactly that suppression.
+    const releaseFirst = deferNotify();
+    const releaseSecond = deferNotify();
+    completeOnce(SEND);
+    completeOnce(SECOND_SEND);
+    expect(notifyMock).toHaveBeenCalledTimes(2);
+
+    releaseSecond();
+    // Let the second delivery's `finally` actually run before asserting. With a
+    // Set this is the point the marker wrongly clears.
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(isFlushing(PROJECT)).toBe(true);
+
+    releaseFirst();
+    await vi.waitFor(() => expect(isFlushing(PROJECT)).toBe(false));
+  });
+});
+
+describe("project teardown", () => {
+  it("discards a removed project's activity without notifying", async () => {
+    // The removal path is genuinely notifiable, not merely leaky: an
+    // already-completed recipient keeps its outcome, so the accumulator can be
+    // complete and worth reporting. Re-adding the directory later would otherwise
+    // release a banner about work that finished before the removal.
+    register(both);
+    markRecipientStarted(SEND, A);
+    markRecipientStarted(SEND, B);
+    settleRecipient(SEND, A, "completed");
+    pushBusy(true);
+
+    forgetProjects([PROJECT]);
+    expect(notifyMock).not.toHaveBeenCalled();
+    expectTrackerEmpty();
+
+    // The re-add: the observer sees the project again and pushes it idle. Nothing
+    // is left to release.
+    pushBusy(false);
+    expect(notifyMock).not.toHaveBeenCalled();
+  });
+
+  it("leaves other projects untouched", async () => {
+    register([{ id: A, name: "claude" }], SEND);
+    registerSend(SECOND_SEND, OTHER_PROJECT, "other", [{ id: B, name: "codex" }]);
+
+    forgetProjects([PROJECT]);
+
+    expect(_testing.projectCount()).toBe(1);
+    settleRecipient(SECOND_SEND, B, "completed");
+    expect(notifyMock).toHaveBeenCalledOnce();
+    expect(lastCall()[0]).toBe(OTHER_PROJECT);
+  });
+
+  it("leaves an in-flight delivery's marker to its own lifecycle", async () => {
+    // Forgetting the project must not clear a marker for a notification that is
+    // genuinely still travelling; the delivery decrements it in its own `finally`.
     let release: () => void = () => {};
     notifyMock.mockImplementationOnce(
       async () =>
@@ -580,13 +704,10 @@ describe("consecutive quiet-downs", () => {
     settleAgentIdle(A);
     expect(isFlushing(PROJECT)).toBe(true);
 
-    register([{ id: A, name: "claude" }], SECOND_SEND);
-    markRecipientStarted(SECOND_SEND, A);
-    settleRecipient(SECOND_SEND, A, "completed");
-    settleAgentIdle(A);
+    forgetProjects([PROJECT]);
+    expect(isFlushing(PROJECT)).toBe(true);
 
-    expect(notifyMock).toHaveBeenCalledTimes(2);
     release();
-    expectTrackerEmpty();
+    await vi.waitFor(() => expect(isFlushing(PROJECT)).toBe(false));
   });
 });

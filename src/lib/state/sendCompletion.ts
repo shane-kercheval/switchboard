@@ -78,6 +78,10 @@ import type { AgentId, ProjectId, SendId, TurnId } from "$lib/types";
 /// *against* notifying — the user asked for it and was present to ask.
 export type RecipientOutcome = "completed" | "failed" | "cancelled";
 
+/// How many agents/workflows the notification body names before summarizing the
+/// rest as a count.
+const SUBJECTS_NAMED_IN_BODY = 3;
+
 /// How a workflow run ended, as the progress channel reports it. `interrupted`
 /// is absent by construction: a crashed run has no live process to emit a
 /// terminal event, so it surfaces only through the seed-on-subscribe query and
@@ -124,7 +128,17 @@ const busyProjects = new Set<ProjectId>();
 /// registered and completed while a previous notification is still in flight is a
 /// genuinely new quiet-down, and suppressing it would drop that notification
 /// entirely, since nothing would retry once the promise settled.
-const flushing = new Set<ProjectId>();
+///
+/// **A count, not a flag, precisely because that second quiet-down is allowed.**
+/// Two deliveries for one project can overlap, and with a `Set` whichever settled
+/// first would clear the marker while the other was still travelling — reporting
+/// "nothing in flight" at the moment M3 most needs the opposite answer.
+///
+/// The delivery owns this lifecycle end to end: only `flushIfReady` increments and
+/// only its `finally` decrements. `forgetProjects` deliberately leaves it alone —
+/// clearing it externally would diverge the marker from reality while a real
+/// notification is still on its way.
+const flushing = new Map<ProjectId, number>();
 
 function ensureActivity(projectId: ProjectId): ProjectActivity {
   const existing = activity.get(projectId);
@@ -299,12 +313,48 @@ export function noteProjectStates(
   for (const projectId of [...activity.keys()]) flushIfReady(projectId);
 }
 
+/// Discard everything tracked for these projects **silently** — never flushing.
+///
+/// Called from the workspace teardown paths (directory removal, project delete),
+/// alongside the cleanup every other per-project store already gets. Two rules,
+/// both load-bearing:
+///
+///   - **Silent.** A deleted project must not notify. Without this the removal
+///     path is genuinely notifiable, not merely leaky: `settleAgentsRemoved`
+///     leaves an already-`completed` recipient alone (deliberately — a real
+///     outcome beats a teardown guess), so the accumulator can be complete and
+///     worth reporting. It cannot flush at teardown because the stale
+///     `busyProjects` entry blocks it, and the project then drops out of the
+///     observer's candidate set so nothing clears that entry — until the same
+///     directory is re-added, whose first idle push releases a notification about
+///     work that finished before the removal.
+///   - **Call before agent teardown.** Run after `unregisterAgents` and
+///     `settleAgentsRemoved` can classify the teardown outcomes and flush first;
+///     running before leaves it a no-op on an already-empty tracker.
+///
+/// `flushing` is deliberately untouched: a delivery already in flight still is,
+/// and owns its own decrement.
+export function forgetProjects(projectIds: ProjectId[]): void {
+  const forgotten = new Set(projectIds);
+  for (const [sendId, send] of [...tracked.entries()]) {
+    if (forgotten.has(send.projectId)) tracked.delete(sendId);
+  }
+  for (const [turnId, started] of [...startedByTurn.entries()]) {
+    if (!tracked.has(started.sendId)) startedByTurn.delete(turnId);
+  }
+  for (const projectId of forgotten) {
+    activity.delete(projectId);
+    projectNames.delete(projectId);
+    busyProjects.delete(projectId);
+  }
+}
+
 /// Whether a notification for `projectId` is currently in flight. Read by M3's
 /// reading-mode fallback so it cannot clear the mode — and with it restore the
 /// project's visibility — while the notification that clearing would suppress is
 /// still travelling to the gate.
 export function isFlushing(projectId: ProjectId): boolean {
-  return flushing.has(projectId);
+  return (flushing.get(projectId) ?? 0) > 0;
 }
 
 /// The whole flush condition, re-evaluated from scratch on every trigger. Level-
@@ -336,11 +386,18 @@ function flushIfReady(projectId: ProjectId): void {
   activity.delete(projectId);
 
   if (message === null) return;
-  flushing.add(projectId);
+  flushing.set(projectId, (flushing.get(projectId) ?? 0) + 1);
   void api
     .notify(projectId, message.title, message.body)
     .catch((e: unknown) => console.error("[switchboard] notify failed", e))
-    .finally(() => flushing.delete(projectId));
+    .finally(() => {
+      // Floors at zero rather than trusting the key to exist: a `finally` can
+      // land after `_testing.reset`, and a decrement must never leave a negative
+      // count that would pin `isFlushing` true forever.
+      const remaining = (flushing.get(projectId) ?? 1) - 1;
+      if (remaining > 0) flushing.set(projectId, remaining);
+      else flushing.delete(projectId);
+    });
 }
 
 /// What to say, or `null` when nothing is worth reporting.
@@ -362,12 +419,14 @@ function describe(
   if (settled.length === 0 && runs.length === 0) return null;
 
   const agentIds = [...new Set(settled.map(([id]) => id))];
-  const agentFailed = agentIds.filter((id) =>
-    settled.some(([settledId, outcome]) => settledId === id && outcome === "failed"),
-  ).length;
-  const runsFailed = runs.filter((run) => run.status === "failed").length;
-  const subjects = agentIds.length + runs.length;
-  const failed = agentFailed + runsFailed;
+  // Counted over *outcomes*, not over deduplicated subjects. Counting per agent
+  // ("did this agent fail at all?") collapses partial failure into total failure
+  // whenever there is one agent — so one agent with a completed and a failed send
+  // reported "Agent failed" for work that half succeeded.
+  const failed =
+    settled.filter(([, outcome]) => outcome === "failed").length +
+    runs.filter((run) => run.status === "failed").length;
+  const total = settled.length + runs.length;
 
   // The noun follows what actually finished, so the title stays specific in the
   // common single-kind cases and degrades to "Work" only when both mix.
@@ -382,7 +441,7 @@ function describe(
           ? "Agent"
           : "Agents";
   const title =
-    failed === subjects
+    failed === total
       ? `${noun} failed`
       : failed > 0
         ? `${noun} finished, some failed`
@@ -392,11 +451,14 @@ function describe(
     ...agentIds.map((id) => project.recipients.get(id) ?? "agent"),
     ...runs.map((run) => run.workflow),
   ];
+  // Summarize the tail rather than letting macOS truncate the body mid-name: an
+  // explicit remainder count still tells the user how much finished.
+  const listed =
+    names.length > SUBJECTS_NAMED_IN_BODY
+      ? `${names.slice(0, SUBJECTS_NAMED_IN_BODY).join(", ")} and ${names.length - SUBJECTS_NAMED_IN_BODY} more`
+      : names.join(", ");
   const projectName = projectNames.get(projectId) ?? "";
-  return {
-    title,
-    body: projectName === "" ? names.join(", ") : `${projectName}: ${names.join(", ")}`,
-  };
+  return { title, body: projectName === "" ? listed : `${projectName}: ${listed}` };
 }
 
 /// Test-only reset — the tracker is module state that would otherwise leak

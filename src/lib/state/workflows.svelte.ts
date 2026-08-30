@@ -107,11 +107,15 @@ export async function refreshRuns(projectId: ProjectId): Promise<void> {
 function handleProgress(projectId: ProjectId, payload: WorkflowProgressPayload): void {
   const current = workflowRuns[projectId] ?? [];
   if (payload.status !== "running") {
-    // Record the run's outcome for the project's completion notification. Order
-    // matters: dropping the run below is the mutation that flips the project idle,
-    // so recording after it leaves a window in which the flush can run without
-    // this outcome and silently omit it. A `failed` run is *retained* rather than
-    // dropped, but it has still terminalized, so it is recorded here either way.
+    // Record the run's outcome for the project's completion notification, before
+    // the drop below. The drop is what flips the project idle, and today that
+    // reaches the flush only through the activity observer's *scheduled* effect —
+    // so the reverse order would work too. Don't rely on that: if the idle push
+    // ever becomes synchronous (calling `noteProjectStates` from here for
+    // promptness is the obvious optimization), recording after the drop would let
+    // the flush run without this outcome and silently omit it. A `failed` run is
+    // *retained* rather than dropped, but it has still terminalized, so it is
+    // recorded here either way.
     recordWorkflowTerminal(projectId, payload.workflow, payload.status);
   }
   if (payload.status === "complete" || payload.status === "cancelled") {

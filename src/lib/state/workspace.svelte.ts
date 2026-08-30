@@ -67,7 +67,7 @@ import {
   transcripts,
   unregisterAgents,
 } from "./index.svelte";
-import { noteProjectStates } from "./sendCompletion";
+import { forgetProjects, noteProjectStates } from "./sendCompletion";
 import {
   subscribeProjectWorkflows,
   unsubscribeProjectWorkflows,
@@ -467,7 +467,11 @@ export async function removeDirectory(path: string): Promise<void> {
 
   await api.removeDirectory(path);
 
-  // Backend drop succeeded — tear down the matching frontend state.
+  // Backend drop succeeded — tear down the matching frontend state. The
+  // completion tracker goes *first*: run after `unregisterAgents`, its
+  // teardown-settled outcomes could classify and flush a notification for a
+  // project that is being removed.
+  forgetProjects(removedProjectIds);
   unregisterAgents(removedAgentIds);
   unsubscribeProjectWorkflows(removedProjectIds);
   for (const id of removedProjectIds) {
@@ -735,6 +739,8 @@ async function deleteProjectOnce(projectId: ProjectId): Promise<void> {
   await api.deleteProject(projectId);
 
   layout.removeProjectPreferences(projectId);
+  // Before `unregisterAgents`, for the reason given in `removeDirectory`.
+  forgetProjects([projectId]);
   unregisterAgents(removedAgentIds);
   unsubscribeProjectWorkflows([projectId]);
   projects.list = projects.list.filter((p) => p.id !== projectId);

@@ -1626,6 +1626,54 @@ describe("project idle predicate", () => {
     expect(ws.projectActivityOverrides[PROJECT_1]).toBeUndefined();
   });
 
+  it("forgets a removed project's tracked work so a re-add cannot notify", async () => {
+    // The removal path is notifiable, not merely leaky: a recipient that already
+    // completed keeps its outcome, so the accumulator can be complete and worth
+    // reporting. Teardown can't flush it (the stale busy flag blocks), and the
+    // project then leaves the observer's candidate set — so without an explicit
+    // forget, re-adding the directory releases a banner about work that finished
+    // before the removal. Project ids are persisted on disk and survive removal.
+    const state = await loadAgentState();
+    const ws = await loadWorkspaceState();
+    const tracker = await import("./sendCompletion");
+    const p = project(PROJECT_1, "2026-05-16T00:00:00Z");
+    ws.projects.list = [p];
+    const agentA = agent(AGENT_1, PROJECT_1);
+    const agentB = agent(AGENT_2, PROJECT_1);
+    ws.agentsByProject[PROJECT_1] = [agentA, agentB];
+    await state.registerAgent(agentA);
+    await state.registerAgent(agentB);
+
+    // One recipient completed, the other still running when the directory goes.
+    tracker.registerSend("send-1" as never, PROJECT_1 as never, p.name, [
+      { id: AGENT_1 as never, name: "claude" },
+      { id: AGENT_2 as never, name: "codex" },
+    ]);
+    tracker.settleRecipient("send-1" as never, AGENT_1 as never, "completed");
+    observerStops.push(ws.startProjectActivityObserver(() => "2026-05-25T12:00:00.000Z"));
+    await tick();
+
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "list_workspace_directories") return { directories: [], persistable: true };
+      if (cmd === "list_projects") return [];
+      return undefined;
+    });
+    await ws.removeDirectory(p.directory);
+    await tick();
+
+    expect(tracker._testing.projectCount()).toBe(0);
+    const notifiedDuringTeardown = invokeMock.mock.calls.filter(([cmd]) => cmd === "notify");
+    expect(notifiedDuringTeardown).toHaveLength(0);
+
+    // The re-add: the project is a candidate again and the observer pushes it
+    // idle. Nothing stale is left to release.
+    ws.projects.list = [p];
+    ws.agentsByProject[PROJECT_1] = [agentA];
+    await tick();
+
+    expect(invokeMock.mock.calls.filter(([cmd]) => cmd === "notify")).toHaveLength(0);
+  });
+
   it("sees a project that has workflow runs but no roster entry", async () => {
     // The union in the activity snapshot exists for this candidate. It is not
     // reachable through today's load path (`ensureProjectLoaded` assigns the

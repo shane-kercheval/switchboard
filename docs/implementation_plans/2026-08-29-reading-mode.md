@@ -310,10 +310,13 @@ be lost:
 
 Two ordering constraints on that hook, both load-bearing:
 
-- **Record the outcome before mutating `workflowRuns`.** `handleProgress`'s terminal branch
-  synchronously drops the run from `workflowRuns`, and that drop is the mutation that flips
-  `projectIsIdle`. Recording after it leaves a window where the flush condition can be
-  evaluated without the workflow's outcome, silently omitting it from the notification.
+- **Record the outcome before mutating `workflowRuns`.** The drop is what flips
+  `projectIsIdle`, and today it reaches the flush only through the activity observer's
+  *scheduled* effect — so the reverse order would also work, and a test cannot distinguish
+  them. State the contract rather than softening it to taste: if the idle push ever becomes
+  synchronous (calling `noteProjectStates` directly from `handleProgress` for promptness is
+  the obvious optimization, and M3 cares about notification timing), recording after the
+  drop would let the flush run without the workflow's outcome and silently omit it.
 - **Do not require the run to be previously known.** A terminal can arrive for a run the
   frontend never held in `workflowRuns` (background-start; noted in that function's own
   comment), so treat the payload as self-contained. It is — except for the project *name*

@@ -16,6 +16,7 @@ vi.mock("@tauri-apps/api/event", () => ({
 
 const { workflowRuns, subscribeProjectWorkflows, unsubscribeProjectWorkflows, _testing } =
   await import("./workflows.svelte");
+const tracker = await import("./sendCompletion");
 
 function emit(projectId: string, payload: WorkflowProgressPayload): void {
   const cb = channels.get(`workflow:${projectId}`);
@@ -37,8 +38,39 @@ function running(over: Partial<WorkflowProgressPayload> = {}): WorkflowProgressP
 
 afterEach(() => {
   _testing.reset();
+  tracker._testing.reset();
   channels.clear();
   invokeMock.mockReset();
+});
+
+describe("workflow terminal → completion notification", () => {
+  it("hands a terminal run to the completion tracker", async () => {
+    // The wiring itself, which nothing else covers: the tracker's own tests call
+    // `recordWorkflowTerminal` directly, so deleting this call would leave every
+    // test green while workflows silently stopped being reported.
+    invokeMock.mockResolvedValueOnce([]); // list_workflow_runs (seed)
+    await subscribeProjectWorkflows("p1");
+    invokeMock.mockClear();
+
+    emit("p1", running({ status: "complete" }));
+
+    const notified = invokeMock.mock.calls.filter(([command]) => command === "notify");
+    expect(notified).toHaveLength(1);
+    expect(notified[0]?.[1]).toMatchObject({
+      title: "Workflow finished",
+      body: expect.stringContaining("review-and-recommend"),
+    });
+  });
+
+  it("stays silent for a cancelled run", async () => {
+    invokeMock.mockResolvedValueOnce([]);
+    await subscribeProjectWorkflows("p1");
+    invokeMock.mockClear();
+
+    emit("p1", running({ status: "cancelled" }));
+
+    expect(invokeMock.mock.calls.some(([command]) => command === "notify")).toBe(false);
+  });
 });
 
 describe("workflows store", () => {

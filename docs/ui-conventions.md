@@ -65,6 +65,8 @@ The non-obvious "which primitive for what":
 - **Expand/collapse actions → `ExpandCollapseIcon`**. Pass the content's current `expanded` state; the glyph communicates the pending action (`expanded` renders Collapse, collapsed renders Expand). Rotating disclosure chevrons, maximize/minimize, and sidebar visibility controls are different interactions and keep their own icons.
 - Forms/overlays: `Button`, `Dialog`, `Input`, `Textarea`. Layout: `AppShell`, `SidebarPanel` + `SidebarSection`, `EmptyState`, `Banner` — express structure through these, not duplicated flex/border classes per screen.
 
+**Known gap — no `Switch` primitive.** The `role="switch"` toggle is hand-rolled in five places (four in `SettingsView.svelte`, one in `AgentProfileEditor.svelte`), well past the rule of three. Each copy repeats the same track/knob class strings, the `disabled` → `cursor-not-allowed opacity-50` triple, and the `translate-x-4` / `translate-x-0.5` knob geometry, so a visual fix or an accessibility fix lands in one and drifts from the rest. Extract `ui/Switch.svelte` taking `checked`, `disabled`, `label`, `testId`, `onchange` before adding a sixth. Preserve each call site's existing `data-testid` when doing it — the current toggle tests then pass unchanged and are the safety net for the refactor.
+
 ## Theming
 
 `theme.svelte.ts` owns the `.dark` class on `<html>`: `light`/`dark` pin a theme, `system` follows the OS and re-applies live on flips (only while on `system`). A pre-paint bootstrap in `index.html` prevents a startup flash for dark-mode users.

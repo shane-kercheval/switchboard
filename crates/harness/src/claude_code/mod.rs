@@ -113,7 +113,7 @@ impl HarnessAdapter for ClaudeCodeAdapter {
             )));
         }
         let binary = crate::subprocess::resolve_binary(&self.claude_binary_path)?;
-        let args = build_args(agent, prompt, cwd, None);
+        let args = build_args(agent, prompt, cwd, options.chrome_integration, None);
 
         let mut command = tokio::process::Command::new(&binary);
         command
@@ -165,11 +165,14 @@ impl HarnessAdapter for ClaudeCodeAdapter {
     }
 }
 
+/// `chrome` enables the Claude in Chrome browser tools for this turn.
+///
 /// `home_override` is `None` in production (reads `$HOME`) and `Some(path)` in tests.
 fn build_args(
     agent: &AgentRecord,
     prompt: &str,
     cwd: &Path,
+    chrome: bool,
     home_override: Option<&Path>,
 ) -> Vec<String> {
     let mut args = vec![
@@ -242,6 +245,15 @@ fn build_args(
         args.push("--effort".to_owned());
         args.push(effort.clone());
     }
+    // Browser tools, from the user-global preference. Stated in both directions
+    // so dispatch always says what it means rather than inheriting a default
+    // from somewhere else. Probed @ 2.1.251: Claude Code's own persisted
+    // "Chrome enabled by default" (`claudeInChromeDefaultEnabled`) does **not**
+    // reach `-p` at all — with it on and no flag, zero browser tools load — so
+    // `--no-chrome` is defensive rather than load-bearing today. Kept because it
+    // costs nothing (both flags ship since 2.0.72) and holds if that setting
+    // ever starts applying headlessly.
+    args.push(if chrome { "--chrome" } else { "--no-chrome" }.to_owned());
     // `claude -p` takes the prompt as a positional. Pass it last, after a `--`
     // end-of-options separator, so a prompt beginning with `-` (e.g. a markdown
     // bullet) is not parsed as an unknown flag — without it `claude` aborts with
@@ -714,7 +726,7 @@ mod tests {
         std::fs::write(session_dir.join(format!("{session_id}.jsonl")), "").unwrap();
 
         let agent = agent_with_session(session_id);
-        let args = build_args(&agent, "hi", &canonical, Some(home.path()));
+        let args = build_args(&agent, "hi", &canonical, false, Some(home.path()));
 
         assert!(args.contains(&"--resume".to_owned()));
         assert!(!args.contains(&"--session-id".to_owned()));
@@ -749,7 +761,7 @@ mod tests {
         let project = tempfile::TempDir::new().unwrap();
         let agent = agent_with_session(Uuid::now_v7());
 
-        let args = build_args(&agent, "hi", project.path(), Some(home.path()));
+        let args = build_args(&agent, "hi", project.path(), false, Some(home.path()));
 
         assert!(args.contains(&"--session-id".to_owned()));
         assert!(!args.contains(&"--resume".to_owned()));
@@ -768,7 +780,7 @@ mod tests {
         std::fs::create_dir_all(&session_dir).unwrap();
         std::fs::write(session_dir.join(format!("{session_id}.jsonl")), "").unwrap();
 
-        let args = build_args(&agent, "hi", project.path(), Some(home.path()));
+        let args = build_args(&agent, "hi", project.path(), false, Some(home.path()));
 
         assert!(args.contains(&"--resume".to_owned()));
         assert!(!args.contains(&"--session-id".to_owned()));
@@ -810,7 +822,7 @@ mod tests {
         let mut agent = agent_with_session(own_session);
         agent.forked_from_session = Some(parent_session);
 
-        let args = build_args(&agent, "hi", project.path(), Some(home.path()));
+        let args = build_args(&agent, "hi", project.path(), false, Some(home.path()));
 
         assert_eq!(
             args[flag_at(&args, "--resume") + 1],
@@ -843,7 +855,7 @@ mod tests {
         agent.forked_from_session = Some(parent_session);
         materialize_session(home.path(), project.path(), own_session);
 
-        let args = build_args(&agent, "hi", project.path(), Some(home.path()));
+        let args = build_args(&agent, "hi", project.path(), false, Some(home.path()));
 
         assert_eq!(
             args[flag_at(&args, "--resume") + 1],
@@ -865,8 +877,8 @@ mod tests {
         let mut agent = agent_with_session(Uuid::now_v7());
         agent.forked_from_session = Some(parent_session);
 
-        let first = build_args(&agent, "hi", project.path(), Some(home.path()));
-        let retry = build_args(&agent, "hi", project.path(), Some(home.path()));
+        let first = build_args(&agent, "hi", project.path(), false, Some(home.path()));
+        let retry = build_args(&agent, "hi", project.path(), false, Some(home.path()));
 
         assert_eq!(first, retry);
         assert!(retry.contains(&"--fork-session".to_owned()), "{retry:?}");
@@ -879,7 +891,7 @@ mod tests {
         let session_id = Uuid::now_v7();
         let agent = agent_with_session(session_id);
 
-        let args = build_args(&agent, "hi", project.path(), Some(home.path()));
+        let args = build_args(&agent, "hi", project.path(), false, Some(home.path()));
 
         assert!(!args.contains(&"--fork-session".to_owned()), "{args:?}");
         assert_eq!(
@@ -900,7 +912,7 @@ mod tests {
         agent.model = Some("opus".to_owned());
         agent.effort = Some("high".to_owned());
 
-        let args = build_args(&agent, "hi", project.path(), Some(home.path()));
+        let args = build_args(&agent, "hi", project.path(), false, Some(home.path()));
 
         assert_eq!(args[flag_at(&args, "--model") + 1], "opus");
         assert_eq!(args[flag_at(&args, "--effort") + 1], "high");
@@ -921,7 +933,7 @@ mod tests {
         agent.session_locator = None;
         agent.forked_from_session = Some(Uuid::now_v7());
 
-        let args = build_args(&agent, "hi", project.path(), Some(home.path()));
+        let args = build_args(&agent, "hi", project.path(), false, Some(home.path()));
 
         assert!(!args.contains(&"--fork-session".to_owned()), "{args:?}");
         assert!(!args.contains(&"--resume".to_owned()), "{args:?}");
@@ -983,7 +995,7 @@ mod tests {
         let project = tempfile::TempDir::new().unwrap();
         let agent = agent_with_session(Uuid::now_v7());
         for prompt in ["- the left border is cut off", "--help"] {
-            let args = build_args(&agent, prompt, project.path(), Some(home.path()));
+            let args = build_args(&agent, prompt, project.path(), false, Some(home.path()));
             assert_eq!(args.last(), Some(&prompt.to_owned()));
             assert_eq!(
                 args[args.len() - 2],
@@ -1007,7 +1019,7 @@ mod tests {
                 " /shanekercheval/path/to/something is missing",
             ),
         ] {
-            let args = build_args(&agent, prompt, project.path(), Some(home.path()));
+            let args = build_args(&agent, prompt, project.path(), false, Some(home.path()));
             assert_eq!(args.last().map(String::as_str), Some(transported));
             assert_eq!(args[args.len() - 2], "--");
         }
@@ -1020,7 +1032,7 @@ mod tests {
         let agent = agent_with_session(Uuid::now_v7());
 
         for prompt in ["plain message", " /plugin"] {
-            let args = build_args(&agent, prompt, project.path(), Some(home.path()));
+            let args = build_args(&agent, prompt, project.path(), false, Some(home.path()));
             assert_eq!(args.last().map(String::as_str), Some(prompt));
         }
     }
@@ -1048,7 +1060,7 @@ mod tests {
             created_at: chrono::Utc::now(),
         };
 
-        let args = build_args(&agent, "hi", project.path(), Some(home.path()));
+        let args = build_args(&agent, "hi", project.path(), false, Some(home.path()));
 
         assert!(!args.contains(&"--session-id".to_owned()));
         assert!(!args.contains(&"--resume".to_owned()));
@@ -1060,6 +1072,40 @@ mod tests {
     }
 
     #[test]
+    fn build_args_states_chrome_in_both_directions() {
+        let home = tempfile::TempDir::new().unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        let agent = agent_with_session(Uuid::now_v7());
+
+        let on = build_args(&agent, "hi", project.path(), true, Some(home.path()));
+        assert!(on.contains(&"--chrome".to_owned()), "{on:?}");
+        assert!(!on.contains(&"--no-chrome".to_owned()), "{on:?}");
+
+        // Off must be *stated*, not omitted: silence would defer to Claude
+        // Code's own persisted "Chrome by default" setting, letting an agent
+        // hold browser tools while Switchboard's Settings says it doesn't.
+        let off = build_args(&agent, "hi", project.path(), false, Some(home.path()));
+        assert!(off.contains(&"--no-chrome".to_owned()), "{off:?}");
+        assert!(!off.contains(&"--chrome".to_owned()), "{off:?}");
+    }
+
+    #[test]
+    fn build_args_puts_chrome_before_the_separator() {
+        let home = tempfile::TempDir::new().unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        let agent = agent_with_session(Uuid::now_v7());
+
+        let args = build_args(&agent, "hi", project.path(), true, Some(home.path()));
+
+        let chrome = args.iter().position(|a| a == "--chrome").unwrap();
+        let sep = args.iter().position(|a| a == "--").unwrap();
+        assert!(
+            chrome < sep,
+            "--chrome after the separator lands as a positional alongside the prompt: {args:?}"
+        );
+    }
+
+    #[test]
     fn build_args_includes_model_and_effort_when_set() {
         let home = tempfile::TempDir::new().unwrap();
         let project = tempfile::TempDir::new().unwrap();
@@ -1067,7 +1113,7 @@ mod tests {
         agent.model = Some("sonnet".to_owned());
         agent.effort = Some("high".to_owned());
 
-        let args = build_args(&agent, "hi", project.path(), Some(home.path()));
+        let args = build_args(&agent, "hi", project.path(), false, Some(home.path()));
 
         let model_pos = flag_value_pos(&args, "--model", "sonnet").expect("--model sonnet present");
         let effort_pos = flag_value_pos(&args, "--effort", "high").expect("--effort high present");
@@ -1084,7 +1130,7 @@ mod tests {
         let project = tempfile::TempDir::new().unwrap();
         let agent = agent_with_session(Uuid::now_v7());
 
-        let args = build_args(&agent, "hi", project.path(), Some(home.path()));
+        let args = build_args(&agent, "hi", project.path(), false, Some(home.path()));
 
         assert!(!args.contains(&"--model".to_owned()));
         assert!(!args.contains(&"--effort".to_owned()));
@@ -1107,7 +1153,7 @@ mod tests {
         std::fs::create_dir_all(&session_dir).unwrap();
         std::fs::write(session_dir.join(format!("{session_id}.jsonl")), "").unwrap();
 
-        let args = build_args(&agent, "hi", project.path(), Some(home.path()));
+        let args = build_args(&agent, "hi", project.path(), false, Some(home.path()));
 
         assert!(
             args.contains(&"--resume".to_owned()),
@@ -1250,7 +1296,7 @@ mod tests {
         // build_args therefore picks --resume on the second turn — not
         // --session-id, which would cause the "already in use" rejection.
         let agent = agent_with_session(session_id);
-        let args = build_args(&agent, "hi", &cwd, Some(home.path()));
+        let args = build_args(&agent, "hi", &cwd, false, Some(home.path()));
         assert!(
             args.contains(&"--resume".to_owned()),
             "expected --resume when session file exists, got: {args:?}"

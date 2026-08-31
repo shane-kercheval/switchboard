@@ -140,6 +140,9 @@ pub enum DiffStyle {
 /// subset may be present in the file.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
+// A bag of independent user toggles — the one shape where a run of bools is the
+// clearest representation, not a state enum waiting to be found.
+#[allow(clippy::struct_excessive_bools)]
 pub struct Preferences {
     /// Command used to open a worktree folder in an external editor. Defaults
     /// to `code`; blank → fall back to the OS folder-open (`open <path>` on
@@ -183,6 +186,20 @@ pub struct Preferences {
     /// still resolves when this is off.
     pub show_builtins: bool,
 
+    /// Whether Claude agents get browser tools, via the Claude in Chrome
+    /// extension. Claude-only: the Codex equivalent is a plugin enabled in the
+    /// `ChatGPT` desktop app, which Switchboard cannot drive.
+    ///
+    /// Read live per dispatch, so toggling it takes effect on an agent's next
+    /// turn rather than requiring a new agent or session.
+    ///
+    /// Defaults off. The flag costs context on every turn and only does anything
+    /// if the user has actually installed the extension, and nothing Switchboard
+    /// can read tells us whether they have — the harness reports success either
+    /// way (see `docs/research/claude-chrome-extension.md`). So this is the
+    /// user's assertion that the extension exists, not a guess we make for them.
+    pub claude_chrome_enabled: bool,
+
     /// Per-harness profiles preselected by Add Agent and used when a new
     /// project auto-creates its roster.
     #[serde(
@@ -199,6 +216,7 @@ impl Default for Preferences {
             terminal_app: default_terminal_app(),
             diff_style: DiffStyle::default(),
             show_builtins: true,
+            claude_chrome_enabled: false,
             notify_on_completion: true,
             notify_while_focused: false,
             agent_defaults: default_agent_defaults(),
@@ -264,6 +282,7 @@ impl Preferences {
             terminal_app,
             diff_style: self.diff_style,
             show_builtins: self.show_builtins,
+            claude_chrome_enabled: self.claude_chrome_enabled,
             notify_on_completion: self.notify_on_completion,
             notify_while_focused: self.notify_while_focused,
             agent_defaults,
@@ -391,6 +410,29 @@ mod tests {
         let path = dir.path().join("config.yaml");
         std::fs::write(&path, "terminal_app: iTerm\n").unwrap();
         assert!(load(&path).show_builtins);
+    }
+
+    #[test]
+    fn missing_claude_chrome_key_defaults_off() {
+        // Browser access must never switch itself on for an existing user: the
+        // flag costs context every turn and only works if they installed the
+        // extension. An upgrade that silently enabled it would be a surprise.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(&path, "terminal_app: iTerm\n").unwrap();
+        assert!(!load(&path).claude_chrome_enabled);
+    }
+
+    #[test]
+    fn claude_chrome_survives_normalization_when_on() {
+        // `normalized()` rebuilds the struct field by field, so a new key is
+        // easy to drop there while every load/save test still passes.
+        let prefs = Preferences {
+            claude_chrome_enabled: true,
+            ..Preferences::default()
+        }
+        .normalized();
+        assert!(prefs.claude_chrome_enabled);
     }
 
     #[test]
@@ -540,6 +582,8 @@ mod tests {
             diff_style: DiffStyle::Unified,
             // Non-default so the round-trip exercises an explicitly-off toggle.
             show_builtins: false,
+            // Non-default in the other direction: an explicitly-on toggle.
+            claude_chrome_enabled: true,
             notify_on_completion: true,
             notify_while_focused: false,
             agent_defaults: default_agent_defaults(),
@@ -567,6 +611,7 @@ mod tests {
                 terminal_app: "iTerm".to_owned(),
                 diff_style: DiffStyle::Unified,
                 show_builtins: true,
+                claude_chrome_enabled: false,
                 notify_on_completion: true,
                 notify_while_focused: false,
                 agent_defaults: default_agent_defaults(),
@@ -616,6 +661,7 @@ mod tests {
                     terminal_app: "iTerm".to_owned(),
                     diff_style: DiffStyle::Unified,
                     show_builtins: true,
+                    claude_chrome_enabled: false,
                     notify_on_completion: true,
                     notify_while_focused: false,
                     agent_defaults: default_agent_defaults(),
@@ -706,6 +752,7 @@ mod tests {
             terminal_app: "  iTerm  ".to_owned(),
             diff_style: DiffStyle::Unified,
             show_builtins: true,
+            claude_chrome_enabled: false,
             notify_on_completion: true,
             notify_while_focused: false,
             agent_defaults: default_agent_defaults(),
@@ -724,6 +771,7 @@ mod tests {
             terminal_app: "   ".to_owned(),
             diff_style: DiffStyle::default(),
             show_builtins: true,
+            claude_chrome_enabled: false,
             notify_on_completion: true,
             notify_while_focused: false,
             agent_defaults: default_agent_defaults(),

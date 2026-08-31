@@ -439,6 +439,82 @@
       <HarnessStatusList />
     </section>
 
+    <section class={cn(sectionClass, "mt-7")} data-testid="browser-access-prefs">
+      <div>
+        <h2 class={sectionHeadingClass}>Browser access</h2>
+        <p class="text-muted mt-1 text-sm leading-relaxed">
+          Claude agents can work in Chrome — opening pages, reading console errors, filling forms,
+          checking a page you just changed. They act in a visible window and share your existing
+          logins, so they reach anything you're already signed in to.
+        </p>
+        <p class="text-muted mt-2 text-sm leading-relaxed">
+          This needs the <span class="text-fg">Claude in Chrome</span> extension installed, and a Claude
+          Pro, Max, Team, or Enterprise plan. Switchboard can't tell whether the extension is there —
+          if it isn't, agents run normally and simply report that the browser is unavailable when they
+          try to use it.
+        </p>
+        <p class="text-muted mt-2 text-sm leading-relaxed">
+          Codex's browser access is separate and is configured in the ChatGPT desktop app. This
+          setting doesn't affect it.
+        </p>
+      </div>
+
+      <div class="flex items-start justify-between gap-4">
+        <div class="min-w-0">
+          <div class="text-fg text-sm">Let Claude agents use Chrome</div>
+          <p class="text-muted mt-0.5 text-xs leading-relaxed">
+            Agents act in your browser without asking first, the same way they run other tools in
+            Switchboard. Which sites they may act on is controlled in the Chrome extension's own
+            settings.
+          </p>
+          <p class="text-muted mt-1 text-xs leading-relaxed">
+            Changes take effect on each agent's next turn. A turn already running keeps browser
+            access until it finishes — cancel it to stop sooner.
+          </p>
+          <p class="text-muted mt-1 text-xs leading-relaxed">
+            Browser tools are loaded on every Claude turn while this is on, which uses a little
+            context whether or not the agent reaches for them.
+          </p>
+          <p class="text-muted mt-1 text-xs leading-relaxed">
+            If more than one browser is connected to your Claude account, the first agent that needs
+            the browser will ask which one to use. Answer it once and the choice is remembered.
+          </p>
+        </div>
+        <button
+          type="button"
+          role="switch"
+          disabled={!preferenceLoadState.ready}
+          aria-checked={preferences.claude_chrome_enabled}
+          aria-label="Let Claude agents use Chrome"
+          data-testid="claude-chrome-toggle"
+          class={cn(
+            "relative mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors outline-none",
+            preferenceLoadState.ready ? "cursor-pointer" : "cursor-not-allowed opacity-50",
+            preferences.claude_chrome_enabled ? "bg-accent" : "bg-active",
+          )}
+          onclick={() =>
+            void updatePreferences({ claude_chrome_enabled: !preferences.claude_chrome_enabled })}
+        >
+          <span
+            class={cn(
+              "bg-raised inline-block h-4 w-4 transform rounded-full transition-transform",
+              preferences.claude_chrome_enabled ? "translate-x-4" : "translate-x-0.5",
+            )}
+          ></span>
+        </button>
+      </div>
+
+      {#if saveFailedFor("claude_chrome_enabled")}
+        <p
+          class="text-status-failed text-xs leading-relaxed"
+          data-testid="claude-chrome-save-error"
+        >
+          Couldn't save your preferences ({saveStatus.error}). The change applies for now but may
+          not survive a restart.
+        </p>
+      {/if}
+    </section>
+
     <section class={cn(sectionClass, "mt-7")} data-testid="notification-prefs">
       <div>
         <h2 class={sectionHeadingClass}>Notifications</h2>

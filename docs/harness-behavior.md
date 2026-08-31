@@ -272,6 +272,26 @@ Empirical corroboration: across a 161-directory sample of a real `~/.claude/proj
 
 **Transcript loading is insulated; dispatch is not.** `claude_code/session_file.rs` falls back to scanning `projects/*/<uuid>.jsonl`, which is encoding-independent, so a stranded agent still renders its full history while every dispatch fails — a confusing signature worth recognizing. `build_args` has no such fallback.
 
+### 3.5c Claude cross-cwd resume (the CLI's own fallback chain)
+
+> **Status: read out of the 2.1.251 binary and live-probed 2026-08-31 @ 2.1.251 (Switchboard's exact `-p` arg shape, 7 tiny turns).** This section is what makes a cross-directory agent move implementable for Claude; it revises the earlier working assumption (recorded in the 2026-08-27 cross-project plan) that a cross-directory move breaks `--resume`.
+
+§3.5b describes *Switchboard's* session lookup. The CLI's own `--resume <id>` resolution turns out **not** to be strictly cwd-scoped: the resolver (shared by `-p` and interactive resume) tries, in order:
+
+1. Exact `<encoded-cwd>/<id>.jsonl` — the documented behavior.
+2. **Worktree fallback** — enumerates the current repo's related git worktrees and checks each one's encoded directory (telemetry `tengu_resume_worktree_fallback`).
+3. **Global scan** — walks every directory under `~/.claude/projects/` for `<id>.jsonl`, accepting the result **only if exactly one match exists**; two matches → refusal, surfacing as `No conversation found with session ID: …` (telemetry `tengu_transcript_id_scan_fallback`).
+
+Separately, `--resume` accepts an **absolute `.jsonl` transcript path** in place of an id, which sidesteps resolution (and the single-match rule) entirely.
+
+**Live probe results (all exit 0):** (a) session created in dir A, resumed twice from an unrelated dir B — chained normally; (b) session created in a git checkout, resumed from its worktree; (c) session resumed by transcript *path* from a foreign dir. In every case the transcript **stays in its original encoded directory and grows in place** — no second file, no relocation, the `relocated`/`relocatedCwd` machinery (§3.5b) did not fire on any `-p` resume. Resumed records chain by `parentUuid` onto the prior history under a single `sessionId`; per-record `cwd` is mixed (old records keep the original, new records carry the resuming cwd) — the same state the interactive `/cd` produces.
+
+**Switchboard implication.** Cross-directory resume needs **no writes into Claude's store**. But `build_args` derives its file-existence lookup from the spawn cwd (§3.5b), so an agent moved to a project in a different directory needs the session's *home cwd* recorded on the agent and used for the lookup, while the spawn cwd stays the new project's directory — otherwise the lookup misses, `--session-id` is passed, and the agent strands exactly as §3.5b describes. See M4 of the 2026-08-27 cross-project plan.
+
+**Fragility.** All three fallbacks are undocumented internals, and the global scan's single-match refusal is load-bearing. Re-check on every CLI bump (harness-update-review); a moved agent's resume must be covered by a live canary test.
+
+**Fork edge (probed same day):** `--resume <parent> --session-id <child> --fork-session` run from a cwd other than the parent's home writes the child transcript into the **forking cwd's** encoded directory; the parent file is untouched in its own, and the child subsequently resumes from the new cwd through the ordinary exact-directory lookup. So a moved agent's future forks are *native* to the new directory — the recorded session-home applies to the moved agent only, never to its descendants.
+
 ### 3.6 Tool vocabularies & facet mapping
 
 > **Status: probed live 2026-07-13** (claude 2.1.206, codex 0.144.3, agy 1.0.16; gemini 0.44.0 **unprobeable** — see G26). Captures live under `crates/harness/tests/fixtures/<harness>/` (`tool-vocabulary*`, `file-change*`, `apply-patch*`, `exec-wrapper*`). Each adapter maps its raw tool vocabulary to a normalized `ToolFacet` (`crates/harness/src/facets.rs`) at both call sites (stream parser + session-file parser); the raw `name`/`input` ride alongside untouched.

@@ -320,6 +320,8 @@ Order is load-bearing: core storage first, then app wiring, then the lock, then 
 
 ## M4 — Move agent between projects (same working directory)
 
+> **OBSOLETE (2026-08-31) — superseded by `2026-08-31-move-agent-between-projects.md`.** This milestone's same-directory restriction rested on the premise that a cross-directory move breaks Claude's `--resume`; that was found stale at CLI 2.1.251 and disproven by live probe (harness-behavior §3.5c). The replacement plan carries this section's surgery/gating/recovery design forward unchanged and lifts the directory restriction. This section, the "Move is scoped to projects sharing one working directory" decision bullet above, and the "Cross-directory agent move" deferred entry below are retained as written for historical traceability and no longer apply.
+
 ### Goal & Outcome
 
 - From an agent's row actions: **Move to project…**, offering only sibling projects (same `directory_id`). The agent — same identity, same session, full history *including pinned messages* — now lives in the target project: its transcript renders there (past failed/cancelled markers included), and its next turn dispatches and journals there. **Attachment images from before the move do not survive it** — see the accepted limitation at the head of this milestone.

@@ -223,6 +223,7 @@ async fn live_claude_transcript_load_round_trips() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let adapter = ClaudeCodeAdapter::new();
     let agent = AgentRecord {
+        session_home: None,
         model: None,
         effort: None,
         profiles: switchboard_core::AgentProfiles::default(),
@@ -285,6 +286,7 @@ async fn live_claude_transcript_load_hydrates_tool_items() {
 
     let adapter = ClaudeCodeAdapter::new();
     let agent = AgentRecord {
+        session_home: None,
         model: None,
         effort: None,
         profiles: switchboard_core::AgentProfiles::default(),
@@ -395,6 +397,7 @@ async fn live_claude_tool_results_bind_after_restart() {
 
     let adapter = ClaudeCodeAdapter::new();
     let agent = AgentRecord {
+        session_home: None,
         model: None,
         effort: None,
         profiles: switchboard_core::AgentProfiles::default(),
@@ -486,6 +489,7 @@ async fn live_codex_transcript_load_via_captured_locator_round_trips() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let adapter = CodexAdapter::new();
     let agent = AgentRecord {
+        session_home: None,
         model: None,
         effort: None,
         profiles: switchboard_core::AgentProfiles::default(),
@@ -563,6 +567,7 @@ async fn live_codex_transcript_load_hydrates_tool_items() {
 
     let adapter = CodexAdapter::new();
     let agent = AgentRecord {
+        session_home: None,
         model: None,
         effort: None,
         profiles: switchboard_core::AgentProfiles::default(),
@@ -762,6 +767,7 @@ async fn live_antigravity_two_turns_hydrate_in_order() {
     // the record thereafter. We simulate the dispatcher here: fold the captured
     // locator back onto the agent so the second dispatch resumes it.
     let mut agent = AgentRecord {
+        session_home: None,
         model: None,
         effort: None,
         profiles: switchboard_core::AgentProfiles::default(),

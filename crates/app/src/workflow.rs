@@ -860,6 +860,7 @@ mod tests {
         // scenario queues are moved in, not copied.
         for (name, scenarios) in agents {
             let record = AgentRecord {
+                session_home: None,
                 id: Uuid::now_v7(),
                 project_id: Uuid::now_v7(),
                 name: name.to_owned(),

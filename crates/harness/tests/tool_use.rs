@@ -29,6 +29,7 @@ const ANTIGRAVITY_TOKEN: &str = "SWITCHBOARD_TOOL_LIVE_AGY001";
 
 fn claude_agent() -> AgentRecord {
     AgentRecord {
+        session_home: None,
         model: None,
         effort: None,
         profiles: switchboard_core::AgentProfiles::default(),
@@ -44,6 +45,7 @@ fn claude_agent() -> AgentRecord {
 
 fn codex_agent() -> AgentRecord {
     AgentRecord {
+        session_home: None,
         model: None,
         effort: None,
         profiles: switchboard_core::AgentProfiles::default(),
@@ -138,6 +140,7 @@ async fn live_claude_emits_tool_started_and_tool_completed_for_file_read() {
 
 fn antigravity_agent() -> AgentRecord {
     AgentRecord {
+        session_home: None,
         model: None,
         effort: None,
         profiles: switchboard_core::AgentProfiles::default(),

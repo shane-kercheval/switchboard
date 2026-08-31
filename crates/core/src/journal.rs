@@ -124,6 +124,93 @@ pub enum JournalRecord {
     },
 }
 
+impl JournalRecord {
+    /// The agent this record belongs to. Every variant is per-recipient, so
+    /// this is total — a fan-out send writes one record per recipient rather
+    /// than one record naming many.
+    #[must_use]
+    pub fn agent_id(&self) -> AgentId {
+        match self {
+            Self::Send { agent_id, .. }
+            | Self::Outcome { agent_id, .. }
+            | Self::TurnLink { agent_id, .. } => *agent_id,
+        }
+    }
+
+    /// This record's identity for "does the target already have it?".
+    ///
+    /// **The key is `(variant tag, turn_id)`**, and that is only implementable
+    /// because every variant carries a `turn_id` with at most one of each kind
+    /// per turn. [`JournalRecord`] is `#[non_exhaustive]`: a future variant
+    /// without a `turn_id`, or with more than one instance per turn, cannot
+    /// borrow this key — it must define its own identity, or moving a journal
+    /// would silently duplicate it. Stated here rather than in a caller because
+    /// the constraint belongs to the type, not to the operation that currently
+    /// relies on it.
+    #[must_use]
+    fn dedup_key(&self) -> (&'static str, Uuid) {
+        match self {
+            Self::Send { turn_id, .. } => ("send", *turn_id),
+            Self::Outcome { turn_id, .. } => ("outcome", *turn_id),
+            Self::TurnLink { turn_id, .. } => ("turn_link", *turn_id),
+        }
+    }
+}
+
+/// Split records into `(this agent's, everyone else's)`, preserving the
+/// original relative order of both halves.
+///
+/// The moving half is what an agent carries to its new project; the remaining
+/// half is what the source journal is rewritten to. Order is preserved rather
+/// than re-sorted because the journal's records are already in append order and
+/// the merge reads timestamps — re-ordering here would be an invisible change
+/// to how a transcript renders.
+///
+/// **A fan-out send that included this agent and others deliberately ends up in
+/// both journals.** Each project renders its own copy grouped by `send_id`,
+/// which is the correct per-project view: the user's message really was sent to
+/// a recipient that still lives in the source. Do not "fix" this into
+/// cross-journal deduplication.
+#[must_use]
+pub fn partition_for_agent(
+    records: Vec<JournalRecord>,
+    agent_id: AgentId,
+) -> (Vec<JournalRecord>, Vec<JournalRecord>) {
+    records.into_iter().partition(|r| r.agent_id() == agent_id)
+}
+
+/// Append only those `records` the journal at `path` does not already have,
+/// keyed by [`JournalRecord::dedup_key`], preserving the given order.
+/// Returns how many were appended.
+///
+/// Idempotent by construction: re-running it after a partial or complete
+/// previous run appends only the remainder. That property is what lets move
+/// recovery re-drive the whole sequence without tracking how far it got.
+pub fn append_missing(path: &Path, records: &[JournalRecord]) -> Result<usize> {
+    let existing = read_records(path)?;
+    let present: std::collections::HashSet<(&'static str, Uuid)> =
+        existing.iter().map(JournalRecord::dedup_key).collect();
+    let mut appended = 0;
+    for record in records {
+        if present.contains(&record.dedup_key()) {
+            continue;
+        }
+        append_record(path, record)?;
+        appended += 1;
+    }
+    Ok(appended)
+}
+
+/// Rewrite a journal to contain exactly `records`, atomically.
+///
+/// The journal is otherwise append-only ([`append_record`]); this exists for
+/// the one operation that removes records from it — moving an agent's history
+/// out of its source project. Rewriting to a set that already excludes the
+/// moved agent is naturally idempotent, so recovery may re-run it freely.
+pub fn rewrite_records(path: &Path, records: &[JournalRecord]) -> Result<()> {
+    crate::io::write_jsonl(path, records)
+}
+
 /// Append one record to a project's `journal.jsonl`.
 ///
 /// Multiple agents in a project append concurrently; a single-line `O_APPEND`
@@ -307,6 +394,208 @@ mod tests {
             }
             other => panic!("expected one Send, got {other:?}"),
         }
+    }
+
+    fn outcome(send_id: SendId, turn_id: Uuid, agent_id: AgentId) -> JournalRecord {
+        JournalRecord::Outcome {
+            send_id,
+            turn_id,
+            agent_id,
+            outcome: json!({"status": "cancelled", "source": "user"}),
+            started_at: Utc::now(),
+            ended_at: Utc::now(),
+        }
+    }
+
+    fn send_for_turn(send_id: SendId, turn_id: Uuid, agent_id: AgentId) -> JournalRecord {
+        JournalRecord::Send {
+            send_id,
+            turn_id,
+            agent_id,
+            prompt: "hi".to_owned(),
+            attachments: Vec::new(),
+            at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn partition_splits_one_agents_records_preserving_order() {
+        let subject = Uuid::now_v7();
+        let bystander = Uuid::now_v7();
+        let (s1, s2, s3) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
+        let (t1, t2, t3) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
+        let records = vec![
+            send_for_turn(s1, t1, subject),
+            send_for_turn(s2, t2, bystander),
+            outcome(s1, t1, subject),
+            send_for_turn(s3, t3, subject),
+            outcome(s2, t2, bystander),
+        ];
+
+        let (moved, remaining) = partition_for_agent(records.clone(), subject);
+
+        assert_eq!(
+            moved,
+            vec![records[0].clone(), records[2].clone(), records[3].clone()]
+        );
+        assert_eq!(remaining, vec![records[1].clone(), records[4].clone()]);
+    }
+
+    #[test]
+    fn a_fan_out_send_deliberately_lands_in_both_halves() {
+        // One user message to two recipients: each project keeps its own copy,
+        // grouped by send_id. This is correct per-project rendering, not a bug.
+        let subject = Uuid::now_v7();
+        let bystander = Uuid::now_v7();
+        let shared = Uuid::now_v7();
+        let records = vec![
+            send_for_turn(shared, Uuid::now_v7(), subject),
+            send_for_turn(shared, Uuid::now_v7(), bystander),
+        ];
+
+        let (moved, remaining) = partition_for_agent(records, subject);
+
+        assert_eq!(moved.len(), 1);
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(moved[0].agent_id(), subject);
+        assert_eq!(remaining[0].agent_id(), bystander);
+    }
+
+    #[test]
+    fn append_missing_writes_records_in_order_and_reports_the_count() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("journal.jsonl");
+        let agent = Uuid::now_v7();
+        let s = Uuid::now_v7();
+        let (t1, t2) = (Uuid::now_v7(), Uuid::now_v7());
+        let records = vec![
+            send_for_turn(s, t1, agent),
+            outcome(s, t1, agent),
+            send_for_turn(s, t2, agent),
+        ];
+
+        let appended = append_missing(&path, &records).unwrap();
+
+        assert_eq!(appended, 3);
+        assert_eq!(read_records(&path).unwrap(), records);
+    }
+
+    #[test]
+    fn append_missing_is_idempotent_and_preserves_timestamps() {
+        // Move recovery re-drives every step, so a second full application must
+        // change nothing at all — including the original timestamps.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("journal.jsonl");
+        let agent = Uuid::now_v7();
+        let s = Uuid::now_v7();
+        let records = vec![
+            send_for_turn(s, Uuid::now_v7(), agent),
+            outcome(s, Uuid::now_v7(), agent),
+        ];
+        append_missing(&path, &records).unwrap();
+        let after_first = read_records(&path).unwrap();
+
+        let appended = append_missing(&path, &records).unwrap();
+
+        assert_eq!(appended, 0);
+        assert_eq!(read_records(&path).unwrap(), after_first);
+    }
+
+    #[test]
+    fn append_missing_appends_only_the_remainder_after_a_partial_run() {
+        // The crash-in-the-middle shape: the first record landed, the rest did
+        // not. Recovery must add exactly what is absent.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("journal.jsonl");
+        let agent = Uuid::now_v7();
+        let s = Uuid::now_v7();
+        let records = vec![
+            send_for_turn(s, Uuid::now_v7(), agent),
+            outcome(s, Uuid::now_v7(), agent),
+            send_for_turn(s, Uuid::now_v7(), agent),
+        ];
+        append_record(&path, &records[0]).unwrap();
+
+        let appended = append_missing(&path, &records).unwrap();
+
+        assert_eq!(appended, 2);
+        assert_eq!(read_records(&path).unwrap(), records);
+    }
+
+    #[test]
+    fn dedup_distinguishes_variants_sharing_one_turn_id() {
+        // A Send, an Outcome and a TurnLink for the same turn are three
+        // distinct records — keying on turn_id alone would drop two of them.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("journal.jsonl");
+        let agent = Uuid::now_v7();
+        let s = Uuid::now_v7();
+        let turn = Uuid::now_v7();
+        let records = vec![
+            send_for_turn(s, turn, agent),
+            outcome(s, turn, agent),
+            JournalRecord::TurnLink {
+                send_id: s,
+                turn_id: turn,
+                agent_id: agent,
+                hydration_key: "msg_1".to_owned(),
+                at: Utc::now(),
+            },
+        ];
+
+        assert_eq!(append_missing(&path, &records).unwrap(), 3);
+        assert_eq!(append_missing(&path, &records).unwrap(), 0);
+        assert_eq!(read_records(&path).unwrap(), records);
+    }
+
+    #[test]
+    fn rewrite_records_drops_the_moved_agent_and_is_repeatable() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("journal.jsonl");
+        let subject = Uuid::now_v7();
+        let bystander = Uuid::now_v7();
+        for r in [
+            send_for_turn(Uuid::now_v7(), Uuid::now_v7(), subject),
+            send_for_turn(Uuid::now_v7(), Uuid::now_v7(), bystander),
+        ] {
+            append_record(&path, &r).unwrap();
+        }
+        let (_moved, remaining) = partition_for_agent(read_records(&path).unwrap(), subject);
+
+        rewrite_records(&path, &remaining).unwrap();
+        let once = read_records(&path).unwrap();
+        rewrite_records(&path, &remaining).unwrap();
+
+        assert_eq!(once, remaining);
+        assert_eq!(read_records(&path).unwrap(), once);
+        assert!(once.iter().all(|r| r.agent_id() == bystander));
+    }
+
+    #[test]
+    fn a_move_round_trip_preserves_order_and_timestamps_in_both_journals() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source.jsonl");
+        let target = dir.path().join("target.jsonl");
+        let subject = Uuid::now_v7();
+        let bystander = Uuid::now_v7();
+        let original = vec![
+            send_for_turn(Uuid::now_v7(), Uuid::now_v7(), subject),
+            send_for_turn(Uuid::now_v7(), Uuid::now_v7(), bystander),
+            outcome(Uuid::now_v7(), Uuid::now_v7(), subject),
+        ];
+        for r in &original {
+            append_record(&source, r).unwrap();
+        }
+
+        let (moved, remaining) = partition_for_agent(read_records(&source).unwrap(), subject);
+        append_missing(&target, &moved).unwrap();
+        rewrite_records(&source, &remaining).unwrap();
+
+        assert_eq!(
+            read_records(&target).unwrap(),
+            vec![original[0].clone(), original[2].clone()]
+        );
+        assert_eq!(read_records(&source).unwrap(), vec![original[1].clone()]);
     }
 
     #[test]

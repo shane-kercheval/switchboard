@@ -64,6 +64,7 @@ fn home_dir() -> std::path::PathBuf {
 
 fn live_agent() -> AgentRecord {
     AgentRecord {
+        session_home: None,
         model: None,
         effort: None,
         profiles: switchboard_core::AgentProfiles::default(),
@@ -977,6 +978,7 @@ async fn live_claude_resume_reuses_session() {
     let session_id = Uuid::now_v7();
 
     let agent1 = AgentRecord {
+        session_home: None,
         model: None,
         effort: None,
         profiles: switchboard_core::AgentProfiles::default(),
@@ -1015,6 +1017,7 @@ async fn live_claude_resume_reuses_session() {
     // Second turn reuses the same session_id — adapter detects the session file
     // and switches to --resume automatically.
     let agent2 = AgentRecord {
+        session_home: None,
         model: None,
         effort: None,
         profiles: switchboard_core::AgentProfiles::default(),
@@ -1088,6 +1091,7 @@ async fn live_claude_resume_reuses_session_in_underscored_cwd() {
     );
 
     let agent = |name: &str| AgentRecord {
+        session_home: None,
         model: None,
         effort: None,
         profiles: switchboard_core::AgentProfiles::default(),
@@ -1271,6 +1275,7 @@ async fn live_claude_fork_inherits_context_on_the_caller_assigned_session() {
 
     let parent_session = Uuid::now_v7();
     let parent = AgentRecord {
+        session_home: None,
         session_locator: Some(SessionLocator::Uuid(parent_session)),
         ..live_agent()
     };
@@ -1291,6 +1296,7 @@ async fn live_claude_fork_inherits_context_on_the_caller_assigned_session() {
     // `--resume <parent> --session-id <own> --fork-session`.
     let fork_session = Uuid::now_v7();
     let fork = AgentRecord {
+        session_home: None,
         session_locator: Some(SessionLocator::Uuid(fork_session)),
         forked_from_session: Some(parent_session),
         ..live_agent()
@@ -1403,6 +1409,7 @@ async fn live_claude_fork_recovers_from_a_cancelled_first_dispatch() {
 
     let parent_session = Uuid::now_v7();
     let parent = AgentRecord {
+        session_home: None,
         session_locator: Some(SessionLocator::Uuid(parent_session)),
         ..live_agent()
     };
@@ -1417,6 +1424,7 @@ async fn live_claude_fork_recovers_from_a_cancelled_first_dispatch() {
 
     let fork_session = Uuid::now_v7();
     let fork = AgentRecord {
+        session_home: None,
         session_locator: Some(SessionLocator::Uuid(fork_session)),
         forked_from_session: Some(parent_session),
         ..live_agent()
@@ -1507,6 +1515,7 @@ async fn live_claude_refresh_picks_up_appended_turn() {
     let session_id = Uuid::now_v7();
     let agent_id = Uuid::now_v7();
     let agent = AgentRecord {
+        session_home: None,
         model: None,
         effort: None,
         profiles: switchboard_core::AgentProfiles::default(),
@@ -1743,6 +1752,7 @@ async fn live_claude_slash_leading_prompt_reaches_model() {
 
 fn live_codex_agent() -> AgentRecord {
     AgentRecord {
+        session_home: None,
         model: None,
         effort: None,
         profiles: switchboard_core::AgentProfiles::default(),
@@ -2040,6 +2050,7 @@ async fn live_codex_resume_reuses_session() {
     let (thread_id, partition_date) =
         codex_capture(&events1).expect("first dispatch emits a captured Codex locator");
     let resumed_agent = AgentRecord {
+        session_home: None,
         model: None,
         effort: None,
         session_locator: Some(SessionLocator::Codex {
@@ -2089,6 +2100,7 @@ async fn live_codex_resume_reuses_session() {
 
 fn live_antigravity_agent() -> AgentRecord {
     AgentRecord {
+        session_home: None,
         model: None,
         effort: None,
         profiles: switchboard_core::AgentProfiles::default(),
@@ -2726,6 +2738,7 @@ async fn live_antigravity_resume_reuses_session() {
     let conversation_id =
         antigravity_capture(&events1).expect("first dispatch emits a captured Antigravity locator");
     let resumed_agent = AgentRecord {
+        session_home: None,
         model: None,
         effort: None,
         session_locator: Some(SessionLocator::Uuid(conversation_id)),
@@ -3282,6 +3295,7 @@ async fn live_claude_model_and_effort_change_across_turns() {
     let session_id = Uuid::now_v7();
     let agent_id = Uuid::now_v7();
     let mut agent = AgentRecord {
+        session_home: None,
         model: Some("sonnet".to_owned()),
         effort: Some("low".to_owned()),
         profiles: switchboard_core::AgentProfiles::default(),
@@ -3599,6 +3613,7 @@ async fn live_antigravity_model_change_announced_on_resume() {
     let adapter = AntigravityAdapter::new();
     let agent_id = Uuid::now_v7();
     let mut agent = AgentRecord {
+        session_home: None,
         model: None,
         effort: None,
         profiles: switchboard_core::AgentProfiles::default(),

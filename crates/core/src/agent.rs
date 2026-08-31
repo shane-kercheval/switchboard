@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -224,6 +226,38 @@ pub struct AgentRecord {
     /// above: a record written before forking existed legitimately lacks the key
     /// and must load as `None`.
     pub forked_from_session: Option<Uuid>,
+    /// For an agent moved across working directories: the directory whose
+    /// harness-side encoded session directory holds this agent's session files.
+    /// `None` — every agent that has never been moved across directories —
+    /// means "sessions live under the owning project's working directory."
+    ///
+    /// Only Claude namespaces its session storage by working directory
+    /// (`docs/harness-behavior.md` §3.5b), so only a Claude agent ever carries a
+    /// value. Read it through the app's effective-session-directory helper
+    /// (`session_home ?? project directory`), never directly: the lock keys, the
+    /// session-file resolver, the fork gates, the collision scans and
+    /// `build_args` must all agree on one answer, and a second derivation is how
+    /// they drift apart.
+    ///
+    /// **A stored physical path, deliberately not a `DirectoryId`.** The catalog
+    /// exists so a *live* dispatch target follows the user re-pointing a moved
+    /// checkout. This field is the opposite kind of value: a frozen historical
+    /// fact about where the harness already encoded a transcript (Claude derives
+    /// that directory name from `realpath(cwd)` at write time and never
+    /// relocates the file afterwards — §3.5c). Resolving through the catalog
+    /// would follow a later re-point *away* from the transcript, producing
+    /// exactly the permanent strand this field prevents.
+    ///
+    /// **Consumers must not re-canonicalize it.** The value stored is already
+    /// the resolved path the harness encoded from, and the source directory may
+    /// since have been deleted (moving an agent out of a pruned worktree is the
+    /// motivating case). Canonicalizing a path that no longer exists fails, and
+    /// the lookup would miss a session file that is still on disk.
+    ///
+    /// Set only by [`crate::Project::adopt_agent`]. Same plain-`Option`
+    /// backward-compat rationale as `model` / `effort`: a record written before
+    /// moves existed legitimately lacks the key and must load as `None`.
+    pub session_home: Option<PathBuf>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -346,6 +380,7 @@ mod tests {
 
     fn record_with_locator(locator: Option<SessionLocator>) -> AgentRecord {
         AgentRecord {
+            session_home: None,
             id: Uuid::now_v7(),
             project_id: Uuid::now_v7(),
             name: "assistant".to_owned(),

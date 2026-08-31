@@ -404,6 +404,7 @@ impl SessionLocatorSink for FailingLocatorSink {
 
 fn agent_record() -> AgentRecord {
     AgentRecord {
+        session_home: None,
         model: None,
         effort: None,
         profiles: switchboard_core::AgentProfiles::default(),

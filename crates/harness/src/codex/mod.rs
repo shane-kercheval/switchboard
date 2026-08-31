@@ -957,6 +957,7 @@ mod tests {
 
     fn codex_test_agent() -> AgentRecord {
         AgentRecord {
+            session_home: None,
             id: uuid::Uuid::now_v7(),
             project_id: uuid::Uuid::now_v7(),
             name: "c".to_owned(),

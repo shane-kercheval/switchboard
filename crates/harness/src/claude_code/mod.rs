@@ -672,6 +672,7 @@ mod tests {
 
     fn agent_with_session(session_id: Uuid) -> AgentRecord {
         AgentRecord {
+            session_home: None,
             model: None,
             effort: None,
             profiles: switchboard_core::AgentProfiles::default(),
@@ -1036,6 +1037,7 @@ mod tests {
         let home = tempfile::TempDir::new().unwrap();
         let project = tempfile::TempDir::new().unwrap();
         let agent = AgentRecord {
+            session_home: None,
             model: None,
             effort: None,
             profiles: switchboard_core::AgentProfiles::default(),

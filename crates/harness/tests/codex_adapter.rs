@@ -28,6 +28,7 @@ fn fixture(name: &str) -> String {
 
 fn codex_agent() -> AgentRecord {
     AgentRecord {
+        session_home: None,
         model: None,
         effort: None,
         profiles: switchboard_core::AgentProfiles::default(),
@@ -47,6 +48,7 @@ fn codex_agent() -> AgentRecord {
 /// capture).
 fn codex_agent_resuming(thread_id: &str, partition_date: chrono::NaiveDate) -> AgentRecord {
     AgentRecord {
+        session_home: None,
         model: None,
         effort: None,
         session_locator: Some(SessionLocator::Codex {

@@ -24,6 +24,7 @@ fn fixture(name: &str) -> String {
 
 fn fake_agent() -> AgentRecord {
     AgentRecord {
+        session_home: None,
         model: None,
         effort: None,
         profiles: switchboard_core::AgentProfiles::default(),

@@ -511,6 +511,7 @@ impl Project {
         check_name_unique(&self.list_agents()?, name, None)?;
 
         let record = AgentRecord {
+            session_home: None,
             id: Uuid::now_v7(),
             project_id: self.id,
             name: name.to_owned(),
@@ -573,6 +574,64 @@ impl Project {
         let updated = agents[idx].clone();
         write_jsonl(&self.registry_path, &agents)?;
         Ok(updated)
+    }
+
+    /// Adopt an agent record moved from another project: re-stamp its
+    /// `project_id` to this project, optionally record its `session_home`, and
+    /// append it to this registry. Returns the adopted record.
+    ///
+    /// **The sanctioned mutator of `project_id`.** [`AgentRecord::project_id`]
+    /// is otherwise immutable — every other write path stamps it once at
+    /// registration. A move is the one operation that changes it, and routing
+    /// that through here keeps the invariant checkable ("who writes
+    /// `project_id`?" has exactly two answers) instead of dissolving into a
+    /// generic update API. The source half of a move is the existing
+    /// [`Self::remove_agent`]; this is the target half.
+    ///
+    /// **Idempotent by `agent_id`, because move recovery re-drives every step.**
+    /// An id already present in this registry means a previous attempt got this
+    /// far, so the existing record is returned untouched and nothing is
+    /// appended — re-running the step cannot duplicate the row. It deliberately
+    /// does *not* reconcile a differing record body: recovery re-drives a move
+    /// whose inputs are fixed, so a body mismatch means something other than
+    /// this operation wrote it, and silently overwriting would destroy that.
+    ///
+    /// **Name uniqueness is enforced here, not assumed.** `register_agent` and
+    /// `rename_agent` are the only other writers and both check; a move that
+    /// appended blind could seat two agents whose names collide under the
+    /// canonical rule (case-insensitive, hyphens as underscores), producing a
+    /// roster the ordinary APIs would have refused and ambiguous name
+    /// resolution in the UI and workflows. The caller is expected to surface
+    /// [`CoreError::DuplicateAgentName`] as a "rename one of them first"
+    /// refusal *before* it starts surgery — reaching this check mid-move means
+    /// the target roster changed underneath, which is why the check lives at
+    /// the write and not only in the caller.
+    ///
+    /// `session_home` carries the moved agent's session location when the move
+    /// crosses working directories; see [`AgentRecord::session_home`] for what
+    /// belongs there and, crucially, what must not (a re-canonicalized or
+    /// catalog-resolved path). Passing `None` leaves the field as it was on the
+    /// incoming record, so a second move preserves the home recorded by the
+    /// first — the transcript never moves, so the first answer stays the right
+    /// one.
+    pub fn adopt_agent(
+        &self,
+        record: &AgentRecord,
+        session_home: Option<PathBuf>,
+    ) -> Result<AgentRecord> {
+        let agents = self.list_agents()?;
+        if let Some(existing) = agents.iter().find(|a| a.id == record.id) {
+            return Ok(existing.clone());
+        }
+        check_name_unique(&agents, &record.name, None)?;
+        let adopted = AgentRecord {
+            project_id: self.id,
+            session_home: session_home.or_else(|| record.session_home.clone()),
+            ..record.clone()
+        };
+        adopted.validate()?;
+        append_jsonl(&self.registry_path, &adopted)?;
+        Ok(adopted)
     }
 
     /// Set one agent's `session_locator` in place, rewriting `registry.jsonl`
@@ -1272,6 +1331,7 @@ mod tests {
             .register_agent("alice", HarnessKind::ClaudeCode, None, None)
             .unwrap();
         let stranded = AgentRecord {
+            session_home: None,
             session_locator: None,
             ..source
         };
@@ -2118,5 +2178,163 @@ mod tests {
             }
             other => panic!("expected CorruptJsonl, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod adopt_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn fresh_project(name: &str) -> (TempDir, Project) {
+        let tmp = TempDir::new().unwrap();
+        let projects_dir = tmp.path().join("projects");
+        create_dir_all(&projects_dir).unwrap();
+        let (_summary, project) = create_on_disk(tmp.path(), None, &projects_dir, name).unwrap();
+        (tmp, project)
+    }
+
+    fn two_projects() -> (TempDir, Project, Project) {
+        let tmp = TempDir::new().unwrap();
+        let projects_dir = tmp.path().join("projects");
+        create_dir_all(&projects_dir).unwrap();
+        let (_s1, source) = create_on_disk(tmp.path(), None, &projects_dir, "source").unwrap();
+        let (_s2, target) = create_on_disk(tmp.path(), None, &projects_dir, "target").unwrap();
+        (tmp, source, target)
+    }
+
+    #[test]
+    fn adopt_restamps_project_id_and_records_session_home() {
+        let (_tmp, source, target) = two_projects();
+        let record = source
+            .register_agent("mover", HarnessKind::ClaudeCode, None, None)
+            .unwrap();
+        let home = PathBuf::from("/repos/checkout");
+
+        let adopted = target.adopt_agent(&record, Some(home.clone())).unwrap();
+
+        assert_eq!(adopted.id, record.id, "identity survives a move");
+        assert_eq!(adopted.session_locator, record.session_locator);
+        assert_eq!(adopted.project_id, target.id);
+        assert_eq!(adopted.session_home, Some(home));
+        assert_eq!(target.list_agents().unwrap(), vec![adopted]);
+    }
+
+    #[test]
+    fn adopt_without_a_session_home_leaves_the_field_unset() {
+        // A same-directory move: the agent's sessions still live under the
+        // project's own working directory, so stamping a home would be a lie.
+        let (_tmp, source, target) = two_projects();
+        let record = source
+            .register_agent("mover", HarnessKind::ClaudeCode, None, None)
+            .unwrap();
+
+        let adopted = target.adopt_agent(&record, None).unwrap();
+
+        assert_eq!(adopted.session_home, None);
+    }
+
+    #[test]
+    fn a_second_move_preserves_the_home_recorded_by_the_first() {
+        // The transcript never leaves the directory it was first encoded from,
+        // so the first answer stays the right one however many moves follow.
+        let (_tmp, source, target) = two_projects();
+        let original = source
+            .register_agent("mover", HarnessKind::ClaudeCode, None, None)
+            .unwrap();
+        let first_home = PathBuf::from("/repos/original-checkout");
+        let once = target
+            .adopt_agent(&original, Some(first_home.clone()))
+            .unwrap();
+
+        let (_tmp2, third) = fresh_project("third");
+        let twice = third.adopt_agent(&once, None).unwrap();
+
+        assert_eq!(twice.session_home, Some(first_home));
+        assert_eq!(twice.project_id, third.id);
+    }
+
+    #[test]
+    fn adopting_an_id_already_present_is_a_no_op() {
+        // Move recovery re-drives every step; the append must not duplicate.
+        let (_tmp, source, target) = two_projects();
+        let record = source
+            .register_agent("mover", HarnessKind::ClaudeCode, None, None)
+            .unwrap();
+        let home = PathBuf::from("/repos/checkout");
+        let first = target.adopt_agent(&record, Some(home.clone())).unwrap();
+
+        let second = target.adopt_agent(&record, Some(home)).unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(target.list_agents().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn adopt_refuses_a_canonically_colliding_name_and_writes_nothing() {
+        // Names collide case-insensitively with hyphens as underscores, so a
+        // move must refuse exactly where register/rename would.
+        let (_tmp, source, target) = two_projects();
+        let resident = target
+            .register_agent("Agent-A", HarnessKind::ClaudeCode, None, None)
+            .unwrap();
+        let incoming = source
+            .register_agent("agent_a", HarnessKind::ClaudeCode, None, None)
+            .unwrap();
+
+        let err = target.adopt_agent(&incoming, None).unwrap_err();
+
+        assert!(
+            matches!(err, CoreError::DuplicateAgentName { .. }),
+            "expected a duplicate-name refusal, got {err:?}"
+        );
+        assert_eq!(target.list_agents().unwrap(), vec![resident]);
+        assert_eq!(
+            source.list_agents().unwrap(),
+            vec![incoming],
+            "a refused adoption leaves the source untouched"
+        );
+    }
+
+    #[test]
+    fn a_record_carrying_session_home_round_trips_through_the_registry() {
+        let (_tmp, source, target) = two_projects();
+        let record = source
+            .register_agent("mover", HarnessKind::ClaudeCode, None, None)
+            .unwrap();
+        let home = PathBuf::from("/repos/checkout with spaces");
+        let adopted = target.adopt_agent(&record, Some(home.clone())).unwrap();
+
+        let reread = target.list_agents().unwrap();
+
+        assert_eq!(reread, vec![adopted]);
+        assert_eq!(reread[0].session_home, Some(home));
+    }
+
+    #[test]
+    fn a_registry_line_without_session_home_loads_as_none() {
+        // Backward compatibility: every record written before moves existed
+        // lacks the key and must load as "sessions live under the project".
+        use std::io::Write;
+
+        let (_tmp, project) = fresh_project("legacy");
+        let line = serde_json::json!({
+            "id": Uuid::now_v7(),
+            "project_id": project.id,
+            "name": "legacy",
+            "harness": "claude_code",
+            "session_locator": {"uuid": Uuid::now_v7()},
+            "model": null,
+            "effort": null,
+            "forked_from_session": null,
+            "created_at": "2026-05-14T04:43:19Z",
+        });
+        let mut file = std::fs::File::create(&project.registry_path).unwrap();
+        writeln!(file, "{line}").unwrap();
+
+        let agents = project.list_agents().unwrap();
+
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].session_home, None);
     }
 }

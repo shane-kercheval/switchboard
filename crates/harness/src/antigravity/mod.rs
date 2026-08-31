@@ -2096,6 +2096,7 @@ mod tests {
         // keeping its context, so one uniform path beats a change-only case.
         let log = PathBuf::from("/tmp/x.log");
         let agent = AgentRecord {
+            session_home: None,
             model: Some("gemini-3.1-pro".to_owned()),
             effort: Some("high".to_owned()),
             ..bare_agent()
@@ -2125,6 +2126,7 @@ mod tests {
         // one level, `medium`, and also dispatches bare.)
         let log = PathBuf::from("/tmp/x.log");
         let agent = AgentRecord {
+            session_home: None,
             model: Some("claude-sonnet-4-6".to_owned()),
             effort: None,
             ..bare_agent()
@@ -2142,6 +2144,7 @@ mod tests {
         // `agy` would reject, since effort validity is a property of the model.
         let log = PathBuf::from("/tmp/x.log");
         let agent = AgentRecord {
+            session_home: None,
             model: None,
             effort: Some("high".to_owned()),
             ..bare_agent()
@@ -2166,6 +2169,7 @@ mod tests {
     async fn dispatch_rejects_empty_prompt_before_spawn() {
         let adapter = AntigravityAdapter::with_binary_path("/nonexistent");
         let agent = AgentRecord {
+            session_home: None,
             model: None,
             effort: None,
             profiles: switchboard_core::AgentProfiles::default(),
@@ -2654,6 +2658,7 @@ mod tests {
     /// arg-shape tests that are not about the selection flags.
     fn bare_agent() -> AgentRecord {
         AgentRecord {
+            session_home: None,
             model: None,
             effort: None,
             profiles: switchboard_core::AgentProfiles::default(),

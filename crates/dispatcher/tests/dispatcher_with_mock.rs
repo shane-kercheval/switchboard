@@ -24,7 +24,7 @@ use switchboard_dispatcher::{
     AwaitableSendOutcome, CancelOutcome, CompletionResult, ConversationJournal, CurrentTurnWait,
     DispatchContext, DispatchContextFactory, Dispatcher, EventEmitter, JournalError, MetadataCache,
     NoopJournal, NoopMetadataCache, NoopSessionLocatorSink, NotQueued, OnBusy, RecordingEmitter,
-    SelectionSnapshot, SendOutcome, SessionLocatorError, SessionLocatorSink,
+    SelectionSnapshot, SendOutcome, SessionLocatorError, SessionLocatorSink, TurnPermit,
 };
 use switchboard_harness::{
     CancelSource, ContextWindowSource, DispatchOptions, FailureKind, HarnessAdapter, MessageId,
@@ -193,13 +193,15 @@ impl DispatchContextFactory for TestFactory {
         })
     }
 
-    fn preflight(
-        &self,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + '_>> {
+    fn preflight<'a>(
+        &'a self,
+        _agent: &'a AgentRecord,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<TurnPermit, String>> + Send + 'a>>
+    {
         Box::pin(async move {
             match &self.refuse_at_start {
                 Some(reason) => Err(reason.clone()),
-                None => Ok(()),
+                None => Ok(TurnPermit::none()),
             }
         })
     }

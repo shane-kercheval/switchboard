@@ -100,6 +100,7 @@
     type Command,
   } from "$lib/state/commandPalette.svelte";
   import type { AgentRecord, HarnessAvailability, HarnessKind, ProjectId } from "$lib/types";
+  import { projectIsAvailable } from "$lib/types";
   import { ALL_HARNESSES, HARNESS_LABEL } from "$lib/harnessDisplay";
   import { harnessAvailability, refreshHarnessAvailability } from "$lib/harnessAvailability.svelte";
   import { loadPreferences, preferences } from "$lib/preferences.svelte";
@@ -318,6 +319,12 @@
   async function openActiveProjectInTerminal(): Promise<void> {
     if (activeProject === null) return;
     commandError = null;
+    // `directory` is null when the project's directory identity resolves to no
+    // single path — there is nothing to open, and the backend refuses to guess.
+    if (activeProject.directory === null) {
+      commandError = "This project's working directory could not be resolved.";
+      return;
+    }
     try {
       await api.openInTerminal(activeProject.directory);
     } catch (e) {
@@ -328,6 +335,10 @@
   async function revealActiveProjectInFinder(): Promise<void> {
     if (activeProject === null) return;
     commandError = null;
+    if (activeProject.directory === null) {
+      commandError = "This project's working directory could not be resolved.";
+      return;
+    }
     try {
       await api.revealInFinder(activeProject.directory);
     } catch (e) {
@@ -432,7 +443,7 @@
   }
 
   async function openActiveProjectInGit(): Promise<void> {
-    if (activeProject === null) return;
+    if (activeProject === null || activeProject.directory === null) return;
     settingsOpen = false;
     const result = await revealProjectBranch(activeProject.id, activeProject.directory);
     if (result.kind === "failed") {
@@ -915,7 +926,10 @@
     if (projectId === null || failure === null) return false;
     if (failure.type === "project_locked") return false;
     const project = projects.list.find((candidate) => candidate.id === projectId);
-    return project?.available === false || failure.type === "project_not_loaded";
+    return (
+      (project !== undefined && !projectIsAvailable(project)) ||
+      failure.type === "project_not_loaded"
+    );
   });
   let activationDeleting = $derived(
     selection.activeProjectId !== null && selection.activeProjectId in projectDeletions.pending,
@@ -1268,7 +1282,7 @@
             <div class="text-fg truncate text-sm font-semibold">{activeProject.name}</div>
             <div class="text-muted shrink-0 text-xs">·</div>
             <Tooltip
-              label={activeProject.directory}
+              label={activeProject.directory ?? "working directory unresolved"}
               delayDuration={SUPPLEMENTAL_TOOLTIP_DELAY}
               focusable={false}
               side="bottom"

@@ -6,7 +6,7 @@ use std::fs::File;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use switchboard_core::{AgentId, AgentRecord, Directory, Project, ProjectId};
+use switchboard_core::{AgentId, AgentRecord, Project, ProjectId, Store};
 use switchboard_dispatcher::{Dispatcher, EventEmitter};
 use switchboard_harness::HarnessAdapter;
 use switchboard_prompts::PromptService;
@@ -84,6 +84,20 @@ impl VisibleProject {
     }
 }
 
+/// Two-way handshake for the post-eviction pause point.
+///
+/// **`entered` is not decoration.** A one-way barrier can be deleted from the
+/// operation and the test still passes, having silently stopped testing the
+/// ordering — which is exactly how the first two attempts at that test failed.
+/// With the handshake, the test blocks on `entered`, so removing the pause makes
+/// it time out rather than pass.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub struct MaintenanceBarrier {
+    pub entered: tokio::sync::Notify,
+    pub release: tokio::sync::Notify,
+}
+
 /// The single piece of state managed by Tauri. Multi-project and
 /// multi-directory (per system-design §3): the app holds N working directories
 /// concurrently, each hosting N projects. `directories` keys every loaded
@@ -91,8 +105,14 @@ impl VisibleProject {
 ///
 /// **Lock-order convention** (when more than one of these mutexes is held
 /// at the same time): `workspace` → `registry_write` → `git_registry` →
-/// `directories` → `projects` → `active_project_id` → `needs_session_meta` →
-/// `project_locks` → `agents_by_id`. Always acquire in this order. `workspace`
+/// `maintenance` → `project_generation` → `projects` → `active_project_id` →
+/// `needs_session_meta` → `project_locks` → `agents_by_id`. Always acquire in
+/// this order.
+///
+/// `maintenance` and `project_generation` sit directly under `registry_write`
+/// because `begin_maintenance` takes all three in that order — the write lock
+/// first (so a claim's membership is derived and marked atomically against
+/// `create_project`), then the marks, then the generations. `workspace`
 /// is at the head because it is the app-owned user-global registry that sits
 /// above any single directory's state; in practice it is taken either standalone
 /// (`list_projects`, the workspace switcher) or nested *under* `registry_write`
@@ -102,9 +122,7 @@ impl VisibleProject {
 /// `registry_write` during `init_directory`'s auto-sync hook — so it sorts after
 /// `registry_write` here. **No path may acquire `registry_write` while holding
 /// `git_registry`** (the inverse order is the deadlock this convention forbids).
-/// `directories` holds every loaded directory keyed by canonical path; it sits
-/// below the registries and above the per-project maps. Violating the order can
-/// deadlock under concurrent access. Single-lock acquisitions (which most
+/// Violating the order can deadlock under concurrent access. Single-lock acquisitions (which most
 /// callers do) are unaffected — the convention only matters when nesting.
 /// `needs_session_meta` is the tail because both `attach_agent_impl` (under
 /// `registry_write`) and `send_message_impl` (no other locks held) acquire
@@ -116,7 +134,7 @@ impl VisibleProject {
 ///
 /// `forwards` and `workflow_runs` are **tail-leaf** maps (acquired alone, last,
 /// briefly, never across an `.await`): they sort after `agents_by_id`. Teardown
-/// (`remove_directory` / `delete_project`) collects the affected runs' cancel
+/// (`delete_project`) collects the affected runs' cancel
 /// tokens under the `workflow_runs` lock, releases it, then fires them and awaits
 /// the runs reaching terminal **before** draining agents — so no cancel token is
 /// fired while the lock is held, and the order keeps a run resolving `cancelled`
@@ -138,20 +156,6 @@ impl VisibleProject {
 /// that window inside one process; cross-process serialization is future
 /// work (an `instance.lock` per directory).
 pub struct AppState {
-    /// Every loaded working directory, keyed by its **canonical** path
-    /// (`Directory::at` canonicalizes, so `Directory.path` is the key). The
-    /// app holds N directories concurrently; commands resolve the directory
-    /// that owns a project from the project's own `directory` field, not a
-    /// single bound handle.
-    ///
-    /// **Session-id uniqueness contract.** Cross-harness session-id uniqueness
-    /// (the same-session-parallel-invocation guard) is enforced across all
-    /// *loaded/available* directories — those present in this map. At startup
-    /// `eager_load_directories` opens a handle for every available workspace
-    /// directory, so "loaded == available" and the Codex/Antigravity collision
-    /// scan is workspace-wide. An unavailable directory (absent from this map)
-    /// cannot collide because it cannot be dispatched into while unavailable.
-    pub directories: Mutex<HashMap<PathBuf, Directory>>,
     pub projects: Mutex<HashMap<ProjectId, Project>>,
     pub active_project_id: Mutex<Option<ProjectId>>,
     /// The project the user is to be treated as **looking at right now**, or
@@ -183,8 +187,6 @@ pub struct AppState {
     pub claude_adapter: Arc<dyn HarnessAdapter>,
     /// Adapter for `HarnessKind::Codex` agents.
     pub codex_adapter: Arc<dyn HarnessAdapter>,
-    /// Adapter for `HarnessKind::Gemini` agents.
-    pub gemini_adapter: Arc<dyn HarnessAdapter>,
     /// Adapter for `HarnessKind::Antigravity` agents.
     pub antigravity_adapter: Arc<dyn HarnessAdapter>,
     pub emitter: Arc<dyn EventEmitter>,
@@ -221,9 +223,9 @@ pub struct AppState {
     /// **Wrapped in `Arc<Mutex<…>>`** so the emitter decorator can hold a
     /// clone for the lifetime of the dispatcher's `'static` drain task.
     ///
-    /// **Removal clearing.** `remove_directory_impl` drops the entries for the
-    /// removed directory's agents alongside the matching `projects` and
-    /// `agents_by_id` entries — a stale `agent_id` from a removed directory's
+    /// **Deletion clearing.** `delete_project_impl` drops the entries for the
+    /// deleted project's agents alongside the matching `projects` and
+    /// `agents_by_id` entries — a stale `agent_id` from a deleted project's
     /// attach must not leak forward.
     pub needs_session_meta: Arc<Mutex<HashSet<AgentId>>>,
 
@@ -246,9 +248,9 @@ pub struct AppState {
     /// every loaded project's `registry.jsonl` from disk (the prior
     /// `lookup_agent` hot path). Populated on project open, agent
     /// register/attach, and `list_agents`; the removed directory's entries are
-    /// dropped on `remove_directory`. v1 has no agent/project deletion, so
-    /// invalidation is insert-only within a session plus a targeted prune when
-    /// a directory is removed. An `AgentRecord` is otherwise immutable after
+    /// dropped by `delete_project_impl`, and a removed agent's by
+    /// `remove_agent_impl`, so invalidation is insert-only within a session
+    /// plus those targeted prunes. An `AgentRecord` is otherwise immutable after
     /// registration, with one exception: `rename_agent_impl` and
     /// `set_agent_session_locator_impl` (the runtime session-locator capture)
     /// mutate a record in place and re-insert the updated copy here in the same
@@ -270,6 +272,123 @@ pub struct AppState {
     /// resolved (tests, or an exotic host with no home dir). `persist_workspace`
     /// is a no-op while this is `None`, so tests never touch user-global state.
     pub workspace_path: Option<PathBuf>,
+
+    /// Per-project counter, bumped by every lifecycle operation.
+    ///
+    /// **Closes the admitted-then-suspended send.** The maintenance mark stops
+    /// *new* work entering the window, but a send that resolved its `Project` a
+    /// moment earlier already holds a snapshot of where the project used to
+    /// live, and nothing bounds how long it can sit between that lookup and the
+    /// dispatcher enqueue — `ensure_materializing_fork_may_dispatch` awaits a
+    /// reply from an actor that may itself be mid-turn. Re-draining after the
+    /// write does not help: a send suspended past the drain still enqueues its
+    /// stale factory.
+    ///
+    /// So the send captures the generation at lookup and re-verifies it
+    /// immediately before handing off. Anything whose view predates a lifecycle
+    /// operation is refused, however long it waited.
+    ///
+    /// **The interval past that check is covered too**, by the same counter read
+    /// a second time. `ProjectDispatchContextFactory` captures this value when it
+    /// is built and re-compares it in `preflight`, which the dispatcher runs at
+    /// the instant the turn actually starts. That is what makes the factory's
+    /// frozen `Project` — and the working directory every dispatch takes from it
+    /// — safe to hold for the actor's whole lifetime, and it is also the only
+    /// check reached by a send that queued behind another turn and popped long
+    /// after every command-boundary gate had passed.
+    ///
+    /// `Arc` for exactly that: the factory holds a clone. The factory is *given*
+    /// its comparison value rather than reading one — see
+    /// `ProjectDispatchContextFactory::generation_at_capture` for why sampling it
+    /// at construction pairs a stale project with a fresh counter.
+    ///
+    /// The span this still does not cover — admission to spawn — is described at
+    /// [`crate::commands::reject_if_generation_changed`], including why delete
+    /// bounds it and re-point would not.
+    pub project_generation: Arc<Mutex<HashMap<ProjectId, u64>>>,
+
+    /// Root under which cross-**process** harness session locks live
+    /// (`<lock_root>/locks/<key>.lock`).
+    ///
+    /// **Required, and deliberately not `config_dir()`.** Every other
+    /// user-global path is dev-isolated so a debug build never touches installed
+    /// state; this one must be the *opposite*, because its entire purpose is to
+    /// make a dev build and the installed app contend on one file. Injected
+    /// rather than resolved here so tests take real locks under a `TempDir`
+    /// instead of the developer's live lock directory, where they would contend
+    /// with a running app. See `crate::session_lock_root`.
+    pub lock_root: PathBuf,
+
+    /// Test-only pause point, awaited by the lifecycle operations immediately
+    /// after they evict and before they drain.
+    ///
+    /// The window between those two steps is what finding-1's race lives in, and
+    /// it closes too fast to observe by polling — the drain completes before a
+    /// test can look. Without a way to hold it open, the ordering could only be
+    /// argued, and this milestone has already shipped one test that looked like
+    /// coverage and wasn't. A barrier is the smaller price.
+    #[cfg(test)]
+    pub maintenance_barrier: Mutex<Option<Arc<MaintenanceBarrier>>>,
+
+    /// Two-way handshake inside `capture_dispatch_snapshot`, taken **while it
+    /// holds `registry_write`**.
+    ///
+    /// **The second such seam, added deliberately rather than by momentum.** The
+    /// property it exists for — that a dispatch's project, agent, roster, and
+    /// lifecycle generation come from one instant — is enforced by holding a
+    /// single lock, and a test cannot observe "one lock" from outside. Every
+    /// version that tried timed out to be indistinguishable from the broken form:
+    /// `maintenance_barrier` pauses *after* `begin_maintenance` has returned and
+    /// released its guard, so it cannot stage the interleaving at all. Pausing
+    /// mid-capture is the only way a test can prove maintenance is excluded.
+    ///
+    /// A third seam should prompt generalizing this into one mechanism rather
+    /// than a third field.
+    #[cfg(test)]
+    pub capture_barrier: Mutex<Option<Arc<MaintenanceBarrier>>>,
+
+    /// Projects currently mid-lifecycle-operation — a re-point or a delete has
+    /// evicted their routable state and has not finished rebuilding it.
+    ///
+    /// **A closed window, not a swept one.** These operations must evict before
+    /// they drain (or a send lands in the gap and spawns a fresh actor on the
+    /// old working directory), which leaves an interval where the project is
+    /// absent from every map but still exists. Without a gate, a user clicking a
+    /// *different* project in the same directory during that interval opens it
+    /// against the stale path, and a second drain would only catch that by
+    /// convergence argument. Refusing entry is the version that stays true when
+    /// the code around it changes.
+    ///
+    /// Read by `open_project_impl`, `create_project_impl`, and the dispatch
+    /// resolution path; set and cleared under `registry_write`, which is what
+    /// makes "evict and mark" atomic against those callers.
+    pub maintenance: Mutex<HashSet<ProjectId>>,
+
+    /// The user-global project store — every project's index, catalog, and
+    /// metadata root.
+    ///
+    /// **Required, unlike the `Option<PathBuf>` paths above.** Those guard
+    /// user-global *convenience* state that degrades to a no-op when
+    /// unresolvable; project persistence cannot. A `None` store would mean
+    /// creating a project silently succeeds and vanishes, so the root is
+    /// injected at construction and its absence is a startup failure, not a
+    /// degraded mode.
+    ///
+    /// Holds no cached state (see [`Store`]), so it needs no lock: every method
+    /// reads or rewrites files, serialized by [`Self::registry_write`] where
+    /// mutation requires it.
+    pub store: Store,
+
+    /// Keeps a test's temp store root alive for the state's lifetime. See
+    /// [`Self::new_for_test`].
+    #[cfg(test)]
+    store_tmp: Option<tempfile::TempDir>,
+
+    /// Keeps a test's temp lock root alive, for the same reason as `store_tmp`:
+    /// the root is required, and a test taking real locks under the developer's
+    /// live lock directory would contend with a running app.
+    #[cfg(test)]
+    lock_tmp: Option<tempfile::TempDir>,
 
     /// User-global Git-view tracked-repo registry — the ordered set of repo roots
     /// the Git view shows (see `crate::git_registry`). A superset of the
@@ -344,12 +463,24 @@ impl AppState {
     pub fn new(
         claude_adapter: Arc<dyn HarnessAdapter>,
         codex_adapter: Arc<dyn HarnessAdapter>,
-        gemini_adapter: Arc<dyn HarnessAdapter>,
         antigravity_adapter: Arc<dyn HarnessAdapter>,
         emitter: Arc<dyn EventEmitter>,
+        store: Store,
+        lock_root: PathBuf,
     ) -> Self {
         Self {
-            directories: Mutex::new(HashMap::new()),
+            store,
+            maintenance: Mutex::new(HashSet::new()),
+            project_generation: Arc::new(Mutex::new(HashMap::new())),
+            lock_root,
+            #[cfg(test)]
+            maintenance_barrier: Mutex::new(None),
+            #[cfg(test)]
+            capture_barrier: Mutex::new(None),
+            #[cfg(test)]
+            store_tmp: None,
+            #[cfg(test)]
+            lock_tmp: None,
             projects: Mutex::new(HashMap::new()),
             active_project_id: Mutex::new(None),
             visible_project: Mutex::new(VisibleProject::default()),
@@ -357,7 +488,6 @@ impl AppState {
             dispatcher: Arc::new(Dispatcher::new()),
             claude_adapter,
             codex_adapter,
-            gemini_adapter,
             antigravity_adapter,
             emitter,
             needs_session_meta: Arc::new(Mutex::new(HashSet::new())),
@@ -378,6 +508,63 @@ impl AppState {
             ))),
             workflows_dir: None,
         }
+    }
+
+    /// Construct a state whose store lives in a temp directory the state itself
+    /// owns.
+    ///
+    /// The store root is required, so without this every one of the ~125 test
+    /// fixtures would have to create a second `TempDir` and thread it through
+    /// its return tuple purely to keep the root alive — churn that obscures what
+    /// each test is actually about. Owning the `TempDir` here ties the store's
+    /// lifetime to the state's, which is exactly the intended scope. Reach for
+    /// `state.store.root()` when a test needs to inspect on-disk layout.
+    #[cfg(test)]
+    pub fn new_for_test(
+        claude_adapter: Arc<dyn HarnessAdapter>,
+        codex_adapter: Arc<dyn HarnessAdapter>,
+        antigravity_adapter: Arc<dyn HarnessAdapter>,
+        emitter: Arc<dyn EventEmitter>,
+    ) -> Self {
+        let root = tempfile::TempDir::new().expect("temp store root");
+        let locks = tempfile::TempDir::new().expect("temp lock root");
+        let store = Store::open(root.path()).expect("open temp store");
+        let mut state = Self::new(
+            claude_adapter,
+            codex_adapter,
+            antigravity_adapter,
+            emitter,
+            store,
+            locks.path().to_path_buf(),
+        );
+        state.store_tmp = Some(root);
+        state.lock_tmp = Some(locks);
+        state
+    }
+
+    /// Construct a test state over an **existing** store root, for tests that
+    /// need two `AppState`s to see the same store — a restart, or a second
+    /// process's view. The caller owns the root and must keep it alive.
+    #[cfg(test)]
+    pub fn new_for_test_at(
+        root: &std::path::Path,
+        claude_adapter: Arc<dyn HarnessAdapter>,
+        codex_adapter: Arc<dyn HarnessAdapter>,
+        antigravity_adapter: Arc<dyn HarnessAdapter>,
+        emitter: Arc<dyn EventEmitter>,
+    ) -> Self {
+        let store = Store::open(root).expect("open temp store");
+        let locks = tempfile::TempDir::new().expect("temp lock root");
+        let mut state = Self::new(
+            claude_adapter,
+            codex_adapter,
+            antigravity_adapter,
+            emitter,
+            store,
+            locks.path().to_path_buf(),
+        );
+        state.lock_tmp = Some(locks);
+        state
     }
 
     /// Builder step that injects the production notifier. Production calls this
@@ -440,48 +627,6 @@ impl AppState {
         self.preferences = Mutex::new(preferences::load(&path));
         self.preferences_path = Some(path);
         self
-    }
-}
-
-/// Eager-load every workspace directory's `Directory` handle into
-/// `state.directories` at startup. `with_workspace` only loads the workspace
-/// registry (paths + cached snapshots); without this, nothing populates
-/// `directories` on a cold start (its only other writer is `init_directory`), so
-/// every directory would report `available: false` until re-initialized and the
-/// cross-harness session-id collision scan would cover no directories.
-///
-/// For each workspace entry we attempt `Directory::at` — a pure on-disk read
-/// that canonicalizes and validates the path is a directory. **No per-project
-/// `instance.lock` is taken here**: locks stay lazy, acquired on project
-/// activation (open/create), not at startup. A directory that fails to open
-/// (unmounted, moved, permissions) is skipped with a `warn` and stays absent
-/// from `directories` → it naturally reports `available: false` and cannot be
-/// dispatched into. Startup never aborts on a bad directory.
-///
-/// Contract this establishes: after eager-load, "loaded == every available
-/// workspace directory," which is what makes the Codex/Antigravity session-id
-/// collision scan (`enumerate_all_projects` over `state.directories`)
-/// workspace-wide for all available directories.
-pub(crate) fn eager_load_directories(state: &AppState) {
-    let paths: Vec<PathBuf> = lock(&state.workspace)
-        .entries()
-        .iter()
-        .map(|e| e.path.clone())
-        .collect();
-    let mut directories = lock(&state.directories);
-    for path in paths {
-        match Directory::at(&path) {
-            Ok(directory) => {
-                directories.insert(directory.path.clone(), directory);
-            }
-            Err(e) => {
-                tracing::warn!(
-                    path = %path.display(),
-                    error = %e,
-                    "workspace directory could not be opened at startup — marking unavailable"
-                );
-            }
-        }
     }
 }
 
@@ -574,13 +719,7 @@ mod tests {
     fn mock_state() -> AppState {
         let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
         let emitter: Arc<dyn EventEmitter> = Arc::new(RecordingEmitter::new());
-        AppState::new(
-            Arc::clone(&mock),
-            Arc::clone(&mock),
-            Arc::clone(&mock),
-            mock,
-            emitter,
-        )
+        AppState::new_for_test(Arc::clone(&mock), Arc::clone(&mock), mock, emitter)
     }
 
     #[test]
@@ -593,47 +732,6 @@ mod tests {
         persist_workspace(&state);
 
         assert!(!path.exists());
-    }
-
-    #[test]
-    fn eager_load_opens_every_available_workspace_directory() {
-        // Given a workspace with two real directories, after eager-load both are
-        // present in `state.directories` (keyed by their canonical paths).
-        let dir_a = tempdir().unwrap();
-        let dir_b = tempdir().unwrap();
-        let state = mock_state();
-        {
-            let mut ws = lock(&state.workspace);
-            ws.add(dir_a.path().to_path_buf());
-            ws.add(dir_b.path().to_path_buf());
-        }
-
-        eager_load_directories(&state);
-
-        let dirs = lock(&state.directories);
-        assert_eq!(dirs.len(), 2, "both available directories loaded");
-        assert!(dirs.contains_key(&dir_a.path().canonicalize().unwrap()));
-        assert!(dirs.contains_key(&dir_b.path().canonicalize().unwrap()));
-    }
-
-    #[test]
-    fn eager_load_skips_unavailable_directory() {
-        // A workspace entry whose path no longer exists is skipped (stays
-        // absent → available:false), and does not abort the load of the rest.
-        let dir_a = tempdir().unwrap();
-        let missing = dir_a.path().join("gone");
-        let state = mock_state();
-        {
-            let mut ws = lock(&state.workspace);
-            ws.add(dir_a.path().to_path_buf());
-            ws.add(missing);
-        }
-
-        eager_load_directories(&state);
-
-        let dirs = lock(&state.directories);
-        assert_eq!(dirs.len(), 1, "only the available directory loaded");
-        assert!(dirs.contains_key(&dir_a.path().canonicalize().unwrap()));
     }
 
     #[test]

@@ -51,6 +51,7 @@
     FORWARD_SENTINEL,
     heldForwardsFor,
     type HeldForward,
+    forwardSourceLabel,
   } from "$lib/state/heldForwards.svelte";
   import { cancelForward, openExternalUrl } from "$lib/api";
   import { agentCopy } from "$lib/agentCopy.svelte";
@@ -628,7 +629,7 @@
   /// so they render as `model (effort)` rather than two loose columns. Effort
   /// alone renders bare — a lone `(high)` reads as a fragment, and the pairing
   /// is only meaningful when there is a model to qualify. Harness-agnostic:
-  /// Codex and Claude both supply effort, Gemini/Antigravity never do.
+  /// Claude, Codex, and Antigravity all supply effort when one was selected.
   function modelWithEffort(model: string | undefined, effort: string | undefined): string {
     if (!model) return effort ?? "";
     return effort ? `${model} (${effort})` : model;
@@ -1931,7 +1932,7 @@
      compose bar's awaiting `forward_message` then resolves cancelled, removes
      this entry, and restores the composer (text + source chips). -->
 {#snippet heldForwardRow(held: HeldForward)}
-  {@const sourceNames = held.sources.map((s) => s.name).join(", ")}
+  {@const sourceNames = held.sources.map((s) => forwardSourceLabel(s, projectId)).join(", ")}
   <div class="group min-w-0 flex-1" data-testid="held-forward" data-forward-id={held.forwardId}>
     {#if held.promptName !== undefined}
       <div class="text-fg text-sm font-medium" data-testid="held-forward-prompt-name">
@@ -1968,7 +1969,7 @@
        authoritative for this turn's status, mirroring the fan-out column. When
        present, suppress the turn's own status chip and the live footer so a
        cancelled-mid turn doesn't reopen with a phantom spinner (Claude
-       `streaming`) or a contradictory `failed` chip (Codex/Gemini/Antigravity). -->
+       `streaming`) or a contradictory `failed` chip (Codex/Antigravity). -->
   {@const ownedByOutcome = hasOutcomeFor(turn)}
   <!-- Compact preview applies to any terminal response with content (complete,
        failed, cancelled, or dangling streaming-on-disk closed by a marker). Only

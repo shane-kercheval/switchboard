@@ -15,7 +15,6 @@ import { HARNESS_SETUP_URL } from "./harnessDisplay";
 const BINARY_PROSE_NAME: Record<HarnessKind, string> = {
   claude_code: "Claude Code",
   codex: "Codex",
-  gemini: "Gemini CLI",
   antigravity: "Antigravity CLI (agy)",
 };
 
@@ -24,7 +23,6 @@ const BINARY_PROSE_NAME: Record<HarnessKind, string> = {
 const BINARY_COPY: Record<HarnessKind, string> = {
   claude_code: binaryMissingCopy("claude_code"),
   codex: binaryMissingCopy("codex"),
-  gemini: binaryMissingCopy("gemini"),
   antigravity: binaryMissingCopy("antigravity"),
 };
 

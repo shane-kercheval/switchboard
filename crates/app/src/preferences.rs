@@ -62,19 +62,6 @@ fn default_agent_defaults() -> BTreeMap<HarnessKind, AgentDefaults> {
             },
         ),
         (
-            HarnessKind::Gemini,
-            AgentDefaults {
-                primary: AgentProfile {
-                    model: Some("auto".to_owned()),
-                    effort: None,
-                },
-                secondary: Some(AgentProfile {
-                    model: Some("gemini-2.5-flash".to_owned()),
-                    effort: None,
-                }),
-            },
-        ),
-        (
             HarnessKind::Antigravity,
             AgentDefaults {
                 primary: AgentProfile {
@@ -102,7 +89,6 @@ where
         let harness = match key.as_str() {
             "claude_code" => HarnessKind::ClaudeCode,
             "codex" => HarnessKind::Codex,
-            "gemini" => HarnessKind::Gemini,
             "antigravity" => HarnessKind::Antigravity,
             _ => continue,
         };

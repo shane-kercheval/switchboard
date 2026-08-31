@@ -7,7 +7,7 @@
 /// preference, *not* conversation history. A draft is earlier than even a
 /// queued send, which system-design §3 already classes as live-UI-only. It
 /// therefore lives in machine-local localStorage rather than the git-tracked
-/// `.switchboard/` project state: a half-typed message must not sync to a
+/// durable project state: a half-typed message must not sync to a
 /// teammate. localStorage is also origin-scoped, so `make dev DEV_PORT=…`
 /// instances get isolated drafts for free.
 ///
@@ -231,7 +231,18 @@ function parseForwardSources(value: unknown): ForwardSource[] {
     if (item === null || typeof item !== "object") continue;
     const s = item as Record<string, unknown>;
     if (typeof s.id === "string" && typeof s.name === "string") {
-      out.push({ id: s.id as AgentId, name: s.name });
+      // `projectId` / `projectName` must survive the round-trip. Dropping them
+      // makes a cross-project source indistinguishable from a legacy local one,
+      // which the restore path then stamps with the *current* project and
+      // filters out against the local roster — the chip is silently deleted on
+      // every launch. Optional (drafts written before sources carried an owner
+      // have neither), which is exactly why they can't be inferred later.
+      out.push({
+        id: s.id as AgentId,
+        name: s.name,
+        ...(typeof s.projectId === "string" ? { projectId: s.projectId as ProjectId } : {}),
+        ...(typeof s.projectName === "string" ? { projectName: s.projectName } : {}),
+      });
     }
   }
   return out;

@@ -67,6 +67,7 @@ function setup(
   const onremove = vi.fn();
   render(WorkflowComposer, {
     props: {
+      projectId: "00000000-0000-7000-8000-0000000000ff",
       descriptor: desc,
       agents: AGENTS,
       panes,
@@ -83,15 +84,35 @@ function setup(
 // in-component mutation, which requires a reactive `$bindable` proxy — so they go
 // through a harness that owns `$state`, mirroring how `ComposeBar` drives it in
 // production (see `_WorkflowComposerForwardHarness.svelte`).
+const FOREIGN_PROJECT = "00000000-0000-7000-8000-0000000000aa";
+const FOREIGN_AGENT: AgentRecord = {
+  id: "00000000-0000-7000-8000-0000000000bb",
+  project_id: FOREIGN_PROJECT,
+  name: "oracle",
+  harness: "claude_code",
+  session_locator: null,
+  created_at: "2026-05-16T00:00:00Z",
+};
+/// Shared browsing/activation only — the *commit* is per consumer, which is the
+/// distinction that broke: one shared commit closure wrote every surface's foreign
+/// picks into the compose bar's plain-message list.
+const CROSS_PROJECT = {
+  projects: [{ id: FOREIGN_PROJECT, name: "backend", directory: "/work/backend" }],
+  loadAgents: async () => [FOREIGN_AGENT],
+  activate: async () => {},
+};
+
 function setupForward(
   desc: WorkflowFormDescriptor,
   inputs: Record<string, string | string[]> = {},
   initialForwardSources: Record<string, ForwardSource[]> = {},
   panes: TranscriptPane[] = [],
+  crossProject?: typeof CROSS_PROJECT,
 ) {
   let latest: Record<string, ForwardSource[]> = initialForwardSources;
   render(ForwardHarness, {
     props: {
+      crossProject,
       descriptor: desc,
       agents: AGENTS,
       panes,
@@ -237,6 +258,7 @@ describe("WorkflowComposer", () => {
     const onretry = vi.fn();
     render(WorkflowComposer, {
       props: {
+        projectId: "00000000-0000-7000-8000-0000000000ff",
         descriptor: descriptor([], [], {
           compatibility: {
             state: "unavailable",
@@ -268,6 +290,7 @@ describe("WorkflowComposer", () => {
     const onsignin = vi.fn();
     const { rerender } = render(WorkflowComposer, {
       props: {
+        projectId: "00000000-0000-7000-8000-0000000000ff",
         descriptor: descriptor([], [], {
           compatibility: {
             state: "unavailable",
@@ -342,6 +365,7 @@ describe("WorkflowComposer", () => {
     const onretry = vi.fn();
     render(WorkflowComposer, {
       props: {
+        projectId: "00000000-0000-7000-8000-0000000000ff",
         descriptor: descriptor([], [], {
           compatibility: {
             state: "unavailable",
@@ -373,6 +397,7 @@ describe("WorkflowComposer", () => {
     const onretry = vi.fn();
     render(WorkflowComposer, {
       props: {
+        projectId: "00000000-0000-7000-8000-0000000000ff",
         descriptor: descriptor([input({ name: "context" })], [], {
           compatibility: { state: "maintenance" } as unknown as FormCompatibility,
         }),
@@ -400,7 +425,7 @@ describe("WorkflowComposer", () => {
 
     const sourcesEl = await screen.findByTestId("workflow-forward-sources-context");
     expect(within(sourcesEl).getByTestId("forward-source-chip-primary")).toBeInTheDocument();
-    expect(sources().context).toEqual([{ id: "a1", name: "primary" }]);
+    expect(sources().context).toEqual([{ id: "a1", name: "primary", projectId: "p" }]);
 
     await fireEvent.click(screen.getByTestId("forward-source-remove-primary"));
     await waitFor(() => expect(screen.queryByTestId("forward-source-chip-primary")).toBeNull());
@@ -440,7 +465,9 @@ describe("WorkflowComposer", () => {
     await fireEvent.keyDown(window, { key: "1", metaKey: true, ctrlKey: true });
 
     // Pane "Left" expands to its single member agent — a chip per member, no pane chip.
-    await waitFor(() => expect(sources().context).toEqual([{ id: "a1", name: "primary" }]));
+    await waitFor(() =>
+      expect(sources().context).toEqual([{ id: "a1", name: "primary", projectId: "p" }]),
+    );
     const sourcesEl = screen.getByTestId("workflow-forward-sources-context");
     expect(within(sourcesEl).getByTestId("forward-source-chip-primary")).toBeInTheDocument();
   });
@@ -454,7 +481,7 @@ describe("WorkflowComposer", () => {
       descriptor([], [arg({ name: "context" })]),
       { context: "" },
       // Seed with `primary` already attached so the pane pick must dedup it.
-      { context: [{ id: "a1", name: "primary" }] },
+      { context: [{ id: "a1", name: "primary", projectId: "p" }] },
       both,
     );
 
@@ -467,8 +494,8 @@ describe("WorkflowComposer", () => {
     // Both members present, `primary` not duplicated.
     await waitFor(() =>
       expect(sources().context).toEqual([
-        { id: "a1", name: "primary" },
-        { id: "a2", name: "reviewer-1" },
+        { id: "a1", name: "primary", projectId: "p" },
+        { id: "a2", name: "reviewer-1", projectId: "p" },
       ]),
     );
 
@@ -512,7 +539,7 @@ describe("WorkflowComposer", () => {
     await fireEvent.click(screen.getByTestId("workflow-forward-picker-note"));
     await fireEvent.click(await screen.findByTestId("forward-picker-agent-a1"));
     await screen.findByTestId("forward-source-chip-primary");
-    expect(sources().note).toEqual([{ id: "a1", name: "primary" }]);
+    expect(sources().note).toEqual([{ id: "a1", name: "primary", projectId: "p" }]);
   });
 
   it("does not offer a forward picker on agent or list fields", () => {
@@ -531,7 +558,7 @@ describe("WorkflowComposer", () => {
 
   it("treats a required text field with a forward source as filled", () => {
     setup(descriptor([input({ name: "note", ty: "text" })]), { note: "" }, [], false, {
-      note: [{ id: "a1", name: "primary" }],
+      note: [{ id: "a1", name: "primary", projectId: "p" }],
     });
     expect(screen.queryByTestId("workflow-missing")).toBeNull();
   });
@@ -541,5 +568,39 @@ describe("WorkflowComposer", () => {
     expect(screen.getByTestId("workflow-resolving")).toBeInTheDocument();
     // Fields are withheld until resolution settles.
     expect(screen.queryByTestId("workflow-agent-worker-primary")).toBeNull();
+  });
+
+  it("a foreign pick lands in the workflow field, not the message list", async () => {
+    const { sources } = setupForward(
+      descriptor([], [arg({ name: "context" })]),
+      {},
+      {},
+      [],
+      CROSS_PROJECT,
+    );
+
+    await fireEvent.click(screen.getByTestId("workflow-forward-picker-context"));
+    await fireEvent.click(await screen.findByTestId("forward-picker-projects-trigger"));
+    await fireEvent.click(
+      await screen.findByTestId(`forward-picker-project-toggle-${FOREIGN_PROJECT}`),
+    );
+    await fireEvent.click(
+      await screen.findByTestId(`forward-picker-foreign-agent-${FOREIGN_AGENT.id}`),
+    );
+
+    await waitFor(() => {
+      expect(sources().context).toEqual([
+        {
+          id: FOREIGN_AGENT.id,
+          name: "oracle",
+          projectId: FOREIGN_PROJECT,
+          projectName: "backend",
+          // Its position in the foreign project's roster, captured at pick time
+          // — the only place it is knowable — so the chip can sort by that
+          // project's card order rather than by click order.
+          rosterIndex: 0,
+        },
+      ]);
+    });
   });
 });

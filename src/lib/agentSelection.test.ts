@@ -170,8 +170,8 @@ describe("defaultAgentName", () => {
     expect(defaultAgentName("codex", "gpt-5.6-luna", "low")).toBe("gpt-5-6-luna-low");
   });
 
-  it("uses just the model when the harness has no effort axis", () => {
-    expect(defaultAgentName("gemini", "gemini-2.5-pro", undefined)).toBe("gemini-2-5-pro");
+  it("uses just the model when effort is absent", () => {
+    expect(defaultAgentName("claude_code", "opus", undefined)).toBe("opus");
   });
 
   it("uses the short harness name when a secondary profile is configured", () => {
@@ -191,10 +191,9 @@ describe("defaultAgentName", () => {
     ).toBe("codex");
   });
 
-  it("falls back to the bare harness name when the model is auto or absent", () => {
-    // Gemini left on `auto` (picks up the last-used model) and Antigravity
-    // (model is harness-owned) have no concrete model to name after.
-    expect(defaultAgentName("gemini", "auto", undefined)).toBe("gemini");
+  it("falls back to the bare harness name when the model is absent", () => {
+    // An agent created without a concrete model has nothing to name itself
+    // after, so it takes the harness's bare name.
     expect(defaultAgentName("antigravity", undefined, undefined)).toBe("antigravity");
     // The "keep current" sentinel (attach mode) reads as no model.
     expect(defaultAgentName("claude_code", "", "")).toBe("claude-code");

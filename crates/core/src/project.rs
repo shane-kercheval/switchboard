@@ -11,13 +11,12 @@ use crate::agent::{
 };
 use crate::error::{CoreError, Result};
 use crate::harness::{HarnessKind, SelectionAxis};
+use crate::ids::{DirectoryId, ProjectId};
 use crate::io::{append_jsonl, read_jsonl, read_yaml, write_jsonl, write_yaml};
 use crate::name::{canonicalize_for_uniqueness, validate_name};
 use crate::paths::{
     ATTACHMENTS_DIR, CONFIG_FILE, JOURNAL_FILE, PINS_FILE, REGISTRY_FILE, RUNS_DIR,
 };
-
-pub type ProjectId = Uuid;
 
 /// `pub(crate)` so `Directory::rename_project` can stamp the current version
 /// when rewriting `config.yaml` without a redundant read-back.
@@ -35,14 +34,56 @@ pub struct ProjectSummary {
     pub created_at: DateTime<Utc>,
 }
 
-/// On-disk shape of `<directory>/.switchboard/projects/<id>/config.yaml`. This
-/// is the canonical source of truth for a project's identity; the matching
-/// entry in `projects.jsonl` is denormalized for fast listing.
+/// On-disk shape of a project's `config.yaml`.
+///
+/// **Authority is per field, not per file.** Stating it once for the whole
+/// struct is what produced a field documented by analogy to a neighbour whose
+/// contract ran the other way, so each field below says which copy wins and
+/// why. Note the id is *not* among them: it is the enclosing directory's name
+/// (`projects/<id>/`), never written into this file.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProjectConfig {
     pub version: u32,
+    /// **Config is canonical; the index copy is what renders.** Not a
+    /// contradiction — they answer different questions. `rename_project` writes
+    /// this file first and the index second as the commit, so after a partial
+    /// failure this is ahead and the index is behind; correctness and recovery
+    /// take this one, while anything the user reads (the project list, a
+    /// collision error naming another project) quotes the index, because that is
+    /// what they are looking at. Quoting this file in a user-facing string would
+    /// name a project by a name nothing on screen shows.
     pub name: String,
+    /// Same contract as `name`: canonical here, denormalized into the index
+    /// entry, and never independently mutated — only `create_on_disk` writes it,
+    /// and `rename_project` carries the index entry's value back unchanged.
     pub created_at: DateTime<Utc>,
+    /// The working directory this project belongs to — **a recovery record,
+    /// never read at runtime.**
+    ///
+    /// **`projects.jsonl` is authoritative; this copy is never read at
+    /// runtime.** Deliberately stated on its own rather than by analogy to
+    /// `name`, whose contract runs the other way. Nothing resolves a dispatch
+    /// cwd from here: [`load`] must not populate [`Project::directory`] from it,
+    /// because doing so would bypass the catalog — the only place that can
+    /// detect a duplicated or missing directory id — in favour of a copy with no
+    /// such checks.
+    ///
+    /// It exists so the project tree is self-describing. Without it, losing
+    /// `projects.jsonl` and `directories.jsonl` together leaves every project's
+    /// data intact with no record of which directory any of it belongs to. With
+    /// it, a repair tool can rebuild the index and see which projects share a
+    /// directory identity. It does **not** recover the catalog's
+    /// `directory_id -> path` mapping, which still needs migration records or
+    /// the user re-pointing each id.
+    ///
+    /// `None` means the project predates the user-global store (the legacy
+    /// `<directory>/.switchboard/` layout, whose owning directory was implied by
+    /// the path). Every project created in or migrated into the store carries
+    /// `Some`. **Any future writer that can change a project's owning directory
+    /// must update this alongside the index** — today the only writers are
+    /// creation and rename, and both stamp it from the index entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directory_id: Option<DirectoryId>,
 }
 
 /// The per-caller inputs to [`Project::register_agent_inner`].
@@ -96,10 +137,19 @@ impl Project {
     }
 
     /// Directory holding this project's staged attachment files
-    /// (`projects/<id>/attachments/`). Sited inside the per-project metadata dir
-    /// so a staged file resolves under every harness's sandbox (the dir is under
-    /// the user's working tree). Runtime data; `.gitignore`d like the rest of
-    /// `projects/`. Created lazily on first stage; absent until then.
+    /// (`projects/<id>/attachments/`), and the current staging target.
+    ///
+    /// Attachments are handed to agents as absolute paths in the prompt footer
+    /// (see [`crate::render_prompt_with_attachments`]), which is what every
+    /// harness can read regardless of sandbox — the location itself carries no
+    /// requirement.
+    ///
+    /// **Per-project, and staying that way.** A store-wide `attachments/` was
+    /// designed and reversed: it would have turned project delete from a plain
+    /// directory removal into an all-projects reference sweep, moving a GC bug's
+    /// blast radius from one project to every project. Keeping them here means
+    /// delete reclaims them by removing the project root. Do not reintroduce a
+    /// store-level equivalent.
     pub fn attachments_dir(&self) -> PathBuf {
         self.root.join(ATTACHMENTS_DIR)
     }
@@ -144,12 +194,13 @@ impl Project {
     /// undo here (unlike `Directory::create_project`), so no rollback applies.
     ///
     /// `model` / `effort` are the user-selected per-agent settings (`None` =
-    /// harness default). A selection on a harness that can't apply it (a model
-    /// on Antigravity, an effort on Gemini/Antigravity) is rejected at the
-    /// persistence boundary — see `register_agent_inner`. This generic
-    /// create path can't constrain that in its signature the way the attach
-    /// variants do (Gemini takes no effort, Antigravity takes neither), so it
-    /// relies on that shared chokepoint. The commands layer also validates
+    /// harness default). Every supported harness drives both axes today, so the
+    /// capability gates in `register_agent_inner` reject nothing at present; they
+    /// remain as the forcing function for a harness that lacks an axis (see the
+    /// note at those gates). Antigravity does constrain the *pair* — an effort
+    /// with no model is rejected, since its valid levels are per-model.
+    /// This generic create path can't express that in its signature the way the
+    /// attach variants do, so it relies on that shared chokepoint. The commands layer also validates
     /// first to return a friendlier error, but `core` is the backstop that
     /// keeps an inapplicable selection out of the registry regardless of
     /// caller.
@@ -178,12 +229,6 @@ impl Project {
         // session locator at registration vs. learn it at runtime):
         // - Claude Code pre-generates a UUID v7 locator; passed via
         //   `--session-id`/`--resume`.
-        // - Gemini pre-generates a UUID **v4** locator. Gemini's session
-        //   filename embeds the first 8 hex chars of the session ID, and
-        //   UUID v7s minted in the same millisecond share their first 8
-        //   chars — concurrent Gemini dispatches in one cwd would interleave
-        //   on disk. v4's first 8 chars are random across 32 bits, so the
-        //   collision probability is ~1/2^32. Localized to Gemini.
         // - Codex and Antigravity leave it `None`: their session id is
         //   assigned by the harness at runtime (Codex's `thread_id` from
         //   `thread.started`; Antigravity's server-assigned conversation
@@ -192,7 +237,6 @@ impl Project {
         //   `session_locator` via `set_session_locator`.
         let session_locator = match harness {
             HarnessKind::ClaudeCode => Some(SessionLocator::Uuid(Uuid::now_v7())),
-            HarnessKind::Gemini => Some(SessionLocator::Uuid(Uuid::new_v4())),
             HarnessKind::Codex | HarnessKind::Antigravity => None,
         };
         self.register_agent_inner(NewAgent {
@@ -334,35 +378,8 @@ impl Project {
         })
     }
 
-    /// Register an attached **Gemini** agent — one that wraps an
-    /// already-existing Gemini session. Mirrors the Claude pattern
-    /// (caller-controlled session UUID), not the Codex sidecar pattern.
-    /// The provided `session_id` is the UUID embedded in the Gemini
-    /// session-file filename's id8 prefix; the commands layer validates
-    /// the file exists (and is unambiguous) before calling this method.
-    ///
-    /// Takes `model` but no `effort`: Gemini supports model selection but not
-    /// effort selection (`supports_effort_selection` is `false`), so the
-    /// capability invariant is encoded in the signature rather than asserted.
-    pub fn register_attached_gemini_agent(
-        &self,
-        name: &str,
-        session_id: Uuid,
-        model: Option<String>,
-    ) -> Result<AgentRecord> {
-        self.register_agent_inner(NewAgent {
-            name,
-            harness: HarnessKind::Gemini,
-            session_locator: Some(SessionLocator::Uuid(session_id)),
-            model,
-            effort: None,
-            profiles: AgentProfiles::default(),
-            forked_from_session: None,
-        })
-    }
-
     /// Register an attached **Antigravity** agent — one that wraps an existing
-    /// server-assigned conversation. Now mirrors the Claude/Gemini
+    /// server-assigned conversation. Now mirrors the Claude
     /// caller-controlled-UUID pattern: the conversation UUID is the agent's
     /// session locator and is written straight onto the record, so there is no
     /// sidecar and no pre-generated-id ordering dance. The commands layer
@@ -422,7 +439,7 @@ impl Project {
         validate_name(name)?;
         // Normalize **before** the capability check: a blank selection means
         // "unset," which is allowed on any harness — it must not trip the
-        // capability error (e.g. a whitespace effort on Gemini is "no effort,"
+        // capability error (e.g. a whitespace effort is "no effort,"
         // not an unsupported effort).
         let model = normalize_selection(model);
         let effort = normalize_selection(effort);
@@ -431,6 +448,15 @@ impl Project {
             secondary.model = normalize_selection(secondary.model.take());
             secondary.effort = normalize_selection(secondary.effort.take());
         }
+        // These four capability gates are currently unreachable: every supported
+        // harness drives both axes, so neither `supports_*_selection` returns
+        // false for any variant. They are retained deliberately, not left as dead
+        // code — they are the forcing function that makes the next harness's
+        // capabilities a decision rather than an accident, and the axes really are
+        // independent (a harness with model control but no effort control existed
+        // here until Gemini was removed). The tests that exercised the `Err` paths
+        // went with that harness; there is no way to fabricate an unsupporting
+        // variant, so the paths stay covered by construction rather than by test.
         if model.is_some() && !harness.supports_model_selection() {
             return Err(CoreError::SelectionUnsupported {
                 harness,
@@ -508,21 +534,7 @@ impl Project {
     /// yielding a partially-trustworthy roster — matching how a corrupt JSONL
     /// line is already treated.
     pub fn list_agents(&self) -> Result<Vec<AgentRecord>> {
-        let agents: Vec<AgentRecord> = read_jsonl(&self.registry_path)?;
-        for agent in &agents {
-            agent.validate()?;
-            if agent.project_id != self.id {
-                return Err(CoreError::AgentProjectMismatch {
-                    registry: self.registry_path.clone(),
-                    agent_id: agent.id,
-                    claimed: agent.project_id,
-                    actual: self.id,
-                });
-            }
-        }
-        reject_duplicate_identities(&agents, &self.registry_path)?;
-        reject_fork_provenance_cycles(&agents)?;
-        Ok(agents)
+        read_registry(&self.registry_path, self.id)
     }
 
     /// Remove an agent from the registry by id, rewriting `registry.jsonl`
@@ -804,6 +816,51 @@ pub(crate) fn load(directory: &Path, id: ProjectId, root: PathBuf) -> Result<Pro
     })
 }
 
+/// Read and validate a project's agent registry from its path alone.
+///
+/// **Deliberately independent of the working directory.** `registry.jsonl`
+/// lives under the store root, keyed by project id, so a project whose catalog
+/// entry is missing or ambiguous still has a readable roster. That is what lets
+/// the session-uniqueness scans stay whole when one catalog row is damaged:
+/// they need the registry and a display name, never a cwd. Routing them through
+/// a `Project` would manufacture a dependency on resolution that the read does
+/// not have.
+///
+/// **A missing `registry.jsonl` is corruption, not an empty roster.**
+/// `create_on_disk` creates it with `create_new`, so every project that exists
+/// has one; `read_jsonl` would otherwise map its absence to `Ok(vec![])` and the
+/// session-id uniqueness scans — the whole reason this read is catalog-free —
+/// would silently pass over a project whose agents they could not see. Same
+/// posture the store already takes on `projects.jsonl` and `directories.jsonl`.
+///
+/// Shared with [`Project::list_agents`] so both paths apply the same
+/// cross-field validation rather than one of them growing a laxer copy.
+pub(crate) fn read_registry(
+    registry_path: &Path,
+    project_id: ProjectId,
+) -> Result<Vec<AgentRecord>> {
+    if !registry_path.exists() {
+        return Err(CoreError::MissingAppendOnlyFile {
+            path: registry_path.to_path_buf(),
+        });
+    }
+    let agents: Vec<AgentRecord> = read_jsonl(registry_path)?;
+    for agent in &agents {
+        agent.validate()?;
+        if agent.project_id != project_id {
+            return Err(CoreError::AgentProjectMismatch {
+                registry: registry_path.to_path_buf(),
+                agent_id: agent.id,
+                claimed: agent.project_id,
+                actual: project_id,
+            });
+        }
+    }
+    reject_duplicate_identities(&agents, registry_path)?;
+    reject_fork_provenance_cycles(&agents)?;
+    Ok(agents)
+}
+
 /// Reject a registry containing two records that share an identity.
 ///
 /// Runs **before** the provenance walk, which builds a session-keyed map: with
@@ -883,10 +940,15 @@ fn reject_fork_provenance_cycles(agents: &[AgentRecord]) -> Result<()> {
 }
 
 /// Create a new project's on-disk artifacts (config.yaml + empty registry.jsonl).
-/// The caller (`Directory`) is responsible for appending the `ProjectSummary` to
-/// projects.jsonl — and for rolling back the directory if that append fails.
+/// The caller is responsible for appending the index entry — and, under the
+/// legacy `Directory` layout, for rolling back the directory if that append
+/// fails.
+///
+/// `directory_id` is `None` only for the legacy layout, where the owning
+/// directory was implied by the path; see [`ProjectConfig::directory_id`].
 pub(crate) fn create_on_disk(
     directory: &Path,
+    directory_id: Option<DirectoryId>,
     projects_dir: &Path,
     name: &str,
 ) -> Result<(ProjectSummary, Project)> {
@@ -899,6 +961,7 @@ pub(crate) fn create_on_disk(
         version: PROJECT_CONFIG_VERSION,
         name: name.to_owned(),
         created_at,
+        directory_id,
     };
     write_yaml(&root.join(CONFIG_FILE), &config)?;
 
@@ -942,7 +1005,7 @@ mod tests {
         let projects_dir = tmp.path().join("projects");
         create_dir_all(&projects_dir).unwrap();
         let (_summary, project) =
-            create_on_disk(tmp.path(), &projects_dir, "test-project").unwrap();
+            create_on_disk(tmp.path(), None, &projects_dir, "test-project").unwrap();
         (tmp, project)
     }
 
@@ -958,30 +1021,6 @@ mod tests {
 
         let listed = project.list_agents().unwrap();
         assert_eq!(listed, vec![record]);
-    }
-
-    #[test]
-    fn register_gemini_agent_mints_uuid_v4_session_id() {
-        // Load-bearing: v7 caused the on-disk session-file interleave
-        // hazard against Gemini's 8-char-prefix filename. If a future
-        // refactor accidentally swaps this back to `Uuid::now_v7()`,
-        // concurrent dispatches in one cwd corrupt transcripts.
-        let (_tmp, project) = fresh_project();
-        let record = project
-            .register_agent("g", HarnessKind::Gemini, None, None)
-            .unwrap();
-        let SessionLocator::Uuid(session_id) = record
-            .session_locator
-            .expect("Gemini pre-generates a UUID locator")
-        else {
-            panic!("Gemini locator must be the Uuid variant");
-        };
-        assert_eq!(
-            session_id.get_version_num(),
-            4,
-            "Gemini session_id must be UUID v4, got: {session_id} (version {})",
-            session_id.get_version_num()
-        );
     }
 
     #[test]
@@ -1204,17 +1243,17 @@ mod tests {
     #[test]
     fn fork_agent_rejects_a_harness_that_cannot_branch() {
         let (_tmp, project) = fresh_project();
-        // Gemini pre-generates a locator, so this fails on the capability gate
-        // rather than on a missing session — the distinction the two error
+        // Antigravity pre-generates a locator, so this fails on the capability
+        // gate rather than on a missing session — the distinction the two error
         // variants exist to preserve.
         let source = project
-            .register_agent("g", HarnessKind::Gemini, None, None)
+            .register_agent("g", HarnessKind::Antigravity, None, None)
             .unwrap();
 
         let err = project.fork_agent(source.id).unwrap_err();
 
         assert!(
-            matches!(err, CoreError::SessionForkUnsupported { harness } if harness == HarnessKind::Gemini),
+            matches!(err, CoreError::SessionForkUnsupported { harness } if harness == HarnessKind::Antigravity),
             "got: {err:?}"
         );
         assert_eq!(project.list_agents().unwrap().len(), 1, "no record written");
@@ -1498,7 +1537,7 @@ mod tests {
             .register_agent("beta", HarnessKind::Codex, None, None)
             .unwrap();
         let c = project
-            .register_agent("gamma", HarnessKind::Gemini, None, None)
+            .register_agent("gamma", HarnessKind::Antigravity, None, None)
             .unwrap();
         assert!(b.session_locator.is_none());
 
@@ -1532,7 +1571,7 @@ mod tests {
             .register_agent("beta", HarnessKind::Codex, None, None)
             .unwrap();
         let c = project
-            .register_agent("gamma", HarnessKind::Gemini, None, None)
+            .register_agent("gamma", HarnessKind::Antigravity, None, None)
             .unwrap();
 
         let reordered = project.reorder_agents(&[c.id, a.id, b.id]).unwrap();
@@ -1803,22 +1842,6 @@ mod tests {
     }
 
     #[test]
-    fn register_attached_gemini_persists_model_with_no_effort() {
-        // Gemini supports model but not effort; the signature structurally
-        // forbids an effort, so the stored record always has `effort: None`.
-        let (_tmp, project) = fresh_project();
-        let record = project
-            .register_attached_gemini_agent(
-                "attached",
-                Uuid::now_v7(),
-                Some("gemini-2.5-pro".to_owned()),
-            )
-            .unwrap();
-        assert_eq!(record.model.as_deref(), Some("gemini-2.5-pro"));
-        assert_eq!(record.effort, None);
-    }
-
-    #[test]
     fn register_attached_antigravity_carries_no_model_or_effort() {
         // Antigravity supports neither axis; both are structurally None.
         let (_tmp, project) = fresh_project();
@@ -1969,50 +1992,6 @@ mod tests {
     }
 
     #[test]
-    fn register_agent_rejects_model_on_unsupporting_harness() {
-        // The generic create path is harness-agnostic, so the capability
-        // invariant is enforced at the persistence boundary (the single
-        // chokepoint), not just at the app layer. Gemini has no effort axis, so
-        // an effort never reaches the registry for one. (Antigravity used to be
-        // the model example here; `agy` 1.1.x made `--model` usable, so it now
-        // supports both axes.)
-        let (_tmp, project) = fresh_project();
-        let err = project
-            .register_agent(
-                "a",
-                HarnessKind::Gemini,
-                Some("gemini-3-pro-preview".to_owned()),
-                Some("high".to_owned()),
-            )
-            .unwrap_err();
-        assert!(matches!(
-            err,
-            CoreError::SelectionUnsupported {
-                harness: HarnessKind::Gemini,
-                axis: SelectionAxis::Effort
-            }
-        ));
-        // Rejected *before* the append — no orphan record.
-        assert!(project.list_agents().unwrap().is_empty());
-    }
-
-    #[test]
-    fn register_agent_rejects_effort_on_unsupporting_harness() {
-        let (_tmp, project) = fresh_project();
-        let err = project
-            .register_agent("g", HarnessKind::Gemini, None, Some("high".to_owned()))
-            .unwrap_err();
-        assert!(matches!(
-            err,
-            CoreError::SelectionUnsupported {
-                harness: HarnessKind::Gemini,
-                axis: SelectionAxis::Effort
-            }
-        ));
-        assert!(project.list_agents().unwrap().is_empty());
-    }
-
-    #[test]
     fn core_normalizes_blank_selection_regardless_of_caller() {
         // The persistence boundary, not just the IPC layer, drops a blank
         // selection — so a direct-core caller can't persist a dispatch-breaking
@@ -2042,25 +2021,6 @@ mod tests {
         let reloaded = &project.list_agents().unwrap()[0];
         assert_eq!(reloaded.model, None);
         assert_eq!(reloaded.effort, None);
-    }
-
-    #[test]
-    fn blank_selection_on_unsupporting_harness_is_unset_not_an_error() {
-        // Normalize-before-capability-check: a blank value means "clear the
-        // field," which is allowed on any harness. It must NOT surface as
-        // `SelectionUnsupported` just because the harness lacks that axis —
-        // clearing an effort on Gemini is "no effort," not "illegal effort."
-        let (_tmp, project) = fresh_project();
-        let updated = project
-            .register_agent("g", HarnessKind::Gemini, None, Some("   ".to_owned()))
-            .expect("blank effort on Gemini is a no-op clear, not an error");
-        assert_eq!(updated.effort, None);
-
-        // Same at registration: a blank effort on Gemini registers fine.
-        let agent = project
-            .register_agent("g2", HarnessKind::Gemini, None, Some("  ".to_owned()))
-            .expect("blank effort at registration is unset, not unsupported");
-        assert_eq!(agent.effort, None);
     }
 
     #[test]

@@ -11,6 +11,7 @@ import type {
   AgentProfile,
   AgentProfileSlot,
   AgentRecord,
+  ForwardSourceRef,
   Attachment,
   BranchComparison,
   BranchKind,
@@ -83,11 +84,6 @@ function activationFailure(error: unknown): ActivationFailureError {
 /// carries the version.
 export async function checkCodexAuth(): Promise<void> {
   await invoke<null>("check_codex_auth");
-}
-
-/// See `checkCodexAuth` — same retention rationale.
-export async function checkGeminiAuth(): Promise<void> {
-  await invoke<null>("check_gemini_auth");
 }
 
 /// See `checkCodexAuth` — same retention rationale.
@@ -353,7 +349,7 @@ export async function renameProject(
 
 /// Permanently delete one project's Switchboard state: drains its agents and
 /// removes its index entry, then best-effort removes
-/// `<directory>/.switchboard/projects/<id>/`. The working directory and each
+/// `<store>/projects/<id>/`. The working directory and each
 /// agent's own harness session files are kept. "Already gone" is benign
 /// success; failures that prevent removing the project from the listing reject.
 export async function deleteProject(projectId: ProjectId): Promise<void> {
@@ -392,12 +388,6 @@ export async function migrateMessagePin(
   toKey: string,
 ): Promise<MessagePin[]> {
   return await invoke<MessagePin[]>("migrate_message_pin", { projectId, fromKey, toKey });
-}
-
-// Removes a directory from the workspace: drains its projects' in-flight turns,
-// releases their locks, and drops the entry — leaving `.switchboard/` on disk.
-export async function removeDirectory(path: string): Promise<void> {
-  await invoke<null>("remove_directory", { path });
 }
 
 // The merged post-restart conversation for a project (journal user-messages +
@@ -524,6 +514,42 @@ export async function reorderAgents(
   return await invoke<AgentRecord[]>("reorder_agents", { projectId, agentIds });
 }
 
+/// Repair a project whose working directory moved, was deleted, or ended up
+/// claimed by two catalog rows.
+///
+/// **Moves every project that shares that directory, not just this one.** The
+/// repair is on the directory identity — one folder holds them all — so the
+/// caller must tell the user that before confirming.
+///
+/// Rejects a project with no catalog row at all: there is no identity to
+/// re-point, and minting one would be inventing rather than repairing. That
+/// case belongs to the migration tool.
+export async function repointProjectDirectory(
+  projectId: ProjectId,
+  newPath: string,
+): Promise<void> {
+  await invoke<void>("repoint_project_directory", { projectId, newPath });
+}
+
+/// List another project's agents **without loading or locking it** — the read
+/// side of the display/activation split. Pickers browse with this; picking calls
+/// the ordinary open path. Browsing must not take a project's `instance.lock`
+/// (which would outlive the menu and block other Switchboard instances), and a
+/// hover is no place to surface a lock conflict.
+/// No directory argument: the registry resolves from the project id alone
+/// (`<store-root>/projects/<id>/registry.jsonl`), so passing one would invite a
+/// caller to think the directory is authoritative for this read.
+export async function listProjectAgentsReadonly(projectId: ProjectId): Promise<AgentRecord[]> {
+  try {
+    return await invoke<AgentRecord[]>("list_project_agents_readonly", { projectId });
+  } catch (error) {
+    // The command returns the structured `ActivationCommandError`; Tauri rejects
+    // it as a plain object, so without this the picker's row would render
+    // `[object Object]` instead of the reason the project couldn't be read.
+    throw activationFailure(error);
+  }
+}
+
 export async function listAgents(projectId?: ProjectId): Promise<AgentRecord[]> {
   try {
     return await invoke<AgentRecord[]>("list_agents", { projectId });
@@ -567,7 +593,7 @@ export async function stageAttachment(
 
 // Narrow staged paths to those that still exist under this project's attachments
 // dir. A restored draft prunes its chips through this, so a chip whose file was
-// removed out-of-band (a cleaned `.switchboard/`) doesn't dangle in the composer.
+// removed out-of-band (a manual delete, an interrupted GC) doesn't dangle in the composer.
 export async function existingAttachmentPaths(
   projectId: ProjectId,
   paths: string[],
@@ -592,18 +618,19 @@ export async function cancelSend(sendId: SendId, recipients: AgentId[]): Promise
 // later `cancelForward` with this in-flight hold.
 export async function forwardMessage(
   body: string,
-  sources: AgentId[],
+  sources: ForwardSourceRef[],
   forwardId: string,
+  projectId: ProjectId,
 ): Promise<ForwardOutcome> {
-  return await invoke<ForwardOutcome>("forward_message", { body, sources, forwardId });
+  return await invoke<ForwardOutcome>("forward_message", { body, sources, forwardId, projectId });
 }
 
 // One prompt argument being forwarded into: its name, the (pane-expanded) source
-// agent ids, and whether the argument is required (the backend fails the forward
+// refs (agent + owning project), and whether the argument is required (the backend fails the forward
 // if a required arg resolves fully empty).
 export interface ForwardArg {
   name: string;
-  sources: AgentId[];
+  sources: ForwardSourceRef[];
   required: boolean;
 }
 
@@ -620,8 +647,9 @@ export async function forwardPrompt(
   typedArgs: Record<string, string>,
   forwardArgs: ForwardArg[],
   appendedText: string,
-  appendedSources: AgentId[],
+  appendedSources: ForwardSourceRef[],
   forwardId: string,
+  projectId: ProjectId,
 ): Promise<ForwardOutcome> {
   return await invoke<ForwardOutcome>("forward_prompt", {
     provider,
@@ -631,6 +659,7 @@ export async function forwardPrompt(
     appendedText,
     appendedSources,
     forwardId,
+    projectId,
   });
 }
 
@@ -844,7 +873,7 @@ export async function validateWorkflowInvocation(
   name: string,
   isBuiltin: boolean,
   inputs: Record<string, WorkflowInputValue>,
-  forwardSources: Record<string, AgentId[]>,
+  forwardSources: Record<string, ForwardSourceRef[]>,
 ): Promise<void> {
   await invoke("validate_workflow_invocation", {
     projectId,
@@ -856,14 +885,14 @@ export async function validateWorkflowInvocation(
 }
 
 /// Validate + launch a workflow run on a background task; returns its run id.
-/// `forwardSources` maps a fillable field name → the (pane-expanded) agent ids
+/// `forwardSources` maps a fillable field name → the (pane-expanded) source refs
 /// whose completed output the backend composes into that field. Empty map = none.
 export async function invokeWorkflow(
   projectId: ProjectId,
   name: string,
   isBuiltin: boolean,
   inputs: Record<string, WorkflowInputValue>,
-  forwardSources: Record<string, AgentId[]>,
+  forwardSources: Record<string, ForwardSourceRef[]>,
 ): Promise<string> {
   return await invoke<string>("invoke_workflow", {
     projectId,

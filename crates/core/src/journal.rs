@@ -264,7 +264,8 @@ mod tests {
             attachments: vec![Attachment {
                 label: "image-1".to_owned(),
                 kind: AttachmentKind::Image,
-                path: "/p/.switchboard/projects/x/attachments/u__diagram.png".to_owned(),
+                path: "/store/attachments/u__diagram.png".to_owned(),
+                dispatched_path: None,
                 original_name: "diagram.png".to_owned(),
             }],
             at: Utc::now(),

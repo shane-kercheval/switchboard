@@ -138,13 +138,13 @@ describe("SettingsView", () => {
     expect(screen.getByTestId("settings-profile-codex-secondary-model")).toBeInTheDocument();
   });
 
-  it("lists Antigravity ahead of Gemini in Agent Defaults", () => {
+  it("lists every harness in Agent Defaults", () => {
     render(SettingsView, { props: { onClose: vi.fn() } });
     const section = screen.getByTestId("agent-defaults-settings");
     const labels = Array.from(section.querySelectorAll("summary")).map((el) =>
       el.textContent?.trim(),
     );
-    expect(labels).toEqual(["Claude", "Codex", "Antigravity", "Gemini"]);
+    expect(labels).toEqual(["Claude", "Codex", "Antigravity"]);
   });
 
   it("shows Pro high and Flash high as the Antigravity defaults", async () => {
@@ -172,7 +172,7 @@ describe("SettingsView", () => {
   it("enables the secondary default for every harness", () => {
     render(SettingsView, { props: { onClose: vi.fn() } });
 
-    for (const harness of ["claude_code", "codex", "gemini", "antigravity"]) {
+    for (const harness of ["claude_code", "codex", "antigravity"]) {
       expect(screen.getByTestId(`settings-profile-${harness}-secondary-toggle`)).toHaveAttribute(
         "aria-checked",
         "true",

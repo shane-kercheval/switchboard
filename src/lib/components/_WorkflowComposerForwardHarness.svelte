@@ -19,7 +19,9 @@
     initialInputs = {},
     initialForwardSources = {},
     onForwardSources,
+    crossProject,
   }: {
+    crossProject?: import("$lib/components/ui/ForwardSourcePicker.svelte").CrossProjectBase;
     descriptor: WorkflowFormDescriptor;
     agents: AgentRecord[];
     panes?: TranscriptPane[];
@@ -43,6 +45,8 @@
 </script>
 
 <WorkflowComposer
+  projectId="00000000-0000-7000-8000-0000000000ff"
+  crossProjectBase={crossProject}
   {descriptor}
   {agents}
   {panes}

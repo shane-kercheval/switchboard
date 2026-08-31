@@ -55,7 +55,7 @@ IDE-native multi-agent workspace, shipped as part of the Cursor 3 release. Built
 
 **What it does not do:** No cross-agent message routing, no fan-in aggregation, no YAML workflow files, no `pause_for_user` primitive, no sequential handoff automation, no cross-harness prompt library. Each agent operates independently; the user is still the message bus for any coordinated multi-agent operation.
 
-**Form factor difference:** Cursor is an IDE for developers writing code in Cursor. Switchboard is a harness-agnostic orchestration layer over CLI tools (`claude -p`, `codex exec`, `gemini -p`) that works regardless of editor. A Cursor user running agents inside their IDE and a Switchboard user running multiple CLI agents in parallel are in overlapping but distinct workflows.
+**Form factor difference:** Cursor is an IDE for developers writing code in Cursor. Switchboard is a harness-agnostic orchestration layer over CLI tools (`claude -p`, `codex exec`, `agy`) that works regardless of editor. A Cursor user running agents inside their IDE and a Switchboard user running multiple CLI agents in parallel are in overlapping but distinct workflows.
 
 ### [Nimbalyst](https://nimbalyst.com/)
 

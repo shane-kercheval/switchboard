@@ -67,12 +67,20 @@ pub struct ProjectDispatchFactoryProvider {
 impl ProjectDispatchFactoryProvider {
     /// Build a factory for every supported-harness agent in `roster` (the run's
     /// project roster, a superset of the agents the run actually targets).
+    ///
+    /// `generation` must be the lifecycle generation as of the moment `project`
+    /// was read — passed in rather than sampled here, so every factory carries
+    /// the era its `project` snapshot belongs to. These factories outlive the
+    /// invocation and drive every step of the run, so a generation resampled
+    /// here would let each of them compare a stale project against a fresh
+    /// counter for the whole run's duration.
     #[must_use]
     pub fn new(
         state: &AppState,
         project: &Project,
         roster: &[AgentRecord],
         home_dir: &Path,
+        generation: u64,
     ) -> Self {
         let mut factories: HashMap<AgentId, Arc<dyn DispatchContextFactory>> = HashMap::new();
         for agent in roster {
@@ -95,6 +103,9 @@ impl ProjectDispatchFactoryProvider {
                     registry_write: Arc::clone(&state.registry_write),
                     dispatcher: Arc::downgrade(&state.dispatcher),
                     home_dir: home_dir.to_path_buf(),
+                    lock_root: state.lock_root.clone(),
+                    project_generation: Arc::clone(&state.project_generation),
+                    generation_at_capture: generation,
                 },
             );
             factories.insert(
@@ -461,6 +472,33 @@ fn roster_for_project(state: &AppState, project_id: ProjectId) -> Vec<AgentRecor
         .filter(|r| r.project_id == project_id)
         .cloned()
         .collect()
+}
+
+/// A run's project, lifecycle generation, and roster, taken at one instant.
+///
+/// **One acquisition, three values, for the same reason as
+/// [`crate::commands::capture_dispatch_snapshot`]** — and with one addition the
+/// manual send path does not need: every roster record here is frozen into a
+/// `ProjectDispatchContextFactory` that drives the *whole run*, so a roster read
+/// after a lifecycle bump builds factories from records the eviction already
+/// dropped, each pairing a stale project with a fresh counter that then validates
+/// itself. Returning all three together means a caller holding one has nothing to
+/// reach for.
+///
+/// Nothing on this path already holds `registry_write`, so taking it here is
+/// safe; `begin_maintenance` holds the same lock across its evict-and-bump, which
+/// is what makes the exclusion real.
+fn capture_run_snapshot(
+    state: &AppState,
+    project_id: ProjectId,
+) -> Result<(Project, u64, Vec<AgentRecord>), AppError> {
+    let _write = lock(&state.registry_write);
+    let project = lock(&state.projects)
+        .get(&project_id)
+        .cloned()
+        .ok_or(AppError::ProjectNotLoaded(project_id))?;
+    let generation = crate::commands::project_generation(state, project_id);
+    Ok((project, generation, roster_for_project(state, project_id)))
 }
 
 /// The user-global workflows directory, or a clear error if no config dir was
@@ -1157,6 +1195,26 @@ pub fn validate_workflow_invocation_impl(
 
 // --- invoke ------------------------------------------------------------------
 
+/// Register a live run before its task is spawned, so cancel/list see it
+/// immediately.
+///
+/// Enforces one run per project **atomically** under the registry lock: the
+/// existing-run check and the insert happen under one acquisition, so two
+/// concurrent invokes cannot both pass.
+fn register_live_run(
+    state: &AppState,
+    project_id: ProjectId,
+    run_id: uuid::Uuid,
+    run: ActiveRun,
+) -> Result<(), AppError> {
+    let mut runs = lock(&state.workflow_runs);
+    if runs.values().any(|r| r.project_id == project_id) {
+        return Err(AppError::WorkflowAlreadyRunning { project_id });
+    }
+    runs.insert(run_id, run);
+    Ok(())
+}
+
 /// Validate, bind, snapshot, and launch a workflow run on a background task,
 /// returning its `run_id` immediately. The interpreter dispatches every step
 /// backend-side; there is no per-step frontend round-trip.
@@ -1173,11 +1231,7 @@ pub fn invoke_workflow_impl(
         return Err(AppError::WorkflowStepUnsupported);
     }
 
-    let project = lock(&state.projects)
-        .get(&project_id)
-        .cloned()
-        .ok_or(AppError::ProjectNotLoaded(project_id))?;
-    let roster = roster_for_project(state, project_id);
+    let (project, generation, roster) = capture_run_snapshot(state, project_id)?;
     let names: Vec<String> = roster.iter().map(|r| r.name.clone()).collect();
 
     // Partition the flat payload: declared inputs go through `validate_invocation`
@@ -1210,7 +1264,7 @@ pub fn invoke_workflow_impl(
         .collect();
 
     let provider = Arc::new(ProjectDispatchFactoryProvider::new(
-        state, &project, &roster, home_dir,
+        state, &project, &roster, home_dir, generation,
     ));
 
     let run_id = Uuid::now_v7();
@@ -1239,30 +1293,25 @@ pub fn invoke_workflow_impl(
         return Err(AppError::WorkflowRunRequiresDismissal { project_id });
     }
 
-    // Register the live run before spawning so cancel/list see it immediately.
-    // Enforce one run per project **atomically** under the registry lock: check for
-    // an existing active run for this project and insert under the same acquisition,
-    // so two concurrent invokes can't both pass. The task is spawned only after.
-    {
-        let mut runs = lock(&state.workflow_runs);
-        if runs.values().any(|r| r.project_id == project_id) {
-            return Err(AppError::WorkflowAlreadyRunning { project_id });
-        }
-        runs.insert(
-            run_id,
-            ActiveRun {
-                cancel: cancel.clone(),
-                project_id,
-                workflow: workflow_name.clone(),
-                snapshot: RunSnapshot {
-                    total_steps,
-                    current_step: 0,
-                },
-                steps: resolved_steps,
-                done: Arc::clone(&done),
+    // `project` was captured well above; a lifecycle operation can complete in
+    // between (see `reject_if_generation_changed`).
+    crate::commands::reject_if_generation_changed(state, project_id, generation)?;
+    register_live_run(
+        state,
+        project_id,
+        run_id,
+        ActiveRun {
+            cancel: cancel.clone(),
+            project_id,
+            workflow: workflow_name.clone(),
+            snapshot: RunSnapshot {
+                total_steps,
+                current_step: 0,
             },
-        );
-    }
+            steps: resolved_steps,
+            done: Arc::clone(&done),
+        },
+    )?;
 
     let run = WorkflowRun {
         mcp_prompt_arg_names: form.mcp_prompt_arg_names,

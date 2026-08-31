@@ -4,7 +4,6 @@
   import { cn } from "$lib/utils";
   import claudeCodeIcon from "$lib/assets/harness-icons/claude-code.png";
   import codexIcon from "$lib/assets/harness-icons/codex.png";
-  import geminiIcon from "$lib/assets/harness-icons/gemini.svg";
   import antigravityIcon from "$lib/assets/harness-icons/antigravity.png";
 
   type Props = {
@@ -19,7 +18,6 @@
   const ICON_SRC: Record<HarnessKind, string> = {
     claude_code: claudeCodeIcon,
     codex: codexIcon,
-    gemini: geminiIcon,
     antigravity: antigravityIcon,
   };
 
@@ -31,7 +29,6 @@
   const SCALE_CLASS: Record<HarnessKind, string> = {
     claude_code: "scale-95",
     codex: "scale-110",
-    gemini: "scale-95",
     antigravity: "scale-110",
   };
 </script>

@@ -2,10 +2,11 @@
   import type { Snippet } from "svelte";
   import { tick } from "svelte";
   import * as api from "$lib/api";
-  import type { Prompt, AgentRecord, AgentId } from "$lib/types";
+  import type { Prompt, AgentRecord, AgentId, ProjectId } from "$lib/types";
   import type { TranscriptPane } from "$lib/state/transcriptPanes.svelte";
   import {
     forwardSourceKey,
+    isForeignSource,
     forwardSourceForAgent,
     forwardSourceAgentsForPane,
     orderForwardSources,
@@ -50,7 +51,16 @@
     recipients,
     focusFirstField = false,
     busy = false,
+    projectId,
+    crossProjectBase,
   }: {
+    /// The project composing this send — qualifies foreign forward-source labels.
+    projectId: ProjectId;
+    /// Cross-project forward sourcing, passed straight to each per-field picker
+    /// so this surface offers the same Projects section as the compose bar.
+    /// Shared cross-project sourcing. This component adds the field-scoped
+    /// commit step itself — the picker's config requires one.
+    crossProjectBase?: import("$lib/components/ui/ForwardSourcePicker.svelte").CrossProjectBase;
     prompt: Prompt;
     args: Record<string, string>;
     appendedText: string;
@@ -84,6 +94,11 @@
   /// What a source will contribute at dispatch. Absent the classifier (the
   /// component stands alone in tests), assume it resolves normally.
   function sourceReadiness(source: ForwardSource): ForwardReadiness {
+    // A foreign source's transcript isn't loaded in this project, so any
+    // classification would be a guess — and the guess `forwardReadiness` makes
+    // for a missing transcript is `"empty"`, which renders a false
+    // "blocks your send" warning. Say nothing instead.
+    if (isForeignSource(source, projectId)) return "unknown";
     return agentReadiness?.(source.id) ?? "ready";
   }
 
@@ -137,7 +152,7 @@
   /// after any typed lead text — the preview conveys structure, not final content.
   function withPlaceholders(typed: string, sources: ForwardSource[]): string {
     const lead = typed.trim();
-    const placeholders = orderForwardSources(sources, agents)
+    const placeholders = orderForwardSources(sources, agents, projectId)
       .map((s) => `«forwarding from ${s.name}…»`)
       .join("\n\n");
     return lead === "" ? placeholders : `${lead}\n\n${placeholders}`;
@@ -316,6 +331,14 @@
           {agents}
           {panes}
           onPickAgent={(agent) => onAdd(forwardSourceForAgent(agent))}
+          crossProject={crossProjectBase && {
+            ...crossProjectBase,
+            onPickForeign: (
+              agent: AgentRecord,
+              project: { id: ProjectId; name: string },
+              rosterIndex: number,
+            ) => onAdd(forwardSourceForAgent(agent, { project, rosterIndex })),
+          }}
           onPickPane={(pane) => {
             for (const source of forwardSourceAgentsForPane(pane, agents)) onAdd(source);
           }}
@@ -336,7 +359,7 @@
         onClear: () => void,
         testid: string,
       )}
-        {@const orderedSources = orderForwardSources(sources, agents)}
+        {@const orderedSources = orderForwardSources(sources, agents, projectId)}
         {#if orderedSources.length > 0}
           <div class="flex flex-wrap items-center gap-1.5" data-testid={testid}>
             {#each orderedSources as source (forwardSourceKey(source))}
@@ -345,6 +368,7 @@
                 readiness={sourceReadiness(source)}
                 disabled={busy}
                 onRemove={() => onRemove(forwardSourceKey(source))}
+                currentProjectId={projectId}
               />
             {/each}
             {#if orderedSources.length > 1}

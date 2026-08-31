@@ -1557,7 +1557,7 @@
             <!-- Clean-hide convention: every metadata cell above and below is
                  presence-gated, so a value a harness never reports simply never
                  renders — no blank label, no empty bar, no "—" placeholder. These
-                 absences are correct, not gaps: Gemini exposes no `context_window`
+                 absences are correct, not gaps: some harnesses expose no `context_window`
                  (the bar below never renders for it), and Antigravity reports no
                  cost / quota / context at all. A transient absence (a fresh agent
                  pre-first-turn) hides identically to a permanent one; that's the

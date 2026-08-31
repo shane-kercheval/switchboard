@@ -34,7 +34,7 @@ pub enum DispatchError {
     #[error("adapter pre-stream read failed: {0}")]
     PreStreamRead(String),
     /// Caller-input validation failed before spawn — the supplied prompt is
-    /// not dispatch-shaped (e.g., empty/whitespace-only). The Gemini CLI
+    /// not dispatch-shaped (e.g., empty/whitespace-only). A harness CLI
     /// rejects empty prompts with exit 42; the adapter pre-validates so the
     /// failure surfaces as a recognizable input error rather than a
     /// subprocess crash.

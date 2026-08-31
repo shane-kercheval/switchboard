@@ -26,7 +26,14 @@
 </script>
 
 <div style:width={width === undefined ? undefined : `${width}px`}>
-  <PromptComposer {prompt} bind:args bind:appendedText {agents} onremove={() => undefined}>
+  <PromptComposer
+    projectId="00000000-0000-7000-8000-0000000000ff"
+    {prompt}
+    bind:args
+    bind:appendedText
+    {agents}
+    onremove={() => undefined}
+  >
     {#snippet send()}
       <!-- Width is immaterial to alignment; the right edge mirrors the real
            Send/Fork snippet without pulling the whole ComposeBar into this host. -->

@@ -2,7 +2,7 @@
 
 ![Switchboard](docs/images/banner.png)
 
-Switchboard is a human-directed orchestrator for AI coding agents — a desktop app you run alongside your existing CLIs: **Claude Code, Codex, Gemini, and Antigravity**.
+Switchboard is a human-directed orchestrator for AI coding agents — a desktop app you run alongside your existing CLIs: **Claude Code, Codex, and Antigravity**.
 
 Spawn multiple agent sessions in a single project, route messages between them, and define reusable workflows for common multi-agent operations like second-opinion code review, plan-and-implement, and parallel-solution adjudication.
 
@@ -18,7 +18,7 @@ Switchboard also has a **Git view** for reviewing repositories, complete branch 
 
 ## Features
 
-- **Work with multiple CLI agents in one project.** Run any combination of the supported Claude Code, Codex, Gemini, and Antigravity sessions while keeping each agent's conversation and status visible.
+- **Work with multiple CLI agents in one project.** Run any combination of the supported Claude Code, Codex, and Antigravity sessions while keeping each agent's conversation and status visible.
 - **Fan-out and fan-in.** Send one request to several agents in parallel, then forward one or more responses into the next message — or let a workflow wait for them, combine them, and send the result onward — without copying and pasting between terminals.
 - **Fork a conversation.** Create a new agent that inherits the conversation so far, letting you try another approach while leaving the original agent untouched. Available for Claude Code only for now.
 - **Group agents into transcript panes.** Keep implementers, reviewers, or other roles together, target the group as one recipient, and hide or solo agents when you need a quieter view.
@@ -121,19 +121,33 @@ The layout (panes, names, widths, hidden agents) is remembered per project on th
 - Cross-session persistent agent memory. Possibly a future addition; not in scope for v1.
 - A hosted / SaaS service. Switchboard runs locally on your machine. A future hosted service may exist for cross-machine sync of workflows and prompts; that is not v1.
 
+## Upgrading from a pre-store version
+
+Switchboard used to keep each project's state inside your working directory, in a `.switchboard/` folder. It now keeps everything in one place under `~/Library/Application Support/switchboard/`, so deleting or moving a checkout no longer takes its conversation history with it.
+
+If you used Switchboard before that change, your old projects will not appear until you migrate them. Nothing is lost in the meantime — the old folders are untouched. Run, from a checkout:
+
+```
+cargo run -p switchboard-migrate
+```
+
+It reads the directory list from your existing configuration, copies each directory's projects into the new location, and prints a report. **It never modifies or deletes your originals**, so if the result looks wrong you can delete the new store and run it again. Directories that are unavailable (a deleted worktree, an unplugged disk) are reported and skipped.
+
+Run it **before** launching the new version, which rewrites the configuration file the tool reads.
+
 ## Agent CLI support and limitations
 
 Switchboard drives each agent through its own CLI, so it inherits that CLI's capabilities — and a few CLI-specific limitations are worth knowing up front:
 
-- **Model profiles.** Every agent — Claude Code, Codex, Gemini, and Antigravity — can have a Primary model/effort setup plus an optional Secondary setup for quick switching. Set per-agent-type defaults in Settings; Add Agent and new projects use them automatically. The transcript records the model each past turn actually ran on.
-- **Reasoning effort.** Claude Code, Codex, and Antigravity let Switchboard set the reasoning-effort level per agent (alongside the model). **Gemini does not** — Gemini exposes reasoning effort only through its own config, not a per-run option, so Switchboard can't set it; Gemini agents use whatever Gemini's config specifies. **Antigravity's effort options depend on the model you pick,** and some of its models have no effort setting at all — the picker only offers the levels that model accepts, and hides the control entirely for models that don't have one.
+- **Model profiles.** Every agent — Claude Code, Codex, and Antigravity — can have a Primary model/effort setup plus an optional Secondary setup for quick switching. Set per-agent-type defaults in Settings; Add Agent and new projects use them automatically. The transcript records the model each past turn actually ran on.
+- **Reasoning effort.** Every supported agent CLI lets Switchboard set the reasoning-effort level per agent (alongside the model). **Antigravity's effort options depend on the model you pick,** and some of its models have no effort setting at all — the picker only offers the levels that model accepts, and hides the control entirely for models that don't have one.
 - **Codex models depend on your plan.** When you sign in to Codex with a ChatGPT subscription, only the models your plan includes are available; choosing one your plan doesn't cover fails the turn with Codex's own error.
-- **Gemini isn't added to new projects by default.** Gemini is no longer available on individual plans, so a new project starts with a Claude Code, Codex, and Antigravity agent but not a Gemini one. Gemini is still fully supported — if you have access, add a Gemini agent yourself from the "Add agent" dialog.
+- **Gemini is no longer supported.** Google withdrew Gemini CLI access for individual accounts, which left it impossible to test or use here, so support was removed. Use Antigravity — Google's replacement for individual plans — instead.
 - **Antigravity forgets failed tool calls when you reopen a conversation.** While an Antigravity agent is running you'll see a tool that failed along with Antigravity's reason for it. If you close the project and reopen it later, that tool still appears but its result reads "Antigravity did not record a result for this tool call." Antigravity writes nothing to its own transcript file for a rejected tool call, so the reason genuinely isn't there to recover. Nothing else about the conversation is affected.
-- **Some messages can't be pinned.** Switchboard disables Pin when a message has no identity that survives reopening rather than risk attaching the pin to a different message. This includes some imported history and every Antigravity reply. A newly completed Gemini reply becomes pinnable after you reopen Switchboard and its session history is loaded. User messages sent through Switchboard can still be pinned.
-- **Picking up terminal-continued sessions.** If you continue a session in the agent CLI's own terminal, **Claude Code** picks up the new turns when you switch back to the project. **Codex, Gemini, and Antigravity don't yet** — reopen Switchboard to load their updated history.
+- **Some messages can't be pinned.** Switchboard disables Pin when a message has no identity that survives reopening rather than risk attaching the pin to a different message. This includes some imported history and every Antigravity reply. User messages sent through Switchboard can still be pinned.
+- **Picking up terminal-continued sessions.** If you continue a session in the agent CLI's own terminal, **Claude Code** picks up the new turns when you switch back to the project. **Codex and Antigravity don't yet** — reopen Switchboard to load their updated history.
+- **An existing conversation can only have one turn running at a time, across everything Switchboard runs.** Two situations reach this. If you run a development build alongside the installed app, both see the same agent CLI conversations — those files belong to the CLI, not to Switchboard — and sending from both at once would leave one agent's answer missing from the other's record. And while Fork is creating a branch, that branch's first turn is still reading the original agent's conversation, so the original can't start a turn until the branch's first turn finishes (the reverse was already true: you can't branch from an agent that's mid-turn). Either way the second send is refused with "this conversation is already in use by a running turn" — wait for that turn to finish and resend. This guards Switchboard against itself only: a conversation you're also driving from a terminal, or from another tool, is outside what it can see. A brand-new conversation — an agent's very first message on Codex or Antigravity — has nothing to conflict with yet, so it is never held up.
 - **Fork is currently Claude Code only.** The Fork half of the send button (⇧⌘↵) appears when one idle Claude Code agent with an existing session is selected. It creates a new agent with the conversation so far and sends your message as its first turn. Claude is the only CLI path Switchboard currently uses that can create a lossless child session during a send, so Fork is unavailable for other agents and multi-agent sends.
-- **Slash-leading prompts can retain CLI command behavior.** Switchboard centrally resolves and renders the same prompt for each selected agent, but Gemini still processes recognized slash-leading text as native commands. Avoid slash-leading prompt bodies when they must behave the same across agent CLIs.
 
 ## Notifications
 
@@ -169,7 +183,7 @@ make check        # everything CI runs (incl. the browser suite) — run before 
 make test-live    # live-harness suite against the real agent CLIs (developer-local)
 ```
 
-`make test-live` exercises the adapters against the real `claude` / `codex` / `gemini` / `antigravity` CLIs to catch upstream drift. See [`crates/harness/tests/README.md`](./crates/harness/tests/README.md) for what it covers and how to set it up.
+`make test-live` exercises the adapters against the real `claude` / `codex` / `antigravity` CLIs to catch upstream drift. See [`crates/harness/tests/README.md`](./crates/harness/tests/README.md) for what it covers and how to set it up.
 
 `make test-browser` (and `make check`) run the frontend suite in a real WebKit engine via Vitest browser mode. The target installs a Playwright-managed WebKit build on demand — the first run downloads ~100 MB (cached afterward), so it needs network access once; no extra system packages are required on macOS. The default `make test` stays jsdom-only and needs none of this.
 

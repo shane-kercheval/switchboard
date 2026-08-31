@@ -125,14 +125,6 @@ const CODEX_AGENT: AgentRecord = {
   created_at: "2026-05-16T00:00:01Z",
 };
 
-const GEMINI_AGENT: AgentRecord = {
-  id: "00000000-0000-7000-8000-000000000ccc",
-  project_id: "00000000-0000-7000-8000-0000000000ff",
-  name: "gwen",
-  harness: "gemini",
-  session_locator: { uuid: "00000000-0000-7000-8000-000000000002" },
-  created_at: "2026-05-16T00:00:02Z",
-};
 const ANTIGRAVITY_AGENT: AgentRecord = {
   id: "00000000-0000-7000-8000-000000000ddd",
   project_id: "00000000-0000-7000-8000-0000000000ff",
@@ -863,18 +855,6 @@ describe("Sidebar", () => {
     await openAgentActions();
     await waitFor(() => expect(screen.getByTestId("agent-profile-settings")).toBeInTheDocument());
     expect(screen.getByTestId("agent-profile-settings")).toHaveTextContent("Model settings");
-  });
-
-  it("Gemini exposes model settings without an effort picker", async () => {
-    const state = await loadState();
-    await state.registerAgent(GEMINI_AGENT);
-    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [GEMINI_AGENT] } });
-
-    await openAgentActions();
-    await waitFor(() => expect(screen.getByTestId("agent-profile-settings")).toBeInTheDocument());
-    await fireEvent.click(screen.getByTestId("agent-profile-settings"));
-    expect(await screen.findByTestId("change-profile-primary-model")).toBeInTheDocument();
-    expect(screen.queryByTestId("change-profile-primary-effort")).toBeNull();
   });
 
   it("Antigravity exposes the profile action like every other harness", async () => {
@@ -1868,7 +1848,7 @@ describe("Sidebar pane visibility + assignment", () => {
 });
 
 describe("Sidebar — agent reordering", () => {
-  const THREE_AGENTS = [CLAUDE_AGENT, CODEX_AGENT, GEMINI_AGENT];
+  const THREE_AGENTS = [CLAUDE_AGENT, CODEX_AGENT, ANTIGRAVITY_AGENT];
 
   function grip(index: number): HTMLElement {
     const grips = screen.getAllByTestId("agent-drag-grip");
@@ -1903,7 +1883,7 @@ describe("Sidebar — agent reordering", () => {
     await fireEvent.keyDown(names[1]!, { key: "ArrowDown", altKey: true });
     expect(reorderAgentsMock).toHaveBeenCalledWith(PROJECT_ID, [
       CLAUDE_AGENT.id,
-      GEMINI_AGENT.id,
+      ANTIGRAVITY_AGENT.id,
       CODEX_AGENT.id,
     ]);
   });
@@ -1924,7 +1904,7 @@ describe("Sidebar — agent reordering", () => {
     await fireEvent.keyDown(window, { key: "ArrowDown", altKey: true });
     expect(reorderAgentsMock).toHaveBeenCalledWith(PROJECT_ID, [
       CLAUDE_AGENT.id,
-      GEMINI_AGENT.id,
+      ANTIGRAVITY_AGENT.id,
       CODEX_AGENT.id,
     ]);
   });
@@ -1963,7 +1943,7 @@ describe("Sidebar — agent reordering", () => {
     await fireEvent.pointerUp(handle, { pointerId: 1 });
     expect(reorderAgentsMock).toHaveBeenCalledWith(PROJECT_ID, [
       CODEX_AGENT.id,
-      GEMINI_AGENT.id,
+      ANTIGRAVITY_AGENT.id,
       CLAUDE_AGENT.id,
     ]);
   });

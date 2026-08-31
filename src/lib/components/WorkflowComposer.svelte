@@ -5,10 +5,12 @@
     DerivedArgInfo,
     WorkflowFormDescriptor,
     WorkflowInputValue,
+    ProjectId,
   } from "$lib/types";
   import type { TranscriptPane } from "$lib/state/transcriptPanes.svelte";
   import {
     forwardSourceKey,
+    isForeignSource,
     forwardSourceForAgent,
     forwardSourceAgentsForPane,
     orderForwardSources,
@@ -47,7 +49,16 @@
     signingInProvider = null,
     onconfigure,
     invoke,
+    projectId,
+    crossProjectBase,
   }: {
+    /// The project composing this send — qualifies foreign forward-source labels.
+    projectId: ProjectId;
+    /// Cross-project forward sourcing, passed straight to each per-field picker
+    /// so this surface offers the same Projects section as the compose bar.
+    /// Shared cross-project sourcing. This component adds the field-scoped
+    /// commit step itself — the picker's config requires one.
+    crossProjectBase?: import("$lib/components/ui/ForwardSourcePicker.svelte").CrossProjectBase;
     descriptor: WorkflowFormDescriptor;
     agents: AgentRecord[];
     /// The project's panes, offered as a quick way to fill an `[agent]` input with
@@ -90,6 +101,14 @@
     return list.some((s) => forwardSourceKey(s) === forwardSourceKey(source))
       ? list
       : [...list, source];
+  }
+
+  /// A foreign source's transcript isn't loaded in this project, so classifying
+  /// it would be a guess — and `forwardReadiness`'s guess for a missing
+  /// transcript is `"empty"`, which renders a false "blocks your send" warning.
+  function sourceReadiness(source: ForwardSource): ForwardReadiness {
+    if (isForeignSource(source, projectId)) return "unknown";
+    return agentReadiness?.(source.id) ?? "ready";
   }
 
   function addArgSource(name: string, source: ForwardSource): void {
@@ -514,6 +533,14 @@
         {panes}
         {agentReadiness}
         onPickAgent={(agent) => addArgSource(name, forwardSourceForAgent(agent))}
+        crossProject={crossProjectBase && {
+          ...crossProjectBase,
+          onPickForeign: (
+            agent: AgentRecord,
+            project: { id: ProjectId; name: string },
+            rosterIndex: number,
+          ) => addArgSource(name, forwardSourceForAgent(agent, { project, rosterIndex })),
+        }}
         onPickPane={(pane) => {
           for (const source of forwardSourceAgentsForPane(pane, agents)) addArgSource(name, source);
         }}
@@ -527,7 +554,7 @@
   {/snippet}
 
   {#snippet forwardChips(name: string)}
-    {@const sources = orderForwardSources(forwardSources[name] ?? [], agents)}
+    {@const sources = orderForwardSources(forwardSources[name] ?? [], agents, projectId)}
     {#if sources.length > 0}
       <div
         class="flex flex-wrap items-center gap-1.5"
@@ -536,8 +563,9 @@
         {#each sources as source (forwardSourceKey(source))}
           <ForwardSourceChip
             {source}
-            readiness={agentReadiness?.(source.id) ?? "ready"}
+            readiness={sourceReadiness(source)}
             onRemove={() => removeArgSource(name, forwardSourceKey(source))}
+            currentProjectId={projectId}
           />
         {/each}
         {#if sources.length > 1}

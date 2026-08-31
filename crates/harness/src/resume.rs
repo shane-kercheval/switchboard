@@ -20,7 +20,7 @@ use switchboard_core::HarnessKind;
 /// directory (`cwd`). `None` for a harness with no usable resume-by-id form.
 ///
 /// The returned tokens are unquoted; the caller shell-quotes and prepends a `cd`
-/// into `cwd` (Claude/Codex/Gemini resolve the session file from the cwd, so the
+/// into `cwd` (Claude and Codex resolve the session file from the cwd, so the
 /// `cd` is all they need). **Antigravity additionally needs `--add-dir <cwd>`**:
 /// `cd` alone leaves it with "no active workspace," running file/command tools
 /// against `$HOME` — so the interactive command mirrors the headless dispatch's
@@ -44,12 +44,6 @@ pub fn interactive_resume_command(
             "resume".to_owned(),
             id,
             "--dangerously-bypass-approvals-and-sandbox".to_owned(),
-        ],
-        HarnessKind::Gemini => vec![
-            "gemini".to_owned(),
-            "--resume".to_owned(),
-            id,
-            "--skip-trust".to_owned(),
         ],
         HarnessKind::Antigravity => vec![
             "agy".to_owned(),
@@ -92,22 +86,6 @@ mod tests {
                 "resume".to_owned(),
                 "sid".to_owned(),
                 "--dangerously-bypass-approvals-and-sandbox".to_owned(),
-            ])
-        );
-    }
-
-    #[test]
-    fn gemini_resume_uses_resume_flag() {
-        // `--session-id <existing>` errors ("already exists; use --resume");
-        // interactive resume takes `--resume <uuid>`, mirroring the adapter's
-        // resume-turn args.
-        assert_eq!(
-            interactive_resume_command(HarnessKind::Gemini, "uuid", Path::new(CWD)),
-            Some(vec![
-                "gemini".to_owned(),
-                "--resume".to_owned(),
-                "uuid".to_owned(),
-                "--skip-trust".to_owned(),
             ])
         );
     }

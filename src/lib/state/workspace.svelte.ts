@@ -240,7 +240,7 @@ function liveSliceSendIds(projectId: ProjectId): Set<SendId> {
 }
 
 /// Whether a session file changed between two fingerprints. Gated on
-/// `(source_path, modified_at, byte_len)` together — a moved file (Gemini's
+/// `(source_path, modified_at, byte_len)` together — a moved file (a harness's
 /// candidate selection), a touched mtime, or an appended byte length each count
 /// as changed; absence on one side but not the other (file appeared/vanished) is
 /// also a change.
@@ -483,57 +483,6 @@ export async function addDirectory(path: string): Promise<void> {
   await loadWorkspace();
 }
 
-/// Remove a working directory: drains its projects' in-flight turns and
-/// releases their locks on the backend (leaving `.switchboard/` on disk), and
-/// performs the matching **frontend lifecycle teardown** so a remove-then-re-add
-/// of the same project ids (ids are persisted on disk and survive removal)
-/// starts clean. Without the teardown, the stale memoized `loadStarted` promise
-/// would make re-activation skip `open_project`/`list_agents` and leave the
-/// backend with an unloaded "active" project, and the removed agents' listeners
-/// would leak.
-export async function removeDirectory(path: string): Promise<void> {
-  // Snapshot the affected project + agent ids BEFORE the await — `loadWorkspace`
-  // (below) will drop these projects from the list, so capture them now.
-  const removedProjectIds = projects.list.filter((p) => p.directory === path).map((p) => p.id);
-  const removedAgentIds = removedProjectIds.flatMap((id) =>
-    (agentsByProject[id] ?? []).map((a) => a.id),
-  );
-  const activeRemoved = removedProjectIds.includes(selection.activeProjectId ?? "");
-
-  await api.removeDirectory(path);
-
-  // Backend drop succeeded — tear down the matching frontend state. The
-  // completion tracker goes *first*: run after `unregisterAgents`, its
-  // teardown-settled outcomes could classify and flush a notification for a
-  // project that is being removed.
-  forgetProjects(removedProjectIds);
-  forgetReadingMode(removedProjectIds);
-  unregisterAgents(removedAgentIds);
-  unsubscribeProjectWorkflows(removedProjectIds);
-  for (const id of removedProjectIds) {
-    delete agentsByProject[id];
-    delete conversations[id];
-    delete backgroundCompletedProjectIds[id];
-    delete projectActivityOverrides[id];
-    loadStarted.delete(id);
-    hydrationStarted.delete(id);
-    sessionFingerprintBaseline.delete(id);
-    refreshInFlight.delete(id);
-  }
-  previousLiveProjectSendPairs = previousLiveProjectSendPairs.filter(
-    (pair) => !removedProjectIds.includes(pair.projectId),
-  );
-  previousNonIdleProjectIds = previousNonIdleProjectIds.filter(
-    (id) => !removedProjectIds.includes(id),
-  );
-  if (activeRemoved) {
-    selection.activeProjectId = null;
-    selection.activationFailure = null;
-    selection.loadingProjectId = null;
-  }
-  await loadWorkspace();
-}
-
 /// Create a project in `directory`, refresh the registry, and activate it.
 /// Registers the folder first (idempotent `init_directory`): `create_project`
 /// requires its target directory to already be a loaded workspace directory, so
@@ -552,7 +501,7 @@ export async function createProjectAndActivate(name: string, directory: string):
 
 /// Auto-populate a freshly created project with one agent per installed harness
 /// that opts into auto-seeding (`AUTO_SEED_ON_NEW_PROJECT`); excluded harnesses
-/// like Gemini stay dialog-only. New projects only — called solely from
+/// stay dialog-only. New projects only — called solely from
 /// `createProjectAndActivate`, never on activation of an existing project.
 ///
 /// Awaits a *settled* availability probe before reading `installed()`. Two races
@@ -589,9 +538,11 @@ async function seedAgentsForInstalledHarnesses(projectId: ProjectId): Promise<vo
   }
   for (const harness of harnessAvailability.installed()) {
     if (selection.activeProjectId !== projectId) break;
-    // Installed but auto-seed-excluded harnesses (e.g. Gemini) are still
-    // selectable in the create-agent dialog — they're just not born into a
-    // fresh project by default.
+    // Every harness is auto-seeded today, so this guard takes no branch; it is
+    // retained as the extension point for a harness that shouldn't be born into
+    // a fresh project (see the note above `SUPPORTS_MODEL_SELECTION` in
+    // `harnessDisplay.ts`). Such a harness stays selectable in the create-agent
+    // dialog — it is just not seeded automatically.
     if (!AUTO_SEED_ON_NEW_PROJECT[harness]) continue;
     try {
       // Every auto-created agent is born with a known, displayed model/effort
@@ -775,7 +726,9 @@ async function deleteProjectOnce(projectId: ProjectId): Promise<void> {
   await api.deleteProject(projectId);
 
   layout.removeProjectPreferences(projectId);
-  // Before `unregisterAgents`, for the reason given in `removeDirectory`.
+  // The completion tracker goes *first*: run after `unregisterAgents`, its
+  // teardown-settled outcomes could classify and flush a notification for a
+  // project that is being deleted.
   forgetProjects([projectId]);
   forgetReadingMode([projectId]);
   unregisterAgents(removedAgentIds);

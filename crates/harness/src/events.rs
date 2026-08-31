@@ -21,7 +21,7 @@ pub type MessageId = Uuid;
 /// `Thinking` carries model reasoning text, rendered distinct from (and
 /// subordinate to) the answer (the frontend's `ThinkingWidget`). Whether a
 /// harness exposes reasoning text varies: Antigravity emits it (planner
-/// records, live + on reopen); Gemini writes it only to disk, so we deliberately
+/// records, live + on reopen); a harness that writes it only to disk is deliberately
 /// drop it (reopened-only reasoning is stale UX); Claude's redaction is
 /// **per-model** — Sonnet 4.6 returns non-empty reasoning (live `thinking_delta`
 /// and on disk, reconstructed on hydrate), while Opus 4.8 redacts the text to
@@ -141,7 +141,7 @@ pub enum ContextWindowSource {
 /// intentionally distinct from `output_tokens`: Claude's latter field is a
 /// whole-dispatch billing aggregate that may include auxiliary/subagent output
 /// which never entered the parent's context. `None` where a harness doesn't
-/// compute context occupancy (e.g. Gemini, which exposes no window anyway).
+/// compute context occupancy (e.g. Antigravity, which exposes no window).
 ///
 /// Populated when the harness reports usage on its terminal event. Claude
 /// carries it on both `Completed` and `Failed` turns; Codex carries it on
@@ -277,7 +277,7 @@ pub enum AdapterEvent {
         spend: Option<TurnSpend>,
         /// The model this turn ran on — the live per-turn carrier, mirroring
         /// `spend` (stamped by the adapter, carried through to the frontend).
-        /// Per harness: Claude/Gemini the most-recent `SessionMeta`/`init`; Codex
+        /// Per harness: Claude the most-recent `SessionMeta`/`init`; Codex
         /// the current-turn `turn_context.model` (enrichment re-read); Antigravity
         /// the carry-forward state. `None` when the harness exposes no model.
         model: Option<String>,
@@ -304,7 +304,7 @@ pub enum AdapterEvent {
         /// **Codex** the current turn's `turn_context.turn_id`,
         /// read from the post-terminal enrichment re-read of the session file so it
         /// equals the parsed key by construction (probe-verified live↔disk). `None`
-        /// for keyless harnesses (Antigravity), Gemini (live↔disk parity unprobed),
+        /// for keyless harnesses (Antigravity),
         /// or a turn that produced no keyed record.
         ///
         /// TODO(rename): now that this carries two harnesses' keys (Claude's
@@ -453,7 +453,7 @@ pub enum NormalizedEvent {
         /// the first non-subagent assistant `message.id`; **Codex** the current turn's
         /// `turn_context.turn_id` via the post-terminal enrichment re-read, so it
         /// equals the parsed key by construction (probe-verified). `None` for
-        /// Antigravity (no per-turn id) and Gemini (live↔disk parity unprobed) —
+        /// Antigravity (no per-turn id) —
         /// those dedup by `turn_id`. Frontend-facing; the internal cost-join
         /// `stable_message_id` stays dropped at this boundary.
         hydration_key: Option<String>,
@@ -736,7 +736,6 @@ pub enum FailureKind {
     /// Subscription / tier auth is missing or expired. Detected per-adapter
     /// from stream signals (Claude: `assistant.error == "authentication_failed"`;
     /// Codex: `turn.failed.error.message` containing `"401 Unauthorized"`;
-    /// Gemini: 401 in `result.status:"error"`, exit 41 + "Please set an Auth
     /// method", or exit 42 + 401; Antigravity: `Authentication required` /
     /// `authentication timed out` on stdout). Each adapter authors a uniform
     /// actionable message naming the harness + recovery command — the user

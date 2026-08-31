@@ -43,7 +43,7 @@ export type ForwardOutcome =
 // ContentChunk.kind discriminates rendering. `thinking` carries model reasoning,
 // rendered distinct from (and subordinate to) the answer (the `ThinkingWidget`).
 // Emitted by Antigravity (live + on reopen) and Claude Sonnet 4.6 (live + on
-// reopen). Gemini's reasoning is disk-only and deliberately dropped
+// reopen). Reasoning that is disk-only is deliberately dropped
 // (stale-on-reopen UX). Claude's redaction is per-model: Opus 4.8 redacts the
 // text to empty, so its reasoning surfaces only as a non-rendering `liveness`
 // event. See docs/harness-behavior.md §3.2 for per-harness reality.
@@ -185,6 +185,12 @@ export type Attachment = {
   label: string;
   kind: AttachmentKind;
   path: string;
+  // Where the file was when this send was dispatched, if that differs from
+  // where it lives now. Persisted metadata the frontend never sets — only a
+  // migration writes it, and only the backend's send/turn correlation reads it.
+  // Present here because this type mirrors the Rust wire shape, and dropping
+  // the field on a round-trip would silently discard it.
+  dispatched_path?: string;
   original_name: string;
 };
 
@@ -438,7 +444,13 @@ export type ReducerInput = NormalizedEvent | HeartbeatTimeout | Hydrate;
 // Internal state types (Turn, AgentRuntime, etc.) live in
 // `src/lib/state/types.ts`. This file is wire-format-only.
 
-export type HarnessKind = "claude_code" | "codex" | "gemini" | "antigravity";
+/// One forward source as the backend receives it — the agent plus the project
+/// that owns it. Mirrors `ForwardSourceRef` in `crates/app/src/commands.rs`.
+/// Lives here rather than in the held-forward UI store because it is a wire
+/// shape: `api.ts` must not import its request types from a UI module.
+export type ForwardSourceRef = { agent_id: AgentId; project_id: ProjectId };
+
+export type HarnessKind = "claude_code" | "codex" | "antigravity";
 
 /// State of the `which`-on-PATH binary probe for a single harness.
 /// - `"checking"`: probe in flight (the initial value at mount). Form
@@ -520,7 +532,7 @@ export type AgentProfiles = {
 
 // Mirror of `crates/core::AgentRecord`. `session_locator` is `null` for
 // harnesses that assign their own session id at runtime (Codex and Antigravity)
-// until the first dispatch captures it; for Claude Code and Gemini it's
+// until the first dispatch captures it; for Claude Code it's
 // pre-generated at registration time as a `{ uuid }` locator.
 export type AgentRecord = {
   id: AgentId;
@@ -530,8 +542,8 @@ export type AgentRecord = {
   session_locator: SessionLocator | null;
   created_at: string;
   // The user's selected model + reasoning effort (intent), shown in the sidebar.
-  // `null`/absent for a no-capability harness (Antigravity carries
-  // neither; Gemini carries no effort) or a pre-feature agent.
+  // `null`/absent when the user hasn't chosen one (the harness applies its own
+  // default) or for a pre-feature agent.
   model?: string | null;
   effort?: string | null;
   profiles?: AgentProfiles;
@@ -549,22 +561,53 @@ export type ProjectSummary = {
   created_at: string;
 };
 
+// Mirror of Rust `DirectoryStatus` — why a project's working directory is or
+// isn't usable. Four states rather than a boolean because the three failures
+// have different causes and different repairs:
+//   - `resolved_path_unavailable`: the ordinary moved/deleted/unmounted folder.
+//     Repairable by re-pointing the directory.
+//   - `catalog_ambiguous`: two catalog rows claim one directory identity.
+//     Corruption, also repaired by a re-point (which collapses them).
+//   - `catalog_missing`: no catalog row at all. Corruption, repaired by
+//     re-binding the identity to a user-chosen folder — the same affordance as
+//     the other two, a different operation underneath.
+// New variants land additively (the Rust enum is `#[non_exhaustive]`), so
+// consumers must degrade on an unknown value rather than assume exhaustiveness.
+export type DirectoryStatus =
+  | "resolved_available"
+  | "resolved_path_unavailable"
+  | "catalog_missing"
+  | "catalog_ambiguous";
+
 // Mirror of Rust `ProjectListing` (`crates/app/src/commands.rs`) — one row of
 // the flat cross-directory project list. `directory` is the owning directory's
-// path (label + spawn cwd); `available` is whether that directory is currently
-// loaded/readable; `last_activity` is the recency-ordering key (journal mtime
-// or `created_at`).
+// path (label + spawn cwd), `null` when the directory identity resolves to no
+// single path; `last_activity` is the recency-ordering key (journal mtime or
+// `created_at`).
 export type ProjectListing = {
   id: ProjectId;
   name: string;
   created_at: string;
-  directory: string;
-  available: boolean;
+  // The working directory's stable identity — opaque, and present whatever
+  // `directory_status` says. Group siblings by this, never by `directory`:
+  // that is `null` for both corrupt states, so grouping on it treats every
+  // damaged project as sharing one directory.
+  directory_id: string;
+  directory: string | null;
+  directory_status: DirectoryStatus;
   last_activity: string;
-  /// User-global view-state (from `workspace.yaml`): the user archived this
-  /// project, hiding it from the default `Active` view. Not on-disk project state.
+  // User-global view-state (from `workspace.yaml`): the user archived this
+  // project, hiding it from the default `Active` view. Not on-disk project state.
   archived: boolean;
 };
+
+// Whether a project can be dispatched into. The one question most callers ask —
+// kept as a helper so each doesn't re-derive it, and so an added
+// `DirectoryStatus` variant defaults to "not available" rather than silently
+// reading as usable.
+export function projectIsAvailable(listing: { directory_status: DirectoryStatus }): boolean {
+  return listing.directory_status === "resolved_available";
+}
 
 // Mirror of Rust `WorkspaceDirectoryInfo` / `WorkspaceDirectories`. The
 // switcher renders directory rows independent of projects (so empty directories

@@ -3,7 +3,12 @@
   import { Ban, LoaderCircle } from "@lucide/svelte";
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
   import { SUPPLEMENTAL_TOOLTIP_DELAY } from "$lib/components/ui/tooltip";
-  import type { ForwardReadiness, ForwardSource } from "$lib/state/heldForwards.svelte";
+  import {
+    forwardSourceLabel,
+    type ForwardReadiness,
+    type ForwardSource,
+  } from "$lib/state/heldForwards.svelte";
+  import type { ProjectId } from "$lib/types";
 
   // A forward-source chip — the agent whose latest output will be forwarded.
   // Shared by the compose bar and the prompt/workflow composers' per-field
@@ -29,12 +34,19 @@
     readiness = "ready",
     disabled = false,
     onRemove,
+    currentProjectId,
   }: {
     source: ForwardSource;
     readiness?: ForwardReadiness;
     disabled?: boolean;
     onRemove: () => void;
+    /// The project composing this send. A source from any *other* project is
+    /// labelled `project · agent`, so two same-named agents in different projects
+    /// stay distinguishable on the chip.
+    currentProjectId: ProjectId;
   } = $props();
+
+  const label = $derived(forwardSourceLabel(source, currentProjectId));
 
   // `null` for `ready` — no icon, no tooltip, neutral chip. `tooltip` is the
   // pointer explanation; `srText` is the same consequence phrased to read
@@ -79,9 +91,9 @@
     <polyline points="15 17 20 12 15 7" />
     <path d="M4 18v-2a4 4 0 0 1 4-4h12" />
   </svg>
-  <Tooltip label={source.name} delayDuration={SUPPLEMENTAL_TOOLTIP_DELAY} focusable={false}>
+  <Tooltip {label} delayDuration={SUPPLEMENTAL_TOOLTIP_DELAY} focusable={false}>
     {#snippet trigger(props)}
-      <span {...props} class="truncate">{source.name}</span>
+      <span {...props} class="truncate">{label}</span>
     {/snippet}
   </Tooltip>
   {#if stateHint !== null}
@@ -107,8 +119,8 @@
   <button
     type="button"
     class="text-muted hover:text-status-failed hover:border-status-failed hover:bg-status-failed-soft/70 flex h-4 w-4 shrink-0 items-center justify-center rounded-full border border-transparent transition-colors disabled:cursor-not-allowed disabled:opacity-50"
-    data-testid={`forward-source-remove-${source.name}`}
-    aria-label={`Remove forward source ${source.name}`}
+    data-testid={`forward-source-remove-${label}`}
+    aria-label={`Remove forward source ${label}`}
     {disabled}
     onmousedown={(e) => e.preventDefault()}
     onclick={onRemove}

@@ -16,14 +16,18 @@
     removeHeldForward,
     forwardSourceKey,
     expandForwardSources,
+    forwardSourceIds,
+    refreshForeignSourceLabels,
+    sourceReadinessFor,
     forwardSourceForAgent,
     forwardSourceAgentsForPane,
-    forwardReadiness,
+    agentReadinessFor,
     orderForwardSources,
     reconcileForwardSources,
     reconcileForwardSourceMap,
     type ForwardReadiness,
     type ForwardSource,
+    type ForwardSourceRef,
   } from "$lib/state/heldForwards.svelte";
   import { buildLiveSendsMap } from "$lib/state/liveSends";
   import {
@@ -78,6 +82,7 @@
     WorkflowInputValue,
     WorkflowListing,
   } from "$lib/types";
+  import { projectIsAvailable } from "$lib/types";
   import { classifyKind, nextLabel } from "$lib/attachments";
   import { registerSend } from "$lib/state/sendCompletion";
   import { getCurrentWebview } from "@tauri-apps/api/webview";
@@ -231,8 +236,8 @@
     commitChips(attachmentChips.filter((chip) => chip.id !== id));
   }
 
-  /// Drop restored chips whose staged file no longer exists (a cleaned
-  /// `.switchboard/`, or an older build's GC). Only the *restored* paths are
+  /// Drop restored chips whose staged file no longer exists (a manual delete,
+  /// an interrupted GC, a migration). Only the *restored* paths are
   /// candidates — a file attached while this check was in flight was never at risk
   /// and must not be pruned by a stale answer.
   async function pruneMissingAttachments(restored: Attachment[]): Promise<void> {
@@ -265,9 +270,39 @@
   // a missed dependency.
   const savedForwards = saved.forwards ?? emptyForwards();
   let forwardSources = $state<ForwardSource[]>(
-    untrack(() => reconcileForwardSources(savedForwards.message, agents)),
+    untrack(() => reconcileForwardSources(savedForwards.message, agents, projectId)),
   );
-  const orderedForwardSources = $derived(orderForwardSources(forwardSources, agents));
+  const orderedForwardSources = $derived(orderForwardSources(forwardSources, agents, projectId));
+
+  /// Other projects offered in the Forward picker's `Projects` section.
+  /// Restricted to **available** directories: an unavailable one can't have its
+  /// journal read or its agent dispatched against, so offering it would produce a
+  /// source that fails at send. (M2's central store lifts this — the journal
+  /// moves out of the working directory — but that is not this milestone.)
+  const otherForwardProjects = $derived(
+    projects.list
+      .filter((p) => p.id !== projectId && projectIsAvailable(p) && !p.archived)
+      .map((p) => ({ id: p.id, name: p.name })),
+  );
+
+  /// The **shared half** of cross-project sourcing: what to browse, how to read a
+  /// roster, how to open and validate. Each consumer spreads this and adds its own
+  /// `onPickForeign`, which `CrossProjectConfig` requires — where a picked source
+  /// lands differs per surface, and one shared commit closure is exactly how
+  /// prompt- and workflow-field picks once landed in this bar's plain-message list.
+  ///
+  /// `activate` **opens the project before any chip is added**. Browsing is a read,
+  /// but committing has to prove the project is usable: otherwise one locked by
+  /// another window looks selectable and the user finds out only after composing a
+  /// whole message. The backend still opens at dispatch — that path serves chips
+  /// restored cold from a draft, which never passed through here.
+  const crossProjectBase = $derived({
+    projects: otherForwardProjects,
+    loadAgents: (id: ProjectId) => api.listProjectAgentsReadonly(id),
+    activate: async (id: ProjectId) => {
+      await api.openProject(id);
+    },
+  });
 
   function addForwardSource(source: ForwardSource): void {
     if (forwardSources.some((s) => forwardSourceKey(s) === forwardSourceKey(source))) return;
@@ -289,12 +324,35 @@
     forwardSources = forwardSources.filter((s) => forwardSourceKey(s) !== key);
   }
 
+  /// Whether an agent's on-disk history has been read into `transcripts`.
+  ///
+  /// Load-bearing wherever an *absent* transcript is read as evidence: every
+  /// agent is seeded with an empty one at registration, and a failed read leaves
+  /// it empty until the user retries hydration — so before this holds, "empty"
+  /// and "has months of history" are indistinguishable.
+  function isHydrated(agentId: AgentId): boolean {
+    return runtimes[agentId]?.hydration_status === "complete";
+  }
+
   /// What an agent would contribute if forwarded from right now. The single source
   /// of truth for every surface that flags a forward source — the chips, the
   /// `@`-menu rows, and the per-field pickers in the prompt/workflow composers —
   /// so they cannot disagree about the same agent.
   function agentReadiness(agentId: AgentId): ForwardReadiness {
-    return forwardReadiness(transcripts[agentId]);
+    return agentReadinessFor(transcripts[agentId], runtimes[agentId]);
+  }
+
+  /// Readiness for a chip. Must go through the *source*, not the bare id:
+  /// `transcripts` holds only this project's agents, so a foreign id yields
+  /// `undefined`, and `forwardReadiness(undefined)` is `"empty"` — a "this will
+  /// block your send" warning that is false for a healthy foreign source.
+  function sourceReadiness(source: ForwardSource): ForwardReadiness {
+    return sourceReadinessFor(
+      source,
+      projectId,
+      (id) => transcripts[id],
+      (id) => runtimes[id],
+    );
   }
 
   /// The current chips as the `Attachment` wire shape (drops the local `id`),
@@ -382,12 +440,12 @@
   // prompt-mode send with any entry here — or in `promptAppendedSources` — routes
   // through the forward-prompt path.
   let promptArgSources = $state<Record<string, ForwardSource[]>>(
-    untrack(() => reconcileForwardSourceMap(savedForwards.promptArgs, agents)),
+    untrack(() => reconcileForwardSourceMap(savedForwards.promptArgs, agents, projectId)),
   );
   // Forward sources for the appended-text field (the appended text is just
   // another forwardable field; the backend composes it into the appended tail).
   let promptAppendedSources = $state<ForwardSource[]>(
-    untrack(() => reconcileForwardSources(savedForwards.promptAppended, agents)),
+    untrack(() => reconcileForwardSources(savedForwards.promptAppended, agents, projectId)),
   );
   let appendedText = $state<string>("");
   let promptMenuOpen = $state(false);
@@ -441,8 +499,79 @@
   // keyed by field name. Persisted with the other forward families; reset whenever
   // the workflow changes (a field name means nothing across workflows).
   let workflowForwardSources = $state<Record<string, ForwardSource[]>>(
-    untrack(() => reconcileForwardSourceMap(savedForwards.workflowFields, agents)),
+    untrack(() => reconcileForwardSourceMap(savedForwards.workflowFields, agents, projectId)),
   );
+
+  /// Refresh restored foreign chips' display names — **once per mount**.
+  ///
+  /// `onMount`, not `$effect`, and the distinction is load-bearing: the body reads
+  /// all four source families and writes them back, so as an effect every chip add
+  /// and removal would re-run it and re-read each referenced project's registry.
+  /// (It wouldn't loop — `refreshForeignSourceLabels` returns the same array
+  /// reference when nothing changed — but the reads were unbounded behind a
+  /// comment claiming a bound.)
+  ///
+  /// Once-per-mount is the right scope because `App.svelte` wraps this component
+  /// in `{#key selection.activeProjectId}`, so a project switch remounts it and
+  /// gets a fresh pass. **If that key is ever removed, this stops refreshing on a
+  /// project switch and must become an effect keyed on `projectId`.**
+  ///
+  /// Bounded by what the draft references — the distinct *foreign* projects named
+  /// by saved chips, which is none in the common case. Read-only roster calls (no
+  /// load, no lock), so the browse/activate split holds. This is the only place
+  /// the refresh can happen: restore is synchronous, and the picker's cache is
+  /// empty until the user browses that project — the one path where a stale name
+  /// isn't on screen. Failures keep the stored label rather than mutating or
+  /// dropping the chip.
+  onMount(() => {
+    // A plain record used as a set, not a `Set`: local bookkeeping, never
+    // rendered — the same reasoning as `seenSendSeq` in the transcript, and the
+    // shape the reactivity lint expects here. Only ids are collected now; the
+    // roster read no longer takes a directory.
+    const foreign: Record<ProjectId, true> = {};
+    for (const family of [
+      forwardSources,
+      promptAppendedSources,
+      ...Object.values(promptArgSources),
+      ...Object.values(workflowForwardSources),
+    ]) {
+      for (const source of family) {
+        if (source.projectId !== undefined && source.projectId !== projectId) {
+          foreign[source.projectId] = true;
+        }
+      }
+    }
+    const pending = Object.keys(foreign);
+    if (pending.length === 0) return;
+    let cancelled = false;
+    for (const id of pending) {
+      void api
+        .listProjectAgentsReadonly(id)
+        .then((roster) => {
+          if (cancelled) return;
+          const name = projects.list.find((p) => p.id === id)?.name;
+          forwardSources = refreshForeignSourceLabels(forwardSources, id, roster, name);
+          promptAppendedSources = refreshForeignSourceLabels(
+            promptAppendedSources,
+            id,
+            roster,
+            name,
+          );
+          for (const [field, list] of Object.entries(promptArgSources)) {
+            promptArgSources[field] = refreshForeignSourceLabels(list, id, roster, name);
+          }
+          for (const [field, list] of Object.entries(workflowForwardSources)) {
+            workflowForwardSources[field] = refreshForeignSourceLabels(list, id, roster, name);
+          }
+        })
+        .catch(() => {
+          // Unreadable project: keep the stored labels.
+        });
+    }
+    return () => {
+      cancelled = true;
+    };
+  });
   let invokingWorkflow = $state(false);
   let workflowSigningInProvider = $state<string | null>(null);
   let workflowSignInGen = 0;
@@ -753,13 +882,13 @@
       Object.fromEntries(
         Object.entries(map).map(([field, sources]) => [
           field,
-          orderForwardSources(sources, agents),
+          orderForwardSources(sources, agents, projectId),
         ]),
       );
     return {
       message: [...orderedForwardSources],
       promptArgs: copyMap(promptArgSources),
-      promptAppended: orderForwardSources(promptAppendedSources, agents),
+      promptAppended: orderForwardSources(promptAppendedSources, agents, projectId),
       workflowFields: copyMap(workflowForwardSources),
     };
   }
@@ -1018,10 +1147,10 @@
   /// cannot happen.
   function looksLikeItHasASession(agentId: AgentId): boolean {
     // An empty transcript is evidence only once hydration has *completed*.
-    // While loading, and permanently after a failure, it is empty for an agent
-    // that may have a long history — and "send it a message first" is then not
-    // merely unhelpful but false.
-    if (runtimes[agentId]?.hydration_status !== "complete") return true;
+    // While loading, and after a failure until the user retries, it is empty for
+    // an agent that may have a long history — and "send it a message first" is
+    // then not merely unhelpful but false.
+    if (!isHydrated(agentId)) return true;
     return (transcripts[agentId] ?? []).length > 0;
   }
 
@@ -1239,7 +1368,7 @@
     if (!menuOpen || agents.length <= 1 || mode !== "plain") return [];
     const q = menuQuery.toLowerCase();
     const items: ForwardMenuItem[] = [];
-    const alreadyForwarded = expandForwardSources(forwardSources, agents);
+    const alreadyForwarded = forwardSourceIds(forwardSources);
     if (paneLayout.panes.length > 1) {
       for (const pane of paneLayout.panes) {
         if (!pane.name.toLowerCase().includes(q)) continue;
@@ -1257,9 +1386,33 @@
     }
     return items;
   });
+  /// Forward entries that would resolve to nothing. Rendered (with the reason)
+  /// but **not selectable**. The rule is scoped to *direct leaf rows*: a row
+  /// maps one-to-one to a known-empty source, so it is disabled outright.
+  /// **Panes are deliberately different** — a pane is a bulk shortcut and stays
+  /// selectable even when a member is empty; its expansion produces one chip
+  /// per member, and the empty member's chip carries the warning before the
+  /// user submits. Each route intervenes at the point where it has a surface
+  /// to say why. Keeping disabled rows out of `menuItems` — the list arrow
+  /// keys walk and Enter picks from — is what makes the direct rule hold for
+  /// the keyboard as well as the mouse.
+  const emptyForwardKeys = $derived(
+    new Set(
+      forwardItems
+        .filter(
+          (item) => item.kind === "forward-agent" && agentReadiness(item.agent.id) === "empty",
+        )
+        .map((item) => item.key),
+    ),
+  );
   const menuItems = $derived.by<MenuItem[]>(() => {
     if (!menuOpen) return [];
-    return [...fileItems, ...attachmentItems, ...recipientItems, ...forwardItems];
+    return [
+      ...fileItems,
+      ...attachmentItems,
+      ...recipientItems,
+      ...forwardItems.filter((item) => !emptyForwardKeys.has(item.key)),
+    ];
   });
   const fileStatusText = $derived.by<string | null>(() => {
     if (fileItems.length > 0) return null;
@@ -1269,7 +1422,11 @@
     return null;
   });
   const showFileSection = $derived(fileItems.length > 0 || fileStatusText !== null);
-  const hasMenuContent = $derived(menuItems.length > 0 || showFileSection);
+  // `forwardItems` separately, because an unselectable forward row is still a row:
+  // a query that matches only spent agents must show them, not close the menu.
+  const hasMenuContent = $derived(
+    menuItems.length > 0 || forwardItems.length > 0 || showFileSection,
+  );
 
   // Every recipient's history loaded — the precondition for a send (independent
   // of run_status: a busy recipient's message queues).
@@ -2065,11 +2222,17 @@
     invokingWorkflow = true;
     clearStatus();
     try {
-      // Pane-expand each field's sources to agent ids; omit empty fields so the
-      // map carries only fields the user actually attached a forward to.
-      const forwardSources: Record<string, AgentId[]> = {};
+      // Pane-expand each field's sources to wire refs (agent + owning project);
+      // omit empty fields so the map carries only fields the user actually
+      // attached a forward to.
+      const forwardSources: Record<string, ForwardSourceRef[]> = {};
       for (const [name, sources] of Object.entries(workflowForwardSources)) {
-        if (sources.length > 0) forwardSources[name] = expandForwardSources(sources, agents);
+        if (sources.length > 0) {
+          forwardSources[name] = expandForwardSources(
+            orderForwardSources(sources, agents, projectId),
+            projectId,
+          );
+        }
       }
       const runId = await api.invokeWorkflow(
         projectId,
@@ -2163,7 +2326,7 @@
     const forwardId = crypto.randomUUID();
     const sendId = crypto.randomUUID();
     const recipients = targets.map((t) => t.id);
-    const orderedSources = orderForwardSources(sources, agents);
+    const orderedSources = orderForwardSources(sources, agents, projectId);
     // Capture the project id for the held-forward store calls: the hold can
     // outlive this ComposeBar instance (the user navigates to another project
     // while it waits — the compose bar is `{#key projectId}`-remounted, so this
@@ -2183,8 +2346,9 @@
       try {
         const outcome = await api.forwardMessage(
           body,
-          expandForwardSources(orderedSources, agents),
+          expandForwardSources(orderedSources, projectId),
           forwardId,
+          forwardProjectId,
         );
         removeHeldForward(forwardProjectId, forwardId);
         if (outcome.status === "resolved") {
@@ -2274,7 +2438,7 @@
         allSources.push(source);
       }
     }
-    const orderedSources = orderForwardSources(allSources, agents);
+    const orderedSources = orderForwardSources(allSources, agents, projectId);
     // Capture the project id for the held-forward store calls — see
     // `dispatchForward`: this hold can outlive the `{#key projectId}`-remounted
     // ComposeBar instance, so the cleanup must key the global store by *this*
@@ -2295,7 +2459,10 @@
       .filter((a) => (argSources[a.name]?.length ?? 0) > 0)
       .map((a) => ({
         name: a.name,
-        sources: expandForwardSources(argSources[a.name] ?? [], agents),
+        sources: expandForwardSources(
+          orderForwardSources(argSources[a.name] ?? [], agents, projectId),
+          projectId,
+        ),
         required: a.required,
       }));
     void (async () => {
@@ -2310,8 +2477,9 @@
           buildRenderArgs(prompt, typedArgs),
           forwardArgs,
           appended,
-          expandForwardSources(appendedSources, agents),
+          expandForwardSources(orderForwardSources(appendedSources, agents, projectId), projectId),
           forwardId,
+          forwardProjectId,
         );
         removeHeldForward(forwardProjectId, forwardId);
         if (outcome.status === "resolved") {
@@ -3410,14 +3578,21 @@
             {/if}
             {#each forwardItems as item (item.key)}
               {@const i = menuItems.findIndex((candidate) => candidate.key === item.key)}
+              {@const spent = emptyForwardKeys.has(item.key)}
               <button
                 type="button"
-                class={"hover:bg-hover flex w-full cursor-pointer items-center gap-2 rounded-md px-2.5 py-1 text-left leading-5 outline-none select-none " +
+                class={"flex w-full items-center gap-2 rounded-md px-2.5 py-1 text-left leading-5 outline-none select-none " +
+                  (spent ? "cursor-not-allowed" : "hover:bg-hover cursor-pointer ") +
                   (i === highlighted ? "bg-hover" : "")}
                 data-testid={`forward-option-${item.key}`}
                 role="option"
+                disabled={spent}
                 aria-selected={i === highlighted}
-                onclick={() => pickItem(item)}
+                onclick={() => {
+                  // Guarded as well as `disabled`, so the refusal doesn't rest on
+                  // the browser suppressing clicks on a disabled control.
+                  if (!spent) pickItem(item);
+                }}
               >
                 <!-- ↪ forward glyph, shared by both forward entry kinds. -->
                 <svg
@@ -3450,11 +3625,9 @@
                   {/if}
                 {:else}
                   <HarnessIcon harness={item.agent.harness} size="sm" class="h-4 w-4" />
-                  <span class="text-fg">{item.agent.name}</span>
-                  {#if agentReadiness(item.agent.id) === "empty"}
-                    <span class="text-muted ml-auto text-[11px] italic"
-                      >no output — blocks the send</span
-                    >
+                  <span class={spent ? "text-muted/50" : "text-fg"}>{item.agent.name}</span>
+                  {#if spent}
+                    <span class="text-muted ml-auto text-[11px] italic">no output</span>
                   {:else if agentReadiness(item.agent.id) === "pending"}
                     <span class="text-muted ml-auto text-[11px] italic">still generating</span>
                   {/if}
@@ -3477,9 +3650,10 @@
               {#each orderedForwardSources as source (forwardSourceKey(source))}
                 <ForwardSourceChip
                   {source}
-                  readiness={agentReadiness(source.id)}
+                  readiness={sourceReadiness(source)}
                   disabled={composerBusy}
                   onRemove={() => removeForwardSource(forwardSourceKey(source))}
+                  currentProjectId={projectId}
                 />
               {/each}
               {#if forwardSources.length > 1}
@@ -3758,6 +3932,8 @@
            bar's To field + message forwards are hidden (the workflow routes via
            its agent inputs); the run launches in the background. -->
           <WorkflowComposer
+            {projectId}
+            {crossProjectBase}
             descriptor={workflowForm}
             {agents}
             loading={workflowFormLoading}
@@ -3788,6 +3964,8 @@
            row sits just under it (handed in as a snippet), then the argument /
            appended boxes; the send button rides the composer's footer row. -->
           <PromptComposer
+            {projectId}
+            {crossProjectBase}
             prompt={selectedPrompt}
             bind:args={promptArgs}
             bind:appendedText
@@ -3833,6 +4011,11 @@
                 panes={paneLayout.panes}
                 onPickAgent={(agent) => addForwardSource(forwardSourceForAgent(agent))}
                 onPickPane={(pane) => addPaneForwardSources(pane)}
+                crossProject={{
+                  ...crossProjectBase,
+                  onPickForeign: (agent, project, rosterIndex) =>
+                    addForwardSource(forwardSourceForAgent(agent, { project, rosterIndex })),
+                }}
                 {agentReadiness}
                 disabled={composerBusy}
                 showPaneShortcuts
@@ -3879,8 +4062,8 @@
                       <path d="M6 3h9l3 3v15H6z" />
                       <path d="M15 3v4h4" />
                       <path d="M9 11h6M9 15h6" />
-                    </svg>
-                  </button>
+                    </svg></button
+                  >
                 {/snippet}
               </Tooltip>
               <Tooltip label="Run a workflow" disableHoverableContent>

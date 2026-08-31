@@ -352,7 +352,7 @@ describe("UnifiedTranscript", () => {
   it("suppresses empty tool output body while keeping the lifecycle badge", async () => {
     // Harness-agnostic rule: a completed tool with `output === ""` renders
     // the tool name + completed state but no `<pre>` output body.
-    // Defends against the regression where Gemini's live stream emits
+    // Defends against the regression where a harness's live stream emits
     // empty `output` for read-like tools, and the body block would
     // otherwise render as a visible blank pre.
     const state = await loadState();
@@ -1184,14 +1184,14 @@ describe("UnifiedTranscript — fan-out groups", () => {
     expect(body.compareDocumentPosition(chip) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 
-  // Codex/Gemini/Antigravity persist a cancelled-mid turn as `failed`, not
+  // Codex/Antigravity persist a cancelled-mid turn as `failed`, not
   // `streaming`. The cancelled marker still wins, so the column reads cancelled
   // rather than the mislabelled "failed" the bare disk status would give.
   it("reads a reopened cancelled column cancelled even when the disk turn is failed", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
     await state.registerAgent(CODEX_AGENT);
-    // The cancelled-mid recipient is the Codex agent — Codex (like Gemini /
+    // The cancelled-mid recipient is the Codex agent — Codex (like
     // Antigravity) persists a killed turn as `failed`, so this is the harness
     // shape where the marker must override a `failed` disk status.
     seedFanout(

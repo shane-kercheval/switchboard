@@ -15,6 +15,7 @@ mod metadata;
 mod notification;
 mod preferences;
 mod secret_store;
+mod session_lock;
 mod state;
 mod wake_lock;
 pub mod workflow;
@@ -26,8 +27,7 @@ use std::sync::Arc;
 
 use switchboard_dispatcher::EventEmitter;
 use switchboard_harness::{
-    AntigravityAdapter, ClaudeCodeAdapter, CodexAdapter, GeminiAdapter, HarnessAdapter,
-    MockHarnessAdapter,
+    AntigravityAdapter, ClaudeCodeAdapter, CodexAdapter, HarnessAdapter, MockHarnessAdapter,
 };
 use tauri::{Emitter, Manager, State};
 
@@ -300,8 +300,7 @@ use crate::commands::{
     cancel_forward_impl, cancel_send_impl, cancel_turn_impl, changed_files_impl,
     check_antigravity_auth_impl, check_antigravity_binary_impl, check_claude_auth_impl,
     check_claude_binary_impl, check_codex_auth_impl, check_codex_binary_impl,
-    check_gemini_auth_impl, check_gemini_binary_impl, commit_changed_files_impl,
-    commit_file_diff_impl, commit_ranges_impl, copy_builtin_prompt_impl,
+    commit_changed_files_impl, commit_file_diff_impl, commit_ranges_impl, copy_builtin_prompt_impl,
     create_agent_with_profiles_impl, create_project_impl, delete_project_impl, editor_open_argv,
     existing_attachment_paths_impl, fetch_repo_impl, file_diff_impl, fork_agent_impl,
     forward_message_impl, forward_prompt_impl, get_preferences_impl, get_prompt_source_impl,
@@ -312,10 +311,10 @@ use crate::commands::{
     open_branch_comparison_file_difftool_impl, open_commit_file_difftool_impl, open_project_impl,
     open_worktree_file_difftool_impl, parse_uuid, pick_directory_impl,
     project_session_fingerprints_impl, read_tracked_repo_from_inputs,
-    recheck_harness_installs_impl, remove_agent_impl, remove_directory_impl,
-    remove_mcp_provider_impl, remove_message_pins_impl, remove_queued_message_impl,
-    remove_tracked_repo_impl, rename_agent_impl, rename_project_impl, render_prompt_impl,
-    reorder_agents_impl, resolve_saved_prompt_fresh_impl, resolve_saved_prompt_impl,
+    recheck_harness_installs_impl, remove_agent_impl, remove_mcp_provider_impl,
+    remove_message_pins_impl, remove_queued_message_impl, remove_tracked_repo_impl,
+    rename_agent_impl, rename_project_impl, render_prompt_impl, reorder_agents_impl,
+    repoint_project_directory_impl, resolve_saved_prompt_fresh_impl, resolve_saved_prompt_impl,
     resume_agent_in_terminal_impl, reveal_in_finder_argv, search_project_files_in_root,
     search_project_files_root_impl, send_message_impl, set_active_agent_profile_impl,
     set_active_project_impl, set_agent_profiles_impl, set_message_pin_impl, set_preferences_impl,
@@ -427,19 +426,6 @@ async fn check_codex_auth() -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn check_gemini_binary(state: State<'_, AppState>) -> Result<(), String> {
-    check_gemini_binary_impl(state.inner()).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-async fn check_gemini_auth() -> Result<(), String> {
-    let home = std::env::var_os("HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_default();
-    check_gemini_auth_impl(&home).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
 async fn check_antigravity_binary(state: State<'_, AppState>) -> Result<(), String> {
     check_antigravity_binary_impl(state.inner()).map_err(|e| e.to_string())
 }
@@ -492,8 +478,8 @@ async fn recheck_harness_installs() -> Result<PathSource, String> {
 }
 
 #[tauri::command]
-async fn pick_directory(path: String) -> Result<DirectoryInfo, String> {
-    pick_directory_impl(&path).await.map_err(|e| e.to_string())
+async fn pick_directory(state: State<'_, AppState>, path: String) -> Result<DirectoryInfo, String> {
+    pick_directory_impl(state.inner(), &path).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -503,9 +489,17 @@ async fn init_directory(state: State<'_, AppState>, path: String) -> Result<Dire
         .map_err(|e| e.to_string())
 }
 
+/// Repair a project whose working directory moved, was deleted, or is claimed
+/// by two catalog rows. **Moves every project sharing that directory**, not just
+/// the one named — the UI must say so before the user confirms.
 #[tauri::command]
-async fn remove_directory(state: State<'_, AppState>, path: String) -> Result<(), String> {
-    remove_directory_impl(state.inner(), &path)
+async fn repoint_project_directory(
+    state: State<'_, AppState>,
+    project_id: String,
+    new_path: String,
+) -> Result<(), String> {
+    let pid = parse_uuid(&project_id).map_err(|e| e.to_string())?;
+    repoint_project_directory_impl(state.inner(), pid, &new_path)
         .await
         .map_err(|e| e.to_string())
 }
@@ -1117,6 +1111,16 @@ async fn reorder_agents(
 }
 
 #[tauri::command]
+async fn list_project_agents_readonly(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<Vec<AgentRecord>, ActivationCommandError> {
+    let pid = parse_uuid(&project_id).map_err(ActivationCommandError::from)?;
+    crate::commands::list_project_agents_readonly_impl(state.inner(), pid)
+        .map_err(ActivationCommandError::from)
+}
+
+#[tauri::command]
 async fn list_agents(
     state: State<'_, AppState>,
     project_id: Option<String>,
@@ -1272,15 +1276,12 @@ async fn cancel_send(
 async fn forward_message(
     state: State<'_, AppState>,
     body: String,
-    sources: Vec<String>,
+    sources: Vec<crate::commands::ForwardSourceRef>,
     forward_id: String,
+    project_id: String,
 ) -> Result<ForwardOutcome, String> {
-    let source_ids = sources
-        .iter()
-        .map(|s| parse_uuid(s))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e.to_string())?;
     let fid = parse_uuid(&forward_id).map_err(|e| e.to_string())?;
+    let recipient = parse_uuid(&project_id).map_err(|e| e.to_string())?;
     let home = std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_default();
@@ -1288,7 +1289,7 @@ async fn forward_message(
     // its sources to finish, then resolves the composed body (or invalidate /
     // cancel). The frontend dispatches the body; `cancel_forward` (below)
     // interrupts the wait out of band.
-    forward_message_impl(state.inner(), body, source_ids, fid, &home)
+    forward_message_impl(state.inner(), body, sources, fid, &home, recipient)
         .await
         .map_err(|e| e.to_string())
 }
@@ -1302,10 +1303,12 @@ async fn forward_prompt(
     typed_args: std::collections::BTreeMap<String, String>,
     forward_args: Vec<ForwardArg>,
     appended_text: String,
-    appended_sources: Vec<switchboard_core::AgentId>,
+    appended_sources: Vec<crate::commands::ForwardSourceRef>,
     forward_id: String,
+    project_id: String,
 ) -> Result<ForwardOutcome, String> {
     let fid = parse_uuid(&forward_id).map_err(|e| e.to_string())?;
+    let recipient = parse_uuid(&project_id).map_err(|e| e.to_string())?;
     let home = std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_default();
@@ -1323,6 +1326,7 @@ async fn forward_prompt(
         appended_sources,
         fid,
         &home,
+        recipient,
     )
     .await
     .map_err(|e| e.to_string())
@@ -1547,7 +1551,8 @@ async fn refresh_workflow_form_from_cache(
 async fn merge_workflow_forwards(
     state: &AppState,
     inputs: &std::collections::BTreeMap<String, InputValue>,
-    forward_sources: &std::collections::BTreeMap<String, Vec<switchboard_core::AgentId>>,
+    forward_sources: &std::collections::BTreeMap<String, Vec<crate::commands::ForwardSourceRef>>,
+    recipient_project: switchboard_core::ProjectId,
 ) -> Result<std::collections::BTreeMap<String, InputValue>, String> {
     if forward_sources.values().all(Vec::is_empty) {
         return Ok(inputs.clone());
@@ -1555,10 +1560,15 @@ async fn merge_workflow_forwards(
     let home = std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_default();
-    let resolved =
-        crate::commands::resolve_workflow_forwards(state, forward_sources, inputs, &home)
-            .await
-            .map_err(|e| e.to_string())?;
+    let resolved = crate::commands::resolve_workflow_forwards(
+        state,
+        forward_sources,
+        inputs,
+        &home,
+        recipient_project,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     let mut effective = inputs.clone();
     for (field, text) in resolved {
         effective.insert(field, InputValue::Text(text));
@@ -1575,9 +1585,10 @@ async fn validate_workflow_invocation(
     name: String,
     is_builtin: bool,
     inputs: std::collections::BTreeMap<String, InputValue>,
-    forward_sources: std::collections::BTreeMap<String, Vec<switchboard_core::AgentId>>,
+    forward_sources: std::collections::BTreeMap<String, Vec<crate::commands::ForwardSourceRef>>,
 ) -> Result<(), String> {
-    let effective = merge_workflow_forwards(state.inner(), &inputs, &forward_sources).await?;
+    let effective =
+        merge_workflow_forwards(state.inner(), &inputs, &forward_sources, project_id).await?;
     validate_workflow_invocation_impl(state.inner(), project_id, &name, is_builtin, &effective)
         .map_err(|e| e.to_string())
 }
@@ -1590,9 +1601,10 @@ async fn invoke_workflow(
     name: String,
     is_builtin: bool,
     inputs: std::collections::BTreeMap<String, InputValue>,
-    forward_sources: std::collections::BTreeMap<String, Vec<switchboard_core::AgentId>>,
+    forward_sources: std::collections::BTreeMap<String, Vec<crate::commands::ForwardSourceRef>>,
 ) -> Result<String, String> {
-    let effective = merge_workflow_forwards(state.inner(), &inputs, &forward_sources).await?;
+    let effective =
+        merge_workflow_forwards(state.inner(), &inputs, &forward_sources, project_id).await?;
     let home = std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_default();
@@ -1760,12 +1772,12 @@ impl EventEmitter for AppHandleEmitter {
 /// - `"mock"` → all three adapters = `MockHarnessAdapter`.
 /// - Any other value → panic (silent fall-through to default would be a footgun).
 ///
-/// Returns `(claude_adapter, codex_adapter, gemini_adapter, antigravity_adapter)`.
+/// Returns `(claude_adapter, codex_adapter, antigravity_adapter)`.
 /// All are constructed under "claude"/unset because the `match agent.harness`
 /// routing in `send_message_impl` may dispatch to any at runtime; no
 /// adapter's constructor performs a binary check, so missing CLIs only
 /// surface at `check_*_binary` time, not at app startup.
-// A 4-tuple of the same trait object reads as "complex" to clippy, but a
+// A 3-tuple of the same trait object reads as "complex" to clippy, but a
 // named struct for a private one-call-site startup helper would be more
 // ceremony than it's worth — the tuple is destructured immediately at the
 // single call site in `run`.
@@ -1774,23 +1786,16 @@ fn build_adapters() -> (
     Arc<dyn HarnessAdapter>,
     Arc<dyn HarnessAdapter>,
     Arc<dyn HarnessAdapter>,
-    Arc<dyn HarnessAdapter>,
 ) {
     match std::env::var("SWITCHBOARD_HARNESS").as_deref() {
         Ok("mock") => {
             tracing::info!("SWITCHBOARD_HARNESS=mock — using MockHarnessAdapter for all harnesses");
             let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
-            (
-                Arc::clone(&mock),
-                Arc::clone(&mock),
-                Arc::clone(&mock),
-                mock,
-            )
+            (Arc::clone(&mock), Arc::clone(&mock), mock)
         }
         Ok("claude") | Err(_) => (
             Arc::new(ClaudeCodeAdapter::new()),
             Arc::new(CodexAdapter::new()),
-            Arc::new(GeminiAdapter::new()),
             Arc::new(AntigravityAdapter::new()),
         ),
         Ok(other) => panic!(
@@ -1840,6 +1845,41 @@ fn debug_config_dir(override_dir: Option<std::ffi::OsString>) -> Option<std::pat
 /// Path to the user-global `workspace.yaml` (the cross-directory project list).
 fn workspace_config_path() -> Option<std::path::PathBuf> {
     config_dir().map(|dir| dir.join("workspace.yaml"))
+}
+
+/// Root of the user-global project store (`<config-dir>/store/`).
+///
+/// A **subdirectory** rather than the config dir itself: the store owns its
+/// root — it inspects it to decide whether a missing version marker means a
+/// fresh install or a damaged store — and sharing that root with `config.yaml`,
+/// `workspace.yaml`, and `git-view.yaml` would put unrelated files inside the
+/// thing it reasons about. Follows the same `config_dir()` resolution as its
+/// siblings, so the debug `SWITCHBOARD_CONFIG_DIR` override relocates the store
+/// along with everything else and a dev build never touches the release store.
+fn store_root_path() -> Option<std::path::PathBuf> {
+    config_dir().map(|dir| dir.join("store"))
+}
+
+/// Root for the cross-**process** harness session locks
+/// (`<lock-root>/locks/<key>.lock`).
+///
+/// **Deliberately not `config_dir()`, and not `cfg`-split.** Every sibling path
+/// above resolves through `config_dir()`, which a debug build redirects so dev
+/// runs never touch installed state — the right default for anything Switchboard
+/// owns. These locks are the one exception: their whole purpose is to stop a dev
+/// build and the installed app driving the *same harness session* concurrently,
+/// and the harness's session files are shared between them whatever Switchboard's
+/// config dir says. Inheriting dev isolation here would give both builds their
+/// own lock directory, so neither would ever see the other's lock and the guard
+/// would silently protect nothing. So: resolve the release location
+/// unconditionally, in both build profiles.
+///
+/// Tests never call this — they inject a `TempDir` through `AppState`, because a
+/// test that took a real lock here would contend with the developer's running
+/// app.
+fn session_lock_root() -> Option<std::path::PathBuf> {
+    directories::ProjectDirs::from("", "", "switchboard")
+        .map(|dirs| dirs.config_dir().to_path_buf())
 }
 
 /// The Git-view tracked-repo registry (`git-view.yaml`) — a sibling of
@@ -2074,7 +2114,7 @@ pub fn run() {
         let _ = build_log_subscriber(env_filter, std::io::stdout).try_init();
     }
 
-    let (claude_adapter, codex_adapter, gemini_adapter, antigravity_adapter) = build_adapters();
+    let (claude_adapter, codex_adapter, antigravity_adapter) = build_adapters();
 
     // In release builds, enforce single-instance: a second launch focuses the
     // existing window instead of spawning a rival process, keeping one
@@ -2139,12 +2179,25 @@ pub fn run() {
                 base_emitter,
                 wake_lock::KeepAwakeInhibitor::new(),
             ));
+            // The store is required, so both failures abort startup rather than
+            // degrading: with no store the app would accept project creation
+            // and silently lose it. Contrast the `Option<PathBuf>` persistence
+            // paths below, which guard convenience state.
+            let store_root = store_root_path()
+                .ok_or("no config directory resolved — cannot locate the project store")?;
+            let store = switchboard_core::Store::open(&store_root)?;
+            // Also required, and aborts for the same reason: without a lock root
+            // every turn would refuse (fail-closed), which is worse than not
+            // starting and much harder to diagnose.
+            let lock_root = session_lock_root()
+                .ok_or("no config directory resolved — cannot locate the session lock root")?;
             let state = AppState::new(
                 Arc::clone(&claude_adapter),
                 Arc::clone(&codex_adapter),
-                Arc::clone(&gemini_adapter),
                 Arc::clone(&antigravity_adapter),
                 emitter,
+                store,
+                lock_root,
             );
             // Attach all user-global persistence locations (workspace.yaml,
             // git-view.yaml, config.yaml) — see `with_persistence_paths`.
@@ -2216,7 +2269,6 @@ pub fn run() {
             // restored directories report `available: true` and participate in
             // the cross-harness session-id collision scan. Unopenable
             // directories (unmounted/moved) are skipped and stay unavailable.
-            crate::state::eager_load_directories(&state);
             app.manage(crate::lifecycle::QuitCoordinator::new());
             app.manage(state);
             Ok(())
@@ -2225,8 +2277,6 @@ pub fn run() {
             check_claude_binary,
             check_codex_binary,
             check_codex_auth,
-            check_gemini_binary,
-            check_gemini_auth,
             check_antigravity_binary,
             check_antigravity_auth,
             check_claude_auth,
@@ -2235,7 +2285,7 @@ pub fn run() {
             await_harness_path,
             pick_directory,
             init_directory,
-            remove_directory,
+            repoint_project_directory,
             list_projects,
             list_message_pins,
             set_message_pin,
@@ -2304,6 +2354,7 @@ pub fn run() {
             reorder_agents,
             attach_agent,
             list_agents,
+            list_project_agents_readonly,
             search_project_files,
             send_message,
             stage_attachment,
@@ -2334,17 +2385,213 @@ pub fn run() {
     builder.run(|_, _| {});
 }
 
+/// The webview's asset-protocol allowlist is a JSON string in `tauri.conf.json`
+/// with no compile-time relationship to the paths it is supposed to authorize.
+/// When the store layout moved, the glob kept pointing at the old per-directory
+/// path and every attachment thumbnail rendered broken — with nothing failing,
+/// because every frontend test mocks `convertFileSrc` and the Rust live tests
+/// prove the *agent* can read the file, not the webview.
+///
+/// These tests close that: they build an attachment path the way production
+/// does and match it against the glob the shipped config actually contains.
+///
+/// **They match the glob, not the whole production predicate.** Tauri's
+/// `is_allowed` canonicalizes (resolving symlinks) before matching and denies
+/// outright if that fails — so these synthetic paths, which do not exist, would
+/// be rejected by the real check regardless of the pattern. That is the right
+/// scope for what is being pinned here (does the shipped glob describe the
+/// shipped layout), but it is not end-to-end coverage of the asset protocol.
+///
+/// A consequence of that canonicalization worth stating where the scope is
+/// chosen: matching happens on the *canonical* path, so a store root that
+/// canonicalizes to a location without a matching component — the config or
+/// store directory itself symlinked into a differently-named path — loses
+/// thumbnails, in any build profile. (An earlier note called this
+/// developer-only, which understated it, and a proposed correction blamed a
+/// symlinked home, which is wrong: that changes the prefix, which the leading
+/// `**` absorbs, and leaves the named component intact.)
+#[cfg(test)]
+mod asset_scope_tests {
+    use glob::Pattern;
+    use switchboard_core::Store;
+    use tempfile::TempDir;
+
+    /// The `scope` array from the config the app ships with.
+    fn shipped_scope() -> Vec<String> {
+        let raw = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tauri.conf.json"))
+            .expect("tauri.conf.json is next to Cargo.toml");
+        let conf: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+        conf["app"]["security"]["assetProtocol"]["scope"]
+            .as_array()
+            .expect("assetProtocol.scope is an array")
+            .iter()
+            .map(|v| v.as_str().expect("scope entries are strings").to_owned())
+            .collect()
+    }
+
+    /// **Tauri's match options, not the crate defaults.** `glob`'s default
+    /// `require_literal_separator` is `false`, which lets `*` cross path
+    /// separators — so matching with the defaults tests looser semantics than the
+    /// webview actually enforces, and a test that does is worse than none: it
+    /// reports safe for a scope that is not, and misses layout drift the shipped
+    /// matcher would catch. Tauri sets `require_literal_separator: true`
+    /// deliberately, under a security advisory (GHSA-6mv3-wm7j-h4w5), and
+    /// `require_literal_leading_dot: true` on unix so dotfiles are not exposed by
+    /// default. Mirror both. Re-check this against `tauri::scope::fs` on a Tauri
+    /// major bump.
+    fn tauri_match_options() -> glob::MatchOptions {
+        glob::MatchOptions {
+            require_literal_separator: true,
+            require_literal_leading_dot: cfg!(unix),
+            ..glob::MatchOptions::default()
+        }
+    }
+
+    fn is_allowed(path: &std::path::Path) -> bool {
+        shipped_scope().iter().any(|p| {
+            Pattern::new(p)
+                .expect("valid glob")
+                .matches_path_with(path, tauri_match_options())
+        })
+    }
+
+    /// The store-relative shape of an attachment path, derived from the real
+    /// layout code rather than written out — so a change to where attachments
+    /// live reaches this test instead of only reaching users.
+    fn attachment_below(store_root: &std::path::Path) -> std::path::PathBuf {
+        let tmp = TempDir::new().expect("temp store");
+        let cwd = TempDir::new().expect("temp working directory");
+        let probe = Store::open(tmp.path()).expect("open temp store");
+        let directory = probe.add_directory(cwd.path()).expect("bind a directory");
+        let project = probe
+            .create_project(directory.directory_id, "probe")
+            .expect("create a project");
+        // Through `Project::attachments_dir()` rather than a literal: renaming
+        // the layout constant must reach this test, since that rename breaks
+        // thumbnails and nothing else would notice.
+        let relative = project
+            .attachments_dir()
+            .strip_prefix(tmp.path())
+            .expect("attachments live below the store root")
+            .to_path_buf();
+        store_root.join(relative).join("shot.png")
+    }
+
+    #[test]
+    fn the_asset_scope_authorizes_release_attachment_paths() {
+        let config = directories::ProjectDirs::from("", "", "switchboard")
+            .expect("a config dir resolves on any supported host");
+        let path = attachment_below(&config.config_dir().join("store"));
+        assert!(
+            is_allowed(&path),
+            "the shipped asset scope does not authorize {}, so every attachment \
+             thumbnail renders broken in the installed app",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn the_asset_scope_authorizes_dev_attachment_paths() {
+        // `make dev` points `SWITCHBOARD_CONFIG_DIR` at
+        // `<app support>/switchboard-dev[-<port>]`, and a bare `cargo run` falls
+        // back to `switchboard-dev`. Both must be authorized or thumbnails break
+        // for every developer while working in the installed app.
+        let base = directories::ProjectDirs::from("", "", "switchboard")
+            .expect("a config dir resolves on any supported host")
+            .config_dir()
+            .parent()
+            .expect("the config dir has a parent")
+            .to_path_buf();
+        for name in ["switchboard-dev", "switchboard-dev-1420"] {
+            let path = attachment_below(&base.join(name).join("store"));
+            assert!(
+                is_allowed(&path),
+                "the shipped asset scope does not authorize the {name} dev root: {}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn the_asset_scope_matching_requires_literal_separators() {
+        // **Pins the option, not the glob.** Every other case here behaves
+        // identically under Tauri's strict options and `glob`'s loose defaults,
+        // because each is missing a *literal* segment no wildcard can supply. So
+        // the setting the module depends on — and whose absence let a wrong glob
+        // pass in the first place — was itself unenforced.
+        //
+        // These two are the exception: each needs a wildcard to swallow a `/`.
+        // Strict rejects them; loose accepts them. Swap `tauri_match_options()`
+        // for `MatchOptions::default()` and only these fail.
+        for path in [
+            // `switchboard-dev*` would have to span two components.
+            "/Users/x/Library/Application Support/switchboard-dev/other/store/projects/abc/attachments/shot.png",
+            // The project-id `*` would have to span two components.
+            "/Users/x/Library/Application Support/switchboard/store/projects/a/b/attachments/shot.png",
+        ] {
+            assert!(
+                !is_allowed(std::path::Path::new(path)),
+                "a wildcard crossed a path separator — the match options are no \
+                 longer Tauri's, and the scope is looser than it reads: {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_asset_scope_does_not_authorize_unrelated_files() {
+        // The glob leads with `**`, so it is worth pinning that it still requires
+        // the whole `switchboard*/store/projects/*/attachments/` shape rather
+        // than matching anything that merely ends in a file.
+        for path in [
+            "/Users/someone/Documents/taxes.pdf",
+            "/Users/someone/Library/Application Support/switchboard/store/store.yaml",
+            "/Users/someone/Library/Application Support/switchboard/store/projects/abc/journal.jsonl",
+            // Prefix-adjacent roots the old `switchboard*` glob authorized.
+            "/Users/someone/Library/Application Support/switchboard-backup/store/projects/abc/attachments/shot.png",
+            "/Users/someone/Library/Application Support/switchboard-demo/store/projects/abc/attachments/shot.png",
+            "/Users/someone/Library/Application Support/switchboard-dev-backup/store/projects/abc/attachments/shot.png",
+        ] {
+            assert!(
+                !is_allowed(std::path::Path::new(path)),
+                "the asset scope must not authorize {path}"
+            );
+        }
+    }
+}
+
 // Gated on `debug_assertions` because `debug_config_dir` exists only in debug
 // builds; `cargo test --release` turns those off and the symbol away.
 #[cfg(all(test, debug_assertions))]
 mod tests {
     use super::{
         ActivationCommandError, build_debug_secret_store, build_release_secret_store,
-        debug_config_dir, run_open_argv,
+        debug_config_dir, run_open_argv, session_lock_root,
     };
     use crate::error::AppError;
     use std::path::PathBuf;
     use uuid::Uuid;
+
+    #[test]
+    fn the_session_lock_root_resolves_to_the_release_location_in_a_debug_build() {
+        // The one user-global path deliberately *inconsistent* with its siblings:
+        // every other one is dev-isolated so a debug build never touches the
+        // installed app's state, and this one must be the opposite or a dev build
+        // and the installed app get separate lock directories and neither ever
+        // sees the other's lock. This test runs in a debug build, so if anyone
+        // routes it through `config_dir()` for consistency it fails here.
+        //
+        // Pinned to the expected value rather than merely asserted different from
+        // `config_dir()`: inequality would also hold if the root drifted somewhere
+        // else entirely, and it would break spuriously if a developer pointed
+        // `SWITCHBOARD_CONFIG_DIR` at the release directory.
+        let expected = directories::ProjectDirs::from("", "", "switchboard")
+            .map(|dirs| dirs.config_dir().to_path_buf());
+        assert_eq!(
+            session_lock_root(),
+            expected,
+            "the session lock root must resolve to the release config path in every build profile"
+        );
+    }
 
     #[test]
     fn activation_command_errors_serialize_kind_separately_from_message() {

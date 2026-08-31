@@ -1,6 +1,6 @@
 //! Fixture binary used by integration tests in place of the real `agy` CLI.
 //!
-//! Unlike `fake_claude` / `fake_gemini` (which only drip stdout), the
+//! Unlike `fake_claude` (which only drips stdout), the
 //! Antigravity producer reads the conversation directory under `$HOME` *while
 //! the child runs* — correlating the server-assigned UUID, then tailing
 //! `transcript.jsonl`. So `fake_agy` must actually create that directory and

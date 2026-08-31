@@ -23,7 +23,8 @@ use uuid::Uuid;
 /// per-user state. Named `GeminiDir` inside the `agy` binary; the shared
 /// `~/.gemini/` namespace is load-bearing — `agy` reads
 /// `~/.gemini/oauth_creds.json`, `settings.json`, and `installation_id`
-/// from the parent directory (Gemini-CLI residue) but writes only to its
+/// from the parent directory (Gemini-CLI residue — Google's shared config
+/// root, not Switchboard's removed Gemini adapter) but writes only to its
 /// own `antigravity-cli/` subtree.
 #[must_use]
 pub fn antigravity_root(home_dir: &Path) -> PathBuf {

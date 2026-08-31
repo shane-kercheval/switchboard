@@ -57,7 +57,27 @@ steps:
 
         {{ aggregated_responses(reviewers) }}
 
-        Weigh their responses and give your final recommendation.
+        Weigh their responses and settle every finding. Then write your final response in two sections, in this order, for two different readers.
+
+        ## Decision summary — for the human
+
+        Assume the human has read NOTHING else: not the reviews, not your analysis, not the reviewers' responses. This section is the only thing they will read, and it must stand alone.
+
+        Format: bullet points, grouped by issue. Depth is your judgment, calibrated per issue by one question — what does this change in the running system, and what does it ask of the reader? An issue that changes observable behavior or needs a decision gets enough bullets to cover what happens, why it matters, and what you're doing or asking. An obviously-correct fix nobody disputed gets one bullet naming it. Depth tracks substance, in both directions — never a template, never a fixed length.
+
+        - Open with the bottom line: what you will do, what you won't, and what you need from them — or that you need nothing.
+        - For every decision they must make: the question, your recommendation, and what happens if they defer.
+        - If your position changed during the debate, say so plainly and why. Report the cumulative outcome across rounds, not this round's delta.
+        - Write for someone who wasn't there: never refer to "finding #3" or "the hydration issue" as if they know the label — re-state what it is. No code identifiers unless they need them to act; describe the behavior instead.
+        - If you bold a lead sentence, it must be a complete plain-language statement of the point — the reader should understand the issue from that sentence alone. Never a slogan or theme label ("Depth tracks substance", "Proportionality") that names a topic without saying anything about it.
+
+        ## Full record — for the reviewers and for implementation
+
+        Precise enough that a reviewer can verify alignment and implementation can proceed without re-reading the debate:
+
+        - Every finding from every round with its final status (accept / reject / modify), the deciding argument in one or two sentences, and the exact change: files, functions, tests.
+        - Where you verified a disputed claim against the code, say what you checked and what you found.
+        - What changed from your original analysis across all rounds, and why.
   - label: Recommendation ready
     wait_for:
       agent: "{{ worker }}"

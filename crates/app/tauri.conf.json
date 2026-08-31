@@ -30,7 +30,9 @@
       "assetProtocol": {
         "enable": true,
         "scope": [
-          "**/.switchboard/projects/*/attachments/*"
+          "**/switchboard/store/projects/*/attachments/*",
+          "**/switchboard-dev/store/projects/*/attachments/*",
+          "**/switchboard-dev-[0-9]*/store/projects/*/attachments/*"
         ]
       }
     }

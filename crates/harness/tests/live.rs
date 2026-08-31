@@ -2,7 +2,7 @@
 ///
 /// Run with: `make test-live`
 ///
-/// Requires `claude`, `codex`, and/or `gemini` installed and authenticated.
+/// Requires `claude`, `codex`, and/or `agy` installed and authenticated.
 /// Developer-local only — not run in CI. See `AGENTS.md` "Live testing
 /// against real harnesses" for the policy.
 use std::path::Path;
@@ -12,10 +12,9 @@ use serde_json::json;
 use switchboard_core::{AgentRecord, HarnessKind, SessionLocator};
 use switchboard_harness::{
     AdapterEvent, AntigravityAdapter, ClaudeCodeAdapter, CodexAdapter, ContentKind,
-    ContextWindowSource, DispatchOptions, EditChange, FailureKind, GeminiAdapter, HarnessAdapter,
-    RateLimitSource, ToolFacet, Turn, TurnItem, TurnOutcome, UserPromptSource,
-    claude_session_file_path, load_antigravity_transcript, load_claude_transcript,
-    load_codex_transcript, load_gemini_transcript,
+    ContextWindowSource, DispatchOptions, EditChange, FailureKind, HarnessAdapter, RateLimitSource,
+    ToolFacet, Turn, TurnItem, TurnOutcome, UserPromptSource, claude_session_file_path,
+    load_antigravity_transcript, load_claude_transcript, load_codex_transcript,
 };
 use uuid::Uuid;
 
@@ -2086,330 +2085,6 @@ async fn live_codex_resume_reuses_session() {
     );
 }
 
-// --- Gemini live tests ---
-
-fn live_gemini_agent() -> AgentRecord {
-    AgentRecord {
-        model: None,
-        effort: None,
-        profiles: switchboard_core::AgentProfiles::default(),
-        forked_from_session: None,
-        id: Uuid::now_v7(),
-        project_id: Uuid::now_v7(),
-        name: "live-gemini-agent".to_owned(),
-        harness: HarnessKind::Gemini,
-        // Gemini follows the Claude shape — caller-controlled session UUID.
-        // **UUID v4, not v7**: Gemini's session-file filename uses the first
-        // 8 hex chars of the session UUID, and v7s minted in the same
-        // millisecond share their first 8 chars. v4 makes the collision
-        // probability ~1/2^32. The production `Project::register_agent`
-        // honors this contract; tests must mint v4 explicitly here too.
-        session_locator: Some(SessionLocator::Uuid(Uuid::new_v4())),
-        created_at: chrono::Utc::now(),
-    }
-}
-
-#[tokio::test]
-#[ignore = "requires gemini installed — run with: make test-live"]
-async fn live_gemini_basic_turn_completes() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let adapter = GeminiAdapter::new();
-    let agent = live_gemini_agent();
-    let turn_id = Uuid::now_v7();
-
-    let stream = adapter
-        .dispatch(
-            &agent,
-            tmp.path(),
-            "Reply with the single word 'ack' and nothing else.",
-            turn_id,
-            DispatchOptions::default(),
-        )
-        .await
-        .expect("dispatch should succeed with real gemini");
-
-    let events: Vec<AdapterEvent> = stream.collect().await;
-
-    let text: String = events
-        .iter()
-        .filter_map(|e| {
-            if let AdapterEvent::ContentChunk { text, .. } = e {
-                Some(text.clone())
-            } else {
-                None
-            }
-        })
-        .collect();
-    assert!(
-        text.to_lowercase().contains("ack"),
-        "expected 'ack' in response text, got: {text:?}"
-    );
-
-    let terminal = events
-        .iter()
-        .find(|e| matches!(e, AdapterEvent::TurnEnd { .. }))
-        .expect("should have a terminal TurnEnd");
-    assert!(
-        matches!(
-            terminal,
-            AdapterEvent::TurnEnd {
-                outcome: TurnOutcome::Completed,
-                ..
-            }
-        ),
-        "expected TurnEnd(Completed), got: {terminal:?}"
-    );
-
-    // Gemini emits `SessionMeta` from its stream `init` event on every
-    // dispatch. The contract is asymmetric vs. Claude / Codex:
-    // - `model` populates from `init.model`.
-    // - `tools` is always `vec![]` — Gemini's `init` doesn't carry tools.
-    // - `harness_version` comes from a lazy `gemini --version` fetch on
-    //   first dispatch; empty string is tolerated if the version probe
-    //   fails (the field is display-only).
-    // - `mcp_servers` / `skills` come from the adapter's
-    //   loader injection (settings.json / ~/.agents/skills). Structural
-    //   checks only — content is developer-environment-dependent (we
-    //   don't pin a particular setup), matching Codex's live-test
-    //   discipline.
-    let session_meta = events
-        .iter()
-        .find(|e| matches!(e, AdapterEvent::SessionMeta { .. }))
-        .expect("Gemini must emit SessionMeta from stream init on every dispatch");
-    match session_meta {
-        AdapterEvent::SessionMeta {
-            model,
-            tools,
-            mcp_servers,
-            skills,
-            ..
-        } => {
-            assert!(!model.is_empty(), "SessionMeta.model must be non-empty");
-            assert!(tools.is_empty(), "Gemini SessionMeta.tools is vec![]");
-            // Structural check only — the loader emits real entries when
-            // settings.json / ~/.agents/skills carry config, [] otherwise.
-            // Both shapes are valid; pinning content would couple the
-            // test to the developer's machine.
-            let _: &Vec<_> = mcp_servers;
-            let _: &Vec<_> = skills;
-        }
-        _ => unreachable!(),
-    }
-}
-
-#[tokio::test]
-#[ignore = "requires gemini installed — run with: make test-live"]
-async fn live_gemini_model_dispatch() {
-    // The selected model surfaces in `SessionMeta` (from `init.model`), proving
-    // `--model` took effect. Gemini has no effort axis, so there is nothing
-    // effort-shaped to assert.
-    let tmp = tempfile::TempDir::new().unwrap();
-    let adapter = GeminiAdapter::new();
-    let mut agent = live_gemini_agent();
-    agent.model = Some("gemini-2.5-flash".to_owned());
-    let turn_id = Uuid::now_v7();
-
-    let stream = adapter
-        .dispatch(
-            &agent,
-            tmp.path(),
-            "Reply with only the number 4 and nothing else.",
-            turn_id,
-            DispatchOptions::default(),
-        )
-        .await
-        .expect("dispatch should succeed with real gemini");
-    let events: Vec<AdapterEvent> = stream.collect().await;
-
-    let model = session_meta_model(&events).expect("Gemini emits SessionMeta with model");
-    assert!(
-        model.contains("flash"),
-        "selected `--model gemini-2.5-flash` must surface in SessionMeta.model; got {model:?}"
-    );
-    let terminal = events
-        .iter()
-        .find(|e| matches!(e, AdapterEvent::TurnEnd { .. }))
-        .expect("terminal TurnEnd");
-    assert!(
-        matches!(
-            terminal,
-            AdapterEvent::TurnEnd {
-                outcome: TurnOutcome::Completed,
-                ..
-            }
-        ),
-        "dispatch with model must complete; got {terminal:?}"
-    );
-}
-
-#[tokio::test]
-#[ignore = "requires gemini installed — run with: make test-live"]
-async fn live_gemini_resume_reuses_session() {
-    // Memorize-then-recall: definitive proof that `--resume` restores the
-    // prior turn's context (matches the Codex pattern, strictly stronger
-    // than "two completes succeed"). The adapter must detect the session
-    // file from turn 1 and switch from `--session-id` to `--resume` on
-    // turn 2. A regression in the path-lookup helper would surface here
-    // as the recall failing.
-    let tmp = tempfile::TempDir::new().unwrap();
-    let adapter = GeminiAdapter::new();
-    let agent = live_gemini_agent();
-
-    let turn1 = Uuid::now_v7();
-    let stream1 = adapter
-        .dispatch(
-            &agent,
-            tmp.path(),
-            "Remember the word 'mango'. Reply with only 'ok'.",
-            turn1,
-            DispatchOptions::default(),
-        )
-        .await
-        .expect("first dispatch should succeed");
-    let _events1: Vec<AdapterEvent> = stream1.collect().await;
-
-    let turn2 = Uuid::now_v7();
-    let stream2 = adapter
-        .dispatch(
-            &agent,
-            tmp.path(),
-            "What word did I ask you to remember? Reply with only that word.",
-            turn2,
-            DispatchOptions::default(),
-        )
-        .await
-        .expect("resume dispatch should succeed");
-    let events2: Vec<AdapterEvent> = stream2.collect().await;
-    let recall_text: String = events2
-        .iter()
-        .filter_map(|e| match e {
-            AdapterEvent::ContentChunk { text, .. } => Some(text.clone()),
-            _ => None,
-        })
-        .collect();
-    assert!(
-        recall_text.to_lowercase().contains("mango"),
-        "--resume must restore the prior turn's context: turn2 reply was {recall_text:?}"
-    );
-}
-
-#[tokio::test]
-#[ignore = "requires gemini installed — run with: make test-live"]
-async fn live_gemini_streamed_answer_completes_despite_trailing_error() {
-    // Gemini frequently (observed ~60% of runs on CLI 0.44.0, model auto)
-    // appends an empty/malformed trailing step after a complete answer,
-    // tainting the turn's `result.status` to `"error"`. This test pins the
-    // post-fix invariant: a turn that streamed a complete answer ALWAYS
-    // completes, regardless of whether the benign trailing error fired this
-    // run. It does NOT force the error (it's non-deterministic) — the
-    // deterministic proof of the rescue path is the fixture test
-    // `benign_trailing_error_fixture_completes_despite_result_error` in
-    // `gemini_adapter.rs`. A read-and-summarize prompt over a small file
-    // reliably triggers the tool-use shape where the quirk appears.
-    let tmp = tempfile::TempDir::new().unwrap();
-    std::fs::write(
-        tmp.path().join("hello.txt"),
-        "Hello, world! This is a tiny test file.",
-    )
-    .unwrap();
-
-    let adapter = GeminiAdapter::new();
-    let agent = live_gemini_agent();
-    let turn_id = Uuid::now_v7();
-
-    let stream = adapter
-        .dispatch(
-            &agent,
-            tmp.path(),
-            "Read and summarize the files in this directory in one short sentence.",
-            turn_id,
-            DispatchOptions::default(),
-        )
-        .await
-        .expect("dispatch should succeed with real gemini");
-
-    let events: Vec<AdapterEvent> = stream.collect().await;
-
-    let text: String = events
-        .iter()
-        .filter_map(|e| match e {
-            AdapterEvent::ContentChunk { text, .. } => Some(text.clone()),
-            _ => None,
-        })
-        .collect();
-    assert!(
-        !text.trim().is_empty(),
-        "expected the model to stream a summary, got empty text"
-    );
-
-    let terminal = events
-        .iter()
-        .find(|e| matches!(e, AdapterEvent::TurnEnd { .. }))
-        .expect("should have a terminal TurnEnd");
-    assert!(
-        matches!(
-            terminal,
-            AdapterEvent::TurnEnd {
-                outcome: TurnOutcome::Completed,
-                ..
-            }
-        ),
-        "a turn that streamed a complete answer must complete even if Gemini \
-         appended a benign trailing error, got: {terminal:?}"
-    );
-}
-
-#[tokio::test]
-#[ignore = "requires gemini installed — run with: make test-live"]
-async fn live_gemini_dash_leading_prompt_completes() {
-    // Canary: a prompt beginning with `-` must dispatch and complete. `gemini`'s
-    // parser (yargs) otherwise rejects a `-`-leading `-p` value with `Not enough
-    // arguments following: p` — the adapter passes it as `--prompt=<value>`.
-    let tmp = tempfile::TempDir::new().unwrap();
-    let adapter = GeminiAdapter::new();
-    let agent = live_gemini_agent();
-    let turn_id = Uuid::now_v7();
-
-    let stream = adapter
-        .dispatch(
-            &agent,
-            tmp.path(),
-            "- Reply with the single word 'ack' and nothing else.",
-            turn_id,
-            DispatchOptions::default(),
-        )
-        .await
-        .expect("dispatch should succeed with a dash-leading prompt");
-    let events: Vec<AdapterEvent> = stream.collect().await;
-
-    let text: String = events
-        .iter()
-        .filter_map(|e| match e {
-            AdapterEvent::ContentChunk { text, .. } => Some(text.clone()),
-            _ => None,
-        })
-        .collect();
-    assert!(
-        text.to_lowercase().contains("ack"),
-        "expected 'ack' in response text, got: {text:?}"
-    );
-
-    let terminal = events
-        .iter()
-        .find(|e| matches!(e, AdapterEvent::TurnEnd { .. }))
-        .expect("should have a terminal TurnEnd");
-    assert!(
-        matches!(
-            terminal,
-            AdapterEvent::TurnEnd {
-                outcome: TurnOutcome::Completed,
-                ..
-            }
-        ),
-        "dash-leading prompt must complete, got: {terminal:?}"
-    );
-}
-
 // --- Antigravity live tests ---
 
 fn live_antigravity_agent() -> AgentRecord {
@@ -2854,7 +2529,7 @@ async fn live_antigravity_basic_turn_completes() {
     // loader injection (`~/.gemini/config/mcp_config.json` and
     // `~/.gemini/config/plugins/*/skills/*`). Structural-only checks — the
     // dev env varies, so we assert presence and types, not values (matching
-    // Codex/Gemini live discipline).
+    // Codex live discipline).
     let session_meta = events
         .iter()
         .find(|e| matches!(e, AdapterEvent::SessionMeta { .. }))
@@ -3094,7 +2769,7 @@ async fn live_antigravity_resume_reuses_session() {
 #[ignore = "requires agy authenticated (run `agy`) — run with: make test-live"]
 async fn live_antigravity_dash_leading_prompt_completes() {
     // Canary / drift tripwire: `agy` currently tolerates a `-`-leading `-p`
-    // value (so the adapter passes the prompt unchanged), unlike claude/gemini/
+    // value (so the adapter passes the prompt unchanged), unlike claude/
     // codex. This guards that assumption — if a CLI bump makes `agy` dash-
     // sensitive, this fails and the adapter needs the same treatment.
     let tmp = tempfile::TempDir::new().unwrap();
@@ -3590,7 +3265,7 @@ async fn live_antigravity_slash_and_flag_shaped_prompts_reach_the_model() {
 //
 // Each asserts on BOTH the emitted `TurnEnd` (the live carrier) AND a real-file
 // hydration via `load_*_transcript` — because the live carrier and the hydrator
-// read different sources for some harnesses (Gemini/Claude live = stream
+// read different sources for some harnesses (Claude live = stream
 // `init`/`SessionMeta`; hydrate = on-disk per-record model), so only asserting
 // the live path would let on-disk format drift ship undetected.
 
@@ -3823,83 +3498,6 @@ async fn live_codex_hydration_key_matches_live_turn_end() {
     assert_ne!(
         live_key_1, live_key_2,
         "the per-turn key must vary across turns — a constant key would mean stale carryover"
-    );
-}
-
-#[tokio::test]
-#[ignore = "requires gemini installed — run with: make test-live"]
-async fn live_gemini_model_changes_across_turns() {
-    // `gemini-2.5-flash` → `-pro` per turn; no effort axis. Asserts the per-turn
-    // model switch on the emitted `TurnEnd` AND on a real-file hydration (each
-    // `gemini` record carries its own model — the reopen guard).
-    let adapter = GeminiAdapter::new();
-    let cwd = tempfile::TempDir::new().unwrap();
-    // Gemini uses UUID v4 (session-file naming embeds the first 8 hex chars).
-    let session_id = Uuid::new_v4();
-    let agent_id = Uuid::now_v7();
-    let mut agent = AgentRecord {
-        model: Some("gemini-2.5-flash".to_owned()),
-        effort: None,
-        profiles: switchboard_core::AgentProfiles::default(),
-        forked_from_session: None,
-        id: agent_id,
-        project_id: Uuid::now_v7(),
-        name: "m4-gemini".to_owned(),
-        harness: HarnessKind::Gemini,
-        session_locator: Some(SessionLocator::Uuid(session_id)),
-        created_at: chrono::Utc::now(),
-    };
-
-    let events1: Vec<AdapterEvent> = adapter
-        .dispatch(
-            &agent,
-            cwd.path(),
-            "Reply with only the number 4.",
-            Uuid::now_v7(),
-            DispatchOptions::default(),
-        )
-        .await
-        .expect("dispatch 1")
-        .collect()
-        .await;
-    let (m1, _) = turn_end_model_effort(&events1).expect("turn 1 TurnEnd");
-    assert!(
-        m1.as_deref().is_some_and(|m| m.contains("flash")),
-        "turn 1 per-turn model = flash; got {m1:?}"
-    );
-
-    agent.model = Some("gemini-2.5-pro".to_owned());
-    let events2: Vec<AdapterEvent> = adapter
-        .dispatch(
-            &agent,
-            cwd.path(),
-            "Reply with only the number 5.",
-            Uuid::now_v7(),
-            DispatchOptions::default(),
-        )
-        .await
-        .expect("dispatch 2")
-        .collect()
-        .await;
-    let (m2, _) = turn_end_model_effort(&events2).expect("turn 2 TurnEnd");
-    assert!(
-        m2.as_deref().is_some_and(|m| m.contains("pro")),
-        "turn 2 per-turn model = pro; got {m2:?}"
-    );
-
-    let hydrated =
-        load_gemini_transcript(&home_dir(), cwd.path(), session_id, agent_id).expect("hydrate");
-    let models = hydrated_turn_models(&hydrated);
-    assert_eq!(models.len(), 2, "two agent turns on disk; got {models:?}");
-    assert!(
-        models[0].as_deref().is_some_and(|m| m.contains("flash")),
-        "hydrated turn 1 = flash; got {:?}",
-        models[0]
-    );
-    assert!(
-        models[1].as_deref().is_some_and(|m| m.contains("pro")),
-        "hydrated turn 2 = pro; got {:?}",
-        models[1]
     );
 }
 

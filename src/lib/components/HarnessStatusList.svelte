@@ -10,7 +10,6 @@
   import Button from "./ui/Button.svelte";
   import {
     ALL_HARNESSES,
-    HARNESS_ORDER_GEMINI_LAST,
     HARNESS_SETUP_URL,
     HARNESS_LABEL,
     HARNESS_LOGIN_HINT,
@@ -34,14 +33,12 @@
   let authed = $state<Record<HarnessKind, boolean | null>>({
     claude_code: null,
     codex: null,
-    gemini: null,
     antigravity: null,
   });
 
   const AUTH_PROBE: Record<HarnessKind, () => Promise<void>> = {
     claude_code: api.checkClaudeAuth,
     codex: api.checkCodexAuth,
-    gemini: api.checkGeminiAuth,
     antigravity: api.checkAntigravityAuth,
   };
 
@@ -172,7 +169,7 @@
     data-testid="harness-status"
     class="harness-status-container border-border divide-border/60 flex flex-col divide-y rounded-lg border"
   >
-    {#each HARNESS_ORDER_GEMINI_LAST as harness (harness)}
+    {#each ALL_HARNESSES as harness (harness)}
       {@const install = harnessAvailability.status(harness)}
       <!-- Derived, not read straight off `install.installed`, so this list obeys
            the same provisional-result rule as gating: a negative answer taken
@@ -253,20 +250,6 @@
             </span>
           {/if}
         </span>
-
-        {#if harness === "gemini"}
-          <!-- Full-row availability note (spans every grid column).
-             Individual-tier Gemini access moved to Antigravity on 2026-06-18;
-             see docs/harness-update-review.md for the tier terminology. -->
-          <p
-            class="harness-note text-muted pt-1 text-xs leading-5"
-            data-testid="harness-note-gemini"
-          >
-            Gemini is no longer available on individual Google accounts — replaced by Antigravity.
-            It still works if you have an organization plan (Gemini Code Assist Standard or
-            Enterprise).
-          </p>
-        {/if}
       </li>
     {/each}
   </ul>
@@ -315,10 +298,6 @@
   .harness-install-cell,
   .harness-auth-cell {
     grid-column: 2;
-  }
-
-  .harness-note {
-    grid-column: 1 / -1;
   }
 
   @container (min-width: 24rem) {

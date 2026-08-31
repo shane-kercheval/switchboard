@@ -17,7 +17,6 @@ import type { HarnessKind } from "./types";
 export const HARNESS_LABEL: Record<HarnessKind, string> = {
   claude_code: "Claude",
   codex: "Codex",
-  gemini: "Gemini",
   antigravity: "Antigravity",
 };
 
@@ -28,37 +27,19 @@ export const HARNESS_LABEL: Record<HarnessKind, string> = {
 /// surface that iterates this list. **Always iterate this** instead of a literal
 /// `["claude_code", …]` array — a bare array is type-legal while incomplete and
 /// silently drops a harness from probes/banners/pickers. Insertion order
-/// (claude → codex → gemini → antigravity) is **load-bearing**: it governs
+/// (claude → codex → antigravity) is **load-bearing**: it governs
 /// auto-create sequencing and any surface that hasn't opted into a different
-/// display order (see `HARNESS_ORDER_GEMINI_LAST` below). Reorder only if
+/// display order. Reorder only if
 /// the backend's `HARNESSES` constant changes.
 export const ALL_HARNESSES = Object.keys(HARNESS_LABEL) as HarnessKind[];
 
-/// Display order for surfaces that list harnesses to the user (the
-/// create-agent picker, the settings harness-status table, the settings
-/// Agent Defaults list): Antigravity ahead of Gemini. Antigravity superseded
-/// Gemini for individual Google accounts (2026-06-18) — Gemini is
-/// corporate-account-only going forward and much less commonly set up from
-/// here on, so leading with it reads as outdated. Derived from
-/// `ALL_HARNESSES` (not a literal array) so a new
-/// `HarnessKind` can't be silently dropped from these surfaces.
-/// `ALL_HARNESSES`'s own insertion order stays untouched — it governs
-/// auto-create sequencing and any other backend-order-sensitive surface;
-/// only presentational lists that choose to de-prioritize Gemini should use
-/// this instead.
-export const HARNESS_ORDER_GEMINI_LAST: HarnessKind[] = [
-  ...ALL_HARNESSES.filter((h) => h !== "gemini"),
-  ...ALL_HARNESSES.filter((h) => h === "gemini"),
-];
-
 /// Brand/icon-derived accent colors for transcript attribution and compact
-/// harness identity. Chosen from the actual icon artwork — except gemini and
-/// antigravity, whose icons share both hues: the blue reads as Gemini's primary
-/// brand color, so Gemini takes it and Antigravity takes the green.
+/// harness identity. Chosen from the actual icon artwork. Antigravity's icons
+/// carry both a blue and a green; it takes the green so its chip stays
+/// distinguishable from Codex's blue.
 export const HARNESS_COLOR: Record<HarnessKind, string> = {
   claude_code: "#d97757",
   codex: "#3831ff",
-  gemini: "#3187fe",
   antigravity: "#17b967",
 };
 
@@ -69,7 +50,6 @@ export const HARNESS_COLOR: Record<HarnessKind, string> = {
 export const HARNESS_SETUP_URL: Record<HarnessKind, string> = {
   claude_code: "https://code.claude.com/docs/en/quickstart",
   codex: "https://developers.openai.com/codex/cli",
-  gemini: "https://geminicli.com/docs/get-started/installation/",
   antigravity: "https://antigravity.google/docs/cli-install",
 };
 
@@ -80,7 +60,6 @@ export const HARNESS_SETUP_URL: Record<HarnessKind, string> = {
 export const HARNESS_LOGIN_HINT: Record<HarnessKind, string> = {
   claude_code: "run `claude auth login` to authenticate",
   codex: "run `codex login` to authenticate",
-  gemini: "run `gemini` to authenticate",
   antigravity: "run `agy` to authenticate",
 };
 
@@ -93,18 +72,27 @@ export const HARNESS_LOGIN_HINT: Record<HarnessKind, string> = {
 /// with the Rust helper by hand (no shared source crosses the IPC boundary);
 /// the exhaustive `Record<HarnessKind, …>` makes a missing harness a
 /// type error, the same discipline the Rust match enforces.
+/// **Uniform capability maps are extension points, not dead weight.** Several
+/// per-harness maps here (and `MODEL_PRESENTATION` in `agentSelection.ts`,
+/// `AUTO_SEED_ON_NEW_PROJECT` below) currently hold the same value for every
+/// harness, so the code reading them can only take one branch. They stay written
+/// out per harness: the map is what forces the next harness's capability to be a
+/// deliberate decision instead of an inherited default, and the exhaustive
+/// `Record<HarnessKind, …>` makes omitting one a type error. Collapsing any of
+/// them to a constant would answer that question silently for whoever adds the
+/// next harness. Same argument as the retained capability gates in
+/// `crates/core/src/project.rs::register_agent_inner` — that is the canonical
+/// statement on the Rust side; this is its frontend counterpart.
 export const SUPPORTS_MODEL_SELECTION: Record<HarnessKind, boolean> = {
   claude_code: true,
   codex: true,
-  gemini: true,
   antigravity: true,
 };
 
 /// Frontend mirror of `HarnessKind::supports_effort_selection()`. A *separate*
-/// axis with a *different* set: true for Claude (`--effort`), Codex
-/// (`-c model_reasoning_effort=`) and Antigravity (`--effort`); false for
-/// Gemini (thinking is config-only). Same sync + exhaustiveness rationale as
-/// [`SUPPORTS_MODEL_SELECTION`].
+/// axis from model selection: true for Claude (`--effort`), Codex
+/// (`-c model_reasoning_effort=`) and Antigravity (`--effort`). Same sync +
+/// exhaustiveness rationale as [`SUPPORTS_MODEL_SELECTION`].
 ///
 /// This says only that the axis is drivable. Antigravity's valid levels are
 /// **per-model**, and several of its models have no axis at all — a form must
@@ -112,14 +100,13 @@ export const SUPPORTS_MODEL_SELECTION: Record<HarnessKind, boolean> = {
 export const SUPPORTS_EFFORT_SELECTION: Record<HarnessKind, boolean> = {
   claude_code: true,
   codex: true,
-  gemini: false,
   antigravity: true,
 };
 
 /// Whether a harness is auto-seeded as a default agent when a new project is
 /// created (one agent per *installed* harness with this set). This gates **only**
 /// the no-friction seeding — every harness stays fully selectable in the
-/// create-agent dialog regardless. Gemini is excluded because it's no longer
+/// create-agent dialog regardless. A harness may be excluded when it's no longer
 /// available on individual plans, so most users can't authenticate it; seeding
 /// it by default would strand a dead agent in every new project. Users who do
 /// have access can still add it explicitly. Same exhaustive-`Record`
@@ -128,13 +115,12 @@ export const SUPPORTS_EFFORT_SELECTION: Record<HarnessKind, boolean> = {
 export const AUTO_SEED_ON_NEW_PROJECT: Record<HarnessKind, boolean> = {
   claude_code: true,
   codex: true,
-  gemini: false,
   antigravity: true,
 };
 
 /// Bare per-harness agent name — the fallback used by `defaultAgentName`
 /// (`agentSelection.ts`) when there's no concrete model to name an agent after
-/// (Antigravity, or Gemini left on `auto`). Create-form pre-fill and
+/// (e.g. Antigravity). Create-form pre-fill and
 /// new-project auto-seed names now derive from model+effort for the
 /// model-selectable harnesses (`opus-high`, `gpt-5-5-medium`); only the
 /// fallback path lands here. A **direct** slug map, deliberately not derived
@@ -145,6 +131,5 @@ export const AUTO_SEED_ON_NEW_PROJECT: Record<HarnessKind, boolean> = {
 export const HARNESS_DEFAULT_AGENT_NAME: Record<HarnessKind, string> = {
   claude_code: "claude-code",
   codex: "codex",
-  gemini: "gemini",
   antigravity: "antigravity",
 };

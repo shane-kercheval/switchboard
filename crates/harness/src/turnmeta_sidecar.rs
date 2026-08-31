@@ -44,7 +44,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use switchboard_core::{AgentId, ProjectId};
+use switchboard_core::AgentId;
 
 use crate::events::TurnSpend;
 
@@ -69,20 +69,16 @@ pub struct TurnMetaRecord {
 }
 
 /// Canonical turn-metadata-sidecar path:
-/// `<directory>/.switchboard/projects/<project-id>/sessions/<agent-id>.turnmeta.jsonl`.
-/// Shares the per-agent `sessions/` directory with the metadata snapshot
-/// ([`crate::meta_sidecar`]) and any session-link sidecar, but is a distinct
-/// filename and concern (an append-log of per-turn telemetry).
+/// `<project-root>/sessions/<agent-id>.turnmeta.jsonl`. Shares the per-agent
+/// `sessions/` directory with the metadata snapshot ([`crate::meta_sidecar`])
+/// and any session-link sidecar, but is a distinct filename and concern (an
+/// append-log of per-turn telemetry).
+///
+/// Takes the project root for the same reason as
+/// [`crate::meta_sidecar::meta_sidecar_path`] — see that doc comment.
 #[must_use]
-pub fn turnmeta_sidecar_path(
-    directory: &Path,
-    project_id: ProjectId,
-    agent_id: AgentId,
-) -> PathBuf {
-    directory
-        .join(".switchboard")
-        .join("projects")
-        .join(project_id.to_string())
+pub fn turnmeta_sidecar_path(project_root: &Path, agent_id: AgentId) -> PathBuf {
+    project_root
         .join("sessions")
         .join(format!("{agent_id}.turnmeta.jsonl"))
 }
@@ -194,12 +190,11 @@ mod tests {
 
     #[test]
     fn turnmeta_sidecar_path_matches_canonical_layout() {
-        let directory = Path::new("/Users/x/workspace");
-        let project_id = Uuid::nil();
+        let project_root = Path::new("/store/projects/proj-1");
         let agent_id = Uuid::nil();
-        let path = turnmeta_sidecar_path(directory, project_id, agent_id);
+        let path = turnmeta_sidecar_path(project_root, agent_id);
         let expected = PathBuf::from(format!(
-            "/Users/x/workspace/.switchboard/projects/{project_id}/sessions/{agent_id}.turnmeta.jsonl"
+            "/store/projects/proj-1/sessions/{agent_id}.turnmeta.jsonl"
         ));
         assert_eq!(path, expected);
     }

@@ -46,7 +46,8 @@ function project(id: string, lastActivity: string): ProjectListing {
     name: `proj-${id.slice(-2)}`,
     created_at: "2026-05-16T00:00:00Z",
     directory: `/work/${id.slice(-2)}`,
-    available: true,
+    directory_id: `dir:${`/work/${id.slice(-2)}`}`,
+    directory_status: "resolved_available",
     last_activity: lastActivity,
     archived: false,
   };
@@ -373,40 +374,6 @@ describe("workspace project activity", () => {
     expect(ws.conversations[PROJECT_1]?.status).toBe("complete");
     expect(ws.conversations[PROJECT_1]?.error).toBeUndefined();
     warnSpy.mockRestore();
-  });
-
-  it("removing a busy project clears activity observer memory and local markers", async () => {
-    const state = await loadAgentState();
-    const ws = await loadWorkspaceState();
-    const layoutStore = await import("$lib/layout.svelte");
-    const busyProject = project(PROJECT_1, "2026-05-16T00:00:00Z");
-    ws.projects.list = [busyProject];
-    const a = agent(AGENT_1, PROJECT_1);
-    ws.agentsByProject[PROJECT_1] = [a];
-    layoutStore.layout.setRightSidebarMode(PROJECT_1, "pins");
-    layoutStore.layout.setPinsSortMode(PROJECT_1, "message_at");
-    await state.registerAgent(a);
-    state.dispatchUserTurn(AGENT_1, "user-1", "go", [], "send-1", busyProject.last_activity);
-    observerStops.push(ws.startProjectActivityObserver(() => "2026-05-25T12:00:00.000Z"));
-    await tick();
-    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
-      if (cmd === "list_workspace_directories") {
-        return { directories: [], persistable: true };
-      }
-      if (cmd === "list_projects") {
-        return [];
-      }
-      return undefined;
-    });
-
-    await ws.removeDirectory(busyProject.directory);
-    await tick();
-
-    expect(ws.backgroundCompletedProjectIds[PROJECT_1]).toBeUndefined();
-    expect(ws.projectActivityOverrides[PROJECT_1]).toBeUndefined();
-    expect(ws.projects.list).toEqual([]);
-    expect(layoutStore.layout.rightSidebarModeFor(PROJECT_1)).toBe("pins");
-    expect(layoutStore.layout.pinsSortModeFor(PROJECT_1)).toBe("message_at");
   });
 });
 
@@ -1630,13 +1597,16 @@ describe("project idle predicate", () => {
     expect(ws.projectActivityOverrides[PROJECT_1]).toBeUndefined();
   });
 
-  it("forgets a removed project's tracked work so a re-add cannot notify", async () => {
-    // The removal path is notifiable, not merely leaky: a recipient that already
+  it("forgets a deleted project's tracked work so a re-add cannot notify", async () => {
+    // The deletion path is notifiable, not merely leaky: a recipient that already
     // completed keeps its outcome, so the accumulator can be complete and worth
     // reporting. Teardown can't flush it (the stale busy flag blocks), and the
     // project then leaves the observer's candidate set — so without an explicit
-    // forget, re-adding the directory releases a banner about work that finished
-    // before the removal. Project ids are persisted on disk and survive removal.
+    // forget, a project re-entering the list under that id releases a banner
+    // about work that finished before the deletion.
+    //
+    // Deletion, not hiding: hiding a directory deliberately keeps its projects
+    // loaded and running, so its tracked work must *survive*.
     const state = await loadAgentState();
     const ws = await loadWorkspaceState();
     const tracker = await import("./sendCompletion");
@@ -1662,7 +1632,7 @@ describe("project idle predicate", () => {
       if (cmd === "list_projects") return [];
       return undefined;
     });
-    await ws.removeDirectory(p.directory);
+    await ws.deleteProject(PROJECT_1);
     await tick();
 
     expect(tracker._testing.projectCount()).toBe(0);
@@ -1701,13 +1671,13 @@ describe("project idle predicate", () => {
     expect(ws.backgroundCompletedProjectIds[PROJECT_1]).toBe(true);
   });
 
-  it("removing a workflow-only-busy project clears the observer's non-idle memory", async () => {
-    // Mirrors the send-busy removal test for the case the non-idle snapshot was
+  it("deleting a workflow-only-busy project clears the observer's non-idle memory", async () => {
+    // Mirrors the send-busy deletion test for the case the non-idle snapshot was
     // added for. Without the teardown filter, dropping the project from the
     // candidate set reads as a not-idle -> idle transition and re-marks it
-    // completed after the teardown already cleared the flag — and because ids are
-    // persisted on disk and survive removal, a re-add would show a green
-    // "finished" checkmark on a project that never ran anything.
+    // completed after the teardown already cleared the flag — so a project
+    // re-entering the list under that id would show a green "finished" checkmark
+    // for work it never ran.
     const ws = await loadWorkspaceState();
     const wf = await loadWorkflowState();
     const p = project(PROJECT_1, "2026-05-16T00:00:00Z");
@@ -1726,7 +1696,7 @@ describe("project idle predicate", () => {
       return undefined;
     });
 
-    await ws.removeDirectory(p.directory);
+    await ws.deleteProject(PROJECT_1);
     await tick();
 
     expect(ws.backgroundCompletedProjectIds[PROJECT_1]).toBeUndefined();
@@ -1921,7 +1891,7 @@ describe("reading mode fallback", () => {
     expect(reading.isReadingMode(PROJECT_1)).toBe(false);
   });
 
-  it("drops reading mode when the project is removed", async () => {
+  it("drops reading mode when the project is deleted", async () => {
     const ws = await loadWorkspaceState();
     const reading = await loadReadingMode();
     const p = project(PROJECT_1, "2026-05-16T00:00:00Z");
@@ -1934,7 +1904,7 @@ describe("reading mode fallback", () => {
       if (cmd === "list_projects") return [];
       return undefined;
     });
-    await ws.removeDirectory(p.directory);
+    await ws.deleteProject(PROJECT_1);
 
     expect(reading.isReadingMode(PROJECT_1)).toBe(false);
   });

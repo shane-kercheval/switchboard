@@ -109,7 +109,7 @@ pub enum Turn {
         items: Vec<TurnItem>,
         usage: Option<TurnUsage>,
         /// The model this turn ran on, reconstructed from the harness session
-        /// file (Codex `turn_context.model`, Claude `message.model`, Gemini's
+        /// file (Codex `turn_context.model`, Claude `message.model`,
         /// per-record `model`, Antigravity carry-forward). Per-turn *history* —
         /// distinct from the agent's *selected* model on `AgentRecord`, and from
         /// the agent-scoped `SessionMeta.model`. `None` when the harness exposes
@@ -119,7 +119,7 @@ pub enum Turn {
         /// The reasoning effort this turn ran at. Codex reads
         /// `turn_context.effort`; Claude reads the top-level `effort` its
         /// session file has carried on each assistant record since CLI 2.1.212.
-        /// `None` for Gemini/Antigravity (no per-turn effort), for a Claude
+        /// `None` for Antigravity (no per-turn effort), for a Claude
         /// agent left on "Default", and for Claude turns written by an older
         /// CLI.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -144,7 +144,7 @@ pub enum Turn {
         /// UUID for re-parse stability but have no live-matched key. Codex uses the
         /// `turn_context.turn_id` (**not**
         /// `task_started.turn_id`, whose per-turn uniqueness is unconfirmed — see
-        /// `codex/session_file.rs`); Gemini the turn's first `gemini` record `id`.
+        /// `codex/session_file.rs`).
         /// `None` for Antigravity (no native per-turn id) — the merge falls back to
         /// `turn_id` for keyless turns.
         ///

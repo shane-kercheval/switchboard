@@ -61,6 +61,50 @@ pub enum AppError {
     #[error("project {0} is not loaded")]
     ProjectNotLoaded(ProjectId),
 
+    /// The project is mid-lifecycle-operation (a re-point or a delete has
+    /// evicted its routable state and is rebuilding it). Distinct from
+    /// [`Self::ProjectNotLoaded`]: the project exists and will be usable again
+    /// shortly, so the caller should retry rather than treat it as gone.
+    #[error("project {0} is being repaired — try again in a moment")]
+    ProjectUnderMaintenance(ProjectId),
+
+    /// A turn was prepared against a view of the project that a lifecycle
+    /// operation has since invalidated — the working directory moved, or the
+    /// project was deleted, between resolving it and starting the turn.
+    ///
+    /// **Its own variant because both neighbours misdescribe it.**
+    /// [`Self::ProjectUnderMaintenance`] says a repair is in progress, which may
+    /// have finished; [`Self::ProjectNotLoaded`] says the project is absent, which
+    /// it may not be. Both were returned for this condition, so the user was told
+    /// one of two untrue things depending on which gate caught it. Collapsing a
+    /// distinct condition onto a neighbouring error at the point of use is the
+    /// habit this variant exists to stop — do not fold it back.
+    ///
+    /// The message avoids "resend": a workflow turn has no sender to retry it,
+    /// and a deleted project cannot be retried at all.
+    #[error(
+        "project {0} changed before the turn could start — reload the project and try again if it still exists"
+    )]
+    ProjectViewStale(ProjectId),
+
+    /// One `AgentId` is claimed by two projects' registries.
+    ///
+    /// Cannot happen from ordinary use — agent ids are minted fresh and an
+    /// agent lives in exactly one registry. It becomes reachable once agents can
+    /// be *moved* between projects, where an interrupted move leaves the record
+    /// in both the source and the target. Surfacing it here is what makes that
+    /// anomaly visible and fixable instead of silent: the id cache used to
+    /// insert last-wins, so whichever registry was read second quietly won and
+    /// the agent dispatched into a project the user wasn't looking at.
+    #[error(
+        "agent {agent_id} is claimed by two projects ({existing_project_id} and {incoming_project_id}) — its registry record exists in both"
+    )]
+    AgentProjectConflict {
+        agent_id: AgentId,
+        existing_project_id: ProjectId,
+        incoming_project_id: ProjectId,
+    },
+
     /// The project's `instance.lock` is held by another Switchboard process.
     /// Inter-process guard: one Switchboard process per project. The
     /// frontend surfaces this as "This project is already open in another
@@ -78,8 +122,63 @@ pub enum AppError {
         source: std::io::Error,
     },
 
+    /// The advisory lock on this turn's harness session file is already held.
+    ///
+    /// **The message names both causes, because the lock cannot tell them
+    /// apart.** The one it exists for is another Switchboard instance — a dev
+    /// build and the installed app have separate stores, so nothing else stops
+    /// them driving one session. But an unmaterialized branch holds its
+    /// *parent's* key for its whole first turn, so the same refusal reaches a
+    /// user who sent to that parent from this window. `flock` reports contention,
+    /// not who holds it, so claiming "another instance" would be a guess that is
+    /// sometimes simply false — and the two causes have the same fix anyway.
+    ///
+    /// Phrased for the user: a refused turn surfaces this string verbatim as the
+    /// dispatch failure.
+    #[error(
+        "this conversation is already in use by a running turn — in another Switchboard window, or by a branch being created from it here. Wait for that turn to finish, then resend."
+    )]
+    SessionInUse,
+
+    /// Failed to open or `flock` a session lock for a reason other than
+    /// contention (e.g. the lock directory is unwritable). Refuses the turn
+    /// exactly as contention does — see `session_lock::acquire_session_locks`
+    /// for why this is fail-closed rather than warn-and-proceed.
+    #[error("failed to acquire the session lock for this turn: {source}")]
+    SessionLockIo {
+        #[source]
+        source: std::io::Error,
+    },
+
     #[error("agent {0} not found in any loaded project")]
     AgentNotFound(AgentId),
+
+    /// A forward source resolved to a project the journal read pass never
+    /// covered — the read set and the resolve set diverged. Distinct from
+    /// `ProjectNotLoaded` on purpose: the project *is* loaded, so "open it"
+    /// is the wrong recovery, and the honest diagnosis is an internal invariant
+    /// break in the forward resolver rather than anything the user can act on.
+    #[error(
+        "internal: forward source resolved to project {0}, which the journal read \
+         pass did not cover — the read set and resolve set have diverged"
+    )]
+    ForwardJournalMissing(ProjectId),
+
+    /// A forward source named a project that does not own the agent. Reachable
+    /// from a persisted draft whose agent moved between projects, or was removed
+    /// and re-created elsewhere. Refused rather than resolved against whichever
+    /// project happens to own it now: the user picked a specific agent in a
+    /// specific project, and silently substituting a different context is the
+    /// stale-forward class this whole path exists to prevent.
+    #[error(
+        "forward source {agent_id} no longer belongs to the project it was picked from \
+         (declared {declared}, now in {actual}) — remove the chip and pick it again"
+    )]
+    ForwardSourceMoved {
+        agent_id: AgentId,
+        declared: ProjectId,
+        actual: ProjectId,
+    },
 
     #[error("invalid UUID {value:?}: {source}")]
     InvalidUuid {

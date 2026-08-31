@@ -27,6 +27,63 @@ pub enum CoreError {
     #[error("project not found: {0}")]
     ProjectNotFound(uuid::Uuid),
 
+    /// A `directory_id` referenced by a project index entry has no catalog
+    /// entry. The catalog never deletes an entry a project still references, so
+    /// this is corruption (a hand-edited or truncated `directories.jsonl`), not
+    /// an ordinary "the user removed that directory" state — a removed working
+    /// *directory* keeps its catalog entry with a path that no longer resolves.
+    #[error("directory not found in the store catalog: {0}")]
+    DirectoryNotFound(uuid::Uuid),
+
+    /// A bind would add a second catalog row for an id that already has one.
+    ///
+    /// `bind_directory` exists only to restore a *lost* mapping; letting it run
+    /// on a live id would produce the ambiguous state
+    /// [`Self::AmbiguousDirectory`] describes, by the very command meant to
+    /// repair it. Re-pointing is the operation for an id that still resolves.
+    #[error("directory {0} already has a catalog entry — re-point it instead of binding")]
+    DuplicateDirectoryId(uuid::Uuid),
+
+    /// Two or more catalog entries claim the same `directory_id`, so the id
+    /// resolves to no single path.
+    ///
+    /// Deliberately distinct from [`Self::DirectoryNotFound`]: the repair is the
+    /// opposite one. A missing row means the id was never (or is no longer)
+    /// registered; an ambiguous one means it is registered twice, and pointing
+    /// the user at "register this directory" would mint a *third* identity that
+    /// no project references. `Store::repoint_directory` collapses the
+    /// duplicates, which is the only in-app exit from this state.
+    ///
+    /// Not reachable from ordinary use — ids are minted fresh and re-points
+    /// preserve them — so the realistic source is an external edit or a bulk
+    /// catalog write.
+    #[error("directory {0} has more than one catalog entry")]
+    AmbiguousDirectory(uuid::Uuid),
+
+    /// The store root holds data but no `store.yaml`. Distinct from
+    /// [`Self::MissingAppendOnlyFile`] ("a file that should exist doesn't"):
+    /// here the schema marker is what's absent, so nothing establishes which
+    /// layout the surviving data is in.
+    ///
+    /// Reached by the events that lose the marker in the first place. It, the
+    /// index, and the catalog are siblings at the store root while project data
+    /// is a subdirectory, so a selective restore, a sync conflict, or a filtered
+    /// copy takes them together and leaves the data — and stamping a fresh
+    /// marker there would bless an unknown layout and, on the recreate path,
+    /// present a store full of projects as empty.
+    #[error("store at {root} holds data but no version marker ({marker} is missing)")]
+    StoreDataWithoutVersionMarker { root: PathBuf, marker: PathBuf },
+
+    /// A catalog write would leave two entries pointing at the same working
+    /// directory. One canonical path must map to exactly one `DirectoryId`:
+    /// per-directory scopes (project-name uniqueness, and the Claude
+    /// session-id collision scan, which is per-directory precisely because
+    /// Claude session ids are cwd-namespaced) are evaluated by id, so a split
+    /// identity silently narrows them to half the agents that share the
+    /// namespace.
+    #[error("working directory {path} is already registered as {existing}")]
+    DuplicateDirectoryPath { path: PathBuf, existing: uuid::Uuid },
+
     #[error("agent not found: {0}")]
     AgentNotFound(uuid::Uuid),
 

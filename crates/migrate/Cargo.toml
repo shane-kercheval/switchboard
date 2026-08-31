@@ -1,0 +1,25 @@
+[package]
+name = "switchboard-migrate"
+description = "One-off migration of legacy <dir>/.switchboard/ project state into the user-global store. Run by hand; deletable once every user has migrated."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+switchboard-core = { path = "../core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+serde_norway = { workspace = true }
+directories = "6.0.0"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+uuid = { workspace = true }

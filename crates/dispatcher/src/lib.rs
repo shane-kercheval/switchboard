@@ -777,10 +777,16 @@ impl ConversationJournal for NoopJournal {
 }
 
 /// Everything needed to run one turn, produced fresh by a
-/// [`DispatchContextFactory`] at the moment a turn starts. The immutable fields
-/// (`adapter`, `cwd`, `agent`) are stable for an agent's lifetime; `emitter`,
-/// `options`, and `journal` are rebuilt per dispatch so per-dispatch state is
-/// never frozen at enqueue.
+/// [`DispatchContextFactory`] at the moment a turn starts.
+///
+/// `adapter` and `cwd` are stable for an agent's lifetime. **`agent` is not** —
+/// it is re-read from the app's live registry cache on every `build`, precisely
+/// because a session locator captured mid-turn by the locator sink has to reach
+/// the *next* turn's dispatch input. An earlier version of this doc listed it as
+/// immutable, which is what made it look harmless for `preflight` to sample it a
+/// second time; it now receives the record built here instead. `emitter`,
+/// `options`, and `journal` are likewise rebuilt per dispatch so per-dispatch
+/// state is never frozen at enqueue.
 pub struct DispatchContext {
     pub adapter: Arc<dyn HarnessAdapter>,
     pub cwd: PathBuf,
@@ -790,6 +796,50 @@ pub struct DispatchContext {
     pub journal: Arc<dyn ConversationJournal>,
     pub metadata: Arc<dyn MetadataCache>,
     pub locator_sink: Arc<dyn SessionLocatorSink>,
+}
+
+/// What a turn must keep alive for its whole lifetime, handed back by
+/// [`DispatchContextFactory::preflight`] and bound by the turn loop until the
+/// turn ends.
+///
+/// **Deliberately concrete, not an opaque `Box<dyn Send>`.** The permit's whole
+/// meaning is "handles whose closing ends this turn's claim," and naming the
+/// handles is what makes releasing legible in the one type whose job is to make
+/// releasing automatic. Revisit if a permit ever has to carry something that is
+/// not a handle — the project-scoped admission claim recorded as a precondition
+/// of the directory-repair affordance is the case that would force it.
+///
+/// **The dispatcher never looks inside it.** It holds `File` handles because the
+/// only thing a turn currently needs to own is an advisory lock on the harness
+/// session file(s) it will write, and an advisory lock *is* an open handle —
+/// releasing it means closing the file, which `Drop` already does. Binding the
+/// permit locally in the turn loop therefore releases on every terminal,
+/// cancellation, drain, shutdown, and panic path without the dispatcher knowing
+/// what release means or a single explicit release call existing to be missed.
+///
+/// The alternative — a `pending_guard` slot on the factory that `build` fills
+/// and someone later clears — puts the same obligation back on call-site
+/// discipline, which is the failure mode this shape exists to remove.
+#[derive(Debug, Default)]
+pub struct TurnPermit {
+    /// Held, never read: dropping these handles is the entire behaviour. The
+    /// leading underscore is what states that to the compiler and the reader.
+    _held: Vec<std::fs::File>,
+}
+
+impl TurnPermit {
+    /// A permit that owns nothing — the factory had no session to lock (no
+    /// locator captured yet), or has no locking policy at all.
+    #[must_use]
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// A permit owning `held` until the turn ends.
+    #[must_use]
+    pub fn holding(held: Vec<std::fs::File>) -> Self {
+        Self { _held: held }
+    }
 }
 
 /// Builds a [`DispatchContext`] for an agent's next turn. Injected by the app
@@ -828,10 +878,30 @@ pub trait DispatchContextFactory: Send + Sync {
     /// real one. It stays policy-free itself: the rule lives in the injected
     /// factory, and the default is "always allowed," so a factory with no
     /// start-time policy is unaffected.
-    fn preflight(
-        &self,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + '_>> {
-        Box::pin(async { Ok(()) })
+    ///
+    /// **Takes the `agent` from the already-built [`DispatchContext`].** The
+    /// factory could read the registry cache itself — it did — but then `build`
+    /// and `preflight` sample it independently, and the turn can end up holding a
+    /// lock on one session while dispatching another. Whatever this authorizes
+    /// has to be what actually runs, so the caller hands it over rather than the
+    /// callee looking it up again.
+    ///
+    /// **Returns a [`TurnPermit`], so admission and acquisition are one step.**
+    /// A factory that must hold something for the turn's duration — an advisory
+    /// lock on the harness session file it is about to write — cannot express
+    /// that by acquiring elsewhere: `build()` runs *before* this and destructures
+    /// its result field-by-field, so a guard placed there would drop immediately,
+    /// and a check here followed by an acquisition anywhere else is a TOCTOU
+    /// hole. Handing the guard back from the same call that grants admission
+    /// makes "allowed" and "holding what the permission depends on" the same
+    /// fact. A factory with nothing to hold returns [`TurnPermit::none`].
+    fn preflight<'a>(
+        &'a self,
+        agent: &'a AgentRecord,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<TurnPermit, String>> + Send + 'a>>
+    {
+        let _ = agent;
+        Box::pin(async { Ok(TurnPermit::none()) })
     }
 
     /// The plain per-agent event sink, used to emit `AgentIdle` after the
@@ -1562,42 +1632,65 @@ async fn run_turn(
         );
     }
 
-    // Start-moment policy, ahead of the journal write: a refused turn must leave
-    // no durable trace, exactly like the journal-failure path below. This is the
-    // **freshest** judgement available — the caller's pre-enqueue check answered
-    // a question that may have gone stale while this item sat in the backlog —
-    // and it is deliberately sited after the PATH wait above so no unrelated
-    // await separates it from the dispatch it gates. It bounds that queue race;
-    // it is not a lock, and the residual is documented in system-design §9.
-    if let Err(reason) = factory.preflight().await {
-        emit_message_failed(
-            emitter.as_ref(),
-            channel,
-            item.message_id,
-            // Nothing was journaled, so reload has no send to reconstruct.
-            None,
-            agent_id,
-            &reason,
-        );
-        fire_completion(
-            &mut completion,
-            TurnOutcome::Failed {
-                // `AdapterFailure` is imprecise here — nothing reached an adapter,
-                // this is a policy refusal — and it matches the journal-failure
-                // path below, which is equally imprecise. Deliberately deferred:
-                // the frontend classifies from `MessageFailed`, which carries no
-                // kind at all and hardcodes `adapter_failure`, so fixing the
-                // signal means adding a cause to that wire event and threading it
-                // through the reducer. Worth doing before any differentiated
-                // retry UI lands; not worth a half-fix that leaves two shapes of
-                // "refused" disagreeing.
-                kind: FailureKind::AdapterFailure,
-                message: reason,
-            },
-            String::new(),
-        );
-        return TurnAfter::Continue;
-    }
+    // Start-moment admission, ahead of the journal write: a refused turn must
+    // leave no durable trace, exactly like the journal-failure path below. This
+    // is the **freshest** judgement available — the caller's pre-enqueue check
+    // answered a question that may have gone stale while this item sat in the
+    // backlog — and it is deliberately sited after the PATH wait above so no
+    // unrelated await separates it from the dispatch it gates. It is also where
+    // the turn takes ownership of whatever it must hold while it runs, which is
+    // why it hands back a permit rather than a bare `Ok`.
+    // Bound, not discarded: the permit owns whatever this turn must hold until it
+    // ends (today, the session-file locks). `_permit` keeps it alive to the end
+    // of `run_turn`, which is `drain_turn`'s return — a bare `_` would drop it
+    // here and release the locks before the subprocess ever spawned.
+    //
+    // **And `drain_turn` returns only once the event stream is exhausted, on
+    // every path.** Its sole stream-side exit is `maybe_event == None`; cancel
+    // and shutdown fire the token and keep draining rather than returning early.
+    // So the permit outlives the subprocess even when the turn is cancelled or
+    // the actor is being torn down. That is the assumption that makes a
+    // turn-scoped lock correct rather than merely well-intentioned — if anyone
+    // ever makes the drain loop return before the stream ends, this stops
+    // holding and the lock has to move with it.
+    //
+    // `agent` is the record `build` produced, not a fresh read — see
+    // [`DispatchContextFactory::preflight`].
+    let _permit = match factory.preflight(&agent).await {
+        Ok(permit) => permit,
+        Err(reason) => {
+            emit_message_failed(
+                emitter.as_ref(),
+                channel,
+                item.message_id,
+                // Nothing was journaled, so reload has no send to reconstruct.
+                None,
+                agent_id,
+                &reason,
+            );
+            fire_completion(
+                &mut completion,
+                TurnOutcome::Failed {
+                    // `AdapterFailure` is wrong here — nothing reached an
+                    // adapter, this is a policy refusal — and it matches the
+                    // journal-failure path below, which is equally wrong.
+                    // **The rule: a policy refusal must not be classified as an
+                    // adapter failure.** Honouring it means giving `MessageFailed`
+                    // a cause (it carries none, so the frontend hardcodes
+                    // `adapter_failure`) and branching on it in the reducer —
+                    // a wire change, so it is not made here. It is not cosmetic:
+                    // this path fires during ordinary Fork use, so a documented
+                    // product behaviour's only machine-readable signal currently
+                    // says the CLI crashed, and no differentiated retry UI can be
+                    // built until it stops.
+                    kind: FailureKind::AdapterFailure,
+                    message: reason,
+                },
+                String::new(),
+            );
+            return TurnAfter::Continue;
+        }
+    };
 
     // Fail-closed: journal the send before spawning. On failure, no turn starts,
     // no outcome marker (the journal is what's broken — a marker would orphan),

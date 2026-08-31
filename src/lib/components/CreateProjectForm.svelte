@@ -218,8 +218,9 @@
   {#if mode === "new"}
     <div class="space-y-4" data-testid="new-project-form">
       <p class="text-muted text-sm leading-relaxed">
-        Choose the folder you want to work in — typically your repo or working directory.
-        Switchboard will create a <code>.switchboard/</code> folder there to store project state.
+        Choose the folder you want to work in — typically your repo or working directory. Nothing is
+        written into it: Switchboard keeps the project's state separately, so the folder stays
+        exactly as it is.
       </p>
       <div class="space-y-1.5">
         <span class="text-muted block text-xs">Folder</span>
@@ -298,10 +299,9 @@
   {:else}
     <div class="space-y-4" data-testid="add-existing-form">
       <p class="text-muted text-sm leading-relaxed">
-        Choose a folder you've already used with Switchboard — your repo or working directory (the
-        one that contains a
-        <code class="bg-panel text-fg rounded px-1 font-mono text-xs">.switchboard/</code>
-        folder). Switchboard looks there for projects you've created before.
+        Choose a working directory Switchboard already has projects for. Their history is kept
+        outside the folder, so they come back exactly as they were — this restores the folder to
+        your list rather than scanning it.
       </p>
       <Button
         variant="secondary"
@@ -331,7 +331,7 @@
           </div>
         {:else}
           <p class="text-warning text-xs leading-relaxed" data-testid="add-existing-none">
-            No Switchboard projects found in
+            Switchboard has no projects for
             <Tooltip
               label={addFolder ?? ""}
               delayDuration={SUPPLEMENTAL_TOOLTIP_DELAY}
@@ -340,9 +340,9 @@
               {#snippet trigger(props)}
                 <span {...props} class="font-mono">{addFolder}</span>
               {/snippet}</Tooltip
-            >. Make sure you picked the working directory that contains a
-            <code class="bg-panel text-fg rounded px-1 font-mono">.switchboard/</code>
-            folder — or switch to "New project" to create one there.
+            >. If you moved or renamed this folder, its projects still exist under the old path —
+            they'll come back if the folder is restored there. If this folder has simply never held
+            a project, switch to "New project" to create one.
           </p>
         {/if}
       {/if}

@@ -37,7 +37,6 @@ const CODEX_AVAILABLE: HarnessAvailability = { harness: "codex", binary: "availa
 const CODEX_BINARY_MISSING: HarnessAvailability = { harness: "codex", binary: "missing" };
 const CLAUDE_CHECKING: HarnessAvailability = { harness: "claude_code", binary: "checking" };
 const CODEX_CHECKING: HarnessAvailability = { harness: "codex", binary: "checking" };
-const GEMINI_AVAILABLE: HarnessAvailability = { harness: "gemini", binary: "available" };
 
 const VALID_UUID = "019e2c5f-aaaa-7000-8000-000000000001";
 
@@ -112,18 +111,13 @@ describe("CreateAgentForm", () => {
     } satisfies AgentFormSubmit);
   });
 
-  it("lists Antigravity ahead of Gemini in the harness picker", () => {
+  it("lists every harness in the picker", () => {
     renderForm();
     const picker = screen.getByTestId("harness-picker");
     const ids = Array.from(picker.querySelectorAll("input[type=radio]")).map((el) =>
       el.getAttribute("data-testid"),
     );
-    expect(ids).toEqual([
-      "harness-claude_code",
-      "harness-codex",
-      "harness-antigravity",
-      "harness-gemini",
-    ]);
+    expect(ids).toEqual(["harness-claude_code", "harness-codex", "harness-antigravity"]);
   });
 
   it("preselects the saved primary and secondary defaults", async () => {
@@ -258,50 +252,6 @@ describe("CreateAgentForm", () => {
     await fireEvent.click(screen.getByTestId("mode-attach"));
     await rerender({ onSubmit, busy: true });
     expect(screen.getByTestId("confirm-create-agent")).toHaveTextContent("Attaching…");
-  });
-
-  it("create mode + Gemini selection: submits {mode:create, harness:gemini}", async () => {
-    const { onSubmit } = renderForm();
-    await fireEvent.click(screen.getByTestId("harness-gemini"));
-    await fireEvent.click(screen.getByTestId("confirm-create-agent"));
-    expect(onSubmit).toHaveBeenCalledExactlyOnceWith({
-      mode: "create",
-      name: "gemini",
-      harness: "gemini",
-      primary: { model: "auto", effort: null },
-      secondary: { model: "gemini-2.5-flash", effort: null },
-    } satisfies AgentFormSubmit);
-  });
-
-  it("attach mode + Gemini selection: submits {mode:attach, harness:gemini, ...}", async () => {
-    const { onSubmit } = renderForm();
-    await fireEvent.click(screen.getByTestId("mode-attach"));
-    await fireEvent.click(screen.getByTestId("harness-gemini"));
-    const sessionInput = screen.getByTestId("attach-session-id") as HTMLInputElement;
-    await fireEvent.input(sessionInput, { target: { value: VALID_UUID } });
-    await fireEvent.click(screen.getByTestId("confirm-create-agent"));
-    expect(onSubmit).toHaveBeenCalledExactlyOnceWith({
-      mode: "attach",
-      name: "gemini",
-      harness: "gemini",
-      existingSessionId: VALID_UUID,
-    } satisfies AgentFormSubmit);
-  });
-
-  it("all three harnesses available: Gemini control enabled by default", () => {
-    const onSubmit = vi.fn();
-    render(CreateAgentForm, {
-      props: {
-        onSubmit,
-        availability: {
-          claude_code: CLAUDE_AVAILABLE,
-          codex: CODEX_AVAILABLE,
-          gemini: GEMINI_AVAILABLE,
-        },
-      },
-    });
-    const geminiControl = screen.getByTestId("harness-gemini") as HTMLInputElement;
-    expect(geminiControl.disabled).toBe(false);
   });
 
   it("attach mode + Codex selection: submits {mode:attach, harness:codex, ...}", async () => {
@@ -572,14 +522,6 @@ describe("CreateAgentForm", () => {
     expect(pickerValue("effort-select")).toBe("high");
   });
 
-  it("create + Gemini: model picker present (auto), effort replaced by a note", async () => {
-    renderForm();
-    await fireEvent.click(screen.getByTestId("harness-gemini"));
-    expect(pickerValue("model-select")).toBe("auto");
-    expect(screen.queryByTestId("effort-select")).not.toBeInTheDocument();
-    expect(screen.getByTestId("create-profile")).not.toHaveTextContent("Reasoning effort");
-  });
-
   it("create + Antigravity: model and effort are selectable, and submit carries them", async () => {
     // `agy` 1.1.x made `--model`/`--effort` usable headlessly without touching
     // the harness's own global config, so Antigravity now gets the same two
@@ -622,6 +564,32 @@ describe("CreateAgentForm", () => {
     expect(screen.getByTestId("effort-select-option-high")).toBeInTheDocument();
     expect(screen.queryByTestId("effort-select-option-medium")).toBeNull();
     expect(screen.queryByTestId("effort-select-option-no-override")).toBeNull();
+  });
+
+  it("create + Antigravity: switching to a narrower model clamps the effort", async () => {
+    // `agy` fails the turn when the level isn't in the model's own set, so an
+    // effort left over from the previous model has to be brought back into
+    // range at selection time rather than discovered at dispatch. 3.7 Flash
+    // takes low/medium/high; 3.1 Pro only low/high.
+    const { onSubmit } = renderForm();
+    await fireEvent.click(screen.getByTestId("harness-antigravity"));
+    await choosePicker("model-select", "gemini-3.7-flash");
+    await choosePicker("effort-select", "medium");
+    expect(pickerValue("effort-select")).toBe("medium");
+
+    await choosePicker("model-select", "gemini-3.1-pro");
+
+    expect(pickerValue("effort-select")).toBe("low");
+    // Pinned at the wire too: a clamp the picker shows but the payload drops
+    // would still fail the turn.
+    await fireEvent.click(screen.getByTestId("confirm-create-agent"));
+    expect(onSubmit).toHaveBeenCalledExactlyOnceWith({
+      mode: "create",
+      name: "antigravity",
+      harness: "antigravity",
+      primary: { model: "gemini-3.1-pro", effort: "low" },
+      secondary: { model: "gemini-3.7-flash", effort: "high" },
+    } satisfies AgentFormSubmit);
   });
 
   it("changing the model and effort pickers submits the chosen values", async () => {
@@ -734,10 +702,6 @@ describe("CreateAgentForm", () => {
     const nameInput = screen.getByTestId("agent-name") as HTMLInputElement;
     await fireEvent.click(screen.getByTestId("harness-codex"));
     expect(nameInput.value).toBe("codex");
-    await fireEvent.click(screen.getByTestId("harness-gemini"));
-    expect(nameInput.value).toBe("gemini");
-    // Multi-profile defaults use the stable harness name; Gemini stays bare
-    // because its default model is the non-descriptive `auto`.
     await fireEvent.click(screen.getByTestId("harness-antigravity"));
     expect(nameInput.value).toBe("antigravity");
   });

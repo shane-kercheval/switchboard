@@ -178,9 +178,9 @@ const invokeMock = vi.fn(async (cmd: string, args?: Record<string, unknown>): Pr
         persistable: backend.persistable,
       };
     case "list_projects":
-      // Only projects in registered directories surface (matches the real
-      // backend: the workspace registry gates which projects are listed).
-      return backend.projects.filter((p) => backend.dirs.has(p.directory));
+      // Only projects in registered directories surface (matches the
+      // real backend: the workspace registry gates which projects are listed).
+      return backend.projects.filter((p) => p.directory !== null && backend.dirs.has(p.directory));
     case "pick_directory": {
       // Read-only probe: discovers projects on disk for the chosen folder
       // WITHOUT registering it (no mutation of `backend.dirs`). Mirrors the real
@@ -198,12 +198,6 @@ const invokeMock = vi.fn(async (cmd: string, args?: Record<string, unknown>): Pr
       const path = args?.path as string;
       backend.dirs.set(path, { available: true });
       return { path, has_switchboard: true, projects: [] };
-    }
-    case "remove_directory": {
-      const path = args?.path as string;
-      backend.dirs.delete(path);
-      backend.projects = backend.projects.filter((p) => p.directory !== path);
-      return null;
     }
     case "delete_project": {
       const projectId = args?.projectId as string;
@@ -226,7 +220,8 @@ const invokeMock = vi.fn(async (cmd: string, args?: Record<string, unknown>): Pr
         name: args?.name as string,
         created_at: "2026-05-20T00:00:00Z",
         directory: args?.directory as string,
-        available: true,
+        directory_id: `dir:${args?.directory as string}`,
+        directory_status: "resolved_available",
         last_activity: "2026-05-20T00:00:00Z",
         archived: false,
       };
@@ -286,7 +281,6 @@ const invokeMock = vi.fn(async (cmd: string, args?: Record<string, unknown>): Pr
     // can be simulated; default to authed + installed.
     case "check_claude_auth":
     case "check_codex_auth":
-    case "check_gemini_auth":
     case "check_antigravity_auth":
       if (backend.probeFailures.has(cmd)) throw new Error(`auth failed: ${cmd}`);
       return null;
@@ -380,6 +374,10 @@ const invokeMock = vi.fn(async (cmd: string, args?: Record<string, unknown>): Pr
       if (backend.openEditorQueue.length > 0) return await backend.openEditorQueue.shift();
       if (backend.openEditorFailure !== null) throw new Error(backend.openEditorFailure);
       return null;
+    case "project_session_fingerprints":
+      // Reached once hiding stopped tearing the project down: it stays loaded,
+      // so its periodic transcript-freshness check keeps running.
+      return [];
     // Fire-and-forget display/notification writes. Recorded (order matters to the
     // reading-mode tests) but otherwise inert — the suppression policy they feed
     // lives in Rust and is tested there.
@@ -413,7 +411,10 @@ function listing(
   return {
     name: "alpha",
     created_at: "2026-05-20T00:00:00Z",
-    available: true,
+    // Fixtures group by directory path, so deriving the opaque id from it keeps
+    // siblings siblings without hard-coding a UUID per directory.
+    directory_id: `dir:${over.directory}`,
+    directory_status: "resolved_available",
     last_activity: "2026-05-20T00:00:00Z",
     archived: false,
     ...over,
@@ -448,7 +449,8 @@ function seedProject(opts: {
       id: opts.projectId,
       directory: dir,
       name: opts.name ?? "alpha",
-      available: opts.available ?? true,
+      directory_status:
+        (opts.available ?? true) ? "resolved_available" : "resolved_path_unavailable",
       last_activity: opts.lastActivity ?? "2026-05-20T00:00:00Z",
     }),
   );
@@ -625,10 +627,7 @@ describe("App", () => {
     await waitFor(() => {
       const authCalls = invokeMock.mock.calls.filter(
         ([c]) =>
-          c === "check_claude_auth" ||
-          c === "check_codex_auth" ||
-          c === "check_gemini_auth" ||
-          c === "check_antigravity_auth",
+          c === "check_claude_auth" || c === "check_codex_auth" || c === "check_antigravity_auth",
       );
       expect(authCalls.length).toBeGreaterThan(0);
     });
@@ -805,7 +804,7 @@ describe("App", () => {
     expect(createProjectCalls).toHaveLength(1);
     expect(createProjectCalls[0]?.[1]).toEqual({ name: "brand-new", directory: DIR_A });
 
-    // All four harnesses are installed, but Gemini is excluded from auto-seeding
+    // All harnesses are installed and every one is auto-seeded
     // (no longer on individual plans) → one agent each for Claude/Codex/
     // Antigravity, in HARNESSES order. Its two default profiles use the stable
     // harness name rather than naming only one of the configurations.
@@ -916,19 +915,7 @@ describe("App", () => {
     });
   });
 
-  it("new project: an installed but auto-seed-excluded harness (Gemini) is not seeded", async () => {
-    await mountApp();
-    await waitFor(() => expect(screen.getByTestId("welcome-add-project")).toBeInTheDocument());
-
-    await createNewProjectViaDialog("brand-new");
-
-    // Gemini is installed by default in the test backend, yet never seeded.
-    await waitFor(() => expect(createAgentCalls()).toHaveLength(3));
-    expect(createAgentCalls().some(({ harness }) => harness === "gemini")).toBe(false);
-  });
-
   it("new project: seeds agents only for installed harnesses", async () => {
-    backend.notInstalled.add("gemini");
     backend.notInstalled.add("antigravity");
     await mountApp();
     await waitFor(() => expect(screen.getByTestId("welcome-add-project")).toBeInTheDocument());
@@ -1840,75 +1827,6 @@ describe("App", () => {
     expect(screen.queryByTestId(/^banner-auth_missing-/)).not.toBeInTheDocument();
   });
 
-  // --- directory removal lifecycle (store-level: the `removeDirectory` +
-  // teardown primitive; there is no directory-removal UI yet) ---
-
-  it("removeDirectory drops the directory's projects and tears down its agents' listeners", async () => {
-    seedProject({
-      projectId: "p-a",
-      directory: DIR_A,
-      name: "alpha",
-      agents: [agent({ id: "ag-1", project_id: "p-a", name: "assistant" })],
-    });
-    seedProject({ projectId: "p-b", directory: DIR_B, name: "beta" });
-    await mountApp();
-    await waitFor(() => expect(screen.getAllByTestId("project-row").length).toBe(2));
-
-    // Activate p-a so ag-1's listener is registered, then remove its directory.
-    await fireEvent.click(screen.getByText("alpha"));
-    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
-    expect(listenCallbacks.has("agent:ag-1")).toBe(true);
-
-    const ws = await import("$lib/state/workspace.svelte");
-    await ws.removeDirectory(DIR_A);
-
-    await waitFor(() => {
-      const names = screen.getAllByTestId("project-row").map((r) => r.textContent);
-      expect(names.some((n) => n?.includes("beta"))).toBe(true);
-      expect(names.some((n) => n?.includes("alpha"))).toBe(false);
-    });
-    // Teardown: the removed agent's listener is gone (no leak), and the backend
-    // drain command fired.
-    expect(listenCallbacks.has("agent:ag-1")).toBe(false);
-    expect(
-      invokeMock.mock.calls.some(([c, a]) => c === "remove_directory" && a?.path === DIR_A),
-    ).toBe(true);
-  });
-
-  it("remove-then-re-add reuses no stale state: re-activation re-opens the project", async () => {
-    seedProject({
-      projectId: "p-a",
-      directory: DIR_A,
-      name: "alpha",
-      agents: [agent({ id: "ag-1", project_id: "p-a", name: "assistant" })],
-    });
-    await mountApp();
-    await waitFor(() => expect(screen.getByTestId("project-row")).toBeInTheDocument());
-    await fireEvent.click(screen.getByText("alpha"));
-    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
-
-    const ws = await import("$lib/state/workspace.svelte");
-    await ws.removeDirectory(DIR_A);
-    await waitFor(() => expect(screen.queryByTestId("project-row")).not.toBeInTheDocument());
-
-    // Re-add the same directory + project id (ids persist on disk). The stale
-    // memoized load must NOT be reused: re-activation re-opens the project.
-    const openCallsBefore = invokeMock.mock.calls.filter(([c]) => c === "open_project").length;
-    seedProject({
-      projectId: "p-a",
-      directory: DIR_A,
-      name: "alpha",
-      agents: [agent({ id: "ag-1", project_id: "p-a", name: "assistant" })],
-    });
-    await ws.loadWorkspace();
-
-    await waitFor(() => expect(screen.getByTestId("project-row")).toBeInTheDocument());
-    await fireEvent.click(screen.getByText("alpha"));
-    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
-    const openCallsAfter = invokeMock.mock.calls.filter(([c]) => c === "open_project").length;
-    expect(openCallsAfter).toBeGreaterThan(openCallsBefore);
-  });
-
   it("a failed activation shows a center error + retry, not an endless loading state", async () => {
     seedProject({
       projectId: "p-a",
@@ -1922,7 +1840,7 @@ describe("App", () => {
     });
     const lockedRow = backend.projects.find((project) => project.id === "p-a");
     if (lockedRow === undefined) throw new Error("expected seeded project");
-    lockedRow.available = false;
+    lockedRow.directory_status = "resolved_path_unavailable";
     await mountApp();
     await waitFor(() => expect(screen.getByTestId("project-row")).toBeInTheDocument());
 
@@ -1955,7 +1873,7 @@ describe("App", () => {
     seedProject({ projectId: "p-a", directory: DIR_A, name: "alpha", agents: [] });
     const row = backend.projects.find((project) => project.id === "p-a");
     if (row === undefined) throw new Error("expected seeded project");
-    row.available = false;
+    row.directory_status = "resolved_path_unavailable";
     backend.failOpenFor.set("p-a", { type: "other", message: "directory disappeared" });
     await mountApp();
 

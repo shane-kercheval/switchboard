@@ -31,10 +31,9 @@
         <p class="text-fg text-sm font-medium">Start with a project</p>
         <p class="text-muted text-sm leading-relaxed">
           A project is bound to a working directory — a repo, or any folder you want to work in.
-          Everything the project does happens inside that folder; Switchboard keeps its own state in
-          a <code class="bg-panel text-fg rounded px-1 font-mono text-xs">.switchboard/</code>
-          subdirectory there. One folder can hold more than one project, so separate efforts can run against
-          the same codebase.
+          Everything the agents do happens inside that folder, but Switchboard keeps its own state
+          outside it, so deleting or moving the folder never loses your conversations. One folder
+          can hold more than one project, so separate efforts can run against the same codebase.
         </p>
       </div>
     </li>

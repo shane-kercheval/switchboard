@@ -11,10 +11,9 @@ running**, then repeated with the extension **removed** from Chrome.
 
 | | Claude Code | Codex |
 | --- | --- | --- |
-| Opt-in mechanism | `--chrome` CLI flag (per session) | none — global plugin |
-| Where enablement lives | `~/.claude.json` → `claudeInChromeDefaultEnabled` | `~/.codex/config.toml` → `[plugins."chrome@openai-bundled"] enabled = true` |
-| Who writes it | Claude Code (`/chrome` → "Enabled by default") | the ChatGPT desktop app |
-| Works in headless `-p` | yes | yes |
+| Opt-in mechanism | `--chrome` CLI flag, per invocation | none — global plugin |
+| Persisted "on by default" | `~/.claude.json` → `claudeInChromeDefaultEnabled`, written by `/chrome` → "Enabled by default" — **interactive-only, does not apply to `-p`** (probed) | `~/.codex/config.toml` → `[plugins."chrome@openai-bundled"] enabled = true`, written by the `ChatGPT` desktop app — **does** apply to `codex exec` |
+| Headless enablement | the flag, and only the flag | inherited from the global plugin |
 
 Codex "just works" because the ChatGPT desktop app enables a **global** plugin that
 `codex exec` inherits. Claude Code gates the same capability behind a per-session
@@ -198,19 +197,27 @@ is on a pre-2.0.72 CLI (auto-update is on by default). Alternatives considered a
 dropped as machinery against a non-existent risk: omitting the flag when off, and
 gating emission on reading `claudeInChromeDefaultEnabled`.
 
-**Unverified, deliberately:** that `--no-chrome` actually overrides
-`claudeInChromeDefaultEnabled: true`. Near-certain — an explicit flag beating persisted
-config is near-universal CLI behavior, and `--no-chrome` exists for exactly this — but
-never probed, because probing requires mutating the developer's real `~/.claude.json`
-(auth is Keychain-bound, so an isolated `CLAUDE_CONFIG_DIR` copy fails to log in). The
-only evidence in hand is `claude --chrome --no-chrome` → 0 tools, which is flag-vs-flag
-precedence, a different question. If the assumption is wrong, the consequence is bounded
-and cosmetic-to-mild: a user who enabled Chrome by default inside Claude Code sees
-browser tools while Switchboard's Settings says off. To settle it, set the key `true`
-and run two arms in one window — no flag (expect the server **present**, which proves
-the key reaches `-p` at all) then `--no-chrome` (expect **absent**). Arm 1 is required:
-without it a negative result cannot distinguish "the flag wins" from "the key is inert
-in headless mode."
+**Probed 2026-08-31 @ 2.1.251 — Claude Code's own "Chrome by default" does not apply
+to `-p` at all.** With `~/.claude.json` → `claudeInChromeDefaultEnabled` set `true`:
+
+| Invocation | Browser tools |
+| --- | --- |
+| no flag | **0** |
+| `--no-chrome` | 0 |
+| `--chrome` | **22** |
+
+The third row is the control and is what makes the first interpretable: without it,
+zero tools is equally consistent with "the flag wins" and "the key is inert or
+misnamed." It shows the probe can observe tools in this exact configuration, so the
+first row's zero is a real negative.
+
+Consequence: the scenario `--no-chrome` was introduced to prevent — a user who picked
+"Enabled by default" in Claude Code getting browser tools while Switchboard's Settings
+reads off — **is not reachable through the way Switchboard invokes Claude**. That
+setting is interactive-only. The off-direction flag is retained as belt-and-braces: it
+costs nothing (both flags ship since 2.0.72) and holds if the setting ever starts
+applying headlessly. It is no longer load-bearing, and no design should be built on the
+assumption that it is.
 
 Note the asymmetry when presenting this in Settings: the toggle governs Claude agents
 only. Codex's browser capability is controlled in the ChatGPT desktop app and cannot

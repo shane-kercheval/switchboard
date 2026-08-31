@@ -246,10 +246,13 @@ fn build_args(
         args.push(effort.clone());
     }
     // Browser tools, from the user-global preference. Stated in both directions
-    // rather than omitted when off: Claude Code has its own persisted
-    // "Chrome enabled by default" setting, so staying silent would let that
-    // decide, and an agent could hold browser tools while Switchboard's Settings
-    // says it doesn't. Passing the flag makes dispatch say what it means.
+    // so dispatch always says what it means rather than inheriting a default
+    // from somewhere else. Probed @ 2.1.251: Claude Code's own persisted
+    // "Chrome enabled by default" (`claudeInChromeDefaultEnabled`) does **not**
+    // reach `-p` at all — with it on and no flag, zero browser tools load — so
+    // `--no-chrome` is defensive rather than load-bearing today. Kept because it
+    // costs nothing (both flags ship since 2.0.72) and holds if that setting
+    // ever starts applying headlessly.
     args.push(if chrome { "--chrome" } else { "--no-chrome" }.to_owned());
     // `claude -p` takes the prompt as a positional. Pass it last, after a `--`
     // end-of-options separator, so a prompt beginning with `-` (e.g. a markdown

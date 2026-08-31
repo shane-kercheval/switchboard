@@ -84,10 +84,11 @@ pub struct DispatchOptions {
     /// agent's next turn rather than needing a new agent or session.
     ///
     /// Only the Claude Code adapter reads this — it maps to `--chrome` /
-    /// `--no-chrome`, which the adapter emits in *both* directions so the flag
-    /// never falls through to Claude Code's own global default (a key in a file
-    /// Switchboard doesn't own, which would otherwise let an agent hold browser
-    /// tools while Switchboard's UI says it doesn't). The Codex equivalent lives
+    /// `--no-chrome`, emitted in *both* directions so a dispatch never inherits
+    /// browser access from anywhere but this field. Claude Code's own persisted
+    /// "Chrome by default" setting was probed and does not apply to `-p`, so the
+    /// off-direction flag is belt-and-braces, not a fix for a live gap. The
+    /// Codex equivalent lives
     /// in the `ChatGPT` desktop app and can't be driven from here, so the Codex
     /// and Antigravity adapters ignore this field.
     pub chrome_integration: bool,

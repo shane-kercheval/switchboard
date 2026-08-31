@@ -79,6 +79,19 @@ pub struct DispatchOptions {
     /// `system/init` stream event on every dispatch regardless.
     pub is_first_dispatch_after_attach: bool,
 
+    /// Whether this turn should get browser tools, from the user-global
+    /// preference. Read live per dispatch, so a toggle takes effect on an
+    /// agent's next turn rather than needing a new agent or session.
+    ///
+    /// Only the Claude Code adapter reads this — it maps to `--chrome` /
+    /// `--no-chrome`, which the adapter emits in *both* directions so the flag
+    /// never falls through to Claude Code's own global default (a key in a file
+    /// Switchboard doesn't own, which would otherwise let an agent hold browser
+    /// tools while Switchboard's UI says it doesn't). The Codex equivalent lives
+    /// in the `ChatGPT` desktop app and can't be driven from here, so the Codex
+    /// and Antigravity adapters ignore this field.
+    pub chrome_integration: bool,
+
     /// Fired by the dispatcher to request cancellation of this turn. The
     /// adapter watches it (via `select!`) and, on cancel, does only the
     /// harness-specific teardown — kill the subprocess group — then **ends

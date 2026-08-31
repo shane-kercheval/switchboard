@@ -22,6 +22,7 @@ const PREFS = (editor: string | null, terminal: string): Preferences => ({
   terminal_app: terminal,
   diff_style: "side_by_side",
   show_builtins: true,
+  claude_chrome_enabled: false,
   notify_on_completion: true,
   notify_while_focused: false,
   agent_defaults: structuredClone(DEFAULT_AGENT_PROFILES),
@@ -122,6 +123,23 @@ describe("preferences store", () => {
     // The whole merged value is sent to the backend.
     expect(invokeMock).toHaveBeenLastCalledWith("set_preferences", {
       preferences: expect.objectContaining({ show_builtins: true }),
+    });
+  });
+
+  it("loads and persists the claude_chrome_enabled toggle", async () => {
+    _testing.reset({ ready: false });
+    invokeMock.mockResolvedValueOnce({
+      ...PREFS("code", "Terminal"),
+      claude_chrome_enabled: true,
+    });
+    await loadPreferences();
+    expect(preferences.claude_chrome_enabled).toBe(true);
+
+    invokeMock.mockResolvedValueOnce(null);
+    await updatePreferences({ claude_chrome_enabled: false });
+    expect(preferences.claude_chrome_enabled).toBe(false);
+    expect(invokeMock).toHaveBeenLastCalledWith("set_preferences", {
+      preferences: expect.objectContaining({ claude_chrome_enabled: false }),
     });
   });
 

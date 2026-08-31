@@ -28,6 +28,7 @@ const defaultInvoke = async (cmd: string, _args?: Record<string, unknown>): Prom
       terminal_app: "Terminal",
       diff_style: "unified",
       show_builtins: true,
+      claude_chrome_enabled: false,
       notify_on_completion: true,
       notify_while_focused: false,
     };
@@ -202,12 +203,14 @@ describe("SettingsView", () => {
     expect(screen.getByTestId("notify-toggle")).toBeDisabled();
     expect(screen.getByTestId("notify-while-focused-toggle")).toBeDisabled();
     expect(screen.getByTestId("show-builtins-toggle")).toBeDisabled();
+    expect(screen.getByTestId("claude-chrome-toggle")).toBeDisabled();
 
     resolvePreferences({
       editor_command: "zed",
       terminal_app: "iTerm",
       diff_style: "unified",
       show_builtins: true,
+      claude_chrome_enabled: false,
       notify_on_completion: true,
       notify_while_focused: false,
       agent_defaults: {
@@ -325,6 +328,7 @@ describe("SettingsView", () => {
           terminal_app: "Terminal",
           diff_style: "unified",
           show_builtins: true,
+          claude_chrome_enabled: false,
           notify_on_completion: true,
           notify_while_focused: false,
           agent_defaults: expect.any(Object),
@@ -343,6 +347,7 @@ describe("SettingsView", () => {
           terminal_app: "Terminal",
           diff_style: "unified",
           show_builtins: true,
+          claude_chrome_enabled: false,
           notify_on_completion: true,
           notify_while_focused: false,
           agent_defaults: expect.any(Object),
@@ -364,6 +369,7 @@ describe("SettingsView", () => {
           terminal_app: "iTerm",
           diff_style: "unified",
           show_builtins: true,
+          claude_chrome_enabled: false,
           notify_on_completion: true,
           notify_while_focused: false,
           agent_defaults: expect.any(Object),
@@ -380,6 +386,7 @@ describe("SettingsView", () => {
           terminal_app: "Terminal",
           diff_style: "unified",
           show_builtins: true,
+          claude_chrome_enabled: false,
           notify_on_completion: true,
           notify_while_focused: false,
           agent_defaults: expect.any(Object),
@@ -401,6 +408,47 @@ describe("SettingsView", () => {
       }),
     );
     expect(toggle).toHaveAttribute("aria-checked", "false");
+  });
+
+  it("toggles claude_chrome_enabled and persists the change", async () => {
+    render(SettingsView, { props: { onClose: vi.fn() } });
+    const toggle = screen.getByTestId("claude-chrome-toggle");
+    // Browser access is opt-in: it must not be on until the user says so.
+    expect(toggle).toHaveAttribute("aria-checked", "false");
+
+    await fireEvent.click(toggle);
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("set_preferences", {
+        preferences: expect.objectContaining({ claude_chrome_enabled: true }),
+      }),
+    );
+    expect(toggle).toHaveAttribute("aria-checked", "true");
+  });
+
+  it("reflects a persisted claude_chrome_enabled from the backend", async () => {
+    // Not ready → SettingsView triggers the load, so this covers the hydration
+    // path rather than just local toggle state.
+    prefsTesting.reset({ ready: false });
+    invokeMock.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "get_preferences")
+        return {
+          editor_command: "code",
+          terminal_app: "Terminal",
+          diff_style: "unified",
+          show_builtins: true,
+          claude_chrome_enabled: true,
+          notify_on_completion: true,
+          notify_while_focused: false,
+          agent_defaults: DEFAULT_AGENT_PROFILES,
+        };
+      return defaultInvoke(cmd, args);
+    });
+
+    render(SettingsView, { props: { onClose: vi.fn() } });
+
+    await waitFor(() =>
+      expect(screen.getByTestId("claude-chrome-toggle")).toHaveAttribute("aria-checked", "true"),
+    );
   });
 
   it("surfaces an inline error when a preference save fails, keeping the value", async () => {

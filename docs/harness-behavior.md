@@ -332,6 +332,34 @@ Switchboard transports attachments by staging the file and appending its absolut
 
 **Consequence.** The "inside cwd is the only universally readable location" constraint is **not true at current CLI versions**, so Switchboard's per-project state is free to live outside the user's working directories. Do not read this as "sandboxing is gone" — it holds *because* all four adapters spawn with sandboxing/permissions fully disabled. If any adapter ever re-enables a sandbox, this table must be re-probed before trusting an out-of-cwd path. Tests: `live_<harness>_attachment_outside_cwd_is_readable` (`crates/dispatcher/tests/live_end_to_end.rs`), alongside the original in-cwd cases.
 
+### 3.8 Browser control (Claude in Chrome) — how a harness exposes it, and how failure reads
+
+> **Status: probed 2026-08-31 @ Claude 2.1.251 / codex-cli 0.151.0. Full detail, including the raw probe transcripts, in `docs/research/claude-chrome-extension.md`.**
+
+Asymmetric across harnesses, so it is a per-harness capability rather than a shared one:
+
+| Harness | How it's enabled | Switchboard can drive it |
+|---|---|---|
+| **Claude** | `--chrome` / `--no-chrome`, per invocation | ✅ — `DispatchOptions::chrome_integration`, from the `claude_chrome_enabled` preference |
+| **Codex** | `[plugins."chrome@openai-bundled"] enabled = true` in `~/.codex/config.toml`, written by the `ChatGPT` desktop app | ❌ — global config we don't own; `codex exec` just inherits it |
+| **Antigravity** | not probed | — |
+
+**`--chrome` attaches an MCP server** named `claude-in-chrome` (22 tools: `navigate`, `read_page`, `get_page_text`, `read_console_messages`, `browser_batch`, `file_upload`, …), reported in `SessionMeta.mcp_servers` like any other. It does **not** appear in `claude mcp list`, being built in rather than user-configured, so Switchboard's MCP registry surfaces it only via `SessionMeta`.
+
+**The failure mode is the important part: it is entirely invisible to a supervising process.** With the extension uninstalled, `--chrome` still exits 0, still loads all 22 tools, and still reports `status: "connected"` — that status describes the *local MCP server process*, not the browser. The final `result` event carries `is_error: false`. The failure surfaces only when a browser tool is called, and even then as an ordinary tool result whose text happens to be an error (`"Browser extension is not connected. …"`) with **no `is_error` key at all**. Nothing structural distinguishes it from success.
+
+There is also **no pre-flight check**: `cachedChromeExtensionInstalled` in `~/.claude.json` stays `true` after an uninstall (stale cache), and the native-messaging manifest survives uninstall and isn't re-consulted once Chrome holds a connection. Hence the design: browser access is an explicit user assertion (a Settings toggle), not something Switchboard detects.
+
+One adjacent behavior *does* set `is_error: true` — when multiple browsers are connected and none is paired, every browser call fails demanding `AskUserQuestion`, which doesn't exist in `-p`. Escapable in-conversation (`select_browser` works headlessly) and the pairing then persists user-globally in `~/.claude.json` → `chromeExtension.pairedDeviceId`, so it costs one round-trip once.
+
+**Both flags shipped together in 2.0.72 (2025-12-17)**, the release introducing Claude in Chrome as a beta — verified by pulling that tarball and 2.1.0's from npm and finding `--no-chrome` in both `cli.js` files. GA was 2.1.198; current is 2.1.251. So there is no version window where `--chrome` parses and `--no-chrome` does not, and emitting one on every dispatch introduces no practical CLI floor. This was checked because an unconditionally-emitted flag couples *every* Claude turn — not just browser ones — to the CLI recognizing it, which would otherwise be a poor trade for an opt-in feature.
+
+**Assumed, not probed:** that `--no-chrome` overrides `claudeInChromeDefaultEnabled: true`. It is the premise for stating the flag in both directions, and the only evidence in hand is flag-vs-flag (`--chrome --no-chrome` → 0 tools), not flag-vs-config. Probing it requires mutating the developer's real `~/.claude.json` (auth is Keychain-bound, so an isolated `CLAUDE_CONFIG_DIR` fails to log in) and needs a control arm — key `true` with *no* flag, to establish the key reaches `-p` at all — or a negative result is uninterpretable. Bounded consequence if wrong: a user who enabled Chrome-by-default inside Claude Code gets browser tools while Switchboard's Settings reads off.
+
+**Scope is global and per-turn, a deliberate v1 tradeoff.** One user-global preference, sampled per dispatch, so enabling it gives *every* Claude agent the browser tools and their ~2,400-token init cost on *every* turn, including agents doing unrelated work. `ToolSearch` deferral keeps the remainder unpaid until an agent reaches for the browser, but this part is not deferred. Accepted because extension install and browser pairing are machine-level facts, and because the per-agent sidebar already shows which agents carry the tools. A per-agent override remains open but is not free — it needs a persisted `AgentRecord` field, defaulting for existing agents, UI, and precedence rules against the global.
+
+Test: `live_claude_chrome_flag_toggles_browser_tools` (`crates/harness/tests/live.rs`) — one agent, three turns, so the on/off assertions land on `--resume` invocations rather than fresh sessions (a CLI that latched the capability at session creation would otherwise pass). Deliberately extension-independent, so it runs anywhere `claude` is logged in.
+
 ## 4. Gap register (actionable)
 
 Grouped by theme; this is the candidate scope for the failure/metadata-surfacing milestone.

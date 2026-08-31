@@ -1896,17 +1896,29 @@ pub fn get_preferences_impl(state: &AppState) -> Preferences {
 /// reflects the change even if the write fails. A `None` path (no resolvable
 /// config location — tests/exotic host) updates memory only.
 ///
-/// **The `preferences` guard is held across the file write** (the one place we
-/// hold a state lock across I/O). `write_yaml` uses a fixed `<file>.tmp`, so two
-/// unserialized saves would race on that temp file and could corrupt
-/// `config.yaml`. Serializing here is safe and clearer than routing through
-/// `registry_write`: `preferences` is a singleton touched only by get/set, the
-/// write is a tiny YAML file on an explicit user action, and nothing
-/// latency-sensitive waits behind it. See the lock-order note in `state.rs`.
+/// **The `preferences` guard is released before the file write**, so nothing
+/// that reads preferences waits on I/O. That matters because dispatch reads them:
+/// `ProjectDispatchContextFactory::build` samples the browser-tools preference
+/// live for every turn, and holding the guard across a write would park a
+/// starting turn behind a `config.yaml` save.
+///
+/// What serializes the write is `switchboard_core`'s process-wide
+/// `YAML_EDIT_LOCK`, which `preferences::save` takes via `edit_yaml_mapping` —
+/// **not** this guard, which never could: the other co-owner of `config.yaml`
+/// is the prompt service's `add_mcp_provider`, in a different crate, which
+/// doesn't know `AppState` exists. So the fixed-`<file>.tmp` collision and the
+/// cross-subsystem key clobbering are both handled a layer down.
+///
+/// What's given up: under two concurrent saves, memory ends at the last writer
+/// while disk ends at whichever won `YAML_EDIT_LOCK`, so the two can disagree.
+/// Unreachable in practice — the frontend chains saves through a single tail
+/// (`saveTail`, `preferences.svelte.ts`) in a single webview.
 pub fn set_preferences_impl(state: &AppState, prefs: &Preferences) -> Result<(), AppError> {
     let normalized = prefs.clone().normalized();
-    let mut guard = lock(&state.preferences);
-    guard.clone_from(&normalized);
+    {
+        let mut guard = lock(&state.preferences);
+        guard.clone_from(&normalized);
+    }
     let Some(path) = state.preferences_path.as_ref() else {
         return Ok(());
     };
@@ -3922,6 +3934,7 @@ pub async fn send_message_impl(
             lock_root: state.lock_root.clone(),
             project_generation: Arc::clone(&state.project_generation),
             generation_at_capture: generation,
+            preferences: Arc::clone(&state.preferences),
         },
     ));
     // Last point before the hand-off: refuse if the project moved under us while
@@ -7981,6 +7994,7 @@ mod tests {
                 lock_root: state.lock_root.clone(),
                 project_generation: Arc::clone(&state.project_generation),
                 generation_at_capture: generation,
+                preferences: Arc::clone(&state.preferences),
             },
         )
     }
@@ -8091,6 +8105,7 @@ mod tests {
         let adapter: Arc<dyn HarnessAdapter> = Arc::new(GatedRecordingAdapter {
             prompts: Arc::new(Mutex::new(Vec::new())),
             profiles: None,
+            chrome: None,
             texts: vec!["parked".to_owned()],
             gate: Arc::new(tokio::sync::Notify::new()),
             park_at: 0,
@@ -9866,6 +9881,10 @@ mod tests {
     struct GatedRecordingAdapter {
         prompts: Arc<Mutex<Vec<String>>>,
         profiles: Option<Arc<Mutex<Vec<RecordedProfile>>>>,
+        /// Per-dispatch `chrome_integration`, for the mirror of the profile test:
+        /// profiles are captured when a send is *submitted*, this preference when
+        /// the turn *runs*, and only a queued send can tell the two apart.
+        chrome: Option<Arc<Mutex<Vec<bool>>>>,
         texts: Vec<String>,
         gate: Arc<tokio::sync::Notify>,
         park_at: usize,
@@ -9918,6 +9937,9 @@ mod tests {
             lock(&self.prompts).push(prompt.to_owned());
             if let Some(profiles) = &self.profiles {
                 lock(profiles).push((agent.model.clone(), agent.effort.clone()));
+            }
+            if let Some(chrome) = &self.chrome {
+                lock(chrome).push(options.chrome_integration);
             }
             let text = self.texts.get(index).cloned().unwrap_or_default();
             let park = index == self.park_at;
@@ -10030,6 +10052,7 @@ mod tests {
         let adapter: Arc<dyn HarnessAdapter> = Arc::new(GatedRecordingAdapter {
             prompts: Arc::clone(&prompts),
             profiles: None,
+            chrome: None,
             texts: texts.iter().map(|t| (*t).to_owned()).collect(),
             gate: Arc::clone(gate),
             park_at,
@@ -10054,6 +10077,7 @@ mod tests {
         let adapter: Arc<dyn HarnessAdapter> = Arc::new(GatedRecordingAdapter {
             prompts: Arc::clone(&prompts),
             profiles: None,
+            chrome: None,
             texts: texts.iter().map(|t| (*t).to_owned()).collect(),
             gate: Arc::clone(first.0),
             park_at: first.1,
@@ -11432,6 +11456,128 @@ mod tests {
             lock(&state.needs_session_meta).contains(&agent.id),
             "flag must persist through pre-stream failure so a retry still forces SessionMeta"
         );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // A recording adapter plus three sequential turns; linear.
+    async fn chrome_preference_reaches_the_adapter_and_is_read_live() {
+        // Two things at once, because they share a setup and only matter
+        // together: the browser-tools preference actually reaches the adapter,
+        // and it is read at dispatch time rather than frozen when the agent or
+        // its factory was built. The second is what lets a user flip the toggle
+        // and have their *next* message honor it.
+        struct ChromeRecordingAdapter {
+            seen: Arc<Mutex<Vec<bool>>>,
+        }
+
+        #[async_trait]
+        impl HarnessAdapter for ChromeRecordingAdapter {
+            fn probe(&self) -> Result<(), switchboard_harness::DispatchError> {
+                Ok(())
+            }
+            fn version(&self) -> Option<String> {
+                None
+            }
+            async fn dispatch(
+                &self,
+                _agent: &AgentRecord,
+                _cwd: &Path,
+                _prompt: &str,
+                turn_id: switchboard_harness::TurnId,
+                options: switchboard_harness::DispatchOptions,
+            ) -> Result<switchboard_harness::EventStream, switchboard_harness::DispatchError>
+            {
+                lock(&self.seen).push(options.chrome_integration);
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                tokio::spawn(async move {
+                    let _ = tx.send(switchboard_harness::AdapterEvent::TurnEnd {
+                        turn_id,
+                        outcome: switchboard_harness::TurnOutcome::Completed,
+                        ended_at: chrono::Utc::now(),
+                        usage: None,
+                        context_window_source: None,
+                        stable_message_id: None,
+                        first_message_id: None,
+                        spend: None,
+                        model: None,
+                        effort: None,
+                    });
+                });
+                Ok(Box::pin(
+                    tokio_stream::wrappers::UnboundedReceiverStream::new(rx),
+                ))
+            }
+        }
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let adapter: Arc<dyn HarnessAdapter> = Arc::new(ChromeRecordingAdapter {
+            seen: Arc::clone(&seen),
+        });
+        let emitter = Arc::new(RecordingEmitter::new());
+        let state = AppState::new_for_test(
+            Arc::clone(&adapter),
+            Arc::clone(&adapter),
+            Arc::clone(&adapter),
+            emitter.clone() as Arc<dyn EventEmitter>,
+        );
+        let tmp = TempDir::new().unwrap();
+        init_directory_impl(&state, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let proj = create_project_in_only_dir(&state, "alpha");
+        set_active_project_impl(&state, proj.id).unwrap();
+        let agent = create_agent_impl(&state, "a", HarnessKind::ClaudeCode, None, None).unwrap();
+
+        // Default: off.
+        send_msg(&state, agent.id, "one").await.unwrap();
+        within(
+            &emitter,
+            "turn 1 idle",
+            emitter.wait_for_type("agent_idle", 1),
+        )
+        .await;
+        assert_eq!(lock(&seen).as_slice(), [false], "default must be off");
+
+        // Turn it on mid-agent — the same agent, the same actor, the same
+        // factory. A value captured at construction would still report false.
+        set_preferences_impl(
+            &state,
+            &Preferences {
+                claude_chrome_enabled: true,
+                ..Preferences::default()
+            },
+        )
+        .unwrap();
+        send_msg(&state, agent.id, "two").await.unwrap();
+        within(
+            &emitter,
+            "turn 2 idle",
+            emitter.wait_for_type("agent_idle", 2),
+        )
+        .await;
+        assert_eq!(
+            lock(&seen).as_slice(),
+            [false, true],
+            "flipping the preference must affect the very next turn"
+        );
+
+        // And back off again, so the test can't pass on a one-way latch.
+        set_preferences_impl(
+            &state,
+            &Preferences {
+                claude_chrome_enabled: false,
+                ..Preferences::default()
+            },
+        )
+        .unwrap();
+        send_msg(&state, agent.id, "three").await.unwrap();
+        within(
+            &emitter,
+            "turn 3 idle",
+            emitter.wait_for_type("agent_idle", 3),
+        )
+        .await;
+        assert_eq!(lock(&seen).as_slice(), [false, true, false]);
     }
 
     #[tokio::test]
@@ -14098,6 +14244,7 @@ mod tests {
         let adapter: Arc<dyn HarnessAdapter> = Arc::new(GatedRecordingAdapter {
             prompts: Arc::new(Mutex::new(Vec::new())),
             profiles: Some(Arc::clone(&profiles)),
+            chrome: None,
             texts: vec![String::new(); 3],
             gate: Arc::clone(&gate),
             park_at: 0,
@@ -14151,6 +14298,78 @@ mod tests {
                 (Some("opus".to_owned()), Some("high".to_owned())),
                 (Some("sonnet".to_owned()), Some("medium".to_owned())),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_queued_send_adopts_the_chrome_preference_in_force_when_it_runs() {
+        // The deliberate mirror of
+        // `queued_sends_capture_the_profile_active_when_each_was_submitted`.
+        // A profile is frozen when the user hits send; the browser-tools
+        // preference is sampled when the turn actually starts. Only a send that
+        // is *already queued* when the toggle flips can tell those two apart —
+        // sequential sends produce identical results either way, which is why
+        // `chrome_preference_reaches_the_adapter_and_is_read_live` cannot cover
+        // this and this test exists.
+        let tmp = TempDir::new().unwrap();
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let chrome = Arc::new(Mutex::new(Vec::<bool>::new()));
+        let adapter: Arc<dyn HarnessAdapter> = Arc::new(GatedRecordingAdapter {
+            prompts: Arc::new(Mutex::new(Vec::new())),
+            profiles: None,
+            chrome: Some(Arc::clone(&chrome)),
+            texts: vec![String::new(); 2],
+            gate: Arc::clone(&gate),
+            park_at: 0,
+            extra_parks: Vec::new(),
+            fail_at: Vec::new(),
+            teardown: None,
+            dispatches: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let emitter = Arc::new(RecordingEmitter::new());
+        let state = AppState::new_for_test(
+            Arc::clone(&adapter),
+            Arc::clone(&adapter),
+            adapter,
+            emitter.clone() as Arc<dyn EventEmitter>,
+        );
+        let (agent, _) = project_with_agent(&state, &tmp).await;
+
+        // Turn 1 dispatches with the preference off and parks mid-turn.
+        send_msg(&state, agent.id, "park").await.unwrap();
+        within(
+            &emitter,
+            "first turn starts",
+            emitter.wait_for_type("turn_start", 1),
+        )
+        .await;
+
+        // Turn 2 is submitted while the preference is still off, so it queues
+        // behind the parked turn carrying the OLD value if capture were at
+        // submission time.
+        send_msg(&state, agent.id, "queued").await.unwrap();
+        set_preferences_impl(
+            &state,
+            &Preferences {
+                claude_chrome_enabled: true,
+                ..Preferences::default()
+            },
+        )
+        .unwrap();
+
+        gate.notify_one();
+        within(
+            &emitter,
+            "queued turn drains",
+            emitter.wait_for_type("agent_idle", 1),
+        )
+        .await;
+
+        assert_eq!(
+            *lock(&chrome),
+            vec![false, true],
+            "a send queued before the toggle flipped must dispatch under the \
+             setting in force when it RAN, not when it was submitted"
         );
     }
 
@@ -21930,6 +22149,7 @@ mod tests {
             terminal_app: "iTerm".to_owned(),
             diff_style: preferences::DiffStyle::Unified,
             show_builtins: false,
+            claude_chrome_enabled: true,
             notify_on_completion: true,
             notify_while_focused: false,
             agent_defaults: Preferences::default().agent_defaults,
@@ -21957,6 +22177,7 @@ mod tests {
                 terminal_app: String::new(),
                 diff_style: preferences::DiffStyle::SideBySide,
                 show_builtins: true,
+                claude_chrome_enabled: false,
                 notify_on_completion: true,
                 notify_while_focused: false,
                 agent_defaults: Preferences::default().agent_defaults,
@@ -21981,6 +22202,7 @@ mod tests {
             terminal_app: "Terminal".to_owned(),
             diff_style: preferences::DiffStyle::SideBySide,
             show_builtins: true,
+            claude_chrome_enabled: false,
             notify_on_completion: true,
             notify_while_focused: false,
             agent_defaults: Preferences::default().agent_defaults,

@@ -417,7 +417,7 @@ Switchboard resolves prompt IDs itself and sends agents the rendered text as a p
 
 What this does **not** cover:
 
-- **MCP tools.** Tools are invoked by the model mid-turn, not by the user pre-turn. Switchboard cannot proxy them; tools (e.g. an Atlassian MCP server, Google Drive integration) must still be configured in the underlying agent.
+- **MCP tools.** Tools are invoked by the model mid-turn, not by the user pre-turn. Switchboard cannot proxy them; tools (e.g. an Atlassian MCP server, Google Drive integration) must still be configured in the underlying agent. **One narrow exception:** where a harness ships a *built-in* tool server behind a per-invocation CLI flag, Switchboard can govern whether it loads — currently only Claude's browser tools (`--chrome` / `--no-chrome`, §9), from a user-global preference sampled per turn. Switchboard still neither proxies nor owns the server; it only decides whether the harness enables its own. Do not generalize this to externally-configured MCP servers, which remain harness-owned.
 - **Claude Code skills.** Configured in Claude Code itself (`~/.claude/skills/`, project `.claude/skills/`); Switchboard does not mediate them. **Auto-invoked skills do work normally in Switchboard-spawned sessions** because default `claude -p` loads the user's full environment — the model can discover and invoke skills mid-turn just as it would interactively. The *user-invoked* side of skills (`/skill-name` as an explicit command) is currently unavailable due to a `claude -p` limitation; see §9 passthrough and [docs/research/archive/claude-code-headless.md](research/archive/claude-code-headless.md).
 - **Per-agent setup in general.** Authentication, permission flags, hooks, and MCP tool registration remain the underlying harness's concern.
 
@@ -712,6 +712,17 @@ Switchboard consumes the harness stream by spawning the process, reading stdout 
 
 - **Codex** passes `--skip-git-repo-check` unconditionally. Switchboard's safety guidance about git-tracked projects (see §9 "Safety guidance") sits at a higher layer than Codex's own check; we don't want Codex refusing to spawn in a non-git directory just because the user hasn't initialized a repo yet.
 - **Antigravity** passes `--dangerously-skip-permissions` unconditionally. Without it, tool calls would block on interactive permission prompts that a headless dispatch can't answer. The bound cwd is the user's own workspace, so per-tool approval is auto-granted, consistent with the max-autonomy posture (§11).
+- **Claude** passes `--chrome` or `--no-chrome` on every dispatch, from the user-global `claude_chrome_enabled` preference. Stated in both directions so Claude Code's own persisted `claudeInChromeDefaultEnabled` cannot leave an agent holding browser tools while Switchboard's Settings reads off; both flags have existed since 2.0.72, so this imposes no practical CLI floor.
+
+**Browser control** is the one capability where the harnesses diverge on *who can enable it*, rather than on how it behaves:
+
+| Harness | Enabled by | Switchboard can drive it |
+|---|---|---|
+| **Claude Code** | `--chrome` / `--no-chrome`, per invocation | ✅ user-global preference, sampled per turn |
+| **Codex** | `[plugins."chrome@openai-bundled"]` in `~/.codex/config.toml`, written by the ChatGPT desktop app | ❌ global config Switchboard does not own; `codex exec` inherits it |
+| **Antigravity** | not probed | — |
+
+Claude's browser tools arrive as a built-in MCP server (`claude-in-chrome`) reported in `SessionMeta.mcp_servers`, so they surface per agent with no new UI. Operational detail — including that a missing extension fails invisibly to a supervising process — is in [harness-behavior.md](harness-behavior.md) §3.8.
 
 ### Permissions and sandboxing
 

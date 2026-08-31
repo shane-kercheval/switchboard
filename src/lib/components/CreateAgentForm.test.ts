@@ -83,6 +83,7 @@ describe("CreateAgentForm", () => {
       terminal_app: "Terminal",
       diff_style: "unified",
       show_builtins: true,
+      claude_chrome_enabled: false,
       notify_on_completion: true,
       notify_while_focused: false,
       agent_defaults: {

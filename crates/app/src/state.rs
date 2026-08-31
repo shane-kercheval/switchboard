@@ -140,12 +140,16 @@ pub struct MaintenanceBarrier {
 /// fired while the lock is held, and the order keeps a run resolving `cancelled`
 /// (not `failed`) and stops it dispatching against unloaded state.
 ///
-/// `preferences` is a **standalone leaf**: it is only ever acquired by
-/// `get_preferences` / `set_preferences`, never nested with another state lock.
-/// `set_preferences_impl` deliberately holds it **across its `config.yaml`
-/// write** to serialize saves (the temp file is a fixed path, so concurrent
-/// unserialized writes would corrupt it). Because it's a leaf taken alone, no
-/// other lock may be acquired while holding it — keep it that way.
+/// `preferences` is a **standalone leaf**: acquired by `get_preferences` /
+/// `set_preferences`, and by `ProjectDispatchContextFactory::build`, which
+/// samples the browser-tools preference live for every dispatch. Never nested
+/// with another state lock, and never held across I/O — `set_preferences_impl`
+/// releases it before writing `config.yaml`, precisely so a starting turn can't
+/// park behind a save. The write is serialized by `switchboard_core`'s
+/// `YAML_EDIT_LOCK`, not by this mutex (which cannot serialize it: the prompt
+/// service co-owns `config.yaml` from another crate and never takes this lock).
+/// Because it's a leaf taken alone, no other lock may be acquired while holding
+/// it — keep it that way.
 ///
 /// `registry_write` serializes project-registry mutations and small mutable
 /// project sidecars such as message pins.
@@ -405,7 +409,9 @@ pub struct AppState {
     /// User-global personal preferences (see `crate::preferences`). Backend-owned
     /// `config.yaml`; the first backend-persisted settings (theme stays
     /// frontend-only). Defaults until hydrated via [`AppState::with_preferences`].
-    pub preferences: Mutex<Preferences>,
+    /// Shared so `ProjectDispatchContextFactory` can read it live per dispatch
+    /// (browser-tools toggle), rather than freezing the value at enqueue.
+    pub preferences: Arc<Mutex<Preferences>>,
 
     /// Resolved path of `config.yaml`, or `None` when no global location was
     /// resolved (tests, exotic host). `set_preferences` errors-as-noop persist
@@ -497,7 +503,7 @@ impl AppState {
             workspace_path: None,
             git_registry: Mutex::new(GitRegistry::default()),
             git_registry_path: None,
-            preferences: Mutex::new(Preferences::default()),
+            preferences: Arc::new(Mutex::new(Preferences::default())),
             preferences_path: None,
             prompts: PromptService::disabled(),
             forwards: Mutex::new(HashMap::new()),
@@ -624,7 +630,7 @@ impl AppState {
     /// file simply yields defaults this session and the next save replaces it.
     #[must_use]
     pub fn with_preferences(mut self, path: PathBuf) -> Self {
-        self.preferences = Mutex::new(preferences::load(&path));
+        self.preferences = Arc::new(Mutex::new(preferences::load(&path)));
         self.preferences_path = Some(path);
         self
     }

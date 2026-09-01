@@ -670,6 +670,90 @@ async fn live_codex_cancel_terminates_and_synthesizes_cancelled() {
 }
 
 #[tokio::test]
+#[ignore = "requires codex installed and authenticated — run with: make test-live"]
+async fn live_codex_cancel_after_content_recovers_turn_identity() {
+    // Pins the cancel-path identity recovery against the REAL Codex CLI: by
+    // the time the first content chunk streams, the rollout file holds this
+    // turn's `turn_context` — so a cancel must kill the group, read the file,
+    // and surface `turn_context.turn_id` as a `turn_identity` event (which the
+    // dispatcher journals as the cancelled turn's `TurnLink`). Cancelling only
+    // after content deliberately avoids the pre-`turn_context` window, where
+    // no identity legitimately exists (the plain cancel test covers that).
+    let tmp = TempDir::new().expect("tempdir");
+    let (_store_root, project) = temp_project(tmp.path(), "cancel-identity-test");
+    let agent = project
+        .register_agent("assistant", HarnessKind::Codex, None, None)
+        .expect("register_agent");
+
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let channel = format!("agent:{}", agent.id);
+    let factory = LiveFactory::new(
+        Arc::new(CodexAdapter::new()),
+        project.directory.clone(),
+        agent.clone(),
+        Arc::clone(&emitter),
+    );
+
+    expect_accepted(
+        dispatcher
+            .send_message(
+                agent.id,
+                "Count slowly to one hundred, one number per line.",
+                vec![],
+                Uuid::now_v7(),
+                factory,
+                OnBusy::Enqueue,
+            )
+            .await,
+        "send",
+    );
+
+    tokio::time::timeout(LIVE_WAIT, emitter.wait_for_type("content_chunk", 1))
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "no content within the timeout; events: {:?}",
+                emitter.snapshot()
+            )
+        });
+    dispatcher.cancel(agent.id, CancelSource::User);
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        emitter.wait_for_type("agent_idle", 1),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "turn did not drain within 30s of cancel; events: {:?}",
+            emitter.snapshot()
+        )
+    });
+
+    assert_eq!(
+        cancelled_source(&emitter, &channel).as_deref(),
+        Some("user"),
+        "expected a cancelled terminal stamped `user`; events: {:?}",
+        emitter.snapshot()
+    );
+    let identity = emitter
+        .snapshot()
+        .iter()
+        .find(|(name, payload)| name == &channel && payload["type"] == "turn_identity")
+        .map(|(_, payload)| {
+            payload["hydration_key"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned()
+        });
+    assert!(
+        identity.as_deref().is_some_and(|k| !k.is_empty()),
+        "cancel after content must surface the turn's identity from the session file; events: {:?}",
+        emitter.snapshot()
+    );
+}
+
+#[tokio::test]
 #[ignore = "requires agy authenticated (run `agy`) — run with: make test-live"]
 async fn live_antigravity_cancel_terminates_and_synthesizes_cancelled() {
     live_cancel_case(

@@ -122,6 +122,17 @@ pub struct Enrichment {
     /// `None`, never a predecessor turn's id — a stale key would mis-link a new
     /// turn to an old send.
     pub current_turn_id: Option<String>,
+    /// The **last `task_started` record's timestamp** — when the file's current
+    /// (tail) turn began. The reset at `task_started` protects
+    /// [`Self::current_turn_id`] only once *this* turn's `task_started` has hit
+    /// the file; on a resumed session read before that (the cancel path's
+    /// fast-cancel window), the tail turn is the *previous* dispatch and its
+    /// key is still resident. This timestamp is what lets the cancel path prove
+    /// the tail turn is its own — the key is trusted only when the tail turn
+    /// started at or after this dispatch. `None` when no `task_started` exists
+    /// or the record carries no parseable timestamp (warned — a format change
+    /// there would otherwise silently retire cancel-path identity recovery).
+    pub current_turn_started_at: Option<chrono::DateTime<chrono::Utc>>,
     /// The full `session_meta` line as JSON, with
     /// `payload.base_instructions.text` replaced by a sentinel. Used as
     /// `SessionMeta.raw`. `None` if line 1 isn't a `session_meta` record.
@@ -493,6 +504,21 @@ fn absorb_session_meta(payload: &Value, enrichment: &mut Enrichment) -> HistoryM
     mode
 }
 
+/// The record-level timestamp of a `task_started` line — the freshness proof
+/// for cancel-path identity recovery ([`Enrichment::current_turn_started_at`]).
+/// Absent/unparseable reads as `None` — **fail-closed** (the freshness check
+/// rejects, no identity is recovered). Deliberately silent here: this parse
+/// runs on every enrichment read, where freshness is never consulted; the one
+/// consumer that consults it (the Codex cancel path) owns the
+/// missing-timestamp breadcrumb, so the warn fires exactly when missing data
+/// prevented an otherwise-possible recovery — never about values nothing read.
+fn task_started_timestamp(value: &Value) -> Option<chrono::DateTime<chrono::Utc>> {
+    value
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .and_then(|s| s.parse::<chrono::DateTime<chrono::Utc>>().ok())
+}
+
 #[must_use]
 pub fn parse_session_content(content: &str) -> Enrichment {
     let mut enrichment = Enrichment::default();
@@ -603,6 +629,10 @@ pub fn parse_session_content(content: &str) -> Enrichment {
                         // keyless → positional. Guarded live by
                         // `live_codex_hydration_key_matches_live_turn_end`.
                         enrichment.current_turn_id = None;
+                        // When the file's current turn began — the freshness
+                        // proof the cancel path's identity recovery compares
+                        // against its dispatch instant (see the field doc).
+                        enrichment.current_turn_started_at = task_started_timestamp(&value);
                         // Turn-scoped for the same reason: the facet upgrade
                         // must never replay a *previous* turn's patches onto
                         // this turn's file_change rows.
@@ -2710,8 +2740,9 @@ impl CodexReconstruction {
             // per-turn hydration key. The live adapter now emits the same id on
             // `TurnEnd` (sourced from the post-terminal enrichment re-read — the
             // durable send↔turn `TurnLink`), so link-eligibility is probe-verified.
-            // It is **not** refresh-eligible: the live key arrives only at terminal
-            // (from disk), not mid-stream, so `supports_refresh` stays off.
+            // It is **not** refresh-eligible: the live key arrives only at
+            // terminal, or on the cancel path's session-file read — never
+            // mid-stream during a live turn — so `supports_refresh` stays off.
             spend: None,
             hydration_key: builder.hydration_key,
             continuation_of: None,
@@ -3521,6 +3552,33 @@ mod tests {
             enrichment.context_window,
             Some(300_000),
             "last task_started wins"
+        );
+    }
+
+    #[test]
+    fn parse_tracks_last_task_started_timestamp_and_fails_closed_without_one() {
+        // The freshness proof for cancel-path identity recovery: the LAST
+        // task_started's record-level timestamp, and `None` (fail-closed —
+        // the cancel path's guard rejects) when that record carries no
+        // parseable timestamp, even if an earlier one did.
+        let with_ts = r#"
+{"timestamp":"2026-01-01T12:00:00.100Z","type":"event_msg","payload":{"type":"task_started"}}
+{"timestamp":"2026-01-01T12:00:05.200Z","type":"event_msg","payload":{"type":"task_started"}}
+"#;
+        assert_eq!(
+            parse_session_content(with_ts).current_turn_started_at,
+            Some("2026-01-01T12:00:05.200Z".parse().unwrap()),
+            "the last task_started's timestamp is the current turn's start"
+        );
+
+        let tail_missing_ts = r#"
+{"timestamp":"2026-01-01T12:00:00.100Z","type":"event_msg","payload":{"type":"task_started"}}
+{"type":"event_msg","payload":{"type":"task_started"}}
+"#;
+        assert_eq!(
+            parse_session_content(tail_missing_ts).current_turn_started_at,
+            None,
+            "a tail task_started without a timestamp reads as no-proof (fail-closed), never an earlier record's value"
         );
     }
 

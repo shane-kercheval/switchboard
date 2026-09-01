@@ -798,7 +798,7 @@ mod tests {
             session_home: Some(session_home),
             ..agent_with_session(session_id)
         };
-        let args = build_args(&agent, "hi", &new_cwd, Some(home.path()));
+        let args = build_args(&agent, "hi", &new_cwd, false, Some(home.path()));
 
         assert!(args.contains(&"--resume".to_owned()), "got {args:?}");
         assert!(!args.contains(&"--session-id".to_owned()), "got {args:?}");
@@ -840,6 +840,7 @@ mod tests {
             &agent,
             "hi",
             &moved_to.path().canonicalize().unwrap(),
+            false,
             Some(home.path()),
         );
 
@@ -863,6 +864,7 @@ mod tests {
             &agent,
             "hi",
             &moved_to.path().canonicalize().unwrap(),
+            false,
             Some(home.path()),
         );
 
@@ -889,6 +891,7 @@ mod tests {
             &agent,
             "hi",
             &project.path().canonicalize().unwrap(),
+            false,
             Some(home.path()),
         );
 

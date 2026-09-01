@@ -73,7 +73,6 @@ pub enum AppError {
     /// not sacrificed to make a move happen; the user retries when things are
     /// idle.
     #[error("{reason} in this project — wait for it to finish, then try the move again")]
-    #[allow(dead_code)] // Constructed by the move operation, next milestone.
     ProjectNotQuiescent {
         project_id: switchboard_core::ProjectId,
         reason: String,
@@ -122,6 +121,35 @@ pub enum AppError {
     /// Switchboard window."
     #[error("project {0} is already open in another Switchboard process")]
     ProjectLocked(ProjectId),
+
+    /// An agent move into or out of this project was interrupted and its
+    /// automatic recovery failed, so the project stays closed rather than
+    /// resuming against half-moved state. Retried at every launch; the intent
+    /// file is where a manual repair starts.
+    #[error(
+        "an agent move involving this project could not be completed — it will be retried at next launch (move record: {intent})"
+    )]
+    MoveRepairRequired {
+        project_id: ProjectId,
+        intent: std::path::PathBuf,
+    },
+
+    /// A second move was requested while one is already running. Moves are
+    /// rare, serialized, and quick; refusing beats queueing.
+    #[error("another agent move is already in progress — wait for it to finish")]
+    MoveInProgress,
+
+    #[error("the agent is already in that project")]
+    MoveSourceIsTarget,
+
+    /// Filesystem failure inside a move's surgery, outside core's own typed
+    /// I/O errors (which cover the journal/registry/pin writes themselves).
+    #[error("agent move could not write {path}: {source}")]
+    MoveIo {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 
     /// Failed to open or `flock` a project's `instance.lock` for a reason
     /// other than contention (e.g. the metadata directory is unwritable).

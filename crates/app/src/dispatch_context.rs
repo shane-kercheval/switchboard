@@ -212,18 +212,13 @@ impl ProjectDispatchContextFactory {
 /// protection disappears with nothing failing. The agent's *spawn* cwd is
 /// unaffected; only the key follows the record.
 ///
-/// **The fork-parent key uses the dispatching agent's own session directory,
-/// which is exact only while that directory is also where the parent's
-/// transcript lives.** It diverges in two shapes, both requiring a move and so
-/// unreachable until one exists: a fork *created after* its parent moved (the
-/// child belongs to the parent's new project, the parent's transcript is still
-/// in the old one), and a fork whose own agent has since been moved. The
-/// parent's location cannot be recovered here — an unmoved parent records no
-/// home, and resolving its project needs the store this factory does not carry
-/// — so it is fixed at the source instead: the move milestone records the
-/// parent's effective session directory as immutable fork provenance when the
-/// fork is created, and this key reads it. Deliberately **not** resolved by
-/// searching the agent cache for a matching session id: ids are unique only per
+/// **The fork-parent key comes from recorded provenance, not from resolution.**
+/// `forked_from_session_home` — the parent's effective session directory,
+/// captured at fork creation and invariant thereafter — names where the
+/// parent's transcript lives; the fallback for legacy forks predating the field
+/// is this agent's own session directory, exact whenever the two share a
+/// directory (every pre-move fork). Deliberately **not** resolved by searching
+/// the agent cache for a matching session id: ids are unique only per
 /// directory, so an unscoped search can lock an unrelated conversation while
 /// leaving the real one unguarded (the same trap `busy_fork_source` documents,
 /// which is why its own lookup is scoped to the fork's project).
@@ -244,10 +239,14 @@ fn session_lock_keys_for(
     if let Some(parent) = agent.forked_from_session
         && crate::commands::resolve_session_file(agent, project_directory, home_dir).is_none()
     {
+        let parent_cwd = agent
+            .forked_from_session_home
+            .as_deref()
+            .unwrap_or(session_cwd);
         keys.insert(crate::session_lock::session_lock_key(
             agent.harness,
             &SessionLocator::Uuid(parent),
-            session_cwd,
+            parent_cwd,
         )?);
     }
     Ok(keys)
@@ -451,6 +450,7 @@ mod session_lock_key_tests {
             effort: None,
             profiles: AgentProfiles::default(),
             forked_from_session: None,
+            forked_from_session_home: None,
             created_at: chrono::Utc::now(),
         }
     }
@@ -543,6 +543,37 @@ mod session_lock_key_tests {
         .unwrap();
 
         assert!(keys.contains(&parent_key), "got {keys:?}");
+        assert_eq!(keys.len(), 2, "own session plus the parent's: {keys:?}");
+    }
+
+    /// The provenance path: a fork whose parent's transcript lives elsewhere —
+    /// recorded at fork creation — locks the parent there, and its own session
+    /// under its own directory.
+    #[test]
+    fn a_materializing_fork_locks_the_parent_at_its_recorded_provenance() {
+        let home_dir = TempDir::new().unwrap();
+        let parent_session = Uuid::now_v7();
+        let parent_home = PathBuf::from("/work/parents-original-checkout");
+        let project = Path::new("/work/project");
+
+        let child = AgentRecord {
+            forked_from_session: Some(parent_session),
+            forked_from_session_home: Some(parent_home.clone()),
+            ..claude_agent(Uuid::now_v7())
+        };
+
+        let keys = session_lock_keys_for(&child, project, home_dir.path()).unwrap();
+        let parent_key = crate::session_lock::session_lock_key(
+            HarnessKind::ClaudeCode,
+            &SessionLocator::Uuid(parent_session),
+            &parent_home,
+        )
+        .unwrap();
+
+        assert!(
+            keys.contains(&parent_key),
+            "the parent must be locked where its transcript lives: {keys:?}"
+        );
         assert_eq!(keys.len(), 2, "own session plus the parent's: {keys:?}");
     }
 

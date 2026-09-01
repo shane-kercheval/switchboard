@@ -449,6 +449,19 @@ pub struct AppState {
     /// updates a run's step snapshot, the task removes the entry on terminal.
     pub workflow_runs: Arc<Mutex<HashMap<Uuid, ActiveRun>>>,
 
+    /// Serializes agent moves within this process. Moves are rare and
+    /// user-initiated, so a second attempt while one runs is refused rather
+    /// than queued. Cross-process exclusion is not this mutex's job: the store's
+    /// files are covered by the two projects' `instance.lock`s and the harness
+    /// session by the session lock.
+    pub move_mutex: tokio::sync::Mutex<()>,
+    /// Projects blocked by a move whose recovery failed, mapped to the intent
+    /// file a repair would start from. Entries here are also in `maintenance`
+    /// (which is what actually refuses work); this map only upgrades the
+    /// refusal to a repair-required error naming the file. Never cleared in
+    /// process — a failed recovery retries at next launch.
+    pub move_repairs: Mutex<HashMap<ProjectId, PathBuf>>,
+
     /// Fires OS notifications on a workflow run's completion/failure (suppressed
     /// when the window is focused). Defaults to a no-op; production injects the
     /// gated notifier via [`AppState::with_notifier`].
@@ -508,6 +521,8 @@ impl AppState {
             prompts: PromptService::disabled(),
             forwards: Mutex::new(HashMap::new()),
             workflow_runs: Arc::new(Mutex::new(HashMap::new())),
+            move_mutex: tokio::sync::Mutex::new(()),
+            move_repairs: Mutex::new(HashMap::new()),
             notifier: Arc::new(NullNotifier),
             notification_gate: Arc::new(crate::notification::AuthorizationGate::new(Arc::new(
                 crate::notification::OsAuthorizationRequester,

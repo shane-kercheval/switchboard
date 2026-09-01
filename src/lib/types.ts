@@ -559,6 +559,11 @@ export type AgentRecord = {
   // Optional here for compatibility with records and fixtures written before
   // the field existed; live IPC responses always send a string or null.
   session_home?: string | null;
+  // For a forked agent: the directory the parent's transcript lives in,
+  // captured at fork creation. See the Rust field's doc for semantics; the UI
+  // only passes it through. Optional for pre-field record compatibility; live
+  // IPC responses always send a string or null.
+  forked_from_session_home?: string | null;
 };
 
 export type ProjectSummary = {

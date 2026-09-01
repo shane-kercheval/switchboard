@@ -15,6 +15,7 @@ fn fake_agent() -> AgentRecord {
         effort: None,
         profiles: switchboard_core::AgentProfiles::default(),
         forked_from_session: None,
+        forked_from_session_home: None,
         id: Uuid::now_v7(),
         project_id: Uuid::now_v7(),
         name: "mock-test-agent".to_owned(),

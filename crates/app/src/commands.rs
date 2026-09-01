@@ -344,8 +344,21 @@ pub(crate) fn reject_if_generation_changed(
 /// Called by every path that could otherwise enter the window a re-point or
 /// delete opens between evicting routable state and rebuilding it — opening,
 /// creating, and dispatching. See [`AppState::maintenance`].
-fn reject_if_under_maintenance(state: &AppState, project_id: ProjectId) -> Result<(), AppError> {
+pub(crate) fn reject_if_under_maintenance(
+    state: &AppState,
+    project_id: ProjectId,
+) -> Result<(), AppError> {
     if lock(&state.maintenance).contains(&project_id) {
+        // A mark left by a failed move recovery upgrades to the repair error,
+        // so the user learns what is actually wrong (and which intent file a
+        // repair starts from) instead of a generic "briefly under maintenance"
+        // that never ends.
+        if let Some(intent) = lock(&state.move_repairs).get(&project_id) {
+            return Err(AppError::MoveRepairRequired {
+                project_id,
+                intent: intent.clone(),
+            });
+        }
         return Err(AppError::ProjectUnderMaintenance(project_id));
     }
     Ok(())
@@ -365,10 +378,6 @@ fn reject_if_under_maintenance(state: &AppState, project_id: ProjectId) -> Resul
 ///
 /// Once the intent record is durable the obligation inverts, and
 /// [`Self::into_recovery_barrier`] is the only way to get there.
-// Dead until the move operation lands next milestone: the plan sequences the
-// gate first so it is reviewable before any file surgery exists. Delete this
-// attribute when the move wires it up.
-#[allow(dead_code)]
 pub(crate) struct MoveAdmission {
     maintenance: Arc<Mutex<HashSet<ProjectId>>>,
     marked: Vec<ProjectId>,
@@ -391,10 +400,6 @@ impl MoveAdmission {
     /// free: on the error path the moved-in admission is dropped, so a *failed*
     /// intent write un-marks both projects with no extra handling. Switching
     /// this to borrow would silently remove that.
-    // Dead until the move operation lands next milestone: the plan sequences the
-    // gate first so it is reviewable before any file surgery exists. Delete this
-    // attribute when the move wires it up.
-    #[allow(dead_code)]
     pub(crate) fn into_recovery_barrier(self) -> MoveRecoveryBarrier {
         let barrier = MoveRecoveryBarrier {
             maintenance: Arc::clone(&self.maintenance),
@@ -439,10 +444,6 @@ impl Drop for MoveAdmission {
 /// the projects blocked, which is the fail-closed answer. A move that fails and
 /// whose recovery also fails leaves them blocked until restart, by which point
 /// the durable intent record drives recovery instead.
-// Dead until the move operation lands next milestone: the plan sequences the
-// gate first so it is reviewable before any file surgery exists. Delete this
-// attribute when the move wires it up.
-#[allow(dead_code)]
 pub(crate) struct MoveRecoveryBarrier {
     maintenance: Arc<Mutex<HashSet<ProjectId>>>,
     marked: Vec<ProjectId>,
@@ -451,10 +452,6 @@ pub(crate) struct MoveRecoveryBarrier {
 impl MoveRecoveryBarrier {
     /// Clear the marks. Call only when the two projects are consistent — the
     /// move completed, or recovery restored them.
-    // Dead until the move operation lands next milestone: the plan sequences the
-    // gate first so it is reviewable before any file surgery exists. Delete this
-    // attribute when the move wires it up.
-    #[allow(dead_code)]
     pub(crate) fn release(self) {
         let mut marks = lock(&self.maintenance);
         for id in &self.marked {
@@ -476,10 +473,6 @@ impl MoveRecoveryBarrier {
 /// Returns a [`MoveAdmission`], which releases on drop: everything up to the
 /// durable intent write is a phase where failing must cost a retry, not leave
 /// the projects blocked.
-// Dead until the move operation lands next milestone: the plan sequences the
-// gate first so it is reviewable before any file surgery exists. Delete this
-// attribute when the move wires it up.
-#[allow(dead_code)]
 pub(crate) fn begin_move_barrier(
     state: &AppState,
     source: ProjectId,
@@ -516,10 +509,6 @@ pub(crate) fn begin_move_barrier(
 ///
 /// Call this **after** the barrier is in place, never before — checking first
 /// leaves a window in which a send is admitted between the check and the mark.
-// Dead until the move operation lands next milestone: the plan sequences the
-// gate first so it is reviewable before any file surgery exists. Delete this
-// attribute when the move wires it up.
-#[allow(dead_code)]
 pub(crate) async fn ensure_projects_quiescent(
     state: &AppState,
     projects: [ProjectId; 2],
@@ -759,7 +748,7 @@ fn begin_maintenance<'a>(
 ///
 /// Fallible work completes before anything is committed, so a failure leaves no
 /// lock, no cached agents, and no map entry.
-fn activate_project(state: &AppState, project: Project) -> Result<(), AppError> {
+pub(crate) fn activate_project(state: &AppState, project: Project) -> Result<(), AppError> {
     let already_held = lock(&state.project_locks).contains_key(&project.id);
     let lock_handle = if already_held {
         None
@@ -3652,12 +3641,24 @@ fn check_claude_session_id_unique(
     directory_id: DirectoryId,
     candidate: &Uuid,
 ) -> Result<(), AppError> {
+    // The scope is where each agent's *session* lives — its effective session
+    // directory — not which project it belongs to. A moved agent's transcript
+    // stays under its recorded `session_home`, so an agent in another
+    // directory's project can still collide here, and an agent in this
+    // directory's project whose home is elsewhere cannot. Resolving the target
+    // directory is fail-loud on a missing or ambiguous catalog row, which is
+    // the refuse-don't-narrow posture this scan has always had; every registry
+    // is read (registry reads need no directory resolution), and agents with
+    // no recorded home keep the id-based scoping.
+    let target_path = state.store.directory_path(directory_id)?;
     for entry in indexed_projects(state)? {
-        if entry.directory_id != directory_id {
-            continue;
-        }
+        let same_directory = entry.directory_id == directory_id;
         for agent in state.store.read_project_registry(&entry)? {
-            if locator_uuid(&agent) == Some(*candidate) {
+            let in_scope = match &agent.session_home {
+                Some(home) => *home == target_path,
+                None => same_directory,
+            };
+            if in_scope && locator_uuid(&agent) == Some(*candidate) {
                 return Err(session_collision(&entry, agent));
             }
         }
@@ -7339,7 +7340,10 @@ fn open_project_from_store(state: &AppState, project_id: ProjectId) -> Result<Pr
     state.store.open_project(project_id).map_err(AppError::from)
 }
 
-fn lookup_agent(state: &AppState, agent_id: AgentId) -> Result<(Project, AgentRecord), AppError> {
+pub(crate) fn lookup_agent(
+    state: &AppState,
+    agent_id: AgentId,
+) -> Result<(Project, AgentRecord), AppError> {
     // Register-cache hit: the cached `AgentRecord` carries its `project_id`, so
     // we resolve the owning project without scanning every loaded project's
     // `registry.jsonl` from disk. **The project is always loaded when its agents
@@ -7372,7 +7376,7 @@ const INSTANCE_LOCK_FILE: &str = "instance.lock";
 /// dropping it (rebind, process exit/crash) releases the lock with no explicit
 /// unlock. Contention (another process holds it) maps to `ProjectLocked`; any
 /// other I/O failure to `ProjectLockIo`.
-fn acquire_project_lock(project_id: ProjectId, root: &Path) -> Result<File, AppError> {
+pub(crate) fn acquire_project_lock(project_id: ProjectId, root: &Path) -> Result<File, AppError> {
     let lock_path = root.join(INSTANCE_LOCK_FILE);
     let file = OpenOptions::new()
         .create(true)
@@ -7993,6 +7997,7 @@ pub(crate) mod tests {
             effort: None,
             profiles: switchboard_core::AgentProfiles::default(),
             forked_from_session: None,
+            forked_from_session_home: None,
             created_at: chrono::Utc::now(),
         };
 
@@ -8457,6 +8462,50 @@ pub(crate) mod tests {
 
     pub(crate) fn project_of(state: &AppState, project_id: ProjectId) -> Project {
         lock(&state.projects).get(&project_id).cloned().unwrap()
+    }
+
+    /// A moved Claude agent's session still collides in its *home* directory:
+    /// the scan scopes by where each session lives (`session_home ?? project
+    /// directory`), not by which project owns the agent — and, symmetrically,
+    /// a moved agent no longer collides in the directory it merely belongs to.
+    #[tokio::test]
+    async fn claude_collision_scan_follows_a_moved_agents_session_home() {
+        let (_tmp, state, _emitter) = fresh_state_with_mock();
+        let dir_a = TempDir::new().unwrap();
+        let dir_b = TempDir::new().unwrap();
+        let a = state.store.add_directory(dir_a.path()).unwrap();
+        let b = state.store.add_directory(dir_b.path()).unwrap();
+        let _home_project = state
+            .store
+            .create_project(a.directory_id, "origin")
+            .unwrap();
+        let away = state.store.create_project(b.directory_id, "away").unwrap();
+        let session = Uuid::now_v7();
+        // A moved agent: lives in the B-directory project, session at home in A.
+        let moved = AgentRecord {
+            session_home: Some(state.store.directory_path(a.directory_id).unwrap()),
+            id: Uuid::now_v7(),
+            project_id: away.id,
+            name: "moved".to_owned(),
+            harness: HarnessKind::ClaudeCode,
+            session_locator: Some(SessionLocator::Uuid(session)),
+            model: None,
+            effort: None,
+            profiles: switchboard_core::AgentProfiles::default(),
+            forked_from_session: None,
+            forked_from_session_home: None,
+            created_at: chrono::Utc::now(),
+        };
+        switchboard_core::append_jsonl(&away.registry_path, &moved).unwrap();
+
+        assert!(
+            check_claude_session_id_unique(&state, a.directory_id, &session).is_err(),
+            "the session lives in A, so it must collide there"
+        );
+        assert!(
+            check_claude_session_id_unique(&state, b.directory_id, &session).is_ok(),
+            "belonging to a B project does not put the session in B"
+        );
     }
 
     /// Two sibling projects in one registered directory — the shape a move

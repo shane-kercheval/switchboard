@@ -12,6 +12,7 @@ mod journal;
 mod lifecycle;
 mod locator_sink;
 mod metadata;
+mod move_agent;
 mod notification;
 mod preferences;
 mod secret_store;
@@ -1355,6 +1356,22 @@ async fn load_transcript(
 }
 
 #[tauri::command]
+async fn move_agent(
+    state: State<'_, AppState>,
+    agent_id: String,
+    target_project_id: String,
+) -> Result<AgentRecord, String> {
+    let agent_id = parse_uuid(&agent_id).map_err(|e| e.to_string())?;
+    let target = parse_uuid(&target_project_id).map_err(|e| e.to_string())?;
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default();
+    crate::move_agent::move_agent_impl(state.inner(), agent_id, target, &home)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 async fn agent_session_info(
     state: State<'_, AppState>,
     agent_id: String,
@@ -2202,6 +2219,17 @@ pub fn run() {
             // Attach all user-global persistence locations (workspace.yaml,
             // git-view.yaml, config.yaml) — see `with_persistence_paths`.
             let state = with_persistence_paths(state);
+            // Complete any interrupted agent move before the first command can
+            // open a project — recovery must run before an open-time
+            // consistency check could wall off a half-moved pair. Nothing is
+            // loaded yet, so it cannot race a user action. Normally there are
+            // no intents and this is a directory listing.
+            {
+                let home = std::env::var_os("HOME")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_default();
+                crate::move_agent::recover_pending_moves_at_startup(&state, &home);
+            }
             // Resolve and inject the user-global prompt config + default prompts
             // store. Built-in example prompts are baked into the service as a
             // read-only library — nothing is written into the user's folder.
@@ -2335,6 +2363,7 @@ pub fn run() {
             invoke_workflow,
             cancel_workflow_run,
             list_workflow_runs,
+            move_agent,
             abandon_workflow_run,
             copy_builtin_workflow,
             open_workflows_dir,

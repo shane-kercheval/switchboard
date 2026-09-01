@@ -64,6 +64,19 @@ use crate::project::{self, PROJECT_CONFIG_VERSION, Project, ProjectConfig};
 /// misinterpreting `projects.jsonl` / `directories.jsonl`.
 pub const STORE_VERSION: u32 = 1;
 
+/// Store-root directory holding one file per in-flight agent move.
+const MOVES_DIR: &str = "moves";
+
+/// What an in-flight move is, durably: the agent and the two projects. See
+/// [`Store::write_move_intent`] for the lifecycle and why there is no
+/// progress field.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MoveIntent {
+    pub agent_id: crate::agent::AgentId,
+    pub source_project: ProjectId,
+    pub target_project: ProjectId,
+}
+
 /// One line of `store.yaml`'s worth of state: the schema marker.
 ///
 /// **One version for the whole store, not one per file.** `projects.jsonl` and
@@ -955,6 +968,47 @@ impl Store {
     /// reflects *send* time, not the eventual response time, for a completed
     /// turn; that's close enough for ordering. A missing or unreadable journal
     /// (never-dispatched project) yields `fallback`.
+    /// The durable record that an agent move is in flight. Written before any
+    /// surgery, deleted after the last step; its presence is what makes an
+    /// interrupted move recoverable — it records **what** is moving, never how
+    /// far it got, because every surgery step is idempotent and recovery
+    /// re-drives the whole sequence.
+    pub fn write_move_intent(&self, intent: &MoveIntent) -> Result<PathBuf> {
+        let dir = self.root.join(MOVES_DIR);
+        create_dir_all(&dir).map_err(|e| CoreError::io(&dir, e))?;
+        // One file per move, never a fixed name: the admission gate is
+        // per-project-pair and does not stop two moves across *different* pairs
+        // from being in flight across a crash boundary.
+        let path = dir.join(format!("{}.jsonl", Uuid::now_v7()));
+        crate::io::append_jsonl(&path, intent)?;
+        Ok(path)
+    }
+
+    /// Every move intent currently on disk, with the file that holds it.
+    /// Recovery drains all of them. Fail-loud on a corrupt line, matching every
+    /// other Switchboard-owned JSONL: a move intent that cannot be read is a
+    /// repair case, not something to skip past silently.
+    pub fn list_move_intents(&self) -> Result<Vec<(PathBuf, MoveIntent)>> {
+        let dir = self.root.join(MOVES_DIR);
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(CoreError::io(&dir, e)),
+        };
+        let mut intents = Vec::new();
+        for entry in entries {
+            let path = entry.map_err(|e| CoreError::io(&dir, e))?.path();
+            if path.extension().is_none_or(|ext| ext != "jsonl") {
+                continue;
+            }
+            let mut records: Vec<MoveIntent> = crate::io::read_jsonl(&path)?;
+            if let Some(intent) = records.pop() {
+                intents.push((path, intent));
+            }
+        }
+        Ok(intents)
+    }
+
     #[must_use]
     pub fn project_last_activity(&self, id: ProjectId, fallback: DateTime<Utc>) -> DateTime<Utc> {
         let journal = self.project_root(id).join(JOURNAL_FILE);

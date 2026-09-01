@@ -193,6 +193,13 @@ pub enum CoreError {
         harness: crate::harness::HarnessKind,
     },
 
+    /// A record locates a fork parent's session directory
+    /// (`forked_from_session_home`) while naming no parent session at all —
+    /// provenance for a relationship the record does not claim. Reachable only
+    /// through a hand-edited or corrupted registry.
+    #[error("agent {0} carries fork-parent provenance but no parent session")]
+    ForkProvenanceWithoutParent(crate::agent::AgentId),
+
     /// A move tried to adopt an agent into a project that already holds a
     /// *different* record under that `agent_id`.
     ///

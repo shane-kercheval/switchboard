@@ -158,6 +158,43 @@ pub(crate) fn write_jsonl<T: Serialize>(path: &Path, values: &[T]) -> Result<()>
     Ok(())
 }
 
+/// Copy `src` to `dst` with the same durability contract as [`write_jsonl`]:
+/// sibling temp, `sync_data`, rename over the target, parent-directory fsync.
+///
+/// **A finalized destination is the only state a crash can leave besides
+/// absence.** That is the property move recovery leans on: "does `dst` exist"
+/// is a sound idempotence predicate for a copy step only because a crash
+/// mid-copy leaves the *temp* file, never a truncated `dst` — a plain
+/// `std::fs::copy` would leave exactly that, and an existence check over it
+/// would skip the re-copy and ship truncated data while claiming equivalence
+/// to an uninterrupted run.
+pub fn copy_file_durable(src: &Path, dst: &Path) -> Result<()> {
+    let bytes = std::fs::read(src).map_err(|e| CoreError::io(src, e))?;
+    let tmp = tmp_path(dst);
+    {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)
+            .map_err(|e| CoreError::io(&tmp, e))?;
+        file.write_all(&bytes).map_err(|e| CoreError::io(&tmp, e))?;
+        file.flush().map_err(|e| CoreError::io(&tmp, e))?;
+        file.sync_data().map_err(|e| CoreError::io(&tmp, e))?;
+    }
+    if let Err(e) = std::fs::rename(&tmp, dst) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(CoreError::io(dst, e));
+    }
+    #[cfg(unix)]
+    if let Some(parent) = dst.parent() {
+        File::open(parent)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|e| CoreError::io(parent, e))?;
+    }
+    Ok(())
+}
+
 pub fn read_yaml<T: DeserializeOwned>(path: &Path) -> Result<T> {
     let bytes = std::fs::read(path).map_err(|e| CoreError::io(path, e))?;
     serde_norway::from_slice(&bytes).map_err(|source| CoreError::CorruptYaml {

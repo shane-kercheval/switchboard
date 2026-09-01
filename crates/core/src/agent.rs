@@ -258,6 +258,32 @@ pub struct AgentRecord {
     /// backward-compat rationale as `model` / `effort`: a record written before
     /// moves existed legitimately lacks the key and must load as `None`.
     pub session_home: Option<PathBuf>,
+    /// For a forked agent: the directory the **parent's** transcript lives in —
+    /// the parent's effective session directory, captured at fork creation.
+    /// `None` for non-forks and for forks created before this field existed.
+    ///
+    /// Exists because [`Self::forked_from_session`] under-specifies a Claude
+    /// session: identity is `(uuid, directory)` (harness-behavior §3.5b), and
+    /// until this agent's own transcript materializes, dispatch must lock and
+    /// resume the parent's file — wherever *the parent* keeps it, which after a
+    /// move is not this agent's own directory. Resolving that at dispatch time
+    /// by searching for the parent is unsafe (ids are unique only per
+    /// directory; an unscoped search can name an unrelated conversation), so it
+    /// is recorded once here instead.
+    ///
+    /// **Immutable and never stale**: an agent's effective session directory is
+    /// invariant across every later move — the first cross-directory move
+    /// stamps `session_home` with the directory the transcript was already in,
+    /// and `Project::adopt_agent` refuses any later change — so the value
+    /// captured at fork creation stays correct however the parent moves
+    /// afterwards. Like [`Self::forked_from_session`] it is kept after the fork
+    /// materializes rather than cleared.
+    ///
+    /// Same plain-`Option` backward-compat rationale as its siblings; a legacy
+    /// fork carrying `None` falls back to this agent's own session directory,
+    /// which is correct unless the parent moved between the fork's creation and
+    /// its materialization.
+    pub forked_from_session_home: Option<PathBuf>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -334,6 +360,12 @@ impl AgentRecord {
             return Err(CoreError::SessionForkUnsupported {
                 harness: self.harness,
             });
+        }
+        // Parent-session-directory provenance is meaningless without the parent
+        // session it locates; a record carrying one without the other is
+        // corrupt, not a policy question.
+        if self.forked_from_session_home.is_some() && self.forked_from_session.is_none() {
+            return Err(CoreError::ForkProvenanceWithoutParent(self.id));
         }
         // Only Claude derives its session-storage directory from the agent's
         // cwd (`docs/harness-behavior.md` §3.5b), so only a Claude agent can
@@ -448,6 +480,7 @@ mod tests {
             effort: None,
             profiles: AgentProfiles::default(),
             forked_from_session: None,
+            forked_from_session_home: None,
             created_at: Utc::now(),
         }
     }

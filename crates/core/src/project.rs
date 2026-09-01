@@ -103,6 +103,7 @@ struct NewAgent<'a> {
     effort: Option<String>,
     profiles: AgentProfiles,
     forked_from_session: Option<Uuid>,
+    forked_from_session_home: Option<PathBuf>,
 }
 
 /// A task-scoped project within a working directory. Holds agents in its registry.
@@ -250,6 +251,7 @@ impl Project {
                 active: AgentProfileSlot::Primary,
             },
             forked_from_session: None,
+            forked_from_session_home: None,
         })
     }
 
@@ -323,6 +325,14 @@ impl Project {
             effort,
             profiles,
             forked_from_session: Some(parent_session),
+            // Where the parent's transcript lives, captured now because it is
+            // invariant from here on (see the field's doc) and cannot be safely
+            // re-derived at dispatch time once projects can move.
+            forked_from_session_home: Some(
+                source
+                    .effective_session_directory(&self.directory)
+                    .to_owned(),
+            ),
         })
     }
 
@@ -347,6 +357,7 @@ impl Project {
             effort,
             profiles: AgentProfiles::default(),
             forked_from_session: None,
+            forked_from_session_home: None,
         })
     }
 
@@ -375,6 +386,7 @@ impl Project {
             effort,
             profiles: AgentProfiles::default(),
             forked_from_session: None,
+            forked_from_session_home: None,
         })
     }
 
@@ -401,6 +413,7 @@ impl Project {
             effort: None,
             profiles: AgentProfiles::default(),
             forked_from_session: None,
+            forked_from_session_home: None,
         })
     }
 
@@ -435,6 +448,7 @@ impl Project {
             effort,
             profiles,
             forked_from_session,
+            forked_from_session_home,
         } = spec;
         validate_name(name)?;
         // Normalize **before** the capability check: a blank selection means
@@ -512,6 +526,7 @@ impl Project {
 
         let record = AgentRecord {
             session_home: None,
+            forked_from_session_home,
             id: Uuid::now_v7(),
             project_id: self.id,
             name: name.to_owned(),
@@ -1405,6 +1420,7 @@ mod tests {
                 effort: None,
                 profiles: AgentProfiles::default(),
                 forked_from_session: Some(Uuid::now_v7()),
+                forked_from_session_home: None,
             })
             .unwrap_err();
 
@@ -1433,6 +1449,7 @@ mod tests {
                 effort: None,
                 profiles: AgentProfiles::default(),
                 forked_from_session: Some(parent),
+                forked_from_session_home: None,
             })
             .unwrap();
 
@@ -2240,6 +2257,71 @@ mod adopt_tests {
         let (_s1, source) = create_on_disk(tmp.path(), None, &projects_dir, "source").unwrap();
         let (_s2, target) = create_on_disk(tmp.path(), None, &projects_dir, "target").unwrap();
         (tmp, source, target)
+    }
+
+    #[test]
+    fn a_fork_records_where_its_parents_transcript_lives() {
+        // For an unmoved parent that is the shared project directory; the value
+        // is captured at creation because it cannot be safely re-derived at
+        // dispatch time once projects can move.
+        let (_tmp, project) = fresh_project("forking");
+        let parent = project
+            .register_agent("alice", HarnessKind::ClaudeCode, None, None)
+            .unwrap();
+
+        let child = project.fork_agent(parent.id).unwrap();
+
+        assert_eq!(
+            child.forked_from_session_home.as_deref(),
+            Some(project.directory.as_path())
+        );
+    }
+
+    #[test]
+    fn a_fork_of_a_moved_parent_records_the_parents_recorded_home() {
+        // The "move an agent, then branch it" sequence: the parent's transcript
+        // stays under the directory the move recorded, and the fork must lock
+        // and resume it there — not under the project they now share.
+        let (_tmp, source, target) = two_projects();
+        let parent = source
+            .register_agent("alice", HarnessKind::ClaudeCode, None, None)
+            .unwrap();
+        let home = PathBuf::from("/repos/original-checkout");
+        let moved = target.adopt_agent(&parent, Some(home.clone())).unwrap();
+        assert_eq!(moved.session_home, Some(home.clone()));
+
+        let child = target.fork_agent(moved.id).unwrap();
+
+        assert_eq!(child.forked_from_session_home, Some(home));
+        assert_eq!(
+            child.session_home, None,
+            "the child itself is native to the project it was forked in"
+        );
+    }
+
+    #[test]
+    fn a_registry_line_with_provenance_but_no_parent_fails_the_load() {
+        use std::io::Write;
+
+        let (_tmp, project) = fresh_project("corrupt");
+        let line = serde_json::json!({
+            "id": Uuid::now_v7(),
+            "project_id": project.id,
+            "name": "orphan",
+            "harness": "claude_code",
+            "session_locator": {"uuid": Uuid::now_v7()},
+            "forked_from_session_home": "/repos/somewhere",
+            "created_at": "2026-05-14T04:43:19Z",
+        });
+        let mut file = std::fs::File::create(&project.registry_path).unwrap();
+        writeln!(file, "{line}").unwrap();
+
+        let err = project.list_agents().unwrap_err();
+
+        assert!(
+            matches!(err, CoreError::ForkProvenanceWithoutParent(_)),
+            "got {err:?}"
+        );
     }
 
     #[test]

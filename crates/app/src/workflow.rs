@@ -872,6 +872,7 @@ mod tests {
                 effort: None,
                 profiles: switchboard_core::AgentProfiles::default(),
                 forked_from_session: None,
+                forked_from_session_home: None,
                 created_at: Utc::now(),
             };
             let id = record.id;

@@ -633,16 +633,23 @@ pub trait ConversationJournal: Send + Sync {
     ///
     /// **Best-effort, like `record_outcome`** — and deliberately *not* fail-closed
     /// like `record_send`: a lost link just drops that turn to positional
-    /// correlation. Returns `()`; the impl logs on failure. Not called for a
-    /// keyless turn (no `hydration_key` ever surfaced). At most one call per
-    /// turn (the dispatcher gates the terminal write on the mid-turn one).
+    /// correlation, and a write failure must never fail the turn. Unlike the
+    /// other best-effort methods it **returns whether the record persisted** —
+    /// it is the only journal write with a natural second chance: an early
+    /// (mid-turn) write that fails can be retried at the terminal, and marking
+    /// it "written" without knowing would silently forfeit that retry. The
+    /// retry exists **only on the terminal path**; a cancelled Codex turn's
+    /// write (no terminal ever runs — the cancel latch owns it) is a single
+    /// best-effort attempt by design. Not called for a keyless turn (no
+    /// `hydration_key` ever surfaced); at most one *persisted* link per turn
+    /// (the dispatcher gates the terminal write on the early one).
     fn record_link(
         &self,
         turn_id: TurnId,
         agent_id: AgentId,
         hydration_key: &str,
         at: DateTime<Utc>,
-    );
+    ) -> bool;
 }
 
 /// Sink for **stream-only** (class-C) metadata that has no harness-side
@@ -778,7 +785,11 @@ impl ConversationJournal for NoopJournal {
         _: DateTime<Utc>,
     ) {
     }
-    fn record_link(&self, _: TurnId, _: AgentId, _: &str, _: DateTime<Utc>) {}
+    // "Persisted" by definition — a noop journal has nothing to retry into,
+    // so reporting `false` would only trigger pointless terminal re-attempts.
+    fn record_link(&self, _: TurnId, _: AgentId, _: &str, _: DateTime<Utc>) -> bool {
+        true
+    }
 }
 
 /// Everything needed to run one turn, produced fresh by a
@@ -1867,10 +1878,13 @@ async fn drain_turn(
     // may be valid for a future harness shape, so it remains Completed; the
     // warning simply turns a silent parser regression into an actionable log.
     let mut visible_output_seen = false;
-    // Whether this turn's durable send↔turn link has been journaled. Set by the
-    // early `TurnIdentity` write below; gates the terminal write so a turn
-    // never journals two links.
-    let mut link_written = false;
+    // The hydration key this turn's durable send↔turn link was **persisted**
+    // with, set only when `record_link` reports success — a swallowed write
+    // failure must not forfeit the terminal retry. Carrying the key (not a
+    // bool) also lets the terminal detect an early/terminal disagreement,
+    // which today is contractually impossible (both come from one adapter
+    // field) but must be loud, not silent, if an adapter ever regresses.
+    let mut recorded_link_key: Option<String> = None;
     // Set when the dispatcher itself synthesizes a `Failed` terminal (a
     // load-bearing locator-persist failure). Distinct from the cancel latch:
     // cancellation deliberately still forwards buffered content (system-design
@@ -1993,10 +2007,17 @@ async fn drain_turn(
                 // cancellations from accumulating permanently link-less sends.
                 // The event still flows to the frontend below (no `continue`).
                 if let AdapterEvent::TurnIdentity { message_id, .. } = &event
-                    && !link_written
+                    && recorded_link_key.is_none()
                 {
-                    journal.record_link(turn_id, agent_id, message_id, Utc::now());
-                    link_written = true;
+                    // Explicit statement (not a conjunct in the chain above),
+                    // matching the terminal site's spelling of this same
+                    // operation: whether the journal write executes must never
+                    // depend on conjunct order — a lost link degrades silently
+                    // to positional, with no error anywhere to notice.
+                    let persisted = journal.record_link(turn_id, agent_id, message_id, Utc::now());
+                    if persisted {
+                        recorded_link_key = Some(message_id.clone());
+                    }
                 }
                 if let AdapterEvent::TurnEnd {
                     outcome,
@@ -2028,21 +2049,47 @@ async fn drain_turn(
                     }
                     // Terminal fallback for the durable send↔turn key-join: a
                     // harness that never surfaced a mid-turn `TurnIdentity`
-                    // (Codex's normal completion) carries the key here instead.
-                    // Written for `Completed` AND `Failed` (a failed-with-content
-                    // turn's partial output is on disk and needs the same
-                    // correlation). Best-effort — a failed link write must not
-                    // fail the turn; it just drops to positional. Complements
-                    // the `Outcome` above: a failed-with-content turn writes both
-                    // (link correlates content, outcome supplies the badge). A
-                    // keyless terminal writes neither; a cancelled turn never
-                    // reaches here (latch above) — its only link chance is the
-                    // early `TurnIdentity` write.
-                    if let Some(key) = first_message_id
-                        && !link_written
-                    {
-                        journal.record_link(turn_id, agent_id, key, *ended_at);
-                        link_written = true;
+                    // (Codex's normal completion) carries the key here instead —
+                    // and it doubles as the RETRY for an early write that failed
+                    // to persist (`recorded_link_key` still `None`). Written for
+                    // `Completed` AND `Failed` (a failed-with-content turn's
+                    // partial output is on disk and needs the same correlation).
+                    // Best-effort — a failed link write must not fail the turn;
+                    // it just drops to positional. Complements the `Outcome`
+                    // above: a failed-with-content turn writes both (link
+                    // correlates content, outcome supplies the badge). A keyless
+                    // terminal writes neither; a cancelled turn never reaches
+                    // here (latch above) — its only link chance is the early
+                    // `TurnIdentity` write.
+                    //
+                    // A terminal key DISAGREEING with the persisted early key is
+                    // a contract violation (both come from one adapter field) —
+                    // warn and never write the second link. The early key stays
+                    // authoritative by policy: the merge's poison rule keys on
+                    // `hydration_key`, so two *different* keys naming one send
+                    // is NOT a detectable conflict — both links would stay live
+                    // and claim-once would pick whichever turn the walk reaches
+                    // first. Writing the second link converts a loud anomaly
+                    // into a silent arbitrary pick; do not "simplify" this into
+                    // writing both.
+                    if let Some(key) = first_message_id {
+                        match &recorded_link_key {
+                            None => {
+                                if journal.record_link(turn_id, agent_id, key, *ended_at) {
+                                    recorded_link_key = Some(key.clone());
+                                }
+                            }
+                            Some(early) if early == key => {}
+                            Some(early) => {
+                                tracing::warn!(
+                                    agent_id = %agent_id,
+                                    %turn_id,
+                                    early_key = %early,
+                                    terminal_key = %key,
+                                    "terminal hydration key disagrees with the persisted early link — keeping the early link, not writing a second (adapter contract violation)"
+                                );
+                            }
+                        }
                     }
                     // Fire the awaited-send + current-turn waiters with the real
                     // outcome. Only a completed turn carries forwardable text; a

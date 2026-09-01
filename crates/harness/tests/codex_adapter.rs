@@ -1221,23 +1221,6 @@ async fn cancel_recovers_turn_identity_from_session_file() {
         format!("{{\"type\":\"thread.started\",\"thread_id\":\"{thread_id}\"}}\n// hang\n"),
     )
     .unwrap();
-    // Stage the rollout under today's LOCAL date (the partition the capture
-    // stamps), with the `task_started` → `turn_context` pair that leaves the
-    // enrichment's current (in-flight) turn id set — the real mid-turn shape
-    // of a file whose turn never completed.
-    let date = chrono::Local::now().date_naive();
-    stage_session_file(
-        home.path(),
-        date,
-        thread_id,
-        concat!(
-            r#"{"timestamp":"2026-01-01T00:00:00.000Z","type":"event_msg","payload":{"type":"task_started","model_context_window":258400}}"#,
-            "\n",
-            r#"{"timestamp":"2026-01-01T00:00:00.500Z","type":"turn_context","payload":{"turn_id":"key-cancelled-turn","model":"gpt-5.5"}}"#,
-            "\n",
-        ),
-    );
-
     let adapter = CodexAdapter::with_binary_and_home(FAKE_CODEX, home.path());
     let token = CancellationToken::new();
     let options = DispatchOptions {
@@ -1270,6 +1253,23 @@ async fn cancel_recovers_turn_identity_from_session_file() {
             break;
         }
     }
+    // Stage the rollout only NOW — after dispatch, as in reality (Codex writes
+    // the file after our spawn). The freshness guard compares the tail turn's
+    // `task_started` timestamp against a pre-spawn anchor, so a file staged
+    // before dispatch (or with fixed past timestamps) is correctly rejected as
+    // a stale predecessor — the negative tests below pin exactly that.
+    let now = chrono::Utc::now();
+    let date = chrono::Local::now().date_naive();
+    stage_session_file(
+        home.path(),
+        date,
+        thread_id,
+        &format!(
+            "{{\"timestamp\":\"{ts}\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_started\",\"model_context_window\":258400}}}}\n\
+             {{\"timestamp\":\"{ts}\",\"type\":\"turn_context\",\"payload\":{{\"turn_id\":\"key-cancelled-turn\",\"model\":\"gpt-5.5\"}}}}\n",
+            ts = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        ),
+    );
     token.cancel();
     let rest: Vec<AdapterEvent> = tokio::time::timeout(Duration::from_secs(15), stream.collect())
         .await
@@ -1290,6 +1290,157 @@ async fn cancel_recovers_turn_identity_from_session_file() {
         identity.as_deref(),
         Some("key-cancelled-turn"),
         "cancel must surface turn_context.turn_id as TurnIdentity; got: {events:?}"
+    );
+}
+
+/// Drives a resumed dispatch against a pre-staged rollout, cancels immediately,
+/// and returns every emitted event. The shared body for the stale-tail negative
+/// tests: the staged file is the *previous* dispatch's content (fixed past
+/// timestamps), so the freshness guard must reject its resident key.
+#[cfg(unix)]
+async fn cancel_resumed_with_staged_tail(staged_content: &str) -> Vec<AdapterEvent> {
+    let cwd = tempfile::TempDir::new().unwrap();
+    let home = tempfile::TempDir::new().unwrap();
+    let thread_id = "00000000-0000-7000-8000-0000000000ce";
+    let date = chrono::Local::now().date_naive();
+    stage_session_file(home.path(), date, thread_id, staged_content);
+    let fixture_path = cwd.path().join("resume-cancel-fixture.jsonl");
+    std::fs::write(&fixture_path, "// hang\n").unwrap();
+
+    let adapter = CodexAdapter::with_binary_and_home(FAKE_CODEX, home.path());
+    let token = CancellationToken::new();
+    let options = DispatchOptions {
+        cancel_token: token.clone(),
+        ..Default::default()
+    };
+    let stream = adapter
+        .dispatch(
+            &codex_agent_resuming(thread_id, date),
+            cwd.path(),
+            fixture_path.to_str().unwrap(),
+            Uuid::now_v7(),
+            options,
+        )
+        .await
+        .expect("dispatch should succeed");
+    // Cancel immediately — the fast-cancel window where the new turn has
+    // written nothing yet and the file's tail is the previous dispatch.
+    token.cancel();
+    tokio::time::timeout(Duration::from_secs(15), stream.collect())
+        .await
+        .expect("stream must end promptly after cancel")
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancel_of_resumed_session_ignores_completed_predecessors_key() {
+    // The stale-key hazard the freshness guard exists for: a resumed session
+    // cancelled before this turn's `task_started` flushed still holds the
+    // PREVIOUS (completed) turn's `turn_context.turn_id`. Emitting it would
+    // journal that key against the new send — conflicting with the previous
+    // turn's own TurnLink and poisoning the key in the merge, permanently
+    // destroying a good link. The guard must reject it: the tail turn's
+    // `task_started` predates this dispatch.
+    let events = cancel_resumed_with_staged_tail(concat!(
+        r#"{"timestamp":"2026-01-01T00:00:00.000Z","type":"event_msg","payload":{"type":"task_started","model_context_window":258400}}"#,
+        "\n",
+        r#"{"timestamp":"2026-01-01T00:00:00.500Z","type":"turn_context","payload":{"turn_id":"key-previous-turn","model":"gpt-5.5"}}"#,
+        "\n",
+        r#"{"timestamp":"2026-01-01T00:00:10.000Z","type":"event_msg","payload":{"type":"task_complete"}}"#,
+        "\n",
+    ))
+    .await;
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AdapterEvent::TurnIdentity { .. })),
+        "a completed predecessor's key must not be emitted; got: {events:?}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancel_of_resumed_session_ignores_truncated_predecessors_key() {
+    // The consecutive-cancel shape, and why the guard is temporal rather than
+    // open/closed: the previous turn was itself cancelled, so its tail has NO
+    // `task_complete` — it looks exactly like an in-flight turn. Only the
+    // timestamp comparison (its `task_started` predates this dispatch) can
+    // tell it isn't ours.
+    let events = cancel_resumed_with_staged_tail(concat!(
+        r#"{"timestamp":"2026-01-01T00:00:00.000Z","type":"event_msg","payload":{"type":"task_started","model_context_window":258400}}"#,
+        "\n",
+        r#"{"timestamp":"2026-01-01T00:00:00.500Z","type":"turn_context","payload":{"turn_id":"key-previous-cancelled-turn","model":"gpt-5.5"}}"#,
+        "\n",
+    ))
+    .await;
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AdapterEvent::TurnIdentity { .. })),
+        "a truncated predecessor's key must not be emitted; got: {events:?}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancel_with_fresh_task_started_but_no_turn_context_emits_no_identity() {
+    // The window between this turn's `task_started` and its `turn_context`:
+    // the freshness proof passes but no key exists yet (the `task_started`
+    // reset cleared any predecessor's). No identity, no fabrication.
+    let cwd = tempfile::TempDir::new().unwrap();
+    let home = tempfile::TempDir::new().unwrap();
+    let thread_id = "00000000-0000-7000-8000-0000000000cf";
+    let fixture_path = cwd.path().join("cancel-nokey-fixture.jsonl");
+    std::fs::write(
+        &fixture_path,
+        format!("{{\"type\":\"thread.started\",\"thread_id\":\"{thread_id}\"}}\n// hang\n"),
+    )
+    .unwrap();
+    let adapter = CodexAdapter::with_binary_and_home(FAKE_CODEX, home.path());
+    let token = CancellationToken::new();
+    let options = DispatchOptions {
+        cancel_token: token.clone(),
+        ..Default::default()
+    };
+    let mut stream = adapter
+        .dispatch(
+            &codex_agent(),
+            cwd.path(),
+            fixture_path.to_str().unwrap(),
+            Uuid::now_v7(),
+            options,
+        )
+        .await
+        .expect("dispatch should succeed");
+    // Wait for the locator capture, then stage a fresh-but-keyless tail.
+    loop {
+        let ev = tokio::time::timeout(Duration::from_secs(15), stream.next())
+            .await
+            .expect("locator capture must arrive before the timeout")
+            .expect("stream must not end before the locator capture");
+        if matches!(ev, AdapterEvent::SessionLocatorCaptured { .. }) {
+            break;
+        }
+    }
+    let date = chrono::Local::now().date_naive();
+    stage_session_file(
+        home.path(),
+        date,
+        thread_id,
+        &format!(
+            "{{\"timestamp\":\"{ts}\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_started\",\"model_context_window\":258400}}}}\n",
+            ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        ),
+    );
+    token.cancel();
+    let events: Vec<AdapterEvent> = tokio::time::timeout(Duration::from_secs(15), stream.collect())
+        .await
+        .expect("stream must end promptly after cancel");
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AdapterEvent::TurnIdentity { .. })),
+        "fresh task_started without turn_context has no key to emit; got: {events:?}"
     );
 }
 

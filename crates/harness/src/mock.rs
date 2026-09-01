@@ -150,6 +150,18 @@ pub enum MockScenario {
     /// same key must NOT write a second one.
     IdentityThenTerminalWithKey { message_id: String },
 
+    /// Emits `ContentChunk → TurnIdentity(identity_key) → TurnEnd(Completed,
+    /// first_message_id: Some(terminal_key))` with **differing** keys — an
+    /// adapter contract violation (both values come from one field in every
+    /// real adapter). The vehicle for the dispatcher's disagreement policy:
+    /// keep the persisted early link, warn, and never write the second (two
+    /// different keys naming one send is not a poison-detectable conflict, so
+    /// a second write would be a silent arbitrary claim-once pick).
+    IdentityThenConflictingTerminalKey {
+        identity_key: String,
+        terminal_key: String,
+    },
+
     /// Emits one `ContentChunk`, **awaits the cancellation token**, then emits
     /// `TurnIdentity(key)` and ends the stream **without** a terminal event —
     /// the Codex cancel shape, where the adapter recovers the turn's durable
@@ -651,6 +663,36 @@ impl HarnessAdapter for MockHarnessAdapter {
                         effort: None,
                         stable_message_id: None,
                         first_message_id: Some(message_id),
+                    });
+                });
+            }
+            MockScenario::IdentityThenConflictingTerminalKey {
+                ref identity_key,
+                ref terminal_key,
+            } => {
+                let identity_key = identity_key.clone();
+                let terminal_key = terminal_key.clone();
+                tokio::spawn(async move {
+                    let _ = tx.send(AdapterEvent::ContentChunk {
+                        turn_id,
+                        kind: ContentKind::Text,
+                        text: "ack".to_owned(),
+                    });
+                    let _ = tx.send(AdapterEvent::TurnIdentity {
+                        turn_id,
+                        message_id: identity_key,
+                    });
+                    let _ = tx.send(AdapterEvent::TurnEnd {
+                        turn_id,
+                        outcome: TurnOutcome::Completed,
+                        ended_at: Utc::now(),
+                        usage: None,
+                        context_window_source: None,
+                        spend: None,
+                        model: None,
+                        effort: None,
+                        stable_message_id: None,
+                        first_message_id: Some(terminal_key),
                     });
                 });
             }

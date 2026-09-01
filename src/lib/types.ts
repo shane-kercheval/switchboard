@@ -553,6 +553,12 @@ export type AgentRecord = {
   // "still unmaterialized" signal on its own — pair it with session info.
   // `null`/absent for every agent that wasn't forked.
   forked_from_session?: string | null;
+  // For an agent moved between projects in different working directories: the
+  // directory whose harness-side session storage holds its transcript. See the
+  // Rust field's doc comment for the semantics — the UI only passes it through.
+  // Optional here for compatibility with records and fixtures written before
+  // the field existed; live IPC responses always send a string or null.
+  session_home?: string | null;
 };
 
 export type ProjectSummary = {

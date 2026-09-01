@@ -178,6 +178,35 @@ pub enum CoreError {
         harness: crate::harness::HarnessKind,
     },
 
+    /// A record carries a `session_home` on a harness that does not namespace
+    /// its session storage by working directory. Only Claude does, so only a
+    /// Claude agent can have a meaningful value; on any other harness the field
+    /// would be inert data that later acquires accidental meaning as
+    /// session-directory handling spreads. Distinct from
+    /// [`Self::SessionForkUnsupported`] so the diagnostic names the actual
+    /// contradiction rather than an unrelated capability.
+    #[error(
+        "{harness} does not namespace sessions by working directory \
+         — refusing to record a session home it could never use"
+    )]
+    SessionHomeUnsupported {
+        harness: crate::harness::HarnessKind,
+    },
+
+    /// A move tried to adopt an agent into a project that already holds a
+    /// *different* record under that `agent_id`.
+    ///
+    /// Adoption is idempotent so move recovery can re-drive it, but only for a
+    /// row equal to the one this move would write. A mismatch means something
+    /// other than this operation put it there, so it is surfaced rather than
+    /// resolved: accepting it would report a completed adoption and let the
+    /// move go on to delete the source copy.
+    #[error(
+        "agent {agent_id} already exists in this project as a different record \
+         — refusing to treat it as a completed move"
+    )]
+    AgentAdoptionConflict { agent_id: crate::agent::AgentId },
+
     /// Fork provenance forms a loop: following `forked_from_session` from this
     /// agent leads back to it. Unreachable through any supported path — a fork's
     /// parent always predates it — so this means the registry was edited or

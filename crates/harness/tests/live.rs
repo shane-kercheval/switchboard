@@ -1275,7 +1275,6 @@ async fn live_claude_fork_inherits_context_on_the_caller_assigned_session() {
 
     let parent_session = Uuid::now_v7();
     let parent = AgentRecord {
-        session_home: None,
         session_locator: Some(SessionLocator::Uuid(parent_session)),
         ..live_agent()
     };
@@ -1296,7 +1295,6 @@ async fn live_claude_fork_inherits_context_on_the_caller_assigned_session() {
     // `--resume <parent> --session-id <own> --fork-session`.
     let fork_session = Uuid::now_v7();
     let fork = AgentRecord {
-        session_home: None,
         session_locator: Some(SessionLocator::Uuid(fork_session)),
         forked_from_session: Some(parent_session),
         ..live_agent()
@@ -1409,7 +1407,6 @@ async fn live_claude_fork_recovers_from_a_cancelled_first_dispatch() {
 
     let parent_session = Uuid::now_v7();
     let parent = AgentRecord {
-        session_home: None,
         session_locator: Some(SessionLocator::Uuid(parent_session)),
         ..live_agent()
     };
@@ -1424,7 +1421,6 @@ async fn live_claude_fork_recovers_from_a_cancelled_first_dispatch() {
 
     let fork_session = Uuid::now_v7();
     let fork = AgentRecord {
-        session_home: None,
         session_locator: Some(SessionLocator::Uuid(fork_session)),
         forked_from_session: Some(parent_session),
         ..live_agent()
@@ -2050,7 +2046,6 @@ async fn live_codex_resume_reuses_session() {
     let (thread_id, partition_date) =
         codex_capture(&events1).expect("first dispatch emits a captured Codex locator");
     let resumed_agent = AgentRecord {
-        session_home: None,
         model: None,
         effort: None,
         session_locator: Some(SessionLocator::Codex {
@@ -2738,7 +2733,6 @@ async fn live_antigravity_resume_reuses_session() {
     let conversation_id =
         antigravity_capture(&events1).expect("first dispatch emits a captured Antigravity locator");
     let resumed_agent = AgentRecord {
-        session_home: None,
         model: None,
         effort: None,
         session_locator: Some(SessionLocator::Uuid(conversation_id)),

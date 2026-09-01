@@ -4360,7 +4360,6 @@ async fn resolve_source_completed_only(
     let (project, agent) = lookup_agent(state, agent_id)?;
     let journal = journals.for_project(project.id)?;
     let agent = AgentRecord {
-        session_home: None,
         name: qualified_source_name(&agent.name, &project, recipient_project),
         ..agent
     };
@@ -4510,7 +4509,6 @@ async fn resolve_source(
     let (project, agent) = lookup_agent(state, agent_id)?;
     let journal = journals.for_project(project.id)?;
     let agent = AgentRecord {
-        session_home: None,
         name: qualified_source_name(&agent.name, &project, recipient_project),
         ..agent
     };

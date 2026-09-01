@@ -310,6 +310,17 @@ impl AgentRecord {
                 harness: self.harness,
             });
         }
+        // Only Claude derives its session-storage directory from the agent's
+        // cwd (`docs/harness-behavior.md` §3.5b), so only a Claude agent can
+        // carry a meaningful session home. Enforced here beside the other
+        // cross-field harness invariants for the reason this function exists:
+        // serde validates each field alone and cannot compare one against
+        // `harness`.
+        if self.session_home.is_some() && self.harness != HarnessKind::ClaudeCode {
+            return Err(CoreError::SessionHomeUnsupported {
+                harness: self.harness,
+            });
+        }
         if self.model.is_some() && !self.harness.supports_model_selection() {
             return Err(CoreError::SelectionUnsupported {
                 harness: self.harness,

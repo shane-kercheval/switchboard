@@ -588,13 +588,18 @@ impl Project {
     /// generic update API. The source half of a move is the existing
     /// [`Self::remove_agent`]; this is the target half.
     ///
-    /// **Idempotent by `agent_id`, because move recovery re-drives every step.**
-    /// An id already present in this registry means a previous attempt got this
-    /// far, so the existing record is returned untouched and nothing is
-    /// appended — re-running the step cannot duplicate the row. It deliberately
-    /// does *not* reconcile a differing record body: recovery re-drives a move
-    /// whose inputs are fixed, so a body mismatch means something other than
-    /// this operation wrote it, and silently overwriting would destroy that.
+    /// **Idempotent by `agent_id`, because move recovery re-drives every step**
+    /// — but only for a row that *matches*. The intended record is built first
+    /// and an already-present id is accepted as "this step already ran" only
+    /// when the stored row equals it exactly; anything else is
+    /// [`CoreError::AgentAdoptionConflict`], leaving the move blocked for
+    /// repair. Trusting a same-id row unconditionally would let a stray or
+    /// corrupt record be reported as a completed adoption, after which the move
+    /// deletes the source copy — the "silently pick a winner" outcome the
+    /// recovery design exists to prevent. Equality is over the whole record
+    /// because `project_id` and `session_home` are already resolved on the
+    /// intended one: a differing `session_home` is precisely the divergence
+    /// worth catching, so it must not be excluded from the comparison.
     ///
     /// **Name uniqueness is enforced here, not assumed.** `register_agent` and
     /// `rename_agent` are the only other writers and both check; a move that
@@ -620,15 +625,20 @@ impl Project {
         session_home: Option<PathBuf>,
     ) -> Result<AgentRecord> {
         let agents = self.list_agents()?;
-        if let Some(existing) = agents.iter().find(|a| a.id == record.id) {
-            return Ok(existing.clone());
-        }
-        check_name_unique(&agents, &record.name, None)?;
         let adopted = AgentRecord {
             project_id: self.id,
             session_home: session_home.or_else(|| record.session_home.clone()),
             ..record.clone()
         };
+        if let Some(existing) = agents.iter().find(|a| a.id == adopted.id) {
+            if *existing == adopted {
+                return Ok(adopted);
+            }
+            return Err(CoreError::AgentAdoptionConflict {
+                agent_id: adopted.id,
+            });
+        }
+        check_name_unique(&agents, &adopted.name, None)?;
         adopted.validate()?;
         append_jsonl(&self.registry_path, &adopted)?;
         Ok(adopted)
@@ -1331,7 +1341,6 @@ mod tests {
             .register_agent("alice", HarnessKind::ClaudeCode, None, None)
             .unwrap();
         let stranded = AgentRecord {
-            session_home: None,
             session_locator: None,
             ..source
         };
@@ -2293,6 +2302,82 @@ mod adopt_tests {
             source.list_agents().unwrap(),
             vec![incoming],
             "a refused adoption leaves the source untouched"
+        );
+    }
+
+    #[test]
+    fn adopting_a_conflicting_row_under_the_same_id_is_refused() {
+        // Recovery re-drives adoption, so a matching row means "already done".
+        // A *differing* row under the same id means something else wrote it —
+        // accepting it would report a finished move and let the caller delete
+        // the source copy.
+        let (_tmp, source, target) = two_projects();
+        let record = source
+            .register_agent("mover", HarnessKind::ClaudeCode, None, None)
+            .unwrap();
+        let impostor = AgentRecord {
+            session_locator: Some(SessionLocator::Uuid(Uuid::now_v7())),
+            ..record.clone()
+        };
+        let seated = target.adopt_agent(&impostor, None).unwrap();
+
+        let err = target.adopt_agent(&record, None).unwrap_err();
+
+        assert!(
+            matches!(err, CoreError::AgentAdoptionConflict { agent_id } if agent_id == record.id),
+            "expected an adoption conflict, got {err:?}"
+        );
+        assert_eq!(
+            target.list_agents().unwrap(),
+            vec![seated],
+            "the conflicting row is left exactly as it was"
+        );
+        assert_eq!(source.list_agents().unwrap(), vec![record]);
+    }
+
+    #[test]
+    fn adopt_refuses_a_session_home_on_a_harness_that_does_not_use_one() {
+        // Only Claude namespaces session storage by working directory, so a
+        // home on any other harness is inert data that would later acquire
+        // accidental meaning.
+        let (_tmp, source, target) = two_projects();
+        let codex = source
+            .register_agent("coder", HarnessKind::Codex, None, None)
+            .unwrap();
+
+        let err = target
+            .adopt_agent(&codex, Some(PathBuf::from("/repos/checkout")))
+            .unwrap_err();
+
+        assert!(
+            matches!(err, CoreError::SessionHomeUnsupported { harness } if harness == HarnessKind::Codex),
+            "expected a session-home refusal, got {err:?}"
+        );
+        assert!(target.list_agents().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_registry_line_with_a_session_home_on_a_non_claude_harness_fails_the_load() {
+        use std::io::Write;
+
+        let (_tmp, project) = fresh_project("contradictory");
+        let line = serde_json::json!({
+            "id": Uuid::now_v7(),
+            "project_id": project.id,
+            "name": "coder",
+            "harness": "codex",
+            "session_locator": null,
+            "session_home": "/repos/checkout",
+            "created_at": "2026-05-14T04:43:19Z",
+        });
+        let mut file = std::fs::File::create(&project.registry_path).unwrap();
+        writeln!(file, "{line}").unwrap();
+
+        let err = project.list_agents().unwrap_err();
+
+        assert!(
+            matches!(err, CoreError::SessionHomeUnsupported { harness } if harness == HarnessKind::Codex),
+            "expected a session-home refusal, got {err:?}"
         );
     }
 

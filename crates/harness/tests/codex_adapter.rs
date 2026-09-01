@@ -48,7 +48,6 @@ fn codex_agent() -> AgentRecord {
 /// capture).
 fn codex_agent_resuming(thread_id: &str, partition_date: chrono::NaiveDate) -> AgentRecord {
     AgentRecord {
-        session_home: None,
         model: None,
         effort: None,
         session_locator: Some(SessionLocator::Codex {

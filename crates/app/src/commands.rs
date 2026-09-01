@@ -351,44 +351,104 @@ fn reject_if_under_maintenance(state: &AppState, project_id: ProjectId) -> Resul
     Ok(())
 }
 
-/// Marks a pair of projects as closed to new work for the duration of an agent
-/// move, and — unlike every other claim on those marks — **keeps them marked
-/// unless it is told the operation succeeded**.
+/// A move's claim on two projects **before** it becomes recoverable: marks them
+/// closed to new work, and releases on drop.
 ///
-/// **Why not [`begin_maintenance`].** That guard is right for delete and
-/// re-point and wrong for a move, in two ways that matter. It *evicts* all
-/// routable state up front, but a move needs both projects loaded: it has to
-/// read their queues to verify quiescence, and it has to keep serving them
-/// afterwards. And its `Drop` discards-and-releases on any early return, which
-/// is the correct "unloaded and openable is the recoverable state" posture for
-/// an operation that can be retried from scratch — but a move that fails
-/// *after* it has begun rewriting files must leave both projects blocked until
-/// recovery finishes, because re-enabling dispatch into half-moved state is the
-/// one outcome the move's recovery design exists to prevent.
+/// **Auto-release is correct here and only here.** Up to the moment a durable
+/// intent record exists, a failure has changed nothing — no journal, registry,
+/// pin or sidecar has been touched — so there is nothing for recovery to find
+/// and nothing to protect by staying blocked. Leaving the marks set would wedge
+/// both projects for the life of the process on the most ordinary refusal there
+/// is: the user asked for a move while something was still running. That
+/// refusal is expected ("running work is never cancelled to make a move
+/// happen"), so it must cost a retry, not a restart.
 ///
-/// So this shares the mark set and nothing else. Sharing the marks is
-/// deliberate and load-bearing: every gate that already refuses a marked
-/// project refuses for free, and overlapping claims are refused in both
-/// directions — a move cannot start on a project being deleted or re-pointed,
-/// and neither can start on a project being moved out of.
-///
-/// **Dropping this guard does not release the marks.** There is no `Drop` impl,
-/// and that is the design: an unwind or an early `?` between marking and an
-/// explicit outcome leaves the projects blocked, which is the fail-closed
-/// answer. The move calls [`Self::release`] on success, and its recovery path
-/// calls it once the pair is consistent again. A move that fails and whose
-/// recovery also fails leaves the marks set until the process restarts, by
-/// which point the durable intent record drives recovery instead.
+/// Once the intent record is durable the obligation inverts, and
+/// [`Self::into_recovery_barrier`] is the only way to get there.
 // Dead until the move operation lands next milestone: the plan sequences the
 // gate first so it is reviewable before any file surgery exists. Delete this
 // attribute when the move wires it up.
 #[allow(dead_code)]
-pub(crate) struct MoveBarrier {
+pub(crate) struct MoveAdmission {
     maintenance: Arc<Mutex<HashSet<ProjectId>>>,
     marked: Vec<ProjectId>,
 }
 
-impl MoveBarrier {
+impl MoveAdmission {
+    /// Hand the claim over to the recovery phase, once the move's intent record
+    /// is **durably written**.
+    ///
+    /// **That boundary is the intent write, not the plan's "commit point."** The
+    /// commit point is the source-registry rewrite — step (d), well into
+    /// surgery. The obligation to stay blocked begins earlier, the instant an
+    /// intent record exists, because from then on a failure can leave real
+    /// residue that only recovery may clear. Taking the boundary at the commit
+    /// point instead would leave steps (a)–(c) releasing their marks on failure:
+    /// the same wedge-or-expose bug, relocated rather than fixed.
+    ///
+    /// Takes `self` by value on purpose, and a caller shaped
+    /// `into_recovery_barrier(admission, …) -> Result<…>` gets one property for
+    /// free: on the error path the moved-in admission is dropped, so a *failed*
+    /// intent write un-marks both projects with no extra handling. Switching
+    /// this to borrow would silently remove that.
+    // Dead until the move operation lands next milestone: the plan sequences the
+    // gate first so it is reviewable before any file surgery exists. Delete this
+    // attribute when the move wires it up.
+    #[allow(dead_code)]
+    pub(crate) fn into_recovery_barrier(self) -> MoveRecoveryBarrier {
+        let barrier = MoveRecoveryBarrier {
+            maintenance: Arc::clone(&self.maintenance),
+            marked: self.marked.clone(),
+        };
+        // Defuse: the marks now belong to the recovery barrier, which must not
+        // release them on drop.
+        std::mem::forget(self);
+        barrier
+    }
+}
+
+impl Drop for MoveAdmission {
+    fn drop(&mut self) {
+        let mut marks = lock(&self.maintenance);
+        for id in &self.marked {
+            marks.remove(id);
+        }
+    }
+}
+
+/// A move's claim on two projects **after** its intent record is durable:
+/// marks them closed to new work and — unlike every other claim on those marks —
+/// keeps them marked unless it is told the pair is consistent again.
+///
+/// **Why not [`begin_maintenance`].** That guard is right for delete and
+/// re-point and wrong for a move, in two ways. It *evicts* all routable state
+/// up front, but a move needs both projects loaded: it reads their queues to
+/// verify quiescence and keeps serving them afterwards. And its `Drop`
+/// discards-and-releases on any early return — the correct "unloaded and
+/// openable is the recoverable state" posture for an operation that can simply
+/// be retried, but wrong for a move that has begun rewriting files, which must
+/// stay blocked until recovery finishes. Re-enabling dispatch into half-moved
+/// state is the one outcome the recovery design exists to prevent.
+///
+/// So this shares the mark set and nothing else. Sharing the marks is
+/// deliberate: every gate that already refuses a marked project refuses for
+/// free, and overlapping claims are refused in both directions.
+///
+/// **Dropping this does not release the marks** — there is no `Drop` impl, and
+/// that is the design. An unwind or an early `?` after surgery has begun leaves
+/// the projects blocked, which is the fail-closed answer. A move that fails and
+/// whose recovery also fails leaves them blocked until restart, by which point
+/// the durable intent record drives recovery instead.
+// Dead until the move operation lands next milestone: the plan sequences the
+// gate first so it is reviewable before any file surgery exists. Delete this
+// attribute when the move wires it up.
+#[allow(dead_code)]
+pub(crate) struct MoveRecoveryBarrier {
+    maintenance: Arc<Mutex<HashSet<ProjectId>>>,
+    marked: Vec<ProjectId>,
+}
+
+impl MoveRecoveryBarrier {
     /// Clear the marks. Call only when the two projects are consistent — the
     /// move completed, or recovery restored them.
     // Dead until the move operation lands next milestone: the plan sequences the
@@ -412,6 +472,10 @@ impl MoveBarrier {
 /// quiescence, which is what closes the check-then-act window — a send admitted
 /// between "the queues look empty" and "the marks are set" would otherwise start
 /// mid-surgery.
+///
+/// Returns a [`MoveAdmission`], which releases on drop: everything up to the
+/// durable intent write is a phase where failing must cost a retry, not leave
+/// the projects blocked.
 // Dead until the move operation lands next milestone: the plan sequences the
 // gate first so it is reviewable before any file surgery exists. Delete this
 // attribute when the move wires it up.
@@ -420,7 +484,7 @@ pub(crate) fn begin_move_barrier(
     state: &AppState,
     source: ProjectId,
     target: ProjectId,
-) -> Result<MoveBarrier, AppError> {
+) -> Result<MoveAdmission, AppError> {
     let _write = lock(&state.registry_write);
     let mut marks = lock(&state.maintenance);
     for id in [source, target] {
@@ -430,7 +494,7 @@ pub(crate) fn begin_move_barrier(
     }
     marks.insert(source);
     marks.insert(target);
-    Ok(MoveBarrier {
+    Ok(MoveAdmission {
         maintenance: Arc::clone(&state.maintenance),
         marked: vec![source, target],
     })
@@ -8412,53 +8476,83 @@ pub(crate) mod tests {
         let (tmp, state, _emitter) = fresh_state_with_mock();
         let (source, target) = two_projects(&state, &tmp).await;
 
-        let barrier = begin_move_barrier(&state, source.id, target.id).unwrap();
+        let admission = begin_move_barrier(&state, source.id, target.id).unwrap();
         assert!(lock(&state.maintenance).contains(&source.id));
         assert!(lock(&state.maintenance).contains(&target.id));
 
-        barrier.release();
+        admission.into_recovery_barrier().release();
 
         assert!(lock(&state.maintenance).is_empty());
     }
 
-    /// The distinguishing property against `MaintenanceGuard`, whose `Drop`
-    /// discards and releases. A move that fails after it began rewriting files
-    /// must leave both projects blocked; auto-release would re-enable dispatch
-    /// into half-moved state.
+    /// The wedge this phase split exists to prevent: refusing a move because a
+    /// project is busy is the *expected* outcome ("running work is never
+    /// cancelled to make a move happen"), so it must cost a retry, not a
+    /// restart. Nothing has been written at this point, so there is also
+    /// nothing for recovery to find if the marks were left behind.
     #[tokio::test]
-    async fn dropping_a_move_barrier_without_releasing_leaves_both_marked() {
+    async fn a_quiescence_refusal_leaves_neither_project_marked() {
+        let (tmp, state, _emitter) = fresh_state_with_mock();
+        let (source, target) = two_projects(&state, &tmp).await;
+        lock(&state.workflow_runs).insert(
+            Uuid::now_v7(),
+            crate::state::ActiveRun {
+                cancel: tokio_util::sync::CancellationToken::new(),
+                project_id: target.id,
+                workflow: "nightly".to_owned(),
+                snapshot: crate::state::RunSnapshot {
+                    total_steps: 2,
+                    current_step: 0,
+                },
+                steps: Vec::new(),
+                done: Arc::new(tokio::sync::Notify::new()),
+            },
+        );
+
+        // The shape M4 will use: claim, then verify — and bail on the refusal.
+        let outcome = async {
+            let admission = begin_move_barrier(&state, source.id, target.id)?;
+            ensure_projects_quiescent(&state, [source.id, target.id]).await?;
+            Ok::<_, AppError>(admission)
+        }
+        .await;
+
+        assert!(outcome.is_err(), "a busy project must refuse the move");
+        assert!(
+            lock(&state.maintenance).is_empty(),
+            "a pre-surgery refusal must not leave either project blocked"
+        );
+    }
+
+    /// The same guarantee for the other pre-surgery failure: the intent write
+    /// itself failing. Dropping the admission on that path un-marks both.
+    #[tokio::test]
+    async fn dropping_the_admission_before_the_intent_write_releases_both_marks() {
         let (tmp, state, _emitter) = fresh_state_with_mock();
         let (source, target) = two_projects(&state, &tmp).await;
 
         drop(begin_move_barrier(&state, source.id, target.id).unwrap());
 
-        assert!(lock(&state.maintenance).contains(&source.id));
-        assert!(lock(&state.maintenance).contains(&target.id));
+        assert!(lock(&state.maintenance).is_empty());
     }
 
+    /// The distinguishing property against `MaintenanceGuard`, whose `Drop`
+    /// discards and releases. Once the intent record is durable, a move that
+    /// fails must leave both projects blocked; auto-release would re-enable
+    /// dispatch into half-moved state.
     #[tokio::test]
-    async fn a_move_barrier_refuses_a_project_already_under_maintenance() {
+    async fn dropping_the_recovery_barrier_leaves_both_projects_marked() {
         let (tmp, state, _emitter) = fresh_state_with_mock();
         let (source, target) = two_projects(&state, &tmp).await;
 
-        // Either side of the pair, and nothing is left half-marked on refusal.
-        for (claimed, other) in [(source.id, target.id), (target.id, source.id)] {
-            lock(&state.maintenance).insert(claimed);
+        drop(
+            begin_move_barrier(&state, source.id, target.id)
+                .unwrap()
+                .into_recovery_barrier(),
+        );
 
-            let Err(err) = begin_move_barrier(&state, source.id, target.id) else {
-                panic!("a claimed project must refuse the move barrier");
-            };
-
-            assert!(
-                matches!(err, AppError::ProjectUnderMaintenance(id) if id == claimed),
-                "got {err:?}"
-            );
-            assert!(
-                !lock(&state.maintenance).contains(&other),
-                "a refused claim must not leave the other project marked"
-            );
-            lock(&state.maintenance).remove(&claimed);
-        }
+        assert!(lock(&state.maintenance).contains(&source.id));
+        assert!(lock(&state.maintenance).contains(&target.id));
     }
 
     #[tokio::test]

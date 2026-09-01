@@ -412,7 +412,7 @@ pub fn normalize_selection(value: Option<String>) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-
+    use super::*;
     #[test]
     fn effective_session_directory_prefers_a_recorded_home() {
         let project = Path::new("/work/current-project");
@@ -435,7 +435,6 @@ mod tests {
             "a recorded home wins over the project directory"
         );
     }
-    use super::*;
 
     fn record_with_locator(locator: Option<SessionLocator>) -> AgentRecord {
         AgentRecord {

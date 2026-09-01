@@ -1669,7 +1669,7 @@ pub async fn cancel_runs_for_projects(state: &AppState, project_ids: &[ProjectId
 
 #[cfg(test)]
 mod tests {
-
+    use super::*;
     /// Workflow steps dispatch without passing through `send_message_impl`, so
     /// the admission check that path inherits never runs for them. A project
     /// closed for a move must refuse a step just the same.
@@ -1703,7 +1703,6 @@ mod tests {
             "got {err:?}"
         );
     }
-    use super::*;
     use switchboard_workflow::{TerminalStatus, WorkflowStepKind};
 
     /// Captures the most recent emitted (channel, payload) for assertions.

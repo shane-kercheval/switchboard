@@ -143,72 +143,50 @@ impl ProjectDispatchContextFactory {
     }
 
     /// Every harness session file this turn may write, as lock keys.
-    ///
-    /// Two keys, not one, when the agent is a **fork that has not materialized
-    /// yet**: that dispatch reads the *parent's* session file to branch from it
-    /// while carrying its own freshly generated uuid, so keying only on the
-    /// dispatching agent would lock a file nobody contends on and leave the
-    /// contended one open. It writes its own file too, hence "in addition to,"
-    /// not "instead of."
-    ///
-    /// **Materialization is resolved from the fork's own session file, and
-    /// staleness from `forked_from_session` — never from `busy_fork_source`.**
-    /// That function answers a different question: it returns the parent only
-    /// when the parent is busy *in this process*, and `None` for "not a fork,
-    /// already materialized, parent gone, or parent idle." Keying off it would
-    /// invert the coverage — the parent would be locked only in the case the
-    /// in-process gate above was already refusing. "Parent gone" is the same trap
-    /// mirrored: it yields `None` because *our* process is not writing that
-    /// session, while the file is still on disk, still read by the fork, and
-    /// possibly live in the other build.
-    ///
-    /// **An agent with no locator yet takes no lock, and that exception is
-    /// safe for a reason that is not a check anywhere in this codebase.** A
-    /// Codex or Antigravity first turn has no session *yet* — the harness mints
-    /// the id during this dispatch, and the locator sink persists it, so the
-    /// *next* turn locks it. Nothing can be contending for a conversation that
-    /// does not exist. The assumption this rests on, stated so it can be
-    /// re-checked when a harness changes: **harness-assigned conversation ids are
-    /// unique per conversation** (recorded in `docs/harness-behavior.md`).
-    ///
-    /// An earlier version of this comment credited a "post-capture uniqueness
-    /// scan" instead. There is no such scan — `check_claude_session_id_unique`
-    /// and its siblings run at *attach*, and
-    /// [`crate::locator_sink::ProjectSessionLocatorSink::persist`] writes the
-    /// captured locator straight through. The exception was always sound; its
-    /// stated reason was invented.
-    /// The recorded session home of the agent whose session is `parent_session`,
-    /// if that agent is cached and carries one. Only the parent's session uuid
-    /// is on a forked record, so the parent is located by locator match.
-    fn parent_session_home(&self, parent_session: uuid::Uuid) -> Option<PathBuf> {
-        lock(&self.agents_by_id)
-            .values()
-            .find(|candidate| {
-                candidate
-                    .session_locator
-                    .as_ref()
-                    .and_then(SessionLocator::as_uuid)
-                    == Some(parent_session)
-            })
-            .and_then(|parent| parent.session_home.clone())
-    }
-
+    /// Thin shim; the rule and its rationale live on [`session_lock_keys_for`].
     fn session_lock_keys(
         &self,
         agent: &AgentRecord,
     ) -> Result<BTreeSet<String>, crate::error::AppError> {
-        session_lock_keys_for(
-            agent,
-            &self.project.directory,
-            &self.home_dir,
-            agent
-                .forked_from_session
-                .and_then(|parent| self.parent_session_home(parent)),
-        )
+        session_lock_keys_for(agent, &self.project.directory, &self.home_dir)
     }
 }
 
 /// The cross-process session-lock keys one dispatch of `agent` must hold.
+///
+/// Two keys, not one, when the agent is a **fork that has not materialized
+/// yet**: that dispatch reads the *parent's* session file to branch from it
+/// while carrying its own freshly generated uuid, so keying only on the
+/// dispatching agent would lock a file nobody contends on and leave the
+/// contended one open. It writes its own file too, hence "in addition to,"
+/// not "instead of."
+///
+/// **Materialization is resolved from the fork's own session file, and
+/// staleness from `forked_from_session` — never from `busy_fork_source`.**
+/// That function answers a different question: it returns the parent only
+/// when the parent is busy *in this process*, and `None` for "not a fork,
+/// already materialized, parent gone, or parent idle." Keying off it would
+/// invert the coverage — the parent would be locked only in the case the
+/// in-process gate above was already refusing. "Parent gone" is the same trap
+/// mirrored: it yields `None` because *our* process is not writing that
+/// session, while the file is still on disk, still read by the fork, and
+/// possibly live in the other build.
+///
+/// **An agent with no locator yet takes no lock, and that exception is
+/// safe for a reason that is not a check anywhere in this codebase.** A
+/// Codex or Antigravity first turn has no session *yet* — the harness mints
+/// the id during this dispatch, and the locator sink persists it, so the
+/// *next* turn locks it. Nothing can be contending for a conversation that
+/// does not exist. The assumption this rests on, stated so it can be
+/// re-checked when a harness changes: **harness-assigned conversation ids are
+/// unique per conversation** (recorded in `docs/harness-behavior.md`).
+///
+/// An earlier version of this comment credited a "post-capture uniqueness
+/// scan" instead. There is no such scan — `check_claude_session_id_unique`
+/// and its siblings run at *attach*, and
+/// [`crate::locator_sink::ProjectSessionLocatorSink::persist`] writes the
+/// captured locator straight through. The exception was always sound; its
+/// stated reason was invented.
 ///
 /// **Keys name where the session *file* is, not where the agent now lives.** A
 /// Claude lock key includes the working directory (its session ids are
@@ -218,18 +196,25 @@ impl ProjectDispatchContextFactory {
 /// protection disappears with nothing failing. The agent's *spawn* cwd is
 /// unaffected; only the key follows the record.
 ///
-/// `parent_session_home` is the recorded home of the fork parent, when this
-/// agent is an unmaterialized fork and the parent carries one. Only the
-/// parent's session uuid is on a forked record, so the caller resolves it.
-/// Falling back to this agent's own session directory is the historical
-/// behavior and correct whenever the two share a directory; the residual gap
-/// (an unmoved parent whose child has been moved away) is documented at the
-/// call site.
+/// **The fork-parent key uses the dispatching agent's own session directory,
+/// which is exact only while that directory is also where the parent's
+/// transcript lives.** It diverges in two shapes, both requiring a move and so
+/// unreachable until one exists: a fork *created after* its parent moved (the
+/// child belongs to the parent's new project, the parent's transcript is still
+/// in the old one), and a fork whose own agent has since been moved. The
+/// parent's location cannot be recovered here — an unmoved parent records no
+/// home, and resolving its project needs the store this factory does not carry
+/// — so it is fixed at the source instead: the move milestone records the
+/// parent's effective session directory as immutable fork provenance when the
+/// fork is created, and this key reads it. Deliberately **not** resolved by
+/// searching the agent cache for a matching session id: ids are unique only per
+/// directory, so an unscoped search can lock an unrelated conversation while
+/// leaving the real one unguarded (the same trap `busy_fork_source` documents,
+/// which is why its own lookup is scoped to the fork's project).
 fn session_lock_keys_for(
     agent: &AgentRecord,
     project_directory: &Path,
     home_dir: &Path,
-    parent_session_home: Option<PathBuf>,
 ) -> Result<BTreeSet<String>, crate::error::AppError> {
     let mut keys = BTreeSet::new();
     let session_cwd = agent.effective_session_directory(project_directory);
@@ -243,19 +228,10 @@ fn session_lock_keys_for(
     if let Some(parent) = agent.forked_from_session
         && crate::commands::resolve_session_file(agent, project_directory, home_dir).is_none()
     {
-        // Residual, deliberately not closed: a parent with no recorded home
-        // whose *child* has been moved to another directory resolves to the
-        // child's directory, so the two dispatches take different keys. Closing
-        // it needs the parent's owning project, which the factory does not
-        // carry. Bounded exposure — a materializing fork reads the parent while
-        // the parent may be appending, and harness-behavior §3.5 establishes the
-        // parent file is not corrupted by that — so it is a fidelity risk on the
-        // new branch, not a corruption one.
-        let parent_cwd = parent_session_home.unwrap_or_else(|| session_cwd.to_path_buf());
         keys.insert(crate::session_lock::session_lock_key(
             agent.harness,
             &SessionLocator::Uuid(parent),
-            &parent_cwd,
+            session_cwd,
         )?);
     }
     Ok(keys)
@@ -464,8 +440,8 @@ mod session_lock_key_tests {
         let unmoved_at_home = claude_agent(session);
 
         assert_eq!(
-            session_lock_keys_for(&moved, new_project, home_dir.path(), None).unwrap(),
-            session_lock_keys_for(&unmoved_at_home, &session_home, home_dir.path(), None).unwrap(),
+            session_lock_keys_for(&moved, new_project, home_dir.path()).unwrap(),
+            session_lock_keys_for(&unmoved_at_home, &session_home, home_dir.path()).unwrap(),
             "a moved agent must contend with its session's real location"
         );
     }
@@ -482,9 +458,8 @@ mod session_lock_key_tests {
         };
 
         assert_ne!(
-            session_lock_keys_for(&moved, new_project, home_dir.path(), None).unwrap(),
-            session_lock_keys_for(&claude_agent(session), new_project, home_dir.path(), None)
-                .unwrap(),
+            session_lock_keys_for(&moved, new_project, home_dir.path()).unwrap(),
+            session_lock_keys_for(&claude_agent(session), new_project, home_dir.path()).unwrap(),
             "keying by the new project would name a session that isn't there"
         );
     }
@@ -495,8 +470,7 @@ mod session_lock_key_tests {
         let session = Uuid::now_v7();
         let project = Path::new("/work/project");
 
-        let keys =
-            session_lock_keys_for(&claude_agent(session), project, home_dir.path(), None).unwrap();
+        let keys = session_lock_keys_for(&claude_agent(session), project, home_dir.path()).unwrap();
 
         assert_eq!(
             keys,
@@ -512,40 +486,12 @@ mod session_lock_key_tests {
         );
     }
 
-    /// A materializing fork locks the parent where the *parent* keeps it, so it
-    /// contends with the parent's own dispatch after the parent has moved.
+    /// A materializing fork locks its parent under its own session directory,
+    /// which is exact while the two share one. The divergent shapes all require
+    /// a move and are closed at the source by fork provenance (see the M4 rule
+    /// in the move plan), never by searching the cache for a matching id.
     #[test]
-    fn a_materializing_fork_locks_the_parents_recorded_home() {
-        let home_dir = TempDir::new().unwrap();
-        let parent_session = Uuid::now_v7();
-        let parent_home = PathBuf::from("/work/parents-original-checkout");
-        let project = Path::new("/work/project");
-
-        let child = AgentRecord {
-            forked_from_session: Some(parent_session),
-            ..claude_agent(Uuid::now_v7())
-        };
-
-        let keys =
-            session_lock_keys_for(&child, project, home_dir.path(), Some(parent_home.clone()))
-                .unwrap();
-        let parent_key = crate::session_lock::session_lock_key(
-            HarnessKind::ClaudeCode,
-            &SessionLocator::Uuid(parent_session),
-            &parent_home,
-        )
-        .unwrap();
-
-        assert!(
-            keys.contains(&parent_key),
-            "the fork must lock the parent where the parent's transcript lives"
-        );
-        assert_eq!(keys.len(), 2, "own session plus the parent's: {keys:?}");
-    }
-
-    /// A fork whose parent has never moved keeps the historical behavior.
-    #[test]
-    fn a_materializing_fork_falls_back_to_its_own_session_directory() {
+    fn a_materializing_fork_locks_the_parent_under_its_own_session_directory() {
         let home_dir = TempDir::new().unwrap();
         let parent_session = Uuid::now_v7();
         let project = Path::new("/work/project");
@@ -555,7 +501,7 @@ mod session_lock_key_tests {
             ..claude_agent(Uuid::now_v7())
         };
 
-        let keys = session_lock_keys_for(&child, project, home_dir.path(), None).unwrap();
+        let keys = session_lock_keys_for(&child, project, home_dir.path()).unwrap();
         let parent_key = crate::session_lock::session_lock_key(
             HarnessKind::ClaudeCode,
             &SessionLocator::Uuid(parent_session),
@@ -564,5 +510,42 @@ mod session_lock_key_tests {
         .unwrap();
 
         assert!(keys.contains(&parent_key), "got {keys:?}");
+        assert_eq!(keys.len(), 2, "own session plus the parent's: {keys:?}");
+    }
+
+    /// Regression guard for re-introducing an unscoped search for the parent:
+    /// Claude session ids are unique only per directory, so an agent elsewhere
+    /// carrying the same id is a different conversation. Locking *its*
+    /// directory would guard the wrong file and leave the real parent open.
+    #[test]
+    fn an_unrelated_agent_sharing_the_parents_session_id_does_not_move_the_key() {
+        let home_dir = TempDir::new().unwrap();
+        let parent_session = Uuid::now_v7();
+        let project = Path::new("/work/project");
+
+        let child = AgentRecord {
+            forked_from_session: Some(parent_session),
+            ..claude_agent(Uuid::now_v7())
+        };
+        // The same session id, in another project, with a home of its own —
+        // exactly what an unscoped cache search would have latched onto.
+        let _impostor = AgentRecord {
+            session_home: Some(PathBuf::from("/work/unrelated-checkout")),
+            ..claude_agent(parent_session)
+        };
+
+        let keys = session_lock_keys_for(&child, project, home_dir.path()).unwrap();
+
+        assert!(
+            keys.contains(
+                &crate::session_lock::session_lock_key(
+                    HarnessKind::ClaudeCode,
+                    &SessionLocator::Uuid(parent_session),
+                    project,
+                )
+                .unwrap()
+            ),
+            "the key must derive from this dispatch alone, got {keys:?}"
+        );
     }
 }

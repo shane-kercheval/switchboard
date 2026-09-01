@@ -1019,9 +1019,10 @@ impl Store {
         }
     }
 
-    /// Every candidate intent file currently in `moves/` — paths only, no
-    /// parsing, so one unreadable file cannot hide the others. Recovery owns
-    /// the per-file policy; see `read_move_intent` for the validation.
+    /// Every candidate entry in `moves/` — paths only, no parsing, so one
+    /// unreadable file cannot hide the others. Excludes only the atomic
+    /// writer's `.tmp` artifacts. Recovery owns the per-entry policy; see
+    /// `read_move_intent` for the validation.
     pub fn list_move_intent_files(&self) -> Result<Vec<PathBuf>> {
         let dir = self.root.join(MOVES_DIR);
         let entries = match std::fs::read_dir(&dir) {
@@ -1032,12 +1033,16 @@ impl Store {
         let mut files = Vec::new();
         for entry in entries {
             let path = entry.map_err(|e| CoreError::io(&dir, e))?.path();
-            // Skip only *temp* artifacts of our own atomic writer; every other
-            // file in this private directory is a candidate the caller must
-            // account for, never silently ignore.
-            if path.extension().is_some_and(|ext| ext == "jsonl") {
-                files.push(path);
+            // Everything except our atomic writer's own temp artifacts. Filtering
+            // to `.jsonl` would silently drop a real intent that a sync tool or
+            // an editor renamed — `<name>.jsonl.bak`, a conflicted copy — which
+            // is precisely the "one file hides a pending move" failure this
+            // enumeration exists to prevent. The caller decides what an
+            // unrecognized entry means; this function does not get to guess.
+            if path.extension().is_some_and(|ext| ext == "tmp") {
+                continue;
             }
+            files.push(path);
         }
         files.sort();
         Ok(files)

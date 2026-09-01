@@ -165,6 +165,16 @@ pub enum AppError {
         intent: std::path::PathBuf,
     },
 
+    /// The move-recovery directory could not be read at startup, so it is
+    /// unknown whether any move was interrupted — and therefore unknown whether
+    /// any project is consistent. Every project operation refuses until it is
+    /// repaired; the rest of the app keeps working.
+    #[error(
+        "Switchboard cannot read its move-recovery records ({reason}) — projects stay closed \
+         until the store's `moves` directory is readable again"
+    )]
+    MoveRecoveryUnavailable { reason: String },
+
     /// Filesystem failure inside a move's surgery, outside core's own typed
     /// I/O errors (which cover the journal/registry/pin writes themselves).
     #[error("agent move could not write {path}: {source}")]

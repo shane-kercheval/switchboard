@@ -348,6 +348,14 @@ pub(crate) fn reject_if_under_maintenance(
     state: &AppState,
     project_id: ProjectId,
 ) -> Result<(), AppError> {
+    // Recovery could not even enumerate what moves were in flight, so no
+    // project can be shown to be consistent — refuse all of them rather than
+    // guess. Deliberately unlike a known-bad intent, which blocks only the
+    // projects it implicates: here the *identity* of the affected projects is
+    // what is unknown.
+    if let Some(reason) = lock(&state.move_recovery_unavailable).clone() {
+        return Err(AppError::MoveRecoveryUnavailable { reason });
+    }
     if lock(&state.maintenance).contains(&project_id) {
         // A mark left by the move machinery upgrades to the right story —
         // damage needing repair, or a healthy deferral because another
@@ -406,15 +414,15 @@ impl MoveAdmission {
     /// free: on the error path the moved-in admission is dropped, so a *failed*
     /// intent write un-marks both projects with no extra handling. Switching
     /// this to borrow would silently remove that.
-    pub(crate) fn into_recovery_barrier(self) -> MoveRecoveryBarrier {
-        let barrier = MoveRecoveryBarrier {
+    pub(crate) fn into_recovery_barrier(mut self) -> MoveRecoveryBarrier {
+        // Defuse by emptying the mark list: the marks now belong to the
+        // recovery barrier, and `Drop` still runs — over nothing. Preferred
+        // over `mem::forget`, which would leak the `Arc` and the `Vec` and
+        // leave a future reader working out why a destructor was suppressed.
+        MoveRecoveryBarrier {
             maintenance: Arc::clone(&self.maintenance),
-            marked: self.marked.clone(),
-        };
-        // Defuse: the marks now belong to the recovery barrier, which must not
-        // release them on drop.
-        std::mem::forget(self);
-        barrier
+            marked: std::mem::take(&mut self.marked),
+        }
     }
 }
 
@@ -2477,6 +2485,11 @@ pub fn create_project_impl(
     name: &str,
     directory_path: &str,
 ) -> Result<ProjectSummary, AppError> {
+    // No new project state while recovery is blind — see
+    // `reject_if_under_maintenance`, which gates the open paths for the same
+    // reason. Checked with a project id that cannot be marked, so only the
+    // global condition can refuse here.
+    reject_if_under_maintenance(state, ProjectId::nil())?;
     // Serialize the uniqueness check + JSONL append against concurrent
     // `create_project` / `register_agent` / `init_directory` calls. Without
     // this, two concurrent IPC calls could both pass the canonical-name

@@ -271,25 +271,34 @@ fn block_pair_for_repair(
 /// the first command can run; on a fresh launch nothing is open, so recovery
 /// cannot race a user action.
 ///
-/// **Per-file, fail-closed per pair.** One unreadable intent must not abandon
-/// the others (that would let *their* half-moved pairs open and accept work),
-/// and a file whose contents cannot be trusted still blocks the two projects
-/// its **filename** names. A file whose name doesn't parse gets one more
-/// chance at attribution through its body — the realistic path there is a sync
-/// tool duplicating a real intent under a mangled name — and is blocked by
-/// that pair if it parses. Only a file yielding neither is logged loudly and
-/// left in place: it is not a file this app ever writes (the naming scheme
-/// ships with the feature; note it becomes a compatibility surface if the
-/// format ever changes), filenames do not corrupt the way contents do, and
-/// blocking the whole app over an alien file would trade a contained failure
-/// for a total one — the plan's blast-radius rule is "exactly the two named
-/// projects, never the whole app".
+/// **Three failure postures, and the differences are deliberate.**
+///
+/// *Enumeration fails* (the directory cannot be read at all): every project
+/// operation is refused until it is repaired. This is the one genuinely
+/// epistemic failure — we cannot prove no move is pending, so we cannot prove
+/// any project is safe to open.
+///
+/// *A file identifies a project pair but cannot be trusted* (unreadable body,
+/// filename/body disagreement, semantic corruption): exactly those projects are
+/// blocked — **the union of every pair any source names**, never a choice
+/// between them, because a body that disagrees with its filename names the pair
+/// whose surgery may already have run.
+///
+/// *A file identifies nothing*: logged and left in place. It is **not** grounds
+/// to block the store, and the reason is concrete rather than a matter of
+/// taste: this enumeration deliberately returns every non-temp entry, so the
+/// unidentifiable set is dominated by ordinary detritus — `.DS_Store` from a
+/// Finder visit, an editor swap file, a sync tool's metadata sibling. Blocking
+/// globally here would mean opening this directory in Finder bricks every
+/// project in the store. The plan's blast-radius rule ("exactly the two named
+/// projects, never the whole app") points the same way.
 pub(crate) fn recover_pending_moves_at_startup(state: &AppState, home_dir: &Path) {
     let files = match state.store.list_move_intent_files() {
         Ok(files) => files,
         Err(e) => {
             tracing::error!(error = %e,
-                "cannot enumerate pending move intents — interrupted moves will not be recovered this launch");
+                "cannot read the move-recovery directory — refusing project operations until it is repaired");
+            *lock(&state.move_recovery_unavailable) = Some(e.to_string());
             return;
         }
     };
@@ -297,32 +306,59 @@ pub(crate) fn recover_pending_moves_at_startup(state: &AppState, home_dir: &Path
         match state.store.read_move_intent(&path) {
             Ok(intent) => recover_one(state, &path, &intent, home_dir),
             Err(read_err) => {
-                let attributed = switchboard_core::intent_pair_from_filename(&path).or_else(|| {
-                    // Body fallback: a raw parse without the filename cross-check.
-                    switchboard_core::read_jsonl::<switchboard_core::store::MoveIntent>(&path)
-                        .ok()
-                        .and_then(|records| match records.as_slice() {
-                            [one] if one.source_project != one.target_project => {
-                                Some((one.source_project, one.target_project))
-                            }
-                            _ => None,
-                        })
-                });
-                match attributed {
-                    Some((source, target)) => {
-                        tracing::error!(error = %read_err, intent = %path.display(),
-                            "untrusted move intent — blocking its project pair until repaired");
-                        block_pair_at_startup(state, source, target, &path, false);
+                let projects = candidate_projects(&path);
+                if projects.is_empty() {
+                    // Split by plausibility so the error channel keeps meaning
+                    // something: a lost intent must stay loud, and it cannot if
+                    // every stray dotfile in this directory cries wolf.
+                    if looks_like_ours(&path) {
+                        tracing::error!(error = %read_err, file = %path.display(),
+                            "a move-recovery file could not be attributed to any project — \
+                             inspect it; a pending move may be unrecoverable");
+                    } else {
+                        tracing::debug!(file = %path.display(),
+                            "ignoring an unrelated file in the move-recovery directory");
                     }
-                    None => {
-                        tracing::error!(error = %read_err, intent = %path.display(),
-                            "unattributable file in the move-intent directory — ignored; \
-                             remove it by hand if it is not yours");
-                    }
+                    continue;
                 }
+                tracing::error!(error = %read_err, intent = %path.display(),
+                    "untrusted move intent — blocking every project it could involve");
+                block_projects_at_startup(state, &projects, &path, false);
             }
         }
     }
+}
+
+/// Every project id an untrusted file could implicate: from its filename and,
+/// independently, from whatever its body parses to. The **union** — a body that
+/// disagrees with its filename names the pair whose surgery may already have
+/// run, so choosing one source would leave the other open.
+fn candidate_projects(path: &Path) -> Vec<ProjectId> {
+    let mut projects = Vec::new();
+    if let Some((source, target)) = switchboard_core::intent_pair_from_filename(path) {
+        projects.push(source);
+        projects.push(target);
+    }
+    if let Ok(records) = switchboard_core::read_jsonl::<MoveIntent>(path) {
+        for record in records {
+            projects.push(record.source_project);
+            projects.push(record.target_project);
+        }
+    }
+    projects.sort();
+    projects.dedup();
+    projects
+}
+
+/// Whether a file in `moves/` plausibly came from us — it parses as our JSONL
+/// or carries our naming shape. Only the difference between a loud and a quiet
+/// log; neither blocks anything.
+fn looks_like_ours(path: &Path) -> bool {
+    path.extension().is_some_and(|ext| ext == "jsonl")
+        || path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .is_some_and(|stem| stem.split("--").count() == 3)
 }
 
 /// One intent: acquire both projects' `instance.lock`s, re-drive the surgery,
@@ -346,10 +382,9 @@ fn recover_one(state: &AppState, path: &Path, intent: &MoveIntent, home_dir: &Pa
             tracing::warn!(error = %e, intent = %path.display(),
                 "move recovery deferred — a project is open in another Switchboard process; \
                  retrying at next launch");
-            block_pair_at_startup(
+            block_projects_at_startup(
                 state,
-                intent.source_project,
-                intent.target_project,
+                &[intent.source_project, intent.target_project],
                 path,
                 true,
             );
@@ -357,10 +392,9 @@ fn recover_one(state: &AppState, path: &Path, intent: &MoveIntent, home_dir: &Pa
         Err(e) => {
             tracing::error!(error = %e, intent = %path.display(),
                 "move recovery failed at startup — blocking both projects until repaired");
-            block_pair_at_startup(
+            block_projects_at_startup(
                 state,
-                intent.source_project,
-                intent.target_project,
+                &[intent.source_project, intent.target_project],
                 path,
                 false,
             );
@@ -368,27 +402,28 @@ fn recover_one(state: &AppState, path: &Path, intent: &MoveIntent, home_dir: &Pa
     }
 }
 
-fn block_pair_at_startup(
+fn block_projects_at_startup(
     state: &AppState,
-    source: ProjectId,
-    target: ProjectId,
+    projects: &[ProjectId],
     intent: &Path,
     deferred: bool,
 ) {
     let mut marks = lock(&state.maintenance);
-    marks.insert(source);
-    marks.insert(target);
+    for id in projects {
+        marks.insert(*id);
+    }
     drop(marks);
     let block = crate::state::MoveBlock {
         intent: intent.to_owned(),
         deferred,
     };
     let mut repairs = lock(&state.move_repairs);
-    repairs.insert(source, block.clone());
-    repairs.insert(target, block);
+    for id in projects {
+        repairs.insert(*id, block.clone());
+    }
 }
 
-/// The surgery: steps (a)/// The surgery: steps (a)–(g) in commit order — appends before rewrites,
+/// The surgery: steps (a)–(g) in commit order — appends before rewrites,
 /// target before source. Every step is a no-op when already applied, so
 /// recovery re-drives the whole sequence from any interruption point. Returns
 /// the adopted record (always `Some` when `stop_after` is `None`).
@@ -407,8 +442,7 @@ pub(crate) fn apply_move_steps(
     // removal fires, silently erasing the agent. Surgery from an untrusted
     // instruction is the one thing recovery must never do.
     if intent.source_project == intent.target_project {
-        return Err(AppError::Core(CoreError::InvalidMoveIntent {
-            path: store.root().join("moves"),
+        return Err(AppError::Core(CoreError::InvalidMoveIntentValue {
             reason: "source and target name the same project".to_owned(),
         }));
     }
@@ -1898,7 +1932,7 @@ mod protocol_tests {
             assert!(
                 matches!(
                     apply_move_steps(&state.store, &bad, f.claude_home.path(), None),
-                    Err(AppError::Core(CoreError::InvalidMoveIntent { .. }))
+                    Err(AppError::Core(CoreError::InvalidMoveIntentValue { .. }))
                 ),
                 "the surgery refuses it even if handed the value directly"
             );
@@ -2040,6 +2074,138 @@ mod protocol_tests {
         assert!(lock(&state.maintenance).is_empty(), "marks released");
         assert!(state.store.list_move_intent_files().unwrap().is_empty());
         assert_eq!(f.source.list_agents().unwrap().len(), 2, "nothing moved");
+    }
+
+    /// An unreadable recovery directory is the one epistemic failure: we cannot
+    /// prove no move is pending, so no project may open — but the block is a
+    /// distinct, explanatory error, not a silent skip.
+    #[test]
+    fn an_unreadable_recovery_directory_refuses_every_project_operation() {
+        let root = TempDir::new().unwrap();
+        let state = state_at(root.path());
+        let dirs = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let f = seeded(&state, &dirs);
+        let moves_dir = root.path().join("moves");
+        std::fs::create_dir_all(&moves_dir).unwrap();
+        let mut perms = std::fs::metadata(&moves_dir).unwrap().permissions();
+        let readable = perms.clone();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o000);
+        std::fs::set_permissions(&moves_dir, perms).unwrap();
+
+        let restarted = state_at(root.path());
+        recover_pending_moves_at_startup(&restarted, f.claude_home.path());
+        let open_err = crate::commands::reject_if_under_maintenance(&restarted, f.source.id)
+            .expect_err("no project may open while recovery state is unreadable");
+        let create_err = crate::commands::create_project_impl(
+            &restarted,
+            "new",
+            &dirs.0.path().to_string_lossy(),
+        )
+        .expect_err("no project may be created either");
+        std::fs::set_permissions(&moves_dir, readable).unwrap();
+
+        assert!(
+            matches!(open_err, AppError::MoveRecoveryUnavailable { .. }),
+            "got {open_err:?}"
+        );
+        assert!(
+            matches!(create_err, AppError::MoveRecoveryUnavailable { .. }),
+            "got {create_err:?}"
+        );
+    }
+
+    /// A record whose filename and body name *different* pairs blocks the
+    /// union: the body's pair is the one whose surgery may already have run, so
+    /// choosing either source alone would leave the other open.
+    #[test]
+    fn a_filename_body_disagreement_blocks_every_project_it_could_involve() {
+        let root = TempDir::new().unwrap();
+        let dirs_a = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let dirs_b = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let (fa, fb);
+        {
+            let state = state_at(root.path());
+            fa = seeded(&state, &dirs_a);
+            fb = seeded(&state, &dirs_b);
+            // Named for pair A, carrying pair B's intent.
+            let dir = state.store.root().join("moves");
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join(format!(
+                "{}--{}--{}.jsonl",
+                fa.source.id,
+                fa.target.id,
+                Uuid::now_v7()
+            ));
+            append_jsonl(&path, &fb.intent).unwrap();
+        }
+        let restarted = state_at(root.path());
+        recover_pending_moves_at_startup(&restarted, fa.claude_home.path());
+
+        let marks = lock(&restarted.maintenance);
+        for id in [fa.source.id, fa.target.id, fb.source.id, fb.target.id] {
+            assert!(
+                marks.contains(&id),
+                "every implicated project must be blocked"
+            );
+        }
+    }
+
+    /// Ordinary filesystem detritus in the recovery directory is ignored — it
+    /// must not block anything. The counter-case matters: this enumeration
+    /// deliberately returns every non-temp entry, so blocking here would mean
+    /// opening the folder in Finder bricks the store.
+    #[test]
+    fn unrelated_files_in_the_recovery_directory_block_nothing() {
+        let root = TempDir::new().unwrap();
+        let dirs = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let f;
+        {
+            let state = state_at(root.path());
+            f = seeded(&state, &dirs);
+            state.store.write_move_intent(&f.intent).unwrap();
+            apply_move_steps(
+                &state.store,
+                &f.intent,
+                f.claude_home.path(),
+                Some(MoveStep::Sidecars),
+            )
+            .unwrap();
+            let dir = state.store.root().join("moves");
+            std::fs::write(dir.join(".DS_Store"), b"finder").unwrap();
+            std::fs::write(dir.join(".swp"), b"editor").unwrap();
+        }
+        let restarted = state_at(root.path());
+        recover_pending_moves_at_startup(&restarted, f.claude_home.path());
+
+        assert_fully_moved(&f);
+        assert!(
+            lock(&restarted.maintenance).is_empty(),
+            "detritus blocks nothing and the real move still recovered"
+        );
+        assert!(lock(&restarted.move_recovery_unavailable).is_none());
+    }
+
+    /// A real intent a sync tool renamed away from our scheme is still found —
+    /// the enumeration returns every non-temp entry, so its body attributes it.
+    #[test]
+    fn a_renamed_intent_file_is_still_attributed_and_blocks_its_pair() {
+        let root = TempDir::new().unwrap();
+        let dirs = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let f;
+        {
+            let state = state_at(root.path());
+            f = seeded(&state, &dirs);
+            let path = state.store.write_move_intent(&f.intent).unwrap();
+            std::fs::rename(&path, path.with_extension("jsonl.bak")).unwrap();
+        }
+        let restarted = state_at(root.path());
+        recover_pending_moves_at_startup(&restarted, f.claude_home.path());
+
+        assert!(
+            lock(&restarted.maintenance).contains(&f.source.id)
+                && lock(&restarted.maintenance).contains(&f.target.id),
+            "a renamed real intent must block its pair, not vanish"
+        );
     }
 
     /// In-flight work refuses the move with the agent-named reason — using the

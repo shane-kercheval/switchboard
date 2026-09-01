@@ -206,6 +206,13 @@ pub enum CoreError {
     #[error("move intent at {path} is invalid ({reason}) — refusing to act on it")]
     InvalidMoveIntent { path: PathBuf, reason: String },
 
+    /// The same validation applied to an in-memory intent rather than a file —
+    /// the surgery re-checks the value it is handed. A separate variant so
+    /// file-corruption errors keep naming a real file; this one has none to
+    /// name.
+    #[error("refusing to act on an invalid move intent ({reason})")]
+    InvalidMoveIntentValue { reason: String },
+
     /// A move-intent write failed **and** the file it may have left behind
     /// could not be durably removed. The caller must treat the pair as blocked:
     /// releasing would let the next launch execute a move the user was told

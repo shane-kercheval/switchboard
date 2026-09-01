@@ -473,6 +473,12 @@ pub struct AppState {
     /// another Switchboard process holds the project. Never cleared in process;
     /// the next launch retries.
     pub move_repairs: Mutex<HashMap<ProjectId, MoveBlock>>,
+    /// Set when the move-recovery directory could not be read at startup,
+    /// holding the reason. While set, **every** project operation refuses: this
+    /// is the one failure where we cannot prove any project is safe, because we
+    /// cannot prove no move is pending. Distinct from `move_repairs`, which
+    /// blocks the specific projects a known-bad intent implicates.
+    pub move_recovery_unavailable: Mutex<Option<String>>,
 
     /// Fires OS notifications on a workflow run's completion/failure (suppressed
     /// when the window is focused). Defaults to a no-op; production injects the
@@ -535,6 +541,7 @@ impl AppState {
             workflow_runs: Arc::new(Mutex::new(HashMap::new())),
             move_mutex: tokio::sync::Mutex::new(()),
             move_repairs: Mutex::new(HashMap::new()),
+            move_recovery_unavailable: Mutex::new(None),
             notifier: Arc::new(NullNotifier),
             notification_gate: Arc::new(crate::notification::AuthorizationGate::new(Arc::new(
                 crate::notification::OsAuthorizationRequester,

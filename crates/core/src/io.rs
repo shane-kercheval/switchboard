@@ -205,15 +205,31 @@ pub fn copy_file_durable(src: &Path, dst: &Path) -> Result<()> {
 /// idempotent re-drive does not need this.
 pub fn remove_file_durable(path: &Path) -> Result<()> {
     match std::fs::remove_file(path) {
+        // **`NotFound` falls through to the fsync rather than returning.** The
+        // idempotent retry is exactly where the guarantee would otherwise be
+        // skipped: an earlier attempt can unlink successfully and then fail its
+        // parent fsync, and a retry that treated "already absent" as done would
+        // clear the recovery trigger while the removal is still undurable — the
+        // resurrection this helper exists to prevent.
+        //
+        // A *missing parent directory* is the one absence that needs no fsync
+        // and is handled below: there is no directory entry to make durable and
+        // nothing that could resurrect. This is reachable in ordinary use — an
+        // agent that never dispatched has no `sessions/` directory at all — so
+        // it is a supported input, not an edge case. (An earlier version of this
+        // comment called it unreachable and fail-loud; the first test over a
+        // never-dispatched agent disproved that immediately.)
         Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(CoreError::io(path, e)),
     }
     #[cfg(unix)]
     if let Some(parent) = path.parent() {
-        File::open(parent)
-            .and_then(|dir| dir.sync_all())
-            .map_err(|e| CoreError::io(parent, e))?;
+        match File::open(parent) {
+            Ok(dir) => dir.sync_all().map_err(|e| CoreError::io(parent, e))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(CoreError::io(parent, e)),
+        }
     }
     Ok(())
 }
@@ -343,6 +359,45 @@ fn tmp_path(target: &Path) -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The idempotent retry must not treat "already absent" as "already
+    /// durable". An unlink that succeeded but whose parent fsync failed leaves
+    /// the file gone and the directory entry not yet durable; a retry that
+    /// returned `Ok` here would let the caller clear its recovery trigger while
+    /// a crash could still resurrect the file.
+    #[test]
+    fn removing_an_absent_file_still_confirms_the_parent_is_durable() {
+        let dir = tempdir().unwrap();
+        let parent = dir.path().join("holder");
+        std::fs::create_dir_all(&parent).unwrap();
+        let path = parent.join("gone.json");
+
+        // Absent file, readable parent: succeeds, having synced the parent.
+        assert!(remove_file_durable(&path).is_ok());
+
+        // Absent file, unreadable parent: the fsync cannot be confirmed, so
+        // this reports rather than claiming success.
+        let mut perms = std::fs::metadata(&parent).unwrap().permissions();
+        let readable = perms.clone();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o000);
+        std::fs::set_permissions(&parent, perms).unwrap();
+        let result = remove_file_durable(&path);
+        std::fs::set_permissions(&parent, readable).unwrap();
+        assert!(
+            result.is_err(),
+            "an unconfirmable parent must not report a durable deletion"
+        );
+    }
+
+    /// A parent directory that does not exist needs no fsync — there is no
+    /// entry to make durable and nothing that could resurrect. Reachable in
+    /// ordinary use: an agent that never dispatched has no `sessions/` dir.
+    #[test]
+    fn removing_a_file_whose_parent_is_absent_succeeds() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("never-created").join("file.json");
+        assert!(remove_file_durable(&path).is_ok());
+    }
     use serde_norway::Value;
     use tempfile::tempdir;
 

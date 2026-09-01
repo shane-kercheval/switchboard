@@ -8496,6 +8496,7 @@ describe("ComposeBar — auto reading mode", () => {
   async function resetPrefsAndReadingMode(): Promise<void> {
     (await import("$lib/preferences.svelte"))._testing.reset({ ready: true });
     (await import("$lib/state/readingMode.svelte"))._testing.reset();
+    (await import("$lib/state/sendCompletion"))._testing.reset();
     workflowsTesting.reset();
   }
 
@@ -8577,6 +8578,48 @@ describe("ComposeBar — auto reading mode", () => {
     resolveInvoke("run-1");
     await waitFor(() => expect(workflowRuns[PROJECT_ID]?.[0]?.run_id).toBe("run-1"));
     expect(await isReading()).toBe(true);
+  });
+
+  it("stays off when the run terminalizes before its own launch reply arrives", async () => {
+    // The lifecycle that forced arm-before-invoke: the backend spawns the run
+    // before replying, so a fast run can reach its terminal — and the flush that
+    // owns clearing reading mode — while the invoke promise is still pending.
+    // Arming survives that (the mode is on when the terminal lands, so the flush
+    // has something to clear); what must not happen is the post-invoke tail
+    // re-arming a mode the terminal already retired.
+    await setAutoReadingMode(true);
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    let resolveInvoke: (runId: string) => void = () => {};
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "list_workflows") return [WORKFLOW];
+      if (cmd === "describe_workflow_form") return DESCRIPTOR;
+      if (cmd === "list_prompts") return [];
+      if (cmd === "invoke_workflow")
+        return await new Promise<string>((resolve) => {
+          resolveInvoke = resolve;
+        });
+      return null;
+    });
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await enterWorkflowModeAndFill();
+
+    await fireEvent.click(screen.getByTestId("workflow-invoke-button"));
+    await waitFor(() => {
+      expect(invokeMock.mock.calls.some(([c]) => c === "invoke_workflow")).toBe(true);
+    });
+    expect(await isReading()).toBe(true);
+
+    // The run finishes while the launch reply is still in flight.
+    const completion = await import("$lib/state/sendCompletion");
+    completion.recordWorkflowTerminal(PROJECT_ID, "review", "complete");
+    await waitFor(async () => expect(await isReading()).toBe(false));
+
+    // The reply lands afterwards; nothing in its tail may switch the mode back on.
+    resolveInvoke("run-1");
+    await waitFor(() => expect(workflowRuns[PROJECT_ID]?.[0]?.run_id).toBe("run-1"));
+    await tick();
+    expect(await isReading()).toBe(false);
   });
 
   it("rolls back reading mode when the workflow invoke is rejected", async () => {

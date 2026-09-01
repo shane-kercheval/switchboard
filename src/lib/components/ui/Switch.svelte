@@ -13,6 +13,15 @@
   };
 
   let { checked, disabled = false, ariaLabel, testid, onclick }: Props = $props();
+
+  /// Guarded rather than relying on the `disabled` attribute alone, matching
+  /// `SegmentedSelect`: the attribute stops a real pointer click, but not a
+  /// programmatic dispatch, and a caller that swaps to `aria-disabled` for
+  /// focusability would silently lose the protection entirely.
+  function activate(): void {
+    if (disabled) return;
+    onclick();
+  }
 </script>
 
 <button
@@ -27,7 +36,7 @@
     disabled ? "cursor-not-allowed opacity-50" : "cursor-pointer",
     checked ? "bg-accent" : "bg-active",
   )}
-  {onclick}
+  onclick={activate}
 >
   <span
     class={cn(

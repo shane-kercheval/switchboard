@@ -207,6 +207,34 @@ pub enum CoreError {
     )]
     AgentAdoptionConflict { agent_id: crate::agent::AgentId },
 
+    /// An adoption proposed a `session_home` that contradicts the one already
+    /// recorded on the agent.
+    ///
+    /// The recorded value is immutable historical identity — the transcript
+    /// stays in the directory it was first encoded from, so however many times
+    /// the agent moves afterwards, the first answer remains the only correct
+    /// one. A contradicting proposal therefore means the *caller* computed the
+    /// wrong directory, not that the agent's sessions relocated.
+    ///
+    /// Deliberately distinct from [`Self::AgentAdoptionConflict`], which points
+    /// at a different repair: that one means the target registry holds a stray
+    /// or corrupt row (fix the data), this one means the move logic computed a
+    /// bad value (fix the code). Collapsing them would make a repair-required
+    /// surface describe the wrong problem.
+    ///
+    /// Refused rather than silently ignored in favour of the recorded value:
+    /// silently correcting it would hide the caller's miscomputation here while
+    /// it went on to be wrong elsewhere.
+    #[error(
+        "agent {agent_id} already records a different session home ({recorded}) \
+         — refusing to overwrite where its transcript actually lives"
+    )]
+    SessionHomeContradiction {
+        agent_id: crate::agent::AgentId,
+        recorded: PathBuf,
+        proposed: PathBuf,
+    },
+
     /// Fork provenance forms a loop: following `forked_from_session` from this
     /// agent leads back to it. Unreachable through any supported path — a fork's
     /// parent always predates it — so this means the registry was edited or

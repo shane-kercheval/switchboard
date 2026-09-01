@@ -612,22 +612,52 @@ impl Project {
     /// the target roster changed underneath, which is why the check lives at
     /// the write and not only in the caller.
     ///
-    /// `session_home` carries the moved agent's session location when the move
-    /// crosses working directories; see [`AgentRecord::session_home`] for what
-    /// belongs there and, crucially, what must not (a re-canonicalized or
-    /// catalog-resolved path). Passing `None` leaves the field as it was on the
-    /// incoming record, so a second move preserves the home recorded by the
-    /// first — the transcript never moves, so the first answer stays the right
-    /// one.
+    /// `session_home` is a **proposal, applied only when the record has none**;
+    /// see [`AgentRecord::session_home`] for what belongs there and, crucially,
+    /// what must not (a re-canonicalized or catalog-resolved path). A value
+    /// already on the record always wins, because the transcript never leaves
+    /// the directory it was first encoded from — so a second move preserves the
+    /// first move's answer whatever the caller computes. A proposal that
+    /// *contradicts* the recorded value is
+    /// [`CoreError::SessionHomeContradiction`] rather than either overwriting
+    /// it (which strands the agent permanently — harness-behavior §3.5b) or
+    /// silently discarding it (which would hide a caller that computed the
+    /// wrong directory, letting it stay wrong everywhere else it is used).
+    /// Enforcing this here rather than trusting the caller is deliberate: the
+    /// contract belongs to the field, and the caller's own rule for deriving it
+    /// lives several calls away.
+    ///
+    /// **Safe under move recovery, which is where a spurious refusal would hurt
+    /// most.** Recovery re-drives adoption from scratch and recomputes the
+    /// proposal each time (the intent record carries only the agent and the two
+    /// projects, never intermediate values). That recomputation is
+    /// deterministic while it matters: both projects are held under the move's
+    /// maintenance gate, so the directory identities and session-file existence
+    /// it reads cannot change between attempts. A re-drive therefore proposes
+    /// the same value it proposed before and matches — it cannot wedge a
+    /// half-finished move by refusing itself.
     pub fn adopt_agent(
         &self,
         record: &AgentRecord,
         session_home: Option<PathBuf>,
     ) -> Result<AgentRecord> {
         let agents = self.list_agents()?;
+        let session_home = match (&record.session_home, session_home) {
+            (Some(recorded), Some(proposed)) if *recorded != proposed => {
+                return Err(CoreError::SessionHomeContradiction {
+                    agent_id: record.id,
+                    recorded: recorded.clone(),
+                    proposed,
+                });
+            }
+            // The recorded value wins whenever there is one: the transcript did
+            // not move, so neither may this.
+            (Some(recorded), _) => Some(recorded.clone()),
+            (None, proposed) => proposed,
+        };
         let adopted = AgentRecord {
             project_id: self.id,
-            session_home: session_home.or_else(|| record.session_home.clone()),
+            session_home,
             ..record.clone()
         };
         if let Some(existing) = agents.iter().find(|a| a.id == adopted.id) {
@@ -2303,6 +2333,84 @@ mod adopt_tests {
             vec![incoming],
             "a refused adoption leaves the source untouched"
         );
+    }
+
+    #[test]
+    fn a_second_move_proposing_the_identical_home_succeeds() {
+        // The recompute-on-re-drive shape: recovery proposes the same value it
+        // proposed before, which must be accepted rather than read as a
+        // contradiction.
+        let (_tmp, source, target) = two_projects();
+        let record = source
+            .register_agent("mover", HarnessKind::ClaudeCode, None, None)
+            .unwrap();
+        let home = PathBuf::from("/repos/original-checkout");
+        let once = target.adopt_agent(&record, Some(home.clone())).unwrap();
+
+        let (_tmp2, third) = fresh_project("third");
+        let twice = third.adopt_agent(&once, Some(home.clone())).unwrap();
+
+        assert_eq!(twice.session_home, Some(home));
+        assert_eq!(twice.project_id, third.id);
+    }
+
+    #[test]
+    fn a_second_move_proposing_a_different_home_is_refused() {
+        // The recorded home is immutable historical identity — the transcript
+        // stays where it was first encoded. A caller computing something else
+        // has a bug, and silently preferring the recorded value would hide it.
+        let (_tmp, source, target) = two_projects();
+        let record = source
+            .register_agent("mover", HarnessKind::ClaudeCode, None, None)
+            .unwrap();
+        let original_home = PathBuf::from("/repos/original-checkout");
+        let once = target
+            .adopt_agent(&record, Some(original_home.clone()))
+            .unwrap();
+
+        let (_tmp2, third) = fresh_project("third");
+        let err = third
+            .adopt_agent(&once, Some(PathBuf::from("/repos/somewhere-else")))
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                &err,
+                CoreError::SessionHomeContradiction { agent_id, recorded, .. }
+                    if *agent_id == record.id && *recorded == original_home
+            ),
+            "expected a session-home contradiction, got {err:?}"
+        );
+        assert!(third.list_agents().unwrap().is_empty());
+        assert_eq!(
+            target.list_agents().unwrap(),
+            vec![once],
+            "the recorded home is left exactly as it was"
+        );
+    }
+
+    #[test]
+    fn a_target_row_differing_only_in_session_home_is_a_conflict() {
+        // Guards the full-record equality rule on the one field whose exclusion
+        // would sound reasonable ("it is expected to change across moves") and
+        // be wrong: a divergent home is precisely the divergence worth catching.
+        let (_tmp, source, target) = two_projects();
+        let record = source
+            .register_agent("mover", HarnessKind::ClaudeCode, None, None)
+            .unwrap();
+        let seated = target
+            .adopt_agent(&record, Some(PathBuf::from("/repos/checkout-x")))
+            .unwrap();
+
+        let err = target
+            .adopt_agent(&record, Some(PathBuf::from("/repos/checkout-y")))
+            .unwrap_err();
+
+        assert!(
+            matches!(err, CoreError::AgentAdoptionConflict { agent_id } if agent_id == record.id),
+            "expected an adoption conflict, got {err:?}"
+        );
+        assert_eq!(target.list_agents().unwrap(), vec![seated]);
     }
 
     #[test]

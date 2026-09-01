@@ -142,6 +142,29 @@ pub enum AppError {
     #[error("the agent is already in that project")]
     MoveSourceIsTarget,
 
+    /// The caller declared a source project the agent no longer belongs to —
+    /// a stale view (second window, outdated picker). Refused before anything
+    /// is locked or loaded.
+    #[error(
+        "the agent has moved to another project since this request was made — refresh and try again"
+    )]
+    MoveSourceStale {
+        declared: ProjectId,
+        actual: ProjectId,
+    },
+
+    /// An interrupted move could not be recovered because another Switchboard
+    /// process holds one of its projects open. Nothing is damaged; the pair
+    /// waits.
+    #[error(
+        "an interrupted agent move is waiting on this project, which is open in another \
+         Switchboard process — close that instance and relaunch (move record: {intent})"
+    )]
+    MoveDeferredElsewhere {
+        project_id: ProjectId,
+        intent: std::path::PathBuf,
+    },
+
     /// Filesystem failure inside a move's surgery, outside core's own typed
     /// I/O errors (which cover the journal/registry/pin writes themselves).
     #[error("agent move could not write {path}: {source}")]

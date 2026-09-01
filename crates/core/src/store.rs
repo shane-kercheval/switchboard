@@ -77,6 +77,21 @@ pub struct MoveIntent {
     pub target_project: ProjectId,
 }
 
+/// The project pair encoded in an intent file's name
+/// (`<source>--<target>--<uuid>.jsonl`), recoverable even when the file's
+/// contents are not — which is what lets startup recovery block the right two
+/// projects instead of failing open on a corrupt body. `None` for a name this
+/// app never writes.
+#[must_use]
+pub fn intent_pair_from_filename(path: &Path) -> Option<(ProjectId, ProjectId)> {
+    let stem = path.file_stem()?.to_str()?;
+    let mut parts = stem.split("--");
+    let source = parts.next()?.parse().ok()?;
+    let target = parts.next()?.parse().ok()?;
+    parts.next()?.parse::<Uuid>().ok()?;
+    parts.next().is_none().then_some((source, target))
+}
+
 /// One line of `store.yaml`'s worth of state: the schema marker.
 ///
 /// **One version for the whole store, not one per file.** `projects.jsonl` and
@@ -957,6 +972,119 @@ impl Store {
         Ok(())
     }
 
+    /// The durable record that an agent move is in flight. Written before any
+    /// surgery, deleted after the last step; its presence is what makes an
+    /// interrupted move recoverable — it records **what** is moving, never how
+    /// far it got, because every surgery step is idempotent and recovery
+    /// re-drives the whole sequence.
+    ///
+    /// **This file is the sole recovery authority, and its lifecycle is
+    /// handled accordingly**: the write is atomic and durable (temp,
+    /// `sync_data`, rename, parent fsync — one validated record), the project
+    /// pair is encoded in the **filename** so a file whose *contents* are later
+    /// unreadable can still block the right two projects rather than failing
+    /// open, and a write error attempts durable removal of anything that
+    /// landed — an intent visible after a reported failure would execute at the
+    /// next launch a move the user was told failed. If that cleanup itself
+    /// fails, [`CoreError::MoveIntentResidue`] tells the caller to fall back to
+    /// the blocked-pair posture instead of releasing. (Deleting on error is
+    /// sound *here*, unlike `append_jsonl`'s general warning against rollback:
+    /// the write precedes all surgery, so the file is the only artifact.)
+    pub fn write_move_intent(&self, intent: &MoveIntent) -> Result<PathBuf> {
+        if intent.source_project == intent.target_project {
+            return Err(CoreError::InvalidMoveIntent {
+                path: self.root.join(MOVES_DIR),
+                reason: "source and target name the same project".to_owned(),
+            });
+        }
+        let dir = self.root.join(MOVES_DIR);
+        create_dir_all(&dir).map_err(|e| CoreError::io(&dir, e))?;
+        // One file per move, never a fixed name: the admission gate is
+        // per-project-pair and does not stop two moves across *different* pairs
+        // from being in flight across a crash boundary.
+        let path = dir.join(format!(
+            "{}--{}--{}.jsonl",
+            intent.source_project,
+            intent.target_project,
+            Uuid::now_v7()
+        ));
+        match crate::io::write_jsonl(&path, std::slice::from_ref(intent)) {
+            Ok(()) => Ok(path),
+            Err(write_err) => {
+                if path.exists() && crate::io::remove_file_durable(&path).is_err() {
+                    return Err(CoreError::MoveIntentResidue { path });
+                }
+                Err(write_err)
+            }
+        }
+    }
+
+    /// Every candidate intent file currently in `moves/` — paths only, no
+    /// parsing, so one unreadable file cannot hide the others. Recovery owns
+    /// the per-file policy; see `read_move_intent` for the validation.
+    pub fn list_move_intent_files(&self) -> Result<Vec<PathBuf>> {
+        let dir = self.root.join(MOVES_DIR);
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(CoreError::io(&dir, e)),
+        };
+        let mut files = Vec::new();
+        for entry in entries {
+            let path = entry.map_err(|e| CoreError::io(&dir, e))?.path();
+            // Skip only *temp* artifacts of our own atomic writer; every other
+            // file in this private directory is a candidate the caller must
+            // account for, never silently ignore.
+            if path.extension().is_some_and(|ext| ext == "jsonl") {
+                files.push(path);
+            }
+        }
+        files.sort();
+        Ok(files)
+    }
+
+    /// Read and fully validate one intent file: exactly one record, its ids
+    /// matching the filename, source ≠ target. Anything else is typed
+    /// corruption — an intent that cannot be trusted must never drive surgery,
+    /// and in particular a same-project intent would make the idempotent steps
+    /// *delete* the agent (the appends all no-op against the removals).
+    pub fn read_move_intent(&self, path: &Path) -> Result<MoveIntent> {
+        let records: Vec<MoveIntent> = crate::io::read_jsonl(path)?;
+        let [intent] = records.as_slice() else {
+            return Err(CoreError::InvalidMoveIntent {
+                path: path.to_owned(),
+                reason: format!("expected exactly one record, found {}", records.len()),
+            });
+        };
+        if intent.source_project == intent.target_project {
+            return Err(CoreError::InvalidMoveIntent {
+                path: path.to_owned(),
+                reason: "source and target name the same project".to_owned(),
+            });
+        }
+        match intent_pair_from_filename(path) {
+            Some((source, target))
+                if source == intent.source_project && target == intent.target_project =>
+            {
+                Ok(intent.clone())
+            }
+            _ => Err(CoreError::InvalidMoveIntent {
+                path: path.to_owned(),
+                reason: "filename does not match the recorded project pair".to_owned(),
+            }),
+        }
+    }
+
+    /// Convenience over the per-file API: every intent, all-or-error. Recovery
+    /// deliberately does **not** use this — it must keep going past one corrupt
+    /// file — but tests asserting "no intents remain" want the strict read.
+    pub fn list_move_intents(&self) -> Result<Vec<(PathBuf, MoveIntent)>> {
+        self.list_move_intent_files()?
+            .into_iter()
+            .map(|path| self.read_move_intent(&path).map(|intent| (path, intent)))
+            .collect()
+    }
+
     /// Best-effort "last activity" timestamp for a project, used to order the
     /// cross-directory project list by recency. Returns the later of the
     /// project's conversation-journal modification time and `fallback`
@@ -968,47 +1096,6 @@ impl Store {
     /// reflects *send* time, not the eventual response time, for a completed
     /// turn; that's close enough for ordering. A missing or unreadable journal
     /// (never-dispatched project) yields `fallback`.
-    /// The durable record that an agent move is in flight. Written before any
-    /// surgery, deleted after the last step; its presence is what makes an
-    /// interrupted move recoverable — it records **what** is moving, never how
-    /// far it got, because every surgery step is idempotent and recovery
-    /// re-drives the whole sequence.
-    pub fn write_move_intent(&self, intent: &MoveIntent) -> Result<PathBuf> {
-        let dir = self.root.join(MOVES_DIR);
-        create_dir_all(&dir).map_err(|e| CoreError::io(&dir, e))?;
-        // One file per move, never a fixed name: the admission gate is
-        // per-project-pair and does not stop two moves across *different* pairs
-        // from being in flight across a crash boundary.
-        let path = dir.join(format!("{}.jsonl", Uuid::now_v7()));
-        crate::io::append_jsonl(&path, intent)?;
-        Ok(path)
-    }
-
-    /// Every move intent currently on disk, with the file that holds it.
-    /// Recovery drains all of them. Fail-loud on a corrupt line, matching every
-    /// other Switchboard-owned JSONL: a move intent that cannot be read is a
-    /// repair case, not something to skip past silently.
-    pub fn list_move_intents(&self) -> Result<Vec<(PathBuf, MoveIntent)>> {
-        let dir = self.root.join(MOVES_DIR);
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err(CoreError::io(&dir, e)),
-        };
-        let mut intents = Vec::new();
-        for entry in entries {
-            let path = entry.map_err(|e| CoreError::io(&dir, e))?.path();
-            if path.extension().is_none_or(|ext| ext != "jsonl") {
-                continue;
-            }
-            let mut records: Vec<MoveIntent> = crate::io::read_jsonl(&path)?;
-            if let Some(intent) = records.pop() {
-                intents.push((path, intent));
-            }
-        }
-        Ok(intents)
-    }
-
     #[must_use]
     pub fn project_last_activity(&self, id: ProjectId, fallback: DateTime<Utc>) -> DateTime<Utc> {
         let journal = self.project_root(id).join(JOURNAL_FILE);

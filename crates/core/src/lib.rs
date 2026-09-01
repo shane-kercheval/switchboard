@@ -34,12 +34,13 @@ pub use error::{CoreError, Result};
 pub use harness::{HarnessKind, SelectionAxis};
 pub use ids::{DirectoryId, ProjectId};
 pub use io::{
-    append_jsonl, copy_file_durable, edit_yaml_mapping, read_jsonl, read_yaml, write_yaml,
+    append_jsonl, copy_file_durable, edit_yaml_mapping, read_jsonl, read_yaml, remove_file_durable,
+    write_yaml,
 };
 pub use journal::{JournalRecord, SendId};
 pub use pins::MessagePin;
 pub use project::{Project, ProjectConfig, ProjectSummary};
 pub use store::{
     DirectoryEntry, DirectoryResolution, MoveIntent, ProjectEntry, ResolvedProject, STORE_VERSION,
-    Store, StoreConfig,
+    Store, StoreConfig, intent_pair_from_filename,
 };

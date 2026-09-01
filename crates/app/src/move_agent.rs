@@ -65,6 +65,7 @@ pub(crate) enum MoveStep {
 pub(crate) async fn move_agent_impl(
     state: &AppState,
     agent_id: AgentId,
+    source_project: ProjectId,
     target_project: ProjectId,
     home_dir: &Path,
 ) -> Result<AgentRecord, AppError> {
@@ -81,6 +82,15 @@ pub(crate) async fn move_agent_impl(
         .map_err(|_| AppError::MoveInProgress)?;
 
     let (source, agent) = lookup_agent(state, agent_id)?;
+    // The caller declares where it believes the agent is, checked before the
+    // cold-target activation below — a stale request from an outdated view
+    // must not acquire the target's lock or load anything.
+    if source.id != source_project {
+        return Err(AppError::MoveSourceStale {
+            declared: source_project,
+            actual: source.id,
+        });
+    }
     if source.id == target_project {
         return Err(AppError::MoveSourceIsTarget);
     }
@@ -138,8 +148,25 @@ pub(crate) async fn move_agent_impl(
     };
     // A failed intent write drops `admission`, whose `Drop` un-marks both
     // projects — the by-value hand-off below is what makes that automatic, so
-    // do not change it to borrow.
-    let intent_path = state.store.write_move_intent(&intent)?;
+    // do not change it to borrow. The one exception: a write failure that may
+    // have left a *visible* intent the store could not remove. Released marks
+    // there would let the next launch execute a move the user was just told
+    // failed, so that specific error converts the admission into the sticky
+    // blocked-pair state instead — the same posture as a failed post-move
+    // deletion, because it is the same durable fact on disk.
+    let intent_path = match state.store.write_move_intent(&intent) {
+        Ok(path) => path,
+        Err(CoreError::MoveIntentResidue { path }) => {
+            return Err(block_pair_for_repair(
+                state,
+                admission.into_recovery_barrier(),
+                source.id,
+                target.id,
+                path,
+            ));
+        }
+        Err(other) => return Err(other.into()),
+    };
     let barrier = admission.into_recovery_barrier();
 
     let first_attempt = apply_move_steps(&state.store, &intent, home_dir, None);
@@ -155,31 +182,87 @@ pub(crate) async fn move_agent_impl(
             apply_move_steps(&state.store, &intent, home_dir, None)
         }
     };
+    finish_move(
+        state,
+        barrier,
+        source.id,
+        target.id,
+        intent_path,
+        agent_id,
+        outcome,
+    )
+}
+
+/// Settle a move whose surgery has run: on success, cache the adopted record
+/// and durably clear the intent **before** releasing the pair — a leftover
+/// intent is only a harmless no-op while the store never changes again; after
+/// a second move or an agent delete, its replay fails and wrongly
+/// repair-blocks a healthy pair. Any other outcome blocks exactly this pair.
+fn finish_move(
+    state: &AppState,
+    barrier: crate::commands::MoveRecoveryBarrier,
+    source: ProjectId,
+    target: ProjectId,
+    intent_path: PathBuf,
+    agent_id: AgentId,
+    outcome: Result<Option<AgentRecord>, AppError>,
+) -> Result<AgentRecord, AppError> {
     match outcome {
         Ok(Some(adopted)) => {
             lock(&state.agents_by_id).insert(agent_id, adopted.clone());
-            remove_intent_file(&intent_path);
+            if let Err(e) = switchboard_core::remove_file_durable(&intent_path) {
+                tracing::error!(error = %e, intent = %intent_path.display(),
+                    "completed move's intent record could not be removed — blocking the pair");
+                return Err(block_pair_for_repair(
+                    state,
+                    barrier,
+                    source,
+                    target,
+                    intent_path,
+                ));
+            }
             barrier.release();
             Ok(adopted)
         }
         // `stop_after` was `None`, so the surgery always reaches adoption.
         Ok(None) => unreachable!("a full surgery pass always yields the adopted record"),
-        Err(second) => {
-            // Recovery failed too: exactly these two projects stay blocked
-            // (dropping `barrier` keeps the marks — it has no auto-release),
-            // with the refusal upgraded to name the intent file. Everything
-            // else keeps working; the next launch retries.
-            tracing::error!(error = %second, intent = %intent_path.display(),
+        Err(failure) => {
+            tracing::error!(error = %failure, intent = %intent_path.display(),
                 "agent move recovery failed — blocking both projects until repaired");
-            let mut repairs = lock(&state.move_repairs);
-            repairs.insert(source.id, intent_path.clone());
-            repairs.insert(target.id, intent_path.clone());
-            drop(barrier);
-            Err(AppError::MoveRepairRequired {
-                project_id: source.id,
-                intent: intent_path,
-            })
+            Err(block_pair_for_repair(
+                state,
+                barrier,
+                source,
+                target,
+                intent_path,
+            ))
         }
+    }
+}
+
+/// Leave exactly this pair blocked with the repair story: keep the sticky
+/// barrier's marks (dropping it releases nothing — that is its design), record
+/// the intent file each refusal will name, and hand back the error the caller
+/// returns. Everything else keeps working; the next launch retries.
+fn block_pair_for_repair(
+    state: &AppState,
+    barrier: crate::commands::MoveRecoveryBarrier,
+    source: ProjectId,
+    target: ProjectId,
+    intent: PathBuf,
+) -> AppError {
+    let mut repairs = lock(&state.move_repairs);
+    let block = crate::state::MoveBlock {
+        intent: intent.clone(),
+        deferred: false,
+    };
+    repairs.insert(source, block.clone());
+    repairs.insert(target, block);
+    drop(repairs);
+    drop(barrier);
+    AppError::MoveRepairRequired {
+        project_id: source,
+        intent,
     }
 }
 
@@ -187,55 +270,125 @@ pub(crate) async fn move_agent_impl(
 /// interrupted moves before any project can open. Call during startup, before
 /// the first command can run; on a fresh launch nothing is open, so recovery
 /// cannot race a user action.
+///
+/// **Per-file, fail-closed per pair.** One unreadable intent must not abandon
+/// the others (that would let *their* half-moved pairs open and accept work),
+/// and a file whose contents cannot be trusted still blocks the two projects
+/// its **filename** names. A file whose name doesn't parse gets one more
+/// chance at attribution through its body — the realistic path there is a sync
+/// tool duplicating a real intent under a mangled name — and is blocked by
+/// that pair if it parses. Only a file yielding neither is logged loudly and
+/// left in place: it is not a file this app ever writes (the naming scheme
+/// ships with the feature; note it becomes a compatibility surface if the
+/// format ever changes), filenames do not corrupt the way contents do, and
+/// blocking the whole app over an alien file would trade a contained failure
+/// for a total one — the plan's blast-radius rule is "exactly the two named
+/// projects, never the whole app".
 pub(crate) fn recover_pending_moves_at_startup(state: &AppState, home_dir: &Path) {
-    let intents = match state.store.list_move_intents() {
-        Ok(intents) => intents,
+    let files = match state.store.list_move_intent_files() {
+        Ok(files) => files,
         Err(e) => {
-            tracing::error!(error = %e, "could not read pending move intents — recovery skipped");
+            tracing::error!(error = %e,
+                "cannot enumerate pending move intents — interrupted moves will not be recovered this launch");
             return;
         }
     };
-    for (path, intent) in intents {
-        // Same cross-process rule as the move itself: both projects'
-        // `instance.lock`s before any file is touched. Held elsewhere → defer
-        // without touching files; the pair stays blocked locally and the next
-        // launch retries. Roots are store-relative, so no directory resolution
-        // is needed to lock.
-        let locks: Result<Vec<_>, _> = [intent.source_project, intent.target_project]
-            .into_iter()
-            .map(|id| acquire_project_lock(id, &state.store.project_root(id)))
-            .collect();
-        let outcome = locks
-            .and_then(|_held| apply_move_steps(&state.store, &intent, home_dir, None).map(|_| ()));
-        match outcome {
-            Ok(()) => remove_intent_file(&path),
-            Err(e) => {
-                tracing::error!(error = %e, intent = %path.display(),
-                    "move recovery failed at startup — blocking both projects until repaired");
-                let mut marks = lock(&state.maintenance);
-                marks.insert(intent.source_project);
-                marks.insert(intent.target_project);
-                drop(marks);
-                let mut repairs = lock(&state.move_repairs);
-                repairs.insert(intent.source_project, path.clone());
-                repairs.insert(intent.target_project, path.clone());
+    for path in files {
+        match state.store.read_move_intent(&path) {
+            Ok(intent) => recover_one(state, &path, &intent, home_dir),
+            Err(read_err) => {
+                let attributed = switchboard_core::intent_pair_from_filename(&path).or_else(|| {
+                    // Body fallback: a raw parse without the filename cross-check.
+                    switchboard_core::read_jsonl::<switchboard_core::store::MoveIntent>(&path)
+                        .ok()
+                        .and_then(|records| match records.as_slice() {
+                            [one] if one.source_project != one.target_project => {
+                                Some((one.source_project, one.target_project))
+                            }
+                            _ => None,
+                        })
+                });
+                match attributed {
+                    Some((source, target)) => {
+                        tracing::error!(error = %read_err, intent = %path.display(),
+                            "untrusted move intent — blocking its project pair until repaired");
+                        block_pair_at_startup(state, source, target, &path, false);
+                    }
+                    None => {
+                        tracing::error!(error = %read_err, intent = %path.display(),
+                            "unattributable file in the move-intent directory — ignored; \
+                             remove it by hand if it is not yours");
+                    }
+                }
             }
         }
     }
 }
 
-/// Best-effort: the marks are already released by the time this runs, and a
-/// leftover intent is re-driven as a no-op at next launch, which then deletes
-/// it. Never worth failing a completed move over.
-fn remove_intent_file(path: &Path) {
-    if let Err(e) = std::fs::remove_file(path)
-        && e.kind() != std::io::ErrorKind::NotFound
-    {
-        tracing::warn!(path = %path.display(), error = %e, "completed move's intent file not deleted");
+/// One intent: acquire both projects' `instance.lock`s, re-drive the surgery,
+/// durably remove the intent. Any failure blocks exactly this pair — as a
+/// *deferral* when the cause is another process holding a lock (their store is
+/// healthy; closing the other instance and relaunching is the whole fix), as a
+/// repair otherwise.
+fn recover_one(state: &AppState, path: &Path, intent: &MoveIntent, home_dir: &Path) {
+    let locks: Result<Vec<_>, _> = [intent.source_project, intent.target_project]
+        .into_iter()
+        .map(|id| acquire_project_lock(id, &state.store.project_root(id)))
+        .collect();
+    let deferred = matches!(&locks, Err(AppError::ProjectLocked(_)));
+    let outcome = locks.and_then(|_held| {
+        apply_move_steps(&state.store, intent, home_dir, None)?;
+        switchboard_core::remove_file_durable(path).map_err(AppError::from)
+    });
+    match outcome {
+        Ok(()) => {}
+        Err(e) if deferred => {
+            tracing::warn!(error = %e, intent = %path.display(),
+                "move recovery deferred — a project is open in another Switchboard process; \
+                 retrying at next launch");
+            block_pair_at_startup(
+                state,
+                intent.source_project,
+                intent.target_project,
+                path,
+                true,
+            );
+        }
+        Err(e) => {
+            tracing::error!(error = %e, intent = %path.display(),
+                "move recovery failed at startup — blocking both projects until repaired");
+            block_pair_at_startup(
+                state,
+                intent.source_project,
+                intent.target_project,
+                path,
+                false,
+            );
+        }
     }
 }
 
-/// The surgery: steps (a)–(g) in commit order — appends before rewrites,
+fn block_pair_at_startup(
+    state: &AppState,
+    source: ProjectId,
+    target: ProjectId,
+    intent: &Path,
+    deferred: bool,
+) {
+    let mut marks = lock(&state.maintenance);
+    marks.insert(source);
+    marks.insert(target);
+    drop(marks);
+    let block = crate::state::MoveBlock {
+        intent: intent.to_owned(),
+        deferred,
+    };
+    let mut repairs = lock(&state.move_repairs);
+    repairs.insert(source, block.clone());
+    repairs.insert(target, block);
+}
+
+/// The surgery: steps (a)/// The surgery: steps (a)–(g) in commit order — appends before rewrites,
 /// target before source. Every step is a no-op when already applied, so
 /// recovery re-drives the whole sequence from any interruption point. Returns
 /// the adopted record (always `Some` when `stop_after` is `None`).
@@ -248,6 +401,17 @@ pub(crate) fn apply_move_steps(
     home_dir: &Path,
     stop_after: Option<MoveStep>,
 ) -> Result<Option<AgentRecord>, AppError> {
+    // The write and read paths both validate this, and it is re-checked here
+    // because this function is what a corrupt record ultimately reaches: with
+    // source == target every append no-ops ("already there") while every
+    // removal fires, silently erasing the agent. Surgery from an untrusted
+    // instruction is the one thing recovery must never do.
+    if intent.source_project == intent.target_project {
+        return Err(AppError::Core(CoreError::InvalidMoveIntent {
+            path: store.root().join("moves"),
+            reason: "source and target name the same project".to_owned(),
+        }));
+    }
     let source = store.open_project(intent.source_project)?;
     let target = store.open_project(intent.target_project)?;
     let agent_id = intent.agent_id;
@@ -326,13 +490,16 @@ pub(crate) fn apply_move_steps(
         return Ok(Some(adopted));
     }
 
-    // (g) Remove the source sidecars. Missing is the re-drive.
+    // (g) Remove the source sidecars — durably, and failure propagates like
+    // every other step's (recovery then retries it; swallowing it here would
+    // report a move as equivalent-to-uninterrupted while leaving files behind).
+    // Durable because of the final ordering: this deletion precedes the
+    // intent's own durable removal, and a crash that persisted the intent
+    // deletion but lost this one would resurrect a stale sidecar with nothing
+    // left to re-drive — which a later move *back* would then read as
+    // already-copied, silently reverting the agent's metadata.
     for (src, _dst) in sidecar_pairs(&source, &target, agent_id) {
-        if let Err(e) = std::fs::remove_file(&src)
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            tracing::warn!(path = %src.display(), error = %e, "moved agent's source sidecar not deleted");
-        }
+        switchboard_core::remove_file_durable(&src)?;
     }
     Ok(Some(adopted))
 }
@@ -984,7 +1151,20 @@ pub(crate) mod tests {
         assert_eq!(restarted.store.list_move_intents().unwrap().len(), 1);
         assert!(lock(&restarted.maintenance).contains(&f.source.id));
         assert!(lock(&restarted.maintenance).contains(&f.target.id));
-        assert!(lock(&restarted.move_repairs).contains_key(&f.source.id));
+        let block = lock(&restarted.move_repairs)
+            .get(&f.source.id)
+            .cloned()
+            .expect("block recorded");
+        assert!(
+            block.deferred,
+            "a healthy hold-elsewhere is a deferral, never a repair"
+        );
+        let refusal = crate::commands::reject_if_under_maintenance(&restarted, f.source.id)
+            .expect_err("the blocked project refuses work");
+        assert!(
+            matches!(refusal, AppError::MoveDeferredElsewhere { .. }),
+            "the user hears about their other instance, not about damage: {refusal:?}"
+        );
         drop(other);
     }
 
@@ -1099,9 +1279,15 @@ mod semantics_tests {
         assert!(pre.is_ok(), "pre-move send failed: {pre:?}");
         wait_for_idle(&state, f.mover.id).await;
 
-        let adopted = move_agent_impl(&state, f.mover.id, f.target.id, f.claude_home.path())
-            .await
-            .expect("move should succeed");
+        let adopted = move_agent_impl(
+            &state,
+            f.mover.id,
+            f.source.id,
+            f.target.id,
+            f.claude_home.path(),
+        )
+        .await
+        .expect("move should succeed");
 
         assert_eq!(adopted.project_id, f.target.id);
         assert_eq!(
@@ -1179,9 +1365,15 @@ mod semantics_tests {
             },
         );
 
-        let err = move_agent_impl(&state, f.mover.id, f.target.id, f.claude_home.path())
-            .await
-            .expect_err("an active run must refuse the move");
+        let err = move_agent_impl(
+            &state,
+            f.mover.id,
+            f.source.id,
+            f.target.id,
+            f.claude_home.path(),
+        )
+        .await
+        .expect_err("an active run must refuse the move");
 
         assert!(
             matches!(err, AppError::ProjectNotQuiescent { .. }),
@@ -1207,9 +1399,15 @@ mod semantics_tests {
         activate_project(&state, f.source.clone()).unwrap();
 
         let _held = state.move_mutex.try_lock().unwrap();
-        let err = move_agent_impl(&state, f.mover.id, f.target.id, f.claude_home.path())
-            .await
-            .expect_err("the mutex must refuse a concurrent move");
+        let err = move_agent_impl(
+            &state,
+            f.mover.id,
+            f.source.id,
+            f.target.id,
+            f.claude_home.path(),
+        )
+        .await
+        .expect_err("the mutex must refuse a concurrent move");
         assert!(matches!(err, AppError::MoveInProgress), "got {err:?}");
     }
 
@@ -1228,9 +1426,15 @@ mod semantics_tests {
         };
         append_jsonl(&f.target.registry_path, &resident).unwrap();
 
-        let err = move_agent_impl(&state, f.mover.id, f.target.id, f.claude_home.path())
-            .await
-            .expect_err("a canonical name collision must refuse the move");
+        let err = move_agent_impl(
+            &state,
+            f.mover.id,
+            f.source.id,
+            f.target.id,
+            f.claude_home.path(),
+        )
+        .await
+        .expect_err("a canonical name collision must refuse the move");
 
         assert!(
             matches!(&err, AppError::Core(CoreError::DuplicateAgentName { .. })),
@@ -1267,9 +1471,15 @@ mod semantics_tests {
         let f = seeded(&state, &dirs);
         activate_project(&state, f.source.clone()).unwrap();
 
-        let err = move_agent_impl(&state, f.mover.id, f.source.id, f.claude_home.path())
-            .await
-            .expect_err("moving into the same project is meaningless");
+        let err = move_agent_impl(
+            &state,
+            f.mover.id,
+            f.source.id,
+            f.source.id,
+            f.claude_home.path(),
+        )
+        .await
+        .expect_err("moving into the same project is meaningless");
         assert!(matches!(err, AppError::MoveSourceIsTarget), "got {err:?}");
     }
 
@@ -1286,9 +1496,15 @@ mod semantics_tests {
         let _other = acquire_project_lock(f.target.id, &state.store.project_root(f.target.id))
             .expect("simulated other process");
 
-        let err = move_agent_impl(&state, f.mover.id, f.target.id, f.claude_home.path())
-            .await
-            .expect_err("a target held elsewhere must refuse");
+        let err = move_agent_impl(
+            &state,
+            f.mover.id,
+            f.source.id,
+            f.target.id,
+            f.claude_home.path(),
+        )
+        .await
+        .expect_err("a target held elsewhere must refuse");
 
         assert!(
             matches!(err, AppError::ProjectLocked(id) if id == f.target.id),
@@ -1315,9 +1531,15 @@ mod semantics_tests {
         let dst = switchboard_harness::meta_sidecar::meta_sidecar_path(&f.target.root, f.mover.id);
         std::fs::create_dir_all(&dst).unwrap();
 
-        let err = move_agent_impl(&state, f.mover.id, f.target.id, f.claude_home.path())
-            .await
-            .expect_err("a poisoned target must fail the move");
+        let err = move_agent_impl(
+            &state,
+            f.mover.id,
+            f.source.id,
+            f.target.id,
+            f.claude_home.path(),
+        )
+        .await
+        .expect_err("a poisoned target must fail the move");
 
         assert!(
             matches!(err, AppError::MoveRepairRequired { .. }),
@@ -1446,9 +1668,15 @@ mod semantics_tests {
             .collect();
         std::fs::write(&catalog, kept.join("\n") + "\n").unwrap();
 
-        let err = move_agent_impl(&state, f.mover.id, f.target.id, f.claude_home.path())
-            .await
-            .expect_err("an unresolvable target directory must refuse");
+        let err = move_agent_impl(
+            &state,
+            f.mover.id,
+            f.source.id,
+            f.target.id,
+            f.claude_home.path(),
+        )
+        .await
+        .expect_err("an unresolvable target directory must refuse");
 
         assert!(
             matches!(err, AppError::Core(CoreError::DirectoryNotFound(_))),
@@ -1555,5 +1783,459 @@ mod semantics_tests {
             Some(f.source.directory.as_path()),
             "the home recorded by the first move survives the second"
         );
+    }
+}
+
+#[cfg(test)]
+mod protocol_tests {
+    use std::sync::Arc;
+
+    use switchboard_core::{CoreError, append_jsonl};
+    use switchboard_harness::MockScenario;
+    use tempfile::TempDir;
+    use uuid::Uuid;
+
+    use super::tests::*;
+    use super::*;
+    use crate::state::AppState;
+
+    fn state_with_scenario(root: &Path, scenario: MockScenario) -> AppState {
+        let mock: std::sync::Arc<dyn switchboard_harness::HarnessAdapter> = std::sync::Arc::new(
+            switchboard_harness::MockHarnessAdapter::with_scenario(scenario),
+        );
+        let emitter = std::sync::Arc::new(switchboard_dispatcher::RecordingEmitter::new());
+        AppState::new_for_test_at(
+            root,
+            std::sync::Arc::clone(&mock),
+            std::sync::Arc::clone(&mock),
+            mock,
+            emitter as std::sync::Arc<dyn switchboard_dispatcher::EventEmitter>,
+        )
+    }
+
+    /// A corrupt intent must not abandon recovery of the others: the valid one
+    /// completes, the corrupt one blocks exactly its own filename-named pair.
+    #[test]
+    fn a_corrupt_intent_blocks_its_pair_without_abandoning_the_valid_one() {
+        let root = TempDir::new().unwrap();
+        let dirs_a = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let dirs_b = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let (fa, fb);
+        {
+            let state = state_at(root.path());
+            fa = seeded(&state, &dirs_a);
+            fb = seeded(&state, &dirs_b);
+            let corrupt = state.store.write_move_intent(&fa.intent).unwrap();
+            std::fs::write(&corrupt, "{not json}\n").unwrap();
+            state.store.write_move_intent(&fb.intent).unwrap();
+            apply_move_steps(
+                &state.store,
+                &fb.intent,
+                fb.claude_home.path(),
+                Some(MoveStep::Sidecars),
+            )
+            .unwrap();
+        }
+        let restarted = state_at(root.path());
+        recover_pending_moves_at_startup(&restarted, fb.claude_home.path());
+
+        assert_fully_moved(&fb);
+        assert!(lock(&restarted.maintenance).contains(&fa.intent.source_project));
+        assert!(lock(&restarted.maintenance).contains(&fa.intent.target_project));
+        assert!(
+            !lock(&restarted.maintenance).contains(&fb.intent.source_project),
+            "the valid move's pair is released"
+        );
+        assert_eq!(
+            restarted.store.list_move_intent_files().unwrap().len(),
+            1,
+            "the corrupt file stays for repair; the recovered one is gone"
+        );
+    }
+
+    /// A same-project intent is refused as corruption everywhere it could
+    /// enter, and startup recovery leaves every artifact of the agent intact.
+    #[test]
+    fn a_same_project_intent_is_refused_and_deletes_nothing() {
+        let root = TempDir::new().unwrap();
+        let dirs = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let f;
+        let poisoned_path;
+        {
+            let state = state_at(root.path());
+            f = seeded(&state, &dirs);
+            let bad = MoveIntent {
+                agent_id: f.mover.id,
+                source_project: f.source.id,
+                target_project: f.source.id,
+            };
+            assert!(
+                matches!(
+                    state.store.write_move_intent(&bad),
+                    Err(CoreError::InvalidMoveIntent { .. })
+                ),
+                "the write refuses it outright"
+            );
+            // Corruption can't come through the writer — plant it by hand under
+            // a well-formed name so the filename check passes and the semantic
+            // check is what fires.
+            let dir = state.store.root().join("moves");
+            std::fs::create_dir_all(&dir).unwrap();
+            poisoned_path = dir.join(format!(
+                "{}--{}--{}.jsonl",
+                f.source.id,
+                f.source.id,
+                Uuid::now_v7()
+            ));
+            append_jsonl(&poisoned_path, &bad).unwrap();
+            assert!(
+                matches!(
+                    state.store.read_move_intent(&poisoned_path),
+                    Err(CoreError::InvalidMoveIntent { .. })
+                ),
+                "the read refuses it"
+            );
+            assert!(
+                matches!(
+                    apply_move_steps(&state.store, &bad, f.claude_home.path(), None),
+                    Err(AppError::Core(CoreError::InvalidMoveIntent { .. }))
+                ),
+                "the surgery refuses it even if handed the value directly"
+            );
+        }
+        let journal_before = std::fs::read(f.source.journal_path()).unwrap();
+        let restarted = state_at(root.path());
+        recover_pending_moves_at_startup(&restarted, f.claude_home.path());
+
+        assert_eq!(
+            std::fs::read(f.source.journal_path()).unwrap(),
+            journal_before,
+            "nothing was rewritten"
+        );
+        assert_eq!(f.source.list_agents().unwrap().len(), 2, "no row deleted");
+        assert!(!pins::read_pins(&f.source.pins_path()).unwrap().is_empty());
+        assert!(
+            switchboard_harness::meta_sidecar::meta_sidecar_path(&f.source.root, f.mover.id)
+                .is_file(),
+            "sidecar untouched"
+        );
+        assert!(lock(&restarted.maintenance).contains(&f.source.id));
+        assert!(poisoned_path.is_file(), "the corrupt file stays for repair");
+    }
+
+    /// Zero records, two records, and a filename/body mismatch are all typed
+    /// corruption, never silently skipped or last-record-wins.
+    #[test]
+    fn intent_files_require_exactly_one_record_matching_their_name() {
+        let root = TempDir::new().unwrap();
+        let state = state_at(root.path());
+        let dirs = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let f = seeded(&state, &dirs);
+        let dir = state.store.root().join("moves");
+        std::fs::create_dir_all(&dir).unwrap();
+        let named = |source: ProjectId, target: ProjectId| {
+            dir.join(format!("{source}--{target}--{}.jsonl", Uuid::now_v7()))
+        };
+
+        let empty = named(f.source.id, f.target.id);
+        std::fs::write(&empty, "").unwrap();
+        let doubled = named(f.source.id, f.target.id);
+        append_jsonl(&doubled, &f.intent).unwrap();
+        append_jsonl(&doubled, &f.intent).unwrap();
+        let mismatched = named(f.target.id, f.source.id);
+        append_jsonl(&mismatched, &f.intent).unwrap();
+
+        for path in [&empty, &doubled, &mismatched] {
+            assert!(
+                matches!(
+                    state.store.read_move_intent(path),
+                    Err(CoreError::InvalidMoveIntent { .. })
+                ),
+                "{} must be typed corruption",
+                path.display()
+            );
+        }
+    }
+
+    /// A completed recovery whose intent record cannot be removed keeps the
+    /// pair blocked rather than releasing — a leftover intent replayed after
+    /// later store changes would repair-block a healthy pair at some future
+    /// launch, so "done but couldn't clear the trigger" is not done.
+    #[test]
+    fn an_undeletable_intent_after_recovery_keeps_the_pair_blocked() {
+        let root = TempDir::new().unwrap();
+        let dirs = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let f;
+        {
+            let state = state_at(root.path());
+            f = seeded(&state, &dirs);
+            state.store.write_move_intent(&f.intent).unwrap();
+            apply_move_steps(
+                &state.store,
+                &f.intent,
+                f.claude_home.path(),
+                Some(MoveStep::Pins),
+            )
+            .unwrap();
+        }
+        // The intent stays readable but undeletable: its directory refuses
+        // writes.
+        let moves_dir = root.path().join("moves");
+        let mut perms = std::fs::metadata(&moves_dir).unwrap().permissions();
+        let writable = perms.clone();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o555);
+        std::fs::set_permissions(&moves_dir, perms).unwrap();
+
+        let restarted = state_at(root.path());
+        recover_pending_moves_at_startup(&restarted, f.claude_home.path());
+        std::fs::set_permissions(&moves_dir, writable).unwrap();
+
+        assert_fully_moved(&f);
+        assert!(
+            lock(&restarted.maintenance).contains(&f.source.id)
+                && lock(&restarted.maintenance).contains(&f.target.id),
+            "the pair stays blocked while the trigger cannot be cleared"
+        );
+        let block = lock(&restarted.move_repairs)
+            .get(&f.source.id)
+            .cloned()
+            .expect("repair recorded");
+        assert!(
+            !block.deferred,
+            "an undeletable trigger is a failure, not a deferral"
+        );
+    }
+
+    /// A failed intent write refuses the move cleanly: marks released, no file
+    /// left behind, retry possible immediately.
+    #[tokio::test]
+    async fn a_failed_intent_write_refuses_cleanly_with_nothing_left_behind() {
+        let root = TempDir::new().unwrap();
+        let state = state_at(root.path());
+        let dirs = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let f = seeded(&state, &dirs);
+        activate_project(&state, f.source.clone()).unwrap();
+        let moves_dir = root.path().join("moves");
+        std::fs::create_dir_all(&moves_dir).unwrap();
+        let mut perms = std::fs::metadata(&moves_dir).unwrap().permissions();
+        let writable = perms.clone();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o555);
+        std::fs::set_permissions(&moves_dir, perms).unwrap();
+
+        let err = move_agent_impl(
+            &state,
+            f.mover.id,
+            f.source.id,
+            f.target.id,
+            f.claude_home.path(),
+        )
+        .await
+        .expect_err("an unwritable intent directory must refuse the move");
+        std::fs::set_permissions(&moves_dir, writable).unwrap();
+
+        assert!(
+            !matches!(err, AppError::MoveRepairRequired { .. }),
+            "got {err:?}"
+        );
+        assert!(lock(&state.maintenance).is_empty(), "marks released");
+        assert!(state.store.list_move_intent_files().unwrap().is_empty());
+        assert_eq!(f.source.list_agents().unwrap().len(), 2, "nothing moved");
+    }
+
+    /// In-flight work refuses the move with the agent-named reason — using the
+    /// mock's hold-open scenario, which keeps a turn running until signalled.
+    #[tokio::test]
+    async fn a_move_is_refused_while_the_agents_turn_is_in_flight() {
+        let root = TempDir::new().unwrap();
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let state = state_with_scenario(
+            root.path(),
+            MockScenario::CompletesOnSignal(Arc::clone(&gate)),
+        );
+        let dirs = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let f = seeded(&state, &dirs);
+        activate_project(&state, f.source.clone()).unwrap();
+
+        crate::commands::send_message_impl(
+            &state,
+            f.bystander.id,
+            "long running",
+            Vec::new(),
+            Uuid::now_v7(),
+            f.claude_home.path(),
+        )
+        .await
+        .expect("send should start");
+        wait_until_busy(&state, f.bystander.id).await;
+
+        let err = move_agent_impl(
+            &state,
+            f.mover.id,
+            f.source.id,
+            f.target.id,
+            f.claude_home.path(),
+        )
+        .await
+        .expect_err("a running turn in the source must refuse the move");
+
+        assert!(
+            matches!(&err, AppError::ProjectNotQuiescent { reason, .. } if reason.contains("bystander")),
+            "the refusal names the busy agent, got {err:?}"
+        );
+        assert!(lock(&state.maintenance).is_empty(), "nothing left marked");
+        assert!(state.store.list_move_intent_files().unwrap().is_empty());
+
+        // Release the turn; once idle the same move succeeds — the refusal was
+        // about the work, not the agent.
+        gate.notify_one();
+        wait_for_idle(&state, f.bystander.id).await;
+        move_agent_impl(
+            &state,
+            f.mover.id,
+            f.source.id,
+            f.target.id,
+            f.claude_home.path(),
+        )
+        .await
+        .expect("the same move succeeds once the project is idle");
+    }
+
+    /// Queued work counts as pending too: a send waiting behind a held turn
+    /// refuses the move just like the running one.
+    #[tokio::test]
+    async fn a_move_is_refused_while_a_send_is_queued_behind_a_running_turn() {
+        let root = TempDir::new().unwrap();
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let state = state_with_scenario(
+            root.path(),
+            MockScenario::CompletesOnSignal(Arc::clone(&gate)),
+        );
+        let dirs = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let f = seeded(&state, &dirs);
+        activate_project(&state, f.source.clone()).unwrap();
+
+        for prompt in ["held", "queued behind it"] {
+            crate::commands::send_message_impl(
+                &state,
+                f.bystander.id,
+                prompt,
+                Vec::new(),
+                Uuid::now_v7(),
+                f.claude_home.path(),
+            )
+            .await
+            .expect("send should be accepted");
+        }
+        wait_until_busy(&state, f.bystander.id).await;
+
+        let err = move_agent_impl(
+            &state,
+            f.mover.id,
+            f.source.id,
+            f.target.id,
+            f.claude_home.path(),
+        )
+        .await
+        .expect_err("queued work must refuse the move");
+        assert!(
+            matches!(err, AppError::ProjectNotQuiescent { .. }),
+            "got {err:?}"
+        );
+
+        gate.notify_one();
+        gate.notify_one();
+        wait_for_idle(&state, f.bystander.id).await;
+    }
+
+    async fn wait_until_busy(state: &AppState, agent_id: AgentId) {
+        for _ in 0..200 {
+            if state.dispatcher.has_pending_work(agent_id).await {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("agent never became busy");
+    }
+
+    async fn wait_for_idle(state: &AppState, agent_id: AgentId) {
+        for _ in 0..300 {
+            if !state.dispatcher.has_pending_work(agent_id).await {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("agent never went idle");
+    }
+
+    /// A stale request naming a source the agent has since left is refused
+    /// before the target is locked or loaded.
+    #[tokio::test]
+    async fn a_stale_declared_source_is_refused_without_touching_the_target() {
+        let root = TempDir::new().unwrap();
+        let state = state_at(root.path());
+        let dirs = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let f = seeded(&state, &dirs);
+        activate_project(&state, f.source.clone()).unwrap();
+        let wrong_source = Uuid::now_v7();
+
+        let err = move_agent_impl(
+            &state,
+            f.mover.id,
+            wrong_source,
+            f.target.id,
+            f.claude_home.path(),
+        )
+        .await
+        .expect_err("a stale declared source must refuse");
+
+        assert!(
+            matches!(err, AppError::MoveSourceStale { declared, actual }
+                if declared == wrong_source && actual == f.source.id),
+            "got {err:?}"
+        );
+        assert!(
+            !lock(&state.projects).contains_key(&f.target.id),
+            "the target was never activated"
+        );
+        assert!(state.store.list_move_intent_files().unwrap().is_empty());
+    }
+
+    /// Non-Claude agents never get a session home, composed through a real
+    /// cross-directory move.
+    #[test]
+    fn a_cross_directory_move_of_a_codex_agent_stamps_no_home() {
+        let root = TempDir::new().unwrap();
+        let state = state_at(root.path());
+        let dirs = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let f = seeded(&state, &dirs);
+        let codex = AgentRecord {
+            harness: HarnessKind::Codex,
+            session_locator: Some(switchboard_core::SessionLocator::Codex {
+                thread_id: "thread-1".to_owned(),
+                partition_date: "2026-08-31".parse().unwrap(),
+            }),
+            ..claude_record(f.source.id, "coder", Uuid::now_v7())
+        };
+        let codex = AgentRecord {
+            session_locator: Some(switchboard_core::SessionLocator::Codex {
+                thread_id: "thread-1".to_owned(),
+                partition_date: "2026-08-31".parse().unwrap(),
+            }),
+            ..codex
+        };
+        append_jsonl(&f.source.registry_path, &codex).unwrap();
+        let intent = MoveIntent {
+            agent_id: codex.id,
+            source_project: f.source.id,
+            target_project: f.target.id,
+        };
+        state.store.write_move_intent(&intent).unwrap();
+
+        let adopted = apply_move_steps(&state.store, &intent, f.claude_home.path(), None)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(adopted.session_home, None);
+        assert_eq!(adopted.harness, HarnessKind::Codex);
     }
 }

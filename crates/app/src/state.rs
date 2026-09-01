@@ -19,6 +19,17 @@ use crate::notification::{Notifier, NullNotifier};
 use crate::preferences::{self, Preferences};
 use crate::workspace::{self, Workspace};
 
+/// Why a project is blocked by the move machinery, and the intent file
+/// involved. Distinguished because the two ask different things of the user:
+/// a failure means the store needs repairing; a deferral means their *other*
+/// Switchboard process has the project open and closing it plus a relaunch is
+/// the whole fix.
+#[derive(Debug, Clone)]
+pub struct MoveBlock {
+    pub intent: PathBuf,
+    pub deferred: bool,
+}
+
 /// A live workflow run's in-memory handle. The on-disk `runs/<run-id>.jsonl` is
 /// the durable record (and the only thing that survives a crash); this registry
 /// is the live mirror that lets the app cancel a run, list active runs, and
@@ -455,12 +466,13 @@ pub struct AppState {
     /// files are covered by the two projects' `instance.lock`s and the harness
     /// session by the session lock.
     pub move_mutex: tokio::sync::Mutex<()>,
-    /// Projects blocked by a move whose recovery failed, mapped to the intent
-    /// file a repair would start from. Entries here are also in `maintenance`
-    /// (which is what actually refuses work); this map only upgrades the
-    /// refusal to a repair-required error naming the file. Never cleared in
-    /// process — a failed recovery retries at next launch.
-    pub move_repairs: Mutex<HashMap<ProjectId, PathBuf>>,
+    /// Projects blocked by a move that could not complete, mapped to what
+    /// blocks them. Entries here are also in `maintenance` (which is what
+    /// actually refuses work); this map only upgrades the refusal to the right
+    /// story — genuine damage needing repair, or a healthy deferral because
+    /// another Switchboard process holds the project. Never cleared in process;
+    /// the next launch retries.
+    pub move_repairs: Mutex<HashMap<ProjectId, MoveBlock>>,
 
     /// Fires OS notifications on a workflow run's completion/failure (suppressed
     /// when the window is focused). Defaults to a no-op; production injects the

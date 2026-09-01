@@ -1359,14 +1359,16 @@ async fn load_transcript(
 async fn move_agent(
     state: State<'_, AppState>,
     agent_id: String,
+    source_project_id: String,
     target_project_id: String,
 ) -> Result<AgentRecord, String> {
     let agent_id = parse_uuid(&agent_id).map_err(|e| e.to_string())?;
+    let source = parse_uuid(&source_project_id).map_err(|e| e.to_string())?;
     let target = parse_uuid(&target_project_id).map_err(|e| e.to_string())?;
     let home = std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_default();
-    crate::move_agent::move_agent_impl(state.inner(), agent_id, target, &home)
+    crate::move_agent::move_agent_impl(state.inner(), agent_id, source, target, &home)
         .await
         .map_err(|e| e.to_string())
 }

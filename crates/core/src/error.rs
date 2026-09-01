@@ -200,6 +200,22 @@ pub enum CoreError {
     #[error("agent {0} carries fork-parent provenance but no parent session")]
     ForkProvenanceWithoutParent(crate::agent::AgentId),
 
+    /// A move-intent file that cannot be trusted: wrong record count, ids that
+    /// contradict its filename, or a same-project pair. Never drives surgery —
+    /// the affected projects are blocked for repair instead.
+    #[error("move intent at {path} is invalid ({reason}) — refusing to act on it")]
+    InvalidMoveIntent { path: PathBuf, reason: String },
+
+    /// A move-intent write failed **and** the file it may have left behind
+    /// could not be durably removed. The caller must treat the pair as blocked:
+    /// releasing would let the next launch execute a move the user was told
+    /// failed.
+    #[error(
+        "a failed move left its intent record at {path} and it could not be removed \
+         — the affected projects stay blocked until it is repaired"
+    )]
+    MoveIntentResidue { path: PathBuf },
+
     /// A move tried to adopt an agent into a project that already holds a
     /// *different* record under that `agent_id`.
     ///

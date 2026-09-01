@@ -195,6 +195,29 @@ pub fn copy_file_durable(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Delete a file durably: unlink, then fsync the parent directory so the
+/// removal survives a crash. A missing file is success (the deletion's
+/// re-drive). Reach for this only where a *resurrected* file would be read as
+/// truthful state by a later pass — a move-intent file, whose existence is
+/// itself the recovery trigger, or a source sidecar, whose resurrection would
+/// satisfy a later move-back's already-copied check and silently revert the
+/// agent's metadata. An ordinary deletion whose re-appearance is healed by an
+/// idempotent re-drive does not need this.
+pub fn remove_file_durable(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(CoreError::io(path, e)),
+    }
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        File::open(parent)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|e| CoreError::io(parent, e))?;
+    }
+    Ok(())
+}
+
 pub fn read_yaml<T: DeserializeOwned>(path: &Path) -> Result<T> {
     let bytes = std::fs::read(path).map_err(|e| CoreError::io(path, e))?;
     serde_norway::from_slice(&bytes).map_err(|source| CoreError::CorruptYaml {

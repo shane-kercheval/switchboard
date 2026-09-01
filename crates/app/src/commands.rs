@@ -349,14 +349,20 @@ pub(crate) fn reject_if_under_maintenance(
     project_id: ProjectId,
 ) -> Result<(), AppError> {
     if lock(&state.maintenance).contains(&project_id) {
-        // A mark left by a failed move recovery upgrades to the repair error,
-        // so the user learns what is actually wrong (and which intent file a
-        // repair starts from) instead of a generic "briefly under maintenance"
-        // that never ends.
-        if let Some(intent) = lock(&state.move_repairs).get(&project_id) {
+        // A mark left by the move machinery upgrades to the right story —
+        // damage needing repair, or a healthy deferral because another
+        // Switchboard process holds the project — instead of a generic
+        // "briefly under maintenance" that never ends.
+        if let Some(block) = lock(&state.move_repairs).get(&project_id) {
+            if block.deferred {
+                return Err(AppError::MoveDeferredElsewhere {
+                    project_id,
+                    intent: block.intent.clone(),
+                });
+            }
             return Err(AppError::MoveRepairRequired {
                 project_id,
-                intent: intent.clone(),
+                intent: block.intent.clone(),
             });
         }
         return Err(AppError::ProjectUnderMaintenance(project_id));

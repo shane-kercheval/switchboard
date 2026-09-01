@@ -112,6 +112,7 @@ impl ProjectDispatchFactoryProvider {
                     maintenance: Arc::clone(&state.maintenance),
                     project_generation: Arc::clone(&state.project_generation),
                     generation_at_capture: generation,
+                    preferences: Arc::clone(&state.preferences),
                 },
             );
             factories.insert(

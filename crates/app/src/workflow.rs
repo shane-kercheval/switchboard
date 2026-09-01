@@ -771,7 +771,9 @@ mod tests {
             _: chrono::DateTime<Utc>,
         ) {
         }
-        fn record_link(&self, _: TurnId, _: AgentId, _: &str, _: chrono::DateTime<Utc>) {}
+        fn record_link(&self, _: TurnId, _: AgentId, _: &str, _: chrono::DateTime<Utc>) -> bool {
+            true
+        }
     }
 
     /// Per-agent factory: vends the agent's next mock scenario each turn (the actor

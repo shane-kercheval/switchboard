@@ -185,6 +185,14 @@ impl HarnessAdapter for CodexAdapter {
         crate::subprocess::apply_path_env(&mut command);
         #[cfg(unix)]
         command.process_group(0);
+        // The cancel path's identity-recovery freshness anchor. Captured
+        // BEFORE the spawn — the guard's invariant is "Codex writes this
+        // turn's `task_started` after our spawn", so anchoring any later
+        // (e.g. at `run_producer` entry, behind task scheduling) would compare
+        // against an instant after the event the invariant rests on. Raw
+        // instant; the millisecond flooring lives in `tail_turn_is_fresh`
+        // so the comparison subtlety is unit-testable in one place.
+        let dispatched_at = Utc::now();
         let mut child = command.spawn().map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 DispatchError::BinaryNotFound
@@ -220,6 +228,7 @@ impl HarnessAdapter for CodexAdapter {
             cwd.to_owned(),
             force_session_meta,
             options.cancel_token,
+            dispatched_at,
         ));
 
         Ok(Box::pin(UnboundedReceiverStream::new(rx)))
@@ -324,6 +333,7 @@ async fn run_producer(
     cwd: PathBuf,
     force_session_meta: bool,
     cancel_token: CancellationToken,
+    dispatched_at: chrono::DateTime<Utc>,
 ) {
     let stderr_tail: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::with_capacity(
         crate::subprocess::STDERR_TAIL_CAPACITY,
@@ -578,6 +588,71 @@ async fn run_producer(
         // (Codex exits 0 on SIGTERM, so neither would be meaningful here).
         crate::subprocess::terminate_then_kill(&mut child).await;
         let _ = stderr_task.await;
+        // Codex never surfaces its durable per-turn id in the exec stream —
+        // the normal path recovers it from the session file at post-terminal
+        // enrichment, which cancellation skips. Without this, every cancelled
+        // turn permanently lacks a `TurnLink` and its on-disk partial content
+        // correlates only by the merge's text-matching fallback. So read the
+        // (now-stable — the process is dead) rollout file here and surface the
+        // key as `TurnIdentity`; the dispatcher journals the link from it
+        // before synthesizing `Cancelled` (its drain still runs — the
+        // synthesized terminal comes only after this stream closes).
+        //
+        // **Freshness guard (load-bearing on resume).** The file's resident
+        // `current_turn_id` belongs to whatever turn last wrote `turn_context`.
+        // On a resumed session cancelled before THIS turn's `task_started`
+        // flushed (~the first second), that is the *previous* dispatch — and
+        // journaling its key against this send would conflict with the
+        // previous turn's own link, poisoning the key in the merge and
+        // permanently destroying a good link. So the key is trusted only when
+        // the tail turn provably started at or after this dispatch
+        // (`task_started` timestamp vs the pre-spawn `dispatched_at` anchor).
+        // Same-machine wall-clock ordering is the same assumption the merge's
+        // dispatch-window guards already rest on; the accepted residual is a
+        // backward clock step larger than the gap since the previous turn —
+        // whose worst case is the bounded poison path, never a mis-group. A
+        // false reject (or a cancel before `turn_context` landed) yields no
+        // key and no event — the shipped text-matching fallback covers it.
+        //
+        // Latency: this parse runs on the interactive cancel path, delaying
+        // the synthesized `Cancelled` by a full rollout parse (the same cost
+        // the normal terminal already pays) plus up to 400ms of locate
+        // retries; the synchronous parse also occupies a Tokio worker for its
+        // duration (pre-existing on normal completion). Accepted as
+        // imperceptible today; `spawn_blocking` is the remedy if cancel
+        // feedback ever becomes user-visibly slow.
+        let locator = prior.as_ref().or(captured.as_ref());
+        if let Some(loc) = locator {
+            let enrichment = session_file::load_with_retry(
+                &home_dir,
+                loc.partition_date,
+                &loc.thread_id,
+                &TokioSleeper,
+            )
+            .await;
+            if let Some(key) = enrichment.current_turn_id {
+                if enrichment.current_turn_started_at.is_none() {
+                    // Breadcrumb, placed at the one consumer of the freshness
+                    // proof (never in the parser, which runs on every
+                    // enrichment read where freshness is unconsulted): a key
+                    // exists, so a recovery was otherwise possible, but the
+                    // tail `task_started` carried no parseable timestamp. No
+                    // legitimate trigger in valid data — Codex stamps every
+                    // record — so a firing means the format moved and
+                    // cancel-path identity recovery is silently disabled.
+                    tracing::warn!(
+                        agent_id = %agent_id,
+                        %turn_id,
+                        "Codex cancel-path identity recovery: tail task_started has no parseable timestamp — cannot prove turn freshness; no link for this cancelled turn"
+                    );
+                } else if tail_turn_is_fresh(enrichment.current_turn_started_at, dispatched_at) {
+                    let _ = tx.send(AdapterEvent::TurnIdentity {
+                        turn_id,
+                        message_id: key,
+                    });
+                }
+            }
+        }
         return;
     }
 
@@ -949,11 +1024,59 @@ fn synthesize_truncation_turn_end(
     }
 }
 
+/// Whether the session file's tail turn provably belongs to this dispatch:
+/// its `task_started` timestamp is at or after the pre-spawn dispatch anchor.
+/// Owns the **millisecond flooring** of the anchor so the whole comparison is
+/// unit-testable in one place — Codex records millisecond-precision
+/// timestamps while `Utc::now()` is finer, so a `task_started` written
+/// microseconds after the anchor truncates *below* it and would fail a raw
+/// `>=`. Flooring the anchor (never the record) is the permissive direction:
+/// it admits the same-millisecond case without opening a false accept — a
+/// stale tail turn is separated from a new dispatch by a full turn, not a
+/// millisecond. Concretely: anchor `…00.456700Z` floors to `…00.456Z`; a
+/// `task_started` at `…00.456Z` is fresh, at `…00.455Z` is stale; `None`
+/// (no `task_started`, or an unparseable timestamp) is stale — fail-closed.
+fn tail_turn_is_fresh(
+    started: Option<chrono::DateTime<Utc>>,
+    dispatched_at: chrono::DateTime<Utc>,
+) -> bool {
+    started.is_some_and(|s| s >= chrono::SubsecRound::trunc_subsecs(dispatched_at, 3))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const RESUME_THREAD_ID: &str = "019e2c5f-aaaa-7000-8000-000000000001";
+
+    /// Fixed-clock pins for `tail_turn_is_fresh` — the flooring direction and
+    /// the equality boundary are exactly what a later "simplification" (drop
+    /// the truncation, or flip `>=` to `>`) would break, and without these
+    /// the breakage surfaces as an intermittent sub-millisecond flake in the
+    /// integration tests instead of a red unit test.
+    #[test]
+    fn tail_turn_freshness_admits_the_same_millisecond() {
+        let dispatched: chrono::DateTime<Utc> = "2026-01-01T12:00:00.456700Z".parse().unwrap();
+        let same_ms: chrono::DateTime<Utc> = "2026-01-01T12:00:00.456Z".parse().unwrap();
+        assert!(
+            tail_turn_is_fresh(Some(same_ms), dispatched),
+            "a task_started in the anchor's own millisecond is fresh — the flooring exists to admit it"
+        );
+    }
+
+    #[test]
+    fn tail_turn_freshness_rejects_the_prior_millisecond_and_none() {
+        let dispatched: chrono::DateTime<Utc> = "2026-01-01T12:00:00.456700Z".parse().unwrap();
+        let prior_ms: chrono::DateTime<Utc> = "2026-01-01T12:00:00.455Z".parse().unwrap();
+        assert!(
+            !tail_turn_is_fresh(Some(prior_ms), dispatched),
+            "one millisecond before the floored anchor is stale"
+        );
+        assert!(
+            !tail_turn_is_fresh(None, dispatched),
+            "no timestamp is stale — fail-closed"
+        );
+    }
 
     fn codex_test_agent() -> AgentRecord {
         AgentRecord {

@@ -239,6 +239,9 @@ struct RecordingJournal {
     sends: Mutex<Vec<(TurnId, String, Vec<Attachment>)>>,
     outcomes: Mutex<Vec<(TurnId, TurnOutcome)>>,
     links: Mutex<Vec<(TurnId, String)>>,
+    /// Number of upcoming `record_link` calls to fail (report not-persisted,
+    /// record nothing). Drives the early-write-fails → terminal-retry test.
+    link_failures_remaining: Mutex<u32>,
 }
 
 impl ConversationJournal for RecordingJournal {
@@ -275,11 +278,17 @@ impl ConversationJournal for RecordingJournal {
         _agent_id: AgentId,
         hydration_key: &str,
         _at: DateTime<Utc>,
-    ) {
+    ) -> bool {
+        let mut failures = self.link_failures_remaining.lock().unwrap();
+        if *failures > 0 {
+            *failures -= 1;
+            return false;
+        }
         self.links
             .lock()
             .unwrap()
             .push((turn_id, hydration_key.to_owned()));
+        true
     }
 }
 
@@ -371,7 +380,9 @@ impl ConversationJournal for FailingJournal {
         _: DateTime<Utc>,
     ) {
     }
-    fn record_link(&self, _: TurnId, _: AgentId, _: &str, _: DateTime<Utc>) {}
+    fn record_link(&self, _: TurnId, _: AgentId, _: &str, _: DateTime<Utc>) -> bool {
+        true
+    }
 }
 
 /// Records every captured locator the dispatcher persists, so tests can assert
@@ -2391,6 +2402,163 @@ async fn cancelled_turn_writes_no_link() {
         journal.outcomes.lock().unwrap().len(),
         1,
         "only the cancelled outcome is written"
+    );
+}
+
+#[tokio::test]
+async fn mid_turn_identity_writes_the_link_early_and_terminal_does_not_duplicate() {
+    // The Claude shape: `TurnIdentity` announces the key mid-stream and the
+    // terminal repeats it. The link must be journaled at the identity (so a
+    // mid-turn conversation re-read already finds it) and exactly once — the
+    // terminal's matching key must not append a second record.
+    let (journal, turn_id) = run_keyed_terminal(MockScenario::IdentityThenTerminalWithKey {
+        message_id: "msg_early01".to_owned(),
+    })
+    .await;
+    let links = journal.links.lock().unwrap();
+    assert_eq!(
+        *links,
+        vec![(turn_id, "msg_early01".to_owned())],
+        "exactly one link, from the mid-turn identity"
+    );
+    assert!(
+        journal.outcomes.lock().unwrap().is_empty(),
+        "a completed turn writes no outcome"
+    );
+}
+
+#[tokio::test]
+async fn early_link_write_failure_is_retried_at_the_terminal() {
+    // `record_link` is best-effort but reports persistence. An early write
+    // that fails must NOT mark the link done — the terminal carries the same
+    // key and is the natural retry. Blindly marking it written would forfeit
+    // that second chance and lose the link for good.
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let journal = Arc::new(RecordingJournal::default());
+    // The first record_link call (the early one) fails; the send write is
+    // unaffected (separate method).
+    *journal.link_failures_remaining.lock().unwrap() = 1;
+    let agent = agent_record();
+    let factory = TestFactory::new(
+        MockScenario::IdentityThenTerminalWithKey {
+            message_id: "msg_retry01".to_owned(),
+        },
+        agent.clone(),
+        Arc::clone(&emitter),
+        Arc::clone(&journal) as Arc<dyn ConversationJournal>,
+    );
+    dispatcher
+        .send_message(
+            agent.id,
+            "hi",
+            vec![],
+            Uuid::now_v7(),
+            factory,
+            OnBusy::Enqueue,
+        )
+        .await;
+    within(
+        &emitter,
+        "agent_idle",
+        emitter.wait_for_type("agent_idle", 1),
+    )
+    .await;
+    let turn_id = extract_turn_id(
+        &emitter
+            .snapshot()
+            .iter()
+            .find(|(_, v)| event_type(v) == "turn_start")
+            .expect("a turn_start")
+            .1,
+    );
+    assert_eq!(
+        *journal.links.lock().unwrap(),
+        vec![(turn_id, "msg_retry01".to_owned())],
+        "the terminal retries the failed early write — exactly one persisted link"
+    );
+}
+
+#[tokio::test]
+async fn conflicting_terminal_key_keeps_the_early_link_and_writes_no_second() {
+    // Early and terminal keys come from one adapter field, so disagreement is
+    // a contract violation. Policy: the persisted early link is authoritative;
+    // the terminal writes nothing (two different keys naming one send is not a
+    // poison-detectable conflict — a second link would be resolved silently
+    // and arbitrarily by claim-once). This pins the single-write behavior;
+    // the accompanying tracing::warn is deliberately not asserted here.
+    let (journal, turn_id) = run_keyed_terminal(MockScenario::IdentityThenConflictingTerminalKey {
+        identity_key: "msg_early02".to_owned(),
+        terminal_key: "msg_conflict02".to_owned(),
+    })
+    .await;
+    assert_eq!(
+        *journal.links.lock().unwrap(),
+        vec![(turn_id, "msg_early02".to_owned())],
+        "only the early link persists; the conflicting terminal key is declined"
+    );
+}
+
+#[tokio::test]
+async fn cancelled_turn_with_late_identity_writes_the_link() {
+    // The Codex cancel shape: the adapter recovers the turn's durable id from
+    // the session file after the kill and emits `TurnIdentity` during the
+    // post-cancel drain, before the stream ends. The dispatcher must journal
+    // the link from it — the synthesized `Cancelled` terminal never can — so
+    // the cancelled turn's on-disk partial content correlates by key instead
+    // of permanently depending on the merge's text-matching fallback.
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let journal = Arc::new(RecordingJournal::default());
+    let agent = agent_record();
+    let factory = TestFactory::new(
+        MockScenario::CancelsWithLateIdentity {
+            message_id: "codex-turn-key-01".to_owned(),
+        },
+        agent.clone(),
+        Arc::clone(&emitter),
+        Arc::clone(&journal) as Arc<dyn ConversationJournal>,
+    );
+    dispatcher
+        .send_message(
+            agent.id,
+            "task",
+            vec![],
+            Uuid::now_v7(),
+            factory,
+            OnBusy::Enqueue,
+        )
+        .await;
+    within(
+        &emitter,
+        "turn_start",
+        emitter.wait_for_type("turn_start", 1),
+    )
+    .await;
+    dispatcher.cancel(agent.id, CancelSource::User);
+    within(
+        &emitter,
+        "agent_idle",
+        emitter.wait_for_type("agent_idle", 1),
+    )
+    .await;
+    let turn_id = extract_turn_id(
+        &emitter
+            .snapshot()
+            .iter()
+            .find(|(_, v)| event_type(v) == "turn_start")
+            .expect("a turn_start")
+            .1,
+    );
+    assert_eq!(
+        *journal.links.lock().unwrap(),
+        vec![(turn_id, "codex-turn-key-01".to_owned())],
+        "the post-cancel identity journals the cancelled turn's link"
+    );
+    assert_eq!(
+        journal.outcomes.lock().unwrap().len(),
+        1,
+        "the cancelled outcome is still written"
     );
 }
 

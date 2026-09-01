@@ -566,6 +566,108 @@ fn session_meta_model(events: &[AdapterEvent]) -> Option<String> {
     })
 }
 
+/// The `mcp_servers` names of the first `SessionMeta` in an event stream.
+fn session_meta_mcp_names(events: &[AdapterEvent]) -> Vec<String> {
+    events
+        .iter()
+        .find_map(|e| match e {
+            AdapterEvent::SessionMeta { mcp_servers, .. } => {
+                Some(mcp_servers.iter().map(|s| s.name.clone()).collect())
+            }
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+#[ignore = "requires claude installed — run with: make test-live"]
+async fn live_claude_chrome_flag_toggles_browser_tools() {
+    // `--chrome` / `--no-chrome` still mean what we think to the installed CLI.
+    // This is the contract Switchboard's browser-access preference rests on, and
+    // it is exactly the kind of thing a CLI release can rename or drop.
+    //
+    // **One agent, three turns.** Turn 1 creates the session; turns 2 and 3
+    // `--resume` it. That is deliberate: every turn after an agent's first is a
+    // resume, so a CLI that latched the browser capability at session creation
+    // and ignored the flag thereafter would break the feature's headline
+    // behavior — flip the toggle, the agent's next message honors it — while a
+    // fresh-session-only test stayed green.
+    //
+    // Deliberately asserts only that the flag is *honored*. It does NOT require
+    // Chrome to be running, the extension to be installed, or a browser to be
+    // paired: with the extension removed the server still loads and still
+    // reports itself connected (that status describes the local MCP server
+    // process, not the browser). So this runs on any machine with a logged-in
+    // `claude`, and stays about the flag rather than about someone's browser.
+    // See docs/research/claude-chrome-extension.md.
+    let adapter = ClaudeCodeAdapter::new();
+    let agent = live_agent();
+    let prompt = "Reply with the single word 'ack'.";
+
+    let chrome_servers = |events: &[AdapterEvent]| -> bool {
+        session_meta_mcp_names(events)
+            .iter()
+            .any(|n| n == "claude-in-chrome")
+    };
+
+    let dispatch = |chrome: bool| {
+        let adapter = &adapter;
+        let agent = &agent;
+        async move {
+            let stream = adapter
+                .dispatch(
+                    agent,
+                    Path::new("/tmp"),
+                    prompt,
+                    Uuid::now_v7(),
+                    DispatchOptions {
+                        chrome_integration: chrome,
+                        ..DispatchOptions::default()
+                    },
+                )
+                .await
+                .expect("dispatch should succeed with real claude");
+            stream.collect::<Vec<AdapterEvent>>().await
+        }
+    };
+
+    // Turn 1 — creates the session (`--session-id`), browser tools off.
+    let first = dispatch(false).await;
+    assert!(
+        !chrome_servers(&first),
+        "--no-chrome must not attach the browser server; got {:?}",
+        session_meta_mcp_names(&first)
+    );
+
+    // Turn 2 — RESUMES that session with the flag flipped on.
+    let on = dispatch(true).await;
+    assert!(
+        chrome_servers(&on),
+        "--chrome must attach claude-in-chrome on a RESUMED session; got {:?}",
+        session_meta_mcp_names(&on)
+    );
+    let tools = on
+        .iter()
+        .find_map(|e| match e {
+            AdapterEvent::SessionMeta { tools, .. } => Some(tools.clone()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    assert!(
+        tools.iter().any(|t| t.contains("claude-in-chrome")),
+        "--chrome must expose browser tools on resume; got {tools:?}"
+    );
+
+    // Turn 3 — resumes again with it back off, so the capability is provably
+    // not latched on for the rest of the session once granted.
+    let off = dispatch(false).await;
+    assert!(
+        !chrome_servers(&off),
+        "--no-chrome must remove browser tools again on a RESUMED session; got {:?}",
+        session_meta_mcp_names(&off)
+    );
+}
+
 #[tokio::test]
 #[ignore = "requires claude installed — run with: make test-live"]
 async fn live_claude_model_and_effort_dispatch() {

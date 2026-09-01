@@ -105,7 +105,7 @@ impl ConversationJournal for ProjectJournal {
         agent_id: AgentId,
         hydration_key: &str,
         at: DateTime<Utc>,
-    ) {
+    ) -> bool {
         let record = JournalRecord::TurnLink {
             send_id: self.send_id,
             turn_id,
@@ -114,13 +114,19 @@ impl ConversationJournal for ProjectJournal {
             at,
         };
         // Best-effort: a lost link just drops this turn to positional correlation
-        // in the merge; the turn already produced content, so never fail it.
-        if let Err(e) = switchboard_core::journal::append_record(&self.journal_path, &record) {
-            tracing::warn!(
-                %agent_id,
-                error = %e,
-                "failed to journal turn link — turn proceeds; merge falls back to positional correlation for it"
-            );
+        // in the merge; the turn already produced content, so never fail it. The
+        // returned success signal lets the dispatcher retry an early write at
+        // the terminal instead of marking it done blind.
+        match switchboard_core::journal::append_record(&self.journal_path, &record) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(
+                    %agent_id,
+                    error = %e,
+                    "failed to journal turn link — turn proceeds; merge falls back to positional correlation for it"
+                );
+                false
+            }
         }
     }
 }
@@ -133,15 +139,19 @@ mod tests {
     /// Best-effort contract: a failing link write must not panic or propagate —
     /// the turn already produced content, so it just drops to positional. The
     /// path's parent doesn't exist, so `append_record` errors; `record_link`
-    /// must swallow it. (`record_link` returns `()`, so the type already forbids
-    /// failing the turn; this guards the impl against a future `unwrap`.)
+    /// must swallow it AND report `false`, so the dispatcher knows the early
+    /// write didn't land and retries at the terminal.
     #[test]
-    fn record_link_swallows_write_errors() {
+    fn record_link_swallows_write_errors_and_reports_not_persisted() {
         let journal = ProjectJournal::new(
             PathBuf::from("/nonexistent-dir-xyz/journal.jsonl"),
             Uuid::now_v7(),
         );
-        journal.record_link(Uuid::now_v7(), Uuid::now_v7(), "msg_first", Utc::now());
-        // Reaching here (no panic) is the assertion.
+        let persisted =
+            journal.record_link(Uuid::now_v7(), Uuid::now_v7(), "msg_first", Utc::now());
+        assert!(
+            !persisted,
+            "a swallowed write error must read as not-persisted"
+        );
     }
 }

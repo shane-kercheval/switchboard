@@ -29,6 +29,7 @@ use crate::emitter::SessionMetaObservingEmitter;
 use crate::journal::ProjectJournal;
 use crate::locator_sink::ProjectSessionLocatorSink;
 use crate::metadata::ProjectMetadataCache;
+use crate::preferences::Preferences;
 use crate::state::lock;
 
 pub struct ProjectDispatchContextFactory {
@@ -80,6 +81,9 @@ pub struct ProjectDispatchContextFactory {
     /// together.
     project_generation: Arc<Mutex<HashMap<ProjectId, u64>>>,
     generation_at_capture: u64,
+    /// User-global preferences, read live at `build()` so the browser-tools
+    /// toggle takes effect on an agent's next turn.
+    preferences: Arc<Mutex<Preferences>>,
 }
 
 /// The app-wide handles every dispatch context needs, grouped so the factory's
@@ -111,6 +115,8 @@ pub struct DispatchDeps {
     /// [`ProjectDispatchContextFactory`] for why the distinction is the whole
     /// point.
     pub generation_at_capture: u64,
+    /// Read live per dispatch (browser-tools toggle), never frozen at enqueue.
+    pub preferences: Arc<Mutex<Preferences>>,
 }
 
 impl ProjectDispatchContextFactory {
@@ -131,6 +137,7 @@ impl ProjectDispatchContextFactory {
             maintenance,
             project_generation,
             generation_at_capture,
+            preferences,
         } = deps;
         Self {
             project,
@@ -147,6 +154,7 @@ impl ProjectDispatchContextFactory {
             maintenance,
             project_generation,
             generation_at_capture,
+            preferences,
         }
     }
 
@@ -371,8 +379,13 @@ impl DispatchContextFactory for ProjectDispatchContextFactory {
         // Read (don't drain) the attach-flow flag *now* — the per-dispatch
         // emitter decorator clears it iff a `session_meta` event is observed.
         let is_first_dispatch_after_attach = lock(&self.needs_session_meta).contains(&agent_id);
+        // Live-read for the same reason as the two above: a send queued before
+        // the user flipped the browser-tools toggle should dispatch under the
+        // setting in force when it *runs*, not when it was enqueued.
+        let chrome_integration = lock(&self.preferences).claude_chrome_enabled;
         let options = DispatchOptions {
             is_first_dispatch_after_attach,
+            chrome_integration,
             // The dispatcher overwrites `cancel_token` with the turn's token.
             ..Default::default()
         };

@@ -2032,17 +2032,29 @@ pub fn get_preferences_impl(state: &AppState) -> Preferences {
 /// reflects the change even if the write fails. A `None` path (no resolvable
 /// config location — tests/exotic host) updates memory only.
 ///
-/// **The `preferences` guard is held across the file write** (the one place we
-/// hold a state lock across I/O). `write_yaml` uses a fixed `<file>.tmp`, so two
-/// unserialized saves would race on that temp file and could corrupt
-/// `config.yaml`. Serializing here is safe and clearer than routing through
-/// `registry_write`: `preferences` is a singleton touched only by get/set, the
-/// write is a tiny YAML file on an explicit user action, and nothing
-/// latency-sensitive waits behind it. See the lock-order note in `state.rs`.
+/// **The `preferences` guard is released before the file write**, so nothing
+/// that reads preferences waits on I/O. That matters because dispatch reads them:
+/// `ProjectDispatchContextFactory::build` samples the browser-tools preference
+/// live for every turn, and holding the guard across a write would park a
+/// starting turn behind a `config.yaml` save.
+///
+/// What serializes the write is `switchboard_core`'s process-wide
+/// `YAML_EDIT_LOCK`, which `preferences::save` takes via `edit_yaml_mapping` —
+/// **not** this guard, which never could: the other co-owner of `config.yaml`
+/// is the prompt service's `add_mcp_provider`, in a different crate, which
+/// doesn't know `AppState` exists. So the fixed-`<file>.tmp` collision and the
+/// cross-subsystem key clobbering are both handled a layer down.
+///
+/// What's given up: under two concurrent saves, memory ends at the last writer
+/// while disk ends at whichever won `YAML_EDIT_LOCK`, so the two can disagree.
+/// Unreachable in practice — the frontend chains saves through a single tail
+/// (`saveTail`, `preferences.svelte.ts`) in a single webview.
 pub fn set_preferences_impl(state: &AppState, prefs: &Preferences) -> Result<(), AppError> {
     let normalized = prefs.clone().normalized();
-    let mut guard = lock(&state.preferences);
-    guard.clone_from(&normalized);
+    {
+        let mut guard = lock(&state.preferences);
+        guard.clone_from(&normalized);
+    }
     let Some(path) = state.preferences_path.as_ref() else {
         return Ok(());
     };
@@ -4059,6 +4071,7 @@ pub async fn send_message_impl(
             maintenance: Arc::clone(&state.maintenance),
             project_generation: Arc::clone(&state.project_generation),
             generation_at_capture: generation,
+            preferences: Arc::clone(&state.preferences),
         },
     ));
     // Last point before the hand-off: refuse if the project moved under us while
@@ -5797,8 +5810,12 @@ fn classify_turns_by_provenance(
         .collect()
 }
 
-/// Assign sends to surplus-case candidates by **exact dispatched text**, keeping
+/// Assign sends to candidate prompts by **exact dispatched text**, keeping
 /// the assignment monotonic (a later send never takes an earlier candidate).
+/// Two call sites: the provenance classifier's surplus arm (candidates
+/// outnumber sends), and the count path's identity pre-pass in
+/// [`classify_residual`] (any candidate/send ratio — the count walk has no
+/// other signal to align on).
 ///
 /// Returns `candidate turn index → send`. A send with no matching candidate, or
 /// with more than one, is left out entirely: an ambiguous match is a coin flip
@@ -5811,7 +5828,13 @@ fn classify_turns_by_provenance(
 /// user's clean prompt plus its attachments; the harness receives — and records —
 /// `render_prompt_with_attachments` of the two, then the Claude adapter's
 /// transport rule ([`switchboard_harness::claude_transport_prompt`]). Both forms
-/// are accepted, so this stays correct without a harness branch here. Note this
+/// are accepted, so this stays correct without a harness branch here. Both
+/// forms apply to **all** harnesses deliberately — as of the count path's
+/// identity join that includes `Unknown` (Codex and other non-Claude) records,
+/// a broadening chosen over threading harness identity into the merge: the
+/// acceptance is a permissive OR, and a false match would require a non-Claude
+/// harness to record the Claude-transformed spelling of a send's prompt,
+/// in-window and uniquely. Note this
 /// binds correlation to a *versioned rendering format*: if the attachment footer
 /// ever changes shape, historical sends stop reconstructing. That degradation is
 /// contained by design — no match means no assignment, which renders the echo
@@ -5879,7 +5902,7 @@ fn align_surplus_candidates(
                 %send_id,
                 ?send_at,
                 ?previous_send_at,
-                "send instants are not strictly increasing; surplus dispatch windows overlap"
+                "send instants are not strictly increasing; dispatch windows overlap"
             );
         }
         previous_send_at = Some(send_at);
@@ -5895,11 +5918,15 @@ fn align_surplus_candidates(
         // enforces — `[send.at, next_send.at)` — so the two correlation paths
         // agree on what "caused by this send" means instead of one silently
         // being looser.
+        // Window before text: the integer comparisons reject every
+        // out-of-window candidate before any string is touched, which keeps
+        // the uniqueness proof (the scan past the first match) cheap on the
+        // count path's every-load usage.
         let mut matches = candidates[floor..].iter().filter(|&&i| {
             recorded(i).is_some_and(|(text, at)| {
-                (text == dispatched || text == transported)
-                    && at >= send_at
+                at >= send_at
                     && next_send_at.is_none_or(|next| at < next)
+                    && (text == dispatched || text == transported)
             })
         });
         let (Some(&only), None) = (matches.next(), matches.next()) else {
@@ -5928,13 +5955,15 @@ fn align_surplus_candidates(
 /// completed turn. A user turn is dropped (journal owns it) exactly when it
 /// corresponds to a send: one *with* a reply iff that reply is journaled; a *dangling*
 /// (reply-less) one while `dangling_journaled` = sends-minus-journaled-replies remain.
-/// Two positional edges persist, both confined to the discouraged pattern of running
-/// the bare CLI on a session Switchboard is also driving, and both pinned by
-/// characterization tests: a send cancelled before its prompt was recorded makes
-/// `dangling_journaled` overcount by one; and two reply-less dangling sources are
-/// order-ambiguous (an imported dangling prompt before a journaled one is dropped and
-/// the journaled one duplicated). The durable key-join dissolves these for any turn
-/// that carries a link.
+/// One positional edge persists, confined to the discouraged pattern of running
+/// the bare CLI on a session Switchboard is also driving, and pinned by a
+/// characterization test: a send cancelled before its prompt was recorded makes
+/// `dangling_journaled` overcount by one (no recorded text, so the identity join
+/// upstream cannot claim it either). The former second edge — two reply-less
+/// dangling sources being order-ambiguous — is resolved by the identity join
+/// ([`commit_identity_join`]) whenever the journaled prompt's text reconstructs;
+/// only a reconstruction/ambiguity decline reaches this walk with it intact. The
+/// durable key-join dissolves both for any turn that carries a link.
 fn classify_turns_by_count(
     turns: &[&switchboard_harness::Turn],
     all_sends: &[SendId],
@@ -6214,6 +6243,15 @@ fn classify_agent_turns(
 /// where an imported bare-CLI turn between a claimed send and a later unclaimed send
 /// was mis-classified as journaled and duplicated the later prompt. Inert for
 /// keyless/legacy agents (no claims ⇒ unclaimed == all sends ⇒ boundary unchanged).
+///
+/// The count path runs an **identity join first** (exact dispatched text inside
+/// the send's dispatch window, unique match only — the prompt and its send
+/// claimed at the match, the reply attached only with adjacency and window
+/// evidence), then the count walk over what identity left unclaimed — see
+/// [`commit_identity_join`] for why position alone duplicates a prompt whenever
+/// the residual mixes eras (old link-less sends + an in-flight turn with no
+/// `TurnLink` yet). The provenance path is untouched: its ordered walk already
+/// consumes by slot, and its surplus arm already does this identity matching.
 fn classify_residual(
     turns: &[&switchboard_harness::Turn],
     all_sends: &[SendId],
@@ -6221,23 +6259,6 @@ fn classify_residual(
     send_windows: &SendWindows,
     journal_start: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Vec<TurnRender> {
-    let agent_turn_count = turns
-        .iter()
-        .copied()
-        .filter(|t| matches!(t, switchboard_harness::Turn::Agent { .. }))
-        .count();
-    let turn_offset = match journal_start {
-        Some(start) => turns
-            .iter()
-            .copied()
-            .filter(|t| {
-                matches!(t, switchboard_harness::Turn::Agent { started_at, .. } if *started_at < start)
-            })
-            .count(),
-        None => agent_turn_count,
-    };
-    let journaled_replies = agent_turn_count - turn_offset;
-    let dangling_journaled = all_sends.len().saturating_sub(journaled_replies);
     let has_known_provenance = turns.iter().copied().any(|t| {
         matches!(t, switchboard_harness::Turn::User { source, .. }
             if *source != switchboard_harness::UserPromptSource::Unknown)
@@ -6250,16 +6271,180 @@ fn classify_residual(
         })
     });
     if has_known_provenance && !ambiguous_unknown {
-        classify_turns_by_provenance(turns, all_sends, send_prompts, send_windows, journal_start)
-    } else {
-        classify_turns_by_count(
+        return classify_turns_by_provenance(
             turns,
             all_sends,
-            turn_offset,
-            dangling_journaled,
-            agent_turn_count,
-        )
+            send_prompts,
+            send_windows,
+            journal_start,
+        );
     }
+
+    let (mut renders, resolved, claimed) =
+        commit_identity_join(turns, all_sends, send_prompts, send_windows, journal_start);
+
+    // Count walk over what identity left unclaimed, with every count — and the
+    // pre-history boundary — recomputed from that view (the same
+    // residual-recompute rule `classify_agent_turns` applies after its
+    // key-join; a send's window start is its dispatch instant).
+    let remaining_indices: Vec<usize> = (0..turns.len()).filter(|&i| !resolved[i]).collect();
+    let remaining_turns: Vec<&switchboard_harness::Turn> =
+        remaining_indices.iter().map(|&i| turns[i]).collect();
+    let remaining_sends: Vec<SendId> = all_sends
+        .iter()
+        .filter(|s| !claimed.contains(s))
+        .copied()
+        .collect();
+    let remaining_journal_start = remaining_sends
+        .iter()
+        .filter_map(|s| send_windows.get(s).map(|&(at, _)| at))
+        .min()
+        .or(journal_start);
+    let agent_turn_count = remaining_turns
+        .iter()
+        .copied()
+        .filter(|t| matches!(t, switchboard_harness::Turn::Agent { .. }))
+        .count();
+    let turn_offset = match remaining_journal_start {
+        Some(start) => remaining_turns
+            .iter()
+            .copied()
+            .filter(|t| {
+                matches!(t, switchboard_harness::Turn::Agent { started_at, .. } if *started_at < start)
+            })
+            .count(),
+        None => agent_turn_count,
+    };
+    let journaled_replies = agent_turn_count - turn_offset;
+    let dangling_journaled = remaining_sends.len().saturating_sub(journaled_replies);
+    let count_renders = classify_turns_by_count(
+        &remaining_turns,
+        &remaining_sends,
+        turn_offset,
+        dangling_journaled,
+        agent_turn_count,
+    );
+    for (&oi, render) in remaining_indices.iter().zip(count_renders) {
+        renders[oi] = render;
+    }
+    renders
+}
+
+/// The count path's identity join, run before its positional walk. The
+/// count-based fallback aligns purely by position, and a residual that mixes
+/// eras — link-less sends left by old failed/cancelled turns alongside a
+/// just-dispatched turn whose `TurnLink` hasn't been journaled yet (the link
+/// lands at turn end) — walks out of step: an extra unlinked reply consumes a
+/// send that isn't its own, and the newest prompt falls out `UserImported`,
+/// rendering the user's message twice (once from the journal, once as the
+/// harness echo — the mid-turn-refresh duplicate). Position can't recover
+/// across eras, so try identity first: a prompt (with its send) is consumed
+/// exactly when its recorded text is the text the send dispatched, inside that
+/// send's dispatch window, and uniquely so ([`align_surplus_candidates`] — the
+/// provenance surplus arm's decline-on-ambiguity posture: no match means no
+/// assignment, never a confident mis-pair).
+///
+/// The match authorizes the **prompt**, not the reply, and the commit rules
+/// follow from that split:
+///
+/// - An assigned prompt is consumed **immediately at the match** (suppressed +
+///   its send claimed), reply or no reply. The match already proves the echo is
+///   journal-owned, and declining to consume a *dangling* one would preserve
+///   the exact duplication this join exists to remove (the old
+///   order-ambiguous-dangling defect the characterization test used to pin as
+///   known-bad).
+/// - The reply association is only an inference — "the agent turn directly
+///   after the echo" — so it needs corroborating evidence: **any** subsequent
+///   user record clears the pending association (in every harness's file, a
+///   reply follows its own prompt's echo with no other user record between —
+///   verified against both parsers, not assumed: Claude routes tool results /
+///   housekeeping / `<task-notification>` records away from `Turn::User`, and
+///   Codex emits `Turn::User` only for `user_message`/`UserMessage` items; an
+///   intervening record is therefore evidence the next agent turn answers
+///   *that* record instead), and the agent turn must end inside the send's dispatch
+///   window — the key-join's exact predicate, reused so the two paths agree on
+///   what "caused by this send" means. A declined reply stays unresolved for
+///   the count walk; its send stays claimed either way.
+///
+/// **This deliberately inverts the key-join walk's clearing rule.** Pass 1 of
+/// [`classify_agent_turns`] argues a non-candidate record must NOT clear the
+/// pending prompt, because there the *reply's own link* authorizes the claim
+/// and clearing would unsuppress the echo (the prompt renders twice). Here the
+/// prompt is already consumed at match time, so clearing can only cost the
+/// reply *attachment*, never the suppression — do not "harmonize" the two
+/// walks. The trade is real but the right direction: in the interleaved
+/// bare-CLI shape, a possible mis-group (reply under the wrong message)
+/// becomes a possible lost grouping (reply renders ungrouped).
+///
+/// Returns the partial renders, which slots they resolved, and the claimed
+/// sends; [`classify_residual`] runs the count walk over everything left.
+fn commit_identity_join(
+    turns: &[&switchboard_harness::Turn],
+    all_sends: &[SendId],
+    send_prompts: &HashMap<SendId, (String, Vec<Attachment>)>,
+    send_windows: &SendWindows,
+    journal_start: Option<chrono::DateTime<chrono::Utc>>,
+) -> (Vec<TurnRender>, Vec<bool>, HashSet<SendId>) {
+    // Built in index order (`enumerate` yields ascending) — load-bearing for
+    // `align_surplus_candidates`, whose `floor` logic assumes chronological
+    // candidate order.
+    let candidates: Vec<usize> = turns
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| {
+            matches!(t,
+                switchboard_harness::Turn::User { source: switchboard_harness::UserPromptSource::Sdk | switchboard_harness::UserPromptSource::Unknown, started_at, .. }
+                if journal_start.is_some_and(|start| *started_at >= start))
+        })
+        .map(|(i, _)| i)
+        .collect();
+    let assignment =
+        align_surplus_candidates(turns, &candidates, all_sends, send_prompts, send_windows);
+    let mut renders: Vec<TurnRender> = vec![TurnRender::Skip; turns.len()];
+    let mut resolved: Vec<bool> = vec![false; turns.len()];
+    let mut claimed: HashSet<SendId> = HashSet::new();
+    let mut pending_reply: Option<SendId> = None;
+    for (i, turn) in turns.iter().enumerate() {
+        match turn {
+            switchboard_harness::Turn::User { .. } => {
+                // Every user record is a reply-pairing boundary (see the doc);
+                // an assigned candidate then opens its own association.
+                pending_reply = None;
+                if let Some(&send_id) = assignment.get(&i) {
+                    renders[i] = TurnRender::Skip;
+                    resolved[i] = true;
+                    claimed.insert(send_id);
+                    pending_reply = Some(send_id);
+                }
+            }
+            switchboard_harness::Turn::Agent {
+                started_at,
+                ended_at,
+                ..
+            } => {
+                // A window miss is unreachable today — `align_surplus_candidates`
+                // only assigns sends it found windows for — and degrades
+                // conservatively (the turn falls to the count walk). Re-check
+                // this if a second source of assignments ever appears.
+                if let Some(send_id) = pending_reply.take()
+                    && let Some(&(send_at, next_send_at)) = send_windows.get(&send_id)
+                {
+                    let turn_end = ended_at.unwrap_or(*started_at);
+                    if turn_end >= send_at && next_send_at.is_none_or(|next| turn_end <= next) {
+                        renders[i] = TurnRender::Agent {
+                            send_id: Some(send_id),
+                            correlation: Some(SendCorrelation::Positional),
+                        };
+                        resolved[i] = true;
+                    }
+                }
+            }
+            // A `System` marker is not a reply boundary — the association
+            // survives it, same as the key-join walk.
+            _ => {}
+        }
+    }
+    (renders, resolved, claimed)
 }
 
 /// Pure merge of the two conversation sources into the unified transcript. No
@@ -6462,14 +6647,15 @@ fn merge_project_conversation(
         // Correlate this agent's harness turns to its journaled sends. The
         // dispatcher's `turn_id` and the harness file's ids are different id
         // spaces, so we join by the durable `hydration_key` where a `TurnLink`
-        // exists (`classify_agent_turns`, authoritative) and fall back to ORDER for
-        // the residual (`classify_turns_by_count`/`_by_provenance`). The residual's
-        // front-offset / dangling / straddling reasoning — and the two known
-        // positional edges it still carries (a cancelled-before-output send shifting
-        // labels; two reply-less dangling sources being order-ambiguous), confined
-        // to the discouraged bare-CLI-on-a-driven-session pattern and pinned by
-        // characterization tests — live in those helpers' docs. The key-join
-        // dissolves them for any turn that carries a link.
+        // exists (`classify_agent_turns`, authoritative) and fall back to the
+        // residual classifiers (`classify_residual`: identity join, then
+        // provenance/count). The residual's front-offset / dangling / straddling
+        // reasoning — and the one known positional edge it still carries (a send
+        // cancelled before its prompt was recorded overcounts the dangling pool
+        // and can absorb an imported prompt; no recorded text means identity
+        // cannot help), confined to the discouraged bare-CLI-on-a-driven-session
+        // pattern and pinned by a characterization test — live in those helpers'
+        // docs. The key-join dissolves it for any turn that carries a link.
         let all_sends = agent_sends.get(&agent_id).map_or(&[][..], Vec::as_slice);
         let journal_start_at = journal_start.get(&agent_id).copied();
         // Durable key-join first (authoritative), positional fallback for the
@@ -8177,6 +8363,7 @@ pub(crate) mod tests {
                 maintenance: Arc::clone(&state.maintenance),
                 project_generation: Arc::clone(&state.project_generation),
                 generation_at_capture: generation,
+                preferences: Arc::clone(&state.preferences),
             },
         )
     }
@@ -8463,6 +8650,7 @@ pub(crate) mod tests {
         let adapter: Arc<dyn HarnessAdapter> = Arc::new(GatedRecordingAdapter {
             prompts: Arc::new(Mutex::new(Vec::new())),
             profiles: None,
+            chrome: None,
             texts: vec!["parked".to_owned()],
             gate: Arc::new(tokio::sync::Notify::new()),
             park_at: 0,
@@ -10238,6 +10426,10 @@ pub(crate) mod tests {
     struct GatedRecordingAdapter {
         prompts: Arc<Mutex<Vec<String>>>,
         profiles: Option<Arc<Mutex<Vec<RecordedProfile>>>>,
+        /// Per-dispatch `chrome_integration`, for the mirror of the profile test:
+        /// profiles are captured when a send is *submitted*, this preference when
+        /// the turn *runs*, and only a queued send can tell the two apart.
+        chrome: Option<Arc<Mutex<Vec<bool>>>>,
         texts: Vec<String>,
         gate: Arc<tokio::sync::Notify>,
         park_at: usize,
@@ -10290,6 +10482,9 @@ pub(crate) mod tests {
             lock(&self.prompts).push(prompt.to_owned());
             if let Some(profiles) = &self.profiles {
                 lock(profiles).push((agent.model.clone(), agent.effort.clone()));
+            }
+            if let Some(chrome) = &self.chrome {
+                lock(chrome).push(options.chrome_integration);
             }
             let text = self.texts.get(index).cloned().unwrap_or_default();
             let park = index == self.park_at;
@@ -10402,6 +10597,7 @@ pub(crate) mod tests {
         let adapter: Arc<dyn HarnessAdapter> = Arc::new(GatedRecordingAdapter {
             prompts: Arc::clone(&prompts),
             profiles: None,
+            chrome: None,
             texts: texts.iter().map(|t| (*t).to_owned()).collect(),
             gate: Arc::clone(gate),
             park_at,
@@ -10426,6 +10622,7 @@ pub(crate) mod tests {
         let adapter: Arc<dyn HarnessAdapter> = Arc::new(GatedRecordingAdapter {
             prompts: Arc::clone(&prompts),
             profiles: None,
+            chrome: None,
             texts: texts.iter().map(|t| (*t).to_owned()).collect(),
             gate: Arc::clone(first.0),
             park_at: first.1,
@@ -11804,6 +12001,128 @@ pub(crate) mod tests {
             lock(&state.needs_session_meta).contains(&agent.id),
             "flag must persist through pre-stream failure so a retry still forces SessionMeta"
         );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // A recording adapter plus three sequential turns; linear.
+    async fn chrome_preference_reaches_the_adapter_and_is_read_live() {
+        // Two things at once, because they share a setup and only matter
+        // together: the browser-tools preference actually reaches the adapter,
+        // and it is read at dispatch time rather than frozen when the agent or
+        // its factory was built. The second is what lets a user flip the toggle
+        // and have their *next* message honor it.
+        struct ChromeRecordingAdapter {
+            seen: Arc<Mutex<Vec<bool>>>,
+        }
+
+        #[async_trait]
+        impl HarnessAdapter for ChromeRecordingAdapter {
+            fn probe(&self) -> Result<(), switchboard_harness::DispatchError> {
+                Ok(())
+            }
+            fn version(&self) -> Option<String> {
+                None
+            }
+            async fn dispatch(
+                &self,
+                _agent: &AgentRecord,
+                _cwd: &Path,
+                _prompt: &str,
+                turn_id: switchboard_harness::TurnId,
+                options: switchboard_harness::DispatchOptions,
+            ) -> Result<switchboard_harness::EventStream, switchboard_harness::DispatchError>
+            {
+                lock(&self.seen).push(options.chrome_integration);
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                tokio::spawn(async move {
+                    let _ = tx.send(switchboard_harness::AdapterEvent::TurnEnd {
+                        turn_id,
+                        outcome: switchboard_harness::TurnOutcome::Completed,
+                        ended_at: chrono::Utc::now(),
+                        usage: None,
+                        context_window_source: None,
+                        stable_message_id: None,
+                        first_message_id: None,
+                        spend: None,
+                        model: None,
+                        effort: None,
+                    });
+                });
+                Ok(Box::pin(
+                    tokio_stream::wrappers::UnboundedReceiverStream::new(rx),
+                ))
+            }
+        }
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let adapter: Arc<dyn HarnessAdapter> = Arc::new(ChromeRecordingAdapter {
+            seen: Arc::clone(&seen),
+        });
+        let emitter = Arc::new(RecordingEmitter::new());
+        let state = AppState::new_for_test(
+            Arc::clone(&adapter),
+            Arc::clone(&adapter),
+            Arc::clone(&adapter),
+            emitter.clone() as Arc<dyn EventEmitter>,
+        );
+        let tmp = TempDir::new().unwrap();
+        init_directory_impl(&state, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let proj = create_project_in_only_dir(&state, "alpha");
+        set_active_project_impl(&state, proj.id).unwrap();
+        let agent = create_agent_impl(&state, "a", HarnessKind::ClaudeCode, None, None).unwrap();
+
+        // Default: off.
+        send_msg(&state, agent.id, "one").await.unwrap();
+        within(
+            &emitter,
+            "turn 1 idle",
+            emitter.wait_for_type("agent_idle", 1),
+        )
+        .await;
+        assert_eq!(lock(&seen).as_slice(), [false], "default must be off");
+
+        // Turn it on mid-agent — the same agent, the same actor, the same
+        // factory. A value captured at construction would still report false.
+        set_preferences_impl(
+            &state,
+            &Preferences {
+                claude_chrome_enabled: true,
+                ..Preferences::default()
+            },
+        )
+        .unwrap();
+        send_msg(&state, agent.id, "two").await.unwrap();
+        within(
+            &emitter,
+            "turn 2 idle",
+            emitter.wait_for_type("agent_idle", 2),
+        )
+        .await;
+        assert_eq!(
+            lock(&seen).as_slice(),
+            [false, true],
+            "flipping the preference must affect the very next turn"
+        );
+
+        // And back off again, so the test can't pass on a one-way latch.
+        set_preferences_impl(
+            &state,
+            &Preferences {
+                claude_chrome_enabled: false,
+                ..Preferences::default()
+            },
+        )
+        .unwrap();
+        send_msg(&state, agent.id, "three").await.unwrap();
+        within(
+            &emitter,
+            "turn 3 idle",
+            emitter.wait_for_type("agent_idle", 3),
+        )
+        .await;
+        assert_eq!(lock(&seen).as_slice(), [false, true, false]);
     }
 
     #[tokio::test]
@@ -14470,6 +14789,7 @@ pub(crate) mod tests {
         let adapter: Arc<dyn HarnessAdapter> = Arc::new(GatedRecordingAdapter {
             prompts: Arc::new(Mutex::new(Vec::new())),
             profiles: Some(Arc::clone(&profiles)),
+            chrome: None,
             texts: vec![String::new(); 3],
             gate: Arc::clone(&gate),
             park_at: 0,
@@ -14523,6 +14843,78 @@ pub(crate) mod tests {
                 (Some("opus".to_owned()), Some("high".to_owned())),
                 (Some("sonnet".to_owned()), Some("medium".to_owned())),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_queued_send_adopts_the_chrome_preference_in_force_when_it_runs() {
+        // The deliberate mirror of
+        // `queued_sends_capture_the_profile_active_when_each_was_submitted`.
+        // A profile is frozen when the user hits send; the browser-tools
+        // preference is sampled when the turn actually starts. Only a send that
+        // is *already queued* when the toggle flips can tell those two apart —
+        // sequential sends produce identical results either way, which is why
+        // `chrome_preference_reaches_the_adapter_and_is_read_live` cannot cover
+        // this and this test exists.
+        let tmp = TempDir::new().unwrap();
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let chrome = Arc::new(Mutex::new(Vec::<bool>::new()));
+        let adapter: Arc<dyn HarnessAdapter> = Arc::new(GatedRecordingAdapter {
+            prompts: Arc::new(Mutex::new(Vec::new())),
+            profiles: None,
+            chrome: Some(Arc::clone(&chrome)),
+            texts: vec![String::new(); 2],
+            gate: Arc::clone(&gate),
+            park_at: 0,
+            extra_parks: Vec::new(),
+            fail_at: Vec::new(),
+            teardown: None,
+            dispatches: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let emitter = Arc::new(RecordingEmitter::new());
+        let state = AppState::new_for_test(
+            Arc::clone(&adapter),
+            Arc::clone(&adapter),
+            adapter,
+            emitter.clone() as Arc<dyn EventEmitter>,
+        );
+        let (agent, _) = project_with_agent(&state, &tmp).await;
+
+        // Turn 1 dispatches with the preference off and parks mid-turn.
+        send_msg(&state, agent.id, "park").await.unwrap();
+        within(
+            &emitter,
+            "first turn starts",
+            emitter.wait_for_type("turn_start", 1),
+        )
+        .await;
+
+        // Turn 2 is submitted while the preference is still off, so it queues
+        // behind the parked turn carrying the OLD value if capture were at
+        // submission time.
+        send_msg(&state, agent.id, "queued").await.unwrap();
+        set_preferences_impl(
+            &state,
+            &Preferences {
+                claude_chrome_enabled: true,
+                ..Preferences::default()
+            },
+        )
+        .unwrap();
+
+        gate.notify_one();
+        within(
+            &emitter,
+            "queued turn drains",
+            emitter.wait_for_type("agent_idle", 1),
+        )
+        .await;
+
+        assert_eq!(
+            *lock(&chrome),
+            vec![false, true],
+            "a send queued before the toggle flipped must dispatch under the \
+             setting in force when it RAN, not when it was submitted"
         );
     }
 
@@ -19129,19 +19521,17 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn merge_count_path_continuation_steals_send_known_defect() {
-        // KNOWN DEFECT (pre-existing, characterized not fixed): on the COUNT path
-        // (all-`Unknown` prompts — a pre-`promptSource` Claude session, or any
-        // keyless harness), a promptless continuation turn STEALS the next send,
-        // because `classify_turns_by_count` hands every agent turn a send by
-        // position — it has no "this turn had no prompt, skip it" notion (unlike the
-        // provenance path's `pending_send` and the key-join's link). The real
-        // matching prompt then renders a second time as imported, and the real reply
-        // renders ungrouped. Reachable TODAY for an old auto-compacted Claude
-        // session; the key-join dissolves it wherever links exist, but the keyless
-        // count path still carries it. Pinned here to make the failure mode visible
-        // and give the eventual positional-continuation guard a clear before/after —
-        // this is NOT desired behavior (gap register: docs/harness-behavior.md).
+    fn merge_count_path_identity_join_keeps_continuation_from_stealing_send() {
+        // The COUNT path (all-`Unknown` prompts — a pre-`promptSource` Claude
+        // session, or any keyless harness) used to let a promptless continuation
+        // turn STEAL the next send: `classify_turns_by_count` hands every agent
+        // turn a send by position, with no "this turn had no prompt" notion. The
+        // real matching prompt then rendered a second time as imported and the
+        // real reply ungrouped. The identity join fixes this: each prompt is
+        // matched to its send by exact dispatched text inside the send's window
+        // and claimed at the match (its reply attached by adjacency + window),
+        // so the continuation (which has neither a prompt nor a matching send
+        // left) stays uncorrelated instead of shifting the alignment.
         let agent = Uuid::now_v7();
         let (s1, s2) = (Uuid::now_v7(), Uuid::now_v7());
         let journal = vec![
@@ -19158,17 +19548,403 @@ pub(crate) mod tests {
         ];
         let merged = merge_project_conversation(journal, vec![(agent, transcript_of(turns), None)]);
 
-        // The defect: prompt2 renders TWICE (journal copy + an imported duplicate).
         assert_eq!(
             user_texts(&merged),
-            vec!["prompt1", "prompt2", "prompt2"],
-            "KNOWN DEFECT: the count path duplicates prompt2 when a continuation steals its send"
+            vec!["prompt1", "prompt2"],
+            "each prompt renders once, from the journal"
         );
-        // The continuation steals s2; the real reply2 is left ungrouped.
+        assert!(
+            !merged
+                .items
+                .iter()
+                .any(|i| matches!(i, ConversationItem::UserMessage { send_id: None, .. })),
+            "no imported duplicate"
+        );
+        // reply1↔s1 and reply2↔s2 by identity; the continuation gets nothing.
         assert_eq!(
             agent_send_ids(&merged),
-            vec![Some(s1), Some(s2), None],
-            "KNOWN DEFECT: continuation grabs s2, reply2 ungrouped"
+            vec![Some(s1), None, Some(s2)],
+            "identity pairing skips the promptless continuation"
+        );
+    }
+
+    #[test]
+    fn merge_count_path_unlinked_inflight_turn_does_not_duplicate_prompt() {
+        // The mid-turn-refresh duplicate (observed live, 2026-08-30, Codex): a
+        // switch-back refresh re-merges while a turn is still in flight — its
+        // `TurnLink` is only journaled at turn end — so the newest (prompt,
+        // reply, send) reaches the classifier unlinked. With link-less dead
+        // sends and promptless housekeeping turns also in the residual, the
+        // positional count walk let the housekeeping turn steal the in-flight
+        // send and re-imported the just-sent prompt, which then rendered a
+        // second time BELOW the streaming reply (an imported prompt has no send
+        // anchor). The identity join must pair the echo to its send by text and
+        // suppress it.
+        let agent = Uuid::now_v7();
+        let (s0, s1, s2) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
+        let journal = vec![
+            send_record(s0, Uuid::now_v7(), agent, "first", 1),
+            link_record(s0, agent, "k0", 3),
+            // A dead send: cancelled after its prompt was recorded, never linked.
+            send_record(s1, Uuid::now_v7(), agent, "Proceed", 5),
+            outcome_record(
+                s1,
+                Uuid::now_v7(),
+                agent,
+                serde_json::json!({"status": "cancelled", "source": "user"}),
+                7,
+            ),
+            // The in-flight send: journaled at dispatch, no TurnLink yet.
+            send_record(
+                s2,
+                Uuid::now_v7(),
+                agent,
+                "Proceed with your recommendations.",
+                10,
+            ),
+        ];
+        let turns = vec![
+            user_turn(Uuid::now_v7(), agent, "first", 2), // Unknown → count residual
+            agent_turn_keyed(Uuid::now_v7(), agent, "reply0", 3, "k0"),
+            user_turn(Uuid::now_v7(), agent, "Proceed", 6),
+            agent_turn(Uuid::now_v7(), agent, "cancelled partial", 7), // unlinked
+            agent_turn(Uuid::now_v7(), agent, "housekeeping, no prompt", 8), // unlinked
+            user_turn(
+                Uuid::now_v7(),
+                agent,
+                "Proceed with your recommendations.",
+                11,
+            ),
+            // Keyed (the parser reads `turn_context` early) but unlinked (the
+            // `TurnLink` record lands only when the turn completes).
+            agent_turn_keyed(Uuid::now_v7(), agent, "in-flight partial", 12, "k2"),
+        ];
+        let merged = merge_project_conversation(journal, vec![(agent, transcript_of(turns), None)]);
+
+        assert_eq!(
+            user_texts(&merged),
+            vec!["first", "Proceed", "Proceed with your recommendations."],
+            "every prompt renders exactly once, from the journal"
+        );
+        assert!(
+            !merged
+                .items
+                .iter()
+                .any(|i| matches!(i, ConversationItem::UserMessage { send_id: None, .. })),
+            "the in-flight prompt's echo must not re-import"
+        );
+        // s0 by key; s1/s2 by identity; the housekeeping turn stays uncorrelated.
+        assert_eq!(
+            agent_send_ids(&merged),
+            vec![Some(s0), Some(s1), None, Some(s2)],
+            "identity pairing survives the promptless housekeeping turn"
+        );
+    }
+
+    #[test]
+    fn merge_count_path_identity_will_not_pair_text_across_windows() {
+        // Conservative-decline pin for the count path's identity join, mirroring
+        // the surplus arm's window tests: a prompt recorded inside a LATER
+        // send's window never consumes an EARLIER send just because the text
+        // matches. No assignment is made here (wrong window for "same", wrong
+        // text for s2's window), so the walk falls back to the positional count
+        // behavior unchanged.
+        let agent = Uuid::now_v7();
+        let (s1, s2) = (Uuid::now_v7(), Uuid::now_v7());
+        let journal = vec![
+            send_record(s1, Uuid::now_v7(), agent, "same", 1),
+            send_record(s2, Uuid::now_v7(), agent, "other", 5),
+        ];
+        let turns = vec![
+            agent_turn(Uuid::now_v7(), agent, "stray reply", 2), // promptless
+            user_turn(Uuid::now_v7(), agent, "same", 6),         // in s2's window
+            agent_turn(Uuid::now_v7(), agent, "reply", 7),
+        ];
+        let merged = merge_project_conversation(journal, vec![(agent, transcript_of(turns), None)]);
+
+        // Identity declined everywhere → the pre-existing positional pairing.
+        assert_eq!(user_texts(&merged), vec!["same", "other"]);
+        assert_eq!(agent_send_ids(&merged), vec![Some(s1), Some(s2)]);
+    }
+
+    #[test]
+    fn merge_count_path_identity_reply_boundary_blocks_external_interleave() {
+        // A bare-CLI (`External`) prompt between a matched echo and the next
+        // agent turn means that turn answers the EXTERNAL prompt, not the
+        // matched send — every user record is a reply-pairing boundary in the
+        // identity join. Without the boundary, the external prompt's reply
+        // would render confidently grouped under the Switchboard message (a
+        // mis-group, worse than the ungrouped reply this produces).
+        let agent = Uuid::now_v7();
+        let s1 = Uuid::now_v7();
+        let journal = vec![send_record(s1, Uuid::now_v7(), agent, "alpha", 1)];
+        let turns = vec![
+            user_turn(Uuid::now_v7(), agent, "alpha", 2), // matched echo
+            user_turn_src(
+                Uuid::now_v7(),
+                agent,
+                "typed into the TUI",
+                3,
+                UserPromptSource::External,
+            ),
+            agent_turn(Uuid::now_v7(), agent, "the external prompt's reply", 4),
+        ];
+        let merged = merge_project_conversation(journal, vec![(agent, transcript_of(turns), None)]);
+
+        assert_eq!(user_texts(&merged), vec!["alpha", "typed into the TUI"]);
+        assert!(
+            merged.items.iter().any(|i| matches!(
+                i,
+                ConversationItem::UserMessage { send_id: None, text, .. } if text == "typed into the TUI"
+            )),
+            "the bare-CLI prompt renders imported"
+        );
+        // The reply is NOT handed the matched send — ungrouped, never mis-grouped.
+        assert_eq!(agent_send_ids(&merged), vec![None]);
+    }
+
+    #[test]
+    fn merge_count_path_identity_window_guard_blocks_stale_reply_claim() {
+        // A matched DANGLING prompt (its send produced no recorded reply) must
+        // not hand its send to a later send's reply. The reply here ends inside
+        // s2's window, so the guard declines the s1 association and the count
+        // walk pairs the reply with its own send.
+        let agent = Uuid::now_v7();
+        let (s1, s2) = (Uuid::now_v7(), Uuid::now_v7());
+        let journal = vec![
+            send_record(s1, Uuid::now_v7(), agent, "go", 1),
+            // s2's own echo never flushed (cancel-before-flush edge), but its
+            // reply did.
+            send_record(s2, Uuid::now_v7(), agent, "next", 5),
+        ];
+        let turns = vec![
+            user_turn(Uuid::now_v7(), agent, "go", 2), // matched, dangling
+            agent_turn(Uuid::now_v7(), agent, "reply to next", 6),
+        ];
+        let merged = merge_project_conversation(journal, vec![(agent, transcript_of(turns), None)]);
+
+        assert_eq!(user_texts(&merged), vec!["go", "next"]);
+        assert!(
+            !merged
+                .items
+                .iter()
+                .any(|i| matches!(i, ConversationItem::UserMessage { send_id: None, .. })),
+            "the dangling echo is consumed (journal owns it), not re-imported"
+        );
+        assert_eq!(
+            agent_send_ids(&merged),
+            vec![Some(s2)],
+            "the reply pairs with its own send, not the dangling one"
+        );
+    }
+
+    #[test]
+    fn merge_count_path_partial_identity_claim_reanchors_residual_boundary() {
+        // The mixed-era shape where the recomputed residual boundary does real
+        // work: identity claims s1's triple but declines s2's (its echo text
+        // does not reconstruct), leaving a promptless continuation and s2's
+        // pair for the count walk. The boundary re-anchors to s2's instant, so
+        // the continuation (older than it) classifies as pre-history instead
+        // of stealing s2 — without the recompute, `turn_offset` would be 0 and
+        // the walk would misalign exactly like the original defect.
+        let agent = Uuid::now_v7();
+        let (s1, s2) = (Uuid::now_v7(), Uuid::now_v7());
+        let journal = vec![
+            send_record(s1, Uuid::now_v7(), agent, "alpha", 1),
+            send_record(s2, Uuid::now_v7(), agent, "beta", 5),
+        ];
+        let turns = vec![
+            user_turn(Uuid::now_v7(), agent, "alpha", 2), // matched
+            agent_turn(Uuid::now_v7(), agent, "reply1", 3),
+            agent_turn(Uuid::now_v7(), agent, "continuation", 4), // promptless
+            user_turn(Uuid::now_v7(), agent, "beta (recorded differently)", 6), // declines
+            agent_turn(Uuid::now_v7(), agent, "reply2", 7),
+        ];
+        let merged = merge_project_conversation(journal, vec![(agent, transcript_of(turns), None)]);
+
+        assert_eq!(user_texts(&merged), vec!["alpha", "beta"]);
+        assert!(
+            !merged
+                .items
+                .iter()
+                .any(|i| matches!(i, ConversationItem::UserMessage { send_id: None, .. })),
+            "no imported duplicate on either side of the partial claim"
+        );
+        assert_eq!(
+            agent_send_ids(&merged),
+            vec![Some(s1), None, Some(s2)],
+            "continuation is pre-history for the re-anchored residual; s2 pairs positionally"
+        );
+    }
+
+    #[test]
+    fn merge_count_path_identity_declines_ambiguous_identical_prompts() {
+        // Uniqueness decline (the window decline is pinned separately above):
+        // two identical in-window echoes for one send are a coin flip, so the
+        // join assigns neither and the balanced count walk proceeds exactly as
+        // before the identity join existed — no duplicate, no confident pick.
+        let agent = Uuid::now_v7();
+        let s1 = Uuid::now_v7();
+        let journal = vec![send_record(s1, Uuid::now_v7(), agent, "go", 1)];
+        let turns = vec![
+            user_turn(Uuid::now_v7(), agent, "go", 2),
+            user_turn(Uuid::now_v7(), agent, "go", 3),
+            agent_turn(Uuid::now_v7(), agent, "reply", 4),
+        ];
+        let merged = merge_project_conversation(journal, vec![(agent, transcript_of(turns), None)]);
+
+        assert_eq!(user_texts(&merged), vec!["go"]);
+        assert!(
+            !merged
+                .items
+                .iter()
+                .any(|i| matches!(i, ConversationItem::UserMessage { send_id: None, .. })),
+            "ambiguity declines without re-importing either echo"
+        );
+        assert_eq!(agent_send_ids(&merged), vec![Some(s1)]);
+    }
+
+    #[test]
+    fn merge_count_path_identity_association_survives_system_marker() {
+        // A `System` marker (compaction) between a matched echo and its reply is
+        // NOT a reply-pairing boundary — only user records are. This is one of
+        // the walk's four load-bearing rules, and the other marker-bearing tests
+        // all place their marker where nothing is pending; a "clear pending on
+        // every non-agent record" refactor would pass them while ungrouping
+        // every post-compaction reply from its prompt.
+        let agent = Uuid::now_v7();
+        let s1 = Uuid::now_v7();
+        let journal = vec![send_record(s1, Uuid::now_v7(), agent, "go", 1)];
+        let turns = vec![
+            user_turn(Uuid::now_v7(), agent, "go", 2), // matched
+            system_marker_turn(Uuid::now_v7(), agent, "compacted", 3),
+            agent_turn(Uuid::now_v7(), agent, "reply", 4),
+        ];
+        let merged = merge_project_conversation(journal, vec![(agent, transcript_of(turns), None)]);
+
+        assert_eq!(user_texts(&merged), vec!["go"]);
+        assert!(
+            !merged
+                .items
+                .iter()
+                .any(|i| matches!(i, ConversationItem::UserMessage { send_id: None, .. })),
+            "the matched echo stays suppressed"
+        );
+        assert_eq!(
+            agent_send_ids(&merged),
+            vec![Some(s1)],
+            "the reply keeps its send across the marker"
+        );
+        assert!(
+            merged
+                .items
+                .iter()
+                .any(|i| matches!(i, ConversationItem::SystemMarker { .. })),
+            "the marker itself still renders"
+        );
+    }
+
+    #[test]
+    fn merge_codex_truncated_linkless_rollout_does_not_duplicate_prompt() {
+        // The mid-turn-refresh incident THROUGH THE REAL PARSER — the
+        // normalized-turn tests above hand-build their input, so they can stay
+        // green across a parser change in exactly the behaviors the fix leans
+        // on: `task_started` anchors the echoed `user_message` to the task
+        // start, an open builder becomes a truncated agent turn at EOF (no
+        // `task_complete`), and no `TurnLink` exists yet. This fixture pins
+        // that path end-to-end.
+        let agent = Uuid::now_v7();
+        let send = Uuid::now_v7();
+        let home = TempDir::new().unwrap();
+        let session_id = "019ff97b-0000-7000-8000-000000000001";
+        let dir = home.path().join(".codex/sessions/2026/08/12");
+        std::fs::create_dir_all(&dir).unwrap();
+        let rollout = concat!(
+            r#"{"timestamp":"2026-08-31T03:57:49.183Z","type":"event_msg","payload":{"type":"task_started","turn_id":"key-inflight","model_context_window":258400}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-31T03:57:51.853Z","type":"turn_context","payload":{"turn_id":"key-inflight","cwd":"/tmp/proj","model":"gpt-5.6-sol"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-31T03:57:51.896Z","type":"event_msg","payload":{"type":"user_message","message":"Proceed with your recommendations.","images":[]}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-31T03:57:56.063Z","type":"event_msg","payload":{"type":"agent_message","message":"Working on it."}}"#,
+            "\n",
+        );
+        std::fs::write(
+            dir.join(format!("rollout-2026-08-12T21-57-37-{session_id}.jsonl")),
+            rollout,
+        )
+        .unwrap();
+        let journal = vec![JournalRecord::Send {
+            send_id: send,
+            turn_id: Uuid::now_v7(),
+            agent_id: agent,
+            prompt: "Proceed with your recommendations.".to_owned(),
+            attachments: Vec::new(),
+            at: "2026-08-31T03:57:48.144Z".parse().unwrap(),
+        }];
+        let transcript = switchboard_harness::load_codex_transcript(
+            home.path(),
+            std::path::Path::new("/tmp/proj"),
+            session_id,
+            Some(chrono::NaiveDate::from_ymd_opt(2026, 8, 12).unwrap()),
+            agent,
+        )
+        .unwrap();
+        let merged = merge_project_conversation(journal, vec![(agent, transcript, None)]);
+
+        let user_sends: Vec<Option<SendId>> = merged
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                ConversationItem::UserMessage { send_id, .. } => Some(*send_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            user_sends,
+            vec![Some(send)],
+            "exactly one user message, journal-owned — the parsed echo is suppressed"
+        );
+        assert_eq!(
+            agent_send_ids(&merged),
+            vec![Some(send)],
+            "the truncated in-flight turn pairs with its send by identity"
+        );
+    }
+
+    #[test]
+    fn dispatched_prompt_reconstruction_format_is_frozen() {
+        // Identity correlation matches harness-recorded echoes byte-for-byte
+        // against `render_prompt_with_attachments` (+ the Claude transport
+        // rule). Every other test on this path derives its expected echo by
+        // calling those same functions, so a format change passes them all
+        // while HISTORICAL sends silently stop reconstructing — echoes
+        // re-import as visible duplicates, and Antigravity (permanently
+        // keyless) relies on reconstruction for all of its correlation. These
+        // bytes are hardcoded on purpose: if this fails, the dispatched-text
+        // format changed — read `align_surplus_candidates`' doc before
+        // updating them.
+        let attachment = Attachment {
+            label: "image-1".to_owned(),
+            kind: switchboard_core::AttachmentKind::Image,
+            path: "/tmp/staged/a.png".to_owned(),
+            original_name: "a.png".to_owned(),
+            dispatched_path: None,
+        };
+        assert_eq!(
+            switchboard_core::render_prompt_with_attachments(
+                "Review this.",
+                std::slice::from_ref(&attachment)
+            ),
+            "Review this.\n\n---\nAttached files (read them):\nimage-1: /tmp/staged/a.png",
+        );
+        assert_eq!(
+            switchboard_harness::claude_transport_prompt("/compact"),
+            " /compact"
+        );
+        assert_eq!(
+            switchboard_harness::claude_transport_prompt("plain prompt"),
+            "plain prompt"
         );
     }
 
@@ -20087,18 +20863,14 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn merge_imported_dangling_before_journaled_dangling_is_misclassified() {
-        // CHARACTERIZATION of a documented limitation (not desired behavior): when
-        // an imported dangling prompt (bare CLI, no Send) precedes a journaled
-        // dangling one (an in-flight Switchboard send) in the file, the front-to-
-        // back dangling classification mis-assigns them. Order alone can't tell
-        // which dangling turn owns the in-flight send; this only arises under the
-        // discouraged "drive the same session from the bare CLI and Switchboard"
-        // pattern. Pinned so a future fix (or regression) changes it consciously.
-        //
-        // CORRECT behavior would be: "external" rendered once (imported), "later"
-        // rendered once (from the journal Send). What actually happens: "external"
-        // is dropped and "later" is duplicated.
+    fn merge_imported_dangling_before_journaled_dangling_classifies_both() {
+        // An imported dangling prompt (bare CLI, no Send) preceding a journaled
+        // dangling one (an in-flight Switchboard send) — order alone can't tell
+        // which dangling turn owns the in-flight send, and the count walk used
+        // to drop "external" and duplicate "later" (pinned then as a documented
+        // limitation). The identity join resolves it: "later" matches its send
+        // by exact text in-window and is consumed even without a reply, so
+        // "external" renders once (imported) and "later" once (journal).
         let agent = Uuid::now_v7();
         let s1 = Uuid::now_v7();
         let journal = vec![send_record(s1, Uuid::now_v7(), agent, "later", 2)];
@@ -20116,15 +20888,14 @@ pub(crate) mod tests {
                 .filter(|i| matches!(i, ConversationItem::UserMessage { text, .. } if text == t))
                 .count()
         };
-        assert_eq!(
-            count("external"),
-            0,
-            "documented limitation: imported prompt dropped"
-        );
-        assert_eq!(
-            count("later"),
-            2,
-            "documented limitation: journaled prompt duplicated"
+        assert_eq!(count("external"), 1, "imported prompt renders once");
+        assert_eq!(count("later"), 1, "journaled prompt renders once");
+        assert!(
+            merged.items.iter().any(|i| matches!(
+                i,
+                ConversationItem::UserMessage { send_id: None, text, .. } if text == "external"
+            )),
+            "the bare-CLI prompt renders as imported (no send)"
         );
     }
 
@@ -20719,13 +21490,15 @@ pub(crate) mod tests {
         );
     }
 
-    /// Documented residual (NOT a correctness assertion): a cancelled-before-output
-    /// send positioned *before* a content-bearing send shifts labels by one — the
-    /// completed answer lands under the cancelled send's `send_id` (content
-    /// mis-grouping). The prompt is still journal-owned (no duplication). Pins the
-    /// known-bound so a future change to it is a conscious decision.
+    /// A cancelled-before-output send positioned *before* a content-bearing send
+    /// used to shift labels by one (the completed answer landed under the
+    /// cancelled send's `send_id`). The identity join fixes the grouping: each
+    /// prompt is claimed by its own send at the text-in-window match — the
+    /// cancelled send's dangling echo included, so it is suppressed (the journal
+    /// renders it) without ever holding a reply — and the completed answer
+    /// attaches to its own send by adjacency + window (no duplication).
     #[test]
-    fn merge_residual_leading_cancel_before_output_misgroups() {
+    fn merge_residual_leading_cancel_before_output_groups_correctly() {
         let s0 = Uuid::now_v7(); // cancelled before output (prompt recorded)
         let s1 = Uuid::now_v7(); // completed
         let agent = Uuid::now_v7();
@@ -20760,7 +21533,6 @@ pub(crate) mod tests {
             )),
             "no imported duplicate prompt"
         );
-        // The residual: s1's answer is mis-grouped under s0.
         let answer = merged
             .items
             .iter()
@@ -20771,8 +21543,8 @@ pub(crate) mod tests {
             .expect("one agent turn");
         assert_eq!(
             answer,
-            Some(s0),
-            "documented residual: leading cancel-before-output mis-groups the answer onto s0"
+            Some(s1),
+            "the answer groups under its own send, not the leading cancelled one"
         );
     }
 
@@ -22302,6 +23074,7 @@ pub(crate) mod tests {
             terminal_app: "iTerm".to_owned(),
             diff_style: preferences::DiffStyle::Unified,
             show_builtins: false,
+            claude_chrome_enabled: true,
             notify_on_completion: true,
             notify_while_focused: false,
             agent_defaults: Preferences::default().agent_defaults,
@@ -22329,6 +23102,7 @@ pub(crate) mod tests {
                 terminal_app: String::new(),
                 diff_style: preferences::DiffStyle::SideBySide,
                 show_builtins: true,
+                claude_chrome_enabled: false,
                 notify_on_completion: true,
                 notify_while_focused: false,
                 agent_defaults: Preferences::default().agent_defaults,
@@ -22353,6 +23127,7 @@ pub(crate) mod tests {
             terminal_app: "Terminal".to_owned(),
             diff_style: preferences::DiffStyle::SideBySide,
             show_builtins: true,
+            claude_chrome_enabled: false,
             notify_on_completion: true,
             notify_while_focused: false,
             agent_defaults: Preferences::default().agent_defaults,

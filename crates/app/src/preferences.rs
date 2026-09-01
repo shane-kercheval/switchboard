@@ -1,11 +1,14 @@
 //! User-global personal preferences (`config.yaml`).
 //!
-//! The first **backend-persisted** preferences in Switchboard — distinct from
-//! the frontend-only theme (which stays in `localStorage`, since it's a
-//! device-local presentation concern the backend never reads). The rule: a
-//! setting lives where its consumer is. These are backend-consumed (the Git
-//! view's open-in-editor / open-in-terminal actions run them) and so live in a
-//! backend-owned YAML file, a sibling of `workspace.yaml` / `git-view.yaml`.
+//! **Backend-persisted** preferences — distinct from the frontend-only theme
+//! (which stays in `localStorage`, since it's a device-local presentation
+//! concern that shouldn't sync across machines). Consumers vary: some fields
+//! are backend-consumed (the Git view's open-in-editor / open-in-terminal
+//! actions run them, dispatch reads `claude_chrome_enabled`), others are read
+//! only by the frontend (`diff_style`, `auto_reading_mode`) and merely persist
+//! here. Anything that is a real setting — not device-local presentation —
+//! lives in this backend-owned YAML file, a sibling of `workspace.yaml` /
+//! `git-view.yaml`.
 //!
 //! Shape and persistence mirror [`crate::git_registry`]: a user-global YAML file
 //! resolved through the same mechanism, with graceful degradation — a missing or
@@ -200,6 +203,14 @@ pub struct Preferences {
     /// user's assertion that the extension exists, not a guess we make for them.
     pub claude_chrome_enabled: bool,
 
+    /// Whether dispatching work — a compose-bar send or a workflow launch —
+    /// automatically puts that project into reading mode, as if the user had
+    /// toggled it themselves. Consumed entirely by the frontend; the backend
+    /// only persists it. Defaults off: reading mode hides the compose box after
+    /// every send, which is the point for users who toggle it manually on each
+    /// send today and a surprise for everyone else.
+    pub auto_reading_mode: bool,
+
     /// Per-harness profiles preselected by Add Agent and used when a new
     /// project auto-creates its roster.
     #[serde(
@@ -217,6 +228,7 @@ impl Default for Preferences {
             diff_style: DiffStyle::default(),
             show_builtins: true,
             claude_chrome_enabled: false,
+            auto_reading_mode: false,
             notify_on_completion: true,
             notify_while_focused: false,
             agent_defaults: default_agent_defaults(),
@@ -283,6 +295,7 @@ impl Preferences {
             diff_style: self.diff_style,
             show_builtins: self.show_builtins,
             claude_chrome_enabled: self.claude_chrome_enabled,
+            auto_reading_mode: self.auto_reading_mode,
             notify_on_completion: self.notify_on_completion,
             notify_while_focused: self.notify_while_focused,
             agent_defaults,
@@ -436,6 +449,28 @@ mod tests {
     }
 
     #[test]
+    fn missing_auto_reading_mode_key_defaults_off() {
+        // An upgrade must not start hiding the compose box after every send —
+        // to a user who never chose that, it reads as the composer breaking.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(&path, "terminal_app: iTerm\n").unwrap();
+        assert!(!load(&path).auto_reading_mode);
+    }
+
+    #[test]
+    fn auto_reading_mode_round_trips_and_survives_normalization() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        let prefs = Preferences {
+            auto_reading_mode: true,
+            ..Preferences::default()
+        };
+        save(&path, &prefs).unwrap();
+        assert!(load(&path).auto_reading_mode, "load applies normalized()");
+    }
+
+    #[test]
     fn missing_agent_defaults_gets_all_harness_defaults() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("config.yaml");
@@ -584,6 +619,7 @@ mod tests {
             show_builtins: false,
             // Non-default in the other direction: an explicitly-on toggle.
             claude_chrome_enabled: true,
+            auto_reading_mode: false,
             notify_on_completion: true,
             notify_while_focused: false,
             agent_defaults: default_agent_defaults(),
@@ -612,6 +648,7 @@ mod tests {
                 diff_style: DiffStyle::Unified,
                 show_builtins: true,
                 claude_chrome_enabled: false,
+                auto_reading_mode: false,
                 notify_on_completion: true,
                 notify_while_focused: false,
                 agent_defaults: default_agent_defaults(),
@@ -662,6 +699,7 @@ mod tests {
                     diff_style: DiffStyle::Unified,
                     show_builtins: true,
                     claude_chrome_enabled: false,
+                    auto_reading_mode: false,
                     notify_on_completion: true,
                     notify_while_focused: false,
                     agent_defaults: default_agent_defaults(),
@@ -753,6 +791,7 @@ mod tests {
             diff_style: DiffStyle::Unified,
             show_builtins: true,
             claude_chrome_enabled: false,
+            auto_reading_mode: false,
             notify_on_completion: true,
             notify_while_focused: false,
             agent_defaults: default_agent_defaults(),
@@ -772,6 +811,7 @@ mod tests {
             diff_style: DiffStyle::default(),
             show_builtins: true,
             claude_chrome_enabled: false,
+            auto_reading_mode: false,
             notify_on_completion: true,
             notify_while_focused: false,
             agent_defaults: default_agent_defaults(),

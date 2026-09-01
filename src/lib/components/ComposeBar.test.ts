@@ -8467,3 +8467,180 @@ describe("ComposeBar — reading mode", () => {
     expect(invokeMock.mock.calls.some(([c]) => c === "send_message")).toBe(false);
   });
 });
+
+describe("ComposeBar — auto reading mode", () => {
+  const WORKFLOW = {
+    name: "review",
+    is_builtin: true,
+    description: "d",
+    inputs: [{ name: "worker", ty: "agent", optional: false, description: null }],
+    invocable: true,
+    parse_error: null,
+  };
+  const DESCRIPTOR = {
+    name: "review",
+    description: "d",
+    is_builtin: true,
+    invocable: true,
+    inputs: WORKFLOW.inputs,
+    steps: [],
+    derived_args: [],
+    compatibility: { state: "ok" },
+  };
+
+  async function setAutoReadingMode(on: boolean): Promise<void> {
+    const prefs = await import("$lib/preferences.svelte");
+    prefs.preferences.auto_reading_mode = on;
+  }
+
+  async function resetPrefsAndReadingMode(): Promise<void> {
+    (await import("$lib/preferences.svelte"))._testing.reset({ ready: true });
+    (await import("$lib/state/readingMode.svelte"))._testing.reset();
+    (await import("$lib/state/sendCompletion"))._testing.reset();
+    workflowsTesting.reset();
+  }
+
+  beforeEach(resetPrefsAndReadingMode);
+  afterEach(resetPrefsAndReadingMode);
+
+  async function isReading(): Promise<boolean> {
+    const { isReadingMode } = await import("$lib/state/readingMode.svelte");
+    return isReadingMode(PROJECT_ID);
+  }
+
+  async function sendPlain(): Promise<void> {
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    await fireEvent.input(textarea, { target: { value: "hello" } });
+    await fireEvent.click(screen.getByTestId("compose-send"));
+    await waitFor(() => {
+      expect(invokeMock.mock.calls.some(([c]) => c === "send_message")).toBe(true);
+    });
+  }
+
+  it("leaves reading mode alone on send while the preference is off (the default)", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    invokeMock.mockResolvedValue("msg-1");
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+
+    await sendPlain();
+    expect(await isReading()).toBe(false);
+  });
+
+  it("enters reading mode on send when the preference is on", async () => {
+    await setAutoReadingMode(true);
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    invokeMock.mockResolvedValue("msg-1");
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+
+    await sendPlain();
+    expect(await isReading()).toBe(true);
+    // The mode's normal consequence follows: the compose box is gone.
+    expect(screen.queryByTestId("compose-box")).toBeNull();
+  });
+
+  async function enterWorkflowModeAndFill(): Promise<void> {
+    await fireEvent.click(screen.getByTestId("compose-workflow-button"));
+    await waitFor(() => screen.getByTestId("workflow-option-builtin:review"));
+    await fireEvent.click(screen.getByTestId("workflow-option-builtin:review"));
+    await waitFor(() => screen.getByTestId("workflow-agent-worker-alice"));
+    await fireEvent.click(screen.getByTestId("workflow-agent-worker-alice"));
+  }
+
+  it("arms reading mode before the workflow invoke resolves, and keeps it on success", async () => {
+    // The backend spawns the run before its reply travels back, so an
+    // instantly-terminal run can settle during this await — arming must not
+    // wait for the reply or the clear would have already come and gone.
+    await setAutoReadingMode(true);
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    let resolveInvoke: (runId: string) => void = () => {};
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "list_workflows") return [WORKFLOW];
+      if (cmd === "describe_workflow_form") return DESCRIPTOR;
+      if (cmd === "list_prompts") return [];
+      if (cmd === "invoke_workflow")
+        return await new Promise<string>((resolve) => {
+          resolveInvoke = resolve;
+        });
+      return null;
+    });
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await enterWorkflowModeAndFill();
+
+    await fireEvent.click(screen.getByTestId("workflow-invoke-button"));
+    await waitFor(() => {
+      expect(invokeMock.mock.calls.some(([c]) => c === "invoke_workflow")).toBe(true);
+    });
+    expect(await isReading()).toBe(true);
+
+    resolveInvoke("run-1");
+    await waitFor(() => expect(workflowRuns[PROJECT_ID]?.[0]?.run_id).toBe("run-1"));
+    expect(await isReading()).toBe(true);
+  });
+
+  it("stays off when the run terminalizes before its own launch reply arrives", async () => {
+    // The lifecycle that forced arm-before-invoke: the backend spawns the run
+    // before replying, so a fast run can reach its terminal — and the flush that
+    // owns clearing reading mode — while the invoke promise is still pending.
+    // Arming survives that (the mode is on when the terminal lands, so the flush
+    // has something to clear); what must not happen is the post-invoke tail
+    // re-arming a mode the terminal already retired.
+    await setAutoReadingMode(true);
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    let resolveInvoke: (runId: string) => void = () => {};
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "list_workflows") return [WORKFLOW];
+      if (cmd === "describe_workflow_form") return DESCRIPTOR;
+      if (cmd === "list_prompts") return [];
+      if (cmd === "invoke_workflow")
+        return await new Promise<string>((resolve) => {
+          resolveInvoke = resolve;
+        });
+      return null;
+    });
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await enterWorkflowModeAndFill();
+
+    await fireEvent.click(screen.getByTestId("workflow-invoke-button"));
+    await waitFor(() => {
+      expect(invokeMock.mock.calls.some(([c]) => c === "invoke_workflow")).toBe(true);
+    });
+    expect(await isReading()).toBe(true);
+
+    // The run finishes while the launch reply is still in flight.
+    const completion = await import("$lib/state/sendCompletion");
+    completion.recordWorkflowTerminal(PROJECT_ID, "review", "complete");
+    await waitFor(async () => expect(await isReading()).toBe(false));
+
+    // The reply lands afterwards; nothing in its tail may switch the mode back on.
+    resolveInvoke("run-1");
+    await waitFor(() => expect(workflowRuns[PROJECT_ID]?.[0]?.run_id).toBe("run-1"));
+    await tick();
+    expect(await isReading()).toBe(false);
+  });
+
+  it("rolls back reading mode when the workflow invoke is rejected", async () => {
+    // A rejection means no run ever spawned: nothing would clear the mode, and
+    // the user needs the composer back to retry.
+    await setAutoReadingMode(true);
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "list_workflows") return [WORKFLOW];
+      if (cmd === "describe_workflow_form") return DESCRIPTOR;
+      if (cmd === "list_prompts") return [];
+      if (cmd === "invoke_workflow") throw new Error("another run is already live");
+      return null;
+    });
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await enterWorkflowModeAndFill();
+
+    await fireEvent.click(screen.getByTestId("workflow-invoke-button"));
+    await waitFor(async () => expect(await isReading()).toBe(false));
+    // The composer is back for the retry.
+    expect(screen.getByTestId("workflow-composer")).toBeInTheDocument();
+  });
+});

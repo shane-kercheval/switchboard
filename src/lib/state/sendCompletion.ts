@@ -435,7 +435,29 @@ function flushIfReady(projectId: ProjectId): void {
       //
       // Runs on rejection too: a failed notify still leaves the project quiet,
       // and stranding the user with a hidden compose box is the worse outcome.
-      clearReadingMode(projectId);
+      //
+      // Skipped when work started while this delivery was in flight: the
+      // auto-reading-mode preference arms the mode at dispatch, so work landing
+      // inside this round trip would otherwise have its freshly-armed mode
+      // switched off by a stale release — that work's own flush owns the clear
+      // from here. Two conditions, because the two kinds of work become visible
+      // to this module at different moments: a send is tracked from
+      // `registerSend`, but a workflow run is tracked only at its *terminal*
+      // (`recordWorkflowTerminal`), so a launch is invisible to
+      // `hasTrackedActivity` for its whole duration and is caught by the
+      // observer's busy push instead.
+      //
+      // Three same-shape windows remain, deliberately accepted rather than
+      // guarded, each needing a user to act inside a single local IPC round
+      // trip and costing one lost notification or one extra click: two
+      // deliveries overlapping; a manual toggle inside the round trip; and a
+      // workflow launch whose optimistic run row and first progress event have
+      // both yet to land, so the busy push has not happened. Same profile as
+      // the visibility-entry race `App.svelte` documents and accepts. If these
+      // ever need closing, the fix is an ownership generation on reading mode
+      // itself — not more predicates here.
+      if (!hasTrackedActivity(projectId) && !busyProjects.has(projectId))
+        clearReadingMode(projectId);
       // Released last, so the reading-mode fallback (which reads `isFlushing`)
       // can never observe "nothing in flight" while this delivery is still
       // deciding. Floors at zero rather than trusting the key to exist: a

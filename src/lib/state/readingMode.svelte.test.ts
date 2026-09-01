@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   clearReadingMode,
+  enterReadingMode,
   forgetReadingMode,
   isReadingMode,
   toggleReadingMode,
@@ -19,6 +20,15 @@ describe("reading mode state", () => {
     expect(toggleReadingMode("p-a")).toBe(false);
     expect(isReadingMode("p-a")).toBe(false);
     expect(isReadingMode("p-b")).toBe(true);
+  });
+
+  it("enters idempotently — a send while the mode is already on must leave it on", () => {
+    enterReadingMode("p-a");
+    enterReadingMode("p-a");
+    expect(isReadingMode("p-a")).toBe(true);
+    // A manual exit still works afterwards.
+    expect(toggleReadingMode("p-a")).toBe(false);
+    expect(isReadingMode("p-a")).toBe(false);
   });
 
   it("clears idempotently, since the flush clears on every project quiet-down", () => {

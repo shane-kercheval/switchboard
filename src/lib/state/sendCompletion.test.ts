@@ -782,6 +782,75 @@ describe("reading mode auto-off", () => {
     await vi.waitFor(() => expect(readingMode.isReadingMode(PROJECT)).toBe(false));
   });
 
+  it("does not clear reading mode armed by a send that landed during delivery", async () => {
+    // Auto reading mode arms at dispatch, so a send inside the notify round
+    // trip is a real sequence: the stale release must not switch off the mode
+    // the new send just armed. The new activity's own flush owns it from here.
+    let release: () => void = () => {};
+    notifyMock.mockImplementationOnce(
+      async () =>
+        await new Promise<void>((resolve) => {
+          release = resolve;
+        }),
+    );
+    readingMode.enterReadingMode(PROJECT);
+    register();
+    markRecipientStarted(SEND, A);
+    settleRecipient(SEND, A, "completed");
+    settleAgentIdle(A);
+    expect(isFlushing(PROJECT)).toBe(true);
+
+    // The next send dispatches while the notification is still travelling.
+    register([{ id: A, name: "claude" }], SECOND_SEND);
+    readingMode.enterReadingMode(PROJECT);
+
+    release();
+    // The stale release resolves and skips the clear; only the second send's
+    // own settlement may end the mode.
+    await vi.waitFor(() => expect(isFlushing(PROJECT)).toBe(false));
+    expect(readingMode.isReadingMode(PROJECT)).toBe(true);
+
+    markRecipientStarted(SECOND_SEND, A);
+    settleRecipient(SECOND_SEND, A, "completed");
+    settleAgentIdle(A);
+    await vi.waitFor(() => expect(readingMode.isReadingMode(PROJECT)).toBe(false));
+  });
+
+  it("does not clear reading mode armed by a workflow launched during delivery", async () => {
+    // A workflow is invisible to `hasTrackedActivity` until its terminal, so the
+    // send-shaped guard alone would let a stale release switch off the mode a
+    // launch just armed. The observer's busy push is what covers it.
+    let release: () => void = () => {};
+    notifyMock.mockImplementationOnce(
+      async () =>
+        await new Promise<void>((resolve) => {
+          release = resolve;
+        }),
+    );
+    readingMode.enterReadingMode(PROJECT);
+    register();
+    markRecipientStarted(SEND, A);
+    settleRecipient(SEND, A, "completed");
+    settleAgentIdle(A);
+    expect(isFlushing(PROJECT)).toBe(true);
+    // Nothing tracked: the send's accumulator was drained by its own flush.
+    expect(hasTrackedActivity(PROJECT)).toBe(false);
+
+    // A workflow launches while the notification is still travelling; the
+    // observer sees the run row and pushes the project busy.
+    readingMode.enterReadingMode(PROJECT);
+    pushBusy(true);
+
+    release();
+    await vi.waitFor(() => expect(isFlushing(PROJECT)).toBe(false));
+    expect(readingMode.isReadingMode(PROJECT)).toBe(true);
+
+    // The run's own terminal ends the mode, once the project is quiet again.
+    pushBusy(false);
+    recordWorkflowTerminal(PROJECT, "review", "complete");
+    await vi.waitFor(() => expect(readingMode.isReadingMode(PROJECT)).toBe(false));
+  });
+
   it("clears reading mode even when the notification fails to deliver", async () => {
     notifyMock.mockRejectedValueOnce(new Error("no notification permission"));
     readingMode.toggleReadingMode(PROJECT);

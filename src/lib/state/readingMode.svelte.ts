@@ -53,6 +53,16 @@ export function toggleReadingMode(projectId: ProjectId): boolean {
   return true;
 }
 
+/// Turn reading mode on for a project. Idempotent — and that is load-bearing,
+/// not convenience: the auto-on-send preference calls this from the dispatch
+/// path, which can run while the mode is already on (a held forward resolving
+/// after the user entered reading mode manually). Routing that through
+/// `toggleReadingMode` would turn the mode *off* on exactly the send the user
+/// wanted it kept on for.
+export function enterReadingMode(projectId: ProjectId): void {
+  readingProjects[projectId] = true;
+}
+
 /// Turn reading mode off for a project. Idempotent — the flush calls this on
 /// every project quiet-down, most of which were never in reading mode.
 export function clearReadingMode(projectId: ProjectId): void {

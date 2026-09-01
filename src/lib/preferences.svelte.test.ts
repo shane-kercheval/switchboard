@@ -23,6 +23,7 @@ const PREFS = (editor: string | null, terminal: string): Preferences => ({
   diff_style: "side_by_side",
   show_builtins: true,
   claude_chrome_enabled: false,
+  auto_reading_mode: false,
   notify_on_completion: true,
   notify_while_focused: false,
   agent_defaults: structuredClone(DEFAULT_AGENT_PROFILES),

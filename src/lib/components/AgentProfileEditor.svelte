@@ -13,7 +13,7 @@
     SUPPORTS_MODEL_SELECTION,
   } from "$lib/harnessDisplay";
   import SelectionPicker from "$lib/components/ui/SelectionPicker.svelte";
-  import { cn } from "$lib/utils";
+  import Switch from "$lib/components/ui/Switch.svelte";
 
   type Props = {
     harness: HarnessKind;
@@ -158,27 +158,13 @@
         <div class="text-fg text-sm">Secondary configuration</div>
         <p class="text-muted mt-0.5 text-xs">Add a second model and effort for quick switching.</p>
       </div>
-      <button
-        type="button"
-        role="switch"
-        aria-checked={secondary !== null}
-        aria-label="Enable secondary configuration"
-        data-testid={`${testidPrefix}-secondary-toggle`}
-        class={cn(
-          "relative mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors outline-none",
-          disabled ? "cursor-not-allowed opacity-50" : "cursor-pointer",
-          secondary !== null ? "bg-accent" : "bg-active",
-        )}
+      <Switch
+        checked={secondary !== null}
         {disabled}
+        ariaLabel="Enable secondary configuration"
+        testid={`${testidPrefix}-secondary-toggle`}
         onclick={toggleSecondary}
-      >
-        <span
-          class={cn(
-            "bg-raised inline-block h-4 w-4 transform rounded-full transition-transform",
-            secondary !== null ? "translate-x-4" : "translate-x-0.5",
-          )}
-        ></span>
-      </button>
+      />
     </div>
 
     {#if secondary !== null}

@@ -15,6 +15,7 @@
   import HarnessStatusList from "$lib/components/HarnessStatusList.svelte";
   import AgentProfileEditor from "$lib/components/AgentProfileEditor.svelte";
   import Input from "$lib/components/ui/Input.svelte";
+  import Switch from "$lib/components/ui/Switch.svelte";
   import CopyButton from "$lib/components/ui/CopyButton.svelte";
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
   import { SUPPLEMENTAL_TOOLTIP_DELAY } from "$lib/components/ui/tooltip";
@@ -480,28 +481,14 @@
             the browser will ask which one to use. Answer it once and the choice is remembered.
           </p>
         </div>
-        <button
-          type="button"
-          role="switch"
+        <Switch
+          checked={preferences.claude_chrome_enabled}
           disabled={!preferenceLoadState.ready}
-          aria-checked={preferences.claude_chrome_enabled}
-          aria-label="Let Claude agents use Chrome"
-          data-testid="claude-chrome-toggle"
-          class={cn(
-            "relative mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors outline-none",
-            preferenceLoadState.ready ? "cursor-pointer" : "cursor-not-allowed opacity-50",
-            preferences.claude_chrome_enabled ? "bg-accent" : "bg-active",
-          )}
+          ariaLabel="Let Claude agents use Chrome"
+          testid="claude-chrome-toggle"
           onclick={() =>
             void updatePreferences({ claude_chrome_enabled: !preferences.claude_chrome_enabled })}
-        >
-          <span
-            class={cn(
-              "bg-raised inline-block h-4 w-4 transform rounded-full transition-transform",
-              preferences.claude_chrome_enabled ? "translate-x-4" : "translate-x-0.5",
-            )}
-          ></span>
-        </button>
+        />
       </div>
 
       {#if saveFailedFor("claude_chrome_enabled")}
@@ -540,28 +527,14 @@
             Turn this off to stop all notifications, including the sound.
           </p>
         </div>
-        <button
-          type="button"
-          role="switch"
+        <Switch
+          checked={preferences.notify_on_completion}
           disabled={!preferenceLoadState.ready}
-          aria-checked={preferences.notify_on_completion}
-          aria-label="Notify me when agents finish"
-          data-testid="notify-toggle"
-          class={cn(
-            "relative mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors outline-none",
-            preferenceLoadState.ready ? "cursor-pointer" : "cursor-not-allowed opacity-50",
-            preferences.notify_on_completion ? "bg-accent" : "bg-active",
-          )}
+          ariaLabel="Notify me when agents finish"
+          testid="notify-toggle"
           onclick={() =>
             void updatePreferences({ notify_on_completion: !preferences.notify_on_completion })}
-        >
-          <span
-            class={cn(
-              "bg-raised inline-block h-4 w-4 transform rounded-full transition-transform",
-              preferences.notify_on_completion ? "translate-x-4" : "translate-x-0.5",
-            )}
-          ></span>
-        </button>
+        />
       </div>
 
       <div class="flex items-start justify-between gap-4">
@@ -581,33 +554,43 @@
             its completion notification follows this setting instead of being skipped.
           </p>
         </div>
-        <button
-          type="button"
-          role="switch"
+        <Switch
+          checked={preferences.notify_while_focused}
           disabled={!preferenceLoadState.ready || !preferences.notify_on_completion}
-          aria-checked={preferences.notify_while_focused}
-          aria-label="Also notify me about other projects while I'm using Switchboard"
-          data-testid="notify-while-focused-toggle"
-          class={cn(
-            "relative mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors outline-none",
-            preferenceLoadState.ready && preferences.notify_on_completion
-              ? "cursor-pointer"
-              : "cursor-not-allowed opacity-50",
-            preferences.notify_while_focused ? "bg-accent" : "bg-active",
-          )}
+          ariaLabel="Also notify me about other projects while I'm using Switchboard"
+          testid="notify-while-focused-toggle"
           onclick={() =>
             void updatePreferences({ notify_while_focused: !preferences.notify_while_focused })}
-        >
-          <span
-            class={cn(
-              "bg-raised inline-block h-4 w-4 transform rounded-full transition-transform",
-              preferences.notify_while_focused ? "translate-x-4" : "translate-x-0.5",
-            )}
-          ></span>
-        </button>
+        />
       </div>
 
-      {#if saveFailedFor("notify_on_completion", "notify_while_focused")}
+      <div class="flex items-start justify-between gap-4">
+        <div class="min-w-0">
+          <div class="text-fg text-sm">Turn on reading mode automatically when I send</div>
+          <p class="text-muted mt-0.5 text-xs leading-relaxed">
+            Every message you send — and every workflow you start — puts that project into
+            <span class="text-fg">reading mode</span>, exactly as if you'd pressed the reading-mode
+            button yourself: the compose box hides until the project finishes, and the project's
+            completion notifies you like any other project's. Reading mode turns itself off when the
+            project goes quiet.
+          </p>
+          <p class="text-muted mt-1 text-xs leading-relaxed">
+            To send a follow-up while agents are still working, leave reading mode first — click the
+            highlighted reading-mode button in the pane header, or press ⌘⇧R. And while you're
+            working in Switchboard, the completion alert only arrives if the setting above is on.
+          </p>
+        </div>
+        <Switch
+          checked={preferences.auto_reading_mode}
+          disabled={!preferenceLoadState.ready}
+          ariaLabel="Turn on reading mode automatically when I send"
+          testid="auto-reading-mode-toggle"
+          onclick={() =>
+            void updatePreferences({ auto_reading_mode: !preferences.auto_reading_mode })}
+        />
+      </div>
+
+      {#if saveFailedFor("notify_on_completion", "notify_while_focused", "auto_reading_mode")}
         <p class="text-status-failed text-xs leading-relaxed" data-testid="notify-save-error">
           Couldn't save your preferences ({saveStatus.error}). The change applies for now but may
           not survive a restart.
@@ -639,27 +622,13 @@
             Turn this off to see only your own content in the prompt and workflow pickers.
           </p>
         </div>
-        <button
-          type="button"
-          role="switch"
+        <Switch
+          checked={preferences.show_builtins}
           disabled={!preferenceLoadState.ready}
-          aria-checked={preferences.show_builtins}
-          aria-label="Show built-in prompts and workflows"
-          data-testid="show-builtins-toggle"
-          class={cn(
-            "relative mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors outline-none",
-            preferenceLoadState.ready ? "cursor-pointer" : "cursor-not-allowed opacity-50",
-            preferences.show_builtins ? "bg-accent" : "bg-active",
-          )}
+          ariaLabel="Show built-in prompts and workflows"
+          testid="show-builtins-toggle"
           onclick={() => void updatePreferences({ show_builtins: !preferences.show_builtins })}
-        >
-          <span
-            class={cn(
-              "bg-raised inline-block h-4 w-4 transform rounded-full transition-transform",
-              preferences.show_builtins ? "translate-x-4" : "translate-x-0.5",
-            )}
-          ></span>
-        </button>
+        />
       </div>
     </section>
 

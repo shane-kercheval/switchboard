@@ -105,7 +105,8 @@
   import WorkflowComposer from "$lib/components/WorkflowComposer.svelte";
   import WorkflowSteps from "$lib/components/WorkflowSteps.svelte";
   import { workflowRuns, cancelRun, abandonRun, refreshRuns } from "$lib/state/workflows.svelte";
-  import { isReadingMode } from "$lib/state/readingMode.svelte";
+  import { clearReadingMode, enterReadingMode, isReadingMode } from "$lib/state/readingMode.svelte";
+  import { preferences } from "$lib/preferences.svelte";
   import Button from "$lib/components/ui/Button.svelte";
   import ForwardSourceChip from "$lib/components/ui/ForwardSourceChip.svelte";
   import ForwardSourcePicker from "$lib/components/ui/ForwardSourcePicker.svelte";
@@ -2221,6 +2222,18 @@
     const workflow = selectedWorkflow;
     invokingWorkflow = true;
     clearStatus();
+    // Captured before any await: the function's tail runs in a closure that can
+    // outlive this `{#key projectId}`-remounted instance.
+    const invokedProjectId = projectId;
+    // Auto reading mode arms *before* the invoke, not after it succeeds: the
+    // backend spawns the run task before its reply travels back, so an
+    // instantly-failing run can reach its terminal — and run the flush that
+    // owns clearing the mode — while this await is still in flight. Arming
+    // afterwards would latch the mode with nothing left to clear it. A
+    // rejected invoke rolls back below, unless the mode was already on (then
+    // it wasn't ours to take away).
+    const armedReadingMode = preferences.auto_reading_mode && !isReadingMode(invokedProjectId);
+    if (armedReadingMode) enterReadingMode(invokedProjectId);
     try {
       // Pane-expand each field's sources to wire refs (agent + owning project);
       // omit empty fields so the map carries only fields the user actually
@@ -2269,6 +2282,10 @@
       await refreshRuns(projectId);
       removeWorkflow();
     } catch (err) {
+      // A rejection means validation failed before the run spawned — no run,
+      // no terminal, so the arming above has nothing to clear it and is rolled
+      // back here to restore the composer the error tells the user to retry in.
+      if (armedReadingMode) clearReadingMode(invokedProjectId);
       showError(`Couldn't run workflow: ${err instanceof Error ? err.message : String(err)}`);
     } finally {
       invokingWorkflow = false;
@@ -2580,6 +2597,14 @@
       projects.list.find((p) => p.id === dispatchProjectId)?.name ?? "",
       targets.map((a) => ({ id: a.id, name: a.name })),
     );
+    // Auto reading mode arms once per send, and only when the send actually has
+    // recipients — mirroring `registerSend`'s guard, since with nothing
+    // registered there would be no settlement to turn the mode back off. Keyed
+    // to `dispatchProjectId`, not the viewed project: a held forward arms the
+    // project it dispatches into, and the mode self-clears when that project
+    // goes quiet. `enterReadingMode` (not toggle) so a send landing while the
+    // mode is already on leaves it on.
+    if (targets.length > 0 && preferences.auto_reading_mode) enterReadingMode(dispatchProjectId);
     for (const agent of targets) {
       const userTurnId = crypto.randomUUID();
       // Every recipient gets the SAME snapshotted attachment list (one shared

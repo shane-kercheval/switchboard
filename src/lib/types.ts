@@ -811,6 +811,8 @@ export type DiffStyle = "side_by_side" | "unified";
 // `claude_chrome_enabled` defaults to false (Claude agents get browser tools via
 // the Claude in Chrome extension; Claude-only, since Codex's equivalent is
 // configured in the ChatGPT desktop app).
+// `auto_reading_mode` defaults to false (a send or workflow launch puts that
+// project into reading mode automatically; frontend-consumed only).
 // Theme is NOT here — it stays in frontend localStorage (a device-local concern).
 export type Preferences = {
   editor_command: string | null;
@@ -818,6 +820,7 @@ export type Preferences = {
   diff_style: DiffStyle;
   show_builtins: boolean;
   claude_chrome_enabled: boolean;
+  auto_reading_mode: boolean;
   notify_on_completion: boolean;
   notify_while_focused: boolean;
   agent_defaults: Record<HarnessKind, { primary: AgentProfile; secondary: AgentProfile | null }>;

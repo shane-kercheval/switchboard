@@ -435,7 +435,18 @@ function flushIfReady(projectId: ProjectId): void {
       //
       // Runs on rejection too: a failed notify still leaves the project quiet,
       // and stranding the user with a hidden compose box is the worse outcome.
-      clearReadingMode(projectId);
+      //
+      // Skipped when new work registered while this delivery was in flight: the
+      // auto-reading-mode preference arms the mode at dispatch, so a send
+      // landing inside this round trip would otherwise have its freshly-armed
+      // mode switched off by a stale release — the new activity's own flush
+      // owns the clear from here. Narrower same-shape windows stay accepted
+      // rather than guarded (two deliveries overlapping; a manual toggle inside
+      // the round trip): hitting one takes a user acting within a single local
+      // IPC call, and the cost is one lost notification or one extra click —
+      // the same profile as the visibility-entry race `App.svelte` documents
+      // and accepts.
+      if (!hasTrackedActivity(projectId)) clearReadingMode(projectId);
       // Released last, so the reading-mode fallback (which reads `isFlushing`)
       // can never observe "nothing in flight" while this delivery is still
       // deciding. Floors at zero rather than trusting the key to exist: a

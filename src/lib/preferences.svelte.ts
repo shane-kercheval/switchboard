@@ -1,7 +1,9 @@
 /// Backend-owned personal preferences (`config.yaml`), loaded once at startup and
 /// written back on change. Distinct from `theme.svelte.ts` (frontend-only,
-/// localStorage): these are consumed by the backend's Git-view open-actions, so
-/// the backend is the source of truth and this store is a cached mirror.
+/// localStorage, device-local presentation): these are real settings — some
+/// consumed by the backend (Git-view open-actions, dispatch), some read only
+/// here (`diff_style`, `auto_reading_mode`) — so the backend is the source of
+/// truth and this store is a cached mirror.
 ///
 /// Loading is lazy + idempotent (`load()` is safe to call repeatedly; it fetches
 /// once). Saving is optimistic: the in-memory value updates immediately and the
@@ -19,6 +21,7 @@ const DEFAULTS: Preferences = {
   diff_style: "unified",
   show_builtins: true,
   claude_chrome_enabled: false,
+  auto_reading_mode: false,
   notify_on_completion: true,
   notify_while_focused: false,
   agent_defaults: structuredClone(DEFAULT_AGENT_PROFILES),

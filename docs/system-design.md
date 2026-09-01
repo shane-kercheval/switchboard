@@ -495,6 +495,8 @@ Everything else keeps working: live streaming, panes, pinned messages, the sideb
 
 Reading mode **turns itself off when the project goes quiet**, at the same moment the completion is delivered, because that is when the user has something to act on again. It can also be turned on for a project that is already finished (reading a long transcript without the compose box in the way), where it simply stays on until the user turns it off or until later work starts and settles. It is per-project, in-memory, and does not survive a restart — a posture, not a preference.
 
+For users who adopt this posture on every send, a Settings toggle (**"Turn on reading mode automatically when I send"**, under Notifications, off by default) enters reading mode automatically whenever a send is dispatched or a workflow run is launched in a project. What persists is only that *policy* (`auto_reading_mode` in the user-global `config.yaml`); the per-project posture itself stays in-memory and still ends the same way — the project going quiet, or the user toggling it off.
+
 ### Per-agent status and actions
 
 Each agent's operational state is surfaced in the **overview sidebar** (per "Inside a project" above). State includes:

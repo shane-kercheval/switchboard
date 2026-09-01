@@ -84,6 +84,7 @@ describe("CreateAgentForm", () => {
       diff_style: "unified",
       show_builtins: true,
       claude_chrome_enabled: false,
+      auto_reading_mode: false,
       notify_on_completion: true,
       notify_while_focused: false,
       agent_defaults: {

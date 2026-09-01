@@ -29,6 +29,7 @@ const defaultInvoke = async (cmd: string, _args?: Record<string, unknown>): Prom
       diff_style: "unified",
       show_builtins: true,
       claude_chrome_enabled: false,
+      auto_reading_mode: false,
       notify_on_completion: true,
       notify_while_focused: false,
     };
@@ -202,6 +203,7 @@ describe("SettingsView", () => {
     expect(screen.getByTestId("external-terminal-app-option-iterm")).toBeDisabled();
     expect(screen.getByTestId("notify-toggle")).toBeDisabled();
     expect(screen.getByTestId("notify-while-focused-toggle")).toBeDisabled();
+    expect(screen.getByTestId("auto-reading-mode-toggle")).toBeDisabled();
     expect(screen.getByTestId("show-builtins-toggle")).toBeDisabled();
     expect(screen.getByTestId("claude-chrome-toggle")).toBeDisabled();
 
@@ -211,6 +213,7 @@ describe("SettingsView", () => {
       diff_style: "unified",
       show_builtins: true,
       claude_chrome_enabled: false,
+      auto_reading_mode: false,
       notify_on_completion: true,
       notify_while_focused: false,
       agent_defaults: {
@@ -329,6 +332,7 @@ describe("SettingsView", () => {
           diff_style: "unified",
           show_builtins: true,
           claude_chrome_enabled: false,
+          auto_reading_mode: false,
           notify_on_completion: true,
           notify_while_focused: false,
           agent_defaults: expect.any(Object),
@@ -348,6 +352,7 @@ describe("SettingsView", () => {
           diff_style: "unified",
           show_builtins: true,
           claude_chrome_enabled: false,
+          auto_reading_mode: false,
           notify_on_completion: true,
           notify_while_focused: false,
           agent_defaults: expect.any(Object),
@@ -370,6 +375,7 @@ describe("SettingsView", () => {
           diff_style: "unified",
           show_builtins: true,
           claude_chrome_enabled: false,
+          auto_reading_mode: false,
           notify_on_completion: true,
           notify_while_focused: false,
           agent_defaults: expect.any(Object),
@@ -387,6 +393,7 @@ describe("SettingsView", () => {
           diff_style: "unified",
           show_builtins: true,
           claude_chrome_enabled: false,
+          auto_reading_mode: false,
           notify_on_completion: true,
           notify_while_focused: false,
           agent_defaults: expect.any(Object),
@@ -437,6 +444,7 @@ describe("SettingsView", () => {
           diff_style: "unified",
           show_builtins: true,
           claude_chrome_enabled: true,
+          auto_reading_mode: false,
           notify_on_completion: true,
           notify_while_focused: false,
           agent_defaults: DEFAULT_AGENT_PROFILES,
@@ -577,6 +585,37 @@ describe("SettingsView — notifications", () => {
 
     await fireEvent.click(master);
     await waitFor(() => expect(nested).toBeDisabled());
+  });
+
+  it("the auto-reading-mode toggle is off by default and persists a flip", async () => {
+    render(SettingsView, { props: { onClose: vi.fn() } });
+    const toggle = await screen.findByTestId("auto-reading-mode-toggle");
+    await waitFor(() => expect(toggle).toHaveAttribute("aria-checked", "false"));
+
+    await fireEvent.click(toggle);
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith(
+        "set_preferences",
+        expect.objectContaining({
+          preferences: expect.objectContaining({ auto_reading_mode: true }),
+        }),
+      ),
+    );
+    expect(toggle).toHaveAttribute("aria-checked", "true");
+  });
+
+  it("keeps the auto-reading-mode toggle live when notifications are off entirely", async () => {
+    // Unlike the background-projects toggle it is not a sub-clause of "notify
+    // me": hiding the compose box after each send is meaningful on its own as a
+    // focus mode, so turning notifications off must not lock the user out of it.
+    render(SettingsView, { props: { onClose: vi.fn() } });
+    const master = await screen.findByTestId("notify-toggle");
+    const autoReading = screen.getByTestId("auto-reading-mode-toggle");
+    expect(autoReading).not.toBeDisabled();
+
+    await fireEvent.click(master);
+    await waitFor(() => expect(screen.getByTestId("notify-while-focused-toggle")).toBeDisabled());
+    expect(autoReading).not.toBeDisabled();
   });
 
   it("explains the two rules a user cannot infer from the toggle", async () => {

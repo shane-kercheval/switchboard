@@ -184,14 +184,22 @@ fn build_args(
         // --session-id creates a new session with the given UUID (first turn).
         // --resume continues an existing session (all subsequent turns).
         // Claude Code stores sessions at ~/.claude/projects/<encoded-cwd>/<uuid>.jsonl;
-        // we check that path to pick the right flag. The `cwd` used for the
-        // session-path lookup must be the SAME cwd we pass to the
-        // subprocess — claude computes its own session-storage path from
-        // its actual cwd, so any divergence here means we look in the
-        // wrong place and pass `--session-id` when we should `--resume`.
+        // we check that path to pick the right flag, and looking in the wrong
+        // place means passing `--session-id` for a session that already exists,
+        // which the CLI refuses permanently (harness-behavior §3.5b).
+        //
+        // The lookup directory is normally the cwd we spawn in, but for an agent
+        // moved across working directories the two deliberately diverge: its
+        // transcript stays under the directory it was first encoded from
+        // (`AgentRecord::session_home`) while the subprocess runs in the new
+        // project. Resuming across that gap is the CLI's own behavior, not
+        // something we arrange — it resolves `--resume <id>` through a worktree
+        // and single-match global-scan fallback and appends to the transcript in
+        // place (§3.5c). So we pass the id, spawn in the new cwd, and only the
+        // existence check follows the record.
         let exists = match home_override {
-            Some(home) => session_exists_in(home, cwd, session_id),
-            None => session_file_exists(cwd, session_id),
+            Some(home) => session_exists_for(home, agent, cwd, session_id),
+            None => session_file_exists(agent, cwd, session_id),
         };
         match (exists, agent.forked_from_session) {
             // The agent's own session exists: an ordinary resume. A forked
@@ -217,6 +225,14 @@ fn build_args(
             // treats the file as present-or-absent — a *truncated* file (killed
             // mid-copy) reads as present. See harness-behavior.md §3.5 for
             // whether that state is reachable.
+            // A fork needs no session-home handling, and adding "defensive"
+            // handling here would be wrong. The parent is resumed by id, which
+            // the CLI resolves wherever the parent's file lives; the child's
+            // transcript is then written under the **forking cwd's** encoded
+            // directory (§3.5c), so a fork is always native to the directory it
+            // was taken in and never inherits its parent's home. Stamping one on
+            // an unmaterialized fork would make this existence check miss
+            // forever and re-fork on every turn.
             (false, Some(parent_session)) => {
                 args.push("--resume".to_owned());
                 args.push(parent_session.to_string());
@@ -279,14 +295,38 @@ pub fn claude_transport_prompt(prompt: &str) -> String {
 }
 
 /// Production wrapper: reads `$HOME` and delegates to `session_exists_in`.
-fn session_file_exists(cwd: &Path, session_id: &uuid::Uuid) -> bool {
+fn session_file_exists(agent: &AgentRecord, cwd: &Path, session_id: &uuid::Uuid) -> bool {
     let Ok(home) = std::env::var("HOME") else {
         return false;
     };
-    session_exists_in(Path::new(&home), cwd, session_id)
+    session_exists_for(Path::new(&home), agent, cwd, session_id)
 }
 
-/// Pure check — testable without touching the real `$HOME`.
+/// Does this agent's session file exist, under whichever directory actually
+/// holds it? Pure — testable without touching the real `$HOME`.
+///
+/// **Two directories, and the difference is load-bearing.** An agent that has
+/// been moved across working directories keeps its transcript where it was
+/// first encoded (`AgentRecord::session_home`), so the lookup follows the record
+/// while the subprocess still spawns in the project's cwd. A recorded home is
+/// used **verbatim**: it is already resolved, and it may name a directory that
+/// no longer exists — a pruned worktree is the motivating case — where
+/// canonicalizing would fail and report a session file that is plainly on disk
+/// as missing. The project cwd keeps its canonicalization, which is what makes
+/// the encoding match for every agent that has never moved.
+fn session_exists_for(
+    home: &Path,
+    agent: &AgentRecord,
+    cwd: &Path,
+    session_id: &uuid::Uuid,
+) -> bool {
+    match &agent.session_home {
+        Some(session_home) => claude_session_file_path(home, session_home, session_id).exists(),
+        None => session_exists_in(home, cwd, session_id),
+    }
+}
+
+/// Pure check for an agent whose sessions live under its project's cwd.
 fn session_exists_in(home: &Path, cwd: &Path, session_id: &uuid::Uuid) -> bool {
     let Ok(canonical) = cwd.canonicalize() else {
         return false;
@@ -719,6 +759,132 @@ mod tests {
 
         assert!(args.contains(&"--resume".to_owned()));
         assert!(!args.contains(&"--session-id".to_owned()));
+    }
+
+    /// The post-move shape: the transcript is under the directory the agent was
+    /// first encoded from, while the subprocess spawns in the new project. The
+    /// spawn cwd's encoded directory is empty, so a lookup that followed the cwd
+    /// would pass `--session-id` and strand the agent permanently (§3.5b).
+    #[test]
+    fn build_args_resumes_a_moved_agent_from_its_recorded_session_home() {
+        let home = tempfile::TempDir::new().unwrap();
+        let original = tempfile::TempDir::new().unwrap();
+        let moved_to = tempfile::TempDir::new().unwrap();
+        let session_id = Uuid::now_v7();
+        let session_home = original.path().canonicalize().unwrap();
+        let new_cwd = moved_to.path().canonicalize().unwrap();
+
+        let session_dir = home
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join(encode_cwd(&session_home));
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(session_dir.join(format!("{session_id}.jsonl")), "").unwrap();
+
+        let agent = AgentRecord {
+            session_home: Some(session_home),
+            ..agent_with_session(session_id)
+        };
+        let args = build_args(&agent, "hi", &new_cwd, Some(home.path()));
+
+        assert!(args.contains(&"--resume".to_owned()), "got {args:?}");
+        assert!(!args.contains(&"--session-id".to_owned()), "got {args:?}");
+    }
+
+    /// Moving an agent out of a worktree the user has since pruned: the
+    /// recorded home no longer exists on disk, but the transcript does.
+    /// Canonicalizing the recorded path would fail and report the session as
+    /// missing.
+    #[test]
+    fn build_args_resumes_when_the_recorded_session_home_no_longer_exists() {
+        let home = tempfile::TempDir::new().unwrap();
+        let moved_to = tempfile::TempDir::new().unwrap();
+        let session_id = Uuid::now_v7();
+        let pruned = {
+            let worktree = tempfile::TempDir::new().unwrap();
+            let path = worktree.path().canonicalize().unwrap();
+            drop(worktree);
+            path
+        };
+        assert!(
+            !pruned.exists(),
+            "fixture must exercise a deleted directory"
+        );
+
+        let session_dir = home
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join(encode_cwd(&pruned));
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(session_dir.join(format!("{session_id}.jsonl")), "").unwrap();
+
+        let agent = AgentRecord {
+            session_home: Some(pruned),
+            ..agent_with_session(session_id)
+        };
+        let args = build_args(
+            &agent,
+            "hi",
+            &moved_to.path().canonicalize().unwrap(),
+            Some(home.path()),
+        );
+
+        assert!(args.contains(&"--resume".to_owned()), "got {args:?}");
+    }
+
+    /// A recorded home with no file anywhere is still a first turn — the stamp
+    /// must not be read as "a session exists".
+    #[test]
+    fn build_args_starts_a_session_when_the_recorded_home_holds_no_file() {
+        let home = tempfile::TempDir::new().unwrap();
+        let original = tempfile::TempDir::new().unwrap();
+        let moved_to = tempfile::TempDir::new().unwrap();
+        let session_id = Uuid::now_v7();
+
+        let agent = AgentRecord {
+            session_home: Some(original.path().canonicalize().unwrap()),
+            ..agent_with_session(session_id)
+        };
+        let args = build_args(
+            &agent,
+            "hi",
+            &moved_to.path().canonicalize().unwrap(),
+            Some(home.path()),
+        );
+
+        assert!(args.contains(&"--session-id".to_owned()), "got {args:?}");
+        assert!(!args.contains(&"--resume".to_owned()), "got {args:?}");
+    }
+
+    /// An unmaterialized fork carries no home (M4 refuses to stamp one), and
+    /// its parent is resumed by id from the forking cwd. Guards the rule that a
+    /// fork is native to the directory it is taken in.
+    #[test]
+    fn build_args_forks_from_the_spawn_cwd_for_an_agent_with_no_recorded_home() {
+        let home = tempfile::TempDir::new().unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        let session_id = Uuid::now_v7();
+        let parent_session = Uuid::now_v7();
+
+        let agent = AgentRecord {
+            session_home: None,
+            forked_from_session: Some(parent_session),
+            ..agent_with_session(session_id)
+        };
+        let args = build_args(
+            &agent,
+            "hi",
+            &project.path().canonicalize().unwrap(),
+            Some(home.path()),
+        );
+
+        assert!(args.contains(&"--fork-session".to_owned()), "got {args:?}");
+        assert!(
+            args.contains(&parent_session.to_string()),
+            "resumes the parent by id, got {args:?}"
+        );
     }
 
     #[test]

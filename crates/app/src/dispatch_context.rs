@@ -15,7 +15,7 @@
 //!   make a Codex/Antigravity agent re-create its session every turn.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
 
 use switchboard_core::{AgentId, AgentRecord, Project, ProjectId, SendId, SessionLocator};
@@ -177,30 +177,88 @@ impl ProjectDispatchContextFactory {
     /// [`crate::locator_sink::ProjectSessionLocatorSink::persist`] writes the
     /// captured locator straight through. The exception was always sound; its
     /// stated reason was invented.
+    /// The recorded session home of the agent whose session is `parent_session`,
+    /// if that agent is cached and carries one. Only the parent's session uuid
+    /// is on a forked record, so the parent is located by locator match.
+    fn parent_session_home(&self, parent_session: uuid::Uuid) -> Option<PathBuf> {
+        lock(&self.agents_by_id)
+            .values()
+            .find(|candidate| {
+                candidate
+                    .session_locator
+                    .as_ref()
+                    .and_then(SessionLocator::as_uuid)
+                    == Some(parent_session)
+            })
+            .and_then(|parent| parent.session_home.clone())
+    }
+
     fn session_lock_keys(
         &self,
         agent: &AgentRecord,
     ) -> Result<BTreeSet<String>, crate::error::AppError> {
-        let mut keys = BTreeSet::new();
-        let cwd = &self.project.directory;
-        if let Some(locator) = &agent.session_locator {
-            keys.insert(crate::session_lock::session_lock_key(
-                agent.harness,
-                locator,
-                cwd,
-            )?);
-        }
-        if let Some(parent) = agent.forked_from_session
-            && crate::commands::resolve_session_file(agent, cwd, &self.home_dir).is_none()
-        {
-            keys.insert(crate::session_lock::session_lock_key(
-                agent.harness,
-                &SessionLocator::Uuid(parent),
-                cwd,
-            )?);
-        }
-        Ok(keys)
+        session_lock_keys_for(
+            agent,
+            &self.project.directory,
+            &self.home_dir,
+            agent
+                .forked_from_session
+                .and_then(|parent| self.parent_session_home(parent)),
+        )
     }
+}
+
+/// The cross-process session-lock keys one dispatch of `agent` must hold.
+///
+/// **Keys name where the session *file* is, not where the agent now lives.** A
+/// Claude lock key includes the working directory (its session ids are
+/// cwd-namespaced), so keying a moved agent by its current project would mint a
+/// key for a session that does not exist there and silently stop contending
+/// with whatever is driving the real transcript from its recorded home — the
+/// protection disappears with nothing failing. The agent's *spawn* cwd is
+/// unaffected; only the key follows the record.
+///
+/// `parent_session_home` is the recorded home of the fork parent, when this
+/// agent is an unmaterialized fork and the parent carries one. Only the
+/// parent's session uuid is on a forked record, so the caller resolves it.
+/// Falling back to this agent's own session directory is the historical
+/// behavior and correct whenever the two share a directory; the residual gap
+/// (an unmoved parent whose child has been moved away) is documented at the
+/// call site.
+fn session_lock_keys_for(
+    agent: &AgentRecord,
+    project_directory: &Path,
+    home_dir: &Path,
+    parent_session_home: Option<PathBuf>,
+) -> Result<BTreeSet<String>, crate::error::AppError> {
+    let mut keys = BTreeSet::new();
+    let session_cwd = agent.effective_session_directory(project_directory);
+    if let Some(locator) = &agent.session_locator {
+        keys.insert(crate::session_lock::session_lock_key(
+            agent.harness,
+            locator,
+            session_cwd,
+        )?);
+    }
+    if let Some(parent) = agent.forked_from_session
+        && crate::commands::resolve_session_file(agent, project_directory, home_dir).is_none()
+    {
+        // Residual, deliberately not closed: a parent with no recorded home
+        // whose *child* has been moved to another directory resolves to the
+        // child's directory, so the two dispatches take different keys. Closing
+        // it needs the parent's owning project, which the factory does not
+        // carry. Bounded exposure — a materializing fork reads the parent while
+        // the parent may be appending, and harness-behavior §3.5 establishes the
+        // parent file is not corrupted by that — so it is a fidelity risk on the
+        // new branch, not a corruption one.
+        let parent_cwd = parent_session_home.unwrap_or_else(|| session_cwd.to_path_buf());
+        keys.insert(crate::session_lock::session_lock_key(
+            agent.harness,
+            &SessionLocator::Uuid(parent),
+            &parent_cwd,
+        )?);
+    }
+    Ok(keys)
 }
 
 impl DispatchContextFactory for ProjectDispatchContextFactory {
@@ -359,5 +417,152 @@ impl DispatchContextFactory for ProjectDispatchContextFactory {
 
     fn idle_emitter(&self) -> Arc<dyn EventEmitter> {
         Arc::clone(&self.base_emitter)
+    }
+}
+
+#[cfg(test)]
+mod session_lock_key_tests {
+    use std::path::{Path, PathBuf};
+
+    use switchboard_core::{AgentProfiles, AgentRecord, HarnessKind, SessionLocator};
+    use tempfile::TempDir;
+    use uuid::Uuid;
+
+    use super::session_lock_keys_for;
+
+    fn claude_agent(session: Uuid) -> AgentRecord {
+        AgentRecord {
+            session_home: None,
+            id: Uuid::now_v7(),
+            project_id: Uuid::now_v7(),
+            name: "agent".to_owned(),
+            harness: HarnessKind::ClaudeCode,
+            session_locator: Some(SessionLocator::Uuid(session)),
+            model: None,
+            effort: None,
+            profiles: AgentProfiles::default(),
+            forked_from_session: None,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    /// The contention guarantee: a moved agent must take the *same* lock as
+    /// anything driving that session from the directory the transcript actually
+    /// lives in. Keying it by its new project would mint a different key, and
+    /// two processes could then write one session file with nothing failing.
+    #[test]
+    fn a_moved_agent_locks_the_same_key_as_its_session_home() {
+        let home_dir = TempDir::new().unwrap();
+        let session = Uuid::now_v7();
+        let session_home = PathBuf::from("/work/original-checkout");
+        let new_project = Path::new("/work/somewhere-else");
+
+        let moved = AgentRecord {
+            session_home: Some(session_home.clone()),
+            ..claude_agent(session)
+        };
+        let unmoved_at_home = claude_agent(session);
+
+        assert_eq!(
+            session_lock_keys_for(&moved, new_project, home_dir.path(), None).unwrap(),
+            session_lock_keys_for(&unmoved_at_home, &session_home, home_dir.path(), None).unwrap(),
+            "a moved agent must contend with its session's real location"
+        );
+    }
+
+    #[test]
+    fn a_moved_agent_does_not_lock_its_new_projects_key() {
+        let home_dir = TempDir::new().unwrap();
+        let session = Uuid::now_v7();
+        let new_project = Path::new("/work/somewhere-else");
+
+        let moved = AgentRecord {
+            session_home: Some(PathBuf::from("/work/original-checkout")),
+            ..claude_agent(session)
+        };
+
+        assert_ne!(
+            session_lock_keys_for(&moved, new_project, home_dir.path(), None).unwrap(),
+            session_lock_keys_for(&claude_agent(session), new_project, home_dir.path(), None)
+                .unwrap(),
+            "keying by the new project would name a session that isn't there"
+        );
+    }
+
+    #[test]
+    fn an_agent_with_no_recorded_home_is_unchanged() {
+        let home_dir = TempDir::new().unwrap();
+        let session = Uuid::now_v7();
+        let project = Path::new("/work/project");
+
+        let keys =
+            session_lock_keys_for(&claude_agent(session), project, home_dir.path(), None).unwrap();
+
+        assert_eq!(
+            keys,
+            std::iter::once(
+                crate::session_lock::session_lock_key(
+                    HarnessKind::ClaudeCode,
+                    &SessionLocator::Uuid(session),
+                    project,
+                )
+                .unwrap()
+            )
+            .collect::<std::collections::BTreeSet<_>>()
+        );
+    }
+
+    /// A materializing fork locks the parent where the *parent* keeps it, so it
+    /// contends with the parent's own dispatch after the parent has moved.
+    #[test]
+    fn a_materializing_fork_locks_the_parents_recorded_home() {
+        let home_dir = TempDir::new().unwrap();
+        let parent_session = Uuid::now_v7();
+        let parent_home = PathBuf::from("/work/parents-original-checkout");
+        let project = Path::new("/work/project");
+
+        let child = AgentRecord {
+            forked_from_session: Some(parent_session),
+            ..claude_agent(Uuid::now_v7())
+        };
+
+        let keys =
+            session_lock_keys_for(&child, project, home_dir.path(), Some(parent_home.clone()))
+                .unwrap();
+        let parent_key = crate::session_lock::session_lock_key(
+            HarnessKind::ClaudeCode,
+            &SessionLocator::Uuid(parent_session),
+            &parent_home,
+        )
+        .unwrap();
+
+        assert!(
+            keys.contains(&parent_key),
+            "the fork must lock the parent where the parent's transcript lives"
+        );
+        assert_eq!(keys.len(), 2, "own session plus the parent's: {keys:?}");
+    }
+
+    /// A fork whose parent has never moved keeps the historical behavior.
+    #[test]
+    fn a_materializing_fork_falls_back_to_its_own_session_directory() {
+        let home_dir = TempDir::new().unwrap();
+        let parent_session = Uuid::now_v7();
+        let project = Path::new("/work/project");
+
+        let child = AgentRecord {
+            forked_from_session: Some(parent_session),
+            ..claude_agent(Uuid::now_v7())
+        };
+
+        let keys = session_lock_keys_for(&child, project, home_dir.path(), None).unwrap();
+        let parent_key = crate::session_lock::session_lock_key(
+            HarnessKind::ClaudeCode,
+            &SessionLocator::Uuid(parent_session),
+            project,
+        )
+        .unwrap();
+
+        assert!(keys.contains(&parent_key), "got {keys:?}");
     }
 }

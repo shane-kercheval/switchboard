@@ -5108,7 +5108,16 @@ pub(crate) fn resolve_session_file(
     match agent.harness {
         HarnessKind::ClaudeCode => {
             let sid = locator_uuid(agent)?;
-            let path = switchboard_harness::claude_session_file_path(home_dir, directory, &sid);
+            // Claude alone files sessions by working directory, and a moved
+            // agent's transcript stays under the directory it was first encoded
+            // from — so the lookup follows the record, not the project. Every
+            // caller of this function inherits that; see
+            // `AgentRecord::effective_session_directory`.
+            let path = switchboard_harness::claude_session_file_path(
+                home_dir,
+                agent.effective_session_directory(directory),
+                &sid,
+            );
             path.exists().then_some(path)
         }
         HarnessKind::Codex => {
@@ -7566,6 +7575,55 @@ mod tests {
         // Cached for `lookup_agent`, or the immediately-following send would
         // fail to resolve the agent it just created.
         assert!(lock(&state.agents_by_id).contains_key(&fork.id));
+    }
+
+    #[test]
+    fn resolve_session_file_follows_a_moved_agents_recorded_home() {
+        // The transcript stays under the directory the agent was first encoded
+        // from; everything this resolver serves — session info, the resume
+        // command, freshness fingerprints, the fork gate — must find it there
+        // rather than under the project the agent now belongs to.
+        let home = TempDir::new().unwrap();
+        let original = TempDir::new().unwrap();
+        let moved_to = TempDir::new().unwrap();
+        let original_cwd = original.path().canonicalize().unwrap();
+        let new_cwd = moved_to.path().canonicalize().unwrap();
+        let session_id = Uuid::now_v7();
+
+        let expected =
+            switchboard_harness::claude_session_file_path(home.path(), &original_cwd, &session_id);
+        std::fs::create_dir_all(expected.parent().unwrap()).unwrap();
+        std::fs::write(&expected, "").unwrap();
+
+        let agent = AgentRecord {
+            session_home: Some(original_cwd),
+            id: Uuid::now_v7(),
+            project_id: Uuid::now_v7(),
+            name: "mover".to_owned(),
+            harness: HarnessKind::ClaudeCode,
+            session_locator: Some(SessionLocator::Uuid(session_id)),
+            model: None,
+            effort: None,
+            profiles: switchboard_core::AgentProfiles::default(),
+            forked_from_session: None,
+            created_at: chrono::Utc::now(),
+        };
+
+        assert_eq!(
+            resolve_session_file(&agent, &new_cwd, home.path()),
+            Some(expected),
+            "must resolve through the recorded home, not the project directory"
+        );
+
+        let unmoved = AgentRecord {
+            session_home: None,
+            ..agent
+        };
+        assert_eq!(
+            resolve_session_file(&unmoved, &new_cwd, home.path()),
+            None,
+            "an agent with no recorded home still resolves under its project"
+        );
     }
 
     #[tokio::test]

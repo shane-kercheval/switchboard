@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
@@ -279,6 +279,31 @@ impl AgentRecord {
         }
     }
 
+    /// The working directory whose harness-side encoded directory holds this
+    /// agent's session files: [`Self::session_home`] when one is recorded,
+    /// otherwise the owning project's working directory.
+    ///
+    /// **The single authority for "where do this agent's sessions live."** Every
+    /// consumer that answers that question must go through here — the adapter's
+    /// resume/first-turn decision, the session-file resolver behind session info
+    /// and freshness fingerprints, the fork-materialization checks, the
+    /// cross-process session lock's key, and the session-id collision scans. A
+    /// second derivation is how they drift apart, and they must not: the lock in
+    /// particular stops guarding the real transcript the moment its key names a
+    /// different directory than the resume does, which is silent — nothing fails
+    /// until two processes write the same session file.
+    ///
+    /// The returned path is **already resolved and must not be canonicalized**
+    /// by the caller; see [`Self::session_home`] for why (the recorded directory
+    /// may no longer exist, and canonicalizing a missing path fails).
+    ///
+    /// `project_directory` is the owning project's resolved working directory —
+    /// which stays the agent's *spawn* cwd. Only the session-file lookup moves.
+    #[must_use]
+    pub fn effective_session_directory<'a>(&'a self, project_directory: &'a Path) -> &'a Path {
+        self.session_home.as_deref().unwrap_or(project_directory)
+    }
+
     /// Re-check, on **read**, the cross-field invariants the registration
     /// chokepoint enforces on write.
     ///
@@ -387,6 +412,29 @@ pub fn normalize_selection(value: Option<String>) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn effective_session_directory_prefers_a_recorded_home() {
+        let project = Path::new("/work/current-project");
+        let home = PathBuf::from("/work/original-checkout");
+
+        let unmoved = record_with_locator(Some(SessionLocator::Uuid(Uuid::now_v7())));
+        assert_eq!(
+            unmoved.effective_session_directory(project),
+            project,
+            "an agent that has never moved resolves under its project"
+        );
+
+        let moved = AgentRecord {
+            session_home: Some(home.clone()),
+            ..unmoved
+        };
+        assert_eq!(
+            moved.effective_session_directory(project),
+            home,
+            "a recorded home wins over the project directory"
+        );
+    }
     use super::*;
 
     fn record_with_locator(locator: Option<SessionLocator>) -> AgentRecord {

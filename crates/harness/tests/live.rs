@@ -3928,3 +3928,205 @@ async fn live_antigravity_run_command_emits_shell_facet() {
         "CommandLine must decode transcript.jsonl's string-encoding, got {shell:?}"
     );
 }
+
+/// Cross-directory resume: the load-bearing tripwire for moving an agent
+/// between working directories.
+///
+/// A moved agent keeps its transcript under the directory it was first encoded
+/// from and dispatches from its new project's directory. That works only
+/// because the CLI resolves `--resume <id>` through its own fallback chain
+/// (worktree lookup, then a single-match global scan) rather than looking solely
+/// under the spawn cwd, and because it then **appends in place** instead of
+/// relocating the file. Both are undocumented internals, established by probe
+/// and recorded in `docs/harness-behavior.md` §3.5c.
+///
+/// If this test fails after a CLI bump, cross-directory agent moves are what
+/// broke: the fallback chain or the append-in-place behavior changed, and a
+/// moved agent will strand (§3.5b) rather than resume. Re-probe §3.5c before
+/// changing anything here.
+#[tokio::test]
+#[ignore = "requires claude installed — run with: make test-live"]
+async fn live_claude_cross_directory_resume_appends_in_place() {
+    let adapter = ClaudeCodeAdapter::new();
+    let original = tempfile::TempDir::new().unwrap();
+    let moved_to = tempfile::TempDir::new().unwrap();
+    let original_cwd = original.path().canonicalize().unwrap();
+    let moved_cwd = moved_to.path().canonicalize().unwrap();
+    let home = Path::new(env!("HOME"));
+
+    // Turn 1 in the original directory: creates the session there.
+    let agent = live_agent();
+    let session_id = match agent.session_locator.as_ref() {
+        Some(SessionLocator::Uuid(id)) => *id,
+        other => panic!("expected a uuid locator, got {other:?}"),
+    };
+    let events: Vec<AdapterEvent> = adapter
+        .dispatch(
+            &agent,
+            &original_cwd,
+            "Reply with the single word 'ack'.",
+            Uuid::now_v7(),
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("first dispatch should succeed")
+        .collect()
+        .await;
+    assert!(
+        matches!(
+            events
+                .iter()
+                .find(|e| matches!(e, AdapterEvent::TurnEnd { .. })),
+            Some(AdapterEvent::TurnEnd {
+                outcome: TurnOutcome::Completed,
+                ..
+            })
+        ),
+        "turn 1 should complete, got: {events:?}"
+    );
+
+    let original_transcript = claude_session_file_path(home, &original_cwd, &session_id);
+    assert!(
+        original_transcript.exists(),
+        "turn 1 must write the transcript under the original directory"
+    );
+    let after_first = std::fs::read_to_string(&original_transcript).unwrap();
+
+    // Turn 2 from the *new* directory, exactly as a moved agent dispatches:
+    // the session home stays the original directory, the cwd is the new one.
+    let moved = AgentRecord {
+        session_home: Some(original_cwd.clone()),
+        ..agent
+    };
+    let events: Vec<AdapterEvent> = adapter
+        .dispatch(
+            &moved,
+            &moved_cwd,
+            "Reply with the single word 'ack'.",
+            Uuid::now_v7(),
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("cross-directory dispatch should succeed")
+        .collect()
+        .await;
+    assert!(
+        matches!(
+            events
+                .iter()
+                .find(|e| matches!(e, AdapterEvent::TurnEnd { .. })),
+            Some(AdapterEvent::TurnEnd {
+                outcome: TurnOutcome::Completed,
+                ..
+            })
+        ),
+        "resuming from another directory should complete — if this fails with a \
+         session-id-in-use error, the CLI's resume fallback chain (§3.5c) changed: \
+         got {events:?}"
+    );
+
+    // The transcript stays put and grows; no second file appears under the new cwd.
+    let after_second = std::fs::read_to_string(&original_transcript).unwrap();
+    assert!(
+        after_second.len() > after_first.len(),
+        "the resumed turn must append to the original transcript in place"
+    );
+    assert!(
+        !claude_session_file_path(home, &moved_cwd, &session_id).exists(),
+        "resuming must not relocate or duplicate the transcript into the new cwd"
+    );
+}
+
+/// A fork taken from a directory other than the parent's home writes the child
+/// under the **forking** cwd, leaving the parent untouched (§3.5c fork edge).
+///
+/// This is why a moved agent's descendants never inherit its session home: they
+/// are native to wherever they were forked. If this fails after a CLI bump,
+/// `build_args`'s fork arm needs re-examining — a fork of a moved agent would
+/// then be looking for its transcript in the wrong place.
+#[tokio::test]
+#[ignore = "requires claude installed — run with: make test-live"]
+async fn live_claude_cross_directory_fork_lands_in_forking_cwd() {
+    let adapter = ClaudeCodeAdapter::new();
+    let parent_dir = tempfile::TempDir::new().unwrap();
+    let fork_dir = tempfile::TempDir::new().unwrap();
+    let parent_cwd = parent_dir.path().canonicalize().unwrap();
+    let fork_cwd = fork_dir.path().canonicalize().unwrap();
+    let home = Path::new(env!("HOME"));
+
+    let parent = live_agent();
+    let parent_session = match parent.session_locator.as_ref() {
+        Some(SessionLocator::Uuid(id)) => *id,
+        other => panic!("expected a uuid locator, got {other:?}"),
+    };
+    let events: Vec<AdapterEvent> = adapter
+        .dispatch(
+            &parent,
+            &parent_cwd,
+            "Reply with the single word 'ack'.",
+            Uuid::now_v7(),
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("parent dispatch should succeed")
+        .collect()
+        .await;
+    assert!(
+        matches!(
+            events
+                .iter()
+                .find(|e| matches!(e, AdapterEvent::TurnEnd { .. })),
+            Some(AdapterEvent::TurnEnd {
+                outcome: TurnOutcome::Completed,
+                ..
+            })
+        ),
+        "parent turn should complete, got: {events:?}"
+    );
+    let parent_transcript = claude_session_file_path(home, &parent_cwd, &parent_session);
+    let parent_before = std::fs::read_to_string(&parent_transcript).unwrap();
+
+    // An unmaterialized fork carries no session home — it is native to the cwd
+    // it is forked in, which here is deliberately not the parent's.
+    let child_session = Uuid::now_v7();
+    let child = AgentRecord {
+        session_home: None,
+        forked_from_session: Some(parent_session),
+        session_locator: Some(SessionLocator::Uuid(child_session)),
+        ..live_agent()
+    };
+    let events: Vec<AdapterEvent> = adapter
+        .dispatch(
+            &child,
+            &fork_cwd,
+            "Reply with the single word 'ack'.",
+            Uuid::now_v7(),
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("cross-directory fork should succeed")
+        .collect()
+        .await;
+    assert!(
+        matches!(
+            events
+                .iter()
+                .find(|e| matches!(e, AdapterEvent::TurnEnd { .. })),
+            Some(AdapterEvent::TurnEnd {
+                outcome: TurnOutcome::Completed,
+                ..
+            })
+        ),
+        "forking across directories should complete, got: {events:?}"
+    );
+
+    assert!(
+        claude_session_file_path(home, &fork_cwd, &child_session).exists(),
+        "the child transcript must land under the forking cwd, not the parent's home"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&parent_transcript).unwrap(),
+        parent_before,
+        "forking must not modify the parent transcript"
+    );
+}

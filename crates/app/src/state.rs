@@ -362,7 +362,7 @@ pub struct AppState {
     /// Read by `open_project_impl`, `create_project_impl`, and the dispatch
     /// resolution path; set and cleared under `registry_write`, which is what
     /// makes "evict and mark" atomic against those callers.
-    pub maintenance: Mutex<HashSet<ProjectId>>,
+    pub maintenance: Arc<Mutex<HashSet<ProjectId>>>,
 
     /// The user-global project store — every project's index, catalog, and
     /// metadata root.
@@ -470,7 +470,7 @@ impl AppState {
     ) -> Self {
         Self {
             store,
-            maintenance: Mutex::new(HashSet::new()),
+            maintenance: Arc::new(Mutex::new(HashSet::new())),
             project_generation: Arc::new(Mutex::new(HashMap::new())),
             lock_root,
             #[cfg(test)]

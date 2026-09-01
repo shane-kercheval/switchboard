@@ -53,6 +53,10 @@ pub struct ProjectDispatchContextFactory {
     home_dir: PathBuf,
     /// Root for the cross-process session locks `preflight` takes.
     lock_root: PathBuf,
+    /// Projects closed to new work. Shared with `AppState`, never snapshotted:
+    /// this is the one gate that must observe a mark set *after* the turn was
+    /// queued.
+    maintenance: Arc<Mutex<HashSet<ProjectId>>>,
     /// Live lifecycle generations, and the value that belongs to `project`.
     ///
     /// **This is what makes the frozen `project` above safe to keep.** The
@@ -100,6 +104,8 @@ pub struct DispatchDeps {
     pub lock_root: PathBuf,
     /// `preflight` only: the lifecycle generations to re-check against.
     pub project_generation: Arc<Mutex<HashMap<ProjectId, u64>>>,
+    /// `preflight` only: projects closed to new work, shared with `AppState`.
+    pub maintenance: Arc<Mutex<HashSet<ProjectId>>>,
     /// The generation as of the moment the caller read the `Project` it is
     /// handing over — **not** as of now. See the field of the same name on
     /// [`ProjectDispatchContextFactory`] for why the distinction is the whole
@@ -122,6 +128,7 @@ impl ProjectDispatchContextFactory {
             dispatcher,
             home_dir,
             lock_root,
+            maintenance,
             project_generation,
             generation_at_capture,
         } = deps;
@@ -137,6 +144,7 @@ impl ProjectDispatchContextFactory {
             dispatcher,
             home_dir,
             lock_root,
+            maintenance,
             project_generation,
             generation_at_capture,
         }
@@ -290,6 +298,18 @@ impl DispatchContextFactory for ProjectDispatchContextFactory {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<TurnPermit, String>> + Send + 'a>>
     {
         Box::pin(async move {
+            // **The authoritative maintenance check, and not a duplicate of the
+            // admission-time one.** A send passes admission, sits in the queue,
+            // and a move then marks the project and observes an empty queue —
+            // the queued send would start mid-surgery. Only this check runs at
+            // the instant the turn actually begins, which is what bounds that
+            // race. Refusing here leaves no durable trace (no journal write has
+            // happened yet), which is exactly what a blocked turn wants.
+            if lock(&self.maintenance).contains(&self.project.id) {
+                return Err(
+                    crate::error::AppError::ProjectUnderMaintenance(self.project.id).to_string(),
+                );
+            }
             let generation_now = lock(&self.project_generation)
                 .get(&self.project.id)
                 .copied()

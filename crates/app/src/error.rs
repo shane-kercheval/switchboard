@@ -68,6 +68,17 @@ pub enum AppError {
     #[error("project {0} is being repaired — try again in a moment")]
     ProjectUnderMaintenance(ProjectId),
 
+    /// A move was asked for while one of the two projects still had work
+    /// outstanding. Never resolved by cancelling that work — running turns are
+    /// not sacrificed to make a move happen; the user retries when things are
+    /// idle.
+    #[error("{reason} in this project — wait for it to finish, then try the move again")]
+    #[allow(dead_code)] // Constructed by the move operation, next milestone.
+    ProjectNotQuiescent {
+        project_id: switchboard_core::ProjectId,
+        reason: String,
+    },
+
     /// A turn was prepared against a view of the project that a lifecycle
     /// operation has since invalidated — the working directory moved, or the
     /// project was deleted, between resolving it and starting the turn.

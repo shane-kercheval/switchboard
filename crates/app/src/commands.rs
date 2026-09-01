@@ -351,6 +351,142 @@ fn reject_if_under_maintenance(state: &AppState, project_id: ProjectId) -> Resul
     Ok(())
 }
 
+/// Marks a pair of projects as closed to new work for the duration of an agent
+/// move, and — unlike every other claim on those marks — **keeps them marked
+/// unless it is told the operation succeeded**.
+///
+/// **Why not [`begin_maintenance`].** That guard is right for delete and
+/// re-point and wrong for a move, in two ways that matter. It *evicts* all
+/// routable state up front, but a move needs both projects loaded: it has to
+/// read their queues to verify quiescence, and it has to keep serving them
+/// afterwards. And its `Drop` discards-and-releases on any early return, which
+/// is the correct "unloaded and openable is the recoverable state" posture for
+/// an operation that can be retried from scratch — but a move that fails
+/// *after* it has begun rewriting files must leave both projects blocked until
+/// recovery finishes, because re-enabling dispatch into half-moved state is the
+/// one outcome the move's recovery design exists to prevent.
+///
+/// So this shares the mark set and nothing else. Sharing the marks is
+/// deliberate and load-bearing: every gate that already refuses a marked
+/// project refuses for free, and overlapping claims are refused in both
+/// directions — a move cannot start on a project being deleted or re-pointed,
+/// and neither can start on a project being moved out of.
+///
+/// **Dropping this guard does not release the marks.** There is no `Drop` impl,
+/// and that is the design: an unwind or an early `?` between marking and an
+/// explicit outcome leaves the projects blocked, which is the fail-closed
+/// answer. The move calls [`Self::release`] on success, and its recovery path
+/// calls it once the pair is consistent again. A move that fails and whose
+/// recovery also fails leaves the marks set until the process restarts, by
+/// which point the durable intent record drives recovery instead.
+// Dead until the move operation lands next milestone: the plan sequences the
+// gate first so it is reviewable before any file surgery exists. Delete this
+// attribute when the move wires it up.
+#[allow(dead_code)]
+pub(crate) struct MoveBarrier {
+    maintenance: Arc<Mutex<HashSet<ProjectId>>>,
+    marked: Vec<ProjectId>,
+}
+
+impl MoveBarrier {
+    /// Clear the marks. Call only when the two projects are consistent — the
+    /// move completed, or recovery restored them.
+    // Dead until the move operation lands next milestone: the plan sequences the
+    // gate first so it is reviewable before any file surgery exists. Delete this
+    // attribute when the move wires it up.
+    #[allow(dead_code)]
+    pub(crate) fn release(self) {
+        let mut marks = lock(&self.maintenance);
+        for id in &self.marked {
+            marks.remove(id);
+        }
+    }
+}
+
+/// Claim `source` and `target` for a move, refusing if either is already
+/// claimed by any maintenance operation.
+///
+/// Takes `registry_write` for the check-and-mark so the claim cannot interleave
+/// with a lifecycle operation's own claim: without it both could observe an
+/// unmarked project and proceed. Marking happens **before** the caller verifies
+/// quiescence, which is what closes the check-then-act window — a send admitted
+/// between "the queues look empty" and "the marks are set" would otherwise start
+/// mid-surgery.
+// Dead until the move operation lands next milestone: the plan sequences the
+// gate first so it is reviewable before any file surgery exists. Delete this
+// attribute when the move wires it up.
+#[allow(dead_code)]
+pub(crate) fn begin_move_barrier(
+    state: &AppState,
+    source: ProjectId,
+    target: ProjectId,
+) -> Result<MoveBarrier, AppError> {
+    let _write = lock(&state.registry_write);
+    let mut marks = lock(&state.maintenance);
+    for id in [source, target] {
+        if marks.contains(&id) {
+            return Err(AppError::ProjectUnderMaintenance(id));
+        }
+    }
+    marks.insert(source);
+    marks.insert(target);
+    Ok(MoveBarrier {
+        maintenance: Arc::clone(&state.maintenance),
+        marked: vec![source, target],
+    })
+}
+
+/// Refuse unless **both** projects are completely idle: no turn running or
+/// enriching, no queued send, and no active workflow run, for every agent in
+/// either one.
+///
+/// **The scope is the projects, not the moved agent**, and that is the whole
+/// point. Journal appends take no shared lock, so any *other* agent in either
+/// project completing a turn while the move rewrites a journal file would have
+/// its record silently lost to the pre-rewrite copy. The gate exists for those
+/// agents' writes.
+///
+/// Workflow runs count even when every agent is idle: a run can hold a *future*
+/// step targeting an agent that is doing nothing right now, so quiescence is
+/// about outstanding commitments, not momentary activity.
+///
+/// Call this **after** the barrier is in place, never before — checking first
+/// leaves a window in which a send is admitted between the check and the mark.
+// Dead until the move operation lands next milestone: the plan sequences the
+// gate first so it is reviewable before any file surgery exists. Delete this
+// attribute when the move wires it up.
+#[allow(dead_code)]
+pub(crate) async fn ensure_projects_quiescent(
+    state: &AppState,
+    projects: [ProjectId; 2],
+) -> Result<(), AppError> {
+    for project_id in projects {
+        if let Some(run) = lock(&state.workflow_runs)
+            .values()
+            .find(|run| run.project_id == project_id)
+        {
+            return Err(AppError::ProjectNotQuiescent {
+                project_id,
+                reason: format!("workflow \"{}\" is still running", run.workflow),
+            });
+        }
+        let agents: Vec<AgentRecord> = lock(&state.agents_by_id)
+            .values()
+            .filter(|agent| agent.project_id == project_id)
+            .cloned()
+            .collect();
+        for agent in agents {
+            if state.dispatcher.has_pending_work(agent.id).await {
+                return Err(AppError::ProjectNotQuiescent {
+                    project_id,
+                    reason: format!("{} is still working", agent.name),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Owns one lifecycle operation's claim on a set of projects: their maintenance
 /// marks, the routable state evicted from under them, and the obligation to put
 /// something coherent back.
@@ -3920,6 +4056,7 @@ pub async fn send_message_impl(
             dispatcher: Arc::downgrade(&state.dispatcher),
             home_dir: home_dir.to_path_buf(),
             lock_root: state.lock_root.clone(),
+            maintenance: Arc::clone(&state.maintenance),
             project_generation: Arc::clone(&state.project_generation),
             generation_at_capture: generation,
         },
@@ -7013,7 +7150,7 @@ pub(crate) fn parse_uuid(value: &str) -> Result<Uuid, AppError> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -8037,10 +8174,187 @@ mod tests {
                 dispatcher: Arc::downgrade(&state.dispatcher),
                 home_dir: home.to_path_buf(),
                 lock_root: state.lock_root.clone(),
+                maintenance: Arc::clone(&state.maintenance),
                 project_generation: Arc::clone(&state.project_generation),
                 generation_at_capture: generation,
             },
         )
+    }
+
+    /// Shared with the workflow-preflight test in `workflow_commands`, which
+    /// needs the same seeded state but cannot reach these private helpers.
+    pub(crate) async fn state_for_workflow_preflight(
+        tmp: &TempDir,
+    ) -> (AppState, Arc<RecordingEmitter>) {
+        let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
+        let emitter = Arc::new(RecordingEmitter::new());
+        let state = AppState::new_for_test(
+            Arc::clone(&mock),
+            Arc::clone(&mock),
+            Arc::clone(&mock),
+            emitter.clone() as Arc<dyn EventEmitter>,
+        );
+        project_with_agent(&state, tmp).await;
+        (state, emitter)
+    }
+
+    pub(crate) fn sole_agent(state: &AppState) -> (AgentRecord, ProjectId) {
+        let agent = lock(&state.agents_by_id).values().next().cloned().unwrap();
+        let project_id = agent.project_id;
+        (agent, project_id)
+    }
+
+    pub(crate) fn project_of(state: &AppState, project_id: ProjectId) -> Project {
+        lock(&state.projects).get(&project_id).cloned().unwrap()
+    }
+
+    /// Two sibling projects in one registered directory — the shape a move
+    /// operates on.
+    async fn two_projects(state: &AppState, tmp: &TempDir) -> (ProjectSummary, ProjectSummary) {
+        init_directory_impl(state, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        (
+            create_project_in_only_dir(state, "source"),
+            create_project_in_only_dir(state, "target"),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_move_barrier_marks_both_projects_and_release_clears_them() {
+        let (tmp, state, _emitter) = fresh_state_with_mock();
+        let (source, target) = two_projects(&state, &tmp).await;
+
+        let barrier = begin_move_barrier(&state, source.id, target.id).unwrap();
+        assert!(lock(&state.maintenance).contains(&source.id));
+        assert!(lock(&state.maintenance).contains(&target.id));
+
+        barrier.release();
+
+        assert!(lock(&state.maintenance).is_empty());
+    }
+
+    /// The distinguishing property against `MaintenanceGuard`, whose `Drop`
+    /// discards and releases. A move that fails after it began rewriting files
+    /// must leave both projects blocked; auto-release would re-enable dispatch
+    /// into half-moved state.
+    #[tokio::test]
+    async fn dropping_a_move_barrier_without_releasing_leaves_both_marked() {
+        let (tmp, state, _emitter) = fresh_state_with_mock();
+        let (source, target) = two_projects(&state, &tmp).await;
+
+        drop(begin_move_barrier(&state, source.id, target.id).unwrap());
+
+        assert!(lock(&state.maintenance).contains(&source.id));
+        assert!(lock(&state.maintenance).contains(&target.id));
+    }
+
+    #[tokio::test]
+    async fn a_move_barrier_refuses_a_project_already_under_maintenance() {
+        let (tmp, state, _emitter) = fresh_state_with_mock();
+        let (source, target) = two_projects(&state, &tmp).await;
+
+        // Either side of the pair, and nothing is left half-marked on refusal.
+        for (claimed, other) in [(source.id, target.id), (target.id, source.id)] {
+            lock(&state.maintenance).insert(claimed);
+
+            let Err(err) = begin_move_barrier(&state, source.id, target.id) else {
+                panic!("a claimed project must refuse the move barrier");
+            };
+
+            assert!(
+                matches!(err, AppError::ProjectUnderMaintenance(id) if id == claimed),
+                "got {err:?}"
+            );
+            assert!(
+                !lock(&state.maintenance).contains(&other),
+                "a refused claim must not leave the other project marked"
+            );
+            lock(&state.maintenance).remove(&claimed);
+        }
+    }
+
+    #[tokio::test]
+    async fn quiescence_passes_for_two_idle_projects() {
+        let (tmp, state, _emitter) = fresh_state_with_mock();
+        let (source, target) = two_projects(&state, &tmp).await;
+
+        ensure_projects_quiescent(&state, [source.id, target.id])
+            .await
+            .expect("two freshly created projects are idle");
+    }
+
+    /// A run can hold a *future* step targeting an agent that is idle right now,
+    /// so quiescence is about outstanding commitments, not momentary activity.
+    #[tokio::test]
+    async fn quiescence_refuses_a_project_with_an_active_workflow_run() {
+        let (tmp, state, _emitter) = fresh_state_with_mock();
+        let (source, target) = two_projects(&state, &tmp).await;
+
+        lock(&state.workflow_runs).insert(
+            Uuid::now_v7(),
+            crate::state::ActiveRun {
+                cancel: tokio_util::sync::CancellationToken::new(),
+                project_id: target.id,
+                workflow: "nightly".to_owned(),
+                snapshot: crate::state::RunSnapshot {
+                    total_steps: 2,
+                    current_step: 0,
+                },
+                steps: Vec::new(),
+                done: Arc::new(tokio::sync::Notify::new()),
+            },
+        );
+
+        let err = ensure_projects_quiescent(&state, [source.id, target.id])
+            .await
+            .expect_err("an active run must block the move");
+
+        assert!(
+            matches!(err, AppError::ProjectNotQuiescent { project_id, .. } if project_id == target.id),
+            "got {err:?}"
+        );
+    }
+
+    /// Admission: a send into a marked project is refused before it is queued.
+    #[tokio::test]
+    async fn a_send_into_a_marked_project_is_refused_at_admission() {
+        let (tmp, state, _emitter) = fresh_state_with_mock();
+        let (agent, project_id) = project_with_agent(&state, &tmp).await;
+        lock(&state.maintenance).insert(project_id);
+
+        let err = lookup_agent(&state, agent.id).unwrap_err();
+
+        assert!(
+            matches!(err, AppError::ProjectUnderMaintenance(id) if id == project_id),
+            "got {err:?}"
+        );
+    }
+
+    /// The decisive one: a turn that passed admission and sat in the queue is
+    /// refused at the moment it would start. Without this check the send would
+    /// run mid-surgery — admission already said yes, and the move saw an empty
+    /// queue.
+    #[tokio::test]
+    async fn a_queued_turn_is_refused_at_turn_start_once_the_project_is_marked() {
+        let (tmp, state, _emitter) = fresh_state_with_mock();
+        let home = TempDir::new().unwrap();
+        let (agent, project_id) = project_with_agent(&state, &tmp).await;
+        let factory = factory_for(&state, project_id, agent.id, home.path());
+
+        // Marked *after* the factory exists, exactly as a move marks a project
+        // whose queue already holds an admitted send.
+        lock(&state.maintenance).insert(project_id);
+
+        let err = factory
+            .preflight(&agent)
+            .await
+            .expect_err("a marked project must refuse the turn at start");
+
+        assert!(
+            err.contains(&AppError::ProjectUnderMaintenance(project_id).to_string()),
+            "got {err:?}"
+        );
     }
 
     /// As [`factory_for`], with the capture-time generation the caller chooses —

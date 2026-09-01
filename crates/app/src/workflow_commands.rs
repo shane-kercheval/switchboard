@@ -62,6 +62,11 @@ pub struct ProjectDispatchFactoryProvider {
     roster: Vec<AgentRecord>,
     agents_by_id: Arc<Mutex<HashMap<AgentId, AgentRecord>>>,
     home_dir: PathBuf,
+    /// Projects closed to new work. Shared with `AppState` rather than
+    /// snapshotted: unlike the roster and project above, this changes *during* a
+    /// run, and a stale copy would let steps dispatch into a project a move has
+    /// since closed.
+    maintenance: Arc<Mutex<HashSet<ProjectId>>>,
 }
 
 impl ProjectDispatchFactoryProvider {
@@ -104,6 +109,7 @@ impl ProjectDispatchFactoryProvider {
                     dispatcher: Arc::downgrade(&state.dispatcher),
                     home_dir: home_dir.to_path_buf(),
                     lock_root: state.lock_root.clone(),
+                    maintenance: Arc::clone(&state.maintenance),
                     project_generation: Arc::clone(&state.project_generation),
                     generation_at_capture: generation,
                 },
@@ -120,14 +126,16 @@ impl ProjectDispatchFactoryProvider {
             roster: roster.to_vec(),
             agents_by_id: Arc::clone(&state.agents_by_id),
             home_dir: home_dir.to_path_buf(),
+            maintenance: Arc::clone(&state.maintenance),
         }
     }
 }
 
 impl DispatchFactoryProvider for ProjectDispatchFactoryProvider {
-    /// Refuse to materialize a fork while its parent is mid-turn — the same
-    /// policy `send_message_impl` applies to manual sends, reached here through
-    /// the seam because workflow steps dispatch without passing through that
+    /// Refuse a step that would dispatch into a project closed for maintenance,
+    /// or materialize a fork while its parent is mid-turn — the same policies
+    /// `send_message_impl` applies to manual sends, reached here through the
+    /// seam because workflow steps dispatch without passing through that
     /// function. Without it, a step targeting a fork whose first turn failed
     /// could branch from a working parent and inherit a synthesized
     /// "No response requested." placeholder instead of its real answer.
@@ -140,6 +148,13 @@ impl DispatchFactoryProvider for ProjectDispatchFactoryProvider {
                 // Not a bound agent of this run; `factory_for` reports it.
                 return Ok(());
             };
+            // A project closed for maintenance takes no new work from a
+            // workflow either. Workflow steps dispatch without passing through
+            // `send_message_impl`, so the admission check it inherits from
+            // `lookup_agent` never runs for them.
+            if lock(&self.maintenance).contains(&agent.project_id) {
+                return Err(AppError::ProjectUnderMaintenance(agent.project_id).to_string());
+            }
             // One shared policy, not a second copy — the two used to be written
             // independently and their refusal text had already drifted apart.
             match crate::commands::busy_fork_source(
@@ -1653,6 +1668,40 @@ pub async fn cancel_runs_for_projects(state: &AppState, project_ids: &[ProjectId
 
 #[cfg(test)]
 mod tests {
+
+    /// Workflow steps dispatch without passing through `send_message_impl`, so
+    /// the admission check that path inherits never runs for them. A project
+    /// closed for a move must refuse a step just the same.
+    #[tokio::test]
+    async fn a_workflow_step_into_a_marked_project_is_refused() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (state, _emitter) = crate::commands::tests::state_for_workflow_preflight(&tmp).await;
+        let (agent, project_id) = crate::commands::tests::sole_agent(&state);
+        let project = crate::commands::tests::project_of(&state, project_id);
+        let provider = ProjectDispatchFactoryProvider::new(
+            &state,
+            &project,
+            std::slice::from_ref(&agent),
+            std::path::Path::new("/nonexistent-home"),
+            0,
+        );
+
+        assert!(
+            provider.preflight(agent.id).await.is_ok(),
+            "an unmarked project admits the step"
+        );
+        crate::state::lock(&state.maintenance).insert(project_id);
+
+        let err = provider
+            .preflight(agent.id)
+            .await
+            .expect_err("a marked project must refuse the step");
+
+        assert!(
+            err.contains(&crate::error::AppError::ProjectUnderMaintenance(project_id).to_string()),
+            "got {err:?}"
+        );
+    }
     use super::*;
     use switchboard_workflow::{TerminalStatus, WorkflowStepKind};
 

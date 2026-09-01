@@ -621,16 +621,21 @@ pub trait ConversationJournal: Send + Sync {
         ended_at: DateTime<Utc>,
     );
 
-    /// Written at a turn's terminal when the adapter reports a stable per-turn
-    /// `hydration_key` — for a **`Completed` or `Failed`** turn (a failed turn can
-    /// carry partial content on disk keyed by its harness hydration identity).
-    /// Records the durable send↔turn join so the transcript merge matches this
-    /// turn to its send by key instead of by counting.
+    /// Written when the turn's stable per-turn `hydration_key` first becomes
+    /// known: **mid-turn** on a `TurnIdentity` event (Claude announces it at the
+    /// first assistant message; the Codex adapter recovers it on the cancel
+    /// path), else at the terminal from `TurnEnd.first_message_id` (Codex's
+    /// normal completion). Records the durable send↔turn join so the transcript
+    /// merge matches this turn to its send by key instead of by counting.
+    /// Writing at first knowledge — rather than only at the terminal — shrinks
+    /// the window where a mid-turn conversation re-read finds no link, and
+    /// gives cancelled turns (whose partial content is on disk) a link at all.
     ///
     /// **Best-effort, like `record_outcome`** — and deliberately *not* fail-closed
-    /// like `record_send`: the turn already produced content, so a lost link just
-    /// drops that turn to positional correlation. Returns `()`; the impl logs on
-    /// failure. Not called for a keyless terminal (no `hydration_key`).
+    /// like `record_send`: a lost link just drops that turn to positional
+    /// correlation. Returns `()`; the impl logs on failure. Not called for a
+    /// keyless turn (no `hydration_key` ever surfaced). At most one call per
+    /// turn (the dispatcher gates the terminal write on the mid-turn one).
     fn record_link(
         &self,
         turn_id: TurnId,
@@ -1862,6 +1867,10 @@ async fn drain_turn(
     // may be valid for a future harness shape, so it remains Completed; the
     // warning simply turns a silent parser regression into an actionable log.
     let mut visible_output_seen = false;
+    // Whether this turn's durable send↔turn link has been journaled. Set by the
+    // early `TurnIdentity` write below; gates the terminal write so a turn
+    // never journals two links.
+    let mut link_written = false;
     // Set when the dispatcher itself synthesizes a `Failed` terminal (a
     // load-bearing locator-persist failure). Distinct from the cancel latch:
     // cancellation deliberately still forwards buffered content (system-design
@@ -1972,6 +1981,23 @@ async fn drain_turn(
                     }
                     continue;
                 }
+                // Durable send↔turn key-join, written the moment the turn's
+                // stable hydration identity is first known instead of waiting
+                // for the terminal: Claude emits `TurnIdentity` at its first
+                // assistant message (seconds in), and the Codex adapter emits it
+                // from its cancel-path session-file read — the only chance a
+                // cancelled turn gets, since the cancel latch below never lets a
+                // terminal write the link. Early writing shrinks the window
+                // where a mid-turn conversation re-read finds no link and must
+                // fall back to text/positional correlation, and stops
+                // cancellations from accumulating permanently link-less sends.
+                // The event still flows to the frontend below (no `continue`).
+                if let AdapterEvent::TurnIdentity { message_id, .. } = &event
+                    && !link_written
+                {
+                    journal.record_link(turn_id, agent_id, message_id, Utc::now());
+                    link_written = true;
+                }
                 if let AdapterEvent::TurnEnd {
                     outcome,
                     ended_at,
@@ -2000,18 +2026,23 @@ async fn drain_turn(
                     if !matches!(outcome, TurnOutcome::Completed) {
                         journal.record_outcome(turn_id, agent_id, outcome, started_at, *ended_at);
                     }
-                    // Durable send↔turn key-join: whenever the terminal carries a
-                    // stable per-turn hydration identity,
-                    // record the link so the merge matches this turn to its send by
-                    // key, not by counting. Written for `Completed` AND `Failed`
-                    // (a failed-with-content turn's partial output is on disk and
-                    // needs the same correlation). Best-effort — a failed link
-                    // write must not fail the turn; it just drops to positional.
-                    // Complements the `Outcome` above: a failed-with-content turn
-                    // writes both (link correlates content, outcome supplies the
-                    // badge). A cancelled/keyless terminal writes neither here.
-                    if let Some(key) = first_message_id {
+                    // Terminal fallback for the durable send↔turn key-join: a
+                    // harness that never surfaced a mid-turn `TurnIdentity`
+                    // (Codex's normal completion) carries the key here instead.
+                    // Written for `Completed` AND `Failed` (a failed-with-content
+                    // turn's partial output is on disk and needs the same
+                    // correlation). Best-effort — a failed link write must not
+                    // fail the turn; it just drops to positional. Complements
+                    // the `Outcome` above: a failed-with-content turn writes both
+                    // (link correlates content, outcome supplies the badge). A
+                    // keyless terminal writes neither; a cancelled turn never
+                    // reaches here (latch above) — its only link chance is the
+                    // early `TurnIdentity` write.
+                    if let Some(key) = first_message_id
+                        && !link_written
+                    {
                         journal.record_link(turn_id, agent_id, key, *ended_at);
+                        link_written = true;
                     }
                     // Fire the awaited-send + current-turn waiters with the real
                     // outcome. Only a completed turn carries forwardable text; a

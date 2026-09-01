@@ -578,6 +578,33 @@ async fn run_producer(
         // (Codex exits 0 on SIGTERM, so neither would be meaningful here).
         crate::subprocess::terminate_then_kill(&mut child).await;
         let _ = stderr_task.await;
+        // Codex never surfaces its durable per-turn id in the exec stream —
+        // the normal path recovers it from the session file at post-terminal
+        // enrichment, which cancellation skips. Without this, every cancelled
+        // turn permanently lacks a `TurnLink` and its on-disk partial content
+        // correlates only by the merge's text-matching fallback. So read the
+        // (now-stable — the process is dead) rollout file here and surface the
+        // key as `TurnIdentity`; the dispatcher journals the link from it
+        // before synthesizing `Cancelled` (its drain still runs — the
+        // synthesized terminal comes only after this stream closes). A cancel
+        // early enough that `turn_context` never hit the file yields no key
+        // and no event — same as before, and the merge's fallback covers it.
+        let locator = prior.as_ref().or(captured.as_ref());
+        if let Some(loc) = locator {
+            let enrichment = session_file::load_with_retry(
+                &home_dir,
+                loc.partition_date,
+                &loc.thread_id,
+                &TokioSleeper,
+            )
+            .await;
+            if let Some(key) = enrichment.current_turn_id {
+                let _ = tx.send(AdapterEvent::TurnIdentity {
+                    turn_id,
+                    message_id: key,
+                });
+            }
+        }
         return;
     }
 

@@ -225,10 +225,15 @@ pub enum AdapterEvent {
     /// timer so a long silent-but-thinking turn is not falsely declared dead.
     /// Never becomes a transcript item.
     Liveness { turn_id: TurnId },
-    /// The turn's dedup identity, announced immediately from the first assistant
-    /// `message.id`. The value matches `TurnEnd.first_message_id`, so ordinary
-    /// live and disk copies collapse into one turn. Emitted once per turn (Claude
-    /// only); keyless harnesses never emit it. Content-free.
+    /// The turn's dedup identity, announced as soon as the adapter knows it:
+    /// Claude emits it immediately from the first assistant `message.id`; the
+    /// Codex adapter emits it on its **cancel path** from a session-file read
+    /// (`turn_context.turn_id`), since cancellation skips the post-terminal
+    /// enrichment that normally carries the key on `TurnEnd`. The value matches
+    /// `TurnEnd.first_message_id`, so ordinary live and disk copies collapse
+    /// into one turn — and the dispatcher journals the durable `TurnLink` from
+    /// it at first sight. Emitted at most once per turn; keyless harnesses
+    /// (Antigravity) never emit it. Content-free.
     TurnIdentity { turn_id: TurnId, message_id: String },
     ToolStarted {
         turn_id: TurnId,

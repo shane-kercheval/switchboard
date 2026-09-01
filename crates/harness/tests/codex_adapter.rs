@@ -1203,6 +1203,98 @@ async fn cancel_kills_whole_group_and_emits_no_terminal() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn cancel_recovers_turn_identity_from_session_file() {
+    // The cancel path's identity recovery: Codex never surfaces its durable
+    // per-turn id in the exec stream, and cancellation skips the post-terminal
+    // enrichment that normally reads it — so after killing the group, the
+    // adapter reads the (now-stable) rollout file itself and surfaces
+    // `turn_context.turn_id` as `TurnIdentity`. The dispatcher journals the
+    // cancelled turn's `TurnLink` from it; without this, every cancelled turn
+    // permanently lacks a link. Still no terminal event (the dispatcher
+    // synthesizes `Cancelled`).
+    let cwd = tempfile::TempDir::new().unwrap();
+    let home = tempfile::TempDir::new().unwrap();
+    let thread_id = "00000000-0000-7000-8000-0000000000cd";
+    let fixture_path = cwd.path().join("cancel-identity-fixture.jsonl");
+    std::fs::write(
+        &fixture_path,
+        format!("{{\"type\":\"thread.started\",\"thread_id\":\"{thread_id}\"}}\n// hang\n"),
+    )
+    .unwrap();
+    // Stage the rollout under today's LOCAL date (the partition the capture
+    // stamps), with the `task_started` → `turn_context` pair that leaves the
+    // enrichment's current (in-flight) turn id set — the real mid-turn shape
+    // of a file whose turn never completed.
+    let date = chrono::Local::now().date_naive();
+    stage_session_file(
+        home.path(),
+        date,
+        thread_id,
+        concat!(
+            r#"{"timestamp":"2026-01-01T00:00:00.000Z","type":"event_msg","payload":{"type":"task_started","model_context_window":258400}}"#,
+            "\n",
+            r#"{"timestamp":"2026-01-01T00:00:00.500Z","type":"turn_context","payload":{"turn_id":"key-cancelled-turn","model":"gpt-5.5"}}"#,
+            "\n",
+        ),
+    );
+
+    let adapter = CodexAdapter::with_binary_and_home(FAKE_CODEX, home.path());
+    let token = CancellationToken::new();
+    let options = DispatchOptions {
+        cancel_token: token.clone(),
+        ..Default::default()
+    };
+    let mut stream = adapter
+        .dispatch(
+            &codex_agent(),
+            cwd.path(),
+            fixture_path.to_str().unwrap(),
+            Uuid::now_v7(),
+            options,
+        )
+        .await
+        .expect("dispatch should succeed");
+
+    // Consume until the locator capture proves the adapter read
+    // `thread.started` — only then does cancel exercise the recovery (an
+    // earlier cancel races the capture and legitimately yields no identity).
+    let mut events: Vec<AdapterEvent> = Vec::new();
+    loop {
+        let ev = tokio::time::timeout(Duration::from_secs(15), stream.next())
+            .await
+            .expect("locator capture must arrive before the timeout")
+            .expect("stream must not end before the locator capture");
+        let is_capture = matches!(ev, AdapterEvent::SessionLocatorCaptured { .. });
+        events.push(ev);
+        if is_capture {
+            break;
+        }
+    }
+    token.cancel();
+    let rest: Vec<AdapterEvent> = tokio::time::timeout(Duration::from_secs(15), stream.collect())
+        .await
+        .expect("stream must end promptly after cancel");
+    events.extend(rest);
+
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AdapterEvent::TurnEnd { .. })),
+        "adapter must emit no terminal event on cancel; got: {events:?}"
+    );
+    let identity = events.iter().find_map(|e| match e {
+        AdapterEvent::TurnIdentity { message_id, .. } => Some(message_id.clone()),
+        _ => None,
+    });
+    assert_eq!(
+        identity.as_deref(),
+        Some("key-cancelled-turn"),
+        "cancel must surface turn_context.turn_id as TurnIdentity; got: {events:?}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn cancel_sweeps_sigterm_immune_descendant() {
     // Regression guard for `terminate_then_kill`'s unconditional final group
     // SIGKILL. The spawned child IGNORES SIGTERM and holds the inherited stderr

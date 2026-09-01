@@ -2394,6 +2394,91 @@ async fn cancelled_turn_writes_no_link() {
 }
 
 #[tokio::test]
+async fn mid_turn_identity_writes_the_link_early_and_terminal_does_not_duplicate() {
+    // The Claude shape: `TurnIdentity` announces the key mid-stream and the
+    // terminal repeats it. The link must be journaled at the identity (so a
+    // mid-turn conversation re-read already finds it) and exactly once — the
+    // terminal's matching key must not append a second record.
+    let (journal, turn_id) = run_keyed_terminal(MockScenario::IdentityThenTerminalWithKey {
+        message_id: "msg_early01".to_owned(),
+    })
+    .await;
+    let links = journal.links.lock().unwrap();
+    assert_eq!(
+        *links,
+        vec![(turn_id, "msg_early01".to_owned())],
+        "exactly one link, from the mid-turn identity"
+    );
+    assert!(
+        journal.outcomes.lock().unwrap().is_empty(),
+        "a completed turn writes no outcome"
+    );
+}
+
+#[tokio::test]
+async fn cancelled_turn_with_late_identity_writes_the_link() {
+    // The Codex cancel shape: the adapter recovers the turn's durable id from
+    // the session file after the kill and emits `TurnIdentity` during the
+    // post-cancel drain, before the stream ends. The dispatcher must journal
+    // the link from it — the synthesized `Cancelled` terminal never can — so
+    // the cancelled turn's on-disk partial content correlates by key instead
+    // of permanently depending on the merge's text-matching fallback.
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let journal = Arc::new(RecordingJournal::default());
+    let agent = agent_record();
+    let factory = TestFactory::new(
+        MockScenario::CancelsWithLateIdentity {
+            message_id: "codex-turn-key-01".to_owned(),
+        },
+        agent.clone(),
+        Arc::clone(&emitter),
+        Arc::clone(&journal) as Arc<dyn ConversationJournal>,
+    );
+    dispatcher
+        .send_message(
+            agent.id,
+            "task",
+            vec![],
+            Uuid::now_v7(),
+            factory,
+            OnBusy::Enqueue,
+        )
+        .await;
+    within(
+        &emitter,
+        "turn_start",
+        emitter.wait_for_type("turn_start", 1),
+    )
+    .await;
+    dispatcher.cancel(agent.id, CancelSource::User);
+    within(
+        &emitter,
+        "agent_idle",
+        emitter.wait_for_type("agent_idle", 1),
+    )
+    .await;
+    let turn_id = extract_turn_id(
+        &emitter
+            .snapshot()
+            .iter()
+            .find(|(_, v)| event_type(v) == "turn_start")
+            .expect("a turn_start")
+            .1,
+    );
+    assert_eq!(
+        *journal.links.lock().unwrap(),
+        vec![(turn_id, "codex-turn-key-01".to_owned())],
+        "the post-cancel identity journals the cancelled turn's link"
+    );
+    assert_eq!(
+        journal.outcomes.lock().unwrap().len(),
+        1,
+        "the cancelled outcome is still written"
+    );
+}
+
+#[tokio::test]
 async fn cancellation_latches_and_drops_a_late_real_terminal() {
     // The adapter emits a real `Completed` terminal *after* cancel fires (a
     // buffered result that lost the race). The dispatcher must drop it; the

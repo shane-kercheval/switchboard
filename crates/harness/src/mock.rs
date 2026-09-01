@@ -142,6 +142,22 @@ pub enum MockScenario {
         first_message_id: Option<String>,
     },
 
+    /// Emits `ContentChunk → TurnIdentity(key) → TurnEnd(Completed,
+    /// first_message_id: Some(key))` — the Claude shape, where the turn's
+    /// dedup identity is announced mid-stream and repeated on the terminal.
+    /// The vehicle for the dispatcher's early-link gate: the `TurnIdentity`
+    /// must journal the `TurnLink` immediately, and the terminal carrying the
+    /// same key must NOT write a second one.
+    IdentityThenTerminalWithKey { message_id: String },
+
+    /// Emits one `ContentChunk`, **awaits the cancellation token**, then emits
+    /// `TurnIdentity(key)` and ends the stream **without** a terminal event —
+    /// the Codex cancel shape, where the adapter recovers the turn's durable
+    /// id from the session file after killing the subprocess and surfaces it
+    /// during the post-cancel drain. The vehicle for the dispatcher writing a
+    /// `TurnLink` for a cancelled turn (whose synthesized terminal never can).
+    CancelsWithLateIdentity { message_id: String },
+
     /// Emits `ContentChunk → SessionLocatorCaptured(locator) → TurnEnd(Completed)`.
     /// The vehicle for the dispatcher's runtime-capture tests: drives the
     /// internal capture event so the dispatcher's injected `SessionLocatorSink`
@@ -609,6 +625,51 @@ impl HarnessAdapter for MockHarnessAdapter {
                         effort: None,
                         stable_message_id: None,
                         first_message_id,
+                    });
+                });
+            }
+            MockScenario::IdentityThenTerminalWithKey { ref message_id } => {
+                let message_id = message_id.clone();
+                tokio::spawn(async move {
+                    let _ = tx.send(AdapterEvent::ContentChunk {
+                        turn_id,
+                        kind: ContentKind::Text,
+                        text: "ack".to_owned(),
+                    });
+                    let _ = tx.send(AdapterEvent::TurnIdentity {
+                        turn_id,
+                        message_id: message_id.clone(),
+                    });
+                    let _ = tx.send(AdapterEvent::TurnEnd {
+                        turn_id,
+                        outcome: TurnOutcome::Completed,
+                        ended_at: Utc::now(),
+                        usage: None,
+                        context_window_source: None,
+                        spend: None,
+                        model: None,
+                        effort: None,
+                        stable_message_id: None,
+                        first_message_id: Some(message_id),
+                    });
+                });
+            }
+            MockScenario::CancelsWithLateIdentity { ref message_id } => {
+                let message_id = message_id.clone();
+                let cancel_token = options.cancel_token.clone();
+                tokio::spawn(async move {
+                    let _ = tx.send(AdapterEvent::ContentChunk {
+                        turn_id,
+                        kind: ContentKind::Text,
+                        text: "partial-before-cancel".to_owned(),
+                    });
+                    cancel_token.cancelled().await;
+                    // Post-cancel identity recovery (the Codex session-file
+                    // read), then end the stream with no terminal — the
+                    // dispatcher synthesizes Cancelled after the drain.
+                    let _ = tx.send(AdapterEvent::TurnIdentity {
+                        turn_id,
+                        message_id,
                     });
                 });
             }

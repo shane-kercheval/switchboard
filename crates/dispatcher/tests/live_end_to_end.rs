@@ -160,14 +160,25 @@ fn agent_text(emitter: &Arc<RecordingEmitter>, channel: &str) -> String {
         .collect()
 }
 
+/// The wire-`type` sequence of an already-filtered payload list. A payload with
+/// no `type` cannot come off the tagged wire enum; if one ever did it is dropped
+/// rather than rendered as an empty string.
+fn kind_sequence_of(events: &[serde_json::Value]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|p| p["type"].as_str().map(str::to_owned))
+        .collect()
+}
+
 /// The wire-`type` sequence on a channel, in arrival order.
 fn kind_sequence(emitter: &Arc<RecordingEmitter>, channel: &str) -> Vec<String> {
-    emitter
+    let payloads: Vec<serde_json::Value> = emitter
         .snapshot()
         .into_iter()
         .filter(|(name, _)| name == channel)
-        .map(|(_, payload)| payload["type"].as_str().unwrap_or("").to_owned())
-        .collect()
+        .map(|(_, payload)| payload)
+        .collect();
+    kind_sequence_of(&payloads)
 }
 
 /// The shared event-ordering contract every harness must satisfy:
@@ -770,16 +781,32 @@ async fn live_antigravity_cancel_terminates_and_synthesizes_cancelled() {
 /// test's meaning.
 #[derive(Debug, Clone, Copy)]
 enum AttachmentStaging {
-    /// Today's location: `<cwd>/.switchboard/projects/<id>/attachments/`, inside
-    /// the agent's working directory.
-    InsideCwd,
-    /// A directory wholly outside the agent's cwd, standing in for the
-    /// user-global store's `attachments/`. Whether this is readable is the
-    /// question that decides the central-store layout — see
-    /// `docs/implementation_plans/2026-08-27-cross-project-operations-and-central-store.md`
-    /// M0.
-    OutsideCwd,
+    /// The control: `<cwd>/attachments/`, inside the agent's working directory.
+    /// Not a production location (Switchboard writes nothing into a working
+    /// directory) — it is the baseline every harness must pass regardless of
+    /// its sandbox, so a failure on the production case below is attributable
+    /// to the location rather than to attachments as such.
+    InsideCwdControl,
+    /// Production: the project's `attachments/` in the user-global store.
+    /// `temp_project` opens that store in its own tempdir, so this path is
+    /// wholly outside the agent's cwd — exactly as it is for real users.
+    ProjectStore,
 }
+
+/// What one attachment dispatch produced, for callers that assert more than
+/// "the token came back" (the fence test's negative control).
+struct AttachmentRun {
+    token: &'static str,
+    staged: std::path::PathBuf,
+    text: String,
+    /// Every wire payload emitted on the agent's channel, in arrival order.
+    events: Vec<serde_json::Value>,
+}
+
+/// The production-shaped prompt: what a user's send looks like after the
+/// attachment footer is appended.
+const ATTACHMENT_PROMPT: &str =
+    "Read the attached file and reply with just the string it contains, nothing else.";
 
 /// Shared body for the per-harness attachment readability tests. Stages a file
 /// (see [`AttachmentStaging`]) and sends it via the dispatcher's attachment path,
@@ -793,19 +820,42 @@ async fn live_attachment_case(
     staging: AttachmentStaging,
 ) {
     let tmp = TempDir::new().expect("tempdir");
-    let (_store_root, project) = temp_project(tmp.path(), "attachment-test");
+    let run =
+        run_attachment_case_in(tmp.path(), harness, adapter, staging, ATTACHMENT_PROMPT).await;
+    assert!(
+        run.text.contains(run.token),
+        "{harness:?} ({staging:?}): response must contain the token from the staged \
+         attachment (proves a file at {} is readable under this harness's sandbox — \
+         that temp store is deleted after the turn, so the path identifies the case, \
+         not a file to inspect); got: {:?}",
+        run.staged.display(),
+        run.text
+    );
+}
+
+/// The dispatch half of [`live_attachment_case`], with a caller-supplied working
+/// directory (so a caller can seed `<cwd>/.claude/settings.json` first) and no
+/// assertion — it returns what the turn produced. Each call registers a fresh
+/// project and agent, so two calls on one cwd are two independent sessions
+/// under the same `~/.claude/projects/<encoded-cwd>/`, never a resume.
+async fn run_attachment_case_in(
+    cwd: &std::path::Path,
+    harness: HarnessKind,
+    adapter: Arc<dyn HarnessAdapter>,
+    staging: AttachmentStaging,
+    prompt: &str,
+) -> AttachmentRun {
+    let (_store_root, project) = temp_project(cwd, "attachment-test");
     let agent = project
         .register_agent("assistant", harness, None, None)
         .expect("register_agent");
 
     // Mirror what `stage_attachment` does: place the file in the staging dir and
-    // reference it by absolute path. The out-of-cwd tempdir is bound for the
-    // test's lifetime — dropping it early would delete the file under test.
+    // reference it by absolute path.
     let token = "SWITCHBOARD_LIVE_ATTACHMENT_TOKEN_C4D77B";
-    let outside = TempDir::new().expect("out-of-cwd tempdir");
     let dir = match staging {
-        AttachmentStaging::InsideCwd => project.attachments_dir(),
-        AttachmentStaging::OutsideCwd => outside.path().join("attachments"),
+        AttachmentStaging::InsideCwdControl => cwd.join("attachments"),
+        AttachmentStaging::ProjectStore => project.attachments_dir(),
     };
     std::fs::create_dir_all(&dir).expect("create attachments dir");
     let staged = dir.join("note.txt");
@@ -832,7 +882,7 @@ async fn live_attachment_case(
         dispatcher
             .send_message(
                 agent.id,
-                "Read the attached file and reply with just the string it contains, nothing else.",
+                prompt,
                 vec![attachment],
                 Uuid::now_v7(),
                 factory,
@@ -844,63 +894,191 @@ async fn live_attachment_case(
     wait_for_idles(&emitter, 1).await;
 
     let text = agent_text(&emitter, &channel);
+    let events = emitter
+        .snapshot()
+        .into_iter()
+        .filter(|(name, _)| *name == channel)
+        .map(|(_, payload)| payload)
+        .collect();
+    // `_store_root` lives to here so the staged file outlives the turn; it is
+    // deleted on return, so `staged` is a label for diagnostics, not a path
+    // a caller can inspect.
+    AttachmentRun {
+        token,
+        staged,
+        text,
+        events,
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires claude installed and authenticated — run with: make test-live"]
+async fn live_claude_attachment_inside_cwd_is_readable() {
+    live_attachment_case(
+        HarnessKind::ClaudeCode,
+        Arc::new(ClaudeCodeAdapter::new()),
+        AttachmentStaging::InsideCwdControl,
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "requires codex installed and authenticated — run with: make test-live"]
+async fn live_codex_attachment_inside_cwd_is_readable() {
+    live_attachment_case(
+        HarnessKind::Codex,
+        Arc::new(CodexAdapter::new()),
+        AttachmentStaging::InsideCwdControl,
+    )
+    .await;
+}
+
+// --- Project-store staging: attachments live outside every agent's cwd. ---
+//
+// Each of these asks one question: can this harness read an attachment at its
+// real, production location — the user-global store, wholly outside the agent's
+// working directory? This was the decision gate for moving the store out of
+// working directories, and it is settled: all three pass. Read the Claude pass
+// for what it is — the adapter grants the filesystem root via `--add-dir /`, so
+// its green says "our flag holds," not "Claude has no fence" (it does, since
+// 2.1.257; the fence test below is the one that speaks to it). Codex and
+// Antigravity pass on their own sandbox posture. Record any change in
+// `docs/harness-behavior.md` §3.7 before acting on it.
+
+#[tokio::test]
+#[ignore = "requires claude installed and authenticated — run with: make test-live"]
+async fn live_claude_attachment_in_project_store_is_readable() {
+    live_attachment_case(
+        HarnessKind::ClaudeCode,
+        Arc::new(ClaudeCodeAdapter::new()),
+        AttachmentStaging::ProjectStore,
+    )
+    .await;
+}
+
+/// Claude 2.1.257 added `permissions.blockReadsOutsideWorkingDirectories`, a
+/// user setting that refuses reads outside the working directories **even under
+/// `--dangerously-skip-permissions`** (the CLI marks it `bypassImmune`). With it
+/// on, the production case above degrades silently: `Read` is denied, the model
+/// answers that it couldn't open the file, and the turn still ends `success`.
+/// The adapter's root grant (`--add-dir /`) is what keeps attachments readable.
+///
+/// Two halves, both load-bearing. The **negative control** dispatches with the
+/// grant removed and requires the fence to actually fire — the `Read` attempt's
+/// own completion errored and naming the setting — so the positive half cannot
+/// pass for the ordinary reason if a future Claude renames the key, moves it, or
+/// stops reading it from where this test plants it. The **positive half** is the
+/// production adapter reading an identically staged file (each half mints its
+/// own store, so the two files are equivalent copies at different paths, never
+/// one shared file). Both use one cwd on purpose: distinct projects, distinct
+/// agents, distinct session ids, so the second is never a `--resume` of the
+/// first (which could answer from context).
+///
+/// Both halves use a prompt that mandates the tool call. Left to its own
+/// judgment the model sometimes declines an outside read *before* trying the
+/// tool (observed once in three with the fence off), which would leave the
+/// control with no denial to observe and fail it with a message that reads as
+/// upstream drift. Mandating the attempt takes that discretion out of the loop
+/// and makes the two halves a true A/B on the same tool call; the
+/// `*_in_project_store_is_readable` tests keep the production-shaped prompt.
+///
+/// The setting is seeded at project scope (`<cwd>/.claude/settings.json`) so the
+/// test never touches the developer's own settings; if Claude ever stopped
+/// honoring project scope while still honoring user scope, the control would
+/// read the token and fail loudly — the signal to move the seed, not a silent
+/// pass.
+#[tokio::test]
+#[ignore = "requires claude installed and authenticated — run with: make test-live"]
+async fn live_claude_attachment_in_project_store_is_readable_with_outside_reads_blocked() {
+    const MANDATED_READ_PROMPT: &str = "Use the Read tool on the attached file. Do not decline \
+        in advance. If the tool returns an error, reply with the error text verbatim; \
+        otherwise reply with just the string the file contains, nothing else.";
+
+    let tmp = TempDir::new().expect("tempdir");
+    let settings_dir = tmp.path().join(".claude");
+    std::fs::create_dir_all(&settings_dir).expect("create .claude");
+    std::fs::write(
+        settings_dir.join("settings.json"),
+        r#"{"permissions":{"blockReadsOutsideWorkingDirectories":true}}"#,
+    )
+    .expect("write project settings");
+
+    let control = run_attachment_case_in(
+        tmp.path(),
+        HarnessKind::ClaudeCode,
+        Arc::new(ClaudeCodeAdapter::new().with_working_directory_grants(Vec::new())),
+        AttachmentStaging::ProjectStore,
+        MANDATED_READ_PROMPT,
+    )
+    .await;
+    let kinds = kind_sequence_of(&control.events);
+    let read_ids: Vec<&str> = control
+        .events
+        .iter()
+        .filter(|p| p["type"] == "tool_started" && p["name"] == "Read")
+        .filter_map(|p| p["tool_use_id"].as_str())
+        .collect();
     assert!(
-        text.contains(token),
-        "{harness:?} ({staging:?}): response must contain the token from the staged \
-         attachment (proves a file at {} is readable under this harness's sandbox); \
-         got: {text:?}",
-        staged.display()
+        !read_ids.is_empty(),
+        "negative control: the model never attempted the Read (no `tool_started` for \
+         Read) — a model/prompt drift, not a fence result; kinds: {kinds:?}; text: {:?}",
+        control.text
+    );
+    let read_completions: Vec<&serde_json::Value> = control
+        .events
+        .iter()
+        .filter(|p| {
+            p["type"] == "tool_completed"
+                && p["tool_use_id"]
+                    .as_str()
+                    .is_some_and(|id| read_ids.contains(&id))
+        })
+        .collect();
+    let fence_fired = read_completions.iter().any(|p| {
+        p["is_error"] == true
+            && p["output"]
+                .as_str()
+                .is_some_and(|o| o.contains("blockReadsOutsideWorkingDirectories"))
+    });
+    assert!(
+        fence_fired,
+        "negative control: the Read was attempted but not denied by the fence (no \
+         errored completion naming the setting) — the setting is not being honored \
+         where this test plants it, so the positive half below would prove nothing; \
+         Read completions: {read_completions:?}; text: {:?}",
+        control.text
+    );
+    assert!(
+        !control.text.is_empty() && !control.text.contains(control.token),
+        "negative control: the turn must complete with a reply that lacks the token; \
+         got: {:?}",
+        control.text
+    );
+
+    let run = run_attachment_case_in(
+        tmp.path(),
+        HarnessKind::ClaudeCode,
+        Arc::new(ClaudeCodeAdapter::new()),
+        AttachmentStaging::ProjectStore,
+        MANDATED_READ_PROMPT,
+    )
+    .await;
+    assert!(
+        run.text.contains(run.token),
+        "with the root grant the identically staged attachment at {} must be readable \
+         despite the fence; got: {:?}",
+        run.staged.display(),
+        run.text
     );
 }
 
 #[tokio::test]
-#[ignore = "requires claude installed and authenticated — run with: make test-live"]
-async fn live_claude_attachment_in_project_dir_is_readable() {
-    live_attachment_case(
-        HarnessKind::ClaudeCode,
-        Arc::new(ClaudeCodeAdapter::new()),
-        AttachmentStaging::InsideCwd,
-    )
-    .await;
-}
-
-#[tokio::test]
 #[ignore = "requires codex installed and authenticated — run with: make test-live"]
-async fn live_codex_attachment_in_project_dir_is_readable() {
+async fn live_codex_attachment_in_project_store_is_readable() {
     live_attachment_case(
         HarnessKind::Codex,
         Arc::new(CodexAdapter::new()),
-        AttachmentStaging::InsideCwd,
-    )
-    .await;
-}
-
-// --- Out-of-cwd staging: the M0 decision gate for the central project store. ---
-//
-// Each of these asks one question: can this harness read an attachment that lives
-// outside the agent's working directory? A pass means the store can own
-// `attachments/` centrally; a failure means staging must stay cwd-local (or, for
-// Antigravity, be granted via a second `--add-dir`). Record the outcome in
-// `docs/harness-behavior.md` before acting on it.
-
-#[tokio::test]
-#[ignore = "requires claude installed and authenticated — run with: make test-live"]
-async fn live_claude_attachment_outside_cwd_is_readable() {
-    live_attachment_case(
-        HarnessKind::ClaudeCode,
-        Arc::new(ClaudeCodeAdapter::new()),
-        AttachmentStaging::OutsideCwd,
-    )
-    .await;
-}
-
-#[tokio::test]
-#[ignore = "requires codex installed and authenticated — run with: make test-live"]
-async fn live_codex_attachment_outside_cwd_is_readable() {
-    live_attachment_case(
-        HarnessKind::Codex,
-        Arc::new(CodexAdapter::new()),
-        AttachmentStaging::OutsideCwd,
+        AttachmentStaging::ProjectStore,
     )
     .await;
 }
@@ -911,22 +1089,22 @@ async fn live_codex_attachment_outside_cwd_is_readable() {
 /// second `--add-dir` naming the staging directory.
 #[tokio::test]
 #[ignore = "requires agy authenticated (run `agy`) — run with: make test-live"]
-async fn live_antigravity_attachment_outside_cwd_is_readable() {
+async fn live_antigravity_attachment_in_project_store_is_readable() {
     live_attachment_case(
         HarnessKind::Antigravity,
         Arc::new(AntigravityAdapter::new()),
-        AttachmentStaging::OutsideCwd,
+        AttachmentStaging::ProjectStore,
     )
     .await;
 }
 
 #[tokio::test]
 #[ignore = "requires agy authenticated (run `agy`) — run with: make test-live"]
-async fn live_antigravity_attachment_in_project_dir_is_readable() {
+async fn live_antigravity_attachment_inside_cwd_is_readable() {
     live_attachment_case(
         HarnessKind::Antigravity,
         Arc::new(AntigravityAdapter::new()),
-        AttachmentStaging::InsideCwd,
+        AttachmentStaging::InsideCwdControl,
     )
     .await;
 }

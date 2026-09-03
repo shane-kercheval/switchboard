@@ -43,6 +43,7 @@ function renderSidebar(): void {
     onOpenSettings: () => {},
     onProjectSelect: () => {},
     onToggleSidebar: () => {},
+    onLocateFolder: () => {},
   });
 }
 

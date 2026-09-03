@@ -102,14 +102,17 @@ function deferred<T>(): {
   return { promise, resolve, reject };
 }
 
+const onLocateFolderMock = vi.fn<(project: ProjectListing) => void>();
 const noopProps = {
   onAddProject: () => {},
   onOpenSettings: () => {},
   onProjectSelect: () => {},
   onToggleSidebar: () => {},
+  onLocateFolder: (project: ProjectListing) => onLocateFolderMock(project),
 };
 
 beforeEach(() => {
+  onLocateFolderMock.mockReset();
   invokeMock.mockReset();
   invokeMock.mockResolvedValue(undefined);
   revealProjectBranchMock.mockReset();
@@ -1198,5 +1201,46 @@ describe("ProjectsSidebar — workflow run state (M5)", () => {
 
     expect(unhandled).not.toHaveBeenCalled();
     process.off("unhandledRejection", unhandled);
+  });
+});
+
+describe("ProjectsSidebar — locate folder", () => {
+  const A1 = "00000000-0000-7000-8000-0000000000l1";
+  const A2 = "00000000-0000-7000-8000-0000000000l2";
+
+  function unavailable(id: string, name: string, directory: string): ProjectListing {
+    return { ...projectIn(id, name, directory), directory_available: false };
+  }
+
+  it("offers Locate folder only for a project whose folder is missing", async () => {
+    await renderWith([unavailable(A1, "alpha", "/work/a"), projectIn(A2, "beta", "/work/b")]);
+
+    const missing = await openProjectActions(0);
+    expect(missing.querySelector('[data-testid="project-action-locate"]')).not.toBeNull();
+    await fireEvent.keyDown(document.body, { key: "Escape" });
+
+    const healthy = await openProjectActions(1);
+    expect(healthy.querySelector('[data-testid="project-action-locate"]')).toBeNull();
+  });
+
+  it("hands the repair to the app with the row's project, and runs nothing itself", async () => {
+    await renderWith([unavailable(A1, "alpha", "/work/a")]);
+    await openProjectActions();
+    await fireEvent.click(screen.getByTestId("project-action-locate"));
+
+    expect(onLocateFolderMock).toHaveBeenCalledWith(expect.objectContaining({ id: A1 }));
+    expect(invokeMock.mock.calls.some(([cmd]) => cmd === "set_project_directory")).toBe(false);
+  });
+
+  it("disables the item while that project's repair is in flight", async () => {
+    const ws = await loadWorkspace();
+    ws.projectRelocations.pending[A1] = true;
+    await renderWith([unavailable(A1, "alpha", "/work/a")]);
+    await openProjectActions();
+
+    const item = screen.getByTestId("project-action-locate");
+    expect(item).toHaveAttribute("aria-disabled", "true");
+    await fireEvent.click(item);
+    expect(onLocateFolderMock).not.toHaveBeenCalled();
   });
 });

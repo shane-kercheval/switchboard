@@ -84,8 +84,11 @@
     nextUnreadCompletedProjectId,
     projects,
     projectDeletions,
+    dismissProjectRelocationError,
     installRegistryStalenessRefresh,
+    projectRelocations,
     refreshProjectRegistry,
+    setProjectDirectory,
     retryProjectHydration,
     seedPathUnresolved,
     selection,
@@ -102,7 +105,8 @@
     type Command,
   } from "$lib/state/commandPalette.svelte";
   import type { AgentRecord, HarnessAvailability, HarnessKind, ProjectId } from "$lib/types";
-  import { projectIsAvailable } from "$lib/types";
+  import { projectIsAvailable, type ProjectListing } from "$lib/types";
+  import { pickDirectory } from "$lib/native";
   import { ALL_HARNESSES, HARNESS_LABEL } from "$lib/harnessDisplay";
   import { harnessAvailability, refreshHarnessAvailability } from "$lib/harnessAvailability.svelte";
   import { loadPreferences, preferences } from "$lib/preferences.svelte";
@@ -512,8 +516,17 @@
   const activeDirectoryProblemMessage = $derived(
     activeDirectoryProblem === null
       ? ""
-      : `This project's folder no longer exists at ${activeDirectoryProblem.directory}, so its agents can't run. If it was moved, put it back at that location; Switchboard checks again when you return to the window.`,
+      : `This project's folder no longer exists at ${activeDirectoryProblem.directory}, so its agents can't run. Put it back at that location, or locate where it moved to.`,
   );
+
+  /// Point one project at a folder the user picks. Owned here so the banner and
+  /// the sidebar menu run the same flow; the sidebar asks for it by callback.
+  async function locateProjectFolder(project: ProjectListing): Promise<void> {
+    if (project.id in projectRelocations.pending) return;
+    const folder = await pickDirectory();
+    if (folder === null) return;
+    await setProjectDirectory(project.id, folder);
+  }
 
   // The displayed project's roster + hydrated conversation. `rosterLoaded`
   // distinguishes "roster still loading on first activation" (key absent) from
@@ -1248,6 +1261,7 @@
           onOpenSettings={toggleSettings}
           onProjectSelect={() => (settingsOpen = false)}
           onToggleSidebar={() => (layout.projectsSidebarOpen = false)}
+          onLocateFolder={(project) => void locateProjectFolder(project)}
           {settingsOpen}
         />
       {/if}
@@ -1621,10 +1635,21 @@
         <Banner
           message={activeDirectoryProblemMessage}
           testid="banner-project-directory-unavailable"
-          actionLabel="Check again"
-          onAction={() => void refreshProjectRegistry()}
+          actionLabel={activeDirectoryProblem.id in projectRelocations.pending
+            ? "Moving…"
+            : "Locate folder…"}
+          onAction={() => {
+            if (activeDirectoryProblem !== null) void locateProjectFolder(activeDirectoryProblem);
+          }}
         />
       {/if}
+      {#each Object.entries(projectRelocations.errors) as [projectId, error] (projectId)}
+        <Banner
+          message={`Couldn't move ${projects.list.find((project) => project.id === projectId)?.name ?? "the project"} to that folder: ${error}`}
+          testid={`banner-project-relocate-failed-${projectId}`}
+          onDismiss={() => dismissProjectRelocationError(projectId)}
+        />
+      {/each}
 
       <div class="flex min-h-0 flex-1 flex-col overflow-hidden">
         {#if settingsOpen}

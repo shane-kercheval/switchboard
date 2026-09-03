@@ -843,6 +843,64 @@ export function refreshProjectRegistry(): Promise<void> {
   return refresh;
 }
 
+/// Directory repairs in flight and their failures, keyed by project. Shared by
+/// every surface that offers the repair, so one pending flag and one error text
+/// exist per project wherever it was started from.
+export const projectRelocations = $state<{
+  pending: Record<ProjectId, true>;
+  errors: Record<ProjectId, string>;
+}>({ pending: {}, errors: {} });
+
+export function dismissProjectRelocationError(projectId: ProjectId): void {
+  delete projectRelocations.errors[projectId];
+}
+
+/// Point one project at a new working directory — the repair for a folder that
+/// moved or was recreated elsewhere. A sibling project that recorded the same
+/// old folder is untouched and repaired on its own.
+///
+/// The backend drains the project's agents and reloads it against the new path.
+/// Nothing loaded here is torn down: per-agent event channels are keyed by agent
+/// id and survive the reload, and the conversation on screen is unchanged by a
+/// move.
+///
+/// **The registry is re-read whatever the command returned.** The backend can
+/// report an error after the index write is already visible (written, parent
+/// directory not yet synced), and it deliberately does so rather than hide an
+/// unconfirmed write. Re-listing on the error path is what keeps the row honest
+/// in that case: it shows the new path, the unavailable banner clears on its
+/// own, and the reported error stands beside it. A re-list failure is reported
+/// only when the command itself succeeded, so it never replaces the command's
+/// own message. Failures land in `projectRelocations.errors`; nothing throws.
+export async function setProjectDirectory(projectId: ProjectId, newPath: string): Promise<void> {
+  if (projectId in projectRelocations.pending) return;
+  projectRelocations.pending[projectId] = true;
+  delete projectRelocations.errors[projectId];
+  let failure: unknown;
+  try {
+    await api.setProjectDirectory(projectId, newPath);
+  } catch (err) {
+    failure = err;
+  }
+  try {
+    await refreshProjectRegistry();
+  } catch (err) {
+    if (failure === undefined) failure = err;
+  }
+  delete projectRelocations.pending[projectId];
+  if (failure !== undefined) {
+    projectRelocations.errors[projectId] =
+      failure instanceof Error ? failure.message : String(failure);
+    return;
+  }
+  // A project that could not open at all (its folder was unreadable at open
+  // time) is left on the activation error until something retries. The repair
+  // is what that error was waiting for, so re-open without asking for a Retry.
+  if (selection.activeProjectId === projectId && selection.activationFailure !== null) {
+    void activateProject(projectId);
+  }
+}
+
 /// Wire the pre-turn-failure hook that drives [`refreshProjectRegistry`]. Called
 /// once at app start; returns the uninstall, which clears only this hook.
 export function installRegistryStalenessRefresh(): () => void {
@@ -1405,6 +1463,9 @@ export const _testing = {
     readToken = null;
     readRequested = false;
     registryRefresh = null;
+    for (const key of Object.keys(projectRelocations.pending))
+      delete projectRelocations.pending[key];
+    for (const key of Object.keys(projectRelocations.errors)) delete projectRelocations.errors[key];
     workspace.persistable = true;
     projects.list = [];
     for (const key of Object.keys(projectDeletions.pending)) delete projectDeletions.pending[key];

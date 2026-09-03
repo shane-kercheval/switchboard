@@ -101,6 +101,7 @@ type Backend = {
   sendMessageId: string;
   loadConvoCalls: string[];
   failOpenFor: Map<string, unknown>;
+  failRelocateFor: Map<string, { message: string; applied: boolean }>;
   failDeleteFor: Map<string, string>;
   failConvoFor: Set<string>;
   failPickFor: Set<string>;
@@ -140,6 +141,7 @@ function freshBackend(): Backend {
     sendMessageId: "77777777-7777-7000-8000-777777777777",
     loadConvoCalls: [],
     failOpenFor: new Map(),
+    failRelocateFor: new Map(),
     failDeleteFor: new Map(),
     failConvoFor: new Set(),
     failPickFor: new Set(),
@@ -172,6 +174,25 @@ function summaryFor(id: string): ProjectSummary {
 
 const invokeMock = vi.fn(async (cmd: string, args?: Record<string, unknown>): Promise<unknown> => {
   switch (cmd) {
+    case "set_project_directory": {
+      // Mirrors the real command: the project's row moves, and the next list
+      // read reports the new folder as available.
+      const projectId = args?.projectId as string;
+      const newPath = args?.newPath as string;
+      const failure = backend.failRelocateFor.get(projectId);
+      const row = backend.projects.find((p) => p.id === projectId);
+      if (row === undefined) throw new Error(`relocate of unknown project ${projectId}`);
+      if (failure?.applied !== true) {
+        if (failure !== undefined) throw new Error(failure.message);
+      }
+      row.directory = newPath;
+      row.directory_available = true;
+      backend.failOpenFor.delete(projectId);
+      // The backend's uncertain commit: the write landed, but its durability
+      // could not be confirmed, so it errors *after* the row moved.
+      if (failure?.applied === true) throw new Error(failure.message);
+      return null;
+    }
     case "workspace_status":
       return { persistable: backend.persistable };
     case "list_projects":
@@ -4458,9 +4479,9 @@ describe("App", () => {
 
       const banner = await screen.findByTestId("banner-project-directory-unavailable");
       expect(banner).toHaveTextContent(`no longer exists at ${DIR_A}`);
-      expect(banner).toHaveTextContent("put it back at that location");
+      expect(banner).toHaveTextContent("Put it back at that location");
       expect(screen.getByTestId("banner-project-directory-unavailable-action")).toHaveTextContent(
-        "Check again",
+        "Locate folder…",
       );
 
       await fireEvent.input(screen.getByTestId("compose-textarea"), { target: { value: "hi" } });
@@ -4472,22 +4493,119 @@ describe("App", () => {
       expect(invokeMock.mock.calls.filter(([cmd]) => cmd === "send_message")).toHaveLength(0);
     });
 
-    it("re-checks the folder from the banner's Check again button", async () => {
+    it("locates the folder from the banner, lifting the gate and keeping the draft", async () => {
       seedProject({ projectId: "p-a", name: "alpha", available: false, agents: [ASSISTANT] });
       await openAlpha();
       await screen.findByTestId("banner-project-directory-unavailable");
+      await fireEvent.input(screen.getByTestId("compose-textarea"), { target: { value: "hi" } });
 
-      const row = backend.projects.find((project) => project.id === "p-a");
-      if (row === undefined) throw new Error("expected seeded project");
-      row.directory_available = true;
+      openDialogMock.mockResolvedValueOnce(DIR_B);
       await fireEvent.click(screen.getByTestId("banner-project-directory-unavailable-action"));
 
+      await waitFor(() =>
+        expect(invokeMock).toHaveBeenCalledWith("set_project_directory", {
+          projectId: "p-a",
+          newPath: DIR_B,
+        }),
+      );
       await waitFor(() =>
         expect(
           screen.queryByTestId("banner-project-directory-unavailable"),
         ).not.toBeInTheDocument(),
       );
-      expect((screen.getByTestId("compose-send") as HTMLButtonElement).disabled).toBe(true);
+      expect((screen.getByTestId("compose-textarea") as HTMLTextAreaElement).value).toBe("hi");
+      expect((screen.getByTestId("compose-send") as HTMLButtonElement).disabled).toBe(false);
+      expect(screen.queryByTestId("project-unavailable")).not.toBeInTheDocument();
+    });
+
+    it("locates the folder from the sidebar row menu through the same flow", async () => {
+      seedProject({ projectId: "p-a", name: "alpha", available: false, agents: [ASSISTANT] });
+      await mountApp();
+      await waitFor(() => expect(screen.getByTestId("project-row")).toBeInTheDocument());
+
+      openDialogMock.mockResolvedValueOnce(DIR_B);
+      await fireEvent.click(screen.getByTestId("project-actions-trigger"));
+      await fireEvent.click(await screen.findByTestId("project-action-locate"));
+
+      await waitFor(() =>
+        expect(invokeMock).toHaveBeenCalledWith("set_project_directory", {
+          projectId: "p-a",
+          newPath: DIR_B,
+        }),
+      );
+      await waitFor(() => expect(screen.queryByTestId("project-unavailable")).toBeNull());
+    });
+
+    it("leaves everything alone when the folder picker is cancelled", async () => {
+      seedProject({ projectId: "p-a", name: "alpha", available: false, agents: [ASSISTANT] });
+      await openAlpha();
+      await screen.findByTestId("banner-project-directory-unavailable");
+
+      openDialogMock.mockResolvedValueOnce(null);
+      await fireEvent.click(screen.getByTestId("banner-project-directory-unavailable-action"));
+      await waitFor(() => expect(openDialogMock).toHaveBeenCalled());
+
+      expect(invokeMock.mock.calls.some(([cmd]) => cmd === "set_project_directory")).toBe(false);
+      expect(screen.getByTestId("banner-project-directory-unavailable")).toBeInTheDocument();
+    });
+
+    it("reports a refused move verbatim and keeps the repair offered", async () => {
+      seedProject({ projectId: "p-a", name: "alpha", available: false, agents: [ASSISTANT] });
+      backend.failRelocateFor.set("p-a", {
+        message: "a project named alpha already lives there",
+        applied: false,
+      });
+      await openAlpha();
+      await screen.findByTestId("banner-project-directory-unavailable");
+
+      openDialogMock.mockResolvedValueOnce(DIR_B);
+      await fireEvent.click(screen.getByTestId("banner-project-directory-unavailable-action"));
+
+      const failure = await screen.findByTestId("banner-project-relocate-failed-p-a");
+      expect(failure).toHaveTextContent("a project named alpha already lives there");
+      expect(screen.getByTestId("banner-project-directory-unavailable")).toBeInTheDocument();
+
+      await fireEvent.click(screen.getByTestId("banner-project-relocate-failed-p-a-dismiss"));
+      expect(screen.queryByTestId("banner-project-relocate-failed-p-a")).not.toBeInTheDocument();
+    });
+
+    it("shows the moved folder even when the backend could not confirm the write", async () => {
+      // The uncertain commit: the index write landed but its durability was not
+      // confirmed, so the command errors after the row moved. The list must be
+      // re-read anyway, or the app keeps gating a folder the backend already uses.
+      seedProject({ projectId: "p-a", name: "alpha", available: false, agents: [ASSISTANT] });
+      backend.failRelocateFor.set("p-a", {
+        message: "index written but not yet synced",
+        applied: true,
+      });
+      await openAlpha();
+      await screen.findByTestId("banner-project-directory-unavailable");
+
+      openDialogMock.mockResolvedValueOnce(DIR_B);
+      await fireEvent.click(screen.getByTestId("banner-project-directory-unavailable-action"));
+
+      await screen.findByTestId("banner-project-relocate-failed-p-a");
+      await waitFor(() =>
+        expect(
+          screen.queryByTestId("banner-project-directory-unavailable"),
+        ).not.toBeInTheDocument(),
+      );
+      await fireEvent.input(screen.getByTestId("compose-textarea"), { target: { value: "hi" } });
+      expect((screen.getByTestId("compose-send") as HTMLButtonElement).disabled).toBe(false);
+    });
+
+    it("re-opens a project that could not open until its folder was located", async () => {
+      seedProject({ projectId: "p-a", name: "alpha", available: false, agents: [ASSISTANT] });
+      backend.failOpenFor.set("p-a", { type: "other", message: "working directory unreadable" });
+      await mountApp();
+      await fireEvent.click(await screen.findByText("alpha"));
+      await waitFor(() => expect(screen.getByTestId("activation-error")).toBeInTheDocument());
+
+      openDialogMock.mockResolvedValueOnce(DIR_B);
+      await fireEvent.click(screen.getByTestId("banner-project-directory-unavailable-action"));
+
+      await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
+      expect(screen.queryByTestId("activation-error")).not.toBeInTheDocument();
     });
 
     it("still opens the sidebar at launch when a focus refresh overlaps the startup read", async () => {

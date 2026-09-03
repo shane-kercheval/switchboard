@@ -5,6 +5,7 @@
     Check,
     Code2,
     FolderOpen,
+    FolderSearch,
     GitBranch,
     MoreHorizontal,
     Terminal,
@@ -18,6 +19,7 @@
     projectIsIdle,
     projects,
     projectDeletions,
+    projectRelocations,
     deleteProject,
     renameProject,
     selection,
@@ -69,12 +71,17 @@
     onOpenSettings,
     onProjectSelect,
     onToggleSidebar,
+    onLocateFolder,
     settingsOpen = false,
   }: {
     onAddProject: () => void;
     onOpenSettings: () => void;
     onProjectSelect: () => void;
     onToggleSidebar: () => void;
+    /// Start the working-directory repair for `project`. App owns the flow (the
+    /// folder picker, the pending/error state) so the banner and this menu can't
+    /// drift; the row only asks for it.
+    onLocateFolder: (project: ProjectListing) => void;
     settingsOpen?: boolean;
   } = $props();
 
@@ -813,6 +820,22 @@
                           Confirm delete
                         </DropdownMenuItem>
                       {:else}
+                        {#if !projectIsAvailable(project)}
+                          <DropdownMenuItem
+                            onSelect={() => onLocateFolder(project)}
+                            disabled={project.id in projectRelocations.pending}
+                            class="gap-2"
+                            data-testid="project-action-locate"
+                          >
+                            <FolderSearch
+                              size={14}
+                              strokeWidth={1.8}
+                              class="text-muted shrink-0"
+                              aria-hidden="true"
+                            />
+                            Locate folder…
+                          </DropdownMenuItem>
+                        {/if}
                         <DropdownMenuItem
                           onSelect={() => void showProjectInGit(project)}
                           class="gap-2"

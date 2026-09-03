@@ -44,6 +44,16 @@
         shape-rendering="geometricPrecision"
         aria-hidden="true"
       >
+        {#if expanded}
+          <path
+            d={side === "left"
+              ? "M6.75 4H10v16H6.75A1.75 1.75 0 0 1 5 18.25V5.75A1.75 1.75 0 0 1 6.75 4Z"
+              : "M14 4h3.25A1.75 1.75 0 0 1 19 5.75v12.5A1.75 1.75 0 0 1 17.25 20H14Z"}
+            fill="currentColor"
+            stroke="none"
+            data-sidebar-glyph-fill={side}
+          />
+        {/if}
         <rect x="5" y="4" width="14" height="16" rx="1.75" />
         <path d={side === "left" ? "M10 4.5v15" : "M14 4.5v15"} />
       </svg>

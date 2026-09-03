@@ -1392,13 +1392,13 @@
                   aria-pressed={readingModeActive}
                   data-testid="reading-mode-toggle"
                   data-tauri-no-drag
-                  class={cn(
-                    ICON_BUTTON_CLASS,
-                    "shrink-0",
-                    readingModeActive && "text-warning bg-warning-soft",
-                  )}
+                  class={cn(ICON_BUTTON_CLASS, "shrink-0", readingModeActive && "bg-warning-soft")}
                 >
-                  <BookOpen size={14} aria-hidden="true" />
+                  <BookOpen
+                    size={14}
+                    class={readingModeActive ? "text-warning" : undefined}
+                    aria-hidden="true"
+                  />
                 </button>
               {/snippet}
             </Tooltip>

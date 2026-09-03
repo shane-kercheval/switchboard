@@ -834,7 +834,7 @@ describe("GitView", () => {
     expect(screen.getByTestId("git-detail-empty")).toHaveTextContent("Select a commit");
   });
 
-  it("shows branch changes above uncommitted changes and opens the aggregate diff by default", async () => {
+  it("shows branch changes above uncommitted changes but opens the uncommitted diff by default", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     wire([repo()], aggregateComparison);
     await refreshAll();
@@ -860,6 +860,9 @@ describe("GitView", () => {
     expect(screen.getByTestId("tooltip-content")).toHaveTextContent(
       "Includes committed and uncommitted changes compared with main.",
     );
+    expect(screen.getByTestId("detail-title")).toHaveTextContent("Uncommitted changes");
+
+    await fireEvent.click(screen.getByTestId("branch-comparison-select"));
     expect(screen.getByTestId("detail-title")).toHaveTextContent("Branch changes");
     expect(screen.getByTestId("detail-subtitle")).toHaveTextContent(
       "main · compared with main · includes uncommitted changes",
@@ -901,6 +904,7 @@ describe("GitView", () => {
     ) as HTMLElement;
     await fireEvent.click(within(mainRow).getByTestId("branch-select"));
     await screen.findByTestId("branch-comparison-row");
+    await fireEvent.click(screen.getByTestId("branch-comparison-select"));
 
     await fireEvent.click(screen.getByTestId("comparison-base-trigger"));
     await fireEvent.click(

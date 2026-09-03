@@ -123,6 +123,7 @@ function wire(opts: { list?: RepoListing[]; fetchRejects?: boolean } = {}) {
 /// A `SelectedRef` for `main` in `/a`, the common selection-test target.
 const mainRef = (root = "/a") => ({ repoRoot: root, kind: "local" as const, name: "main" });
 const dirtyOpts = { worktreePath: "/a/wt", hasChanges: true, worktreeSubtitle: "~/wt" };
+const cleanOpts = { ...dirtyOpts, hasChanges: false };
 
 const comparison = (baseLabel = "main"): BranchComparison => ({
   base_name: baseLabel === "main" ? "origin/main" : baseLabel,
@@ -202,14 +203,21 @@ describe("gitView store", () => {
     expect(gitView.repos.map((r) => r.repo.root).sort()).toEqual(["/a", "/b", "/c"]);
   });
 
-  it("selectBranch defaults to uncommitted changes when the worktree is dirty", async () => {
-    wire({ list: [listingWithWorktree("/a", "/a/wt")] }); // dirty: true
+  it("selectBranch prefers uncommitted changes over an available comparison when dirty", async () => {
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "list_tracked_repos")
+        return Promise.resolve([listingWithWorktree("/a", "/a/wt")]);
+      if (cmd === "branch_commits") return Promise.resolve([]);
+      if (cmd === "branch_comparison") return Promise.resolve(comparison());
+      return Promise.resolve(null);
+    });
     await refreshAll();
     await selectBranch(mainRef(), dirtyOpts);
+    expect(branchComparison.result).not.toBeNull();
     expect(diffTarget.current).toMatchObject({ kind: "uncommitted", worktreePath: "/a/wt" });
   });
 
-  it("selectBranch defaults to the aggregate comparison and supports an explicit base", async () => {
+  it("selectBranch defaults a clean branch to the aggregate comparison and supports an explicit base", async () => {
     wire({ list: [listingWithWorktree("/a", "/a/wt")] });
     invokeMock.mockImplementation((cmd: string, args?: Record<string, unknown>) => {
       if (cmd === "list_tracked_repos")
@@ -222,7 +230,7 @@ describe("gitView store", () => {
       return Promise.resolve(null);
     });
     await refreshAll();
-    await selectBranch(mainRef(), dirtyOpts);
+    await selectBranch(mainRef(), cleanOpts);
 
     expect(branchComparison.result?.base_label).toBe("main");
     expect(diffTarget.current).toMatchObject({
@@ -262,6 +270,7 @@ describe("gitView store", () => {
     });
 
     const selecting = selectBranch(mainRef(), dirtyOpts);
+    expect(diffTarget.current).toMatchObject({ kind: "uncommitted", worktreePath: "/a/wt" });
     commitsRead.resolve([
       {
         kind: "recent",

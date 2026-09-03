@@ -303,9 +303,10 @@ function readableCommitTimestamp(iso: string | null): string | null {
   });
 }
 
-/// Select (and expand) a branch: load its aggregate comparison and commits, then
-/// default to the comparison. If no base/common ancestor resolves, fall back to
-/// uncommitted changes or the latest commit. Re-selecting collapses the branch.
+/// Select (and expand) a branch: immediately show uncommitted changes for a
+/// dirty worktree while its aggregate comparison and commits load. Clean
+/// branches default to the comparison, then the latest commit when no
+/// base/common ancestor resolves. Re-selecting collapses the branch.
 export async function selectBranch(
   ref: SelectedRef,
   opts: { worktreePath: string | null; hasChanges: boolean; worktreeSubtitle: string },
@@ -332,6 +333,9 @@ export async function selectBranch(
   // Selecting a branch makes its commit list the arrow-key target regardless of
   // which aggregate/uncommitted/commit fallback becomes the default.
   navFocus.pane = "commits";
+  if (opts.worktreePath !== null && opts.hasChanges) {
+    selectUncommitted(ref.repoRoot, opts.worktreePath, opts.worktreeSubtitle);
+  }
 
   const comparisonRead = api
     .branchComparison(ref.repoRoot, ref.kind, ref.name, null, opts.worktreePath)
@@ -391,8 +395,6 @@ export async function selectBranch(
   if (diffTarget.current !== null) return;
   if (branchComparison.result !== null) {
     selectBranchComparison(ref.repoRoot, ref.name, branchComparison.result, opts.worktreePath);
-  } else if (opts.worktreePath !== null && opts.hasChanges) {
-    selectUncommitted(ref.repoRoot, opts.worktreePath, opts.worktreeSubtitle);
   } else {
     const first = firstCommit(branchCommits.ranges);
     if (first !== undefined) selectCommit(ref.repoRoot, first);

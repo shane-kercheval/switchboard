@@ -218,24 +218,24 @@ export function effortIsRequired(harness: HarnessKind, model: string | undefined
 /// Agent and new-project seeding read the user's preferences directly.
 export const DEFAULT_AGENT_SELECTIONS: Preferences["agent_defaults"] = {
   claude_code: {
-    model_choices: ["opus", "sonnet"],
-    effort_choices: ["high", "medium"],
+    model_choices: ["fable", "opus"],
+    effort_choices: ["medium", "high"],
     default_model: "opus",
-    default_effort: "high",
+    default_effort: "medium",
   },
   codex: {
     model_choices: ["gpt-5.6-sol", "gpt-5.6-terra"],
-    effort_choices: ["high", "medium"],
-    default_model: "gpt-5.6-sol",
-    default_effort: "high",
+    effort_choices: ["medium", "high"],
+    default_model: "gpt-5.6-terra",
+    default_effort: "medium",
   },
   // Both carry explicit effort because `agy` rejects these effort-bearing
   // models when dispatched without one.
   antigravity: {
-    model_choices: ["gemini-3.1-pro", "gemini-3.7-flash"],
-    effort_choices: ["high"],
-    default_model: "gemini-3.1-pro",
-    default_effort: "high",
+    model_choices: ["gemini-3.7-flash", "gemini-3.1-pro"],
+    effort_choices: ["medium", "high"],
+    default_model: "gemini-3.7-flash",
+    default_effort: "medium",
   },
 };
 

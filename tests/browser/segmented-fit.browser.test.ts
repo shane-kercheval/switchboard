@@ -2,6 +2,7 @@ import { expect, test } from "vitest";
 import { render } from "vitest-browser-svelte";
 import { page } from "vitest/browser";
 import { EFFORT_OPTIONS, MODEL_OPTIONS } from "$lib/agentSelection";
+import AgentSelectionEditor from "$lib/components/AgentSelectionEditor.svelte";
 import SegmentedFitHost from "./SegmentedFitHost.svelte";
 
 // The effort/model segmented controls must stay on ONE row and never clip their
@@ -17,6 +18,35 @@ import SegmentedFitHost from "./SegmentedFitHost.svelte";
 // an accepted limit, not a covered case — measured crossover for the widest set
 // (Antigravity's five models) is between 500px and 472px of inner width.
 const DIALOG_INNER_WIDTH = 580;
+
+test("multi-select quick choices divide the full track into equal segments", async () => {
+  render(AgentSelectionEditor, {
+    props: {
+      harness: "claude_code",
+      selection: {
+        model: "opus",
+        effort: "high",
+        model_choices: ["opus", "sonnet"],
+        effort_choices: ["high", "medium"],
+      },
+      context: "default",
+      onChange: () => {},
+      testidPrefix: "multi-fit",
+    },
+  });
+  await expect.element(page.getByTestId("multi-fit-model-choices")).toBeInTheDocument();
+
+  const track = page.getByTestId("multi-fit-model-choices").element() as HTMLElement;
+  const buttons = Array.from(track.querySelectorAll<HTMLElement>("button"));
+  expect(buttons).toHaveLength(MODEL_OPTIONS.claude_code.length);
+  const widths = buttons.map((button) => button.getBoundingClientRect().width);
+  expect(Math.max(...widths) - Math.min(...widths)).toBeLessThanOrEqual(1);
+  const trackRect = track.getBoundingClientRect();
+  const firstRect = buttons[0]!.getBoundingClientRect();
+  const lastRect = buttons.at(-1)!.getBoundingClientRect();
+  expect(firstRect.left - trackRect.left).toBeLessThanOrEqual(4);
+  expect(trackRect.right - lastRect.right).toBeLessThanOrEqual(4);
+});
 
 async function assertSingleRowNoClip(testid: string): Promise<void> {
   const buttons = Array.from(

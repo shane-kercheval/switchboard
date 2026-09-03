@@ -292,7 +292,7 @@
   </p>
 
   <fieldset class="space-y-1.5" disabled={formDisabled}>
-    <legend class="text-muted text-xs">Tool</legend>
+    <legend class="text-fg text-sm font-medium">Tool</legend>
     <!-- Native radios (real arrow-key + screen-reader semantics, grouped/labeled
          by the fieldset+legend) styled as a segmented control: the input is
          visually hidden and the label is the pill; `has-[:focus-visible]` lights
@@ -364,7 +364,7 @@
   {/if}
 
   <label class="block space-y-1">
-    <span class="text-muted text-xs">Agent name</span>
+    <span class="text-fg text-sm font-medium">Agent name</span>
     <Input
       bind:value={name}
       disabled={formDisabled}

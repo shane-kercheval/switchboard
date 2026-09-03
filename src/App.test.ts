@@ -737,29 +737,29 @@ describe("App", () => {
         harness: "claude_code",
         selection: {
           model: "opus",
-          effort: "high",
-          model_choices: ["opus", "sonnet"],
-          effort_choices: ["high", "medium"],
+          effort: "medium",
+          model_choices: ["fable", "opus"],
+          effort_choices: ["medium", "high"],
         },
       },
       {
         name: "codex",
         harness: "codex",
         selection: {
-          model: "gpt-5.6-sol",
-          effort: "high",
+          model: "gpt-5.6-terra",
+          effort: "medium",
           model_choices: ["gpt-5.6-sol", "gpt-5.6-terra"],
-          effort_choices: ["high", "medium"],
+          effort_choices: ["medium", "high"],
         },
       },
       {
         name: "antigravity",
         harness: "antigravity",
         selection: {
-          model: "gemini-3.1-pro",
-          effort: "high",
-          model_choices: ["gemini-3.1-pro", "gemini-3.7-flash"],
-          effort_choices: ["high"],
+          model: "gemini-3.7-flash",
+          effort: "medium",
+          model_choices: ["gemini-3.7-flash", "gemini-3.1-pro"],
+          effort_choices: ["medium", "high"],
         },
       },
     ]);
@@ -1502,9 +1502,9 @@ describe("App", () => {
       harness: "claude_code",
       selection: {
         model: "opus",
-        effort: "high",
-        model_choices: ["opus", "sonnet"],
-        effort_choices: ["high", "medium"],
+        effort: "medium",
+        model_choices: ["fable", "opus"],
+        effort_choices: ["medium", "high"],
       },
     });
   });

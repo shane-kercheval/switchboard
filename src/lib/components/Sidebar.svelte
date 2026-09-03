@@ -1400,7 +1400,7 @@
                     {#snippet trigger(props)}
                       <span
                         {...props}
-                        class="bg-panel text-muted inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px]"
+                        class="bg-panel text-muted inline-flex cursor-default items-center gap-1 rounded px-1.5 py-0.5 text-[11px]"
                         data-testid="agent-mcp-chip"
                       >
                         <Plug size={11} strokeWidth={1.8} aria-hidden="true" />{mcpCount}
@@ -1414,7 +1414,7 @@
                     {#snippet trigger(props)}
                       <span
                         {...props}
-                        class="bg-panel text-muted inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px]"
+                        class="bg-panel text-muted inline-flex cursor-default items-center gap-1 rounded px-1.5 py-0.5 text-[11px]"
                         data-testid="agent-skills-chip"
                       >
                         <Zap size={11} strokeWidth={1.8} aria-hidden="true" />{skillCount}

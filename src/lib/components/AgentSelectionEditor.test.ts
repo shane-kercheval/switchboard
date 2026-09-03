@@ -12,7 +12,19 @@ const BASE: AgentSelection = {
 };
 
 describe("AgentSelectionEditor", () => {
-  it("uses pressed multi-select controls and explains why the current value is locked", async () => {
+  it("explains quick choices in dialogs and calls the starting assignment Default", () => {
+    render(AgentSelectionEditor, {
+      props: { harness: "claude_code", selection: BASE, context: "start", onChange: vi.fn() },
+    });
+
+    expect(screen.getByText("Model")).toBeInTheDocument();
+    expect(screen.getByText("Reasoning Effort")).toBeInTheDocument();
+    expect(screen.getByText(/available for quick switching from the Agents sidebar/)).toBeVisible();
+    expect(screen.getAllByText("Default")).toHaveLength(2);
+    expect(screen.queryByText(/Quick Choices/)).toBeNull();
+  });
+
+  it("removes the current choice when another choice can take over", async () => {
     const onChange = vi.fn();
     render(AgentSelectionEditor, {
       props: { harness: "claude_code", selection: BASE, context: "current", onChange },
@@ -20,15 +32,36 @@ describe("AgentSelectionEditor", () => {
 
     const opus = screen.getByTestId("agent-selection-model-choice-opus");
     expect(opus).toHaveAttribute("aria-pressed", "true");
+    expect(opus).toHaveAttribute("aria-disabled", "false");
+    await fireEvent.click(opus);
+    expect(onChange).toHaveBeenCalledWith({
+      ...BASE,
+      model: "sonnet",
+      model_choices: ["sonnet"],
+    });
+  });
+
+  it("locks only the last selected choice on an axis", async () => {
+    const onChange = vi.fn();
+    render(AgentSelectionEditor, {
+      props: {
+        harness: "claude_code",
+        selection: { ...BASE, model_choices: ["opus"] },
+        context: "default",
+        onChange,
+      },
+    });
+
+    const opus = screen.getByTestId("agent-selection-model-choice-opus");
     expect(opus).toHaveAttribute("aria-disabled", "true");
     await fireEvent.click(opus);
     expect(screen.getByRole("status")).toHaveTextContent(
-      "Choose another current before removing this value.",
+      "At least one quick choice is required once this axis is configured.",
     );
     expect(onChange).not.toHaveBeenCalled();
   });
 
-  it("shows an implicit default for one choice and an explicit selector for two", async () => {
+  it("omits a redundant default for one choice and shows a selector for two", async () => {
     const onChange = vi.fn();
     const { rerender } = render(AgentSelectionEditor, {
       props: {
@@ -39,7 +72,7 @@ describe("AgentSelectionEditor", () => {
       },
     });
 
-    expect(screen.getByTestId("agent-selection-model-implicit")).toHaveTextContent("Default: Opus");
+    expect(screen.queryByTestId("agent-selection-model-implicit")).toBeNull();
     expect(screen.queryByTestId("agent-selection-model-current")).toBeNull();
 
     await rerender({
@@ -49,6 +82,51 @@ describe("AgentSelectionEditor", () => {
       onChange,
     });
     expect(screen.getByTestId("agent-selection-model-current")).toBeEnabled();
+  });
+
+  it("orders assignment options like the quick-choice toggles", () => {
+    render(AgentSelectionEditor, {
+      props: {
+        harness: "claude_code",
+        selection: {
+          ...BASE,
+          model: "fable",
+          model_choices: ["haiku", "opus", "fable"],
+        },
+        context: "default",
+        onChange: vi.fn(),
+      },
+    });
+
+    const select = screen.getByTestId("agent-selection-model-current") as HTMLSelectElement;
+    expect(Array.from(select.options, (option) => option.value)).toEqual([
+      "fable",
+      "opus",
+      "haiku",
+    ]);
+  });
+
+  it("promotes the first visible remaining choice when removing the assignment", async () => {
+    const onChange = vi.fn();
+    render(AgentSelectionEditor, {
+      props: {
+        harness: "claude_code",
+        selection: {
+          ...BASE,
+          model: "haiku",
+          model_choices: ["haiku", "opus", "fable"],
+        },
+        context: "default",
+        onChange,
+      },
+    });
+
+    await fireEvent.click(screen.getByTestId("agent-selection-model-choice-haiku"));
+    expect(onChange).toHaveBeenCalledWith({
+      ...BASE,
+      model: "fable",
+      model_choices: ["opus", "fable"],
+    });
   });
 
   it("makes the first choice on an empty existing-agent axis current", async () => {
@@ -71,7 +149,7 @@ describe("AgentSelectionEditor", () => {
     });
   });
 
-  it("allows adopting a sole configured choice when current is null", async () => {
+  it("leaves current assignment out of the existing-agent editor", () => {
     const onChange = vi.fn();
     render(AgentSelectionEditor, {
       props: {
@@ -82,10 +160,9 @@ describe("AgentSelectionEditor", () => {
       },
     });
 
-    await fireEvent.change(screen.getByTestId("agent-selection-model-current"), {
-      target: { value: "sonnet" },
-    });
-    expect(onChange).toHaveBeenCalledWith({ ...BASE, model: "sonnet", model_choices: ["sonnet"] });
+    expect(screen.queryByTestId("agent-selection-model-current")).toBeNull();
+    expect(screen.queryByTestId("agent-selection-model-implicit")).toBeNull();
+    expect(onChange).not.toHaveBeenCalled();
   });
 
   it("preserves unknown choices and allows incompatible effort membership", async () => {
@@ -146,9 +223,7 @@ describe("AgentSelectionEditor", () => {
       context: "current",
       onChange,
     });
-    await fireEvent.change(screen.getByTestId("agent-selection-model-current"), {
-      target: { value: "gpt-oss-120b" },
-    });
+    await fireEvent.click(screen.getByTestId("agent-selection-model-choice-gemini-3.1-pro"));
     expect(current).toMatchObject({ model: "gpt-oss-120b", effort: "medium" });
   });
 
@@ -195,7 +270,7 @@ describe("AgentSelectionEditor", () => {
     );
   });
 
-  it("explains an incompatible model choice within the current editor", async () => {
+  it("explains an incompatible model choice within an assignment editor", async () => {
     render(AgentSelectionEditor, {
       props: {
         harness: "antigravity",
@@ -205,7 +280,7 @@ describe("AgentSelectionEditor", () => {
           model_choices: ["gemini-3.7-flash", "gemini-3.1-pro"],
           effort_choices: ["medium"],
         },
-        context: "current",
+        context: "default",
         onChange: vi.fn(),
       },
     });
@@ -269,7 +344,12 @@ describe("AgentSelectionEditor", () => {
   it("clears interaction feedback when the controlled selection changes externally", async () => {
     const onChange = vi.fn();
     const view = render(AgentSelectionEditor, {
-      props: { harness: "claude_code", selection: BASE, context: "current", onChange },
+      props: {
+        harness: "claude_code",
+        selection: { ...BASE, model_choices: ["opus"] },
+        context: "current",
+        onChange,
+      },
     });
     await fireEvent.click(screen.getByTestId("agent-selection-model-choice-opus"));
     expect(within(screen.getByTestId("agent-selection-model")).getByRole("status")).toBeVisible();

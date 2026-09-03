@@ -112,9 +112,9 @@ describe("SettingsView", () => {
           agent_defaults: expect.objectContaining({
             codex: {
               model_choices: ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"],
-              effort_choices: ["high", "medium"],
-              default_model: "gpt-5.6-sol",
-              default_effort: "high",
+              effort_choices: ["medium", "high"],
+              default_model: "gpt-5.6-terra",
+              default_effort: "medium",
             },
           }),
         }),
@@ -122,7 +122,7 @@ describe("SettingsView", () => {
     );
 
     await fireEvent.change(screen.getByTestId("settings-selection-codex-model-current"), {
-      target: { value: "gpt-5.6-terra" },
+      target: { value: "gpt-5.6-sol" },
     });
     await waitFor(() =>
       expect(invokeMock).toHaveBeenLastCalledWith("set_preferences", {
@@ -130,9 +130,51 @@ describe("SettingsView", () => {
           agent_defaults: expect.objectContaining({
             codex: {
               model_choices: ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"],
+              effort_choices: ["medium", "high"],
+              default_model: "gpt-5.6-sol",
+              default_effort: "medium",
+            },
+          }),
+        }),
+      }),
+    );
+  });
+
+  it("falls back to the first remaining default when the current choice is removed", async () => {
+    preferences.agent_defaults.claude_code = {
+      model_choices: ["fable", "opus", "sonnet"],
+      effort_choices: ["high", "medium"],
+      default_model: "fable",
+      default_effort: "high",
+    };
+    render(SettingsView, { props: { onClose: vi.fn() } });
+
+    await fireEvent.click(screen.getByTestId("settings-selection-claude_code-model-choice-fable"));
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("set_preferences", {
+        preferences: expect.objectContaining({
+          agent_defaults: expect.objectContaining({
+            claude_code: {
+              model_choices: ["opus", "sonnet"],
               effort_choices: ["high", "medium"],
-              default_model: "gpt-5.6-terra",
+              default_model: "opus",
               default_effort: "high",
+            },
+          }),
+        }),
+      }),
+    );
+
+    await fireEvent.click(screen.getByTestId("settings-selection-claude_code-effort-choice-high"));
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("set_preferences", {
+        preferences: expect.objectContaining({
+          agent_defaults: expect.objectContaining({
+            claude_code: {
+              model_choices: ["opus", "sonnet"],
+              effort_choices: ["medium"],
+              default_model: "opus",
+              default_effort: "medium",
             },
           }),
         }),
@@ -143,13 +185,16 @@ describe("SettingsView", () => {
   it("lists every harness in Agent Defaults", () => {
     render(SettingsView, { props: { onClose: vi.fn() } });
     const section = screen.getByTestId("agent-defaults-settings");
+    expect(section).toHaveTextContent(
+      "Choose which models and reasoning efforts are available for quick switching from the Agents sidebar, and which ones new agents start with. New projects use the same defaults for their initial agents.",
+    );
     const labels = Array.from(section.querySelectorAll("summary")).map((el) =>
       el.textContent?.trim(),
     );
     expect(labels).toEqual(["Claude", "Codex", "Antigravity"]);
   });
 
-  it("shows the Antigravity model choices and implicit sole effort default", async () => {
+  it("shows the Antigravity quick choices and defaults", async () => {
     render(SettingsView, { props: { onClose: vi.fn() } });
     await fireEvent.click(screen.getByText("Antigravity", { selector: "summary" }));
 
@@ -159,16 +204,16 @@ describe("SettingsView", () => {
     expect(
       screen.getByTestId("settings-selection-antigravity-model-choice-gemini-3.7-flash"),
     ).toHaveAttribute("aria-pressed", "true");
-    expect(screen.getByTestId("settings-selection-antigravity-effort-implicit")).toHaveTextContent(
-      "Default: High",
+    expect(screen.getByTestId("settings-selection-antigravity-effort-current")).toHaveValue(
+      "medium",
     );
-    expect(screen.queryByTestId("settings-selection-antigravity-effort-current")).toBeNull();
   });
 
   it("refuses an invalid Antigravity default before it can leak through another save", async () => {
     preferences.agent_defaults.antigravity = {
       ...DEFAULT_AGENT_SELECTIONS.antigravity,
-      effort_choices: ["high", "medium"],
+      default_model: "gemini-3.1-pro",
+      default_effort: "high",
     };
     render(SettingsView, { props: { onClose: vi.fn() } });
     await fireEvent.click(screen.getByText("Antigravity", { selector: "summary" }));
@@ -186,7 +231,8 @@ describe("SettingsView", () => {
           agent_defaults: expect.objectContaining({
             antigravity: {
               ...DEFAULT_AGENT_SELECTIONS.antigravity,
-              effort_choices: ["high", "medium"],
+              default_model: "gemini-3.1-pro",
+              default_effort: "high",
             },
           }),
         }),

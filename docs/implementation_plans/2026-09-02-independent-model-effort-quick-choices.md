@@ -66,9 +66,8 @@ re-open silently.
    Changing Settings later does not silently reconfigure existing agents and is not consulted as a
    fallback when an existing agent switches models.
 4. **A default control is enabled only when more than one option is selected.** With exactly one
-   selected option, that option is implicitly the default. Show a muted `Default` label or a disabled
-   representation for clarity, but no interactive default picker. Settings never permits zero
-   selected options on an axis it configures.
+   selected option, that option is implicitly the default, so show no redundant assignment summary
+   or interactive picker. Settings never permits zero selected options on an axis it configures.
 5. **No double-click gesture and no green default state.** Double-click is undiscoverable and poorly
    accessible, and green is reserved for existing semantic/status roles. Multi-select state uses the
    established selected-control treatment; default identity is explicit in text/control state.
@@ -148,9 +147,9 @@ Settings stores, per harness:
 - selected model quick choices and a default model;
 - selected effort quick choices and a default effort.
 
-The default is always a member of its selected set. The one-choice implicit-default rule is a UI
-rule, not a different persisted shape: the single selected value is still stored as the default so
-creation and auto-seeding have one simple contract.
+The default is always a member of its selected set. With one choice the default is unambiguous, so
+the UI shows no redundant assignment summary; the single selected value is still stored as the
+default so creation and auto-seeding have one simple contract.
 
 ### Antigravity model-change resolution
 
@@ -431,7 +430,8 @@ Establish one frontend interaction model that Settings, Add Agent, and the exist
 reuse without drifting.
 
 - Curated options can be independently included/excluded per axis.
-- A context-specific selector shows `Default`, `Start with`, or `Current` as appropriate.
+- A context-specific selector shows `Default` or `Start with` where assignment is part of the form;
+  existing-agent current values are changed from the agent-card chips.
 - `Default` is interactive only with 2+ selected choices; an existing agent can still adopt a sole
   configured choice when its current value is null or different.
 - Antigravity transitions resolve through one tested function.
@@ -446,11 +446,11 @@ reuse without drifting.
    intersection for a current known model.
 2. Replace the profile editor with a shared independent-axis editor. Each axis contains:
    - multi-select toggle controls over the existing curated options;
-   - an explicit context label (`Default`, `Start with`, or `Current`);
-   - a single-value selector restricted to the selected quick choices;
-   - a non-interactive implicit-default presentation when exactly one choice is selected;
-   - in existing-agent context, an explicit way to adopt the sole choice when it differs from the
-     current value, including a null current value migrated from an old or attached agent.
+   - an explicit `Default` label where the surface assigns a value;
+   - a single-value selector restricted to the selected quick choices in Settings and Add Agent;
+   - no redundant default summary when exactly one choice is selected;
+   - no `Current` selector in existing-agent Model settings; current values are changed directly from
+     the agent-card chips, or fall back to the first remaining choice when the current choice is removed.
 3. Use real multi-select semantics (`button` + `aria-pressed` or checkbox semantics), not the current
    radio-group primitive. Reuse the existing semantic color classes so selected choices look like
    selected controls, and communicate default/current with text and accessible state rather than a
@@ -459,18 +459,16 @@ reuse without drifting.
    - Settings/create configuration cannot deselect the last choice on an axis; an existing agent
      may begin empty because it was attached, but once the user configures an axis its last choice
      is likewise not removable through this UI;
-   - the toggle for the current default/start/current value cannot be turned off while it owns that role;
-     the user first chooses another selected value in the explicit selector, then may remove the old
-     value. Give the locked control accessible disabled semantics and a tooltip or helper explaining
-     that another value must assume the role before removal. This avoids an arbitrary automatic
-     replacement and never leaves an invalid intermediate;
+   - any selected choice can be turned off while another remains. Removing the current/default/start
+     value assigns the first remaining choice on that axis; model fallback applies Antigravity's normal
+     effort resolution where possible. Only the last selected choice is locked, with accessible disabled
+     semantics and an explanation;
    - selecting the first choice for an empty attached-agent axis makes it current;
-   - with one choice equal to the current/default value, the selector cannot be focused or changed
+   - with one choice equal to the current/default value, no assignment control or summary is shown
      because there is no decision to make;
-   - with one choice different from an existing agent's current value, the Current control allows
-     adopting that choice; this exception does not make a one-choice Settings Default interactive;
-   - with 2+ choices, the selector becomes enabled and lists only selected choices. For a known
-     Antigravity model, effort values outside the activatable intersection are disabled and explained.
+   - with 2+ choices, the Settings/Add Agent selector becomes enabled and lists only selected choices.
+     For a known Antigravity model, effort values outside the activatable intersection are disabled and
+     explained.
 5. Preserve an off-catalog current value by including it in the editor's selected choices and
    presenting its full string. Do not silently replace it with the first curated option merely by
    opening or saving the dialog.
@@ -488,7 +486,7 @@ value.
 ### Definition of Done
 
 - Pure helper tests cover one/two/3+ choice presentation, catalog ordering, stable off-catalog
-  inclusion, de-duplication, and the one-choice implicit selector state.
+  inclusion, de-duplication, and the one-choice no-selector state.
 - Antigravity resolver tests cover: preserve a valid effort; use the first configured valid effort;
   explicitly known no-effort model clears effort; required-effort model with no compatible
   configured choice refuses without mutation; unknown model preserves effort; and Settings changes
@@ -497,9 +495,9 @@ value.
   model while presentation mode still reflects the complete configured set.
 - Shared-editor component tests cover keyboard and pointer toggling, accessible pressed/checked
   state, inability to remove the last Settings/create choice, default/current membership, first
-  selection from an empty attached state, sole-choice adoption when current is null, the one-choice
-  implicit Default rule, incompatible effort explanations, and accessible explanation for a locked
-  current/default choice.
+  selection from an empty attached state, automatic first-remaining fallback, omission of a redundant
+  one-choice Default summary, incompatible effort explanations, and accessible explanation for a locked
+  last choice.
 - Component tests prove opening/saving an untouched null/off-catalog configuration changes nothing.
 - Keep the toggle implementation scoped to the shared editor unless implementation reveals an
   independent reuse boundary that warrants a low-level UI primitive. No new raw palette colors or
@@ -526,11 +524,11 @@ independent quick choices.
 ### Implementation Outline
 
 1. Replace the Agent Defaults profile copy with two quick-choice sections per harness. The explanatory
-   copy should say these are initial choices for new agents/projects and that existing agents are not
-   changed.
-2. Render multi-select choices using the shared editor. When one value is selected, show it as
-   implicitly `Default` and keep the default control disabled/non-interactive. When 2+ are selected,
-   enable the explicit default selector. Save the complete per-harness defaults atomically through
+   copy should distinguish choices available for quick switching from the default used by new agents
+   and initial project agents.
+2. Render multi-select choices using the shared editor. When one value is selected, omit the redundant
+   default summary. When 2+ are selected, enable the explicit default selector. Save the complete
+   per-harness defaults atomically through
    the existing optimistic preference path; never persist a transient missing default between two
    clicks. Antigravity may retain an independent effort default while its default model has no effort
    axis; explain that the effort is unused for that starting model rather than clearing the setting.
@@ -615,10 +613,11 @@ one-click two-option workflow.
    race from the same stale record and revert each other. Other agents remain independently usable.
    Surface a failure on that agent card, retain the last acknowledged record, and re-enable all three
    controls after failure.
-5. Adapt `Model settings…` to the shared editor's existing-agent context. It edits choices and
-   `Current` values, preserves null/off-catalog state, blocks a known invalid Antigravity current
-   pair with inline correction copy, and keeps the dialog open/non-dismissible during save exactly
-   as today.
+5. Adapt `Model settings…` to the shared editor's existing-agent context. It edits quick-choice
+   membership without a separate `Current` selector; removing the current item chooses the first
+   remaining item, while normal current changes happen from the agent-card chips. Preserve
+   null/off-catalog state, block a known invalid Antigravity current pair with inline correction copy,
+   and keep the dialog open/non-dismissible during save exactly as today.
 6. Hide the effort chip only when the current Antigravity model is explicitly known to have no
    effort axis. An unknown model preserves and displays configured/current effort rather than being
    treated as no-effort. If the current model or effort is null, retain `Harness/session default` as
@@ -645,10 +644,10 @@ while the menu avoids arbitrary cycling for larger sets.
 - Antigravity component tests cover valid-effort preservation, announced automatic adjustment,
   explicitly known no-effort model hiding the chip, unknown model preserving effort, disabled
   incompatible model and effort targets with explanations, and a single atomic persistence call.
-- Existing-agent dialog tests cover adding/removing choices, refusal to remove the current choice
-  until another is explicitly made current, one-choice Current adoption versus one-choice implicit
-  Default, null/unpinned round-trip, off-catalog preservation, required-effort validation for an
-  attached Antigravity agent, and save failure.
+- Existing-agent dialog tests cover adding/removing choices, automatic fallback when removing the
+  current choice, refusal to remove only the last selected choice, absence of Current selectors,
+  null/unpinned round-trip, off-catalog preservation, required-effort validation for an attached
+  Antigravity agent, and save failure.
 - Transcript tests continue to prove historical per-turn model/effort render independently from the
   sidebar's current values.
 - A focused browser test is required only if the final two-chip layout or 3+-choice menu introduces

@@ -132,9 +132,9 @@ describe("CreateAgentForm", () => {
       harness: "claude_code",
       selection: {
         model: "opus",
-        effort: "high",
-        model_choices: ["opus", "sonnet"],
-        effort_choices: ["high", "medium"],
+        effort: "medium",
+        model_choices: ["fable", "opus"],
+        effort_choices: ["medium", "high"],
       },
     } satisfies AgentFormSubmit);
   });
@@ -194,9 +194,9 @@ describe("CreateAgentForm", () => {
       harness: "claude_code",
       selection: {
         model: "opus",
-        effort: "high",
-        model_choices: ["opus", "sonnet"],
-        effort_choices: ["high", "medium"],
+        effort: "medium",
+        model_choices: ["fable", "opus"],
+        effort_choices: ["medium", "high"],
       },
     } satisfies AgentFormSubmit);
   });
@@ -219,10 +219,10 @@ describe("CreateAgentForm", () => {
       name: "codex",
       harness: "codex",
       selection: {
-        model: "gpt-5.6-sol",
-        effort: "high",
+        model: "gpt-5.6-terra",
+        effort: "medium",
         model_choices: ["gpt-5.6-sol", "gpt-5.6-terra"],
-        effort_choices: ["high", "medium"],
+        effort_choices: ["medium", "high"],
       },
     } satisfies AgentFormSubmit);
   });
@@ -386,9 +386,9 @@ describe("CreateAgentForm", () => {
       harness: "claude_code",
       selection: {
         model: "opus",
-        effort: "high",
-        model_choices: ["opus", "sonnet"],
-        effort_choices: ["high", "medium"],
+        effort: "medium",
+        model_choices: ["fable", "opus"],
+        effort_choices: ["medium", "high"],
       },
     } satisfies AgentFormSubmit);
   });
@@ -539,9 +539,9 @@ describe("CreateAgentForm", () => {
       harness: "claude_code",
       selection: {
         model: "opus",
-        effort: "high",
-        model_choices: ["opus", "sonnet"],
-        effort_choices: ["high", "medium"],
+        effort: "medium",
+        model_choices: ["fable", "opus"],
+        effort_choices: ["medium", "high"],
       },
     } satisfies AgentFormSubmit);
   });
@@ -565,7 +565,7 @@ describe("CreateAgentForm", () => {
   it("create + Claude: model and effort pickers preselect the harness defaults", () => {
     renderForm();
     expect(pickerValue("model-select")).toBe("opus");
-    expect(pickerValue("effort-select")).toBe("high");
+    expect(pickerValue("effort-select")).toBe("medium");
     // No unsupported-capability notes for a fully-capable harness.
     expect(screen.queryByTestId("model-note")).not.toBeInTheDocument();
     expect(screen.queryByTestId("effort-note")).not.toBeInTheDocument();
@@ -574,8 +574,8 @@ describe("CreateAgentForm", () => {
   it("create + Codex: pickers preselect the configured default", async () => {
     renderForm();
     await fireEvent.click(screen.getByTestId("harness-codex"));
-    expect(pickerValue("model-select")).toBe("gpt-5.6-sol");
-    expect(pickerValue("effort-select")).toBe("high");
+    expect(pickerValue("model-select")).toBe("gpt-5.6-terra");
+    expect(pickerValue("effort-select")).toBe("medium");
   });
 
   it("create + Antigravity: model and effort are selectable, and submit carries them", async () => {
@@ -592,10 +592,10 @@ describe("CreateAgentForm", () => {
       name: "antigravity",
       harness: "antigravity",
       selection: {
-        model: "gemini-3.1-pro",
-        effort: "high",
-        model_choices: ["gemini-3.1-pro", "gemini-3.7-flash"],
-        effort_choices: ["high"],
+        model: "gemini-3.7-flash",
+        effort: "medium",
+        model_choices: ["gemini-3.7-flash", "gemini-3.1-pro"],
+        effort_choices: ["medium", "high"],
       },
     } satisfies AgentFormSubmit);
   });
@@ -622,7 +622,6 @@ describe("CreateAgentForm", () => {
     expect(screen.getByTestId("create-selection-effort-choice-low")).toBeEnabled();
     expect(screen.getByTestId("create-selection-effort-choice-high")).toBeEnabled();
     expect(screen.getByTestId("create-selection-effort-choice-medium")).toBeEnabled();
-    await fireEvent.click(screen.getByTestId("create-selection-effort-choice-medium"));
     const effortCurrent = screen.getByTestId("create-selection-effort-current");
     expect(within(effortCurrent).getByRole("option", { name: "Medium" })).toBeDisabled();
   });
@@ -690,8 +689,8 @@ describe("CreateAgentForm", () => {
       selection: {
         model: "gemini-3.1-pro",
         effort: "high",
-        model_choices: ["gemini-3.1-pro", "gemini-3.7-flash"],
-        effort_choices: ["high", "medium"],
+        model_choices: ["gemini-3.7-flash", "gemini-3.1-pro"],
+        effort_choices: ["medium", "high"],
       },
     } satisfies AgentFormSubmit);
   });
@@ -708,8 +707,8 @@ describe("CreateAgentForm", () => {
       selection: {
         model: "sonnet",
         effort: "max",
-        model_choices: ["opus", "sonnet"],
-        effort_choices: ["high", "medium", "max"],
+        model_choices: ["fable", "opus", "sonnet"],
+        effort_choices: ["medium", "high", "max"],
       },
     } satisfies AgentFormSubmit);
   });
@@ -720,17 +719,17 @@ describe("CreateAgentForm", () => {
     await choosePicker("model-select", "haiku");
     await fireEvent.click(screen.getByTestId("harness-codex"));
     // The stale Claude value is gone — Codex shows its own default.
-    expect(pickerValue("model-select")).toBe("gpt-5.6-sol");
+    expect(pickerValue("model-select")).toBe("gpt-5.6-terra");
     await fireEvent.click(screen.getByTestId("confirm-create-agent"));
     expect(onSubmit).toHaveBeenCalledExactlyOnceWith({
       mode: "create",
       name: "codex",
       harness: "codex",
       selection: {
-        model: "gpt-5.6-sol",
-        effort: "high",
+        model: "gpt-5.6-terra",
+        effort: "medium",
         model_choices: ["gpt-5.6-sol", "gpt-5.6-terra"],
-        effort_choices: ["high", "medium"],
+        effort_choices: ["medium", "high"],
       },
     } satisfies AgentFormSubmit);
   });
@@ -762,7 +761,7 @@ describe("CreateAgentForm", () => {
     // Untouched, so they're at the harness default — this is re-render, not reset
     // (see the draft-preservation test below).
     expect(pickerValue("model-select")).toBe("opus");
-    expect(pickerValue("effort-select")).toBe("high");
+    expect(pickerValue("effort-select")).toBe("medium");
   });
 
   it("create model/effort selections survive a create → attach → create toggle (draft preservation)", async () => {
@@ -782,8 +781,8 @@ describe("CreateAgentForm", () => {
       selection: {
         model: "haiku",
         effort: "low",
-        model_choices: ["opus", "sonnet", "haiku"],
-        effort_choices: ["high", "medium", "low"],
+        model_choices: ["fable", "opus", "haiku"],
+        effort_choices: ["medium", "high", "low"],
       },
     } satisfies AgentFormSubmit);
   });
@@ -792,9 +791,9 @@ describe("CreateAgentForm", () => {
     renderForm();
     const nameInput = screen.getByTestId("agent-name") as HTMLInputElement;
     expect(nameInput.value).toBe("claude");
-    await fireEvent.click(screen.getByTestId("create-selection-model-choice-sonnet"));
-    await fireEvent.click(screen.getByTestId("create-selection-effort-choice-medium"));
-    expect(nameInput.value).toBe("opus-high");
+    await fireEvent.click(screen.getByTestId("create-selection-model-choice-fable"));
+    await fireEvent.click(screen.getByTestId("create-selection-effort-choice-high"));
+    expect(nameInput.value).toBe("opus-medium");
   });
 
   it("create: adding another choice switches the untouched auto-name to the harness", async () => {
@@ -802,9 +801,9 @@ describe("CreateAgentForm", () => {
     const nameInput = screen.getByTestId("agent-name") as HTMLInputElement;
     expect(nameInput.value).toBe("claude");
 
-    await fireEvent.click(screen.getByTestId("create-selection-model-choice-sonnet"));
-    await fireEvent.click(screen.getByTestId("create-selection-effort-choice-medium"));
-    expect(nameInput.value).toBe("opus-high");
+    await fireEvent.click(screen.getByTestId("create-selection-model-choice-fable"));
+    await fireEvent.click(screen.getByTestId("create-selection-effort-choice-high"));
+    expect(nameInput.value).toBe("opus-medium");
 
     await fireEvent.click(screen.getByTestId("create-selection-model-choice-haiku"));
     expect(nameInput.value).toBe("claude");
@@ -836,10 +835,10 @@ describe("CreateAgentForm", () => {
       name: "my-thing",
       harness: "codex",
       selection: {
-        model: "gpt-5.6-sol",
-        effort: "high",
+        model: "gpt-5.6-terra",
+        effort: "medium",
         model_choices: ["gpt-5.6-sol", "gpt-5.6-terra"],
-        effort_choices: ["high", "medium"],
+        effort_choices: ["medium", "high"],
       },
     } satisfies AgentFormSubmit);
   });

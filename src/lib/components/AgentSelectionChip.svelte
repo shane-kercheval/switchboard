@@ -11,6 +11,7 @@
   } from "$lib/agentSelection";
   import DropdownMenu from "$lib/components/ui/DropdownMenu.svelte";
   import DropdownMenuItem from "$lib/components/ui/DropdownMenuItem.svelte";
+  import Tooltip from "$lib/components/ui/Tooltip.svelte";
   import { cn } from "$lib/utils";
 
   type Axis = "model" | "effort";
@@ -86,37 +87,56 @@
 </script>
 
 {#if presentation === "static"}
-  <span
-    class="bg-panel text-muted inline-flex min-w-0 items-center rounded px-1.5 py-0.5 text-[11px] leading-4"
-    aria-label={`Current ${axisName}: ${label(current)}`}
-    data-testid={`agent-${axis}-chip`}
+  <Tooltip
+    label={`Current ${axisName}: ${label(current)}`}
+    side="top"
+    focusable={false}
+    disableHoverableContent
   >
-    <span class="truncate" title={current ?? undefined}>{label(current)}</span>
-  </span>
+    {#snippet trigger(props)}
+      <span
+        {...props}
+        class="bg-panel text-muted inline-flex min-w-0 cursor-default items-center rounded px-1.5 py-0.5 text-[11px] leading-4"
+        aria-label={`Current ${axisName}: ${label(current)}`}
+        data-testid={`agent-${axis}-chip`}
+      >
+        <span class="truncate">{label(current)}</span>
+      </span>
+    {/snippet}
+  </Tooltip>
 {:else if presentation === "toggle"}
   {@const target = directTarget()}
   {@const result = target === null ? null : resultFor(target)}
-  <button
-    type="button"
-    class={cn(
-      "bg-panel text-muted hover:bg-hover hover:text-fg inline-flex min-w-0 items-center gap-1 rounded px-1.5 py-0.5 text-[11px] leading-4 transition-colors",
-      (busy || result?.ok === false) && "cursor-not-allowed opacity-60",
-    )}
-    disabled={busy || target === null || result?.ok === false}
-    title={result?.ok === false
+  <Tooltip
+    label={result?.ok === false
       ? result.reason
-      : target === null
-        ? undefined
-        : activationLabel(target)}
-    aria-label={`Current ${axisName}: ${label(current)}. Switch to ${target === null ? "another choice" : activationLabel(target)}.`}
-    data-testid={`agent-${axis}-chip`}
-    onclick={() => {
-      if (target !== null) activate(target);
-    }}
+      : `Switch to ${target === null ? "another choice" : activationLabel(target)}`}
+    side="top"
+    disableHoverableContent
+    disabled={busy}
+    reopen="fresh-hover"
   >
-    <span class="truncate">{label(current)}</span>
-    <ChevronsUpDown size={10} strokeWidth={1.8} class="shrink-0" aria-hidden="true" />
-  </button>
+    {#snippet trigger(props)}
+      <button
+        {...props}
+        type="button"
+        class={cn(
+          "bg-panel text-muted hover:bg-hover hover:text-fg inline-flex min-w-0 items-center gap-1 rounded px-1.5 py-0.5 text-[11px] leading-4 transition-colors",
+          busy && "cursor-default opacity-60",
+          result?.ok === false && "cursor-not-allowed opacity-60",
+        )}
+        disabled={busy || target === null || result?.ok === false}
+        aria-label={`Current ${axisName}: ${label(current)}. Switch to ${target === null ? "another choice" : activationLabel(target)}.`}
+        data-testid={`agent-${axis}-chip`}
+        onclick={() => {
+          if (target !== null) activate(target);
+        }}
+      >
+        <span class="truncate">{label(current)}</span>
+        <ChevronsUpDown size={10} strokeWidth={1.8} class="shrink-0" aria-hidden="true" />
+      </button>
+    {/snippet}
+  </Tooltip>
 {:else}
   <DropdownMenu
     triggerClass={cn(
@@ -126,22 +146,26 @@
     triggerLabel={`Current ${axisName}: ${label(current)}. Choose ${axisName}.`}
     triggerTestid={`agent-${axis}-chip`}
     triggerDisabled={busy}
+    tooltipLabel={`Current ${axisName}: ${label(current)}. Choose ${axisName}.`}
+    tooltipSide="top"
     contentTestid={`agent-${axis}-menu`}
+    contentClass="min-w-28 rounded-md p-0.5 text-xs"
     align="start"
   >
     {#snippet trigger()}
-      <span class="truncate" title={current ?? undefined}>{label(current)}</span>
+      <span class="truncate">{label(current)}</span>
       <ChevronsUpDown size={10} strokeWidth={1.8} class="shrink-0" aria-hidden="true" />
     {/snippet}
-    {#each values as value (value)}
+    {#each values.filter((value) => value !== current) as value (value)}
       {@const result = resultFor(value)}
       <DropdownMenuItem
         onSelect={() => activate(value)}
-        disabled={busy || value === current || !result.ok}
+        disabled={busy || !result.ok}
         tooltip={!result.ok ? result.reason : undefined}
+        class="rounded px-2 py-1 leading-4"
         data-testid={`agent-${axis}-option-${value}`}
       >
-        {activationLabel(value)}{value === current ? " (current)" : ""}
+        {activationLabel(value)}
       </DropdownMenuItem>
     {/each}
   </DropdownMenu>

@@ -822,6 +822,8 @@ describe("Sidebar", () => {
     expect(screen.queryByTestId("agent-observed-model")).toBeNull();
     expect(screen.getByTestId("agent-mcp-chip")).toHaveTextContent("1");
     expect(screen.getByTestId("agent-skills-chip")).toHaveTextContent("1");
+    expect(screen.getByTestId("agent-mcp-chip")).toHaveClass("cursor-default");
+    expect(screen.getByTestId("agent-skills-chip")).toHaveClass("cursor-default");
   });
 
   // --- Model / effort: change actions + intent display -----------------------
@@ -865,15 +867,13 @@ describe("Sidebar", () => {
 
     await screen.findByTestId("change-selection-model");
     await fireEvent.click(screen.getByTestId("change-selection-model-choice-sonnet"));
-    await fireEvent.change(screen.getByTestId("change-selection-model-current"), {
-      target: { value: "sonnet" },
-    });
+    await fireEvent.click(screen.getByTestId("change-selection-model-choice-opus"));
     await fireEvent.click(screen.getByTestId("change-save"));
 
     expect(setAgentSelectionMock).toHaveBeenCalledExactlyOnceWith(agent.id, {
       model: "sonnet",
       effort: "high",
-      model_choices: ["opus", "sonnet"],
+      model_choices: ["sonnet"],
       effort_choices: ["high"],
     });
   });
@@ -961,7 +961,7 @@ describe("Sidebar", () => {
       "aria-pressed",
       "true",
     );
-    expect(screen.getByTestId("change-selection-model-implicit")).toHaveTextContent("future-opus");
+    expect(screen.queryByTestId("change-selection-model-implicit")).toBeNull();
     await fireEvent.click(screen.getByTestId("change-save"));
 
     expect(setAgentSelectionMock).toHaveBeenCalledExactlyOnceWith(agent.id, {
@@ -1071,9 +1071,15 @@ describe("Sidebar", () => {
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
 
     await fireEvent.click(screen.getByTestId("agent-model-chip"));
-    expect(await screen.findByTestId("agent-model-option-opus")).toHaveTextContent(
-      "Opus (current)",
+    const menu = await screen.findByTestId("agent-model-menu");
+    expect(menu).toHaveClass("min-w-28", "p-0.5", "text-xs");
+    expect(await screen.findByTestId("agent-model-option-sonnet")).toHaveClass(
+      "px-2",
+      "py-1",
+      "leading-4",
     );
+    expect(screen.queryByTestId("agent-model-option-opus")).toBeNull();
+    expect(screen.getByTestId("agent-model-option-sonnet")).toHaveTextContent("Sonnet");
     await fireEvent.click(await screen.findByTestId("agent-model-option-haiku"));
 
     expect(setAgentSelectionMock).toHaveBeenCalledExactlyOnceWith(agent.id, {
@@ -1181,11 +1187,10 @@ describe("Sidebar", () => {
     await state.registerAgent(agent);
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
 
-    expect(screen.getByTestId("agent-model-chip")).toBeDisabled();
-    expect(screen.getByTestId("agent-model-chip")).toHaveAttribute(
-      "title",
-      "No configured reasoning effort is compatible with that model. Open Model settings to add one.",
-    );
+    const modelChip = screen.getByTestId("agent-model-chip");
+    expect(modelChip).toBeDisabled();
+    expect(modelChip).not.toHaveAttribute("title");
+    expect(modelChip).toHaveAttribute("data-tooltip-trigger");
   });
 
   it("blocks both quick controls while a complete selection write is pending", async () => {
@@ -1203,6 +1208,8 @@ describe("Sidebar", () => {
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
 
     await fireEvent.click(screen.getByTestId("agent-model-chip"));
+    expect(screen.getByTestId("agent-model-chip")).toHaveClass("cursor-default");
+    expect(screen.getByTestId("agent-model-chip")).not.toHaveClass("cursor-not-allowed");
     expect(screen.getByTestId("agent-effort-chip")).toBeDisabled();
     await fireEvent.click(screen.getByTestId("agent-effort-chip"));
     expect(setAgentSelectionMock).toHaveBeenCalledTimes(1);
@@ -1343,8 +1350,12 @@ describe("Sidebar", () => {
 
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
 
-    expect(screen.getByTestId("agent-model-chip")).toHaveTextContent("Opus");
-    expect(screen.getByTestId("agent-model-chip").tagName).toBe("SPAN");
+    const modelChip = screen.getByTestId("agent-model-chip");
+    expect(modelChip).toHaveTextContent("Opus");
+    expect(modelChip.tagName).toBe("SPAN");
+    expect(modelChip).toHaveClass("cursor-default");
+    expect(modelChip).not.toHaveAttribute("title");
+    expect(modelChip).toHaveAttribute("data-tooltip-trigger");
     // The selection wins — the observed line is not shown when intent exists.
     expect(screen.queryByTestId("agent-observed-model")).toBeNull();
   });

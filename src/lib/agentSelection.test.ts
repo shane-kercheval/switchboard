@@ -50,12 +50,23 @@ describe("agent selection catalogs", () => {
 
   it("ships two independent choices for Claude and Codex", () => {
     expect(DEFAULT_AGENT_SELECTIONS.claude_code).toEqual({
-      model_choices: ["opus", "sonnet"],
-      effort_choices: ["high", "medium"],
+      model_choices: ["fable", "opus"],
+      effort_choices: ["medium", "high"],
       default_model: "opus",
-      default_effort: "high",
+      default_effort: "medium",
     });
-    expect(DEFAULT_AGENT_SELECTIONS.codex.default_model).toBe("gpt-5.6-sol");
+    expect(DEFAULT_AGENT_SELECTIONS.codex).toEqual({
+      model_choices: ["gpt-5.6-sol", "gpt-5.6-terra"],
+      effort_choices: ["medium", "high"],
+      default_model: "gpt-5.6-terra",
+      default_effort: "medium",
+    });
+    expect(DEFAULT_AGENT_SELECTIONS.antigravity).toEqual({
+      model_choices: ["gemini-3.7-flash", "gemini-3.1-pro"],
+      effort_choices: ["medium", "high"],
+      default_model: "gemini-3.7-flash",
+      default_effort: "medium",
+    });
   });
 });
 

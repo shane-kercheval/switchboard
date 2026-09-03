@@ -283,8 +283,9 @@
       <div>
         <h2 class={sectionHeadingClass}>Agent Defaults</h2>
         <p class="text-muted mt-1 text-sm leading-relaxed">
-          Choose the model and reasoning-effort quick choices copied into new agents and projects.
-          Existing agents keep their own configuration.
+          Choose which models and reasoning efforts are available for quick switching from the
+          Agents sidebar, and which ones new agents start with. New projects use the same defaults
+          for their initial agents.
         </p>
       </div>
 

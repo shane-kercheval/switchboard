@@ -45,9 +45,7 @@
   }: Props = $props();
   let interactionMessage = $state<InteractionMessage | null>(null);
 
-  const roleLabel = $derived(
-    context === "default" ? "Default" : context === "start" ? "Start with" : "Current",
-  );
+  const roleLabel = $derived(context === "current" ? "Current" : "Default");
   const modelOptions = $derived(
     optionsWithPersisted(MODEL_OPTIONS[harness], selection.model_choices),
   );
@@ -100,6 +98,12 @@
     return axis === "model" ? selection.model : selection.effort;
   }
 
+  function orderedChoices(axis: Axis, values: readonly string[] = choices(axis)): string[] {
+    const selected = new Set(values);
+    const options = axis === "model" ? modelOptions : effortOptions;
+    return options.filter((option) => selected.has(option.value)).map((option) => option.value);
+  }
+
   function withAxis(axis: Axis, values: string[], value: string | null): AgentSelection {
     return axis === "model"
       ? { ...selection, model_choices: values, model: value }
@@ -111,13 +115,6 @@
     interactionMessage = null;
     const selected = choices(axis).includes(value);
     if (selected) {
-      if (current(axis) === value) {
-        interactionMessage = {
-          axis,
-          text: `Choose another ${roleLabel.toLowerCase()} before removing this value.`,
-        };
-        return;
-      }
       if (choices(axis).length === 1) {
         interactionMessage = {
           axis,
@@ -125,13 +122,25 @@
         };
         return;
       }
-      onChange(
-        withAxis(
-          axis,
-          choices(axis).filter((choice) => choice !== value),
-          current(axis),
-        ),
-      );
+      const nextChoices = choices(axis).filter((choice) => choice !== value);
+      if (current(axis) !== value) {
+        onChange(withAxis(axis, nextChoices, current(axis)));
+        return;
+      }
+      const fallback = orderedChoices(axis, nextChoices)[0] ?? null;
+      const next = withAxis(axis, nextChoices, fallback);
+      if (axis === "effort" || fallback === null) {
+        onChange(next);
+        return;
+      }
+      // Settings defaults are independent axes. Inspect the fallback model so
+      // removing a no-effort default preserves the separate effort default.
+      if (context === "default" && effortSupportFor(harness, fallback).kind === "none") {
+        onChange(next);
+        return;
+      }
+      const resolved = resolveModelChange(next, harness, fallback);
+      onChange(resolved.ok ? resolved.selection : next);
       return;
     }
 
@@ -183,11 +192,6 @@
     onChange(resolved.selection);
   }
 
-  function showSelector(axis: Axis): boolean {
-    const axisChoices = choices(axis);
-    return axisChoices.length > 1 || (context === "current" && axisChoices[0] !== current(axis));
-  }
-
   function optionLabel(options: SelectionOption[], value: string): string {
     return options.find((option) => option.value === value)?.label ?? value;
   }
@@ -219,22 +223,29 @@
   {@const axisChoices = choices(axis)}
   {@const axisCurrent = current(axis)}
   {@const unavailableMessage = assignmentUnavailableMessage(axis)}
+  {@const compact = options.length > 5}
   <fieldset class="space-y-2" {disabled} data-testid={`${testidPrefix}-${axis}`}>
     <legend class="text-fg text-sm font-medium">{label}</legend>
-    <div class={cn(SEGMENTED_CONTAINER_CLASS, "flex flex-wrap")}>
+    <div
+      class={cn(SEGMENTED_CONTAINER_CLASS, "grid w-full", compact && "gap-0.5")}
+      style={`grid-template-columns: repeat(${Math.max(1, options.length)}, minmax(0, 1fr));`}
+      data-testid={`${testidPrefix}-${axis}-choices`}
+    >
       {#each options as option (option.value)}
         {@const selected = axisChoices.includes(option.value)}
-        {@const locked = selected && axisCurrent === option.value}
+        {@const locked = selected && axisChoices.length === 1}
         <button
           type="button"
           aria-pressed={selected}
           aria-disabled={locked}
           {disabled}
           title={locked
-            ? `Choose another ${roleLabel.toLowerCase()} before removing this value.`
+            ? "At least one quick choice is required once this axis is configured."
             : undefined}
           class={cn(
             SEGMENTED_ITEM_CLASS,
+            "flex min-w-0 items-center justify-center truncate text-center",
+            compact && "px-1 text-[11px]",
             selected ? SEGMENTED_ITEM_ACTIVE_CLASS : SEGMENTED_ITEM_INACTIVE_CLASS,
             locked && "cursor-not-allowed opacity-60",
           )}
@@ -250,17 +261,13 @@
       <p class="text-muted text-xs" data-testid={`${testidPrefix}-${axis}-unavailable`}>
         {unavailableMessage}
       </p>
-    {:else if axisChoices.length === 1 && !showSelector(axis)}
-      <p class="text-muted text-xs" data-testid={`${testidPrefix}-${axis}-implicit`}>
-        {roleLabel}: {optionLabel(options, axisChoices[0] ?? "")}
-      </p>
-    {:else if axisChoices.length > 0}
+    {:else if context !== "current" && axisChoices.length > 1}
       <label class="block space-y-1">
         <span class="text-muted text-xs">{roleLabel}</span>
         <Select
           value={axisCurrent ?? ""}
           {disabled}
-          options={axisChoices.map((value) => ({
+          options={orderedChoices(axis).map((value) => ({
             value,
             label: optionLabel(options, value),
             disabled: axis === "effort" && effortDisabled(value),
@@ -285,11 +292,22 @@
 {/snippet}
 
 <div class="space-y-4" data-testid={testidPrefix}>
+  {#if context === "start"}
+    <p class="text-muted text-sm leading-relaxed">
+      Choose which models and reasoning efforts are available for quick switching from the Agents
+      sidebar, and which ones this agent uses by default.
+    </p>
+  {:else if context === "current"}
+    <p class="text-muted text-sm leading-relaxed">
+      Choose which models and reasoning efforts are available for quick switching from the Agents
+      sidebar.
+    </p>
+  {/if}
   {#if modelSupported}
-    {@render axisEditor("model", "Model quick choices", modelOptions)}
+    {@render axisEditor("model", "Model", modelOptions)}
   {/if}
   {#if effortSupported}
-    {@render axisEditor("effort", "Reasoning effort quick choices", effortOptions)}
+    {@render axisEditor("effort", "Reasoning Effort", effortOptions)}
   {/if}
   {#if !modelSupported && !effortSupported}
     <p class="text-muted text-xs leading-relaxed" data-testid={`${testidPrefix}-unsupported`}>

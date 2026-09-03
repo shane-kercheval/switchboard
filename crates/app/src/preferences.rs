@@ -99,28 +99,28 @@ fn default_agent_defaults() -> BTreeMap<HarnessKind, AgentDefaults> {
         (
             HarnessKind::ClaudeCode,
             AgentDefaults {
-                model_choices: vec!["opus".to_owned(), "sonnet".to_owned()],
-                effort_choices: vec!["high".to_owned(), "medium".to_owned()],
+                model_choices: vec!["fable".to_owned(), "opus".to_owned()],
+                effort_choices: vec!["medium".to_owned(), "high".to_owned()],
                 default_model: Some("opus".to_owned()),
-                default_effort: Some("high".to_owned()),
+                default_effort: Some("medium".to_owned()),
             },
         ),
         (
             HarnessKind::Codex,
             AgentDefaults {
                 model_choices: vec!["gpt-5.6-sol".to_owned(), "gpt-5.6-terra".to_owned()],
-                effort_choices: vec!["high".to_owned(), "medium".to_owned()],
-                default_model: Some("gpt-5.6-sol".to_owned()),
-                default_effort: Some("high".to_owned()),
+                effort_choices: vec!["medium".to_owned(), "high".to_owned()],
+                default_model: Some("gpt-5.6-terra".to_owned()),
+                default_effort: Some("medium".to_owned()),
             },
         ),
         (
             HarnessKind::Antigravity,
             AgentDefaults {
-                model_choices: vec!["gemini-3.1-pro".to_owned(), "gemini-3.7-flash".to_owned()],
-                effort_choices: vec!["high".to_owned()],
-                default_model: Some("gemini-3.1-pro".to_owned()),
-                default_effort: Some("high".to_owned()),
+                model_choices: vec!["gemini-3.7-flash".to_owned(), "gemini-3.1-pro".to_owned()],
+                effort_choices: vec!["medium".to_owned(), "high".to_owned()],
+                default_model: Some("gemini-3.7-flash".to_owned()),
+                default_effort: Some("medium".to_owned()),
             },
         ),
     ])
@@ -591,10 +591,10 @@ mod tests {
         assert_eq!(
             defaults.agent_defaults[&HarnessKind::Antigravity],
             AgentDefaults {
-                model_choices: vec!["gemini-3.1-pro".to_owned(), "gemini-3.7-flash".to_owned()],
-                effort_choices: vec!["high".to_owned()],
-                default_model: Some("gemini-3.1-pro".to_owned()),
-                default_effort: Some("high".to_owned()),
+                model_choices: vec!["gemini-3.7-flash".to_owned(), "gemini-3.1-pro".to_owned()],
+                effort_choices: vec!["medium".to_owned(), "high".to_owned()],
+                default_model: Some("gemini-3.7-flash".to_owned()),
+                default_effort: Some("medium".to_owned()),
             }
         );
     }

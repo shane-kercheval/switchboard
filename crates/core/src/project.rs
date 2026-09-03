@@ -437,12 +437,18 @@ impl Project {
                 axis: SelectionAxis::Effort,
             });
         }
-        // See `set_agent_selection` for why an effort with no model is refused
-        // here and why its mirror (a model that requires an effort) is not.
-        if harness.effort_requires_model()
-            && (effort.is_some() || !effort_choices.is_empty())
-            && model.is_none()
-        {
+        // An effort with no model is incoherent only where the harness derives
+        // its levels from the model. Claude and Codex emit their effort flag
+        // independently, so "default model at high effort" remains valid.
+        // Configured effort choices are inert and may be prepared before a
+        // model is selected; only the current pair must be dispatchable.
+        //
+        // The mirror case — a model that requires an effort and has none — is
+        // deliberately not checked here. Enforcing it would duplicate the
+        // changing per-model catalog into core; the frontend prevents known
+        // invalid pairs and the harness reports unknown/catalog drift before
+        // dispatch.
+        if harness.effort_requires_model() && effort.is_some() && model.is_none() {
             return Err(CoreError::EffortWithoutModel { harness });
         }
         // Fork provenance is only meaningful to a harness whose fork is the
@@ -593,7 +599,7 @@ impl Project {
             });
         }
         if harness.effort_requires_model()
-            && (selection.effort.is_some() || !selection.effort_choices.is_empty())
+            && selection.effort.is_some()
             && selection.model.is_none()
         {
             return Err(CoreError::EffortWithoutModel { harness });
@@ -1907,6 +1913,73 @@ mod tests {
         assert_eq!(updated.model.as_deref(), Some("sonnet"));
         assert_eq!(updated.effort.as_deref(), Some("medium"));
         assert_eq!(project.list_agents().unwrap(), [updated]);
+    }
+
+    #[test]
+    fn legacy_unpinned_antigravity_choices_load_and_can_be_activated() {
+        let (_tmp, project) = fresh_project();
+        let agent_id = Uuid::now_v7();
+        let legacy = serde_json::json!({
+            "id": agent_id,
+            "project_id": project.id,
+            "name": "legacy",
+            "harness": "antigravity",
+            "session_locator": null,
+            "model": null,
+            "effort": null,
+            "profiles": {
+                "secondary": { "model": "gemini-3.1-pro", "effort": "high" },
+                "active": "primary"
+            },
+            "created_at": "2026-05-15T12:30:45Z"
+        });
+        std::fs::write(&project.registry_path, format!("{legacy}\n")).unwrap();
+
+        let loaded = project.list_agents().unwrap().remove(0);
+        assert_eq!(loaded.model, None);
+        assert_eq!(loaded.effort, None);
+        assert_eq!(loaded.model_choices, ["gemini-3.1-pro"]);
+        assert_eq!(loaded.effort_choices, ["high"]);
+
+        let updated = project
+            .set_agent_selection(
+                agent_id,
+                AgentSelection {
+                    model: Some("gemini-3.1-pro".to_owned()),
+                    effort: Some("high".to_owned()),
+                    model_choices: loaded.model_choices,
+                    effort_choices: loaded.effort_choices,
+                },
+            )
+            .unwrap();
+        assert_eq!(updated.model.as_deref(), Some("gemini-3.1-pro"));
+        assert_eq!(updated.effort.as_deref(), Some("high"));
+        assert!(
+            !std::fs::read_to_string(&project.registry_path)
+                .unwrap()
+                .contains("profiles")
+        );
+    }
+
+    #[test]
+    fn antigravity_choices_can_be_configured_before_a_current_model() {
+        let (_tmp, project) = fresh_project();
+        let record = project
+            .register_agent(
+                "a",
+                HarnessKind::Antigravity,
+                AgentSelection {
+                    model: None,
+                    effort: None,
+                    model_choices: vec!["gemini-3.1-pro".to_owned()],
+                    effort_choices: vec!["high".to_owned()],
+                },
+            )
+            .unwrap();
+
+        assert_eq!(record.model, None);
+        assert_eq!(record.effort, None);
+        assert_eq!(project.list_agents().unwrap(), [record]);
     }
 
     #[test]

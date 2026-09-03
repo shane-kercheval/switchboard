@@ -194,6 +194,36 @@ describe("SettingsView", () => {
     );
   });
 
+  it("keeps the effort default independent when the default model has no effort axis", async () => {
+    preferences.agent_defaults.antigravity = {
+      model_choices: ["claude-sonnet-4-6", "gemini-3.7-flash"],
+      effort_choices: ["high", "medium"],
+      default_model: "claude-sonnet-4-6",
+      default_effort: "high",
+    };
+    render(SettingsView, { props: { onClose: vi.fn() } });
+    await fireEvent.click(screen.getByText("Antigravity", { selector: "summary" }));
+
+    const effortDefault = screen.getByTestId("settings-selection-antigravity-effort-current");
+    expect(within(effortDefault).getByRole("option", { name: "Medium" })).toBeEnabled();
+    await fireEvent.change(effortDefault, { target: { value: "medium" } });
+
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("set_preferences", {
+        preferences: expect.objectContaining({
+          agent_defaults: expect.objectContaining({
+            antigravity: {
+              model_choices: ["claude-sonnet-4-6", "gemini-3.7-flash"],
+              effort_choices: ["high", "medium"],
+              default_model: "claude-sonnet-4-6",
+              default_effort: "medium",
+            },
+          }),
+        }),
+      }),
+    );
+  });
+
   it("keeps backend preference controls unavailable until saved values are authoritative", async () => {
     prefsTesting.reset({ ready: false });
     let resolvePreferences!: (value: Preferences) => void;

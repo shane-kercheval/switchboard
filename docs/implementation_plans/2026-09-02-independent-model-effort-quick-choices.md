@@ -61,7 +61,8 @@ re-open silently.
    more than two is not a general favorites system or a new catalog mechanism; it is only
    multi-selection from the existing per-harness curated lists.
 3. **Settings owns defaults for new agents.** Each harness has selected model choices, selected
-   effort choices, a default model, and a default effort. These values are copied into a new agent.
+   effort choices, a default model, and a default effort. Creation converts those independent axis
+   defaults into a dispatch-ready current pair while copying both choice sets into the new agent.
    Changing Settings later does not silently reconfigure existing agents and is not consulted as a
    fallback when an existing agent switches models.
 4. **A default control is enabled only when more than one option is selected.** With exactly one
@@ -180,16 +181,16 @@ changes. An incompatible two-choice target or 3+-choice menu item is disabled an
 current model is never changed as a side effect of effort activation. For an unknown model, all
 configured effort choices remain activatable and reactive harness validation remains authoritative.
 
-Settings and the create-agent editor must prevent saving a configuration whose default Antigravity
-model requires effort but has no valid selected effort. The existing-agent editor applies the same
-rule to its current model/current effort, including when an attached agent starts with empty sets.
-Settings must refuse an interaction that would create an invalid default pair before mutating its
-optimistic local preference state; merely skipping that one save is insufficient because a later
-unrelated whole-preferences save could persist the invalid pair. These editors need not require every
-selected model to have a compatible selected effort: a currently unusable quick model can remain
-selected and is disabled/explained in the sidebar until the user adds a compatible effort.
-Automatically modifying the effort quick-choice set when a model is selected is intentionally
-avoided because it would make the supposedly independent multi-select controls surprising.
+Settings stores an independent default for each axis. Its default effort remains selected and
+editable when its default model has no effort axis; creation clears the new agent's current effort
+for that starting model while preserving the configured effort choices. For an effort-bearing
+Antigravity default model, the editor still refuses an incompatible default effort. The create-agent
+and existing-agent editors require a dispatch-ready current pair, including when an attached agent
+starts with empty sets. These editors need not require every selected model to have a compatible
+selected effort: a currently unusable quick model can remain selected and is disabled/explained in
+the sidebar until the user adds a compatible effort. Automatically modifying the effort quick-choice
+set when a model is selected is intentionally avoided because it would make the supposedly
+independent multi-select controls surprising.
 
 The resolution order is non-obvious and must survive in a concise comment/docstring beside the
 shared resolver, including the unknown-versus-explicit-no-effort distinction, why Settings is not an
@@ -528,9 +529,9 @@ independent quick choices.
    implicitly `Default` and keep the default control disabled/non-interactive. When 2+ are selected,
    enable the explicit default selector. Save the complete per-harness defaults atomically through
    the existing optimistic preference path; never persist a transient missing default between two
-   clicks. For Antigravity, refuse a model or effort interaction that would make the default pair
-   invalid before mutating local preference state. Do not rely on suppressing only that save because
-   a later unrelated whole-preferences update would otherwise carry the invalid pair.
+   clicks. Antigravity may retain an independent effort default while its default model has no effort
+   axis; explain that the effort is unused for that starting model rather than clearing the setting.
+   When an effort-bearing default model is selected, refuse an incompatible effort default locally.
 3. In create mode, seed the editor from the selected harness's preferences. Label the chosen values
    `Start with`, not `Default`, because the submitted agent stores current selections. Preserve the
    existing rules that switching harness resets harness-specific configuration, while a temporary
@@ -541,24 +542,23 @@ independent quick choices.
    name because a model/effort-derived name would become stale after a switch. If both axes have at
    most one choice, retain the current model/effort-derived naming behavior. As today, once the user
    edits the name manually, later selection or harness changes never overwrite it.
-6. Update new-project seeding to copy the complete default choice sets and start on the explicit
-   default model/effort. For Antigravity, resolve the starting effort against the default model using
-   the shared rules; Settings should normally guarantee this path is valid, while seeding still
-   reports a clear creation failure rather than panicking on manually corrupted preferences.
+6. Give Add Agent and new-project seeding one shared conversion from independent per-axis defaults to
+   a dispatch-ready starting pair. Copy the complete choice sets; for Antigravity, resolve a compatible
+   effort or clear it when the starting model has no effort axis. Add Agent exposes an unresolvable
+   configuration inline and disables Create; seeding records a clear creation failure and continues.
 
 ### Definition of Done
 
 - Settings component tests cover one, two, and 3+ selected choices; the default selector disabled at
   one and enabled at 2+; changing defaults without changing membership; preventing the last option's
   removal; atomic preference payloads; save failure copy; and every harness accordion.
-- Settings tests cover invalid Antigravity default-pair interactions and prove they are explained,
-  do not mutate local preferences, issue no save, and cannot leak through a later unrelated settings
-  change.
+- Settings tests cover incompatible Antigravity defaults for effort-bearing models and independent
+  effort defaults for models with no effort axis.
 - Create-form tests prove preferences prefill both choice sets and starting values, per-agent edits
   submit exactly, harness changes reset correctly, and create/attach draft behavior is preserved.
 - Attach tests prove the controls stay hidden and no default/selection fields are submitted.
-- Auto-seeding tests prove every installed harness receives copied choices and starts on the
-  configured defaults, including an Antigravity valid pair.
+- Add Agent and auto-seeding tests prove both use the shared conversion, including an Antigravity
+  valid pair, a no-effort starting model that preserves effort choices, and an unresolvable default.
 - Naming tests cover one choice on both axes, multiple models only, multiple efforts only, multiple
   on both, harness switching, and the manual-name freeze.
 - Existing preference-loading gates and non-dismissible creation/save behavior remain covered.

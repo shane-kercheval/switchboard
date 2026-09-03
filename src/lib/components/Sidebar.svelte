@@ -148,8 +148,8 @@
   });
   let editBusy = $state<boolean>(false);
   let editError = $state<string | null>(null);
-  let selectionSaving = $state<AgentId | null>(null);
-  let selectionSaveError = $state<{ agentId: AgentId; message: string } | null>(null);
+  let selectionSaving = $state<Record<AgentId, boolean>>({});
+  let selectionSaveErrors = $state<Record<AgentId, string>>({});
 
   const editingAgent = $derived(
     selectionEditingAgentId === null
@@ -167,6 +167,10 @@
       model_choices: agent.model_choices,
       effort_choices: agent.effort_choices,
     };
+  }
+
+  function selectionBusy(agentId: AgentId): boolean {
+    return selectionSaving[agentId] === true;
   }
 
   function openSelectionSettings(agent: AgentRecord): void {
@@ -187,11 +191,11 @@
     const agentId = selectionEditingAgentId;
     if (!selectionIsValid(editSelection, editingAgent.harness)) return;
     editBusy = true;
-    selectionSaving = agentId;
+    selectionSaving[agentId] = true;
     editError = null;
     try {
       await setAgentSelection(agentId, $state.snapshot(editSelection));
-      if (selectionSaveError?.agentId === agentId) selectionSaveError = null;
+      delete selectionSaveErrors[agentId];
       if (selectionEditingAgentId === agentId) closeChange();
     } catch (err) {
       if (selectionEditingAgentId === agentId) {
@@ -199,23 +203,20 @@
         editBusy = false;
       }
     } finally {
-      if (selectionSaving === agentId) selectionSaving = null;
+      delete selectionSaving[agentId];
     }
   }
 
   async function activateSelection(agent: AgentRecord, selection: AgentSelection): Promise<void> {
-    if (selectionSaving === agent.id) return;
-    selectionSaving = agent.id;
-    selectionSaveError = null;
+    if (selectionBusy(agent.id)) return;
+    selectionSaving[agent.id] = true;
+    delete selectionSaveErrors[agent.id];
     try {
       await setAgentSelection(agent.id, selection);
     } catch (err) {
-      selectionSaveError = {
-        agentId: agent.id,
-        message: err instanceof Error ? err.message : String(err),
-      };
+      selectionSaveErrors[agent.id] = err instanceof Error ? err.message : String(err);
     } finally {
-      if (selectionSaving === agent.id) selectionSaving = null;
+      delete selectionSaving[agent.id];
     }
   }
 
@@ -304,8 +305,11 @@
       resumeOpen = false;
     }
     if (selectionEditingAgentId !== null && !ids.has(selectionEditingAgentId)) closeChange();
-    if (selectionSaveError !== null && !ids.has(selectionSaveError.agentId)) {
-      selectionSaveError = null;
+    for (const id of Object.keys(selectionSaving)) {
+      if (!ids.has(id)) delete selectionSaving[id];
+    }
+    for (const id of Object.keys(selectionSaveErrors)) {
+      if (!ids.has(id)) delete selectionSaveErrors[id];
     }
     if (reorderError !== null && !ids.has(reorderError.agentId)) reorderError = null;
     if (dragState !== null && !ids.has(dragState.agentId)) dragState = null;
@@ -1198,7 +1202,7 @@
                     {#if canConfigureSelection(agent)}
                       <DropdownMenuItem
                         onSelect={() => openSelectionSettings(agent)}
-                        disabled={selectionSaving === agent.id}
+                        disabled={selectionBusy(agent.id)}
                         class="gap-2"
                         data-testid="agent-selection-settings"
                       >
@@ -1341,34 +1345,51 @@
                  used by each completed turn. -->
             {@const agentSelection = selectionForAgent(agent)}
             {@const effortSupport = effortSupportFor(agent.harness, agent.model)}
-            {#if agent.model_choices.length > 0 || (agent.effort_choices.length > 0 && effortSupport.kind !== "none")}
+            {@const emptySelection =
+              agent.model === null &&
+              agent.effort === null &&
+              agent.model_choices.length === 0 &&
+              agent.effort_choices.length === 0}
+            {#if canConfigureSelection(agent)}
               <div
                 class="mt-1.5 flex min-w-0 flex-wrap items-center gap-1"
                 data-testid="agent-selection"
               >
-                {#if agent.model_choices.length > 0}
+                {#if emptySelection}
+                  <span class="text-muted text-xs" data-testid="agent-selection-default">
+                    Harness/session default
+                  </span>
+                {:else if agent.model_choices.length > 0}
                   <AgentSelectionChip
                     axis="model"
                     harness={agent.harness}
                     selection={agentSelection}
-                    busy={selectionSaving === agent.id}
+                    busy={selectionBusy(agent.id)}
                     onActivate={(selection) => void activateSelection(agent, selection)}
                   />
+                {:else if agent.model === null && SUPPORTS_MODEL_SELECTION[agent.harness]}
+                  <span class="text-muted text-xs" data-testid="agent-model-default">
+                    Model: Harness/session default
+                  </span>
                 {/if}
                 {#if agent.effort_choices.length > 0 && effortSupport.kind !== "none"}
                   <AgentSelectionChip
                     axis="effort"
                     harness={agent.harness}
                     selection={agentSelection}
-                    busy={selectionSaving === agent.id}
+                    busy={selectionBusy(agent.id)}
                     onActivate={(selection) => void activateSelection(agent, selection)}
                   />
+                {:else if !emptySelection && agent.effort === null && effortSupport.kind !== "none" && SUPPORTS_EFFORT_SELECTION[agent.harness]}
+                  <span class="text-muted text-xs" data-testid="agent-effort-default">
+                    Effort: Harness/session default
+                  </span>
                 {/if}
               </div>
             {/if}
-            {#if selectionSaveError?.agentId === agent.id}
+            {#if selectionSaveErrors[agent.id]}
               <p class="text-status-failed mt-1 text-xs" data-testid="agent-selection-save-error">
-                {selectionSaveError.message}
+                {selectionSaveErrors[agent.id]}
               </p>
             {/if}
             {#if runtime?.meta && (runtime.meta.mcp_servers.length > 0 || runtime.meta.skills.length > 0)}

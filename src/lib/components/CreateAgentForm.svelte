@@ -7,6 +7,7 @@
   import {
     defaultAgentName,
     defaultAgentNameForSelection,
+    selectionForNewAgent,
     selectionIsValid,
   } from "$lib/agentSelection";
   import { loadPreferences, preferenceLoadState, preferences } from "$lib/preferences.svelte";
@@ -70,12 +71,7 @@
   /// afterward (the canonical place for an existing agent).
   function defaultsFor(kind: HarnessKind): AgentSelection {
     const defaults = preferences.agent_defaults[kind];
-    return {
-      model: defaults.default_model,
-      effort: defaults.default_effort,
-      model_choices: [...defaults.model_choices],
-      effort_choices: [...defaults.effort_choices],
-    };
+    return selectionForNewAgent(defaults, kind).selection;
   }
   let agentSelection = $state<AgentSelection>({
     model: null,

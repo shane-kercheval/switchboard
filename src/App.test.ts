@@ -793,6 +793,48 @@ describe("App", () => {
     });
   });
 
+  it("new project: clears active effort but preserves choices for a no-effort default model", async () => {
+    backend.agentDefaults.antigravity = {
+      model_choices: ["claude-sonnet-4-6", "gemini-3.7-flash"],
+      effort_choices: ["high", "medium"],
+      default_model: "claude-sonnet-4-6",
+      default_effort: "high",
+    };
+    await mountApp();
+    await createNewProjectViaDialog("no-effort-default");
+
+    await waitFor(() => expect(createAgentCalls()).toHaveLength(3));
+    const antigravityArgs = invokeMock.mock.calls.find(
+      ([command, args]) => command === "create_agent" && args?.harness === "antigravity",
+    )?.[1];
+    expect(antigravityArgs).toEqual({
+      name: "antigravity",
+      harness: "antigravity",
+      selection: {
+        model: "claude-sonnet-4-6",
+        effort: null,
+        model_choices: ["claude-sonnet-4-6", "gemini-3.7-flash"],
+        effort_choices: ["high", "medium"],
+      },
+    });
+  });
+
+  it("new project: reports an Antigravity default with no compatible effort", async () => {
+    backend.agentDefaults.antigravity = {
+      model_choices: ["gemini-3.1-pro"],
+      effort_choices: ["medium"],
+      default_model: "gemini-3.1-pro",
+      default_effort: "medium",
+    };
+    await mountApp();
+    await createNewProjectViaDialog("invalid-antigravity-default");
+
+    await waitFor(() => expect(createAgentCalls()).toHaveLength(2));
+    expect(await screen.findByTestId("banner-agent-create-failed-antigravity")).toHaveTextContent(
+      "Couldn't create the Antigravity agent",
+    );
+  });
+
   it("new project waits for saved defaults before seeding agents", async () => {
     backend.agentDefaults.claude_code = {
       model_choices: ["sonnet", "haiku"],

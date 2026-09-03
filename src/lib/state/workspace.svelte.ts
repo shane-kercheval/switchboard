@@ -45,7 +45,7 @@ import { tick, untrack } from "svelte";
 import { SvelteSet } from "svelte/reactivity";
 import { harnessAvailability, settledHarnessAvailability } from "$lib/harnessAvailability.svelte";
 import { AUTO_SEED_ON_NEW_PROJECT } from "$lib/harnessDisplay";
-import { defaultAgentNameForSelection } from "$lib/agentSelection";
+import { defaultAgentNameForSelection, selectionForNewAgent } from "$lib/agentSelection";
 import { loadPreferences, preferences } from "$lib/preferences.svelte";
 import {
   compareIsoTimestampsDescending,
@@ -600,12 +600,9 @@ async function seedAgentsForInstalledHarnesses(projectId: ProjectId): Promise<vo
       // Every auto-created agent is born with a known, displayed model/effort
       // (`undefined` for a no-capability harness → backend stores `None`).
       const defaults = preferences.agent_defaults[harness];
-      const agentSelection: AgentSelection = {
-        model: defaults.default_model,
-        effort: defaults.default_effort,
-        model_choices: [...defaults.model_choices],
-        effort_choices: [...defaults.effort_choices],
-      };
+      const resolved = selectionForNewAgent(defaults, harness);
+      if (!resolved.ok) throw new Error(resolved.reason);
+      const agentSelection: AgentSelection = resolved.selection;
       const agent = await api.createAgent(
         defaultAgentNameForSelection(harness, agentSelection),
         harness,

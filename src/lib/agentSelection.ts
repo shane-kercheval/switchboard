@@ -155,11 +155,13 @@ export const EFFORT_OPTIONS: Record<HarnessKind, SelectionOption[]> = {
 ///
 /// The sets genuinely differ per model — Flash takes all three levels, 3.1 Pro
 /// only low/high, GPT-OSS only medium — which is why this is a per-model map
-/// rather than one list. Absence is not interpreted here: explicitly known
-/// no-effort models and unknown/off-catalog models have different behavior.
-const ANTIGRAVITY_MODEL_EFFORTS: Record<string, readonly string[]> = {
+/// rather than one list. `null` explicitly means no effort axis; absence means
+/// an unknown/off-catalog model whose persisted effort must survive.
+const ANTIGRAVITY_MODEL_EFFORTS: Record<string, readonly string[] | null> = {
   "gemini-3.7-flash": ["low", "medium", "high"],
   "gemini-3.1-pro": ["low", "high"],
+  "claude-sonnet-4-6": null,
+  "claude-opus-4-6-thinking": null,
   // Single-valued, and that is the point: the control renders as one
   // already-selected option, which states what the turn will run at instead of
   // leaving the user to infer it from a label suffix. Kept in this map (rather
@@ -168,8 +170,6 @@ const ANTIGRAVITY_MODEL_EFFORTS: Record<string, readonly string[]> = {
   "gpt-oss-120b": ["medium"],
 };
 
-const ANTIGRAVITY_NO_EFFORT_MODELS = new Set(["claude-sonnet-4-6", "claude-opus-4-6-thinking"]);
-
 export type EffortSupport =
   | { kind: "known"; options: SelectionOption[] }
   | { kind: "none" }
@@ -177,11 +177,10 @@ export type EffortSupport =
 
 export function effortSupportFor(harness: HarnessKind, model: string | null): EffortSupport {
   if (harness !== "antigravity") return { kind: "known", options: EFFORT_OPTIONS[harness] };
-  if (model === null || model === "" || ANTIGRAVITY_NO_EFFORT_MODELS.has(model)) {
-    return { kind: "none" };
-  }
+  if (model === null || model === "") return { kind: "none" };
   const levels = ANTIGRAVITY_MODEL_EFFORTS[model];
   if (levels === undefined) return { kind: "unknown", options: EFFORT_OPTIONS.antigravity };
+  if (levels === null) return { kind: "none" };
   return {
     kind: "known",
     options: EFFORT_OPTIONS.antigravity.filter((option) => levels.includes(option.value)),
@@ -299,6 +298,36 @@ export function selectionIsValid(selection: AgentSelection, harness: HarnessKind
   return (
     selection.effort !== null && support.options.some((option) => option.value === selection.effort)
   );
+}
+
+export type NewAgentSelectionResolution =
+  | { ok: true; selection: AgentSelection }
+  | { ok: false; selection: AgentSelection; reason: string };
+
+/// Convert independent axis defaults into the pair a new agent can dispatch.
+/// A default effort remains meaningful in Settings even while the default
+/// model has no effort axis; only this creation boundary clears or resolves it.
+export function selectionForNewAgent(
+  defaults: Preferences["agent_defaults"][HarnessKind],
+  harness: HarnessKind,
+): NewAgentSelectionResolution {
+  const selection: AgentSelection = {
+    model: defaults.default_model,
+    effort: defaults.default_effort,
+    model_choices: [...defaults.model_choices],
+    effort_choices: [...defaults.effort_choices],
+  };
+  if (harness !== "antigravity") return { ok: true, selection };
+  if (selection.model === null) {
+    return { ok: true, selection: { ...selection, effort: null } };
+  }
+  const resolved = resolveModelChange(selection, harness, selection.model);
+  if (resolved.ok) return resolved;
+  return {
+    ok: false,
+    selection,
+    reason: "No configured reasoning effort is compatible with the starting model.",
+  };
 }
 
 /// The model-derived agent name for a single-choice create, with effort appended

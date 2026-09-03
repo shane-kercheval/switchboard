@@ -183,7 +183,10 @@
     harness: HarnessKind,
     selection: AgentSelection,
   ): Promise<void> {
-    if (!selectionIsValid(selection, harness)) return;
+    if (!selectionIsValid(selection, harness)) {
+      console.error("[switchboard] selection editor emitted invalid agent defaults", { harness });
+      return;
+    }
     await loadPreferences();
     const agentDefaults = structuredClone($state.snapshot(preferences.agent_defaults));
     agentDefaults[harness] = {

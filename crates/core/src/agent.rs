@@ -390,10 +390,7 @@ impl AgentRecord {
                 axis: crate::harness::SelectionAxis::Effort,
             });
         }
-        if self.harness.effort_requires_model()
-            && (self.effort.is_some() || !self.effort_choices.is_empty())
-            && self.model.is_none()
-        {
+        if self.harness.effort_requires_model() && self.effort.is_some() && self.model.is_none() {
             return Err(CoreError::EffortWithoutModel {
                 harness: self.harness,
             });
@@ -570,6 +567,18 @@ mod tests {
         assert_eq!(parsed.effort, None);
         assert_eq!(parsed.model_choices, ["opus", "sonnet"]);
         assert_eq!(parsed.effort_choices, ["high"]);
+    }
+
+    #[test]
+    fn legacy_unpinned_antigravity_primary_preserves_secondary_choices() {
+        let json = r#"{"id":"019e2c5f-aaaa-7000-8000-000000000001","project_id":"019e2c5f-bbbb-7000-8000-000000000002","name":"legacy","harness":"antigravity","session_locator":null,"model":null,"effort":null,"profiles":{"secondary":{"model":"gemini-3.1-pro","effort":"high"},"active":"primary"},"created_at":"2026-05-15T12:30:45Z"}"#;
+        let parsed: AgentRecord = serde_json::from_str(json).unwrap();
+
+        assert_eq!(parsed.model, None);
+        assert_eq!(parsed.effort, None);
+        assert_eq!(parsed.model_choices, ["gemini-3.1-pro"]);
+        assert_eq!(parsed.effort_choices, ["high"]);
+        parsed.validate().unwrap();
     }
 
     #[test]

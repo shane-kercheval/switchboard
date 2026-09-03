@@ -15,6 +15,7 @@ import {
   effortOptionsFor,
   effortSupportFor,
   resolveModelChange,
+  selectionForNewAgent,
   selectionIsValid,
 } from "./agentSelection";
 import { canonicalizeForUniqueness, validateAgentName } from "./agentName";
@@ -70,6 +71,12 @@ describe("Antigravity effort support", () => {
     expect(effortSupportFor("antigravity", "future-model").kind).toBe("unknown");
   });
 
+  it("classifies every curated Antigravity model explicitly", () => {
+    for (const { value } of MODEL_OPTIONS.antigravity) {
+      expect(effortSupportFor("antigravity", value).kind, value).not.toBe("unknown");
+    }
+  });
+
   it("requires effort only for known effort-bearing Antigravity models", () => {
     expect(effortIsRequired("antigravity", "gemini-3.1-pro")).toBe(true);
     expect(effortIsRequired("antigravity", "claude-sonnet-4-6")).toBe(false);
@@ -86,6 +93,59 @@ describe("Antigravity effort support", () => {
     });
     expect(configured.effort_choices).toEqual(["medium", "high"]);
     expect([...activatableEffortValues(configured, "antigravity")]).toEqual(["high"]);
+  });
+});
+
+describe("selectionForNewAgent", () => {
+  it("preserves effort choices but clears the active effort for a no-effort model", () => {
+    expect(
+      selectionForNewAgent(
+        {
+          model_choices: ["claude-sonnet-4-6", "gemini-3.7-flash"],
+          effort_choices: ["high", "medium"],
+          default_model: "claude-sonnet-4-6",
+          default_effort: "high",
+        },
+        "antigravity",
+      ),
+    ).toEqual({
+      ok: true,
+      selection: {
+        model: "claude-sonnet-4-6",
+        effort: null,
+        model_choices: ["claude-sonnet-4-6", "gemini-3.7-flash"],
+        effort_choices: ["high", "medium"],
+      },
+    });
+  });
+
+  it("resolves an incompatible effort and reports a configuration with no valid choice", () => {
+    expect(
+      selectionForNewAgent(
+        {
+          model_choices: ["gemini-3.1-pro"],
+          effort_choices: ["medium", "high"],
+          default_model: "gemini-3.1-pro",
+          default_effort: "medium",
+        },
+        "antigravity",
+      ),
+    ).toMatchObject({ ok: true, selection: { effort: "high" } });
+
+    expect(
+      selectionForNewAgent(
+        {
+          model_choices: ["gemini-3.1-pro"],
+          effort_choices: ["medium"],
+          default_model: "gemini-3.1-pro",
+          default_effort: "medium",
+        },
+        "antigravity",
+      ),
+    ).toMatchObject({
+      ok: false,
+      selection: { model: "gemini-3.1-pro", effort: "medium" },
+    });
   });
 });
 

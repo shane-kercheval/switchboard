@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/svelte";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/svelte";
 import CreateAgentForm from "./CreateAgentForm.svelte";
 import type { AgentFormSubmit } from "./CreateAgentForm.types";
 import type { AgentRecord, HarnessAvailability, Preferences } from "$lib/types";
@@ -600,12 +600,15 @@ describe("CreateAgentForm", () => {
     } satisfies AgentFormSubmit);
   });
 
-  it("create + Antigravity: a model with no effort axis disables effort activation", async () => {
+  it("create + Antigravity: a model with no effort axis keeps future choices configurable", async () => {
     renderForm();
     await fireEvent.click(screen.getByTestId("harness-antigravity"));
     await choosePicker("model-select", "claude-sonnet-4-6");
-    expect(screen.getByTestId("create-selection-effort-choice-high")).toBeDisabled();
+    expect(screen.getByTestId("create-selection-effort-choice-high")).toBeEnabled();
     expect(screen.queryByTestId("create-selection-effort-current")).not.toBeInTheDocument();
+    expect(screen.getByTestId("create-selection-effort-unavailable")).toHaveTextContent(
+      "current model does not use reasoning effort",
+    );
   });
 
   it("create + Antigravity: an effort-bearing model offers no Default and only its own levels", async () => {
@@ -618,7 +621,49 @@ describe("CreateAgentForm", () => {
     await choosePicker("model-select", "gemini-3.1-pro");
     expect(screen.getByTestId("create-selection-effort-choice-low")).toBeEnabled();
     expect(screen.getByTestId("create-selection-effort-choice-high")).toBeEnabled();
-    expect(screen.getByTestId("create-selection-effort-choice-medium")).toBeDisabled();
+    expect(screen.getByTestId("create-selection-effort-choice-medium")).toBeEnabled();
+    await fireEvent.click(screen.getByTestId("create-selection-effort-choice-medium"));
+    const effortCurrent = screen.getByTestId("create-selection-effort-current");
+    expect(within(effortCurrent).getByRole("option", { name: "Medium" })).toBeDisabled();
+  });
+
+  it("create + Antigravity: converts independent defaults into a dispatch-ready pair", async () => {
+    preferences.agent_defaults.antigravity = {
+      model_choices: ["claude-sonnet-4-6", "gemini-3.7-flash"],
+      effort_choices: ["high", "medium"],
+      default_model: "claude-sonnet-4-6",
+      default_effort: "high",
+    };
+    const { onSubmit } = renderForm();
+    await fireEvent.click(screen.getByTestId("harness-antigravity"));
+
+    expect(screen.getByTestId("create-selection-effort-unavailable")).toBeInTheDocument();
+    await fireEvent.click(screen.getByTestId("confirm-create-agent"));
+    expect(onSubmit).toHaveBeenCalledExactlyOnceWith({
+      mode: "create",
+      name: "antigravity",
+      harness: "antigravity",
+      selection: {
+        model: "claude-sonnet-4-6",
+        effort: null,
+        model_choices: ["claude-sonnet-4-6", "gemini-3.7-flash"],
+        effort_choices: ["high", "medium"],
+      },
+    } satisfies AgentFormSubmit);
+  });
+
+  it("create + Antigravity: blocks an unresolvable saved configuration", async () => {
+    preferences.agent_defaults.antigravity = {
+      model_choices: ["gemini-3.1-pro"],
+      effort_choices: ["medium"],
+      default_model: "gemini-3.1-pro",
+      default_effort: "medium",
+    };
+    renderForm();
+    await fireEvent.click(screen.getByTestId("harness-antigravity"));
+
+    expect(screen.getByTestId("create-selection-invalid")).toBeInTheDocument();
+    expect(screen.getByTestId("confirm-create-agent")).toBeDisabled();
   });
 
   it("create + Antigravity: switching to a narrower model clamps the effort", async () => {

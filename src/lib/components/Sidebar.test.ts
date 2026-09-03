@@ -45,12 +45,18 @@ vi.mock("$lib/native", () => ({
   copyText: (t: string) => copyTextMock(t),
 }));
 
-function deferred<T = void>(): { promise: Promise<T>; resolve: (value: T) => void } {
+function deferred<T = void>(): {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+  reject: (reason?: unknown) => void;
+} {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((r) => {
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((r, fail) => {
     resolve = r;
+    reject = fail;
   });
-  return { promise, resolve };
+  return { promise, resolve, reject };
 }
 
 async function loadState() {
@@ -810,7 +816,9 @@ describe("Sidebar", () => {
 
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
-    expect(screen.queryByTestId("agent-selection")).toBeNull();
+    expect(screen.getByTestId("agent-selection-default")).toHaveTextContent(
+      "Harness/session default",
+    );
     expect(screen.queryByTestId("agent-observed-model")).toBeNull();
     expect(screen.getByTestId("agent-mcp-chip")).toHaveTextContent("1");
     expect(screen.getByTestId("agent-skills-chip")).toHaveTextContent("1");
@@ -1202,6 +1210,51 @@ describe("Sidebar", () => {
     await waitFor(() => expect(screen.getByTestId("agent-effort-chip")).toBeEnabled());
   });
 
+  it("tracks concurrent selection saves and failures independently per agent", async () => {
+    const state = await loadState();
+    const claude: AgentRecord = {
+      ...CLAUDE_AGENT,
+      model: "opus",
+      effort: "high",
+      model_choices: ["opus", "sonnet"],
+      effort_choices: ["high", "medium"],
+    };
+    const codex: AgentRecord = {
+      ...CODEX_AGENT,
+      model: "gpt-5.6-sol",
+      effort: "high",
+      model_choices: ["gpt-5.6-sol", "gpt-5.6-terra"],
+      effort_choices: ["high", "medium"],
+    };
+    await state.registerAgent(claude);
+    await state.registerAgent(codex);
+    const claudeSave = deferred();
+    const codexSave = deferred();
+    setAgentSelectionMock.mockImplementation((id) =>
+      id === claude.id ? claudeSave.promise : codexSave.promise,
+    );
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [claude, codex] } });
+    const cards = screen.getAllByTestId("sidebar-agent");
+
+    await fireEvent.click(within(cards[0]!).getByTestId("agent-model-chip"));
+    await fireEvent.click(within(cards[1]!).getByTestId("agent-model-chip"));
+    expect(within(cards[0]!).getByTestId("agent-effort-chip")).toBeDisabled();
+    expect(within(cards[1]!).getByTestId("agent-effort-chip")).toBeDisabled();
+
+    claudeSave.reject(new Error("claude registry failed"));
+    await waitFor(() =>
+      expect(within(cards[0]!).getByTestId("agent-selection-save-error")).toHaveTextContent(
+        "claude registry failed",
+      ),
+    );
+    expect(within(cards[0]!).getByTestId("agent-effort-chip")).toBeEnabled();
+    expect(within(cards[1]!).getByTestId("agent-effort-chip")).toBeDisabled();
+
+    codexSave.resolve(undefined);
+    await waitFor(() => expect(within(cards[1]!).getByTestId("agent-effort-chip")).toBeEnabled());
+    expect(within(cards[0]!).getByTestId("agent-selection-save-error")).toBeInTheDocument();
+  });
+
   it("disables a two-choice effort target that the current Antigravity model rejects", async () => {
     const state = await loadState();
     const agent: AgentRecord = {
@@ -1315,8 +1368,26 @@ describe("Sidebar", () => {
     render(Sidebar, {
       props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] },
     });
-    expect(screen.queryByTestId("agent-selection")).toBeNull();
+    expect(screen.getByTestId("agent-selection-default")).toHaveTextContent(
+      "Harness/session default",
+    );
     expect(screen.queryByTestId("agent-observed-model")).toBeNull();
+  });
+
+  it("shows the harness default for an unset model beside an explicit effort", async () => {
+    const state = await loadState();
+    const agent: AgentRecord = {
+      ...CLAUDE_AGENT,
+      effort: "medium",
+      effort_choices: ["medium"],
+    };
+    await state.registerAgent(agent);
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
+
+    expect(screen.getByTestId("agent-model-default")).toHaveTextContent(
+      "Model: Harness/session default",
+    );
+    expect(screen.getByTestId("agent-effort-chip")).toHaveTextContent("Medium");
   });
 
   it("sidebar shows the selected effort", async () => {
@@ -1710,7 +1781,9 @@ describe("Sidebar agent-scoped event tolerance", () => {
     };
     // Runtime metadata never becomes future-send intent.
     await waitFor(() => {
-      expect(screen.queryByTestId("agent-selection")).toBeNull();
+      expect(screen.getByTestId("agent-selection-default")).toHaveTextContent(
+        "Harness/session default",
+      );
       expect(screen.queryByTestId("agent-observed-model")).toBeNull();
     });
   });

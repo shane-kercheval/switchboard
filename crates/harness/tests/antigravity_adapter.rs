@@ -14,8 +14,8 @@ use switchboard_core::{AgentRecord, HarnessKind, SessionLocator};
 use switchboard_harness::antigravity::paths;
 use switchboard_harness::antigravity::{FAKE_AGY_INVOCATIONS_FILE, FAKE_AGY_SCRIPT_FILE};
 use switchboard_harness::{
-    AdapterEvent, AntigravityAdapter, DispatchOptions, FailureKind, HarnessAdapter, Turn, TurnItem,
-    TurnOutcome, TurnStatus, load_antigravity_transcript,
+    AdapterEvent, AntigravityAdapter, DispatchError, DispatchOptions, FailureKind, HarnessAdapter,
+    Turn, TurnItem, TurnOutcome, TurnStatus, load_antigravity_transcript,
 };
 use uuid::Uuid;
 
@@ -1650,4 +1650,27 @@ async fn successful_turn_does_not_scan_or_misclassify_from_log() {
         "successful turn must complete; log scan must not run: {:?}",
         outcome(&events)
     );
+}
+
+#[tokio::test]
+async fn deleted_working_directory_is_reported_as_such_not_as_a_missing_binary() {
+    let home = tempfile::TempDir::new().unwrap();
+    let deleted = tempfile::TempDir::new().unwrap();
+    let cwd = deleted.path().to_path_buf();
+    drop(deleted);
+    let adapter = AntigravityAdapter::with_binary_and_home(FAKE_AGY, home.path());
+    let result = adapter
+        .dispatch(
+            &agy_agent(),
+            &cwd,
+            "hello",
+            Uuid::now_v7(),
+            DispatchOptions::default(),
+        )
+        .await;
+    match result {
+        Err(DispatchError::WorkingDirectoryMissing(path)) => assert_eq!(path, cwd),
+        Err(other) => panic!("expected WorkingDirectoryMissing, got: {other}"),
+        Ok(_) => panic!("expected Err(WorkingDirectoryMissing), got Ok"),
+    }
 }

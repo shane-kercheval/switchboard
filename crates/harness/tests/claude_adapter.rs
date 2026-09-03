@@ -510,6 +510,31 @@ async fn binary_not_found_returns_dispatch_error() {
 }
 
 #[tokio::test]
+async fn deleted_working_directory_is_reported_as_such_not_as_a_missing_binary() {
+    // The OS reports a vanished cwd and a missing executable identically at
+    // spawn (`NotFound`). With a real binary and a directory that was deleted
+    // after the project was created, the error must name the directory.
+    let deleted = tempfile::TempDir::new().unwrap();
+    let cwd = deleted.path().to_path_buf();
+    drop(deleted);
+    let agent = fake_agent();
+    let result = adapter()
+        .dispatch(
+            &agent,
+            &cwd,
+            &fixture("text-only"),
+            Uuid::now_v7(),
+            DispatchOptions::default(),
+        )
+        .await;
+    match result {
+        Err(DispatchError::WorkingDirectoryMissing(path)) => assert_eq!(path, cwd),
+        Err(other) => panic!("expected WorkingDirectoryMissing, got: {other}"),
+        Ok(_) => panic!("expected Err(WorkingDirectoryMissing), got Ok"),
+    }
+}
+
+#[tokio::test]
 async fn text_only_fixture_emits_session_meta_and_rate_limit_event() {
     // The text-only fixture starts with `system/init` (→ SessionMeta) and
     // includes one `rate_limit_event` line (→ RateLimitEvent). Both events

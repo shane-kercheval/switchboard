@@ -193,13 +193,9 @@ impl HarnessAdapter for CodexAdapter {
         // instant; the millisecond flooring lives in `tail_turn_is_fresh`
         // so the comparison subtlety is unit-testable in one place.
         let dispatched_at = Utc::now();
-        let mut child = command.spawn().map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                DispatchError::BinaryNotFound
-            } else {
-                DispatchError::SpawnFailed(e)
-            }
-        })?;
+        let mut child = command
+            .spawn()
+            .map_err(|e| crate::subprocess::map_spawn_error(e, cwd))?;
 
         let stdout = child.stdout.take().expect("stdout piped");
         let stderr = child.stderr.take().expect("stderr piped");

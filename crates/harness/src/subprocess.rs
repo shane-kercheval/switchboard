@@ -1238,6 +1238,22 @@ pub fn probe_binary(path: &Path) -> Result<(), DispatchError> {
     found.map(|_| ()).map_err(|_| DispatchError::BinaryNotFound)
 }
 
+/// Classify a harness spawn failure. `NotFound` is ambiguous at the spawn call:
+/// the OS returns it both for a missing executable and for a `current_dir`
+/// that no longer exists, and the two have different repairs (install the CLI
+/// vs. re-point the project's directory). The cwd is checked only on this
+/// failure path, so a successful spawn pays nothing.
+pub fn map_spawn_error(error: std::io::Error, cwd: &Path) -> DispatchError {
+    if error.kind() != std::io::ErrorKind::NotFound {
+        return DispatchError::SpawnFailed(error);
+    }
+    if cwd.is_dir() {
+        DispatchError::BinaryNotFound
+    } else {
+        DispatchError::WorkingDirectoryMissing(cwd.to_path_buf())
+    }
+}
+
 /// Extract just the version number from a `--version` line, since CLIs pad it
 /// differently: `claude` prints `2.1.156 (Claude Code)`, `codex` prints
 /// `codex-cli 0.134.0`, others print a bare `0.44.0`. Returns the first
@@ -2174,6 +2190,42 @@ mod tests {
         assert!(matches!(
             probe_binary(path),
             Err(DispatchError::BinaryNotFound)
+        ));
+    }
+
+    #[test]
+    fn map_spawn_error_blames_the_binary_when_the_cwd_exists() {
+        let cwd = tempfile::TempDir::new().unwrap();
+        let error = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert!(matches!(
+            map_spawn_error(error, cwd.path()),
+            DispatchError::BinaryNotFound
+        ));
+    }
+
+    #[test]
+    fn map_spawn_error_blames_the_cwd_when_it_is_gone() {
+        let deleted = tempfile::TempDir::new().unwrap();
+        let cwd = deleted.path().to_path_buf();
+        drop(deleted);
+        let error = std::io::Error::from(std::io::ErrorKind::NotFound);
+        match map_spawn_error(error, &cwd) {
+            DispatchError::WorkingDirectoryMissing(path) => assert_eq!(path, cwd),
+            other => panic!("expected WorkingDirectoryMissing, got {other}"),
+        }
+    }
+
+    #[test]
+    fn map_spawn_error_passes_other_kinds_through_as_spawn_failed() {
+        // A missing cwd must not turn an unrelated failure (e.g. a binary that
+        // exists but isn't executable) into a directory diagnosis.
+        let deleted = tempfile::TempDir::new().unwrap();
+        let cwd = deleted.path().to_path_buf();
+        drop(deleted);
+        let error = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert!(matches!(
+            map_spawn_error(error, &cwd),
+            DispatchError::SpawnFailed(e) if e.kind() == std::io::ErrorKind::PermissionDenied
         ));
     }
 

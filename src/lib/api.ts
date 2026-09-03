@@ -521,9 +521,9 @@ export async function reorderAgents(
 /// repair is on the directory identity — one folder holds them all — so the
 /// caller must tell the user that before confirming.
 ///
-/// Rejects a project with no catalog row at all: there is no identity to
-/// re-point, and minting one would be inventing rather than repairing. That
-/// case belongs to the migration tool.
+/// A project whose catalog row was lost (`catalog_missing`) is repaired by the
+/// same call: the backend binds the existing identity to `newPath` instead of
+/// re-pointing it. Refused when another directory already holds `newPath`.
 export async function repointProjectDirectory(
   projectId: ProjectId,
   newPath: string,

@@ -8,7 +8,8 @@ use std::path::Path;
 use futures::StreamExt;
 use switchboard_core::{AgentRecord, HarnessKind, SessionLocator};
 use switchboard_harness::{
-    AdapterEvent, CodexAdapter, DispatchOptions, FailureKind, HarnessAdapter, ToolKind, TurnOutcome,
+    AdapterEvent, CodexAdapter, DispatchError, DispatchOptions, FailureKind, HarnessAdapter,
+    ToolKind, TurnOutcome,
 };
 use uuid::Uuid;
 
@@ -1498,4 +1499,27 @@ async fn cancel_sweeps_sigterm_immune_descendant() {
         "adapter must emit no terminal event on cancel; got: {events:?}"
     );
     assert_group_reaped(leader).await;
+}
+
+#[tokio::test]
+async fn deleted_working_directory_is_reported_as_such_not_as_a_missing_binary() {
+    let home = tempfile::TempDir::new().unwrap();
+    let deleted = tempfile::TempDir::new().unwrap();
+    let cwd = deleted.path().to_path_buf();
+    drop(deleted);
+    let adapter = CodexAdapter::with_binary_and_home(FAKE_CODEX, home.path());
+    let result = adapter
+        .dispatch(
+            &codex_agent(),
+            &cwd,
+            &fixture("text-only"),
+            Uuid::now_v7(),
+            DispatchOptions::default(),
+        )
+        .await;
+    match result {
+        Err(DispatchError::WorkingDirectoryMissing(path)) => assert_eq!(path, cwd),
+        Err(other) => panic!("expected WorkingDirectoryMissing, got: {other}"),
+        Ok(_) => panic!("expected Err(WorkingDirectoryMissing), got Ok"),
+    }
 }

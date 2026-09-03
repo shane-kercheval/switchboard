@@ -81,6 +81,7 @@ type Backend = {
   // resolving — lets a test hold the probe "pending" to exercise the
   // auto-create race guard (await a fresh probe before reading installed()).
   installGate: Promise<void> | null;
+  listProjectsGate: Promise<void> | null;
   // When set, `notify` parks on this gate. Lets a test hold a completion
   // notification "in flight" and check that nothing restores the project's
   // visibility to the gate while it is.
@@ -131,6 +132,7 @@ function freshBackend(): Backend {
     createAgentFailFor: new Set(),
     pathSource: "login_shell",
     installGate: null,
+    listProjectsGate: null,
     notifyGate: null,
     awaitPathGate: null,
     createAgentGate: null,
@@ -178,6 +180,7 @@ const invokeMock = vi.fn(async (cmd: string, args?: Record<string, unknown>): Pr
         persistable: backend.persistable,
       };
     case "list_projects":
+      if (backend.listProjectsGate !== null) await backend.listProjectsGate;
       // Only projects in registered directories surface (matches the
       // real backend: the workspace registry gates which projects are listed).
       return backend.projects.filter((p) => p.directory !== null && backend.dirs.has(p.directory));
@@ -4573,5 +4576,179 @@ describe("App", () => {
         /Also notify me about other projects/,
       ),
     );
+  });
+
+  describe("unavailable project directory", () => {
+    const ASSISTANT = agent({ id: "ag-1", project_id: "p-a", name: "assistant" });
+
+    async function openAlpha(): Promise<void> {
+      await mountApp();
+      await fireEvent.click(await screen.findByText("alpha"));
+      await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
+    }
+
+    it("gates sending behind a banner that names the missing folder", async () => {
+      seedProject({ projectId: "p-a", name: "alpha", available: false, agents: [ASSISTANT] });
+      await openAlpha();
+
+      const banner = await screen.findByTestId("banner-project-directory-unavailable");
+      expect(banner).toHaveTextContent(`no longer exists at ${DIR_A}`);
+      expect(banner).toHaveTextContent("put it back at that location");
+      expect(screen.getByTestId("banner-project-directory-unavailable-action")).toHaveTextContent(
+        "Check again",
+      );
+
+      await fireEvent.input(screen.getByTestId("compose-textarea"), { target: { value: "hi" } });
+      expect((screen.getByTestId("compose-send") as HTMLButtonElement).disabled).toBe(true);
+      await fireEvent.keyDown(screen.getByTestId("compose-textarea"), {
+        key: "Enter",
+        metaKey: true,
+      });
+      expect(invokeMock.mock.calls.filter(([cmd]) => cmd === "send_message")).toHaveLength(0);
+    });
+
+    it("words the banner differently when the catalog cannot resolve the folder", async () => {
+      seedProject({ projectId: "p-a", name: "alpha", agents: [ASSISTANT] });
+      const row = backend.projects.find((project) => project.id === "p-a");
+      if (row === undefined) throw new Error("expected seeded project");
+      row.directory_status = "catalog_missing";
+      await openAlpha();
+
+      const banner = await screen.findByTestId("banner-project-directory-unavailable");
+      expect(banner).toHaveTextContent("can't tell which folder this project belongs to");
+      expect(banner).toHaveTextContent("isn't possible from Switchboard yet");
+      expect(
+        screen.queryByTestId("banner-project-directory-unavailable-action"),
+      ).not.toBeInTheDocument();
+    });
+
+    it("re-checks the folder from the banner's Check again button", async () => {
+      seedProject({ projectId: "p-a", name: "alpha", available: false, agents: [ASSISTANT] });
+      await openAlpha();
+      await screen.findByTestId("banner-project-directory-unavailable");
+
+      const row = backend.projects.find((project) => project.id === "p-a");
+      if (row === undefined) throw new Error("expected seeded project");
+      row.directory_status = "resolved_available";
+      await fireEvent.click(screen.getByTestId("banner-project-directory-unavailable-action"));
+
+      await waitFor(() =>
+        expect(
+          screen.queryByTestId("banner-project-directory-unavailable"),
+        ).not.toBeInTheDocument(),
+      );
+      expect((screen.getByTestId("compose-send") as HTMLButtonElement).disabled).toBe(true);
+    });
+
+    it("still opens the sidebar at launch when a focus refresh overlaps the startup read", async () => {
+      // The startup read decides, once per session, whether to force the
+      // sidebar open. A focus event on launch starts a second read; the two
+      // must not cancel each other into an empty list.
+      seedProject({ projectId: "p-a", name: "alpha", agents: [ASSISTANT] });
+      const { layout } = await import("$lib/layout.svelte");
+      layout.projectsSidebarOpen = false;
+      let release: () => void = () => {};
+      backend.listProjectsGate = new Promise<void>((r) => (release = r));
+
+      await mountApp();
+      window.dispatchEvent(new Event("focus"));
+      await tick();
+      release();
+
+      await waitFor(() => expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument());
+      expect(layout.projectsSidebarOpen).toBe(true);
+    });
+
+    it("clears the banner and the gate once a refresh sees the folder again", async () => {
+      seedProject({ projectId: "p-a", name: "alpha", available: false, agents: [ASSISTANT] });
+      await openAlpha();
+      await screen.findByTestId("banner-project-directory-unavailable");
+      await fireEvent.input(screen.getByTestId("compose-textarea"), { target: { value: "hi" } });
+
+      const row = backend.projects.find((project) => project.id === "p-a");
+      if (row === undefined) throw new Error("expected seeded project");
+      row.directory_status = "resolved_available";
+      window.dispatchEvent(new Event("focus"));
+
+      await waitFor(() =>
+        expect(
+          screen.queryByTestId("banner-project-directory-unavailable"),
+        ).not.toBeInTheDocument(),
+      );
+      expect((screen.getByTestId("compose-textarea") as HTMLTextAreaElement).value).toBe("hi");
+      expect((screen.getByTestId("compose-send") as HTMLButtonElement).disabled).toBe(false);
+    });
+
+    it("notices a folder that vanished while the app was in the background, on window focus", async () => {
+      seedProject({ projectId: "p-a", name: "alpha", agents: [ASSISTANT] });
+      await openAlpha();
+      expect(screen.queryByTestId("banner-project-directory-unavailable")).not.toBeInTheDocument();
+
+      const row = backend.projects.find((project) => project.id === "p-a");
+      if (row === undefined) throw new Error("expected seeded project");
+      row.directory_status = "resolved_path_unavailable";
+      window.dispatchEvent(new Event("focus"));
+
+      await screen.findByTestId("banner-project-directory-unavailable");
+      expect(screen.getByTestId("project-unavailable")).toBeInTheDocument();
+    });
+
+    it("re-checks on visibility change too, and only when becoming visible", async () => {
+      seedProject({ projectId: "p-a", name: "alpha", agents: [ASSISTANT] });
+      await openAlpha();
+      const listsBefore = invokeMock.mock.calls.filter(([cmd]) => cmd === "list_projects").length;
+      const row = backend.projects.find((project) => project.id === "p-a");
+      if (row === undefined) throw new Error("expected seeded project");
+      row.directory_status = "resolved_path_unavailable";
+
+      const original = Object.getOwnPropertyDescriptor(document, "visibilityState");
+      try {
+        Object.defineProperty(document, "visibilityState", { value: "hidden", configurable: true });
+        document.dispatchEvent(new Event("visibilitychange"));
+        await tick();
+        expect(invokeMock.mock.calls.filter(([cmd]) => cmd === "list_projects").length).toBe(
+          listsBefore,
+        );
+
+        Object.defineProperty(document, "visibilityState", {
+          value: "visible",
+          configurable: true,
+        });
+        document.dispatchEvent(new Event("visibilitychange"));
+        await screen.findByTestId("banner-project-directory-unavailable");
+      } finally {
+        if (original === undefined) {
+          delete (document as { visibilityState?: unknown }).visibilityState;
+        } else {
+          Object.defineProperty(document, "visibilityState", original);
+        }
+      }
+    });
+
+    it("re-checks when a send fails before its turn starts, without waiting for focus", async () => {
+      seedProject({ projectId: "p-a", name: "alpha", agents: [ASSISTANT] });
+      await openAlpha();
+      await fireEvent.input(screen.getByTestId("compose-textarea"), { target: { value: "hi" } });
+      await fireEvent.click(screen.getByTestId("compose-send"));
+      await waitFor(() =>
+        expect(invokeMock.mock.calls.some(([cmd]) => cmd === "send_message")).toBe(true),
+      );
+
+      // The folder went away under the app; the backend's answer is the
+      // truthful spawn failure, which is the signal the list is stale.
+      const row = backend.projects.find((project) => project.id === "p-a");
+      if (row === undefined) throw new Error("expected seeded project");
+      row.directory_status = "resolved_path_unavailable";
+      fireTo(`agent:${ASSISTANT.id}`, {
+        type: "message_failed",
+        message_id: backend.sendMessageId,
+        send_id: null,
+        agent_id: ASSISTANT.id,
+        error: `working directory no longer exists: ${DIR_A}`,
+        at: "2026-05-20T00:00:06Z",
+      });
+
+      await screen.findByTestId("banner-project-directory-unavailable");
+    });
   });
 });

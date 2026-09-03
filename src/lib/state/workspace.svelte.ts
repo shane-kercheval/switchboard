@@ -63,6 +63,7 @@ import {
   markHydrationAttempted,
   registerAgent,
   runtimes,
+  setDispatchFailedHook,
   setTurnTerminalHook,
   transcripts,
   unregisterAgents,
@@ -467,14 +468,81 @@ export function startProjectActivityObserver(
 /// Fetch the eager registry: the directory list (incl. empty directories + the
 /// persistability signal) and the flat project list. Called at startup and
 /// after any add/remove/create that changes the registry.
-export async function loadWorkspace(): Promise<void> {
-  const [dirs, projectList] = await Promise.all([
-    api.listWorkspaceDirectories(),
-    api.listProjects(),
-  ]);
-  workspace.directories = dirs.directories;
-  workspace.persistable = dirs.persistable;
-  projects.list = applyActivityOverrides(projectList);
+export function loadWorkspace(): Promise<void> {
+  if (readInFlight !== null) {
+    readRequested = true;
+    return readInFlight;
+  }
+  const generation = loaderGeneration;
+  const token = {};
+  const worker: Promise<void> = (async () => {
+    try {
+      let invalidations = 0;
+      for (;;) {
+        readRequested = false;
+        const epoch = mutationEpoch;
+        const [dirs, projectList] = await Promise.all([
+          api.listWorkspaceDirectories(),
+          api.listProjects(),
+        ]);
+        // A test reset happened underneath: this worker belongs to a previous
+        // world and must neither apply nor retry into the next one.
+        if (generation !== loaderGeneration) return;
+        if (epoch !== mutationEpoch) {
+          invalidations += 1;
+          if (invalidations >= REGISTRY_READ_ATTEMPTS) {
+            throw new Error("the project list kept changing while it was being read");
+          }
+          continue;
+        }
+        // **No `await` from here to the end of this iteration.** A caller that
+        // arrives during a read sets `readRequested` and shares this promise;
+        // the decision to read once more, the apply, and (in `finally`) the
+        // release of `readInFlight` must be one synchronous step, or a caller
+        // could land after the decision to stop and resolve against a list
+        // older than its own request with nothing scheduled to fix it.
+        workspace.directories = dirs.directories;
+        workspace.persistable = dirs.persistable;
+        projects.list = applyActivityOverrides(projectList);
+        if (!readRequested) return;
+      }
+    } finally {
+      if (readToken === token) {
+        readInFlight = null;
+        readToken = null;
+      }
+    }
+  })();
+  readInFlight = worker;
+  readToken = token;
+  return worker;
+}
+
+/// Reads of the registry are single-flight: one worker at a time, and a caller
+/// that arrives mid-read shares it and is guaranteed one more read *after* its
+/// call, so every caller resolves only once a list at least as new as its own
+/// request has been applied (or the read failed — a failure rejects every
+/// waiter, since none of them got their list). A snapshot is discarded and
+/// re-read only when a **local mutation** (`markRegistryMutated`) landed while
+/// it was in flight — applying it would put a renamed or archived row back —
+/// and after `REGISTRY_READ_ATTEMPTS` such invalidations the read fails rather
+/// than pretending it succeeded. Background refreshes swallow that; a caller
+/// that needs the list (startup, create) surfaces it.
+let readInFlight: Promise<void> | null = null;
+/// Identifies the worker that owns `readInFlight`, so a worker finishing late
+/// (after a reset replaced it) releases only its own slot.
+let readToken: object | null = null;
+let readRequested = false;
+let mutationEpoch = 0;
+/// Bumped by `_testing.reset()` so a worker from a previous test abandons
+/// instead of retrying against the next test's mocks.
+let loaderGeneration = 0;
+const REGISTRY_READ_ATTEMPTS = 3;
+
+/// Record a local mutation to a registry row, so a read in flight is re-read
+/// rather than applied over the newer local state.
+function markRegistryMutated(): void {
+  mutationEpoch += 1;
 }
 
 /// Add a working directory to the workspace and refresh the registry.
@@ -689,6 +757,7 @@ function replaceAgentRecord(agentId: AgentId, updated: AgentRecord): void {
 /// surfaces them and stays in edit mode).
 export async function renameProject(projectId: ProjectId, newName: string): Promise<void> {
   const updated = await api.renameProject(projectId, newName);
+  markRegistryMutated();
   projects.list = projects.list.map((p) => (p.id === projectId ? updated : p));
 }
 
@@ -733,6 +802,7 @@ async function deleteProjectOnce(projectId: ProjectId): Promise<void> {
   forgetReadingMode([projectId]);
   unregisterAgents(removedAgentIds);
   unsubscribeProjectWorkflows([projectId]);
+  markRegistryMutated();
   projects.list = projects.list.filter((p) => p.id !== projectId);
   delete agentsByProject[projectId];
   delete conversations[projectId];
@@ -760,7 +830,38 @@ async function deleteProjectOnce(projectId: ProjectId): Promise<void> {
 /// propagate to the caller (the menu surfaces them and keeps the current state).
 export async function setProjectArchived(projectId: ProjectId, archived: boolean): Promise<void> {
   await api.setProjectArchived(projectId, archived);
+  markRegistryMutated();
   projects.list = projects.list.map((p) => (p.id === projectId ? { ...p, archived } : p));
+}
+
+/// Coalesces registry re-reads that arrive together: a window focus and a
+/// visibility change (macOS raises both when the app is brought forward), or the
+/// several dispatch failures one agent shutdown emits.
+let registryRefresh: Promise<void> | null = null;
+
+/// Re-read the registry because something suggests the list on screen is stale.
+/// A directory's availability is computed when the list is read and nothing
+/// watches the filesystem, so a folder deleted or moved while the user was
+/// elsewhere stays "available" here until something re-lists. Two things
+/// suggest staleness: the user returning to the window (they just did something
+/// elsewhere), and a send failing before its turn starts (one cause is the
+/// working directory being gone). Read failures are swallowed: the list on
+/// screen stays, and the next trigger tries again.
+export function refreshProjectRegistry(): Promise<void> {
+  if (registryRefresh !== null) return registryRefresh;
+  const refresh: Promise<void> = loadWorkspace()
+    .catch(() => undefined)
+    .finally(() => {
+      if (registryRefresh === refresh) registryRefresh = null;
+    });
+  registryRefresh = refresh;
+  return refresh;
+}
+
+/// Wire the pre-turn-failure hook that drives [`refreshProjectRegistry`]. Called
+/// once at app start; returns the uninstall, which clears only this hook.
+export function installRegistryStalenessRefresh(): () => void {
+  return setDispatchFailedHook(() => void refreshProjectRegistry());
 }
 
 /// Dismiss the auto-create failure banner for one harness.
@@ -1313,6 +1414,12 @@ export const _testing = {
     forkHistoryLoaded.clear();
     forkHistoryPending.clear();
     setTurnTerminalHook(undefined);
+    setDispatchFailedHook(undefined);
+    loaderGeneration += 1;
+    readInFlight = null;
+    readToken = null;
+    readRequested = false;
+    registryRefresh = null;
     workspace.directories = [];
     workspace.persistable = true;
     projects.list = [];

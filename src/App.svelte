@@ -84,6 +84,8 @@
     nextUnreadCompletedProjectId,
     projects,
     projectDeletions,
+    installRegistryStalenessRefresh,
+    refreshProjectRegistry,
     retryProjectHydration,
     seedPathUnresolved,
     selection,
@@ -485,12 +487,45 @@
       });
 
     window.addEventListener("keydown", handleGlobalKeydown);
+    // Directory availability is only known at list time (see
+    // `refreshProjectRegistry`), so re-list whenever the user comes back, and
+    // whenever a send fails before its turn starts.
+    const uninstallStalenessRefresh = installRegistryStalenessRefresh();
+    const refreshOnReturn = (): void => void refreshProjectRegistry();
+    const refreshWhenVisible = (): void => {
+      if (document.visibilityState === "visible") refreshOnReturn();
+    };
+    window.addEventListener("focus", refreshOnReturn);
+    document.addEventListener("visibilitychange", refreshWhenVisible);
     const removeDevSeed = installDevTranscriptSeed(() => activeAgents);
     return () => {
       stopProjectActivityObserver();
       window.removeEventListener("keydown", handleGlobalKeydown);
+      window.removeEventListener("focus", refreshOnReturn);
+      document.removeEventListener("visibilitychange", refreshWhenVisible);
+      uninstallStalenessRefresh();
       removeDevSeed();
     };
+  });
+
+  // The displayed project's row when its working directory can't be used: the
+  // folder is gone, or the catalog can't say which folder it is. Either way no
+  // agent can run there, so the compose bar is gated (see ComposeBar) and this
+  // banner says why. It clears on its own once a registry refresh sees the
+  // folder again.
+  const activeDirectoryProblem = $derived.by(() => {
+    const projectId = selection.activeProjectId;
+    if (projectId === null) return null;
+    const listing = projects.list.find((candidate) => candidate.id === projectId);
+    if (listing === undefined || projectIsAvailable(listing)) return null;
+    return listing;
+  });
+  const activeDirectoryProblemMessage = $derived.by(() => {
+    const listing = activeDirectoryProblem;
+    if (listing === null) return "";
+    return listing.directory_status === "resolved_path_unavailable" && listing.directory !== null
+      ? `This project's folder no longer exists at ${listing.directory}, so its agents can't run. If it was moved, put it back at that location; Switchboard checks again when you return to the window.`
+      : "Switchboard can't tell which folder this project belongs to, so it can't be used. Repairing its folder record isn't possible from Switchboard yet.";
   });
 
   // The displayed project's roster + hydrated conversation. `rosterLoaded`
@@ -1593,6 +1628,16 @@
           message={`Pin change wasn't saved: ${activePinMutationError}`}
           testid="banner-pins-save-failed"
           onDismiss={() => dismissPinMutationError(selection.activeProjectId!)}
+        />
+      {/if}
+      {#if activeDirectoryProblem !== null}
+        <Banner
+          message={activeDirectoryProblemMessage}
+          testid="banner-project-directory-unavailable"
+          actionLabel={activeDirectoryProblem.directory_status === "resolved_path_unavailable"
+            ? "Check again"
+            : undefined}
+          onAction={() => void refreshProjectRegistry()}
         />
       {/if}
 

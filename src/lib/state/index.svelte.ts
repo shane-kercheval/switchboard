@@ -176,6 +176,25 @@ export function setTurnTerminalHook(hook: TurnTerminalHook | undefined): void {
   turnTerminalHook = hook;
 }
 
+/// Called when a send fails before its turn starts (`message_failed`): the
+/// adapter refused to spawn, or a queued item was dropped by a shutdown. One of
+/// those failures is the working directory having vanished, a fact the project
+/// registry only learns when it is re-listed, so the consumer re-reads it. Same
+/// registration shape as `TurnTerminalHook`, for the same dependency reason.
+type DispatchFailedHook = (agentId: AgentId) => void;
+
+let dispatchFailedHook: DispatchFailedHook | undefined;
+
+/// Install (or, with `undefined`, clear) the hook. Returns a disposer that
+/// removes only the hook it installed, so an owner tearing down late cannot
+/// unhook a successor.
+export function setDispatchFailedHook(hook: DispatchFailedHook | undefined): () => void {
+  dispatchFailedHook = hook;
+  return () => {
+    if (dispatchFailedHook === hook) dispatchFailedHook = undefined;
+  };
+}
+
 /// Per-agent unlisten functions for the Tauri event channel. Keyed by
 /// `agent_id`. We hold these so the test harness can drain them via
 /// `_testing.reset()`; production callers never unregister.
@@ -757,6 +776,7 @@ function handleEvent(agentId: AgentId, event: NormalizedEvent): void {
     turnTerminalHook?.(agentId, outcome);
   } else if (event.type === "message_failed") {
     settleRecipient(failedSendId, agentId, "failed");
+    dispatchFailedHook?.(agentId);
   } else if (event.type === "message_cancelled") {
     settleRecipient(event.send_id, agentId, "cancelled");
   } else if (event.type === "agent_idle") {
